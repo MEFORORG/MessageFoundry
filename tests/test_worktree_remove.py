@@ -454,6 +454,25 @@ def test_name_refuses_a_flagged_file_and_force_overrides_it_by_name(fx: Fixture,
     assert not wt.exists()
 
 
+def test_name_names_flagged_files_in_the_tracked_change_refusal(fx: Fixture) -> None:
+    """The refusal that tells the operator to re-run with -Force must show every flagged file that
+    -Force would also take, not only the tracked change."""
+    wt = fx.add("both")
+    (wt / "other.txt").write_text("tracked\n", encoding="utf-8")
+    _git(wt, "add", "other.txt")
+    _git(wt, "commit", "-qm", "other")
+    _git(wt, "update-index", "--skip-worktree", "seed.txt")
+    (wt / "seed.txt").write_text("hidden edit\n", encoding="utf-8")
+    (wt / "other.txt").write_text("visible edit\n", encoding="utf-8")
+
+    proc = run(fx, "-Name", "both")
+
+    assert proc.returncode != 0
+    assert "uncommitted tracked changes" in proc.stderr, proc.stdout + proc.stderr
+    assert "flagged seed.txt" in proc.stdout, proc.stdout
+    assert fx.is_registered(wt)
+
+
 def test_name_runs_no_blanket_prune_so_another_stale_registration_survives(fx: Fixture) -> None:
     """Red before the fix (and BACKLOG #7619): -Name ran `git worktree prune` after the removal, which
     drops every registration whose directory is missing at that moment, with its HEAD reflog."""

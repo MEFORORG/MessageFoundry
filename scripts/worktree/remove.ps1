@@ -1084,24 +1084,28 @@ else {
         throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
     }
     $tracked = $status | Where-Object { $_ -notmatch '^\?\?' }
-    if ($tracked -and -not $Force -and -not $Discard) {
-        Write-Host ($tracked -join "`n")
-        throw "Worktree has uncommitted tracked changes. Commit/push them, or re-run with -Force."
-    }
     # FILES FLAGGED skip-worktree (S) OR assume-unchanged (lower case), BACKLOG #5648. git status does
     # not look at one, so an edit to it is invisible to the guard above, and `worktree remove --force`
     # deletes it. Nothing here can tell an edited one from an untouched one without reading it, so
     # every flagged file refuses. -Force overrides, as it does for tracked changes, and the run names
     # each file it let go so the override leaves a record in the caller's output. -Discard refuses
     # them whatever -Force says, in its own block below.
-    if ($flagged.Count -gt 0 -and -not $Discard) {
-        if (-not $Force) {
+    # ONE REFUSAL NAMES BOTH KINDS, so an operator told to re-run with -Force for a tracked change has
+    # also been shown every flagged file that -Force would take with it.
+    $refuseFlagged = $flagged.Count -gt 0 -and -not $Discard -and -not $Force
+    if (($tracked -and -not $Force -and -not $Discard) -or $refuseFlagged) {
+        $why = @()
+        if ($tracked -and -not $Discard) { Write-Host ($tracked -join "`n"); $why += 'uncommitted tracked changes' }
+        if ($flagged.Count -gt 0 -and -not $Discard) {
             $flagged | Select-Object -First 20 | ForEach-Object { Write-Host "flagged $($_.Substring(2))" }
             if ($flagged.Count -gt 20) { Write-Host "... and $($flagged.Count - 20) more" }
-            throw ("Worktree has $($flagged.Count) file(s) flagged skip-worktree or assume-unchanged, which git " +
-                "status does not read, so an edit to one would be lost unseen. -Force discards them, and it " +
-                "is the operator's switch. Nothing was removed.")
+            $why += ("$($flagged.Count) file(s) flagged skip-worktree or assume-unchanged, which git status " +
+                "does not read, so an edit to one would be lost unseen")
         }
+        throw ("Worktree has $($why -join ', and '). Commit/push them, or re-run with -Force, which discards " +
+            "them and is the operator's switch. Nothing was removed.")
+    }
+    if ($flagged.Count -gt 0 -and -not $Discard) {
         # Said before the checks below, any of which can still refuse; the line says "if", not "did".
         Write-Host ("-Force: not refusing $($flagged.Count) file(s) flagged skip-worktree or assume-unchanged in " +
             "'$WorktreePath'. They go, unread, if the worktree is removed:") -ForegroundColor Yellow

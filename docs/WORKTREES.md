@@ -182,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. A detached HEAD no ref holds. An unlanded ledger number. Whatever `-Force` says: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, a caller standing in the tree or running a copy of the script that lives in it, a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Without `-Force`: uncommitted tracked changes (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, a caller standing in the tree or running a copy of the script that lives in it, a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` (one above the primary does not count; see below) | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 

@@ -530,7 +530,13 @@ function Get-CloneReport($R) {
                 }
             }
             if ($reasons.Count -gt 0) { $verdict = 'HUMAN' }
-            else { $verdict = 'REMOVE'; $command = $plain }
+            else {
+                $verdict = 'REMOVE'
+                # The host circuit breaker CLAUDE.md section 5 requires of a command handed to the owner:
+                # on a shared coordination root the other PC can have a tree at the same path.
+                $hostQ = "'$(([Environment]::MachineName) -replace "'", "''")'"
+                $command = "if ([Environment]::MachineName -ne $hostQ) { Write-Host ""STOP     this must run on $([Environment]::MachineName), but this is `$([Environment]::MachineName); nothing ran"" } else { $plain }"
+            }
         }
         elseif ($mergeState -eq 'UNKNOWN') { $verdict = 'UNKNOWN' }
 

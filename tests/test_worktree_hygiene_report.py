@@ -408,6 +408,9 @@ def test_it_writes_both_files_and_proposes_only_the_safe_removals(fx: Fx) -> Non
     assert rows["repo-m-clean"]["remoteBranchExists"] is False
     assert rows["repo-m-venv"]["verdict"] == "REMOVE"
     assert "--force" not in rows["repo-m-venv"]["command"], "a gitignored .venv needs no --force"
+    assert rows["repo-m-clean"]["command"].startswith("if ([Environment]::MachineName -ne "), (
+        "no host circuit breaker"
+    )
     assert rows["repo-m-dirty"]["verdict"] == "HUMAN"
     assert any("uncommitted" in r for r in rows["repo-m-dirty"]["reasons"])
     assert rows["repo-m-unpushed"]["verdict"] == "HUMAN"
@@ -656,8 +659,11 @@ def test_the_report_does_not_touch_a_worktrees_index(fx: Fx) -> None:
     os.utime(wt / "m-clean.txt", (later, later))
     before = index.stat().st_mtime_ns
 
-    proc = _run(fx, "-SkipGh", "-SkipFetch")
+    # With merge status read, so m-clean is MERGED and every per-tree ownership read runs on it.
+    fake, _ = _fake_gh(fx)
+    proc = _run(fx, "-SkipFetch", "-Gh", str(fake), "-GhRepo", "acme/repo")
     assert proc.returncode == 0, proc.stderr
+    assert _rows(_report(fx))["repo-m-clean"]["merge"] == "MERGED"
     assert index.stat().st_mtime_ns == before, "the report rewrote a worktree's index"
 
     time.sleep(1.1)
