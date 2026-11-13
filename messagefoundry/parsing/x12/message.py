@@ -6,9 +6,14 @@
 Field paths use ``SEG-EE[.CC]`` syntax: a 2–3 char segment id, the 1-based element index (element 0
 is the segment tag, so ``NM1-03`` is the 3rd element of an ``NM1``; ``ISA-06`` the interchange sender
 id), and an optional 1-based component index. Reads/writes address the **first** occurrence of a
-segment unless ``occurrence=`` is given. All structure is rebuilt with the interchange's **own**
-discovered delimiters (never hardcoded), and a write rejects values carrying a delimiter so it can't
-inject new structure. Re-encoding uses the discovered delimiters only, so it is **not** guaranteed
+segment unless ``occurrence=`` is given. In a repeating element (from 00501, where ISA-11 is the
+repetition separator) a component path addresses the **first** repetition and a write keeps the
+rest; before 00501, on a 00501 header still carrying the legacy ISA-11 ``U``, and in the ISA, a
+component path reads across the whole element. A whole-element read returns the raw element, every
+repetition included; a whole-element write refuses the repetition separator, so it replaces the
+element with one repetition. All structure is rebuilt with the interchange's **own** discovered
+delimiters (never hardcoded), and a write rejects values carrying a delimiter so it can't inject
+new structure. Re-encoding uses the discovered delimiters only, so it is **not** guaranteed
 byte-identical when the source carried cosmetic whitespace between segments (the store keeps the raw
 verbatim — this model is for transforms). Pure: no I/O, no engine imports.
 """
@@ -93,7 +98,9 @@ class X12Message:
 
     def get(self, path: str, *, occurrence: int = 1) -> str | None:
         """Value at ``path`` (``"ISA-06"``, ``"NM1-03"``, ``"NM1-03.1"``), or None if absent/empty.
-        ``occurrence`` (1-based) selects which segment of that id to read."""
+        ``occurrence`` (1-based) selects which segment of that id to read. Where ISA-11 is the
+        repetition separator, a component outside the ISA is read from the element's first
+        repetition (the module docstring names the exceptions)."""
         seg_id, elem, comp = _parse_path(path)
         seg = self._nth_segment(seg_id, occurrence)
         if seg is None or elem >= len(seg):
@@ -101,7 +108,8 @@ class X12Message:
         value = seg[elem]
         if comp is None:
             return value or None
-        comps = value.split(self._delims.component)
+        first, _ = self._split_first_repetition(seg_id, value)
+        comps = first.split(self._delims.component)
         return (comps[comp - 1] or None) if comp <= len(comps) else None
 
     def __getitem__(self, path: str) -> str | None:
@@ -118,11 +126,13 @@ class X12Message:
     # --- mutate --------------------------------------------------------------
 
     def set(self, path: str, value: str, *, occurrence: int = 1) -> None:
-        """Write ``value`` at ``path``, extending the element/components as needed.
+        """Write ``value`` at ``path``, extending the element/components as needed. A component
+        write goes into the element's first repetition and keeps the later ones.
 
-        ``value`` may not contain a delimiter (element/component/repetition separator or a segment
-        terminator character, incl. CR/LF) — that would inject new structure — and raises ``ValueError``
-        if it does. Raises ``KeyError`` if the target segment occurrence is absent.
+        ``value`` may not contain the element or repetition separator or a segment terminator
+        character (incl. CR/LF), nor, in a component write, the component separator — that would
+        inject new structure — and raises ``ValueError`` if it does. Raises ``KeyError`` if the
+        target segment occurrence is absent.
 
         An ``ISA`` write keeps the header's fixed width: a short ``ISA-02``/``04``/``06``/``08`` is
         space-padded on the right and a short all-digit ``ISA-13`` zero-padded on the left, and
@@ -147,11 +157,12 @@ class X12Message:
         if comp is None:
             seg[elem] = value
             return
-        comps = seg[elem].split(self._delims.component) if seg[elem] else []
+        first, rest = self._split_first_repetition(seg_id, seg[elem])
+        comps = first.split(self._delims.component) if first else []
         while len(comps) < comp:
             comps.append("")
         comps[comp - 1] = value
-        seg[elem] = self._delims.component.join(comps)
+        seg[elem] = self._delims.component.join(comps) + rest
 
     def set_data(self, path: str, value: str, *, occurrence: int = 1) -> None:
         """Write ``value`` at ``path`` as data, under the name the HL7 ``Message`` gives its data
@@ -226,6 +237,19 @@ class X12Message:
                 if seen == occurrence:
                     return seg
         return None
+
+    def _split_first_repetition(self, segment_id: str, value: str) -> tuple[str, str]:
+        """``value`` as its first repetition and the rest, the rest keeping its leading separator,
+        so ``first + rest == value``. A component path addresses the first repetition only
+        (BACKLOG #5922). The value comes back whole before 00501, where there is no repetition
+        separator; in an ISA element, which is simple (ISA-11 holds the separator itself); and
+        where a 00501 header still carries the legacy alphanumeric ISA-11 ``U``, which the parse
+        tolerates and where splitting would cut ordinary data such as a code holding a ``U``."""
+        rep = self._delims.repetition
+        if not rep or rep.isalnum() or segment_id == "ISA":
+            return value, ""
+        first, sep, rest = value.partition(rep)
+        return first, sep + rest
 
     def _fit_isa_element(self, elem: int, comp: int | None, value: str) -> str:
         """``value`` at ``ISA-elem``'s fixed width, or ``ValueError`` if it cannot be written there.
