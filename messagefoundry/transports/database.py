@@ -1537,23 +1537,29 @@ def _libpq_homes() -> list[tuple[str, str]]:
     password-file home alone, as libpq 14 and older find it (``pqGetHomeDirectory``). When the two
     differ, both are named, so a check of one cannot clear a file libpq loads from the other.
     Empty when no directory can be named, as libpq then reads no default file, and on Windows
-    when the shell's ANSI folder holds a character no Windows name can hold, which the ANSI call
-    writes for a character its code page cannot hold (``?``, or a best-fit such as ``*`` for a
-    fullwidth asterisk): libpq's open of that path finds no file.
+    when the shell's ANSI folder holds a ``?`` past the drive: the ANSI call writes ``?`` for a
+    character its code page cannot hold and has no best fit for, and libpq's open of that path
+    finds no file. Best-fit maps other such characters to valid ones, and that path is named and
+    checked like any other.
 
     An empty folder or password-file home still names one: libpq joins it as ``'%s/%s'``, so it
     reads ``/.postgresql/root.crt``, or ``/postgresql/root.crt`` on Windows (``pqGetHomeDirectory``
     and ``initialize_SSL`` in libpq 17). Raises ``OSError`` when the Windows shell call cannot be
-    made (:func:`_windows_roaming_appdata`)."""
+    made (:func:`_windows_roaming_appdata`), or off Windows when ``pwd`` cannot be imported."""
     if sys.platform == "win32":
         appdata = _windows_roaming_appdata()
         if appdata is None:
             return []
-        if any(c in _WINDOWS_NAME_FORBIDDEN for c in os.path.splitdrive(appdata)[1]):
-            logger.debug("libpq's shell folder names no file Windows can hold, so none is read")
+        # The ANSI call writes "?" for a character its code page cannot hold and has no best fit
+        # for, and Windows answers a "?" in a name as an invalid name, so libpq opens no file.
+        if "?" in os.path.splitdrive(appdata)[1]:
+            logger.debug("libpq's shell folder holds a substituted '?', so no file is read there")
             return []
         return [("", os.path.join(appdata or os.sep, "postgresql"))]
-    import pwd
+    try:
+        import pwd
+    except ImportError as exc:
+        raise OSError("the password file could not be read to name libpq's home") from exc
 
     # Keyed by the joined directory, so the same spelling of one home is named once. No lexical
     # normpath: past a link, its ".." names another directory than the system resolves.
@@ -1574,8 +1580,6 @@ def _libpq_homes() -> list[tuple[str, str]]:
 
 #: ``CSIDL_APPDATA``: the roaming application-data folder libpq asks the Windows shell for.
 _CSIDL_APPDATA = 0x1A
-#: The characters no Windows file or folder name can hold, past the drive.
-_WINDOWS_NAME_FORBIDDEN = frozenset('<>:"|?*')
 
 
 def _windows_roaming_appdata() -> str | None:

@@ -559,10 +559,11 @@ def test_libpqs_home_on_windows_is_the_shell_roaming_folder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """libpq asks the shell, so an unset ``APPDATA`` does not hide the default file."""
+    ascii_profile = os.environ.get("APPDATA", "").isascii()
     monkeypatch.delenv("APPDATA", raising=False)
-    homes = database._libpq_homes()  # empty for a profile folder the code page cannot hold
+    homes = database._libpq_homes()  # empty only for a "?" the ANSI call substituted
     assert all(label == "" and home.endswith(os.sep + "postgresql") for label, home in homes)
-    assert len(homes) <= 1
+    assert len(homes) == 1 or not ascii_profile
 
 
 class _FakeShell32:
@@ -599,14 +600,53 @@ def test_libpqs_windows_home_comes_from_the_ansi_shell_call(
 def test_a_shell_folder_the_code_page_could_not_hold_names_no_libpq_home(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The ANSI call writes ``?`` for a character its code page cannot hold, and no Windows name
-    holds ``?``, so libpq opens no file there and the check reads none. Red while such a folder
-    was named: the walk refused the folder as unreadable and failed every psqlODBC TLS build."""
+    """The ANSI call writes ``?`` for a character its code page cannot hold and has no best fit
+    for, and Windows answers a ``?`` in a name as an invalid name, so libpq opens no file there
+    and the check reads none. Red while such a folder was named: the walk refused the folder as
+    unreadable and failed every psqlODBC TLS build."""
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
-    for folder in ("C:\\Users\\????", "C:\\Users\\a*b", 'C:\\Users\\a"b'):  # "?" and best fits
-        monkeypatch.setattr(database, "_windows_roaming_appdata", lambda folder=folder: folder)
-        assert database._libpq_homes() == []
-        assert "SSLmode=verify-full;" in _build_psql()
+    monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: "C:\\Users\\????")
+    assert database._libpq_homes() == []
+    assert "SSLmode=verify-full;" in _build_psql()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
+def test_libpqs_windows_root_certificate_is_refused_through_the_shell_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The positive control for the Windows home: a shell folder, through the ANSI call and the
+    drive's own ``:``, names ``postgresql\\root.crt`` there, and an encrypted one is refused. Red
+    whenever the Windows lookup names no home, such as a screen that trips on the drive."""
+    import ctypes
+
+    try:
+        encoded = str(tmp_path).encode("mbcs", "strict")
+    except UnicodeEncodeError:
+        pytest.skip("the runner's temporary folder is outside the ANSI code page")
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name: _FakeShell32(encoded))
+    (tmp_path / "postgresql").mkdir()
+    _write(tmp_path / "postgresql", _certificate(), "root.crt")
+    assert "SSLmode=verify-full;" in _build_psql()
+    _write(tmp_path / "postgresql", _headered(_certificate()), "root.crt")
+    with pytest.raises(ValueError, match="DATABASE libpq's default root certificate:") as refused:
+        _build_psql()
+    assert ENCRYPTION_HEADER_SCOPE in str(refused.value)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="pwd is imported off Windows only")
+def test_a_missing_pwd_module_is_a_valueerror_from_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The password-file home is read whatever ``HOME`` says, so a ``pwd`` that cannot be
+    imported is an ``OSError`` the build refuses as a ``ValueError``. Red before the import was
+    caught: its ``ModuleNotFoundError`` escaped the builder as itself."""
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    monkeypatch.setitem(sys.modules, "pwd", None)
+    with pytest.raises(OSError, match="password file could not be read"):
+        database._libpq_homes()
+    with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):
+        _build_psql()
 
 
 def _refuse_lookup() -> list[tuple[str, str]]:
