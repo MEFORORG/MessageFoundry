@@ -7623,12 +7623,14 @@ again for the row, and only when a send failed. **Still open, at least:**
   `reason: closing`. The close waits only for records started before it finishes. One started
   later can meet the closed store, and is then lost like any failed record write.
 - `admin-reset-totp` loses the record of a failed notice in at least these cases: its reopen of
-  the store fails, the write fails, the run is interrupted, or the reopen, write and close do not
-  finish together within `_OFFLINE_NOTICE_RECORD_SECONDS` in `messagefoundry/__main__.py`. The
-  miss is logged by class only, and what a record still running at the limit then does is logged
-  when it does. The reopen and the write run on their own loop in a daemon thread, so that limit
-  covers a synchronous key-provider hop inside the open too, and a committed row is never reported
-  as missed for a slow close. **The process's exit can still wait for the record**: once the
+  the store fails, or the write fails. The run being interrupted can lose it too. The command waits
+  for the reopen and the write together for at most `_OFFLINE_NOTICE_RECORD_SECONDS` in
+  `messagefoundry/__main__.py`, and then logs a miss by class only. A record still running at
+  that limit is not lost by it: it may still land, or fail, and what it does is logged when it
+  does, unless the wait was interrupted rather than timed out. The close comes after the answer,
+  so a slow close never costs the row or reports it missed. The reopen and the write run on their
+  own loop in a daemon thread, so the limit covers a synchronous key-provider hop inside the open
+  too. **The process's exit can still wait for the record**: once the
   reopen reaches a store driver, the driver's own thread runs the call, and the interpreter waits
   for it at exit. The command has printed its result by then.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are

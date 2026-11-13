@@ -1982,7 +1982,7 @@ def test_cli_wires_the_notifier_drains_it_and_reports_the_takeover(
     assert recorder.started and recorder.queued_at_close == 1
     assert [e.email for e in recorder.events] == ["holder@example.invalid"]
     assert "completed the existing roleless account" in out
-    assert "Sent a takeover notice" in out
+    assert "Queued a takeover notice" in out
 
 
 # The CLI half of BACKLOG #2288 (refuse a row holding an address without --email, before the
@@ -2106,7 +2106,7 @@ def test_cli_records_a_takeover_notice_whose_send_failed(
     if as_json:
         assert json.loads(out)["holder_notice_undelivered"] is True
     else:
-        assert "was queued but not delivered" in out and "Sent a takeover notice" not in out
+        assert "was queued but not delivered" in out and "no failed send" not in out
 
     async def read() -> dict[str, object]:
         cipher = make_cipher(key)
@@ -2133,7 +2133,10 @@ def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
     assert main([*argv, "--email", "operator@example.invalid"]) == 0
-    assert json.loads(capsys.readouterr().out)["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
+    body = json.loads(capsys.readouterr().out)
+    assert body["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
+    # Nothing was dispatched, so whether it was delivered is no answer, not false (BACKLOG #5634).
+    assert body["holder_notice_undelivered"] is None
 
 
 # --- vault BACKLOG #3849 B5: the grant raises administrator_granted -----------------------------

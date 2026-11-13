@@ -1,8 +1,10 @@
 - **`provision-admin` and `admin-reset-totp` now record a security notice whose send failed.** The
   notifier these offline commands build had no audit sink, so a takeover or authenticator notice
   that the relay refused left only a WARNING on stderr, while `provision-admin`'s audit row still
-  read `holder_notice: dispatched`. Both commands now pass their store, and a failed send writes
-  the `auth.security_notice_undelivered` row the running engine writes, with the account's username
-  as the actor. `admin-reset-totp`, whose store has closed by then, opens it again for that row,
-  and only when a send failed. `provision-admin` also says so in its result: a new
-  `holder_notice_undelivered` field in `--json`, and a WARNING line in text output.
+  read `holder_notice: dispatched`. Both commands now give it an audit sink, and a failed send
+  writes the `auth.security_notice_undelivered` row the running engine writes, with the account's
+  username as the actor. `provision-admin` passes the store it holds open. `admin-reset-totp`,
+  whose store has closed by then, passes a sink that opens the store again for that row, and only
+  when a send failed. `provision-admin` also says in its result when the notice it queued was not
+  delivered: a new `holder_notice_undelivered` field in `--json`, and a WARNING line in text
+  output.

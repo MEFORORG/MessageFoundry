@@ -8496,7 +8496,8 @@ class _ReopeningNoticeAudit:
     the thread, and raises into :meth:`SecurityEventNotifier._record_undelivered`, which logs the
     class and swallows it: the notice was best effort, and so is its record. A committed row is
     never reported as missed, so a failed close is logged in the thread and raises nothing. An
-    outcome that arrives after the bound is logged when it does, by class only."""
+    outcome that arrives after the bound has passed is logged when it does, by class only. One
+    whose wait was cancelled instead, by an interrupt, is not logged."""
 
     def __init__(self, opener: Callable[[], Awaitable[Store]]) -> None:
         self._opener = opener
@@ -8596,7 +8597,9 @@ class _CountingNoticeAudit:
     """A :class:`NoticeAuditSink` that forwards to ``inner`` and counts the undelivered records the
     notifier asked for, so ``provision-admin`` can say that a notice it reported as dispatched was
     not delivered (BACKLOG #5634). The notifier records only a notice that never left, so a count
-    above zero is a failed or dropped notice, whether or not the forwarded write then succeeded."""
+    above zero is a failed or dropped notice, whether or not the forwarded write then succeeded. A
+    count of zero is not a delivery receipt: at least a drop past the notifier's record cap, or a
+    drain ended by an interrupt, asks for no record."""
 
     def __init__(self, inner: NoticeAuditSink) -> None:
         self._inner = inner
@@ -9795,8 +9798,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         return refused_write(exc)
 
-    # BACKLOG #5634: the notifier drained before run() returned, so its count is final here.
-    holder_undelivered = bool(notice_audit) and notice_audit[0].undelivered > 0
+    # BACKLOG #5634: the notifier drained before run() returned, so its count is final here. None
+    # unless a notice was dispatched. False is not a delivery receipt: it says only that the
+    # notifier recorded no undelivered notice, and at least a drop past its record cap records none.
+    holder_undelivered: bool | None = (
+        bool(notice_audit) and notice_audit[0].undelivered > 0
+        if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED
+        else None
+    )
 
     # True only once issued codes actually reached the console; ``recovery_codes_shown`` says so to
     # a caller reading only the --json body. The account is written either way.
@@ -9846,7 +9855,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 # BACKLOG #2019: null on a fresh create; see ProvisionedAdministrator.holder_notice.
                 "holder_notice": outcome.holder_notice,
                 # BACKLOG #5634: true when a notice this run dispatched was then not delivered, a
-                # failed send or a dropped one. `holder_notice` keeps what the audit row records.
+                # failed send or a dropped one; false when the notifier recorded none, which is not
+                # a delivery receipt; null when no notice was dispatched. `holder_notice` keeps
+                # what the audit row records.
                 "holder_notice_undelivered": holder_undelivered,
                 # ADR 0197 Amendment A (N-A): whether TOTP was enrolled. Never the secret or codes.
                 "totp_enrolled": totp_secret is not None,
@@ -9885,8 +9896,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     elif outcome.holder_notice == HOLDER_NOTICE_DISPATCHED:
         _safe_print(
-            "Sent a takeover notice to the account's earlier notification address: the relay "
-            "accepted it."
+            "Queued a takeover notice to the account's earlier notification address, and no failed "
+            "send of it was reported before this command finished. Delivery is best effort."
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL:
         _safe_print(
