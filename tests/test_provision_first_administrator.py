@@ -1982,7 +1982,7 @@ def test_cli_wires_the_notifier_drains_it_and_reports_the_takeover(
     assert recorder.started and recorder.queued_at_close == 1
     assert [e.email for e in recorder.events] == ["holder@example.invalid"]
     assert "completed the existing roleless account" in out
-    assert "Queued a takeover notice" in out
+    assert "Sent a takeover notice" in out
 
 
 # The CLI half of BACKLOG #2288 (refuse a row holding an address without --email, before the
@@ -2042,7 +2042,7 @@ def _undelivered_rows(db: Path, key: str) -> list[tuple[str, dict[str, str]]]:
 
 
 def test_cli_sends_through_the_real_notifier_before_it_exits(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """End to end through the real ``SecurityEventNotifier``: built from a service config, started,
     fed, and drained before the command's loop ends. Only the SMTP send itself is stubbed."""
@@ -2070,10 +2070,15 @@ def test_cli_sends_through_the_real_notifier_before_it_exits(
     assert sent == [(["holder@example.invalid"], _SUBJECTS[FIRST_ADMINISTRATOR_TAKEOVER])]
     # BACKLOG #5634's control: a notice that was sent leaves no undelivered row.
     assert _undelivered_rows(db, key) == []
+    assert json.loads(capsys.readouterr().out)["holder_notice_undelivered"] is False
 
 
+@pytest.mark.parametrize("as_json", [True, False])
 def test_cli_records_a_takeover_notice_whose_send_failed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    as_json: bool,
 ) -> None:
     """BACKLOG #5634: the provision row says ``dispatched``, which is never a delivery receipt, so
     a send that then fails must leave its own undelivered row, with the account as actor. Before
@@ -2095,7 +2100,13 @@ def test_cli_records_a_takeover_notice_whose_send_failed(
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
     argv += ["--email", "operator@example.invalid"]
-    assert main([*argv, "--db", str(db), "--json"]) == 0
+    assert main([*argv, "--db", str(db), *(["--json"] if as_json else [])]) == 0
+    out = capsys.readouterr().out
+    # The result says so too: the notifier drained before it printed (finding 7 of the review).
+    if as_json:
+        assert json.loads(out)["holder_notice_undelivered"] is True
+    else:
+        assert "was queued but not delivered" in out and "Sent a takeover notice" not in out
 
     async def read() -> dict[str, object]:
         cipher = make_cipher(key)

@@ -7606,8 +7606,9 @@ source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
 store it holds open, so a takeover notice whose `auth.first_administrator_provisioned` row reads
-`holder_notice: dispatched` and whose send failed gets its own undelivered row too, unless that
-write fails or the run is interrupted mid-send. That row can
+`holder_notice: dispatched` and whose send failed gets its own undelivered row too, except in at
+least these cases: that write fails, or the run is interrupted mid-send. The command's own result
+says so as well: `holder_notice_undelivered` in `--json`, and a WARNING line in text. That row can
 come before the provision row in the chain, because the notice is sent while the provision runs.
 `admin-reset-totp` has closed its store by the time the notice is sent, so it opens the store
 again for the row, and only when a send failed. **Still open, at least:**
@@ -7624,9 +7625,12 @@ again for the row, and only when a send failed. **Still open, at least:**
 - `admin-reset-totp` loses the record of a failed notice in at least these cases: its reopen of
   the store fails, the write fails, the run is interrupted, or the reopen, write and close do not
   finish together within `_OFFLINE_NOTICE_RECORD_SECONDS` in `messagefoundry/__main__.py`. The
-  miss is logged by class only. They run on their own loop in a daemon thread, so that limit
-  covers a synchronous key-provider hop inside the open too; a record still running at the limit
-  is not waited for, and may land later or not at all.
+  miss is logged by class only, and what a record still running at the limit then does is logged
+  when it does. The reopen and the write run on their own loop in a daemon thread, so that limit
+  covers a synchronous key-provider hop inside the open too, and a committed row is never reported
+  as missed for a slow close. **The process's exit can still wait for the record**: once the
+  reopen reaches a store driver, the driver's own thread runs the call, and the interpreter waits
+  for it at exit. The command has printed its result by then.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,

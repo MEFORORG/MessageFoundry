@@ -468,3 +468,100 @@ async def test_the_reopening_sink_bounds_a_reopen_that_blocks_its_thread(
     assert [
         r.getMessage() for r in caplog.records if "could not be recorded" in r.getMessage()
     ] == ["an undelivered security notice could not be recorded in the audit log (TimeoutError)"]
+
+
+def _failing_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(**_: Any) -> None:
+        raise OSError("relay down")
+
+    monkeypatch.setattr(_SEND, boom)
+
+
+async def _one_failed_notice(audit: Any) -> None:
+    notifier = SecurityEventNotifier(
+        host="smtp.example.org", port=25, sender="mf@example.org", audit=audit
+    )
+    notifier.start()
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    await notifier.aclose()
+
+
+def _misses(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "could not be recorded" in r.getMessage()]
+
+
+async def test_the_reopening_sink_reports_a_miss_whatever_ended_its_thread(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A thread ended by an exception that is not an ``Exception`` wrote no row, so it is a miss,
+    never a silent success (finding 2 of the review)."""
+    import messagefoundry.__main__ as cli
+
+    class _Ended(BaseException):
+        pass
+
+    async def ended() -> MessageStore:
+        raise _Ended
+
+    _failing_send(monkeypatch)
+    await _one_failed_notice(cli._ReopeningNoticeAudit(ended))
+    assert _misses(caplog) == [
+        "an undelivered security notice could not be recorded in the audit log (RuntimeError)"
+    ]
+
+
+async def test_the_reopening_sink_does_not_wait_for_the_close_of_a_committed_row(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The answer is the write's, so a close slower than the bound never makes a committed row read
+    as missed, and the command does not wait for that close (finding 1 of the review)."""
+    import time
+
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.setattr(cli, "_OFFLINE_NOTICE_RECORD_SECONDS", 0.3)
+    written: list[str] = []
+
+    class _SlowClose:
+        async def record_audit(self, action: str, **_kw: Any) -> None:
+            written.append(action)
+
+        async def close(self) -> None:
+            time.sleep(1.0)  # blocks the record's own loop, past the bound
+
+    async def opener() -> Any:
+        return _SlowClose()
+
+    _failing_send(monkeypatch)
+    began = time.monotonic()
+    await _one_failed_notice(cli._ReopeningNoticeAudit(opener))
+    assert time.monotonic() - began < 0.9
+    assert written == [SECURITY_NOTICE_UNDELIVERED_ACTION]
+    assert _misses(caplog) == []
+
+
+async def test_the_reopening_sink_logs_an_outcome_that_lands_after_its_bound(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bound passing is logged as a miss, and what the record then did is logged when it does,
+    so the class of a late failure is not lost (finding 3 of the review)."""
+    import time
+
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.setattr(cli, "_OFFLINE_NOTICE_RECORD_SECONDS", 0.2)
+
+    async def late_refusal() -> MessageStore:
+        time.sleep(0.6)
+        raise OSError("refused after the bound")
+
+    _failing_send(monkeypatch)
+    await _one_failed_notice(cli._ReopeningNoticeAudit(late_refusal))
+    late = "an undelivered security notice could not be recorded after its bound (OSError)"
+    deadline = time.monotonic() + 5.0
+    while late not in [r.getMessage() for r in caplog.records] and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert _misses(caplog) == [
+        "an undelivered security notice could not be recorded in the audit log (TimeoutError)",
+        late,
+    ]
