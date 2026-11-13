@@ -58,7 +58,8 @@ _MAX_LONG_VALUE = 64 * 1024
 
 @dataclass(frozen=True)
 class Case:
-    """One fuzz case: ``data`` is exactly what the transport sends, the framed MLLP wire bytes.
+    """One fuzz case: ``data`` is exactly what the transport sends, as MLLP wire bytes. Those are
+    one whole frame except in the ``frame`` layer, whose edits may leave no complete frame at all.
     ``control_id`` is MSH-10 as the tolerant parser reads it from the first frame the engine would
     decode, or None when there is none; it is a prediction, the ACK's MSA-2 is the truth."""
 
@@ -89,7 +90,8 @@ def case_control_id(seed: int, iteration: int) -> str:
 
 
 def make_case(seed: int, iteration: int) -> Case:
-    """Build case ``iteration`` of campaign ``seed``, framed as MLLP wire bytes."""
+    """Build case ``iteration`` of campaign ``seed`` as MLLP wire bytes: framed, unless the
+    ``frame`` layer broke the framing on purpose."""
     if seed < 0 or iteration < 0:
         raise ValueError("seed and iteration are non-negative")
     rng = random.Random(f"harness-fuzz|{seed}|{iteration}")  # nosec B311 (synthetic, seeded)

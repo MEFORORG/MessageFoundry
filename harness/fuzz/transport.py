@@ -14,9 +14,10 @@ folds together. Its probe connects to the inbound before the first case.
 paragraph is the one statement of why, which the invariants module and the harness README point
 at. The invariants read every reply as an HL7 v2 ACK and match the store to the acknowledgements,
 and a stock driver has neither an inbound probe nor a per-frame reply count. So an HTTP, DIMSE or
-X12 reply would fail as not parsing as HL7, and a send that got no reply -- a file drop always, any other
-kind whenever the engine stays silent -- would pass with nothing checked, even against an endpoint
-no inbound polls. A kind joins only with its own probe and a reply invariant for its own shape.
+X12 reply would fail as not parsing as HL7, and a send that got no reply -- a file drop always,
+any other kind whenever the engine stays silent -- would pass with nothing checked, even against
+an endpoint no inbound polls. A kind joins only with its own probe and a reply invariant for its
+own shape. ``--fuzz-driver`` takes ``mllp`` alone at the argument parser, too.
 """
 
 from __future__ import annotations

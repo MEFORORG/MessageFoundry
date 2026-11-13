@@ -663,8 +663,6 @@ def test_fuzz_and_scenario_are_mutually_exclusive(capsys: pytest.CaptureFixture[
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
-        (["--fuzz-driver", "carrier-pigeon", "--fuzz-endpoint", "mllp_in"], "accepts only mllp"),
-        (["--fuzz-driver", "file", "--fuzz-endpoint", "file_in"], "accepts only mllp"),
         (["--fuzz-endpoint", "no_such_endpoint"], "no_such_endpoint"),
         (["--fuzz-seed", "-1"], "non-negative"),
         (["--endpoint", "garbage"], "KEY=VALUE"),
@@ -675,6 +673,17 @@ def test_bad_fuzz_options_are_setup_errors(
 ) -> None:
     assert main(["--fuzz", "--engine", "http://127.0.0.1:9", *extra]) == 2
     assert expected in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("kind", ["file", "carrier-pigeon"])
+def test_the_argument_parser_takes_only_the_mllp_driver(
+    kind: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #5638, #5639: refused at parse time, exit 2, before any endpoint or engine is read.
+    with pytest.raises(SystemExit) as stopped:
+        main(["--fuzz", "--engine", "http://127.0.0.1:9", "--fuzz-driver", kind])
+    assert stopped.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_an_engine_that_is_not_there_is_a_setup_error(
