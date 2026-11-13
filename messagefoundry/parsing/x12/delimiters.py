@@ -31,7 +31,9 @@ __all__ = [
     "discover_delimiters",
     "find_isa_start",
     "isa_end",
+    "isa_separators_line_up",
     "iter_segments",
+    "skip_leading_noise",
     "ISA_SEGMENT_LEN",
     "ELEMENT_SEP_OFFSETS",
     "DEFAULT_MAX_INTERCHANGE_BYTES",
@@ -62,6 +64,8 @@ def _element_separator_offsets() -> tuple[int, ...]:
 
 
 ELEMENT_SEP_OFFSETS = _element_separator_offsets()
+# The sanity-gate positions: every element-separator offset but the defining one at +3.
+_GATE_SEP_OFFSETS = ELEMENT_SEP_OFFSETS[1:]
 # (element number, start, end) of each ISA element's data relative to the ISA start, from the same
 # widths: ISA01 is (1, 4, 6) and ISA16 is (16, 104, 105).
 _ISA_ELEMENT_SPANS = tuple(
@@ -98,16 +102,38 @@ class Delimiters:
     repetition: str | None
 
 
+def skip_leading_noise(raw: str, start: int = 0) -> int:
+    """Index of the first character at/after ``start`` that is not whitespace or a BOM
+    (``len(raw)`` if there is none)."""
+    i, n = start, len(raw)
+    while i < n and raw[i] in _LEADING_NOISE:
+        i += 1
+    return i
+
+
 def find_isa_start(raw: str, start: int = 0) -> int:
     """Index of the ``ISA`` that opens the next interchange at/after ``start`` (skipping leading
     whitespace/BOM). Raises :class:`X12PeekError` if no ``ISA`` is found there."""
-    i = start
-    n = len(raw)
-    while i < n and raw[i] in _LEADING_NOISE:
-        i += 1
+    i = skip_leading_noise(raw, start)
     if raw[i : i + 3] != "ISA":
         raise X12PeekError("X12 interchange does not begin with an ISA segment")
     return i
+
+
+def isa_separators_line_up(buf: str | bytes | bytearray, isa: int) -> bool:
+    """Whether the ``ISA`` at ``isa`` could open an interchange: every fixed element-separator
+    position present in ``buf`` holds the character at +3. Positions past the end of ``buf`` are not
+    yet known, so a short header passes. Structural only, the same positions as the sanity gate in
+    :func:`discover_delimiters`: it never reads element data, so an ISA with a delimiter inside an
+    element still passes and the parse refuses it (BACKLOG #5536, #5921)."""
+    sep = buf[isa + 3 : isa + 4]
+    for offset in _GATE_SEP_OFFSETS:
+        found = buf[isa + offset : isa + offset + 1]
+        if not found:
+            return True
+        if found != sep:
+            return False
+    return True
 
 
 def discover_delimiters(raw: str, isa_start: int | None = None) -> Delimiters:
@@ -136,7 +162,7 @@ def discover_delimiters(raw: str, isa_start: int | None = None) -> Delimiters:
 
     # Sanity gate: every fixed element-separator position (except the defining one at +3) must hold the
     # element separator — catches a mis-sized / non-X12 header before we trust the offsets.
-    for offset in ELEMENT_SEP_OFFSETS[1:]:
+    for offset in _GATE_SEP_OFFSETS:
         if raw[start + offset] != element:
             raise X12PeekError(
                 f"X12 ISA header malformed: expected element separator {element!r} at offset {offset}"

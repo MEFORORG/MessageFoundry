@@ -28,15 +28,19 @@ import re
 from collections.abc import Iterator
 
 from messagefoundry.parsing.x12.delimiters import (
+    _LEADING_NOISE,
     _SEGMENT_TERM_OFFSET,
     _SEGMENT_WHITESPACE,
+    ELEMENT_SEP_OFFSETS,
     ISA_SEGMENT_LEN,
     discover_delimiters,
     find_isa_start,
     isa_end,
+    isa_separators_line_up,
     iter_segments,
+    skip_leading_noise,
 )
-from messagefoundry.parsing.x12.errors import X12FrameError, X12PeekError
+from messagefoundry.parsing.x12.errors import X12FrameError
 
 __all__ = ["split", "X12FrameReader", "check_integrity"]
 
@@ -61,26 +65,45 @@ _FRAME_TAIL_MAX = 2
 def split(raw: str) -> list[str]:
     """Split a complete buffer into its ``ISA…IEA`` interchange substrings (verbatim).
 
-    Inter-interchange whitespace/BOM is skipped. A trailing fragment that opens with ``ISA`` but never
-    closes with ``IEA`` is returned as the final (malformed) element so nothing is silently dropped —
-    the caller can dead-letter it. Raises :class:`X12PeekError` if a fragment's ISA header is itself
-    unparseable (truncated/malformed)."""
+    Inter-interchange whitespace/BOM is skipped. Any other run of data before, between or after
+    interchanges is returned as its own element, without the whitespace/BOM around it, and the split
+    resumes at the next ``ISA`` whose fixed element-separator positions hold its separator, so an
+    ``ISA`` trigram inside the run does not end it (BACKLOG #5921). A trailing fragment that opens with
+    ``ISA`` but never closes with ``IEA`` is returned as the final (malformed) element. Nothing is
+    silently dropped: the caller can dead-letter any element that does not parse. A buffer with no
+    ``ISA`` at all returns its data as one element, and an empty or whitespace/BOM-only buffer returns
+    ``[]``. Raises :class:`X12PeekError` if an ISA header at the start of a fragment is itself
+    unparseable (truncated/malformed), including a truncated one after a run of other data."""
     out: list[str] = []
     pos = 0
     n = len(raw)
     while pos < n:
-        try:
-            isa = find_isa_start(raw, pos)
-        except X12PeekError:
-            break  # no further interchange — only trailing noise remains
-        delims = discover_delimiters(raw, isa)
-        end = _find_iea_end_str(raw, isa_end(isa, delims), delims.segment)
-        if end is None:
-            out.append(raw[isa:])  # unterminated final interchange — surface it, don't lose it
+        start = skip_leading_noise(raw, pos)
+        if start == n:
             break
-        out.append(raw[isa:end])
+        if not raw.startswith("ISA", start):
+            pos = _next_isa_str(raw, start + 1)
+            out.append(raw[start:pos].rstrip(_LEADING_NOISE))  # non-ISA data — surface it
+            continue
+        delims = discover_delimiters(raw, start)
+        end = _find_iea_end_str(raw, isa_end(start, delims), delims.segment)
+        if end is None:
+            out.append(raw[start:])  # unterminated final interchange — surface it, don't lose it
+            break
+        out.append(raw[start:end])
         pos = end
     return out
+
+
+def _next_isa_str(raw: str, start: int) -> int:
+    """Index of the next ``ISA`` at/after ``start`` that
+    :func:`~messagefoundry.parsing.x12.delimiters.isa_separators_line_up` accepts, or
+    ``len(raw)`` if there is none."""
+    while (i := raw.find("ISA", start)) != -1:
+        if isa_separators_line_up(raw, i):
+            return i
+        start = i + 1
+    return len(raw)
 
 
 def _find_iea_end_str(raw: str, body_start: int, terminator: str) -> int | None:
@@ -101,7 +124,9 @@ class X12FrameReader:
     """Stateful byte reassembler that yields complete X12 interchanges from a raw TCP stream.
 
     Feed it whatever bytes arrive; it yields each complete ``ISA…IEA<terminator>`` interchange (bytes,
-    verbatim) as it completes. Inter-interchange noise is discarded. ``max_interchange_bytes`` caps a
+    verbatim) as it completes. Inter-interchange noise is discarded, but an ``ISA`` trigram in it whose
+    fixed element-separator positions do not hold its separator is framed only up to the next ``ISA``
+    that passes, so it cannot swallow that interchange. ``max_interchange_bytes`` caps a
     single open interchange (``None`` disables) — exceeding it raises :class:`X12FrameError` so the
     transport drops the connection rather than buffer without bound.
     """
@@ -115,6 +140,11 @@ class X12FrameReader:
         # received begins; ``_scan`` is where the terminator search picks up, at or after it.
         self._seg_start = 0
         self._scan = 0
+        # Whether the ISA at the front of ``_buf`` failed the structural check, so it may be an "ISA"
+        # trigram in noise rather than an interchange (BACKLOG #5921), and where the search for a
+        # later ISA that passes picks up. See :meth:`_suspect_ends_at`.
+        self._suspect = False
+        self._probe = 0
         #: Line-end bytes the last completed interchange may still take as its ending; 0 once any
         #: other byte has followed it. See :data:`_FRAME_TAIL_BYTES`.
         self._tail_left = 0
@@ -169,6 +199,17 @@ class X12FrameReader:
             return None
         if isa > 0:
             del buf[:isa]  # drop inter-interchange noise before the ISA
+        # An "ISA" whose fixed separator positions disagree may be a trigram in noise. Taking it as an
+        # interchange start let its walk swallow a real interchange behind it (BACKLOG #5921). It may
+        # also be a real interchange with a corrupted header, so it is not dropped: once a later ISA
+        # that passes arrives, everything before that ISA is framed on its own, and the parse after
+        # it refuses, so it reaches the error path. With no such ISA it is walked like any other.
+        # The check is structural only (#5536 still frames a delimiter in ISA data whole). Until the
+        # walk starts a short header is checked again on each feed, since more of it can arrive.
+        if not self._suspect and self._seg_start == 0 and not isa_separators_line_up(buf, 0):
+            self._suspect, self._probe = True, 1
+        if self._suspect and (cut := self._suspect_ends_at()) is not None:
+            return self._take(cut)
         if len(buf) < ISA_SEGMENT_LEN:
             self._check_cap()
             return None  # need the full ISA to discover the terminator
@@ -199,24 +240,47 @@ class X12FrameReader:
                 self._check_cap()
                 return None  # IEA not complete yet
             if _IEA_SEGMENT.match(buf, self._seg_start, idx):
-                end = idx + len(terminator)
-                if self.max_interchange_bytes is not None and end > self.max_interchange_bytes:
-                    # A complete interchange that still exceeds the cap is rejected (a too-large
-                    # message), not relayed — mirrors the eager cap on the shared FrameDecoder.
-                    self._clear()
-                    raise X12FrameError(
-                        f"X12 interchange ({end} bytes) exceeds the "
-                        f"{self.max_interchange_bytes}-byte cap"
-                    )
-                frame = bytes(buf[:end])
-                del buf[:end]
-                self._seg_start = self._scan = 0
-                # What the read held past the terminator: line ends alone are owed to this
-                # interchange, so the allowance left is what they have not used yet.
-                tail = _only_line_ends(buf, _FRAME_TAIL_MAX)
-                self._tail_left = _FRAME_TAIL_MAX - len(buf) if tail else 0
-                return frame
+                return self._take(idx + len(terminator))
             self._seg_start = self._scan = idx + len(terminator)
+
+    def _take(self, end: int) -> bytes:
+        """Cut the frame ``_buf[:end]`` off the front and reset the walk for what follows it."""
+        if self.max_interchange_bytes is not None and end > self.max_interchange_bytes:
+            # A complete frame that still exceeds the cap is rejected (a too-large message), not
+            # relayed — mirrors the eager cap on the shared FrameDecoder.
+            self._clear()
+            raise X12FrameError(
+                f"X12 interchange ({end} bytes) exceeds the {self.max_interchange_bytes}-byte cap"
+            )
+        buf = self._buf
+        frame = bytes(buf[:end])
+        del buf[:end]
+        self._reset_walk()
+        # What the read held past the frame: line ends alone are owed to it, so the allowance left
+        # is what they have not used yet.
+        tail = _only_line_ends(buf, _FRAME_TAIL_MAX)
+        self._tail_left = _FRAME_TAIL_MAX - len(buf) if tail else 0
+        return frame
+
+    def _suspect_ends_at(self) -> int | None:
+        """Index of the first later ``ISA`` in ``_buf`` whose separator positions all hold its
+        separator, or None while there is none. A candidate whose positions have not all arrived is
+        searched again on the next feed; otherwise each byte is searched about once in total."""
+        buf = self._buf
+        while (i := buf.find(b"ISA", self._probe)) != -1:
+            if len(buf) <= i + ELEMENT_SEP_OFFSETS[-1]:
+                self._probe = i
+                return None
+            if isa_separators_line_up(buf, i):
+                return i
+            self._probe = i + 1
+        # Keep the last two bytes in the search, in case "IS" straddles two reads.
+        self._probe = max(self._probe, len(buf) - 2)
+        return None
+
+    def _reset_walk(self) -> None:
+        self._seg_start = self._scan = self._probe = 0
+        self._suspect = False
 
     @staticmethod
     def _terminator(buf: bytearray) -> bytes:
@@ -228,7 +292,9 @@ class X12FrameReader:
 
     def _clear(self) -> None:
         self._buf.clear()
-        self._seg_start = self._scan = 0
+        self._reset_walk()
+        # No interchange precedes a cleared buffer, so no line end is owed to one.
+        self._tail_left = 0
 
     def _check_cap(self) -> None:
         # Called from every path that returns with the interchange still open. Only one of those can

@@ -236,6 +236,93 @@ def test_split_tolerates_cosmetic_newlines_after_terminator() -> None:
     assert len(parts) == 1 and parts[0].lstrip().startswith("ISA") and "IEA" in parts[0]
 
 
+# --- non-ISA noise and false ISA trigrams (BACKLOG #5921) --------------------
+# split used to stop at the first run of non-ISA data and drop it and everything after it. The frame
+# reader took any "ISA" trigram in noise as an interchange start, so a real interchange behind it was
+# swallowed into a false frame. Both now check the ISA's fixed element-separator positions, and both
+# surface what fails the check rather than drop it.
+
+
+@pytest.mark.parametrize(
+    ("raw_parts", "expected"),
+    [
+        pytest.param(["A", "\r\nGARBAGE line\r\n", "B"], ["A", "GARBAGE line", "B"], id="between"),
+        pytest.param(["A", "trailing junk\r\n"], ["A", "trailing junk"], id="trailing"),
+        pytest.param(["leading junk ", "A"], ["leading junk", "A"], id="leading"),
+        pytest.param(
+            ["A", "noise ISAAC here ", "B"], ["A", "noise ISAAC here", "B"], id="false-isa"
+        ),
+        pytest.param(["A", "\r\n"], ["A"], id="trailing-crlf-is-skipped"),
+    ],
+)
+def test_split_surfaces_non_isa_junk_as_its_own_element(
+    raw_parts: list[str], expected: list[str]
+) -> None:
+    a, b = interchange(), interchange(control="000000002")
+    parts = {"A": a, "B": b}
+    out = split("".join(parts.get(p, p) for p in raw_parts))
+    assert out == [parts.get(p, p) for p in expected]
+
+
+def test_split_of_a_buffer_with_no_isa() -> None:
+    assert split("not x12 at all\r\n") == ["not x12 at all"]
+    assert split("﻿ \r\n") == [] and split("") == []
+
+
+def test_split_still_raises_on_a_malformed_isa_at_a_fragment_start() -> None:
+    raw = list(interchange())
+    raw[6] = "X"  # corrupt a fixed element-separator position
+    with pytest.raises(X12PeekError, match="malformed"):
+        split(interchange(control="000000002") + "".join(raw))
+
+
+@pytest.mark.parametrize(
+    "noise",
+    [
+        pytest.param(b"xxISA junk ", id="short"),
+        pytest.param(b"ISA long noise line " * 12, id="longer-than-an-isa"),
+        pytest.param(b"ISAISAISA ", id="repeated"),
+    ],
+)
+@pytest.mark.parametrize("chunk", [4096, 1])
+def test_frame_reader_skips_a_false_isa_in_noise(noise: bytes, chunk: int) -> None:
+    real = interchange().encode("utf-8")
+    data = noise + real
+    reader = X12FrameReader()
+    frames: list[bytes] = []
+    for i in range(0, len(data), chunk):
+        frames.extend(reader.feed(data[i : i + chunk]))
+    # The false ISA's run is framed on its own, so the parse refuses it, and the real one is whole.
+    assert frames == [noise[noise.index(b"ISA") :], real] and not reader.in_frame
+    with pytest.raises(X12PeekError):
+        X12Message.parse(frames[0])
+
+
+@pytest.mark.parametrize("chunk", [4096, 1])
+def test_frame_reader_frames_a_corrupted_isa_rather_than_drop_it(chunk: int) -> None:
+    # A real interchange whose header fails the structural check is not noise to discard: alone it is
+    # framed through its IEA, and before a good interchange it is framed up to that ISA.
+    good = interchange(control="000000002").encode("utf-8")
+    bad = bytearray(interchange().encode("utf-8"))
+    bad[6:7] = b"X"  # clobber a fixed element-separator position
+    for data, expected in ((bytes(bad), [bytes(bad)]), (bytes(bad) + good, [bytes(bad), good])):
+        reader = X12FrameReader()
+        frames: list[bytes] = []
+        for i in range(0, len(data), chunk):
+            frames.extend(reader.feed(data[i : i + chunk]))
+        assert frames == expected and not reader.in_frame
+
+
+def test_frame_reader_clear_resets_the_trailer_allowance() -> None:
+    reader = X12FrameReader()
+    assert list(reader.feed(interchange().encode("utf-8"))) != []
+    assert reader._tail_left == 2
+    reader._clear()
+    assert reader._tail_left == 0
+    list(reader.feed(b"\r\n"))
+    assert not reader.trailer_only
+
+
 # --- streaming byte frame reader ---------------------------------------------
 
 
