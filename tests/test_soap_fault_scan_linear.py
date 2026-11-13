@@ -599,7 +599,9 @@ _MAX_LINEAR_RATIO = 8.0
 
 #: Replies shaped to make the old tails rescan: many start tags, none of them closed. ``long-prefixes``,
 #: ``lt-run`` and ``long-close-prefixes`` name neither element, so they never reached the old tails;
-#: the two ``long-code-*`` shapes reach the checks on a code element that has a close. Since BACKLOG
+#: the three ``long-code-*`` shapes reach a code element's checks: ``long-code-close-prefix`` and
+#: ``long-code-text`` the faultcode's, in ``_code_text``, and ``long-code-close-prefixes`` the Code's
+#: close-tag search, ``_CODE_END_RE``. Since BACKLOG
 #: #5912 the name regexes are tried once, at the Fault's first child, so ``long-prefixes``,
 #: ``value-start-tags`` and ``unterminated-value-tags`` time that one match and the Fault close-tag
 #: scan rather than a name scan; ``unterminated-value-tags-in-a-code`` reaches the Value path. ``long-prefixes`` is here for the

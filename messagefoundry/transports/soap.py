@@ -1092,9 +1092,10 @@ class SoapDestination(DestinationConnector):
         a reply of ``<Fault>`` followed by one long run of ``<``. On a bare run of ``<``,
         ``_FAULT_RE`` finds nothing and the name scans never run. Those are that machine's readings,
         not a bound on another. Later #2827 changes added scans, at least ``_find_fault``'s and the
-        code-element checks in ``_code_text``, and BACKLOG #5912 replaced the name scans with one
-        anchored match at the Fault's first child, found by :func:`_first_child`'s Python-level
-        loop, and added the Code close-tag search, so they are not a reading of this code."""
+        code-element checks in ``_code_text``, and BACKLOG #5912 replaced the name scans with up to
+        three anchored matches, ``faultcode`` then ``Code`` at the Fault's first child and ``Value``
+        at the Code's, each child found by :func:`_first_child`'s Python-level loop, and added the
+        Code close-tag search, so they are not a reading of this code."""
         # WS-* mode: the Handler returned only the <Body> fragment; wrap + stamp here (post-queue
         # boundary), so the per-call MessageID and Timestamp never live in a pure transform.
         if self._ws_mode:

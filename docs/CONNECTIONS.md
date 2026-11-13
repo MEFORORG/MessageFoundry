@@ -2919,7 +2919,11 @@ follow-on and is **not** built.
 
 **Fault & delivery semantics.** The response is inspected for a SOAP `Fault` (which can arrive as an HTTP
 500 **or** an HTTP 200 body). A **Sender/Client** fault → `NegativeAckError` → **dead-letter** (the
-request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. An
+request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. The
+fault code is read only from the Fault's first child element: SOAP 1.2's `Code`, then the `Value` that is
+that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or processing
+instruction before that child is skipped. A `Value` anywhere else in the Fault never decides the class,
+and a SOAP 1.1 Fault whose `faultcode` is not its first child reads as a permanent fault. An
 unrecognized fault is treated as permanent (so a rejected request can't loop the lane). With no fault, the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role

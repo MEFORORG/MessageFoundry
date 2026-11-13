@@ -60,7 +60,9 @@ invariants can't silently regress.
   ``parsing/xml/_deps.py``'s lazy loaders — is covered by its own clause
   (:data:`_XML_DEPS_CONSUMERS`) rather than left to the module-name matcher. Separately,
   ``transports/soap.py`` triages SOAP faults with regexes and ``str.find`` over the XML response
-  body. Its fault-code patterns, ``_FAULTCODE_RE``/``_CODEVALUE_RE``, each match a ``<``, optional
+  body. Its fault-code patterns include at least ``_FAULTCODE_RE``/``_CODEVALUE_RE``, and
+  ``_CODE_RE`` for the SOAP 1.2 ``Code``, whose name must be followed by whitespace, ``/`` or ``>``,
+  with ``_CODE_END_RE`` its close tag. ``_FAULTCODE_RE``/``_CODEVALUE_RE`` each match a ``<``, optional
   whitespace, an optional prefix of word characters, dots and hyphens ending in ``:``, and the name
   ``faultcode`` or ``Value`` in any case with no word character after it. So they also match a
   longer name that goes on with at least ``.``, ``-`` or ``:``, such as ``<faultcode.detail>`` or
