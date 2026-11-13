@@ -2437,7 +2437,7 @@ both are described below:
 | The leak-check refuses when | Where it looks |
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
-| A known partner, vendor or site token, or a routable IP address, survives. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast with no unicast prefix embedded, or in a documentation range (`2001:db8::/32`, `3fff::/20`); an IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. The forms it cannot read are below (BACKLOG #5654) | The whole message |
+| A known partner, vendor or site token, or a routable IP address, survives. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast without the P flag, or in a documentation range (`2001:db8::/32`, `3fff::/20`). A multicast address with the P flag set is refused, whether or not it embeds a prefix: that includes the RFC 3306 and RFC 3956 forms and source-specific `ff3x::/32`. An IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. The forms it cannot read are below (BACKLOG #5654) | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
@@ -2463,10 +2463,11 @@ reading the first one where a component has several. An escape can pair across t
 separator in the first reading and not in the second, so the check takes both. The shape
 detectors read each unmapped value as written, then each of its components decoded whole and each
 of its subcomponents decoded on its own. The MRN-typed check reads the id type as written,
-decoded whole, and as each of its subcomponents, in the readings the site-code scrub takes
-(above) except the split on whitespace, so `X&MR`, `MR\X20\` and `X\S\MR` count and the word in
-`MR BRAIN W\T\WO` does not. An id type set apart only by a break command, such as `X\.br\MR`,
-passes (BACKLOG #5654). The check for a shape cut
+decoded whole, and as each of its subcomponents, as written and decoded, with `\H\` and `\N\`
+kept as `_` or dropped, each trimmed, so `X&MR` and `MR\X20\` count. Unlike the site-code scrub
+(above), it never splits a decoded part again, so the word in `PET\T\MR` or `MR BRAIN W\T\WO`
+does not count, and an id type that only an escaped delimiter or a break command sets apart,
+such as `X\S\MR` or `X\.br\MR`, passes (BACKLOG #5654). The check for a shape cut
 across fields reads each line as written and with each field decoded a subcomponent and a
 component at a time, and counts a cut only where two fields meet (BACKLOG #5533 item 8). The
 token scan reads the whole message as written, then decoded a subcomponent at a time, then
@@ -2493,10 +2494,14 @@ still pass:
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
 
-The IPv6 check also refuses some text that holds no routable address. At least these: a hex word
-joined to `::`, such as `ADD::`; a hex word joined by a colon to an allowed address, such as
-`Feed:fe80::1`; and, in a message whose field or component separator is `:`, digits on either
-side of an empty field, such as `1::1234`.
+The IPv6 check also refuses some text that holds no routable address, under any separators. It
+reads any run of hex digits, colons and dots with two or more colons, so at least these refuse:
+any word that ends in a hex digit or letter joined to `::`, such as `ADD::`, `Note::`, `ID::`,
+`std::bad_alloc` or `Code:: 12`; such a word joined by a colon to an allowed address, such as
+`Feed:fe80::1`; a word that ends in hex digits joined to `::` and more hex, such as `abc 1::2`;
+eight colon-separated hex groups, such as a colon-written EUI-64 device id
+(`00:1A:2B:FF:FE:3C:4D:5E`); and, in a message whose field or component separator is `:`, digits
+on either side of an empty field, such as `1::1234`.
 
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three

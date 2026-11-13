@@ -730,10 +730,11 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     first included, that reads as an ``MR``/``MRN`` id type — an unmapped medical-record number by
     HL7 structure, far more precise than a bare digit-run heuristic. A fail-closed detector refuses
     on any reading, so an id type counts in each of :func:`_is_mrn_type`'s readings: as written,
-    in any subcomponent, decoded, decoded and split again on an escaped delimiter, and stripped.
-    So ``M\\X52\\`` (BACKLOG #5532), ``X&MR``, ``MR\\X20\\`` and ``X\\S\\MR`` (BACKLOG #5654) count.
-    A word ``MR`` that only whitespace sets apart, as in ``MR BRAIN``, does not. The id counts when
-    it is non-empty as written, so one that decodes to nothing, such as ``\\Z98765\\``, counts."""
+    in any subcomponent as written, decoded whole, and stripped. So ``M\\X52\\`` (BACKLOG #5532),
+    ``X&MR`` and ``MR\\X20\\`` (BACKLOG #5654) count. A decoded part is never split again, so a
+    word ``MR`` that an escaped delimiter or whitespace sets apart, as in ``PET\\T\\MR`` or
+    ``MR BRAIN``, does not count, and nor does ``X\\S\\MR``. The id counts when it is non-empty
+    as written, so one that decodes to nothing, such as ``\\Z98765\\``, counts."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
         if comps[0] and any(_is_mrn_type(comp, seps, field_sep) for comp in comps):
@@ -746,14 +747,14 @@ def _is_mrn_type(comp: str, seps: Seps, field_sep: str) -> bool:
     read decodes it, or as any one of its subcomponents, as written or decoded. ``Peek`` reads the
     first subcomponent of a component that has them, and a ``Message`` subcomponent read can read
     any of them, so each counts (BACKLOG #5654). Each part is also read in every one of
-    :func:`.surrogates.decoded_readings` with no whitespace split, and each reading is stripped of
-    surrounding whitespace, so a padded ``MR\\X20\\`` and an ``X\\S\\MR`` count too, while the
-    word ``MR`` in ``MR BRAIN W\\T\\WO`` does not."""
+    :func:`.surrogates.decoded_readings` with no split, and each reading is stripped of
+    surrounding whitespace, so a padded ``MR\\X20\\`` counts too, while the word ``MR`` in
+    ``PET\\T\\MR`` or ``MR BRAIN W\\T\\WO`` does not."""
     parts = (comp, *comp.split(seps.subcomponent))
     forms = [
         form
         for part in parts
-        for form in (part, *decoded_readings(part, seps, field_sep, split_on_whitespace=False))
+        for form in (part, *decoded_readings(part, seps, field_sep, resplit=False))
     ]
     return any(form.strip().upper() in _MRN_TYPES for form in forms)
 

@@ -482,7 +482,7 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     forms = (
         part,
         part.strip(),
-        *decoded_readings(part, seps, field_sep, split_on_whitespace=True),
+        *decoded_readings(part, seps, field_sep, resplit=True),
     )
     return any(SITE_CODE_RE.fullmatch(form) for form in forms)
 
@@ -665,34 +665,32 @@ def unescape(value: str, seps: Seps, field_sep: str) -> str:
     return "".join(out)
 
 
-def decoded_readings(
-    part: str, seps: Seps, field_sep: str, *, split_on_whitespace: bool
-) -> list[str]:
+def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) -> list[str]:
     """The decoded readings a consumer can take of ``part``, one component or one subcomponent,
     for the detectors that must fail closed on any of them (BACKLOG #5632, #5654): the part
     decoded (:func:`unescape`), and decoded with ``\\H\\`` and ``\\N\\`` dropped, as a display
-    that shows highlighting rather than a character reads it; each of those, and each piece of it
-    split again on the message's delimiters, its field separator and escape character, since a
-    consumer that unescapes the part sees an escaped delimiter as a real one; and each stripped of
-    surrounding whitespace. Empty when ``part`` holds no escape character, since then every
-    reading is the part as written.
+    that shows highlighting rather than a character reads it, each stripped of surrounding
+    whitespace. Empty when ``part`` holds no escape character, since then the only reading is the
+    part as written.
 
-    With ``split_on_whitespace`` each reading is split on whitespace too, since :func:`unescape`
-    writes a break command such as ``\\.br\\`` as a space where the engine writes a line break.
-    The site-code check takes it: a site code is digits only, so a word split out of free text
-    is no false hit. The MRN-typed check does not: there a split-out word ``MR`` or ``Mr`` in
-    ordinary text, such as ``MR BRAIN W\\T\\WO``, would refuse the message."""
+    With ``resplit`` each reading is also split again on the message's delimiters, its field
+    separator, its escape character and whitespace, and each piece is a reading too: a consumer
+    that unescapes the part sees an escaped delimiter as a real one, and :func:`unescape` writes a
+    break command such as ``\\.br\\`` as a space where the engine writes a line break. The
+    site-code check takes it, since a site code is digits only, so a word split out of free text
+    is no false hit. The MRN-typed check does not: a split-out word ``MR`` or ``Mr`` in ordinary
+    text, such as ``PET\\T\\MR`` or ``MR BRAIN W\\T\\WO``, would refuse the message."""
     escape = seps.escape
     if not escape or escape not in part:
         return []
     shown = part.replace(f"{escape}H{escape}", "").replace(f"{escape}N{escape}", "")
     breaks = re.escape(field_sep + seps.component + seps.repetition + seps.subcomponent + escape)
-    splitter = f"[{breaks}\\s]" if split_on_whitespace else f"[{breaks}]"
     forms: list[str] = []
     for decoded in dict.fromkeys(
         (unescape(part, seps, field_sep), unescape(shown, seps, field_sep))
     ):
-        forms.extend(form.strip() for form in (decoded, *re.split(splitter, decoded)))
+        pieces = re.split(f"[{breaks}\\s]", decoded) if resplit else []
+        forms.extend(form.strip() for form in (decoded, *pieces))
     return list(dict.fromkeys(forms))
 
 

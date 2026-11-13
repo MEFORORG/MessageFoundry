@@ -45,7 +45,6 @@ def _zpd(value: str, head: str = _HEAD) -> str:
         "M1^^^H^MR\\X20\\",
         "M1^^^H^\\X20\\MRN",
         "M1^^^H^ MR ",
-        "M1^^^H^X\\S\\MR",
         "M1^^^H^MR\\H\\",
     ],
     ids=[
@@ -55,7 +54,6 @@ def _zpd(value: str, head: str = _HEAD) -> str:
         "padded-hex",
         "lead-pad",
         "spaces",
-        "escaped-component-separator",
         "highlighting-dropped",
     ],
 )
@@ -78,16 +76,26 @@ _ORDINARY_MR_TEXT = pytest.mark.parametrize(
         "OBR|1|ORD1||70553^MR BRAIN W\\T\\WO CONTRAST^C4",
         "OBX|1|TX|123^MR HEAD\\T\\NECK^L",
         "OBR|1|ORD1||70553^X^C4|||||||||Prior Mr Smith study\\.br\\see notes",
+        "OBR|1|ORD1||70553^PET\\T\\MR^C4",
+        "OBR|1|ORD1||70553^MR\\T\\CT BRAIN^C4",
+        "ZPD|1|||A1^Mr\\S\\Smith",
     ],
-    ids=["obr-4-procedure", "obx-3-observation", "obr-13-note"],
+    ids=[
+        "obr-4-procedure",
+        "obx-3-observation",
+        "obr-13-note",
+        "obr-4-hybrid-modality",
+        "obr-4-modality-first",
+        "escaped-component-separator",
+    ],
 )
 
 
 @_LEAKS
 @_ORDINARY_MR_TEXT
 def test_the_word_mr_in_ordinary_escaped_text_is_no_mrn(leak: ModuleType, segment: str) -> None:
-    """The MRN-typed check splits a decoded part on escaped delimiters, never on whitespace, so the
-    word ``MR`` or ``Mr`` in a procedure name or a note is not an id type."""
+    """The MRN-typed check never splits a decoded part again, on an escaped delimiter or on
+    whitespace, so the word ``MR`` or ``Mr`` in a procedure name or a note is not an id type."""
     hits = leak.structural_phi_hits(f"{_HEAD}\r{segment}", {"PID-3", "PID-5"})
     assert not any("MRN" in hit for hit in hits), hits
 
@@ -108,8 +116,13 @@ def test_a_message_subcomponent_read_sees_the_type() -> None:
 
 # --- #5654: IPv6 -----------------------------------------------------------------------------------
 
-#: A global unicast address, assembled from parts so no literal sits in this file.
-_GLOBAL = ":".join(["2a01", "4f8", "", "5"])
+#: A synthetic routable address in 4000::/3, space IANA has not allocated, so it names no real
+#: network. Assembled from parts so no literal sits in this file.
+_GLOBAL = ":".join(["4000", "a1", "", "5"])
+#: A synthetic routable IPv4 address the guard does not allow: the first address of the reserved
+#: class E block, written as the low 32 bits of an IPv6 address (``f000:1``) or dotted, from parts.
+_RESERVED_V4_HEX = ":".join(["f000", "1"])
+_RESERVED_V4 = ".".join(["240", "0", "0", "1"])
 
 
 @_NO_SCANNER
@@ -122,12 +135,12 @@ _GLOBAL = ":".join(["2a01", "4f8", "", "5"])
         f"host {_GLOBAL}.",
         f"[{_GLOBAL}]:443",
         _GLOBAL.replace(":", "\\X3A\\"),
-        "::ffff:" + ":".join(["808", "808"]),
-        "Addr:::ffff:" + ":".join(["808", "808"]),
+        "::ffff:" + _RESERVED_V4_HEX,
+        "Addr:::ffff:" + _RESERVED_V4_HEX,
         f"x {_GLOBAL}.443",
         f"{_GLOBAL}.Bad",
         f"{_GLOBAL[:-1]}:",
-        "::" + ".".join(["8"] * 4),
+        "::" + _RESERVED_V4,
         f"IP:{_GLOBAL[:-1]}",
         f"Net:{_GLOBAL[:-1]}/32",
         "ff3e:40:" + _GLOBAL.replace("::5", "::1"),
@@ -195,6 +208,16 @@ def test_a_routable_ipv6_address_is_a_hit(leak: ModuleType, written: str) -> Non
 def test_an_allowed_or_non_address_is_no_ipv6_hit(leak: ModuleType, written: str) -> None:
     report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
     assert leak.IPV6_REASON not in report.hits, report.hits
+
+
+@_LEAKS
+@pytest.mark.parametrize(
+    "written", ["ff3e::8000:1", "Note::", "std::bad_alloc", "00:1A:2B:FF:FE:3C:4D:5E"]
+)
+def test_the_refusals_phi_md_names_hold(leak: ModuleType, written: str) -> None:
+    """docs/PHI.md section 9 says these refuse though they hold no routable address: every
+    P-flagged multicast address, a hex word joined to ``::`` and a colon-written EUI-64."""
+    assert leak._has_routable_ipv6(written, lambda ip: True)
 
 
 @_LEAKS
