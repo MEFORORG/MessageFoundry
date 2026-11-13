@@ -790,8 +790,9 @@ def keep_the_key_step(
         # point a new SQLite store's re-run and its service back at the old store. At least two
         # shipped service paths always pass one: install-service.ps1 writes serve --db <DbPath>, and
         # supervise passes its --db, default messagefoundry.db, to its one SQLite engine shard. So
-        # --db must name the new path in both (PR 2804 eighth hold). Absolute, since provision-admin
-        # resolves a relative --db against its working directory and serve under --project-root.
+        # --db must name the new path in both (PR 2804 eighth hold). Absolute, since a relative --db
+        # resolves under [environments].base_dir when one is set, for provision-admin as for serve
+        # (BACKLOG #5926), and otherwise against each one's own working directory.
         # A reinstall that omits -DbPath writes the default path back, so -DbPath goes on every
         # later reinstall too. install-service.ps1 refuses -EngineWheel over a root that exists and
         # refuses its companions without it, so a reinstall over the root it built leaves out all
