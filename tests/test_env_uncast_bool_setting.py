@@ -212,7 +212,24 @@ _LITERAL_CASES = [
         "fhir lookup 'epic': setting 'smart_enabled' must be true or false, not str",
         id="composer-after-registration",
     ),
+    pytest.param(
+        "from messagefoundry import MLLP, outbound\n"
+        "outbound('OB_X', MLLP(host='h.example.org', port=1, persistent='maybe'))\n",
+        "outbound connection 'OB_X': setting 'persistent' must be true or false, not str",
+        id="mllp-str-not-a-false-spelling",
+    ),
+    pytest.param(
+        # Both desugars in outbound() overwrite capture_response with True, so the refusal must
+        # judge what the author wrote before they run.
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_X', Rest(url='https://partner.example.org/in', capture_response='false', "
+        "reingress_to='IB_LB'))\n",
+        "outbound connection 'OB_X': setting 'capture_response' must be true or false, not str",
+        id="capture-response-beside-reingress",
+    ),
 ]
+
+_QUOTED_FALSE_HINT = "(a false spelling in quotes reads as true)"
 
 
 @pytest.mark.parametrize(("module", "says"), _LITERAL_CASES)
@@ -226,7 +243,9 @@ def test_a_code_first_literal_that_is_not_a_bool_is_refused_at_load(
         load_config(tmp_path, allow_empty=True)
     msg = str(ei.value)
     assert says in msg
-    assert ('a quoted "false" reads as true' in msg) == ("not str" in says)
+    # The hint only where it applies: a false spelling in quotes.
+    quoted_false = any(f"='{w}'" in module for w in ("false", "no", "off", "0"))
+    assert (_QUOTED_FALSE_HINT in msg) == quoted_false
     diagnostics = wiring.validate_config(tmp_path, allow_empty=True)
     assert any(says in d.message for d in diagnostics)
 
@@ -534,6 +553,32 @@ def test_a_literal_ftp_tls_that_is_not_a_bool_is_refused(value: Any, kind: str) 
         with pytest.raises(WiringError) as ei:
             Ftp(host="h", remote_dir="/in", tls=value, tls_ca_file=ca)
         assert f"Ftp tls must be true or false, not {kind}" in str(ei.value)
+
+
+def test_capture_response_beside_reingress_to_is_still_forced_on_when_it_is_a_bool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control for the capture-response-beside-reingress case: a real bool, False included, or
+    # None is still desugared on, as before.
+    for written in (False, True, None):
+        registry = wiring.Registry()
+        monkeypatch.setattr(wiring, "_active", registry)
+        spec = Rest(url="https://partner.example.org/in", reingress_to="IB_LB")
+        spec.settings["capture_response"] = written
+        wiring.outbound("OB_X", spec)
+        assert registry.outbound["OB_X"].spec.settings["capture_response"] is True
+
+
+def test_settings_carriers_names_every_kind_once() -> None:
+    kinds = (
+        "inbound connection",
+        "outbound connection",
+        "database lookup",
+        "fhir lookup",
+        "reference set",
+    )
+    source = inspect.getsource(wiring.Registry.settings_carriers)
+    assert all(source.count(f'"{kind}"') == 1 for kind in kinds)
 
 
 def test_the_derived_ftp_protocol_ref_has_a_stable_repr() -> None:

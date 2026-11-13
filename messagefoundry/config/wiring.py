@@ -1636,6 +1636,29 @@ def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
     return default if value is None else _cast_bool(value)
 
 
+def _bool_literal_problem(key: str, value: Any) -> str | None:
+    """Why the literal ``value`` may not stand on the boolean setting ``key``, or ``None`` when it
+    may (vault BACKLOG #3234). :meth:`Registry.bool_literal_problems` says what is refused and why;
+    :func:`outbound` asks it too, for a flag it is about to overwrite. The value is withheld.
+
+    Raises :class:`WiringError` when a factory's annotations do not resolve (:func:`_bool_settings`)."""
+    strict = _bool_settings().defaults
+    if key not in strict or isinstance(value, EnvRef):
+        return None
+    if value is None and strict[key] is not None and key not in _COMPOSER_BOOL_SETTINGS:
+        return None
+    try:
+        require_flag(value, f"setting {key!r}")
+    except ValueError as exc:  # names the key and the type, never the value
+        # Only where it applies: a false spelling in quotes, which every lax read takes as true.
+        quoted_false = (
+            isinstance(value, str) and _BOOL_SPELLINGS.get(value.strip().lower()) is False
+        )
+        hint = " (a false spelling in quotes reads as true)" if quoted_false else ""
+        return f"{exc}{hint}; write True or False"
+    return None
+
+
 def resolve_env_settings(
     settings: Mapping[str, Any], values: Mapping[str, Any], *, connection: str | None = None
 ) -> dict[str, Any]:
@@ -6509,32 +6532,30 @@ class Registry:
 
         Only a graph that is validated sees this, as the loader's is; a :class:`Registry` built in
         code and handed straight to a runner is not checked here."""
+        problems: list[str] = []
         try:
-            strict = _bool_settings().defaults
+            for kind, name, settings in self.settings_carriers():
+                for key, value in settings.items():
+                    if (bad := _bool_literal_problem(key, value)) is not None:
+                        problems.append(f"{kind} {name!r}: {bad}")
         except WiringError as exc:  # a factory whose annotations do not resolve; report, not raise
             return [str(exc)]
-        declared: list[tuple[str, str, Mapping[str, Any]]] = [
-            ("inbound connection", c.name, c.spec.settings) for c in self.inbound.values()
-        ]
-        declared += [
-            ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
-        ]
-        declared += [("database lookup", s.name, s.settings) for s in self.lookups.values()]
-        declared += [("fhir lookup", s.name, s.settings) for s in self.fhir_lookups.values()]
-        declared += [("reference set", s.name, s.source.settings) for s in self.references.values()]
-        problems: list[str] = []
-        for kind, name, settings in declared:
-            for key, value in settings.items():
-                if key not in strict or isinstance(value, EnvRef):
-                    continue
-                if value is None and strict[key] is not None and key not in _COMPOSER_BOOL_SETTINGS:
-                    continue
-                try:
-                    require_flag(value, f"setting {key!r}")
-                except ValueError as exc:  # names the key and the type, never the value
-                    hint = ' (a quoted "false" reads as true)' if isinstance(value, str) else ""
-                    problems.append(f"{kind} {name!r}: {exc}{hint}; write True or False")
         return problems
+
+    def settings_carriers(self) -> Iterator[tuple[str, str, Mapping[str, Any]]]:
+        """Every declaration that carries transport settings, as ``(kind, name, settings)``: each
+        inbound and outbound connection, database lookup, FHIR lookup and reference set's source.
+        One list, so a reader that must see them all cannot miss one."""
+        for ic in self.inbound.values():
+            yield "inbound connection", ic.name, ic.spec.settings
+        for oc in self.outbound.values():
+            yield "outbound connection", oc.name, oc.spec.settings
+        for lk in self.lookups.values():
+            yield "database lookup", lk.name, lk.settings
+        for fl in self.fhir_lookups.values():
+            yield "fhir lookup", fl.name, fl.settings
+        for ref in self.references.values():
+            yield "reference set", ref.name, ref.source.settings
 
     def encoding_problems(self) -> list[str]:
         """Human-readable messages for declared ``encoding`` values naming no usable text codec.
@@ -8749,6 +8770,11 @@ def build_outbound_connection(
     # capture-validity guards below also gate a re-ingress declaration; the cross-registry check that
     # reingress_to names an existing Loopback() inbound runs in build_check_registry (it sees the whole
     # registry). A re-ingress on FILE/REMOTEFILE therefore fails with the "no synchronous response" error.
+    # vault BACKLOG #3234: both desugars below overwrite capture_response with True, so the load's
+    # bool_literal_problems would only ever see the True. Judge what the author wrote first.
+    bad = _bool_literal_problem("capture_response", spec.settings.get("capture_response"))
+    if bad is not None:
+        raise WiringError(f"outbound connection {name!r}: {bad}")
     reingress_to = spec.settings.get("reingress_to")
     if reingress_to is not None:
         if not isinstance(reingress_to, str) or not reingress_to.strip():

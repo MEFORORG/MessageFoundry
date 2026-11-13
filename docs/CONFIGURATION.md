@@ -521,9 +521,12 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   reads as off, and signing refuses it. On `Ftp(tls=...)` a `None`, from the default or from your
   own cast, reads as FTPS, as every `env()` there did before: only a false spelling turns TLS off.
   A code-first literal on a boolean setting must be a real `True` or `False`; a string such as
-  `"false"` or a number stops the load. A literal `None` is read as the setting's default where
-  it has one, such as on for `verify_tls`; it stops the load on a composer's `enabled` flag and
-  on `Ftp(tls=...)`, where it used to mean plain FTP. Not every reading is covered. At least some checks
+  `"false"` or a number stops the load. A literal `None` is read as the setting's default on most
+  boolean settings, such as on for `verify_tls`. It stops the load on a composer's `enabled`
+  flag, where SMART and OAuth2 had read it as off and signing had already refused it, and on
+  `Ftp(tls=...)`, where it used to mean plain FTP. The hop-policy flags, `tls_hop_attested`,
+  `cleartext_accepted` and `tls_revocation_attested`, refuse it too, as they refused any value
+  but `True` or `False` before. Not every reading is covered. At least some checks
   read a setting before `env()` resolves, so they see the reference and not its value. A cast you
   write yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a
   boolean `cast=bool`.
