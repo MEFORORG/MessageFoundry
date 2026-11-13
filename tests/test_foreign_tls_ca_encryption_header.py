@@ -559,11 +559,19 @@ def test_libpqs_home_on_windows_is_the_shell_roaming_folder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """libpq asks the shell, so an unset ``APPDATA`` does not hide the default file."""
-    ascii_profile = os.environ.get("APPDATA", "").isascii()
+    import ctypes
+
+    buf = ctypes.create_unicode_buffer(260)  # the wide folder, to know what ANSI should name
+    shell32 = vars(ctypes)["WinDLL"]("shell32")  # vars(): WinDLL is typed for win32 only
+    assert shell32.SHGetFolderPathW(None, 0x1A, None, 0, buf) == 0
+    wide = buf.value
     monkeypatch.delenv("APPDATA", raising=False)
-    homes = database._libpq_homes()  # empty only for a "?" the ANSI call substituted
-    assert all(label == "" and home.endswith(os.sep + "postgresql") for label, home in homes)
-    assert len(homes) == 1 or not ascii_profile
+    homes = database._libpq_homes()
+    try:
+        wide.encode("mbcs", "strict")
+    except UnicodeEncodeError:
+        pytest.skip("the profile folder is outside the ANSI code page, so ANSI may name no home")
+    assert homes == [("", os.path.join(wide, "postgresql"))]
 
 
 class _FakeShell32:
@@ -624,7 +632,13 @@ def test_libpqs_windows_root_certificate_is_refused_through_the_shell_call(
     except UnicodeEncodeError:
         pytest.skip("the runner's temporary folder is outside the ANSI code page")
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
-    monkeypatch.setattr(ctypes, "WinDLL", lambda name: _FakeShell32(encoded))
+    real_windll = vars(ctypes)["WinDLL"]
+
+    def shell32_only(name: str, *args: Any, **kwargs: Any) -> Any:
+        # The check's walk loads kernel32 too; only shell32 is faked.
+        return _FakeShell32(encoded) if name == "shell32" else real_windll(name, *args, **kwargs)
+
+    monkeypatch.setattr(ctypes, "WinDLL", shell32_only)
     (tmp_path / "postgresql").mkdir()
     _write(tmp_path / "postgresql", _certificate(), "root.crt")
     assert "SSLmode=verify-full;" in _build_psql()

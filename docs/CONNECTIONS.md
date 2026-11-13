@@ -2364,8 +2364,10 @@ Two limits follow from this:
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder, which the engine asks the shell for as libpq does, through the ANSI
   call. Where that call substitutes a `?` for a character the code page cannot hold, libpq opens
-  no file there, and the engine reads none. Best-fit maps other such characters to valid ones,
-  and the engine checks that path like any other. Elsewhere it is under `.postgresql` in `HOME`, which libpq 15 and later read (or the
+  no file there, and the engine reads none. Best-fit maps other such characters to other
+  characters, and the engine checks that path like any other; one mapped to a character no
+  Windows name holds, at least `*` for a fullwidth asterisk, refuses the build. Elsewhere it is
+  under `.postgresql` in `HOME`, which libpq 15 and later read (or the
   password-file home when `HOME` is unset or empty), and in the password-file home, which libpq
   14 and older read. The engine cannot tell which libpq the driver loads, so when the two differ
   it checks both and refuses on either. With libpq 16 and later, `PGSSLROOTCERT=system` names no

@@ -1515,8 +1515,8 @@ def _libpq_root_certs() -> list[tuple[str, str]]:
     is set and not empty, else ``root.crt`` in each of :func:`_libpq_homes`. Empty for ``system``,
     libpq 16's name for the platform's own store, which is no file, and when no home can be named,
     where libpq reads no default either. A libpq older than 16 reads ``system`` as a file in its
-    working directory, and that file is not read here. Raises ``OSError`` when the Windows home
-    cannot be named."""
+    working directory, and that file is not read here. Raises ``OSError`` when a home cannot be
+    named (:func:`_libpq_homes`)."""
     named = os.environ.get("PGSSLROOTCERT")
     if named:
         # Not "DATABASE PGSSLROOTCERT": the log redaction scrubs two adjacent ALL-CAPS tokens.
@@ -1539,8 +1539,9 @@ def _libpq_homes() -> list[tuple[str, str]]:
     Empty when no directory can be named, as libpq then reads no default file, and on Windows
     when the shell's ANSI folder holds a ``?`` past the drive: the ANSI call writes ``?`` for a
     character its code page cannot hold and has no best fit for, and libpq's open of that path
-    finds no file. Best-fit maps other such characters to valid ones, and that path is named and
-    checked like any other.
+    finds no file. Best-fit maps other such characters to other characters, and that path is
+    named and checked like any other; one mapped to a character no Windows name holds, at least
+    ``*`` for a fullwidth asterisk, makes the check's walk refuse the build.
 
     An empty folder or password-file home still names one: libpq joins it as ``'%s/%s'``, so it
     reads ``/.postgresql/root.crt``, or ``/postgresql/root.crt`` on Windows (``pqGetHomeDirectory``
