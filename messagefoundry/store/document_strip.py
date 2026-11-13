@@ -13,15 +13,18 @@ This module is intentionally dependency-light (no backend imports) so it can be 
 store backends and the retention runner without a cycle.
 
 The pass is shaped the same way on every backend, by :func:`run_strip_pass` (BACKLOG #5651). It
-scans candidates in keyset batches of :data:`STRIP_BATCH_ROWS` by message id, so no pass holds every
-body in memory at once. It runs the decrypt, strip and encrypt of a batch through
-:func:`transform_strip_batch` in a worker thread, holding no pooled connection, so the crypto never
-runs on the event loop. A backend supplies only the batch read and the guarded write. It writes each
-row back only by ``id`` AND ``documents_pruned IS NULL`` AND ``raw`` equal, byte for byte, to the
-stored cell the batch read. A body purge that emptied ``raw``, a key rotation that re-sealed it, or
-another strip that pruned it, committed between the read and the write, therefore fails the guard:
-the row is left as the other writer left it, and the strip never writes old content back over it.
-It counts a row only when its own guarded update changed it.
+scans candidates in keyset batches of at most :data:`STRIP_BATCH_ROWS` rows, ordered by
+``(received_at, id)`` so the scan stays on the ``(received_at, id)`` index and touches only rows past
+the cutoff. It runs the decrypt, strip and encrypt of a batch through :func:`transform_strip_batch` in
+a worker thread, holding no pooled connection, so the crypto never runs on the event loop. A backend
+supplies only the batch read and the guarded write.
+
+It writes each row back only by ``id`` AND ``documents_pruned IS NULL`` AND ``raw`` equal, byte for
+byte, to the stored cell the batch read, AND with no queue row ``pending``/``inflight``, the same
+in-flight guard the read applied. A body purge that emptied ``raw``, a key rotation that re-sealed it,
+another strip that pruned it, or a replay that re-pended the message, committed between the read and
+the write, therefore fails the guard: the row is left as the other writer left it, and the strip never
+writes old content back over it. It counts a row only when its own guarded update changed it.
 """
 
 from __future__ import annotations
@@ -30,8 +33,8 @@ import asyncio
 import functools
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.parsing.binary import strip_documents
 from messagefoundry.store.cell_tag import CellTagError, message_cell_aad, open_message_cell
@@ -53,8 +56,9 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 #: How many candidate rows one keyset batch of the strip reads, transforms and writes. It bounds the
-#: bodies a pass holds in memory at once, whatever the store's size.
-STRIP_BATCH_ROWS: Final = 200
+#: number of bodies a pass holds in memory at once, whatever the store's size; it is a row count, not
+#: a byte budget. Not ``Final``: :func:`run_strip_pass` reads it per batch, so a test may shrink it.
+STRIP_BATCH_ROWS = 200
 
 
 @dataclass(frozen=True)
@@ -109,21 +113,23 @@ def log_unreadable_skips(message_ids: Sequence[object]) -> None:
 class StripUpdate:
     """One row's guarded write-back, as :func:`transform_strip_batch` builds it: the message id, the
     ``raw`` cell exactly as the batch read it (the guard's comparand), the stripped body sealed under
-    the row's tag, and what stripping it reclaimed. It holds sealed cells only, never a plaintext
-    body."""
+    the row's tag, and what stripping it reclaimed. On a keyless store both cells are plaintext
+    bodies, so neither is in its ``repr`` (PHI.md section 2)."""
 
     message_id: str
-    stored: str
-    new_cell: str
+    stored: str = field(repr=False)
+    new_cell: str = field(repr=False)
     documents: int
     reclaimed: int
 
 
-#: Reads one keyset batch: ``(scan_cutoff, after_id, limit)`` to at most ``limit`` candidate rows
-#: with ``id > after_id``, in id order, each with ``id``, ``channel_id``, ``raw`` and
-#: ``received_at``. It applies the scan cutoff and the in-flight guard, and gives its connection back
-#: before it returns.
-type FetchStripBatch = Callable[[float, str, int], Awaitable[Sequence[Any]]]
+#: Where the previous batch ended: the last row's ``(received_at, id)``, or ``None`` before the first.
+type StripCursor = tuple[float, str] | None
+#: Reads one keyset batch: ``(scan_cutoff, after, limit)`` to at most ``limit`` candidate rows with
+#: ``received_at < scan_cutoff`` and ``(received_at, id)`` past ``after``, in ``(received_at, id)``
+#: order, each with ``id``, ``channel_id``, ``raw`` and ``received_at``. It applies the in-flight
+#: guard, and gives its connection back before it returns.
+type FetchStripBatch = Callable[[float, StripCursor, int], Awaitable[Sequence[Any]]]
 #: Writes one batch's guarded updates in one transaction, returning those whose own guarded update
 #: changed their row.
 type WriteStripBatch = Callable[[Sequence[StripUpdate]], Awaitable[Sequence[StripUpdate]]]
@@ -144,8 +150,12 @@ async def run_strip_pass(
     """One ``strip_embedded_documents`` call, the same on every backend (BACKLOG #5651): keyset
     batches of :data:`STRIP_BATCH_ROWS` from ``fetch``, each transformed in a worker thread by
     :func:`transform_strip_batch` with no connection held, and written back by ``write``. Only the
-    rows ``write`` reports changed are counted. :func:`log_unreadable_skips` runs once, even when a
-    write fails, and ``report`` audits the refused cells once, after the last batch.
+    rows ``write`` reports changed are counted.
+
+    Each batch commits on its own. So when a later batch raises, the earlier batches' strips stay
+    committed: the pass then logs a WARNING with what it had already stripped, since the runner
+    writes no audit row for a pass that raised, and still audits the refused cells it met, before it
+    re-raises. :func:`log_unreadable_skips` and ``report`` run once per call either way.
 
     The scan is bounded by the loosest finite cutoff (the global one or the largest override; a
     keep-forever ``-inf`` never widens it), and the precise per-connection cutoff is re-checked per
@@ -157,15 +167,15 @@ async def run_strip_pass(
     messages = documents = reclaimed = 0
     failures: list[CellTagError] = []
     unreadable: list[object] = []
-    after = ""  # message ids are non-empty, so "" sorts before every one
+    after: StripCursor = None
     try:
         while True:
-            limit = STRIP_BATCH_ROWS  # read per batch, so a test may shrink the module constant
+            limit = STRIP_BATCH_ROWS
             rows = await fetch(scan_cutoff, after, limit)
             if not rows:
                 break
-            after = rows[-1]["id"]
-            updates = await asyncio.to_thread(
+            after = (rows[-1]["received_at"], rows[-1]["id"])
+            updates, refused, skipped = await asyncio.to_thread(
                 transform_strip_batch,
                 cipher,
                 rows,
@@ -174,15 +184,24 @@ async def run_strip_pass(
                 connection_cutoffs=connection_cutoffs,
                 min_bytes=min_bytes,
                 content_types=content_types,
-                failures=failures,
-                unreadable=unreadable,
             )
+            failures.extend(refused)
+            unreadable.extend(skipped)
             for done in await write(updates) if updates else ():
                 messages += 1
                 documents += done.documents
                 reclaimed += done.reclaimed
             if len(rows) < limit:
                 break
+    except Exception:
+        log.warning(
+            "document strip failed part way; it had already stripped and committed %d documents "
+            "in %d messages, which no retention audit row records",
+            documents,
+            messages,
+        )
+        await report(failures)
+        raise
     finally:
         log_unreadable_skips(unreadable)
     await report(failures)
@@ -200,22 +219,23 @@ def transform_strip_batch(
     connection_cutoffs: Mapping[str, float] | None,
     min_bytes: int,
     content_types: Mapping[str, str],
-    failures: list[CellTagError],
-    unreadable: list[object],
-) -> list[StripUpdate]:
+) -> tuple[list[StripUpdate], list[CellTagError], list[object]]:
     """Decrypt, strip and re-seal one batch of candidate rows (each with ``id``, ``channel_id``,
-    ``raw`` and ``received_at``), returning the guarded write-backs it needs. Synchronous and free of
+    ``raw`` and ``received_at``), returning the guarded write-backs it needs, the refused cells and
+    the ids of the rows whose HL7 delimiters could not be read. Synchronous and free of
     any store connection, so a backend runs it through ``asyncio.to_thread`` with no pooled
     connection held (BACKLOG #5651).
 
     The per-connection cutoff is re-checked here (:func:`cutoff_for`), so a row past the loose scan
     bound but not past its own tighter or keep-forever cutoff is left intact. A row whose body is
-    refused or cannot be decrypted is contained: a :class:`CellTagError` goes to ``failures`` for the
-    caller to audit on the loop, any other :class:`CipherError` is logged naming only the message id,
+    refused or cannot be decrypted is contained: a :class:`CellTagError` is returned for the caller
+    to audit on the loop, any other :class:`CipherError` is logged naming only the message id,
     and the row is left exactly as found (BACKLOG #1169, #2593). A row whose HL7 delimiters cannot be
-    read goes to ``unreadable`` for :func:`log_unreadable_skips`. A body holding no embedded document
-    needs no write."""
+    read is returned for :func:`log_unreadable_skips`. A body holding no embedded document needs no
+    write."""
     updates: list[StripUpdate] = []
+    failures: list[CellTagError] = []
+    unreadable: list[object] = []
     for row in rows:
         message_id = row["id"]
         channel_id = row["channel_id"]
@@ -251,4 +271,4 @@ def transform_strip_batch(
             new_raw, aad=message_cell_aad("raw", message_id=message_id, channel_id=channel_id)
         )
         updates.append(StripUpdate(message_id, stored, new_cell, n_docs, n_bytes))
-    return updates
+    return updates, failures, unreadable

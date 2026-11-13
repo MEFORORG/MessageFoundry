@@ -143,6 +143,7 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.document_strip import (
+    StripCursor,
     StripResult,
     StripUpdate,
     run_strip_pass,
@@ -10233,47 +10234,49 @@ class SqlServerStore:
         stamp = time.time() if now is None else now
         inflight = (OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value)
 
-        async def fetch(scan_cutoff: float, after: str, limit: int) -> list[dict[str, Any]]:
-            # BACKLOG #5651: one keyset batch, with the cutoff and the in-flight guard on each;
-            # _fetchall gives the connection back before the crypto runs.
+        async def fetch(scan_cutoff: float, after: StripCursor, limit: int) -> list[dict[str, Any]]:
+            # BACKLOG #5651: one keyset batch on (received_at, id), so the scan stays on
+            # ix_messages_received, with the cutoff and the in-flight guard on each; _fetchall
+            # gives the connection back before the crypto runs. FLOAT holds no infinity, so the
+            # first batch has no lower bound. The leading >= is the index seek; the OR resolves
+            # ties on received_at by id.
+            page = ""
+            page_params: tuple[Any, ...] = ()
+            if after is not None:
+                page = " AND m.received_at >= ? AND (m.received_at > ? OR m.id > ?)"
+                page_params = (after[0], after[0], after[1])
             return await self._fetchall(
                 "SELECT TOP (?) m.id, m.channel_id, m.raw, m.received_at FROM messages m"
-                " WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < ?"
-                " AND m.id > ?"
+                " WHERE m.received_at < ?" + page + " AND m.raw <> ''"
+                " AND m.documents_pruned IS NULL"
                 " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id=m.id"
-                " AND q.status IN (?, ?)) ORDER BY m.id",
-                (limit, scan_cutoff, after, *inflight),
+                " AND q.status IN (?, ?)) ORDER BY m.received_at, m.id",
+                (limit, scan_cutoff, *page_params, *inflight),
             )
 
         async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
-            # Each row is written only while it is unpruned and holds the exact stored cell the
-            # batch read, so a purge or key rotation that committed in between wins. The raw
-            # comparison pins a binary collation and the byte length: the column's own collation
-            # may be case-insensitive, and = ignores trailing spaces.
+            # Each row is written only while it is unpruned, holds the exact stored cell the batch
+            # read and is not in flight, so a purge, key rotation or replay committed in between
+            # wins. The raw comparison pins a binary collation, and appends a sentinel to both
+            # sides because = ignores trailing spaces. Whether a row landed is read from OUTPUT,
+            # which a session's SET NOCOUNT ON cannot hide, unlike rowcount.
             landed: list[StripUpdate] = []
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
                     for u in updates:
                         await cur.execute(
-                            "UPDATE messages SET raw=?, documents_pruned=?"
+                            "UPDATE messages SET raw=?, documents_pruned=? OUTPUT inserted.id"
                             " WHERE id=? AND documents_pruned IS NULL"
-                            " AND raw COLLATE Latin1_General_100_BIN2 = ?"
-                            " AND DATALENGTH(raw) = ?",
-                            # NVARCHAR stores UTF-16, so its byte length is the UTF-16LE length;
-                            # sent as an int, so the old body goes over the wire only once.
-                            (
-                                u.new_cell,
-                                stamp,
-                                u.message_id,
-                                u.stored,
-                                len(u.stored.encode("utf-16-le")),
-                            ),
+                            " AND (raw + N'|') COLLATE Latin1_General_100_BIN2 = (? + N'|')"
+                            " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id=messages.id"
+                            " AND q.status IN (?, ?))",
+                            (u.new_cell, stamp, u.message_id, u.stored, *inflight),
                         )
-                        if cur.rowcount == 1:
+                        if await cur.fetchall():
                             landed.append(u)
                     await self._commit(conn)
                 except Exception:
-                    await conn.rollback()
+                    await self._rollback_or_discard(conn)
                     raise
             return landed
 

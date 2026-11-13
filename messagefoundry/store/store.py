@@ -152,6 +152,7 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.document_strip import (
+    StripCursor,
     StripResult,
     StripUpdate,
     run_strip_pass,
@@ -21114,29 +21115,39 @@ class MessageStore:
         stamp = time.time() if now is None else now
         inflight = (OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value)
 
-        async def fetch(scan_cutoff: float, after: str, limit: int) -> list[dict[str, Any]]:
-            # BACKLOG #5651: one keyset batch, with the cutoff and the in-flight guard on each.
+        async def fetch(scan_cutoff: float, after: StripCursor, limit: int) -> list[dict[str, Any]]:
+            # BACKLOG #5651: one keyset batch on (received_at, id), so the scan stays on
+            # ix_messages_received, with the cutoff and the in-flight guard on each.
+            page = ""
+            page_params: tuple[Any, ...] = ()
+            if after is not None:
+                # The leading >= is the index seek; the OR resolves ties on received_at by id.
+                page = "AND m.received_at >= ? AND (m.received_at > ? OR m.id > ?) "
+                page_params = (after[0], after[0], after[1])
             async with self._read() as db:
                 cur = await db.execute(
                     "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m "
-                    "WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < ? "
-                    "AND m.id > ? "
+                    "WHERE m.received_at < ? " + page + "AND m.raw <> '' "
+                    "AND m.documents_pruned IS NULL "
                     "AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id "
-                    "AND q.status IN (?, ?)) ORDER BY m.id LIMIT ?",
-                    (scan_cutoff, after, *inflight, limit),
+                    "AND q.status IN (?, ?)) ORDER BY m.received_at, m.id LIMIT ?",
+                    (scan_cutoff, *page_params, *inflight, limit),
                 )
                 return [dict(r) for r in await cur.fetchall()]
 
         async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
-            # Each row is written only while it is unpruned and holds the exact stored cell the
-            # batch read, so a purge or key rotation that committed in between wins.
+            # Each row is written only while it is unpruned, holds the exact stored cell the batch
+            # read and is not in flight, so a purge, key rotation or replay committed in between
+            # wins.
             landed: list[StripUpdate] = []
             async with _writer_txn(self._db, self._lock):
                 for u in updates:
                     cur = await self._db.execute(
                         "UPDATE messages SET raw=?, documents_pruned=? "
-                        "WHERE id=? AND documents_pruned IS NULL AND raw=?",
-                        (u.new_cell, stamp, u.message_id, u.stored),
+                        "WHERE id=? AND documents_pruned IS NULL AND raw=? "
+                        "AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = messages.id "
+                        "AND q.status IN (?, ?))",
+                        (u.new_cell, stamp, u.message_id, u.stored, *inflight),
                     )
                     if cur.rowcount == 1:
                         landed.append(u)

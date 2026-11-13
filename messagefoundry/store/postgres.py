@@ -154,6 +154,7 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.document_strip import (
+    StripCursor,
     StripResult,
     StripUpdate,
     run_strip_pass,
@@ -11759,34 +11760,43 @@ class PostgresStore:
         stamp = time.time() if now is None else now
         inflight = [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value]
 
-        async def fetch(scan_cutoff: float, after: str, limit: int) -> list[Any]:
-            # BACKLOG #5651: one keyset batch, with the cutoff and the in-flight guard on each;
-            # _fetchall gives the connection back before the crypto runs.
+        async def fetch(scan_cutoff: float, after: StripCursor, limit: int) -> list[Any]:
+            # BACKLOG #5651: one keyset batch on (received_at, id), so the scan stays on
+            # ix_messages_received, with the cutoff and the in-flight guard on each; _fetchall
+            # gives the connection back before the crypto runs. The leading >= is the index seek;
+            # the OR resolves ties on received_at by id. -Infinity starts the first batch.
+            at, last_id = after if after is not None else (float("-inf"), "")
             return await self._fetchall(
                 "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m"
-                " WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < $1"
-                " AND m.id > $3"
+                " WHERE m.received_at < $1"
+                " AND m.received_at >= $3 AND (m.received_at > $3 OR m.id > $4)"
+                " AND m.raw <> '' AND m.documents_pruned IS NULL"
                 " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id"
-                " AND q.status = ANY($2::text[])) ORDER BY m.id LIMIT $4",
+                " AND q.status = ANY($2::text[])) ORDER BY m.received_at, m.id LIMIT $5",
                 scan_cutoff,
                 inflight,
-                after,
+                at,
+                last_id,
                 limit,
             )
 
         async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
-            # Each row is written only while it is unpruned and holds the exact stored cell the
-            # batch read, so a purge or key rotation that committed in between wins.
+            # Each row is written only while it is unpruned, holds the exact stored cell the batch
+            # read and is not in flight, so a purge, key rotation or replay committed in between
+            # wins.
             landed: list[StripUpdate] = []
             async with self._timed_acquire() as conn, conn.transaction():
                 for u in updates:
                     tag = await conn.execute(
                         "UPDATE messages SET raw=$1, documents_pruned=$2"
-                        " WHERE id=$3 AND documents_pruned IS NULL AND raw=$4",
+                        " WHERE id=$3 AND documents_pruned IS NULL AND raw=$4"
+                        " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = messages.id"
+                        " AND q.status = ANY($5::text[]))",
                         u.new_cell,
                         stamp,
                         u.message_id,
                         u.stored,
+                        inflight,
                     )
                     if _rowcount(tag) == 1:
                         landed.append(u)
