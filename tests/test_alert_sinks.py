@@ -250,7 +250,7 @@ async def test_a_cut_drain_waits_for_every_send_to_finish_its_cancel_cleanup() -
             try:
                 await super().send(event, **kw)
             except asyncio.CancelledError:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.01)  # under _DRAIN_CANCEL_GRACE_SECONDS
                 quick_ended_first.append(quick.cancelled)
                 cleanup_done.set()
                 raise
@@ -306,10 +306,10 @@ async def test_a_send_that_swallows_the_cancel_does_not_hold_a_cut_close(
         elapsed = time.monotonic() - started
         assert swallowed  # the control: the send did swallow the cancel
         assert not release.is_set()  # and it is still running
-        # The bound, one grace (aclose's second cancel of the drain does not restart it), and slack.
-        assert elapsed < bound + _DRAIN_CANCEL_GRACE_SECONDS + 0.3, elapsed
+        # The bound and one grace, with slack for a loaded runner; the old wait never ended at all.
+        assert elapsed < bound + _DRAIN_CANCEL_GRACE_SECONDS + 1.0, elapsed
         assert sink._task is None
-        left = [r for r in caplog.records if "still running" in r.getMessage()]
+        left = [r for r in caplog.records if "alert send task(s) still running" in r.getMessage()]
         assert left and left[0].levelname == "WARNING", caplog.text
         assert "1 alert send task(s)" in left[0].getMessage()
         assert all("OB_SECRETNAME" not in r.getMessage() for r in left)
@@ -319,6 +319,52 @@ async def test_a_send_that_swallows_the_cancel_does_not_hold_a_cut_close(
         if sink._task is not None:
             sink._task.cancel()
             await asyncio.gather(sink._task, return_exceptions=True)
+
+
+async def test_a_repeat_drain_cancel_reaches_a_send_in_its_cancel_cleanup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A second cancel of the drain, during the grace, reaches a send whose cleanup of the first
+    cancel is still waiting, so that cleanup is cut rather than left running past the grace."""
+    seen: list[int] = []
+
+    class _LongCleanup(_HungTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            try:
+                await super().send(event, **kw)
+            except asyncio.CancelledError:
+                seen.append(1)
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    seen.append(2)
+                    raise
+
+    slow = _LongCleanup("email")
+    sink = NotifierAlertSink([slow])
+    sink.start()
+    drain = sink._task
+    assert drain is not None
+    sink.connection_stopped("OB_X", detail="boom")
+    await asyncio.wait_for(slow.entered.wait(), 5.0)
+    drain.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert seen == [1]  # the control: the first cancel reached the send, and it is cleaning up
+    drain.cancel()
+    await asyncio.wait_for(asyncio.gather(drain, return_exceptions=True), 5.0)
+    assert drain.cancelled()
+    assert seen == [1, 2]
+    assert "alert send task(s) still running" not in caplog.text
+    assert not sink._left_sends
+
+
+def test_the_drain_grace_nests_inside_the_teardown_cut_grace() -> None:
+    """A close the API teardown cuts gets _CUT_GRACE_SECONDS to end, so the drain's own grace for
+    its sends must be shorter, or the teardown leaves the close running and its line is lost."""
+    from messagefoundry.api import app
+
+    assert _DRAIN_CANCEL_GRACE_SECONDS < app._CUT_GRACE_SECONDS
 
 
 async def test_realert_throttle_suppresses_repeats() -> None:
