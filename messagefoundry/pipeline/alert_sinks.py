@@ -2510,6 +2510,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
+    async def aclose(self) -> None:
+        """Drain and stop the delivery task, then cancel every control task still running and wait
+        for it to end (BACKLOG #5909). The lifespan closes this sink after engine.stop(), so a
+        restart such a task would still attempt meets a stopped runner; left running, the task
+        would also outlive the loop's shutdown. Runs even when the sink was never started."""
+        try:
+            await super().aclose()
+        finally:
+            pending = [task for task in self._control_tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                log.warning(
+                    "%d alert control_action task(s) still running at shutdown were cancelled",
+                    len(pending),
+                )
+                await asyncio.gather(*pending, return_exceptions=True)
+
     def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
         task, exactly like the ADR 0044 state observer). Synchronous + non-blocking: it only creates the

@@ -1676,6 +1676,20 @@ def _managed_teardown_steps(
     # with the graph still serving: engine.stop() raises it through Engine.on_graph_stopped, and
     # gives that write a bounded chance before the store closes.
     steps.append(_TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals)))
+    if notifier is not None:
+        # BACKLOG #5909: a control_action rule firing on an alert the engine's own stop raises must
+        # not restart a listener or worker on the runner being stopped. The runner refuses that
+        # itself since BACKLOG #5702; clearing the callback first means no restart is attempted,
+        # and the notifier's close below cancels any control task still running. A synchronous
+        # call cannot overrun, so it is never cut and adds no cut grace to the budget.
+        steps.append(
+            _TeardownStep(
+                "the alert control callback's removal",
+                0.0,
+                _sync(lambda: notifier.set_control_callback(None)),
+                bounded=False,
+            )
+        )
     steps.append(
         _TeardownStep(
             "engine.stop()",
