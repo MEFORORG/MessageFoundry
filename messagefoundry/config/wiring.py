@@ -1646,8 +1646,8 @@ def resolve_env_settings(
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
     ``default``, else it's *missing*. A setting :func:`_bool_settings` names is then read with the
-    strict spelling cast, from either source, and a literal it names that is not a real ``bool`` is
-    refused (vault BACKLOG #3234). Raises a single :class:`WiringError` listing **all** problems
+    strict spelling cast, from either source (vault BACKLOG #3234). Raises a single
+    :class:`WiringError` listing **all** problems
     at once — both missing keys and values that fail their ``cast`` (naming the setting and the key,
     NEVER the value — BACKLOG #1183) — so
     the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
@@ -1661,8 +1661,6 @@ def resolve_env_settings(
     blank: list[str] = []
     bool_defaults = _bool_settings().defaults
     bad_defaults: list[str] = []
-    bad_literals: list[str] = []
-    owner = f" of connection {connection!r}" if connection else ""
     for name, value in settings.items():
         if isinstance(value, EnvRef):
             if value.key in values:
@@ -1726,6 +1724,7 @@ def resolve_env_settings(
                 # A default is written in the config, so it is reported apart from the
                 # environment values, whose advice would send the author to the wrong place.
                 if source == "default":
+                    owner = f" of connection {connection!r}" if connection else ""
                     bad_defaults.append(problem.replace(" (env ", f"{owner} (env ", 1))
                 else:
                     bad.append(problem)
@@ -1733,22 +1732,13 @@ def resolve_env_settings(
             resolved[name] = got
             if name in _NON_BLANK_ENV_SETTINGS and isinstance(got, str) and not got.strip():
                 # No ":" or "=" after the name: the log scrubber reads "LABEL: value" as a secret.
+                owner = f" of connection {connection!r}" if connection else ""
                 blank.append(f"setting {name!r}{owner} (env {value.key!r}) pins nothing")
         else:
-            # Vault BACKLOG #3234: a literal on a bool setting must be a real bool. A code-first
-            # `persistent="false"` (or 0, or None) would reach a connector whose bool()/truthiness
-            # read takes "false" as True and None as False, the insecure side of verify_tls. It is
-            # REFUSED, never read: every pre-resolve reader (the loosening registers, the build-time
-            # capture checks, a factory's own body) has already read spec.settings laxly, so turning
-            # the literal into a bool only in this copy would split one setting into two readings.
-            # A refusal splits nothing, because no reading survives it. connections.toml refuses a
-            # quoted string on a bool scalar the same way (_check_setting_types).
-            if name in bool_defaults:
-                try:
-                    require_flag(value, f"setting {name!r}{owner}")
-                except ValueError as exc:  # names the key and the type, never the value
-                    bad_literals.append(str(exc))
-                    continue
+            # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the
+            # loosening registers, the build-time capture checks) reads spec.settings, so changing
+            # a literal only in this copy would split one setting into two readings. One that is
+            # not a bool or None was already refused at load, by Registry.bool_literal_problems.
             resolved[name] = value
     problems: list[str] = []
     if missing:
@@ -1758,13 +1748,6 @@ def resolve_env_settings(
     if blank:
         problems.append("blank: " + "; ".join(blank))
     parts: list[str] = []
-    if bad_literals:
-        # Written in the config, like a bad default, so it is reported apart from the environment
-        # values. The value is withheld for the reason _cast_bool gives; its type is the diagnostic.
-        parts.append(
-            "boolean setting(s) not written as True or False, fix them in the config (a quoted "
-            '"false" would read as true) — ' + "; ".join(bad_literals)
-        )
     if bad_defaults:
         # Still one error, batched with any environment problems.
         parts.append(
@@ -5169,14 +5152,8 @@ def _ftp_protocol(tls: bool | EnvRef) -> str | EnvRef:
     the author's cast, reads as FTPS (:func:`_protocol_for_tls` says why). A ``default=`` is read
     here, because :func:`resolve_env_settings` never casts a default.
 
-    A literal must be a real ``bool``, and anything else is refused here, with the value withheld
-    (vault BACKLOG #3234): ``bool()`` read ``tls="false"`` as FTPS and ``tls=None`` as plain FTP,
-    the insecure side. Refusing it here splits no reading, because nothing has read ``tls`` yet."""
+    A literal is a real ``bool`` here: :func:`Ftp` refuses anything else first."""
     if not isinstance(tls, EnvRef):
-        try:
-            require_flag(tls, "Ftp tls")
-        except ValueError as exc:  # names the key and the type, never the value
-            raise WiringError(f"{exc} (write True, False or an env() reference)") from None
         return "ftps" if tls else "ftp"
     default = tls.default
     if default is not _UNSET:
@@ -5229,6 +5206,17 @@ def Ftp(
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
+    # vault BACKLOG #3234: a literal tls is turned into the protocol below, so the load's
+    # bool_literal_problems never sees it. bool() read "false" as FTPS and None as plain FTP, the
+    # insecure side, so anything but a bool is refused first, before the CA check reads it too.
+    refused: str | None = None
+    if not isinstance(tls, EnvRef):
+        try:
+            require_flag(tls, "Ftp tls")
+        except ValueError as exc:  # names the key and the type, never the value
+            refused = str(exc)
+    if refused is not None:
+        raise WiringError(f"{refused} (write True, False or an env() reference)")
     # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
     # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
@@ -6447,6 +6435,7 @@ class Registry:
                 yield str(exc)
         yield from self.encoding_problems()
         yield from self.dialling_pin_problems()
+        yield from self.bool_literal_problems()
         for port, first, second in self.port_collisions():  # low-13
             yield f"inbound connections {first!r} and {second!r} both bind port {port}"
 
@@ -6501,6 +6490,41 @@ class Registry:
             and not isinstance(port, bool)
         ]
         return [(a.port, a.label, b.label) for a, b in _binding_conflicts(bindings)]
+
+    def bool_literal_problems(self) -> list[str]:
+        """A literal on a boolean setting that is neither a ``bool`` nor ``None`` (vault BACKLOG
+        #3234). A connector reads most flags with ``bool()`` or plain truthiness, so a code-first
+        ``persistent="false"`` or ``tls_allow_expired="no"`` would read as True; ``connections.toml``
+        already refuses a quoted value there (``_check_setting_types``).
+
+        Refused, never read: a factory's own body and the pre-resolve readers have read the literal
+        by now, so turning it into a bool here would split one setting into two readings, and a
+        refused graph never runs. Here and not in the factories, because a ``with_*`` composer
+        writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
+        registered. ``None`` passes: an explicit ``None`` is the setting's default to every reader
+        of a default-on flag (``bool_setting``, vault BACKLOG #3230), and ``env()`` references are
+        read strictly once resolved (:func:`resolve_env_settings`). The value is withheld."""
+        strict = _bool_settings().defaults
+        declared: list[tuple[str, str, Mapping[str, Any]]] = [
+            ("inbound connection", c.name, c.spec.settings) for c in self.inbound.values()
+        ]
+        declared += [
+            ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
+        ]
+        declared += [("database lookup", s.name, s.settings) for s in self.lookups.values()]
+        declared += [("fhir lookup", s.name, s.settings) for s in self.fhir_lookups.values()]
+        declared += [("reference set", s.name, s.source.settings) for s in self.references.values()]
+        problems: list[str] = []
+        for kind, name, settings in declared:
+            for key, value in settings.items():
+                if key not in strict or value is None or isinstance(value, EnvRef):
+                    continue
+                try:
+                    require_flag(value, f"setting {key!r}")
+                except ValueError as exc:  # names the key and the type, never the value
+                    hint = ' (a quoted "false" reads as true)' if isinstance(value, str) else ""
+                    problems.append(f"{kind} {name!r}: {exc}{hint}; write True or False")
+        return problems
 
     def encoding_problems(self) -> list[str]:
         """Human-readable messages for declared ``encoding`` values naming no usable text codec.
