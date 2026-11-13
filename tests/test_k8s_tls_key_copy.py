@@ -2,34 +2,48 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The shipped Kubernetes manifests hand the engine a TLS key its key-file gate accepts (BACKLOG #3402).
 
-Under ``[security].enforcement = "enforce"`` the engine refuses an ``[api].tls_key_file`` whose POSIX
-mode carries a group or other bit, :func:`messagefoundry.restricted_file._posix_access_problem`. A
-Secret volume serves its files root-owned, so the engine could read one only through ``fsGroup`` and a
-group-read mode, which that rule refuses. The manifests therefore mount the Secret on a ``copy-tls``
-initContainer, which installs the pair into a memory-backed ``emptyDir`` at ``0600`` as the engine's
-uid, and the engine mounts that ``emptyDir``. Why is recorded once, in ``docs/PHI.md`` section 2,
-*Key files*.
+Under ``[security].enforcement = "enforce"`` the engine refuses an ``[api].tls_key_file`` on POSIX by
+:func:`messagefoundry.restricted_file._posix_key_file_problem`: a group or other bit on the file, an
+owner other than the engine's account or root, and a directory holding it that accounts other than its
+owner may write with no sticky bit. A Secret volume serves its files root-owned, so the engine could
+read one only through ``fsGroup`` and a group-read mode, which that rule refuses. The manifests
+therefore mount the Secret on a ``copy-tls`` initContainer, which installs the pair into a
+memory-backed ``emptyDir`` at ``0600`` as the engine's uid, and the engine mounts that ``emptyDir``.
+The kubelet makes the ``emptyDir``'s root, so a ``tls-dir`` initContainer first makes the pair's own
+directory at ``0700`` as the engine's uid (vault BACKLOG #5636). Why is recorded once, in
+``docs/PHI.md`` section 2, *Key files*.
 
-:func:`_engine_tls_modes` works out, from a pod spec alone, the mode the engine would see on each file
-its ``MEFOR_API_TLS_*_FILE`` variables name. :data:`_PRE_FIX_POD` is the pod spec as it shipped before
-this change, trimmed to the parts the resolver reads, and the positive control: the same resolver and
-the same rule must refuse it before the shipped manifests are judged.
+:func:`_engine_tls_files` works out, from a pod spec alone, what the engine would see on each file its
+``MEFOR_API_TLS_*_FILE`` variables name and on the directory holding it. :data:`_PRE_FIX_POD` is the
+pod spec as it shipped before #3402, trimmed to the parts the resolver reads, and
+:func:`_key_at_the_volume_root` the layout before #5636. Each is a positive control: the same resolver
+and the same rule must refuse it before the shipped manifests are judged.
 """
 
 from __future__ import annotations
 
+import copy
 import shlex
 import stat
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
 import yaml
 
-from messagefoundry.restricted_file import _posix_access_problem
+from messagefoundry.restricted_file import _posix_key_file_problem
 
 _K8S_DIR = Path(__file__).resolve().parent.parent / "docker" / "k8s"
 _TLS_VARS = ("MEFOR_API_TLS_CERT_FILE", "MEFOR_API_TLS_KEY_FILE")
+_ENGINE_UID = 10001
+_KEY = "/etc/mefor/tls/engine/api.key"
+
+#: The root of a volume the kubelet makes: owned by root, at the mode the kubelet's emptyDir code
+#: sets (0777, read from its source, ``pkg/volume/emptydir``). NOT MEASURED on a cluster, and a
+#: memory-backed volume's tmpfs may answer differently, so the manifests never rely on it: the key's
+#: own directory is made by an initContainer.
+_KUBELET_VOLUME_ROOT = (stat.S_IFDIR | 0o777, 0)
 
 #: The pod spec as both manifests shipped before this change: the Secret mounted on the engine at
 #: ``defaultMode: 0440``, readable through ``fsGroup``. YAML 1.1 reads ``0440`` as octal, as the
@@ -53,6 +67,16 @@ volumes:
         - { key: api.crt, path: api.crt }
         - { key: api.key, path: api.key }
 """
+
+
+@dataclass(frozen=True)
+class _Seen:
+    """What the engine would read for one file: its mode and owner, and its directory's."""
+
+    mode: int
+    uid: int
+    parent_mode: int
+    parent_uid: int
 
 
 def _shipped_pods() -> list[tuple[str, dict[str, Any]]]:
@@ -91,6 +115,17 @@ def _mount_at(container: dict[str, Any], directory: PurePosixPath) -> dict[str, 
     return found[0]
 
 
+def _mount_holding(container: dict[str, Any], path: PurePosixPath) -> dict[str, Any]:
+    """The mount ``path`` is on: the deepest one whose mount path is above it."""
+    found = [
+        m
+        for m in container.get("volumeMounts", [])
+        if PurePosixPath(m["mountPath"]) in path.parents
+    ]
+    assert found, f"{container['name']} mounts nothing above {path}"
+    return max(found, key=lambda m: len(PurePosixPath(m["mountPath"]).parts))
+
+
 def _secret_mode(pod: dict[str, Any], volume: dict[str, Any], name: str) -> int:
     """The mode the kubelet serves ``name`` at in a Secret volume, or fail if the volume lacks it.
 
@@ -104,19 +139,36 @@ def _secret_mode(pod: dict[str, Any], volume: dict[str, Any], name: str) -> int:
     raise AssertionError(f"Secret volume {volume['name']} serves no {name}")
 
 
-def _installed_mode(pod: dict[str, Any], volume_name: str, name: str) -> int:
-    """The mode copy-tls's ``install -m MODE SRC... DIR/`` gives ``name`` in ``volume_name``.
+def _installed_mode(pod: dict[str, Any], volume_name: str, path: PurePosixPath) -> int:
+    """The mode copy-tls's ``install -m MODE SRC... DIR/`` gives ``path`` in ``volume_name``.
 
-    The argv's exact form is pinned by the last test. The copy must land on copy-tls's writable mount
-    of ``volume_name``, and its source must be a file a Secret volume that copy-tls mounts serves."""
+    The argv's exact form is pinned by the last test. The copy must land in ``path``'s directory, on
+    copy-tls's writable mount of ``volume_name``, and its source must be a file a Secret volume that
+    copy-tls mounts serves."""
     init = _container(pod, "copy-tls")
     argv = init["command"]
-    target = _mount_at(init, PurePosixPath(argv[-1]))
+    assert PurePosixPath(argv[-1]) == path.parent, "copy lands in another directory"
+    target = _mount_holding(init, path)
     assert target["name"] == volume_name and not target.get("readOnly"), "copy lands elsewhere"
-    [source] = [PurePosixPath(a) for a in argv[3:-1] if PurePosixPath(a).name == name]
+    [source] = [PurePosixPath(a) for a in argv[3:-1] if PurePosixPath(a).name == path.name]
     secret = _volumes(pod)[_mount_at(init, source.parent)["name"]]
-    assert name in {item["path"] for item in secret["secret"]["items"]}, f"Secret serves no {name}"
+    assert path.name in {item["path"] for item in secret["secret"]["items"]}, "Secret serves none"
     return int(argv[argv.index("-m") + 1], 8)
+
+
+def _made_directory(pod: dict[str, Any], volume_name: str, directory: PurePosixPath) -> int:
+    """The mode of ``directory``, which an initContainer before copy-tls makes with
+    ``install -d -m MODE DIR`` on its writable mount of ``volume_name``, or fail if none does."""
+    inits = pod.get("initContainers", [])
+    before_copy = inits[: [c["name"] for c in inits].index("copy-tls")]
+    for init in before_copy:
+        argv = init.get("command", [])
+        if argv[:2] != ["install", "-d"] or PurePosixPath(argv[-1]) != directory:
+            continue
+        mount = _mount_holding(init, directory)
+        assert mount["name"] == volume_name and not mount.get("readOnly"), "made elsewhere"
+        return int(argv[argv.index("-m") + 1], 8)
+    raise AssertionError(f"no initContainer before copy-tls makes {directory}")
 
 
 def _engine_tls_paths(pod: dict[str, Any]) -> list[PurePosixPath]:
@@ -125,28 +177,53 @@ def _engine_tls_paths(pod: dict[str, Any]) -> list[PurePosixPath]:
     return [PurePosixPath(env[var]) for var in _TLS_VARS]
 
 
-def _engine_tls_modes(pod: dict[str, Any]) -> dict[str, int]:
-    """For each file the engine's TLS variables name, the mode the engine would see it at."""
+def _engine_tls_files(pod: dict[str, Any]) -> dict[str, _Seen]:
+    """For each file the engine's TLS variables name, what the engine would see on it and on the
+    directory holding it. A file or directory an initContainer makes is owned by the pod's
+    ``runAsUser``, which a test below pins as the engine's."""
     engine = _container(pod, "engine")
-    modes: dict[str, int] = {}
+    owner = pod["securityContext"]["runAsUser"]
+    seen: dict[str, _Seen] = {}
     for path in _engine_tls_paths(pod):
-        volume = _volumes(pod)[_mount_at(engine, path.parent)["name"]]
+        mount = _mount_holding(engine, path)
+        volume = _volumes(pod)[mount["name"]]
+        root = PurePosixPath(mount["mountPath"])
+        if path.parent == root:
+            parent_mode, parent_uid = _KUBELET_VOLUME_ROOT
+        elif path.parent.parent == root and "emptyDir" in volume:
+            parent_mode = stat.S_IFDIR | _made_directory(pod, volume["name"], path.parent)
+            parent_uid = owner
+        else:
+            raise AssertionError(f"{path} is in a directory this test does not read")
         if "secret" in volume:
-            modes[str(path)] = _secret_mode(pod, volume, path.name)
+            mode, uid = _secret_mode(pod, volume, path.name), 0  # the kubelet writes it as root
         elif "emptyDir" in volume:
-            modes[str(path)] = _installed_mode(pod, volume["name"], path.name)
+            mode, uid = _installed_mode(pod, volume["name"], path), owner
         else:
             raise AssertionError(f"{path} is on a volume of a kind this test does not read")
-    return modes
+        seen[str(path)] = _Seen(stat.S_IFREG | mode, uid, parent_mode, parent_uid)
+    return seen
 
 
-def _refused(modes: dict[str, int]) -> dict[str, str]:
-    """The files of ``modes`` the key-file gate would refuse, with its reason."""
-    return {
-        path: problem
-        for path, mode in modes.items()
-        if (problem := _posix_access_problem(stat.S_IFREG | mode)) is not None
-    }
+def _refused(files: dict[str, _Seen]) -> dict[str, str]:
+    """The files of ``files`` the key-file gate would refuse, with its reason, as the engine's
+    account would see them."""
+    refused: dict[str, str] = {}
+    for path, f in files.items():
+        problem = _posix_key_file_problem(f.mode, f.uid, f.parent_mode, f.parent_uid, _ENGINE_UID)
+        if problem is not None:
+            refused[path] = problem
+    return refused
+
+
+def _key_at_the_volume_root(pod: dict[str, Any]) -> dict[str, Any]:
+    """``pod`` with the pair copied into the emptyDir's root, as it shipped before #5636."""
+    pod = copy.deepcopy(pod)
+    _container(pod, "copy-tls")["command"][-1] = "/etc/mefor/tls/"
+    for entry in _container(pod, "engine")["env"]:
+        if entry["name"] in _TLS_VARS:
+            entry["value"] = entry["value"].replace("/etc/mefor/tls/engine/", "/etc/mefor/tls/")
+    return pod
 
 
 def _serves_a_secret(volume: dict[str, Any]) -> bool:
@@ -176,20 +253,43 @@ def test_the_pre_fix_pod_is_refused_by_the_same_resolver_and_rule() -> None:
     """The positive control: the shape that shipped before is refused, so a pass below means
     something."""
     pod = yaml.safe_load(_PRE_FIX_POD)
-    modes = _engine_tls_modes(pod)
-    assert modes["/etc/mefor/tls/api.key"] == 0o440
-    assert "/etc/mefor/tls/api.key" in _refused(modes)
+    files = _engine_tls_files(pod)
+    assert stat.S_IMODE(files["/etc/mefor/tls/api.key"].mode) == 0o440
+    assert "0440" in _refused(files)["/etc/mefor/tls/api.key"]
     assert _engine_secret_mounts(pod) == ["/etc/mefor/tls"]
+
+
+@pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)
+def test_a_key_copied_into_the_volume_root_is_refused_on_its_directory(
+    name: str, pod: dict[str, Any]
+) -> None:
+    """The positive control for #5636: the layout before it, the pair at the emptyDir's root, is
+    refused for its directory, not for the file, by the same resolver and rule."""
+    files = _engine_tls_files(_key_at_the_volume_root(pod))
+    assert stat.S_IMODE(files["/etc/mefor/tls/api.key"].mode) == 0o600, name
+    problem = _refused(files)["/etc/mefor/tls/api.key"]
+    assert "the directory that holds it has mode 0777" in problem, name
 
 
 @pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)
 def test_the_engine_reads_its_tls_files_at_a_mode_the_gate_accepts(
     name: str, pod: dict[str, Any]
 ) -> None:
-    modes = _engine_tls_modes(pod)
-    assert set(modes) == {"/etc/mefor/tls/api.crt", "/etc/mefor/tls/api.key"}, name
-    assert _refused(modes) == {}, name
-    assert modes["/etc/mefor/tls/api.key"] == 0o600, name
+    files = _engine_tls_files(pod)
+    assert set(files) == {"/etc/mefor/tls/engine/api.crt", _KEY}, name
+    assert _refused(files) == {}, name
+    expected = _Seen(stat.S_IFREG | 0o600, _ENGINE_UID, stat.S_IFDIR | 0o700, _ENGINE_UID)
+    assert files[_KEY] == expected, name
+
+
+@pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)
+def test_tls_dir_makes_the_key_directory_before_copy_tls(name: str, pod: dict[str, Any]) -> None:
+    """The order matters: copy-tls installs into a directory that must already exist."""
+    names = [c["name"] for c in pod["initContainers"]]
+    assert names.index("tls-dir") < names.index("copy-tls"), name
+    assert shlex.join(_container(pod, "tls-dir")["command"]) == (
+        "install -d -m 0700 /etc/mefor/tls/engine"
+    ), name
 
 
 @pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)
@@ -202,7 +302,7 @@ def test_the_key_copy_lives_in_memory_and_the_engine_mounts_it_read_only(
     name: str, pod: dict[str, Any]
 ) -> None:
     key = _engine_tls_paths(pod)[1]
-    mount = _mount_at(_container(pod, "engine"), key.parent)
+    mount = _mount_holding(_container(pod, "engine"), key)
     assert mount.get("readOnly") is True, name
     assert _volumes(pod)[mount["name"]]["emptyDir"].get("medium") == "Memory", name
 
@@ -211,18 +311,21 @@ def test_the_key_copy_lives_in_memory_and_the_engine_mounts_it_read_only(
 def test_copy_tls_runs_as_the_engine_with_the_engine_s_hardening(
     name: str, pod: dict[str, Any]
 ) -> None:
-    """The copy is owned by whoever ran it, so it must be the engine's uid: neither container may
-    override the pod's. And the initContainer is held to the engine's own restrictions."""
-    engine, init = _container(pod, "engine"), _container(pod, "copy-tls")
+    """The copy and its directory are owned by whoever made them, so that must be the engine's uid:
+    no container may override the pod's. And each initContainer is held to the engine's own
+    restrictions."""
+    engine = _container(pod, "engine")
+    inits = [_container(pod, "tls-dir"), _container(pod, "copy-tls")]
     pod_ctx = pod["securityContext"]
     assert pod_ctx["runAsNonRoot"] is True and pod_ctx["runAsUser"] == 10001, name
     assert pod_ctx["seccompProfile"] == {"type": "RuntimeDefault"}, name
-    for container in (engine, init):
+    for container in (engine, *inits):
         assert not {"runAsUser", "runAsGroup"} & set(container["securityContext"]), name
-    assert init["securityContext"] == engine["securityContext"], name
     assert engine["securityContext"]["readOnlyRootFilesystem"] is True, name
     assert engine["securityContext"]["capabilities"] == {"drop": ["ALL"]}, name
-    assert init["image"] == engine["image"], name
+    for init in inits:
+        assert init["securityContext"] == engine["securityContext"], name
+        assert init["image"] == engine["image"], name
 
 
 @pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)
@@ -241,8 +344,9 @@ def test_copy_tls_can_read_the_root_owned_secret(name: str, pod: dict[str, Any])
 def test_fsgroup_widens_a_0400_secret_the_engine_would_mount() -> None:
     """The control for the fsGroup widening: a 0400 Secret on the engine is still refused."""
     pod = yaml.safe_load(_PRE_FIX_POD.replace("defaultMode: 0440", "defaultMode: 0400"))
-    assert _engine_tls_modes(pod)["/etc/mefor/tls/api.key"] == 0o440
-    assert "/etc/mefor/tls/api.key" in _refused(_engine_tls_modes(pod))
+    files = _engine_tls_files(pod)
+    assert stat.S_IMODE(files["/etc/mefor/tls/api.key"].mode) == 0o440
+    assert "/etc/mefor/tls/api.key" in _refused(files)
 
 
 @pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)
@@ -251,5 +355,5 @@ def test_the_install_argv_is_what_the_resolver_reads(name: str, pod: dict[str, A
     reads, written as a list and not a shell string."""
     assert shlex.join(_container(pod, "copy-tls")["command"]) == (
         "install -m 0600 /etc/mefor/tls-secret/api.crt /etc/mefor/tls-secret/api.key "
-        "/etc/mefor/tls/"
+        "/etc/mefor/tls/engine/"
     ), name
