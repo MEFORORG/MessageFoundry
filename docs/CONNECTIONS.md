@@ -2363,7 +2363,8 @@ Two limits follow from this:
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder, which the engine asks the shell for as libpq does, through the ANSI
-  call. Elsewhere it is under `.postgresql` in `HOME`, which libpq 15 and later read (or the
+  call. Where that folder's name holds a character the code page cannot, the call returns a name
+  no Windows file can have, libpq opens no file, and the engine reads none. Elsewhere it is under `.postgresql` in `HOME`, which libpq 15 and later read (or the
   password-file home when `HOME` is unset or empty), and in the password-file home, which libpq
   14 and older read. The engine cannot tell which libpq the driver loads, so when the two differ
   it checks both and refuses on either. With libpq 16 and later, `PGSSLROOTCERT=system` names no

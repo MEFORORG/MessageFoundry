@@ -515,6 +515,14 @@ def test_libpqs_homes_name_home_and_the_password_file_home_when_they_differ(
         monkeypatch.setenv("HOME", same)
         assert database._libpq_homes() == [("", os.path.join("/pw", ".postgresql"))]
 
+    def no_entry(uid: int) -> Any:
+        raise KeyError(uid)
+
+    # No password-file entry: libpq 14 and older name no home, libpq 15 and later read HOME.
+    monkeypatch.setattr(pwd, "getpwuid", no_entry)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert database._libpq_homes() == [("", os.path.join(str(tmp_path), ".postgresql"))]
+
 
 @pytest.mark.skipif(
     sys.platform == "win32", reason="libpq reads HOME and the password file off Windows"
@@ -552,8 +560,9 @@ def test_libpqs_home_on_windows_is_the_shell_roaming_folder(
 ) -> None:
     """libpq asks the shell, so an unset ``APPDATA`` does not hide the default file."""
     monkeypatch.delenv("APPDATA", raising=False)
-    [(label, home)] = database._libpq_homes()
-    assert label == "" and home.endswith(os.sep + "postgresql")
+    homes = database._libpq_homes()  # empty for a profile folder the code page cannot hold
+    assert all(label == "" and home.endswith(os.sep + "postgresql") for label, home in homes)
+    assert len(homes) <= 1
 
 
 class _FakeShell32:
@@ -593,10 +602,11 @@ def test_a_shell_folder_the_code_page_could_not_hold_names_no_libpq_home(
     """The ANSI call writes ``?`` for a character its code page cannot hold, and no Windows name
     holds ``?``, so libpq opens no file there and the check reads none. Red while such a folder
     was named: the walk refused the folder as unreadable and failed every psqlODBC TLS build."""
-    monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: "C:\\Users\\????")
-    assert database._libpq_homes() == []
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
-    assert "SSLmode=verify-full;" in _build_psql()
+    for folder in ("C:\\Users\\????", "C:\\Users\\a*b", 'C:\\Users\\a"b'):  # "?" and best fits
+        monkeypatch.setattr(database, "_windows_roaming_appdata", lambda folder=folder: folder)
+        assert database._libpq_homes() == []
+        assert "SSLmode=verify-full;" in _build_psql()
 
 
 def _refuse_lookup() -> list[tuple[str, str]]:

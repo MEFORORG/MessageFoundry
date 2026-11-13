@@ -1512,7 +1512,7 @@ def _libpq_root_certs() -> list[tuple[str, str]]:
     """The ``(setting, path)`` of each root certificate the installed libpq could read from the
     engine's environment when no ``sslrootcert`` is given, which the generic dialect never gives
     (BACKLOG #3090, step 3), for the caller to refuse on any of them: ``PGSSLROOTCERT`` when it
-    is set and not empty, else ``root.crt`` in each of :func:`_libpq_homes`. None for ``system``,
+    is set and not empty, else ``root.crt`` in each of :func:`_libpq_homes`. Empty for ``system``,
     libpq 16's name for the platform's own store, which is no file, and when no home can be named,
     where libpq reads no default either. A libpq older than 16 reads ``system`` as a file in its
     working directory, and that file is not read here. Raises ``OSError`` when the Windows home
@@ -1536,7 +1536,10 @@ def _libpq_homes() -> list[tuple[str, str]]:
     password-file home when ``HOME`` is unset or empty, as libpq 15 and later find it; and in the
     password-file home alone, as libpq 14 and older find it (``pqGetHomeDirectory``). When the two
     differ, both are named, so a check of one cannot clear a file libpq loads from the other.
-    Empty when no directory can be named, as libpq then reads no default file.
+    Empty when no directory can be named, as libpq then reads no default file, and on Windows
+    when the shell's ANSI folder holds a character no Windows name can hold, which the ANSI call
+    writes for a character its code page cannot hold (``?``, or a best-fit such as ``*`` for a
+    fullwidth asterisk): libpq's open of that path finds no file.
 
     An empty folder or password-file home still names one: libpq joins it as ``'%s/%s'``, so it
     reads ``/.postgresql/root.crt``, or ``/postgresql/root.crt`` on Windows (``pqGetHomeDirectory``
@@ -1544,21 +1547,25 @@ def _libpq_homes() -> list[tuple[str, str]]:
     made (:func:`_windows_roaming_appdata`)."""
     if sys.platform == "win32":
         appdata = _windows_roaming_appdata()
-        # The ANSI call writes "?" for a character its code page cannot hold, and "?" is not a
-        # character a Windows name can hold, so libpq's open of that path finds no file.
-        if appdata is None or "?" in appdata:
+        if appdata is None:
+            return []
+        if any(c in _WINDOWS_NAME_FORBIDDEN for c in os.path.splitdrive(appdata)[1]):
+            logger.debug("libpq's shell folder names no file Windows can hold, so none is read")
             return []
         return [("", os.path.join(appdata or os.sep, "postgresql"))]
     import pwd
 
-    # Keyed by the joined directory, so a home with a trailing separator is not a second one. No
-    # lexical normpath: past a link, its ".." names another directory than the system resolves.
+    # Keyed by the joined directory, so the same spelling of one home is named once. No lexical
+    # normpath: past a link, its ".." names another directory than the system resolves.
     named: dict[str, str] = {}
     env_home = os.environ.get("HOME")
     if env_home:
         named[os.path.join(env_home, ".postgresql")] = " in HOME"
-    with contextlib.suppress(KeyError):  # no password-file entry: libpq 14 and older name none
+    try:
         password_home = pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError:
+        logger.debug("no password-file entry for this user, so libpq 14 and older name no home")
+    else:
         named.setdefault(
             os.path.join(password_home or os.sep, ".postgresql"), " in the password-file home"
         )
@@ -1567,6 +1574,8 @@ def _libpq_homes() -> list[tuple[str, str]]:
 
 #: ``CSIDL_APPDATA``: the roaming application-data folder libpq asks the Windows shell for.
 _CSIDL_APPDATA = 0x1A
+#: The characters no Windows file or folder name can hold, past the drive.
+_WINDOWS_NAME_FORBIDDEN = frozenset('<>:"|?*')
 
 
 def _windows_roaming_appdata() -> str | None:
@@ -1578,8 +1587,8 @@ def _windows_roaming_appdata() -> str | None:
 
     ``None`` when the call reports a failure, as libpq then reads no default file, and possibly
     empty when it succeeds. Raises ``OSError`` off Windows, and when ``ctypes``, ``shell32`` or its
-    export cannot be loaded, or the call cannot be made: then the engine cannot say which folder
-    libpq reads, so its caller refuses rather than read nothing."""
+    export cannot be loaded, the call cannot be made, or its bytes do not decode: then the engine
+    cannot say which folder libpq reads, so its caller refuses rather than read nothing."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the application-data folder is read only on Windows")
     try:
