@@ -65,6 +65,30 @@ def test_an_mrn_type_past_the_first_subcomponent_or_padded_is_a_hit(
 
 
 @_LEAKS
+@pytest.mark.parametrize(
+    "value",
+    ["70553^PET&MR^C4", "A1^Smith&mr", "A1^^^ MR", "MR", "A1^^^^X^MR"],
+    ids=["second-component-sub", "name-sub", "fourth-component", "component-1-alone", "sixth"],
+)
+def test_an_mr_outside_cx_5_is_no_hit(leak: ModuleType, value: str) -> None:
+    """The id type is read where HL7 puts it, CX.5, so an ``MR`` elsewhere is ordinary text."""
+    assert leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"}) == []
+
+
+@_NO_SCANNER
+@pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
+def test_anonymize_checked_passes_an_unescaped_modality(anon: ModuleType) -> None:
+    text = f"{_HEAD}\rOBR|1|ORD1||70553^PET&MR^C4"
+    assert anon.anonymize_checked(text, salt="b224-5654-salt-0123456789abcdef")
+
+
+@_LEAKS
+def test_an_mr_type_in_a_cx_5_subcomponent_is_still_a_hit(leak: ModuleType) -> None:
+    hits = leak.structural_phi_hits(_zpd("ID^^^AUTH^MR&local"), {"PID-3", "PID-5"})
+    assert any("MRN" in hit and "ZPD-4" in hit for hit in hits), hits
+
+
+@_LEAKS
 @pytest.mark.parametrize("value", ["M1^^^H^X&MRX", "M1^^^H^X&M R", "^^^H^X&MR"])
 def test_a_near_miss_or_an_mrn_type_with_no_id_is_no_hit(leak: ModuleType, value: str) -> None:
     assert leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"}) == []
@@ -219,8 +243,17 @@ _FULL = ":".join(["4000", "a1", "0", "0", "0", "0", "0", "5"])
         "Source:::ffff:" + _RESERVED_V4_HEX,
         f"1.{_GLOBAL}",
         f"{_FULL}:443",
+        f"IPv6:{_FULL}:443",
+        f"Connect to {_GLOBAL}.443.",
     ],
-    ids=["hex-label-full", "hex-label-mapped", "dotted-prefix", "full-colon-port"],
+    ids=[
+        "hex-label-full",
+        "hex-label-mapped",
+        "dotted-prefix",
+        "full-colon-port",
+        "label-and-port",
+        "dot-port-and-sentence-dot",
+    ],
 )
 def test_a_label_or_port_joined_to_an_address_is_dropped(leak: ModuleType, written: str) -> None:
     assert leak._has_routable_ipv6(written, lambda ip: True)

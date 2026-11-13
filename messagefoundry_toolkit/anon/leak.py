@@ -19,7 +19,7 @@ already-pseudonymized field is never re-flagged:
   nobody thought to map is **recorded** (carried into the :class:`LeakError` on a refusal, and exposed
   via ``on_report``) rather than passing unrecorded; and
 * **high-precision structural PHI-shape detectors** over those unmapped values (dashed SSN,
-  punctuated NANP phone, CX ``MR``/``MRN``-typed identifier, and a line whose segment id is
+  punctuated NANP phone, a CX whose CX.5 id type is ``MR``/``MRN``, and a line whose segment id is
   malformed), plus a dashed SSN or punctuated phone that the message's own field separator cut
   across fields, when at least one of them is unmapped (BACKLOG #3465) — narrow by design to
   avoid the mass false-positives a broad digit-run search would produce on HL7 bodies (ADR 0030
@@ -31,7 +31,8 @@ already-pseudonymized field is never re-flagged:
   BACKLOG #5533, #5534). The shape detectors that read
   one field, and the token scan, read a value decoded from its HL7 escape sequences as well as as
   written, so a shape or token written ``\\X2D\\`` for a dash is found too (BACKLOG #5532).
-  docs/PHI.md section 9 names the checks that do not decode.
+  docs/PHI.md section 9, *An escaped value is read decoded too*, lists at least the escaped
+  forms each check still passes.
 
 The token-floor signal (``token_floor_failure``) is recorded in every report
 (``token_floor_reason``/``token_tables_live``) and folded into the fail-closed decision when
@@ -157,12 +158,14 @@ _MULTICAST_PREFIX_FLAG = 0x2
 
 def _ipv6_candidates(run: str) -> Iterator[str]:
     """The texts in ``run`` an IPv6 address may be written as: the run, without the dots that end
-    a sentence, and without a trailing ``.port`` or ``.word``; each of those with one colon taken
-    off either end or both, as a label or a list joins one; and each with every colon and dot
-    taken off both ends. So ``Addr:::ffff:808:808``, ``IP:2a01:4f8::``, ``2a01:4f8::5.443`` and
-    ``2a01:4f8:::`` still hold their address. A text may come more than once.
-    :func:`_label_dropped_runs` gives the texts to try when none of these parse."""
-    for base in (run, run.strip("."), run.rsplit(".", 1)[0]):
+    a sentence, without a trailing ``.port`` or ``.word``, and without both; each of those with one
+    colon taken off either end or both, as a label or a list joins one; and each with every colon
+    and dot taken off both ends. So ``Addr:::ffff:808:808``, ``IP:2a01:4f8::``,
+    ``2a01:4f8::5.443``, ``2a01:4f8::5.443.`` and ``2a01:4f8:::`` still hold their address. A
+    text may come more than once. :func:`_label_dropped_runs` gives the texts to try when none of
+    these parse."""
+    stripped = run.strip(".")
+    for base in (run, stripped, run.rsplit(".", 1)[0], stripped.rsplit(".", 1)[0]):
         front = base[1:] if base.startswith(":") else base
         yield from (base, front)
         if base.endswith(":"):
@@ -172,14 +175,15 @@ def _ipv6_candidates(run: str) -> Iterator[str]:
 
 def _label_dropped_runs(run: str) -> tuple[str, ...]:
     """``run`` without a leading label that ends in hex letters or digits and a colon or dot, as
-    in ``Device:`` or ``data.``, and without a trailing ``:port``. Tried only when no text
-    :func:`_ipv6_candidates` gives parses, so a well-formed address, such as a unique-local
-    ``fd00:1::5``, is never read as the shorter address its tail would make."""
-    return (
+    in ``Device:`` or ``data.``, without a trailing ``:port``, and without both, as in
+    ``IPv6:<address>:443``. Tried only when no text :func:`_ipv6_candidates` gives parses, so a
+    well-formed address, such as a unique-local ``fd00:1::5``, is never read as the shorter
+    address its tail would make."""
+    labels = (
         run.split(":", 1)[1] if ":" in run else run,
         run.split(".", 1)[1] if "." in run else run,
-        run.rsplit(":", 1)[0],
     )
+    return (*labels, run.rsplit(":", 1)[0], *(label.rsplit(":", 1)[0] for label in labels))
 
 
 def _is_allowed_ipv6(address: ipaddress.IPv6Address) -> bool:
@@ -758,18 +762,20 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
 
 
 def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
-    """True if any repetition of ``value`` has a non-empty component 1 and any component, the
-    first included, that reads as an ``MR``/``MRN`` id type — an unmapped medical-record number by
-    HL7 structure, far more precise than a bare digit-run heuristic. A fail-closed detector refuses
-    on any reading, so an id type counts in each of :func:`_is_mrn_type`'s readings: as written,
-    in any subcomponent as written, decoded whole, and stripped. So ``M\\X52\\`` (BACKLOG #5532),
-    ``X&MR`` and ``MR\\X20\\`` (BACKLOG #5654) count. A decoded part is never split again, so a
-    word ``MR`` that an escaped delimiter or whitespace sets apart, as in ``PET\\T\\MR`` or
-    ``MR BRAIN``, does not count, and nor does ``X\\S\\MR``. The id counts when it is non-empty
-    as written, so one that decodes to nothing, such as ``\\Z98765\\``, counts."""
+    """True if any repetition of ``value`` has a non-empty component 1 and a 5th component, CX.5
+    the identifier type code, that reads as ``MR``/``MRN`` — an unmapped medical-record number by
+    HL7 structure, far more precise than a bare digit-run heuristic. The id type is read only
+    where HL7 puts it, so ``MR`` in any other component, as in ``70553^PET&MR^C4`` or
+    ``A1^^^^ MR``, does not count (BACKLOG #5654). A fail-closed detector refuses on any reading
+    of CX.5, so an id type counts in each of :func:`_is_mrn_type`'s readings: as written, in any
+    of its subcomponents as written, decoded whole, and stripped. So ``M\\X52\\`` (BACKLOG
+    #5532), ``MR&local`` and ``MR\\X20\\`` count. A decoded part is never split again, so a word
+    ``MR`` that an escaped delimiter or whitespace sets apart, as in ``PET\\T\\MR`` or ``X\\S\\MR``,
+    does not count. The id counts when it is non-empty as written, so one that decodes to
+    nothing, such as ``\\Z98765\\``, counts."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
-        if comps[0] and any(_is_mrn_type(comp, seps, field_sep) for comp in comps):
+        if comps[0] and len(comps) >= 5 and _is_mrn_type(comps[4], seps, field_sep):
             return True
     return False
 
