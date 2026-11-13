@@ -528,6 +528,13 @@ _ENVELOPES = (
     ("<Envelope><Header>", "</Header><Body><Fault><Code>"),
     ("", "<soap:Fault>"),
 )
+#: What may come between a Fault's, or a Code's, start tag and its first child: markup the
+#: first-child search steps over whole (some holding a code element), an unterminated comment, a
+#: DOCTYPE, text, and nothing, the most likely.
+_BEFORE_THE_CHILD = (
+    "", "", "", "", " ", "t", "<!-- <faultcode>Server</faultcode> -->", "<?pi <Value>Receiver?>",
+    "<![CDATA[<Value>Receiver</Value>]]>", "<!-- -->", "<!--", "<!DOCTYPE x>", "<?x?>",
+)  # fmt: skip
 #: A code element's start tag and its own close tag, around random fragments.
 _CODE_ELEMENTS = (
     ("<faultcode>", "</faultcode>"),
@@ -547,6 +554,7 @@ def _random_reply(rng: random.Random) -> str:
         envelope
         + fragments(_HEAD_FRAGMENTS, 6)
         + body_to_fault
+        + fragments(_BEFORE_THE_CHILD, 1)
         + start
         + fragments(_FRAGMENTS, 2)
         + close
@@ -563,9 +571,10 @@ def test_random_replies_yield_the_reference_reading() -> None:
     differently when the Fault is searched for from the reply's start, and at least one in fifty
     has a Body start tag with no Fault after it. Without them a sample of bodies that yield no
     code, or that never reach the anchor or its fallback, would pass any extraction (the seeded
-    sample read about 54%, 6.8% and 4.5% on 2026-11-04, and 26.6%, 12.1% and 4.6% after BACKLOG
+    sample read about 54%, 6.8% and 4.5% on 2026-11-04, and 24.8%, 12.6% and 4.5% after BACKLOG
     #5912 on 2026-11-13: a Value outside a Code, and a code element that is not the Fault's first
-    child, now yield none, and the head fragments gained two Faults that hold a code)."""
+    child, now yield none, the head fragments gained two Faults that hold a code, and markup the
+    first-child search steps over may precede the code element)."""
     rng = random.Random(2827)
     total, with_a_code, anchored, fallback = 5_000, 0, 0, 0
     for _ in range(total):
@@ -590,7 +599,10 @@ _MAX_LINEAR_RATIO = 8.0
 
 #: Replies shaped to make the old tails rescan: many start tags, none of them closed. ``long-prefixes``,
 #: ``lt-run`` and ``long-close-prefixes`` name neither element, so they never reached the old tails;
-#: the two ``long-code-*`` shapes reach the checks on a code element that has a close. ``long-prefixes`` is here for the
+#: the two ``long-code-*`` shapes reach the checks on a code element that has a close. Since BACKLOG
+#: #5912 the name regexes are tried once, at the Fault's first child, so ``long-prefixes``,
+#: ``value-start-tags`` and ``unterminated-value-tags`` time that one match and the Fault close-tag
+#: scan rather than a name scan; ``unterminated-value-tags-in-a-code`` reaches the Value path. ``long-prefixes`` is here for the
 #: name regexes' ``[\w.\-]+:`` prefix class, which backtracks over each run that has no colon, and
 #: ``long-close-prefixes`` for the same class in the Fault close-tag scan, ``_FAULT_END_RE``.
 #: ``lt-run`` is the shape measured in ``SoapDestination._post_and_classify``'s docstring.

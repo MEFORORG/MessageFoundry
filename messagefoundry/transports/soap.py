@@ -192,6 +192,13 @@ _ENV_OPEN = (
 )
 
 
+def _start_tag_gt(body: str, pos: int, end: int) -> int:
+    """The ``>`` that ends the start tag whose name ends at ``pos``, or ``-1`` when it has none
+    before ``end`` or is self-closing, so the element holds nothing."""
+    gt = body.find(">", pos, end)
+    return -1 if gt < 0 or body[gt - 1] == "/" else gt
+
+
 def _code_text(m: re.Match[str], end_re: re.Pattern[str], body: str, end: int) -> str:
     """The text from the ``>`` of the start tag ``m`` begins to the next ``</``, before ``end``, or
     ``""`` when there is none or the element cannot hold a code.
@@ -200,24 +207,12 @@ def _code_text(m: re.Match[str], end_re: re.Pattern[str], body: str, end: int) -
     element cannot hold a code when it is self-closing, when the capture holds another element's
     start tag, or when the ``</`` is not ``end_re``, its own close tag. The capture would then be
     another element's text, such as ``<faultstring>Server busy`` after ``<faultcode/>``."""
-    gt = body.find(">", m.end(), end)
+    gt = _start_tag_gt(body, m.end(), end)
     close = -1 if gt < 0 else body.find("</", gt + 1, end)
     # Cheapest first: the scan for a nested start tag is the only check that reads the whole text.
-    if (
-        close < 0
-        or body[gt - 1] == "/"
-        or not end_re.match(body, close, end)
-        or _TAG_OPEN_RE.search(body, gt + 1, close)
-    ):
+    if close < 0 or not end_re.match(body, close, end) or _TAG_OPEN_RE.search(body, gt + 1, close):
         return ""
     return body[gt + 1 : close]
-
-
-def _start_tag_gt(body: str, pos: int, end: int) -> int:
-    """The ``>`` that ends the start tag whose name ends at ``pos``, or ``-1`` when it has none
-    before ``end`` or is self-closing, so the element holds nothing."""
-    gt = body.find(">", pos, end)
-    return -1 if gt < 0 or body[gt - 1] == "/" else gt
 
 
 def _first_child(body: str, pos: int, end: int) -> int:
@@ -1097,7 +1092,9 @@ class SoapDestination(DestinationConnector):
         a reply of ``<Fault>`` followed by one long run of ``<``. On a bare run of ``<``,
         ``_FAULT_RE`` finds nothing and the name scans never run. Those are that machine's readings,
         not a bound on another. Later #2827 changes added scans, at least ``_find_fault``'s and the
-        code-element checks in ``_code_text``, so they are not a reading of this code."""
+        code-element checks in ``_code_text``, and BACKLOG #5912 replaced the name scans with one
+        anchored match at the Fault's first child, found by :func:`_first_child`'s Python-level
+        loop, and added the Code close-tag search, so they are not a reading of this code."""
         # WS-* mode: the Handler returned only the <Body> fragment; wrap + stamp here (post-queue
         # boundary), so the per-call MessageID and Timestamp never live in a pure transform.
         if self._ws_mode:
