@@ -2292,7 +2292,11 @@ the same permission set on the same method reds CI until it is listed here.
 > row, for a channel it may reach. The row does not say which engine shard answered. To read one,
 > look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
 > that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
-> by a reload. That case was read from the code, not run on more than one engine shard (BACKLOG
+> by a reload. `test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row` in
+> `tests/test_multishard_smoke.py` runs the wrong-engine cause on `GET /connections/{name}/metadata`
+> only, against two plain `serve` processes
+> over one store, each with its own graph and API port. It is not run under `serve --shard`, whose
+> engine shards split one config, so on engine shards that cause is read from the code (BACKLOG
 > #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
 > flag request refused for its direction. Such a row's detail carries
 > `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its
@@ -2304,10 +2308,13 @@ the same permission set on the same method reds CI until it is listed here.
 > all, every one of these routes answers 503 `engine not started` before any scope check, the same
 > answer for every name. Names still show elsewhere. At least the Prometheus exposition above
 > lists them.
-> `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
-> an inbound in its own scope, and every other target gets that 403, before the engine looks the
-> name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
-> reaches the engine, which answers 409 for a name the running graph does not have. The JSON
+> On `POST /connections/{name}/flag` (BACKLOG #1152), a scoped caller gets the 403 and a denial row
+> above for a name outside its scope, a direction of `outbound`, or, with a graph loaded, a
+> name `Registry.inbound_names()` does not hold. On an engine shard that set is every inbound in the
+> whole config, so unlike the routes above, an in-scope inbound that a sibling engine shard holds is
+> not refused by this one: the scope check does not refuse it, and `Engine.set_connection_flag` writes the flag
+> and its `connection_flag_set` row to the shared store. What that method refuses is in its
+> docstring. The JSON
 > route validates the body before any of this, so a direction other than `inbound` or `outbound`
 > gets a 422 there with no denial row, scoped caller or not. The web console's twin reads the
 > direction itself: for such a direction it gives a scoped caller the 403 and a denial row, and an
@@ -6834,7 +6841,7 @@ refused, which grants nothing. The table covers at least these legs. Each cell w
 code at engine commit `3345056505`, and the Where column names the code that does it, except the
 **WebAuthn passkey** cell and the enrolment sentence of the **Engine TOTP or recovery code** cell,
 which describe code merged after `3345056505` (BACKLOG #2239, #3061). The passkey cell's directory
-sentence was read against `AuthService.finish_webauthn_assertion` as BACKLOG #3068 left it, and the
+sentence was read against `AuthService.finish_webauthn_assertion` at engine commit `8c13c9ae03`, and the
 enrolment sentences against `AuthService.confirm_mfa_enrollment` and
 `AuthService.finish_webauthn_registration` as BACKLOG #3061 left them.
 
@@ -7921,7 +7928,9 @@ synchronization without an operator-chosen peer; the default is a no-op.
 
 ### Outbound TLS trust anchor — pinned internal CA (`[tls]`, #190, ADR 0093)
 
-An outbound connector that verifies a downstream **server** certificate (MLLP/DICOM-SCU/FTPS) anchors
+A hop that verifies a downstream **server** certificate and reads `[tls]` (the
+[`[tls]` section of CONFIGURATION.md](CONFIGURATION.md#tls--outbound-client-trust-anchors) names at least
+which hops do) anchors
 trust in the **OS trust store** by default. A hospital estate whose internal endpoints present certs
 from a **private / internal CA** not in the box-global store can pin that CA once via the small opt-in
 `[tls]` section rather than installing it box-wide or repeating a per-connection `tls_ca_file`:
