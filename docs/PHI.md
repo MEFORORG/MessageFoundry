@@ -2428,7 +2428,9 @@ Properties of the anonymizer:
   character that is not a digit, since a raw viewer shows that text and a site code is digits
   only. So `\Z971234\`, `\Z-971234\`, `\.Z971234\` and `\.sp971234 x\` are found, and so is a
   well-formed hex escape whose digits hold a code, such as `\X971234\`, which the scrub then
-  replaces although it decodes to other bytes. With no site prefix loaded it matches nothing, and
+  replaces although it decodes to other bytes. Text between two escape sequences is not a body:
+  it is read only decoded, with the sequences around it, so `\X41\971234`, which decodes to
+  `A971234`, passes, although a raw viewer shows `971234` after the escape character. With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
@@ -2516,8 +2518,9 @@ still pass:
 
 The IPv6 check also refuses some text that holds no routable address, under any separators. It
 reads any run of hex digits, colons and dots with two or more colons, so at least these refuse:
-any word that ends in a hex digit or letter joined to `::`, such as `ADD::`, `Note::`, `ID::`,
-`std::bad_alloc` or `Code:: 12`; such a word joined by a colon to an allowed address, such as
+any word whose trailing run of hex digits and letters is one to four characters long joined to
+`::`, such as `ADD::`, `Note::`, `ID::`, `std::bad_alloc` or `Code:: 12` (a longer run is no
+IPv6 group, so `Decade::` and `BADCAFE::` pass); such a word joined by a colon to an allowed address, such as
 `Feed:fe80::1`; a word that ends in hex digits joined to `::` and more hex, such as `abc 1::2`;
 eight colon-separated hex groups, such as a colon-written EUI-64 device id
 (`00:1A:2B:FF:FE:3C:4D:5E`); nine such groups, read as an address and a `:port`; and, in a
