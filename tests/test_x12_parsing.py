@@ -479,6 +479,9 @@ def _without_iea(raw: str) -> str:
     return raw[: raw.index("IEA*")]
 
 
+_BIG_CUT = _without_iea(interchange(groups=[("HS", "005010X279A1", ["270", "270", "270"])]))
+
+
 @pytest.mark.parametrize(
     ("first", "cap"),
     [
@@ -486,6 +489,9 @@ def _without_iea(raw: str) -> str:
         pytest.param(b"ISA long noise line " * 9, 220, id="suspect"),
         # A passing interchange with no IEA ends at the next one too.
         pytest.param(_without_iea(interchange()).encode(), 232, id="passing-no-iea"),
+        # At the cap exactly, and one over: the next ISA's first bytes are not charged.
+        pytest.param(_BIG_CUT.encode(), len(_BIG_CUT), id="passing-at-cap"),
+        pytest.param(_BIG_CUT.encode(), len(_BIG_CUT) + 1, id="passing-cap-plus-one"),
     ],
 )
 def test_frame_reader_cap_does_not_depend_on_read_size(first: bytes, cap: int) -> None:
@@ -493,7 +499,7 @@ def test_frame_reader_cap_does_not_depend_on_read_size(first: bytes, cap: int) -
     # count against the open frame's cap: they did, and 1- or 64-byte reads raised frame_oversize
     # where one read framed both.
     good = interchange(control="000000002").encode()
-    assert len(first) < cap and len(good) < cap < len(first) + len(good)
+    assert len(first) <= cap and len(good) <= cap < len(first) + len(good)
     data = first + good
     for chunk in (len(data), 4096, 150, 64, 7, 1):
         reader = X12FrameReader(max_interchange_bytes=cap)
@@ -529,6 +535,53 @@ def test_check_integrity_reports_every_trailer_left_open() -> None:
         "GS06 '1' has no GE",
         "no IEA segment",
     ]
+
+
+@pytest.mark.parametrize(
+    ("dropped", "groups", "expected"),
+    [
+        pytest.param(
+            "GE*1*1~",
+            [("HS", "005010X279A1", ["270"]), ("HB", "005010X279A1", ["271"])],
+            ["GS06 '1' has no GE"],
+            id="group-opened-over",
+        ),
+        pytest.param(
+            "SE*2*0001~",
+            [("HS", "005010X279A1", ["270", "270"])],
+            ["ST02 '0001' has no SE"],
+            id="set-opened-over",
+        ),
+    ],
+)
+def test_check_integrity_reports_a_trailer_a_new_header_opens_over(
+    dropped: str, groups: list[tuple[str, str, list[str]]], expected: list[str]
+) -> None:
+    raw = interchange(groups=groups).replace(dropped, "", 1)
+    assert check_integrity(raw) == expected
+
+
+class _CountingStr(str):
+    """A ``str`` that totals how far its ``find`` calls scan."""
+
+    scanned = 0
+
+    def find(self, sub: Any, start: Any = 0, end: Any = None) -> int:
+        stop = len(self) if end is None else end
+        idx = super().find(sub, start, stop)
+        type(self).scanned += max(0, (stop if idx == -1 else idx + len(sub)) - start)
+        return idx
+
+
+def test_split_walks_a_chain_of_interchanges_with_no_iea_linearly() -> None:
+    # Each walk used to run to the end of the buffer before looking for the next ISA, so a run of
+    # interchanges with no IEA cost about N * N.
+    cut = _without_iea(interchange())
+    for k in (50, 400):
+        _CountingStr.scanned = 0
+        raw = _CountingStr(cut * k)
+        assert len(split(raw)) == k
+        assert _CountingStr.scanned < 4 * len(raw), (k, _CountingStr.scanned)
 
 
 def test_split_checks_a_chain_of_interchanges_with_no_iea_once_each() -> None:

@@ -161,7 +161,7 @@ defining one at `+3`) — must equal the element separator. (Derive these in cod
 not a hand-typed list.) No ISA element's data may hold the element separator or the segment terminator
 (either character of a `CR+LF` one). On a delimiter collision, a sanity-gate failure or such a delimiter
 in ISA element data, the codec's delimiter discovery (`discover_delimiters`, which `X12Peek`,
-`X12Message` and `check_integrity` run; `split` returns such an ISA as its own malformed element, per
+`X12Message` and `check_integrity` run; `split` returns such an ISA whole as its own element, per
 the 2026-11-13 amendment below) raises
 **`X12PeekError`** — the Router routes the message to the **error/dead-letter** path (status `ERROR`) rather
 than guessing, honouring the count-and-log invariant (never accept-and-drop). Hardcoding `*~:^` is **wrong** —
@@ -316,7 +316,7 @@ real failure mode), so it is rejected.
 6. **Sample fixtures. → SYNTHETIC `.edi` SAMPLES.** Create synthetic PHI-free `samples/messages/*.edi` (270
    now, 837P/835 later) plus a `samples/config` X12 inbound example module.
 
-## Amendment (2026-11-13) — framing never drops or swallows data around a bad ISA (BACKLOG #5921)
+## Amendment (2026-11-13) — framing keeps the data around a bad ISA, in at least the cases below (BACKLOG #5921)
 
 `split` and `X12FrameReader` both run `isa_separators_line_up` (in `parsing/x12/delimiters.py`) on
 each `ISA` to decide whether it opens an interchange. It is the structural part of section 4's checks:
@@ -328,7 +328,7 @@ an `ISA` that passes ends at its `IEA` or at a later passing `ISA` that opens a 
 the walk's own terminator and whitespace come before it, so an interchange with no `IEA` does not
 swallow the next one. A later `ISA` behind anything else, at least a BOM, is not found that way.
 `X12Peek` and `X12Message` still parse a frame cut there; `check_integrity` reports its missing `SE`,
-`GE` or `IEA`. `split` returns every run as an element, and an
+`GE` or `IEA`. `split` returns every run other than inter-interchange whitespace/BOM as an element, and an
 `ISA` that passes but that `discover_delimiters` refuses, for a delimiter in its element data (BACKLOG
 #5536), is one such element, framed whole, so the parse of it still refuses it. `split` no longer
 raises for the whole buffer. The reader still discards a run that does not open with `ISA`.

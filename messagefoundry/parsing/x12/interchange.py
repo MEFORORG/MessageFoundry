@@ -49,6 +49,8 @@ __all__ = ["split", "X12FrameReader", "check_integrity"]
 # test_iea_segment_whitespace_matches_the_shared_set in tests/test_x12_parsing.py keeps the two equal.
 _IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
 _SEGMENT_WHITESPACE_BYTES = _SEGMENT_WHITESPACE.encode("ascii")
+# How much of a whitespace run :func:`_opens_segment` strips per step.
+_WS_CHUNK = 4096
 #: Line-end bytes a sender may put after an interchange's closing terminator, such as a newline after
 #: ``IEA*...~``. Up to :data:`_FRAME_TAIL_MAX` of them directly after a completed interchange are its
 #: ending, however reads split them (vault BACKLOG #2938). The cap keeps a peer from trickling them
@@ -65,7 +67,8 @@ _FRAME_TAIL_MAX = 2
 def split(raw: str) -> list[str]:
     """Split a complete buffer into its ``ISA…IEA`` interchange substrings (verbatim).
 
-    Inter-interchange whitespace/BOM is skipped. Nothing else is dropped: every other run of data
+    Whitespace/BOM between elements is skipped, except inside a passing element cut at a later
+    ``ISA``, which keeps it. Nothing else is dropped: every other run of data
     becomes an element (BACKLOG #5921). An ``ISA`` *passes* when it is whole and
     :func:`isa_separators_line_up` accepts it.
 
@@ -98,21 +101,19 @@ def split(raw: str) -> list[str]:
     # it failed, so it stays the answer while the search would start at or before it: reusing it keeps
     # a run of many malformed interchanges linear. Only a run that does not pass needs it.
     good = -1
-    # An ISA a passing walk ended at, already checked, so a run of interchanges with no IEA is not
-    # checked twice.
+    # The later passing ISA the last passing walk found, already checked, so the next interchange is
+    # not checked twice. ``good`` is reused the same way: below ``len(raw)`` it is a passing ISA.
     passed = -1
     while pos < n:
         start = skip_leading_noise(raw, pos)
         if start == n:
             break
-        if start == passed or _isa_complete_str(raw, start):
-            end, at_iea = _passing_end_str(raw, start)
+        if start in (passed, good) or _isa_complete_str(raw, start):
+            end, at_iea, passed = _passing_end_str(raw, start)
             if end is None:
                 # Unterminated final interchange — surface it, don't lose it.
                 out.append(raw[start:])
                 break
-            if not at_iea:
-                passed = end
             # Kept verbatim, as the reader frames it, whether it ends at its IEA or at a later ISA.
             out.append(raw[start:end])
             pos = end
@@ -164,21 +165,25 @@ def _malformed_end_str(raw: str, isa: int, bound: int) -> tuple[int, bool]:
     return (bound, False) if end is None else (end, at_iea)
 
 
-def _passing_end_str(raw: str, isa: int) -> tuple[int | None, bool]:
-    """Where the interchange at the passing ``isa`` ends, and whether that is its own ``IEA``: just
-    past its ``IEA`` segment, or at a later passing ``ISA`` that opens a segment if that comes first
-    (False), or None if neither is in ``raw``. The same rule as :meth:`X12FrameReader._bound`."""
-    iea_end, _ = _walk_str(raw, isa)
+def _passing_end_str(raw: str, isa: int) -> tuple[int | None, bool, int]:
+    """Where the interchange at the passing ``isa`` ends, whether that is its own ``IEA``, and the
+    later passing ``ISA`` that opens a segment, or ``len(raw)`` if none does. It ends just past its
+    ``IEA`` segment, or at that later ``ISA`` if that comes first (False), or is None if neither is
+    in ``raw``. The same rule as :meth:`X12FrameReader._bound`. The later ``ISA`` is found first and
+    bounds the walk, so a run of interchanges with no ``IEA`` is walked once, not once per
+    interchange still ahead."""
     term = _terminator_str(raw, isa)
-    stop = len(raw) if iea_end is None else iea_end
-    i = raw.find("ISA", isa + _SEGMENT_TERM_OFFSET + len(term), stop)
-    while i != -1:
-        if _isa_complete_str(raw, i) and _opens_segment(
-            raw, i, isa + _SEGMENT_TERM_OFFSET, term, _SEGMENT_WHITESPACE
-        ):
-            return i, False
-        i = raw.find("ISA", i + 1, stop)
-    return iea_end, iea_end is not None
+    lo = isa + _SEGMENT_TERM_OFFSET
+    nxt = raw.find("ISA", lo + len(term))
+    while nxt != -1 and not (
+        _isa_complete_str(raw, nxt) and _opens_segment(raw, nxt, lo, term, _SEGMENT_WHITESPACE)
+    ):
+        nxt = raw.find("ISA", nxt + 1)
+    bound = len(raw) if nxt == -1 else nxt
+    end, at_iea = _walk_str(raw, isa, bound)
+    if end is None and nxt != -1:
+        return nxt, False, nxt
+    return end, at_iea, bound
 
 
 @overload
@@ -190,10 +195,15 @@ def _opens_segment(
 def _opens_segment(buf: Any, i: int, lo: int, terminator: Any, whitespace: Any) -> bool:
     """Whether position ``i`` of ``buf`` opens a segment: ``terminator`` then only whitespace comes
     before it, with that terminator at or after ``lo``. Only the whitespace run before ``i`` is
-    searched, so checking many candidates stays linear."""
+    read, in C-level chunks rather than byte by byte, so a long run costs one pass and checking
+    many candidates stays linear."""
     j = i
-    while j > lo and buf[j - 1 : j] in whitespace:
-        j -= 1
+    while j > lo:
+        chunk_start = max(lo, j - _WS_CHUNK)
+        kept = len(buf[chunk_start:j].rstrip(whitespace))
+        j = chunk_start + kept
+        if kept:
+            break
     found: int = buf.rfind(terminator, max(lo, j - len(terminator)), i)
     return found != -1
 
@@ -454,8 +464,13 @@ class X12FrameReader:
         # pins the walk's cap twice, with and without "IEA" in element data; keep both if this moves.
         # ``bound`` is where the open frame must end, at a later ISA: the bytes past it belong to that
         # ISA, which is never more than one header still arriving, so they are not charged to this
-        # frame. Charging them made the refusal depend on how the stream was split into reads.
-        held = len(self._buf) if bound is None else min(bound, len(self._buf))
+        # frame. Charging them made the refusal depend on how the stream was split into reads. With
+        # no later ISA yet, a trailing "I" or "IS" may be the start of one, so it is not charged
+        # either; a frame that really ends in them is still measured whole by _take.
+        buf = self._buf
+        held = len(buf) if bound is None else min(bound, len(buf))
+        if held == len(buf):
+            held -= 2 if buf.endswith(b"IS") else 1 if buf.endswith(b"I") else 0
         if self.max_interchange_bytes is not None and held > self.max_interchange_bytes:
             self._clear()
             raise X12FrameError(
@@ -505,7 +520,13 @@ def check_integrity(raw: str) -> list[str]:
         tag = fields[0]
         if current_st is not None:
             seg_in_set += 1
+        # A set or group a new one opens over never closed: report it rather than overwrite it.
+        if tag in ("GS", "ST", "GE") and current_st is not None:
+            problems.append(f"ST02 {get(current_st, 2)!r} has no SE")
+            current_st = None
         if tag == "GS":
+            if current_gs is not None:
+                problems.append(f"GS06 {get(current_gs, 6)!r} has no GE")
             current_gs, st_in_group = fields, 0
         elif tag == "ST":
             current_st, seg_in_set = fields, 1  # the ST itself is segment 1 of the set
