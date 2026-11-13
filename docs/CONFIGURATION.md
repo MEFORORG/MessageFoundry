@@ -1150,10 +1150,12 @@ connect until the first send that works.
 `lost` never goes down while the forwarder runs, so a loss keeps the state `degraded` for that
 long. If the forwarder then stops, the state reads `not_installed`.
 
-**Over UDP the engine cannot see a lost record.** UDP is the default protocol. A UDP send to a
-collector that is down reports no failure, and the engine does not count a UDP send error its own
-host reports either. So a collector that is down looks the same as one that is up. The only
-losses the engine counts are queue and spool losses. `delivery_confirmed` is `false`, a
+**Over UDP the engine cannot see a record lost past this host.** UDP is the default protocol. A
+UDP send to a collector that is down reports no failure, so a collector that is down looks the
+same as one that is up. The engine does count a UDP send that fails on its own host, such as a
+down interface or no route (BACKLOG #5923): it sets `send_failing`, and the record is counted in
+`unsent`, or kept in the spool when there is one. A datagram too large to send is counted in
+`undeliverable`. Beyond those, the only losses the engine counts are queue and spool losses. `delivery_confirmed` is `false`, a
 forwarder with no fault seen reads `unconfirmed` and never `healthy`. In the `unconfirmed` and
 `degraded` states the console row says that delivery is not confirmed. The health indicator does not warn for that alone. Use `tcp` or
 `tls` where a silent loss must page.

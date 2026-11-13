@@ -231,3 +231,22 @@ that is this host through.
 **The Consequences line on start-time cost moved too.** It called the gate "a settings read". For
 an IP-literal collector it is now also one local socket call, measured at well under a
 millisecond on a Windows host. For a name it is one `gethostname` call.
+
+## Amendment B (2026-11-13) -- UDP now counts a send that fails on this host (BACKLOG #5923)
+
+This amendment records a code change. It changes no decision above, and the decision text stays
+as written. Two bullets under *Delivery: best effort, not at least once* no longer match the code:
+
+- **"UDP detects nothing" is now too strong.** The UDP arm uses the same failure-tracking handler
+  as TCP and TLS, so a `sendto` that fails on this host, such as a down interface or no route, is
+  now counted as a failed send. With a spool the record stays on disk and the listener backs off,
+  as on TCP and TLS; without one it is counted in `unsent`. What UDP still cannot detect is a
+  datagram that leaves this host and never reaches the collector, including every datagram to a
+  collector that is down, so delivery over UDP stays unconfirmed.
+- **A send error that is not a network error is now undeliverable on UDP too**, not only on TCP
+  and TLS. So is a datagram too large to send (`EMSGSIZE`), which fails the same way on every
+  retry. Each is dropped, counted in `undeliverable`, and reported at ERROR, never counted as sent.
+
+On every arm a failed send is now reported in one throttled ERROR line naming the error type and
+number, with no record content, instead of the standard library's traceback to stderr.
+[`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]` is the operator-facing statement.

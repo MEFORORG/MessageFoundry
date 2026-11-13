@@ -23,17 +23,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   external provider. (`BACKLOG #2595`)
 
 ### Changed
-- **The `tcp` and `tls` syslog forwarders send octet-counted frames.** Each record goes as
-  `MSG-LEN SP <PRI>msg`, MSG-LEN being its length in UTF-8 bytes (RFC 6587, RFC 5425), not as a
-  NUL-terminated line, which a conforming collector could not frame. A collector that splits a raw
-  TCP stream on LF alone cannot parse either form; point it at an octet-counting listener. `udp` is
-  unchanged. See `forward_protocol` in [CONFIGURATION.md](docs/CONFIGURATION.md). (`BACKLOG #5924`)
-- **The UDP syslog forwarder counts a send that fails on this host, and no forwarder prints a
-  traceback to stderr.** A failed `sendto` (a down interface, no route) now reads as failing and,
-  with a spool, keeps the record on disk instead of deleting it as sent. A failed send on any arm
-  is reported in one throttled ERROR line naming the error type and number, with no record content,
-  where the standard library printed a traceback and the record to stderr each time.
-  (`BACKLOG #5923`)
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
   other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or
