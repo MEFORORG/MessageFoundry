@@ -79,21 +79,23 @@ async def test_sqlserver_orphan_sweep_logs_a_count_per_table_and_no_account(
         async def fetchall(self) -> list[tuple[str, int]]:
             return [("sessions", deleted)]
 
-    control = "control line: the capture reads this logger"
-    with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
-        sqlserver.log.warning(control)
+    from tests._log_absence import assert_capture_sees
+
+    with caplog.at_level("WARNING", logger=sqlserver.log.name):
         await sqlserver._log_orphans_deleted(_Cursor())
-    # Positive control: the capture holds the control line, so an empty result below is the
-    # reader logging nothing, not a capture that saw nothing.
-    assert len(caplog.records) >= 1
-    lines = [r.getMessage() for r in caplog.records if r.getMessage() != control]
-    if deleted:
-        assert lines == [
+        # The capture saw a WARNING sent through the store's logger, so lines that come back
+        # empty mean the reader logged nothing at WARNING or above, not that the capture missed it.
+        assert_capture_sees(caplog, sqlserver.log)
+    lines = [r.getMessage() for r in caplog.records if r.name == sqlserver.log.name]
+    expected = (
+        [
             "sqlserver: deleted 2 sessions row(s) naming an account that does not exist, before"
             " trusting the table's user key"
         ]
-    else:
-        assert lines == []
+        if deleted
+        else []
+    )
+    assert lines == expected
 
 
 def test_postgres_schema_hash_tracks_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
