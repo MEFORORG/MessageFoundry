@@ -32,7 +32,7 @@ import smtplib
 import ssl
 import traceback
 import types
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -53,7 +53,7 @@ from cryptography.hazmat.primitives.asymmetric import (
 )
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
@@ -102,26 +102,55 @@ def _mint_ca() -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
     return key, cert
 
 
+def _with_san(
+    builder: x509.CertificateBuilder,
+    common_name: str,
+    addresses: Sequence[str] | None = None,
+    dns_names: Sequence[str] = (),
+) -> x509.CertificateBuilder:
+    """``builder`` with the subjectAltName a Direct leaf carries, unchanged when it names nothing.
+    ``addresses`` defaults to the common name when it is a mail address, so a leaf minted for a
+    mailbox names it (BACKLOG #5631: the Direct trust check binds every recipient to the recipient
+    cert's SAN)."""
+    if addresses is None:
+        addresses = (common_name,) if "@" in common_name else ()
+    general: list[x509.GeneralName] = [x509.RFC822Name(a) for a in addresses]
+    general += [x509.DNSName(d) for d in dns_names]
+    if not general:
+        return builder
+    return builder.add_extension(x509.SubjectAlternativeName(general), critical=False)
+
+
 def _mint_leaf(
     common_name: str,
     ca_key: rsa.RSAPrivateKey,
     ca_cert: x509.Certificate,
+    *,
+    addresses: Sequence[str] | None = None,
+    dns_names: Sequence[str] = (),
+    valid_from: datetime.timedelta = datetime.timedelta(days=-1),
+    valid_to: datetime.timedelta = datetime.timedelta(days=365),
+    extensions: Sequence[x509.ExtensionType] = (),
 ) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
-    """A leaf cert signed by the given CA."""
+    """A leaf cert signed by the given CA, naming ``addresses`` and ``dns_names`` in its SAN (see
+    :func:`_with_san`), valid from ``now + valid_from`` to ``now + valid_to``, and carrying any
+    further ``extensions`` (non-critical)."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     now = datetime.datetime.now(datetime.UTC)
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(ca_cert.subject)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=365))
-        .sign(ca_key, hashes.SHA256())
+        .not_valid_before(now + valid_from)
+        .not_valid_after(now + valid_to)
     )
-    return key, cert
+    builder = _with_san(builder, common_name, addresses, dns_names)
+    for extension in extensions:
+        builder = builder.add_extension(extension, critical=False)
+    return key, builder.sign(ca_key, hashes.SHA256())
 
 
 def _write_pem(path: Path, cert: x509.Certificate) -> None:
@@ -144,7 +173,11 @@ def pki(tmp_path: Path) -> dict[str, Any]:
     written to PEM files under tmp_path. Returns the paths + the in-memory recipient key for decrypt."""
     ca_key, ca_cert = _mint_ca()
     signer_key, signer_cert = _mint_leaf("Sender Direct", ca_key, ca_cert)
-    recip_key, recip_cert = _mint_leaf("recipient@hisp.example", ca_key, ca_cert)
+    # The dNSName covers the hospital.example recipients the envelope tests borrow from the Email
+    # destination's tests, as an organisation certificate would.
+    recip_key, recip_cert = _mint_leaf(
+        "recipient@hisp.example", ca_key, ca_cert, dns_names=("hospital.example",)
+    )
 
     signing_cert_p = tmp_path / "signer.crt"
     signing_key_p = tmp_path / "signer.key"
@@ -930,7 +963,7 @@ def _mint_ec_leaf(
     key = ec.generate_private_key(ec.SECP256R1())
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     now = datetime.datetime.now(datetime.UTC)
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(ca_cert.subject)
@@ -938,9 +971,8 @@ def _mint_ec_leaf(
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=365))
-        .sign(ca_key, hashes.SHA256())
     )
-    return key, cert
+    return key, _with_san(builder, common_name).sign(ca_key, hashes.SHA256())
 
 
 def _ec_signer(pki: dict[str, Any], tmp_path: Path) -> dict[str, str]:
@@ -1098,7 +1130,7 @@ def _weak_pki(tmp_path: Path, bits: int = 1024) -> dict[str, Any]:
 
     def leaf(cn: str) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
         k = rsa.generate_private_key(public_exponent=65537, key_size=bits)
-        c = (
+        b = (
             x509.CertificateBuilder()
             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
             .issuer_name(ca_cert.subject)
@@ -1106,9 +1138,8 @@ def _weak_pki(tmp_path: Path, bits: int = 1024) -> dict[str, Any]:
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - datetime.timedelta(days=1))
             .not_valid_after(now + datetime.timedelta(days=365))
-            .sign(ca_key, hashes.SHA256())
         )
-        return k, c
+        return k, _with_san(b, cn).sign(ca_key, hashes.SHA256())
 
     signer_key, signer_cert = leaf("Weak Sender")
     recip_key, recip_cert = leaf("weak@hisp.example")
@@ -1232,9 +1263,11 @@ def _cert_for(
     issuer_name: x509.Name | None = None,
     *,
     ca: bool = False,
+    addresses: Sequence[str] | None = None,
 ) -> x509.Certificate:
     """A cert carrying ``public_key``, signed by ``issuer_key``. Self-signed when ``issuer_name`` is
-    None. EdDSA issuers sign with no separate hash, so the hash is None for them."""
+    None. EdDSA issuers sign with no separate hash, so the hash is None for them. The SAN follows
+    :func:`_with_san`."""
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     now = datetime.datetime.now(datetime.UTC)
     builder = (
@@ -1250,6 +1283,7 @@ def _cert_for(
         builder = builder.add_extension(
             x509.BasicConstraints(ca=True, path_length=None), critical=True
         )
+    builder = _with_san(builder, cn, addresses)
     eddsa = isinstance(issuer_key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey))
     return builder.sign(issuer_key, None if eddsa else hashes.SHA256())
 
@@ -1281,7 +1315,13 @@ def _anchor_issuing_an_rsa_recipient(tmp_path: Path, ca_key: Any, tag: str) -> d
     """A self-signed CA on ``ca_key`` and an RSA-2048 recipient it issues, as overrides."""
     ca_cert = _cert_for(ca_key.public_key(), f"{tag} Direct CA", ca_key, ca=True)
     recip_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    recip_cert = _cert_for(recip_key.public_key(), f"rsa-recip-of-{tag}", ca_key, ca_cert.subject)
+    recip_cert = _cert_for(
+        recip_key.public_key(),
+        f"rsa-recip-of-{tag}",
+        ca_key,
+        ca_cert.subject,
+        addresses=("recipient@hisp.example",),
+    )
     anchor_p = tmp_path / f"{tag}_ca.crt"
     recip_p = tmp_path / f"rsa_recip_of_{tag}_ca.crt"
     _write_pem(anchor_p, ca_cert)
@@ -1483,7 +1523,7 @@ def test_a_non_ec_non_rsa_recipient_cert_is_refused_too(
     # The fallback label, on a key type the curve list never sees: Ed25519.
     key = ed25519.Ed25519PrivateKey.generate()
     now = datetime.datetime.now(datetime.UTC)
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ed25519-recip")]))
         .issuer_name(pki["ca_cert"].subject)
@@ -1491,8 +1531,8 @@ def test_a_non_ec_non_rsa_recipient_cert_is_refused_too(
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=365))
-        .sign(pki["ca_key"], hashes.SHA256())
     )
+    cert = _with_san(builder, "recipient@hisp.example").sign(pki["ca_key"], hashes.SHA256())
     path = tmp_path / "ed25519_recip.crt"
     _write_pem(path, cert)
     with pytest.raises(ValueError, match="recipient_cert' key type is Ed25519; S/MIME encryption"):
@@ -1528,7 +1568,7 @@ def test_an_ec_trust_anchor_issuing_an_rsa_recipient_still_constructs(
         .sign(ca_key, hashes.SHA384())
     )
     recip_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    recip_cert = (
+    recip_builder = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "rsa-recip")]))
         .issuer_name(ca_name)
@@ -1536,8 +1576,8 @@ def test_an_ec_trust_anchor_issuing_an_rsa_recipient_still_constructs(
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=365))
-        .sign(ca_key, hashes.SHA384())
     )
+    recip_cert = _with_san(recip_builder, "recipient@hisp.example").sign(ca_key, hashes.SHA384())
     anchor_p = tmp_path / "ec_ca.crt"
     recip_p = tmp_path / "rsa_recip_of_ec_ca.crt"
     _write_pem(anchor_p, ca_cert)
@@ -1715,3 +1755,295 @@ def test_pkcs7_envelope_default_content_cipher_is_still_aes128(pki: dict[str, An
     or this test.
     """
     assert _content_encryption_oid(_library_envelope(pki["recip_cert"])) == _AES128_CBC_OID
+
+
+# --- recipient trust beyond issuance (BACKLOG #5631) --------------------------------------------------
+#
+# Issuance alone used to be the whole trust check. Each refusal below constructed before #5631: an
+# expired or not-yet-valid recipient or anchor, a non-CA anchor, a keyUsage or extendedKeyUsage that
+# rules encryption out, and a cert the same CA issued to another subscriber, so PHI would have been
+# encrypted to it. Each refusal has a positive control.
+
+
+_CA_CONSTRAINTS = x509.BasicConstraints(ca=True, path_length=None)
+
+
+def _key_usage(*, key_encipherment: bool = False, key_cert_sign: bool = False) -> x509.KeyUsage:
+    return x509.KeyUsage(
+        digital_signature=True,
+        content_commitment=False,
+        key_encipherment=key_encipherment,
+        data_encipherment=False,
+        key_agreement=False,
+        key_cert_sign=key_cert_sign,
+        crl_sign=key_cert_sign,
+        encipher_only=False,
+        decipher_only=False,
+    )
+
+
+def _issuer(
+    *,
+    key: rsa.RSAPrivateKey | None = None,
+    constraints: x509.BasicConstraints | None = _CA_CONSTRAINTS,
+    usage: x509.KeyUsage | None = None,
+    valid_to: datetime.timedelta = datetime.timedelta(days=3650),
+) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+    """A self-signed issuing anchor, named like the ``pki`` CA so it can stand in for it."""
+    key = key or rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Direct CA")])
+    now = datetime.datetime.now(datetime.UTC)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=2))
+        .not_valid_after(now + valid_to)
+    )
+    if constraints is not None:
+        builder = builder.add_extension(constraints, critical=True)
+    if usage is not None:
+        builder = builder.add_extension(usage, critical=True)
+    return key, builder.sign(key, hashes.SHA256())
+
+
+def _files(tmp_path: Path, tag: str, **certs: x509.Certificate) -> dict[str, str]:
+    """Write each cert to a file and return ``{setting: path}`` overrides."""
+    out: dict[str, str] = {}
+    for setting, cert in certs.items():
+        path = tmp_path / f"{tag}_{setting}.crt"
+        _write_pem(path, cert)
+        out[setting] = str(path)
+    return out
+
+
+def _recipient(pki: dict[str, Any], tmp_path: Path, tag: str, **mint: Any) -> str:
+    """A recipient cert issued by the ``pki`` CA, minted with ``mint``, as a file path."""
+    _, cert = _mint_leaf("recipient@hisp.example", pki["ca_key"], pki["ca_cert"], **mint)
+    return _files(tmp_path, tag, recipient_cert=cert)["recipient_cert"]
+
+
+def _refusal(pki: dict[str, Any], **overrides: Any) -> str:
+    with pytest.raises(ValueError) as caught:
+        DirectDestination(_dest(pki, **overrides))
+    text = str(caught.value)
+    # Never a subject or a SAN value: either may identify a patient's provider.
+    assert "@" not in text and "Test Direct CA" not in text and "example" not in text
+    return text
+
+
+@pytest.mark.parametrize(
+    "valid_from, valid_to, expected",
+    [
+        (datetime.timedelta(days=-30), datetime.timedelta(days=-1), "'recipient_cert' has expired"),
+        (
+            datetime.timedelta(days=1),
+            datetime.timedelta(days=30),
+            "'recipient_cert' is not yet valid",
+        ),
+    ],
+    ids=["expired", "not-yet-valid"],
+)
+def test_a_recipient_cert_outside_its_validity_window_is_refused(
+    pki: dict[str, Any],
+    tmp_path: Path,
+    valid_from: datetime.timedelta,
+    valid_to: datetime.timedelta,
+    expected: str,
+) -> None:
+    path = _recipient(pki, tmp_path, "window", valid_from=valid_from, valid_to=valid_to)
+    assert expected in _refusal(pki, recipient_cert=path)
+
+
+def test_an_expired_issuing_anchor_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    ca_key, ca = _issuer(valid_to=datetime.timedelta(days=-1))
+    _, recipient = _mint_leaf("recipient@hisp.example", ca_key, ca)
+    files = _files(tmp_path, "old_ca", recipient_cert=recipient, trust_anchor=ca)
+    assert "'trust_anchor' has expired" in _refusal(pki, **files)
+
+
+def test_an_expired_anchor_beside_its_renewed_successor_constructs(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # A CA renewed under the same name and key: the bundle holds both, and the recipient verifies
+    # against either. The search must not stop at the expired one, which comes first.
+    ca_key, old = _issuer(valid_to=datetime.timedelta(days=-1))
+    _, renewed = _issuer(key=ca_key)
+    _, recipient = _mint_leaf("recipient@hisp.example", ca_key, renewed)
+    bundle = tmp_path / "renewed_bundle.pem"
+    bundle.write_bytes(
+        old.public_bytes(serialization.Encoding.PEM)
+        + renewed.public_bytes(serialization.Encoding.PEM)
+    )
+    files = _files(tmp_path, "renewed", recipient_cert=recipient)
+    d = DirectDestination(_dest(pki, trust_anchor=str(bundle), **files))
+    assert d._recipient_anchor == renewed
+
+
+@pytest.mark.parametrize(
+    "constraints",
+    [None, x509.BasicConstraints(ca=False, path_length=None)],
+    ids=["no-basic-constraints", "ca-false"],
+)
+def test_a_non_ca_issuing_anchor_is_refused(
+    pki: dict[str, Any], tmp_path: Path, constraints: x509.BasicConstraints | None
+) -> None:
+    # An end-entity cert used as the anchor: it signed the recipient, but it is no CA.
+    ca_key, ca = _issuer(constraints=constraints)
+    _, recipient = _mint_leaf("recipient@hisp.example", ca_key, ca)
+    files = _files(tmp_path, "leaf_anchor", recipient_cert=recipient, trust_anchor=ca)
+    assert "'trust_anchor' that issues 'recipient_cert' is not a CA" in _refusal(pki, **files)
+
+
+def test_an_anchor_whose_key_usage_forbids_cert_signing_is_refused(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    ca_key, ca = _issuer(usage=_key_usage(key_encipherment=True))
+    _, recipient = _mint_leaf("recipient@hisp.example", ca_key, ca)
+    files = _files(tmp_path, "ku_anchor", recipient_cert=recipient, trust_anchor=ca)
+    assert "does not assert keyCertSign" in _refusal(pki, **files)
+
+
+def test_an_anchor_whose_key_usage_allows_cert_signing_constructs(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    ca_key, ca = _issuer(usage=_key_usage(key_cert_sign=True))
+    _, recipient = _mint_leaf("recipient@hisp.example", ca_key, ca)
+    files = _files(tmp_path, "ku_ok", recipient_cert=recipient, trust_anchor=ca)
+    DirectDestination(_dest(pki, **files))
+
+
+def test_a_self_signed_recipient_pinned_as_its_own_anchor_is_exempt_from_the_ca_check(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # The pinned-correspondent shape: no basicConstraints and no keyCertSign, since it issues nothing.
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    cert = _cert_for(key.public_key(), "recipient@hisp.example", key)
+    path = _files(tmp_path, "pinned", recipient_cert=cert)["recipient_cert"]
+    d = DirectDestination(_dest(pki, recipient_cert=path, trust_anchor=path))
+    assert d._recipient_anchor == cert
+
+
+def test_a_recipient_whose_key_usage_forbids_key_encipherment_is_refused(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    path = _recipient(pki, tmp_path, "ku_sign_only", extensions=[_key_usage()])
+    assert "does not assert keyEncipherment" in _refusal(pki, recipient_cert=path)
+
+
+def test_a_recipient_whose_eku_omits_email_protection_is_refused(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    eku = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH])
+    path = _recipient(pki, tmp_path, "eku_tls", extensions=[eku])
+    assert "does not list emailProtection" in _refusal(pki, recipient_cert=path)
+
+
+def test_a_recipient_whose_usages_allow_email_encryption_constructs(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    usages = [
+        _key_usage(key_encipherment=True),
+        x509.ExtendedKeyUsage([ExtendedKeyUsageOID.EMAIL_PROTECTION]),
+    ]
+    path = _recipient(pki, tmp_path, "usages_ok", extensions=usages)
+    DirectDestination(_dest(pki, recipient_cert=path))
+
+
+@pytest.mark.parametrize(
+    "addresses, dns_names",
+    [
+        (("other@hisp.example",), ()),
+        ((), ()),
+        (("recipient@other.example",), ("other.example",)),
+        (("Recipient@hisp.example",), ()),
+    ],
+    ids=["another-subscriber", "no-san", "another-domain", "local-part-case"],
+)
+def test_a_cert_the_ca_issued_to_another_subscriber_is_refused(
+    pki: dict[str, Any], tmp_path: Path, addresses: tuple[str, ...], dns_names: tuple[str, ...]
+) -> None:
+    # Issued by the trusted CA, in its window, with no usage objection: only the binding fails.
+    path = _recipient(pki, tmp_path, "other", addresses=addresses, dns_names=dns_names)
+    assert "does not name 'recipients' entry 1 of 1" in _refusal(pki, recipient_cert=path)
+
+
+def test_every_recipient_must_be_named_and_the_refusal_gives_the_position(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    path = _recipient(pki, tmp_path, "one_of_two")
+    recipients = ["recipient@hisp.example", "second@hisp.example"]
+    assert "entry 2 of 2" in _refusal(pki, recipient_cert=path, recipients=recipients)
+
+
+@pytest.mark.parametrize(
+    "addresses, dns_names, recipient",
+    [
+        (("recipient@HISP.example",), (), "recipient@hisp.example"),
+        ((), ("hisp.example",), "anyone@HISP.EXAMPLE"),
+    ],
+    ids=["rfc822-domain-case", "dns-name-organisation-cert"],
+)
+def test_a_cert_naming_the_recipient_constructs(
+    pki: dict[str, Any],
+    tmp_path: Path,
+    addresses: tuple[str, ...],
+    dns_names: tuple[str, ...],
+    recipient: str,
+) -> None:
+    path = _recipient(pki, tmp_path, "named", addresses=addresses, dns_names=dns_names)
+    DirectDestination(_dest(pki, recipient_cert=path, recipients=[recipient]))
+
+
+@pytest.mark.parametrize("setting", ["recipient_cert", "trust_anchor"])
+async def test_a_cert_that_expires_after_construction_holds_the_queue_at_send(
+    monkeypatch: pytest.MonkeyPatch,
+    pki: dict[str, Any],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    setting: str,
+) -> None:
+    """Construction passed, then the clock moved past one cert's notAfter. The send must neither
+    build nor dial, and must be a permanent configuration fault, which the delivery worker answers
+    by stopping the lane and keeping the queue rather than dead-lettering each row."""
+    from messagefoundry.transports import direct
+
+    _install_fake(monkeypatch)
+    soon = datetime.timedelta(days=30)
+    if setting == "recipient_cert":
+        overrides = {"recipient_cert": _recipient(pki, tmp_path, "soon", valid_to=soon)}
+    else:
+        ca_key, ca = _issuer(valid_to=soon)
+        _, recipient = _mint_leaf("recipient@hisp.example", ca_key, ca)
+        overrides = _files(tmp_path, "soon_ca", recipient_cert=recipient, trust_anchor=ca)
+    d = DirectDestination(_dest(pki, **overrides))
+    later = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=60)
+    monkeypatch.setattr(direct, "_utcnow", lambda: later)
+    with (
+        caplog.at_level("WARNING", logger="messagefoundry.transports.direct"),
+        pytest.raises(NegativeAckError) as caught,
+    ):
+        await d.send(_SYNTHETIC_HL7)
+    exc = caught.value
+    assert exc.permanent is True and exc.config_fault is True
+    assert exc.code == "direct-cert-validity"
+    assert f"'{setting}' has expired" in str(exc)
+    assert _FakeSMTP.instances == []
+    assert any("keeping the queue" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_cert_inside_its_window_at_send_still_delivers(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
+) -> None:
+    # POSITIVE CONTROL for the send-time check: the same clock seam, at a time inside both windows.
+    from messagefoundry.transports import direct
+
+    _install_fake(monkeypatch)
+    d = DirectDestination(_dest(pki))
+    later = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=30)
+    monkeypatch.setattr(direct, "_utcnow", lambda: later)
+    await d.send(_SYNTHETIC_HL7)
+    [smtp] = _FakeSMTP.instances
+    assert len(smtp.sent) == 1
