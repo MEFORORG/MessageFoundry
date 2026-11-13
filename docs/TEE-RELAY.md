@@ -181,18 +181,27 @@ runs `VACUUM` and a second checkpoint. Both are part of the scrub, not only a di
 B-tree rebalance can leave a stale copy of a deleted row in a page's unused space. Only the
 `VACUUM` rebuild removes it.
 
-If any of those steps fails after the delete, purge prints `error: ...` and exits 1. The error
-names the counts it deleted and the step that failed. Failures include at least these:
+If one of those steps fails after purge deleted rows, purge prints `error: ...` and exits 1.
+The error names the counts it deleted and the step that failed. At least these failures do that:
 
 * a checkpoint that cannot finish within about 5 s, because another connection holds a read
   transaction open or another writer or checkpoint runs;
-* a failed `VACUUM`, for example out of memory, since `VACUUM` builds its copy in memory;
-* an SQLite error from a checkpoint.
+* a failed `VACUUM`, for example out of memory or a full disk;
+* an SQLite error, or an out-of-memory error, from a checkpoint.
 
-The rows are gone then, but their bytes may still be in the DB file or its `-wal` file. Re-running
-purge completes the scrub. It also deletes again under its own arguments. With no `--before`, or a
-relative one, that includes rows recorded since the first run. To scrub without deleting newer
-rows, re-run with an absolute `--before` date.
+Any other failure, such as Ctrl-C, ends purge with a traceback and no counts.
+
+The rows are gone then, but their bytes may still be in the DB file or its `-wal` file. To finish
+the scrub, re-run purge with the same `--captures-only` choice and an absolute `--before` date no
+later than the first run's cutoff. That re-run deletes nothing the first run kept. A run with no
+`--before`, or a relative one, would delete rows the first run kept. A run that deletes nothing
+still tries the scrub, but exits 0 even when the scrub fails again. So after the re-run, while no
+other process writes to the DB, check that the `-wal` file is empty.
+
+`VACUUM` builds its rebuilt copy in a temp file in SQLite's temp directory, which is off the DB's
+volume. Purge does not keep that copy in memory, because a large capture DB would then fail every
+purge. To keep the copy on a protected volume, point SQLite's temp directory there before you run
+purge. It reads `SQLITE_TMPDIR` on POSIX and `TMP` on Windows.
 
 ```bash
 python -m tee purge --db ./tee.db --before 7d -y          # retention sweep

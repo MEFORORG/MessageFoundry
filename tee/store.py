@@ -377,18 +377,18 @@ class RelayStore:
         which CPython raises for SQLITE_NOMEM) is caught and returned as the reason, after the
         checkpoint still runs to truncate the frames a failed VACUUM spilled into the -wal. A
         failure of the checkpoint or of a PRAGMA is not caught here; :meth:`purge` maps it."""
-        # VACUUM builds its rebuilt copy in a temp file, by default in the OS temp directory, off
-        # the protected volume this DB is meant to live on; keep that copy in memory for the call.
-        # This holds only where SQLite was not compiled with SQLITE_TEMP_STORE=0.
+        # temp_store stays at its default, so VACUUM builds its rebuilt copy in a temp file in
+        # SQLite's temp directory, which is off the DB's volume. In memory, a large capture DB
+        # would fail every purge with out of memory. Redirecting that directory per connection is
+        # not available: the temp_store_directory PRAGMA is deprecated and process-wide, and the
+        # SQLITE_TMPDIR (POSIX) or TMP (Windows) setting belongs to the operator's environment.
+        # docs/TEE-RELAY.md, Purge, says so.
         vacuum_error: sqlite3.Error | MemoryError | None = None
-        await self._pragma("temp_store=MEMORY")
         try:
             async with self._db.execute("VACUUM"):
                 pass
         except (sqlite3.Error, MemoryError) as exc:
             vacuum_error = exc
-        finally:
-            await self._pragma("temp_store=DEFAULT")
         truncated = await self._checkpoint_truncate()
         if vacuum_error is not None:
             return f"VACUUM failed: {type(vacuum_error).__name__}: {vacuum_error}"
@@ -405,7 +405,7 @@ class RelayStore:
     async def purge(
         self, *, before: float | None = None, captures_only: bool = False
     ) -> tuple[int, int]:
-        """Delete logged rows + captured bodies, then ``VACUUM`` to reclaim disk.
+        """Delete logged rows + captured bodies, then scrub their bytes from the DB and -wal files.
 
         ``before=None`` purges **everything**; ``before=<epoch>`` purges only rows older than it.
         ``captures_only`` leaves the relay_log (the NAK/leg audit) intact and drops only the captured
@@ -415,11 +415,16 @@ class RelayStore:
         bytes included, on disk until a checkpoint. So the sequence is: delete and commit
         (secure_delete zeroes the freed content), TRUNCATE checkpoint, which copies the zeroed pages
         into the main file and empties the -wal, then ``VACUUM`` and a second TRUNCATE checkpoint
-        (:meth:`_reclaim` says why both belong to the scrub). Once the delete has committed, any
-        failure of these steps raises :class:`PurgeIncompleteError` with the deleted counts: a
-        checkpoint that stays busy, a failed ``VACUUM``, or a ``sqlite3.Error`` or ``MemoryError``
+        (:meth:`_reclaim` says why both belong to the scrub). Once the delete has committed, at
+        least these failures raise :class:`PurgeIncompleteError` with the deleted counts: a
+        checkpoint that stays busy, a failed ``VACUUM``, and a ``sqlite3.Error`` or ``MemoryError``
         from a checkpoint or PRAGMA. Returning the counts then would read as a clean purge that did
-        not happen.
+        not happen. Any other exception, such as a ``KeyboardInterrupt`` or a cancellation,
+        propagates as raised, without the counts.
+
+        A purge that deleted nothing still tries the scrub, so a re-run can finish one an earlier
+        run left unfinished, but it does not raise if the scrub fails: it removed nothing, and a
+        routine retention sweep that overlaps a reader should not exit as an error.
         """
         async with self._lock:
             # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
@@ -447,8 +452,12 @@ class RelayStore:
                 else:
                     reason = await self._reclaim()
             except (sqlite3.Error, MemoryError) as exc:
-                raise PurgeIncompleteError(log_n, cap_n, f"{type(exc).__name__}: {exc}") from exc
-            if reason is not None:
+                if log_n or cap_n:
+                    raise PurgeIncompleteError(
+                        log_n, cap_n, f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                reason = None
+            if reason is not None and (log_n or cap_n):
                 raise PurgeIncompleteError(log_n, cap_n, reason)
         return (log_n, cap_n)
 

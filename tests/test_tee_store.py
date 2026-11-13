@@ -346,10 +346,11 @@ async def test_secure_delete_is_on(tmp_path: Path) -> None:
 async def test_first_checkpoint_alone_scrubs_a_body_already_in_the_main_file(
     tmp_path: Path,
 ) -> None:
-    # The premise that lets a failed reclaim (VACUUM, second checkpoint) be a warning: delete plus
-    # commit plus the first TRUNCATE checkpoint already leaves no purged bytes, because
-    # secure_delete zeroed them. The body is checkpointed into the main file first, as a long-running
-    # relay's auto-checkpoint would, so the residue under test is in the DB file, not the -wal.
+    # Pins secure_delete's share of the scrub, with no VACUUM: for a simple delete like this one,
+    # delete plus commit plus the first TRUNCATE checkpoint leaves no purged bytes. It is not the
+    # whole scrub; a rebalance can leave stale cell copies only VACUUM removes (see _reclaim). The
+    # body is checkpointed into the main file first, as a long-running relay's auto-checkpoint
+    # would, so the residue under test is in the DB file, not the -wal.
     db_path = tmp_path / "tee.db"
     store = await RelayStore.open(str(db_path))
     try:
@@ -399,10 +400,6 @@ async def test_a_failed_vacuum_raises_after_still_running_the_checkpoint(
         assert excinfo.value.reason.startswith(f"VACUUM failed: {type(error).__name__}")
         after_vacuum = ran[ran.index("VACUUM") + 1 :]
         assert any("wal_checkpoint" in sql for sql in after_vacuum)  # it truncates spilled frames
-        monkeypatch.undo()
-        async with store._db.execute("PRAGMA temp_store") as cur:  # noqa: SLF001
-            row = await cur.fetchone()
-        assert row is not None and int(row[0]) == 0  # restored to DEFAULT after the failure
     finally:
         await store.close()
 
@@ -480,3 +477,22 @@ async def test_wal_siblings_recreated_after_open_inherit_owner_only_mode(tmp_pat
             await store.close()
     finally:
         os.umask(old_umask)
+
+
+@pytest.mark.usefixtures("fast_checkpoint_poll")
+async def test_a_purge_that_deleted_nothing_does_not_raise_on_a_busy_scrub(tmp_path: Path) -> None:
+    # A routine retention sweep with nothing old enough to delete, overlapping a reader, is not an
+    # error: it removed nothing, so it left no residue of its own.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    peer: sqlite3.Connection | None = None
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|keep")
+        peer = sqlite3.connect(db_path, isolation_level=None)
+        peer.execute("BEGIN")
+        peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # pins the WAL
+        assert await store.purge(before=0.0) == (0, 0)
+    finally:
+        if peer is not None:
+            peer.close()
+        await store.close()
