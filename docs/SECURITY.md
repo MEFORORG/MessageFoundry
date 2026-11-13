@@ -3212,8 +3212,10 @@ built (BACKLOG #3252). Neither that reconcile nor the one at start moves a row a
 this process claimed over the same store object, or a release any gate in this process is
 running, whatever order the apps were built and started in. Two Engine objects over one database in
 one process are not protected: each has its own store object, so one's unsettled claim that no
-gate is running reads as a leftover to the other. A release made before the engine holds its graph claims
-under `engine` and keeps that owner for the app's life, so start the engine before the app serves
+gate is running reads as a leftover to the other. A later app start in the same process does not
+recover an unsettled claim of this life that no gate is running; it stays `executing` until the
+process restarts or an operator interrupts it. A release made before the engine holds its graph
+claims under `engine` and keeps that owner for the app's life, so start the engine before the app serves
 approvals.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
