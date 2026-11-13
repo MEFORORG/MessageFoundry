@@ -139,10 +139,11 @@ _VERSION_REFUSAL_TEXTS = (
 #: encoded, a fixed algorithm and only a MAC that :func:`transit_mac_version` accepts, so at least
 #: the input-encoding, MAC-shape and algorithm 400s are not reachable from it.
 _NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
-#: The longest reply body, in characters, that :func:`_names_no_version_reason` parses when hvac
-#: parsed none (BACKLOG #6707). Vault's own refusal is far shorter. Without a bound, a very large
-#: body would be parsed whole on the audit walk, and a MemoryError there would turn a row's break
-#: into a walk that could not run. A longer body is not read as a version refusal.
+#: The longest reply body, in characters, that :func:`_reply_errors` parses when hvac parsed none
+#: (BACKLOG #6707). Vault's own refusal is far shorter. It bounds both readers of a 400: the audit
+#: walk's version check, where a MemoryError would turn a row's break into a walk that could not run
+#: and a longer body is not read as a version refusal, and the data-key decrypt's AEAD check
+#: (BACKLOG #5650), where a longer body is not read as a tag refusal. A change here changes both.
 _REPARSED_BODY_MAX_CHARS = 64 * 1024
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
@@ -185,11 +186,8 @@ def _names_no_version_reason(exc: Exception) -> bool:
     error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
     its parent.
 
-    When hvac raised ``InvalidRequest`` at all, it fills ``exc.errors`` only when the reply's
-    Content-Type is exactly ``application/json``, so a proxy that adds a charset leaves the same
-    JSON in ``exc.text``; that is read the same way, but only when hvac parsed no JSON
-    (``exc.json`` is None) and the body is at most :data:`_REPARSED_BODY_MAX_CHARS` long. A longer
-    body is True, unparsed."""
+    The list is read by :func:`_reply_errors`, which says when a body hvac did not parse is read. A
+    body too long for it is True, unparsed."""
     errors, oversize = _reply_errors(exc)
     if oversize is not None:
         # Too long to be Vault's own refusal, and never parsed (BACKLOG #6707).

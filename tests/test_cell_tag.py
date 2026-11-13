@@ -423,6 +423,31 @@ def test_a_cipher_that_cannot_name_its_keys_still_reports_its_own_tag_refusal(
     assert len(seen) == 1 and "nk1" in seen[0]
 
 
+def test_an_error_that_gave_no_verdict_is_never_a_tag_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5650: the outage test is the shared ``gave_no_verdict``, not the class alone. A
+    plain ``CipherError`` raised from an ``OSError``, under a key the keyring holds, keeps its own
+    error rather than reading as a corrupt row. Control: the same cell's real decrypt miss is a
+    tag failure."""
+    monkeypatch.setattr(cell_tag, "_reported", {})
+    cipher = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(cipher, AesGcmCipher)
+    sealed = cipher.encrypt("SYNTH", aad=message_cell_aad("raw", message_id="nv1", channel_id="A"))
+    with pytest.raises(CellTagError):  # control
+        open_message_cell(cipher, "raw", sealed, message_id="nv1", channel_id="B")
+    down = CipherError("the key service could not be reached")
+    down.__cause__ = OSError("connection refused")
+
+    def unreachable(stored: str, *, aad: bytes | None = None, allow_unmarked: bool = False) -> str:
+        raise down
+
+    monkeypatch.setattr(cipher, "decrypt", unreachable)
+    with pytest.raises(CipherError) as kept:
+        open_message_cell(cipher, "raw", sealed, message_id="nv1", channel_id="A")
+    assert kept.value is down
+
+
 def test_a_planted_unmarked_cell_is_drift_with_the_ciphers_alert_alone(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

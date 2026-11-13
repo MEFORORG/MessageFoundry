@@ -652,9 +652,9 @@ class UnauthenticatedCipherError(CipherError):
     The Vault Transit cipher gives it where Vault's reason for refusing a value is wholly the AEAD's
     own authentication failure (BACKLOG #5650): ``decrypt`` raises it for an HTTP 400 that says so,
     and ``decrypt_many`` returns it for a batch result whose per-value ``error`` says so, whatever
-    the batch reply's status. Every other Transit failure, a key-version refusal, a 403 and a 404
-    among them, stays plain :class:`CipherError`, and an outage is
-    :class:`CipherUnavailableError`."""
+    the batch reply's status. Its other failures include at least an outage
+    (:class:`CipherUnavailableError`), a refused unmarked value (:class:`UnmarkedCipherError`), and
+    a key-version refusal, a 403 and a 404, which are plain :class:`CipherError`."""
 
 
 class CipherUnavailableError(CipherError):
@@ -669,8 +669,9 @@ class CipherUnavailableError(CipherError):
     and, in ``decrypt_many``, for each value it never asked for once one value gave no verdict
     (:func:`gave_no_verdict`). That covers a refusal such as a 403 too: the value asked for keeps
     its own plain :class:`CipherError`, and the values after it, never asked for, get this class.
-    Every other Transit failure stays a :class:`CipherError`: a refused AEAD tag as its subclass
-    :class:`UnauthenticatedCipherError` (BACKLOG #5650), the rest plain. A
+    Every other Transit failure stays a :class:`CipherError` of another class: at least a refused
+    AEAD tag as :class:`UnauthenticatedCipherError` (BACKLOG #5650), a refused unmarked value as
+    :class:`UnmarkedCipherError`, and plain :class:`CipherError` for others. A
     reader that tells an outage from a value's failure by :func:`gave_no_verdict` still reads some
     of those as an outage: one whose cause is an ``OSError`` or an ``hvac`` error other than a 400
     (a 403, say). A refused tag, Vault's 400, is read as the value's.

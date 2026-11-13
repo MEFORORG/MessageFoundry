@@ -47,10 +47,10 @@ import annotationlib
 from messagefoundry.store.crypto import (
     NO_STORE_ID,
     CipherError,
-    CipherUnavailableError,
     UnauthenticatedCipherError,
     UnmarkedCipherError,
     cell_aad,
+    gave_no_verdict,
 )
 from messagefoundry.store.queue_tag import is_tag_failure
 from messagefoundry.store.row_seal import seal_bytes
@@ -258,7 +258,7 @@ class UnmarkedCellError(CellTagError):
 def _tag_failure_kind(cipher: Cipher, stored: str, exc: CipherError) -> type[CellTagError] | None:
     """The :class:`CellTagError` class a failed open of ``stored`` raises, or ``None`` to keep the
     cipher's own error: an outage, a key or a format problem."""
-    if isinstance(exc, CipherUnavailableError):
+    if gave_no_verdict(exc):
         return None  # the key service gave no verdict, so nothing is known about the cell
     if isinstance(exc, UnmarkedCipherError):
         return UnmarkedCellError
