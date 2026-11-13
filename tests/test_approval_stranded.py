@@ -29,6 +29,7 @@ from typing import Any
 import httpx
 import pytest
 
+from messagefoundry.api import approvals as approvals_module
 from messagefoundry.api import create_app
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
@@ -269,8 +270,8 @@ async def test_a_restart_never_reads_the_audit_trail(engine: Engine) -> None:
 async def test_a_second_app_leaves_the_first_apps_live_release_executing(engine: Engine) -> None:
     """Residual 5: a second create_app lifespan over the same engine reconciles under the same
     owner, so it used to take the first app's running release for a leftover and move it to
-    'interrupted'. A release any gate in this process is running is left alone. Control: a row
-    left over from before still moves."""
+    'interrupted'. A release any gate in this process is running is left alone, and the second
+    app's interrupt route refuses it. Control: a row left over from before still moves."""
     first = create_app(engine, approvals=ON)
     async with first.router.lifespan_context(first):
         gate: ApprovalGate = first.state.approval_gate
@@ -284,6 +285,16 @@ async def test_a_second_app_leaves_the_first_apps_live_release_executing(engine:
             async with second.router.lifespan_context(second):
                 assert str((await _row(engine, live))["status"]) == "executing"
                 assert str((await _row(engine, leftover))["status"]) == "interrupted"
+                # Nor does the second app's interrupt route take the live release.
+                with pytest.raises(ApprovalError) as refused:
+                    await second.state.approval_gate.interrupt_stranded(
+                        live,
+                        actor="operator",
+                        actor_user_id="operator-id",
+                        attest_owner_stopped=True,
+                    )
+                assert refused.value.status == 409
+                assert str((await _row(engine, live))["status"]) == "executing"
         finally:
             leave.set()
         await asyncio.wait_for(release, 10.0)
@@ -525,7 +536,10 @@ async def test_an_interrupt_in_flight_does_not_read_as_a_release(engine: Engine)
 
 @pytest.mark.parametrize("combined_raises", [False, True])
 async def test_an_outcome_whose_row_was_interrupted_elsewhere(
-    engine: Engine, caplog: pytest.LogCaptureFixture, combined_raises: bool
+    engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    combined_raises: bool,
 ) -> None:
     """An operator interrupt from another process moves the row while this process still runs
     the release. The combined outcome write then finds the row moved, and the outcome row is
@@ -556,7 +570,8 @@ async def test_an_outcome_whose_row_was_interrupted_elsewhere(
         gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     )
     await entered.wait()
-    # Another process's operator interrupts it.
+    # Another process's operator interrupts it. That process sees none of this one's releases.
+    monkeypatch.setattr(approvals_module, "_releasing_in_process", frozenset)
     elsewhere = _gate(engine, owner="shard:other")
     await elsewhere.interrupt_stranded(
         approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True

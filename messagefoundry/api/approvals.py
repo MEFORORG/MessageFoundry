@@ -54,6 +54,7 @@ import asyncio
 import json
 import logging
 import math
+import threading
 import time
 import weakref
 from collections import Counter
@@ -192,15 +193,20 @@ _PARAMS_REFUSALS: Mapping[ReleaseBlocked, tuple[str, str]] = {
 #: store would share it; that layout is unsupported for other reasons too (``__main__`` says why).
 DEFAULT_CLAIM_OWNER = "engine"
 
-#: Every gate in this process (BACKLOG #1562). A reconcile leaves alone a release any of them is
-#: running, so a second app over the same engine never takes the first app's live releases for
-#: leftovers. Approval ids are unique, so gates over different stores cannot collide here.
+#: Every gate in this process (BACKLOG #1562). A release any of them is running is live here: no
+#: reconcile moves it and the interrupt route refuses it, so a second app over the same engine
+#: never takes the first app's live releases for leftovers. Approval ids are unique, so gates over
+#: different stores cannot collide here. The lock keeps a gate built on another thread from
+#: changing the set while it is read.
 _GATES: weakref.WeakSet[ApprovalGate] = weakref.WeakSet()
+_GATES_LOCK = threading.Lock()
 
 
-def _releasing_in_process(approval_id: str) -> bool:
-    """Whether a gate in this process is running the release of ``approval_id`` now."""
-    return any(approval_id in gate._releasing for gate in list(_GATES))
+def _releasing_in_process() -> frozenset[str]:
+    """The approval ids a gate in this process is running a release of now."""
+    with _GATES_LOCK:
+        gates = list(_GATES)
+    return frozenset(approval_id for gate in gates for approval_id in gate._releasing)
 
 
 #: Whether cluster node ``node_id`` heartbeats (BACKLOG #1562): ``True`` for a fresh heartbeat,
@@ -556,9 +562,9 @@ class ApprovalGate:
         # Read by interrupt_stranded on a release a cluster node claimed (BACKLOG #1562). With none,
         # every such release reads owner_heartbeat_unavailable and is refused.
         self._node_liveness = node_liveness
-        # The releases this gate is running, from before the claim until the outcome write ends:
-        # interrupt_stranded refuses each, because this process records that outcome itself, and
-        # no gate's reconcile in this process moves one (_GATES).
+        # The releases this gate is running, from before the claim until the outcome write ends.
+        # Read through _releasing_in_process, so neither this gate nor any other in this process
+        # interrupts or reconciles one: this process records that outcome itself.
         self._releasing: Counter[str] = Counter()
         self._ops: dict[str, _Operation] = {}
         # Wall-clock seconds, injectable so a test can drive the expiry ceiling and the dwell floor.
@@ -589,7 +595,8 @@ class ApprovalGate:
         # When a failed store read of each kind is logged again (BACKLOG #3157): the queue page
         # reads the store on every load, so an outage would otherwise log a traceback per load.
         self._read_faults_reported = SealFailureThrottle()
-        _GATES.add(self)
+        with _GATES_LOCK:
+            _GATES.add(self)
 
     async def _shielded[T](
         self,
@@ -764,13 +771,14 @@ class ApprovalGate:
         or after that time: it is this life's."""
         interrupted: list[str] = []
         unsettled: list[str] = []
+        live = _releasing_in_process()
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
         # A row that fails its seal is reported and left as it is: the store would refuse the move
         # anyway, and nothing re-seals it (BACKLOG #2592).
         for row in await self._verified_rows(
             await self._store.list_executing_approvals(claim_owner=me)
         ):
-            if _releasing_in_process(row.id):
+            if row.id in live:
                 continue  # still running in this process, so not a leftover
             if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
                 continue  # claimed by this process since it started, so not a leftover
@@ -2754,7 +2762,7 @@ class ApprovalGate:
     ) -> OwnerLiveness:
         """What :meth:`interrupt_stranded` judges of ``row``'s owner (its docstring has the
         tiers). ``heartbeats`` caches each node's verdict across one listing."""
-        if row.id in self._releasing:
+        if row.id in _releasing_in_process():
             return "releasing_here"
         prefix, _, node_id = (row.claim_owner or "").partition(":")
         if prefix != "node" or not node_id:
