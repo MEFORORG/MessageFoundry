@@ -24,6 +24,7 @@ from typing import Any, cast
 
 import pytest
 
+from messagefoundry.config.models import InternalErrorPolicy, RetryPolicy
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import MLLP, Loopback, Registry, build_inbound_connection
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome, _RoutedPrep
@@ -569,3 +570,228 @@ async def test_mfenc_text_under_a_keyed_cipher_is_the_rows_fault(
     prep = await runner._prepare_routed(LOOP, item)
 
     assert prep.unreadable is not None and "not JSON" in str(prep.unreadable)
+
+
+# --- A reload that restores the inbound while its transform lane stops (BACKLOG #5708) -------------
+#
+# The lane stops on a row whose inbound a reload dropped during the loopback read. A second reload
+# that deploys the inbound again lands before that STOP ends: in the revert's mark_failed, in the
+# per-lane worker's tail release, or in the pooled adapter after the item. It finds the worker alive
+# (per-lane) or the lane PROCESSING (pooled), so it re-arms nothing. The lane must keep running and
+# drain the reverted row. The runner before BACKLOG #5708 dead-lettered that row under CONTINUE in
+# this race and kept the lane up, so a lane left down is a regression against it.
+
+_WINDOWS = [
+    ("per_lane", "mark_failed"),
+    ("per_lane", "release_tail"),
+    ("pooled", "mark_failed"),
+    ("pooled", "after_item"),
+]
+
+
+class _Race:
+    """Drops the whole feed by a real reload during the first loopback read, then, unless
+    ``restore`` is None, deploys it again by a real reload in the named window."""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        store: MessageStore,
+        runner: RegistryRunner,
+        full: Registry,
+        restore: str | None,
+    ) -> None:
+        self.runner = runner
+        self.full = full
+        self.restore = restore
+        self.dropped = False
+        self.restored = False
+        real_read = store.message_metadata_json
+        real_mark_failed = store.mark_failed
+
+        async def read(message_id: str) -> str | None:
+            if not self.dropped:
+                self.dropped = True
+                await runner.reload(Registry())
+            return await real_read(message_id)
+
+        async def mark_failed(item_id: str, reason: str, policy: Any) -> FailOutcome:
+            # The same retry-forever revert, with a short backoff so the drain is quick to see.
+            if policy.max_attempts is None:
+                policy = RetryPolicy(max_attempts=None, backoff_seconds=0.05)
+            out = await real_mark_failed(item_id, reason, policy)
+            await self._restore_in("mark_failed")
+            return out
+
+        monkeypatch.setattr(store, "message_metadata_json", read)
+        monkeypatch.setattr(store, "mark_failed", mark_failed)
+        real_release = runner._release_tail_on_stop
+
+        async def release(worker: str, name: str, ids: Any) -> None:
+            await real_release(worker, name, ids)
+            if worker == "transform":
+                await self._restore_in("release_tail")
+
+        monkeypatch.setattr(runner, "_release_tail_on_stop", release)
+        real_buildup = runner._pooled_maybe_buildup
+
+        async def buildup(lane: str, stage: str) -> None:
+            await real_buildup(lane, stage)
+            if stage == Stage.ROUTED.value:  # the router's adapter calls it too
+                await self._restore_in("after_item")
+
+        monkeypatch.setattr(runner, "_pooled_maybe_buildup", buildup)
+
+    async def _restore_in(self, window: str) -> None:
+        if self.restore == window and self.dropped and not self.restored:
+            self.restored = True
+            await self.runner.reload(self.full)
+
+
+def _lane_down(runner: RegistryRunner) -> bool:
+    if runner._claim_mode == "pooled":
+        return runner._dispatchers[Stage.ROUTED].stopped(LOOP)
+    task = runner._transform_workers.get(LOOP)
+    return task is None or task.done()
+
+
+@pytest.mark.parametrize(("claim_mode", "window"), _WINDOWS)
+async def test_a_reload_that_restores_the_inbound_while_its_lane_stops_keeps_it_running(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, claim_mode: str, window: str
+) -> None:
+    calls: list[str] = []
+    full = _registry(calls)
+    runner = RegistryRunner(
+        full,
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    race = _Race(monkeypatch, store, runner, full, restore=window)
+    message_id = await store.enqueue_ingress(channel_id=LOOP, raw=RAW)
+    await runner.start()
+    try:
+
+        async def drained() -> bool:
+            return calls == ["ran"] and await _routed_status(store, message_id) is None
+
+        assert await _until(drained), (
+            f"{claim_mode}/{window}: the restored inbound's reverted row was never transformed"
+        )
+        assert race.restored, "the restoring reload never ran in its window"
+        assert calls == ["ran"]
+        assert not _lane_down(runner), "the transform lane is down with its inbound deployed"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_reload_that_leaves_the_inbound_removed_still_stops_its_lane(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, claim_mode: str
+) -> None:
+    # The converse: with no restore, the lane stops and the row waits, reverted, for a reload that
+    # deploys its inbound again. Nothing keeps a worker or a lane looping on a removed inbound.
+    calls: list[str] = []
+    full = _registry(calls)
+    runner = RegistryRunner(
+        full,
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    _Race(monkeypatch, store, runner, full, restore=None)
+    message_id = await store.enqueue_ingress(channel_id=LOOP, raw=RAW)
+    await runner.start()
+    try:
+
+        async def down() -> bool:
+            return _lane_down(runner)
+
+        assert await _until(down), "a lane whose inbound is gone kept running"
+        await asyncio.sleep(0.2)  # well past the revert's backoff: nothing re-arms it
+        assert _lane_down(runner)
+        assert calls == []
+        assert await _routed_status(store, message_id) == OutboxStatus.PENDING.value
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_content_stop_stays_stopped_when_a_reload_lands_while_it_stops(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, claim_mode: str
+) -> None:
+    # Only a STOP for a missing inbound is voided. The internal-error STOP policy stops the lane
+    # for a Handler fault, and a reload that lands during that STOP's mark_failed, with the inbound
+    # deployed throughout, must not undo it: the runner holds that STOP for an operator.
+    full = Registry()
+    full.add_inbound(build_inbound_connection(LOOP, Loopback(), router="route_loop"))
+    full.add_router("route_loop", lambda msg: [HANDLER])
+
+    def h_fails(msg: Any) -> None:
+        raise ValueError("handler fault")
+
+    full.add_handler(HANDLER, h_fails)
+    runner = RegistryRunner(
+        full,
+        store,
+        poll_interval=0.02,
+        claim_mode=claim_mode,
+        internal_error_default=InternalErrorPolicy.STOP,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    real_mark_failed = store.mark_failed
+    reloaded: list[bool] = []
+
+    async def mark_failed(item_id: str, reason: str, policy: Any) -> FailOutcome:
+        out = await real_mark_failed(item_id, reason, policy)
+        if not reloaded:
+            reloaded.append(True)
+            await runner.reload(full)
+        return out
+
+    monkeypatch.setattr(store, "mark_failed", mark_failed)
+    await store.enqueue_ingress(channel_id=LOOP, raw=RAW)
+    await runner.start()
+    try:
+
+        async def down() -> bool:
+            return _lane_down(runner)
+
+        assert await _until(down), "a content STOP did not stop the lane"
+        assert reloaded, "the reload never ran in the STOP's window"
+        await asyncio.sleep(0.2)
+        assert _lane_down(runner), "a reload landing mid-STOP voided a content STOP"
+    finally:
+        await runner.stop()
+
+
+async def test_a_re_prepare_reads_the_batch_snapshot(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A concurrent batch's stale inbound_gone, re-prepared under the restored graph, must read the
+    # batch's frozen state like its siblings, not the live state an earlier sibling may have
+    # committed to.
+    calls: list[str] = []
+    runner = RegistryRunner(
+        _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    item = await _routed_item(store)
+    seen: list[Any] = []
+    real_prepare = runner._prepare_routed
+
+    async def prepare(name: str, it: OutboxItem, **kwargs: Any) -> _RoutedPrep:
+        seen.append(kwargs.get("state_snapshot"))
+        return await real_prepare(name, it, **kwargs)
+
+    monkeypatch.setattr(runner, "_prepare_routed", prepare)
+    snapshot: dict[tuple[str, str], Any] = {}
+
+    outcome = await runner._apply_routed(
+        LOOP, item, _RoutedPrep(inbound_gone=True), state_snapshot=snapshot
+    )
+
+    assert outcome == (_ItemOutcome.PROCESSED, None)
+    assert calls == ["ran"]
+    assert len(seen) == 1 and seen[0] is snapshot, "the re-prepare read live state"

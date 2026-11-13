@@ -2229,6 +2229,10 @@ class RegistryRunner:
         # `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
+        # BACKLOG #5708: inbounds whose transform lane's last routed row stopped it because the inbound
+        # was missing from the graph, recorded by _apply_routed and read once by whatever ends that
+        # STOP (_transform_stop_rearmed). A content STOP never records one.
+        self._transform_gone_stops: set[str] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
         # resolved in _start_pooled_dispatchers AFTER trying to open the sync pools + build the per-stage
@@ -7621,6 +7625,8 @@ class RegistryRunner:
             # runner (the pause primitive is outbound-only) so 'stopped' means zero in-flight.
             on_lane_paused=(self._mark_outbound_quiesced if stage is Stage.OUTBOUND else None),
             on_lane_stopped=self._pooled_stop_hold(stage),
+            # BACKLOG #5708: only the transform stage records a STOP a reload can void.
+            stop_rearmed=(self._transform_stop_rearmed if stage is Stage.ROUTED else None),
             empty_counter=self._empty_claims,
             infra_fault_policy=self._infra_fault_policy,
             infra_fault_stop_after=self._infra_fault_stop_after,
@@ -11686,8 +11692,19 @@ class RegistryRunner:
                 # serial + in claim order; default (concurrency 1 / single row / fused) it is the exact
                 # sequential per-item loop. Returns True iff the lane must halt (STOP policy / missing
                 # inbound), matching the old `for item in items` early return.
+                self._transform_gone_stops.discard(name)  # only this batch's STOP may set it
                 if await self._process_routed_batch(name, items):
                     await self._release_tail_on_stop("transform", name, claimed)
+                    if self._transform_stop_rearmed(name):
+                        # BACKLOG #5708: a reload deployed the missing inbound again while this
+                        # STOP ran, and found this worker alive, so it spawned none. Keep draining,
+                        # as the worker it would have spawned does. The tail is already released.
+                        log.info(
+                            "transform worker %r: inbound redeployed while stopping; continuing",
+                            name,
+                        )
+                        claimed = []
+                        continue
                     return
                 # #1844: resolved. Cleared BEFORE the buildup check, whose store reads can raise, so
                 # its fault does not re-pend rows this pass already handed off.
@@ -11806,7 +11823,9 @@ class RegistryRunner:
                         await self._record_worker_death("transform", name, it, prep)
                     raise prep
                 try:
-                    applied = await self._apply_routed(name, it, prep)
+                    applied = await self._apply_routed(
+                        name, it, prep, state_snapshot=state_snapshot
+                    )
                 except BaseException as exc:
                     if _kills_the_worker(exc):
                         await self._record_worker_death("transform", name, it, exc)
@@ -11955,6 +11974,23 @@ class RegistryRunner:
         if item.handler_name is None or item.handler_name not in registry.handlers:
             return _RoutedPrep(missing_handler=True)
         return None
+
+    def _transform_stop_rearmed(self, name: str) -> bool:
+        """Whether the transform lane STOP that is ending now was for a missing inbound that a reload
+        has deployed again since (BACKLOG #5708), so the lane must keep running. Asked once, with no
+        await, by what ends the STOP: the per-lane worker after it releases its batch tail, and the
+        pooled ROUTED dispatcher at its terminal transition. Reads and clears the record.
+
+        Such a reload lands while the lane still runs, in the revert's ``mark_failed`` or in the
+        tail release after it. Then :meth:`_ensure_inbound_workers` finds the worker alive, and a
+        pooled broadcast finds the lane PROCESSING, so each re-arms nothing, and nothing later
+        re-arms a stopped lane whose inbound is deployed. False for any other STOP, such as the
+        internal-error STOP policy, which records no missing inbound and must stay stopped, and for
+        an inbound still missing, which must stop."""
+        if name not in self._transform_gone_stops:
+            return False
+        self._transform_gone_stops.discard(name)
+        return name in self.registry.inbound
 
     async def _loopback_prep(
         self, name: str, item: OutboxItem
@@ -12126,7 +12162,12 @@ class RegistryRunner:
         return _RoutedPrep(outcome=outcome)
 
     async def _apply_routed(
-        self, name: str, item: OutboxItem, prep: _RoutedPrep
+        self,
+        name: str,
+        item: OutboxItem,
+        prep: _RoutedPrep,
+        *,
+        state_snapshot: Mapping[tuple[str, str], Any] | None = None,
     ) -> tuple[_ItemOutcome, float | None]:
         """Apply one prepared routed row — the SOLE per-lane writer (BACKLOG #214). Called serially in
         ascending claim (rowid/seq) order so per-destination outbound FIFO is preserved even when the
@@ -12138,7 +12179,8 @@ class RegistryRunner:
         than by the prep, and re-prepared when the live graph has the inbound and handler again;
         handler raise → internal-error policy (``STOP``/``CONTINUE``);
         else ``transform_handoff`` + lane wakes (``PROCESSED``). Returns ``(outcome, None)`` — the
-        routed path never re-pends-with-backoff."""
+        routed path never re-pends-with-backoff. ``state_snapshot`` is the concurrent batch's frozen
+        state, passed on to a re-prepare so it reads what its siblings read (BACKLOG #214)."""
         if prep.tag_failure is not None:
             # BACKLOG #2593: the loopback read met a message cell that fails its row tag.
             await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, prep.tag_failure)
@@ -12161,8 +12203,10 @@ class RegistryRunner:
             # reload dropped (that row reverts with its feed, inbound first).
             live = self._dropped_by_reload(name, item)
             if live is None:
-                # Both are back. Nothing has run, so prepare it again under the live graph.
-                return await self._apply_routed(name, item, await self._prepare_routed(name, item))
+                # Both are back. Nothing has run, so prepare it again under the live graph, with
+                # the batch's snapshot, so it reads no sibling's committed write.
+                again = await self._prepare_routed(name, item, state_snapshot=state_snapshot)
+                return await self._apply_routed(name, item, again, state_snapshot=state_snapshot)
             prep = live
         if prep.inbound_gone:
             # Inbound removed; nothing to transform with until a reload restores it (which
@@ -12177,6 +12221,10 @@ class RegistryRunner:
             await self.store.mark_failed(
                 item.id, "inbound not in registry", RetryPolicy(max_attempts=None)
             )
+            # A reload that restores the inbound during that await, or before this STOP ends, finds
+            # the lane still running and re-arms nothing. Record why it stops, so whatever ends the
+            # STOP keeps the lane up if the inbound is back by then (_transform_stop_rearmed).
+            self._transform_gone_stops.add(name)
             return _ItemOutcome.STOPPED, None
         if prep.missing_handler:
             # Handler gone (removed/renamed since routing). Can't transform this row;
@@ -12927,6 +12975,7 @@ class RegistryRunner:
         return result
 
     async def _dispatch_routed(self, lane: str, item: OutboxItem) -> LaneItemResult:
+        self._transform_gone_stops.discard(lane)  # only this item's STOP may set it (BACKLOG #5708)
         result = _to_lane_result(await self._process_routed_item(lane, item))
         await self._pooled_maybe_buildup(lane, Stage.ROUTED.value)  # D1 (see _dispatch_ingress)
         return result
