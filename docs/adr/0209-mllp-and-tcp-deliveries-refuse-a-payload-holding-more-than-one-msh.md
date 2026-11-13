@@ -44,7 +44,10 @@ outbound row is one delivered message. A Handler bug or a pasted batch is the re
    The delivery's `_sends_more_than_one_message` sits beside it. It is the same reading on a
    payload that is not normalized, with searches that stop at the first hit, and a test holds the
    two to one answer on the normalized text of every shape it tries. The ingress guard reads
-   normalized text, so it keeps its CR-only count and pays no LF scan.
+   normalized text, so it keeps its CR-only count and pays no LF scan. *(Changed by the amendment
+   of 2026-11-13 below: the ingress guard and the split now read past marks after a line break as
+   this reading does, so the two agree on a marked later `MSH` too. The guard still pays no LF
+   scan, but it is no longer one count.)*
 2. **The refusal.** `NegativeAckError(permanent=True)` with `code="multiple-messages"`
    (`MULTIPLE_MESSAGES_CODE` in `transports/framing.py`), so the delivery worker dead-letters the
    row at once (ADR 0204). The text names the transport and the rule, never message content.
@@ -149,3 +152,18 @@ the dead-letter queue, with a named code.
 - The dry-run gap above means the error surfaces at delivery, not at the Handler that caused it.
   Checking where a `Send` becomes an outbox row, for MLLP and TCP outbounds, would move it there;
   that is not built.
+
+## Amendment 2026-11-13: the ingress readings take the marked boundary too (BACKLOG #5918)
+
+Decision 1 read past byte order marks between a line break and a later `MSH` on delivery only.
+ADR 0206's ingress guard and the file split did not, so a body whose second message a mark led
+was acknowledged as one message and then dead-lettered here. They now read the same boundary: a
+line break, one or more marks, then `MSH` (`_NORMALIZED` and `_RAW_BYTES` in
+`messagefoundry/parsing/split.py`, beside `_OUTBOUND`), and `split_batch` cuts past the marks.
+ADR 0206's amendment of the same date gives the detail. This reading, `_sends_more_than_one_message`,
+is unchanged.
+
+AC-7 now holds on more shapes: its test strips only the marks that lead a body, which the
+delivery reading reads past and the parser refuses, and keeps those after a line break, so the
+two readings must agree on them. Before the fix that test dropped every mark, so it did not see the
+disagreement. `TWO_VARIANTS` gained an LF-ended marked shape.

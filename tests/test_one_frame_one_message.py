@@ -728,14 +728,19 @@ async def test_the_tcp_listener_sends_one_frame_when_its_reply_holds_its_start_b
 
 #: TWO with each line-end shape a Handler may produce, with leading whitespace, and with byte
 #: order marks where two texts read without stripping them would put them.
+#: TWO with a byte order mark between its first message and its second MSH.
+MARKED = CLEAN + split._BOM + TWO[len(CLEAN) :]
 TWO_VARIANTS = [
     pytest.param(TWO, id="cr"),
     pytest.param(TWO.replace(CR, "\n"), id="lf"),
     pytest.param(TWO.replace(CR, "\r\n"), id="crlf"),
     pytest.param("\r\n" + TWO, id="leading-whitespace"),
-    pytest.param(CLEAN + split._BOM + TWO[len(CLEAN) :], id="byte-order-mark-between"),
+    pytest.param(MARKED, id="byte-order-mark-between"),
+    pytest.param(MARKED.replace(CR, "\n"), id="lf-byte-order-mark-between"),
     pytest.param(split._BOM + TWO, id="byte-order-mark"),
 ]
+#: The whitespace and byte order marks that lead a body, which the delivery reading reads past.
+_LEAD_PAST_BOM = re.compile(r"\A[\s" + split._BOM + r"]*")
 #: A relayed X12 interchange, which a TCP outbound carries opaquely and never reads as HL7.
 X12 = (
     "ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       *260101*1200*^*00501"
@@ -853,8 +858,53 @@ async def test_check_frame_refuses_two_messages_as_a_send_does(
 )
 def test_the_delivery_reading_is_the_ingress_reading_of_an_msh_led_payload(body: str) -> None:
     # The ingress guard reads normalized text; a delivery reads the payload as it will send it.
-    # On the text a receiver reads once it drops each byte order mark, each must find what the
-    # other finds. The ingress guard itself reads no mark: the parser refuses a body one leads.
-    normalized = normalize(body).replace(split._BOM, "").lstrip()
+    # Each must find what the other finds. The ingress guard reads the marks after a line break
+    # itself (BACKLOG #5918), so only the lead's are dropped: the parser refuses a body one leads,
+    # and the delivery reading reads past them.
+    normalized = _LEAD_PAST_BOM.sub("", normalize(body), count=1)
     expected = starts_with_msh(normalized) and split._holds_more_than_one_message(normalized)
     assert split._sends_more_than_one_message(body) is expected
+
+
+# --- BACKLOG #5918: a later MSH that byte order marks lead is a boundary at ingress too ---------
+# Before the fix only the delivery reading looked past a mark after a line break, so the file split
+# and the ingress guard read TWO with a mark before its second MSH as one message: it was ACKed,
+# then dead-lettered at the outbound frame.
+
+#: The second message of TWO, its MSH led by one or two byte order marks.
+MARKED_TWO = [
+    pytest.param(MARKED, id="one-mark"),
+    pytest.param(CLEAN + split._BOM * 2 + TWO[len(CLEAN) :], id="two-marks"),
+    pytest.param(MARKED.replace(CR, "\n"), id="lf-one-mark"),
+]
+
+
+@pytest.mark.parametrize("body", MARKED_TWO)
+def test_the_ingress_guard_refuses_a_second_msh_that_marks_lead(body: str) -> None:
+    with pytest.raises(ingress_guards.IngressMultipleMessagesRejected):
+        ingress_guards.check_decoded(normalize(body), _ic())
+
+
+@pytest.mark.parametrize("body", MARKED_TWO)
+def test_the_file_split_cuts_past_the_marks_before_a_later_msh(body: str) -> None:
+    # Each member must start with MSH, or the parser records the second one as an ERROR: the split
+    # finds what it finds in the same body with no mark.
+    unmarked = split.split_batch(TWO)
+    assert len(unmarked) == 2
+    assert split.split_batch(body) == unmarked
+    raw = body.encode("utf-8")
+    assert split._needs_a_decode(raw, "utf-8") is True
+    assert split.split_batch_bytes(raw, "utf-8") == [m.encode("utf-8") for m in unmarked]
+    # Each member the split hands over passes the ingress guard on its own.
+    for member in unmarked:
+        ingress_guards.check_decoded(member, _ic())
+
+
+def test_a_mark_inside_a_line_or_before_another_segment_is_not_a_boundary() -> None:
+    # Controls: only a line break, then marks, then MSH, is the wider boundary.
+    inside = MSH + CR + "PID|1||111" + split._BOM + "MSH" + CR
+    before_pid = MSH + CR + split._BOM + "PID|1||111" + CR
+    for body in (inside, before_pid):
+        assert split._holds_more_than_one_message(body) is False
+        assert split.split_batch(body) == [body]
+        assert split._needs_a_decode(body.encode("utf-8"), "utf-8") is False

@@ -15,6 +15,11 @@ its copy in the same commit, and says so; never edit one only to make a failure 
 split's copy calls the live ``normalize`` and ``_LEADING_WS_STR``, so it pins the boundary, not
 those. That the delivery reading agrees with the ingress one is AC-7's test, in
 ``tests/test_one_frame_one_message.py``, not this file's. Synthetic data only.
+
+BACKLOG #5918 widened three readings on purpose, and edited their copies here to match: the
+split, the ingress guard and the byte scan now take a later ``MSH`` line that byte order marks
+lead as a boundary, as the delivery reading already did, and the split cuts past those marks.
+Each edited line says what it read at a0a5e4f5a4.
 """
 
 from __future__ import annotations
@@ -35,11 +40,15 @@ BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 
 # --- the readings as they stood at engine origin/main a0a5e4f5a4, verbatim but for names --------
 
-_OLD_MSH_BOUNDARY = re.compile(r"(?=\rMSH)")
+# BACKLOG #5918: was r"(?=\rMSH)"; byte order marks may now sit between the CR and the MSH.
+_OLD_MSH_BOUNDARY = re.compile(r"(?=\r" + BOM + r"*MSH)")
 _OLD_FIRST_KEPT = re.compile(r"\S")
 _OLD_LEADS_WITH_MSH_PAST_BOM = re.compile(r"[\s" + BOM + r"]*MSH")
 _OLD_LATER_MSH_PAST_BOM = re.compile(r"[\r\n]" + BOM + r"+MSH")
 _OLD_LEADING_BOM = re.compile(rb"\s*\xef\xbb\xbf")
+#: BACKLOG #5918: the later MSH lines the ingress guard and the byte scan now read, marks and all.
+_OLD_LATER_MSH_CR = re.compile(r"\r" + BOM + r"*MSH")
+_OLD_LATER_MSH_BYTES_PAST_BOM = re.compile(rb"[\r\n](?:\xef\xbb\xbf)+MSH")
 
 
 def _old_holds_more_than_one_message(text: str) -> bool:
@@ -47,7 +56,7 @@ def _old_holds_more_than_one_message(text: str) -> bool:
     if first is None:
         return False
     start = first.start()
-    later = text.count("\rMSH", start)
+    later = len(_OLD_LATER_MSH_CR.findall(text, start))  # BACKLOG #5918: was text.count("\rMSH")
     return later > 1 or (later == 1 and text.startswith("MSH", start))
 
 
@@ -70,13 +79,16 @@ def _old_needs_a_decode(raw: bytes, encoding: str) -> bool:
         return True
     if name == "utf-8" and _OLD_LEADING_BOM.match(raw):
         return True
-    return b"\rMSH" in raw or b"\nMSH" in raw
+    if b"\rMSH" in raw or b"\nMSH" in raw:
+        return True
+    # BACKLOG #5918: a later MSH that UTF-8 byte order marks lead now needs a decode too.
+    return _OLD_LATER_MSH_BYTES_PAST_BOM.search(raw) is not None
 
 
 def _old_split_batch(raw: str | bytes) -> list[str]:
     text = normalize(raw)
     first, *rest = _OLD_MSH_BOUNDARY.split(text)
-    messages = [chunk[1:] for chunk in rest]
+    messages = [chunk[1:].lstrip(BOM) for chunk in rest]  # BACKLOG #5918: was chunk[1:]
     head = first.lstrip(_LEADING_WS_STR)
     while head.startswith(("FHS", "BHS")):
         head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
@@ -164,7 +176,8 @@ def test_the_batch_split_is_unchanged() -> None:
 
 #: The earliest boundary each multi-spelling ``_Boundary`` names, written as one plain regex.
 _EARLIEST_OUTBOUND = re.compile(r"[\r\n]" + BOM + r"*MSH")
-_EARLIEST_RAW_BYTES = re.compile(rb"[\r\n]MSH")
+_EARLIEST_NORMALIZED = re.compile(r"\r" + BOM + r"*MSH")
+_EARLIEST_RAW_BYTES = re.compile(rb"[\r\n](?:\xef\xbb\xbf)*MSH")
 
 
 def _earliest(pattern: re.Pattern[Any], text: Any, start: int) -> int:
@@ -182,6 +195,12 @@ def test_the_predicate_returns_the_earliest_boundary(start: int) -> None:
         for text in CORPUS
         if split._next_boundary(text, start, split._OUTBOUND)
         != _earliest(_EARLIEST_OUTBOUND, text, start)
+    ] == []
+    assert [
+        text
+        for text in CORPUS
+        if split._next_boundary(text, start, split._NORMALIZED)
+        != _earliest(_EARLIEST_NORMALIZED, text, start)
     ] == []
     assert [
         body
