@@ -3389,7 +3389,7 @@ SESSIONS_REVOKE_FAILED_ACTION: Final = "auth.sessions_revoke_failed"
 #: row, and its second, without the row, runs whatever the budget says, since the first one's
 #: error may be the row's (``AuthService._revoke_with_row``); the budget gates the third. A pool shortage on SQL Server
 #: fails only after waiting up to ``2 x acquire_timeout``, 60 s at the default, which is past the
-#: budget, so at the default it is recorded at once: a second such wait would reach the API's
+#: budget, so at the default a request caller records it at once: a second such wait would reach the API's
 #: request deadline, which cancels the request before any row is written (vault BACKLOG #3802
 #: holds the cancellation). The budget gates only whether a re-run starts, so an
 #: ``acquire_timeout`` under 7.5 s is re-run, and one large enough can still meet the deadline in a
@@ -10345,8 +10345,7 @@ class AuthService:
             # cost the pass what the refused row below says it costs, so it logs and goes on, and
             # the answer is reported as an admin read reports the same answer for a record: the
             # seal-failure report, which pages ``integrity_drift``, the store's Unverifiable page,
-            # or its Outage page. No audit write was refused, so ``audit_write_failed`` is not
-            # paged. A later pass that probes the account tries the rename again.
+            # or its Outage page. A later pass that probes the account tries the rename again.
             if not audit_soft:
                 raise
             _log.error(

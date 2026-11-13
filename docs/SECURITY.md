@@ -1025,8 +1025,7 @@ pass's later revocations as `accounts_not_attempted`, and its `committed` says w
 revocation committed first: its role write, a role write that may have landed, or nothing. A
 refusal that reads as a defect, at least a store whose tables, columns or grants are not what the
 statement needs, and SQLite's `ProgrammingError`, is not re-run and is unrecorded, so it is raised
-after the attempt that met it, save that the reconciler's attempt without the row still runs once
-after a defect on its first. A SQL syntax
+after the attempt that met it; the reconciler's attempt without the row runs as above. A SQL syntax
 error is not always one: SQLite's, and SQL Server's generic 42000, are run again and recorded like a
 fault, while PostgreSQL's, in SQLSTATE class 42, is raised at once. A revoke the service gives up on is logged at ERROR
 and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
