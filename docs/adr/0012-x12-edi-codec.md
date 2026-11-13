@@ -341,18 +341,26 @@ suspect's is, so junk or a cut-off header between an interchange with no `IEA` a
 does not let it swallow that one: a complete interchange reaches its own `IEA` first. While the
 bytes that decide a segment-start `ISA` have not arrived, the reader holds the open frame rather
 than cut it or walk past it, and resumes the check where it stopped on the next read. The costs,
-in at least these cases: an interchange with no `IEA` is framed together with whatever failing run
+in at least these cases. An interchange with no `IEA` is framed together with whatever failing run
 follows it, through that run's `IEA` where it has one with the same terminator, or up to the next
-`ISA` that passes; a passing `ISA` at a segment start, such as a whole interchange carried inside
-binary data, still cuts the interchange around it, as before; and while the reader holds at a
-segment-start `ISA` whose header is still arriving, it holds the open frame too, so a connection
-that ends or reaches the frame deadline then drops both with no message row, where the earlier rule
-yielded the frame at once. Another known gap: a complete interchange whose segments from a literal
-`ISA` to the end of what the sender has sent line up at every gate position that has arrived is
-held in the reader until more bytes decide it, as above, where `split` frames it whole.
+`ISA` that passes, the whitespace before that `ISA` included. Where that run is a corrupted
+interchange, the frame parses under the first interchange's header, carrying the second one's
+groups, and only `check_integrity` reports the mismatch. Where no `ISA` that passes follows, the
+reader holds the whole frame, and a connection that ends drops it with no message row, where the
+earlier rule yielded the interchange with no `IEA` at once. An `ISA` that passes at a segment start
+still cuts the interchange around it; once a failing one has bounded the walk, so does one that
+passes anywhere later, in element data included, and the reader then holds the tail with the real
+`IEA`. Binary data holding a whole interchange can still end or cut the frame around it. While the
+reader holds at a segment-start `ISA` whose header is still arriving, it holds the open frame too,
+so a connection that ends or reaches the frame deadline then drops both. The outbound reply reads
+in `transports/x12.py` use the same reader, so a reply held that way is read as a timeout and the
+send is retried. Another known gap: a complete interchange whose segments from a literal `ISA` to
+the end of what the sender has sent line up at every gate position that has arrived is held in the
+reader until more bytes decide it, as above, where `split` frames it whole.
 Each segment start is checked as the walk reaches it, and the bound's search resumes where the
-last one stopped, so the work stays linear however interchanges are separated. A later `ISA` behind anything else, at least a BOM,
-junk or MLLP envelope bytes, or one in the middle of a segment, does not end the walk: an
+last one stopped, so the work stays linear however interchanges are separated. Until a failing segment-start `ISA` bounds the walk, a later `ISA`
+behind anything else, at least a BOM, junk or MLLP envelope bytes, or one in the middle of a
+segment, does not end the walk: an
 interchange with no `IEA` followed that way is still framed together with what follows it, a known
 gap. A second known gap: "ISA", then 101 copies of one character, then CR LF passes the check for
 at least a space or a zero, because its component separator (CR) and terminator (LF) differ from

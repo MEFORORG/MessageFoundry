@@ -84,7 +84,7 @@ def split(raw: str) -> list[str]:
       that fails, such as ``ISA~`` or a ``<terminator>ISA`` in binary data, is data in this
       interchange, so a complete one is not cut there; from it on, the element also ends at the
       next ``ISA`` that passes, anywhere, if its ``IEA`` has not come first, whitespace before
-      that ``ISA`` included. A later ``ISA`` behind anything
+      that ``ISA`` included. Before such a failing ``ISA``, a later ``ISA`` behind anything
       else, such as a BOM or junk, does not end the walk. A passing interchange that reaches the
       end of the buffer with neither is the final element.
     * An ``ISA`` that fails, or one too short to hold a header, is a malformed interchange. One
@@ -197,9 +197,9 @@ def _walk_str(
     up to the next ``ISA`` that passes, anywhere: the walk returns that ``ISA``'s index and False
     if its ``IEA`` does not come first, so junk or a cut-off header after an interchange with no
     ``IEA`` does not let it swallow the next one. The same rule as :class:`X12FrameReader`'s
-    passing walk. It is checked at each segment start the walk reaches
-    anyway, never by a search ahead, and the check stops at the first gate position that differs,
-    so a chain of interchanges is walked once, however they are separated."""
+    passing walk. The segment-start check runs at each segment start the walk reaches anyway and
+    stops at the first gate position that differs; the bound is searched once per walk, from the
+    failing ``ISA``, so a chain of interchanges is walked once, however they are separated."""
     terminator = _terminator_str(raw, isa)
     if not terminator:
         return None, False
@@ -208,8 +208,6 @@ def _walk_str(
     # The end of the last whitespace run read, already decided not to end the walk. A whitespace
     # terminator can end segments inside that run, and the run from each ends at the same place.
     ws_end = -1
-    # Whether a failing ISA bounded the walk at the next ISA that passes.
-    bounded = False
     while True:
         if cut_at_isa and seg_start > ws_end:
             run = _SEGMENT_WS_RUN_STR.match(raw, seg_start, end)
@@ -220,10 +218,11 @@ def _walk_str(
                 if _isa_complete_str(raw, ws_end):
                     return seg_start, False
                 # Searched once per walk, from here, so a chain of walks searches each byte once.
-                end, bounded, cut_at_isa = _next_isa_str(raw, ws_end + 1), True, False
+                end, cut_at_isa = _next_isa_str(raw, ws_end + 1), False
         idx = raw.find(terminator, seg_start, end)
         if idx == -1:
-            return (end, False) if bounded and end < len(raw) else (None, False)
+            # Short of the buffer end, ``end`` is a bound: a later ISA that passes, or the caller's.
+            return (end, False) if end < len(raw) else (None, False)
         if (
             # With cut_at_isa the segment's opening whitespace has been read already.
             raw.startswith("IEA", ws_end, idx)
@@ -266,8 +265,10 @@ class X12FrameReader:
         # received begins; ``_scan`` is where the terminator search picks up, at or after it.
         self._seg_start = 0
         self._scan = 0
-        # Whether the ISA at the front of ``_buf`` failed the structural check, so it may be an "ISA"
-        # trigram in noise rather than an interchange (BACKLOG #5921), and where the search for a
+        # Whether the walk is bounded by the next ISA that passes: the ISA at the front of ``_buf``
+        # failed the structural check, so it may be an "ISA" trigram in noise rather than an
+        # interchange (BACKLOG #5921), or a passing walk met a failing ISA opening a segment. And
+        # where the search for a
         # later ISA that passes so far picks up. See :meth:`_bound`. ``_probe`` counts from the start
         # of the stream, with ``_dropped`` the bytes cut off the front of ``_buf`` so far, so a search
         # already made is not repeated for the next suspect in the same buffer.
@@ -381,9 +382,8 @@ class X12FrameReader:
                 # interchange with no IEA does not swallow the next one (BACKLOG #5921). The frame
                 # ends at the terminator before it; the whitespace between is noise. A literal
                 # "ISA" that fails is data, so a complete interchange holding an "ISA~" segment is
-                # not cut. Checked at each segment start the walk reaches, never by a search ahead,
-                # so it stays linear however the interchanges are separated. split ends its walk
-                # the same way.
+                # not cut. Checked at each segment start the walk reaches, so it stays linear
+                # however the interchanges are separated. split ends its walk the same way.
                 run = _SEGMENT_WS_RUN.match(buf, self._seg_ws)
                 self._seg_ws = ws = self._seg_ws if run is None else run.end()
                 if len(buf) < ws + 3 and b"ISA".startswith(buf[ws:]):

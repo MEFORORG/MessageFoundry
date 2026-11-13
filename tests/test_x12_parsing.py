@@ -383,10 +383,19 @@ def test_split_and_reader_stay_linear_over_many_malformed_interchanges() -> None
 
     import messagefoundry.parsing.x12.interchange as interchange_mod
 
+    # The reader's bound search checks a candidate through _whole_isa_passes, so count it too.
+    original_whole = interchange_mod._whole_isa_passes
+
+    def counting_whole(buf: Any, isa_at: int, gate: int) -> tuple[bool | None, int]:
+        nonlocal calls
+        calls += 1
+        return original_whole(buf, isa_at, gate)
+
     for k in (50, 200):
         calls = 0
         mp = pytest.MonkeyPatch()
         mp.setattr(interchange_mod, "isa_separators_line_up", counting)
+        mp.setattr(interchange_mod, "_whole_isa_passes", counting_whole)
         try:
             assert len(split(bad * k)) == k
             assert len(list(X12FrameReader().feed((bad * k).encode()))) == k
@@ -734,6 +743,8 @@ _ISA_LIKE_SEGMENTS = [
     pytest.param("ISA~", id="isa-alone"),
     pytest.param("ISAX*1~", id="isax"),
     pytest.param("ISA*NOTE*~", id="isa-note"),
+    # Holds the separator at +3, +6 and +17, and fails at +20, so a read can end mid-check.
+    pytest.param("ISA*00*          *00X~", id="fails-at-a-later-gate"),
     pytest.param("BIN*9*ab~ISAcd~", id="bin-holding-terminator-isa"),
 ]
 
