@@ -2363,17 +2363,19 @@ Two limits follow from this:
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder, which the engine asks the shell for as libpq does, through the ANSI
-  call. Where that call substitutes a `?` for a character the code page cannot hold, libpq opens
-  no file there, and the engine reads none. Best-fit maps other such characters to other
-  characters, and the engine checks that path like any other; one mapped to a character no
-  Windows name holds, at least `*` for a fullwidth asterisk, refuses the build. Elsewhere it is
-  under `.postgresql` in `HOME`, which libpq 15 and later read (or the
-  password-file home when `HOME` is unset or empty), and in the password-file home, which libpq
-  14 and older read. The engine cannot tell which libpq the driver loads, so when the two differ
-  it checks both and refuses on either. With `PGSSLROOTCERT=system` the engine checks no
-  root-certificate file: libpq 16 and later load OpenSSL's default CA file, and an older libpq
-  opens a file named `system` in its working directory, and neither is checked. The check reads the environment of the process
-  that builds. So `messagefoundry check` judges its own machine's file.
+  call. Where that call returns a `?` past the drive, which it writes for a character the code
+  page cannot hold, the engine cannot say which file libpq reads, so it refuses the build; set
+  `PGSSLROOTCERT` to a local path. Best-fit maps other such characters to other characters, and
+  the engine checks that path like any other; one mapped to a character no Windows name holds,
+  at least `*` for a fullwidth asterisk, refuses the build. Elsewhere it is under `.postgresql`
+  in `HOME`, which libpq 15 and later read (or the password-file home when `HOME` is unset or
+  empty), and in the password-file home, which libpq 14 and older read. The engine cannot tell
+  which libpq the driver loads, so when the two differ it checks both and refuses on either.
+  With `PGSSLROOTCERT=system` the engine checks no root-certificate file: libpq 16 and later
+  load at least OpenSSL's default CA file and directory, which `SSL_CERT_FILE` and
+  `SSL_CERT_DIR` can redirect, and an older libpq opens a file named `system` in its working
+  directory; none of these is checked. The check reads the environment of the process that
+  builds. So `messagefoundry check` judges its own machine's file.
   The check runs at build, not at each connect. No ACL check covers the file.
 
 ##### Values on the generic dialect

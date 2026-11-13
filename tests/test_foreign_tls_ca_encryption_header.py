@@ -605,17 +605,20 @@ def test_libpqs_windows_home_comes_from_the_ansi_shell_call(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
-def test_a_shell_folder_the_code_page_could_not_hold_names_no_libpq_home(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("folder", ["C:\\Users\\????", "C:\\X\\?\\..\\Y"], ids=["plain", "dot-dot"])
+def test_a_shell_folder_the_code_page_could_not_hold_refuses_the_build(
+    monkeypatch: pytest.MonkeyPatch, folder: str
 ) -> None:
-    """The ANSI call writes ``?`` for a character its code page cannot hold and has no best fit
-    for, and Windows answers a ``?`` in a name as an invalid name, so libpq opens no file there
-    and the check reads none. Red while such a folder was named: the walk refused the folder as
-    unreadable and failed every psqlODBC TLS build."""
+    """The ANSI call writes ``?`` for a character its code page cannot hold, so the engine
+    cannot say which file libpq reads there, and the build is refused. ``?\\..`` is the case
+    that shows why: Windows drops the ``?`` component before the filesystem sees it, so the path
+    still resolves. Red while such a folder named no home: the build passed with nothing read."""
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
-    monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: "C:\\Users\\????")
-    assert database._libpq_homes() == []
-    assert "SSLmode=verify-full;" in _build_psql()
+    monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: folder)
+    with pytest.raises(ValueError, match="cannot hold the roaming folder's name") as refused:
+        _build_psql()
+    message = str(refused.value)
+    assert _CONNECTION in message and "set PGSSLROOTCERT to a local path" in message
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
@@ -624,16 +627,15 @@ def test_a_shell_folder_the_code_page_could_not_hold_names_no_libpq_home(
     ["\\??\\C:\\x", "\\??\\UNC\\host\\share\\x", "\\\\?\\C:\\x"],
     ids=["nt", "nt-unc", "win32"],
 )
-def test_a_device_prefixed_shell_folder_is_refused_not_cleared(
+def test_a_device_prefixed_shell_folder_is_refused(
     monkeypatch: pytest.MonkeyPatch, folder: str
 ) -> None:
-    """A device prefix holds a ``?`` the ANSI call did not substitute, and can name another
-    host, so the folder is named and the host check refuses it, as on main. Red while the ``?``
-    rule ran first: the folder named no home and the build passed with nothing read."""
+    """A device-prefixed folder is refused, as on main: ``\\??\\`` by the ``?`` rule, since
+    ``splitdrive`` reads no drive there, and ``\\\\?\\`` by the host check. Red while the ``?``
+    rule named no home for ``\\??\\``: the build passed with nothing read."""
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
     monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: folder)
-    assert database._libpq_homes() == [("", os.path.join(folder, "postgresql"))]
-    with pytest.raises(ValueError, match="must be a plain local path on this host"):
+    with pytest.raises(ValueError, match="cannot hold|must be a plain local path on this host"):
         _build_psql()
 
 

@@ -1515,11 +1515,13 @@ def _libpq_root_certs() -> list[tuple[str, str]]:
     is set and not empty, else ``root.crt`` in each of :func:`_libpq_homes`.
 
     Empty for ``system``: the engine then checks no root-certificate file. libpq 16 and later load
-    OpenSSL's default CA file for it, and a libpq older than 16 opens a file named ``system`` in
-    its working directory; neither is checked. Empty too when libpq names no home, as when the
+    at least OpenSSL's default CA file and directory for it, which ``SSL_CERT_FILE`` and
+    ``SSL_CERT_DIR`` can redirect, and a libpq older than 16 opens a file named ``system`` in its
+    working directory; none of these is checked. Empty too when libpq names no home, as when the
     effective user has no password-file entry and ``HOME`` is unset: libpq then reads no default
     file. Raises ``OSError`` when the engine cannot ask which home libpq names, as when ``pwd``,
-    ``ctypes`` or the shell call cannot be loaded or made (:func:`_libpq_homes`)."""
+    ``ctypes`` or the shell call cannot be loaded or made, and :class:`_UnholdableShellFolder`
+    for a ``?`` in the Windows folder (:func:`_libpq_homes`)."""
     named = os.environ.get("PGSSLROOTCERT")
     if named:
         # Not "DATABASE PGSSLROOTCERT": the log redaction scrubs two adjacent ALL-CAPS tokens.
@@ -1528,6 +1530,10 @@ def _libpq_root_certs() -> list[tuple[str, str]]:
         (f"libpq's default root certificate{label}", os.path.join(home, _LIBPQ_ROOT_CERT))
         for label, home in _libpq_homes()
     ]
+
+
+class _UnholdableShellFolder(ValueError):
+    """:func:`_libpq_homes` met a ``?`` the ANSI call wrote into the roaming folder's name."""
 
 
 def _libpq_homes() -> list[tuple[str, str]]:
@@ -1539,13 +1545,14 @@ def _libpq_homes() -> list[tuple[str, str]]:
     password-file home when ``HOME`` is unset or empty, as libpq 15 and later find it; and in the
     password-file home alone, as libpq 14 and older find it (``pqGetHomeDirectory``). When the two
     differ, both are named, so a check of one cannot clear a file libpq loads from the other.
-    Empty when no directory can be named, as libpq then reads no default file, and on Windows
-    when the shell's ANSI folder holds a ``?`` past the drive and no device prefix (a prefixed
-    folder is named, for the host check to refuse): the ANSI call writes ``?`` for a
-    character its code page cannot hold and has no best fit for, and libpq's open of that path
-    finds no file. Best-fit maps other such characters to other characters, and that path is
-    named and checked like any other; one mapped to a character no Windows name holds, at least
-    ``*`` for a fullwidth asterisk, makes the check's walk refuse the build.
+    Empty when no directory can be named, as libpq then reads no default file.
+
+    On Windows, a ``?`` past the drive of the shell's ANSI folder raises
+    :class:`_UnholdableShellFolder`, which the build refuses: the ANSI call writes ``?`` for a
+    character its code page cannot hold, so the engine cannot say which file libpq reads there.
+    Best-fit maps other such characters to other characters, and that path is named and checked
+    like any other; one mapped to a character no Windows name holds, at least ``*`` for a
+    fullwidth asterisk, makes the check's walk refuse the build.
 
     An empty folder or password-file home still names one: libpq joins it as ``'%s/%s'``, so it
     reads ``/.postgresql/root.crt``, or ``/postgresql/root.crt`` on Windows (``pqGetHomeDirectory``
@@ -1555,13 +1562,11 @@ def _libpq_homes() -> list[tuple[str, str]]:
         appdata = _windows_roaming_appdata()
         if appdata is None:
             return []
-        # The ANSI call writes "?" for a character its code page cannot hold and has no best fit
-        # for, and Windows answers a "?" in a name as an invalid name, so libpq opens no file.
-        # A device prefix (\\?\ or \??\) holds a "?" too and can name another host, so it is
-        # named, and the caller's host check refuses it.
-        if not is_remote_spelling(appdata) and "?" in os.path.splitdrive(appdata)[1]:
-            logger.debug("libpq's shell folder holds a substituted '?', so no file is read there")
-            return []
+        if "?" in os.path.splitdrive(appdata)[1]:
+            raise _UnholdableShellFolder(
+                f"the ANSI code page cannot hold the roaming folder's name ({appdata}), so the "
+                "folder libpq reads could not be checked"
+            )
         return [("", os.path.join(appdata or os.sep, "postgresql"))]
     try:
         import pwd
@@ -1682,6 +1687,11 @@ def _refuse_encrypted_libpq_root_cert(
             f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: set "
             "PGSSLROOTCERT to a local path; the folder libpq reads it from could not be named, so "
             f"it was not read to check {_CA_CHECKED_FOR}"
+        ) from exc
+    except _UnholdableShellFolder as exc:
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: set "
+            f"PGSSLROOTCERT to a local path; {exc}"
         ) from exc
     for source, path in found:
         _refuse_libpq_root_cert_file(f"{hop_name_prefix(connection)}DATABASE {source}", path)
