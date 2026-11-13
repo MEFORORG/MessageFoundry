@@ -26,15 +26,23 @@ each of them ``[build-system].requires``, ``[project].dependencies``, every
 2026-07-29 with the hash-pinned CI toolchain (ADR 0034 section 3): those names are not shipped in the
 wheel, but they are resolved into ``uv.lock`` and installed into the runner that executes the BLOCKING
 security gates, which makes a squatted scanner name a sharper target than a runtime dependency rather
-than a softer one. The build requirements, the uv tables and the packaging files were added by
-BACKLOG #5641. A declared entry the gate cannot name -- a bare URL, a path, a non-string, a table of
-the wrong TOML type -- is a finding (``unnameable_entries``), never a silent skip. This repository's
-own distributions (``FIRST_PARTY``) are excluded by exact name, each with its reason.
+than a softer one. The build requirements, the uv tables, hatch build-target and build-hook
+``dependencies`` and the packaging files were added by BACKLOG #5641.
 
-NOT SWEPT: npm manifests. ``ide/package.json`` and ``ci/npm-tools/package.json`` are never opened, so
-an invented npm name passes this gate. ``npm audit`` answers known advisories, the npm counterpart of
-pip-audit, and so has pip-audit's blindness to a freshly registered name. That is a stated boundary,
-pinned by a named test in ``tests/test_new_dependency_check.py``, not a check this gate performs.
+REFUSED RATHER THAN VETTED (each a finding, never a silent skip; ``unnameable_entries``): a declared
+entry the gate cannot name (a bare URL, a path, a non-string, a table or list of the wrong TOML
+type); a direct reference (``name @ url``), whose bytes come from the URL rather than from the PyPI
+project the name would be vetted against; ``[project].dynamic`` naming the dependency lists, which a
+build plugin fills from a file this gate never opens; and a non-empty ``[tool.uv]`` source or index
+key, which sends a vetted name somewhere other than pypi.org. This repository's own distributions
+(``FIRST_PARTY``) are excluded by exact name, each with its reason and what the exclusion gives up.
+
+NOT SWEPT, at least: npm manifests (``ide/package.json``, ``ci/npm-tools/package.json``), and tools
+a workflow or script installs by command line (a ``pipx install`` or ``uv tool install``), hatch
+environment tables, and any requirements file. An invented name there passes this gate. ``npm audit``
+answers known advisories, the npm counterpart of pip-audit, and so has pip-audit's blindness to a
+freshly registered name. The npm boundary is pinned by a named test in
+``tests/test_new_dependency_check.py``; none of these is a check this gate performs.
 
 WHAT IT CHECKS, per declared distribution:
   * EXISTS         -- PyPI serves a project page for the name at all.
@@ -134,14 +142,19 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
 ALLOWLIST: dict[str, str] = {}
 
 # This repository's OWN distributions -> why each is excluded. A packaging/*/pyproject.toml declares
-# its siblings by name (the harness wheel requires messagefoundry and messagefoundry-toolkit), and the
-# questions this gate asks cannot be asked of them: the name is ours, published by release.yml from
-# this tree, so "is it a real, established project" says nothing, and a sibling first published in a
-# release would read as "freshly registered". Matched by exact PEP 503 name only, so a near-miss of one
-# of these names is fetched and vetted like any other.
+# its siblings by name (the harness wheel requires messagefoundry and messagefoundry-toolkit). Each is
+# built from this tree, so "did a model invent this name" is not a question to ask of it, and a sibling
+# not yet uploaded, or first uploaded in a recent release, would read as absent or "freshly
+# registered" and red the gate on every pull request. Matched by exact PEP 503 name only, so a
+# near-miss of one of these names is fetched and vetted like any other.
+#
+# WHAT THIS EXCLUSION GIVES UP, stated so nobody reads it as covered: release.yml does not upload every
+# one of these on every release (the harness and the web console are each behind their own switch), so
+# a name here may be unclaimed on PyPI, and this gate does not check who holds it there. An install of
+# one of these from PyPI before this project has uploaded it would take whoever registered the name.
 _FIRST_PARTY_REASON = (
-    "built from this repository and published by release.yml; the name is this project's own, so "
-    "registry existence and age say nothing about it"
+    "built from this repository, so the question this gate asks of an outside name does not apply; "
+    "whether the PyPI name is held by this project is not checked here"
 )
 FIRST_PARTY: dict[str, str] = {
     "messagefoundry": f"the engine, from the root pyproject.toml; {_FIRST_PARTY_REASON}",
@@ -188,6 +201,8 @@ _UV_REQUIREMENT_LISTS = (
     "override-dependencies",
     "build-constraint-dependencies",
 )
+# The [tool.uv] keys that change where a distribution is fetched from. Any non-empty one is refused.
+_UV_SOURCE_KEYS = ("sources", "index", "index-url", "extra-index-url", "find-links")
 
 
 def scan(
@@ -204,32 +219,39 @@ def scan(
     declared: dict[str, str] = {}
     bad: list[Finding] = []
 
+    def refuse(where: str, problem: str, detail: str) -> None:
+        bad.append(Finding(f"{source} {where}", problem, detail))
+
     def add(where: str, spec: str) -> None:
         name = requirement_name(spec)
-        if name is not None:
-            declared.setdefault(normalize(name), spec)
-            return
-        bad.append(
-            Finding(
-                f"{source} {where}",
+        if name is None:
+            refuse(
+                where,
                 "unnameable entry",
                 f"{spec!r} is not a PEP 508 requirement this gate can name, so the distribution it "
-                "brings in would enter unvetted. Declare it by name (``name @ url`` for a direct "
-                "reference).",
+                "brings in would enter unvetted. Declare it by its PyPI name.",
             )
-        )
+        elif "@" in spec.split(";", 1)[0]:
+            # `name @ url`: the name is vettable, the bytes are not -- uv installs whatever the URL
+            # serves. Vetting the PyPI project of that name would pass an attacker's wheel.
+            refuse(
+                where,
+                "direct reference",
+                f"{spec!r} installs from a URL or path, not from the PyPI project of that name, so "
+                "vetting the name says nothing about what is installed. Declare it by its PyPI name.",
+            )
+        else:
+            declared.setdefault(normalize(name), spec)
 
     def table(container: dict[str, object], key: str, where: str) -> dict[str, object]:
         value = container.get(key, {})
         if isinstance(value, dict):
             return value
-        bad.append(
-            Finding(
-                f"{source} {where}",
-                "not a table",
-                f"expected a TOML table here, found a {type(value).__name__}. Whatever it declares "
-                "cannot be vetted; write it in the shape the tool that reads it expects.",
-            )
+        refuse(
+            where,
+            "not a table",
+            f"expected a TOML table here, found a {type(value).__name__}. Whatever it declares "
+            "cannot be vetted; write it in the shape the tool that reads it expects.",
         )
         return {}
 
@@ -237,13 +259,11 @@ def scan(
         value: object, where: str, *, include_groups: bool = False, requirement_tables: bool = False
     ) -> None:
         if not isinstance(value, list):
-            bad.append(
-                Finding(
-                    f"{source} {where}",
-                    "not a list",
-                    f"expected a list of requirement strings, found a {type(value).__name__}. It is "
-                    "not read entry by entry, so nothing it names is vetted; make it a list.",
-                )
+            refuse(
+                where,
+                "not a list",
+                f"expected a list of requirement strings, found a {type(value).__name__}. It is "
+                "not read entry by entry, so nothing it names is vetted; make it a list.",
             )
             return
         for index, entry in enumerate(value):
@@ -264,13 +284,11 @@ def scan(
             ):
                 add(f"{where}[{index}].requirement", entry["requirement"])
             else:
-                bad.append(
-                    Finding(
-                        f"{source} {where}[{index}]",
-                        "unnameable entry",
-                        f"a {type(entry).__name__} where a requirement string belongs names no "
-                        "distribution this gate can vet; declare it as a PEP 508 string.",
-                    )
+                refuse(
+                    f"{where}[{index}]",
+                    "unnameable entry",
+                    f"a {type(entry).__name__} where a requirement string belongs names no "
+                    "distribution this gate can vet; declare it as a PEP 508 string.",
                 )
 
     data = tomllib.loads(pyproject_text)
@@ -278,12 +296,22 @@ def scan(
     requirements(build_system.get("requires", []), "[build-system].requires")
     project = table(data, "project", "[project]")
     requirements(project.get("dependencies", []), "[project].dependencies")
+    dynamic = project.get("dynamic", [])
+    for key in ("dependencies", "optional-dependencies"):
+        if isinstance(dynamic, list) and key in dynamic:
+            refuse(
+                "[project].dynamic",
+                "dynamic dependencies",
+                f"{key!r} is dynamic, so a build plugin supplies the list from a file this gate "
+                "never opens. Declare the requirements statically in [project].",
+            )
     extras = table(project, "optional-dependencies", "[project.optional-dependencies]")
     for extra, value in extras.items():
         requirements(value, f"[project.optional-dependencies].{extra}")
     for group, value in table(data, "dependency-groups", "[dependency-groups]").items():
         requirements(value, f"[dependency-groups].{group}", include_groups=True)
-    uv = table(table(data, "tool", "[tool]"), "uv", "[tool.uv]")
+    tool = table(data, "tool", "[tool]")
+    uv = table(tool, "uv", "[tool.uv]")
     for key in _UV_REQUIREMENT_LISTS:
         requirements(uv.get(key, []), f"[tool.uv].{key}")
     extra_build = table(uv, "extra-build-dependencies", "[tool.uv.extra-build-dependencies]")
@@ -291,6 +319,38 @@ def scan(
         requirements(
             value, f"[tool.uv.extra-build-dependencies].{package}", requirement_tables=True
         )
+    metadata = uv.get("dependency-metadata", [])
+    for index, entry in enumerate(metadata if isinstance(metadata, list) else [metadata]):
+        where = f"[tool.uv].dependency-metadata[{index}]"
+        if isinstance(entry, dict):
+            requirements(entry.get("requires-dist", []), f"{where}.requires-dist")
+        else:
+            refuse(where, "not a table", "a dependency-metadata entry must be a table.")
+    # Where uv fetches FROM. The gate vets a name against pypi.org, so a source or an index that
+    # sends the name anywhere else makes that verdict about a different artifact.
+    for key in _UV_SOURCE_KEYS:
+        if uv.get(key):
+            refuse(
+                f"[tool.uv].{key}",
+                "non-PyPI source",
+                "this redirects where uv fetches a distribution from, and this gate vets names "
+                "against pypi.org only, so what it passes is not what would be installed.",
+            )
+    hatch_build = table(table(tool, "hatch", "[tool.hatch]"), "build", "[tool.hatch.build]")
+    hooks = [("[tool.hatch.build.hooks]", table(hatch_build, "hooks", "[tool.hatch.build.hooks]"))]
+    for target, config in table(hatch_build, "targets", "[tool.hatch.build.targets]").items():
+        where = f"[tool.hatch.build.targets.{target}]"
+        if not isinstance(config, dict):
+            refuse(where, "not a table", "a hatch build target must be a table.")
+            continue
+        requirements(config.get("dependencies", []), f"{where}.dependencies")
+        hooks.append((f"{where}.hooks", table(config, "hooks", f"{where}.hooks")))
+    for prefix, hook_table in hooks:
+        for hook, config in hook_table.items():
+            if isinstance(config, dict):
+                requirements(config.get("dependencies", []), f"{prefix}.{hook}.dependencies")
+            else:
+                refuse(f"{prefix}.{hook}", "not a table", "a hatch build hook must be a table.")
     return declared, bad
 
 
@@ -313,7 +373,10 @@ def declared_distributions(pyproject_text: str) -> dict[str, str]:
       the job's token before any of these controls report.
     * the ``[tool.uv]`` requirement lists (``dev-dependencies``, ``constraint-dependencies``,
       ``override-dependencies``, ``build-constraint-dependencies``) and every
-      ``[tool.uv.extra-build-dependencies]`` list: uv fetches what they name.
+      ``[tool.uv.extra-build-dependencies]`` list, and each ``[tool.uv].dependency-metadata``
+      entry's ``requires-dist``: uv fetches what they name.
+    * hatch build-target and build-hook ``dependencies``: the backend asks PEP 517 isolation to
+      install them in the same release build jobs.
 
     An entry it cannot name is not here; ``unnameable_entries`` reports it, and ``main`` reads both
     from one ``scan``.
@@ -608,6 +671,21 @@ def _fetch_once(name: str, *, timeout: float) -> dict | None:
     return payload
 
 
+def _annotation(line: str) -> str:
+    """``line`` safe as ONE GitHub workflow command: a raw newline in a TOML key would start another.
+
+    The escapes are the ones the runner itself decodes in a command's message.
+    """
+    return line.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _print_finding(finding: Finding) -> None:
+    print(
+        _annotation(f"::error::{finding.distribution}: {finding.problem} -- {finding.detail}"),
+        file=sys.stderr,
+    )
+
+
 def default_pyprojects(root: Path) -> list[Path]:
     """The files the gate sweeps when none is named: the root pyproject, then every packaging one."""
     return [root / "pyproject.toml", *sorted((root / "packaging").glob("*/pyproject.toml"))]
@@ -636,12 +714,29 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     declared: dict[str, str] = {}
+    declared_in: dict[str, Path] = {}
     unnameable: list[Finding] = []
     for path in files:
-        names, problems = scan(path.read_text(encoding="utf-8"), source=str(path))
+        # A file that cannot be read or parsed is "could not see" (2), never "failed vetting" (1),
+        # which is what a traceback would exit with.
+        try:
+            names, problems = scan(path.read_text(encoding="utf-8"), source=str(path))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            print(
+                _annotation(
+                    f"::error::could not read {path} ({type(exc).__name__}: {exc}). This is a "
+                    "broken gate, not a clean sweep."
+                ),
+                file=sys.stderr,
+            )
+            return 2
         for name, spec in names.items():
             declared.setdefault(name, spec)
+            declared_in.setdefault(name, path)
         unnameable.extend(problems)
+    # Named before PyPI is asked anything, so an unreachable PyPI cannot hide them.
+    for finding in unnameable:
+        _print_finding(finding)
     # FAIL CLOSED on both branches below. Passing here would mean "PyPI was unreachable (or answered
     # nonsense), so every dependency is fine". Either one escaping as a traceback would exit 1, the
     # code that means "a dependency failed vetting", rather than 2, "could not see".
@@ -673,13 +768,12 @@ def main(argv: list[str] | None = None) -> int:
     # parser stopped seeing dependencies" produce the same exit code otherwise.
     sources = ", ".join(str(path) for path in files)
     print(f"new_dependency_check: examined {examined} distributions from {sources}")
-    findings = unnameable + findings
-    # Printed before the zero-count check, so an unnameable entry is named even when it was the only one.
     for finding in findings:
-        print(
-            f"::error::{finding.distribution}: {finding.problem} -- {finding.detail}",
-            file=sys.stderr,
-        )
+        name = finding.distribution
+        if name in declared:
+            name = f"{name} (declared as {declared[name]!r} in {declared_in[name]})"
+        _print_finding(Finding(name, finding.problem, finding.detail))
+    findings = unnameable + findings
     if examined == 0:
         print(
             "::error::examined ZERO distributions. pyproject.toml parsed but yielded no dependency "

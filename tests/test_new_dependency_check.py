@@ -1005,8 +1005,141 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
     """Liveness against the real tree: the default file list names every packaging pyproject."""
     files = _gate.default_pyprojects(_ROOT)
     assert files[0] == _ROOT / "pyproject.toml"
-    assert set(files[1:]) == set((_ROOT / "packaging").glob("*/pyproject.toml"))
-    assert len(files) >= 4, f"expected the root plus three packaging pyprojects, got {files}"
+    # Named, not globbed: a second glob would agree with the first whatever it found.
+    assert {path.parent.name for path in files[1:]} >= {
+        "messagefoundry-harness",
+        "messagefoundry-toolkit",
+        "messagefoundry-webconsole",
+    }, files
+    assert all(path.parent.parent == _ROOT / "packaging" for path in files[1:]), files
+
+
+@pytest.mark.parametrize(
+    ("toml_text", "problem"),
+    [
+        (
+            '[project]\ndependencies = ["fastapi @ https://evil.example/x.whl"]\n',
+            "direct reference",
+        ),
+        (
+            '[project]\ndependencies = ["messagefoundry @ file:///tmp/x.whl"]\n',
+            "direct reference",
+        ),
+        ("[project]\ndynamic = ['version', 'dependencies']\n", "dynamic dependencies"),
+        ("[project]\ndynamic = ['optional-dependencies']\n", "dynamic dependencies"),
+        (
+            "[tool.uv.sources]\nfastapi = { git = 'https://example.invalid/fastapi' }\n",
+            "non-PyPI source",
+        ),
+        (
+            "[[tool.uv.index]]\nname = 'x'\nurl = 'https://example.invalid/simple'\n"
+            "default = true\n",
+            "non-PyPI source",
+        ),
+        ("[tool.uv]\nextra-index-url = ['https://example.invalid/simple']\n", "non-PyPI source"),
+        ("[tool.uv]\nfind-links = ['https://example.invalid/wheels']\n", "non-PyPI source"),
+    ],
+    ids=[
+        "url-reference",
+        "first-party-url-reference",
+        "dynamic-dependencies",
+        "dynamic-extras",
+        "uv-sources",
+        "uv-index",
+        "uv-extra-index-url",
+        "uv-find-links",
+    ],
+)
+def test_what_the_gate_cannot_vet_by_name_is_refused(toml_text: str, problem: str) -> None:
+    """A name vetted against pypi.org says nothing when the bytes come from somewhere else."""
+    declared, findings = _gate.scan(toml_text)
+    assert [f.problem for f in findings] == [problem], findings
+    assert declared == {}, "a refused entry must not also be vetted, or a passing name hides it"
+
+
+def test_hatch_and_uv_metadata_requirements_are_swept() -> None:
+    """The backend installs hatch build-target and hook dependencies in the release build jobs."""
+    declared, findings = _gate.scan(
+        """
+        [tool.hatch.build.targets.wheel]
+        dependencies = ["targetdep>=1"]
+
+        [tool.hatch.build.targets.wheel.hooks.custom]
+        dependencies = ["targethookdep>=1"]
+
+        [tool.hatch.build.hooks.vcs]
+        dependencies = ["hookdep>=1"]
+
+        [[tool.uv.dependency-metadata]]
+        name = "something"
+        requires-dist = ["metadep>=1"]
+        """
+    )
+    assert findings == []
+    assert set(declared) == {"targetdep", "targethookdep", "hookdep", "metadep"}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"[project\n", b"\xff\xfe not utf-8"],
+    ids=["toml-syntax-error", "not-utf-8"],
+)
+def test_main_exits_2_on_a_pyproject_it_cannot_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> None:
+    """Could not see is 2; a traceback would exit 1, the code for a vetting failure."""
+    project = tmp_path / "pyproject.toml"
+    project.write_bytes(content)
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 2
+    assert main(["--pyproject", str(tmp_path / "missing.toml")]) == 2
+
+
+def test_an_unnameable_entry_is_named_even_when_pypi_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100", "./vendor/x.whl"]\n',
+        encoding="utf-8",
+    )
+
+    def unreachable(_name: str, **_kw: object) -> dict:
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr(_gate, "_http_fetch", unreachable)
+    assert main(["--pyproject", str(project)]) == 2
+    assert "unnameable entry" in capsys.readouterr().err
+
+
+def test_a_newline_in_a_toml_key_cannot_start_a_workflow_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n'
+        '[project.optional-dependencies]\n"x\\n::stop-commands::tok" = [42]\n',
+        encoding="utf-8",
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert not any(line.startswith("::stop-commands::") for line in err.splitlines()), err
+    assert "%0A::stop-commands::" in err
+
+
+def test_a_vetting_finding_names_the_declared_spelling_and_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["Invented.Helper>=1"]\n', encoding="utf-8"
+    )
+    _stub_registry(monkeypatch, absent=frozenset({"invented-helper"}))
+    assert main(["--pyproject", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert "declared as 'Invented.Helper>=1'" in err
+    assert str(project) in err
 
 
 def test_the_real_pyprojects_declare_nothing_unnameable() -> None:
@@ -1024,13 +1157,20 @@ def test_documented_blind_spot_npm_manifests_are_not_read(
     blindness to a freshly registered name. If a future change reads npm manifests, update this test
     and the module docstring together rather than deleting the assertion.
     """
-    project = tmp_path / "pyproject.toml"
-    project.write_text(
+    # The DEFAULT sweep, over a tree laid out like this one, so the pin covers the path CI runs.
+    (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
     )
-    (tmp_path / "package.json").write_text(
-        json.dumps({"dependencies": {"invented-npm-helper": "^1.0.0"}}), encoding="utf-8"
+    sub = tmp_path / "packaging" / "messagefoundry-thing"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        '[project]\nname = "messagefoundry-thing"\n', encoding="utf-8"
     )
+    npm = json.dumps({"dependencies": {"invented-npm-helper": "^1.0.0"}})
+    for where in (tmp_path, tmp_path / "ide", tmp_path / "ci" / "npm-tools", sub):
+        where.mkdir(parents=True, exist_ok=True)
+        (where / "package.json").write_text(npm, encoding="utf-8")
+    monkeypatch.setattr(_gate, "_ROOT", tmp_path)
     asked = _stub_registry(monkeypatch, absent=frozenset({"invented-npm-helper"}))
-    assert main(["--pyproject", str(project)]) == 0
+    assert main([]) == 0
     assert asked == ["fastapi"]
