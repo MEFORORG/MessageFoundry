@@ -237,6 +237,82 @@ def test_an_author_past_the_first_page_who_signed_is_not_refused() -> None:
     assert calls == [1], "a pull request with no unseen author never reads the signature file"
 
 
+def _serve(pages: list[Mapping[str, Any]]) -> cla_precheck.Transport:
+    replies = iter(pages)
+    return lambda _q, _v: next(replies)
+
+
+def _page(commits: list[Mapping[str, Any]], total: int, more: bool) -> Mapping[str, Any]:
+    nodes = [{"commit": c} for c in commits]
+    info = {"endCursor": "Y3Vyc29yOjI=" if more else None, "hasNextPage": more}
+    connection = {"totalCount": total, "pageInfo": info, "nodes": nodes}
+    return {"data": {"repository": {"pullRequest": {"headRefOid": _HEAD, "commits": connection}}}}
+
+
+def _commit(
+    oid: int, name: str, login: str | None = None, db_id: int | None = None
+) -> Mapping[str, Any]:
+    person = {
+        "name": name,
+        "user": None if login is None else {"databaseId": db_id, "login": login},
+    }
+    return {"oid": f"{oid:040x}", "author": person, "committer": person}
+
+
+def test_a_linked_signed_author_does_not_cover_an_unlinked_commit_sharing_its_name() -> None:
+    """Past the first page the action sees nothing, so an unlinked 'alice' cannot have signed,
+    whatever a linked alice before it did; the verdict must not depend on commit order."""
+    signed = frozenset({90000004})
+    for later in (
+        [_commit(2, "alice", "alice", 90000004), _commit(3, "alice")],
+        [_commit(3, "alice"), _commit(2, "alice", "alice", 90000004)],
+    ):
+        pages = [
+            _page([_commit(1, "Octo", "octo-contributor", 90000001)], 3, True),
+            _page(later, 3, False),
+        ]
+        read = fetch_commits(_serve(pages), "MEFORORG", "MessageFoundry", 7)
+        refusals = evaluate(read, _ALLOWLIST, lambda: signed).refusals
+        assert len(refusals) == 1 and f"{3:040x}" in refusals[0], later
+
+
+def test_a_refusal_already_proven_survives_a_later_fault(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An impersonation on page one is a refusal; a signature file or page two that then faults
+    must not turn it into exit 3, which the workflow passes."""
+
+    def unreadable() -> frozenset[int]:
+        raise PrecheckFault("the signature file answered HTTP 502")
+
+    assert run(_ENV, _Replay("impersonation_on_page_two"), unreadable) == EXIT_REFUSED
+    capsys.readouterr()
+    pages = [
+        _page([_commit(1, "wshallwshall")], 2, True),
+        {"errors": [{"message": "Something went wrong"}]},
+    ]
+    assert run(_ENV, lambda _q, _v: pages.pop(0), _no_signatures) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert "::warning title=CLA pre-check fault::" in out and "refused::" in out
+    # The neighbour: the same page-two fault with nothing refused on page one stays a fault.
+    pages = [_page([_commit(1, "Octo", "octo-contributor", 90000001)], 2, True), {"errors": [{}]}]
+    assert run(_ENV, lambda _q, _v: pages.pop(0), _no_signatures) == EXIT_FAULT
+
+
+def test_an_unreadable_signature_file_with_nothing_else_refused_is_a_fault() -> None:
+    def unreadable() -> frozenset[int]:
+        raise PrecheckFault("the signature file answered HTTP 502")
+
+    assert run(_ENV, _Replay("new_author_past_100"), unreadable) == EXIT_FAULT
+
+
+def test_a_linked_author_with_a_malformed_committer_is_not_a_fault() -> None:
+    """The action reads no committer once the author is linked, so neither does the mirror."""
+    commit = {"oid": "a", "author": {"name": "A", "user": {"login": "a", "databaseId": 1}}}
+    for committer in (None, "not-an-object", {"name": "C", "user": "not-an-object"}):
+        assert attribute({**commit, "committer": committer}).name == "a"
+
+
 def test_the_signature_file_parses_as_the_action_writes_it() -> None:
     assert cla_precheck.parse_signatures({"signedContributors": []}) == frozenset()
     entry = {"name": "octo-contributor", "id": 90000001, "comment_id": 1, "pullRequestNo": 7}
@@ -403,7 +479,8 @@ def test_without_a_transport_it_needs_a_token_and_https(capsys: pytest.CaptureFi
 def test_a_malformed_token_or_url_is_a_fault_not_a_traceback(
     override: dict[str, str], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A traceback exits 1, the refusal code; bad input is a fault, exit 2."""
+    """Bad input is a fault, exit 3, never a traceback; and never 2, python3's own exit when it
+    cannot open the script, which the workflow fails on."""
     assert run({**_ENV, **override}) == EXIT_FAULT
     assert "synthetic-token" not in capsys.readouterr().out
 

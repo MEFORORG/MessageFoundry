@@ -132,7 +132,13 @@ _REPOSITORY = re.compile(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
 
 
 class PrecheckFault(Exception):
-    """The pre-check could not reach a verdict: bad input, a failed call, or a malformed reply."""
+    """The pre-check could not reach a verdict: bad input, a failed call, or a malformed reply.
+
+    ``partial`` carries the commits read before a later page failed, so a refusal they already
+    prove is not thrown away with the fault.
+    """
+
+    partial: PullRequestRead | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +165,8 @@ class PullRequestRead:
 class Verdict:
     refusals: tuple[str, ...]
     notices: tuple[str, ...]
+    #: Set when part of the verdict could not be reached. The refusals that WERE reached still stand.
+    fault: str | None = None
 
 
 def _person(commit: Mapping[str, Any], role: str) -> Mapping[str, Any]:
@@ -185,7 +193,9 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
     """
     author = _person(commit, "author")
     author_user = _user(author)
-    committer_user = _user(_person(commit, "committer"))
+    # The action never reads the committer when the author is linked, so neither does this: a
+    # malformed committer there must not fault the run and drop every other commit's refusal.
+    committer_user = _user(_person(commit, "committer")) if author_user is None else None
     if author_user is not None:
         chosen = author_user
     elif committer_user is not None:
@@ -231,6 +241,25 @@ def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> P
     ``totalCount`` is returned as it is, for ``evaluate`` to refuse.
     """
     commits: list[Mapping[str, Any]] = []
+    state: dict[str, Any] = {"head": None, "first_page": None}
+    try:
+        return _fetch_pages(transport, owner, name, number, commits, state)
+    except PrecheckFault as exc:
+        if commits and state["head"] is not None and state["first_page"] is not None:
+            exc.partial = PullRequestRead(
+                list(commits), len(commits), state["head"], state["first_page"]
+            )
+        raise
+
+
+def _fetch_pages(
+    transport: Transport,
+    owner: str,
+    name: str,
+    number: int,
+    commits: list[Mapping[str, Any]],
+    state: dict[str, Any],
+) -> PullRequestRead:
     cursor: str | None = None
     seen_cursors: set[str] = set()
     head: str | None = None
@@ -252,13 +281,16 @@ def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> P
         if not isinstance(page_head, str) or (head is not None and page_head != head):
             raise PrecheckFault("the pull request's head moved while its commits were being read")
         head = page_head
+        page: list[Mapping[str, Any]] = []
         for node in nodes:
             commit = node.get("commit") if isinstance(node, Mapping) else None
             if not isinstance(commit, Mapping):
                 raise PrecheckFault("a commit node holds no commit object")
-            commits.append(commit)
+            page.append(commit)
+        commits.extend(page)  # whole pages only, so a partial read never holds half a page
         if first_page is None:
             first_page = len(nodes)
+        state["head"], state["first_page"] = head, first_page
         total = _total_count(connection)
         if not page_info.get("hasNextPage"):
             break
@@ -286,28 +318,49 @@ Signatures = Callable[[], frozenset[int]]
 
 
 def evaluate(
-    read: PullRequestRead, allowlist: Sequence[str], signatures: Signatures | None = None
+    read: PullRequestRead,
+    allowlist: Sequence[str],
+    signatures: Signatures | None = None,
+    *,
+    complete: bool = True,
 ) -> Verdict:
     """Refusals and notices for one read. ``signatures`` returns the signed account ids; it is
-    called only for an author the action never sees, and with none every such author refuses."""
-    signed_cache: list[frozenset[int]] = []
+    called only for an author the action never sees, and with none every such author refuses.
 
-    def has_signed(who: Attribution) -> bool:
+    A fault partway (an unreadable signature file, a malformed commit) is recorded in
+    ``Verdict.fault`` and the rest is still judged, so a refusal already proven stands. With
+    ``complete`` false (a read cut short by a fault) the count check is skipped.
+    """
+    faults: list[str] = []
+    signed_cache: dict[str, frozenset[int] | None] = {}
+
+    def has_signed(who: Attribution) -> bool | None:
+        """True or False, or None when the signature file could not be read."""
         if who.database_id is None or signatures is None:
             return False
-        if not signed_cache:
-            signed_cache.append(signatures())
-        return who.database_id in signed_cache[0]
+        if "ids" not in signed_cache:
+            try:
+                signed_cache["ids"] = signatures()
+            except PrecheckFault as exc:
+                faults.append(str(exc))
+                signed_cache["ids"] = None
+        ids = signed_cache["ids"]
+        return None if ids is None else who.database_id in ids
 
     refusals: list[str] = []
     notices: list[str] = []
     distinct = len({str(commit.get("oid", "")) for commit in read.commits})
-    if distinct != read.total:
+    if complete and distinct != read.total:
         refusals.append(
             f"read {distinct} distinct commits where the pull request has {read.total}; a commit "
             "not read once cannot be checked"
         )
-    attributions = [attribute(commit) for commit in read.commits]
+    attributions: list[Attribution] = []
+    for commit in read.commits:
+        try:
+            attributions.append(attribute(commit))
+        except PrecheckFault as exc:
+            faults.append(str(exc))
 
     def skipped(entry: Attribution) -> bool:
         """Does the action skip this committer entry: the id it drops, or an allowlisted name?"""
@@ -317,7 +370,9 @@ def evaluate(
     entries: dict[str, Attribution] = {}
     for who in attributions[: read.first_page]:
         entries.setdefault(who.name, who)
-    never_checked: set[str] = set()
+    # Keyed on the name AND the account, so a linked author does not cover an unlinked commit that
+    # merely shares its name.
+    never_checked: set[tuple[str, int | None]] = set()
     for who in attributions:
         unlinked = not who.author_linked and not who.committer_linked
         entry = entries.get(who.name)
@@ -328,9 +383,9 @@ def evaluate(
                     f"commit {who.oid} is linked to no GitHub account, and its git author name "
                     f"{who.name!r} is one the action skips, so it would pass unsigned"
                 )
-            elif not skipped(who) and who.name not in never_checked:
-                never_checked.add(who.name)
-                if not has_signed(who):
+            elif not skipped(who) and (who.name, who.database_id) not in never_checked:
+                never_checked.add((who.name, who.database_id))
+                if has_signed(who) is False:
                     refusals.append(
                         f"commit {who.oid} is past the {read.first_page} commits the action "
                         f"reads, its author {who.name!r} appears in none of them, and the CLA "
@@ -358,7 +413,7 @@ def evaluate(
                 f"commit {who.oid} has an unlinked author and is attributed to the allowlisted "
                 f"committer {who.name!r}, so its author is never asked to sign"
             )
-    return Verdict(tuple(refusals), tuple(notices))
+    return Verdict(tuple(refusals), tuple(notices), "; ".join(faults) or None)
 
 
 def _escape_command(text: str) -> str:
@@ -520,19 +575,31 @@ def run(
                     raise PrecheckFault("CLA_SIGNATURES_PATH or CLA_SIGNATURES_BRANCH is not set")
                 api = _https_url(env, "GITHUB_API_URL", DEFAULT_API_URL)
                 signatures = rest_signatures(api, token, owner, name, path, branch)
-        read = fetch_commits(transport, owner, name, number)
+        try:
+            read = fetch_commits(transport, owner, name, number)
+            complete, read_fault = True, None
+        except PrecheckFault as exc:
+            # A later page failed. The pages already read still prove what they prove.
+            if exc.partial is None:
+                raise
+            read, complete, read_fault = exc.partial, False, str(exc)
         if expected_head and read.head != expected_head:
             raise PrecheckFault("the pull request's head is not CLA_HEAD_SHA; this run is stale")
-        verdict = evaluate(read, allowlist, signatures)
+        verdict = evaluate(read, allowlist, signatures, complete=complete)
     except PrecheckFault as exc:
         print(f"::warning title=CLA pre-check fault::{_escape_command(str(exc))}")
         return EXIT_FAULT
     for notice in verdict.notices:
         print(f"::notice title=CLA pre-check::{_escape_command(notice)}")
+    fault = "; ".join(f for f in (read_fault, verdict.fault) if f)
+    if fault:
+        print(f"::warning title=CLA pre-check fault::{_escape_command(fault)}")
     for refusal in verdict.refusals:
         print(f"::error title=CLA pre-check refused::{_escape_command(refusal)}")
     if verdict.refusals:
-        return EXIT_REFUSED
+        return EXIT_REFUSED  # a refusal the read proved stands, whatever else faulted
+    if fault:
+        return EXIT_FAULT
     print(f"CLA pre-check: {len(read.commits)} commit(s) read, nothing refused")
     return EXIT_PASS
 

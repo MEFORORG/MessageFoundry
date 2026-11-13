@@ -62,7 +62,7 @@ concurrency:
   # in-flight `cla` run of an UNRELATED one. `cla` is a REQUIRED context and a cancelled run is not
   # a success, so the victim cannot merge until something re-runs it -- and what it waits on reports
   # `conclusion: cancelled` with `steps: 0` and no downloadable log (measured on run 34560869543; a
-  # healthy run has 5 steps), so it renders in the fail column with NOTHING TO READ. That is why the
+  # healthy run then had 5 steps, 6 since the pre-check step), so it renders in the fail column with NOTHING TO READ. That is why the
   # cause sat unattributed: the evidence is not in the victim's own run, it is in the start time of a
   # run on somebody else's branch. Measured 2026-09-11 over this workflow's last 100 runs, with
   # security.yml as a paired control; numbers and method in BACKLOG #1533.
@@ -173,8 +173,9 @@ jobs:
       # WHAT THE VENDORED ACTION CANNOT SEE (BACKLOG #5644, #5645). The action reads one page of 100
       # commits, and matches its allowlist on a commit's free-text git name when no account is
       # linked. scripts/security/cla_precheck.py reads every commit and refuses what the action would
-      # pass unsigned; its docstring lists what it refuses and what it only reports. Same `if:` as
-      # the action's step, so it runs exactly when that step does.
+      # pass unsigned; its docstring lists what it refuses and what it only reports. It runs on the
+      # same events as the action's step; the action's `if:` alone adds `!cancelled()`, so after an
+      # earlier step fails the action still runs and this step does not.
       #
       # FAIL-OPEN ON A FAULT, BY OWNER RULING 2026-11-13 ("Wire, fail-open on fault"). Exit 1 is a
       # refusal and fails the required `cla` context. Exit 3 is a fault -- a GitHub outage, a
@@ -219,9 +220,12 @@ jobs:
       # condition per event and fails against the form without the pull-request test.
       #
       # `!cancelled()` LETS THIS STEP RUN AFTER THE PRE-CHECK REFUSES. Without a status function
-      # GitHub adds an implicit `success()`, so a refusal would skip the action: no request to sign
-      # would be posted, and a sign comment would not be recorded. The job still fails, because the
-      # pre-check step failed, so the `cla` context stays red either way.
+      # GitHub adds an implicit `success()`, so a refusal would skip the action, and an unsigned
+      # author the ACTION sees would get no request to sign and could not record a sign comment.
+      # The action does NOT see what the pre-check refuses: for those commits it may judge every
+      # author signed and say so in its comment, while the job is red. The job still fails, because
+      # the pre-check step failed, so the `cla` context stays red either way; read the pre-check's
+      # annotations for why.
       - name: CLA Assistant
         if: >-
           !cancelled() &&
