@@ -8108,10 +8108,11 @@ async def _await_connection_worker_exit(
 #: forever. Past it the teardown is cancelled, which runs its ``finally`` blocks.
 _OPEN_CLEANUP_TIMEOUT: Final[float] = 30.0
 
-#: Upper bound on the server backends' settle at ``close``: one round trip, which a
-#: ``command_timeout`` of 0 leaves unbounded. Past it the settle is logged and skipped, and the
-#: pool closes (BACKLOG #5720).
-CLOSE_SETTLE_TIMEOUT: Final[float] = 10.0
+#: Upper bound on the server backends' settle at ``close``: at most a few statements, which a
+#: ``command_timeout`` of 0 leaves unbounded. Twice the default ``command_timeout``, so a slow but
+#: healthy server still settles. Past it the settle is logged and skipped, and the pool closes
+#: (BACKLOG #5720). A failed open's cleanup is bounded sooner, by ``_OPEN_CLEANUP_TIMEOUT``.
+CLOSE_SETTLE_TIMEOUT: Final[float] = 60.0
 
 #: Every teardown :func:`_teardown_to_completion` started, kept referenced until it finishes, so
 #: the loop cannot collect one it stopped waiting for.
@@ -8125,7 +8126,11 @@ def _report_abandoned_teardown(what: str, task: asyncio.Task[None]) -> None:
 
 
 async def _teardown_to_completion(
-    body: Callable[[], Awaitable[None]], *, what: str, timeout: float = _OPEN_CLEANUP_TIMEOUT
+    body: Callable[[], Awaitable[None]],
+    *,
+    what: str,
+    timeout: float = _OPEN_CLEANUP_TIMEOUT,
+    bound_after_cancel: bool = False,
 ) -> tuple[bool, BaseException | None]:
     """Run ``body`` as its own task and wait for it, so a cancel delivered to the caller cannot cut
     it short. Returns whether such a cancel arrived, for the caller to raise once this returns,
@@ -8133,16 +8138,18 @@ async def _teardown_to_completion(
 
     Waits with :func:`asyncio.wait`, which never cancels what it waits on. Past ``timeout`` the
     task is cancelled, which runs its ``finally`` blocks, and is not waited for further (BACKLOG
-    #5720); it is then reported as failed with :class:`TimeoutError`. Never raises."""
+    #5720); it is then reported as failed with :class:`TimeoutError`. ``timeout`` counts from the
+    start, or with ``bound_after_cancel`` from the first cancel, so a teardown nobody cancelled
+    may take as long as it needs. Never raises."""
     task: asyncio.Task[None] = asyncio.ensure_future(body())
     _TEARDOWNS.add(task)
     task.add_done_callback(_TEARDOWNS.discard)
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+    deadline: float | None = None if bound_after_cancel else loop.time() + timeout
     cancelled = False
     while not task.done():
-        remaining = deadline - loop.time()
-        if remaining <= 0:
+        remaining = None if deadline is None else deadline - loop.time()
+        if remaining is not None and remaining <= 0:
             log.warning("%s did not finish within %.0fs; cancelling it", what, timeout)
             task.add_done_callback(functools.partial(_report_abandoned_teardown, what))
             task.cancel()
@@ -8151,6 +8158,8 @@ async def _teardown_to_completion(
             await asyncio.wait({task}, timeout=remaining)
         except asyncio.CancelledError:
             cancelled = True
+            if deadline is None:
+                deadline = loop.time() + timeout
     if task.cancelled():
         return cancelled, asyncio.CancelledError()
     return cancelled, task.exception()
@@ -12999,9 +13008,6 @@ class MessageStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
-        # The teardown below runs in a finally, so a cancel during the settle still closes every
-        # connection, whose worker threads are non-daemon (BACKLOG #5720). The settle is local, so
-        # unlike the server backends it needs no bound of its own.
         try:
             try:
                 # A read-only handle reserved nothing and cannot write the settlement (#1780).
@@ -13012,45 +13018,77 @@ class MessageStore:
                     "could not settle the AES-GCM invocation bound at close (%s)",
                     type(failure).__name__,
                 )
-        finally:
-            # Run to completion even when a cancel lands in it: every connection here owns a
-            # non-daemon worker thread, and one skipped close leaves it running (BACKLOG #5720).
-            cancelled, teardown_failure = await _teardown_to_completion(
-                self._close_connections, what="the store's close"
-            )
-            if cancelled:
-                raise asyncio.CancelledError from teardown_failure
-            if teardown_failure is not None:
-                raise teardown_failure
+        except BaseException as in_flight:
+            # A cancel, an interrupt or an exit during the settle: the connections still close,
+            # and what is in flight propagates unchanged (BACKLOG #5720).
+            if isinstance(in_flight, GeneratorExit):
+                self._stop_connections()  # a closed coroutine cannot await a close
+            else:
+                await self._finish_close(raise_failure=False)
+            raise
+        await self._finish_close(raise_failure=True)
+
+    def _stop_connections(self) -> None:
+        """End every connection's worker thread without awaiting: aiosqlite's ``stop()`` is
+        synchronous, for a close that cannot await (BACKLOG #5720)."""
+        for conn in [*self._read_conns, self._db]:
+            conn.stop()
+
+    async def _finish_close(self, *, raise_failure: bool) -> None:
+        """Run :meth:`_close_connections` to completion even when a cancel lands in it: every
+        connection owns a non-daemon worker thread, and one skipped close leaves it running
+        (BACKLOG #5720). The bound starts only once a cancel arrives, so a slow but healthy flush
+        is never cut short. With ``raise_failure`` that cancel, or the teardown's own failure, is
+        raised; without it, something else is already propagating, so the failure is logged by
+        class instead."""
+        cancelled, failure = await _teardown_to_completion(
+            self._close_connections, what="the store's close", bound_after_cancel=True
+        )
+        if not raise_failure:
+            if failure is not None:
+                log.warning("the store's close failed (%s)", type(failure).__name__)
+            return
+        if cancelled:
+            raise asyncio.CancelledError from failure
+        if failure is not None:
+            raise failure
 
     async def _close_connections(self) -> None:
-        """:meth:`close`'s teardown: the group-commit committer, the read pool, then the writer."""
-        # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members
-        # and resolves their futures before the write connection is closed — otherwise an
-        # in-flight handoff would hang forever on a future no committer will ever complete.
-        if self._group_commit is not None:
+        """:meth:`close`'s teardown: the group-commit committer, the read pool, then the writer.
+        Each step sits in a ``finally`` of the one before, so a step that raises, a cancel
+        included, skips none of the rest (BACKLOG #5720)."""
+        try:
+            # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members
+            # and resolves their futures before the write connection is closed — otherwise an
+            # in-flight handoff would hang forever on a future no committer will ever complete.
+            if self._group_commit is not None:
+                try:
+                    await self._group_commit.aclose()
+                except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log, continue
+                    # By class only (vault BACKLOG #3054); a failed open reaches this too.
+                    log.warning("error closing group-commit committer (%s)", type(failure).__name__)
+        finally:
             try:
-                await self._group_commit.aclose()
-            except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
-                # By class only (vault BACKLOG #3054); a failed open reaches this too.
-                log.warning("error closing group-commit committer (%s)", type(failure).__name__)
-        # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
-        # state), then the writer. Best-effort: one failing close must not strand the rest.
-        for conn in self._read_conns:
-            try:
-                await conn.close()
-                await _await_connection_worker_exit(conn)
-            except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
-                # By class only (vault BACKLOG #3054); a failed open reaches this too.
-                log.warning("error closing read-pool connection (%s)", type(failure).__name__)
-        self._read_conns = []
-        self._read_pool = None
-        await self._db.close()
-        # Each close above returns before the worker thread it stops has actually gone, and
-        # those threads are non-daemon, so a `close`d store could still hold threads interpreter
-        # exit has to join. Wait them out so "the store is closed" means every thread it owned
-        # is gone.
-        await _await_connection_worker_exit(self._db)
+                # Close every pooled read connection (tracked in _read_conns regardless of pool
+                # checkout state). Best-effort: one failing close must not strand the rest.
+                for conn in self._read_conns:
+                    try:
+                        await conn.close()
+                        await _await_connection_worker_exit(conn)
+                    except Exception as failure:  # noqa: BLE001 — shutdown best-effort; continue
+                        # By class only (vault BACKLOG #3054); a failed open reaches this too.
+                        log.warning(
+                            "error closing read-pool connection (%s)", type(failure).__name__
+                        )
+            finally:
+                self._read_conns = []
+                self._read_pool = None
+                await self._db.close()
+                # Each close above returns before the worker thread it stops has actually gone,
+                # and those threads are non-daemon, so a `close`d store could still hold threads
+                # interpreter exit has to join. Wait them out so "the store is closed" means every
+                # thread it owned is gone.
+                await _await_connection_worker_exit(self._db)
 
     # --- write path ----------------------------------------------------------
 

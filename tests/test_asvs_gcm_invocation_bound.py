@@ -26,6 +26,7 @@ import asyncio
 import base64
 import inspect
 import io
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -604,6 +605,21 @@ async def test_checkpoint_never_raises_when_the_store_write_fails() -> None:
     assert total == 0
     cipher.encrypt("x")
     assert await checkpoint_invocations(cipher, _boom) == 1
+
+
+async def test_a_failed_checkpoint_logs_its_class_and_not_the_driver_text(caplog) -> None:
+    """BACKLOG #5720, vault BACKLOG #3054: a failed store open now settles through this path, so a
+    failing write is logged at WARNING by class only. The driver's text may name the server and
+    login; it reaches DEBUG only."""
+    cipher = _cipher()
+
+    async def _boom(_key_id: str, _count: int) -> int:
+        raise ConnectionResetError("server db01 refused login mefor")
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.gcm_bound"):
+        await checkpoint_invocations(cipher, _boom)
+    assert "(ConnectionResetError)" in caplog.text
+    assert "db01" not in caplog.text
 
 
 # --- the OTHER writer under the same DEK: uploaded logs (ADR 0134) -----------

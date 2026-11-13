@@ -4335,7 +4335,8 @@ class SqlServerStore:
                     )
 
             def _release_sync() -> None:
-                # Both are synchronous, so even a closed coroutine can end the pool and its threads.
+                # Both are synchronous, so even a closed coroutine can run them. pool.close() only
+                # marks the pool closing; its free connections end when they are collected.
                 pool.close()
                 executor.shutdown(wait=False)
 
