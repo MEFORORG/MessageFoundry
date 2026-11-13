@@ -146,8 +146,9 @@ REDACTED = "[REDACTED]"
 class Seps:
     """The component/repetition/subcomponent separators and the escape character of the message
     being anonymized, read from its own MSH-1/MSH-2 (never hardcoded). The field separator is the
-    adapter's concern. The surrogates never read ``escape``; the leak-check decodes an escaped value
-    with it before its detectors look (BACKLOG #5532)."""
+    adapter's concern. The surrogate kinds never read ``escape``; the leak-check decodes an escaped
+    value with it before its detectors look (BACKLOG #5532), and so does the site-code scrub
+    (BACKLOG #5632)."""
 
     component: str = "^"
     repetition: str = "~"
@@ -628,7 +629,8 @@ def unescape(value: str, seps: Seps, field_sep: str) -> str:
     """``value`` with every HL7 escape sequence decoded, by the message's own escape character and
     separators (BACKLOG #5532), as :func:`_decode_escape` reads each one. The tee cannot import the
     engine's parser, so the leak-check of both copies decodes here, in this byte-identical file.
-    The anonymizer never calls it. Pass one component or one subcomponent, the two parts the
+    Of the anonymizer's own passes, only the site-code scrub calls it, through
+    :func:`decoded_readings` (BACKLOG #5632). Pass one component or one subcomponent, the two parts the
     engine's ``Message`` decodes on a component read and a subcomponent read: an escape character
     no second one closes is kept, with the text after it, and across a separator it would pair
     with the next sequence's opener. Never raises."""
@@ -664,9 +666,10 @@ def decoded_readings(part: str, seps: Seps, field_sep: str) -> list[str]:
     for the detectors that must fail closed on any of them (BACKLOG #5632, #5654): the part
     decoded (:func:`unescape`), and decoded with ``\\H\\`` and ``\\N\\`` dropped, as a display
     that shows highlighting rather than a character reads it; each of those, and each piece of it
-    split again on the message's delimiters, its field separator, a carriage return or a line
-    feed, since a consumer that unescapes the part sees an escaped delimiter or line break as a
-    real one; and each stripped of surrounding whitespace. Empty when ``part`` holds no escape
+    split again on the message's delimiters, its field separator or whitespace, since a consumer
+    that unescapes the part sees an escaped delimiter or line break as a real one, and
+    :func:`unescape` writes a break command such as ``\\.br\\`` as a space where the engine
+    writes a line break; and each stripped of surrounding whitespace. Empty when ``part`` holds no escape
     character, since then every reading is the part as written."""
     escape = seps.escape
     if not escape or escape not in part:
@@ -677,7 +680,7 @@ def decoded_readings(part: str, seps: Seps, field_sep: str) -> list[str]:
     for decoded in dict.fromkeys(
         (unescape(part, seps, field_sep), unescape(shown, seps, field_sep))
     ):
-        forms.extend(form.strip() for form in (decoded, *re.split(f"[{breaks}\r\n]", decoded)))
+        forms.extend(form.strip() for form in (decoded, *re.split(f"[{breaks}\\s]", decoded)))
     return list(dict.fromkeys(forms))
 
 
@@ -796,6 +799,8 @@ def message_has_site_code(text: str, rules: tuple[FieldRule, ...] = ()) -> bool:
     Each component and subcomponent is read as :func:`scrub_site_codes` reads it
     (:func:`_reads_as_site_code`), so a site code joined to an escaped delimiter or written with a
     hex escape is found, and the scrub's output reads as clean (BACKLOG #5632)."""
+    if not _SITE_PREFIXES:
+        return False  # no site code can match, so skip decoding every escaped part
     parsed = read_message_seps(text)
     if parsed is None:
         return SITE_CODE_RE.search(text) is not None

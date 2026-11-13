@@ -145,19 +145,33 @@ _ALLOWED_IPV6: tuple[ipaddress.IPv6Network, ...] = tuple(
 )
 #: The deprecated IPv4-compatible block, whose low 32 bits are an IPv4 address.
 _IPV4_COMPATIBLE = ipaddress.IPv6Network("::/96")
+#: The loopback address, the highest one in :data:`_IPV4_COMPATIBLE` that embeds no IPv4 address.
+_IPV6_LOOPBACK = ipaddress.IPv6Address(1)
+#: The multicast flag that says the address embeds a unicast prefix (RFC 3306 and the embedded-RP
+#: form of RFC 3956), set in bits 116 to 119 of the address.
+_MULTICAST_PREFIX_FLAG = 0x2
 
 
 def _ipv6_candidates(run: str) -> Iterator[str]:
     """The texts in ``run`` an IPv6 address may be written as: the run, without the dots that end
-    a sentence, without a trailing ``.port`` or ``.word``, and each of those with a colon a label
-    or a list joined to a ``::`` at either end taken off, so ``Addr:::ffff:808:808``,
-    ``2a01:4f8::5.443`` and ``2a01:4f8:::`` still hold their address."""
-    bases = [run, run.strip("."), run.rsplit(".", 1)[0]]
-    for base in dict.fromkeys(bases):
-        yield base
-        yield base.removeprefix(":") if base.startswith(":::") else base
-        yield base.removesuffix(":") if base.endswith(":::") else base
+    a sentence, and without a trailing ``.port`` or ``.word``; each of those with one colon taken
+    off either end or both, as a label or a list joins one; and each with every colon and dot
+    taken off both ends. So ``Addr:::ffff:808:808``, ``IP:2a01:4f8::``, ``2a01:4f8::5.443`` and
+    ``2a01:4f8:::`` still hold their address. A text may come more than once."""
+    for base in (run, run.strip("."), run.rsplit(".", 1)[0]):
+        front = base[1:] if base.startswith(":") else base
+        yield from (base, front)
+        if base.endswith(":"):
+            yield from (base[:-1], front[:-1])
         yield base.strip(":.")
+
+
+def _is_allowed_ipv6(address: ipaddress.IPv6Address) -> bool:
+    """True if ``address`` is in :data:`_ALLOWED_IPV6` and, when it is multicast, does not embed a
+    unicast prefix, which can name the site's own network."""
+    if address.is_multicast and (int(address) >> 116) & _MULTICAST_PREFIX_FLAG:
+        return False
+    return any(address in net for net in _ALLOWED_IPV6)
 
 
 #: The reason a routable IPv6 address gets (BACKLOG #5654).
@@ -181,16 +195,12 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
             except ValueError:
                 continue
             embedded = address.ipv4_mapped
-            if (
-                embedded is None
-                and address in _IPV4_COMPATIBLE
-                and address > ipaddress.IPv6Address(1)
-            ):
+            if embedded is None and address in _IPV4_COMPATIBLE and address > _IPV6_LOOPBACK:
                 embedded = ipaddress.IPv4Address(int(address))
             if embedded is not None:
                 if ipv4_is_routable(str(embedded)):
                     return True
-            elif not any(address in net for net in _ALLOWED_IPV6):
+            elif not _is_allowed_ipv6(address):
                 return True
     return False
 

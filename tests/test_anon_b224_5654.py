@@ -45,6 +45,7 @@ def _zpd(value: str, head: str = _HEAD) -> str:
         "M1^^^H^ MR ",
         "M1^^^H^X\\S\\MR",
         "M1^^^H^MR\\H\\",
+        "M1^^^H^X\\.br\\MR",
     ],
     ids=[
         "second-sub",
@@ -55,6 +56,7 @@ def _zpd(value: str, head: str = _HEAD) -> str:
         "spaces",
         "escaped-component-separator",
         "highlighting-dropped",
+        "after-a-break-command",
     ],
 )
 def test_an_mrn_type_past_the_first_subcomponent_or_padded_is_a_hit(
@@ -99,6 +101,9 @@ _GLOBAL = ":".join(["2a01", "4f8", "", "5"])
         f"{_GLOBAL}.Bad",
         f"{_GLOBAL[:-1]}:",
         "::" + ".".join(["8"] * 4),
+        f"IP:{_GLOBAL[:-1]}",
+        f"Net:{_GLOBAL[:-1]}/32",
+        "ff3e:40:" + _GLOBAL.replace("::5", "::1"),
     ],
     ids=[
         "plain",
@@ -112,6 +117,9 @@ _GLOBAL = ":".join(["2a01", "4f8", "", "5"])
         "dot-word",
         "list-colon",
         "compatible-routable",
+        "label-colon-before-trailing-double",
+        "label-colon-and-prefix-length",
+        "multicast-with-unicast-prefix",
     ],
 )
 def test_a_routable_ipv6_address_is_a_hit(leak: ModuleType, written: str) -> None:
@@ -168,7 +176,14 @@ def test_a_long_hex_run_is_scanned_in_linear_time(leak: ModuleType) -> None:
     so the scan does not backtrack over it; the old pattern took seconds at 60 KB."""
     import time
 
-    payload = "0123456789ABCDEF" * 40_000 + "::"
-    started = time.perf_counter()
-    assert not leak._has_routable_ipv6(payload, lambda ip: True)
-    assert time.perf_counter() - started < 5
+    def seconds(repeats: int) -> float:
+        payload = "0123456789ABCDEF" * repeats + "::"
+        started = time.perf_counter()
+        assert not leak._has_routable_ipv6(payload, lambda ip: True)
+        return time.perf_counter() - started
+
+    # Four times the input takes about four times as long when the scan is linear, sixteen when
+    # it is quadratic, which took seconds at 320 KB. The bound sits between them, with a floor
+    # that keeps a noisy runner's sub-millisecond timings from deciding it.
+    small, large = seconds(5_000), seconds(20_000)
+    assert large < max(small * 10, 0.25)

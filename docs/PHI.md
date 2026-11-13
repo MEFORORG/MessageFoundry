@@ -2412,8 +2412,8 @@ Properties of the anonymizer:
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. A component or subcomponent is a site code when it is one whole as
   written or trimmed, or decoded from its escape sequences, with `\H\` and `\N\` kept as `_` or
-  dropped, and then trimmed, whole or split again on the delimiters, a carriage return or a line
-  feed. So a code joined to `\S\`, padded with `\X20\` or written with a hex escape is replaced,
+  dropped, and then trimmed, whole or split again on the delimiters or on whitespace, which a
+  break command such as `\.br\` decodes to. So a code joined to `\S\`, padded with `\X20\` or written with a hex escape is replaced,
   escapes and all, by digits of the same width (BACKLOG #5632). The surrogate is keyed on the
   part as written, so one code written two ways gets two unrelated surrogates. With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
@@ -2436,7 +2436,7 @@ both are described below:
 | The leak-check refuses when | Where it looks |
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
-| A known partner, vendor or site token, or a routable IP address, survives. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast or in a documentation range (`2001:db8::/32`, `3fff::/20`); an IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. The forms it cannot read are below (BACKLOG #5654) | The whole message |
+| A known partner, vendor or site token, or a routable IP address, survives. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast with no unicast prefix embedded, or in a documentation range (`2001:db8::/32`, `3fff::/20`); an IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. The forms it cannot read are below (BACKLOG #5654) | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
