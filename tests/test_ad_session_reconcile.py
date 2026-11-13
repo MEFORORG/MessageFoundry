@@ -6891,8 +6891,7 @@ async def test_a_reconciler_revoke_refused_every_time_is_recorded_and_raised(
         assert set(calls) == {calls[0]}, "the pass went on to the next account"
         assert await _live_sessions(store, hashes) == hashes
         [missed] = await store.list_audit(action=SESSIONS_REVOKE_FAILED_ACTION)
-        first = await store.get_user(calls[0])
-        assert first is not None and missed["actor"] == first.username
+        assert missed["actor"] is None, "the account's own security feed would show the miss"
         assert json.loads(missed["detail"]) == {
             "user_id": calls[0],
             "change": "ad_reconcile_directory_absent",

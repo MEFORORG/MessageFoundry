@@ -10352,8 +10352,8 @@ class AuthService:
                 scrub_log_argument(new_username),
                 exc_info=exc,
             )
-            await self._user_seal_failed(user_id)
             self._note_refused_reconciler_row("auth.ad_username_refreshed")
+            await self._user_seal_failed(user_id)
             return
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
@@ -11202,11 +11202,12 @@ class AuthService:
                 # Vault BACKLOG #3023 residual (1): the retry without the row is the post-commit
                 # revoke's, so it gets that revoke's attempts, budget and miss row, the attempt
                 # with the row counted as the first. That retry itself always runs, as it did:
-                # the first attempt's error may be the row's, not the revoke's.
+                # the first attempt's error may be the row's, not the revoke's. No actor: the pass
+                # is not the account's act, and a row naming the account would show it, and the
+                # count of other accounts the pass left, in that account's own security feed.
                 ended = await self._revoke_after_commit(
                     revocation.user_id,
                     change=f"ad_reconcile_{revocation.reason}",
-                    actor=revocation.username,
                     not_attempted=not_attempted,
                     first_attempt_at=started_at,
                 )

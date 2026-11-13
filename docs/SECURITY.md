@@ -1012,15 +1012,16 @@ ERROR, so the row is the record of a miss only while the audit log accepts write
 custom-role edit, a directory map save, a directory sign-in's role or scope resync and the
 `provision-admin` repair end the account's sessions after their own change has committed. A
 custom-role delete revokes before it deletes, so a refusal there leaves the role in place and
-writes no such row. A store
-refusal of that revoke, such as a pool shortage at the acquire limit, a statement timeout or a lost
-connection, is run again, up to three attempts. A re-run starts only while less than 15 seconds
-have passed since the first attempt began, give or take its half-second pause, and nothing bounds
-how long one attempt runs. The directory reconciler's revoke counts the same way, except that its
-first attempt carries its `auth.ad_session_revoked` row and its second, without the row, always
-runs, since the first one's error may be the row's. One it gives up on ends the pass, and its
-miss row counts the pass's later revocations as `accounts_not_attempted`. At the default `acquire_timeout` a SQL Server pool wait uses up that
-budget on its own, so it is recorded at once rather than run into the request deadline. A refusal
+writes no such row. A store refusal of that revoke, such as a pool shortage at the acquire limit,
+a statement timeout or a lost connection, is run again, up to three attempts. A re-run starts
+only while less than 15 seconds have passed since the first attempt began, give or take its
+half-second pause, and nothing bounds how long one attempt runs. At the default `acquire_timeout`
+a SQL Server pool wait uses up that budget on its own, so it is recorded at once rather than run
+into the request deadline. The directory reconciler's revoke counts its attempts the same way, but
+its first attempt carries its `auth.ad_session_revoked` row and its second, without the row,
+always runs, since the first one's error may be the row's; so there a SQL Server pool wait is
+recorded after the second wait. One it gives up on ends the pass, and its miss row counts the
+pass's later revocations as `accounts_not_attempted`. A refusal
 that reads as a defect is raised at once, unretried and unrecorded: at least a store whose tables,
 columns or grants are not what the statement needs, and SQLite's `ProgrammingError`. A SQL syntax
 error is not always one: SQLite's, and SQL Server's generic 42000, are run again and recorded like a
@@ -5863,9 +5864,10 @@ action. A pass that raises part-way raises no such page, and its refused rows ha
 ERROR lines. An error in either write or its row that is not a store refusal still ends the pass,
 and that account gets no `ad_session_revoked` alert; a role change's `no_enabled_administrator`
 and `administrator_granted` alerts are raised before it. The error is raised only after that
-account's revoke has been tried, again without its row if the row raised. A revoke that raises
-twice is raised after a role change's user is told of it; any other revocation's user is told
-nothing then. A revoke that lands, with only its row raising, sends the notice the revocation is
+account's revoke has been tried, again without its row if the row raised. The revoke without its
+row is retried and recorded as the post-commit revoke is (vault BACKLOG #3023, above). A revoke
+given up on is raised after a role change's user is told of it; any other revocation's user is
+told nothing then. A revoke that lands, with only its row raising, sends the notice the revocation is
 due, if any, before the error is raised. When the role write's retry found its read-back refused, the row written on its own
 carries `"read_back": "refused"`. Any notice that account was due still goes. Its alert still goes too, unless something
 later in the same pass raises and ends it. A later refused audit write does not end the pass. The `auth.ad_username_refreshed` row is different: it commits in
