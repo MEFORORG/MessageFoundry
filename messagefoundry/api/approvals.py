@@ -733,7 +733,9 @@ class ApprovalGate:
         moves to ``interrupted`` with an ``approval.interrupted`` audit row in the SAME write
         (vault BACKLOG #2255), whose ``reason`` is ``engine_restart``. The move keeps the row's
         ``decided_at``, the claim time. Nothing re-runs: an operator records what happened through
-        :meth:`resolve_interrupted`, exactly as for a release cut off by a cancel.
+        :meth:`resolve_interrupted`, exactly as for a release cut off by a cancel. A second app's
+        call in the same process also moves such a row of THIS life that no gate runs, with the
+        same ``engine_restart`` reason, though nothing restarted.
 
         **Only this process's rows.** Engine shards and cluster nodes share one store, so an
         ``executing`` row may be a sibling's release still running. A row moves only when its
