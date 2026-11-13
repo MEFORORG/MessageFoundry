@@ -4,9 +4,14 @@
 
 from __future__ import annotations
 
+import os
+import sqlite3
+import stat
 from pathlib import Path
 
-from tee.store import RelayStore
+import pytest
+
+from tee.store import PurgeIncompleteError, RelayStore
 
 
 async def _open(tmp_path: Path) -> RelayStore:
@@ -220,3 +225,92 @@ async def test_export_naks_only_and_limit(tmp_path: Path) -> None:
         assert [r["control_id"] for r in limited["rows"]] == ["C3"]  # the most recent
     finally:
         await store.close()
+
+
+# --- BACKLOG #5637: WAL-sibling permissions and purged-body residue -----------------------------
+#
+# A synthetic capture body with a marker that cannot occur by chance in SQLite's own page headers or
+# schema text, so its bytes on disk prove a purged body survived. No PHI: the HL7 is invented.
+_MARKER = b"ZZPURGEMARKER5637QX"
+_MARKER_BODY = b"MSH|^~\\&|TEE|TEST|||20260101000000||ADT^A01|C5637|P|2.5.1\rPID|1||" + _MARKER
+
+
+def _on_disk(path: Path) -> bytes:
+    """The DB file plus its -wal sibling, as raw bytes (an absent -wal reads as empty)."""
+    wal = Path(f"{path}-wal")
+    return path.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
+
+
+async def test_purge_leaves_no_body_bytes_in_wal_or_db(tmp_path: Path) -> None:
+    # A second connection held open is the realistic case: with only one connection, closing it
+    # checkpoints and deletes the -wal, which would hide residue that a live peer keeps on disk.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    peer = sqlite3.connect(db_path)
+    try:
+        peer.execute("SELECT COUNT(*) FROM relay_log").fetchall()  # attach to the WAL, no txn held
+        await store.record_capture(direction="corepoint_copy", control_id="C5637", raw=_MARKER_BODY)
+        assert _MARKER in _on_disk(db_path)  # positive control: the instrument sees the body
+        assert await store.purge(captures_only=True) == (0, 1)
+        assert _MARKER not in _on_disk(db_path)
+        assert Path(f"{db_path}-wal").stat().st_size == 0  # TRUNCATE checkpoint emptied the WAL
+    finally:
+        peer.close()
+        await store.close()
+
+
+async def test_purge_refuses_to_report_clean_when_checkpoint_is_busy(tmp_path: Path) -> None:
+    # A peer holding a read transaction pins the WAL, so a TRUNCATE checkpoint cannot finish. Purge
+    # must say so rather than return counts that read as a clean purge.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    await store._db.execute("PRAGMA busy_timeout=0")  # noqa: SLF001 - keep the busy wait short
+    await store.record_capture(direction="corepoint_copy", control_id="C5637", raw=_MARKER_BODY)
+    peer = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        peer.execute("BEGIN")
+        peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # holds the read snapshot
+        with pytest.raises(PurgeIncompleteError) as excinfo:
+            await store.purge(captures_only=True)
+        assert (excinfo.value.log_rows, excinfo.value.capture_rows) == (0, 1)
+        peer.execute("COMMIT")
+        # Once the reader lets go, a re-run completes and scrubs the residue.
+        assert await store.purge(captures_only=True) == (0, 0)
+        assert _MARKER not in _on_disk(db_path)
+    finally:
+        peer.close()
+        await store.close()
+
+
+async def test_secure_delete_is_on(tmp_path: Path) -> None:
+    store = await _open(tmp_path)
+    try:
+        cur = await store._db.execute("PRAGMA secure_delete")  # noqa: SLF001 - test introspection
+        row = await cur.fetchone()
+        assert row is not None and int(row[0]) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits; the Windows DACL half is open")
+async def test_wal_siblings_recreated_after_open_inherit_owner_only_mode(tmp_path: Path) -> None:
+    # Reviewed not-a-bug check for the POSIX half of #5637: SQLite creates -wal and -shm with the
+    # main DB file's mode (unix VFS findCreateFileMode), so siblings re-created long after open's
+    # chmod are 0600 even under a permissive umask. Switching the journal mode away and back removes
+    # both siblings, and the next write re-creates them after _secure_file has already run.
+    db_path = tmp_path / "tee.db"
+    old_umask = os.umask(0)
+    try:
+        store = await RelayStore.open(str(db_path))
+        try:
+            await store._db.execute("PRAGMA journal_mode=DELETE")  # noqa: SLF001
+            assert not Path(f"{db_path}-wal").exists()
+            await store._db.execute("PRAGMA journal_mode=WAL")  # noqa: SLF001
+            await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|x")
+            for sibling in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+                assert sibling.exists(), sibling
+                assert stat.S_IMODE(sibling.stat().st_mode) == 0o600, sibling
+        finally:
+            await store.close()
+    finally:
+        os.umask(old_umask)

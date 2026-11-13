@@ -24,7 +24,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ["RelayStore", "NakRow", "CaptureRow"]
+__all__ = ["RelayStore", "NakRow", "CaptureRow", "PurgeIncompleteError"]
 
 # Bound the stored detail (an MSA-3 reason or an error string) so a hostile/huge field can't bloat the
 # log, and scrub control characters that could corrupt a terminal when an operator reads it back.
@@ -58,6 +58,21 @@ CREATE INDEX IF NOT EXISTS ix_capture_at ON relay_capture(at);
 
 # An ACK code that means the partner rejected the message (vs AA/CA accepted). Used to flag NAK rows.
 _NAK_CODES = ("AE", "AR", "CE", "CR")
+
+
+class PurgeIncompleteError(RuntimeError):
+    """The rows were deleted and committed, but a TRUNCATE checkpoint stayed busy, so purged bodies
+    may still sit in the -wal file or the main file's old pages. Re-run purge once no other process
+    holds the database open in a read transaction."""
+
+    def __init__(self, *, log_rows: int, capture_rows: int, phase: str) -> None:
+        self.log_rows = log_rows
+        self.capture_rows = capture_rows
+        super().__init__(
+            f"purge deleted {log_rows} log row(s) and {capture_rows} capture row(s), but the WAL"
+            f" checkpoint {phase} stayed busy: another connection holds the database open, so"
+            " purged bytes may remain on disk. Close the other reader and re-run purge."
+        )
 
 
 @dataclass(frozen=True)
@@ -164,7 +179,13 @@ def _precreate_secure(path: str) -> None:
 
 def _secure_file(path: str) -> None:
     """Best-effort owner-only permissions on the DB file **and its WAL/SHM siblings** (which WAL mode
-    creates and which can hold message data when body capture is on)."""
+    creates and which can hold message data when body capture is on).
+
+    On POSIX a sibling SQLite re-creates later, after this one-time chmod, still comes out 0600:
+    the unix VFS gives -wal and -shm the main file's mode whatever the umask, which
+    test_wal_siblings_recreated_after_open_inherit_owner_only_mode pins. On Windows chmod sets only
+    the read-only bit, so none of the three files is restricted to the owner here; that half is
+    open (BACKLOG #5637) and the protected-volume advice below is the only control there today."""
     for sibling in (path, path + "-wal", path + "-shm"):
         try:  # noqa: SIM105 - suppress() would drop the rationale recorded in the handler below
             os.chmod(sibling, 0o600)
@@ -194,6 +215,9 @@ class RelayStore:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.execute("PRAGMA busy_timeout=5000")
+        # Zero freed content instead of only unlinking it, so a deleted capture body leaves no
+        # readable bytes in a free page. Per-connection, so set on the store's one connection.
+        await db.execute("PRAGMA secure_delete=ON")
         await db.executescript(_SCHEMA)
         await db.commit()
         if path != ":memory:":
@@ -313,6 +337,16 @@ class RelayStore:
             for row in rows
         ]
 
+    async def _checkpoint_truncate(self) -> bool:
+        """Copy every WAL frame into the main file and truncate the -wal to zero bytes.
+
+        The result row is ``(busy, log, checkpointed)``; only ``busy == 0`` means the WAL was fully
+        copied back and truncated. busy_timeout already makes the checkpoint wait for a reader."""
+        cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        row = await cur.fetchone()
+        await cur.close()  # a still-open PRAGMA cursor would hold a statement against VACUUM
+        return row is not None and int(row[0]) == 0
+
     async def purge(
         self, *, before: float | None = None, captures_only: bool = False
     ) -> tuple[int, int]:
@@ -321,6 +355,12 @@ class RelayStore:
         ``before=None`` purges **everything**; ``before=<epoch>`` purges only rows older than it.
         ``captures_only`` leaves the relay_log (the NAK/leg audit) intact and drops only the captured
         message bodies (the PHI-bearing table). Returns ``(relay_log rows, relay_capture rows)`` deleted.
+
+        In WAL mode a delete and a ``VACUUM`` write new pages to the -wal file and leave the old
+        frames, body bytes included, on disk until a checkpoint. So the sequence is: delete and
+        commit (secure_delete zeroes the freed pages), TRUNCATE checkpoint, ``VACUUM``, TRUNCATE
+        checkpoint. Raises :class:`PurgeIncompleteError` if either checkpoint stays busy, because
+        returning the counts then would read as a clean purge that did not happen.
         """
         async with self._lock:
             # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
@@ -342,7 +382,16 @@ class RelayStore:
             cap_n = cap.rowcount
             log_n = 0 if log is None else log.rowcount
             await self._db.commit()
-            await self._db.execute("VACUUM")  # reclaim freed pages (esp. after dropping bodies)
+            # The first checkpoint fails fast, before a VACUUM a pinned WAL would leave on disk.
+            if not await self._checkpoint_truncate():
+                raise PurgeIncompleteError(
+                    log_rows=log_n, capture_rows=cap_n, phase="before VACUUM"
+                )
+            await self._db.execute(
+                "VACUUM"
+            )  # rebuild without the freed pages (esp. dropped bodies)
+            if not await self._checkpoint_truncate():
+                raise PurgeIncompleteError(log_rows=log_n, capture_rows=cap_n, phase="after VACUUM")
         return (log_n, cap_n)
 
     async def export(
