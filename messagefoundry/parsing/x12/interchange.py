@@ -81,9 +81,11 @@ def split(raw: str) -> list[str]:
       swallow the next one; that ``ISA`` starts the next element. A later ``ISA`` behind anything
       else, such as a BOM or junk, does not end the walk. A passing interchange that reaches the
       end of the buffer with neither is the final element.
-    * An ``ISA`` that fails, or one too short to hold a header, is a malformed interchange. It ends
-      at its own ``IEA``, read the same way, or at the next ``ISA`` that passes, wherever that is,
-      whichever comes first.
+    * An ``ISA`` that fails, or one too short to hold a header, is a malformed interchange. One
+      that fails ends at its own ``IEA``, read the same way, or at the next ``ISA`` that passes,
+      wherever that is, whichever comes first. One too short to hold a header has no terminator to
+      read, so it ends at the next ``ISA`` that passes, its own ``IEA`` and anything after it
+      included.
     * A run that does not open with ``ISA`` is returned as its own element and ends at the next
       ``ISA`` that passes, so a trigram in it ("VISA", "ISAAC") does not end it.
     * A malformed or non-ISA element that ends at a later ``ISA`` loses the whitespace/BOM before
