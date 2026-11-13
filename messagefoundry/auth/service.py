@@ -11453,10 +11453,12 @@ class AuthService:
                 committed = "roles_unconfirmed"
             else:
                 roles_changed, pending = roles.result, roles.held
-                # Only a first write that landed is known to have committed: a retried one may
-                # count a write read back as refused, or another writer's.
-                if roles_changed:
-                    committed = "roles" if not roles.retried else "roles_unconfirmed"
+                # A first write's answer is known. A retried one's is not either way: the first
+                # write may have committed with its reply lost, whatever the retry then read.
+                if roles.retried:
+                    committed = "roles_unconfirmed"
+                elif roles_changed:
+                    committed = "roles"
             if not roles_changed:
                 # The roles moved after the read above, or the row went. The writer that moved
                 # them, a second reconciler or a directory sign-in, owns that change and its report;
@@ -12116,17 +12118,19 @@ class AuthService:
         if reconciled is None:
             after, later = f"a committed {change}", ""
         else:
-            after = (
-                f"the directory reconciler's {change} revocation, "
-                + {
-                    "roles": "whose role write committed",
-                    "roles_unconfirmed": "whose role write may have committed",
-                    "nothing": "which committed no change",
-                }[reconciled]
-            )
+            what = {
+                "roles": "its role write committed",
+                "roles_unconfirmed": "its role write may have committed",
+                "nothing": "it committed no change",
+            }[reconciled]
+            after = f"the directory reconciler's {change} revocation ({what})"
+            # A pass plans a role revocation from a difference between the stored roles and the
+            # directory's, so once its role write is stored no pass plans it again.
             later = (
                 "; a later reconcile pass plans the revocation again only if it probes the account"
                 " and the directory still calls for it"
+                if reconciled == "nothing"
+                else "; no later reconcile pass plans it again once that role write is stored"
             )
         _log.error(
             "auth: the session revoke of account %s after %s was given up on after %d attempt(s),"

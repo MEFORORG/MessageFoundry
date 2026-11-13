@@ -6939,7 +6939,7 @@ async def test_a_reconciler_revoke_refused_every_time_is_recorded_and_raised(
         ):
             await service.reconcile_directory_sessions()
         assert _logged_at_error(
-            caplog, f"account {calls[0]} after", "which committed no change", "may stay live"
+            caplog, f"account {calls[0]} after", "(it committed no change)", "may stay live"
         )
         assert len(calls) == service_module._POST_COMMIT_REVOKE_ATTEMPTS
         assert set(calls) == {calls[0]}, "the pass went on to the next account"
@@ -8151,6 +8151,9 @@ async def test_a_revoke_given_up_on_after_a_committed_role_change_still_tells_th
             )
         assert sorted(await store.get_user_role_ids(revocation.user_id)) == sorted(target)
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
+        # Vault BACKLOG #3023: the miss row says the role write committed.
+        [missed] = await store.list_audit(action=SESSIONS_REVOKE_FAILED_ACTION)
+        assert json.loads(missed["detail"])["committed"] == "roles"
     finally:
         await store.close()
 
