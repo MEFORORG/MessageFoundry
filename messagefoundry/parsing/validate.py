@@ -33,15 +33,16 @@ line's text: ``segment ORC at line N ...``, ``unknown segment at line N`` or ``u
 N``. Where the structure has HL7's "any HL7 segment" slot, which hl7apy's tables spell
 ``ANYHL7SEGMENT`` and its grouping never fills (MFN_M01 and QVR_Q17 among others), a dropped
 segment whose ID the message's version defines, followed by a field separator, is not refused; it
-is listed in :attr:`ValidationResult.unvalidated_segments` as a Z-segment is. An ID the version
-does not define, and a bare defined ID with no field separator, are still refused. The exemption
-is per structure, not per slot: it does not count against the slot's cardinality or position. It
-holds only where MSH-9.1 names the structure's own message code, so a structure borrowed through
-MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none; one borrowed under the same
-code (``MFN^M02^MFN_M01``) still gets it. Where the slot sits inside a nested group (PRR_PC5,
-PPV_PCA), such a segment can still break hl7apy's grouping of what follows. Segment order is not
-checked as such:
-hl7apy keeps each segment where the message has it, so an out-of-order message may pass.
+is listed in :attr:`ValidationResult.unvalidated_segments`, but only when the comparison runs,
+which is when no earlier check refused the message (a Z-segment is always listed). A dropped ID
+the version does not define, and a dropped bare defined ID with no field separator, are still
+refused. The exemption is per structure, not per slot: it does not count against the slot's
+cardinality or position. It holds only where MSH-9.1 names the structure's own message code, so a
+structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none; one
+borrowed under the same code (``MFN^M02^MFN_M01``) still gets it. Where the slot sits inside a
+nested group (at least PRR_PC5 and PPV_PCA), such a segment can still break hl7apy's grouping of
+what follows. Segment order is not checked as such: hl7apy keeps each segment where the message
+has it, so an out-of-order message may pass.
 
 It is slower and far stricter than :mod:`~messagefoundry.parsing.peek`, so it runs only when
 a channel sets ``validation.strict = true`` and is kept off the routing hot path.
@@ -354,7 +355,8 @@ def _exempts_defined_segments(message: Any) -> bool:
     borrow MFN_M01's slot for an ADT body. The exemption holds only where MSH-9.1 names the
     structure's own message code, which fails closed on a structure borrowed under another code.
     One borrowed under the same code (``MFN^M02^MFN_M01``) still gets it: MSH-9.2 is not
-    compared, since a wildcard structure (MFN_Znn, RTB_Knn) serves many trigger events."""
+    compared, since one structure can serve several trigger events (PGL_PC6 serves PC6 to PC8,
+    for one)."""
     code = message.msh.msh_9.msh_9_1.to_er7()
     return code == message.name.split("_", 1)[0] and _has_any_segment_slot(
         message.name, message.classname, message.version
@@ -387,7 +389,7 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
             [],
         )
     defined = hl7apy.load_library(message.version).SEGMENTS
-    exempts = _exempts_defined_segments(message)
+    exempts: bool | None = None  # read once, on the first dropped defined segment
     refusals: list[str] = []
     exempted: list[tuple[str, int]] = []
     for name, number in lines.segments:
@@ -396,6 +398,8 @@ def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[s
         elif _SEGMENT_ID.fullmatch(name) is None:
             refusals.append(f"unrecognised line {number}")
         elif name in defined:
+            if exempts is None:
+                exempts = _exempts_defined_segments(message)
             if exempts and number not in lines.bare:
                 exempted.append((name, number))
             else:
@@ -416,9 +420,9 @@ class ValidationResult:
     re-deriving that measurement (BACKLOG #2105).
 
     ``unvalidated_segments`` lists the segments strict validation left unchecked, the Z-segments
-    and those the "any HL7 segment" exemption let through, each as its ``(segment ID, 1-based
-    position)`` in position order; the module docstring has the rule. No engine surface shows it
-    yet."""
+    and, when the dropped-segment comparison ran, those the "any HL7 segment" exemption let
+    through, each as its ``(segment ID, 1-based position)`` in position order; the module
+    docstring has the rule. No engine surface shows it yet."""
 
     ok: bool
     version: str | None

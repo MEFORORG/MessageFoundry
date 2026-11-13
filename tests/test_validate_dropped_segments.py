@@ -154,7 +154,7 @@ def test_a_defined_segment_in_an_any_hl7_segment_slot_is_not_refused_and_is_list
     assert result.unvalidated_segments == listed
 
 
-def test_a_bare_defined_id_in_a_wildcard_message_is_refused() -> None:
+def test_a_bare_defined_id_in_an_any_segment_message_is_refused() -> None:
     """A lone ``ORC`` line, with no field separator, is refused as it is in any other message."""
     result = validate(_MFN_M01 + "\rORC")
     assert not result.ok
@@ -200,7 +200,7 @@ def test_a_segment_in_a_nested_slot_can_break_hl7apys_grouping() -> None:
         pytest.param("hello world", "unrecognised line 4", id="non-hl7-text"),
     ],
 )
-def test_a_wildcard_message_still_refuses_what_its_version_does_not_define(
+def test_an_any_segment_message_still_refuses_what_its_version_does_not_define(
     extra: str, error: str
 ) -> None:
     result = validate(_MFN_M01 + "\r" + extra)

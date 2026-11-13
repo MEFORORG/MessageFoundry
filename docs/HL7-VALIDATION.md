@@ -81,8 +81,10 @@ the comparison.** `hl7apy`'s table for the message's version marks that slot (in
 `MFN_M01` and `QVR_Q17`; which structures carry it varies by version) but its grouping never fills
 it. So in such a message the comparison does not refuse a segment that version defines, followed
 by a field separator, in any number and wherever it sits, and lists it in `unvalidated_segments`
-with its position, as it lists a Z-segment. A segment ID the version does not define is still
-refused, and so is a bare defined ID with no field separator (a lone `ORC` line). Every dropped
+with its position, as it lists a Z-segment, though only when the comparison runs: a message an
+earlier check refused lists its Z-segments alone. A dropped segment ID the version does not define
+is still refused, and so is a dropped bare defined ID with no field separator (a lone `ORC` line
+in `MFN_M01`); a bare line `hl7apy` placed is not. Every dropped
 segment is refused where MSH-9.3 borrows a slot-bearing structure under another message code
 (`ADT^A01^MFN_M01`); a structure borrowed under the same message code (`MFN^M02^MFN_M01`) still
 gets the exemption, since MSH-9.2 is not compared. Where the slot is required and its group is
