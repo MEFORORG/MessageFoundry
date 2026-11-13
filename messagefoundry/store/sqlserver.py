@@ -2196,6 +2196,15 @@ async def _log_orphans_deleted(cur: Any) -> None:
         )
 
 
+async def _hold_account_row(cur: Any, user_id: str, hints: str) -> None:
+    """Lock the account's ``users`` row under ``hints`` inside the caller's transaction, the one
+    spelling of the account-first lock every write keyed to an account takes before its own row
+    (BACKLOG #2733, #4974): ``UPDLOCK`` for a writer of the account or its sessions, ``HOLDLOCK``
+    for a sign-in address write, and ``XLOCK`` for the user delete. The row is drained, not read."""
+    await cur.execute(f"SELECT id FROM users WITH ({hints}) WHERE id=?", (user_id,))
+    await cur.fetchall()
+
+
 _SCHEMA: list[str] = [
     # Single-row marker recording which shipped DDL batch was last applied (the sha256 of this very
     # list — see _schema_hash). Lets a re-open of a current database SKIP the whole guarded batch +
@@ -15034,8 +15043,7 @@ class SqlServerStore:
         Transit Outage tripped still holds every account row before its session sweep, the lock
         order :meth:`revoke_all_sessions` relies on (decision d20261109T200352805-599b24, item
         2)."""
-        await cur.execute("SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (user_id,))
-        await cur.fetchall()
+        await _hold_account_row(cur, user_id, "UPDLOCK, ROWLOCK")
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -15615,8 +15623,7 @@ class SqlServerStore:
         delete waits on that address row: a deadlock. Shared, as ``create_session``'s unguarded read
         is, so parallel sign-ins of one account do not wait on each other; nothing that takes it
         writes the account row, so no two holders can each wait to convert it."""
-        await cur.execute("SELECT id FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?", (user_id,))
-        await cur.fetchall()
+        await _hold_account_row(cur, user_id, "HOLDLOCK, ROWLOCK")
 
     async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
         """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
@@ -15793,8 +15800,7 @@ class SqlServerStore:
         # the passkey and role writes (_read_user_record), the sign-in, the session writes
         # (_write_session_txn, revoke_user_sessions) and the sign-in address writes
         # (remember_login_address, reset_login_addresses).
-        await cur.execute("SELECT id FROM users WITH (XLOCK, ROWLOCK) WHERE id=?", (user_id,))
-        await cur.fetchall()
+        await _hold_account_row(cur, user_id, "XLOCK, ROWLOCK")
         await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))

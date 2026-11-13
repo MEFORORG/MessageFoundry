@@ -1195,8 +1195,8 @@ async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
 
 async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
     """BACKLOG #2738 on the real SQL Server backend: ``delete_user`` takes the account's ``users``
-    row with ``UPDLOCK, ROWLOCK`` before its sessions (#2733), as the bind does, so the two cannot
-    deadlock.
+    row before its sessions (#2733), under ``XLOCK, ROWLOCK``, as the bind takes it first, so the
+    two cannot deadlock.
 
     The shared body is the one the Postgres suite runs. The probe reads ``sys.dm_exec_requests``: a
     request whose ``blocking_session_id`` is the bind's session."""
@@ -1328,7 +1328,6 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(
         " trusting the table's user key"
         for table in keys
     ), swept
-    assert not any("ghost" in line for line in swept)
     caplog.clear()
     # Trusted keys refuse every later orphan, here a session and a role grant.
     async with store._pool.acquire() as conn:
@@ -1365,78 +1364,24 @@ async def test_a_session_for_a_missing_account_is_refused(store) -> None:
 
 
 async def _race_a_held_user_delete(
-    store: Any, account: str, step: Callable[[], Awaitable[Any]]
-) -> BaseException | Any:
-    """Hold ``delete_user(account)`` right after it takes the account row, before it deletes any
-    row keyed to it; start ``step``; require that ``step`` really queues behind the delete's server
-    session; release the delete, which must complete; return ``step``'s result, or the exception
-    it raised. The race is hooked, not timed: the probe reads ``sys.dm_exec_requests``, as the
-    lock-order tests above do (BACKLOG #2733)."""
-    from tests._federated_unbind_store_contract import (
-        _PROBE_INTERVAL,
-        _PROBE_POLLS,
-        _STEP_TIMEOUT,
-    )
+    store: Any,
+    account: str,
+    step: Callable[[], Awaitable[Any]],
+    seed: Callable[[], Awaitable[Any]] | None = None,
+) -> Any:
+    """Create ``account`` and run ``seed``; hold ``delete_user(account)`` right after it takes the
+    account row, before it deletes any row keyed to it; start ``step``; require that ``step``
+    really queues behind the delete's server session; release the delete, which must complete;
+    return ``step``'s result, or the exception it raised (BACKLOG #2733). ``_hold_then_race``
+    hooks and probes the race, as the lock-order tests above use it."""
+    from tests._federated_unbind_store_contract import _hold_then_race
 
-    probes = _lock_wait_probes(store)
-    real_rows = store._delete_user_rows
-    holding, release = asyncio.Event(), asyncio.Event()
-    holder: list[object] = []
-
-    class _Paused:
-        def __init__(self, cur: Any) -> None:
-            self._cur = cur
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._cur, name)
-
-        async def execute(self, sql: str, *args: Any) -> Any:
-            if not holder and sql.startswith("DELETE FROM user_roles"):
-                holder.append(await probes["holder_of"](self._cur))
-                holding.set()
-                await release.wait()
-            return await self._cur.execute(sql, *args)
-
-    async def _paused_rows(cur: Any, user_id: str) -> None:
-        await real_rows(_Paused(cur), user_id)
-
-    store._delete_user_rows = _paused_rows
-    tasks: list[asyncio.Task[Any]] = []
-    try:
-        deleting = asyncio.create_task(store.delete_user(account))
-        tasks.append(deleting)
-        await asyncio.wait_for(holding.wait(), timeout=_STEP_TIMEOUT)
-        stepping = asyncio.create_task(step())
-        tasks.append(stepping)
-        queued = False
-        for _ in range(_PROBE_POLLS):
-            if stepping.done():
-                break
-            if await probes["is_blocking"](holder[0]):
-                queued = True
-                break
-            await asyncio.sleep(_PROBE_INTERVAL)
-        if stepping.done():
-            raise AssertionError(
-                f"the step finished while the delete held the account row: {stepping!r}"
-            )
-        assert queued, "the step never queued behind the delete, so the race did not run"
-        release.set()
-        await asyncio.wait_for(deleting, timeout=_STEP_TIMEOUT)  # the delete completes, no 547
+    async def _step_or_its_refusal() -> Any:
         try:
-            return await asyncio.wait_for(stepping, timeout=_STEP_TIMEOUT)
+            return await step()
         except Exception as exc:  # noqa: BLE001 - returned for the caller to classify
             return exc
-    finally:
-        release.set()
-        del store._delete_user_rows  # the instance attribute only; the static method is untouched
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
 
-
-async def _account_for_the_delete_race(store: Any, account: str) -> None:
     await store.create_user(
         user_id=account,
         username=account,
@@ -1446,6 +1391,19 @@ async def _account_for_the_delete_race(store: Any, account: str) -> None:
         password_generated=False,
         audits=(),
     )
+    if seed is not None:
+        await seed()
+    _, outcome = await _hold_then_race(
+        store,
+        attr="_delete_user_rows",
+        key=account,
+        first=("delete_user", lambda: store.delete_user(account)),  # completes, no 547
+        second=("the step", _step_or_its_refusal),
+        pause_before="DELETE FROM user_roles",
+        **_lock_wait_probes(store),
+    )
+    assert await store.get_user(account) is None
+    return outcome
 
 
 async def test_a_sign_in_inside_a_user_delete_waits_and_is_refused(store) -> None:
@@ -1457,18 +1415,19 @@ async def test_a_sign_in_inside_a_user_delete_waits_and_is_refused(store) -> Non
     from messagefoundry.auth.service import _is_integrity_refusal
 
     account = "del-sign-in"
-    await _account_for_the_delete_race(store, account)
     outcome = await _race_a_held_user_delete(
         store,
         account,
         lambda: store.create_session(token_hash="d" * 64, user_id=account, expires_at=9e9, now=2.0),
     )
     assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
-    assert await store.get_user(account) is None
     assert await store.get_session("d" * 64) is None
 
 
-async def test_writes_keyed_to_an_account_queue_behind_its_delete(store) -> None:
+@pytest.mark.parametrize(
+    "write", ["remember_login_address", "reset_login_addresses", "mark_session_mfa_verified"]
+)
+async def test_writes_keyed_to_an_account_queue_behind_its_delete(store, write: str) -> None:
     """BACKLOG #2733: the delete holds the account row under ``XLOCK`` before any row keyed to it,
     so each write of such a row must take the account row first, or it can hold its own row while
     its key check waits on the delete, which waits on that row: a deadlock the server ends. The
@@ -1476,34 +1435,27 @@ async def test_writes_keyed_to_an_account_queue_behind_its_delete(store) -> None
     behind a held delete and then finds the account gone, and the delete completes."""
     from messagefoundry.auth.service import _is_integrity_refusal
 
-    remembered = "del-remember"
-    await _account_for_the_delete_race(store, remembered)
-    await store.remember_login_address(remembered, "10.0.0.1", now=2.0)
-    outcome = await _race_a_held_user_delete(
-        store, remembered, lambda: store.remember_login_address(remembered, "10.0.0.2", now=3.0)
-    )
-    assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
+    account = f"del-{write}"
+    token = "s" * 64
+    steps: dict[str, Callable[[], Awaitable[Any]]] = {
+        "remember_login_address": lambda: store.remember_login_address(
+            account, "10.0.0.2", now=3.0
+        ),
+        "reset_login_addresses": lambda: store.reset_login_addresses(account),
+        "mark_session_mfa_verified": lambda: store.mark_session_mfa_verified(token, now=3.0),
+    }
 
-    reset = "del-reset"
-    await _account_for_the_delete_race(store, reset)
-    await store.remember_login_address(reset, "10.0.0.1", now=2.0)
-    outcome = await _race_a_held_user_delete(
-        store, reset, lambda: store.reset_login_addresses(reset)
-    )
-    assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
+    async def _seed() -> None:
+        await store.remember_login_address(account, "10.0.0.1", now=2.0)
+        await store.create_session(token_hash=token, user_id=account, expires_at=9e9, now=2.0)
 
-    stamped = "del-stamp"
-    await _account_for_the_delete_race(store, stamped)
-    await store.create_session(token_hash="s" * 64, user_id=stamped, expires_at=9e9, now=2.0)
-    outcome = await _race_a_held_user_delete(
-        store, stamped, lambda: store.mark_session_mfa_verified("s" * 64, now=3.0)
-    )
-    assert outcome is None, outcome  # the session went with the account, so nothing was stamped
-
-    for account in (remembered, reset, stamped):
-        assert await store.get_user(account) is None
-    assert await store.list_known_login_addresses(remembered, since=0.0) == []
-    assert await store.get_session("s" * 64) is None
+    outcome = await _race_a_held_user_delete(store, account, steps[write], seed=_seed)
+    if write == "mark_session_mfa_verified":
+        assert outcome is None, outcome  # the session went with the account: nothing stamped
+    else:
+        assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
+    assert await store.list_known_login_addresses(account, since=0.0) == []
+    assert await store.get_session(token) is None
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:

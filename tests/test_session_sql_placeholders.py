@@ -256,6 +256,8 @@ async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
 
 _OWNER_READ = "SELECT user_id FROM sessions WHERE token_hash=?"
 _ACCOUNT_LOCK = "SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?"
+_ACCOUNT_SHARE = "SELECT id FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?"
+_ACCOUNT_DELETE_LOCK = "SELECT id FROM users WITH (XLOCK, ROWLOCK) WHERE id=?"
 
 
 #: Each session write that rewrites the whole row, ``user_id`` included, through
@@ -305,14 +307,14 @@ async def test_sqlserver_session_rewrites_lock_the_account_row_before_the_sessio
 @pytest.mark.parametrize(
     ("call", "lock"),
     [
-        (lambda s: s.delete_user("u"), "SELECT id FROM users WITH (XLOCK, ROWLOCK) WHERE id=?"),
+        (lambda s: s.delete_user("u"), _ACCOUNT_DELETE_LOCK),
         (
             lambda s: s.remember_login_address("u", "10.0.0.1", now=_NOW),
-            "SELECT id FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
+            _ACCOUNT_SHARE,
         ),
         (
             lambda s: s.reset_login_addresses("u"),
-            "SELECT id FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
+            _ACCOUNT_SHARE,
         ),
     ],
     ids=["delete_user", "remember_login_address", "reset_login_addresses"],
