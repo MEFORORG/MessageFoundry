@@ -2922,11 +2922,15 @@ follow-on and is **not** built.
 request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. The
 Sender/Receiver class is read only from the Fault's first child element: SOAP 1.2's `Code`, then the
 `Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or
-processing instruction before either child is stepped over; one that holds a `</Fault>` or `</Code>`
-close tag, or any other `<!` markup such as a DOCTYPE, leaves no code. A Fault whose first child is
-neither, including a SOAP 1.1 Fault whose `faultcode` is not its first child, or whose code element holds
-no code, reads as a permanent fault. The WS-Security check is separate: a WS-Security code anywhere in
-the Fault still dead-letters it. An
+processing instruction before either child is stepped over, with at least these exceptions, each of
+which leaves no code: such markup that has no terminator; a `<!` that opens anything else, such as a
+DOCTYPE; one that holds a `</Fault>` before the code element, or a `</Code>` between the Code and its
+`Value`; and a Fault-named start tag inside such markup in the Body ahead of the real Fault, which is
+still taken as the Fault. A Fault whose first child is neither, including a SOAP 1.1 Fault whose
+`faultcode` is not its first child, or whose code element holds no code, reads as a permanent fault.
+The WS-Security check is separate: a WS-Security code anywhere from where the Fault search starts (after
+the first Body start tag when a Fault follows it, else the whole reply), inside the Fault or not, still
+dead-letters the reply. An
 unrecognized fault is treated as permanent (so a rejected request can't loop the lane). With no fault, the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role
