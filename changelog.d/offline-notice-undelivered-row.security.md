@@ -3,5 +3,5 @@
   that the relay refused left only a WARNING on stderr, while `provision-admin`'s audit row still
   read `holder_notice: dispatched`. Both commands now pass their store, and a failed send writes
   the `auth.security_notice_undelivered` row the running engine writes, with the recipient as the
-  actor. `admin-reset-totp` opens its store again for the notice, because the swap's store is
-  closed by then.
+  actor. `admin-reset-totp`, whose store has closed by then, opens it again for that row, and only
+  when a send failed.

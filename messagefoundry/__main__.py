@@ -105,8 +105,8 @@ if TYPE_CHECKING:
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
-    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
-    from messagefoundry.store.base import AdminStore, AuditStore, Store
+    from messagefoundry.pipeline.security_notify import NoticeAuditSink, SecurityEventNotifier
+    from messagefoundry.store.base import AdminStore, Store
     from messagefoundry.store.custody_host import MintedCustody
     from messagefoundry.store.store import UserRecord
 
@@ -8116,15 +8116,17 @@ def _offline_security_notifier(
     settings: ServiceSettings,
     posture: HopPosture | None = None,
     *,
-    audit: AuditStore | None = None,
+    audit: NoticeAuditSink | None = None,
 ) -> SecurityEventNotifier | None:
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
 
     ``audit`` is where a notice that never left is recorded, as
     ``auth.security_notice_undelivered`` with the recipient as actor (BACKLOG #5634), as the API
-    lifespan records it. Pass the command's store, and keep it open until the notifier's
-    :meth:`~SecurityEventNotifier.aclose` returns: the failed send is recorded during that drain,
-    and a row written to a closed store fails and is swallowed. ``None`` records nothing.
+    lifespan records it. A send can fail, and be recorded, as soon as the notifier is started and
+    fed, and at the latest during its :meth:`~SecurityEventNotifier.aclose` drain, so a store passed
+    here must stay open until ``aclose`` returns: a row written to a closed store fails and is
+    swallowed. A command whose store is already closed passes :class:`_ReopeningNoticeAudit`
+    instead. ``None`` records nothing.
 
     ``posture`` is the caller's instance posture, for the Vault hop a ``[secrets]`` read can dial
     (vault BACKLOG #2983). ``None`` counts as enforcing there. The SMTP login's revocation guard
@@ -8451,7 +8453,8 @@ def _close_late_store(opened: asyncio.Future[Store]) -> None:
         return
     if (exc := opened.exception()) is not None:
         logging.getLogger(__name__).warning(
-            "the alert's store reopen failed after its bound (%s)", type(exc).__name__
+            "a store reopen for an offline alert or notice failed after its bound (%s)",
+            type(exc).__name__,
         )
         return
     _hold_late(asyncio.ensure_future(opened.result().close()), _log_late_close)
@@ -8461,8 +8464,41 @@ def _log_late_close(closing: asyncio.Future[None]) -> None:
     """``on_late`` for the alert's store close, and for a late store's: name a failure's class."""
     if not closing.cancelled() and (exc := closing.exception()) is not None:
         logging.getLogger(__name__).warning(
-            "the alert's store did not close cleanly (%s)", type(exc).__name__
+            "a store reopened for an offline alert or notice did not close cleanly (%s)",
+            type(exc).__name__,
         )
+
+
+class _ReopeningNoticeAudit:
+    """A :class:`NoticeAuditSink` that opens a store only to write the row, for a command whose own
+    store has closed before its notice is drained, as ``admin-reset-totp``'s has (BACKLOG #5634).
+
+    A notice that is sent opens nothing. The open and the close are each bounded by
+    :data:`_OFFLINE_ALERT_REOPEN_SECONDS`, as the alert step bounds its reopen, so a store that
+    stops answering holds the command's report up by that long, not by its driver's own timeout. A
+    failure raises into :meth:`SecurityEventNotifier._record_undelivered`, which logs it by class
+    and swallows it: the notice was best effort, and so is its record."""
+
+    def __init__(self, opener: Callable[[], Awaitable[Store]]) -> None:
+        self._opener = opener
+
+    async def record_audit(
+        self,
+        action: str,
+        *,
+        actor: str | None = None,
+        channel_id: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        store = await _within(self._opener(), _OFFLINE_ALERT_REOPEN_SECONDS, _close_late_store)
+        try:
+            await store.record_audit(
+                action, actor=actor, channel_id=channel_id, detail=detail, client=client, now=now
+            )
+        finally:
+            await _within(store.close(), _OFFLINE_ALERT_REOPEN_SECONDS, _log_late_close)
 
 
 async def _raise_offline_administrator_granted(
@@ -9480,8 +9516,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # not owe. Attached, not passed to the build (#2081). The [alerts] notifier for the
             # administrator_granted alert is built on every run, below (vault BACKLOG #3849 B5).
             existing = await store.get_user_by_username(username)
-            # BACKLOG #5634: the store is the audit sink, so a send that fails during the drain
-            # below writes its undelivered row; the store closes only after that drain.
+            # BACKLOG #5634: the store is the audit sink, so a send that fails, while the service
+            # runs or in the drain below, writes its undelivered row. The store closes only after
+            # that drain.
             security_notifier = (
                 _offline_security_notifier(settings, posture, audit=store)
                 if existing is not None
@@ -10432,37 +10469,21 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         address = (user.notify_email or "").strip()
         if not address:
             return "no_address"
-        if not (settings.alerts.email_smtp_host and settings.alerts.email_from):
-            # The notifier's own first check, made here so a site with no relay opens no store.
+        # BACKLOG #5634: a send that fails is recorded as undelivered. run()'s store is closed by
+        # now, and a row written to it would fail and be swallowed, so the sink opens the store
+        # again for that one write. A notice that is sent opens nothing.
+        notifier = _offline_security_notifier(
+            settings, posture, audit=_ReopeningNoticeAudit(opened)
+        )
+        if notifier is None:
             return "no_channel"
-        # BACKLOG #5634: a send that fails is recorded in the store, during aclose()'s drain, so
-        # the notice runs inside a store's lifetime. run()'s store is closed by now, and a row
-        # written to a closed store would fail and be swallowed. A store that does not reopen
-        # costs the record, never the notice.
-        audit: Store | None
+        notifier.start()
         try:
-            audit = await opened()
-        except Exception as exc:  # noqa: BLE001 - the notice is best effort; it still goes out
-            print(
-                f"WARNING: the store could not be reopened for the notice ({type(exc).__name__}), "
-                "so a failed send of it is not recorded in the audit log.",
-                file=sys.stderr,
+            queued = await notifier.notify(
+                SecurityEvent(event_type=MFA_ENABLED, username=user.username, email=address)
             )
-            audit = None
-        try:
-            notifier = _offline_security_notifier(settings, posture, audit=audit)
-            if notifier is None:
-                return "no_channel"
-            notifier.start()
-            try:
-                queued = await notifier.notify(
-                    SecurityEvent(event_type=MFA_ENABLED, username=user.username, email=address)
-                )
-            finally:
-                await notifier.aclose()
         finally:
-            if audit is not None:
-                await audit.close()
+            await notifier.aclose()
         # What the notifier said it took (vault BACKLOG #3120), never a forecast.
         return "dispatched" if queued else "no_channel"
 
@@ -13305,8 +13326,9 @@ def _warn_on_an_unrevoked_store_hop(settings: ServiceSettings) -> None:
     Called just before each open, and so BEFORE it: the WARNING is logged even when that open then
     refuses for its key, its cipher or its driver, and no connection is made. ``serve`` runs the
     guard inside the open, after the cipher, so it logs nothing in that case. Only a refusal of the
-    command's input or arguments, before this call, logs nothing. A command that opens twice, as
-    ``admin-reset-totp`` does, logs it once per open. Only a verifying PostgreSQL hop has that guard. A weakened one is refused by the
+    command's input or arguments, before this call, logs nothing. A command that opens more than once,
+    as ``admin-reset-totp`` does (twice, and a third time to record a notice whose send failed,
+    BACKLOG #5634), logs it once per open. Only a verifying PostgreSQL hop has that guard. A weakened one is refused by the
     open before the guard would run, so it is skipped here. A context that cannot be built is
     skipped too: the open builds the same context and reports the error itself. At a non-enforcing
     posture the guard warns or allows and does not refuse."""

@@ -342,3 +342,48 @@ def test_admin_reset_totp_records_a_notice_whose_send_failed(
             {"notice": "mfa_enabled", "reason": "send_failed"},
         )
     ]
+
+
+async def test_the_reopening_sink_opens_nothing_for_a_sent_notice_and_survives_a_failed_open(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5634: ``admin-reset-totp``'s sink opens the store only to write the row. A sent
+    notice opens nothing, and a store that will not open costs the record, never the notice."""
+    from messagefoundry.__main__ import _ReopeningNoticeAudit
+
+    opens: list[str] = []
+
+    async def no_store() -> MessageStore:
+        opens.append("open")
+        raise OSError("store gone")
+
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(_SEND, lambda **kw: sent.append(kw))
+    notifier = SecurityEventNotifier(
+        host="smtp.example.org",
+        port=25,
+        sender="mf@example.org",
+        audit=_ReopeningNoticeAudit(no_store),
+    )
+    notifier.start()
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    await notifier.aclose()
+    assert len(sent) == 1 and opens == []
+
+    def boom(**_: Any) -> None:
+        raise OSError("relay down")
+
+    monkeypatch.setattr(_SEND, boom)
+    failing = SecurityEventNotifier(
+        host="smtp.example.org",
+        port=25,
+        sender="mf@example.org",
+        audit=_ReopeningNoticeAudit(no_store),
+    )
+    failing.start()
+    await failing.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    await failing.aclose()
+    assert opens == ["open"]
+    assert [
+        r.getMessage() for r in caplog.records if "could not be recorded" in r.getMessage()
+    ] == ["an undelivered security notice could not be recorded in the audit log (OSError)"]

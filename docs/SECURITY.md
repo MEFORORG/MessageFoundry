@@ -7603,12 +7603,13 @@ notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notic
 notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
-`messagefoundry/pipeline/security_notify.py`. The offline commands that send a notice,
-`provision-admin` and `admin-reset-totp`, record it the same way, into the store the command
-opened (BACKLOG #5634). So a takeover notice whose `auth.first_administrator_provisioned` row reads
-`holder_notice: dispatched` and whose send then failed has an undelivered row after it. Where
-`admin-reset-totp` cannot open its store again for the notice, it says so on stderr, still sends
-the notice, and a failed send is then not recorded. **Still open, at least:**
+`messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
+`admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
+store it holds open, so a takeover notice whose `auth.first_administrator_provisioned` row reads
+`holder_notice: dispatched` and whose send failed has its own undelivered row too. That row can
+come before the provision row in the chain, because the notice is sent while the provision runs.
+`admin-reset-totp` has closed its store by the time the notice is sent, so it opens the store
+again for the row, and only when a send failed. **Still open, at least:**
 
 - At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
   fails in its final drain is recorded. That close is one bounded step of the shutdown. When the
@@ -7619,7 +7620,8 @@ the notice, and a failed send is then not recorded. **Still open, at least:**
 - A notice that reaches the notifier once it has begun to close is refused and recorded with
   `reason: closing`. The close waits only for records started before it finishes. One started
   later can meet the closed store, and is then lost like any failed record write.
-- An offline command such as `provision-admin` wires no audit writer, so it records nothing.
+- Where `admin-reset-totp`'s reopen for that row fails, or takes longer than five seconds, the failed
+  notice is not recorded. The miss is logged by class only.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
