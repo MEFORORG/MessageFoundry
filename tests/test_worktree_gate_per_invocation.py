@@ -326,3 +326,62 @@ def test_a_spacey_quoted_chdir_is_not_guessed_as_the_cwd(rig: SimpleNamespace) -
 def test_a_cd_after_an_inferred_invocation_does_not_refuse_it(rig: SimpleNamespace) -> None:
     cmd = f"git stash && cd {rig.primary.as_posix()} && git -C {rig.outside.as_posix()} rebase main"
     assert _allowed(rig, cmd, rig.outside)
+
+
+# ------------------------------------------------------------------ Manager repair round, same rows
+
+
+def test_an_absolute_own_dash_C_is_read_after_an_unfollowable_chdir(rig: SimpleNamespace) -> None:
+    o, o2, p = rig.outside.as_posix(), rig.outside2.as_posix(), rig.primary.as_posix()
+    cmd = f"cd {o} && git -C {o2} fetch && cd {o2} && git -C {p} reset --hard"
+    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.outside)
+
+
+def test_an_absolute_own_dash_C_into_a_linked_worktree_after_pushd_popd(
+    rig: SimpleNamespace,
+) -> None:
+    o, o2, w = rig.outside.as_posix(), rig.outside2.as_posix(), rig.wt.as_posix()
+    cmd = f"pushd {o} ; popd ; git -C {o2} status ; git -C {w} checkout {rig.other}"
+    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize(
+    ("template", "where", "text"),
+    [
+        ("git -C {o} status ; echo cd ; git reset --hard", "primary", "SHARED PRIMARY"),
+        (
+            "git -C {o2} status ; echo cd ; git worktree remove Primary-wt2",
+            "tmp",
+            "worktree remove",
+        ),
+        ("git -C {o} clean -fd ; echo cd ; git switch {b}", "wt", "LINKED WORKTREE"),
+    ],
+)
+def test_a_chdir_word_that_is_only_an_argument_does_not_switch_the_reading_off(
+    rig: SimpleNamespace, template: str, where: str, text: str
+) -> None:
+    cmd = template.format(o=rig.outside.as_posix(), o2=rig.outside2.as_posix(), b=rig.other)
+    cwd = {"primary": rig.primary, "tmp": rig.tmp, "wt": rig.wt}[where]
+    assert text in _reason(rig, cmd, cwd)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "git stash push -m \"try -C '{p}' later\"",
+        "git stash push -m \"see --work-tree='{p}' bug\"",
+    ],
+)
+def test_a_single_quoted_path_inside_a_double_quoted_message_is_not_a_token(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """Allowed on origin/main; round one's strip made the mention a live path and refused it."""
+    assert _allowed(rig, template.format(p=rig.primary.as_posix()), rig.outside)
+
+
+def test_a_single_quoted_spacey_chdir_is_not_guessed_as_the_cwd(rig: SimpleNamespace) -> None:
+    spacey = rig.tmp / "a b"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(spacey)], check=True, capture_output=True
+    )
+    assert _allowed(rig, f"cd '{spacey.as_posix()}' && git reset --hard", rig.primary)

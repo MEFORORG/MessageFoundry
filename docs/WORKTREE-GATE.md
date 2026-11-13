@@ -131,15 +131,19 @@ for the checkouts named in its allowlist:
 `--git-dir` or `GIT_DIR` is read the same whether it is bare, double-quoted or single-quoted. Until
 BACKLOG #5642 a single-quoted path kept its quotes, named nothing, and was allowed. A quoted path that
 contains a space is still truncated at the space; that residual is listed in the hook beside rule 3d.
+A single-quoted path inside a double-quoted message is left as it was read before #5642.
 
 **Rule 3d judges every invocation on the line.** Each `git worktree remove` or `move` outside quotes is
-judged, with its victim resolved against that invocation's own `-C` tokens as well as against the
-line's first one. Until BACKLOG #5643 only the first match on the raw line was judged, so a quoted
+judged. Its victim is resolved against the line's first `-C`, and also against that invocation's
+own `-C` tokens where they can be read: a chdir before the invocation that the hook cannot follow, with
+no absolute `-C` of the invocation's own, leaves only the first reading. Until BACKLOG #5643 only the first match on the raw line was judged, so a quoted
 mention before the real command, or a second command, let a governed worktree be removed.
 
-**Rules 3 and 3b judge every invocation too.** A `-C` belongs to the git command it is written on, so
-`git -C <elsewhere> status && git reset --hard` run in the primary is refused, and a `-C` on another
-command or inside a quoted message no longer stops the `cd <primary>` reading. Rule 3b is handed every
+**Rules 3 and 3b judge every invocation too.** Each git command is also read with only its own `-C`,
+so `git -C <elsewhere> status && git reset --hard` run in the primary is refused. A `-C` on another
+command or inside a quoted message no longer stops the `cd <primary>` reading, for a `cd` written on
+the same line before the command. At least these are not covered: a `cd` on an earlier line, and a
+chdir the hook cannot follow when the command has no absolute `-C` of its own. Rule 3b is handed every
 invocation on the line, not only the first one carrying a verb. Both closed under BACKLOG #5655.
 
 This list is not the whole rule set. The hook itself,

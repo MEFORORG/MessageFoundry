@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.12.5"
+$GateVersion = "2026.11.13.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -635,11 +635,27 @@ function ConvertFrom-RawDashCValue([string]$Value) {
 # pattern has already taken the shell's double quotes and the capture is `'..'`, text the shell hands
 # git LITERALLY. Stripping that second layer read it as `..` and allowed commands the gate had denied.
 # So the character before the group decides: a `"` there means the shell's quote is gone already.
+#
+# AND NOT INSIDE A DOUBLE-QUOTED SPAN (review of BACKLOG #5642, round 3). On a RAW line the readers also
+# match inside a message: `git stash push -m "try -C '<primary>' later"` captured `'<primary>'`, the
+# strip made it a live path, and an ordinary stash was refused. An odd count of unescaped `"` before the
+# capture means it sits inside such a span, and the capture is returned as it was before #5642. That
+# is a COUNT, not a parse, and it errs toward the pre-change reading in both directions.
 function Get-UnquotedCapture([System.Text.RegularExpressions.Group]$Group, [string]$Text, [switch]$RawDashC) {
-    $value = $Group.Value
+    $value = $Group.Value.Trim()
     if ($Group.Index -gt 0 -and $Text[$Group.Index - 1] -eq [char]'"') { return $value }
+    $before = $Text.Substring(0, $Group.Index)
+    if (([regex]::Matches($before, '(?<![\\`])"')).Count % 2 -eq 1) { return $value }
     if ($RawDashC) { return (ConvertFrom-RawDashCValue $value) }
     Remove-OuterQuotePair $value
+}
+
+# THE CHDIR VERBS, AT COMMAND POSITION ONLY (review of BACKLOG #5655, round 3). The own-window guard
+# asked whether the prefix held a chdir verb ANYWHERE, so `echo cd` read as an unfollowable chdir and
+# switched every added reading off. Same verb list as rule 3c's $chdirVerbs; the position is the line
+# start, a separator, or a group opener.
+function Get-ChdirAtCommandPattern {
+    '(?:^|[;&|(){}])\s*(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)(?=\s|$)'
 }
 
 function Get-ChdirTargetRaw([string]$Text) {
@@ -657,10 +673,7 @@ function Get-ChdirTargetRaw([string]$Text) {
         "(?:^|\s)(?:$chdirComposeVerbs)\s+`"?([^`"&|;]+?)`"?\s*(?:&&|;|\||`$)",
         [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if ($cds.Count -ne 1) { return "" }
-    $chdirTo = $cds[0].Groups[1]
-    $chdirVal = $chdirTo.Value.Trim()
-    if ($chdirTo.Index -gt 0 -and $Text[$chdirTo.Index - 1] -eq [char]'"') { return $chdirVal }
-    Remove-OuterQuotePair $chdirVal
+    Get-UnquotedCapture $cds[0].Groups[1] $Text
 }
 
 # git's global `-C <path>`, as the resolver and rule 3c's window fold both spell it. One spelling of the
@@ -934,15 +947,21 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # answers nothing rather than the cwd (review of BACKLOG #5655). On the scan prefix a quoted target
     # with a space in it is a blanked pair, so `cd "C:/a b" && git reset --hard` fell back to the cwd and
     # denied a command that runs in `C:/a b`. Rule 3c's $pfxFollowable asks the same question.
-    if ($OwnWindow -and -not $cd -and
-        $Prefix -match '(?:^|[\s;&|(){}])(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)(?:\s|$)') {
-        return
-    }
+    #
+    # ONLY WHERE THE ANSWER DEPENDS ON THAT DIRECTORY (round 3): an ABSOLUTE `-C` in the window makes any
+    # earlier chdir irrelevant, so `cd <a> && ... && cd <b> && git -C <primary> reset --hard` is still
+    # read. A chdir target that kept a quote character (the scan's blanked `''` for a single-quoted
+    # target with a space) is unknown too.
     if ($OwnWindow) {
         $winHits = @([regex]::Matches($DashCText, $dashCPattern))
         if ($winHits.Count -ne [regex]::Matches($DashCText, (Get-GitDashCPresencePattern)).Count) { return }
         $dashCs = @($winHits | ForEach-Object { Get-UnquotedCapture $_.Groups[1] $DashCText })
         foreach ($wc in $dashCs) { if ($wc -match '[''"]') { return } }
+        $absoluteOwn = @($dashCs | Where-Object { [System.IO.Path]::IsPathRooted($_) }).Count -gt 0
+        if (-not $absoluteOwn) {
+            if ($cd -match '[''"]') { return }
+            if (-not $cd -and $Prefix -match (Get-ChdirAtCommandPattern)) { return }
+        }
     } elseif ($AllTargets) {
         # [regex]::Matches is case-SENSITIVE by default, which is the same reading `-cmatch` gives, so
         # this changes WHICH MATCHES ARE KEPT and nothing about which text matches.
@@ -4588,10 +4607,13 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     # and otherwise falls back to the cwd. Every invocation is also queued for rule 3b below, which
     # judged only the first verb-bearing segment.
     #
-    # WHAT THIS DOES NOT COVER, read as "at least the following". A chdir the scan prefix cannot follow
-    # (two of them, a subshell, `cd -`) falls back to the cwd; the in-text fallback still catches an
-    # absolute primary path there, but not a relative one. Every resolver residual rule 3d lists
-    # applies, such as a quoted `-C` value containing a space, which yields no candidate at all.
+    # WHAT THIS DOES NOT COVER, read as "at least the following". Where the scan prefix holds a chdir
+    # at command position that it cannot follow (two of them, a subshell, `cd -`, a quoted target with
+    # a space), and the invocation carries no ABSOLUTE `-C` of its own, this reading yields NO
+    # candidate -- it does not fall back to the cwd -- and the command gets only the pre-change
+    # reading; the in-text fallback still catches an absolute primary path written before it. A chdir
+    # on an EARLIER LINE is not read here at all. Every resolver residual rule 3d lists applies, such
+    # as a quoted `-C` value containing a space, which also yields no candidate.
     # =================================================================================================
     $invocations = @()
     $inferredBefore = @()
