@@ -811,6 +811,23 @@ def test_a_component_write_keeps_the_later_repetitions(delims: dict[str, str]) -
     assert reparsed["ZZ1-01"] == f"A{comp}X{comp}E{rep}C{comp}D"
 
 
+@pytest.mark.parametrize("delims", _REPEATING_DELIMS)
+def test_a_component_write_holding_the_repetition_separator_is_refused(
+    delims: dict[str, str],
+) -> None:
+    # The later repetitions are kept as they are, so a separator in the value would put a new
+    # repetition in front of them.
+    msg = X12Message.parse(_repeating(**delims))
+    before = msg.encode()
+    rep = msg.delimiters.repetition
+    assert rep is not None
+    with pytest.raises(ValueError, match="delimiter"):
+        msg.set("ZZ1-01.1", f"X{rep}Y")
+    with pytest.raises(ValueError, match="delimiter"):
+        msg.set_data("ZZ1-01.2", f"X{rep}Y")
+    assert msg.encode() == before
+
+
 def test_a_component_write_into_an_empty_first_repetition() -> None:
     msg = X12Message.parse(_repeating().replace("ZZ1*A:B^", "ZZ1*^"))
     assert msg["ZZ1-01"] == "^C:D"

@@ -8,10 +8,12 @@ is the segment tag, so ``NM1-03`` is the 3rd element of an ``NM1``; ``ISA-06`` t
 id), and an optional 1-based component index. Reads/writes address the **first** occurrence of a
 segment unless ``occurrence=`` is given. In a repeating element (from 00501, where ISA-11 is the
 repetition separator) a component path addresses the **first** repetition and a write keeps the
-rest. A whole-element read returns the raw element, every repetition included; a whole-element
-write refuses the repetition separator, so it replaces the element with one repetition. All
-structure is rebuilt with the interchange's **own** discovered delimiters (never hardcoded), and a write rejects values carrying a delimiter so it can't
-inject new structure. Re-encoding uses the discovered delimiters only, so it is **not** guaranteed
+rest; before 00501, on a 00501 header still carrying the legacy ISA-11 ``U``, and in the ISA, a
+component path reads across the whole element. A whole-element read returns the raw element, every
+repetition included; a whole-element write refuses the repetition separator, so it replaces the
+element with one repetition. All structure is rebuilt with the interchange's **own** discovered
+delimiters (never hardcoded), and a write rejects values carrying a delimiter so it can't inject
+new structure. Re-encoding uses the discovered delimiters only, so it is **not** guaranteed
 byte-identical when the source carried cosmetic whitespace between segments (the store keeps the raw
 verbatim — this model is for transforms). Pure: no I/O, no engine imports.
 """
@@ -96,8 +98,9 @@ class X12Message:
 
     def get(self, path: str, *, occurrence: int = 1) -> str | None:
         """Value at ``path`` (``"ISA-06"``, ``"NM1-03"``, ``"NM1-03.1"``), or None if absent/empty.
-        ``occurrence`` (1-based) selects which segment of that id to read. Outside the ISA, a
-        component is read from the element's first repetition."""
+        ``occurrence`` (1-based) selects which segment of that id to read. Where ISA-11 is the
+        repetition separator, a component outside the ISA is read from the element's first
+        repetition (the module docstring names the exceptions)."""
         seg_id, elem, comp = _parse_path(path)
         seg = self._nth_segment(seg_id, occurrence)
         if seg is None or elem >= len(seg):
@@ -128,7 +131,8 @@ class X12Message:
 
         ``value`` may not contain the element or repetition separator or a segment terminator
         character (incl. CR/LF), nor, in a component write, the component separator — that would
-        inject new structure — and raises ``ValueError`` if it does. Raises ``KeyError`` if the target segment occurrence is absent.
+        inject new structure — and raises ``ValueError`` if it does. Raises ``KeyError`` if the
+        target segment occurrence is absent.
 
         An ``ISA`` write keeps the header's fixed width: a short ``ISA-02``/``04``/``06``/``08`` is
         space-padded on the right and a short all-digit ``ISA-13`` zero-padded on the left, and
