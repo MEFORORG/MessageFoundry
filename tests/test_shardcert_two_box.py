@@ -28,6 +28,7 @@ import pytest
 
 import harness.__main__ as hmain
 import harness.load.shardcert as sc
+from harness.config.shardcert._shape import BROADCAST, PARTITIONED
 from harness.load.coord import DRIVE_START, SHARDS_READY, FileDropCoord
 
 
@@ -45,6 +46,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
         awaited_ports=[],
         resets=[],
         queues=[],
+        pollers=[],
     )
 
     class FakeNode:
@@ -127,8 +129,19 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
             *,
             origin: Any = None,
             allow_insecure: bool = False,
+            cacert: str | None = None,
         ) -> None:
             self.final = types.SimpleNamespace(done=0, dead=0, in_pipeline=0)
+            # What the two-box drives built their poller with: the scheme, the credential marker and
+            # the anchor are the BACKLOG #5640 / #5977 wiring the tests below pin.
+            rec.pollers.append(
+                {
+                    "urls": list(urls),
+                    "token": token,
+                    "allow_insecure": allow_insecure,
+                    "cacert": cacert,
+                }
+            )
 
         async def open(self) -> None:
             return None
@@ -508,3 +521,309 @@ def test_shardcert_driver_cli_threads_args(monkeypatch: pytest.MonkeyPatch, tmp_
     assert captured["sink_host"] == "10.0.0.9"
     coord = captured["coord"]
     assert isinstance(coord, FileDropCoord) and coord.run_id == "cli"
+
+
+# --- BACKLOG #5640: the driver verdict counts the outbound COPIES, not just distinct messages -------
+
+
+def _driver_report(**over: Any) -> sc.ShardCertDriverReport:
+    """A clean two-box driver report at a broadcast fan-out of 4: 10 acked messages, 40 copies."""
+    fields: dict[str, Any] = {
+        "shards": ("a", "b"),
+        "killed_shard": None,
+        "sent": 10,
+        "acked": 10,
+        "delivered_distinct": 10,
+        "sink_received": 40,
+        "acked_not_delivered": 0,
+        "lane_inversions": 0,
+        "lanes_observed": 4,
+        "lane_repeats": 0,
+        "engine_done": 10,
+        "engine_dead": 0,
+        "in_pipeline_final": 0,
+        "drained": True,
+        "drain_seconds": 0.1,
+        "delivering": 4,
+        "routing": BROADCAST,
+    }
+    fields.update(over)
+    return sc.ShardCertDriverReport(**fields)
+
+
+def test_driver_verdict_refuses_a_broadcast_run_that_lost_outbound_copies() -> None:
+    """The tracker counts DISTINCT messages, so one copy of each reaching the sink cleared
+    ``acked_not_delivered`` while three of every four broadcast copies were lost. The verdict now
+    balances the sink count against the fan-out, as the multi-process drive's ``no_loss`` does.
+
+    Mutation: drop the count-balance term from ``ok``. Red: the one-copy run passes."""
+    assert _driver_report().ok
+    one_copy_each = _driver_report(sink_received=10)
+    assert one_copy_each.acked_not_delivered == 0  # the old verdict's only loss signal is clean
+    assert not one_copy_each.ok
+    assert not _driver_report(sink_received=39).ok
+    # No kill: strict. A copy more than the fan-out is a duplicate the run must not certify.
+    assert not _driver_report(sink_received=41).ok
+    assert "expect A*delivering=40" in one_copy_each.render()
+
+
+def test_driver_verdict_on_a_kill_run_allows_redelivery_but_not_loss() -> None:
+    """Across a kill, at-least-once may re-deliver, so the sink may hold MORE copies than the
+    fan-out implies; it may never hold fewer."""
+    assert _driver_report(killed_shard="a", sink_received=44, lane_repeats=4).ok
+    assert not _driver_report(killed_shard="a", sink_received=39).ok
+
+
+def test_driver_verdict_refuses_a_vacuous_fanout() -> None:
+    """A fan-out below 1 balances 0 == 0 and would certify a run that delivered nothing."""
+    assert not _driver_report(delivering=0, sink_received=0).ok
+
+
+def _post_ready(coord: FileDropCoord, *, drop: Sequence[str] = (), **over: Any) -> None:
+    ready: dict[str, Any] = {
+        "shards": ["a", "b"],
+        "inbound_base": 3600,
+        "lanes": 1,
+        "api_ports": [9001, 9002],
+        "sink_base": 3700,
+        "sink_ports": 1,
+        "sink_port": 3700,
+        "killed": None,
+        "dests": 4,
+        "handlers": 4,
+        "delivering": 4,
+        "routing": BROADCAST,
+    }
+    ready.update(over)
+    for key in drop:
+        del ready[key]
+    coord.post(SHARDS_READY, ready)
+
+
+async def test_driver_learns_the_fanout_from_shards_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``delivering`` and ``routing`` come from SHARDS_READY, the engine box's one source of truth,
+    and never from ``dests``: a partitioned run's fan-out is 1 whatever its destination count."""
+    _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id="fan")
+    _post_ready(coord, dests=8, handlers=1, delivering=1, routing=PARTITIONED)
+    report = await sc.run_shardcert_driver(
+        engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
+    )
+    assert report.delivering == 1
+    assert report.routing == PARTITIONED
+    assert "routing=partitioned" in report.render()
+
+
+async def test_driver_defaults_an_older_payload_to_fanout_one_with_a_note(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An engine half that predates the keys sends neither. The driver reads that as fan-out 1 and
+    says so, rather than guessing ``dests``. On a no-kill run at a real fan-out above 1 the sink
+    then holds more copies than 1 per message, so the strict balance fails closed."""
+    _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id="old")
+    _post_ready(coord, drop=("delivering", "routing", "handlers", "dests"))
+    report = await sc.run_shardcert_driver(
+        engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
+    )
+    assert report.delivering == 1
+    assert report.routing == BROADCAST
+    assert any("older engine half" in n for n in report.notes), report.notes
+
+
+# --- BACKLOG #5640 / #5977 (https and session half): the two-box drain poll ------------------------
+
+
+async def test_driver_polls_the_engine_box_over_https_with_the_remote_rig_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The engine box serves TLS with sign-in on, so the default drain poll is https, signed in as
+    the rig Administrator another process provisioned, verified against ``cacert``.
+
+    Mutation: build the URLs with ``http://`` or pass ``None`` as the token. Red: the assert."""
+    from harness.load.rigadmin import REMOTE_RIG_SESSION
+
+    rec = _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id="tls")
+    _post_ready(coord)
+    await sc.run_shardcert_driver(
+        engine_host="10.0.0.5",
+        hold_seconds=0.05,
+        drain_timeout=1.0,
+        coord=coord,
+        cacert="engine-box.pem",
+    )
+    assert rec.pollers == [
+        {
+            "urls": ["https://10.0.0.5:9001", "https://10.0.0.5:9002"],
+            "token": REMOTE_RIG_SESSION,
+            "allow_insecure": False,
+            "cacert": "engine-box.pem",
+        }
+    ]
+
+
+async def test_driver_insecure_keeps_the_plaintext_poll_without_a_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--insecure`` stays the opt-in for an engine box that serves plain http, and carries no
+    credential on that cleartext hop."""
+    rec = _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id="plain")
+    _post_ready(coord)
+    await sc.run_shardcert_driver(
+        engine_host="10.0.0.5",
+        hold_seconds=0.05,
+        drain_timeout=1.0,
+        coord=coord,
+        allow_insecure=True,
+    )
+    assert rec.pollers[0]["urls"] == ["http://10.0.0.5:9001", "http://10.0.0.5:9002"]
+    assert rec.pollers[0]["token"] is None
+    assert rec.pollers[0]["allow_insecure"] is True
+
+
+def test_remote_poller_refuses_insecure_with_a_cacert() -> None:
+    """A certificate means nothing on a plaintext hop; asking for both is a mistake, said loud."""
+    with pytest.raises(ValueError, match="--cacert"):
+        sc._remote_engine_poller("10.0.0.5", [9001], allow_insecure=True, cacert="x.pem")
+
+
+def _refusing_poller(built: list[dict[str, Any]], exc: Exception) -> type:
+    class RefusingPoller:
+        def __init__(self, urls: Any, token: Any = None, **kw: Any) -> None:
+            built.append({"urls": list(urls), "token": token, **kw})
+
+        async def open(self) -> None:
+            raise exc
+
+        async def close(self) -> None:
+            return None
+
+    return RefusingPoller
+
+
+async def test_driver_sign_in_refusal_is_a_named_setup_error_before_any_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A refused sign-in used to surface only after the whole hold. The poller now opens before
+    DRIVE_START, and its refusal is a named error rather than a traceback."""
+    from harness.load.rigadmin import RigAdminError
+
+    _install_fakes(monkeypatch)
+    built: list[dict[str, Any]] = []
+    refusal = RigAdminError("set MEFOR_RIG_ADMIN_USERNAME and MEFOR_RIG_ADMIN_PASSWORD")
+    monkeypatch.setattr(sc, "EnginePoller", _refusing_poller(built, refusal))
+    coord = FileDropCoord(tmp_path, run_id="refused")
+    _post_ready(coord)
+    with pytest.raises(sc.RemoteEngineSignInError, match="MEFOR_RIG_ADMIN_PASSWORD"):
+        await sc.run_shardcert_driver(
+            engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
+        )
+    assert len(built) == 1
+    assert coord.read(DRIVE_START) is None, "the driver offered load to an engine it cannot poll"
+
+
+async def test_drive_coordinator_signs_in_over_https_before_spawning_children(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The multi-process drive shares the driver's helper: https, the remote rig session, the
+    ``cacert`` anchor, and a refusal raised before any child process is spawned."""
+    from harness.load.rigadmin import REMOTE_RIG_SESSION, RigSignInRefused
+
+    built: list[dict[str, Any]] = []
+    spawned: list[list[str]] = []
+
+    async def fake_spawn(argv: list[str]) -> Any:
+        spawned.append(argv)
+        raise AssertionError("a child was spawned before the poller signed in")
+
+    refusal = RigSignInRefused("the engine refused the rig's sign-in")
+    monkeypatch.setattr(sc, "EnginePoller", _refusing_poller(built, refusal))
+    monkeypatch.setattr(sc, "_spawn_proc", fake_spawn)
+    coord = FileDropCoord(tmp_path, run_id="drive")
+    _post_ready(coord)
+    with pytest.raises(sc.RemoteEngineSignInError, match="refused"):
+        await sc.run_shardcert_drive(
+            engine_host="10.0.0.5",
+            hold_seconds=0.05,
+            coord=coord,
+            cacert="engine-box.pem",
+        )
+    assert spawned == []
+    assert built[0]["urls"] == ["https://10.0.0.5:9001", "https://10.0.0.5:9002"]
+    assert built[0]["token"] is REMOTE_RIG_SESSION
+    assert built[0]["cacert"] == "engine-box.pem"
+
+
+def test_shardcert_driver_cli_threads_cacert_and_reports_a_sign_in_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--cacert`` reaches the driver, and a refused sign-in exits 2 with its reason in words."""
+    captured: dict[str, object] = {}
+
+    async def refusing_driver(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        raise sc.RemoteEngineSignInError("could not sign in to the engine box's API: refused")
+
+    monkeypatch.setattr("harness.load.shardcert.run_shardcert_driver", refusing_driver)
+    rc = hmain.main(
+        [
+            "shardcert-driver",
+            "--engine-host",
+            "10.0.0.5",
+            "--cacert",
+            "engine-box.pem",
+            "--coord-dir",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert captured["cacert"] == "engine-box.pem"
+    assert captured["allow_insecure"] is False
+    assert "could not sign in to the engine box's API" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("sub", ["shardcert-driver", "shardcert-drive"])
+def test_two_box_cli_refuses_insecure_with_cacert(sub: str, tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc:
+        hmain.main(
+            [
+                sub,
+                "--engine-host",
+                "10.0.0.5",
+                "--insecure",
+                "--cacert",
+                "x.pem",
+                "--coord-dir",
+                str(tmp_path),
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_shardcert_drive_cli_threads_cacert(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def refusing_drive(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        raise sc.RemoteEngineSignInError("could not sign in to the engine box's API: refused")
+
+    monkeypatch.setattr("harness.load.shardcert.run_shardcert_drive", refusing_drive)
+    rc = hmain.main(
+        [
+            "shardcert-drive",
+            "--engine-host",
+            "10.0.0.5",
+            "--cacert",
+            "engine-box.pem",
+            "--coord-dir",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert captured["cacert"] == "engine-box.pem"

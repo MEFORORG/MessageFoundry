@@ -612,6 +612,7 @@ def _install_coordinator_fakes(
             *,
             origin: Any = None,
             allow_insecure: bool = False,
+            cacert: str | None = None,
         ) -> None:
             if insecure_seen is not None:
                 insecure_seen.append(allow_insecure)

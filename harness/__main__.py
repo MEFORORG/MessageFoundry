@@ -117,16 +117,25 @@ from datetime import UTC
 #: opaque `httpx.ReadError` instead. Trading a named refusal for an unnamed transport error is worse
 #: than the refusal, which is why the old wording had to go rather than be softened.
 #:
-#: The two-box rig has no https path yet, deliberately: the engine box is one this process never
+#: Without the flag the two-box drives poll https, signed in with the engine box's rig credential,
+#: and verify against `--cacert` (BACKLOG #5640, #5977): the engine box is one this process never
 #: spawned, so `harness.load.tlsmat`'s anchor cannot cover it and `EnginePoller._cacert_for` declines
-#: to pin a non-loopback URL. Sharing one certificate across the two boxes is a rig-provisioning
-#: decision recorded in BACKLOG #1276 part B, not a code change here. Stated once and reused at all
-#: three sites so the three copies cannot drift apart again.
+#: to pin a non-loopback URL, so its certificate PEM is shipped to the load box and named there.
+#: Stated once and reused at all three sites so the three copies cannot drift apart again.
 _INSECURE_HINT = (
     "(hint: --insecure only clears this client's own refusal -- it cannot make a TLS-serving engine "
     "answer http. A stock engine serves TLS (ADR 0172), so the poll then fails at the handshake "
     "instead. The flag helps only where the engine box genuinely serves plaintext http, and it now "
-    "carries no credential.)"
+    "carries no credential. Without it the poll is https: name the engine box's certificate with "
+    "--cacert.)"
+)
+
+#: Printed beside a two-box drive's sign-in refusal. The drive signs in to engines another process
+#: provisioned, so the credential must be supplied (`harness.load.rigadmin.REMOTE_RIG_SESSION`).
+_SIGN_IN_HINT = (
+    "(hint: set MEFOR_RIG_ADMIN_USERNAME and MEFOR_RIG_ADMIN_PASSWORD to the engine box's rig "
+    "credential, and pass --cacert with the engine box's certificate PEM unless this box already "
+    "trusts it.)"
 )
 
 
@@ -1244,6 +1253,21 @@ def _add_coord_args(parser: argparse.ArgumentParser, *, default_run_id: str = "s
     )
 
 
+def _add_two_box_cacert_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--cacert",
+        default=None,
+        help="the engine box's API certificate PEM, which verifies the https /stats poll (default: "
+        "this box's trust store). The engine box is not one this process started, so this run's own "
+        "certificate cannot verify it. Not with --insecure",
+    )
+
+
+def _reject_cacert_with_insecure(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.insecure and args.cacert:
+        parser.error("--cacert and --insecure do not combine: --insecure polls plaintext http")
+
+
 def _log_store_env_source(label: str, store_env: dict[str, str]) -> None:
     """D5 P3: surface that the store connection is sourced from the ambient ``MEFOR_STORE_*`` env (no --dsn
     flag). Print KEY NAMES ONLY (sorted) — NEVER values, so ``MEFOR_STORE_PASSWORD`` can't leak (secrets
@@ -1491,18 +1515,21 @@ def _run_shardcert_driver(argv: list[str]) -> int:
         "--insecure",
         action="store_true",
         help="allow the REMOTE /stats poller plaintext http to an engine box that GENUINELY serves "
-        "plaintext http (loopback never needs it). Without it the poller fail-closes on the non-loopback "
-        "URL at drain. It does not make a TLS-serving engine answer http, and it carries no credential",
+        "plaintext http (loopback never needs it). Without it the poll is https, signed in with the "
+        "engine box's rig credential. It does not make a TLS-serving engine answer http, and it "
+        "carries no credential",
     )
+    _add_two_box_cacert_arg(parser)
     _add_coord_args(parser)
     parser.add_argument("--report-json", help="write the JSON report to this path")
     args = parser.parse_args(argv)
+    _reject_cacert_with_insecure(parser, args)
 
     import json
     from pathlib import Path
 
     from harness.load.coord import CoordTimeout, FileDropCoord
-    from harness.load.shardcert import run_shardcert_driver
+    from harness.load.shardcert import RemoteEngineSignInError, run_shardcert_driver
     from messagefoundry.apiclient import ApiError
 
     coord = _coord_from_args(args)
@@ -1517,8 +1544,12 @@ def _run_shardcert_driver(argv: list[str]) -> int:
                 coord=coord,
                 sink_host=args.sink_host,
                 allow_insecure=args.insecure,
+                cacert=args.cacert,
             )
         )
+    except RemoteEngineSignInError as exc:  # a setup failure, before any load was offered
+        print(f"shardcert-driver: {_exc_text(exc)}\n{_SIGN_IN_HINT}", file=sys.stderr)
+        return 2
     except (
         ApiError
     ) as exc:  # plaintext http to a remote engine without --insecure — actionable, not a crash
@@ -1545,6 +1576,10 @@ def _run_shardcert_driver(argv: list[str]) -> int:
                     "sent": report.sent,
                     "acked": report.acked,
                     "sink_received": report.sink_received,
+                    # The count balance's inputs: S against A x delivering (BACKLOG #5640).
+                    "delivering": report.delivering,
+                    "routing": report.routing,
+                    "count_balance_ok": report.count_balance_ok,
                     "acked_not_delivered": report.acked_not_delivered,
                     "lane_inversions": report.lane_inversions,
                     "lanes_observed": report.lanes_observed,
@@ -1767,16 +1802,18 @@ def _run_shardcert_drive(argv: list[str]) -> int:
         "--insecure",
         action="store_true",
         help="allow the engine /stats poller plaintext http to a REMOTE engine box that GENUINELY "
-        "serves plaintext http (loopback never needs it). Without it the poller fail-closes on the "
-        "non-loopback URL after spawning children. It does not make a TLS-serving engine answer http, "
-        "and it carries no credential",
+        "serves plaintext http (loopback never needs it). Without it the poll is https, signed in "
+        "with the engine box's rig credential before any child is spawned. It does not make a "
+        "TLS-serving engine answer http, and it carries no credential",
     )
+    _add_two_box_cacert_arg(parser)
     _add_coord_args(parser)
     parser.add_argument("--report-json", help="write the JSON report to this path")
     args = parser.parse_args(argv)
+    _reject_cacert_with_insecure(parser, args)
 
     from harness.load.coord import CoordTimeout, FileDropCoord
-    from harness.load.shardcert import run_shardcert_drive
+    from harness.load.shardcert import RemoteEngineSignInError, run_shardcert_drive
     from messagefoundry.apiclient import ApiError
 
     coord = _coord_from_args(args)
@@ -1792,12 +1829,16 @@ def _run_shardcert_drive(argv: list[str]) -> int:
                 sink_host=args.sink_host,
                 coord=coord,
                 allow_insecure=args.insecure,
+                cacert=args.cacert,
             )
         )
     except (
         ValueError
     ) as exc:  # a mis-sized fleet (partition/slice can't tile) — fail loud, setup error
         print(f"shardcert-drive: {exc}", file=sys.stderr)
+        return 2
+    except RemoteEngineSignInError as exc:  # a setup failure, before any child was spawned
+        print(f"shardcert-drive: {_exc_text(exc)}\n{_SIGN_IN_HINT}", file=sys.stderr)
         return 2
     except (
         ApiError
@@ -2121,7 +2162,7 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     from harness.load.coord import CoordTimeout, FileDropCoord
-    from harness.load.shardcert import parse_rate_ladder
+    from harness.load.shardcert import RemoteEngineSignInError, parse_rate_ladder
     from harness.load.shardcert_ladder import run_drive_ladder
     from messagefoundry.apiclient import ApiError
 
@@ -2163,6 +2204,9 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         )
     except ValueError as exc:  # a mis-sized fleet / bad ladder — fail loud, setup error
         print(f"shardcert-drive-ladder: {exc}", file=sys.stderr)
+        return 2
+    except RemoteEngineSignInError as exc:  # a rung's drive could not sign in to the engine box
+        print(f"shardcert-drive-ladder: {_exc_text(exc)}\n{_SIGN_IN_HINT}", file=sys.stderr)
         return 2
     except ApiError as exc:  # plaintext http to a remote engine without --insecure
         print(
