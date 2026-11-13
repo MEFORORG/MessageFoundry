@@ -1157,7 +1157,7 @@ same as one that is up. The engine does count a UDP send that raises a network e
 host, such as `ENETUNREACH` (BACKLOG #5923): it sets `send_failing`, and the record is counted in
 `unsent`, or kept in the spool while it has room. A datagram this host drops after the
 send reported success is not counted; on Linux that can include a full local transmit queue or a
-neighbour address that never resolves (reasoned, not measured; ADR 0200 Amendment B). A datagram too large to send (`EMSGSIZE`), and a send error that
+neighbour address that never resolves (reasoned, not measured; ADR 0200 Amendment B). A UDP send error that fails the same way on every retry, at least a datagram too large to send (`EMSGSIZE`), `EACCES` (a broadcast address without `SO_BROADCAST`), `EADDRNOTAVAIL`, `EAFNOSUPPORT` and `EINVAL`, and a send error that
 is not a network error, are dropped as undeliverable: counted in `undeliverable`, not kept for a
 retry, and they never set `send_failing`. A copy already in the spool for another reason, such as backoff or the drain deadline, is dropped the same way when replay reaches it. Queue and spool losses are counted as on every
 protocol. `delivery_confirmed` is `false`, a

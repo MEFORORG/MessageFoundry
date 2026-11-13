@@ -842,6 +842,29 @@ _EAI_NO_SUCH_NAME = frozenset(
 )
 
 
+#: UDP send errnos that fail the same way on every retry, so a spooled entry that hits one is dropped
+#: as undeliverable like ``EMSGSIZE`` rather than retried, which would wedge the spool head (BACKLOG
+#: #5923). At least: ``EACCES`` (a broadcast address without ``SO_BROADCAST``), ``EADDRNOTAVAIL``,
+#: ``EAFNOSUPPORT`` and ``EINVAL``, each under its POSIX value and, on Windows, its Winsock value,
+#: which is what a socket error carries there. A network error that may clear, ``ENETUNREACH``,
+#: ``EHOSTUNREACH`` or ``ECONNREFUSED`` say, is not here and stays retryable. Read only for a
+#: datagram socket; a stream arm's errors keep the reconnect-and-retry path.
+_DETERMINISTIC_UDP_SEND_ERRNOS = frozenset(
+    code
+    for name in (
+        "EACCES",
+        "EADDRNOTAVAIL",
+        "EAFNOSUPPORT",
+        "EINVAL",
+        "WSAEACCES",
+        "WSAEADDRNOTAVAIL",
+        "WSAEAFNOSUPPORT",
+        "WSAEINVAL",
+    )
+    if (code := getattr(errno, name, None)) is not None
+)
+
+
 def _retry_a_swallowed_lookup(handler: logging.handlers.SysLogHandler) -> None:
     """Connect again when ``handler`` has no socket, so a lookup failure raises at construction.
 
@@ -972,9 +995,10 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         reports the drops. With a spool (BACKLOG #1966, ADR 0200) this also sets :attr:`send_failed`,
         and the listener backs off and keeps the record on disk instead of losing it.
 
-        **A datagram too large to send** (``EMSGSIZE``) sets :attr:`send_error`, never
-        :attr:`send_failed` (BACKLOG #5923). It fails the same way on every retry, so read as a
-        network failure it would hold every later spooled entry behind it for good.
+        **A datagram too large to send** (``EMSGSIZE``), and a UDP send error in
+        :data:`_DETERMINISTIC_UDP_SEND_ERRNOS`, set :attr:`send_error`, never :attr:`send_failed`
+        (BACKLOG #5923). Each fails the same way on every retry, so read as a network failure it
+        would hold every later spooled entry behind it for good.
 
         **It never calls the stdlib** ``handleError`` (BACKLOG #5923), which writes a traceback, the
         call stack and the record's message and arguments to stderr on every failed send, outside
@@ -987,7 +1011,11 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         if exc is not None:
             errno_part = f", errno {exc.errno}" if isinstance(exc, OSError) and exc.errno else ""
             self.send_error_cause = type(exc).__name__ + errno_part
-        if exc is not None and (not isinstance(exc, OSError) or exc.errno == errno.EMSGSIZE):
+        if exc is not None and (
+            not isinstance(exc, OSError)
+            or exc.errno == errno.EMSGSIZE
+            or (self.socktype == socket.SOCK_DGRAM and exc.errno in _DETERMINISTIC_UDP_SEND_ERRNOS)
+        ):
             # Not the network's fault, or deterministic, so no reconnect; but never counted as
             # sent (BACKLOG #1966, #5923).
             self.send_error = True
@@ -1506,8 +1534,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             # the shutdown drain too, unless the throttle holds it: the line then reaches the local
             # sinks only, and close() counts nothing a failed send cost. It does not wait on the
             # queue handler's lock, which logging.shutdown holds, because the queue handler's
-            # handle() skips that lock on this thread (BACKLOG #5923); another root handler's lock,
-            # or logging's module lock, can still hold it. ERROR, not WARNING, so it survives
+            # handle() skips that lock on this thread (BACKLOG #5923); at least another root
+            # handler's lock, or logging's module lock, can still hold it. ERROR, not WARNING, so it survives
             # [logging].level = "ERROR", as the stdlib's stderr traceback did.
             if last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL:
                 self._last_send_failure_report = now
@@ -2055,8 +2083,9 @@ class ForwarderStatus:
     #: so ``lost`` can then stay at zero while every record is lost on the wire. What the engine
     #: can see there is at least a ``sendto`` that raises on this host (BACKLOG #5923), and queue
     #: and spool losses. A network error such as ``ENETUNREACH`` sets ``send_failing``; a datagram
-    #: too large to send (``EMSGSIZE``) is counted in ``undeliverable`` and never sets
-    #: ``send_failing``.
+    #: too large to send (``EMSGSIZE``), or a UDP send error that fails the same way on every retry
+    #: (at least those in ``_DETERMINISTIC_UDP_SEND_ERRNOS``), is counted in ``undeliverable`` and
+    #: never sets ``send_failing``.
     delivery_confirmed: bool = True
     #: Whether the last send hit a network error. Also true from a deferred start, where the
     #: connect failed, until the first good send. A spool keeps the records while it has room.

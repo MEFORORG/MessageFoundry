@@ -1350,7 +1350,9 @@ def _udp_forwarder(spool: LogSpool | None) -> tuple[Any, _ForwardQueueHandler]:
     """A UDP forwarder whose listener is stopped, so a test drives it by hand."""
     target = _build_syslog_handler(SyslogForward(host="127.0.0.1", port=9, protocol="udp"))
     fwd = _build_queued_forwarder(target, fmt="text", spool=spool)
-    assert fwd._listener.stop_within(1.0)
+    if not fwd._listener.stop_within(1.0):
+        fwd.close()
+        raise AssertionError("the forwarder's listener did not stop")
     fwd._listener._drain_deadline = None  # replay runs only outside a drain
     fwd._listener._retry_at = 0.0
     return target, fwd
@@ -1414,6 +1416,64 @@ def test_an_oversized_udp_datagram_is_undeliverable_so_replay_does_not_wedge(
         assert fwd._listener.undeliverable == 2
         assert fwd._listener.send_failures == 0
         assert not spool.pending
+    finally:
+        fwd.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    sorted(
+        {errno.EACCES, errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT, errno.EINVAL}
+        | {
+            code
+            for name in ("WSAEACCES", "WSAEADDRNOTAVAIL", "WSAEAFNOSUPPORT", "WSAEINVAL")
+            if (code := getattr(errno, name, None)) is not None
+        }
+    ),
+)
+def test_a_deterministic_udp_send_error_is_undeliverable_so_replay_does_not_wedge(
+    spool_dir: Path, error: int
+) -> None:
+    """A UDP send error that fails the same way on every retry, ``EACCES`` from a broadcast address
+    without ``SO_BROADCAST`` for one, wedges the spool head exactly as ``EMSGSIZE`` did if read as a
+    network failure. It is dropped as undeliverable, and the later entries still deliver."""
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    target, fwd = _udp_forwarder(spool)
+    try:
+        assert spool.append(SpoolEntry(level="WARNING", line="bad"))
+        assert spool.append(SpoolEntry(level="WARNING", line="next"))
+        failing = _FailingDatagramSocket(OSError(error, "deterministic"))
+        _swap_socket(target, failing)
+        fwd._listener._replay()
+        assert len(failing.sent) == 2  # the second entry was tried: nothing wedged
+        assert fwd._listener.undeliverable == 2
+        assert fwd._listener.send_failures == 0
+        assert fwd._listener.send_failing is False
+        assert not spool.pending
+    finally:
+        fwd.close()
+
+
+@pytest.mark.parametrize("error", [errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED])
+def test_a_transient_udp_send_error_is_retried_and_holds_the_spool_head(
+    spool_dir: Path, error: int
+) -> None:
+    """A network error may clear, so the head entry is kept for a retry and nothing behind it is
+    sent past it."""
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    target, fwd = _udp_forwarder(spool)
+    try:
+        assert spool.append(SpoolEntry(level="WARNING", line="head"))
+        assert spool.append(SpoolEntry(level="WARNING", line="next"))
+        failing = _FailingDatagramSocket(OSError(error, "transient"))
+        _swap_socket(target, failing)
+        fwd._listener._replay()
+        assert len(failing.sent) == 1
+        assert fwd._listener.send_failing is True
+        assert fwd._listener.undeliverable == 0
+        assert spool.pending
     finally:
         fwd.close()
 
@@ -1519,14 +1579,18 @@ def test_a_failed_send_during_the_shutdown_drain_does_not_deadlock() -> None:
             fwd.release()
         done.append(True)
 
+    closer = threading.Thread(target=_shutdown_like, daemon=True)
     try:
         fwd.handle(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
-        closer = threading.Thread(target=_shutdown_like, daemon=True)
         started = time.monotonic()
         closer.start()
         closer.join(30.0)
     finally:
         root.removeHandler(fwd)
+        # Close it when the closer never ran; one still parked under the lock is left alone, since
+        # a second close() would park beside it.
+        if not done and not closer.is_alive():
+            fwd.close()
     assert done == [True], "close() under the queue handler's lock did not return"
     # Not just "returned": a listener parked on the lock would return only after the join gave up
     # (about 11 s here), and would be left running.
@@ -1607,6 +1671,7 @@ def test_a_send_report_raised_while_shutdown_holds_the_lock_does_not_park_the_li
         fwd.close()  # a no-op once closed; stops the listener when an assert above failed
         root.removeHandler(fwd)
         root.removeHandler(seen)
+        seen.close()
     assert reported.is_set(), "the listener never reported the failed send"
     assert fwd._listener._thread is None, "the listener did not stop cleanly"
     # Measured well under 1 s; a parked listener holds close() for about 11 s. The bound sits

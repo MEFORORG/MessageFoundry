@@ -243,15 +243,18 @@ its statements no longer match the code; where they disagree, this amendment hol
 - **"UDP detects nothing" is now too strong.** The UDP arm uses the same failure-tracking handler
   as TCP and TLS, so a `sendto` that raises a network error on this host, such as `ENETUNREACH`,
   is now counted as a failed send: spooled with a spool, counted as unsent without one, as on TCP
-  and TLS. A datagram too large to send (`EMSGSIZE`) is not one of these; the next bullet covers
-  it. Unlike a stream socket, the UDP socket is kept, not reset. Not every loss on this host is detected:
+  and TLS. A datagram too large to send (`EMSGSIZE`), and at least the other deterministic UDP
+  send errors the next bullet names, are not among these; that bullet covers them. Unlike a stream socket, the UDP socket is kept, not reset. Not every loss on this host is detected:
   a datagram the kernel drops after `sendto` reported success is not. On Linux that can include a
   full local transmit queue or a neighbour address that never resolves (reasoned from the kernel,
   not measured). Nor is a datagram that leaves this host and never reaches the collector, which
   includes every datagram to a collector that is down. Delivery over UDP stays unconfirmed.
 - **A send error that is not a network error is now undeliverable on UDP too**, not only on TCP
-  and TLS. So is a datagram too large to send (`EMSGSIZE`), which fails the same way on every
-  retry. Neither is ever counted as sent: each is counted in `undeliverable`, is not kept for a
+  and TLS. So is a UDP send error that fails the same way on every retry: at least a datagram too
+  large to send (`EMSGSIZE`), `EACCES` (a broadcast address without `SO_BROADCAST`),
+  `EADDRNOTAVAIL`, `EAFNOSUPPORT` and `EINVAL`, under their POSIX or Winsock values. A network error
+  that may clear, such as `ENETUNREACH`, `EHOSTUNREACH` or `ECONNREFUSED`, stays retryable. None of
+  these is ever counted as sent: each is counted in `undeliverable`, is not kept for a
   retry, and never sets `send_failing`. A copy already in the spool for another reason, such as
   backoff or the drain deadline, is dropped the same way when replay reaches it.
 - **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
@@ -260,6 +263,6 @@ its statements no longer match the code; where they disagree, this amendment hol
 
 On every arm the standard library's traceback to stderr on a failed send is gone. A throttled
 ERROR line with no record content reports network send errors instead, and an undeliverable
-record gets its own. Both are logged during the shutdown drain too, when they reach only the
-local sinks. The counts each case moves are stated for
+record gets its own. Both are logged during the shutdown drain too, unless the throttle holds
+one back, when they reach only the local sinks; the running count carries what the throttle held. The counts each case moves are stated for
 operators in [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]`.
