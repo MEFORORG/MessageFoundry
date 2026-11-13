@@ -2362,9 +2362,12 @@ Two limits follow from this:
   ends the walk and is left to libpq.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
-  application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as
-  libpq 15 and later do. Another libpq version may read a different home. With libpq 16 and
-  later, `PGSSLROOTCERT=system` names no file, so the engine reads nothing. The check reads the
+  application-data folder, which the engine asks the shell for as libpq does, through the ANSI
+  call. Elsewhere it is under `.postgresql` in `HOME`, which libpq 15 and later read, and in the
+  password-file home, which libpq 14 and older read. The engine cannot tell which libpq the
+  driver loads, so when the two differ it checks both and refuses on either. With libpq 16 and
+  later, `PGSSLROOTCERT=system` names no file, but older libpq opens a file named `system` in the
+  working directory, so the engine checks that file. The check reads the
   environment of the process that builds. So `messagefoundry check` judges its own machine's file.
   The check runs at build, not at each connect. No ACL check covers the file.
 

@@ -1508,30 +1508,41 @@ def _refuse_ca_content(setting: str, data: bytes, *, refusing: str) -> None:
 _LIBPQ_ROOT_CERT = "root.crt"
 
 
-def _libpq_root_cert() -> tuple[str, str] | None:
-    """The ``(setting, path)`` of the root certificate libpq reads from the engine's environment
-    when no ``sslrootcert`` is given, which the generic dialect never gives (BACKLOG #3090, step
-    3): ``PGSSLROOTCERT`` when it is set and not empty, else ``root.crt`` in
-    :func:`_libpq_home`. ``None`` for ``system``, libpq 16's name for the platform's own store,
-    which is no file, and when no home directory can be named, where libpq reads no default
-    either. A libpq older than 16 reads ``system`` as a file in its working directory, and that
-    file is not read here."""
+def _libpq_root_certs() -> list[tuple[str, str]]:
+    """The ``(setting, path)`` of each root certificate the installed libpq could read from the
+    engine's environment when no ``sslrootcert`` is given, which the generic dialect never gives
+    (BACKLOG #3090, step 3). The engine cannot tell which libpq psqlODBC loads, so each file a
+    libpq version would read is named, and the caller refuses on any of them.
+
+    ``PGSSLROOTCERT`` when it is set and not empty, which every version reads. Its value
+    ``system`` is libpq 16's name for the platform's own store, which is no file, but a libpq
+    older than 16 opens it as a file named ``system`` in the working directory, so that file is
+    named. Without it, ``root.crt`` in each of :func:`_libpq_homes`: none when no home can be
+    named, where libpq reads no default either. Raises ``OSError`` when the working directory or
+    the Windows home cannot be named."""
     named = os.environ.get("PGSSLROOTCERT")
     if named:
         # Not "DATABASE PGSSLROOTCERT": the log redaction scrubs two adjacent ALL-CAPS tokens.
-        return None if named == "system" else ("libpq root certificate PGSSLROOTCERT", named)
-    home = _libpq_home()
-    if home is None:
-        return None
-    return "libpq's default root certificate", os.path.join(home, _LIBPQ_ROOT_CERT)
+        if named == "system":
+            setting = "libpq root certificate PGSSLROOTCERT=system, a file to libpq 15 and older"
+            return [(setting, os.path.abspath(named))]
+        return [("libpq root certificate PGSSLROOTCERT", named)]
+    return [
+        (f"libpq's default root certificate{label}", os.path.join(home, _LIBPQ_ROOT_CERT))
+        for label, home in _libpq_homes()
+    ]
 
 
-def _libpq_home() -> str | None:
-    """The directory libpq reads its default files from, found as libpq 15 and later find it:
-    ``postgresql`` in the roaming application-data folder the shell names on Windows, and
-    ``.postgresql`` in ``HOME``, or in the effective user's password-file home when ``HOME`` is
-    unset or empty, elsewhere. libpq 14 and older read the password-file home only. ``None`` when
-    neither can be named, as libpq then reads no default file.
+def _libpq_homes() -> list[tuple[str, str]]:
+    """``(label, directory)`` for each directory a libpq version reads its default files from.
+    The label words a refusal, and is empty when only one directory is named.
+
+    On Windows, ``postgresql`` in the roaming application-data folder the shell names, which every
+    version asks for. Elsewhere, ``.postgresql`` in ``HOME``, or in the effective user's
+    password-file home when ``HOME`` is unset or empty, as libpq 15 and later find it; and in the
+    password-file home alone, as libpq 14 and older find it (``pqGetHomeDirectory``). When the two
+    differ, both are named, so a check of one cannot clear a file libpq loads from the other.
+    Empty when no directory can be named, as libpq then reads no default file.
 
     An empty folder or password-file home still names one: libpq joins it as ``'%s/%s'``, so it
     reads ``/.postgresql/root.crt``, or ``/postgresql/root.crt`` on Windows (``pqGetHomeDirectory``
@@ -1539,16 +1550,22 @@ def _libpq_home() -> str | None:
     made (:func:`_windows_roaming_appdata`)."""
     if sys.platform == "win32":
         appdata = _windows_roaming_appdata()
-        return None if appdata is None else os.path.join(appdata or os.sep, "postgresql")
-    home = os.environ.get("HOME")
-    if not home:
-        import pwd
+        return [] if appdata is None else [("", os.path.join(appdata or os.sep, "postgresql"))]
+    import pwd
 
-        try:
-            home = pwd.getpwuid(os.geteuid()).pw_dir
-        except KeyError:
-            return None
-    return os.path.join(home or os.sep, ".postgresql")
+    try:
+        password_home: str | None = pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError:
+        password_home = None
+    labels = {password_home: " in the password-file home"}
+    env_home = os.environ.get("HOME")
+    if env_home:
+        labels.setdefault(env_home, " in HOME")
+    homes = [home for home in labels if home is not None]
+    return [
+        (labels[home] if len(homes) > 1 else "", os.path.join(home or os.sep, ".postgresql"))
+        for home in homes
+    ]
 
 
 #: ``CSIDL_APPDATA``: the roaming application-data folder libpq asks the Windows shell for.
@@ -1556,31 +1573,42 @@ _CSIDL_APPDATA = 0x1A
 
 
 def _windows_roaming_appdata() -> str | None:
-    """``SHGetFolderPathW``'s ``CSIDL_APPDATA`` folder, the call libpq makes, rather than the
-    ``APPDATA`` variable, which a service's environment may not carry. ``None`` when the call
-    reports a failure, as libpq then reads no default file, and possibly empty when it succeeds.
-    Raises ``OSError`` off Windows, and when ``shell32`` or its export cannot be loaded: then the
-    engine cannot say which folder libpq reads, so its caller refuses rather than read nothing."""
+    """``SHGetFolderPathA``'s ``CSIDL_APPDATA`` folder, the call libpq makes, rather than the
+    ``APPDATA`` variable, which a service's environment may not carry. libpq is built without
+    ``UNICODE``, so it calls the ANSI export and opens the ANSI path it gets back; for a folder
+    the code page cannot hold, that names a different file than the wide export would. The bytes
+    are decoded in that code page (``mbcs``), as Windows maps them when libpq opens the file.
+
+    ``None`` when the call reports a failure, as libpq then reads no default file, and possibly
+    empty when it succeeds. Raises ``OSError`` off Windows, and when ``ctypes``, ``shell32`` or its
+    export cannot be loaded, or the call cannot be made: then the engine cannot say which folder
+    libpq reads, so its caller refuses rather than read nothing."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the application-data folder is read only on Windows")
-    import ctypes
-
     try:
-        get_folder = ctypes.WinDLL("shell32").SHGetFolderPathW
-    except (OSError, AttributeError) as exc:
-        raise OSError("SHGetFolderPathW could not be loaded from shell32") from exc
-    get_folder.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_wchar_p,
-    ]
-    get_folder.restype = ctypes.c_long
-    buf = ctypes.create_unicode_buffer(260)  # MAX_PATH, the size the call is documented to take
-    if get_folder(None, _CSIDL_APPDATA, None, 0, buf) != 0:
+        import ctypes
+    except ImportError as exc:
+        raise OSError("ctypes could not be loaded to ask for SHGetFolderPathA") from exc
+    try:
+        get_folder = ctypes.WinDLL("shell32").SHGetFolderPathA
+        get_folder.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+        ]
+        get_folder.restype = ctypes.c_long
+        buf = ctypes.create_string_buffer(260)  # MAX_PATH, the size the call is documented to take
+        failed = get_folder(None, _CSIDL_APPDATA, None, 0, buf) != 0
+    except (OSError, AttributeError, ctypes.ArgumentError) as exc:
+        raise OSError("SHGetFolderPathA could not be loaded from shell32 or called") from exc
+    if failed:
         return None
-    return buf.value
+    try:
+        return buf.value.decode("mbcs")
+    except UnicodeDecodeError as exc:
+        raise OSError("SHGetFolderPathA gave a folder its code page does not decode") from exc
 
 
 def _refuse_encrypted_libpq_root_cert(
@@ -1591,7 +1619,8 @@ def _refuse_encrypted_libpq_root_cert(
     refuses an ``sslca``.
 
     psqlODBC hands libpq no ``sslrootcert``, since the generic dialect refuses that keyword and
-    ``pqopt``, so libpq takes the file :func:`_libpq_root_cert` names. libpq 17's
+    ``pqopt``, so libpq takes a file :func:`_libpq_root_certs` names, each of which is judged
+    here and refused on its own. libpq 17's
     ``initialize_SSL`` loads that file at every TLS attempt whose ``stat`` of it succeeds, whatever
     the mode, and only a ``verify`` mode fails the connect when the ``stat`` fails. So the check
     runs for the psqlODBC family whenever ``sslmode`` asks libpq for TLS, erring wide on ``allow``
@@ -1628,17 +1657,19 @@ def _refuse_encrypted_libpq_root_cert(
     ):
         return
     try:
-        found = _libpq_root_cert()
+        found = _libpq_root_certs()
     except OSError as exc:
         raise ValueError(
             f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: set "
             "PGSSLROOTCERT to a local path; the folder libpq reads it from could not be named, so "
             f"it was not read to check {_CA_CHECKED_FOR}"
         ) from exc
-    if found is None:
-        return
-    source, path = found
-    setting = f"{hop_name_prefix(connection)}DATABASE {source}"
+    for source, path in found:
+        _refuse_libpq_root_cert_file(f"{hop_name_prefix(connection)}DATABASE {source}", path)
+
+
+def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
+    """:func:`_refuse_encrypted_libpq_root_cert`'s judgement of one file libpq could load."""
     what = "root certificate file"
     unread: dict[str, str] = {}
     verdicts = file_keyword_verdicts(path, unread)

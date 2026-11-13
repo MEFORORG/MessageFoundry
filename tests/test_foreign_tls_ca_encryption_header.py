@@ -280,7 +280,7 @@ def _no_libpq_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
     home = tmp_path / "libpq-home"
     home.mkdir()
-    monkeypatch.setattr(database, "_libpq_home", lambda: str(home))
+    monkeypatch.setattr(database, "_libpq_homes", lambda: [("", str(home))])
     return home
 
 
@@ -336,8 +336,26 @@ def test_libpqs_root_certificate_controls_still_build(
     _write(_no_libpq_root, _headered(_certificate()), "root.crt")
     assert "SSLmode=disable;" in _build_psql("disable")
     assert "SSLMODE=VERIFY_IDENTITY;" in _build()  # MySQL's driver reads no libpq root
+    monkeypatch.chdir(tmp_path)  # no file named system in the working directory
     monkeypatch.setenv("PGSSLROOTCERT", "system")
     assert "SSLmode=verify-full;" in _build_psql()
+    _write(tmp_path, _certificate(), "system")
+    assert "SSLmode=verify-full;" in _build_psql()
+
+
+@pytest.mark.usefixtures("_no_libpq_root")
+def test_pgsslrootcert_system_reads_the_file_older_libpq_opens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """libpq 16 reads ``system`` as the platform's store, but libpq 15 and older open a file
+    named ``system`` in the working directory, and the engine cannot tell which libpq psqlODBC
+    loads (vault BACKLOG #8153 item 1). Red before the file was named: ``system`` read nothing."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PGSSLROOTCERT", "system")
+    _write(tmp_path, _headered(_certificate()), "system")
+    with pytest.raises(ValueError, match="PGSSLROOTCERT=system, a file to libpq 15") as refused:
+        _build_psql()
+    assert ENCRYPTION_HEADER_SCOPE in str(refused.value)
 
 
 #: The refusal of a path the host check does not clear, worded as ``_refuse_remote_path`` words
@@ -490,7 +508,59 @@ def test_libpqs_home_falls_back_to_the_password_file_for_an_empty_home(
 
     monkeypatch.setenv("HOME", "")
     expected = os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, ".postgresql")
-    assert database._libpq_home() == expected
+    assert database._libpq_homes() == [("", expected)]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="libpq reads HOME and the password file off Windows"
+)
+def test_libpqs_homes_name_home_and_the_password_file_home_when_they_differ(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """libpq 15 and later read ``HOME``; libpq 14 and older read the password-file home only
+    (vault BACKLOG #8153 item 1). The control: the same directory is named once, unlabelled."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir="/pw"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert sorted(database._libpq_homes()) == sorted(
+        [
+            (" in HOME", os.path.join(str(tmp_path), ".postgresql")),
+            (" in the password-file home", os.path.join("/pw", ".postgresql")),
+        ]
+    )
+    monkeypatch.setenv("HOME", "/pw")
+    assert database._libpq_homes() == [("", os.path.join("/pw", ".postgresql"))]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="libpq reads HOME and the password file off Windows"
+)
+@pytest.mark.parametrize("encrypted", ["HOME", "password-file home"])
+def test_libpqs_root_certificate_is_refused_in_either_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, encrypted: str
+) -> None:
+    """The check reads ``root.crt`` in both homes and refuses on either, since it cannot tell
+    which libpq psqlODBC loads (vault BACKLOG #3090 step 3, #8153 step 2). Red on the
+    password-file case before both were read: the check read ``HOME`` alone and built, while a
+    libpq 14 would load the encrypted file. The control: both clean builds."""
+    import pwd
+
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    env_home, password_home = tmp_path / "env-home", tmp_path / "password-home"
+    for home in (env_home, password_home):
+        (home / ".postgresql").mkdir(parents=True)
+        _write(home / ".postgresql", _certificate(), "root.crt")
+    monkeypatch.setenv("HOME", str(env_home))
+    monkeypatch.setattr(
+        pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=str(password_home))
+    )
+    assert "SSLmode=verify-full;" in _build_psql()
+    bad = env_home if encrypted == "HOME" else password_home
+    _write(bad / ".postgresql", _headered(_certificate()), "root.crt")
+    with pytest.raises(ValueError, match=f"default root certificate in {encrypted}") as refused:
+        _build_psql()
+    assert ENCRYPTION_HEADER_SCOPE in str(refused.value)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the shell folder is read on Windows only")
@@ -499,11 +569,64 @@ def test_libpqs_home_on_windows_is_the_shell_roaming_folder(
 ) -> None:
     """libpq asks the shell, so an unset ``APPDATA`` does not hide the default file."""
     monkeypatch.delenv("APPDATA", raising=False)
-    home = database._libpq_home()
-    assert home is not None and home.endswith(os.sep + "postgresql")
+    [(label, home)] = database._libpq_homes()
+    assert label == "" and home.endswith(os.sep + "postgresql")
 
 
-def _refuse_lookup() -> tuple[str, str] | None:
+class _FakeShell32:
+    """A ``shell32`` whose ANSI folder call writes ``folder`` and whose wide export is absent."""
+
+    def __init__(self, folder: bytes) -> None:
+        def call(owner: object, csidl: int, token: object, flags: int, buf: Any) -> int:
+            buf.value = folder
+            return 0
+
+        self.SHGetFolderPathA = call
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
+def test_libpqs_windows_home_comes_from_the_ansi_shell_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """psqlODBC's libpq is built without ``UNICODE``, so it calls ``SHGetFolderPathA`` and opens
+    the ANSI path it gets back; the engine asks the same export and decodes in the ANSI code page
+    (vault BACKLOG #8153 item 18). Red while the engine asked ``SHGetFolderPathW``: the fake has
+    no wide export, so the lookup raised."""
+    import ctypes
+
+    folder = "C:\\Users\\synthetic\\AppData\\Roaming"
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name: _FakeShell32(folder.encode("mbcs")))
+    assert database._windows_roaming_appdata() == folder
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
+@pytest.mark.parametrize("failure", ["import", "call"])
+def test_a_ctypes_failure_is_a_valueerror_from_the_build(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Red before these were caught: an ``ImportError`` of ``ctypes`` and a ``ctypes.ArgumentError``
+    from the call escaped the builder as themselves, not as a ``ValueError`` (vault BACKLOG #8153
+    item 18)."""
+    import ctypes
+
+    if failure == "import":
+        monkeypatch.setitem(sys.modules, "ctypes", None)
+    else:
+
+        def refuse(*args: Any) -> int:
+            raise ctypes.ArgumentError("synthetic: the call could not be made")
+
+        shell = _FakeShell32(b"")
+        shell.SHGetFolderPathA = refuse  # type: ignore[assignment]
+        monkeypatch.setattr(ctypes, "WinDLL", lambda name: shell)
+    with pytest.raises(OSError, match="SHGetFolderPathA|ctypes could not be loaded"):
+        database._windows_roaming_appdata()
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):
+        _build_psql()
+
+
+def _refuse_lookup() -> list[tuple[str, str]]:
     raise AssertionError("the root certificate was looked up")
 
 
@@ -521,7 +644,7 @@ def test_libpqs_root_certificate_is_not_looked_up_when_psqlodbc_sends_disable(
     """With no ``SSLmode`` psqlODBC sends ``disable`` to libpq (``DEFAULT_SSLMODE`` in its
     ``dlg_specific.h``), so libpq attempts no TLS and loads no root certificate. Red before the
     check keyed on the build's own ``sslmode``: an unset mode looked the file up."""
-    monkeypatch.setattr(database, "_libpq_root_cert", _refuse_lookup)
+    monkeypatch.setattr(database, "_libpq_root_certs", _refuse_lookup)
     assert _build_generic("PostgreSQL Unicode", params).startswith("DRIVER={PostgreSQL Unicode};")
 
 
@@ -706,13 +829,13 @@ def test_libpqs_home_for_an_empty_password_file_home_is_the_root(
 
     monkeypatch.setenv("HOME", "")
     monkeypatch.setattr(pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=""))
-    assert database._libpq_home() == os.path.join(os.sep, ".postgresql")
+    assert database._libpq_homes() == [("", os.path.join(os.sep, ".postgresql"))]
 
     def no_entry(uid: int) -> Any:
         raise KeyError(uid)
 
     monkeypatch.setattr(pwd, "getpwuid", no_entry)
-    assert database._libpq_home() is None
+    assert database._libpq_homes() == []
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
@@ -723,9 +846,9 @@ def test_libpqs_home_for_an_empty_shell_folder_is_the_root(
     drive (``pqGetHomeDirectory``, libpq 17). Red when an empty folder gave ``None``. The
     control: a failed shell call names no home, as libpq names none."""
     monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: "")
-    assert database._libpq_home() == os.path.join(os.sep, "postgresql")
+    assert database._libpq_homes() == [("", os.path.join(os.sep, "postgresql"))]
     monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: None)
-    assert database._libpq_home() is None
+    assert database._libpq_homes() == []
 
 
 def test_a_libpq_home_the_engine_cannot_name_refuses_the_build(
@@ -735,10 +858,10 @@ def test_a_libpq_home_the_engine_cannot_name_refuses_the_build(
     ``OSError`` out of the builder, and never a check that read nothing."""
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
 
-    def unnamed() -> str | None:
+    def unnamed() -> list[tuple[str, str]]:
         raise OSError("synthetic: shell32 did not load")
 
-    monkeypatch.setattr(database, "_libpq_home", unnamed)
+    monkeypatch.setattr(database, "_libpq_homes", unnamed)
     with pytest.raises(ValueError, match="root certificate: set PGSSLROOTCERT to a local path"):
         _build_psql()
 
@@ -755,10 +878,10 @@ def test_a_shell32_failure_is_an_oserror_the_build_refuses(
     def broken(name: str, *args: Any, **kwargs: Any) -> object:
         if failure == "load":
             raise OSError("synthetic: shell32 did not load")
-        return object()  # no SHGetFolderPathW on it
+        return object()  # no SHGetFolderPathA on it
 
     monkeypatch.setattr(ctypes, "WinDLL", broken)
-    with pytest.raises(OSError, match="SHGetFolderPathW could not be loaded"):
+    with pytest.raises(OSError, match="SHGetFolderPathA could not be loaded"):
         database._windows_roaming_appdata()
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
     with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):
