@@ -656,9 +656,10 @@ NSSM environment.
 
   **`serve` and `supervise` refuse to start when the store key, or a retired one, is in that
   list**, or in the service's own `Environment` registry value, whatever `[security].enforcement`
-  says (vault BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in
-  the shell that runs `messagefoundry rotate-key`, not in the service. What the engine reads, what
-  it refuses and what it does not cover are in
+  says (vault BACKLOG #2595). An application that builds the API itself, with `create_app` or
+  `create_managed_app`, raises on the same finding as it is built. Move the key to the DPAPI key
+  file above. A retired key belongs in the shell that runs `messagefoundry rotate-key`, not in the
+  service. What the engine reads, what it refuses and what it does not cover are in
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-service_environment_unobservable-and-secret_in_service_environment-secrets-in-the-windows-services-environment).
 
 - **The other secrets: a secrets directory (any platform).** At least the engine's own secret

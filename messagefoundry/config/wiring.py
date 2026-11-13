@@ -4242,7 +4242,9 @@ def Direct(
     **body** (content-agnostic — an HL7 string, a CDA/XML document, plain text); this **signs** it with
     ``signing_key``/``signing_cert``, **encrypts** the signed blob to the partner's ``recipient_cert``
     (which must chain to ``trust_anchor`` and carry an RSA key), and submits the S/MIME message to
-    ``host:port`` over STARTTLS. All cert/key material is loaded + validated at construction (fail loud).
+    ``host:port`` over STARTTLS. Cert/key material is loaded + validated at construction (fail loud),
+    except the certificates' validity window: construction only warns on it, and each send refuses
+    a recipient cert or issuing anchor outside it (code ``direct-cert-validity``, BACKLOG #5631).
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``

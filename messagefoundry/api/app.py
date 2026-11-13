@@ -518,7 +518,12 @@ from messagefoundry.remotedebug import (
     remote_debug_posture,
 )
 from messagefoundry.service_status import query_service_state
-from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
+from messagefoundry.serviceenv import (
+    ServiceEnvironmentRefused,
+    ServiceEnvPosture,
+    service_env_posture,
+    service_env_refusal,
+)
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import (
@@ -4516,6 +4521,17 @@ _FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
 }
 
 
+def _refuse_a_secret_in_the_service_environment(caller: str) -> None:
+    """Raise where ``serve`` would refuse to start on its own Windows service environment.
+
+    The rule is ``serve``'s and ``supervise``'s, :func:`service_env_refusal`, so an app built here
+    without either of them refuses on the same finding (vault BACKLOG #2595, #8212 item 1).
+    ``service_env_posture`` says what the reading covers, and when it cannot read the lists."""
+    refused = service_env_refusal(service_env_posture())
+    if refused is not None:
+        raise ServiceEnvironmentRefused(f"{caller}: refusing to start: {refused}")
+
+
 def create_app(
     engine: Engine | None = None,
     *,
@@ -4562,6 +4578,7 @@ def create_app(
     # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
     # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
     install_remote_debug_guard()
+    _refuse_a_secret_in_the_service_environment("create_app")
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
     if allow_no_auth and auth is not None:
@@ -9728,9 +9745,10 @@ def create_app(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
             except CellTagError:
-                # BACKLOG #2593: the criteria fail their owner tag (alerted and audited) or are
-                # corrupt (logged); the store refused. The caller's own preset exists, so a refusal,
-                # never a 500. Caught before CipherError, which it subclasses.
+                # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
+                # unmarked value (audited; the cipher alerted, BACKLOG #5650) or are corrupt
+                # (logged); the store refused. The caller's own preset exists, so a refusal, never
+                # a 500. Caught before CipherError, which it subclasses.
                 refusal = HTTPException(
                     423, f"preset {preset_id} failed its integrity check and cannot be used"
                 )
@@ -9745,12 +9763,13 @@ def create_app(
                     headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
                 )
             except CipherError as exc:
-                # BACKLOG #5523: a key or format problem the cipher raises as is, for example an
-                # unmarked value planted in a keyed store, or a value Vault Transit refused. It
-                # answered 500. The type name only: the text is the cipher's, not this route's.
-                # ERROR: under Transit a cell planted across owners lands here, not in the
-                # CellTagError arm, so it is neither audited nor alerted and this is the engine's
-                # only record of it. The outage above is a WARNING: it says nothing about the cell.
+                # BACKLOG #5523: a key or format problem the cipher raises as is, for example a
+                # retired key that is not supplied, or a Vault Transit refusal other than the
+                # value's AEAD tag (a key-version refusal, a 403). It answered 500. The type name
+                # only: the text is the cipher's, not this route's. ERROR: it is neither audited
+                # nor alerted, so this is the engine's only record of it. Transit's AEAD refusal of
+                # a cell planted across owners is a CellTagError above (BACKLOG #5650). The outage
+                # above is a WARNING: it says nothing about the cell.
                 _log.error("layered search refused preset %s: %s", preset_id, type(exc).__name__)
                 refusal = HTTPException(
                     423,
@@ -12358,6 +12377,9 @@ def create_managed_app(
     start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
     marked ``unaudited``.
     """
+    # The remote-debugging guard goes in before the reading, as create_app installs it.
+    install_remote_debug_guard()
+    _refuse_a_secret_in_the_service_environment("create_managed_app")
     if store_settings is None:
         if db_path is None:
             raise ValueError("create_managed_app requires either store_settings or db_path")

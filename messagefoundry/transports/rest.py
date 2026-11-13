@@ -96,6 +96,7 @@ from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     LoopbackDirectProxyHandler,
     NoRedirectHandler,
+    ProxyTunnelRefusedError,
     build_strict_opener,
     drain_bounded,
     hop_identity,
@@ -352,8 +353,16 @@ AUTH_CHALLENGE_REFUSED = (
     "met a non-SHA-256 or unanswerable authentication challenge; the engine will not answer it"
 )
 
+#: The FIXED text for the one case no Digest handler sees: the token hop's web proxy, set up for
+#: Digest, answered the ``CONNECT`` for an ``https`` token endpoint with 407. Nothing was screened,
+#: so :data:`AUTH_CHALLENGE_REFUSED`'s hash and challenge words would be false here. It states the
+#: fault only; ADR 0095 Amendment B.1 gives the remedy.
+AUTH_CHALLENGE_REFUSED_ON_CONNECT = (
+    "met a 407 from its web proxy on the CONNECT, which Digest cannot answer (ADR 0095 B.1)"
+)
 
-def auth_challenge_refused(label: str) -> NegativeAckError:
+
+def auth_challenge_refused(label: str, *, on_connect: bool = False) -> NegativeAckError:
     """The delivery failure for a wire-time :class:`HttpAuthError` on ``label``'s hop (BACKLOG #2323).
 
     ``HttpAuthError`` is a ``ValueError``, so each send's ``(ValueError, InvalidURL)`` arm caught it
@@ -361,49 +370,30 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
     and would send an operator looking for a bad header or URL. The fault is the connection's, so
     this is a configuration fault: under the default ``credential_fault_policy`` the delivery
     worker stops the lane and keeps the queue. ADR 0095 Amendment B is the source of record for
-    why a stop was chosen over a retry, and for where that reasoning is weak. The token hop also
-    raises it for the case :func:`is_refused_proxy_digest_tunnel` names (BACKLOG #2989)."""
+    why a stop was chosen over a retry, and for where that reasoning is weak. The text after the
+    label is always one of the two fixed ones; ``on_connect`` picks
+    :data:`AUTH_CHALLENGE_REFUSED_ON_CONNECT`, for the case :func:`is_refused_proxy_digest_tunnel`
+    names (BACKLOG #2989)."""
+    reason = AUTH_CHALLENGE_REFUSED_ON_CONNECT if on_connect else AUTH_CHALLENGE_REFUSED
     return NegativeAckError(
-        f"{label} {AUTH_CHALLENGE_REFUSED}",
+        f"{label} {reason}",
         code=AUTH_CHALLENGE_REFUSED_CODE,
         permanent=True,
         config_fault=True,
     )
 
 
-#: The text of the bare ``OSError`` ``http.client.HTTPConnection._tunnel`` raises when a web
-#: proxy answers the ``CONNECT`` for an ``https`` target with a 407.
-_TUNNEL_407_PREFIX = "Tunnel connection failed: 407 "
+def is_refused_proxy_digest_tunnel(exc: urllib.error.URLError, *, digest_proxy: bool) -> bool:
+    """Whether ``exc`` is a web proxy's 407 to the ``CONNECT`` for an ``https`` target, on a hop
+    whose proxy is set up for Digest (BACKLOG #2989, ADR 0095 Amendment B.1 states the case).
 
-
-def is_refused_proxy_digest_tunnel(
-    opener: urllib.request.OpenerDirector, exc: urllib.error.URLError
-) -> bool:
-    """Whether ``exc`` is a web proxy's 407 to the ``CONNECT`` for an ``https`` target, on an
-    ``opener`` whose proxy is set up for Digest (BACKLOG #2989, ADR 0095 Amendment B.1).
-
-    That is the refusal :func:`auth_challenge_refused` names, met where no handler can raise it.
-    The proxy Digest handler answers only a 407 that reaches it as a status, and ``_tunnel``
-    raises a ``CONNECT`` 407 before any handler runs, as a bare ``OSError`` that ``do_open`` wraps
-    in a ``URLError``. So a retry sends the same unanswered ``CONNECT``. Without a Digest handler
-    on the opener, the 407 stays the plain status Amendment B keeps for a Basic challenge: a
-    refused pre-emptive Basic credential, or a proxy the connection has no credential for.
-
-    Matched on the exact class and the one-argument text ``_tunnel`` builds from the int status,
-    so a socket error, which carries an errno, never matches, and the proxy's bytes can only
-    follow the prefix. ``tests/test_digest_refusal_classification.py`` pins the text on a real
-    socket, so a CPython that rewords it fails that test instead of retrying again unseen."""
+    ``digest_proxy`` is decided when the hop is built, from its proxy configuration, so the answer
+    never rests on what an opener exposes. The status is the one the proxy's status line gave, read
+    from :class:`~messagefoundry.transports.bounded_read.ProxyTunnelRefusedError`, which the strict
+    https connection ``StrictHTTPSHandler`` dials raises for a refused ``CONNECT``; the error's text
+    is not read. ``tests/test_digest_refusal_classification.py`` pins the match on a real socket."""
     reason = exc.reason
-    return (
-        type(reason) is OSError
-        and len(reason.args) == 1
-        and isinstance(reason.args[0], str)
-        and reason.args[0].startswith(_TUNNEL_407_PREFIX)
-        and any(
-            isinstance(handler, _ApprovedProxyDigestAuthHandler)
-            for handler in getattr(opener, "handlers", ())
-        )
-    )
+    return digest_proxy and isinstance(reason, ProxyTunnelRefusedError) and reason.status == 407
 
 
 class _NoRedirectHandler(NoRedirectHandler):
@@ -2249,9 +2239,16 @@ class _HostProxy:
         if not self.credentialed:
             return (self.config._build_proxy_handler(admitted=False),)
         handlers: list[urllib.request.BaseHandler] = [self.config._build_proxy_handler()]
-        if self.config.digest is not None:
-            handlers.append(self.config.digest.build())
+        digest = self.config.digest if self.answers_digest else None
+        if digest is not None:
+            handlers.append(digest.build())
         return tuple(handlers)
+
+    @property
+    def answers_digest(self) -> bool:
+        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener. The
+        token hop reads it as its ``digest_proxy`` flag, so the two decide from one rule."""
+        return self.credentialed and self.config.digest is not None
 
     def auth_headers(self) -> dict[str, str]:
         """The pre-emptive proxy-auth header(s) to add to each request (Basic; empty for Digest/none)."""

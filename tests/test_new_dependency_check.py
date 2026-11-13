@@ -23,12 +23,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from pathlib import Path
 
 import pytest
 
+from scripts.security import new_dependency_check as _gate
 from scripts.security.new_dependency_check import (
     Finding,
     RetryBudget,
@@ -601,7 +603,11 @@ def test_main_passes_when_a_transient_timeout_clears(monkeypatch: pytest.MonkeyP
     import scripts.security.new_dependency_check as mod
 
     _zero_backoff(monkeypatch)
-    seen = set(declared_distributions((_ROOT / "pyproject.toml").read_text(encoding="utf-8")))
+    seen = {
+        name
+        for path in _gate.default_pyprojects(_ROOT)
+        for name in declared_distributions(path.read_text(encoding="utf-8"))
+    }
     seen.discard("fastapi")
     monkeypatch.setattr(mod, "_fetch_once", functools.partial(_fail_once_then_good, seen=seen))
 
@@ -685,6 +691,7 @@ def test_the_real_pyproject_declares_a_plausible_number_of_distributions() -> No
     assert "fastapi" in declared
     assert "pynetdicom" in declared, "the [dicom] extra is not being read"
     assert "bandit" in declared, "the [dependency-groups] CI toolchain is not being read"
+    assert "hatchling" in declared, "the [build-system].requires backend is not being read"
 
 
 def test_the_ci_toolchain_groups_actually_raise_the_examined_count() -> None:
@@ -768,3 +775,606 @@ def test_the_payload_helper_shape_matches_what_pypi_returns() -> None:
     assert "name" in payload["info"]
     entry = next(iter(payload["releases"].values()))[0]
     assert "upload_time_iso_8601" in entry
+
+
+# --- BACKLOG #5641: every declaration surface is read, and nothing is skipped in silence ----------
+#
+# These reach the names #5641 added through the module object (`_gate`) rather than the import block,
+# so against the pre-#5641 code each one fails on its own instead of the whole file failing to collect.
+
+
+def _stub_registry(
+    monkeypatch: pytest.MonkeyPatch, *, absent: frozenset[str] = frozenset()
+) -> list[str]:
+    """Replace the network with a registry that knows every name but ``absent``. Returns the asks."""
+    asked: list[str] = []
+
+    def fetch(name: str, **_kw: object) -> dict | None:
+        asked.append(name)
+        return None if name in absent else _fetch_all_good(name)
+
+    monkeypatch.setattr(_gate, "_http_fetch", fetch)
+    return asked
+
+
+def test_case_and_separator_variants_are_one_distribution() -> None:
+    """S28-84: keyed by the PEP 503 name, so 'PyYAML' and 'pyyaml' are one fetch and one count."""
+    declared = declared_distributions(
+        """
+        [project]
+        dependencies = ["PyYAML>=6", "foo_bar>=1"]
+
+        [project.optional-dependencies]
+        dev = ["pyyaml>=6.0.3", "Foo.Bar>=1"]
+        """
+    )
+    assert set(declared) == {"pyyaml", "foo-bar"}
+    assert declared["pyyaml"] == "PyYAML>=6", "the first spelling's spec is the one kept"
+    asked: list[str] = []
+
+    def fetch(name: str) -> dict:
+        asked.append(name)
+        return _fetch_all_good(name)
+
+    _, examined = vet(declared, fetch, now=_NOW)
+    assert examined == 2
+    assert sorted(asked) == ["foo-bar", "pyyaml"]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "",
+        "   ",
+        "# a comment, not a requirement",
+        "./vendor/thing-1.0-py3-none-any.whl",
+        "https://example.invalid/thing-1.0.tar.gz",
+        "thing:1.0",
+    ],
+    ids=["empty", "blank", "comment", "local-path", "bare-url", "colon"],
+)
+def test_an_unnameable_string_is_a_finding_not_a_silent_skip(spec: str) -> None:
+    """S28-08: a declared entry the gate cannot name used to vanish, so it entered unvetted."""
+    text = f'[project]\ndependencies = ["fastapi>=0.100", {json.dumps(spec)}]\n'
+    assert set(declared_distributions(text)) == {"fastapi"}
+    findings = _gate.unnameable_entries(text)
+    assert [f.problem for f in findings] == ["unnameable entry"]
+    assert "[project].dependencies" in findings[0].distribution
+
+
+def test_a_bare_url_is_not_vetted_as_the_name_https() -> None:
+    """The name grammar must end at a PEP 508 boundary, or 'https://...' is vetted as 'https'."""
+    assert requirement_name("https://example.invalid/x.whl") is None
+    assert requirement_name("thing @ https://example.invalid/x.whl") == "thing"
+    assert requirement_name("thing(>=1)") == "thing"
+
+
+@pytest.mark.parametrize(
+    "toml_text",
+    [
+        "[project]\ndependencies = [42]\n",
+        "[project]\ndependencies = [{ name = 'fastapi' }]\n",
+        "[dependency-groups]\nci = [{ include-group = 'base', extra = 1 }]\nbase = []\n",
+        "[dependency-groups]\nci = [{ not-include-group = 'base' }]\n",
+        "[build-system]\nrequires = [true]\n",
+    ],
+    ids=[
+        "integer",
+        "table-in-dependencies",
+        "include-group-with-extra-key",
+        "other-table-in-group",
+        "boolean-in-build-requires",
+    ],
+)
+def test_a_non_string_entry_is_a_finding(toml_text: str) -> None:
+    findings = _gate.unnameable_entries(toml_text)
+    assert [f.problem for f in findings] == ["unnameable entry"], findings
+
+
+@pytest.mark.parametrize(
+    "toml_text",
+    [
+        "[project]\ndependencies = 'fastapi'\n",
+        "[project]\noptional-dependencies = ['fastapi']\n",
+        "[project.optional-dependencies]\ndev = 'pytest'\n",
+        "[dependency-groups]\nci = 'bandit'\n",
+        "[build-system]\nrequires = 'hatchling'\n",
+        "[tool.uv]\nconstraint-dependencies = 'x'\n",
+    ],
+    ids=["dependencies", "optional-dependencies", "an-extra", "a-group", "build-requires", "uv"],
+)
+def test_a_table_of_the_wrong_toml_type_is_a_finding_not_iterated(toml_text: str) -> None:
+    """``dependencies = 'fastapi'`` used to be iterated character by character, vetting 'f', 'a'."""
+    assert declared_distributions(toml_text) == {}
+    findings = _gate.unnameable_entries(toml_text)
+    assert len(findings) == 1, findings
+    assert findings[0].problem in {"not a list", "not a table"}, findings
+
+
+def test_the_include_group_table_is_still_skipped_without_a_finding() -> None:
+    text = '[dependency-groups]\nbase = ["bandit==1.9.4"]\nall = [{ include-group = "base" }]\n'
+    assert _gate.unnameable_entries(text) == []
+
+
+def test_build_system_requires_is_swept() -> None:
+    """S28-09: a build backend runs in release.yml's build jobs, `release` (id-token) among them."""
+    declared = declared_distributions(
+        '[build-system]\nrequires = ["hatchling==1.33.0", "hatch-vcs-hallucinated>=1"]\n'
+    )
+    assert set(declared) == {"hatchling", "hatch-vcs-hallucinated"}
+
+
+def test_the_uv_dependency_tables_are_swept() -> None:
+    """S28-09: dev-dependencies adds packages; a constraint or override constrains or replaces one
+    already in the graph. All are vetted. None is used in this tree today, so this is synthetic."""
+    declared = declared_distributions(
+        """
+        [tool.uv]
+        dev-dependencies = ["devdep>=1"]
+        constraint-dependencies = ["constrained<2"]
+        override-dependencies = ["overridden==1.0"]
+        build-constraint-dependencies = ["buildconstrained<3"]
+
+        [tool.uv.extra-build-dependencies]
+        some-sdist = ["extrabuild>=1", { requirement = "matched", match-runtime = true }]
+        """
+    )
+    assert set(declared) == {
+        "devdep",
+        "constrained",
+        "overridden",
+        "buildconstrained",
+        "extrabuild",
+        "matched",
+    }
+
+
+def test_main_sweeps_the_packaging_pyprojects_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S28-09: a name declared only in packaging/*/pyproject.toml must be fetched and refused."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    sub = tmp_path / "packaging" / "messagefoundry-thing"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        '[project]\nname = "messagefoundry-thing"\ndependencies = ["invented-helper>=1"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_gate, "_ROOT", tmp_path)
+    asked = _stub_registry(monkeypatch, absent=frozenset({"invented-helper"}))
+
+    assert main([]) == 1
+    assert sorted(asked) == ["fastapi", "invented-helper"]
+
+
+def test_main_refuses_when_the_packaging_tree_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default sweep reading no packaging file is the tree moving under the gate, not clean."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(_gate, "_ROOT", tmp_path)
+    _stub_registry(monkeypatch)
+    assert main([]) == 2
+
+
+def test_main_exits_1_on_an_unnameable_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100", "./vendor/x.whl"]\n',
+        encoding="utf-8",
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 1
+    assert "unnameable entry" in capsys.readouterr().err
+
+
+def test_first_party_names_are_exempt_from_the_age_floor_only() -> None:
+    """A sibling's first upload is recent by construction; every other check still runs on it."""
+    first_party = _gate.FIRST_PARTY
+    assert {normalize(n) for n in first_party} >= {
+        "messagefoundry",
+        "messagefoundry-toolkit",
+        "messagefoundry-webconsole",
+        "messagefoundry-harness",
+    }
+    assert all(len(reason) > 40 for reason in first_party.values())
+
+    declared = declared_distributions(
+        '[project]\ndependencies = ["messagefoundry_toolkit==0.5.2"]\n'
+    )
+    fresh = lambda name: _payload(name, first_release=_NOW - timedelta(days=1))  # noqa: E731
+    assert vet(declared, fresh, now=_NOW) == ([], 1), "vetted and counted, the floor alone waived"
+
+
+@pytest.mark.parametrize(
+    ("fetch", "problem"),
+    [
+        (lambda _name: None, "does not exist on PyPI"),
+        (
+            lambda name: _payload(
+                name, first_release=_NOW - timedelta(days=2000), canonical="someone-else"
+            ),
+            "resolves to a different project",
+        ),
+        (lambda name: _payload(name, first_release=None), "no release history"),
+    ],
+    ids=["absent", "other-canonical", "no-files"],
+)
+def test_a_first_party_name_still_gets_every_other_check(
+    fetch: Callable[[str], dict | None], problem: str
+) -> None:
+    """An unclaimed sibling name is the squat risk: an install from PyPI takes whoever registers it."""
+    findings, examined = vet({"messagefoundry-harness": "messagefoundry-harness"}, fetch, now=_NOW)
+    assert examined == 1
+    assert [f.problem for f in findings] == [problem]
+
+
+def test_a_first_party_name_is_vetted_in_every_table_and_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No table-scoped exclusion: a sibling reference, a root extra and a build table are all asked."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n'
+        '[project.optional-dependencies]\nconsole = ["messagefoundry-webconsole>=0.5"]\n',
+        encoding="utf-8",
+    )
+    sub = tmp_path / "packaging" / "messagefoundry-harness"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["hatchling==1.33.0", "messagefoundry"]\n'
+        '[project]\nname = "messagefoundry-harness"\ndependencies = ["messagefoundry-toolkit==1"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_gate, "_ROOT", tmp_path)
+    asked = _stub_registry(monkeypatch, absent=frozenset({"messagefoundry-toolkit"}))
+    assert main([]) == 1
+    assert sorted(asked) == [
+        "fastapi",
+        "hatchling",
+        "messagefoundry",
+        "messagefoundry-toolkit",
+        "messagefoundry-webconsole",
+    ]
+
+
+def test_main_refuses_a_root_whose_runtime_tables_yield_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """hatchling in [build-system].requires must not mask a lost [project] table."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["hatchling==1.33.0"]\n[project]\nname = "x"\n',
+        encoding="utf-8",
+    )
+    sub = tmp_path / "packaging" / "messagefoundry-thing"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["hatchling==1.33.0"]\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(_gate, "_ROOT", tmp_path)
+    _stub_registry(monkeypatch)
+    assert main([]) == 2
+
+
+def test_a_near_miss_of_a_first_party_name_is_still_vetted() -> None:
+    """The exclusion is by exact PEP 503 name, so a typo of our own name is fetched like any other."""
+    findings, examined = vet(
+        declared_distributions('[project]\ndependencies = ["messagefoundry-tolkit==0.5.2"]\n'),
+        lambda _: None,
+        now=_NOW,
+    )
+    assert examined == 1
+    assert [f.problem for f in findings] == ["does not exist on PyPI"]
+
+
+def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
+    """Liveness against the real tree: the default file list names every packaging pyproject."""
+    files = _gate.default_pyprojects(_ROOT)
+    assert files[0] == _ROOT / "pyproject.toml"
+    # Named, not globbed: a second glob would agree with the first whatever it found.
+    assert {path.parent.name for path in files[1:]} >= {
+        "messagefoundry-harness",
+        "messagefoundry-toolkit",
+        "messagefoundry-webconsole",
+    }, files
+    assert all(path.parent.parent == _ROOT / "packaging" for path in files[1:]), files
+
+
+@pytest.mark.parametrize(
+    ("toml_text", "problem"),
+    [
+        (
+            '[project]\ndependencies = ["fastapi @ https://evil.example/x.whl"]\n',
+            "direct reference",
+        ),
+        (
+            '[project]\ndependencies = ["messagefoundry @ file:///tmp/x.whl"]\n',
+            "direct reference",
+        ),
+        ("[project]\ndynamic = ['version', 'dependencies']\n", "dynamic dependencies"),
+        ("[project]\ndynamic = ['optional-dependencies']\n", "dynamic dependencies"),
+        (
+            "[tool.uv.sources]\nfastapi = { git = 'https://example.invalid/fastapi' }\n",
+            "non-PyPI source",
+        ),
+        (
+            "[[tool.uv.index]]\nname = 'x'\nurl = 'https://example.invalid/simple'\n"
+            "default = true\n",
+            "non-PyPI source",
+        ),
+        ("[tool.uv]\nextra-index-url = ['https://example.invalid/simple']\n", "non-PyPI source"),
+        ("[tool.uv]\nfind-links = ['https://example.invalid/wheels']\n", "non-PyPI source"),
+        (
+            "[tool.uv.pip]\nextra-index-url = ['https://example.invalid/simple']\n",
+            "non-PyPI source",
+        ),
+        ("[tool.uv.workspace]\nmembers = ['tools/*']\n", "uv workspace"),
+        (
+            "[build-system]\nbackend-path = ['_build']\nbuild-backend = 'backend'\n",
+            "in-tree build backend",
+        ),
+        ("[tool.hatch.build.hooks.custom]\n", "in-tree build hook"),
+        ("[tool.hatch.build.targets.wheel.hooks.custom]\npath = 'hook.py'\n", "in-tree build hook"),
+        ("[project]\ndynamic = 'dependencies'\n", "not a list"),
+        ("[tool.uv.dependency-metadata]\nname = 'x'\n", "not a list"),
+    ],
+    ids=[
+        "url-reference",
+        "first-party-url-reference",
+        "dynamic-dependencies",
+        "dynamic-extras",
+        "uv-sources",
+        "uv-index",
+        "uv-extra-index-url",
+        "uv-find-links",
+        "uv-pip-extra-index-url",
+        "uv-workspace",
+        "backend-path",
+        "hatch-custom-hook",
+        "hatch-target-custom-hook",
+        "dynamic-not-a-list",
+        "dependency-metadata-not-an-array",
+    ],
+)
+def test_what_the_gate_cannot_vet_by_name_is_refused(toml_text: str, problem: str) -> None:
+    """A name vetted against pypi.org says nothing when the bytes come from somewhere else."""
+    declared, findings = _gate.scan(toml_text)
+    assert [f.problem for f in findings] == [problem], findings
+    assert declared == {}, "a refused entry must not also be vetted, or a passing name hides it"
+
+
+def test_hatch_and_uv_metadata_requirements_are_swept() -> None:
+    """The backend installs hatch build-target and hook dependencies in the release build jobs."""
+    declared, findings = _gate.scan(
+        """
+        [tool.hatch.build]
+        dependencies = ["globalbuilddep>=1"]
+
+        [tool.hatch.build.targets.wheel]
+        dependencies = ["targetdep>=1"]
+
+        [tool.hatch.build.targets.wheel.hooks.plugin]
+        dependencies = ["targethookdep>=1"]
+
+        [tool.hatch.build.hooks.vcs]
+        dependencies = ["hookdep>=1"]
+
+        [[tool.uv.dependency-metadata]]
+        name = "something"
+        requires-dist = ["metadep>=1"]
+        """
+    )
+    assert findings == []
+    assert set(declared) == {"globalbuilddep", "targetdep", "targethookdep", "hookdep", "metadep"}
+
+
+def test_hatchlings_builtin_version_hook_is_not_refused() -> None:
+    """Its `path` names the file it WRITES; only the `custom` hook loads code from the tree."""
+    declared, findings = _gate.scan(
+        "[tool.hatch.build.hooks.version]\npath = 'messagefoundry/_version.py'\n"
+        "[tool.hatch.build.targets.wheel.hooks.version]\npath = 'x/_version.py'\n"
+    )
+    assert (declared, findings) == ({}, [])
+
+
+def test_an_in_tree_metadata_hook_is_refused() -> None:
+    """A custom metadata hook can rewrite [project].dependencies from code the gate never reads."""
+    _, findings = _gate.scan("[tool.hatch.metadata.hooks.custom]\n")
+    assert [f.problem for f in findings] == ["in-tree metadata hook"], findings
+
+
+def test_hatch_toml_is_merged_over_tool_hatch_as_hatchling_does() -> None:
+    """hatchling loads hatch.toml beside the pyproject and shallow-merges it over [tool.hatch]."""
+    pyproject = "[tool.hatch.build.targets.wheel]\ndependencies = ['replaced-by-hatch-toml>=1']\n"
+    hatch_toml = (
+        "[build.targets.wheel]\ndependencies = ['invented-helper>=1']\n[build.hooks.custom]\n"
+    )
+    declared, findings = _gate.scan(pyproject, hatch_toml_text=hatch_toml)
+    assert set(declared) == {"invented-helper"}, "the shallow merge replaces [tool.hatch].build"
+    assert [f.problem for f in findings] == ["in-tree build hook"], findings
+
+
+def test_main_reads_a_hatch_toml_beside_a_pyproject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    (tmp_path / "hatch.toml").write_text(
+        "[build.targets.wheel]\ndependencies = ['invented-helper>=1']\n", encoding="utf-8"
+    )
+    asked = _stub_registry(monkeypatch, absent=frozenset({"invented-helper"}))
+    assert main(["--pyproject", str(project)]) == 1
+    assert sorted(asked) == ["fastapi", "invented-helper"]
+
+
+def test_refusals_already_collected_print_before_a_later_parse_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = tmp_path / "a.toml"
+    first.write_text('[project]\nname = "x"\ndependencies = ["./x.whl"]\n', encoding="utf-8")
+    broken = tmp_path / "b.toml"
+    broken.write_text("[project\n", encoding="utf-8")
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(first), "--pyproject", str(broken)]) == 2
+    assert "unnameable entry" in capsys.readouterr().err
+
+
+def test_the_no_packaging_error_is_escaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "café%x"  # a newline is not a legal Windows path character; % is
+    root.mkdir()
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(_gate, "_ROOT", root)
+    _stub_registry(monkeypatch)
+    assert main([]) == 2
+    err = capsys.readouterr().err
+    assert err.isascii() and "caf\\xe9%25x" in err, err
+
+
+def test_a_file_whose_every_entry_is_refused_exits_1_not_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Zero examined beside a refusal is a definitive answer, not a parser that stopped seeing."""
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["foo @ https://evil.example/x.whl"]\n',
+        encoding="utf-8",
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 1
+
+
+def test_a_repeated_pyproject_is_swept_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100", "./x.whl"]\n', encoding="utf-8"
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project), "--pyproject", str(project)]) == 1
+    assert capsys.readouterr().err.count("unnameable entry") == 1
+
+
+def test_a_non_ascii_key_prints_as_ascii(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A stock cp1252 console raises UnicodeEncodeError on a character it cannot encode."""
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n'
+        '[project.optional-dependencies]\n"caf\\u00e9" = [42]\n',
+        encoding="utf-8",
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert err.isascii(), err
+    assert "caf\\xe9" in err
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"[project\n", b"\xff\xfe not utf-8"],
+    ids=["toml-syntax-error", "not-utf-8"],
+)
+def test_main_exits_2_on_a_pyproject_it_cannot_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> None:
+    """Could not see is 2; a traceback would exit 1, the code for a vetting failure."""
+    project = tmp_path / "pyproject.toml"
+    project.write_bytes(content)
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 2
+    assert main(["--pyproject", str(tmp_path / "missing.toml")]) == 2
+
+
+def test_an_unnameable_entry_is_named_even_when_pypi_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100", "./vendor/x.whl"]\n',
+        encoding="utf-8",
+    )
+
+    def unreachable(_name: str, **_kw: object) -> dict:
+        raise urllib.error.URLError("no route to host")
+
+    monkeypatch.setattr(_gate, "_http_fetch", unreachable)
+    assert main(["--pyproject", str(project)]) == 2
+    assert "unnameable entry" in capsys.readouterr().err
+
+
+def test_a_newline_in_a_toml_key_cannot_start_a_workflow_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n'
+        '[project.optional-dependencies]\n"x\\n::stop-commands::tok" = [42]\n',
+        encoding="utf-8",
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert not any(line.startswith("::stop-commands::") for line in err.splitlines()), err
+    assert "%0A::stop-commands::" in err
+
+
+def test_a_vetting_finding_names_the_declared_spelling_and_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["Invented.Helper>=1"]\n', encoding="utf-8"
+    )
+    _stub_registry(monkeypatch, absent=frozenset({"invented-helper"}))
+    assert main(["--pyproject", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert "declared as 'Invented.Helper>=1'" in err
+    assert str(project) in err
+
+
+def test_the_real_pyprojects_declare_nothing_unnameable() -> None:
+    for path in _gate.default_pyprojects(_ROOT):
+        text = path.read_text(encoding="utf-8")
+        assert _gate.unnameable_entries(text, source=str(path)) == []
+
+
+def test_documented_blind_spot_npm_manifests_are_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A STATED BOUNDARY, pinned. This gate vets PyPI names only. A package.json -- ide/package.json
+    and ci/npm-tools/package.json in this tree -- is never opened, so an invented npm name passes
+    here. `npm audit` answers known advisories, the npm counterpart of pip-audit, and so shares its
+    blindness to a freshly registered name. If a future change reads npm manifests, update this test
+    and the module docstring together rather than deleting the assertion.
+    """
+    # The DEFAULT sweep, over a tree laid out like this one, so the pin covers the path CI runs.
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    sub = tmp_path / "packaging" / "messagefoundry-thing"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        '[project]\nname = "messagefoundry-thing"\n', encoding="utf-8"
+    )
+    npm = json.dumps({"dependencies": {"invented-npm-helper": "^1.0.0"}})
+    for where in (tmp_path, tmp_path / "ide", tmp_path / "ci" / "npm-tools", sub):
+        where.mkdir(parents=True, exist_ok=True)
+        (where / "package.json").write_text(npm, encoding="utf-8")
+    monkeypatch.setattr(_gate, "_ROOT", tmp_path)
+    asked = _stub_registry(monkeypatch, absent=frozenset({"invented-npm-helper"}))
+    assert main([]) == 0
+    assert asked == ["fastapi"]

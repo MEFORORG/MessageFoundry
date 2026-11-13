@@ -91,13 +91,16 @@ MessageFoundry package, a package the lock does not pin, or every pin, or that h
 or an abbreviation of it that is no abbreviation of a pip-audit option, in the ``=`` form or not;
 and any other word after the lock that holds ``=`` and is not ``--option=value`` for a pip-audit
 option that takes a value, named in full (``_after_lock_refusal``), since pip-audit's usage error
-would print a ``NAME=value`` typed there; and a lock path that holds ``=``. No refusal quotes a
+would print a ``NAME=value`` typed there; and a pip-audit option after the lock that can exit 0
+on pins it did not audit, ``-r`` among them, as ``_FAIL_OPEN_LONG`` says of each, short,
+abbreviated or in the ``=`` form; and a lock path that holds ``=``. No refusal quotes a
 word that holds ``=``, and the module's own usage error quotes nothing once a word holds one. A free-text value after the lock that holds ``=``, as in ``--index-url=URL``, still
 reaches pip-audit, which can print it in its own output. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
-before it (a line ending in a backslash continues, unless it is a comment), indented or not. It
+before it (a line ending in a backslash continues, unless it is a comment), indented or not, and
+a line of only indentation and backslashes starts none, since pip's ``join_lines`` strips them. It
 decodes the lock as pip 26 does (vault BACKLOG #3786 L3): by its UTF-8, UTF-16 or UTF-32
 byte-order mark; failing one, by a PEP 263 ``coding:`` declaration in a comment on either of the
 first two lines, and the copy is written in that encoding too; failing that, as UTF-8, and as the
@@ -144,6 +147,7 @@ from messagefoundry.childenv import (
     pass_environment_refusal,
     python_module_argv,
 )
+from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.redaction import safe_exc
 
 
@@ -161,27 +165,51 @@ def _body(line: str) -> str:
     return line.splitlines()[0] if line else ""
 
 
+def _continues(body: str) -> bool:
+    """Whether pip's ``join_lines`` joins the line after ``body`` onto it."""
+    return body.endswith("\\") and not body.lstrip().startswith("#")
+
+
+def _text(body: str) -> str:
+    """What ``body`` adds to its logical line, without its indentation.
+
+    pip's ``join_lines`` strips the backslashes from both ends of a line it joins, so a line of
+    only backslashes, or of indentation then backslashes, adds no text and a logical line starts
+    after it (vault BACKLOG #3786 R1, R2); its indentation still reaches the joined line.
+    """
+    return (body.strip("\\") if _continues(body) else body).lstrip()
+
+
 def _kinds(lines: list[str]) -> list[str]:
     """Classify each physical line as pip joins them into logical lines.
 
     ``requirement`` or ``option`` where a logical line starts; ``continued`` where a requirement
     goes on to a line that is neither a hash or other option nor a comment, so a marker there would
-    escape the strip; ``other`` for the rest. A line ending in a backslash continues onto the next,
-    unless it is a comment.
+    escape the strip; ``other`` for any other line that starts a logical line (blank, a comment, or
+    only backslashes); ``joined`` for any other line that continues one. A line ending in a
+    backslash continues onto the next, unless it is a comment (:func:`_text`).
     """
     kinds: list[str] = []
     continued = in_requirement = False
     for line in lines:
         body = _body(line)
         head = body.lstrip()
+        continues = _continues(body)
+        text = _text(body)
         if not continued:
-            in_requirement = is_requirement_line(head)
-            kind = "requirement" if in_requirement else "option" if head[:1] == "-" else "other"
+            in_requirement = is_requirement_line(text)
+            kind = "requirement" if in_requirement else "option" if text[:1] == "-" else "other"
+            continues = continues and bool(text)
         else:
-            kind = "continued" if in_requirement and head[:1] not in ("", "-", "#") else "other"
+            continuing = in_requirement and text and head[:1] not in ("-", "#")
+            kind = "continued" if continuing else "joined"
         kinds.append(kind)
-        continued = body.endswith("\\") and not head.startswith("#")
+        continued = continues
     return kinds
+
+
+#: The kinds :func:`_kinds` gives a line that starts a logical line.
+_STARTS = frozenset({"requirement", "option", "other"})
 
 
 def _classify(text: str) -> tuple[list[str], list[str]]:
@@ -483,24 +511,28 @@ def canonical_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def _pin_name(requirement: str) -> str | None:
+    """The canonical name that starts ``requirement``, or ``None`` where none does."""
+    match = _NAME.match(requirement)
+    return canonical_name(match[0]) if match else None
+
+
 def _drop(
     lines: list[str], kinds: list[str], names: Collection[str]
 ) -> tuple[list[str], list[tuple[str, str]]]:
     out: list[str] = []
     dropped: list[tuple[str, str]] = []
-    dropping = continued = False
+    dropping = False
     for line, kind in zip(lines, kinds, strict=True):
-        body = _body(line)
-        if not continued:
-            head = body.lstrip()
-            match = _NAME.match(head) if kind == "requirement" else None
-            name = canonical_name(match[0]) if match else ""
-            dropping = bool(name) and name in names
-            if dropping:
+        if kind in _STARTS:
+            head = _text(_body(line))
+            name = _pin_name(head) if kind == "requirement" else None
+            dropping = False
+            if name is not None and name in names:
+                dropping = True
                 dropped.append((name, head.removesuffix("\\").rstrip()))
         if not dropping:
             out.append(line)
-        continued = body.endswith("\\") and not body.lstrip().startswith("#")
     return out, dropped
 
 
@@ -598,9 +630,10 @@ _OWN_OPTIONS = ("--skip-private", "--pass-environment")
 #: pip-audit options refused after the lock. A dry run without
 #: ``--fix``, help and version audit nothing and exit 0. ``--fix`` audits, then rewrites every
 #: requirements file pip-audit was given, the copy included, to fixed versions; it can exit 0 on a
-#: vulnerable lock.
-_FAIL_OPEN_LONG = ("--dry-run", "--fix", "--help", "--version")
-_FAIL_OPEN_SHORT = frozenset("dhV")
+#: vulnerable lock. ``--requirement`` hands pip-audit a second file, which it reads with its markers
+#: in place and none of its pins counted (vault BACKLOG #3786 R3).
+_FAIL_OPEN_LONG = ("--dry-run", "--fix", "--help", "--version", "--requirement")
+_FAIL_OPEN_SHORT = frozenset("dhVr")
 
 
 def _opens_the_gate(head: str) -> bool:
@@ -711,7 +744,23 @@ def _run(cmd: list[str], *, pass_environment: Sequence[str] = ()) -> int:
     return subprocess.run(cmd, check=False, env=env).returncode  # nosec B603 - argv list, no shell
 
 
+def _distinct_count(requirements: Sequence[str]) -> int:
+    """How many different requirement strings ``requirements`` holds (vault BACKLOG #3786 R4).
+
+    pip-audit 2.10.1's ``_collect_preresolved_deps`` passes over a second requirement with the same
+    name, as written, and the same specifier, which a lock that pinned one version under two
+    markers holds once they are stripped. This counts such a pair once only where both read the
+    same; it does not model pip-audit's comparison, so it counts two where they differ only in how
+    the specifier is written.
+    """
+    return len(set(requirements))
+
+
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
+    # The lock's own text reaches stdout, which on a cp1252 console raised a traceback quoting a
+    # character it could not encode (vault BACKLOG #3786 R5). UTF-8 keeps every character of an
+    # un-gated pin and of the lock's path, as console_streams says a tool printing paths needs.
+    harden_console_streams(encoding="utf-8")
     words = list(sys.argv[1:] if argv is None else argv)
     parser = _UnquotingParser(words, description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
@@ -805,8 +854,9 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
     if refusal:
         print(f"::error::{lock}: {refusal}", file=sys.stderr)
         return 2
-    # _strip rewrote lines one for one and kept each one's continuation, so their kinds stand: the
-    # check above refuses a copy where they do not.
+    # _strip rewrote lines one for one, so _drop reads them by the lock's kinds. Where the strip
+    # left a pin ending in a backslash, the copy joins lines the kinds keep apart; the check above
+    # refuses that where it changes the count, and the check after _drop reads the copy it leaves.
     kept, skipped = _drop(stripped_lines, kinds, private)
     unmatched = private - {name for name, _ in skipped}
     if unmatched:
@@ -829,12 +879,10 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
         print(f"::error::{lock}: {_MARKER_REFUSAL}", file=sys.stderr)
         return 2
     # A skipped pin is neither counted nor listed as audited.
-    stripped = [
-        e for e in stripped if not (m := _NAME.match(e)) or canonical_name(m[0]) not in private
-    ]
+    stripped = [e for e in stripped if (name := _pin_name(e)) is None or name not in private]
     print(
-        f"{lock}: {counted} pinned requirements audited, {len(stripped)} "
-        "un-gated from a marker the host would have evaluated:"
+        f"{lock}: {_distinct_count(read)} pinned requirements audited, {len(stripped)} "
+        "requirement lines un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
         print(f"  {entry}")
