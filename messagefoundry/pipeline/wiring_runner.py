@@ -291,6 +291,7 @@ __all__ = [
     "DrParkedError",
     "NotDeployedError",
     "RegistryRunner",
+    "RunnerLeaseLostError",
     "RunnerNotRunningError",
     "ShardLaneOwnershipError",
 ]
@@ -548,27 +549,48 @@ class ShardLaneOwnershipError(RuntimeError):
 
 class RunnerNotRunningError(RuntimeError):
     """A run-state CONTROL (at least an inbound start or restart, an outbound start, stop or
-    restart) targeted a runner whose graph is not running (BACKLOG #5702).
+    restart) targeted a runner whose graph is not running (BACKLOG #5702). Its subclass
+    :class:`RunnerLeaseLostError` covers one case where the graph still runs; see below.
 
-    Refused rather than acted on. The graph is down, at least before :meth:`RegistryRunner.start`
-    and after a teardown, which includes the ADR 0157 demoted follower, whose ``_stop_graph`` stops
-    the runner while the API keeps serving. A start there would bind a live listener or spawn a
-    delivery worker outside the engine lifecycle, and a stop would record a pause that a later
-    promotion's start inherits. The test is the runner's own flag, not leadership: a node that has
-    lost its lease but not yet stopped its graph still takes the controls until it does.
+    Refused rather than acted on. This class itself is raised while the graph is not running, at
+    least before :meth:`RegistryRunner.start` and after a teardown, which includes the ADR 0157
+    demoted follower, whose ``_stop_graph`` stops the runner while the API keeps serving. A start
+    there would bind a live listener or spawn a delivery worker outside the engine lifecycle, and a
+    stop would record a pause that a later promotion's start inherits. The runner's own flag is not
+    the whole test: a node that has lost its lease but not yet stopped its graph still reads
+    running, so the start and restart doors also ask the coordinator and raise
+    :class:`RunnerLeaseLostError` there (BACKLOG #5906).
 
     An inbound stop is not refused, and neither is an outbound stop while a teardown that raised or
-    was cancelled has left state behind (``has_residual_state``): either may still have a live
-    listener or lane to take down, and the next start tears that state down again, pause records
-    included. The API maps this to 503, as it does a missing runner."""
+    was cancelled has left state behind (``has_residual_state``), or on a node that lost its lease:
+    either may still have a live listener or lane to take down, and the next start tears that
+    state down again, pause records included. The API maps this to 503, as it does a missing
+    runner."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, detail: str | None = None) -> None:
         super().__init__(
-            f"connection {name!r}: this engine's graph is not running (stopped, or a demoted "
+            detail
+            or f"connection {name!r}: this engine's graph is not running (stopped, or a demoted "
             "node), so it takes no connection control until the graph runs again; on a cluster, "
             "the leader runs it"
         )
         self.name = name
+
+
+class RunnerLeaseLostError(RunnerNotRunningError):
+    """A start or restart CONTROL reached a cluster node that no longer holds the leader lease while
+    its graph still runs, in the window before ``Engine._stop_graph`` tears it down (BACKLOG #5906,
+    #8214 item 16). A start there would bring intake or delivery up on a node about to stand by,
+    against the shared store the new leader drives. A subclass, so every handler of
+    :class:`RunnerNotRunningError` (the API's 503, the alert action's INFO line) takes it as is; its
+    own text, because this graph is running."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            name,
+            f"connection {name!r}: this node no longer holds the cluster lease, so it starts no "
+            "connection; its graph stops shortly, and the leader runs it",
+        )
 
 
 class _ConnectorRetired(Exception):
@@ -4285,14 +4307,33 @@ class RegistryRunner:
         )
         return True
 
-    def _require_running(self, name: str, *, residual_ok: bool = False) -> None:
+    def _require_running(self, name: str, *, stop: bool = False) -> None:
         """Refuse a run-state control while the graph is not running (BACKLOG #5702), with
         :class:`RunnerNotRunningError`. Read under the reload lock, which :meth:`start` and every
         teardown also hold, so the flag cannot change between this read and the act.
-        ``residual_ok`` lets a stop through while a failed teardown left lanes behind; the error's
-        docstring says why."""
-        if not self._running and not (residual_ok and self.has_residual_state):
+
+        A ``stop`` passes while a failed teardown left lanes behind; the error's docstring says
+        why. Any other control, a start or restart, also needs this node to hold the leader lease,
+        with :class:`RunnerLeaseLostError` (BACKLOG #5906): a node that lost it before
+        ``Engine._stop_graph`` ran still reads running. The single-node ``NullCoordinator`` always
+        leads, so nothing changes there. A stop needs no lease, since it only takes work down.
+
+        Only the ``_running`` read is fixed by the lock. The lease read is point in time: the
+        coordinator's own task can drop the lease without the lock, during the awaits a start makes
+        after this check. This door is not the fence there. What backs it includes at least the
+        ``leader_gate`` a poll source reads at each tick (its contract is
+        :meth:`~messagefoundry.transports.base.SourceConnector.start`), the L1 pre-send leadership
+        re-check (in :meth:`_process_delivery_item`, and :meth:`_may_send` on the coalesced-batch
+        path), and ``Engine._stop_graph`` itself. The store's H1 leader-epoch fence (ADR 0157; its
+        scope is :meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.current_epoch`) does
+        not fire on this node's claims before at least a successor's acquire bumps the epoch, and
+        it does not cover intake, the ingress commit a listener makes. A listen source does not read
+        ``leader_gate``, so a listener a start brings up after the lease drops keeps taking messages
+        until ``Engine._stop_graph`` stops it, whether or not a successor has acquired."""
+        if not self._running and not (stop and self.has_residual_state):
             raise RunnerNotRunningError(name)
+        if not stop and not self._coordinator.is_leader():
+            raise RunnerLeaseLostError(name)
 
     def _require_owned_destination(self, name: str) -> None:
         """Refuse an outbound CONTROL for a lane another shard owns (ADR 0073). Without this, a
@@ -4356,7 +4397,7 @@ class RegistryRunner:
         reload after a release could not lift (vault BACKLOG #3067)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
-            self._require_running(name, residual_ok=True)
+            self._require_running(name, stop=True)
             self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
 
@@ -4386,7 +4427,12 @@ class RegistryRunner:
         neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067).
 
         ``hold_on_store_fault`` is the operator control route's alone, as on :meth:`start_outbound`.
-        The stop half has run by then, so a raise leaves the lane paused."""
+        The stop half has run by then, so a raise leaves the lane paused.
+
+        The run-state door is the exception to stop-first: a graph that is not running, or a node
+        that lost its lease (:class:`RunnerLeaseLostError`), refuses the whole restart before the
+        stop half, so the lane keeps the state it had. Delivery on such a node is already gated on
+        leadership, and its graph is coming down."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._require_running(name)
@@ -5315,6 +5361,13 @@ class RegistryRunner:
         # is gated: an inbound park just unbinds, and a halted outbound never reads as running.
         if would_start and self._log_halt_holds(name, kind):
             return
+        # A node that lost its lease while its graph still runs: the start door refuses it
+        # (RunnerLeaseLostError, BACKLOG #5906). The graph stops shortly; the leader keeps the
+        # calendar. The park branch still runs, since a stop only takes work down. This read is a
+        # fast path that skips the start log line; the door, read under the reload lock, is the
+        # authority, and the start arms below catch its refusal for a lease lost while they wait.
+        if would_start and not self._coordinator.is_leader():
+            return
         if active and not running:
             # Per-connection auto-start (#115): ``auto_start=False`` means the ENGINE never brings this
             # connection up on its own — only an explicit operator start does. A scheduler tick IS the
@@ -5333,13 +5386,18 @@ class RegistryRunner:
                 kind,
                 name,
             )
-            if kind == "inbound":
-                try:
+            try:
+                if kind == "inbound":
                     await self.start_inbound(name)
-                except Exception as exc:
-                    self._record_window_open_failure(name, exc)
-            else:
-                await self.start_outbound(name)
+                else:
+                    await self.start_outbound(name)
+            except RunnerNotRunningError as exc:
+                # A refusal, not a failed start: no record, no page.
+                log.info("schedule: %s connection %r not started: %s", kind, name, exc)
+            except Exception as exc:
+                if kind == "outbound":
+                    raise
+                self._record_window_open_failure(name, exc)
         elif not active and running:
             log.info(
                 "schedule: %s connection %r leaving active window — parking (clean stop)",
