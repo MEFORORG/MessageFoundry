@@ -12,6 +12,11 @@ from pathlib import Path
 
 import pytest
 
+from tests._log_absence import assert_capture_sees
+
+#: Marks the orphan-sweep log test's control record, so the lines it compares leave it out.
+_SWEEP_CONTROL = "_orphan_sweep_control"
+
 
 def test_sqlserver_schema_hash_tracks_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
     sqlserver = pytest.importorskip(
@@ -68,9 +73,10 @@ def test_sqlserver_passkeys_carry_the_user_foreign_key() -> None:
 async def test_sqlserver_orphan_sweep_logs_a_count_per_table_and_no_account(
     deleted: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #2733: the schema step's orphan delete was silent. Its row is logged when it deleted
-    any rows, as a count and the table, never an account id; a sweep that deleted none logs
-    nothing."""
+    """BACKLOG #2733: the schema step's orphan delete was silent. When it deleted rows, its row is
+    logged at WARNING as a count and the table, with no account id. What this test reads is the
+    records at WARNING and above sent through the store's logger or a logger under it: with a
+    deletion, that is exactly the one line; with none, it is nothing."""
     sqlserver = pytest.importorskip(
         "messagefoundry.store.sqlserver", reason="requires the sqlserver extra (aioodbc)"
     )
@@ -79,23 +85,28 @@ async def test_sqlserver_orphan_sweep_logs_a_count_per_table_and_no_account(
         async def fetchall(self) -> list[tuple[str, int]]:
             return [("sessions", deleted)]
 
-    from tests._log_absence import assert_capture_sees
-
-    with caplog.at_level("WARNING", logger=sqlserver.log.name):
+    tree = sqlserver.log.name
+    with caplog.at_level("WARNING", logger=tree):
         await sqlserver._log_orphans_deleted(_Cursor())
-        # The capture saw a WARNING sent through the store's logger, so lines that come back
-        # empty mean the reader logged nothing at WARNING or above, not that the capture missed it.
+        # The capture sees WARNING records sent through the store's logger during the act.
         assert_capture_sees(caplog, sqlserver.log)
-    lines = [r.getMessage() for r in caplog.records if r.name == sqlserver.log.name]
-    expected = (
-        [
+        # A record kept in the capture and left out of the lines below; the helper takes its own
+        # probe back out, so this one is what the count assertion after the block reads.
+        sqlserver.log.warning("orphan-sweep test control", extra={_SWEEP_CONTROL: True})
+    assert caplog.records
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if not getattr(r, _SWEEP_CONTROL, False)
+        and (r.name == tree or r.name.startswith(tree + "."))
+    ]
+    if deleted:
+        assert lines == [
             "sqlserver: deleted 2 sessions row(s) naming an account that does not exist, before"
             " trusting the table's user key"
         ]
-        if deleted
-        else []
-    )
-    assert lines == expected
+    else:
+        assert lines == []
 
 
 def test_postgres_schema_hash_tracks_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
