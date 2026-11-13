@@ -96,8 +96,11 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "97\\X00\\1234",
         "971234\x00X",
         "97\x001234",
-        "971234​",
-        "97​1234",
+        "971234\u200b",
+        "97\u200b1234",
+        "9\u00ad71234",
+        "9\u200b71234",
+        "9\x0071234",
     ],
     ids=[
         "component-escape",
@@ -138,6 +141,9 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "raw-nul-inside",
         "zero-width-padded",
         "zero-width-inside",
+        "soft-hyphen-in-prefix",
+        "zero-width-in-prefix",
+        "nul-in-prefix",
     ],
 )
 
@@ -160,8 +166,24 @@ def test_an_escaped_site_code_is_found_and_scrubbed(
 @_SURROGATES
 @pytest.mark.parametrize(
     "value",
-    ["9712345\\S\\X", "A971234", "97\\X31\\2345", "971234\\X41\\", "20260101\\S\\971"],
-    ids=["seven-digits", "glued-letter", "hex-seven-digits", "hex-letter", "date"],
+    [
+        "9712345\\S\\X",
+        "A971234",
+        "97\\X31\\2345",
+        "971234\\X41\\",
+        "20260101\\S\\971",
+        "Call\t971234\ttoday",
+        "Order\t971234",
+    ],
+    ids=[
+        "seven-digits",
+        "glued-letter",
+        "hex-seven-digits",
+        "hex-letter",
+        "date",
+        "tab-separated-free-text",
+        "tab-before",
+    ],
 )
 def test_a_site_code_run_inside_a_longer_value_is_left(
     surrogates: ModuleType, site_prefix: str, value: str

@@ -521,7 +521,9 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
     ``field_sep`` is the message's field separator, which ``\\F\\`` decodes to."""
     if not value or not _SITE_PREFIXES:
         return value
-    if not any(p in value for p in _SITE_PREFIXES) and not (seps.escape and seps.escape in value):
+    # The check also reads the value with its invisible characters dropped, so the fast exit does.
+    visible = dropped(value)
+    if not any(p in visible for p in _SITE_PREFIXES) and not (seps.escape and seps.escape in value):
         return value
 
     def _fake(part: str) -> str:
@@ -758,11 +760,13 @@ def trim(text: str) -> str:
 
 def _split_at_invisible(text: str) -> list[str]:
     """``text`` split at each invisible character, as a consumer that stops at one reads each
-    piece. Whitespace does not split it."""
+    piece. Whitespace does not split it, a tab, a form feed or NEL included, though they are
+    category Cc: free text such as ``Call<TAB>971234<TAB>today`` keeps the code, as it does with
+    spaces."""
     pieces: list[str] = []
     start = 0
     for at, char in enumerate(text):
-        if _is_invisible(char):
+        if _is_invisible(char) and not char.isspace():
             pieces.append(text[start:at])
             start = at + 1
     pieces.append(text[start:])

@@ -2405,8 +2405,8 @@ Properties of the anonymizer:
   the check-digit scheme, the identifier type and the issuer's names. It blanks CX.2, the check digit, the CX.7 and
   CX.8 dates, and anything past CX.10. `PID-20`, a driver's licence, takes the `dln` kind: the
   number is fabricated, the issuing state kept and the expiry blanked (BACKLOG #5534). The
-  leak-check still scans a kept component, as written and decoded. A dashed SSN or a punctuated
-  phone number there refuses, as it would in a field no rule maps. Any other text a sender puts
+  leak-check still scans a kept component, as written and decoded. A dashed SSN, a punctuated
+  phone number or a routable IPv6 address there refuses, as it would in a field no rule maps. Any other text a sender puts
   in one, such as a name, passes. The kept positions are
   CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
@@ -2520,8 +2520,13 @@ any word that ends in a hex digit or letter joined to `::`, such as `ADD::`, `No
 `std::bad_alloc` or `Code:: 12`; such a word joined by a colon to an allowed address, such as
 `Feed:fe80::1`; a word that ends in hex digits joined to `::` and more hex, such as `abc 1::2`;
 eight colon-separated hex groups, such as a colon-written EUI-64 device id
-(`00:1A:2B:FF:FE:3C:4D:5E`); nine such groups, read as an address and a `:port`; and, in a message whose field or component separator is `:`, digits
-on either side of an empty field, such as `1::1234`.
+(`00:1A:2B:FF:FE:3C:4D:5E`); nine such groups, read as an address and a `:port`; and, in a
+message whose component separator is `:`, digits on either side of an empty component, such as
+`1::1234`.
+
+In a message whose field separator is `:`, every IPv6 address is cut into separate fields, none
+of which holds it, and there is no cut-across-fields check for IPv6 as there is for the SSN and
+phone shapes, so every IPv6 address there passes, and `1::1234` refuses nothing (BACKLOG #5654).
 
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
@@ -2827,8 +2832,8 @@ field as captured.** The kinds do not rewrite the same parts of a field. `id`, `
 rewrite the first component and keep CX components 3 to 6, 9 and 10, so `PID-5` pointed at `id`
 leaves the middle name. `dln` keeps the second component, so it would leave the given name. `date` keeps
 the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check scans what such a
-field has left past its first component for a dashed SSN and a punctuated phone number, as the
-table above says, and refuses either. A name, a city or a year left there passes, and so does a
+field has left past its first component for a dashed SSN, a punctuated phone number and a
+routable IPv6 address, as the table above says, and refuses any of them. A name, a city or a year left there passes, and so does a
 year left in the first component, so a clean return does not clear it.
 
 **`load_rules` refuses such a retarget unless the overlay lists the field under
