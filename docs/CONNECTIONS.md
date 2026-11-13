@@ -2920,10 +2920,13 @@ follow-on and is **not** built.
 **Fault & delivery semantics.** The response is inspected for a SOAP `Fault` (which can arrive as an HTTP
 500 **or** an HTTP 200 body). A **Sender/Client** fault → `NegativeAckError` → **dead-letter** (the
 request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. The
-fault code is read only from the Fault's first child element: SOAP 1.2's `Code`, then the `Value` that is
-that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or processing
-instruction before that child is skipped. A `Value` anywhere else in the Fault never decides the class,
-and a SOAP 1.1 Fault whose `faultcode` is not its first child reads as a permanent fault. An
+Sender/Receiver class is read only from the Fault's first child element: SOAP 1.2's `Code`, then the
+`Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or
+processing instruction before either child is stepped over; one that holds a `</Fault>` or `</Code>`
+close tag, or any other `<!` markup such as a DOCTYPE, leaves no code. A Fault whose first child is
+neither, including a SOAP 1.1 Fault whose `faultcode` is not its first child, or whose code element holds
+no code, reads as a permanent fault. The WS-Security check is separate: a WS-Security code anywhere in
+the Fault still dead-letters it. An
 unrecognized fault is treated as permanent (so a rejected request can't loop the lane). With no fault, the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role

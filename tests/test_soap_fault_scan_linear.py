@@ -602,8 +602,9 @@ _MAX_LINEAR_RATIO = 8.0
 #: the three ``long-code-*`` shapes reach a code element's checks: ``long-code-close-prefix`` and
 #: ``long-code-text`` the faultcode's, in ``_code_text``, and ``long-code-close-prefixes`` the Code's
 #: close-tag search, ``_CODE_END_RE``. Since BACKLOG
-#: #5912 the name regexes are tried once, at the Fault's first child, so ``long-prefixes``,
-#: ``value-start-tags`` and ``unterminated-value-tags`` time that one match and the Fault close-tag
+#: #5912 the name regexes are tried at most once each, anchored, ``faultcode`` and ``Code`` at the
+#: Fault's first child and ``Value`` at the Code's, so ``long-prefixes``, ``value-start-tags`` and
+#: ``unterminated-value-tags`` time the matches at the Fault's first child and the Fault close-tag
 #: scan rather than a name scan; ``unterminated-value-tags-in-a-code`` reaches the Value path. ``long-prefixes`` is here for the
 #: name regexes' ``[\w.\-]+:`` prefix class, which backtracks over each run that has no colon, and
 #: ``long-close-prefixes`` for the same class in the Fault close-tag scan, ``_FAULT_END_RE``.
