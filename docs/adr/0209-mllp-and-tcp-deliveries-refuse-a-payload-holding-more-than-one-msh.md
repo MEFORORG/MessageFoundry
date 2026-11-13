@@ -142,8 +142,10 @@ the dead-letter queue, with a named code.
   payload previews as a delivery and dead-letters live. That is the gap ADR 0205 names, vault #2824.
 - A payload led by `FHS` or `BHS` is never read, so a Handler-built envelope with a wrong `BTS-1`
   goes out as written.
-- Only a line whose first three characters are `MSH` counts, the parser's reading, or a line whose
-  `MSH` follows a run of byte order marks *(added by the amendment of 2026-11-13 below)*. A second
+- A line counts when its first three characters are `MSH`, the parser's reading, or when its `MSH`
+  follows a run of byte order marks, which the parser does not read as a header but a receiver
+  that drops the marks does. Delivery has read the marked line since this ADR was built; the
+  amendment of 2026-11-13 below brings the ingress guard and the split to it. A second
   message behind a CR and another character, such as `0x0B` toward an `stx_etx` TCP outbound, or a
   space, is not refused here. A receiver that trims each line would read it as a message.
 - An MLLP or TCP inbound whose `content_type` is not `hl7v2` admits a body holding several

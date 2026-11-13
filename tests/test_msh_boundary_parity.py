@@ -191,7 +191,7 @@ def _earliest(pattern: re.Pattern[Any], text: Any, start: int) -> int:
 def test_the_predicate_returns_the_earliest_boundary(start: int) -> None:
     # The boolean readings throw the index away, so the parity tests above would not see a search
     # return a later boundary (BACKLOG #4972). Each answer is held to a plain regex for the same
-    # boundary, for each spelling.
+    # boundary, for each kind of text.
     assert [
         text
         for text in CORPUS
