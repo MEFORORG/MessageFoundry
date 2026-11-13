@@ -97,9 +97,15 @@ from .._auth import (
 )
 from .._html import CSP_PROBE_SRC
 from .._service import _service
+from ..pages import restore_eol
 from ..pages._common import _seg
-from ..pages.messages import restore_eol
-from ._common import UI_BODY_FILTER_RULES, blank_to_none, check_filters, for_echo
+from ._common import (
+    UI_BODY_FILTER_RULES,
+    _form_pairs,
+    blank_to_none,
+    check_filters,
+    for_echo,
+)
 from .oidc import reauth_idp_response
 
 _log = logging.getLogger(__name__)
@@ -1587,19 +1593,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
         The submitted body's line breaks are rewritten here to the original's terminator style, the
         ``eol`` field the editor rendered (BACKLOG #5930), so the repeat key and the spend key both
-        hash the body that is resubmitted. An ``eol`` that ``restore_eol`` does not know, an empty
-        one included, leaves the body as sent, and the route refuses it. ``restore_eol`` is called
-        by its bare name so the seam digest hashes its body: the helper walk follows global names,
-        not module attributes.
+        hash the body that is resubmitted. An ``eol`` that ``restore_eol`` does not know leaves the
+        body as sent, and the route refuses it. An empty ``eol`` counts as unknown. The parser
+        calls ``restore_eol`` by its bare name, because the seam's helper walk follows global names
+        and not module attributes.
 
-        A blank field is dropped, as ``parse_qsl`` drops it by default, except ``eol``: an empty
-        ``eol`` is kept so the route refuses it rather than resubmitting the browser's CRLF."""
+        The parser drops every blank field except ``eol``, which it keeps for the route to refuse.
+        Without that, an empty ``eol`` would resubmit the browser's CRLF unchanged."""
         cache = request.scope.setdefault("mf_2625", {})
         cached = cache.get("form")
         if isinstance(cached, dict):
             return cached
-        pairs = parse_qsl((await request.body()).decode("utf-8", "replace"), keep_blank_values=True)
-        form = {k: v for k, v in pairs if v or k == "eol"}
+        form = {k: v for k, v in await _form_pairs(request) if v or k == "eol"}
         if "eol" in form and "raw" in form:
             restored = restore_eol(form["raw"], form["eol"])
             if restored is not None:
