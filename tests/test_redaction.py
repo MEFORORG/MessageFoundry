@@ -2106,7 +2106,56 @@ def test_a_cut_after_whitespace_or_punctuation_led_xml_text_is_a_stated_residual
     assert "zqxa" in redact_untrusted(_over_window(tail))
 
 
-# --- json_loads_or_refusal (BACKLOG #2048) ------------------------------------
+# --- a malformed end tag inside a vocabulary element (BACKLOG #5925) ---
+#
+# The element walk copied an end tag's remainder, everything up to the next ``<`` or ``>``, into the
+# output as it stood. So text inside an end tag, or after one that never got its ``>``, walked
+# through. Each value is a single token on purpose: a two-name run is dropped by the name pass
+# whatever the XML pass does, and the arm would pass for the wrong reason.
+
+_MALFORMED_END_TAGS = {
+    "text-inside": ("<family>Smith</family Johnathan>", "Johnathan"),
+    "no-bracket-at-end": ("<family>Smith</family Johnathan", "Johnathan"),
+    "no-bracket-before-tag": ("<family>Smith</family SSN123456789<given>x</given>", "SSN123456789"),
+    "no-bracket-newline": ("<family>Smith</family\nJohnathan", "Johnathan"),
+    "nested-child": ("<name><given>Smith</given SSN123456789></name>", "SSN123456789"),
+    "kept-child": (
+        '<identifier><system value="urn:x"></system Johnathan><value value="1"/></identifier>',
+        "Johnathan",
+    ),
+    "unopened-name": ("<family>Smith</other Johnathan></family>", "Johnathan"),
+}
+
+
+@pytest.mark.parametrize(
+    ("text", "token"), list(_MALFORMED_END_TAGS.values()), ids=list(_MALFORMED_END_TAGS)
+)
+def test_a_malformed_end_tag_strands_nothing(
+    text: str, token: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = redact(text)
+    assert token not in out, out
+    assert redact(out) == out
+    assert "</" in out  # the tag's name stays; only its remainder goes
+    # The positive control: the token is the XML pass's to catch, not a neighbour's.
+    monkeypatch.setattr(redaction, "_redact_xml_elements", lambda t, *_, **__: t)
+    assert token in redact(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("<family>Smith</family >", "<family>[redacted]</family >"),
+        ("<family>Smith</family\t>", "<family>[redacted]</family\t>"),
+        ("<family>Smith</family Johnathan>", "<family>[redacted]</family [redacted]>"),
+        ("<family>Smith</family Johnathan", "<family>[redacted]</family [redacted]"),
+    ],
+)
+def test_an_end_tag_keeps_its_name_and_whitespace(text: str, want: str) -> None:
+    assert redaction._redact_xml_elements(text) == want
+
+
+# --- json_loads_or_refusal (BACKLOG #2048)------------------------------------
 
 
 def test_json_loads_or_refusal_returns_the_value_and_no_hint() -> None:

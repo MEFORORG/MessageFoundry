@@ -1550,8 +1550,11 @@ _XML_PHI_ELEMENT = re.compile(
 )
 #: Any start or end tag, for the walk through an element's content.
 _XML_TAG = re.compile(r"<(/?)((?:[A-Za-z_][\w.-]*+:)?([A-Za-z_][\w.-]*+))")
-#: The rest of an end tag, up to its ``>``.
-_XML_END_TAG_REST = re.compile(r"[^<>]*+>?")
+#: The rest of an end tag after its name, up to its ``>``: the whitespace XML allows there, anything
+#: else (which well-formed XML never has, so the walk scrubs it), and the ``>`` if there is one. A
+#: bracketless end tag's rest runs to the next ``<`` or the end of the text, the fail-closed edge
+#: (BACKLOG #5925).
+_XML_END_TAG_REST = re.compile(r"(\s*+)([^<>]*+)(>?)")
 #: One part of a start tag after its name: whitespace, the tag's end, an attribute and the opening of
 #: its quoted value (the value itself is read by :data:`_XML_ATTR_VALUE`), or anything else.
 #:
@@ -1664,9 +1667,14 @@ def _scrub_xml_element(
             return "".join(out), n
         qname = tag.group(2)
         if tag.group(1):  # an end tag: close back to the element it names, if it is open at all
+            out.append(tag.group())
             rest = _XML_END_TAG_REST.match(text, tag.end())
-            pos = rest.end() if rest is not None else tag.end()
-            out.append(text[tag.start() : pos])
+            if rest is None:  # unreachable: the pattern matches the empty string
+                pos = tag.end()
+            else:
+                ws, junk, bracket = rest.groups()
+                out.append(f"{ws}{_REDACTED if junk else ''}{bracket}")
+                pos = rest.end()
             if open_names.get(qname):
                 while stack:
                     name, _ = stack.pop()
