@@ -1406,20 +1406,30 @@ def test_serve_mints_a_tls_key_it_accepts_in_a_store_directory_a_group_may_write
     directory again on every mount, so a later start refuses them."""
     from messagefoundry.api.tls import _generated_pair
 
-    tmp_path.chmod(0o775)
+    # The store in a directory of its own: the settings file stays in tmp_path, whose folder the
+    # start-path guard requires owner-only.
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    store_dir.chmod(0o775)
     # The control: a key straight in this directory, as the engine minted it before, is refused.
-    beside = tmp_path / "beside.key"
+    beside = store_dir / "beside.key"
     write_restricted_file(beside, b"KEY-MATERIAL-STAND-IN")
     assert "has mode 0775 with no sticky bit" in str(broad_access_problem(beside))
     beside.unlink()
 
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    assert _serve(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML) == 0
-    _cert, key = _generated_pair(tmp_path)
-    assert key.parent != tmp_path and stat.S_IMODE(key.parent.stat().st_mode) == 0o700
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(PHI_GATE_PROVISIONS_TOML, encoding="utf-8")
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]
+    argv += ["--db", str(store_dir / "messagefoundry.db")]
+    assert main(argv) == 0
+    _cert, key = _generated_pair(store_dir)
+    assert key.parent != store_dir and stat.S_IMODE(key.parent.stat().st_mode) == 0o700
     assert broad_access_problem(key) is None
     assert "is not restricted" not in capsys.readouterr().err
-    assert _serve(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML) == 0  # and it reuses the pair
+    assert main(argv) == 0  # and it reuses the pair
 
 
 @pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])

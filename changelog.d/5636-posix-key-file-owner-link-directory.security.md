@@ -9,7 +9,10 @@
   POSIX, so its key check passes in a store directory a group may write, such as one made under
   umask `002`; that group can still replace the certificate, lock and store beside it. The
   certificate stays beside the store. `cert self-signed` and `cert import` create `--out-dir` at
-  `0700` on POSIX. On Windows both directories inherit their parent's access list, as before.
+  `0700` on POSIX, so other local accounts can no longer read the public certificate files in a
+  directory they create; copy a certificate out for a client that runs as another account. An
+  existing `--out-dir` keeps its mode. On POSIX the engine refuses to mint into an
+  `api-generated-key.d` that is a link, or that another account owns or a group or other may write. On Windows both directories inherit their parent's access list, as before.
   Only the last part of a path is read without following a link; a link above it is followed. A link is now judged
   as itself, so a dangling link to a key is refused rather than passed as a missing file. Only the
   directory that holds the file is read, not the ones above it. The shipped manifests

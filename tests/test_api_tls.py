@@ -12,7 +12,9 @@ import inspect
 import ipaddress
 import json
 import logging
+import os
 import ssl
+import stat
 import subprocess  # nosec B404 -- runs our own interpreter only
 import sys
 import threading
@@ -110,9 +112,6 @@ def _self_signed(tmp_path: Path, *, password: str | None = None) -> tuple[Path, 
     # operator's key must be: under enforce `serve` refuses one a broad group can read (#3402).
     # The restricted create refuses an existing name, and a test may mint twice into one directory.
     key_path.unlink(missing_ok=True)
-    key_path.parent.mkdir(
-        mode=0o700, exist_ok=True
-    )  # the key's own directory, as the engine makes it
     write_restricted_file(
         key_path,
         approved_pkcs8_pem(key, password)
@@ -4781,9 +4780,38 @@ def test_the_key_directory_is_owner_only_on_posix_and_inherits_on_windows(
 
     seen: list[dict[str, object]] = []
     monkeypatch.setattr(Path, "mkdir", lambda _self, **kwargs: seen.append(kwargs))
+    monkeypatch.setattr(os, "geteuid", lambda: 10001, raising=False)
+    owned = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=10001)
+    monkeypatch.setattr(os, "lstat", lambda _path: owned)
     monkeypatch.setattr(tls_mod.sys, "platform", platform)
     tls_mod._make_key_directory(tmp_path / "keys")
     assert seen == [{"exist_ok": True} if mode is None else {"mode": mode, "exist_ok": True}]
+
+
+@pytest.mark.parametrize(
+    ("st_mode", "st_uid", "why"),
+    [
+        (stat.S_IFLNK | 0o777, 10001, "a link"),
+        (stat.S_IFDIR | 0o700, 10002, "uid 10002"),
+        (stat.S_IFDIR | 0o770, 10001, "mode 0770"),
+        (stat.S_IFREG | 0o600, 10001, "mode 0600"),
+    ],
+)
+def test_a_planted_posix_key_directory_stops_the_mint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, st_mode: int, st_uid: int, why: str
+) -> None:
+    """In a store directory a group may write, a link or directory planted under the key
+    directory's name would take the minted key before the key-file gate ran (vault BACKLOG #5636).
+    The control is the owner-only directory the test above accepts."""
+    from messagefoundry.api import tls as tls_mod
+
+    monkeypatch.setattr(Path, "mkdir", lambda _self, **_kwargs: None)
+    monkeypatch.setattr(os, "geteuid", lambda: 10001, raising=False)
+    monkeypatch.setattr(os, "lstat", lambda _path: SimpleNamespace(st_mode=st_mode, st_uid=st_uid))
+    monkeypatch.setattr(tls_mod.sys, "platform", "linux")
+    with pytest.raises(ValueError, match="will not mint its TLS key there") as refused:
+        tls_mod._make_key_directory(tmp_path / "keys")
+    assert why in str(refused.value)
 
 
 def test_a_hung_mint_holder_times_out_with_a_named_lock_and_mints_nothing(
@@ -5075,9 +5103,9 @@ def _plant_generated_pair(
     # refuse a generated key a broad account can read, and a plain write is group- and
     # world-readable on POSIX, so a planted pair must not differ from a minted one on that axis.
     key_path.unlink(missing_ok=True)
-    key_path.parent.mkdir(
-        mode=0o700, exist_ok=True
-    )  # the key's own directory, as the engine makes it
+    from messagefoundry.api.tls import _make_key_directory
+
+    _make_key_directory(key_path.parent)  # the key's own directory, made as the engine makes it
     write_restricted_file(
         key_path,
         key.private_bytes(

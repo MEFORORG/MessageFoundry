@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import ssl
+import stat
 import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -739,11 +740,30 @@ def _make_key_directory(key_dir: Path) -> None:
     Windows: with no mode, so it inherits the data directory's access list, the service account's
     grant included; CPython 3.13 and later give a directory made with ``mode=0o700`` a protected list
     of its own instead, which would shut that account out. An existing directory is left as it is,
-    and the key-file gate judges it."""
+    and the key-file gate judges it.
+
+    **POSIX: what is there is checked before a key is written into it or deleted from it.** The
+    store directory may be one a group can write, so a link or a directory another account planted
+    under this name would otherwise take the minted key, or have a file deleted through it, before
+    the key-file gate runs. A link, a non-directory, an owner other than this account or root, and
+    a group or other write bit raise ``ValueError``, which stops the start under every enforcement
+    setting rather than falling back to a pair that would be read through it."""
     if sys.platform == "win32":
         key_dir.mkdir(exist_ok=True)
-    else:
-        key_dir.mkdir(mode=0o700, exist_ok=True)
+        return
+    key_dir.mkdir(mode=0o700, exist_ok=True)
+    status = os.lstat(key_dir)
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_uid not in (os.geteuid(), 0)
+        or status.st_mode & 0o022
+    ):
+        raise ValueError(
+            f"{key_dir} is not a directory this account owns and only it may write (mode "
+            f"{stat.S_IMODE(status.st_mode):04o}, uid {status.st_uid}, "
+            f"{'a link' if stat.S_ISLNK(status.st_mode) else 'not a link'}), so the engine will "
+            "not mint its TLS key there. Remove it, and the next start makes it again at 0700"
+        )
 
 
 def _still_serves(cert_path: Path, key_path: Path) -> bool:
