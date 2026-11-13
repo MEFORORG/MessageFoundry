@@ -8,6 +8,7 @@
   `messagefoundry/store/document_strip.py` module docstring. The pass also reads candidates in
   keyset batches ordered by received time and message id instead of all at once, and runs the
   decrypt, strip and encrypt in a worker thread with no store connection held, rather than on the
-  event loop. A failing row is skipped and a failing batch is rolled back and passed over; a
-  key-service outage ends the strip phase early with a WARNING, and the rest of the retention pass
-  still runs.
+  event loop. A failing row is skipped and a failing batch is rolled back and passed over, while a
+  store-wide cipher error, such as the encryption invocation ceiling, still stops the pass as
+  before; a key-service outage ends the strip phase early with a WARNING, and the rest of the
+  retention pass still runs.

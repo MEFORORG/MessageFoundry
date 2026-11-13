@@ -663,10 +663,11 @@ async def test_a_failed_audit_of_refused_cells_still_logs_what_was_committed(
 async def test_a_key_service_outage_stops_the_pass(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5651: a batch whose every row got no verdict from the key service is an outage: the
-    strip call ends after it, rather than failing, and timing out, once per row of every later
-    batch. The call returns, flagged ``ended_early``, instead of raising."""
-    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 2)
+    """BACKLOG #5651: a batch where at least ``OUTAGE_MIN_ROWS`` rows reached the key service and
+    none got a verdict is an outage: the strip call ends after it, rather than failing, and timing
+    out, once per row of every later batch. The call returns, flagged ``ended_early``, instead of
+    raising."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 3)
     for i in range(5):
         await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=float(i), control=f"C-O{i}")
     calls: list[str] = []
@@ -682,7 +683,7 @@ async def test_a_key_service_outage_stops_the_pass(
     )
 
     assert result == StripResult(ended_early=True)
-    assert len(calls) == 2  # the first batch only
+    assert len(calls) == 3  # the first batch only
 
 
 async def test_one_row_the_key_service_gives_no_verdict_on_is_skipped(
@@ -708,6 +709,100 @@ async def test_one_row_the_key_service_gives_no_verdict_on_is_skipped(
     assert (result.messages_stripped, result.ended_early) == (1, False)
     assert (await _get(store, bad))["raw"] == MFB64_BODY
     assert binary.is_document_tombstone((await _get(store, good))["raw"])
+
+
+async def test_a_row_refused_alone_in_its_batch_is_skipped_and_does_not_end_the_call(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: a row the key service always gives no verdict on is skipped, as on
+    origin/main, even when it is the only row of its batch to reach the service. Fewer than
+    ``OUTAGE_MIN_ROWS`` such rows are not an outage, so the scan goes on to the rows after it."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    bad = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-AL1")
+    good = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=1.0, control="C-AL2")
+    from messagefoundry.store.cell_tag import open_message_cell as real
+
+    def one_bad(cipher: Any, column: str, stored: Any, **kwargs: Any) -> Any:
+        if kwargs["message_id"] == bad:
+            raise CipherUnavailableError("synthetic: no verdict on this one cell")
+        return real(cipher, column, stored, **kwargs)
+
+    monkeypatch.setattr(document_strip, "open_message_cell", one_bad)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert (result.messages_stripped, result.ended_early) == (1, False)
+    assert binary.is_document_tombstone((await _get(store, good))["raw"])
+
+
+async def test_a_store_wide_cipher_error_from_encrypt_propagates(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: a store-wide fail-closed :class:`CipherError` from ``encrypt``, the AES-GCM
+    invocation ceiling here, is not swallowed as one row's failure: it propagates out of the strip,
+    as on origin/main, so its instruction to rotate the store key reaches the operator."""
+    from messagefoundry.store.crypto import CipherError
+
+    mid = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-CEIL")
+
+    def ceiling(*_args: Any, **_kwargs: Any) -> str:
+        raise CipherError(
+            "AES-GCM invocation ceiling reached for this store's data key; rotate the store "
+            "encryption key (`messagefoundry rotate-key`) and restart before encrypting further"
+        )
+
+    monkeypatch.setattr(store._cipher, "encrypt", ceiling)
+
+    with pytest.raises(CipherError, match="rotate the store encryption key"):
+        await store.strip_embedded_documents(
+            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+        )
+
+    assert (await _get(store, mid))["raw"] == MFB64_BODY
+
+
+async def test_a_failed_batch_read_ends_the_call_and_counts_as_audited_work() -> None:
+    """BACKLOG #5651: a batch read that fails ends the call with ``read_failed`` set. Unlike an
+    outage, a database fault is work for the retention audit row, so a pass whose only event it
+    was still writes that row, recording it."""
+    from messagefoundry.pipeline.retention import RetentionPass
+
+    async def fetch(*_args: Any) -> list[Any]:
+        raise RuntimeError("synthetic read failure")
+
+    async def never(*_args: Any) -> list[Any]:
+        raise AssertionError("no batch to write")
+
+    async def report(_failures: Any) -> None:
+        return None
+
+    result = await document_strip.run_strip_pass(
+        IdentityCipher(),
+        fetch=fetch,
+        write=never,
+        report=report,
+        now=PRUNED_AT,
+        older_than=float("-inf"),
+        connection_cutoffs={"IB": 4 * DAY},
+        min_bytes=0,
+        content_types={},
+    )
+
+    assert (result.ended_early, result.read_failed) == (True, True)
+    quiet: dict[str, Any] = {
+        "messages_purged": 0,
+        "dead_purged": 0,
+        "state_purged": 0,
+        "conn_events_purged": 0,
+        "wal_checkpointed": False,
+        "vacuumed": False,
+        "size_bytes": None,
+        "over_limit": False,
+    }
+    assert RetentionPass(**quiet, documents_strip_read_failed=True).did_work
+    assert not RetentionPass(**quiet, documents_strip_ended_early=True).did_work
 
 
 async def test_a_key_service_outage_ends_only_the_strip_phase_of_a_retention_pass(
