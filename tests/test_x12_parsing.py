@@ -266,14 +266,45 @@ def test_split_surfaces_non_isa_junk_as_its_own_element(
 
 def test_split_of_a_buffer_with_no_isa() -> None:
     assert split("not x12 at all\r\n") == ["not x12 at all"]
-    assert split("﻿ \r\n") == [] and split("") == []
+    assert split("\ufeff \r\n") == [] and split("") == []
 
 
-def test_split_still_raises_on_a_malformed_isa_at_a_fragment_start() -> None:
-    raw = list(interchange())
-    raw[6] = "X"  # corrupt a fixed element-separator position
-    with pytest.raises(X12PeekError, match="malformed"):
-        split(interchange(control="000000002") + "".join(raw))
+def _corrupt(raw: str) -> str:
+    return raw[:6] + "X" + raw[7:]  # clobber a fixed element-separator position
+
+
+@pytest.mark.parametrize(
+    ("raw_parts", "expected"),
+    [
+        pytest.param(["A", "\r\nPaid by VISA\r\n"], ["A", "Paid by VISA"], id="trailing-visa"),
+        pytest.param(["A", "\r\nISAAC\r\n"], ["A", "ISAAC"], id="short-trailing-isa"),
+        pytest.param(
+            ["A", "\r\nISA segment missing\r\n", "B"],
+            ["A", "ISA segment missing", "B"],
+            id="junk-opening-with-isa",
+        ),
+        pytest.param(["BAD", "BAD", "B"], ["BAD", "BAD", "B"], id="two-corrupted-then-good"),
+        pytest.param(
+            ["BAD", "\r\nGARBAGE\r\n", "B"], ["BAD", "GARBAGE", "B"], id="corrupted-noise"
+        ),
+    ],
+)
+def test_split_bounds_a_malformed_isa_and_never_raises_on_one(
+    raw_parts: list[str], expected: list[str]
+) -> None:
+    a, b = interchange(), interchange(control="000000002")
+    parts = {"A": a, "B": b, "BAD": _corrupt(interchange(control="000000003"))}
+    out = split("".join(parts.get(p, p) for p in raw_parts))
+    assert out == [parts.get(p, p) for p in expected]
+
+
+def _frames_of(data: bytes, chunk: int) -> list[bytes]:
+    reader = X12FrameReader()
+    frames: list[bytes] = []
+    for i in range(0, len(data), chunk):
+        frames.extend(reader.feed(data[i : i + chunk]))
+    assert not reader.in_frame
+    return frames
 
 
 @pytest.mark.parametrize(
@@ -285,32 +316,39 @@ def test_split_still_raises_on_a_malformed_isa_at_a_fragment_start() -> None:
     ],
 )
 @pytest.mark.parametrize("chunk", [4096, 1])
-def test_frame_reader_skips_a_false_isa_in_noise(noise: bytes, chunk: int) -> None:
+def test_frame_reader_frames_a_false_isa_in_noise_apart_from_the_real_one(
+    noise: bytes, chunk: int
+) -> None:
     real = interchange().encode("utf-8")
-    data = noise + real
-    reader = X12FrameReader()
-    frames: list[bytes] = []
-    for i in range(0, len(data), chunk):
-        frames.extend(reader.feed(data[i : i + chunk]))
+    frames = _frames_of(noise + real, chunk)
     # The false ISA's run is framed on its own, so the parse refuses it, and the real one is whole.
-    assert frames == [noise[noise.index(b"ISA") :], real] and not reader.in_frame
+    assert frames == [noise[noise.index(b"ISA") :], real]
     with pytest.raises(X12PeekError):
         X12Message.parse(frames[0])
 
 
-@pytest.mark.parametrize("chunk", [4096, 1])
-def test_frame_reader_frames_a_corrupted_isa_rather_than_drop_it(chunk: int) -> None:
-    # A real interchange whose header fails the structural check is not noise to discard: alone it is
-    # framed through its IEA, and before a good interchange it is framed up to that ISA.
+@pytest.mark.parametrize(
+    "parts",
+    [
+        pytest.param(["BAD"], id="alone"),
+        pytest.param(["BAD", "GOOD"], id="before-good"),
+        pytest.param(["BAD", "\r\n", "GOOD"], id="crlf-between"),
+        pytest.param(["BAD", "\r\nGARBAGE\r\n", "GOOD"], id="noise-between"),
+        pytest.param(["BAD", "BAD", "BAD", "GOOD"], id="three-corrupted"),
+        pytest.param(["GOOD", "BAD", "GOOD"], id="between-goods"),
+    ],
+)
+@pytest.mark.parametrize("chunk", [4096, 7, 1])
+def test_frame_reader_frames_each_corrupted_isa_through_its_own_iea(
+    parts: list[str], chunk: int
+) -> None:
+    # A real interchange whose header fails the structural check is not noise to discard, and its
+    # frame does not depend on how the stream was split into reads.
     good = interchange(control="000000002").encode("utf-8")
-    bad = bytearray(interchange().encode("utf-8"))
-    bad[6:7] = b"X"  # clobber a fixed element-separator position
-    for data, expected in ((bytes(bad), [bytes(bad)]), (bytes(bad) + good, [bytes(bad), good])):
-        reader = X12FrameReader()
-        frames: list[bytes] = []
-        for i in range(0, len(data), chunk):
-            frames.extend(reader.feed(data[i : i + chunk]))
-        assert frames == expected and not reader.in_frame
+    bad = _corrupt(interchange()).encode("utf-8")
+    pieces = {"BAD": bad, "GOOD": good}
+    data = b"".join(pieces.get(p, p.encode()) for p in parts)
+    assert _frames_of(data, chunk) == [pieces[p] for p in parts if p in pieces]
 
 
 def test_frame_reader_clear_resets_the_trailer_allowance() -> None:
@@ -532,9 +570,11 @@ class _CountingBuffer(bytearray):
     scanned = 0
 
     def find(self, sub: object, start: object = 0, end: object = None) -> int:
-        assert isinstance(sub, bytes) and isinstance(start, int) and end is None
-        idx = super().find(sub, start)
-        self.scanned += (len(self) if idx == -1 else idx + len(sub)) - start
+        assert isinstance(sub, bytes) and isinstance(start, int)
+        assert end is None or isinstance(end, int)
+        stop = len(self) if end is None else end
+        idx = super().find(sub, start, stop)
+        self.scanned += (stop if idx == -1 else idx + len(sub)) - start
         return idx
 
 
