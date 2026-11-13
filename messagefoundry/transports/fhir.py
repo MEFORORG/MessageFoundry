@@ -105,12 +105,14 @@ from messagefoundry.transports.rest import (
     _RETRYABLE_4XX,
     AUTH_CHALLENGE_REFUSED,
     MAX_OUTBOUND_HEADER_VALUE_LEN,
+    MAX_OUTBOUND_URL_LEN,
     HttpAuthError,
     InsecureHopGuard,
     ProxyConfig,
     _expiry_relaxed_opener,
     _insecure_opener,
     _is_shared_no_redirect_opener,
+    _latin1_refusal_position,
     _no_redirect_opener,
     _redact_url,
     _shared_no_redirect_opener,
@@ -850,6 +852,53 @@ def _reject_config_control_chars(value: str, setting: str, where: str = "destina
     return value
 
 
+def _refuse_unsendable_conditional_query(query: str, conditional: str | None, base: str) -> None:
+    """Refuse at CONSTRUCTION a ``conditional_query`` its sink could never send (BACKLOG #5911).
+
+    The value is the same for every message, so a value the wire refuses would otherwise dead-letter
+    the whole lane one message at a time, each as a permanent per-message refusal. Each form is
+    judged by its own sink. ``conditional-update`` puts the query unencoded in the request line,
+    which http.client sends as ASCII and refuses with any space in it, so whitespace and non-ASCII
+    are refused. So is a ``#``: urllib splits it off client-side as a fragment, so the server
+    would run a shorter search than the one configured. A backslash stays, since FHIR's search
+    escapes use it. ``if-none-exist`` puts it in the ``If-None-Exist`` header, which http.client
+    encodes as Latin-1 and where a space is legal, so only non-Latin-1 is refused. Control
+    characters were already refused by :func:`_reject_config_control_chars`.
+
+    The URL length is checked as a LOWER bound: the shortest resourceType is one letter, so a query
+    that overflows here overflows on every message. A long resourceType that overflows only with a
+    shorter query stays the per-message refusal ``_post`` raises. PHI-safe: names the setting and
+    lengths, never the value, which an env() binding can fill with anything.
+    """
+    setting = "FHIR destination 'conditional_query'"
+    if conditional == "conditional-update":
+        # isascii and the control-character screen leave the space as the only whitespace.
+        if not query.isascii() or " " in query or "#" in query:
+            raise ValueError(
+                f"{setting} must be ASCII with no space or '#' for "
+                "conditional='conditional-update' (it is sent unencoded in the request URL); "
+                "percent-encode the search parameters"
+            )
+        shortest = len(base) + len("/X?") + len(query)
+        if shortest > MAX_OUTBOUND_URL_LEN:
+            raise ValueError(
+                f"{setting} makes a request URL of at least {shortest} chars, over the "
+                f"{MAX_OUTBOUND_URL_LEN}-char limit"
+            )
+    elif conditional == "if-none-exist":
+        # Raised outside any except block, so no __context__ carries the value (see the helper).
+        if _latin1_refusal_position(query) is not None:
+            raise ValueError(
+                f"{setting} is not encodable as Latin-1 for conditional='if-none-exist' (it is "
+                "sent as the If-None-Exist header value); percent-encode the search parameters"
+            )
+        if len(query) > MAX_OUTBOUND_HEADER_VALUE_LEN:
+            raise ValueError(
+                f"{setting} is {len(query)} chars, over the {MAX_OUTBOUND_HEADER_VALUE_LEN}-char "
+                "If-None-Exist header limit"
+            )
+
+
 def _validate_path_token(value: str, pattern: re.Pattern[str], field: str) -> str:
     """Reject a message-derived path segment that doesn't match its FHIR grammar before it flows into
     the request URL. ``_reject_control_chars`` blocks CRLF/NUL but NOT path metacharacters ('/', '..',
@@ -1071,6 +1120,16 @@ class FhirDestination(DestinationConnector):
                 f"FHIR destination conditional={self.conditional!r} requires a 'conditional_query' "
                 "setting (the search parameters)"
             )
+        if self.conditional_query is not None:
+            _refuse_unsendable_conditional_query(
+                self.conditional_query, self.conditional, url.rstrip("/")
+            )
+        # BACKLOG #5911: the If-None-Exist value is this connection's setting, bounded above, so _post
+        # leaves it out of the message-derived set. Belt and braces: the check above already keeps an
+        # over-length value from reaching the send-time gate.
+        self._connector_header_names: frozenset[str] = (
+            frozenset({"If-None-Exist"}) if self.conditional == "if-none-exist" else frozenset()
+        )
         if self.conditional is not None and self.interaction in _BUNDLE_INTERACTIONS:
             # A connection-level conditional applies to a single create/update, not a Bundle — it would
             # be silently ignored for transaction/batch (per-entry conditionals go in Bundle.entry.request
@@ -1607,7 +1666,7 @@ class FhirDestination(DestinationConnector):
                 headers,
                 connector=f"FHIR {_redact_url(self.base_url)}",
                 url_is_message_derived=True,
-                message_header_names=frozenset(extra_headers),
+                message_header_names=frozenset(extra_headers) - self._connector_header_names,
                 minted_credential_names=(
                     frozenset({"Authorization"})
                     if self._token_provider is not None
@@ -1698,8 +1757,9 @@ class FhirDestination(DestinationConnector):
             raise auth_challenge_refused(f"FHIR {_redact_url(self.base_url)}") from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # Backstop for an illegal request value urllib rejects (a CRLF in a header/URL that slipped
-            # past the control-char guard, or a bad conditional_query) — a permanent failure (a retry
-            # re-sends the same body), never an escaping internal error. PHI-safe: redacted url only.
+            # past the control-char guard; a conditional_query urllib would refuse is refused at
+            # construction since BACKLOG #5911) — a permanent failure (a retry re-sends the same
+            # body), never an escaping internal error. PHI-safe: redacted url only.
             #
             # InvalidURL is named EXPLICITLY because it is not a ValueError: its MRO is
             # InvalidURL -> HTTPException -> Exception, so it is neither a ValueError nor an OSError
