@@ -1007,7 +1007,8 @@ def test_a_refused_version_on_the_second_ask_keeps_its_label() -> None:
         cipher.verify_audit_hmac(b"row", _PLANTED)
 
 
-# --- BACKLOG #8222 items 1 and 5: a timeout is an outage, a malformed handover reply a break --------
+# --- BACKLOG #8222 items 1 and 5: a timeout on both asks is an outage; the walk reads a malformed
+# handover reply as a break, and the open still refuses on it ------------------------------------
 
 
 def _status_error(status: int) -> Exception:
@@ -1325,8 +1326,8 @@ async def test_a_malformed_handover_reply_at_open_still_refuses_the_open(
 ) -> None:
     """A planted range row closing the Transit range, whose handover tag Transit answers with no
     well-formed MAC, still refuses the store open, as on engine PR 2903: the open path is unruled
-    and on the owner's queue (BACKLOG #8222 item 5). This pins the limit: while the open refuses,
-    the walk's reading of such a row as a break is not observable for it."""
+    and on the owner's queue (BACKLOG #8222 item 5). It pins the limit: here the open's check
+    reaches the row and refuses, so no walk runs to read the row as a break."""
     _needs_hvac()
     from messagefoundry.store.crypto import audit_key_id, generate_key
     from messagefoundry.store.store import (

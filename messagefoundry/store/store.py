@@ -6953,8 +6953,8 @@ def _handover_tag_ok(
     (:class:`~messagefoundry.store.crypto.AuditMacMalformedError`) is logged and read as a tag that
     does not match, a break at that row (BACKLOG #8222). Any other provider failure propagates.
     The store open (``settle_audit_ranges``) calls :func:`_audit_tag_ok` itself, so there the same
-    reply still refuses the open; that path is unruled and on the owner's queue, and while it
-    refuses, the walk's reading is not observable for a planted range row."""
+    reply still refuses the open; that path is unruled and on the owner's queue. Where the open's
+    check reaches such a row and refuses, no walk runs, so this reading is not seen there."""
     try:
         return _audit_tag_ok(epoch, secret)
     except AuditMacMalformedError as exc:

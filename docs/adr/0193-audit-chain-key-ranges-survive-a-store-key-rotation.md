@@ -599,7 +599,7 @@ Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
 
 - `test_audit_hmac_refuses_a_reply_its_own_check_would_reject`.
 
-## Amendment 2026-11-13 -- a timeout on both asks of a row's verify could not run; a malformed handover reply is a mismatch
+## Amendment 2026-11-13 -- a timeout on both asks of a row's verify could not run; the walk reads a malformed handover reply as a mismatch
 
 - **Status:** Accepted -- built with the change (BACKLOG #8222 items 1 and 5). The owner ruling
   of 2026-11-13, "Fix forward", on engine PR 2903 (comment 6840783854) ruled that a 504 or 408 on
@@ -627,8 +627,8 @@ Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
    match, a break at that range row, as before engine PR 2903. The store open
    (`settle_audit_ranges`) still calls `_audit_tag_ok` with no catch, so the open refuses, as on
    engine PR 2903; that path is unruled and on the owner's queue. The open runs before every walk,
-   `audit-verify`'s read-only open included, so for a planted range row the walk's reading is not
-   observable while the open refuses. An empty or non-string reply is still a plain `CipherError`:
+   `audit-verify`'s read-only open included, so where the open's check reaches such a row and
+   refuses, no walk runs to read it. An empty or non-string reply is still a plain `CipherError`:
    the walk could not run, and the open refuses.
 
 Evidence, in `tests/test_transit_bound_attestation.py`:
