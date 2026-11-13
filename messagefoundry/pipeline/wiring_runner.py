@@ -9924,8 +9924,9 @@ class RegistryRunner:
 
         Returns whether the tail is free: True with nothing to release or once the release lands,
         False when it was skipped on a node that lost leadership or failed. A worker that would
-        rather keep draining than return must return on False (BACKLOG #5708): its next claim
-        would pass the rows still in flight, and the backstop recovers only a worker that returned."""
+        rather keep draining than return must return on False (BACKLOG #5708), unless it re-pends
+        the rows itself first: its next claim would pass the rows still in flight, and the backstop
+        recovers only a worker that returned."""
         if not ids:
             return True
         if not self._coordinator.is_leader():
@@ -11705,6 +11706,20 @@ class RegistryRunner:
                 self._transform_gone_stops.discard(name)  # only this batch's STOP may set it
                 if await self._process_routed_batch(name, items):
                     released = await self._release_tail_on_stop("transform", name, claimed)
+                    if not released and self._transform_stop_voidable(name):
+                        # The STOP is void, but its one release failed. A store fault there must not
+                        # leave the lane down with its inbound deployed, so re-pend the tail as the
+                        # except arm below does: retried while this worker holds the lane, so no
+                        # claim passes those rows. Only LANDED frees them; any other end returns.
+                        held = await self._repend_claimed_on_fault(
+                            "transform",
+                            name,
+                            claimed,
+                            faults=faults,
+                            fence=fence,
+                            abandon=functools.partial(self._inbound_log_halted, name),
+                        )
+                        released = held is HoldResult.LANDED
                     if released and self._take_voided_transform_stop(name):
                         # BACKLOG #5708: a reload deployed the missing inbound again while this
                         # STOP ran, and found this worker alive, so it spawned none. Keep draining,
@@ -11996,15 +12011,24 @@ class RegistryRunner:
         re-arms a stopped lane whose inbound is deployed. False for any other STOP, such as the
         internal-error STOP policy, which records no missing inbound and must stay stopped, and for
         an inbound still missing, which must stop."""
-        if name not in self._transform_gone_stops:
-            return False
+        voided = self._transform_stop_voidable(name)
         self._transform_gone_stops.discard(name)
+        if voided:
+            log.info(
+                "transform lane %r: inbound redeployed while its lane stopped; continuing", name
+            )
+        return voided
+
+    def _transform_stop_voidable(self, name: str) -> bool:
+        """What :meth:`_take_voided_transform_stop` would return now, without taking the record:
+        the per-lane worker reads it to decide whether a failed tail release is worth retrying."""
         # Not on a node that has lost leadership either: the successor drains the lane, as
         # _release_tail_on_stop already decides for the per-lane worker.
-        if name not in self.registry.inbound or not self._coordinator.is_leader():
-            return False
-        log.info("transform lane %r: inbound redeployed while its lane stopped; continuing", name)
-        return True
+        return (
+            name in self._transform_gone_stops
+            and name in self.registry.inbound
+            and self._coordinator.is_leader()
+        )
 
     async def _loopback_prep(
         self, name: str, item: OutboxItem

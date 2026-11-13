@@ -27,6 +27,7 @@ import pytest
 from messagefoundry.config.models import InternalErrorPolicy, RetryPolicy
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import MLLP, Loopback, Registry, build_inbound_connection
+from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome, _RoutedPrep
 from messagefoundry.store import FailOutcome, MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, StoreKeylessError
@@ -687,19 +688,10 @@ async def test_a_reload_that_restores_the_inbound_while_its_lane_stops_keeps_it_
         await runner.stop()
 
 
-@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
-async def test_a_restore_does_not_keep_a_worker_draining_past_a_tail_it_could_not_release(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, claim_mode: str
-) -> None:
-    # The same race with a batch tail whose release fails: those rows stay in flight, and only a
-    # worker that returns has them recovered by the reload-time backstop. A worker or a pooled lane
-    # that kept draining would claim the newer row past them, so it must stop, restore or not.
-    # infra_fault_stop_after=1 ends the pooled serializer's retry of the release at its first
-    # failure; the per-lane worker makes one attempt anyway.
-    calls: list[str] = []
-    full = _registry(calls)
+async def _routed_rows(store: MessageStore, count: int) -> list[str]:
+    """Enqueue ``count`` messages and route each, so its ROUTED row waits; their message ids."""
     message_ids = []
-    for _ in range(4):
+    for _ in range(count):
         message_id = await store.enqueue_ingress(channel_id=LOOP, raw=RAW)
         ingress = await store.claim_next_fifo(LOOP, stage=Stage.INGRESS.value)
         assert ingress is not None
@@ -711,11 +703,25 @@ async def test_a_restore_does_not_keep_a_worker_draining_past_a_tail_it_could_no
             disposition=MessageStatus.ROUTED,
         )
         message_ids.append(message_id)
+    return message_ids
+
+
+async def test_a_restore_does_not_keep_a_worker_draining_past_a_tail_it_could_not_release(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same race with a batch tail whose release fails: those rows stay in flight. A pooled lane
+    # that kept draining would claim the newer row past them, so it must stop, restore or not.
+    # infra_fault_stop_after=1 ends the pooled serializer's retry of the release at its first
+    # failure (EXHAUSTED). The per-lane worker re-pends such a tail instead, and the per-lane test
+    # below covers it.
+    calls: list[str] = []
+    full = _registry(calls)
+    message_ids = await _routed_rows(store, 4)
     runner = RegistryRunner(
         full,
         store,
         poll_interval=0.02,
-        claim_mode=claim_mode,
+        claim_mode="pooled",
         fifo_claim_batch=3,
         infra_fault_stop_after=1,
         egress=EgressSettings(deny_by_default=False),
@@ -744,6 +750,137 @@ async def test_a_restore_does_not_keep_a_worker_draining_past_a_tail_it_could_no
         ]
     finally:
         await runner.stop()
+
+
+@pytest.mark.parametrize("repend", ["lands", "fails"])
+@pytest.mark.parametrize("window", ["mark_failed", "release_tail"])
+async def test_a_per_lane_release_fault_in_the_restore_window_does_not_take_the_lane_down(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, window: str, repend: str
+) -> None:
+    # The restore lands while the per-lane worker stops, and its one release of the batch tail
+    # fails. The STOP is void, so the worker re-pends the tail, held, as its except arm does. Once
+    # that lands, the lane keeps running and drains every row, as it does when the release lands.
+    # While it fails, the worker holds the lane and transforms nothing past the rows in flight.
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.01)
+    calls: list[str] = []
+    full = _registry(calls)
+    message_ids = await _routed_rows(store, 4)
+    runner = RegistryRunner(
+        full,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        fifo_claim_batch=3,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    race = _Race(monkeypatch, store, runner, full, restore=window)
+    faults = {"release_claimed": 0, "reschedule_claimed": 0}
+
+    async def release_claimed(ids: Any) -> None:
+        faults["release_claimed"] += 1
+        raise RuntimeError("store fault")
+
+    monkeypatch.setattr(store, "release_claimed", release_claimed)
+    if repend == "fails":
+
+        async def reschedule_claimed(ids: Any, when: float) -> None:
+            faults["reschedule_claimed"] += 1
+            raise RuntimeError("store fault")
+
+        monkeypatch.setattr(store, "reschedule_claimed", reschedule_claimed)
+    await runner.start()
+    try:
+        if repend == "lands":
+
+            async def drained() -> bool:
+                statuses = [await _routed_status(store, m) for m in message_ids]
+                return calls == ["ran"] * 4 and statuses == [None] * 4
+
+            assert await _until(drained), (
+                f"{window}: a failed tail release left the restored inbound's lane down"
+            )
+        else:
+
+            async def holding() -> bool:
+                return faults["reschedule_claimed"] >= 3
+
+            assert await _until(holding), "the worker did not retry the failed tail release"
+            assert calls == [], "a row was transformed past rows still in flight"
+            statuses = [await _routed_status(store, m) for m in message_ids]
+            assert statuses == [
+                OutboxStatus.PENDING.value,
+                OutboxStatus.INFLIGHT.value,
+                OutboxStatus.INFLIGHT.value,
+                OutboxStatus.PENDING.value,
+            ]
+        assert race.restored, "the restoring reload never ran in its window"
+        assert faults["release_claimed"] >= 1, "the tail release never failed"
+        assert not _lane_down(runner), "the transform lane is down with its inbound deployed"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("end", ["landed", "exhausted", "superseded"])
+async def test_a_pooled_stop_whose_tail_release_did_not_land_stays_stopped(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, end: str
+) -> None:
+    # A pooled transform STOP that the runner says is void goes READY only once its tail is pending
+    # again. A release that ends SUPERSEDED (another node led since the claim, so its recovery may
+    # hold the rows) or EXHAUSTED (the stop policy's bound) leaves the rows in flight, so the lane
+    # stays STOPPED: READY, its next claim would pass them. `landed` is the positive control.
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.01)
+    await _routed_rows(store, 3)
+    items = await store.claim_next_fifo_batch(LOOP, stage=Stage.ROUTED.value, limit=3)
+    assert len(items) == 3
+    tail = [it.id for it in items[1:]]
+    epoch = 7
+    asked: list[str] = []
+
+    def stop_rearmed(lane: str) -> bool:
+        asked.append(lane)
+        return True  # the runner says a reload voided this STOP
+
+    dispatcher = stage_dispatcher.StageDispatcher(
+        Stage.ROUTED,
+        store,
+        process_item=None,  # type: ignore[arg-type]  # _drain_lane is replaced below
+        lane_provider=set,
+        per_lane_limit=3,
+        stop_rearmed=stop_rearmed,
+        infra_fault_policy="stop" if end == "exhausted" else "retry_forever",
+        infra_fault_stop_after=1 if end == "exhausted" else 10,
+        is_leader=lambda: True,
+        current_epoch=lambda: epoch,
+    )
+
+    async def drained(lane: str, claimed: Any) -> Any:
+        # The body stopped on the head, as _apply_routed does for a missing inbound.
+        return stage_dispatcher._LaneOutcome(stage_dispatcher.LaneResultKind.STOP), tail, None
+
+    monkeypatch.setattr(dispatcher, "_drain_lane", drained)
+    real_release = store.release_claimed
+
+    async def release_claimed(ids: list[str]) -> Any:
+        nonlocal epoch
+        if end == "landed":
+            return await real_release(ids)
+        if end == "superseded":
+            epoch = 8  # another node took the lease while this write failed
+        raise RuntimeError("store fault")
+
+    monkeypatch.setattr(store, "release_claimed", release_claimed)
+    dispatcher._states[LOOP] = stage_dispatcher._LaneState(
+        phase=stage_dispatcher._LanePhase.PROCESSING
+    )
+    await asyncio.wait_for(dispatcher._run_lane(LOOP, items), timeout=5.0)
+    statuses = {await _routed_status(store, it.message_id) for it in items[1:]}
+    if end == "landed":
+        assert dispatcher.phase(LOOP) is stage_dispatcher._LanePhase.READY
+        assert asked == [LOOP]
+        assert statuses == {OutboxStatus.PENDING.value}
+    else:
+        assert dispatcher.stopped(LOOP), f"{end}: a lane holding rows in flight was re-armed"
+        assert statuses == {OutboxStatus.INFLIGHT.value}
 
 
 @pytest.mark.parametrize("claim_mode", CLAIM_MODES)

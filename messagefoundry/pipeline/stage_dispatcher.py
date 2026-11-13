@@ -1570,6 +1570,12 @@ class StageDispatcher:
             st.lane_stuck_alerted = False
             # Only with every claimed row re-pended: a READY lane's next claim would pass any still
             # in flight. Not asked otherwise, so the runner's record stays for its next item to clear.
+            # A STOP has no head re-pend, so `unlanded` is the tail, whose release _land_while_holding
+            # already retried. It ends unlanded only when it must not go on (BACKLOG #5708): SUPERSEDED
+            # means another node has led since the claim, and its recovery may have re-claimed these
+            # rows, and EXHAUSTED means the store refused the release up to the stop policy's bound, the
+            # one that STOPs a T17 lane. Both leave the rows INFLIGHT, so the lane stays down even when
+            # a reload restored its inbound, until a store recovery re-pends them, at least the next start.
             if not unlanded and self._stop_voided(lane):
                 self._to_ready(lane, woken=True)  # as the reload's notify_work would have
             else:
