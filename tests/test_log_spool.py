@@ -27,6 +27,7 @@ import pytest
 from messagefoundry import log_spool
 from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_setup import (
+    _DETERMINISTIC_UDP_SEND_ERRNOS,
     SyslogForward,
     _build_queued_forwarder,
     _build_syslog_handler,
@@ -1446,7 +1447,8 @@ def _deterministic_codes() -> set[int]:
     return {getattr(errno, n) for n in _DETERMINISTIC_NAMES if hasattr(errno, n)}
 
 
-@pytest.mark.parametrize("error", sorted(_deterministic_codes()))
+# The union, so an errno added to the production set gets a case without editing this list.
+@pytest.mark.parametrize("error", sorted(_deterministic_codes() | _DETERMINISTIC_UDP_SEND_ERRNOS))
 def test_a_deterministic_udp_send_error_is_undeliverable_so_replay_does_not_wedge(
     spool_dir: Path, error: int
 ) -> None:
@@ -1471,9 +1473,16 @@ def test_a_deterministic_udp_send_error_is_undeliverable_so_replay_does_not_wedg
         fwd.close()
 
 
-def test_a_deterministic_udp_errno_on_a_stream_arm_still_reconnects_and_retries() -> None:
+def test_a_deterministic_udp_errno_on_a_stream_arm_still_reconnects_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The deterministic set is read only for a datagram socket: on TCP the same errno keeps the
     reconnect-and-retry path, so the record is a failed send, not an undeliverable one."""
+
+    def _no_connect(self: Any) -> None:
+        self.socket = None  # no real connect, so nothing to leak and no refused-SYN wait
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _no_connect)
     handler = _TimeoutSysLogHandler(
         address=("127.0.0.1", 9), socktype=socket.SOCK_STREAM, defer_connect=True
     )
@@ -1502,8 +1511,11 @@ def test_a_lookup_error_whose_code_matches_a_deterministic_errno_is_retried() ->
         address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM, defer_connect=True
     )
     try:
-        handler.socket = _FailingDatagramSocket(
-            socket.gaierror(getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT), "lookup")
+        _swap_socket(
+            handler,
+            _FailingDatagramSocket(
+                socket.gaierror(getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT), "lookup")
+            ),
         )
         handler.emit(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
         assert handler.send_failed is True

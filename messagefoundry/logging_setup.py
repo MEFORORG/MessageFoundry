@@ -846,11 +846,14 @@ _EAI_NO_SUCH_NAME = frozenset(
 #: undeliverable like ``EMSGSIZE`` rather than retried, which would wedge the spool head (BACKLOG
 #: #5923). Not every deterministic errno is here; at least these are: ``EACCES`` (a broadcast
 #: address without ``SO_BROADCAST``), ``EADDRNOTAVAIL``, ``EAFNOSUPPORT`` and ``EINVAL``, each under
-#: its POSIX value and, on Windows, its Winsock value, which is what a socket error carries there.
+#: its POSIX value and its Winsock value. On Windows CPython maps some Winsock codes to the POSIX
+#: value (a broadcast ``sendto`` raised errno 13, winerror 10013, measured) and passes others
+#: through, so both are listed; neither is redundant on every platform.
 #: Any errno not listed, ``ENETUNREACH``, ``EHOSTUNREACH``, ``ECONNREFUSED``, ``EPERM`` or
-#: ``ENOBUFS`` say, stays retryable. The cost: on Linux a ``prohibit`` route raises ``EACCES`` and a
-#: ``blackhole`` route ``EINVAL``, and either can be installed and removed at run time, so a record
-#: sent while one is present is dropped, not kept (reasoned from the kernel, not measured). Read
+#: ``ENOBUFS`` say, stays retryable. The cost includes at least this: on Linux a ``prohibit`` route
+#: raises ``EACCES`` and a ``blackhole`` route ``EINVAL``, either can come and go at run time, and
+#: ``EADDRNOTAVAIL`` can come from an IPv6 source address still in duplicate address detection, so a
+#: record sent then is dropped, not kept (reasoned from the kernel, not measured). Read
 #: only for a datagram socket, and never for a ``socket.gaierror``, whose errno is a lookup code from
 #: another namespace; a stream arm's errors keep the reconnect-and-retry path.
 _DETERMINISTIC_UDP_SEND_ERRNOS = frozenset(
