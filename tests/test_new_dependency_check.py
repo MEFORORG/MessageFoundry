@@ -602,7 +602,11 @@ def test_main_passes_when_a_transient_timeout_clears(monkeypatch: pytest.MonkeyP
     import scripts.security.new_dependency_check as mod
 
     _zero_backoff(monkeypatch)
-    seen = set(declared_distributions((_ROOT / "pyproject.toml").read_text(encoding="utf-8")))
+    seen = {
+        name
+        for path in _gate.default_pyprojects(_ROOT)
+        for name in declared_distributions(path.read_text(encoding="utf-8"))
+    }
     seen.discard("fastapi")
     monkeypatch.setattr(mod, "_fetch_once", functools.partial(_fail_once_then_good, seen=seen))
 
@@ -1038,6 +1042,19 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         ),
         ("[tool.uv]\nextra-index-url = ['https://example.invalid/simple']\n", "non-PyPI source"),
         ("[tool.uv]\nfind-links = ['https://example.invalid/wheels']\n", "non-PyPI source"),
+        (
+            "[tool.uv.pip]\nextra-index-url = ['https://example.invalid/simple']\n",
+            "non-PyPI source",
+        ),
+        ("[tool.uv.workspace]\nmembers = ['tools/*']\n", "uv workspace"),
+        (
+            "[build-system]\nbackend-path = ['_build']\nbuild-backend = 'backend'\n",
+            "in-tree build backend",
+        ),
+        ("[tool.hatch.build.hooks.custom]\n", "in-tree build hook"),
+        ("[tool.hatch.build.targets.wheel.hooks.thing]\npath = 'hook.py'\n", "in-tree build hook"),
+        ("[project]\ndynamic = 'dependencies'\n", "not a list"),
+        ("[tool.uv.dependency-metadata]\nname = 'x'\n", "not a list"),
     ],
     ids=[
         "url-reference",
@@ -1048,6 +1065,13 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         "uv-index",
         "uv-extra-index-url",
         "uv-find-links",
+        "uv-pip-extra-index-url",
+        "uv-workspace",
+        "backend-path",
+        "hatch-custom-hook",
+        "hatch-hook-with-path",
+        "dynamic-not-a-list",
+        "dependency-metadata-not-an-array",
     ],
 )
 def test_what_the_gate_cannot_vet_by_name_is_refused(toml_text: str, problem: str) -> None:
@@ -1061,10 +1085,13 @@ def test_hatch_and_uv_metadata_requirements_are_swept() -> None:
     """The backend installs hatch build-target and hook dependencies in the release build jobs."""
     declared, findings = _gate.scan(
         """
+        [tool.hatch.build]
+        dependencies = ["globalbuilddep>=1"]
+
         [tool.hatch.build.targets.wheel]
         dependencies = ["targetdep>=1"]
 
-        [tool.hatch.build.targets.wheel.hooks.custom]
+        [tool.hatch.build.targets.wheel.hooks.plugin]
         dependencies = ["targethookdep>=1"]
 
         [tool.hatch.build.hooks.vcs]
@@ -1076,7 +1103,49 @@ def test_hatch_and_uv_metadata_requirements_are_swept() -> None:
         """
     )
     assert findings == []
-    assert set(declared) == {"targetdep", "targethookdep", "hookdep", "metadep"}
+    assert set(declared) == {"globalbuilddep", "targetdep", "targethookdep", "hookdep", "metadep"}
+
+
+def test_a_file_whose_every_entry_is_refused_exits_1_not_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Zero examined beside a refusal is a definitive answer, not a parser that stopped seeing."""
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["foo @ https://evil.example/x.whl"]\n',
+        encoding="utf-8",
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 1
+
+
+def test_a_repeated_pyproject_is_swept_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100", "./x.whl"]\n', encoding="utf-8"
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project), "--pyproject", str(project)]) == 1
+    assert capsys.readouterr().err.count("unnameable entry") == 1
+
+
+def test_a_non_ascii_key_prints_as_ascii(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A stock cp1252 console raises UnicodeEncodeError on a character it cannot encode."""
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n'
+        '[project.optional-dependencies]\n"caf\\u00e9" = [42]\n',
+        encoding="utf-8",
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert err.isascii(), err
+    assert "caf\\xe9" in err
 
 
 @pytest.mark.parametrize(

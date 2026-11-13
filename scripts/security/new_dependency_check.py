@@ -33,8 +33,11 @@ REFUSED RATHER THAN VETTED (each a finding, never a silent skip; ``unnameable_en
 entry the gate cannot name (a bare URL, a path, a non-string, a table or list of the wrong TOML
 type); a direct reference (``name @ url``), whose bytes come from the URL rather than from the PyPI
 project the name would be vetted against; ``[project].dynamic`` naming the dependency lists, which a
-build plugin fills from a file this gate never opens; and a non-empty ``[tool.uv]`` source or index
-key, which sends a vetted name somewhere other than pypi.org. This repository's own distributions
+build plugin fills from a file this gate never opens; an in-tree build backend
+(``backend-path``) or an in-tree hatch hook (``custom``, or one with a ``path``), either of which can
+return build requirements from code; a non-empty source or index key in ``[tool.uv]`` or
+``[tool.uv.pip]``, which sends a vetted name somewhere other than pypi.org; and a
+``[tool.uv].workspace``, whose members this gate does not sweep. A ``uv.toml`` is not read. This repository's own distributions
 (``FIRST_PARTY``) are excluded by exact name, each with its reason and what the exclusion gives up.
 
 NOT SWEPT, at least: npm manifests (``ide/package.json``, ``ci/npm-tools/package.json``), and tools
@@ -294,11 +297,21 @@ def scan(
     data = tomllib.loads(pyproject_text)
     build_system = table(data, "build-system", "[build-system]")
     requirements(build_system.get("requires", []), "[build-system].requires")
+    if "backend-path" in build_system:
+        refuse(
+            "[build-system].backend-path",
+            "in-tree build backend",
+            "an in-tree backend can return build requirements from code this gate never reads. "
+            "Use a published backend named in [build-system].requires.",
+        )
     project = table(data, "project", "[project]")
     requirements(project.get("dependencies", []), "[project].dependencies")
     dynamic = project.get("dynamic", [])
+    if not isinstance(dynamic, list):
+        refuse("[project].dynamic", "not a list", "[project].dynamic must be a list of keys.")
+        dynamic = []
     for key in ("dependencies", "optional-dependencies"):
-        if isinstance(dynamic, list) and key in dynamic:
+        if key in dynamic:
             refuse(
                 "[project].dynamic",
                 "dynamic dependencies",
@@ -320,7 +333,14 @@ def scan(
             value, f"[tool.uv.extra-build-dependencies].{package}", requirement_tables=True
         )
     metadata = uv.get("dependency-metadata", [])
-    for index, entry in enumerate(metadata if isinstance(metadata, list) else [metadata]):
+    if not isinstance(metadata, list):
+        refuse(
+            "[tool.uv].dependency-metadata",
+            "not a list",
+            "dependency-metadata must be an array of tables ([[tool.uv.dependency-metadata]]).",
+        )
+        metadata = []
+    for index, entry in enumerate(metadata):
         where = f"[tool.uv].dependency-metadata[{index}]"
         if isinstance(entry, dict):
             requirements(entry.get("requires-dist", []), f"{where}.requires-dist")
@@ -328,15 +348,25 @@ def scan(
             refuse(where, "not a table", "a dependency-metadata entry must be a table.")
     # Where uv fetches FROM. The gate vets a name against pypi.org, so a source or an index that
     # sends the name anywhere else makes that verdict about a different artifact.
-    for key in _UV_SOURCE_KEYS:
-        if uv.get(key):
-            refuse(
-                f"[tool.uv].{key}",
-                "non-PyPI source",
-                "this redirects where uv fetches a distribution from, and this gate vets names "
-                "against pypi.org only, so what it passes is not what would be installed.",
-            )
+    uv_pip = table(uv, "pip", "[tool.uv.pip]")
+    for where, settings in (("[tool.uv]", uv), ("[tool.uv.pip]", uv_pip)):
+        for key in _UV_SOURCE_KEYS:
+            if settings.get(key):
+                refuse(
+                    f"{where}.{key}",
+                    "non-PyPI source",
+                    "this redirects where uv fetches a distribution from, and this gate vets names "
+                    "against pypi.org only, so what it passes is not what would be installed.",
+                )
+    if uv.get("workspace"):
+        refuse(
+            "[tool.uv].workspace",
+            "uv workspace",
+            "a workspace member's pyproject is resolved into uv.lock, and this gate sweeps only the "
+            "root and packaging/*/pyproject.toml, so a member's dependencies would go unvetted.",
+        )
     hatch_build = table(table(tool, "hatch", "[tool.hatch]"), "build", "[tool.hatch.build]")
+    requirements(hatch_build.get("dependencies", []), "[tool.hatch.build].dependencies")
     hooks = [("[tool.hatch.build.hooks]", table(hatch_build, "hooks", "[tool.hatch.build.hooks]"))]
     for target, config in table(hatch_build, "targets", "[tool.hatch.build.targets]").items():
         where = f"[tool.hatch.build.targets.{target}]"
@@ -349,6 +379,14 @@ def scan(
         for hook, config in hook_table.items():
             if isinstance(config, dict):
                 requirements(config.get("dependencies", []), f"{prefix}.{hook}.dependencies")
+                if hook == "custom" or "path" in config:
+                    # An in-tree hook's dependencies() method returns requirements from code.
+                    refuse(
+                        f"{prefix}.{hook}",
+                        "in-tree build hook",
+                        "an in-tree hatch hook can return build requirements from code this gate "
+                        "never reads. Use a published hook plugin named in [build-system].requires.",
+                    )
             else:
                 refuse(f"{prefix}.{hook}", "not a table", "a hatch build hook must be a table.")
     return declared, bad
@@ -375,7 +413,8 @@ def declared_distributions(pyproject_text: str) -> dict[str, str]:
       ``override-dependencies``, ``build-constraint-dependencies``) and every
       ``[tool.uv.extra-build-dependencies]`` list, and each ``[tool.uv].dependency-metadata``
       entry's ``requires-dist``: uv fetches what they name.
-    * hatch build-target and build-hook ``dependencies``: the backend asks PEP 517 isolation to
+    * hatch ``[tool.hatch.build]``, build-target and build-hook ``dependencies``: the backend asks
+      PEP 517 isolation to
       install them in the same release build jobs.
 
     An entry it cannot name is not here; ``unnameable_entries`` reports it, and ``main`` reads both
@@ -676,7 +715,9 @@ def _annotation(line: str) -> str:
 
     The escapes are the ones the runner itself decodes in a command's message.
     """
-    return line.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    escaped = line.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    # ASCII only, so a non-ASCII TOML key cannot raise UnicodeEncodeError on a cp1252 console.
+    return escaped.encode("ascii", "backslashreplace").decode("ascii")
 
 
 def _print_finding(finding: Finding) -> None:
@@ -704,7 +745,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-age-days", type=int, default=DEFAULT_MIN_AGE_DAYS)
     args = parser.parse_args(argv)
 
-    files: list[Path] = args.pyproject or default_pyprojects(_ROOT)
+    # dict.fromkeys de-duplicates a repeated --pyproject in order, so no file is reported twice.
+    files: list[Path] = list(dict.fromkeys(args.pyproject or default_pyprojects(_ROOT)))
     if not args.pyproject and len(files) == 1:
         print(
             f"::error::found no packaging/*/pyproject.toml under {_ROOT}. The default sweep reads "
@@ -767,14 +809,16 @@ def main(argv: list[str] | None = None) -> int:
     # Liveness receipt: report the number EXAMINED, not the number of problems. "0 findings" and "the
     # parser stopped seeing dependencies" produce the same exit code otherwise.
     sources = ", ".join(str(path) for path in files)
-    print(f"new_dependency_check: examined {examined} distributions from {sources}")
+    print(_annotation(f"new_dependency_check: examined {examined} distributions from {sources}"))
     for finding in findings:
         name = finding.distribution
         if name in declared:
             name = f"{name} (declared as {declared[name]!r} in {declared_in[name]})"
         _print_finding(Finding(name, finding.problem, finding.detail))
     findings = unnameable + findings
-    if examined == 0:
+    # Zero examined WITH a refusal is a definitive answer about the declarations (1), not a parser
+    # that stopped seeing them (2).
+    if examined == 0 and not unnameable:
         print(
             "::error::examined ZERO distributions. pyproject.toml parsed but yielded no dependency "
             "names -- the schema moved under the parser. This is a broken gate, not a clean sweep.",
