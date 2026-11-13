@@ -1159,7 +1159,7 @@ host, such as `ENETUNREACH` (BACKLOG #5923): it sets `send_failing`, and the rec
 send reported success is not counted; on Linux that can include a full local transmit queue or a
 neighbour address that never resolves (reasoned, not measured; ADR 0200 Amendment B). A datagram too large to send (`EMSGSIZE`), and a send error that
 is not a network error, are dropped as undeliverable: counted in `undeliverable`, not kept for a
-retry, and they never set `send_failing`. A copy already in the spool for another reason, such as backoff or the drain deadline, is dropped the same way when replay reaches it. Queue and spool losses are counted as on every
+retry, and they never set `send_failing`. A copy already in the spool for another reason, such as backoff or the drain deadline, is dropped the same way when replay reaches it. Every other send error, `EACCES` included, counts as a network error; why, and what a broadcast `forward_host` costs, is in ADR 0200 Amendment B. Queue and spool losses are counted as on every
 protocol. `delivery_confirmed` is `false`, a
 forwarder with no fault seen reads `unconfirmed` and never `healthy`. In the `unconfirmed` and
 `degraded` states the console row says that delivery is not confirmed. The health indicator does not warn for that alone. Use `tcp` or

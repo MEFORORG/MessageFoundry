@@ -972,12 +972,13 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         reports the drops. With a spool (BACKLOG #1966, ADR 0200) this also sets :attr:`send_failed`,
         and the listener backs off and keeps the record on disk instead of losing it.
 
-        **A datagram too large to send** (``EMSGSIZE``) sets :attr:`send_error`, never
-        :attr:`send_failed` (BACKLOG #5923). A retry resends the same record as the same datagram,
-        so read as a network failure it would hold every later spooled entry behind it for as long
-        as the size limit that refused it stands. It is the only ``OSError`` read that way: every
-        other send errno, ``EACCES`` included, is a failed send and is kept for a retry, because a
-        firewall block or a route can clear while the record is still worth sending.
+        **A datagram too large to send** (``EMSGSIZE`` on a datagram socket, never from a
+        ``socket.gaierror``) sets :attr:`send_error`, never :attr:`send_failed` (BACKLOG #5923). A
+        retry resends the same record as the same datagram, so read as a network failure it would
+        hold every later spooled entry behind it for as long as the size limit that refused it
+        stands. It is the only ``OSError`` read that way; why every other one, ``EACCES``
+        included, stays a failed send is ADR 0200 Amendment B. On a stream arm an ``EMSGSIZE``
+        keeps the reconnect path, since a ``sendall`` that raised may have written part of a frame.
 
         **It never calls the stdlib** ``handleError`` (BACKLOG #5923), which writes a traceback, the
         call stack and the record's message and arguments to stderr on every failed send, outside
@@ -990,7 +991,14 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         if exc is not None:
             errno_part = f", errno {exc.errno}" if isinstance(exc, OSError) and exc.errno else ""
             self.send_error_cause = type(exc).__name__ + errno_part
-        if exc is not None and (not isinstance(exc, OSError) or exc.errno == errno.EMSGSIZE):
+        if exc is not None and (
+            not isinstance(exc, OSError)
+            or (
+                exc.errno == errno.EMSGSIZE
+                and self.socktype == socket.SOCK_DGRAM
+                and not isinstance(exc, socket.gaierror)
+            )
+        ):
             # Not the network's fault, or a datagram a retry would resend unchanged, so no
             # reconnect; but never counted as sent (BACKLOG #1966, #5923).
             self.send_error = True

@@ -1434,21 +1434,42 @@ class _DeliveringDatagramSocket:
         pass
 
 
-def test_a_udp_collector_every_send_to_which_fails_with_eacces_keeps_the_spool(
-    spool_dir: Path,
+# The errnos an earlier revision dropped as undeliverable, under their POSIX and Winsock values;
+# CPython on Windows passes some Winsock codes through unmapped.
+_ROUTE_LEVEL_UDP_ERRNOS = sorted(
+    {
+        getattr(errno, name)
+        for name in (
+            "EACCES",
+            "EADDRNOTAVAIL",
+            "EAFNOSUPPORT",
+            "EINVAL",
+            "WSAEACCES",
+            "WSAEADDRNOTAVAIL",
+            "WSAEAFNOSUPPORT",
+            "WSAEINVAL",
+        )
+        if hasattr(errno, name)
+    }
+)
+
+
+@pytest.mark.parametrize("error", _ROUTE_LEVEL_UDP_ERRNOS)
+def test_a_udp_collector_every_send_to_which_fails_keeps_the_spool(
+    spool_dir: Path, error: int
 ) -> None:
-    """``EACCES`` on UDP belongs to the destination or the route, not the record: a firewall or
-    endpoint-security block surfaces on Windows as ``WSAEACCES``, errno 13, and on Linux a
-    ``prohibit`` route raises it. Every send to that collector fails alike, so nothing good waits
-    behind the head, and the block can clear. The spool keeps every entry while it holds, and
-    delivers them in order once sends succeed; dropping them would lose the log evidence."""
+    """An errno such as ``EACCES`` on UDP is read as belonging to the destination or the route,
+    not the record: a Linux ``prohibit`` route raises it, for one. Every send to that collector
+    fails alike, so nothing good waits behind the head, and the cause can clear. The spool keeps
+    every entry while it holds, and delivers them in order once sends succeed; dropping them would
+    lose the log evidence (ADR 0200 Amendment B)."""
     spool = LogSpool(spool_dir, max_bytes=1_000_000)
     spool.open()
     target, fwd = _udp_forwarder(spool)
     try:
         assert spool.append(SpoolEntry(level="WARNING", line="first"))
         assert spool.append(SpoolEntry(level="WARNING", line="second"))
-        blocked = _FailingDatagramSocket(OSError(errno.EACCES, "permission denied"))
+        blocked = _FailingDatagramSocket(OSError(error, "refused on this host"))
         _swap_socket(target, blocked)
         for _ in range(3):  # each retry fails alike; none drops an entry
             fwd._listener._retry_at = 0.0
@@ -1472,11 +1493,13 @@ def test_a_udp_collector_every_send_to_which_fails_with_eacces_keeps_the_spool(
         fwd.close()
 
 
-def test_eacces_on_a_stream_arm_reconnects_and_retries(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("error", [errno.EACCES, errno.EMSGSIZE])
+def test_a_stream_arm_send_error_reconnects_and_retries(
+    monkeypatch: pytest.MonkeyPatch, error: int
 ) -> None:
-    """On TCP a send error such as ``EACCES`` keeps the reconnect-and-retry path, so the record is
-    a failed send, not an undeliverable one, and the socket is dropped for a reconnect."""
+    """On TCP a send error such as ``EACCES``, and ``EMSGSIZE`` too, keeps the reconnect-and-retry
+    path, so the record is a failed send, not an undeliverable one, and the socket is dropped for a
+    reconnect: a ``sendall`` that raised may have written part of a frame."""
 
     def _no_connect(self: Any) -> None:
         self.socket = None  # no real connect, so nothing to leak and no refused-SYN wait
@@ -1489,7 +1512,7 @@ def test_eacces_on_a_stream_arm_reconnects_and_retries(
 
         class _Refusing:
             def sendall(self, _data: bytes) -> None:
-                raise OSError(errno.EACCES, "denied")
+                raise OSError(error, "refused")
 
             def close(self) -> None:
                 pass
@@ -1503,9 +1526,12 @@ def test_eacces_on_a_stream_arm_reconnects_and_retries(
         handler.close()
 
 
-def test_a_udp_lookup_error_is_a_failed_send_and_is_retried() -> None:
-    """A ``socket.gaierror`` carries a lookup code from another namespace; on Windows
-    ``EAI_FAMILY`` is 10047, the Winsock ``EAFNOSUPPORT``. It is a failed send, kept for a retry,
+@pytest.mark.parametrize(
+    "code", [getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT), errno.EMSGSIZE]
+)
+def test_a_udp_lookup_error_is_a_failed_send_and_is_retried(code: int) -> None:
+    """A ``socket.gaierror`` carries a lookup code from another namespace, so its code is never
+    read as an errno: not even one equal to ``EMSGSIZE``. It is a failed send, kept for a retry,
     never an undeliverable record."""
     handler = _TimeoutSysLogHandler(
         address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM, defer_connect=True
@@ -1513,9 +1539,7 @@ def test_a_udp_lookup_error_is_a_failed_send_and_is_retried() -> None:
     try:
         _swap_socket(
             handler,
-            _FailingDatagramSocket(
-                socket.gaierror(getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT), "lookup")
-            ),
+            _FailingDatagramSocket(socket.gaierror(code, "lookup")),
         )
         handler.emit(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
         assert handler.send_failed is True

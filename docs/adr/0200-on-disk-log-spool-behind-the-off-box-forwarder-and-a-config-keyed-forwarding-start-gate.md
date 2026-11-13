@@ -255,11 +255,19 @@ its statements no longer match the code; where they disagree, this amendment hol
   the size limit stands. Neither is ever counted as sent: each is counted in `undeliverable`, is
   not kept for a retry, and never sets `send_failing`. A copy already in the spool for another
   reason, such as backoff or the drain deadline, is dropped the same way when replay reaches it.
-  `EMSGSIZE` is the only send errno read this way. Every other one, at least `EACCES` (a
-  firewall or endpoint-security block on Windows surfaces as `WSAEACCES`, errno 13), is a failed
-  send and is kept for a retry: such an error belongs to the destination or the route, so every
-  record to that collector fails alike, nothing good waits behind the head, and the error can
-  clear. Dropping those records would turn spool retention into a loss of log evidence.
+  `EMSGSIZE` is the only send errno read this way. Every other one, `EACCES`, `EADDRNOTAVAIL`,
+  `EAFNOSUPPORT` and `EINVAL` included, is a failed send: with a spool the record is kept for a
+  retry, and without one it is counted in `unsent`. Such an error is read as belonging to the
+  destination or the route, so every record to that collector fails alike and nothing good waits
+  behind the head. Some causes can clear, at least a Linux `prohibit` or `blackhole` route and an
+  IPv6 source address still in duplicate address detection; a firewall or endpoint-security
+  block on Windows is expected to surface as `WSAEACCES`, errno 13 (reasoned, not measured).
+  Some cannot, at least a broadcast `forward_host`, since the forwarder never sets
+  `SO_BROADCAST`: every send then fails, `send_failing` stays set, and the spool fills to its cap,
+  after which the newest records are dropped and counted. Dropping each record as undeliverable
+  instead would turn spool retention into a loss of log evidence for every cause that clears.
+  A filter that refuses one record by its content or length with one of these errnos would hold
+  the spool head; that case is not handled (reasoned, not measured).
 - **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
   deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process
   running with no forwarder. A name that does not exist is still permanent.
