@@ -846,3 +846,14 @@ the SR→PowerScribe flow the practice runs on Corepoint's DICOM Gear, authored 
   `### DICOM — DICOM(...)` / `### DICOMweb — DICOMweb(...)` sections in [CONNECTIONS.md](../CONNECTIONS.md), update
   [CLAUDE.md](../../CLAUDE.md) §8, enrich the BACKLOG DICOM item, and flip this ADR's [README.md](README.md) row to
   Accepted.
+
+## Amendment (2026-11-13) — some 2xx STOW-RS replies are now a permanent refusal (BACKLOG #5914)
+
+The *Consequences* bullet "STOW-RS response classification is heuristic" names the conservative rule
+"HTTP status wins when in doubt" and `capture_response` as the mitigation. That rule no longer holds
+for every 2xx: at least a 2xx reply body that does not parse as dicom+json, a malformed
+FailedSOPSequence, and a 202 that names no stored instance are now **permanent refusals**, never a
+delivery, in both capture modes. Not every 2xx that fails to confirm the store is refused, and a
+5xx or timeout still stays transient. Which 2xx replies are refused is stated once, in
+[CONNECTIONS.md](../CONNECTIONS.md) *DICOMweb*, *Status classification*. The decision text above is
+otherwise unchanged.
