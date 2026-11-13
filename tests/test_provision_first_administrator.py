@@ -2070,7 +2070,7 @@ def test_cli_sends_through_the_real_notifier_before_it_exits(
     assert sent == [(["holder@example.invalid"], _SUBJECTS[FIRST_ADMINISTRATOR_TAKEOVER])]
     # BACKLOG #5634's control: a notice that was sent leaves no undelivered row.
     assert _undelivered_rows(db, key) == []
-    assert json.loads(capsys.readouterr().out)["holder_notice_undelivered"] is False
+    assert json.loads(capsys.readouterr().out)["holder_notice_send_failed"] is False
 
 
 @pytest.mark.parametrize("as_json", [True, False])
@@ -2104,9 +2104,9 @@ def test_cli_records_a_takeover_notice_whose_send_failed(
     out = capsys.readouterr().out
     # The result says so too: the notifier drained before it printed (finding 7 of the review).
     if as_json:
-        assert json.loads(out)["holder_notice_undelivered"] is True
+        assert json.loads(out)["holder_notice_send_failed"] is True
     else:
-        assert "was queued but not delivered" in out and "no failed send" not in out
+        assert "is unconfirmed" in out and "no failed send" not in out
 
     async def read() -> dict[str, object]:
         cipher = make_cipher(key)
@@ -2136,7 +2136,7 @@ def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
     body = json.loads(capsys.readouterr().out)
     assert body["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
     # Nothing was dispatched, so whether it was delivered is no answer, not false (BACKLOG #5634).
-    assert body["holder_notice_undelivered"] is None
+    assert body["holder_notice_send_failed"] is None
 
 
 # --- vault BACKLOG #3849 B5: the grant raises administrator_granted -----------------------------

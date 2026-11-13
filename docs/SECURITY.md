@@ -7608,7 +7608,9 @@ source of record is `SecurityEventNotifier._record_undelivered` in
 store it holds open, so a takeover notice whose `auth.first_administrator_provisioned` row reads
 `holder_notice: dispatched` and whose send failed gets its own undelivered row too, except in at
 least these cases: that write fails, or the run is interrupted mid-send. The command's own result
-says so as well: `holder_notice_undelivered` in `--json`, and a WARNING line in text. That row can
+says so as well: `holder_notice_send_failed` in `--json`, and a WARNING line in text. Both say
+the notifier recorded the notice as undelivered, that is, its send raised, so delivery is
+unconfirmed; a send can raise after the relay has queued the mail. That row can
 come before the provision row in the chain, because the notice is sent while the provision runs.
 `admin-reset-totp` has closed its store by the time the notice is sent, so it opens the store
 again for the row, and only when a send failed. **Still open, at least:**
@@ -7625,14 +7627,15 @@ again for the row, and only when a send failed. **Still open, at least:**
 - `admin-reset-totp` loses the record of a failed notice in at least these cases: its reopen of
   the store fails, or the write fails. The run being interrupted can lose it too. The command waits
   for the reopen and the write together for at most `_OFFLINE_NOTICE_RECORD_SECONDS` in
-  `messagefoundry/__main__.py`, and then logs a miss by class only. A record still running at
-  that limit is not lost by it: it may still land, or fail, and what it does is logged when it
-  does, unless the wait was interrupted rather than timed out. The close comes after the answer,
-  so a slow close never costs the row or reports it missed. The reopen and the write run on their
-  own loop in a daemon thread, so the limit covers a synchronous key-provider hop inside the open
-  too. **The process's exit can still wait for the record**: once the
-  reopen reaches a store driver, the driver's own thread runs the call, and the interpreter waits
-  for it at exit. The command has printed its result by then.
+  `messagefoundry/__main__.py`, and then logs a miss by class only. While the command still runs,
+  a record past that limit may land or fail, and what it does is logged when it does, unless the
+  wait was interrupted rather than timed out. The close comes after the answer, so a slow close
+  never costs the row or reports it missed. The reopen and the write run on their own loop in a
+  daemon thread, so the limit covers a synchronous key-provider hop inside the open too. **At exit
+  a record still running behaves in at least two ways.** On SQLite, once the reopen has reached
+  the driver's worker thread, the exit waits for it, after the command has printed its result. On
+  PostgreSQL, and on any backend before the reopen reaches a driver thread, the exit does not wait:
+  the record is lost with no log line.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,

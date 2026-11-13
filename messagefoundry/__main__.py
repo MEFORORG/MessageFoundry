@@ -8485,12 +8485,14 @@ class _ReopeningNoticeAudit:
     it. Nothing inside the command's own loop could bound the wait: the open's key-provider hop is
     synchronous, and a worker-thread call still running would hold that loop's executor shutdown.
 
-    **The process's exit can still wait for the record.** The thread is a daemon, but once the
-    reopen reaches a store driver, that driver's own thread runs the open or the write, and the
-    interpreter waits for it at exit: aiosqlite's worker is not a daemon, and executor workers are
-    joined at shutdown. So a record still running at the bound can hold the exit, after the command
-    has printed its result, until the driver's own timeouts end it, as
-    :func:`_run_offline_alert_step` says of its step.
+    **What happens at exit to a record still running at the bound depends on where it is**, in at
+    least these two cases. On SQLite, once the reopen has reached aiosqlite's worker thread, which
+    is not a daemon, the interpreter waits for that thread at exit, after the command has printed
+    its result, until the driver's own timeouts end it, as :func:`_run_offline_alert_step` says of
+    its step. On PostgreSQL, whose driver runs on this thread's own loop, and on any backend
+    before the reopen reaches a driver thread, for example inside a synchronous key-provider hop,
+    nothing holds the exit: the daemon thread is stopped with it, and the record is lost with no
+    log line.
 
     The row counts as written only when the write returned. Anything else is a miss, whatever ended
     the thread, and raises into :meth:`SecurityEventNotifier._record_undelivered`, which logs the
@@ -8595,9 +8597,11 @@ class _ReopeningNoticeAudit:
 
 class _CountingNoticeAudit:
     """A :class:`NoticeAuditSink` that forwards to ``inner`` and counts the undelivered records the
-    notifier asked for, so ``provision-admin`` can say that a notice it reported as dispatched was
-    not delivered (BACKLOG #5634). The notifier records only a notice that never left, so a count
-    above zero is a failed or dropped notice, whether or not the forwarded write then succeeded. A
+    notifier asked for, so ``provision-admin`` can say that delivery of a notice it reported as
+    dispatched is unconfirmed (BACKLOG #5634). The notifier records only a notice whose send raised
+    or that it dropped, so a count above zero is one of those, whether or not the forwarded write
+    then succeeded. A send can raise after the relay queued the mail, so it is not proof the
+    notice never left. A
     count of zero is not a delivery receipt: at least a drop past the notifier's record cap, or a
     drain ended by an interrupt, asks for no record."""
 
@@ -9801,7 +9805,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # BACKLOG #5634: the notifier drained before run() returned, so its count is final here. None
     # unless a notice was dispatched. False is not a delivery receipt: it says only that the
     # notifier recorded no undelivered notice, and at least a drop past its record cap records none.
-    holder_undelivered: bool | None = (
+    holder_send_failed: bool | None = (
         bool(notice_audit) and notice_audit[0].undelivered > 0
         if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED
         else None
@@ -9854,11 +9858,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "store": store_path,
                 # BACKLOG #2019: null on a fresh create; see ProvisionedAdministrator.holder_notice.
                 "holder_notice": outcome.holder_notice,
-                # BACKLOG #5634: true when a notice this run dispatched was then not delivered, a
-                # failed send or a dropped one; false when the notifier recorded none, which is not
-                # a delivery receipt; null when no notice was dispatched. `holder_notice` keeps
-                # what the audit row records.
-                "holder_notice_undelivered": holder_undelivered,
+                # BACKLOG #5634: true when the notifier recorded a notice this run dispatched as
+                # undelivered: its send raised, or it was dropped. Delivery is then unconfirmed,
+                # not disproved: a send can raise after the relay queued the mail. False when it
+                # recorded none, which is not a delivery receipt; null when no notice was
+                # dispatched. `holder_notice` keeps what the audit row records.
+                "holder_notice_send_failed": holder_send_failed,
                 # ADR 0197 Amendment A (N-A): whether TOTP was enrolled. Never the secret or codes.
                 "totp_enrolled": totp_secret is not None,
                 # True only when recovery codes were issued AND reached the console; false with
@@ -9886,13 +9891,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
     _safe_print(
         f"Sign in as {outcome.username!r} once the engine is running; it creates no account itself."
     )
-    if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED and holder_undelivered:
+    if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED and holder_send_failed:
         _safe_print(
-            "WARNING: a takeover notice to the account's earlier notification address was queued "
-            "but not delivered, so its earlier holder was not told of this takeover; a WARNING "
-            "above says why, for example when this shell lacks the SMTP password the service runs "
-            "with. Unless that write failed too, an auth.security_notice_undelivered audit row "
-            "records it."
+            "WARNING: the send of a takeover notice to the account's earlier notification address "
+            "raised, so whether its earlier holder was told of this takeover is unconfirmed; a "
+            "WARNING above says why, for example when this shell lacks the SMTP password the "
+            "service runs with. Unless that write failed too, an auth.security_notice_undelivered "
+            "audit row records it."
         )
     elif outcome.holder_notice == HOLDER_NOTICE_DISPATCHED:
         _safe_print(
