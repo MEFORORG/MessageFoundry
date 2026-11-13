@@ -22,8 +22,8 @@ It needs **no** ``pydicom``: the object rides as opaque bytes, so DICOMweb works
   into a known study) when a ``study_uid`` is configured. ``Accept: application/dicom+json``.
 - Response classification refines the HTTP-status retry model: a 2xx whose ``application/dicom+json`` body
   carries a per-instance **FailedSOPSequence** (``00081198``) → the instance was rejected → permanent
-  dead-letter; so does a non-empty 2xx body that is not parseable JSON (or repeats a key), and a 202
-  that names no stored instance in a ReferencedSOPSequence (``00081199``). Other 4xx, a 409 (all
+  dead-letter; so does any other 2xx that does not confirm the store (:func:`_stowrs_refusal` holds
+  the rule). Other 4xx, a 409 (all
   instances failed) or a refused 3xx is permanent; 5xx / 408 / 429 / connection-timeout is a
   transient retry. **The HTTP status wins when in doubt; a 5xx stays transient.**
 
@@ -106,8 +106,17 @@ _DICOM_PART_TYPE = "application/dicom"
 _DICOM_JSON = "application/dicom+json"
 # DICOM Tag (group,element) for the STOW-RS FailedSOPSequence in the dicom+json response (DICOM PS3.18).
 _FAILED_SOP_SEQUENCE = "00081198"
-# ReferencedSOPSequence: the instances the server stored. A 202 must name at least one (#5914).
+# ReferencedSOPSequence: the instances the server stored. A 202 must name at least one (#5914), by
+# an item carrying a ReferencedSOPInstanceUID.
 _REFERENCED_SOP_SEQUENCE = "00081199"
+_REFERENCED_SOP_INSTANCE_UID = "00081155"
+# Written by name, never as a raw character an editor can silently drop (as fhir.py's _BOM).
+_BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
+_JSON_WHITESPACE = (
+    " \t\r\n"  # RFC 8259 section 2; str.strip() would also take NBSP and C0 separators
+)
+# The advice a reply refusal that does not prove a rejection carries: the partner may have stored it.
+_NOT_SENT = "not sent again, and the partner may hold the instance, so check it before a replay"
 
 
 # DICOM PS3.5 section 9.1: a UID is dot-separated numeric components, at most 64 characters.
@@ -165,17 +174,28 @@ def _reject_url_control_chars(value: str, field: str) -> None:
         raise ValueError(f"DICOMweb {field} contains an illegal control character")
 
 
-def _sequence_items(datasets: list[Any], tag: str) -> list[Any]:
-    """Every item of the ``tag`` sequence across the datasets, in order. Only the shape is read,
-    never an item's contents (PHI-safe)."""
+def _reply_is_empty(body: str) -> bool:
+    """True for a reply with nothing in it: empty, or only JSON whitespace once a leading BOM is
+    dropped. send() and :func:`_stowrs_refusal` both read emptiness through this one test."""
+    return not body.lstrip(_BOM).strip(_JSON_WHITESPACE)
+
+
+def _sequence_items(datasets: list[dict[str, Any]], tag: str) -> list[Any] | None:
+    """Every item of the ``tag`` sequence across the datasets, in order, or ``None`` when the
+    element is present in a shape dicom+json does not allow (not an object, or a ``Value`` that is
+    not an array). An absent element, or one with no ``Value``, is an empty sequence (PS3.18
+    F.2.5). Only the shape is read, never an item's contents (PHI-safe)."""
     items: list[Any] = []
     for ds in datasets:
-        if isinstance(ds, dict):
-            element = ds.get(tag)
-            if isinstance(element, dict):
-                value = element.get("Value")
-                if isinstance(value, list):
-                    items.extend(value)
+        if tag not in ds:
+            continue
+        element = ds[tag]
+        if not isinstance(element, dict):
+            return None
+        value = element.get("Value", [])
+        if not isinstance(value, list):
+            return None
+        items.extend(value)
     return items
 
 
@@ -184,34 +204,37 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
     it does. Every code is permanent: a re-send would get the same reply.
 
     - ``unparseable-reply``: the body is not JSON, repeats a key at any depth (``json.loads`` keeps
-      the last of two, so a FailedSOPSequence could be read two ways), or is nested past json's
-      recursion limit (a ``RecursionError``, which a ``ValueError`` arm does not reach).
-    - ``failed-sop``: a non-empty FailedSOPSequence (``00081198``) -- an instance was rejected.
+      the last of two, so a FailedSOPSequence could be read two ways), is nested past json's
+      recursion limit (a ``RecursionError``, which a ``ValueError`` arm does not reach), or is not
+      a dataset object or a non-empty array of them.
+    - ``failed-sop``: a FailedSOPSequence (``00081198``) with any item, or in a shape dicom+json
+      does not allow -- that direction fails closed.
     - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply names
-      no stored instance: no ReferencedSOPSequence (``00081199``) item that is a dataset. An empty
-      202 is one.
+      no stored instance: no ReferencedSOPSequence (``00081199``) item that is a dataset carrying
+      a ReferencedSOPInstanceUID (``00081155``). An empty 202 is one.
 
-    A body that is empty, or whitespace once a leading BOM is dropped, is not refused on any other
-    2xx; with ``capture_response`` on, send() reports it as ``no_reply``. A 200 is not held to the
-    ReferencedSOPSequence rule (BACKLOG #5914 ruling). Any FailedSOPSequence item refuses, whatever
-    its shape: that direction fails closed.
+    An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
+    the ReferencedSOPSequence rule (BACKLOG #5914 ruling).
 
     Returned as ``(code, reason)``; both are fixed strings that name no reply content."""
-    unconfirmed = ("unconfirmed-202", "no ReferencedSOPSequence confirming the store")
-    text = body.removeprefix("﻿")  # a BOM json.loads refuses, as fhir.py strips it
-    if not text.strip():
+    unconfirmed = ("unconfirmed-202", f"no ReferencedSOPSequence confirming the store; {_NOT_SENT}")
+    if _reply_is_empty(body):
         return unconfirmed if status == 202 else None
-    obj, refusal = json_loads_or_refusal(text, object_pairs_hook=refuse_repeated_keys)
-    if refusal is not None:
-        return "unparseable-reply", "a reply that is not parseable dicom+json"
-    # The response is a single dicom+json dataset object (defensively also accept a list).
-    datasets = obj if isinstance(obj, list) else [obj]
-    if _sequence_items(datasets, _FAILED_SOP_SEQUENCE):
+    # A refused parse is (None, hint), and None is not a dataset, so the hint need not be read.
+    obj, _ = json_loads_or_refusal(body.lstrip(_BOM), object_pairs_hook=refuse_repeated_keys)
+    if isinstance(obj, dict):
+        datasets = [obj]
+    elif isinstance(obj, list) and obj and all(isinstance(ds, dict) for ds in obj):
+        datasets = obj
+    else:
+        return "unparseable-reply", f"a reply that is not parseable dicom+json; {_NOT_SENT}"
+    failed = _sequence_items(datasets, _FAILED_SOP_SEQUENCE)
+    if failed is None or failed:
         return "failed-sop", "a FailedSOPSequence (instance rejected)"
-    if status == 202 and not any(
-        isinstance(item, dict) for item in _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE)
-    ):
-        return unconfirmed
+    if status == 202:
+        referenced = _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or []
+        if not any(isinstance(i, dict) and _REFERENCED_SOP_INSTANCE_UID in i for i in referenced):
+            return unconfirmed
     return None
 
 
@@ -434,7 +457,7 @@ class DicomWebDestination(DestinationConnector):
         # retry / permanent dead-letter).
         if not self.capture_response:
             return None
-        if not body:
+        if _reply_is_empty(body):
             return DeliveryResponse(body="", outcome="no_reply", detail=f"HTTP {status}")
         return DeliveryResponse(body=body, outcome="accepted", detail=f"HTTP {status}")
 
@@ -566,8 +589,7 @@ class DicomWebDestination(DestinationConnector):
         if refused is not None:
             code, reason = refused
             raise NegativeAckError(
-                f"DICOMweb {code}: HTTP {status} with {reason}; not sent again, and the partner may "
-                f"hold the instance, so check it before a replay ({_redact_url(self.base_url)})",
+                f"DICOMweb {code}: HTTP {status} with {reason} ({_redact_url(self.base_url)})",
                 code=code,
                 permanent=True,
             )

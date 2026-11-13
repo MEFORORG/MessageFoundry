@@ -40,7 +40,7 @@ PAYLOAD = RawMessage.from_bytes(
 STORED_OK = json.dumps(
     {
         "00081190": {"vr": "UR", "Value": [f"{BASE}/studies/1.2.3"]},
-        "00081199": {"vr": "SQ", "Value": [{}]},
+        "00081199": {"vr": "SQ", "Value": [{"00081155": {"vr": "UI", "Value": ["1.2.3.4.5"]}}]},
     }
 )
 # A dicom+json body carrying a non-empty FailedSOPSequence (00081198) → an instance was rejected.
@@ -499,7 +499,7 @@ async def test_dicomweb_unparseable_2xx_reply_is_a_permanent_refusal(
         json.dumps({"00081199": {"vr": "SQ", "Value": "x"}}),
         json.dumps({"00081199": {"vr": "SQ", "Value": [None, "x"]}}),  # no item is a dataset
         json.dumps([{"00081199": {"vr": "SQ", "Value": []}}]),
-        "42",
+        json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}),  # an item naming no instance
     ],
     ids=[
         "empty",
@@ -511,7 +511,7 @@ async def test_dicomweb_unparseable_2xx_reply_is_a_permanent_refusal(
         "bad-value",
         "non-dataset-items",
         "list-empty-sequence",
-        "scalar",
+        "item-without-instance-uid",
     ],
 )
 async def test_dicomweb_202_without_a_referenced_sop_is_a_permanent_refusal(
@@ -541,15 +541,75 @@ async def test_dicomweb_202_with_a_referenced_sop_delivers() -> None:
 @pytest.mark.parametrize("status", [200, 202])
 async def test_dicomweb_a_leading_bom_is_not_a_refusal(status: int) -> None:
     dest = _dest()
-    dest._opener = _FakeOpener(body=("﻿" + STORED_OK).encode(), status=status)  # type: ignore[assignment]
+    dest._opener = _FakeOpener(body=("\ufeff" + STORED_OK).encode(), status=status)  # type: ignore[assignment]
     assert await dest.send(PAYLOAD) is None
 
 
-async def test_dicomweb_a_whitespace_200_is_not_a_refusal() -> None:
-    # As an empty 200 is not: neither can carry a FailedSOPSequence.
+@pytest.mark.parametrize("body", ["\r\n", "\ufeff", "\ufeff \t\r\n"], ids=["ws", "bom", "bom-ws"])
+async def test_dicomweb_a_whitespace_200_is_not_a_refusal(body: str) -> None:
+    # As an empty 200 is not: neither can carry a FailedSOPSequence. Captured, it is no_reply.
     dest = _dest()
-    dest._opener = _FakeOpener(body=b"\r\n", status=200)  # type: ignore[assignment]
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
     assert await dest.send(PAYLOAD) is None
+    dest = _dest(capture_response=True)
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    resp = await dest.send(PAYLOAD)
+    assert isinstance(resp, DeliveryResponse)
+    assert resp.outcome == "no_reply"
+
+
+async def test_dicomweb_unicode_space_is_not_json_whitespace() -> None:
+    # A no-break space is not JSON whitespace, so the body is unparseable, not empty.
+    dest = _dest()
+    dest._opener = _FakeOpener(body="\N{NO-BREAK SPACE}".encode(), status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "unparseable-reply"
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["null", "true", '"x"', "42", "[]", "NaN", "[[" + STORED_FAILED + "]]", '[{}, "x"]'],
+)
+async def test_dicomweb_a_2xx_that_is_not_a_dataset_is_unparseable(body: str) -> None:
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "unparseable-reply"
+
+
+@pytest.mark.parametrize(
+    "element",
+    ['"garbage"', '{"vr": "SQ", "Value": {"a": 1}}', '{"vr": "SQ", "Value": null}'],
+    ids=["not-object", "value-object", "value-null"],
+)
+async def test_dicomweb_a_malformed_failed_sop_sequence_fails_closed(element: str) -> None:
+    dest = _dest()
+    dest._opener = _FakeOpener(body=f'{{"00081198": {element}}}'.encode(), status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "failed-sop"
+
+
+async def test_dicomweb_an_empty_failed_sop_sequence_is_not_a_refusal() -> None:
+    # PS3.18 F.2.5: an element with no Value, or an empty one, is an empty sequence.
+    for element in ('{"vr": "SQ"}', '{"vr": "SQ", "Value": []}'):
+        dest = _dest()
+        dest._opener = _FakeOpener(body=f'{{"00081198": {element}}}'.encode(), status=200)  # type: ignore[assignment]
+        assert await dest.send(PAYLOAD) is None
+
+
+async def test_only_the_reply_refusals_that_prove_nothing_carry_the_replay_advice() -> None:
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_FAILED.encode(), status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert "before a replay" not in str(exc.value)
+    dest._opener = _FakeOpener(body=b"", status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert "before a replay" in str(exc.value)
 
 
 async def test_dicomweb_refusal_text_leads_with_its_code() -> None:
