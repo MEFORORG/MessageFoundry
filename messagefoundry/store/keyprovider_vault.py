@@ -305,8 +305,10 @@ def _record_reply_status(client: Any) -> None:
     """Make every hvac error ``client`` raises for a reply carry that reply's HTTP status, as
     :data:`_REPLY_STATUS_ATTR` (BACKLOG #8222). hvac raises one ``UnexpectedError`` for every status
     it does not name, a 413 and a 504 alike, and keeps no status on it. Wraps the adapter's
-    ``_raise_for_error``, which hvac 2.4.0 calls with the reply; where an hvac release has none, no
-    status is recorded, and :func:`is_vault_timeout_reply` is ``False`` for every error."""
+    ``_raise_for_error``, which hvac 2.4.0 calls with the reply; where a client has none, no
+    status is recorded, and :func:`is_vault_timeout_reply` is ``False`` for every error, which
+    keeps the louder reading (``tests/test_transit_bound_attestation.py`` pins that the store's
+    real client records it)."""
     adapter: Any = getattr(client, "adapter", None)
     raise_for_error = getattr(adapter, "_raise_for_error", None)
     if raise_for_error is None:

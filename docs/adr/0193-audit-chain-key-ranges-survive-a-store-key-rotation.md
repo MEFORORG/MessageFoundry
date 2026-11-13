@@ -605,7 +605,7 @@ changes two readings of the 2026-11-11 amendment.
 2. **A malformed reply to a handover tag is a break in the walk.** Item 1 above makes
    `audit_hmac` raise for a reply `transit_mac_version` does not accept. For a non-empty string it
    now raises the subclass `AuditMacMalformedError`, and the walk's handover-tag check
-   (`_walk_tag_ok`) reads it as a tag that does not match: a break at that range row, as before
+   (`verify_audit_rows`) reads it as a tag that does not match: a break at that range row, as before
    engine PR 2903. An empty or non-string reply is still a plain `CipherError`, and the walk could
    not run. The store open (`settle_audit_ranges`) still lets the subclass propagate, so the open
    fails, as since engine PR 2903.
