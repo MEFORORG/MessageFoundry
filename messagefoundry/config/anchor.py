@@ -48,6 +48,7 @@ from messagefoundry.config.environments import is_drive_relative, resolve_values
 from messagefoundry.config.wiring import EnvRef
 
 if TYPE_CHECKING:
+    from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.config.wiring import Registry
 
 _log = logging.getLogger(__name__)
@@ -55,6 +56,8 @@ _log = logging.getLogger(__name__)
 __all__ = [
     "resolve_project_root",
     "anchor_under_root",
+    "anchored_store_path",
+    "anchor_settings_store_path",
     "graph_references_env",
     "referenced_env_keys_in_graph",
 ]
@@ -116,6 +119,38 @@ def anchor_under_root(value: str | None, root: Path | None, *, cwd: Path) -> str
         parts = tail.parts[1:] if tail.parts and tail.parts[0] in ("/", "\\") else tail.parts
         return str(root.joinpath(*parts))
     return str(root / p)
+
+
+def anchored_store_path(store_path: str, base_dir: str | None, *, cwd: Path) -> str:
+    """``store_path`` with a relative value taken under the merged ``[environments].base_dir``.
+
+    THE ONE RULE every command applies to ``[store].path`` after the settings load (BACKLOG #5926,
+    #5927), so an offline command names the store ``serve`` opens: a relative path, whether it came
+    from ``--db`` or the settings file, follows the root, an absolute one stays put (AC-1/AC-7), and
+    with no root the string is returned unchanged, to resolve against the working directory as it
+    always has. ``base_dir`` is the MERGED value, so ``--project-root`` and a file- or env-set
+    ``base_dir`` anchor alike. It is not backend-gated, because ``serve`` is not: a server backend
+    never opens this path, but the generated TLS pair's state dir is derived from it
+    (``generated_state_dir``), and a gated copy would name a different pair from the one serve uses.
+    The join is :func:`anchor_under_root`'s, drive-relative guard included, so ``[store].path``
+    follows the same rule as every other bundle member.
+    """
+    root = resolve_project_root(base_dir or None, cwd=cwd)
+    # A str in is a str out (only None maps to None); the `or` only narrows the type.
+    return anchor_under_root(store_path, root, cwd=cwd) or store_path
+
+
+def anchor_settings_store_path(settings: ServiceSettings | None, *, cwd: Path) -> None:
+    """Apply :func:`anchored_store_path` to loaded settings in place. ``None`` (a command that
+    tolerates a settings file it could not load, such as ``support-bundle``) is a no-op.
+
+    Call it straight after the load and BEFORE any guard that tests the path, an existence check
+    or a refusal, or the guard tests a different file from the one the command then opens."""
+    if settings is None:
+        return
+    settings.store.path = anchored_store_path(
+        settings.store.path, settings.environments.base_dir, cwd=cwd
+    )
 
 
 def _iter_settings_values(registry: Registry) -> Iterable[Any]:
