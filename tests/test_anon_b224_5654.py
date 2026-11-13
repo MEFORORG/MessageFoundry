@@ -185,7 +185,6 @@ def test_a_routable_ipv6_address_is_a_hit(leak: ModuleType, written: str) -> Non
         "::ffff:a00:1",
         "10:30:45",
         "a:b",
-        "1:2:3:4:5:6:7:8:9",
         "::10.0.0.1",
         "3fff::1",
     ],
@@ -200,7 +199,6 @@ def test_a_routable_ipv6_address_is_a_hit(leak: ModuleType, written: str) -> Non
         "mapped-private-hex",
         "a-time",
         "one-colon",
-        "too-many-groups",
         "compatible-private",
         "documentation-3fff",
     ],
@@ -210,13 +208,41 @@ def test_an_allowed_or_non_address_is_no_ipv6_hit(leak: ModuleType, written: str
     assert leak.IPV6_REASON not in report.hits, report.hits
 
 
+_FULL = ":".join(["4000", "a1", "0", "0", "0", "0", "0", "5"])
+
+
 @_LEAKS
 @pytest.mark.parametrize(
-    "written", ["ff3e::8000:1", "Note::", "std::bad_alloc", "00:1A:2B:FF:FE:3C:4D:5E"]
+    "written",
+    [
+        f"Device:{_FULL}",
+        "Source:::ffff:" + _RESERVED_V4_HEX,
+        f"1.{_GLOBAL}",
+        f"{_FULL}:443",
+    ],
+    ids=["hex-label-full", "hex-label-mapped", "dotted-prefix", "full-colon-port"],
+)
+def test_a_label_or_port_joined_to_an_address_is_dropped(leak: ModuleType, written: str) -> None:
+    assert leak._has_routable_ipv6(written, lambda ip: True)
+
+
+@_LEAKS
+@pytest.mark.parametrize("written", ["fd00:1::5", "fe80:1::1", "fe80::1:5"])
+def test_a_well_formed_allowed_address_is_not_shortened(leak: ModuleType, written: str) -> None:
+    """The label and port drops run only when nothing parses, so an allowed address is never read
+    as the routable one its tail would make."""
+    assert not leak._has_routable_ipv6(written, lambda ip: True)
+
+
+@_LEAKS
+@pytest.mark.parametrize(
+    "written",
+    ["ff3e::8000:1", "Note::", "std::bad_alloc", "00:1A:2B:FF:FE:3C:4D:5E", "1:2:3:4:5:6:7:8:9"],
 )
 def test_the_refusals_phi_md_names_hold(leak: ModuleType, written: str) -> None:
     """docs/PHI.md section 9 says these refuse though they hold no routable address: every
-    P-flagged multicast address, a hex word joined to ``::`` and a colon-written EUI-64."""
+    P-flagged multicast address, a hex word joined to ``::``, a colon-written EUI-64, and nine
+    colon-separated hex groups, read as an address and a ``:port``."""
     assert leak._has_routable_ipv6(written, lambda ip: True)
 
 

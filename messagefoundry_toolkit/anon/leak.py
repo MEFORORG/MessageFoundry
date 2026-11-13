@@ -128,9 +128,12 @@ def _can_cut_a_shape(field_sep: str) -> bool:
 #: with fewer than two colons is skipped, and ``ipaddress`` decides whether the rest hold one. The
 #: run is matched whole, never with a colon pinned inside it, so the scan stays linear.
 _IPV6_RUN: re.Pattern[str] = re.compile(r"[0-9A-Fa-f.:]+")
-#: The IPv6 networks that identify no site: the unspecified and loopback addresses, link-local,
-#: unique-local, multicast and the two documentation ranges. An IPv4-mapped or IPv4-compatible
-#: address is judged by its IPv4 part instead (:func:`_has_routable_ipv6`).
+#: The IPv6 networks the check allows, as the publish guard allows the private and reserved IPv4
+#: ranges: the unspecified and loopback addresses, link-local, unique-local, multicast and the two
+#: documentation ranges. They are not routable on the internet, but a unique-local address's
+#: Global ID, and a link-local address built from a MAC, can still name a site's network or a
+#: device; docs/PHI.md section 9 says so. An IPv4-mapped or IPv4-compatible address is judged by
+#: its IPv4 part instead (:func:`_has_routable_ipv6`).
 _ALLOWED_IPV6: tuple[ipaddress.IPv6Network, ...] = tuple(
     ipaddress.IPv6Network(net)
     for net in (
@@ -157,13 +160,26 @@ def _ipv6_candidates(run: str) -> Iterator[str]:
     a sentence, and without a trailing ``.port`` or ``.word``; each of those with one colon taken
     off either end or both, as a label or a list joins one; and each with every colon and dot
     taken off both ends. So ``Addr:::ffff:808:808``, ``IP:2a01:4f8::``, ``2a01:4f8::5.443`` and
-    ``2a01:4f8:::`` still hold their address. A text may come more than once."""
+    ``2a01:4f8:::`` still hold their address. A text may come more than once.
+    :func:`_label_dropped_runs` gives the texts to try when none of these parse."""
     for base in (run, run.strip("."), run.rsplit(".", 1)[0]):
         front = base[1:] if base.startswith(":") else base
         yield from (base, front)
         if base.endswith(":"):
             yield from (base[:-1], front[:-1])
         yield base.strip(":.")
+
+
+def _label_dropped_runs(run: str) -> tuple[str, ...]:
+    """``run`` without a leading label that ends in hex letters or digits and a colon or dot, as
+    in ``Device:`` or ``data.``, and without a trailing ``:port``. Tried only when no text
+    :func:`_ipv6_candidates` gives parses, so a well-formed address, such as a unique-local
+    ``fd00:1::5``, is never read as the shorter address its tail would make."""
+    return (
+        run.split(":", 1)[1] if ":" in run else run,
+        run.split(".", 1)[1] if "." in run else run,
+        run.rsplit(":", 1)[0],
+    )
 
 
 def _is_allowed_ipv6(address: ipaddress.IPv6Address) -> bool:
@@ -183,26 +199,42 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
     IPv4-mapped or IPv4-compatible address counts when ``ipv4_is_routable`` says its dotted IPv4
     part is routable, so the IPv4 allow list stays the publish guard's own. Every text
     :func:`_ipv6_candidates` gives is tried, and any one that parses to a routable address is a
-    hit, so a fail-closed check refuses on any reading. What it misses, and what it refuses
+    hit, so a fail-closed check refuses on any reading. When none parses, the texts of
+    :func:`_label_dropped_runs` are tried the same way. What it misses, and what it refuses
     though it holds no address, is listed in docs/PHI.md section 9."""
     for match in _IPV6_RUN.finditer(text):
         run = match.group()
         if run.count(":") < 2:
             continue
-        for candidate in dict.fromkeys(_ipv6_candidates(run)):
-            try:
-                address = ipaddress.IPv6Address(candidate)
-            except ValueError:
-                continue
-            embedded = address.ipv4_mapped
-            if embedded is None and address in _IPV4_COMPATIBLE and address > _IPV6_LOOPBACK:
-                embedded = ipaddress.IPv4Address(int(address))
-            if embedded is not None:
-                if ipv4_is_routable(str(embedded)):
-                    return True
-            elif not _is_allowed_ipv6(address):
-                return True
+        verdict = _judge_ipv6_texts(_ipv6_candidates(run), ipv4_is_routable)
+        if verdict is None:
+            dropped = (c for r in _label_dropped_runs(run) for c in _ipv6_candidates(r))
+            verdict = _judge_ipv6_texts(dropped, ipv4_is_routable)
+        if verdict:
+            return True
     return False
+
+
+def _judge_ipv6_texts(texts: Iterable[str], ipv4_is_routable: Callable[[str], bool]) -> bool | None:
+    """True if any of ``texts`` parses to a routable IPv6 address, False if some parse and none is
+    routable, and None if none parses. A failed parse means the text is no address, so it is
+    skipped, not logged."""
+    parsed = False
+    for candidate in dict.fromkeys(texts):
+        try:
+            address = ipaddress.IPv6Address(candidate)
+        except ValueError:
+            continue  # not an address: the next text is tried
+        parsed = True
+        embedded = address.ipv4_mapped
+        if embedded is None and address in _IPV4_COMPATIBLE and address > _IPV6_LOOPBACK:
+            embedded = ipaddress.IPv4Address(int(address))
+        if embedded is not None:
+            if ipv4_is_routable(str(embedded)):
+                return True
+        elif not _is_allowed_ipv6(address):
+            return True
+    return False if parsed else None
 
 
 def _with_ipv6(

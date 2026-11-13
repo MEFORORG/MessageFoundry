@@ -2416,7 +2416,10 @@ Properties of the anonymizer:
   whitespace, which a
   break command such as `\.br\` decodes to. So a code joined to `\S\`, padded with `\X20\` or written with a hex escape is replaced,
   escapes and all, by digits of the same width (BACKLOG #5632). The surrogate is keyed on the
-  part as written, so one code written two ways gets two unrelated surrogates. With no site prefix loaded it matches nothing, and
+  part as written, so one code written two ways gets two unrelated surrogates. The split on
+  whitespace and escaped delimiters applies only to a part that holds an escape character: free
+  text such as `Call 971234 today` keeps the code, while `Call 971234 today\.br\` loses the whole
+  part, text included, to digits. With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
@@ -2437,7 +2440,7 @@ both are described below:
 | The leak-check refuses when | Where it looks |
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
-| A known partner, vendor or site token, or a routable IP address, survives. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast without the P flag, or in a documentation range (`2001:db8::/32`, `3fff::/20`). A multicast address with the P flag set is refused, whether or not it embeds a prefix: that includes the RFC 3306 and RFC 3956 forms and source-specific `ff3x::/32`. An IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. The forms it cannot read are below (BACKLOG #5654) | The whole message |
+| A known partner, vendor or site token, or a routable IP address, survives. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast without the P flag, or in a documentation range (`2001:db8::/32`, `3fff::/20`). A multicast address with the P flag set is refused, whether or not it embeds a prefix: that includes the RFC 3306 and RFC 3956 forms and source-specific `ff3x::/32`. An IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. An allowed address is not routable on the internet, but it can still name a site or a device: a unique-local address carries its site's random Global ID, and a link-local one built from a MAC carries that MAC. The forms it cannot read are below (BACKLOG #5654) | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
@@ -2490,7 +2493,10 @@ still pass:
   whose escape pairs across a component separator passes both (BACKLOG #5632).
 - The IPv6 check reads runs of hex digits, colons and dots, as written and decoded. An address
   glued to other hex digits or letters, such as one written straight after a hex word, is not
-  read as an address, and nor is one a run joins to another (BACKLOG #5654).
+  read as an address, and nor is one a run joins to another. A leading label that ends in hex,
+  such as `Device:`, and a trailing `:port` are dropped only when the run as written holds no
+  address. An address split by `\H\` or `\N\` is read with them as `_`, so one a display that
+  drops highlighting would show whole passes (BACKLOG #5654).
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
 
@@ -2500,7 +2506,7 @@ any word that ends in a hex digit or letter joined to `::`, such as `ADD::`, `No
 `std::bad_alloc` or `Code:: 12`; such a word joined by a colon to an allowed address, such as
 `Feed:fe80::1`; a word that ends in hex digits joined to `::` and more hex, such as `abc 1::2`;
 eight colon-separated hex groups, such as a colon-written EUI-64 device id
-(`00:1A:2B:FF:FE:3C:4D:5E`); and, in a message whose field or component separator is `:`, digits
+(`00:1A:2B:FF:FE:3C:4D:5E`); nine such groups, read as an address and a `:port`; and, in a message whose field or component separator is `:`, digits
 on either side of an empty field, such as `1::1234`.
 
 **A shape cut across fields by the message's own field separator is refused, but not in every

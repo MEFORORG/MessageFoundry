@@ -477,8 +477,11 @@ def surrogate_field_recorded(
 def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     """True if ``part``, one component or one subcomponent, is a site code on any reading a
     consumer can take (BACKLOG #5632): as written, trimmed or not, or any of
-    :func:`decoded_readings`. Each reading must be a site code whole, by ``fullmatch``, so a
-    site-code run inside a longer value still reads as no site code."""
+    :func:`decoded_readings`. Each reading must be a site code whole, by ``fullmatch``. A part with
+    no escape character is read only whole, so a site-code run inside a longer value, such as
+    ``Call 971234 today``, reads as no site code. A part that holds one is also read split on
+    whitespace and on escaped delimiters, so ``Call 971234 today\\.br\\`` reads as a site code,
+    and :func:`scrub_site_codes` then replaces the whole part."""
     forms = (
         part,
         part.strip(),
@@ -490,7 +493,10 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
 def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|") -> str:
     """Field-anchored site-code safety pass (ADR 0030 §5): replace any **whole component or
     subcomponent** that is a site code with a fabricated non-site code of the same width, leaving a
-    coincidental site-code run inside a longer value (timestamps, order numbers) untouched. Applied
+    coincidental site-code run inside a longer value with no escape character (timestamps, order
+    numbers) untouched. In a part that holds an escape character, a site-code run that whitespace
+    or an escaped delimiter sets apart counts, and the whole part, free text included, becomes
+    digits (:func:`_reads_as_site_code`). Applied
     to every field as a net under the rule map, since a site code can lurk in an unexpected field.
     A no-op when no site-code prefix is configured (a token-less build; the rule map remains the
     primary control).
