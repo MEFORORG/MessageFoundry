@@ -74,6 +74,7 @@ __all__ = [
     "must_change_target",
     "must_enrol_first",
     "oidc_flow_cookie_name",
+    "reauth_before_input",
     "reauth_landing",
     "register_ui_action",
     "rekey_continuations",
@@ -1518,8 +1519,31 @@ def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPExce
     """
     target = next_path if next_path is not None else request.url.path
     _issue_continuation(request, target)
-    nxt = quote(target, safe="/")
-    return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": f"/ui/reauth?next={nxt}"})
+    return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": _reauth_location(target)})
+
+
+def _reauth_location(target: str) -> str:
+    """The ``/ui/reauth`` URL toward ``target``, a whole path carried in one query parameter."""
+    return "/ui/reauth?next=" + quote(target, safe="/")
+
+
+async def reauth_before_input(request: Request, action: str, next_path: str) -> str | None:
+    """Where a page sends the operator BEFORE it collects input for a gate bound to ``action``.
+
+    ``None`` when that gate's proof check would pass now: the session holds the live grant, or the
+    org opted out and the window is fresh. Nothing is spent here, so the gate still spends the one
+    proof at submit. The gate's new-client-IP refusal is not run, because it records the address;
+    a submit from a new address can still be sent to re-auth. Otherwise the ``/ui/reauth`` URL toward ``next_path``, an unlock page,
+    with the continuation recorded as the gate's own refusal records it, so the re-auth mints the
+    grant and lands on that page. The case it exists for is a body-carrying POST whose refusal
+    would drop what the operator typed (BACKLOG #5931: the first TOTP enrolment code)."""
+    auth = get_auth(request)
+    if auth is None or await _ui_action_step_up_ok(
+        auth, session_token(request), action, spend=False
+    ):
+        return None
+    _issue_continuation(request, next_path)
+    return _reauth_location(next_path)
 
 
 async def _refuse_from_new_address(
