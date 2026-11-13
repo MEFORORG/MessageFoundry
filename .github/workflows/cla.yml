@@ -177,12 +177,15 @@ jobs:
       # the action's step, so it runs exactly when that step does.
       #
       # FAIL-OPEN ON A FAULT, BY OWNER RULING 2026-11-13 ("Wire, fail-open on fault"). Exit 1 is a
-      # refusal, or a traceback, and fails the required `cla` context. Exit 2 is a fault -- a GitHub
-      # outage, a malformed reply, bad input -- and warns and passes, because this workflow runs from
-      # the DEFAULT branch: a step that failed on every fault would wedge every pull request,
-      # including the one reverting it. Event data reaches the script through `env:` only, never a
-      # templated `run:` line (zizmor's template-injection rule). CLA_ALLOWLIST must equal the
-      # action's `allowlist:` below; tests/test_merge_gate_controls.py pins the two equal.
+      # refusal and fails the required `cla` context. Exit 3 is a fault -- a GitHub outage, a
+      # malformed reply, bad input, a bug in the script -- and warns and passes, because this
+      # workflow runs from the DEFAULT branch: a step that failed on every fault would wedge every
+      # pull request, including the one reverting it. EXIT 2 IS NOT A FAULT AND FAILS: it is what
+      # python3 returns when it cannot open the script, so a renamed script fails loudly instead of
+      # switching the check off. Event data reaches the script through `env:` only, never a
+      # templated `run:` line (zizmor's template-injection rule). CLA_ALLOWLIST and the two
+      # CLA_SIGNATURES_* values must equal the action's `with:` below;
+      # tests/test_merge_gate_controls.py pins them equal and pins the script path to a real file.
       - name: CLA pre-check (every commit, unlinked allowlisted names)
         if: >-
           (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
@@ -194,13 +197,15 @@ jobs:
           CLA_PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           CLA_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CLA_ALLOWLIST: 'wshallwshall,dependabot[bot],github-actions[bot]'
+          CLA_SIGNATURES_PATH: 'signatures/version1/cla.json'
+          CLA_SIGNATURES_BRANCH: 'cla-signatures'
         run: |
           set +e
           python3 scripts/security/cla_precheck.py
           rc=$?
           set -e
-          if [ "$rc" -eq 2 ]; then
-            echo "::warning title=CLA pre-check not enforced::the pre-check faulted (exit 2), so this run rests on the CLA action alone"
+          if [ "$rc" -eq 3 ]; then
+            echo "::warning title=CLA pre-check not enforced::the pre-check faulted (exit 3), so this run rests on the CLA action alone"
             exit 0
           fi
           exit "$rc"
@@ -212,12 +217,18 @@ jobs:
       # `pull_request_target` arm is unchanged, and on `merge_group` the step still skips (the `on:`
       # note above says why that green is accepted). tests/test_merge_gate_controls.py evaluates this
       # condition per event and fails against the form without the pull-request test.
+      #
+      # `!cancelled()` LETS THIS STEP RUN AFTER THE PRE-CHECK REFUSES. Without a status function
+      # GitHub adds an implicit `success()`, so a refusal would skip the action: no request to sign
+      # would be posted, and a sign comment would not be recorded. The job still fails, because the
+      # pre-check step failed, so the `cla` context stays red either way.
       - name: CLA Assistant
         if: >-
-          (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+          !cancelled() &&
+          ((github.event_name == 'issue_comment' && github.event.issue.pull_request &&
            (github.event.comment.body == 'recheck' ||
             github.event.comment.body == 'I have read the CLA and I agree to its terms.')) ||
-          github.event_name == 'pull_request_target'
+          github.event_name == 'pull_request_target')
         uses: ./.github/actions/cla-assistant-lite # vendored ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1); upstream archived, see .github/actions/cla-assistant-lite/README.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

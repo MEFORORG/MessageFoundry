@@ -1401,7 +1401,21 @@ def _cla_step_condition() -> str:
     steps = jobs_of("cla.yml")["cla"]["steps"]
     candidates = [s for s in steps if "allowlist" in (s.get("with") or {})]
     assert len(candidates) == 1, f"expected ONE CLA action step in cla.yml, found {len(candidates)}"
-    return str(candidates[0]["if"])
+    return _without_not_cancelled(str(candidates[0]["if"]))
+
+
+_NOT_CANCELLED = "!cancelled() &&"
+
+
+def _without_not_cancelled(condition: str) -> str:
+    """The CLA action's `if:` opens with `!cancelled() &&` so it runs after a pre-check refusal.
+    `_evaluate` models no status function, so the prefix is checked here and the rest graded."""
+    text = condition.strip()
+    assert text.startswith(_NOT_CANCELLED), (
+        "the CLA action's `if:` must open with `!cancelled() &&`; without a status function GitHub "
+        "adds `success()`, and a pre-check refusal would skip the request to sign"
+    )
+    return text[len(_NOT_CANCELLED) :].strip()
 
 
 @pytest.mark.parametrize("body", ["recheck", _CLA_SIGN_TEXT])
@@ -1453,13 +1467,27 @@ def test_the_cla_pre_check_reads_the_same_allowlist_and_sign_text_as_the_action(
     skips. And the sign text the `if:` matches must be the one the action tells people to post."""
     pre, act = _cla_steps()
     assert str(pre["env"]["CLA_ALLOWLIST"]) == str(act["with"]["allowlist"])
+    assert str(pre["env"]["CLA_SIGNATURES_PATH"]) == str(act["with"]["path-to-signatures"])
+    assert str(pre["env"]["CLA_SIGNATURES_BRANCH"]) == str(act["with"]["branch"])
     assert str(act["with"]["custom-pr-sign-comment"]) == _CLA_SIGN_TEXT
-    assert str(pre["if"]) == str(act["if"]), "the pre-check must run exactly when the action does"
+    # Same events; the action alone adds `!cancelled()`, so it also runs after a refusal.
+    pre_if = " ".join(str(pre["if"]).split())
+    act_if = " ".join(_without_not_cancelled(str(act["if"])).split())
+    assert act_if == f"({pre_if})", "the pre-check must run on exactly the action's events"
+
+
+def test_the_cla_pre_check_step_names_a_script_that_exists() -> None:
+    """A renamed or moved script makes python3 exit 2, which the wrapper fails on; this catches
+    the rename at pull request time instead, before it reaches the default branch."""
+    pre, _ = _cla_steps()
+    paths = re.findall(r"python3\s+(\S+\.py)", str(pre["run"]))
+    assert len(paths) == 1, f"expected one python3 call in the pre-check step: {pre['run']!r}"
+    assert (ROOT / paths[0]).is_file(), f"cla.yml runs {paths[0]}, which does not exist"
 
 
 def test_the_cla_pre_check_fails_open_on_a_fault_only(tmp_path: Path) -> None:
-    """Owner ruling 2026-11-13, "Wire, fail-open on fault": exit 2 passes with a warning; exit 1
-    and any other non-zero fail. Run the step's own script with a stub in place of the pre-check,
+    """Owner ruling 2026-11-13, "Wire, fail-open on fault": exit 3 (fault) passes with a warning;
+    exit 1, exit 2 (python3 could not open the script) and any other non-zero fail. Run the step's own script with a stub in place of the pre-check,
     so the wrapper is what is measured. Event data stays in `env:`, never in `run:`."""
     pre, _ = _cla_steps()
     script = str(pre["run"])
@@ -1467,15 +1495,15 @@ def test_the_cla_pre_check_fails_open_on_a_fault_only(tmp_path: Path) -> None:
     call = "python3 scripts/security/cla_precheck.py"
     assert script.count(call) == 1, f"the step must call the pre-check exactly once: {script!r}"
     bash = _require_bash(tmp_path)
-    for code, expect in ((0, 0), (1, 1), (2, 0), (3, 3)):
+    # 2 is python3's own "cannot open the script", so it must FAIL; 3 is the script's fault code.
+    for code, expect in ((0, 0), (1, 1), (2, 2), (3, 0), (4, 4)):
         # GitHub runs a bash `run:` with `-e`, so the wrapper must survive it.
         wrapped = "set -e\n" + script.replace(call, f"(exit {code})")
         proc = subprocess.run(  # noqa: S603 -- the repository's own workflow script, under test
             [bash, "-c", wrapped], capture_output=True, check=False, cwd=tmp_path, timeout=60
         )
         assert proc.returncode == expect, (code, proc.returncode, _text(proc))
-        if code == 2:
-            assert "::warning title=CLA pre-check not enforced::" in _text(proc)
+        assert ("::warning title=CLA pre-check not enforced::" in _text(proc)) == (code == 3)
 
 
 # ===================================================================================================

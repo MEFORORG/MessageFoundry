@@ -8,10 +8,12 @@ of the GraphQL connection the script queries. No test reaches the network.
 
 from __future__ import annotations
 
+import ast
 import functools
 import http.client
 import io
 import json
+import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
@@ -80,6 +82,15 @@ class _Replay:
         self.calls.append(dict(variables))
         assert self.pages, "the script asked for a page past the last one the scenario holds"
         return self.pages.pop(0)
+
+
+def _no_signatures() -> frozenset[int]:
+    return frozenset()
+
+
+def _run(env: Mapping[str, str], transport: cla_precheck.Transport) -> int:
+    """`run` with the network replaced: GraphQL by `transport`, the signature file by an empty one."""
+    return run(env, transport, _no_signatures)
 
 
 def _verdict(scenario: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -208,6 +219,94 @@ def test_the_actions_view_is_the_first_page_however_short_it_is() -> None:
     )
 
 
+def test_an_author_past_the_first_page_who_signed_is_not_refused() -> None:
+    """The action never sees this author, but the signature file it keeps already holds their id,
+    so refusing would be a false refusal of a signed contributor."""
+    read = fetch_commits(_Replay("new_author_past_100"), "MEFORORG", "MessageFoundry", 7)
+    calls: list[int] = []
+
+    def signed() -> frozenset[int]:
+        calls.append(1)
+        return frozenset({90000003})
+
+    assert evaluate(read, _ALLOWLIST, signed).refusals == ()
+    assert len(evaluate(read, _ALLOWLIST, _no_signatures).refusals) == 1
+    assert calls == [1], "the signature file is read once, and only for an unseen author"
+    linked = fetch_commits(_Replay("linked_on_page_two"), "MEFORORG", "MessageFoundry", 7)
+    evaluate(linked, _ALLOWLIST, signed)
+    assert calls == [1], "a pull request with no unseen author never reads the signature file"
+
+
+def test_the_signature_file_parses_as_the_action_writes_it() -> None:
+    assert cla_precheck.parse_signatures({"signedContributors": []}) == frozenset()
+    entry = {"name": "octo-contributor", "id": 90000001, "comment_id": 1, "pullRequestNo": 7}
+    assert cla_precheck.parse_signatures({"signedContributors": [entry]}) == {90000001}
+    bad_files: list[object] = [
+        [],
+        {"signedContributors": {}},
+        {"signedContributors": [{"id": "1"}]},
+    ]
+    for bad in bad_files:
+        with pytest.raises(PrecheckFault):
+            cla_precheck.parse_signatures(bad)
+
+
+def test_the_signature_file_is_read_from_the_base_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 404 is no signatures, as the action reads it; any other HTTP error is a fault."""
+    seen: list[str] = []
+
+    def answer(code: int) -> Any:
+        def fake(request: urllib.request.Request, timeout: float) -> object:
+            seen.append(request.full_url)
+            raise urllib.error.HTTPError(
+                request.full_url, code, "x", http.client.HTTPMessage(), None
+            )
+
+        return fake
+
+    reader = cla_precheck.rest_signatures(
+        "https://api.example.test",
+        "synthetic-token-value",
+        "MEFORORG",
+        "MessageFoundry",
+        "signatures/version1/cla.json",
+        "cla-signatures",
+    )
+    monkeypatch.setattr(cla_precheck._OPENER, "open", answer(404))
+    assert reader() == frozenset()
+    assert seen[-1] == (
+        "https://api.example.test/repos/MEFORORG/MessageFoundry/contents/"
+        "signatures/version1/cla.json?ref=cla-signatures"
+    )
+    monkeypatch.setattr(cla_precheck._OPENER, "open", answer(500))
+    with pytest.raises(PrecheckFault):
+        reader()
+
+
+def test_an_unexpected_exception_is_a_fault_and_exits_three(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bug in the script must not fail every pull request: exit 3 (fault), never 1 (refused),
+    and never 2, which is the interpreter's own exit when it cannot open the script."""
+
+    def broken(env: Mapping[str, str]) -> int:
+        raise KeyError("synthetic-secret-value")
+
+    monkeypatch.setattr(cla_precheck, "run", broken)
+    assert cla_precheck.main() == EXIT_FAULT == 3
+    out = capsys.readouterr().out
+    assert "::warning title=CLA pre-check fault::unexpected KeyError" in out
+    assert "synthetic-secret-value" not in out
+
+
+def test_the_script_keeps_to_the_runners_python_3_12_grammar() -> None:
+    """The step runs the runner's system python3 (3.12 on ubuntu-24.04), not this repo's 3.14."""
+    source = Path(cla_precheck.__file__).read_text(encoding="utf-8")
+    ast.parse(source, feature_version=(3, 12))
+
+
 def test_the_first_commit_seen_under_a_name_is_the_entry_the_action_keeps() -> None:
     """An unlinked commit named github-actions[bot] BEFORE the linked bot commit becomes the
     action's entry, with no id. With the bot off the allowlist the action asks it to sign, so
@@ -249,16 +348,16 @@ def test_wildcard_and_empty_entries_match_as_the_action_matches() -> None:
 
 
 def test_run_exit_codes_and_annotations(capsys: pytest.CaptureFixture[str]) -> None:
-    assert run(_ENV, _Replay("linked_on_page_two")) == EXIT_PASS
-    assert run(_ENV, _Replay("impersonation_on_page_two")) == EXIT_REFUSED
+    assert _run(_ENV, _Replay("linked_on_page_two")) == EXIT_PASS
+    assert _run(_ENV, _Replay("impersonation_on_page_two")) == EXIT_REFUSED
     assert "::error title=CLA pre-check refused::" in capsys.readouterr().out
-    assert run(_ENV, _Replay("graphql_error")) == EXIT_FAULT
+    assert _run(_ENV, _Replay("graphql_error")) == EXIT_FAULT
     assert "::warning title=CLA pre-check fault::" in capsys.readouterr().out
 
 
 def test_a_stale_head_is_a_fault(capsys: pytest.CaptureFixture[str]) -> None:
-    assert run({**_ENV, "CLA_HEAD_SHA": _HEAD}, _Replay("linked_on_page_two")) == EXIT_PASS
-    assert run({**_ENV, "CLA_HEAD_SHA": "cd" * 20}, _Replay("linked_on_page_two")) == EXIT_FAULT
+    assert _run({**_ENV, "CLA_HEAD_SHA": _HEAD}, _Replay("linked_on_page_two")) == EXIT_PASS
+    assert _run({**_ENV, "CLA_HEAD_SHA": "cd" * 20}, _Replay("linked_on_page_two")) == EXIT_FAULT
     assert "stale" in capsys.readouterr().out
 
 
@@ -277,7 +376,7 @@ def test_bad_environment_is_a_fault_before_any_call(
     override: dict[str, str], fault: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     replay = _Replay("linked_on_page_two")
-    assert run({**_ENV, **override}, replay) == EXIT_FAULT
+    assert _run({**_ENV, **override}, replay) == EXIT_FAULT
     assert replay.calls == []
     assert fault in capsys.readouterr().out
 
@@ -369,7 +468,7 @@ def test_a_commit_name_cannot_open_a_workflow_command_of_its_own(
             }
         }
     }
-    assert run(_ENV, lambda _q, _v: page) == EXIT_REFUSED
+    assert _run(_ENV, lambda _q, _v: page) == EXIT_REFUSED
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1 and "%25%0A::set-output" in lines[0]
 

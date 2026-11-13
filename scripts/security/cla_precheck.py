@@ -28,10 +28,18 @@ never holds, or a read with fewer distinct commits than GitHub's ``totalCount``.
 pull request's head moved while it read.
 
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
-the CLA action, FAIL-OPEN ON A FAULT (owner ruling 2026-11-13, "Wire, fail-open on fault"): exit 2
-warns and passes, so a GitHub outage or bad input cannot wedge every pull request, its own revert
-included; exit 1, a refusal or an unanticipated traceback, fails the check. It does not patch the
-vendored bundle; the provenance gate forbids that.
+the CLA action, FAIL-OPEN ON A FAULT (owner ruling 2026-11-13, "Wire, fail-open on fault"): exit 3
+warns and passes, so a GitHub outage, bad input or a bug in this script cannot wedge every pull
+request, its own revert included; exit 1, a refusal, fails the check. Exit 2 is NOT a fault: it is
+what the interpreter returns when it cannot open the script, so a renamed or deleted script fails
+the check instead of switching it off. The runner runs this with its system ``python3``, so the
+script keeps to Python 3.12 syntax; tests/test_cla_precheck.py parses it at that grammar. It does
+not patch the vendored bundle; the provenance gate forbids that.
+
+AN AUTHOR THE ACTION NEVER SEES, first seen past its one page, is refused only when absent from the
+signature file the action keeps (``signedContributors`` ids, read over REST from the base
+repository's signature branch). A file GitHub answers 404 for holds no signatures, as the action
+itself assumes; any other unreadable answer is a fault. It is read only when such an author exists.
 
 WHAT IT DOES NOT REFUSE. It reports as a NOTICE, without refusing, at least these shapes the owner
 has not ruled on:
@@ -57,10 +65,13 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   CLA_ALLOWLIST       the same comma-separated list cla.yml passes the action
   CLA_HEAD_SHA        optional; the head commit the run judges. A different head is a fault.
   GITHUB_GRAPHQL_URL  optional; defaults to https://api.github.com/graphql
+  GITHUB_API_URL      optional; defaults to https://api.github.com
+  CLA_SIGNATURES_PATH the action's ``path-to-signatures``
+  CLA_SIGNATURES_BRANCH the action's ``branch``
 
-EXIT CODES: 0 nothing refused; 1 refused; 2 a fault (bad input, network, or a reply in the wrong
-shape). The split lets a workflow choose how to treat a fault without parsing text. An exception
-this script does not anticipate ends in a traceback and exit 1, so a bug in it reads as a refusal.
+EXIT CODES: 0 nothing refused; 1 refused; 3 a fault (bad input, network, a reply in the wrong
+shape, or an exception this script did not anticipate). The split lets a workflow choose how to
+treat a fault without parsing text.
 """
 
 from __future__ import annotations
@@ -80,12 +91,13 @@ from typing import Any
 
 EXIT_PASS = 0
 EXIT_REFUSED = 1
-EXIT_FAULT = 2
+EXIT_FAULT = 3  # never 2: the interpreter exits 2 when it cannot open the script
 
 # `github-actions[bot]`, the one id the action drops from its committer list.
 ACTIONS_BOT_ID = 41898282
 
 DEFAULT_GRAPHQL_URL = "https://api.github.com/graphql"
+DEFAULT_API_URL = "https://api.github.com"
 
 # The cursor is nullable: GitHub reads a null `after` as "from the start". The action's empty-string
 # cursor works only because it never asks for a second page.
@@ -270,7 +282,23 @@ def _total_count(connection: Mapping[str, Any]) -> int:
     return total
 
 
-def evaluate(read: PullRequestRead, allowlist: Sequence[str]) -> Verdict:
+Signatures = Callable[[], frozenset[int]]
+
+
+def evaluate(
+    read: PullRequestRead, allowlist: Sequence[str], signatures: Signatures | None = None
+) -> Verdict:
+    """Refusals and notices for one read. ``signatures`` returns the signed account ids; it is
+    called only for an author the action never sees, and with none every such author refuses."""
+    signed_cache: list[frozenset[int]] = []
+
+    def has_signed(who: Attribution) -> bool:
+        if who.database_id is None or signatures is None:
+            return False
+        if not signed_cache:
+            signed_cache.append(signatures())
+        return who.database_id in signed_cache[0]
+
     refusals: list[str] = []
     notices: list[str] = []
     distinct = len({str(commit.get("oid", "")) for commit in read.commits})
@@ -302,11 +330,12 @@ def evaluate(read: PullRequestRead, allowlist: Sequence[str]) -> Verdict:
                 )
             elif not skipped(who) and who.name not in never_checked:
                 never_checked.add(who.name)
-                refusals.append(
-                    f"commit {who.oid} is past the {read.first_page} commits the action reads, and "
-                    f"its author {who.name!r} appears in none of them, so the action never checks "
-                    "that author"
-                )
+                if not has_signed(who):
+                    refusals.append(
+                        f"commit {who.oid} is past the {read.first_page} commits the action "
+                        f"reads, its author {who.name!r} appears in none of them, and the CLA "
+                        "signature file holds no signature for that account"
+                    )
         elif unlinked and skipped(entry):
             refusals.append(
                 f"commit {who.oid} is linked to no GitHub account, and the action files it under "
@@ -341,40 +370,53 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuse every redirect: urllib would re-send the Authorization header to wherever it points."""
 
     def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
-        raise PrecheckFault(
-            "GraphQL answered with a redirect, which this pre-check does not follow"
-        )
+        raise PrecheckFault("GitHub answered with a redirect, which this pre-check does not follow")
 
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+class _NotFound(Exception):
+    """GitHub answered 404."""
+
+
+def _fetch_json(
+    url: str, token: str, what: str, *, body: bytes | None = None, accept: str, timeout: float
+) -> object:
+    """One authenticated request to GitHub, its reply parsed as JSON; every failure is a fault."""
+    headers = {"Authorization": f"Bearer {token}", "Accept": accept}
+    headers["User-Agent"] = "messagefoundry-cla-precheck"
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    try:
+        request = urllib.request.Request(  # nosec B310 -- run() refuses a URL that is not https
+            url, data=body, headers=headers, method="GET" if body is None else "POST"
+        )
+        with _OPENER.open(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise _NotFound from exc
+        raise PrecheckFault(f"{what} answered HTTP {exc.code}") from exc
+    except (OSError, http.client.HTTPException) as exc:  # URLError, timeouts, truncated replies
+        raise PrecheckFault(f"{what} call failed ({type(exc).__name__})") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PrecheckFault(f"{what} replied with something that is not UTF-8 JSON") from exc
+    except ValueError as exc:  # a URL or header urllib cannot form, UnicodeEncodeError included
+        raise PrecheckFault(
+            f"the {what} request could not be formed ({type(exc).__name__})"
+        ) from exc
 
 
 def urllib_transport(url: str, token: str, timeout: float = 30.0) -> Transport:
     def call(query: str, variables: Mapping[str, object]) -> Mapping[str, Any]:
         body = json.dumps({"query": query, "variables": dict(variables)}).encode("utf-8")
         try:
-            request = urllib.request.Request(  # nosec B310 -- run() refuses a URL that is not https
-                url,
-                data=body,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "messagefoundry-cla-precheck",
-                },
-                method="POST",
+            payload = _fetch_json(
+                url, token, "GraphQL", body=body, accept="application/json", timeout=timeout
             )
-            with _OPENER.open(request, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise PrecheckFault(f"GraphQL answered HTTP {exc.code}") from exc
-        except (OSError, http.client.HTTPException) as exc:  # URLError, timeouts, truncated replies
-            raise PrecheckFault(f"GraphQL call failed ({type(exc).__name__})") from exc
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise PrecheckFault("GraphQL replied with something that is not UTF-8 JSON") from exc
-        except ValueError as exc:  # a URL or header urllib cannot form, UnicodeEncodeError included
-            raise PrecheckFault(
-                f"the GraphQL request could not be formed ({type(exc).__name__})"
-            ) from exc
+        except _NotFound as exc:
+            raise PrecheckFault("GraphQL answered HTTP 404") from exc
         if not isinstance(payload, Mapping):
             raise PrecheckFault("GraphQL replied with JSON that is not an object")
         return payload
@@ -382,8 +424,69 @@ def urllib_transport(url: str, token: str, timeout: float = 30.0) -> Transport:
     return call
 
 
-def run(env: Mapping[str, str], transport: Transport | None = None) -> int:
-    """Read the environment, check every commit, print annotations, and return the exit code."""
+def parse_signatures(payload: object) -> frozenset[int]:
+    """The account ids in the action's ``{"signedContributors": [{"id": ...}, ...]}`` file."""
+    contributors = payload.get("signedContributors") if isinstance(payload, Mapping) else None
+    if not isinstance(contributors, list):
+        raise PrecheckFault("the CLA signature file holds no signedContributors list")
+    ids: set[int] = set()
+    for entry in contributors:
+        raw = entry.get("id") if isinstance(entry, Mapping) else None
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            raise PrecheckFault("a CLA signature entry holds no integer id")
+        ids.add(raw)
+    return frozenset(ids)
+
+
+def rest_signatures(
+    api_url: str, token: str, owner: str, name: str, path: str, branch: str, timeout: float = 30.0
+) -> Signatures:
+    """Read the signature file the action keeps, from the base repository, over REST.
+
+    A 404 means the file does not exist yet, which the action itself reads as no signatures.
+    """
+    url = (
+        f"{api_url.rstrip('/')}/repos/{owner}/{name}/contents/"
+        f"{urllib.parse.quote(path)}?ref={urllib.parse.quote(branch, safe='')}"
+    )
+
+    def read() -> frozenset[int]:
+        try:
+            payload = _fetch_json(
+                url,
+                token,
+                "the signature file",
+                accept="application/vnd.github.raw+json",
+                timeout=timeout,
+            )
+        except _NotFound:
+            return frozenset()
+        return parse_signatures(payload)
+
+    return read
+
+
+def _https_url(env: Mapping[str, str], key: str, default: str) -> str:
+    url = env.get(key, "") or default
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+    except ValueError as exc:
+        raise PrecheckFault(f"{key} is not a URL") from exc
+    if parts.scheme != "https" or not host:
+        raise PrecheckFault(f"{key} is not an https URL with a host")
+    return url
+
+
+def run(
+    env: Mapping[str, str],
+    transport: Transport | None = None,
+    signatures: Signatures | None = None,
+) -> int:
+    """Read the environment, check every commit, print annotations, and return the exit code.
+
+    ``transport`` and ``signatures`` replace the network for tests; both default to GitHub.
+    """
     try:
         repository = _REPOSITORY.fullmatch(env.get("GITHUB_REPOSITORY", ""))
         number_text = env.get("CLA_PR_NUMBER", "")
@@ -401,23 +504,26 @@ def run(env: Mapping[str, str], transport: Transport | None = None) -> int:
             raise PrecheckFault("CLA_ALLOWLIST is empty")
         if expected_head and not _SHA.fullmatch(expected_head):
             raise PrecheckFault("CLA_HEAD_SHA is not a 40-character lowercase commit id")
-        if transport is None:
+        owner, name = repository.group(1), repository.group(2)
+        if transport is None or signatures is None:
             token = env.get("GITHUB_TOKEN", "")
-            url = env.get("GITHUB_GRAPHQL_URL", "") or DEFAULT_GRAPHQL_URL
             if not _TOKEN.fullmatch(token):
                 raise PrecheckFault("GITHUB_TOKEN is not set, or holds a character a header cannot")
-            try:
-                parts = urllib.parse.urlsplit(url)
-                host = parts.hostname
-            except ValueError as exc:
-                raise PrecheckFault("GITHUB_GRAPHQL_URL is not a URL") from exc
-            if parts.scheme != "https" or not host:
-                raise PrecheckFault("GITHUB_GRAPHQL_URL is not an https URL with a host")
-            transport = urllib_transport(url, token)
-        read = fetch_commits(transport, repository.group(1), repository.group(2), number)
+            if transport is None:
+                transport = urllib_transport(
+                    _https_url(env, "GITHUB_GRAPHQL_URL", DEFAULT_GRAPHQL_URL), token
+                )
+            if signatures is None:
+                path = env.get("CLA_SIGNATURES_PATH", "")
+                branch = env.get("CLA_SIGNATURES_BRANCH", "")
+                if not path or not branch:
+                    raise PrecheckFault("CLA_SIGNATURES_PATH or CLA_SIGNATURES_BRANCH is not set")
+                api = _https_url(env, "GITHUB_API_URL", DEFAULT_API_URL)
+                signatures = rest_signatures(api, token, owner, name, path, branch)
+        read = fetch_commits(transport, owner, name, number)
         if expected_head and read.head != expected_head:
             raise PrecheckFault("the pull request's head is not CLA_HEAD_SHA; this run is stale")
-        verdict = evaluate(read, allowlist)
+        verdict = evaluate(read, allowlist, signatures)
     except PrecheckFault as exc:
         print(f"::warning title=CLA pre-check fault::{_escape_command(str(exc))}")
         return EXIT_FAULT
@@ -435,7 +541,14 @@ def main() -> int:
     # A commit name the console cannot encode must not end the run in a traceback.
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(errors="backslashreplace")
-    return run(os.environ)
+    try:
+        return run(os.environ)
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see below
+        # A bug in this script is a FAULT, not a refusal (owner ruling 2026-11-13, fail-open on a
+        # fault): a traceback would exit 1 and fail every pull request, its own revert included.
+        # Only the type is printed; the message could quote commit data.
+        print(f"::warning title=CLA pre-check fault::unexpected {type(exc).__name__}")
+        return EXIT_FAULT
 
 
 if __name__ == "__main__":
