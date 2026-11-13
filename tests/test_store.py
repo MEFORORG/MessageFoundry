@@ -1491,7 +1491,7 @@ async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connect
     watched: set[threading.Thread] = set()
     opened = _watch_aiosqlite_connects(monkeypatch, watched)
     closing = asyncio.Event()
-    real_close = MessageStore.close
+    real_close = MessageStore._close_steps
 
     async def slow_close(self: MessageStore) -> None:
         closing.set()
@@ -1501,7 +1501,7 @@ async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connect
     async def boom(self: MessageStore) -> None:
         raise RuntimeError("reference cache boom")
 
-    monkeypatch.setattr(MessageStore, "close", slow_close)
+    monkeypatch.setattr(MessageStore, "_close_steps", slow_close)
     monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
     task = asyncio.create_task(MessageStore.open(tmp_path / "cancel.db"))
     try:
@@ -1516,24 +1516,76 @@ async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connect
     assert left == [], f"a cancelled cleanup left live aiosqlite worker(s): {', '.join(left)}"
 
 
-async def test_run_open_cleanup_cancels_the_cleanup_at_its_bound(caplog) -> None:
-    """BACKLOG #5720: a wedged cleanup is cancelled at the bound, which runs its ``finally``
-    blocks, so a failed open still raises and the teardown a cancel triggers still happens."""
+async def test_run_open_cleanup_bounds_nothing_until_a_cancel(monkeypatch) -> None:
+    """BACKLOG #5720 round 5, finding 4: a slow but healthy cleanup, such as a large WAL checkpoint,
+    runs to completion however long it takes when nobody cancels it."""
     from messagefoundry.store.store import run_open_cleanup
 
+    monkeypatch.setattr("messagefoundry.store.store.TEARDOWN_CANCEL_DEADLINE", 0.01)
+    finished: list[str] = []
+
+    async def slow() -> None:
+        await asyncio.sleep(0.2)
+        finished.append("done")
+
+    await run_open_cleanup(RuntimeError("open boom"), slow)
+    assert finished == ["done"]
+
+
+async def test_run_open_cleanup_cancels_the_cleanup_at_the_deadline_after_a_cancel(
+    monkeypatch, caplog
+) -> None:
+    """BACKLOG #5720 round 5, findings 12 and 14: once a cancel arrives, the cleanup gets one
+    deadline, read at call time; past it the cleanup is cancelled, which runs its ``finally``
+    blocks, and that is reported in exactly one WARNING."""
+    from messagefoundry.store.store import run_open_cleanup
+
+    monkeypatch.setattr("messagefoundry.store.store.TEARDOWN_CANCEL_DEADLINE", 0.05)
     finally_ran: list[str] = []
+    started = asyncio.Event()
 
     async def wedged() -> None:
+        started.set()
         try:
             await asyncio.Event().wait()
         finally:
             finally_ran.append("finally")
 
-    await run_open_cleanup(RuntimeError("open boom"), wedged, timeout=0.05)
+    task = asyncio.create_task(run_open_cleanup(RuntimeError("open boom"), wedged))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
     for _ in range(10):
         await asyncio.sleep(0)
-    assert "did not finish within" in caplog.text
     assert finally_ran == ["finally"]
+    bounded = [r for r in caplog.records if "did not finish within" in r.getMessage()]
+    assert len(bounded) == 1, caplog.text
+    assert "failed (" not in "".join(r.getMessage() for r in bounded)
+    assert "the cleanup after a failed store open failed" not in caplog.text
+
+
+async def test_run_teardown_steps_runs_every_step_and_keeps_the_cancel() -> None:
+    """BACKLOG #5720 round 5, findings 1 and 6: a cancel in one step skips none of the rest, and
+    a later step's failure never replaces the propagating cancel."""
+    from messagefoundry.store.store import run_teardown_steps
+
+    ran: list[str] = []
+
+    async def cancelled() -> None:
+        ran.append("cancelled")
+        raise asyncio.CancelledError
+
+    async def failing() -> None:
+        ran.append("failing")
+        raise RuntimeError("teardown boom")
+
+    def sync_step() -> None:
+        ran.append("sync")
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_teardown_steps(cancelled, failing, sync_step)
+    assert ran == ["cancelled", "failing", "sync"]
 
 
 async def test_run_open_cleanup_raises_a_cancel_that_lands_while_it_runs(caplog) -> None:
@@ -1630,3 +1682,80 @@ async def test_a_cancel_inside_close_still_closes_every_connection(tmp_path, mon
         for conn in opened:
             await conn.close()
     assert left == [], f"a cancelled close left live aiosqlite worker(s): {', '.join(left)}"
+
+
+async def test_a_cancel_and_a_hanging_settle_still_close_every_connection(
+    tmp_path, monkeypatch
+) -> None:
+    """BACKLOG #5720 round 5, findings 1 and 2: a settle that hangs after a cancel is cut at the
+    one deadline, and every read connection and the writer still close."""
+    watched: set[threading.Thread] = set()
+    opened = _watch_aiosqlite_connects(monkeypatch, watched)
+    store = await MessageStore.open(tmp_path / "settle.db")
+    monkeypatch.setattr("messagefoundry.store.store.TEARDOWN_CANCEL_DEADLINE", 0.05)
+    settling = asyncio.Event()
+
+    async def hanging_settle(self: MessageStore, *, settle: bool = False) -> None:
+        settling.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(MessageStore, "checkpoint_cipher_invocations", hanging_settle)
+    task = asyncio.create_task(store.close())
+    try:
+        await asyncio.wait_for(settling.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        left = await _workers_left(watched)
+    finally:
+        for conn in opened:
+            await conn.close()
+    assert left == [], f"a cancelled close left live aiosqlite worker(s): {', '.join(left)}"
+
+
+async def test_a_failed_open_closes_its_writer_once(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720 round 5, finding 5: the failed open's cleanup closes the writer through the
+    store only; a second close beside it raced the store's own close of the same connection."""
+    opened = _watch_aiosqlite_connects(monkeypatch, set())
+    closes: list[int] = []
+
+    async def boom(self: MessageStore) -> None:
+        writer = self._db
+        real = writer.close
+
+        async def counting_close() -> None:
+            closes.append(1)
+            await real()
+
+        writer.close = counting_close  # type: ignore[method-assign]
+        raise RuntimeError("reference cache boom")
+
+    monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
+    try:
+        with pytest.raises(RuntimeError, match="reference cache boom"):
+            await MessageStore.open(tmp_path / "once.db")
+        seen = list(closes)
+    finally:
+        for conn in opened:
+            await conn.close()
+    assert seen == [1]
+
+
+async def test_the_sync_close_stops_every_worker_and_the_committer(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720 round 5, finding 8: the close a coroutine that cannot await falls back to
+    stops the group committer, ends every worker with aiosqlite's ``stop()``, and forgets the read
+    pool, so the store no longer hands out stopped connections."""
+    watched: set[threading.Thread] = set()
+    _watch_aiosqlite_connects(monkeypatch, watched)
+    store = await MessageStore.open(tmp_path / "sync.db", group_commit_window_ms=5.0)
+    committer = store._group_commit
+    assert committer is not None and committer._task is not None
+    task = committer._task
+    store._close_sync()
+    assert store._read_conns == []
+    assert store._read_pool is None
+    assert committer._task is None
+    await asyncio.sleep(0)
+    assert task.cancelled() or task.done()
+    left = await _workers_left(watched)
+    assert left == [], f"the sync close left live aiosqlite worker(s): {', '.join(left)}"

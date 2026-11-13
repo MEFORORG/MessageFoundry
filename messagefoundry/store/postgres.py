@@ -225,7 +225,6 @@ from messagefoundry.store.store import (
     AD_SCOPE_MAP,
     ANY_CLAIM_OWNER,
     AUDIT_KEY_EPOCH_ACTION,
-    CLOSE_SETTLE_TIMEOUT,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
@@ -329,6 +328,7 @@ from messagefoundry.store.store import (
     check_executing_owner_filter,
     check_open_store_pin,
     check_password_generated,
+    close_to_completion,
     conditional_way_past,
     create_batch_failure,
     delivery_key,
@@ -386,6 +386,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_reseal,
     run_open_cleanup,
+    run_teardown_steps,
     scope_if_source,
     scope_withdrawal,
     seal_approval_async,
@@ -396,6 +397,7 @@ from messagefoundry.store.store import (
     session_owes_unproven_factor_async,
     session_reseal_params,
     session_writer_seal_check,
+    settle_at_close,
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
@@ -2261,20 +2263,10 @@ class PostgresStore:
                 )  # populate the reference-snapshot read cache (ADR 0006)
         except BaseException as exc:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included, and
-            # settle the invocation block this open reserved rather than forfeit it: close() does
-            # both (BACKLOG #5720). A cleanup that fails is logged by class, so it never replaces
-            # the open's own error (vault BACKLOG #3054).
-            async def _cleanup() -> None:
-                try:
-                    await store.close()
-                except Exception as cleanup:
-                    log.warning(
-                        "closing the pool after a failed open also failed (%s)",
-                        type(cleanup).__name__,
-                    )
-
-            # pool.terminate() is synchronous, so even a closed coroutine can drop the connections.
-            await run_open_cleanup(exc, _cleanup, sync_teardown=lambda: pool.terminate())
+            # settle the invocation block this open reserved rather than forfeit it: close()'s
+            # steps do both (BACKLOG #5720). A cleanup that fails is logged by class, so it never
+            # replaces the open's own error (vault BACKLOG #3054).
+            await run_open_cleanup(exc, store._close_steps, sync_teardown=store._close_sync)
             raise
         return store
 
@@ -2906,26 +2898,25 @@ class PostgresStore:
         # --- end custom RBAC roles (ADR 0045) --------------------------------
 
     async def close(self) -> None:
-        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
-        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
-        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
-        # a failing settlement must never turn a clean shutdown into an error.
-        # The pool closes in a finally, so a cancel during the settle still closes it. The settle
-        # is a server round trip with no bound of its own when command_timeout is 0, so it gets
-        # one here: the pool close must not wait on a degraded server (BACKLOG #5720).
+        """Settle the invocation reserve, then close the pool: run to completion through a
+        cancel, inside one deadline from it (:func:`close_to_completion`, BACKLOG #5720)."""
+        await close_to_completion(self._close_steps, self._close_sync)
+
+    async def _close_steps(self) -> None:
+        """:meth:`close`'s teardown, each step run whatever an earlier one raised."""
+        await run_teardown_steps(functools.partial(settle_at_close, self), self._close_pool)
+
+    async def _close_pool(self) -> None:
         try:
-            try:
-                # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one.
-                if not self._cipher_foreign and not self._read_only:
-                    async with asyncio.timeout(CLOSE_SETTLE_TIMEOUT):
-                        await self.checkpoint_cipher_invocations(settle=True)
-            except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
-                log.warning(  # by class only (vault BACKLOG #3054); a failed open reaches this too
-                    "could not settle the AES-GCM invocation bound at close (%s)",
-                    type(failure).__name__,
-                )
-        finally:
             await self._pool.close()
+        except asyncio.CancelledError:
+            # A graceful close cut short leaves connections open; terminate() drops them.
+            self._pool.terminate()
+            raise
+
+    def _close_sync(self) -> None:
+        """:meth:`close` for a coroutine that cannot await: terminate() is synchronous."""
+        self._pool.terminate()
 
     async def warm_pool(self) -> None:
         # Pre-open pooled connections so a connection burst (the post-promotion delivery workers, or a

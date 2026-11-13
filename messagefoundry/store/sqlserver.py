@@ -227,7 +227,6 @@ from messagefoundry.store.store import (
     AD_SCOPE_MAP,
     ANY_CLAIM_OWNER,
     AUDIT_KEY_EPOCH_ACTION,
-    CLOSE_SETTLE_TIMEOUT,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
@@ -336,6 +335,7 @@ from messagefoundry.store.store import (
     check_executing_owner_filter,
     check_open_store_pin,
     check_password_generated,
+    close_to_completion,
     conditional_way_past,
     create_batch_failure,
     delivery_key,
@@ -394,6 +394,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_reseal,
     run_open_cleanup,
+    run_teardown_steps,
     scope_if_source,
     scope_withdrawal,
     seal_approval_async,
@@ -404,6 +405,7 @@ from messagefoundry.store.store import (
     session_owes_unproven_factor_async,
     session_reseal_params,
     session_writer_seal_check,
+    settle_at_close,
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
@@ -4318,29 +4320,11 @@ class SqlServerStore:
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except BaseException as exc:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included, and
-            # settle the invocation block this open reserved rather than forfeit it: close() does
-            # both (BACKLOG #5720). close() closes the pool and releases the executor in finally
-            # blocks, so a teardown step that raises does not skip them. A wait_closed() that
-            # never returns is cancelled at run_open_cleanup's bound, and that cancel runs the
-            # finally that releases the executor.
-            async def _cleanup() -> None:
-                try:
-                    await store.close()
-                except Exception as cleanup:
-                    # Logged by class, so it never replaces the open's own error (vault BACKLOG
-                    # #3054).
-                    log.warning(
-                        "closing the pool after a failed open also failed (%s)",
-                        type(cleanup).__name__,
-                    )
-
-            def _release_sync() -> None:
-                # Both are synchronous, so even a closed coroutine can run them. pool.close() only
-                # marks the pool closing; its free connections end when they are collected.
-                pool.close()
-                executor.shutdown(wait=False)
-
-            await run_open_cleanup(exc, _cleanup, sync_teardown=_release_sync)
+            # settle the invocation block this open reserved rather than forfeit it: close()'s
+            # steps do both (BACKLOG #5720). Each step runs whatever an earlier one raised, so a
+            # wait_closed() that fails, or is cancelled at the deadline, still releases the
+            # executor. A cleanup that fails is logged by class (vault BACKLOG #3054).
+            await run_open_cleanup(exc, store._close_steps, sync_teardown=store._close_sync)
             raise
         return store
 
@@ -5781,49 +5765,46 @@ class SqlServerStore:
         return bool(row is not None and row[0] == expected)
 
     async def close(self) -> None:
-        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
-        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
-        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
-        # a failing settlement must never turn a clean shutdown into an error.
-        # The settle is a server round trip with no bound of its own when command_timeout is 0, so
-        # it gets one here: the pool close must not wait on a degraded server (BACKLOG #5720).
+        """Settle the invocation reserve, then tear down the sync-handoff pools, the claim holders,
+        the pool and its executor: run to completion through a cancel, inside one deadline from it
+        (:func:`close_to_completion`, BACKLOG #5720).
+
+        THE EXECUTOR IS RELEASED AS ITS OWN STEP, which runs whatever wait_closed() did, and that
+        is the point. wait_closed() cannot complete while the pool is wedged -- which is precisely
+        the state these threads are stuck in -- so releasing them only on the success path would
+        leak the whole pool's worth of threads in the one case that matters. shutdown(wait=False)
+        does not join: a wedged ODBC call is not interruptible, and the process is going away
+        regardless."""
+        await close_to_completion(self._close_steps, self._close_sync)
+
+    async def _close_steps(self) -> None:
+        """:meth:`close`'s teardown, each step run whatever an earlier one raised."""
+        await run_teardown_steps(
+            partial(settle_at_close, self),
+            # Synchronous fused-handoff pools first (a no-op when none were opened). ADR 0071 B5.
+            self.close_sync_handoff_pool,
+            # ADR 0114 sub-lever B: the store-owned claim holders (a no-op when none were opened).
+            self._close_claim_holders,
+            self._pool.close,
+            self._pool.wait_closed,
+            self._release_pool_executor,
+        )
+
+    def _release_pool_executor(self) -> None:
+        if self._pool_executor is not None:
+            self._pool_executor.shutdown(wait=False)
+            self._pool_executor = None
+
+    def _close_sync(self) -> None:
+        """:meth:`close` for a coroutine that cannot await. pool.close() only marks the pool
+        closing; its free connections end when they are collected."""
         try:
-            try:
-                # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one.
-                if not self._cipher_foreign and not self._read_only:
-                    async with asyncio.timeout(CLOSE_SETTLE_TIMEOUT):
-                        await self.checkpoint_cipher_invocations(settle=True)
-            except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
-                log.warning(  # by class only (vault BACKLOG #3054); a failed open reaches this too
-                    "could not settle the AES-GCM invocation bound at close (%s)",
-                    type(failure).__name__,
-                )
+            self.close_sync_handoff_pool()
         finally:
-            # Every teardown below is in a finally, so a settle that raises or is cancelled, or a
-            # teardown step that raises, skips none of the rest (BACKLOG #5720).
             try:
-                try:
-                    # Tear down any synchronous fused-handoff pools first (best-effort; a no-op
-                    # when none were opened, so it never affects the async path). ADR 0071 B5.
-                    self.close_sync_handoff_pool()
-                finally:
-                    # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a
-                    # no-op when the prepared path never opened one).
-                    await self._close_claim_holders()
+                self._pool.close()
             finally:
-                # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point.
-                # wait_closed() cannot complete while the pool is wedged -- which is precisely the
-                # state these threads are stuck in -- so releasing them only on the success path
-                # would leak the whole pool's worth of threads in the one case that matters.
-                # shutdown(wait=False) does not join: a wedged ODBC call is not interruptible, and
-                # the process is going away regardless.
-                try:
-                    self._pool.close()
-                    await self._pool.wait_closed()
-                finally:
-                    if self._pool_executor is not None:
-                        self._pool_executor.shutdown(wait=False)
-                        self._pool_executor = None
+                self._release_pool_executor()
 
     # --- ADR 0071 B5: synchronous fused-handoff connection source ------------
     def open_sync_handoff_pool(self, stage: str, size: int) -> _SyncHandoffPool:

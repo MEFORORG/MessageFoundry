@@ -170,11 +170,11 @@ async def test_open_still_shuts_down_the_executor_when_wait_closed_hangs(
     )
 
     with (
-        caplog.at_level(logging.WARNING, logger=sqlserver_module.__name__),
+        caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"),
         pytest.raises(RuntimeError, match="schema boom"),
     ):
         await SqlServerStore.open(_settings())
-    assert "closing the pool after a failed open also failed (ConnectionResetError)" in caplog.text
+    assert "the cleanup after a failed store open failed (ConnectionResetError)" in caplog.text
     assert "wait_closed wedged" not in caplog.text  # by class only
 
     assert pool.closed == 1
@@ -406,11 +406,16 @@ async def test_a_cancel_during_the_settle_still_runs_every_teardown(
     monkeypatch.setattr(SqlServerStore, "close_sync_handoff_pool", _sync_pools)
     monkeypatch.setattr(SqlServerStore, "_close_claim_holders", _holders)
 
+    monkeypatch.setattr("messagefoundry.store.store.TEARDOWN_CANCEL_DEADLINE", 0.05)
     task = asyncio.create_task(store.close())
     await asyncio.wait_for(settling.wait(), 5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 5)
+    for _ in range(50):  # the teardown finishes on its own once the deadline cancels the settle
+        if fake_executor.shutdown_calls:
+            break
+        await asyncio.sleep(0.01)
 
     assert teardowns == ["sync handoff pools", "claim holders"]
     assert pool.closed == 1

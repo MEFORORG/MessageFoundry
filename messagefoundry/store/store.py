@@ -38,6 +38,7 @@ import asyncio
 import functools
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import math
@@ -589,6 +590,18 @@ class _GroupCommitter:
     def start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="store-group-committer")
+
+    def stop_now(self) -> None:
+        """Stop the committer without awaiting, for a close that cannot await (BACKLOG #5720):
+        enrolled members' futures are cancelled rather than left unresolved."""
+        self._closed = True
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+        for member in self._pending:
+            if not member.future.done():
+                member.future.cancel()
+        self._pending = []
 
     async def aclose(self) -> None:
         """Stop the committer, flushing any enrolled members first so nothing is stranded."""
@@ -1913,39 +1926,76 @@ async def deferred_revoke_reports() -> AsyncIterator[None]:
 
 async def _run_to_completion(
     body: Callable[[], Awaitable[None]],
+    *,
+    what: str = "a revoke's seal report",
+    consequence: str = "; its remaining audit rows and pages were not sent",
+    level: int = logging.ERROR,
+    cancel_deadline: float | None = None,
+    already_cancelled: bool = False,
 ) -> tuple[bool, BaseException | None]:
-    """Run ``body`` as a task awaited through :func:`asyncio.shield`, awaited again after each
-    cancel, so a cancel cannot cut it short. Returns whether a cancel landed meanwhile, and the
-    body's own failure, for the caller to re-raise or not. Never raises. A failure is logged at
-    ERROR with its class, and its traceback at DEBUG only, since a defect's message may carry a
-    row value (CLAUDE.md section 9). A body that ends cancelled is logged too, and returned as a
-    ``CancelledError`` (decision d20261110T063908944-857965, item 5)."""
+    """Run ``body`` as a task waited on with :func:`asyncio.wait`, which never cancels what it
+    waits on, and waited on again after each cancel, so a cancel cannot cut it short. Returns
+    whether a cancel landed meanwhile, and the body's own failure, for the caller to re-raise or
+    not. Never raises, except a ``GeneratorExit``, which cancels the body and propagates: a closed
+    coroutine cannot wait. A failure is logged at ``level`` with its class, and its traceback at
+    DEBUG only, since a defect's message may carry a row value (CLAUDE.md section 9). A body that
+    ends cancelled is logged too, and returned as a ``CancelledError`` (decision
+    d20261110T063908944-857965, item 5).
+
+    ``cancel_deadline`` (BACKLOG #5720) bounds the wait from the first cancel, or from the start
+    with ``already_cancelled``. Nothing is bounded before a cancel, so a slow but healthy body
+    finishes. Past the deadline the body is cancelled, which runs its ``finally`` blocks, and is
+    no longer waited for; that one WARNING is the whole report."""
     task = asyncio.ensure_future(body())
-    cancelled = False
+    _DETACHED.add(task)
+    task.add_done_callback(_DETACHED.discard)
+    loop = asyncio.get_running_loop()
+    cancelled = already_cancelled
+    deadline: float | None = None
+    if cancelled and cancel_deadline is not None:
+        deadline = loop.time() + cancel_deadline
     while not task.done():
+        remaining = None if deadline is None else deadline - loop.time()
+        if remaining is not None and remaining <= 0:
+            log.warning(
+                "%s did not finish within %gs of a cancel, so it was cancelled%s",
+                what,
+                cancel_deadline,
+                consequence,
+            )
+            task.add_done_callback(_retrieve_detached)
+            task.cancel()
+            return cancelled, None
         try:
-            await asyncio.shield(task)
+            await asyncio.wait({task}, timeout=remaining)
         except asyncio.CancelledError:
             # A cancel of this caller, recorded first, so a cancel landing in the turn the loop
             # ends is still raised; the body's own cancel is read below instead.
-            if not task.cancelled():
-                cancelled = True
-        except BaseException:  # noqa: BLE001 -- the body's own failure, read from the task below
-            pass
+            cancelled = True
+            if deadline is None and cancel_deadline is not None:
+                deadline = loop.time() + cancel_deadline
+        except GeneratorExit:
+            task.cancel()
+            raise
     if task.cancelled():
-        log.error(
-            "a revoke's seal report was cancelled before it finished; its remaining audit rows"
-            " and pages were not sent"
-        )
+        log.log(level, "%s was cancelled before it finished%s", what, consequence)
         return cancelled, asyncio.CancelledError()
     failure = task.exception()
     if failure is not None:
-        log.error(
-            "a revoke's seal report failed (%s); its remaining audit rows and pages were not sent",
-            type(failure).__name__,
-        )
-        log.debug("a revoke's seal report failure", exc_info=failure)
+        log.log(level, "%s failed (%s)%s", what, type(failure).__name__, consequence)
+        log.debug("%s failure", what, exc_info=failure)
     return cancelled, failure
+
+
+#: Every body :func:`_run_to_completion` started, kept referenced until it finishes, so the loop
+#: cannot collect one it stopped waiting for.
+_DETACHED: set[asyncio.Future[None]] = set()
+
+
+def _retrieve_detached(task: asyncio.Future[None]) -> None:
+    """Retrieve a body nobody waits for any more, so its failure is not reported as unretrieved."""
+    if not task.cancelled():
+        task.exception()
 
 
 async def raise_account_epoch(
@@ -8102,67 +8152,90 @@ async def _await_connection_worker_exit(
         delay = 0.001 if delay == 0.0 else min(delay * 2.0, 0.05)
 
 
-#: Upper bound on :func:`run_open_cleanup` and on :func:`_teardown_to_completion` in
-#: ``MessageStore.close``. A healthy teardown settles the invocation reserve and closes a pool or a
-#: few connections, each sub-second; this only keeps a wedged one from holding a cancelled caller
-#: forever. Past it the teardown is cancelled, which runs its ``finally`` blocks.
-_OPEN_CLEANUP_TIMEOUT: Final[float] = 30.0
-
-#: Upper bound on the server backends' settle at ``close``: at most a few statements, which a
-#: ``command_timeout`` of 0 leaves unbounded. Twice the default ``command_timeout``, so a slow but
-#: healthy server still settles. Past it the settle is logged and skipped, and the pool closes
-#: (BACKLOG #5720). A failed open's cleanup is bounded sooner, by ``_OPEN_CLEANUP_TIMEOUT``.
-CLOSE_SETTLE_TIMEOUT: Final[float] = 60.0
-
-#: Every teardown :func:`_teardown_to_completion` started, kept referenced until it finishes, so
-#: the loop cannot collect one it stopped waiting for.
-_TEARDOWNS: set[asyncio.Task[None]] = set()
+#: How long a store teardown may run once a cancel reaches it (BACKLOG #5720): one deadline for
+#: everything left, the settle included, sized inside NSSM's 15 s stop window. Nothing is bounded
+#: before a cancel, so a slow but healthy close finishes. Read at call time, so a patch applies.
+TEARDOWN_CANCEL_DEADLINE: float = 10.0
 
 
-def _report_abandoned_teardown(what: str, task: asyncio.Task[None]) -> None:
-    """Log by class only how a teardown nobody waits for any more ended (vault #3054)."""
-    if not task.cancelled() and (failure := task.exception()) is not None:
-        log.warning("%s failed after it was cancelled (%s)", what, type(failure).__name__)
+def _run_sync_teardown(sync_teardown: Callable[[], None] | None, what: str) -> None:
+    """Run a synchronous teardown for a coroutine that cannot await any more, logging by class."""
+    log.warning("%s was closed before it finished; only its synchronous teardown ran", what)
+    if sync_teardown is None:
+        return
+    try:
+        sync_teardown()
+    except Exception as exc:  # noqa: BLE001 — cleanup must never mask the real failure
+        log.warning("the synchronous teardown of %s failed (%s)", what, type(exc).__name__)
 
 
-async def _teardown_to_completion(
-    body: Callable[[], Awaitable[None]],
-    *,
-    what: str,
-    timeout: float = _OPEN_CLEANUP_TIMEOUT,
-    bound_after_cancel: bool = False,
-) -> tuple[bool, BaseException | None]:
-    """Run ``body`` as its own task and wait for it, so a cancel delivered to the caller cannot cut
-    it short. Returns whether such a cancel arrived, for the caller to raise once this returns,
-    and the body's own failure, for the caller to log or raise.
+async def run_teardown_steps(*steps: Callable[[], object]) -> None:
+    """Run every step of a store teardown, whatever an earlier one raised (BACKLOG #5720).
 
-    Waits with :func:`asyncio.wait`, which never cancels what it waits on. Past ``timeout`` the
-    task is cancelled, which runs its ``finally`` blocks, and is not waited for further (BACKLOG
-    #5720); it is then reported as failed with :class:`TimeoutError`. ``timeout`` counts from the
-    start, or with ``bound_after_cancel`` from the first cancel, so a teardown nobody cancelled
-    may take as long as it needs. Never raises."""
-    task: asyncio.Task[None] = asyncio.ensure_future(body())
-    _TEARDOWNS.add(task)
-    task.add_done_callback(_TEARDOWNS.discard)
-    loop = asyncio.get_running_loop()
-    deadline: float | None = None if bound_after_cancel else loop.time() + timeout
+    A step may be synchronous or return an awaitable. A cancel landing in one step does not skip
+    the rest. Afterwards a cancel is raised in preference to any failure, so a teardown failure
+    never replaces a propagating cancel; otherwise the first failure is raised and any later one
+    is logged by class only (vault BACKLOG #3054)."""
+    first: Exception | None = None
     cancelled = False
-    while not task.done():
-        remaining = None if deadline is None else deadline - loop.time()
-        if remaining is not None and remaining <= 0:
-            log.warning("%s did not finish within %.0fs; cancelling it", what, timeout)
-            task.add_done_callback(functools.partial(_report_abandoned_teardown, what))
-            task.cancel()
-            return cancelled, TimeoutError()
+    for step in steps:
         try:
-            await asyncio.wait({task}, timeout=remaining)
+            result = step()
+            if inspect.isawaitable(result):
+                await result
         except asyncio.CancelledError:
             cancelled = True
-            if deadline is None:
-                deadline = loop.time() + timeout
-    if task.cancelled():
-        return cancelled, asyncio.CancelledError()
-    return cancelled, task.exception()
+        except Exception as exc:  # noqa: BLE001 — every step runs; the first failure is raised
+            if first is None:
+                first = exc
+            else:
+                log.warning("a later store teardown step also failed (%s)", type(exc).__name__)
+    if cancelled:
+        raise asyncio.CancelledError from first
+    if first is not None:
+        raise first
+
+
+async def settle_at_close(store: Any) -> None:
+    """The three backends' settle at close (ASVS 11.3.4): charge whatever this process spent
+    BEYOND its reserved block before the store goes away, so a long burst that outran the refill
+    cadence (`rotate-key` re-encrypting a whole store in one offline process is the extreme case)
+    is accounted rather than lost. Best-effort, logged by class only (vault BACKLOG #3054).
+
+    A read-only handle reserved nothing (#1780), and a cipher the open has not bound to this
+    store's salt may count for another store or for none (BACKLOG #5720), so neither settles."""
+    if store._cipher_foreign or store._read_only:
+        return
+    try:
+        await store.checkpoint_cipher_invocations(settle=True)
+    except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
+        log.warning(
+            "could not settle the AES-GCM invocation bound at close (%s)", type(failure).__name__
+        )
+
+
+async def close_to_completion(
+    steps: Callable[[], Awaitable[None]], sync_teardown: Callable[[], None]
+) -> None:
+    """A store's ``close``: run ``steps`` to completion through :func:`_run_to_completion`, with
+    one :data:`TEARDOWN_CANCEL_DEADLINE` from the first cancel (BACKLOG #5720). A cancel is raised
+    once that is done; otherwise the teardown's own failure is. A ``GeneratorExit`` runs only
+    ``sync_teardown``, since a closed coroutine cannot await."""
+    try:
+        cancelled, failure = await _run_to_completion(
+            steps,
+            what="the store's close",
+            consequence="",
+            level=logging.WARNING,
+            cancel_deadline=TEARDOWN_CANCEL_DEADLINE,
+        )
+    except GeneratorExit:
+        _run_sync_teardown(sync_teardown, "the store's close")
+        raise
+    if cancelled:
+        raise asyncio.CancelledError from failure
+    if failure is not None:
+        raise failure
 
 
 async def run_open_cleanup(
@@ -8170,41 +8243,54 @@ async def run_open_cleanup(
     cleanup: Callable[[], Awaitable[None]],
     *,
     sync_teardown: Callable[[], None] | None = None,
-    timeout: float = _OPEN_CLEANUP_TIMEOUT,
 ) -> None:
     """Run a failed store open's ``cleanup`` to completion, whatever reaches the caller meanwhile.
 
-    Shared by the three backends' ``open`` (BACKLOG #5720), through
-    :func:`_teardown_to_completion`. A cancel delivered to the caller while the cleanup runs is
-    raised once it is done, chained to the open's own ``failure``, when that failure is an
-    ``Exception``; the failure is logged by class first, since a cancel is all the caller then
-    sees. A cancel, an interrupt or an exit is left for the caller to re-raise as it is. Otherwise
-    this returns, and the caller re-raises ``failure``.
-
-    A ``GeneratorExit`` (the open's coroutine closed while suspended) cannot await at all, so on one
-    only ``sync_teardown`` runs, best-effort, and the skip is logged. Every log here is by class
-    only (vault BACKLOG #3054)."""
-    if isinstance(failure, GeneratorExit):
-        log.warning("a store open was closed before it finished; only its synchronous teardown ran")
-        if sync_teardown is not None:
-            try:
-                sync_teardown()
-            except Exception as exc:  # noqa: BLE001 — cleanup must never mask the real failure
-                log.warning(
-                    "the synchronous teardown of a closed store open failed (%s)",
-                    type(exc).__name__,
-                )
-        return
+    Shared by the three backends' ``open`` (BACKLOG #5720), through :func:`_run_to_completion`,
+    with one :data:`TEARDOWN_CANCEL_DEADLINE` from the first cancel, or from the start when the
+    open's own ``failure`` is the cancel. A cancel delivered while the cleanup runs is raised once
+    it is done, chained to ``failure`` when that is an ``Exception``, which is logged by class
+    first, since a cancel is all the caller then sees. A cancel, an interrupt or an exit is left
+    for the caller to re-raise as it is; otherwise this returns, and the caller re-raises
+    ``failure``. A ``GeneratorExit`` runs only ``sync_teardown``. Every log is by class only
+    (vault BACKLOG #3054)."""
     what = "the cleanup after a failed store open"
-    cancelled, cleanup_failure = await _teardown_to_completion(cleanup, what=what, timeout=timeout)
-    if cleanup_failure is not None:
-        log.warning("%s failed (%s)", what, type(cleanup_failure).__name__)
+    if isinstance(failure, GeneratorExit):
+        _run_sync_teardown(sync_teardown, "a store open")
+        return
+    try:
+        cancelled, _cleanup_failure = await _run_to_completion(
+            cleanup,
+            what=what,
+            consequence="",
+            level=logging.WARNING,
+            cancel_deadline=TEARDOWN_CANCEL_DEADLINE,
+            already_cancelled=isinstance(failure, asyncio.CancelledError),
+        )
+    except GeneratorExit:
+        _run_sync_teardown(sync_teardown, "a store open")
+        raise
     if cancelled and isinstance(failure, Exception):
         log.warning(
             "a store open failed (%s) and was cancelled while it cleaned up",
             type(failure).__name__,
         )
         raise asyncio.CancelledError from failure
+
+
+async def _close_and_wait(conn: aiosqlite.Connection) -> None:
+    """Close one aiosqlite connection and wait out its non-daemon worker thread."""
+    await conn.close()
+    await _await_connection_worker_exit(conn)
+
+
+async def _close_read_conn_quietly(conn: aiosqlite.Connection) -> None:
+    """A read-pool connection's close: best-effort, so one failing close strands no other."""
+    try:
+        await _close_and_wait(conn)
+    except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
+        # By class only (vault BACKLOG #3054); a failed open reaches this too.
+        log.warning("error closing read-pool connection (%s)", type(failure).__name__)
 
 
 async def _close_snapshot_connection(conn: aiosqlite.Connection, role: str) -> None:
@@ -11398,35 +11484,20 @@ class MessageStore:
             opened = store
 
             async def _cleanup() -> None:
-                try:
-                    if opened is not None:
-                        try:
-                            await opened.close()
-                        except Exception as failure:  # noqa: BLE001 — never mask the real failure
-                            log.warning(  # by class only (vault BACKLOG #3054)
-                                "error closing a partially-opened store (%s)",
-                                type(failure).__name__,
-                            )
-                finally:
-                    try:
-                        await db.close()
-                        # `close` returns before the worker thread it stops has left
-                        # `threading.enumerate()` (see :func:`_await_connection_worker_exit`). A
-                        # failed open is the shortest path there is — one PRAGMA, then straight out
-                        # — so the caller most often wins that race here, and the caller of a
-                        # raising `open` is entitled to find nothing left behind.
-                        await _await_connection_worker_exit(db)
-                    except Exception as failure:  # noqa: BLE001 — never mask the real failure
-                        log.warning(  # by class only (vault BACKLOG #3054)
-                            "error closing the connection after a failed store open (%s)",
-                            type(failure).__name__,
-                        )
+                # The store owns the writer too, so close it through the store only; closing `db`
+                # beside it would race the store's own close of the same connection.
+                if opened is not None:
+                    await opened._close_steps()
+                else:
+                    await _close_and_wait(db)
 
             def _stop_workers() -> None:
                 # A closed coroutine cannot await a close, but aiosqlite's stop() is synchronous and
                 # still ends each non-daemon worker thread.
-                for conn in [*(opened._read_conns if opened is not None else []), db]:
-                    conn.stop()
+                if opened is not None:
+                    opened._close_sync()
+                else:
+                    db.stop()
 
             # BACKLOG #5720: run to completion, so a cancel landing mid-cleanup cannot leave the
             # writer's non-daemon worker thread behind. That cancel is raised once it is done.
@@ -13004,91 +13075,46 @@ class MessageStore:
             )
 
     async def close(self) -> None:
-        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
-        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
-        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
-        # a failing settlement must never turn a clean shutdown into an error.
-        try:
-            try:
-                # A read-only handle reserved nothing and cannot write the settlement (#1780).
-                if not self._cipher_foreign and not self._read_only:
-                    await self.checkpoint_cipher_invocations(settle=True)
-            except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
-                log.warning(  # by class only (vault BACKLOG #3054)
-                    "could not settle the AES-GCM invocation bound at close (%s)",
-                    type(failure).__name__,
-                )
-        except BaseException as in_flight:
-            # A cancel, an interrupt or an exit during the settle: the connections still close,
-            # and what is in flight propagates unchanged (BACKLOG #5720).
-            if isinstance(in_flight, GeneratorExit):
-                self._stop_connections()  # a closed coroutine cannot await a close
-            else:
-                await self._finish_close(raise_failure=False)
-            raise
-        await self._finish_close(raise_failure=True)
+        """Settle the invocation reserve, then close the committer, the read pool and the writer.
 
-    def _stop_connections(self) -> None:
-        """End every connection's worker thread without awaiting: aiosqlite's ``stop()`` is
-        synchronous, for a close that cannot await (BACKLOG #5720)."""
+        Every connection owns a non-daemon worker thread, so the teardown runs to completion
+        through a cancel, inside one deadline from it (:func:`close_to_completion`, BACKLOG #5720).
+        Each close returns before the worker thread it stops has actually gone, so each is waited
+        out too: "the store is closed" means every thread it owned is gone."""
+        await close_to_completion(self._close_steps, self._close_sync)
+
+    async def _close_steps(self) -> None:
+        """:meth:`close`'s teardown, each step run whatever an earlier one raised."""
+        steps: list[Callable[[], object]] = [functools.partial(settle_at_close, self)]
+        if self._group_commit is not None:
+            # FIRST, so it flushes any enrolled members and resolves their futures before the
+            # write connection is closed — otherwise an in-flight handoff would hang forever.
+            steps.append(self._close_group_commit_quietly)
+        steps.extend(functools.partial(_close_read_conn_quietly, c) for c in self._read_conns)
+        steps.append(self._forget_read_pool)
+        steps.append(functools.partial(_close_and_wait, self._db))
+        await run_teardown_steps(*steps)
+
+    async def _close_group_commit_quietly(self) -> None:
+        assert self._group_commit is not None
+        try:
+            await self._group_commit.aclose()
+        except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
+            # By class only (vault BACKLOG #3054); a failed open reaches this too.
+            log.warning("error closing group-commit committer (%s)", type(failure).__name__)
+
+    def _forget_read_pool(self) -> None:
+        self._read_conns = []
+        self._read_pool = None
+
+    def _close_sync(self) -> None:
+        """:meth:`close` for a coroutine that cannot await (BACKLOG #5720): stop the committer,
+        and end every connection's worker with aiosqlite's synchronous ``stop()``."""
+        if self._group_commit is not None:
+            self._group_commit.stop_now()
         for conn in [*self._read_conns, self._db]:
             conn.stop()
-
-    async def _finish_close(self, *, raise_failure: bool) -> None:
-        """Run :meth:`_close_connections` to completion even when a cancel lands in it: every
-        connection owns a non-daemon worker thread, and one skipped close leaves it running
-        (BACKLOG #5720). The bound starts only once a cancel arrives, so a slow but healthy flush
-        is never cut short. With ``raise_failure`` that cancel, or the teardown's own failure, is
-        raised; without it, something else is already propagating, so the failure is logged by
-        class instead."""
-        cancelled, failure = await _teardown_to_completion(
-            self._close_connections, what="the store's close", bound_after_cancel=True
-        )
-        if not raise_failure:
-            if failure is not None:
-                log.warning("the store's close failed (%s)", type(failure).__name__)
-            return
-        if cancelled:
-            raise asyncio.CancelledError from failure
-        if failure is not None:
-            raise failure
-
-    async def _close_connections(self) -> None:
-        """:meth:`close`'s teardown: the group-commit committer, the read pool, then the writer.
-        Each step sits in a ``finally`` of the one before, so a step that raises, a cancel
-        included, skips none of the rest (BACKLOG #5720)."""
-        try:
-            # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members
-            # and resolves their futures before the write connection is closed — otherwise an
-            # in-flight handoff would hang forever on a future no committer will ever complete.
-            if self._group_commit is not None:
-                try:
-                    await self._group_commit.aclose()
-                except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log, continue
-                    # By class only (vault BACKLOG #3054); a failed open reaches this too.
-                    log.warning("error closing group-commit committer (%s)", type(failure).__name__)
-        finally:
-            try:
-                # Close every pooled read connection (tracked in _read_conns regardless of pool
-                # checkout state). Best-effort: one failing close must not strand the rest.
-                for conn in self._read_conns:
-                    try:
-                        await conn.close()
-                        await _await_connection_worker_exit(conn)
-                    except Exception as failure:  # noqa: BLE001 — shutdown best-effort; continue
-                        # By class only (vault BACKLOG #3054); a failed open reaches this too.
-                        log.warning(
-                            "error closing read-pool connection (%s)", type(failure).__name__
-                        )
-            finally:
-                self._read_conns = []
-                self._read_pool = None
-                await self._db.close()
-                # Each close above returns before the worker thread it stops has actually gone,
-                # and those threads are non-daemon, so a `close`d store could still hold threads
-                # interpreter exit has to join. Wait them out so "the store is closed" means every
-                # thread it owned is gone.
-                await _await_connection_worker_exit(self._db)
+        self._forget_read_pool()
 
     # --- write path ----------------------------------------------------------
 

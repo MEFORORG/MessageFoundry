@@ -34,12 +34,16 @@ class _FakePool:
 
     def __init__(self, *, close_fails: bool = False) -> None:
         self.closed = 0
+        self.terminated = 0
         self._close_fails = close_fails
 
     async def close(self) -> None:
         self.closed += 1
         if self._close_fails:
             raise ConnectionResetError("pool close wedged")
+
+    def terminate(self) -> None:
+        self.terminated += 1
 
 
 def _install_fake_asyncpg(monkeypatch: pytest.MonkeyPatch, pool: _FakePool) -> None:
@@ -93,12 +97,12 @@ async def test_a_pool_close_that_fails_does_not_replace_the_opens_error(
     monkeypatch.setattr(PostgresStore, "_ensure_schema", _boom)
 
     with (
-        caplog.at_level(logging.WARNING, logger="messagefoundry.store.postgres"),
+        caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"),
         pytest.raises(RuntimeError, match="schema boom"),
     ):
         await PostgresStore.open(_settings())
     assert pool.closed == 1
-    assert "closing the pool after a failed open also failed (ConnectionResetError)" in caplog.text
+    assert "the cleanup after a failed store open failed (ConnectionResetError)" in caplog.text
     assert "pool close wedged" not in caplog.text  # by class only
 
 
@@ -305,21 +309,24 @@ async def test_an_open_that_fails_before_the_salt_bind_settles_nothing(
     assert pool.closed == 1
 
 
-async def test_a_settle_that_hangs_does_not_hold_the_pool_open(
+async def test_a_cancel_bounds_a_hanging_settle_inside_one_deadline(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5720 round 3: the failed open's cleanup settles through close(), a server round trip
-    that ``command_timeout = 0`` leaves unbounded. close() now bounds the settle, so the pool still
-    closes, and the settle's failure is logged by class only (vault BACKLOG #3054)."""
+    """BACKLOG #5720 round 5: nothing bounds a teardown until a cancel arrives; then one deadline
+    covers everything left, the settle included. A settle hanging on a degraded server is cancelled
+    at that deadline, the pool still closes, the caller sees its cancel, and the bound is reported
+    in one WARNING."""
     pool = _FakePool()
     _install_fake_asyncpg(monkeypatch, pool)
     settles: list[bool] = []
     _keyed_open_steps(monkeypatch, settles)
-    monkeypatch.setattr("messagefoundry.store.postgres.CLOSE_SETTLE_TIMEOUT", 0.05)
+    monkeypatch.setattr("messagefoundry.store.store.TEARDOWN_CANCEL_DEADLINE", 0.05)
+    settling = asyncio.Event()
 
     async def _hanging_settle(self: PostgresStore, *, settle: bool = False) -> None:
         settles.append(settle)
         if settle:
+            settling.set()
             await asyncio.Event().wait()
 
     async def _boom(self: PostgresStore) -> None:
@@ -328,15 +335,43 @@ async def test_a_settle_that_hangs_does_not_hold_the_pool_open(
     monkeypatch.setattr(PostgresStore, "checkpoint_cipher_invocations", _hanging_settle)
     monkeypatch.setattr(PostgresStore, "_encrypt_existing_rows", _boom)
 
-    with (
-        caplog.at_level(logging.WARNING, logger="messagefoundry.store.postgres"),
-        pytest.raises(RuntimeError, match="at-rest sweep boom"),
-    ):
-        await asyncio.wait_for(PostgresStore.open(_settings()), 5)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+        task = asyncio.create_task(PostgresStore.open(_settings()))
+        await asyncio.wait_for(settling.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        for _ in range(20):
+            if pool.closed:
+                break
+            await asyncio.sleep(0.01)
 
     assert settles == [False, True]
     assert pool.closed == 1
-    assert "could not settle the AES-GCM invocation bound at close (TimeoutError)" in caplog.text
+    bounded = [r for r in caplog.records if "did not finish within" in r.getMessage()]
+    assert len(bounded) == 1, caplog.text
+    assert "cleanup after a failed store open failed" not in caplog.text  # one WARNING, no echo
+
+
+async def test_a_close_closed_mid_settle_terminates_the_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720 round 5: a ``close()`` coroutine closed while it waits (``GeneratorExit``)
+    cannot await the pool's graceful close, so the synchronous ``terminate()`` runs instead."""
+    pool = _FakePool()
+    store = object.__new__(PostgresStore)  # close() reads only the pool and the patched steps
+    store._pool = pool
+
+    async def _wedged(self: PostgresStore) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(PostgresStore, "_close_steps", _wedged)
+    coro = store.close()
+    coro.send(None)  # suspended inside the wait, with the teardown task started
+    with pytest.raises(GeneratorExit):
+        coro.throw(GeneratorExit())
+    assert pool.terminated == 1
+    await asyncio.sleep(0)  # let the cancelled teardown task finish
 
 
 async def test_a_settle_failure_at_close_is_logged_by_class_only(
