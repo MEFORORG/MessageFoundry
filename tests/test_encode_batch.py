@@ -157,6 +157,8 @@ def _batch_reading(head: str) -> _Reading:
         M1.replace("\r", "\n"),  # LF line endings
         "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|MSG1|P|2.7\r",  # MSH-2 with a fifth char (v2.7)
         "MSH#@~\\&#A#B\r",  # custom delimiters
+        "MSH|^~\\&|A\rOBX|1|TX|||\\.in5\\\r",  # a counted escape under the budget still frames
+        "MSH#@~$&#A\rOBX#1#TX###$.in5$" + "\\.in9999999\\" * 20 + "\r",  # not its escape char
         "MSH|^~\\&",  # MSH-2 and nothing more
         "MSH|^~\\ \r",  # a trailing space the parser's strip removes, leaving MSH-2 short
         "MSH|^~\\\t",
@@ -183,9 +185,8 @@ _OVER_BUDGET = "MSH|^~\\&|A\rOBX|1|TX|||" + "\\.in9999999\\" * 20 + "\r"
 
 @pytest.mark.parametrize("head", [_OVER_BUDGET, " \n" + _OVER_BUDGET.replace("\r", "\n")])
 def test_a_head_over_the_escape_budget_is_refused_as_a_parse_refuses_it(head: str) -> None:
-    # The budget is checked on the text encode_batch frames. On the delivery path that is the
-    # hydrated head, which the caller's parse of the stored payload never saw, so a header-only
-    # read would frame and send a head a parse refuses.
+    # The budget is checked on the text encode_batch frames, so a header-only read refuses a head
+    # a parse refuses for its escapes, whatever its caller checked first.
     refusal = _parser_reading(head)
     assert refusal[0] == "HL7PeekError"  # positive control: a parse refuses it
     assert _batch_reading(head) == refusal

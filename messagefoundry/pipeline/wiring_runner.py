@@ -10718,9 +10718,9 @@ class RegistryRunner:
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
-        # the head is PARSED, for the BHS-11 control id. encode_batch reads the BHS separators from the
-        # hydrated head's MSH line where that line alone holds them, and parses the head where it
-        # does not (BACKLOG #5919).
+        # the head is PARSED here, for the BHS-11 control id. How encode_batch reads the BHS
+        # separators, parsing the head where its MSH line alone does not hold them, is in
+        # parsing/split.py, _head_separators (BACKLOG #5919).
         refused: list[_RefusedMember] = []
         # The outbox id of the member whose own step is running, set before each per-member step and
         # cleared before a batch-wide one, so every arm below names the member a fault came from,

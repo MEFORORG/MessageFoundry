@@ -325,12 +325,14 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     non-HL7 one or one whose MSH-2 is short, is parsed as before, so it frames or raises exactly as
     it did, ``ValueError`` and its message included.
 
-    Such a head is still checked against the parser's own escape expansion budget
-    (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`, ASVS 1.3.3), on ``norm``
-    itself: the text encode_batch frames, which on the delivery path is the HYDRATED head, so a
-    head a parse refuses for its escapes raises the same ``HL7PeekError`` here. What else a parse
-    checks in the rest of the head is not checked: at least a later header line too short to
-    read."""
+    A head read from its MSH line is still checked against the parser's own escape expansion
+    budget (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`, ASVS 1.3.3), run on
+    ``norm`` itself, the text encode_batch frames: a head a parse refuses for its escapes raises
+    the same ``HL7PeekError`` here, whatever its caller checked. On the delivery path that text is
+    the hydrated head, whose stored payload the caller and the document re-attach have each
+    parsed already, and the re-attach refuses a document holding the escape character, so this is
+    a second check of the same budget there, not the only one. What else a parse checks in the
+    rest of the head is not checked: at least a later header line too short to read."""
     line = _first_line_head(norm)
     # _extract_separators fills a short MSH-2 with defaults, where _encoding_chars refuses one, so
     # the line must hold MSH-1 and four encoding characters with no field separator among them. A
@@ -341,7 +343,8 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
         or line.find(line[3], 4, _SEPARATORS_WIDTH) != -1
     ):
         return Message.parse(norm)._encoding_chars()
-    # The parse runs the budget first, so this does too; the parse above runs it for itself.
+    # A parse checks the budget before it reads anything, so a head it refuses for its escapes is
+    # refused here too, with the same error. The parse above checks it for itself.
     enforce_expansion_budget(norm)
     field_sep, comp_sep, rep_sep, sub_sep, esc = _extract_separators(line)
     return field_sep, comp_sep, rep_sep, esc, sub_sep
