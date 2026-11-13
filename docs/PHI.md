@@ -2124,13 +2124,13 @@ body; and `relay_capture`, whose `raw` column holds the **full message** and is 
 `--capture-bodies` is passed). Its process logging is a bare `logging.basicConfig` to stderr with **none**
 of the filters above. It is **out of scope for this section** — but treat **every** tee DB,
 capture on or off, as a PHI-at-rest location on the terms of
-[§2](#2-where-phi-lives--data-at-rest-inventory), because of that detail. **This is the one
-statement of what the detail holds.** It can carry at least the partner's MSA-3 ACK text or a
-transport error string, and either can name a patient. The store cuts it to 500 characters, then
-escapes every character of the engine's log alphabet with a copy of
-`messagefoundry/controlchars.py`'s `scrub_control_chars` (`tee/controlchars.py`, kept
-byte-identical by a test), so at least C0, DEL, C1 and bidirectional controls are stored as
-backslash escapes; tab is kept. The relay's own process log writes the same detail unescaped
+[§2](#2-where-phi-lives--data-at-rest-inventory), because of that detail. It can carry at least the partner's MSA-3 ACK text or a
+transport error string, and either can name a patient. The store escapes every character of the
+engine's log alphabet with a copy of `messagefoundry/controlchars.py`'s `scrub_control_chars`
+(`tee/controlchars.py`, kept byte-identical by a test), so at least C0, DEL, C1 and bidirectional
+controls are stored as backslash escapes; tab is kept. It then cuts the escaped text to at most 500
+characters, never inside an escape. `tee naks` and `tee export` escape the control id, message
+type and ACK code the same way when they print them. The relay's own process log writes the same detail unescaped
 (open item). Its `purge` scrubs deleted bodies from the DB and `-wal`
 files, at file level only; [TEE-RELAY.md, Purge](TEE-RELAY.md#purge) states what the scrub
 does and does not reach, and where `VACUUM`'s temp copy may go. On POSIX the `-wal` and `-shm`

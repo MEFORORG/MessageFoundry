@@ -157,12 +157,31 @@ class CaptureRow:
 
 
 def _clean_detail(detail: str | None) -> str | None:
-    """Cap a logged detail string at ``_MAX_DETAIL`` characters, then escape its control
-    characters with the vendored engine helper, so an escape is never cut in half. The rule is
-    stated once, in docs/PHI.md, section 7, the tee relay paragraph."""
+    """Escape a logged detail string's control characters with the vendored engine helper,
+    then cut it to at most ``_MAX_DETAIL`` characters, at a character boundary of the original so
+    an escape is never cut in half. docs/PHI.md, section 7, the tee relay paragraph, says what is
+    escaped."""
     if detail is None:
         return None
-    return scrub_control_chars(detail[:_MAX_DETAIL])
+    escaped = scrub_control_chars(detail)
+    if len(escaped) <= _MAX_DETAIL:
+        return escaped
+    pieces: list[str] = []
+    used = 0
+    for ch in detail:
+        piece = scrub_control_chars(ch)
+        if used + len(piece) > _MAX_DETAIL:
+            break
+        pieces.append(piece)
+        used += len(piece)
+    return "".join(pieces)
+
+
+def _shown(value: str | None) -> str | None:
+    """A stored identifier (MSH-10, MSH-9, an ACK code) as naks and export emit it: escaped, so a
+    control character from the partner's bytes can neither drive a terminal nor break a strict
+    console encoding. The stored value itself is kept as received, for correlation."""
+    return None if value is None else scrub_control_chars(value)
 
 
 def _iso(at: float) -> str:
@@ -176,19 +195,18 @@ def _is_nak(row: aiosqlite.Row) -> bool:
 
 
 def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
-    """One relay_log row as a plain JSON-able dict. Never a message body, but ``detail`` is
-    emitted verbatim and can carry at least the partner's MSA-3 ACK text or a transport error string,
-    and either can name a patient."""
+    """One relay_log row as a plain JSON-able dict. Never a message body, but ``detail`` can name a
+    patient (docs/PHI.md, section 7, the tee relay paragraph). Identifiers are escaped (_shown)."""
     return {
         "at": row["at"],
         "at_iso": _iso(row["at"]),
         "direction": row["direction"],
         "leg": row["leg"],
-        "control_id": row["control_id"],
-        "message_type": row["message_type"],
+        "control_id": _shown(row["control_id"]),
+        "message_type": _shown(row["message_type"]),
         "size_bytes": row["size_bytes"],
         "outcome": row["outcome"],
-        "ack_code": row["ack_code"],
+        "ack_code": _shown(row["ack_code"]),
         "detail": row["detail"],
     }
 

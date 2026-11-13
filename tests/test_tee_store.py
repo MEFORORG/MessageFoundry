@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+import tee.controlchars as tee_controlchars
 import tee.store as tee_store
 from tee.__main__ import main as tee_main
 from tee.store import PurgeIncompleteError, RelayStore
@@ -966,13 +967,6 @@ async def test_a_db_without_the_record_owes_one_scrub(
         await store.close()
 
 
-def test_the_vendored_controlchars_stays_byte_identical_to_the_engine() -> None:
-    # tee imports no messagefoundry module, so it carries a copy; this keeps the copy honest.
-    root = Path(__file__).resolve().parents[1]
-    engine = (root / "messagefoundry" / "controlchars.py").read_bytes()
-    assert (root / "tee" / "controlchars.py").read_bytes() == engine
-
-
 async def test_detail_escapes_c0_del_c1_and_bidi_controls_and_keeps_tab(tmp_path: Path) -> None:
     store = await _open(tmp_path)
     try:
@@ -1013,4 +1007,78 @@ def test_naks_output_survives_a_strict_cp1252_stdout(tmp_path: Path) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
-    assert b"control_id=" in result.stdout
+    assert b"\\u0080\\u0099" in result.stdout  # the escaped detail reached the output
+
+
+def test_naks_escapes_a_control_id_and_type_from_partner_bytes(tmp_path: Path) -> None:
+    # MSH-10 and MSH-9 come from latin-1-decoded partner bytes too. Printed raw, a C1 code point in
+    # either broke a strict cp1252 stdout, and an ESC sequence could drive the terminal.
+    db_path = tmp_path / "tee.db"
+
+    async def seed() -> None:
+        store = await RelayStore.open(str(db_path))
+        try:
+            await _record(
+                store,
+                outcome="nak",
+                ack_code="AE",
+                control_id="C\u0080\u0099",
+                message_type="ADT\x1b[31m",
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252:strict", "PYTHONUTF8": "0"}
+    result = subprocess.run(
+        [sys.executable, "-m", "tee", "naks", "--db", str(db_path)],
+        capture_output=True,
+        env=env,
+        cwd=Path(__file__).resolve().parents[1],
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    assert b"\x1b" not in result.stdout
+    assert b"control_id=C\\u0080\\u0099" in result.stdout
+
+
+async def test_export_escapes_identifiers_but_the_store_keeps_them(tmp_path: Path) -> None:
+    store = await _open(tmp_path)
+    try:
+        await _record(store, control_id="C\u0080", message_type="ADT\x1b[31m")
+        row = (await store.export())["rows"][0]
+        assert row["control_id"] == "C\\u0080"
+        assert row["message_type"] == "ADT\\u001b[31m"
+        cur = await store._db.execute("SELECT control_id FROM relay_log")  # noqa: SLF001
+        stored = await cur.fetchone()
+        assert stored is not None and stored["control_id"] == "C\u0080"  # kept for correlation
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "detail",
+    ["\u0080" * 600, "a" * 499 + "\x00tail", "b" * 497 + "\U0001f600" * 3],
+    ids=["all-c1", "control-at-the-cut", "astral-at-the-cut"],
+)
+async def test_detail_is_at_most_500_characters_after_escaping_and_never_cuts_an_escape(
+    tmp_path: Path, detail: str
+) -> None:
+    store = await _open(tmp_path)
+    try:
+        await _record(store, outcome="nak", ack_code="AE", detail=detail)
+        stored = (await store.recent_naks())[0].detail
+        assert stored is not None
+        assert len(stored) <= 500
+        expected = "".join(tee_controlchars.scrub_control_chars(ch) for ch in detail)
+        assert expected.startswith(stored)  # a prefix of whole escapes
+        assert tee_controlchars.scrub_control_chars(stored) == stored  # no half escape left over
+        # It ends where a whole escape of the original ends.
+        ends, used = {0}, 0
+        for ch in detail:
+            used += len(tee_controlchars.scrub_control_chars(ch))
+            ends.add(used)
+        assert len(stored) in ends
+    finally:
+        await store.close()

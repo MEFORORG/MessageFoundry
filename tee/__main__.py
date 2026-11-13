@@ -66,6 +66,7 @@ from tee.anon.rules import (
     retargeted_defaults,
 )
 from tee.anon.surrogates import site_prefixes_loaded
+from tee.controlchars import scrub_control_chars
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -437,10 +438,14 @@ async def _naks(args: argparse.Namespace) -> int:
         return 0
     for row in rows:
         when = datetime.fromtimestamp(row.at, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        code = row.ack_code or row.outcome
+        # Identifiers come from partner bytes, so escape them like the stored detail: a control
+        # character could otherwise drive the terminal or break a strict console encoding.
+        code = scrub_control_chars(row.ack_code or row.outcome)
+        control_id = scrub_control_chars(row.control_id or "-")
+        message_type = scrub_control_chars(row.message_type or "-")
         print(
             f"{when}  {row.direction:<17}  {row.leg:<9}  {code:<6}  "
-            f"control_id={row.control_id or '-'}  type={row.message_type or '-'}  {row.detail or ''}"
+            f"control_id={control_id}  type={message_type}  {row.detail or ''}"
         )
     return 0
 
