@@ -1516,32 +1516,30 @@ async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connect
     assert left == [], f"a cancelled cleanup left live aiosqlite worker(s): {', '.join(left)}"
 
 
-async def test_run_open_cleanup_stops_waiting_at_its_bound(caplog) -> None:
-    """BACKLOG #5720: a wedged cleanup is left running past the bound and logged, so a failed open
-    still raises; the cleanup is kept referenced until it ends."""
-    from messagefoundry.store.store import _OPEN_CLEANUPS, run_open_cleanup
+async def test_run_open_cleanup_cancels_the_cleanup_at_its_bound(caplog) -> None:
+    """BACKLOG #5720: a wedged cleanup is cancelled at the bound, which runs its ``finally``
+    blocks, so a failed open still raises and the teardown a cancel triggers still happens."""
+    from messagefoundry.store.store import run_open_cleanup
 
-    release = asyncio.Event()
+    finally_ran: list[str] = []
 
     async def wedged() -> None:
-        await release.wait()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finally_ran.append("finally")
 
-    before = set(_OPEN_CLEANUPS)
-    try:
-        await run_open_cleanup(RuntimeError("open boom"), wedged, timeout=0.05)
-        assert "did not finish within" in caplog.text
-        ours = _OPEN_CLEANUPS - before
-        assert len(ours) == 1
-    finally:
-        release.set()
+    await run_open_cleanup(RuntimeError("open boom"), wedged, timeout=0.05)
     for _ in range(10):
         await asyncio.sleep(0)
-    assert not (ours & _OPEN_CLEANUPS)
+    assert "did not finish within" in caplog.text
+    assert finally_ran == ["finally"]
 
 
-async def test_run_open_cleanup_raises_a_cancel_that_lands_while_it_runs() -> None:
-    """BACKLOG #5720: a cancel landing mid-cleanup waits for the cleanup, then is raised, chained
-    to the open's own failure; a failure that is itself a cancel is left to the caller."""
+async def test_run_open_cleanup_raises_a_cancel_that_lands_while_it_runs(caplog) -> None:
+    """BACKLOG #5720: a cancel landing mid-cleanup waits for the cleanup, logs the open's own
+    failure by class, then is raised chained to it; a failure that is itself a cancel is left to
+    the caller."""
     from messagefoundry.store.store import run_open_cleanup
 
     started = asyncio.Event()
@@ -1552,7 +1550,7 @@ async def test_run_open_cleanup_raises_a_cancel_that_lands_while_it_runs() -> No
         await asyncio.sleep(0.1)
         finished.append("done")
 
-    failure = RuntimeError("open boom")
+    failure = RuntimeError("open boom with driver text")
     task = asyncio.create_task(run_open_cleanup(failure, slow))
     await started.wait()
     task.cancel()
@@ -1560,6 +1558,8 @@ async def test_run_open_cleanup_raises_a_cancel_that_lands_while_it_runs() -> No
         await task
     assert finished == ["done"]
     assert raised.value.__cause__ is failure
+    assert "a store open failed (RuntimeError) and was cancelled while it cleaned up" in caplog.text
+    assert "driver text" not in caplog.text  # by class only (vault BACKLOG #3054)
 
     started.clear()
     task = asyncio.create_task(run_open_cleanup(asyncio.CancelledError(), slow))
@@ -1569,15 +1569,64 @@ async def test_run_open_cleanup_raises_a_cancel_that_lands_while_it_runs() -> No
     assert finished == ["done", "done"]
 
 
-async def test_run_open_cleanup_runs_nothing_on_generator_exit() -> None:
-    """BACKLOG #5720: a coroutine closed with ``GeneratorExit`` cannot await, so the cleanup is not
-    started at all rather than raising "coroutine ignored GeneratorExit"."""
+async def test_run_open_cleanup_runs_only_the_sync_teardown_on_generator_exit(caplog) -> None:
+    """BACKLOG #5720: a coroutine closed with ``GeneratorExit`` cannot await, so the async cleanup
+    is not started, the synchronous teardown runs, and the skip is logged."""
     from messagefoundry.store.store import run_open_cleanup
 
     ran: list[str] = []
 
     async def cleanup() -> None:
-        ran.append("ran")
+        ran.append("async")
 
-    await run_open_cleanup(GeneratorExit(), cleanup)
-    assert ran == []
+    await run_open_cleanup(GeneratorExit(), cleanup, sync_teardown=lambda: ran.append("sync"))
+    assert ran == ["sync"]
+    assert "only its synchronous teardown ran" in caplog.text
+
+
+async def test_a_pin_refused_open_settles_nothing(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720: a writable open that fails BEFORE its salt bind (here the pin check) must not
+    settle, because the cipher is not yet this store's. Red before the fix: the close the failed
+    open runs settles once."""
+    settles: list[bool] = []
+
+    async def record(self: MessageStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+
+    async def refused(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("pin refused")
+
+    monkeypatch.setattr(MessageStore, "checkpoint_cipher_invocations", record)
+    monkeypatch.setattr("messagefoundry.store.store.check_open_store_pin", refused)
+    with pytest.raises(RuntimeError, match="pin refused"):
+        await MessageStore.open(tmp_path / "refused.db")
+    assert settles == []
+
+
+async def test_a_cancel_inside_close_still_closes_every_connection(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720: ``close()`` runs its connection teardown to completion, so a cancel landing
+    while one read connection closes no longer skips the rest and the writer."""
+    watched: set[threading.Thread] = set()
+    opened = _watch_aiosqlite_connects(monkeypatch, watched)
+    store = await MessageStore.open(tmp_path / "close.db")
+    first = store._read_conns[0]
+    real_close = first.close
+    closing = asyncio.Event()
+
+    async def slow_close() -> None:
+        closing.set()
+        await asyncio.sleep(0.2)
+        await real_close()
+
+    first.close = slow_close  # type: ignore[method-assign]
+    task = asyncio.create_task(store.close())
+    try:
+        await asyncio.wait_for(closing.wait(), 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        left = await _workers_left(watched)
+    finally:
+        for conn in opened:
+            await conn.close()
+    assert left == [], f"a cancelled close left live aiosqlite worker(s): {', '.join(left)}"

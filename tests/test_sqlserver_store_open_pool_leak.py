@@ -367,3 +367,51 @@ async def test_a_cancel_while_the_pool_dials_releases_the_executor(
         await SqlServerStore.open(_settings())
 
     assert fake_executor.shutdown_calls == [False]
+
+
+async def test_a_cancel_during_the_settle_still_runs_every_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720 round 3: a cancel during close()'s settle skipped the sync-pool and
+    claim-holder teardowns, which sat after an ``except Exception``. They are now in the finally
+    with the pool close. Red before the fix: ``teardowns`` is empty."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    settles: list[bool] = []
+    fake_executor = _keyed_open_steps(monkeypatch, settles)
+
+    async def _noop(*_args: object, **_kwargs: object) -> Any:
+        return None
+
+    monkeypatch.setattr(SqlServerStore, "_encrypt_existing_rows", _noop)
+    monkeypatch.setattr(sqlserver_module, "load_audit_chain", _noop)
+    monkeypatch.setattr(SqlServerStore, "_load_state_cache_noting", _noop)
+    monkeypatch.setattr(SqlServerStore, "_load_reference_cache", _noop)
+    store = await SqlServerStore.open(_settings())
+
+    settling = asyncio.Event()
+    teardowns: list[str] = []
+
+    async def _slow_settle(self: SqlServerStore, *, settle: bool = False) -> None:
+        settling.set()
+        await asyncio.Event().wait()
+
+    def _sync_pools(self: SqlServerStore) -> None:
+        teardowns.append("sync handoff pools")
+
+    async def _holders(self: SqlServerStore) -> None:
+        teardowns.append("claim holders")
+
+    monkeypatch.setattr(SqlServerStore, "checkpoint_cipher_invocations", _slow_settle)
+    monkeypatch.setattr(SqlServerStore, "close_sync_handoff_pool", _sync_pools)
+    monkeypatch.setattr(SqlServerStore, "_close_claim_holders", _holders)
+
+    task = asyncio.create_task(store.close())
+    await asyncio.wait_for(settling.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert teardowns == ["sync handoff pools", "claim holders"]
+    assert pool.closed == 1
+    assert fake_executor.shutdown_calls == [False]

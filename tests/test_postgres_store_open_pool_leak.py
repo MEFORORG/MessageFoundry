@@ -303,3 +303,68 @@ async def test_an_open_that_fails_before_the_salt_bind_settles_nothing(
 
     assert settles == []
     assert pool.closed == 1
+
+
+async def test_a_settle_that_hangs_does_not_hold_the_pool_open(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5720 round 3: the failed open's cleanup settles through close(), a server round trip
+    that ``command_timeout = 0`` leaves unbounded. close() now bounds the settle, so the pool still
+    closes, and the settle's failure is logged by class only (vault BACKLOG #3054)."""
+    pool = _FakePool()
+    _install_fake_asyncpg(monkeypatch, pool)
+    settles: list[bool] = []
+    _keyed_open_steps(monkeypatch, settles)
+    monkeypatch.setattr("messagefoundry.store.postgres.CLOSE_SETTLE_TIMEOUT", 0.05)
+
+    async def _hanging_settle(self: PostgresStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+        if settle:
+            await asyncio.Event().wait()
+
+    async def _boom(self: PostgresStore) -> None:
+        raise RuntimeError("at-rest sweep boom")
+
+    monkeypatch.setattr(PostgresStore, "checkpoint_cipher_invocations", _hanging_settle)
+    monkeypatch.setattr(PostgresStore, "_encrypt_existing_rows", _boom)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.store.postgres"),
+        pytest.raises(RuntimeError, match="at-rest sweep boom"),
+    ):
+        await asyncio.wait_for(PostgresStore.open(_settings()), 5)
+
+    assert settles == [False, True]
+    assert pool.closed == 1
+    assert "could not settle the AES-GCM invocation bound at close (TimeoutError)" in caplog.text
+
+
+async def test_a_settle_failure_at_close_is_logged_by_class_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5720 round 3, vault BACKLOG #3054: a failed open now reaches close()'s settle log,
+    which named the driver's text and traceback. It names the class only."""
+    pool = _FakePool()
+    _install_fake_asyncpg(monkeypatch, pool)
+    settles: list[bool] = []
+    _keyed_open_steps(monkeypatch, settles)
+
+    async def _failing_settle(self: PostgresStore, *, settle: bool = False) -> None:
+        if settle:
+            raise ConnectionResetError("server db01 refused login mefor")
+
+    async def _boom(self: PostgresStore) -> None:
+        raise RuntimeError("at-rest sweep boom")
+
+    monkeypatch.setattr(PostgresStore, "checkpoint_cipher_invocations", _failing_settle)
+    monkeypatch.setattr(PostgresStore, "_encrypt_existing_rows", _boom)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="messagefoundry.store.postgres"),
+        pytest.raises(RuntimeError, match="at-rest sweep boom"),
+    ):
+        await PostgresStore.open(_settings())
+
+    assert pool.closed == 1
+    assert "(ConnectionResetError)" in caplog.text
+    assert "db01" not in caplog.text

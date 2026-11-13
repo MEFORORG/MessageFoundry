@@ -151,12 +151,16 @@ async def checkpoint_invocations(
     if need:
         try:
             total = await add(bound.invocation_key_id, need)
-        except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
+        except Exception as exc:  # noqa: BLE001 — advisory accounting must never fail an operation
+            # By class, with the traceback at DEBUG only: the driver's text can name the server and
+            # login, and a failed store open reaches this through close() (vault BACKLOG #3054,
+            # BACKLOG #5720).
             log.warning(
-                "could not checkpoint the AES-GCM invocation bound for the active key; the "
+                "could not checkpoint the AES-GCM invocation bound for the active key (%s); the "
                 "in-process ceiling still applies and the next pass retries",
-                exc_info=True,
+                type(exc).__name__,
             )
+            log.debug("the AES-GCM invocation checkpoint failure", exc_info=exc)
             return bound.cumulative_invocations()
         # A settlement grant zeroes the reserve exactly (remaining was `-need`), so a repeated settle is a
         # no-op — in EITHER direction, an overspend charged or an unspent reserve refunded; a refill grant
@@ -188,12 +192,14 @@ async def reserve_invocations_ahead(cipher: Cipher | None, add: AddInvocations, 
         return
     try:
         total = await add(bound.invocation_key_id, need)
-    except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
+    except Exception as exc:  # noqa: BLE001 — advisory accounting must never fail an operation
+        # By class, with the traceback at DEBUG only, as the checkpoint above (vault #3054).
         log.warning(
-            "could not reserve the AES-GCM invocation bound ahead of an at-rest seal; the "
+            "could not reserve the AES-GCM invocation bound ahead of an at-rest seal (%s); the "
             "in-process ceiling still applies",
-            exc_info=True,
+            type(exc).__name__,
         )
+        log.debug("the AES-GCM invocation reserve failure", exc_info=exc)
         return
     bound.grant_invocations(need, total)
 

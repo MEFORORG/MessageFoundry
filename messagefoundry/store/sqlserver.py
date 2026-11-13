@@ -227,6 +227,7 @@ from messagefoundry.store.store import (
     AD_SCOPE_MAP,
     ANY_CLAIM_OWNER,
     AUDIT_KEY_EPOCH_ACTION,
+    CLOSE_SETTLE_TIMEOUT,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
@@ -4320,7 +4321,8 @@ class SqlServerStore:
             # settle the invocation block this open reserved rather than forfeit it: close() does
             # both (BACKLOG #5720). close() closes the pool and releases the executor in finally
             # blocks, so a teardown step that raises does not skip them. A wait_closed() that
-            # never returns still holds the executor until run_open_cleanup's bound gives up.
+            # never returns is cancelled at run_open_cleanup's bound, and that cancel runs the
+            # finally that releases the executor.
             async def _cleanup() -> None:
                 try:
                     await store.close()
@@ -4332,7 +4334,12 @@ class SqlServerStore:
                         type(cleanup).__name__,
                     )
 
-            await run_open_cleanup(exc, _cleanup)
+            def _release_sync() -> None:
+                # Both are synchronous, so even a closed coroutine can end the pool and its threads.
+                pool.close()
+                executor.shutdown(wait=False)
+
+            await run_open_cleanup(exc, _cleanup, sync_teardown=_release_sync)
             raise
         return store
 
@@ -5777,37 +5784,45 @@ class SqlServerStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
-        # The teardown below runs in a finally, so a cancel during the settle still closes the pool
-        # (BACKLOG #5720).
+        # The settle is a server round trip with no bound of its own when command_timeout is 0, so
+        # it gets one here: the pool close must not wait on a degraded server (BACKLOG #5720).
         try:
             try:
                 # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one.
                 if not self._cipher_foreign and not self._read_only:
-                    await self.checkpoint_cipher_invocations(settle=True)
-            except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-                log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
-            try:
-                # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when
-                # none were opened, so it never affects the async path). ADR 0071 B5.
-                self.close_sync_handoff_pool()
-            finally:
-                # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op
-                # when the prepared path never opened one).
-                await self._close_claim_holders()
+                    async with asyncio.timeout(CLOSE_SETTLE_TIMEOUT):
+                        await self.checkpoint_cipher_invocations(settle=True)
+            except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
+                log.warning(  # by class only (vault BACKLOG #3054); a failed open reaches this too
+                    "could not settle the AES-GCM invocation bound at close (%s)",
+                    type(failure).__name__,
+                )
         finally:
-            # In a finally, so a teardown above that raises still closes the pool (BACKLOG #5720).
-            # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point. wait_closed()
-            # cannot complete while the pool is wedged -- which is precisely the state these threads
-            # are stuck in -- so releasing them only on the success path would leak the whole pool's
-            # worth of threads in the one case that matters. shutdown(wait=False) does not join: a
-            # wedged ODBC call is not interruptible, and the process is going away regardless.
+            # Every teardown below is in a finally, so a settle that raises or is cancelled, or a
+            # teardown step that raises, skips none of the rest (BACKLOG #5720).
             try:
-                self._pool.close()
-                await self._pool.wait_closed()
+                try:
+                    # Tear down any synchronous fused-handoff pools first (best-effort; a no-op
+                    # when none were opened, so it never affects the async path). ADR 0071 B5.
+                    self.close_sync_handoff_pool()
+                finally:
+                    # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a
+                    # no-op when the prepared path never opened one).
+                    await self._close_claim_holders()
             finally:
-                if self._pool_executor is not None:
-                    self._pool_executor.shutdown(wait=False)
-                    self._pool_executor = None
+                # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point.
+                # wait_closed() cannot complete while the pool is wedged -- which is precisely the
+                # state these threads are stuck in -- so releasing them only on the success path
+                # would leak the whole pool's worth of threads in the one case that matters.
+                # shutdown(wait=False) does not join: a wedged ODBC call is not interruptible, and
+                # the process is going away regardless.
+                try:
+                    self._pool.close()
+                    await self._pool.wait_closed()
+                finally:
+                    if self._pool_executor is not None:
+                        self._pool_executor.shutdown(wait=False)
+                        self._pool_executor = None
 
     # --- ADR 0071 B5: synchronous fused-handoff connection source ------------
     def open_sync_handoff_pool(self, stage: str, size: int) -> _SyncHandoffPool:

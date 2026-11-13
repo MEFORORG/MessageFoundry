@@ -225,6 +225,7 @@ from messagefoundry.store.store import (
     AD_SCOPE_MAP,
     ANY_CLAIM_OWNER,
     AUDIT_KEY_EPOCH_ACTION,
+    CLOSE_SETTLE_TIMEOUT,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
@@ -2272,7 +2273,8 @@ class PostgresStore:
                         type(cleanup).__name__,
                     )
 
-            await run_open_cleanup(exc, _cleanup)
+            # pool.terminate() is synchronous, so even a closed coroutine can drop the connections.
+            await run_open_cleanup(exc, _cleanup, sync_teardown=lambda: pool.terminate())
             raise
         return store
 
@@ -2908,15 +2910,20 @@ class PostgresStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
-        # The teardown below runs in a finally, so a cancel during the settle still closes the pool
-        # (BACKLOG #5720).
+        # The pool closes in a finally, so a cancel during the settle still closes it. The settle
+        # is a server round trip with no bound of its own when command_timeout is 0, so it gets
+        # one here: the pool close must not wait on a degraded server (BACKLOG #5720).
         try:
             try:
                 # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one.
                 if not self._cipher_foreign and not self._read_only:
-                    await self.checkpoint_cipher_invocations(settle=True)
-            except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-                log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
+                    async with asyncio.timeout(CLOSE_SETTLE_TIMEOUT):
+                        await self.checkpoint_cipher_invocations(settle=True)
+            except Exception as failure:  # noqa: BLE001 — shutdown best-effort; log and continue
+                log.warning(  # by class only (vault BACKLOG #3054); a failed open reaches this too
+                    "could not settle the AES-GCM invocation bound at close (%s)",
+                    type(failure).__name__,
+                )
         finally:
             await self._pool.close()
 
