@@ -2312,7 +2312,7 @@ the same permission set on the same method reds CI until it is listed here.
 > above for a name outside its scope, a direction of `outbound`, or, with a graph loaded, a
 > name `Registry.inbound_names()` does not hold. On an engine shard that set is every inbound in the
 > whole config, so unlike the routes above, an in-scope inbound that a sibling engine shard holds is
-> not refused by this one: the route answers 200, and `Engine.set_connection_flag` writes the flag
+> not refused by this one: the scope check does not refuse it, and `Engine.set_connection_flag` writes the flag
 > and its `connection_flag_set` row to the shared store. What that method refuses is in its
 > docstring. The JSON
 > route validates the body before any of this, so a direction other than `inbound` or `outbound`

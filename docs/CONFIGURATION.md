@@ -431,15 +431,14 @@ as well (vault BACKLOG #2370): a `pinned` mode or a `crl_file` must suit its par
 endpoints present a private/internal-CA certificate can pin that CA **once** here instead of installing it
 box-globally or repeating a per-connection `tls_ca_file`. This selects **which** roots verify the peer — it
 **never disables verification** — so it composes with (never weakens) the connectors' fail-closed no-CA /
-`tls_verify=false` / cleartext-hop refusals. A connection naming its **own** `tls_ca_file` always wins
-verbatim, and a loopback hop is exempt. The default is a no-op: a config with no `[tls]` block builds a
+`tls_verify=false` / cleartext-hop refusals. A loopback hop is exempt. The default is a no-op: a config with no `[tls]` block builds a
 byte-identical SSL context.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `internal_ca_file` | path | — | PEM path to the org's internal CA. **Not a secret** — a path, like `tls_cert_file` / `forward_tls_ca_file`. Unset (default) = no internal anchor; every hop uses the OS trust store. |
 | `trust_anchor_mode` | enum | `system` | how `internal_ca_file` composes with the OS default roots on a non-loopback internal hop. `system` (default) = **OS trust store only**, `internal_ca_file` ignored (byte-identical). `augment` = OS roots **and** the internal CA (a mixed public + private estate). `pinned` = **only** the internal CA, not the public bundle (a fully-private estate; strictest). `pinned` **without** `internal_ca_file` is **refused at load** — with nothing to pin it would silently fall back to the full OS trust store, i.e. the operator excludes public roots and gets all of them. |
-| `crl_file` | path | — | PEM file of CRLs for the hops this block reaches (BACKLOG #299, #2370). **Not a secret** — a path, like `internal_ca_file`. Unset (default) = this block adds no revocation checking. A missing or blank path is refused when settings load. A lapsed or bad CRL in the file refuses each connection that loads it when that connection is built, at start or reload, a REST connection behind an ECH sidecar included. On that ECH connection the sidecar opens the TLS to the partner, so no CRL from this block is checked against the partner's certificate. CRLs in a CA file count as well: see **A CRL inside a CA file counts too** in [`[cert_monitor]`](#cert_monitor). |
+| `crl_file` | path | — | PEM file of CRLs for the hops this block reaches (BACKLOG #299, #2370). **Not a secret** — a path, like `internal_ca_file`. Unset (default) = this block adds no revocation checking. A missing or blank path is refused when settings load. A lapsed or bad CRL in the file refuses whatever loads it when that is built (a REST connection behind an ECH sidecar included); **What a signature refusal stops** in [`[cert_monitor]`](#cert_monitor) says what a refusal stops. On that ECH connection the sidecar opens the TLS to the partner, so no CRL from this block is checked against the partner's certificate. CRLs in a CA file count as well: see **A CRL inside a CA file counts too** in [`[cert_monitor]`](#cert_monitor). |
 
 **The engine AI broker reads this block too** (BACKLOG #5527). On an app this section reaches,
 as `messagefoundry serve` hands it, `POST /ai/chat` verifies an `[ai].endpoint` whose host is not
