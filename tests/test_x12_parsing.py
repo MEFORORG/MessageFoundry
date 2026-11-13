@@ -748,11 +748,22 @@ def test_message_set_rejects_delimiter_injection() -> None:
 
 
 def _repeating(
-    *, el: str = "*", comp: str = ":", term: str = "~", rep: str = "^", between: str = "", **kw: str
+    *,
+    el: str = "*",
+    comp: str = ":",
+    term: str = "~",
+    rep: str = "^",
+    between: str | None = None,
+    **kw: str,
 ) -> str:
     """An interchange with one ``ZZ1`` whose element 1 is ``A:B`` and ``C:D`` joined by ``between``
     (the repetition separator ``rep`` unless given)."""
-    body = el.join(["ZZ1", comp.join(["A", "B"]) + (between or rep) + comp.join(["C", "D"])])
+    body = el.join(
+        [
+            "ZZ1",
+            comp.join(["A", "B"]) + (rep if between is None else between) + comp.join(["C", "D"]),
+        ]
+    )
     return (
         isa(el=el, comp=comp, term=term, rep=rep, **kw)
         + el.join(["GS", "HS", "A", "B", "20240101", "1200", "1", "X", "005010X279A1"])
@@ -815,6 +826,17 @@ def test_before_00501_the_caret_is_data_so_a_component_spans_it() -> None:
     assert msg["ZZ1-01.2"] == "B^C"
     msg["ZZ1-01.2"] = "X^Y"
     assert msg["ZZ1-01"] == "A:X^Y:D"
+
+
+def test_a_legacy_isa11_u_on_00501_is_not_split_in_component_paths() -> None:
+    # The parse tolerates a 00501 header still carrying ISA-11 "U" (see 00501-legacy-ISA11-U), so
+    # a "U" in data is an ordinary character there and a component path keeps today's behaviour.
+    raw = _repeating(rep="U", between="^").replace("ZZ1*A:B^C:D", "ZZ1*ABK:U071")
+    msg = X12Message.parse(raw)
+    assert msg.delimiters.repetition == "U"
+    assert msg["ZZ1-01.2"] == "U071"
+    msg["ZZ1-01.1"] = "ABF"
+    assert msg["ZZ1-01"] == "ABF:U071"
 
 
 def test_an_isa_component_read_is_unchanged_by_the_repetition_split() -> None:

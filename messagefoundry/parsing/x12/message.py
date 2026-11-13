@@ -8,8 +8,9 @@ is the segment tag, so ``NM1-03`` is the 3rd element of an ``NM1``; ``ISA-06`` t
 id), and an optional 1-based component index. Reads/writes address the **first** occurrence of a
 segment unless ``occurrence=`` is given. In a repeating element (from 00501, where ISA-11 is the
 repetition separator) a component path addresses the **first** repetition and a write keeps the
-rest; a whole-element path reads or writes the raw element, every repetition included. All structure is rebuilt with the interchange's **own**
-discovered delimiters (never hardcoded), and a write rejects values carrying a delimiter so it can't
+rest. A whole-element read returns the raw element, every repetition included; a whole-element
+write refuses the repetition separator, so it replaces the element with one repetition. All
+structure is rebuilt with the interchange's **own** discovered delimiters (never hardcoded), and a write rejects values carrying a delimiter so it can't
 inject new structure. Re-encoding uses the discovered delimiters only, so it is **not** guaranteed
 byte-identical when the source carried cosmetic whitespace between segments (the store keeps the raw
 verbatim — this model is for transforms). Pure: no I/O, no engine imports.
@@ -95,8 +96,8 @@ class X12Message:
 
     def get(self, path: str, *, occurrence: int = 1) -> str | None:
         """Value at ``path`` (``"ISA-06"``, ``"NM1-03"``, ``"NM1-03.1"``), or None if absent/empty.
-        ``occurrence`` (1-based) selects which segment of that id to read. A component is read
-        from the element's first repetition."""
+        ``occurrence`` (1-based) selects which segment of that id to read. Outside the ISA, a
+        component is read from the element's first repetition."""
         seg_id, elem, comp = _parse_path(path)
         seg = self._nth_segment(seg_id, occurrence)
         if seg is None or elem >= len(seg):
@@ -125,9 +126,9 @@ class X12Message:
         """Write ``value`` at ``path``, extending the element/components as needed. A component
         write goes into the element's first repetition and keeps the later ones.
 
-        ``value`` may not contain a delimiter (element/component/repetition separator or a segment
-        terminator character, incl. CR/LF) — that would inject new structure — and raises ``ValueError``
-        if it does. Raises ``KeyError`` if the target segment occurrence is absent.
+        ``value`` may not contain the element or repetition separator or a segment terminator
+        character (incl. CR/LF), nor, in a component write, the component separator — that would
+        inject new structure — and raises ``ValueError`` if it does. Raises ``KeyError`` if the target segment occurrence is absent.
 
         An ``ISA`` write keeps the header's fixed width: a short ``ISA-02``/``04``/``06``/``08`` is
         space-padded on the right and a short all-digit ``ISA-13`` zero-padded on the left, and
@@ -236,10 +237,12 @@ class X12Message:
     def _split_first_repetition(self, segment_id: str, value: str) -> tuple[str, str]:
         """``value`` as its first repetition and the rest, the rest keeping its leading separator,
         so ``first + rest == value``. A component path addresses the first repetition only
-        (BACKLOG #5922). Before 00501 there is no repetition separator, and an ISA element is
-        simple (ISA-11 holds the separator itself), so both come back whole."""
+        (BACKLOG #5922). The value comes back whole before 00501, where there is no repetition
+        separator; in an ISA element, which is simple (ISA-11 holds the separator itself); and
+        where a 00501 header still carries the legacy alphanumeric ISA-11 ``U``, which the parse
+        tolerates and where splitting would cut ordinary data such as a code holding a ``U``."""
         rep = self._delims.repetition
-        if rep is None or segment_id == "ISA":
+        if not rep or rep.isalnum() or segment_id == "ISA":
             return value, ""
         first, sep, rest = value.partition(rep)
         return first, sep + rest
