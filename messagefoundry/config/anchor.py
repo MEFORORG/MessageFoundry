@@ -126,7 +126,7 @@ def _iter_settings_values(registry: Registry) -> Iterable[Any]:
     references as dict values (see the ``env()`` examples in ``wiring.py``). Routers/Handlers author
     *logic*, not transport settings, so they hold no ``EnvRef`` — they are not scanned.
     """
-    for _kind, _name, settings in registry.settings_carriers():
+    for _kind, _name, settings, _deployed in registry.settings_carriers():
         yield from _mapping_values(settings)
 
 

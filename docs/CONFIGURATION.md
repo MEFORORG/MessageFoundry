@@ -526,7 +526,12 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   flag, where SMART and OAuth2 had read it as off and signing had already refused it, and on
   `Ftp(tls=...)`, where it used to mean plain FTP. The hop-policy flags, `tls_hop_attested`,
   `cleartext_accepted` and `tls_revocation_attested`, refuse it too, as they refused any value
-  but `True` or `False` before. Not every reading is covered. At least some checks
+  but `True` or `False` before. Not every reading is covered. The rule covers the settings a
+  connection, lookup or reference factory takes and the composers' `enabled` flags, in a graph
+  the loader validates. It does not yet cover at least the flags `inbound()` and `outbound()`
+  take themselves, such as `simulate` or `deployed`, so write those as real booleans. Some checks
+  inside a factory still read a flag before this one does, so a quoted value there can stop the
+  load with an error about the flag's effect instead. At least some checks
   read a setting before `env()` resolves, so they see the reference and not its value. A cast you
   write yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a
   boolean `cast=bool`.

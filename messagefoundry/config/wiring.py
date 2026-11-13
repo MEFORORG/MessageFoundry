@@ -1650,13 +1650,16 @@ def _bool_literal_problem(key: str, value: Any) -> str | None:
     try:
         require_flag(value, f"setting {key!r}")
     except ValueError as exc:  # names the key and the type, never the value
-        # Only where it applies: a false spelling in quotes, which every lax read takes as true.
-        quoted_false = (
-            isinstance(value, str) and _BOOL_SPELLINGS.get(value.strip().lower()) is False
-        )
-        hint = " (a false spelling in quotes reads as true)" if quoted_false else ""
-        return f"{exc}{hint}; write True or False"
+        return f"{exc}{_quoted_false_hint(value)}; write True or False"
     return None
+
+
+def _quoted_false_hint(value: object) -> str:
+    """A hint for a false spelling in quotes, which every lax read takes as true; empty for any
+    other value, where it would not apply. It says the value is a false spelling, never which."""
+    if isinstance(value, str) and _BOOL_SPELLINGS.get(value.strip().lower()) is False:
+        return " (a false spelling in quotes reads as true)"
+    return ""
 
 
 def resolve_env_settings(
@@ -5233,11 +5236,13 @@ def Ftp(
     # vault BACKLOG #3234: a literal tls is turned into the protocol below, so the load's
     # bool_literal_problems never sees it. bool() read "false" as FTPS and None as plain FTP, the
     # insecure side, so anything but a bool is refused first, before the CA check reads it too.
-    if not isinstance(tls, (bool, EnvRef)):
-        raise WiringError(
-            f"Ftp tls must be true or false, not {type(tls).__name__} (write True, False or an "
-            "env() reference)"
-        )
+    if not isinstance(tls, EnvRef):
+        try:
+            require_flag(tls, "setting 'tls'")
+        except ValueError as exc:  # names the key and the type, never the value
+            raise WiringError(
+                f"Ftp: {exc}{_quoted_false_hint(tls)}; write True, False or an env() reference"
+            ) from None
     # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
     # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
@@ -6534,7 +6539,7 @@ class Registry:
         code and handed straight to a runner is not checked here."""
         problems: list[str] = []
         try:
-            for kind, name, settings in self.settings_carriers():
+            for kind, name, settings, _deployed in self.settings_carriers():
                 for key, value in settings.items():
                     if (bad := _bool_literal_problem(key, value)) is not None:
                         problems.append(f"{kind} {name!r}: {bad}")
@@ -6542,20 +6547,26 @@ class Registry:
             return [str(exc)]
         return problems
 
-    def settings_carriers(self) -> Iterator[tuple[str, str, Mapping[str, Any]]]:
-        """Every declaration that carries transport settings, as ``(kind, name, settings)``: each
-        inbound and outbound connection, database lookup, FHIR lookup and reference set's source.
-        One list, so a reader that must see them all cannot miss one."""
-        for ic in self.inbound.values():
-            yield "inbound connection", ic.name, ic.spec.settings
-        for oc in self.outbound.values():
-            yield "outbound connection", oc.name, oc.spec.settings
-        for lk in self.lookups.values():
-            yield "database lookup", lk.name, lk.settings
-        for fl in self.fhir_lookups.values():
-            yield "fhir lookup", fl.name, fl.settings
-        for ref in self.references.values():
-            yield "reference set", ref.name, ref.source.settings
+    def settings_carriers(self) -> Iterator[tuple[str, str, Mapping[str, Any], bool]]:
+        """Every declaration that carries transport settings, as ``(kind, name, settings,
+        deployed)``: each inbound and outbound connection, database lookup, FHIR lookup and
+        reference set's source. A reader that must see them all reads this rather than keeping its
+        own copy, so a table added here reaches each of them (:meth:`bool_literal_problems`,
+        :meth:`_declared_encodings`, ``anchor._iter_settings_values``).
+
+        ``deployed`` is the #233 / ADR 0111 flag. Only a connection has one; a lookup, a FHIR lookup
+        and a reference set are always ``True``, there being no declared-but-not-deployed state for
+        them."""
+        for name, ic in self.inbound.items():
+            yield _INBOUND_ENCODING_KIND, name, ic.spec.settings, ic.deployed
+        for name, oc in self.outbound.items():
+            yield "outbound connection", name, oc.spec.settings, oc.deployed
+        for name, lk in self.lookups.items():
+            yield "database lookup", name, lk.settings, True
+        for name, fl in self.fhir_lookups.items():
+            yield "fhir lookup", name, fl.settings, True
+        for name, ref in self.references.items():
+            yield "reference set", name, ref.source.settings, True
 
     def encoding_problems(self) -> list[str]:
         """Human-readable messages for declared ``encoding`` values naming no usable text codec.
@@ -6687,32 +6698,12 @@ class Registry:
         """``(kind, name, value, deployed)`` for every registry entry whose settings carry an
         ``encoding``.
 
-        Every settings-bearing table, because an unusable codec name is a property of the setting and
-        not of the direction it is read in. The table list is the same one
-        ``messagefoundry.config.anchor._iter_settings_values`` walks for ``env()`` refs — keep the two
-        together, since a sixth settings-bearing table added to one and missed here reads as clean.
-
-        ``deployed`` is the #233 / ADR 0111 flag, carried so :func:`resolved_encoding_problems` can
-        honour it without re-deriving it per table. Only a connection has one; a lookup, a FHIR lookup
-        and a reference set are always ``True``, there being no declared-but-not-deployed state for
-        them."""
-        tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any], bool]]]] = [
-            (
-                _INBOUND_ENCODING_KIND,
-                ((n, c.spec.settings, c.deployed) for n, c in self.inbound.items()),
-            ),
-            (
-                "outbound connection",
-                ((n, c.spec.settings, c.deployed) for n, c in self.outbound.items()),
-            ),
-            ("database lookup", ((n, s.settings, True) for n, s in self.lookups.items())),
-            ("fhir lookup", ((n, s.settings, True) for n, s in self.fhir_lookups.items())),
-            ("reference set", ((n, r.source.settings, True) for n, r in self.references.items())),
-        ]
-        for kind, entries in tables:
-            for name, settings, deployed in entries:
-                if "encoding" in settings:
-                    yield kind, name, settings["encoding"], deployed
+        Every settings-bearing table (:meth:`settings_carriers`), because an unusable codec name is a
+        property of the setting and not of the direction it is read in. ``deployed`` is carried so
+        :func:`resolved_encoding_problems` can honour it without re-deriving it per table."""
+        for kind, name, settings, deployed in self.settings_carriers():
+            if "encoding" in settings:
+                yield kind, name, settings["encoding"], deployed
 
 
 # --- declaration API (writes to the registry being loaded) -------------------
@@ -8770,11 +8761,14 @@ def build_outbound_connection(
     # capture-validity guards below also gate a re-ingress declaration; the cross-registry check that
     # reingress_to names an existing Loopback() inbound runs in build_check_registry (it sees the whole
     # registry). A re-ingress on FILE/REMOTEFILE therefore fails with the "no synchronous response" error.
-    # vault BACKLOG #3234: both desugars below overwrite capture_response with True, so the load's
-    # bool_literal_problems would only ever see the True. Judge what the author wrote first.
-    bad = _bool_literal_problem("capture_response", spec.settings.get("capture_response"))
-    if bad is not None:
-        raise WiringError(f"outbound connection {name!r}: {bad}")
+    # vault BACKLOG #3234: both desugars below overwrite capture_response with True, the second on
+    # a truthy capture_out_params, and the capture checks after them read both. The load's
+    # bool_literal_problems runs later, so it would only see the True, or a refusal about a flag the
+    # author set false would come first. Judge what the author wrote, first.
+    for flag in ("capture_response", "capture_out_params"):
+        bad = _bool_literal_problem(flag, spec.settings.get(flag))
+        if bad is not None:
+            raise WiringError(f"outbound connection {name!r}: {bad}")
     reingress_to = spec.settings.get("reingress_to")
     if reingress_to is not None:
         if not isinstance(reingress_to, str) or not reingress_to.strip():

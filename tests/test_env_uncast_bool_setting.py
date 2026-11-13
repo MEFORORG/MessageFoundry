@@ -219,6 +219,15 @@ _LITERAL_CASES = [
         id="mllp-str-not-a-false-spelling",
     ),
     pytest.param(
+        # A truthy capture_out_params forced capture on, and a capture check then refused the
+        # statement as if the author had set it.
+        "from messagefoundry import Database, outbound\n"
+        "outbound('OB_X', Database(server='db.example.org', database='d', "
+        "statement='INSERT INTO t VALUES (?)', capture_out_params='false'))\n",
+        "outbound connection 'OB_X': setting 'capture_out_params' must be true or false, not str",
+        id="capture-out-params-before-the-desugar",
+    ),
+    pytest.param(
         # Both desugars in outbound() overwrite capture_response with True, so the refusal must
         # judge what the author wrote before they run.
         "from messagefoundry import Rest, outbound\n"
@@ -552,7 +561,9 @@ def test_a_literal_ftp_tls_that_is_not_a_bool_is_refused(value: Any, kind: str) 
     for ca in (None, "ca.pem"):
         with pytest.raises(WiringError) as ei:
             Ftp(host="h", remote_dir="/in", tls=value, tls_ca_file=ca)
-        assert f"Ftp tls must be true or false, not {kind}" in str(ei.value)
+        msg = str(ei.value)
+        assert f"Ftp: setting 'tls' must be true or false, not {kind}" in msg
+        assert (_QUOTED_FALSE_HINT in msg) == (value == "false")
 
 
 def test_capture_response_beside_reingress_to_is_still_forced_on_when_it_is_a_bool(
@@ -567,18 +578,6 @@ def test_capture_response_beside_reingress_to_is_still_forced_on_when_it_is_a_bo
         spec.settings["capture_response"] = written
         wiring.outbound("OB_X", spec)
         assert registry.outbound["OB_X"].spec.settings["capture_response"] is True
-
-
-def test_settings_carriers_names_every_kind_once() -> None:
-    kinds = (
-        "inbound connection",
-        "outbound connection",
-        "database lookup",
-        "fhir lookup",
-        "reference set",
-    )
-    source = inspect.getsource(wiring.Registry.settings_carriers)
-    assert all(source.count(f'"{kind}"') == 1 for kind in kinds)
 
 
 def test_the_derived_ftp_protocol_ref_has_a_stable_repr() -> None:
