@@ -7603,7 +7603,12 @@ notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notic
 notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
-`messagefoundry/pipeline/security_notify.py`. **Still open, at least:**
+`messagefoundry/pipeline/security_notify.py`. The offline commands that send a notice,
+`provision-admin` and `admin-reset-totp`, record it the same way, into the store the command
+opened (BACKLOG #5634). So a takeover notice whose `auth.first_administrator_provisioned` row reads
+`holder_notice: dispatched` and whose send then failed has an undelivered row after it. Where
+`admin-reset-totp` cannot open its store again for the notice, it says so on stderr, still sends
+the notice, and a failed send is then not recorded. **Still open, at least:**
 
 - At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
   fails in its final drain is recorded. That close is one bounded step of the shutdown. When the
