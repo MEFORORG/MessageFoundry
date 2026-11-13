@@ -26,12 +26,22 @@ that happens to sit there changes.
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
+
+import messagefoundry.api.app as appmod
+from messagefoundry.api import create_managed_app
+from messagefoundry.config.settings import AlertsSettings, EgressSettings, StoreSettings
+from messagefoundry.pipeline import engine as engine_module
+from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+from messagefoundry.store import open_store
 
 # The defect is an INDEFINITE hang, so any finite bound discriminates; this is sized to stay
 # UNDER the suite's own `--timeout=60` watchdog. That ordering is the whole point: at 90s the
@@ -141,3 +151,152 @@ def test_a_startup_failure_after_engine_start_lets_the_process_exit(tmp_path: Pa
         f"something raised while handling the startup failure, so the operator is shown the "
         f"teardown's error instead of the real cause:\n{out}"
     )
+
+
+# --- BACKLOG #5907: the spans between open_store and the teardown's try --------------------------
+#
+# Before #5907 five isolated guards each closed the notifier and the store for their own span, and
+# at least the UploadStore rebuild, notifier.set_store/start, prime_suspensions,
+# record_generated_pair_replacements, build_coordinator, the Engine(...) call and the factories it
+# evaluates as arguments, and _install_security_signals sat between them unguarded. A raise or a
+# cancel there left the store open, so aiosqlite's non-daemon worker held the process at exit.
+# These run in-process: what they read is that the store and the notifier were closed, which is
+# the precondition the subprocess test above measures as the process exiting.
+
+
+class _Opened:
+    """What the probed lifespan opened, and whether it closed it."""
+
+    def __init__(self) -> None:
+        self.store: Any = None
+        self.store_closed = False
+        self.notifier: Any = None
+        self.engine_stops = 0
+
+
+def _probed_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opened: _Opened, *, uploads: bool = False
+) -> Any:
+    async def _open(*args: Any, **kwargs: Any) -> Any:
+        store: Any = await open_store(*args, **kwargs)
+        real_close = store.close
+
+        async def _close() -> None:
+            opened.store_closed = True
+            await real_close()
+
+        store.close = _close
+        opened.store = store
+        return store
+
+    def _notifier(*_args: Any, **_kwargs: Any) -> NotifierAlertSink:
+        # A real sink with no transport: the lifespan builds none from bare AlertsSettings.
+        opened.notifier = NotifierAlertSink([])
+        return opened.notifier
+
+    real_stop = engine_module.Engine.stop
+
+    async def _stop(self: Any) -> None:
+        opened.engine_stops += 1
+        await real_stop(self)
+
+    monkeypatch.setattr(appmod, "open_store", _open)
+    monkeypatch.setattr(appmod, "notifier_from_settings", _notifier)
+    monkeypatch.setattr(engine_module.Engine, "stop", _stop)
+    settings = StoreSettings(
+        path=str(tmp_path / "probe.db"),
+        uploads_dir=str(tmp_path / "up") if uploads else "",
+    )
+    return create_managed_app(
+        store_settings=settings,
+        alerts_settings=AlertsSettings(),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+
+
+async def _close_leftovers(opened: _Opened) -> None:
+    # Red, the lifespan left these open; close them so the test process can still exit.
+    if opened.notifier is not None and opened.notifier._task is not None:
+        await opened.notifier.aclose()
+    if opened.store is not None and not opened.store_closed:
+        await opened.store.close()
+
+
+def _boom(*_args: object, **_kwargs: object) -> Any:
+    raise RuntimeError("PROBE: deliberate failure in an unguarded startup span")
+
+
+async def _aboom(*_args: object, **_kwargs: object) -> Any:
+    raise RuntimeError("PROBE: deliberate failure in an unguarded startup span")
+
+
+#: Each probe replaces one call the lifespan makes between open_store and the teardown's ``try:``,
+#: as (the object it lives on, its name, the replacement).
+_PROBES: dict[str, tuple[object, str, Callable[..., Any]]] = {
+    "the UploadStore rebuild": (appmod, "UploadStore", _boom),
+    "the suspension priming": (NotifierAlertSink, "prime_suspensions", _aboom),
+    "the generated-pair audit": (appmod, "record_generated_pair_replacements", _aboom),
+    "the coordinator": (appmod, "build_coordinator", _boom),
+    "an anchor-preflight factory evaluated as an Engine argument": (
+        appmod,
+        "make_lane_anchor_check",
+        _boom,
+    ),
+    "the Engine constructor": (appmod, "Engine", _boom),
+    "the security-signal install": (appmod, "_install_security_signals", _boom),
+}
+
+
+@pytest.mark.parametrize("probe", list(_PROBES))
+async def test_a_raise_in_an_unguarded_startup_span_closes_the_store_and_notifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe: str
+) -> None:
+    opened = _Opened()
+    app = _probed_app(tmp_path, monkeypatch, opened, uploads=probe == "the UploadStore rebuild")
+    # Patched after create_app, which builds its own UploadStore from the same name.
+    target, name, fake = _PROBES[probe]
+    monkeypatch.setattr(target, name, fake)
+    try:
+        with pytest.raises(RuntimeError, match="PROBE: deliberate failure"):
+            async with app.router.lifespan_context(app):
+                pytest.fail("startup should have failed")
+        # The control: the probe fired after the store opened, so there was a store to close.
+        assert opened.store is not None
+        assert opened.store_closed, f"{probe}: the store was left open"
+        assert opened.notifier is not None and opened.notifier._task is None, (
+            f"{probe}: the notifier's drain task was left running"
+        )
+        # The engine never started, so nothing stops it.
+        assert opened.engine_stops == 0
+    finally:
+        await _close_leftovers(opened)
+
+
+async def test_a_cancel_in_an_unguarded_startup_span_closes_the_store_and_notifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = _Opened()
+    app = _probed_app(tmp_path, monkeypatch, opened)
+    reached = asyncio.Event()
+
+    async def _held(*_args: object, **_kwargs: object) -> None:
+        reached.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(appmod, "record_generated_pair_replacements", _held)
+
+    async def _start() -> None:
+        async with app.router.lifespan_context(app):
+            pytest.fail("startup should not have finished")
+
+    task = asyncio.create_task(_start())
+    try:
+        await asyncio.wait_for(reached.wait(), 10.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10.0)
+        assert opened.store_closed, "a cancel left the store open"
+        assert opened.notifier is not None and opened.notifier._task is None
+        assert opened.engine_stops == 0
+    finally:
+        await _close_leftovers(opened)
