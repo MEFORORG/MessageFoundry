@@ -2330,8 +2330,8 @@ Two limits follow from this:
   neither judged. Oracle's ODBC driver documents `DBQ` for its target, and `DBQ` is refused. The
   engine cannot see which keyword a driver reads, so it accepts only the drivers on
   [the generic driver allowlist](#the-generic-driver-allowlist), each documented to read
-  `SERVER`, and refuses every other name when the connection is built (BACKLOG #5041). Before
-  that refusal, any name built, with a WARNING and an advisory line (BACKLOG #5163). That section says
+  `SERVER`, and refuses every other name when the connection is built (BACKLOG #5041). Until
+  BACKLOG #5041, any name built, with a WARNING and an advisory line (BACKLOG #5163). That section says
   what the list rests on and what it cannot see.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,

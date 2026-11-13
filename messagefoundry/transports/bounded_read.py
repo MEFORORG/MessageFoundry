@@ -713,11 +713,15 @@ class ProxyTunnelRefusedError(OSError):
     :class:`_StrictHTTPSConnection` raises this subclass in its place, with the text unchanged and
     the status code the reply's own status line gave, so a caller reads ``status`` rather than the
     text (BACKLOG #2989). It is still an ``OSError``, so ``urllib`` wraps it in a ``URLError`` and
-    every caller that caught the bare one catches it."""
+    a caller that catches ``OSError`` catches it; a check for the exact type does not."""
 
     def __init__(self, message: str, *, status: int) -> None:
         super().__init__(message)
         self.status = status
+
+    def __reduce__(self) -> tuple[Any, tuple[str]]:
+        # OSError's own reduce passes the args alone, and status is keyword-only.
+        return functools.partial(type(self), status=self.status), (str(self),)
 
 
 class _StrictHTTPSConnection(http.client.HTTPSConnection):
@@ -727,13 +731,16 @@ class _StrictHTTPSConnection(http.client.HTTPSConnection):
         # The reply to CONNECT is built from response_class inside _tunnel and never returned, so
         # the one built here is kept to read its status after _tunnel refuses the tunnel.
         replies: list[StrictHTTPResponse] = []
+        own = vars(self)
+        prior = own.get("response_class")
+        response_class = prior if prior is not None else type(self).response_class
 
         def reply(sock: socket.socket, *args: Any, **kwargs: Any) -> StrictHTTPResponse:
-            built = StrictHTTPResponse(sock, *args, **kwargs)
+            built = response_class(sock, *args, **kwargs)
             replies.append(built)
             return built
 
-        vars(self)["response_class"] = reply
+        own["response_class"] = reply
         try:
             super()._tunnel()  # type: ignore[misc]
         except OSError as exc:
@@ -744,7 +751,10 @@ class _StrictHTTPSConnection(http.client.HTTPSConnection):
                 raise
             raise ProxyTunnelRefusedError(str(exc), status=status) from exc
         finally:
-            vars(self).pop("response_class", None)
+            if prior is None:
+                own.pop("response_class", None)
+            else:
+                own["response_class"] = prior
 
 
 class StrictHTTPHandler(urllib.request.HTTPHandler):

@@ -356,10 +356,11 @@ AUTH_CHALLENGE_REFUSED = (
 #: The FIXED text for the one case no Digest handler sees: the token hop's web proxy, set up for
 #: Digest, answered the ``CONNECT`` for an ``https`` token endpoint with 407. Nothing was screened,
 #: so :data:`AUTH_CHALLENGE_REFUSED`'s hash and challenge words would be false here. It names the
-#: proxy and the two remedies ADR 0095 Amendment B.1 gives, within the same 200-character cut.
+#: proxy and, right after, the two remedies ADR 0095 Amendment B.1 gives, so a long token URL
+#: before it costs the reason at the tail before it costs a remedy.
 AUTH_CHALLENGE_REFUSED_ON_CONNECT = (
-    "met its web proxy's 407 to the CONNECT, which Digest cannot answer; "
-    "use Basic proxy auth or bypass this host"
+    "met a 407 from its web proxy on the CONNECT: use Basic proxy auth or bypass this host "
+    "(Digest cannot answer it)"
 )
 
 
@@ -388,9 +389,9 @@ def is_refused_proxy_digest_tunnel(exc: urllib.error.URLError, *, digest_proxy: 
 
     ``digest_proxy`` is decided when the hop is built, from its proxy configuration, so the answer
     never rests on what an opener exposes. The status is the one the proxy's status line gave, read
-    from :class:`~messagefoundry.transports.bounded_read.ProxyTunnelRefusedError`, which every
-    opener ``build_strict_opener`` builds raises for a refused ``CONNECT``; the error's text is not
-    read. ``tests/test_digest_refusal_classification.py`` pins the match on a real socket."""
+    from :class:`~messagefoundry.transports.bounded_read.ProxyTunnelRefusedError`, which the strict
+    https connection ``StrictHTTPSHandler`` dials raises for a refused ``CONNECT``; the error's text
+    is not read. ``tests/test_digest_refusal_classification.py`` pins the match on a real socket."""
     reason = exc.reason
     return digest_proxy and isinstance(reason, ProxyTunnelRefusedError) and reason.status == 407
 
@@ -2238,13 +2239,15 @@ class _HostProxy:
         if not self.credentialed:
             return (self.config._build_proxy_handler(admitted=False),)
         handlers: list[urllib.request.BaseHandler] = [self.config._build_proxy_handler()]
-        if self.config.digest is not None:
-            handlers.append(self.config.digest.build())
+        digest = self.config.digest if self.answers_digest else None
+        if digest is not None:
+            handlers.append(digest.build())
         return tuple(handlers)
 
     @property
     def answers_digest(self) -> bool:
-        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener."""
+        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener. The
+        token hop reads it as its ``digest_proxy`` flag, so the two decide from one rule."""
         return self.credentialed and self.config.digest is not None
 
     def auth_headers(self) -> dict[str, str]:

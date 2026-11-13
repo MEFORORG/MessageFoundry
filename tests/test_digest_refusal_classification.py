@@ -461,11 +461,9 @@ class _Refusing:
         pass
 
 
-async def _deliver_one(
-    tmp_path: Path, exc: NegativeAckError | None, *, dest: Any = None
-) -> tuple[Any, str, _Stops]:
-    """Queue one outbound row, deliver it through ``exc``, or through the real outbound ``dest``,
-    and return the outcome, the row's status and the alert sink."""
+async def _deliver_one(tmp_path: Path, dest: Any) -> tuple[Any, str, _Stops]:
+    """Queue one outbound row, deliver it through ``dest``, and return the outcome, the row's
+    status and the alert sink."""
     store = await MessageStore.open(tmp_path / "digest.db")
     try:
         mid = await store.enqueue_ingress(channel_id=CHANNEL, raw=RAW, now=0.0)
@@ -496,7 +494,7 @@ async def _deliver_one(
             alert_sink=sink,
             egress=EgressSettings(deny_by_default=False),
         )
-        runner._destinations[DEST] = dest if exc is None else _Refusing(exc)  # type: ignore[assignment]
+        runner._destinations[DEST] = dest
         item = await store.claim_next_fifo(DEST, now=1.0)
         assert item is not None
         outcome = await runner._process_delivery_item(DEST, item)
@@ -511,7 +509,9 @@ async def _deliver_one(
 
 
 async def test_a_refused_challenge_stops_the_lane_and_keeps_the_row(tmp_path: Path) -> None:
-    outcome, status, sink = await _deliver_one(tmp_path, auth_challenge_refused("REST https://h/x"))
+    outcome, status, sink = await _deliver_one(
+        tmp_path, _Refusing(auth_challenge_refused("REST https://h/x"))
+    )
     assert outcome is _ItemOutcome.STOPPED
     assert status == OutboxStatus.PENDING.value, "the row was not kept for the operator"
     assert [name for name, _ in sink.stopped] == [DEST]
@@ -525,7 +525,7 @@ async def test_a_bad_request_value_still_dead_letters_one_row(tmp_path: Path) ->
         code="bad-request-value",
         permanent=True,
     )
-    outcome, status, sink = await _deliver_one(tmp_path, bad)
+    outcome, status, sink = await _deliver_one(tmp_path, _Refusing(bad))
     assert outcome is _ItemOutcome.PROCESSED
     assert status == OutboxStatus.DEAD.value
     assert sink.stopped == []
@@ -795,7 +795,7 @@ async def test_the_digest_connect_refusal_stops_the_lane_and_keeps_the_row(tmp_p
     with the row kept, as for any refused challenge."""
     with _Challenger(407, _SHA256, refuse_answered=True) as proxy:
         dest = _bearer_rest_via(proxy.url)
-        outcome, status, sink = await _deliver_one(tmp_path, None, dest=dest)
+        outcome, status, sink = await _deliver_one(tmp_path, dest)
     assert outcome is _ItemOutcome.STOPPED
     assert status == OutboxStatus.PENDING.value, "the row was not kept for the operator"
     assert [name for name, _ in sink.stopped] == [DEST]
@@ -866,6 +866,65 @@ def test_the_connect_407_match_reads_the_status_and_the_built_digest_setup(
     assert is_refused_proxy_digest_tunnel(urllib.error.URLError(match), digest_proxy=True)
     refused = urllib.error.URLError(reason)  # type: ignore[arg-type]
     assert not is_refused_proxy_digest_tunnel(refused, digest_proxy=digest_proxy)
+
+
+class _ConnectReply:
+    """A socket whose reader holds the proxy's status line and nothing after it."""
+
+    def __init__(self, status_line: bytes) -> None:
+        self._status_line = status_line
+
+    def makefile(self, mode: str) -> Any:
+        import io
+
+        return io.BytesIO(self._status_line)
+
+
+@pytest.mark.parametrize(
+    ("raised", "typed"),
+    [
+        (OSError("Tunnel connection failed: 407 x"), True),
+        (ConnectionResetError(104, "reset while reading the head"), False),
+        (OSError(113, "no route"), False),
+        (TimeoutError("timed out"), False),
+    ],
+    ids=["tunnel-refusal", "reset-after-status", "errno-oserror", "timeout"],
+)
+def test_the_strict_connection_types_only_its_own_tunnel_refusal(
+    monkeypatch: pytest.MonkeyPatch, raised: OSError, typed: bool
+) -> None:
+    """The pass-through arms of ``_StrictHTTPSConnection._tunnel``. A socket error after the
+    proxy's 407 status line was read keeps its own type, so it stays the transient it was rather
+    than becoming the refusal that stops the lane. The stand-in reads the status as ``_tunnel``
+    does, then raises."""
+    from messagefoundry.transports import bounded_read
+
+    def tunnel(self: http.client.HTTPConnection) -> None:
+        response = self.response_class(_ConnectReply(b"HTTP/1.1 407 x\r\n"))  # type: ignore[arg-type]
+        response._read_status()  # type: ignore[attr-defined]
+        raise raised
+
+    monkeypatch.setattr(http.client.HTTPConnection, "_tunnel", tunnel)
+    conn = bounded_read._StrictHTTPSConnection("proxy.invalid")
+    with pytest.raises(OSError) as ei:
+        conn._tunnel()
+    if typed:
+        assert isinstance(ei.value, ProxyTunnelRefusedError)
+        assert ei.value.status == 407
+        assert str(ei.value) == str(raised)
+    else:
+        assert ei.value is raised
+    assert "response_class" not in vars(conn), "the CONNECT reply hook outlived the tunnel"
+
+
+def test_the_typed_tunnel_refusal_survives_a_copy() -> None:
+    import copy
+    import pickle
+
+    err = ProxyTunnelRefusedError("Tunnel connection failed: 407 x", status=407)
+    for clone in (copy.copy(err), pickle.loads(pickle.dumps(err))):  # noqa: S301
+        assert isinstance(clone, ProxyTunnelRefusedError)
+        assert (clone.status, str(clone)) == (407, str(err))
 
 
 @pytest.mark.usefixtures("no_bypass")
