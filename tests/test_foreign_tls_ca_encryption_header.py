@@ -598,33 +598,6 @@ def test_libpqs_windows_home_comes_from_the_ansi_shell_call(
     assert database._windows_roaming_appdata() == folder
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
-@pytest.mark.parametrize("failure", ["import", "call"])
-def test_a_ctypes_failure_is_a_valueerror_from_the_build(
-    monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    """An ``ImportError`` of ``ctypes`` and a ``ctypes.ArgumentError`` from the call are an
-    ``OSError`` the build refuses as a ``ValueError`` (vault BACKLOG #8153 item 18). Red before
-    the import was caught: its ``ModuleNotFoundError`` escaped the builder as itself."""
-    import ctypes
-
-    if failure == "import":
-        monkeypatch.setitem(sys.modules, "ctypes", None)
-    else:
-
-        def refuse(*args: Any) -> int:
-            raise ctypes.ArgumentError("synthetic: the call could not be made")
-
-        shell = _FakeShell32(b"")
-        shell.SHGetFolderPathA = refuse  # type: ignore[assignment]
-        monkeypatch.setattr(ctypes, "WinDLL", lambda name: shell)
-    with pytest.raises(OSError, match="SHGetFolderPathA|ctypes could not be loaded"):
-        database._windows_roaming_appdata()
-    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
-    with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):
-        _build_psql()
-
-
 def _refuse_lookup() -> list[tuple[str, str]]:
     raise AssertionError("the root certificate was looked up")
 
@@ -866,21 +839,31 @@ def test_a_libpq_home_the_engine_cannot_name_refuses_the_build(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
-@pytest.mark.parametrize("failure", ["load", "export"])
+@pytest.mark.parametrize("failure", ["load", "export", "import", "call"])
 def test_a_shell32_failure_is_an_oserror_the_build_refuses(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     """Red before the load was caught: ``WinDLL``'s ``OSError`` and a missing export's
-    ``AttributeError`` escaped the builder as themselves."""
+    ``AttributeError`` escaped the builder as themselves. Red before the import was caught too
+    (vault BACKLOG #8153 item 18): ``ctypes``' ``ModuleNotFoundError`` escaped. A
+    ``ctypes.ArgumentError`` from the call is refused the same way."""
     import ctypes
+
+    def refuse(*args: Any) -> int:
+        raise ctypes.ArgumentError("synthetic: the call could not be made")
 
     def broken(name: str, *args: Any, **kwargs: Any) -> object:
         if failure == "load":
             raise OSError("synthetic: shell32 did not load")
+        if failure == "call":
+            return types.SimpleNamespace(SHGetFolderPathA=refuse)
         return object()  # no SHGetFolderPathA on it
 
-    monkeypatch.setattr(ctypes, "WinDLL", broken)
-    with pytest.raises(OSError, match="SHGetFolderPathA could not be loaded"):
+    if failure == "import":
+        monkeypatch.setitem(sys.modules, "ctypes", None)
+    else:
+        monkeypatch.setattr(ctypes, "WinDLL", broken)
+    with pytest.raises(OSError, match="SHGetFolderPathA could not be|ctypes could not be loaded"):
         database._windows_roaming_appdata()
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
     with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):

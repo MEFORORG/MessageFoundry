@@ -1553,18 +1553,15 @@ def _libpq_homes() -> list[tuple[str, str]]:
         return [] if appdata is None else [("", os.path.join(appdata or os.sep, "postgresql"))]
     import pwd
 
-    try:
-        password_home: str | None = pwd.getpwuid(os.geteuid()).pw_dir
-    except KeyError:
-        password_home = None
-    labels = {password_home: " in the password-file home"}
+    named: dict[str, str] = {}
     env_home = os.environ.get("HOME")
     if env_home:
-        labels.setdefault(env_home, " in HOME")
-    homes = [home for home in labels if home is not None]
+        named[env_home] = " in HOME"
+    with contextlib.suppress(KeyError):  # no password-file entry: libpq 14 and older name none
+        named.setdefault(pwd.getpwuid(os.geteuid()).pw_dir, " in the password-file home")
     return [
-        (labels[home] if len(homes) > 1 else "", os.path.join(home or os.sep, ".postgresql"))
-        for home in homes
+        (label if len(named) > 1 else "", os.path.join(home or os.sep, ".postgresql"))
+        for home, label in named.items()
     ]
 
 
