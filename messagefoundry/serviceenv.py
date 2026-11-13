@@ -17,9 +17,10 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   says.** The same ruling covers it. Its protected alternative is the secrets directory
   ``MEFOR_SECRETS_DIRECTORY`` names (:mod:`messagefoundry.engine_secrets`, ADR 0214), and the
   refusal points there (vault BACKLOG #2595, slice B).
-* **Both refusals are ``serve``'s and ``supervise``'s.** An API app neither of them started, such
-  as one built with ``create_app(engine)``, is not refused. Where it finds its service, it names
-  what they refuse as the loosening ``secret_in_service_environment`` instead.
+* **Both refusals are ``serve``'s and ``supervise``'s, and the API app factories'.**
+  ``create_app`` and ``create_managed_app`` raise on the same finding as they are built (vault
+  BACKLOG #8212 item 1). The loosening ``secret_in_service_environment`` names it for a caller
+  that reads the loosenings with no refusal of its own.
 * **A store key that reaches a Windows service through its environment is named** (key-custody
   slice S2a), wherever it came from, since the machine-wide environment is readable by every
   local user too.
@@ -190,7 +191,10 @@ class _WindowsProbe:
 
         # Walked one step at a time, so the reader's stop ends the walk. parent() drops a parent
         # whose process id was reused by a later process.
-        proc = psutil.Process()
+        try:
+            proc = psutil.Process()
+        except psutil.Error as exc:
+            raise OSError(f"this process could not be queried: {exc}") from exc
         while True:
             try:
                 parent = proc.parent()
@@ -370,8 +374,16 @@ def _where(posture: ServiceEnvPosture) -> str:
     )
 
 
+class ServiceEnvironmentRefused(Exception):  # noqa: N818 - a refusal, not an error condition
+    """An API app factory refused to build on :func:`service_env_refusal`'s finding.
+
+    Not a ``RuntimeError``, so a handler written for another build failure, such as the absent
+    web console ``create_app(serve_ui=True)`` reports, does not catch this refusal with it."""
+
+
 def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
-    """Why ``serve`` or ``supervise`` must not start, whatever the enforcement setting, or None.
+    """Why ``serve``, ``supervise`` or an API app factory must not start, whatever the enforcement
+    setting, or None.
 
     Every secret-class name in the service's environment lists refuses: a key-class name, and
     each name the secrets directory supplies. The owner's 2026-10-01 ruling refuses them always,
@@ -474,8 +486,9 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
     """The ``(name, plain-language risk)`` entries for ``posture``. One place for the wording, so
     ``security_loosenings()`` and the ``supervise`` start-up lines cannot say different things.
 
-    A caller that refuses on :func:`service_env_refusal` checks it first, as ``serve`` and
-    ``supervise`` do, so ``secret_in_service_environment`` reaches only a caller that does not."""
+    A caller that refuses on :func:`service_env_refusal` checks it first, as ``serve``,
+    ``supervise``, ``create_app`` and ``create_managed_app`` do, so
+    ``secret_in_service_environment`` reaches only a caller that does not."""
     out: list[tuple[str, str]] = []
     if posture.status is ServiceEnvStatus.UNOBSERVABLE:
         out.append(
@@ -500,16 +513,16 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
                 "with `messagefoundry protect-key`)",
             )
         )
-    # What `serve` and `supervise` refuse, named for an engine neither started, such as an app an
-    # embedder built with `create_app(engine)`: nothing refused that start, so the posture names
-    # it rather than going quiet. Those two refuse before they read this list, so it never
-    # reaches them.
+    # What `serve`, `supervise` and the API app factories refuse, named for a caller that reads
+    # this list with no refusal of its own, rather than going quiet. Those refuse before they read
+    # it, so it never reaches them.
     refused = _refusal_findings(posture)
     if refused is not None:
         out.append(
             (
                 "secret_in_service_environment",
-                f"`serve` and `supervise` would refuse to start on this: {refused}",
+                "`serve`, `supervise` and the API app factories would refuse to start on this: "
+                f"{refused}",
             )
         )
     return out
