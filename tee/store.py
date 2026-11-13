@@ -69,22 +69,30 @@ _CHECKPOINT_ATTEMPTS = 50
 
 
 class PurgeIncompleteError(RuntimeError):
-    """The rows were deleted and committed, but the scrub after the delete did not finish, so
-    purged bodies may still sit in the main DB file or its -wal file. ``reason`` names the step."""
+    """The scrub after a purge's delete (or a ``scrub()`` run alone) did not finish, so purged
+    bodies may still sit in the main DB file or its -wal file. ``reason`` names the step. Any
+    counts are rows the run already deleted and committed; a ``scrub()`` run deletes none."""
 
     def __init__(self, log_rows: int, capture_rows: int, reason: str) -> None:
         self.log_rows = log_rows
         self.capture_rows = capture_rows
         self.reason = reason
         super().__init__(
-            f"purge deleted {log_rows} log row(s) and {capture_rows} capture row(s), but its scrub"
-            f" did not finish ({reason}), so purged bytes may remain in the DB file or its -wal"
-            " file. Read the Purge section of docs/TEE-RELAY.md before re-running purge."
+            f"deleted {log_rows} log row(s) and {capture_rows} capture row(s), but the scrub did"
+            f" not finish ({reason}), so purged bytes may remain in the DB file or its -wal file."
+            " Run `python -m tee purge --scrub-only` once the cause is gone; docs/TEE-RELAY.md,"
+            " Purge, says more."
         )
 
     def __reduce__(self) -> tuple[type[PurgeIncompleteError], tuple[int, int, str]]:
         # BaseException would rebuild from the message alone, which this __init__ does not take.
         return (type(self), (self.log_rows, self.capture_rows, self.reason))
+
+
+def _describe(exc: BaseException) -> str:
+    """An exception as ``Type: message``, or the bare type when it has no message (MemoryError)."""
+    text = str(exc)
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 @dataclass(frozen=True)
@@ -193,9 +201,11 @@ def _secure_file(path: str) -> None:
     """Best-effort owner-only permissions on the DB file **and its WAL/SHM siblings** (which WAL mode
     creates and which can hold message data when body capture is on).
 
-    On POSIX a sibling SQLite re-creates later, after this one-time chmod, still comes out 0600:
-    the unix VFS gives -wal and -shm the main file's mode whatever the umask, which
-    test_wal_siblings_recreated_after_open_inherit_owner_only_mode pins. On Windows chmod sets only
+    On POSIX a sibling SQLite re-creates later, after this one-time chmod, takes the main file's
+    mode whatever the umask (the unix VFS copies it), so it is 0600 whenever the main file is: a
+    new file is created 0600, and an existing one is 0600 only if this chmod succeeds, which is
+    not reported when it fails. test_wal_siblings_recreated_after_open_inherit_owner_only_mode
+    pins the inheritance. On Windows chmod sets only
     the read-only bit, so none of the three files is restricted to the owner here; that half is
     open (BACKLOG #5637) and the protected-volume advice below is the only control there today."""
     for sibling in (path, path + "-wal", path + "-shm"):
@@ -229,7 +239,8 @@ class RelayStore:
         await db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         # Zero freed content instead of only unlinking it, so a deleted capture body leaves no
         # readable bytes in a free page. Per-connection, so set on the store's one connection.
-        await db.execute("PRAGMA secure_delete=ON")
+        async with db.execute("PRAGMA secure_delete=ON"):
+            pass
         await db.executescript(_SCHEMA)
         await db.commit()
         if path != ":memory:":
@@ -367,34 +378,63 @@ class RelayStore:
         finally:
             await self._pragma(f"busy_timeout={_BUSY_TIMEOUT_MS}")
 
-    async def _reclaim(self) -> str | None:
-        """VACUUM, then a TRUNCATE checkpoint. Returns why the scrub is unfinished, or None.
+    async def _scrub(self, log_rows: int, capture_rows: int) -> None:
+        """TRUNCATE checkpoint, VACUUM, TRUNCATE checkpoint; raise if any of them does not finish.
 
-        This is part of the scrub, not only a disk reclaim: secure_delete zeroes freed pages and
-        cells, but B-tree rebalancing can leave stale copies of a deleted cell in a page's unused
-        space, which only VACUUM's rebuild removes, and only once the checkpoint writes the
-        rebuilt pages over the old ones. A VACUUM error (``sqlite3.Error``, or ``MemoryError``,
-        which CPython raises for SQLITE_NOMEM) is caught and returned as the reason, after the
-        checkpoint still runs to truncate the frames a failed VACUUM spilled into the -wal. A
-        failure of the checkpoint or of a PRAGMA is not caught here; :meth:`purge` maps it."""
-        # temp_store stays at its default, so VACUUM builds its rebuilt copy in a temp file in
-        # SQLite's temp directory, which is off the DB's volume. In memory, a large capture DB
-        # would fail every purge with out of memory. Redirecting that directory per connection is
-        # not available: the temp_store_directory PRAGMA is deprecated and process-wide, and the
-        # SQLITE_TMPDIR (POSIX) or TMP (Windows) setting belongs to the operator's environment.
-        # docs/TEE-RELAY.md, Purge, says so.
-        vacuum_error: sqlite3.Error | MemoryError | None = None
+        The first checkpoint writes the pages secure_delete zeroed back into the main file and
+        empties the -wal. VACUUM is part of the scrub too: B-tree rebalancing can leave stale
+        copies of a deleted cell in a page's unused space, which only its rebuild removes, and only
+        once the second checkpoint writes the rebuilt pages over the old ones. That checkpoint runs
+        even after a failed VACUUM, to truncate the frames the VACUUM spilled into the -wal.
+
+        At least these raise :class:`PurgeIncompleteError`, with ``log_rows`` and
+        ``capture_rows`` as the caller's deleted counts: a checkpoint that stays busy, and a
+        ``sqlite3.Error`` or ``MemoryError`` (CPython's SQLITE_NOMEM) from VACUUM, a checkpoint or a
+        PRAGMA. Anything else, such as a cancellation, propagates as raised.
+
+        This is a file-level scrub. A TRUNCATE frees the -wal's blocks and VACUUM's checkpoint
+        shrinks the DB file without overwriting either, so the bytes can stay in freed filesystem
+        blocks, and nothing here reaches a copy or backup taken before the purge."""
+        # temp_store stays at its default, so VACUUM may build its rebuilt copy in a temp file in
+        # SQLite's temp directory, which may sit off the DB's volume. In memory, a large capture DB
+        # would fail every purge with out of memory. docs/TEE-RELAY.md, Purge, says how an operator
+        # points that directory at a protected volume.
         try:
-            async with self._db.execute("VACUUM"):
-                pass
+            if not await self._checkpoint_truncate():
+                raise PurgeIncompleteError(log_rows, capture_rows, "the WAL checkpoint stayed busy")
+            vacuum_error: sqlite3.Error | MemoryError | None = None
+            try:
+                async with self._db.execute("VACUUM"):
+                    pass
+            except (sqlite3.Error, MemoryError) as exc:
+                vacuum_error = exc
+            try:
+                truncated = await self._checkpoint_truncate()
+            except (sqlite3.Error, MemoryError) as exc:
+                if vacuum_error is None:
+                    raise
+                raise PurgeIncompleteError(
+                    log_rows,
+                    capture_rows,
+                    f"VACUUM failed: {_describe(vacuum_error)}; then the WAL checkpoint failed:"
+                    f" {_describe(exc)}",
+                ) from vacuum_error
+            if vacuum_error is not None:
+                raise PurgeIncompleteError(
+                    log_rows, capture_rows, f"VACUUM failed: {_describe(vacuum_error)}"
+                ) from vacuum_error
+            if not truncated:
+                raise PurgeIncompleteError(
+                    log_rows, capture_rows, "the WAL checkpoint after VACUUM stayed busy"
+                )
         except (sqlite3.Error, MemoryError) as exc:
-            vacuum_error = exc
-        truncated = await self._checkpoint_truncate()
-        if vacuum_error is not None:
-            return f"VACUUM failed: {type(vacuum_error).__name__}: {vacuum_error}"
-        if not truncated:
-            return "the WAL checkpoint after VACUUM stayed busy"
-        return None
+            raise PurgeIncompleteError(log_rows, capture_rows, _describe(exc)) from exc
+
+    async def scrub(self) -> None:
+        """Run the scrub alone, deleting nothing: the recovery step after a purge whose scrub did
+        not finish. Raises :class:`PurgeIncompleteError` (with zero counts) as :meth:`_scrub` says."""
+        async with self._lock:
+            await self._scrub(0, 0)
 
     async def _pragma(self, setting: str) -> None:
         # Close the cursor: aiosqlite keeps an unclosed one's statement in progress, which makes a
@@ -405,26 +445,19 @@ class RelayStore:
     async def purge(
         self, *, before: float | None = None, captures_only: bool = False
     ) -> tuple[int, int]:
-        """Delete logged rows + captured bodies, then scrub their bytes from the DB and -wal files.
+        """Delete logged rows + captured bodies, then scrub deleted bodies from the DB and -wal files.
 
         ``before=None`` purges **everything**; ``before=<epoch>`` purges only rows older than it.
         ``captures_only`` leaves the relay_log (the NAK/leg audit) intact and drops only the captured
         message bodies (the PHI-bearing table). Returns ``(relay_log rows, relay_capture rows)`` deleted.
 
         In WAL mode a delete writes new pages to the -wal file and leaves the old frames, body
-        bytes included, on disk until a checkpoint. So the sequence is: delete and commit
-        (secure_delete zeroes the freed content), TRUNCATE checkpoint, which copies the zeroed pages
-        into the main file and empties the -wal, then ``VACUUM`` and a second TRUNCATE checkpoint
-        (:meth:`_reclaim` says why both belong to the scrub). Once the delete has committed, at
-        least these failures raise :class:`PurgeIncompleteError` with the deleted counts: a
-        checkpoint that stays busy, a failed ``VACUUM``, and a ``sqlite3.Error`` or ``MemoryError``
-        from a checkpoint or PRAGMA. Returning the counts then would read as a clean purge that did
-        not happen. Any other exception, such as a ``KeyboardInterrupt`` or a cancellation,
-        propagates as raised, without the counts.
-
-        A purge that deleted nothing still tries the scrub, so a re-run can finish one an earlier
-        run left unfinished, but it does not raise if the scrub fails: it removed nothing, and a
-        routine retention sweep that overlaps a reader should not exit as an error.
+        bytes included, on disk until a checkpoint, so once the delete commits, a run that deleted
+        any capture body runs :meth:`_scrub`, which raises :class:`PurgeIncompleteError` with the
+        deleted counts if the scrub does not finish. Returning the counts then would read as a clean
+        purge that did not happen. A run that deleted no capture body skips the scrub: relay_log
+        rows hold no bodies, and a routine sweep should not rewrite the DB or contend with a
+        reader for nothing. :meth:`scrub` runs the scrub alone, to recover.
         """
         async with self._lock:
             # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
@@ -446,19 +479,8 @@ class RelayStore:
             cap_n = cap.rowcount
             log_n = 0 if log is None else log.rowcount
             await self._db.commit()
-            try:
-                if not await self._checkpoint_truncate():
-                    reason: str | None = "the WAL checkpoint stayed busy"
-                else:
-                    reason = await self._reclaim()
-            except (sqlite3.Error, MemoryError) as exc:
-                if log_n or cap_n:
-                    raise PurgeIncompleteError(
-                        log_n, cap_n, f"{type(exc).__name__}: {exc}"
-                    ) from exc
-                reason = None
-            if reason is not None and (log_n or cap_n):
-                raise PurgeIncompleteError(log_n, cap_n, reason)
+            if cap_n:
+                await self._scrub(log_n, cap_n)
         return (log_n, cap_n)
 
     async def export(

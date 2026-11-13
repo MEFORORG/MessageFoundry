@@ -175,33 +175,40 @@ consequences follow from it:
 the captured bodies (the PHI-bearing table) and keeps the NAK/leg log. It **prompts for confirmation**
 (or refuses, in a non-interactive shell) unless you pass `-y`.
 
-The DB runs in WAL mode. A deleted row stays readable on disk until a checkpoint writes the
-zeroed pages back. Purge therefore deletes and commits, then runs a `TRUNCATE` checkpoint. It then
-runs `VACUUM` and a second checkpoint. Both are part of the scrub, not only a disk reclaim. A
-B-tree rebalance can leave a stale copy of a deleted row in a page's unused space. Only the
-`VACUUM` rebuild removes it.
+The DB runs in WAL mode, so a deleted body stays in the DB file or its `-wal` file until a
+checkpoint writes the zeroed pages back. When a run deletes at least one captured body, purge
+then scrubs: a `TRUNCATE` checkpoint, `VACUUM`, and a second checkpoint. `VACUUM` is part of the
+scrub. A B-tree rebalance can leave a stale copy of a deleted row in a page's unused space, and
+only the rebuild removes it. A run that deletes no captured body, such as a sweep with nothing old
+enough or one that removes only log rows, skips the scrub. Log rows hold no bodies.
 
-If one of those steps fails after purge deleted rows, purge prints `error: ...` and exits 1.
-The error names the counts it deleted and the step that failed. At least these failures do that:
+**The scrub is file-level only.** A checkpoint frees the `-wal` file's blocks and `VACUUM` shrinks
+the DB file, but neither overwrites the freed blocks. So the bytes can stay readable on the raw
+volume, and nothing here touches a copy or backup taken before the purge. [PHI.md section
+8](PHI.md#8-retention--purge) states the same limit for the engine store. Put a volume that holds
+captured bodies under full-disk encryption, as [section 10](PHI.md#10-secure-deployment--operations-checklist) advises.
+
+`VACUUM` may build its rebuilt copy in a temp file in SQLite's temp directory. That directory can
+be on another volume. Purge does not keep the copy in memory, because a large capture DB would
+then fail every purge. To keep the copy on a protected volume, point SQLite's temp directory there
+before you run purge. SQLite reads `SQLITE_TMPDIR` on POSIX and `TMP` on Windows.
+
+If the scrub does not finish, purge prints `error: ...` and exits 1. The error names the counts it
+deleted and the step that failed. At least these failures do that:
 
 * a checkpoint that cannot finish within about 5 s, because another connection holds a read
   transaction open or another writer or checkpoint runs;
 * a failed `VACUUM`, for example out of memory or a full disk;
 * an SQLite error, or an out-of-memory error, from a checkpoint.
 
-Any other failure, such as Ctrl-C, ends purge with a traceback and no counts.
+The scrub runs only after the delete has committed. So when one of those errors prints, the rows
+it counts are gone, but their bytes may still be in the DB file or its `-wal` file. A failure
+before the commit, such as the delete itself timing out, deletes nothing. Any other failure, such
+as Ctrl-C, ends purge with a traceback and no counts.
 
-The rows are gone then, but their bytes may still be in the DB file or its `-wal` file. To finish
-the scrub, re-run purge with the same `--captures-only` choice and an absolute `--before` date no
-later than the first run's cutoff. That re-run deletes nothing the first run kept. A run with no
-`--before`, or a relative one, would delete rows the first run kept. A run that deletes nothing
-still tries the scrub, but exits 0 even when the scrub fails again. So after the re-run, while no
-other process writes to the DB, check that the `-wal` file is empty.
-
-`VACUUM` builds its rebuilt copy in a temp file in SQLite's temp directory, which is off the DB's
-volume. Purge does not keep that copy in memory, because a large capture DB would then fail every
-purge. To keep the copy on a protected volume, point SQLite's temp directory there before you run
-purge. It reads `SQLITE_TMPDIR` on POSIX and `TMP` on Windows.
+To finish an unfinished scrub, run `python -m tee purge --db ./tee.db --scrub-only` once the cause
+is gone. It deletes nothing and needs no `-y`. It exits 1 with `error: ...` if the scrub still
+does not finish, and prints `scrubbed <db>` when it does.
 
 ```bash
 python -m tee purge --db ./tee.db --before 7d -y          # retention sweep

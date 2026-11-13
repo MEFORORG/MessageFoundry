@@ -272,6 +272,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="drop only the captured message bodies, keep the NAK/leg log",
     )
+    purge.add_argument(
+        "--scrub-only",
+        action="store_true",
+        help="delete nothing; only re-run the scrub a failed purge left unfinished",
+    )
     purge.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
 
     compare = sub.add_parser(
@@ -454,7 +459,28 @@ async def _export(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _scrub_only(args: argparse.Namespace) -> int:
+    if args.before is not None or args.captures_only:
+        print(
+            "error: --scrub-only deletes nothing; drop --before and --captures-only",
+            file=sys.stderr,
+        )
+        return 2
+    store = await RelayStore.open(args.db)
+    try:
+        await store.scrub()
+    except PurgeIncompleteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await store.close()
+    print(f"scrubbed {args.db}")
+    return 0
+
+
 async def _purge(args: argparse.Namespace) -> int:
+    if args.scrub_only:
+        return await _scrub_only(args)
     scope = "captured bodies only" if args.captures_only else "all logged rows + captured bodies"
     window = "older than the cutoff" if args.before is not None else "EVERYTHING"
     target = f"{scope} ({window}) in {args.db}"

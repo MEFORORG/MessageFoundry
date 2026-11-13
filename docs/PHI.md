@@ -2124,15 +2124,13 @@ never a body; and `relay_capture`, whose `raw` column holds the **full message**
 `--capture-bodies` is passed). Its process logging is a bare `logging.basicConfig` to stderr with **none**
 of the filters above. It is **out of scope for this section** — but treat a
 `--capture-bodies` capture store as a PHI-at-rest location on the terms of
-[§2](#2-where-phi-lives--data-at-rest-inventory). Its `purge` zeroes deleted bodies
-(`secure_delete`) and runs a `TRUNCATE` checkpoint, `VACUUM` and a second checkpoint before it
-reports success. If at least one of them fails after it deleted rows, it exits 1, and the purged
-bytes may remain in the DB file or its `-wal` file. Its `VACUUM` copies the surviving rows to a
-temp file in SQLite's temp directory, off the DB's volume, unless the operator points that
-directory elsewhere. On POSIX the `-wal` and `-shm` files take the DB file's mode. That mode is
-`0600` only when the store's best-effort `chmod` on open succeeded, and a failure there is not
-reported. On Windows nothing restricts the three files to the owner yet (BACKLOG #5637, open half),
-so place a capture DB on a protected volume.
+[§2](#2-where-phi-lives--data-at-rest-inventory). Its `purge` scrubs deleted bodies from the DB and `-wal`
+files, at file level only; [TEE-RELAY.md, Purge](TEE-RELAY.md#purge) states what the scrub
+does and does not reach, and where `VACUUM`'s temp copy may go. On POSIX the `-wal` and `-shm`
+files take the DB file's mode. That is `0600` for a DB the store created. For an existing DB it is
+`0600` only if the store's best-effort `chmod` on open succeeds, and a failure is not reported. On
+Windows nothing restricts the three files to the owner yet (BACKLOG #5637, open half), so place a
+capture DB on a protected volume.
 
 The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) is **not** an
 exclusion, and this paragraph is the single statement of how its output reaches stream 1 — the code

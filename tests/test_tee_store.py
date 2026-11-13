@@ -290,8 +290,8 @@ async def test_purge_refuses_to_report_clean_when_checkpoint_is_busy(tmp_path: P
         assert (excinfo.value.log_rows, excinfo.value.capture_rows) == (0, 1)
         assert _MARKER in _on_disk(db_path)  # the residue the error reports is really there
         peer.execute("COMMIT")
-        # Once the reader lets go, a re-run completes and scrubs the residue.
-        assert await store.purge(captures_only=True) == (0, 0)
+        # Once the reader lets go, the scrub-only recovery step finishes and removes the residue.
+        await store.scrub()
         assert _MARKER not in _on_disk(db_path)
     finally:
         if peer is not None:
@@ -329,7 +329,7 @@ def test_purge_cli_reports_a_busy_checkpoint_as_an_error(
         peer.close()
     assert rc == 1
     captured = capsys.readouterr()
-    assert "error: purge deleted 0 log row(s) and 1 capture row(s)" in captured.err
+    assert "error: deleted 0 log row(s) and 1 capture row(s)" in captured.err
     assert "purged " not in captured.out
 
 
@@ -348,7 +348,7 @@ async def test_first_checkpoint_alone_scrubs_a_body_already_in_the_main_file(
 ) -> None:
     # Pins secure_delete's share of the scrub, with no VACUUM: for a simple delete like this one,
     # delete plus commit plus the first TRUNCATE checkpoint leaves no purged bytes. It is not the
-    # whole scrub; a rebalance can leave stale cell copies only VACUUM removes (see _reclaim). The
+    # whole scrub; a rebalance can leave stale cell copies only VACUUM removes (see _scrub). The
     # body is checkpointed into the main file first, as a long-running relay's auto-checkpoint
     # would, so the residue under test is in the DB file, not the -wal.
     db_path = tmp_path / "tee.db"
@@ -479,20 +479,106 @@ async def test_wal_siblings_recreated_after_open_inherit_owner_only_mode(tmp_pat
         os.umask(old_umask)
 
 
+def _count_checkpoints(store: RelayStore, monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Record each _checkpoint_truncate result, so a test can see whether the scrub ran at all."""
+    real = store._checkpoint_truncate  # noqa: SLF001
+    results: list[bool] = []
+
+    async def counted() -> bool:
+        results.append(await real())
+        return results[-1]
+
+    monkeypatch.setattr(store, "_checkpoint_truncate", counted)
+    return results
+
+
 @pytest.mark.usefixtures("fast_checkpoint_poll")
-async def test_a_purge_that_deleted_nothing_does_not_raise_on_a_busy_scrub(tmp_path: Path) -> None:
-    # A routine retention sweep with nothing old enough to delete, overlapping a reader, is not an
-    # error: it removed nothing, so it left no residue of its own.
+@pytest.mark.parametrize("seed_old_log_row", [False, True], ids=["zero-delete", "log-rows-only"])
+async def test_a_purge_that_deleted_no_capture_body_skips_the_scrub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seed_old_log_row: bool
+) -> None:
+    # A routine sweep that removes no body (nothing old enough, or log rows only) must not VACUUM
+    # or contend with a reader. The control: with the same reader pinning the WAL, scrub() fails,
+    # so a purge that had run the scrub would have raised.
     db_path = tmp_path / "tee.db"
     store = await RelayStore.open(str(db_path))
     peer: sqlite3.Connection | None = None
     try:
         await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|keep")
+        if seed_old_log_row:
+            await store._db.execute(  # noqa: SLF001
+                "INSERT INTO relay_log (at,direction,leg,size_bytes,outcome) VALUES (?,?,?,?,?)",
+                (1000.0, "epic_to_corepoint", "corepoint", 10, "accepted"),
+            )
+            await store._db.commit()  # noqa: SLF001
         peer = sqlite3.connect(db_path, isolation_level=None)
         peer.execute("BEGIN")
         peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # pins the WAL
-        assert await store.purge(before=0.0) == (0, 0)
+        checkpoints = _count_checkpoints(store, monkeypatch)
+        expected = (1, 0) if seed_old_log_row else (0, 0)
+        assert await store.purge(before=5000.0) == expected
+        assert checkpoints == []  # the scrub never ran
+        with pytest.raises(PurgeIncompleteError):  # control: the reader really pins the WAL
+            await store.scrub()
+        assert checkpoints == [False]  # it stopped at the first busy checkpoint
     finally:
         if peer is not None:
             peer.close()
         await store.close()
+
+
+async def test_a_vacuum_failure_is_kept_when_the_checkpoint_after_it_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = await _open(tmp_path)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        real_execute = store._db.execute  # noqa: SLF001
+        seen = {"vacuum": False}
+
+        def execute(sql: str, *args: Any) -> Any:
+            if sql == "VACUUM":
+                seen["vacuum"] = True
+                raise sqlite3.OperationalError("database or disk is full")
+            if seen["vacuum"] and "wal_checkpoint" in sql:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_execute(sql, *args)
+
+        monkeypatch.setattr(store._db, "execute", execute)  # noqa: SLF001
+        with pytest.raises(PurgeIncompleteError) as excinfo:
+            await store.purge(captures_only=True)
+        assert excinfo.value.reason == (
+            "VACUUM failed: OperationalError: database or disk is full;"
+            " then the WAL checkpoint failed: OperationalError: disk I/O error"
+        )
+        assert str(excinfo.value.__cause__) == "database or disk is full"
+    finally:
+        await store.close()
+
+
+def test_scrub_only_cli_deletes_nothing_and_reports_a_busy_scrub(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tee_store, "_CHECKPOINT_ATTEMPTS", 2)
+    monkeypatch.setattr(tee_store, "_CHECKPOINT_POLL_SECONDS", 0.0)
+    db_path = tmp_path / "tee.db"
+
+    async def seed() -> None:
+        store = await RelayStore.open(str(db_path))
+        try:
+            await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|keep")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    assert tee_main(["purge", "--db", str(db_path), "--scrub-only"]) == 0  # no -y needed
+    assert f"scrubbed {db_path}" in capsys.readouterr().out
+    peer = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        peer.execute("BEGIN")
+        assert peer.execute("SELECT COUNT(*) FROM relay_capture").fetchone() == (1,)  # kept
+        assert tee_main(["purge", "--db", str(db_path), "--scrub-only"]) == 1
+    finally:
+        peer.close()
+    assert "error: deleted 0 log row(s) and 0 capture row(s)" in capsys.readouterr().err
+    assert tee_main(["purge", "--db", str(db_path), "--scrub-only", "--captures-only"]) == 2
