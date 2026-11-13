@@ -91,6 +91,68 @@ async def test_the_delivery_observer_hears_only_sends_that_returned() -> None:
     assert len(last.events) == 2
 
 
+class _HungTransport:
+    """A transport whose send never returns until cancelled, recording the cancel."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.entered = asyncio.Event()
+        self.cancelled = False
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+async def test_a_hung_transport_does_not_hold_the_alert_from_a_healthy_one() -> None:
+    """BACKLOG #5907: each alert went to its transports in turn, so a hung first transport held the
+    alert from every one after it. The alert being handled now reaches the healthy transport, and
+    the observer hears that send, while the hung one is still waiting."""
+    hung, good = _HungTransport("webhook"), _RecordingTransport("email")
+    heard: list[str] = []
+    delivered = asyncio.Event()
+
+    def observe(name: str, _event: dict[str, Any]) -> None:
+        heard.append(name)
+        delivered.set()
+
+    sink = NotifierAlertSink([hung, good])
+    sink.set_delivery_observer(observe)
+    sink.start()
+    sink.connection_stopped("OB_X", detail="boom")
+    await asyncio.wait_for(delivered.wait(), 5.0)
+    assert hung.entered.is_set() and not hung.cancelled  # the control: still hung
+    assert len(good.events) == 1
+    assert heard == ["email"]  # only the send that returned
+    # A close cut at its bound cancels the drain, and that cancel reaches the hung send.
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(sink.aclose(), 0.2)
+    assert hung.cancelled
+    assert sink._task is None
+
+
+async def test_a_failing_transport_does_not_stop_a_slower_sibling() -> None:
+    """A send that raises while a sibling's send is still running leaves that sibling to finish."""
+
+    class _Slow(_RecordingTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            await asyncio.sleep(0.05)
+            await super().send(event, **kw)
+
+    bad, slow = _RecordingTransport("bad", fail=True), _Slow("slow")
+    heard: list[str] = []
+    sink = NotifierAlertSink([bad, slow])
+    sink.set_delivery_observer(lambda name, _event: heard.append(name))
+    sink.connection_stopped("OB_X", detail="boom")
+    await _drain(sink)
+    assert len(slow.events) == 1
+    assert heard == ["slow"]
+
+
 async def test_realert_throttle_suppresses_repeats() -> None:
     t = _RecordingTransport("t")
     sink = NotifierAlertSink([t], realert_seconds=10_000.0)

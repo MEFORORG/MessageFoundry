@@ -1739,7 +1739,8 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     test_the_alert_fires_even_when_the_start_then_fails, fails at or after engine.start(), so it
     runs the managed teardown, not this. The drain's own wait ends at _INNER_SHARE of its bound,
     before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered.
-    The cut ends only the asyncio side: a send in a worker thread runs on to its socket timeout."""
+    A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
+    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The cut ends only the asyncio side: a send in a worker thread runs on to its socket timeout."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:

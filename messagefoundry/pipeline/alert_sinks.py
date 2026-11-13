@@ -389,7 +389,7 @@ class AlertTransport(Protocol):
     ``recipients`` (#146) is the per-rule EMAIL recipient override the matching rule carried (``None`` =
     the transport's own default); ``context`` (#138) carries the extra non-PHI template values the
     notifier popped off the event (rule label + effective cooldown). Both are meaningful only to
-    :class:`EmailTransport`; other transports (the webhook) accept and ignore them so the fan-out loop
+    :class:`EmailTransport`; other transports (the webhook) accept and ignore them so the fan-out
     can call every transport uniformly."""
 
     name: str
@@ -844,7 +844,7 @@ class WebhookTransport:
         context: Mapping[str, Any] | None = None,
     ) -> None:
         # recipients (#146) + context (#138) are EMAIL-only; a webhook has neither a per-rule recipient nor
-        # an email template — accept and ignore them so the notifier's fan-out loop is uniform.
+        # an email template — accept and ignore them so the notifier's fan-out is uniform.
         await asyncio.to_thread(self._post, event)
 
     def _post(self, event: dict[str, Any]) -> None:
@@ -857,7 +857,7 @@ class WebhookTransport:
             raise ValueError(f"[alerts].webhook_url must be https, got scheme {split.scheme!r}")
         _refuse_off_allowlist_webhook(self.url, self.allowed_hosts)
         # Never serialize INTERNAL routing keys (``_``-prefixed: e.g. the #146 ``_recipients`` override)
-        # onto the wire — the fan-out loop pops them before send, but strip defensively so a webhook
+        # onto the wire — the fan-out pops them before send, but strip defensively so a webhook
         # payload can never carry recipient addresses / internal metadata even if a key slips through.
         payload = {k: v for k, v in event.items() if not k.startswith("_")}
         data = json.dumps(payload).encode("utf-8")
@@ -1286,6 +1286,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     background task, with a per-(event, connection) re-alert throttle. An optional :class:`AlertRuleSet`
     (ADR 0014) refines each event's severity, which transports fire, the cooldown, and suppression;
     with no rules the behaviour is byte-identical (every event → every transport, global throttle).
+
+    Each event goes to its transports concurrently (BACKLOG #5907), so a slow transport does not
+    hold the event being handled from a healthy one. Events are still handled one at a time, so an
+    event queued behind a slow transport waits for it, and a drain cut while it waits loses those.
 
     The emit methods are synchronous and return immediately (enqueue only). Call :meth:`start` once a
     loop is running (the ASGI lifespan does this) and :meth:`aclose` on shutdown."""
@@ -2040,8 +2044,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         """Wire (or clear) a callback told ``(transport name, event)`` each time a transport's send
         returns without raising: the relay accepted every recipient, or the webhook answered 2xx
         (vault BACKLOG #3849). The offline ``provision-admin`` uses it to tell a page that went out
-        from one the notifier only accepted. Called on the drain task; an observer that raises is
-        logged and never stops the drain."""
+        from one the notifier only accepted. Called on the event loop as each send returns, in no
+        set order across transports; an observer that raises is logged and never stops the drain."""
         self._delivery_observer = observer
 
     # --- #143 (ADR 0044 amendment) windowed suspend / mute (notification-only) ---
@@ -2602,7 +2606,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     async def _handle(self, event: dict[str, Any]) -> None:
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)
-        # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out loop so it never reaches the
+        # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out so it never reaches the
         # webhook (which serializes the event to JSON); only the email transport consumes it.
         recipients = event.pop("_recipients", None)
         # #5021: a reason kept off the wire. _record_state already read it in _emit.
@@ -2613,9 +2617,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             "rule_id": event.pop("_rule_id", ""),
             "cooldown_seconds": event.pop("_cooldown_seconds", None),
         }
-        for transport in self._transports:
-            if targets is not None and transport.name not in targets:
-                continue  # this transport isn't in the matching rule's routing
+
+        async def deliver(transport: AlertTransport) -> None:
             try:
                 await transport.send(event, recipients=recipients, context=context)
             except Exception:
@@ -2629,13 +2632,23 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     event.get("connection"),
                     exc_info=True,
                 )
-                continue
+                return
             observer = self._delivery_observer
             if observer is not None:
                 try:
                     observer(transport.name, event)
                 except Exception:
                     log.warning("alert delivery observer failed", exc_info=True)
+
+        # BACKLOG #5907: concurrently, with the limit the class docstring states. A cancel of this
+        # task reaches every send.
+        await asyncio.gather(
+            *(
+                deliver(transport)
+                for transport in self._transports
+                if targets is None or transport.name in targets
+            )
+        )
 
 
 def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:

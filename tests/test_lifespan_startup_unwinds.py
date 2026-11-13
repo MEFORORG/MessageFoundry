@@ -382,6 +382,43 @@ async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
     assert sink._task is None
 
 
+class _HealthyEmail:
+    """An SMTP relay that accepts every alert at once."""
+
+    name = "email"
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.events.append(event)
+
+
+async def test_a_blackholed_webhook_does_not_stop_the_email_in_the_unwind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5907: the notifier sent each alert to its transports in turn, webhook first, so a
+    blackholed webhook held the email until the unwind cut the drain, and the refusal alert never
+    reached a healthy relay. The alert being handled now reaches the email; an alert queued behind
+    it still waits on the webhook and is lost to the cut, which the count reports."""
+    monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", 1.5)
+    monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.5)
+    webhook, email = _BlackholedTransport(), _HealthyEmail()
+    sink = NotifierAlertSink([webhook, email])  # notifier_from_settings's order
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    sink.connection_stopped("IB_TEST_ORU", detail="probe")
+
+    class _Store:
+        async def close(self) -> None:
+            return None
+
+    store: Any = _Store()
+    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    assert webhook.entered.is_set()  # the control: the webhook did hang
+    assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]
+    assert sink.undelivered == 2
+
+
 async def test_a_close_cancelled_on_a_full_queue_still_stops_the_drain() -> None:
     """BACKLOG #5907: an alert notifier close cancelled while its sentinel waited on a full queue
     left the drain task delivering, so the unwind's cut did not stop it."""
