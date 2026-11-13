@@ -10313,6 +10313,7 @@ class AuthService:
             client=client,
         )
         refused: Exception | None = None
+        seal_refused = False
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
             # row running at once only one writes.
@@ -10326,6 +10327,13 @@ class AuthService:
             # integrity arm below (``UsernameAuditAppendError``). Handled after this block, so the
             # append's own error is raised or logged with its own chain, not this wrapper's.
             refused = exc.cause
+            written = False
+        except RowSealError as exc:
+            # The row verified at the pre-read above, then failed its seal at the write, so the
+            # store's write helper refused it and wrote nothing (vault BACKLOG #3069 note T2).
+            # Handled with a refused row, below.
+            refused = exc
+            seal_refused = True
             written = False
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
@@ -10392,6 +10400,11 @@ class AuthService:
             # the engine would apply it on a pass or sign-in that reaches the rename and is not
             # refused, with its row and its notice. A defect still raises. The sort is
             # ``write_audit_soft``'s, called with the same sets ``_audit_reconciler_row`` passes.
+            #
+            # A row that failed its seal at the write (``seal_refused``) takes the same rule (vault
+            # BACKLOG #3069 note T2): nothing was written, so a raise would cost the pass what it
+            # costs above. It is reported as the loader reports a failing record, too, since the
+            # pre-read verified it and so reported nothing.
             if not audit_soft:
                 raise refused
             cause = refused
@@ -10402,7 +10415,11 @@ class AuthService:
             await write_audit_soft(
                 _refused,
                 log=_log,
-                message="directory reconcile: the auth.ad_username_refreshed audit row for account "
+                message="directory reconcile: account %s (%s, renaming to %s) failed its "
+                "integrity check at the rename's write, so nothing was written and nobody was "
+                "told; the pass goes on (vault BACKLOG #3069)"
+                if seal_refused
+                else "directory reconcile: the auth.ad_username_refreshed audit row for account "
                 "%s (%s, renaming to %s) could not be written, so its rename was rolled back and "
                 "nobody was told; the engine would apply it on a pass or sign-in that reaches the "
                 "rename and is not refused (BACKLOG #3018)",
@@ -10411,9 +10428,11 @@ class AuthService:
                     scrub_log_argument(before.username),
                     scrub_log_argument(new_username),
                 ),
-                errors=audit_write_errors(),
+                errors=(RowSealError,) if seal_refused else audit_write_errors(),
                 defects=AUDIT_WRITE_DEFECTS,
             )
+            if seal_refused:
+                await self._user_seal_failed(user_id)
             # BACKLOG #3018 step 2: the refused row pages, as the pass's other refused rows do.
             self._note_refused_reconciler_row("auth.ad_username_refreshed")
             return

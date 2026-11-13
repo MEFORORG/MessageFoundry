@@ -6726,6 +6726,64 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
         await store.close()
 
 
+def _seal_refusing_rename(store: MessageStore, user_id: str) -> list[str]:
+    """Make ``set_user_username`` raise ``RowSealError`` for ``user_id`` alone, as the store's
+    write helper does for a row that fails its seal at the write. Returns the ids it refused."""
+    real = store.set_user_username
+    refused: list[str] = []
+
+    async def renaming(uid: str, username: str, **kw: Any) -> bool:
+        if uid == user_id:
+            refused.append(uid)
+            raise RowSealError("user", uid)
+        return await real(uid, username, **kw)
+
+    store.set_user_username = renaming  # type: ignore[method-assign]
+    return refused
+
+
+async def test_a_rename_whose_row_fails_its_seal_at_the_write_does_not_end_the_pass(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3069 note T2. The store refuses the first rename's write with
+    ``RowSealError``: the reconciler logs it at ERROR, reports the failing record, pages it with
+    the pass's refused rows, and goes on, so the second account's rename still applies. Called the
+    way the login path calls it, the same refusal is raised."""
+    store, service, notifier = await _two_renamed_accounts()
+    try:
+        jdoe = await store.get_user_by_username("jdoe")
+        assert jdoe is not None
+        refused = _seal_refusing_rename(store, jdoe.id)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+        assert refused == [jdoe.id], "the seal refusal was not reached"
+        assert plan.aborted is None and len(plan.renames) == 2
+        assert await store.get_user_by_username("asmith-new") is not None, (
+            "the rename after the refused one was skipped"
+        )
+        still = await store.get_user(jdoe.id)
+        assert still is not None and still.username == "jdoe"
+        assert plan.audit_refused == ("auth.ad_username_refreshed",), "the refusal was not paged"
+        assert _logged_at_error(
+            caplog, f"account {jdoe.id} (jdoe, renaming to jdoe-new)", "integrity check"
+        )
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        told = [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert told == ["asmith-new"]
+
+        with pytest.raises(RowSealError):
+            await service._refresh_cached_username(
+                user_id=jdoe.id,
+                old_username="jdoe",
+                new_username="jdoe-new",
+                held=None,
+                from_plan=False,
+                audit_soft=False,
+            )
+    finally:
+        await store.close()
+
+
 # --- BACKLOG #3085 item 2: the second of two reconcilers revoking one account -----------------------
 
 
