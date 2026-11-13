@@ -43,6 +43,8 @@ import httpx
 from harness.config.shardcert._shape import (
     BROADCAST,
     PARTITIONED_FANOUT,
+    destinations_for_seq,
+    fifo_lane_destination,
     load_routing,
     reported_shape,
 )
@@ -2936,8 +2938,9 @@ class ShardCertDriverReport:
     #: The routing shape SHARDS_READY named; without it ``delivering`` is ambiguous (see
     #: ``ShardCertDriveReport.routing``).
     routing: str
-    #: Copies of ACKed messages that never arrived: per ACKed seq, ``delivering`` minus the
-    #: distinct lanes it reached (:meth:`FailoverTracker.acked_copies_missing`). Must be 0.
+    #: Copies of ACKed messages that never arrived: per ACKed seq, the destinations the served router
+    #: picks for it (``destinations_for_seq``) that no copy's lane label names
+    #: (:meth:`FailoverTracker.acked_copies_missing`). Must be 0.
     acked_copies_missing: int
     #: Sends whose ACK this side never saw (a connection closed, or the stop grace ran out). The
     #: engine may still have delivered them; REPORTED beside ``sink_received``, never gated.
@@ -2946,20 +2949,22 @@ class ShardCertDriverReport:
 
     @property
     def copies_ok(self) -> bool:
-        """Every ACKed message arrived under ``delivering`` distinct lane labels (BACKLOG #5640).
-        The label is the MSH-6 key the harness stamps on each copy, not the sink port it reached.
+        """Every ACKed message arrived at each destination the served router picks for it
+        (BACKLOG #5640). A copy's destination is read from its lane label, the MSH-6 key the harness
+        stamps, not from the sink port it reached.
 
-        Checked per message, so nothing can make up for a lost copy: not a re-delivery across a
-        kill (it lands on a lane the seq already reached), not a duplicate, and not the copies of a
-        send whose ACK this side never saw. ``acked_not_delivered`` alone cannot see this loss: it
+        Checked per message and per expected destination, so nothing can make up for a lost copy:
+        not a re-delivery across a kill (it lands on a lane the seq already reached), not a
+        duplicate, not a copy under a destination the message was never routed to, and not the
+        copies of a send whose ACK this side never saw. ``acked_not_delivered`` alone cannot see this loss: it
         counts DISTINCT messages, so one copy of each clears it. A fan-out below 1 is unknown, so it
         fails. The aggregate ``sink_received`` against ``acked * delivering`` is only reported."""
         return self.delivering >= 1 and self.acked_copies_missing == 0
 
     @property
     def ok(self) -> bool:
-        """Driver-side pass bar: every ACKed message delivered under each of its ``delivering`` lane
-        labels (:attr:`copies_ok`, on a kill run too), drained pipeline (remote ``/stats``), per-lane FIFO
+        """Driver-side pass bar: every ACKed message delivered to each of its expected destinations
+        (:attr:`copies_ok`, on a kill run too), drained pipeline (remote ``/stats``), per-lane FIFO
         (non-vacuous), no dead-letters. Duplicates are allowed only across a kill. The stranded-row
         check lives on the ENGINE report (it needs direct store access)."""
         dup_ok = self.lane_repeats == 0 if self.killed_shard is None else True
@@ -3510,6 +3515,14 @@ async def run_shardcert_driver(
             "SHARDS_READY carried no `routing` (an older engine half, which served broadcast only): "
             "recorded as broadcast"
         )
+    # A partitioned router picks each message's destinations out of `dests`, so the copy check needs it.
+    dests = int(ready["dests"]) if "dests" in ready else 0
+    if routing != BROADCAST and dests < 1 and delivering >= 1:
+        delivering = 0
+        notes.append(
+            "SHARDS_READY carried no `dests` for a partitioned run: the per-message copy check cannot "
+            "know each message's destinations, so it FAILS"
+        )
 
     ids = SHARDCERT_IDS
     metrics = LiveMetrics(counters=Counters(), ack=Histogram(), e2e=Histogram())
@@ -3597,7 +3610,14 @@ async def run_shardcert_driver(
         drain_seconds=drain_s,
         delivering=delivering,
         routing=routing,
-        acked_copies_missing=tracker.acked_copies_missing(delivering),
+        # Each ACKed message must arrive at exactly the destinations the served router picks for it,
+        # so a copy under some other destination cannot stand in for a lost one.
+        acked_copies_missing=tracker.acked_copies_missing(
+            lambda seq: destinations_for_seq(
+                seq, routing=routing, dests=dests, fanout=max(delivering, 0)
+            ),
+            fifo_lane_destination,
+        ),
         timeouts=ctr.timeouts,
         notes=notes,
     )
@@ -4575,14 +4595,19 @@ async def run_shardcert_drive(
     )
     try:
         # (0) Sign in to the engine box's API before spawning any child (https and the remote rig
-        #     session unless --insecure; ``cacert`` is the engine box's certificate PEM). This drive's
-        #     verdict never reads the poller (see ``ShardCertDriveReport.no_loss``), so a refusal is a
-        #     note and the run goes on with its advisory drain terms unread, rather than an abort.
+        #     session unless --insecure; ``cacert`` is the engine box's certificate PEM). The poller's
+        #     drain wait is the barrier that holds the sinks' tally until the engine has delivered,
+        #     unless the ENGINE_DRAINED gate below is armed. So without that gate a refusal is a setup
+        #     error, raised before any child exists: tallying with no barrier would read the in-flight
+        #     tail as loss. With the gate armed, the poller's terms are advisory only, so a refusal is
+        #     a note and the run goes on.
         try:
             poller = await _open_remote_poller(
                 engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
             )
         except RemoteEngineSignInError as exc:
+            if not await_engine_drained:
+                raise
             notes.append(
                 "advisory /stats poller not opened, so drained/engine_done/engine_dead are unread: "
                 + escape_for_terminal(str(exc), single_line=True)

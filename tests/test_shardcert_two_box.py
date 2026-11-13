@@ -28,7 +28,13 @@ import pytest
 
 import harness.__main__ as hmain
 import harness.load.shardcert as sc
-from harness.config.shardcert._shape import BROADCAST, PARTITIONED
+from harness.config.shardcert._shape import (
+    BROADCAST,
+    PARTITIONED,
+    PARTITIONED_FANOUT,
+    destinations_for_seq,
+    fifo_lane_destination,
+)
 from harness.load.coord import DRIVE_START, SHARDS_READY, FileDropCoord
 
 
@@ -565,18 +571,23 @@ def _tracker(acked: Sequence[int], lanes: Mapping[str, Sequence[int]]) -> Any:
     return tracker
 
 
-_FOUR_LANES = ("a|d0", "a|d1", "a|d2", "a|d3")
+_FOUR_LANES = ("a_00", "a_01", "a_02", "a_03")
+
+
+def _broadcast(fanout: int) -> Any:
+    """The expected-destination function the driver builds for a broadcast run at this fan-out."""
+    return lambda seq: destinations_for_seq(seq, routing=BROADCAST, dests=8, fanout=fanout)
 
 
 def test_tracker_counts_each_acked_copy_that_never_arrived() -> None:
-    """Per ACKed seq, the fan-out minus the DISTINCT lanes it reached. A full broadcast run is 0;
-    one copy of each, the old false pass, is 3 per message."""
+    """Per ACKed seq, the expected destinations no copy arrived at. A full broadcast run is 0; one
+    copy of each, the old false pass, is 3 per message."""
     acked = range(10)
     full = _tracker(acked, {lane: list(acked) for lane in _FOUR_LANES})
-    assert full.acked_copies_missing(4) == 0
-    one_copy_each = _tracker(acked, {"a|d0": list(acked)})
+    assert full.acked_copies_missing(_broadcast(4), fifo_lane_destination) == 0
+    one_copy_each = _tracker(acked, {"a_00": list(acked)})
     assert one_copy_each.acked_not_delivered() == 0  # the old verdict's only loss signal is clean
-    assert one_copy_each.acked_copies_missing(4) == 30
+    assert one_copy_each.acked_copies_missing(_broadcast(4), fifo_lane_destination) == 30
 
 
 def test_tracker_copy_check_cannot_be_offset_by_a_surplus() -> None:
@@ -584,14 +595,82 @@ def test_tracker_copy_check_cannot_be_offset_by_a_surplus() -> None:
     lost, and all 4 copies of a timed-out send 10 delivered, gave S=43 inside [40, 44]. Re-delivery
     on a lane the seq already reached, as across a kill, adds nothing either.
 
-    Mutation: count total deliveries instead of distinct lanes. Red: the missing copy reads 0."""
+    Mutation: count total deliveries instead of distinct destinations. Red: the copy reads 0."""
     acked = list(range(10))
     lanes = {lane: [*acked, 10] for lane in _FOUR_LANES}
-    lanes["a|d2"] = [s for s in lanes["a|d2"] if s != 3]
-    lanes["a|d0"] = [*lanes["a|d0"], 3, 5]  # re-deliveries on lanes those seqs already reached
+    lanes["a_02"] = [s for s in lanes["a_02"] if s != 3]
+    lanes["a_00"] = [*lanes["a_00"], 3, 5]  # re-deliveries on lanes those seqs already reached
     tracker = _tracker(acked, lanes)
-    assert tracker.acked_copies_missing(4) == 1
+    assert tracker.acked_copies_missing(_broadcast(4), fifo_lane_destination) == 1
     assert tracker.lane_repeats == 2
+
+
+def test_tracker_copy_at_an_unexpected_destination_does_not_offset_a_lost_one() -> None:
+    """Broadcast with H=8 handlers and D=4 delivering: handler 5 should self-filter. If it regresses
+    and delivers seq 7 while handler 2's copy of seq 7 is lost, seq 7 still arrives under 4 distinct
+    labels, which a count of labels read as complete. Against the expected set it is 1 missing.
+
+    Mutation: count distinct labels instead of expected-destination membership. Red: it reads 0."""
+    acked = list(range(10))
+    lanes = {lane: list(acked) for lane in _FOUR_LANES}
+    lanes["a_02"] = [s for s in acked if s != 7]
+    lanes["a_05"] = [7]
+    tracker = _tracker(acked, lanes)
+    assert tracker.acked_copies_missing(_broadcast(4), fifo_lane_destination) == 1
+
+
+def test_tracker_partitioned_copy_at_the_wrong_destination_is_missing() -> None:
+    """A partitioned message has ONE destination, ``destinations_for_seq`` with fan-out 1. A copy
+    that arrives at any other destination is not its copy: the run lost the expected one."""
+    from harness.config.shardcert._shape import fifo_lane
+
+    def expected(seq: int) -> list[int]:
+        return destinations_for_seq(seq, routing=PARTITIONED, dests=8, fanout=1)
+
+    acked = list(range(20))
+    right: dict[str, list[int]] = {}
+    wrong: dict[str, list[int]] = {}
+    for s in acked:
+        right.setdefault(fifo_lane("a", expected(s)[0]), []).append(s)
+        wrong.setdefault(fifo_lane("a", (expected(s)[0] + 1) % 8), []).append(s)
+    assert _tracker(acked, right).acked_copies_missing(expected, fifo_lane_destination) == 0
+    assert _tracker(acked, wrong).acked_copies_missing(expected, fifo_lane_destination) == 20
+
+
+def test_destinations_for_seq_matches_the_served_router() -> None:
+    """The driver's expected set and the served router's choice come from one function, so they
+    cannot drift: the shape's own selectors agree with it at every seq."""
+    from harness.config.shardcert._shape import ShardCertShape
+    from harness.load.ids import SHARDCERT_IDS
+    from messagefoundry.parsing.message import Message
+
+    def shape(routing: str, delivering: int) -> ShardCertShape:
+        return ShardCertShape(
+            shards=("a",),
+            inbound_base=3600,
+            dests=8,
+            sink_host="127.0.0.1",
+            sink_port=3700,
+            sink_ports=1,
+            transform="edit",
+            persistent=False,
+            lanes_per_shard=1,
+            handlers=8,
+            delivering=delivering,
+            routing=routing,
+        )
+
+    part, fan = shape(PARTITIONED, 8), shape(PARTITIONED_FANOUT, 3)
+    for seq in range(64):
+        msg = Message.parse(
+            f"MSH|^~\\&|A|B|C|D|20260101000000||ADT^A01|{SHARDCERT_IDS.format(seq)}|P|2.5.1\r"
+        )
+        assert [part.destination_index(msg)] == destinations_for_seq(
+            seq, routing=PARTITIONED, dests=8, fanout=1
+        )
+        assert fan.destination_indices(msg) == destinations_for_seq(
+            seq, routing=PARTITIONED_FANOUT, dests=8, fanout=3
+        )
 
 
 def test_driver_verdict_refuses_a_run_that_lost_an_acked_copy() -> None:
@@ -898,6 +977,20 @@ def test_shardcert_drive_cli_threads_cacert(
     )
     assert rc == 0
     assert captured["cacert"] == "engine-box.pem"
+
+
+def test_shardcert_drive_cli_exits_2_on_a_sign_in_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no ENGINE_DRAINED gate the poll is the tally's barrier, so a refusal is a setup error."""
+
+    async def refusing_drive(**kwargs: Any) -> Any:
+        raise sc.RemoteEngineSignInError("could not sign in to the engine box's API: refused")
+
+    monkeypatch.setattr("harness.load.shardcert.run_shardcert_drive", refusing_drive)
+    rc = hmain.main(["shardcert-drive", "--engine-host", "10.0.0.5", "--coord-dir", str(tmp_path)])
+    assert rc == 2
+    assert "could not sign in to the engine box's API" in capsys.readouterr().err
 
 
 def test_shardcert_driver_cli_report_json_banks_the_count_balance(

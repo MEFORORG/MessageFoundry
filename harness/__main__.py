@@ -1812,9 +1812,9 @@ def _run_shardcert_drive(argv: list[str]) -> int:
         action="store_true",
         help="allow the engine /stats poller plaintext http to a REMOTE engine box that GENUINELY "
         "serves plaintext http. Without it the poll is https, loopback included, signed in with the "
-        "engine box's rig credential; a refused sign-in is a note, since this drive's verdict never "
-        "reads the poller. It does not make a TLS-serving engine answer http, and it carries no "
-        "credential",
+        "engine box's rig credential, and a refused sign-in exits 2 before any child is spawned, "
+        "because the poll's drain wait is the barrier before the sinks tally. It does not make a "
+        "TLS-serving engine answer http, and it carries no credential",
     )
     _add_two_box_cacert_arg(parser)
     _add_coord_args(parser)
@@ -1823,7 +1823,7 @@ def _run_shardcert_drive(argv: list[str]) -> int:
     _reject_cacert_with_insecure(parser, args)
 
     from harness.load.coord import CoordTimeout, FileDropCoord
-    from harness.load.shardcert import run_shardcert_drive
+    from harness.load.shardcert import RemoteEngineSignInError, run_shardcert_drive
     from messagefoundry.apiclient import ApiError
 
     coord = _coord_from_args(args)
@@ -1846,6 +1846,9 @@ def _run_shardcert_drive(argv: list[str]) -> int:
         ValueError
     ) as exc:  # a mis-sized fleet (partition/slice can't tile) — fail loud, setup error
         print(f"shardcert-drive: {exc}", file=sys.stderr)
+        return 2
+    except RemoteEngineSignInError as exc:  # no drain barrier without the poller: a setup error
+        print(f"shardcert-drive: {_exc_text(exc)}\n{_SIGN_IN_HINT}", file=sys.stderr)
         return 2
     except (
         ApiError

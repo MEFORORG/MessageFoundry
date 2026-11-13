@@ -1099,14 +1099,16 @@ async def test_coordinator_threads_allow_insecure_to_remote_poller(
         assert seen == [want], f"poller allow_insecure should be {want}, got {seen}"
 
 
-async def test_coordinator_signs_in_over_https_and_runs_on_when_refused(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("gated", [False, True])
+async def test_coordinator_signs_in_over_https_and_a_refusal_needs_a_barrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gated: bool
 ) -> None:
     """BACKLOG #5640 / #5977: the drive polls the engine box over https with the remote rig
-    session and ``cacert``. Its verdict never reads that poller, so a refused sign-in is a note
-    and the run goes on to its sink-truth verdict instead of aborting.
+    session and ``cacert``. The poll's drain wait is the barrier before the sinks tally. So without
+    the ENGINE_DRAINED gate a refused sign-in is a setup error, raised before any child is spawned.
+    With the gate armed, the poll is advisory: the refusal is a note and the run goes on.
 
-    Mutation: let the refusal propagate. Red: the drive raises instead of reporting."""
+    Mutation: note the refusal on the ungated path. Red: the drive spawns and reports."""
     import types
 
     from harness.load.rigadmin import REMOTE_RIG_SESSION, RigSignInRefused
@@ -1142,7 +1144,7 @@ async def test_coordinator_signs_in_over_https_and_runs_on_when_refused(
             return None
 
     monkeypatch.setattr(sc, "EnginePoller", RefusingPoller)
-    coord = FileDropCoord(tmp_path, run_id="tlsdrive")
+    coord = FileDropCoord(tmp_path, run_id=f"tlsdrive{gated}")
     coord.post(
         SHARDS_READY,
         {
@@ -1159,15 +1161,23 @@ async def test_coordinator_signs_in_over_https_and_runs_on_when_refused(
             "sink_port": 3700,
         },
     )
+    kwargs: dict[str, Any] = {
+        "engine_host": "10.0.0.5",
+        "aggregate_rate": 20.0,
+        "hold_seconds": 1.0,
+        "driver_count": 1,
+        "sink_count": 1,
+        "sink_host": "10.0.0.9",
+        "coord": coord,
+        "cacert": "engine-box.pem",
+    }
+    if not gated:
+        with pytest.raises(sc.RemoteEngineSignInError, match="refused"):
+            await sc.run_shardcert_drive(**kwargs)
+        assert spawned == [], "a child was spawned with no drain barrier"
+        return
     report = await sc.run_shardcert_drive(
-        engine_host="10.0.0.5",
-        aggregate_rate=20.0,
-        hold_seconds=1.0,
-        driver_count=1,
-        sink_count=1,
-        sink_host="10.0.0.9",
-        coord=coord,
-        cacert="engine-box.pem",
+        **kwargs, await_engine_drained=True, engine_drained_timeout=0.2
     )
     assert built == [
         {
