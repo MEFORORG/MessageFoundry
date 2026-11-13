@@ -414,6 +414,42 @@ async def test_a_stale_settle_decision_runs_the_row_under_the_restored_graph(
     assert await _routed_status(store, item.message_id) is None, "the routed row was not handed off"
 
 
+@pytest.mark.parametrize("stale", ["inbound_gone", "missing_handler"])
+async def test_a_partial_restore_settles_the_row_by_the_live_graph(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, stale: str
+) -> None:
+    # A reload between the concurrent path's prepare and its apply can restore only one of the two.
+    # Apply settles by the graph live now, never by the stale prep. The inbound back without its
+    # handler dead-letters the row as a missing handler (replayable) and the lane keeps running, as
+    # main's CONTINUE policy did when the live inbound lookup raised in this race; the stale
+    # inbound_gone would have reverted the row and stopped a lane no later reload re-arms. The
+    # converse, a stale missing_handler whose inbound a reload has since dropped, reverts the row
+    # with its feed, inbound first, as on entry to prepare.
+    calls: list[str] = []
+    runner = RegistryRunner(
+        _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    item = await _routed_item(store)
+    if stale == "inbound_gone":
+        prep = _RoutedPrep(inbound_gone=True)
+        runner.registry = _swapped_graph("handler")  # the inbound came back, the handler did not
+    else:
+        prep = _RoutedPrep(missing_handler=True)
+        runner.registry = _swapped_graph("inbound")  # the whole feed is gone now
+
+    outcome = await runner._apply_routed(LOOP, item, prep)
+
+    assert calls == []
+    status = await _routed_status(store, item.message_id)
+    if stale == "inbound_gone":
+        assert outcome == (_ItemOutcome.PROCESSED, None), "a live inbound's lane was stopped"
+        assert status == OutboxStatus.DEAD.value
+        assert "is missing; dead-lettering" in caplog.text
+    else:
+        assert outcome == (_ItemOutcome.STOPPED, None)
+        assert status == OutboxStatus.PENDING.value, "a reload alone dead-lettered an ACKed row"
+
+
 async def test_a_reload_during_an_unreadable_read_reverts_rather_than_dead_letters(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

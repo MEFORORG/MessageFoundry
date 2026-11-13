@@ -12130,8 +12130,9 @@ class RegistryRunner:
         :meth:`_process_routed_item` exactly: a loopback metadata cell that failed its tag →
         dead-letter and audit (``PROCESSED``); an unreadable loopback correlation → dead-letter
         (``PROCESSED``); inbound gone → revert retry-forever (``STOPPED``); handler-missing →
-        dead-letter (``PROCESSED``), each of those two re-prepared instead when the live graph has
-        the inbound and handler again; handler raise → internal-error policy (``STOP``/``CONTINUE``);
+        dead-letter (``PROCESSED``), each of those two decided by the live graph at apply rather
+        than by the prep, and re-prepared when the live graph has the inbound and handler again;
+        handler raise → internal-error policy (``STOP``/``CONTINUE``);
         else ``transform_handoff`` + lane wakes (``PROCESSED``). Returns ``(outcome, None)`` — the
         routed path never re-pends-with-backoff."""
         if prep.tag_failure is not None:
@@ -12146,15 +12147,19 @@ class RegistryRunner:
             )
             await self.store.dead_letter_now(item.id, str(prep.unreadable))
             return _ItemOutcome.PROCESSED, None
-        if (prep.inbound_gone or prep.missing_handler) and self._dropped_by_reload(
-            name, item
-        ) is None:
-            # BACKLOG #5708: a STALE decision. The concurrent batch path decides this in prepare and
-            # applies it only after earlier siblings' handoffs await, so a reload can have put the
-            # inbound or handler back since. Settling it anyway would STOP a lane the restoring
-            # reload found alive and so never re-armed, or dead-letter a row whose handler is
-            # deployed. Nothing has run, so prepare it again under the graph that is live now.
-            return await self._apply_routed(name, item, await self._prepare_routed(name, item))
+        if prep.inbound_gone or prep.missing_handler:
+            # BACKLOG #5708: a possibly STALE decision. The concurrent batch path decides this in
+            # prepare and applies it only after earlier siblings' handoffs await, so a reload can
+            # have changed the graph since. Settle by the graph that is live NOW, never the prep:
+            # a stale inbound_gone would STOP a lane the restoring reload found alive and so never
+            # re-armed, even when only the handler is still missing, and a stale missing_handler
+            # would dead-letter a row whose handler is deployed again, or whose whole feed a later
+            # reload dropped (that row reverts with its feed, inbound first).
+            live = self._dropped_by_reload(name, item)
+            if live is None:
+                # Both are back. Nothing has run, so prepare it again under the live graph.
+                return await self._apply_routed(name, item, await self._prepare_routed(name, item))
+            prep = live
         if prep.inbound_gone:
             # Inbound removed; nothing to transform with until a reload restores it (which
             # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
