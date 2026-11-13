@@ -16,6 +16,7 @@ import pytest
 
 from messagefoundry.parsing import encode_batch, split_batch
 from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.peek import normalize
 
 M1 = "MSH|^~\\&|A|B|C|D|20260101010101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JOHN\r"
 M2 = "MSH|^~\\&|A|B|C|D|20260101010102||ADT^A02|MSG2|P|2.5.1\rPID|1||200||ROE^JANE\r"
@@ -102,6 +103,9 @@ def test_the_head_member_is_not_parsed(monkeypatch: pytest.MonkeyPatch, head: st
     monkeypatch.setattr(Message, "parse", staticmethod(_no_parse))
     env = encode_batch([head, M2], control_id="1", timestamp=_TS)
     assert env.startswith("BHS|^~\\&|")
+    # Negative control: the patch sees a parse when one happens. An envelope-led head is parsed.
+    with pytest.raises(AssertionError, match="parsed a member"):
+        encode_batch(["BHS|^~\\&\r" + head, M2], control_id="1", timestamp=_TS)
 
 
 def test_members_are_not_copied_before_the_join() -> None:
@@ -112,17 +116,16 @@ def test_members_are_not_copied_before_the_join() -> None:
         f"MSH|^~\\&|A|B|C|D|{_TS}||ORU^R01|M{i}|P|2.5.1\r{body}" for i in range(3)
     ]
     total = sum(len(m) for m in members if isinstance(m, str))
-    started_here = not tracemalloc.is_tracing()
-    if started_here:
-        tracemalloc.start()
-    tracemalloc.reset_peak()
-    before, _ = tracemalloc.get_traced_memory()
+    if tracemalloc.is_tracing():
+        # That trace's peak is not this test's, so it is neither reset nor read as this call's.
+        pytest.skip("another tracemalloc trace is running; this test measures with its own")
+    tracemalloc.start()
     try:
+        before, _ = tracemalloc.get_traced_memory()
         env = encode_batch(members, control_id="1", timestamp=_TS)
         _, peak = tracemalloc.get_traced_memory()
     finally:
-        if started_here:
-            tracemalloc.stop()
+        tracemalloc.stop()
     assert len(env) > total  # positive control: the envelope holds every member
     # An ASCII str costs about one byte per character; one envelope is about `total` bytes.
     assert peak - before < 1.5 * total, peak - before
@@ -174,28 +177,57 @@ def test_the_head_separators_match_the_parser(head: str) -> None:
     assert _batch_reading(head) == _parser_reading(head)
 
 
-@pytest.mark.parametrize(
-    "head",
-    [
-        "MSH|^~\\&|A\rMSH",  # a later header line too short to read
-        "MSH|^~\\&|A\rOBX|1|TX|||" + "\\.in9999999\\" * 20 + "\r",  # over the escape budget
-    ],
-)
-def test_what_a_parse_checks_past_the_header_is_not_checked(head: str) -> None:
-    # Where the reading parts from a parse, by design: finding these takes the whole-body scan
-    # BACKLOG #5919 removed. The head's own separators are read, not guessed, and nothing in the
-    # batch unescapes the head. On the delivery path the caller's parse of the head's stored
-    # payload for MSH-10 still refuses such a head before this runs.
+#: A head whose escapes could expand past the parser's budget (ASVS 1.3.3).
+_OVER_BUDGET = "MSH|^~\\&|A\rOBX|1|TX|||" + "\\.in9999999\\" * 20 + "\r"
+
+
+@pytest.mark.parametrize("head", [_OVER_BUDGET, " \n" + _OVER_BUDGET.replace("\r", "\n")])
+def test_a_head_over_the_escape_budget_is_refused_as_a_parse_refuses_it(head: str) -> None:
+    # The budget is checked on the text encode_batch frames. On the delivery path that is the
+    # hydrated head, which the caller's parse of the stored payload never saw, so a header-only
+    # read would frame and send a head a parse refuses.
+    refusal = _parser_reading(head)
+    assert refusal[0] == "HL7PeekError"  # positive control: a parse refuses it
+    assert _batch_reading(head) == refusal
+
+
+def test_a_later_header_line_too_short_to_read_is_not_checked() -> None:
+    # Where the reading parts from a parse, by design: finding one takes the whole-body split
+    # BACKLOG #5919 removed, and the head's own separators are still read, not guessed.
+    head = "MSH|^~\\&|A\rMSH"
     assert _parser_reading(head)[0] == "HL7PeekError"  # positive control: a parse refuses it
     assert _batch_reading(head) == ("|", "^", "~", "\\", "&")
+    # The random heads below skip this shape, and only it.
+    assert _has_a_short_later_header(head) and _has_a_short_later_header(head + " \n")
+    assert not _has_a_short_later_header(head + "X") and not _has_a_short_later_header(head[:-4])
+
+
+def _has_a_short_later_header(head: str) -> bool:
+    """Whether a line after the first is a header too short to read: the one shape whose reading
+    parts from a parse by design, pinned by the test above."""
+    lines = normalize(head).strip().split("\r")
+    return any(line[:3] in ("MSH", "BHS", "FHS") and len(line) < 4 for line in lines[1:])
+
+
+def _random_head(rng: random.Random) -> str:
+    """A short head: optional leading whitespace, a lead that is usually ``MSH``, then noise."""
+    lead_ws = "".join(rng.choice(" \t\r\n") for _ in range(rng.choice((0, 0, 0, 1, 3))))
+    lead = rng.choice(("MSH", "MSH", "MSH", "MSH", "BHS", "FHS", "PID", "MS", ""))
+    alphabet = "MSH|^~\\&# \t\r\nA"
+    return lead_ws + lead + "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 12)))
 
 
 def test_the_head_separators_match_the_parser_over_random_heads() -> None:
     rng = random.Random(5919)
-    alphabet = "MSH|^~\\&# \t\r\nA"
-    for _ in range(5000):
-        head = "MSH" + "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 12)))
-        assert _batch_reading(head) == _parser_reading(head), repr(head)
+    heads = [_random_head(rng) for _ in range(5000)]
+    readings = {h: _parser_reading(h) for h in heads}
+    for head in heads:
+        if not _has_a_short_later_header(head):
+            assert _batch_reading(head) == readings[head], repr(head)
+    # Positive control for the generator: separators read after leading whitespace, and a
+    # non-MSH lead.
+    assert any(h[:1].isspace() and len(readings[h]) == 5 for h in heads)
+    assert any(not h.lstrip().startswith("MSH") for h in heads)
 
 
 @pytest.mark.parametrize(

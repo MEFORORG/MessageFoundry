@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 from messagefoundry.parsing._builtin_hl7 import _extract_separators, _first_line_head
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import normalize, starts_with_msh
+from messagefoundry.parsing.peek import enforce_expansion_budget, normalize, starts_with_msh
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
 __all__ = [
@@ -320,15 +320,17 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     For a head that opens with ``MSH`` after whitespace, with MSH-1 and four encoding characters,
     they are read from that line's first few characters alone, through the parser's own window
     (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read (BACKLOG
-    #5919): a full parse of a large hydrated head to read eight characters cost its whole size in
-    time and memory. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte order
-    mark, a non-HL7 one or one whose MSH-2 is short, is parsed as before, so it frames or raises
-    exactly as it did, ``ValueError`` and its message included.
+    #5919): a full parse of a large hydrated head to read eight characters split every segment of
+    it. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte order mark, a
+    non-HL7 one or one whose MSH-2 is short, is parsed as before, so it frames or raises exactly as
+    it did, ``ValueError`` and its message included.
 
-    The read is of the header alone, so what a parse checks in the rest of the head is not
-    checked here: at least a later header line too short to read, and the escape expansion
-    budget. Nothing in the batch path unescapes the head, and the delivery path's caller parses
-    the head's stored payload for MSH-10 before this runs."""
+    Such a head is still checked against the parser's own escape expansion budget
+    (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`, ASVS 1.3.3), on ``norm``
+    itself: the text encode_batch frames, which on the delivery path is the HYDRATED head, so a
+    head a parse refuses for its escapes raises the same ``HL7PeekError`` here. What else a parse
+    checks in the rest of the head is not checked: at least a later header line too short to
+    read."""
     line = _first_line_head(norm)
     # _extract_separators fills a short MSH-2 with defaults, where _encoding_chars refuses one, so
     # the line must hold MSH-1 and four encoding characters with no field separator among them. A
@@ -339,6 +341,8 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
         or line.find(line[3], 4, _SEPARATORS_WIDTH) != -1
     ):
         return Message.parse(norm)._encoding_chars()
+    # The parse runs the budget first, so this does too; the parse above runs it for itself.
+    enforce_expansion_budget(norm)
     field_sep, comp_sep, rep_sep, sub_sep, esc = _extract_separators(line)
     return field_sep, comp_sep, rep_sep, esc, sub_sep
 
