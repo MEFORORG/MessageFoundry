@@ -10345,33 +10345,23 @@ class AuthService:
             # cost the pass what the refused row below says it costs, so it logs and goes on, and
             # the answer is reported as an admin read reports the same answer for a record: the
             # seal-failure report, which pages ``integrity_drift``, the store's Unverifiable page,
-            # or its Outage page. A Forged record is not reached again until it is repaired: the
-            # pass's account load (``_load_users``) leaves out a record that fails its seal. For
-            # the other two, a later pass that probes the account once Vault transit verifies the
-            # record again tries the rename again.
+            # or its Outage page. Which accounts a later pass reads is ``_load_users``'s.
             if not audit_soft:
                 raise
             if isinstance(exc, RowSealError):
                 what = "its record failed its integrity check"
-                then = "the account is not reached again until its record is repaired"
             elif isinstance(exc, RowSealUnverifiableError):
                 what = "Vault transit could not verify its record's integrity seal"
-                then = (
-                    "a later pass that probes the account once Vault transit verifies it tries "
-                    "again"
-                )
             else:
                 what = "Vault transit did not answer for its record's integrity seal"
-                then = "a later pass that probes the account once Vault transit answers tries again"
             _log.error(
                 "directory reconcile: account %s (%s, renaming to %s): %s at the rename's write, "
-                "so nothing was written and nobody was told; the pass goes on, and %s (vault "
-                "BACKLOG #3069)",
+                "so the rename was not applied; the pass goes on, and the seal answer is reported "
+                "through its seal path (vault BACKLOG #3069)",
                 user_id,
                 scrub_log_argument(before.username),
                 scrub_log_argument(new_username),
                 what,
-                then,
                 exc_info=exc,
             )
             if isinstance(exc, RowSealError):
