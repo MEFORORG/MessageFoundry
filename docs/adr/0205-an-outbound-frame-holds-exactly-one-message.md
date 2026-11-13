@@ -196,11 +196,15 @@ separators raw).
   `tests/test_one_frame_one_message.py::test_P2_a_hex_escaped_nul_does_not_re_enter_raw`,
   `tests/test_one_frame_one_message.py::test_P10_mllp_in_edit_mllp_out_is_one_frame`
   *(Note 2026-11-13, vault BACKLOG #5928: `convert_case` keeps an escape as sent, so it does not
-  hand the leaf escaper a control decoded from one. Each probe still edits with it first and
-  checks that the escape is kept, by its wire form or by one frame. Each probe then writes the decoded value back as data twice: with
-  `copy_field` from the escaped component into another one, and with a component `msg.set` of the
-  decoded read onto the component that arrived with the escape. The second write does not depend
-  on how any action is built. With escaping of controls removed from `escape_leaf`, all three
+  hand the leaf escaper a control decoded from one. Each probe still edits with it first. The two
+  P2 probes then check that the escape is kept, by its wire form. P10 checks only that the edited
+  message frames as one frame, which does not show that the escape was kept. Each probe then writes
+  the decoded value back as data twice, through `_write_back_decoded`: first with `copy_field` from
+  the escaped component into another one, then with a component `msg.set` of the decoded read onto
+  the component that arrived with the escape. The `msg.set` write does not depend on how
+  `copy_field` builds its value, but it runs only after `copy_field` returns: if `copy_field`
+  raises, the `msg.set` write and every later check in the probe do not run, and the probe fails
+  on that exception. With escaping of controls removed from `escape_leaf`, all three
   probes fail, measured on 2026-11-13; their new bodies were not re-measured against `ed2b60bf89`.
   The criterion is unchanged.)*
 - **AC-6** -- WHEN a leaf write holds a C0 character or DEL other than TAB, THE SYSTEM SHALL write it
@@ -211,9 +215,10 @@ separators raw).
   *(Note 2026-11-13, vault BACKLOG #5928: `convert_case` now edits the wire text and keeps a
   `\X0D\` escape as sent, so it no longer raises on one. The second test above now asserts that
   the edit keeps the escape and writes no raw CR, and that a decoded CR written as data is still
-  refused with the message unchanged: by `msg.set` on a component, given a literal CR and given
-  the decoded read of the component's own `\X0D\`, by `copy_field` from a
-  component whose `\X0D\` decodes to a CR, and by `replace_literal` when a match would write a
+  refused with the message unchanged: by `msg.set` on a component, once with a value that holds a
+  CR typed into it and once with the value a read of the component returns, whose CR is decoded
+  from the component's own `\X0D\`; by `copy_field` from a
+  component whose `\X0D\` decodes to a CR; and by `replace_literal` when a match would write a
   `new` holding it. A `replace_literal` that matches nothing writes nothing and
   does not check `new`. The criterion is unchanged.)*
 - **AC-7** -- IF a whole-field write, `add_repetition` or `add_segment` holds `0x0B`, `0x1C` or NUL,

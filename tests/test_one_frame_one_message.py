@@ -3,9 +3,11 @@
 """One outbound frame holds exactly one message (ADR 0205, vault BACKLOG #2557).
 
 Each section pins one rule of the ADR, and the tests marked as an audit probe reproduce that probe
-from the injection audit. Every such test fails on the code before ADR 0205: the payload was framed
-without a look inside it, a leaf write emitted a decoded hex escape raw, and ingress took an HL7 v2
-body with an embedded MLLP start byte. Synthetic data only.
+from the injection audit. Such tests, the controls aside, were measured failing on the code before
+ADR 0205: the payload was framed without a look inside it, a leaf write emitted a decoded hex escape
+raw, and ingress took an HL7 v2 body with an embedded MLLP start byte. The three AC-5 probes were
+rewritten after that measurement and their new bodies were not run against that code; what was
+measured for them instead is in ADR 0205's AC-5 note of 2026-11-13. Synthetic data only.
 
 Control bytes are written as escapes, never literally, so a byte grep of this file finds none.
 """
@@ -272,7 +274,8 @@ def test_P10_mllp_in_edit_mllp_out_is_one_frame() -> None:
     actions.convert_case(msg, "PID-18.1", "upper")
     assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(msg.encode()))) == 1
     _write_back_decoded(msg, "PID-18.1", "PID-19.1")
-    # The frame oracle runs before any check of the copy, so a defect in copy_field cannot hide it.
+    # The first frame check above ran before copy_field. If copy_field raises, the msg.set write and
+    # this second frame check do not run, and the test fails on that exception instead.
     assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(msg.encode()))) == 1
     assert msg.field("PID-18.1") == msg.field("PID-19.1") == "LAST" + EB + SB
 
