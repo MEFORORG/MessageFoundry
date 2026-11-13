@@ -251,3 +251,41 @@ def test_a_printed_git_worktree_remove_after_a_real_one_is_not_judged(
             f"echo git worktree remove {rig.wt2.as_posix()}"
         )
         assert _allowed(rig, cmd, rig.tmp), sep
+
+
+# ------------------------------------------------------------------ review round e48b0ecc
+
+
+@pytest.mark.parametrize(
+    ("leaf", "quote"),
+    [("a (1)/wt3", '"'), ("x(y)/wt9", "'"), ("R&D/wt3", '"'), ("x{y}/wt3", '"')],
+)
+def test_a_quoted_victim_holding_a_closer_character_is_still_judged(
+    rig: SimpleNamespace, leaf: str, quote: str
+) -> None:
+    """DENY on origin/main; the closer split cut the quoted path short in the first reading too."""
+    victim = rig.tmp / leaf
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(rig.primary),
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            f"b-{abs(hash(leaf))}",
+            str(victim),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    cmd = f"git worktree remove {quote}{victim.as_posix()}{quote}"
+    assert "worktree remove" in _reason(rig, cmd, rig.tmp)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the case-insensitive match is Windows-only")
+def test_a_printed_upper_case_git_is_not_judged_on_windows(rig: SimpleNamespace) -> None:
+    """ALLOW on origin/main; the case-insensitive token test caught a word `echo` prints."""
+    assert _allowed(rig, f"echo Git worktree remove {rig.wt2.as_posix()}", rig.tmp)

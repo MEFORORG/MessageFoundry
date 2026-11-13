@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.13.10"
+$GateVersion = "2026.11.13.11"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -3972,7 +3972,11 @@ What to do instead:
     $wtTargets = foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         # CASE-INSENSITIVE ON WINDOWS (review of BACKLOG #5643): there `Git` and `GIT` run git.exe, and
         # a case-sensitive test let `Git worktree remove <governed>` through. Elsewhere it stays exact.
-        if ($(if ($IsWindows) { $seg.Scan -notmatch $gitInvocation } else { $seg.Scan -cnotmatch $gitInvocation })) { continue }
+        # Only a `Git` that STARTS A COMMAND counts that way (review round e48b0ecc): `echo Git worktree
+        # remove <wt>` prints, and the first reading would otherwise refuse it for what it names.
+        $wtGitHere = ($seg.Scan -cmatch $gitInvocation) -or ($IsWindows -and
+            $seg.Scan -match '(?:^|[;&|(){}`])\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:\S*[\\/])?git(?:\.exe)?["'']?(?:\s|$)')
+        if (-not $wtGitHere) { continue }
         if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
         $wtVerb = $Matches['wtverb']
 
@@ -3996,8 +4000,11 @@ What to do instead:
         # pattern outright. Validated against the flag, both quote styles, an embedded space, an
         # unterminated quote and empty input before it was written here.
         $after = ($seg.Raw -replace ('(?s)^.*?\bworktree\s+' + $wtVerb + '\b'), '')
-        $after = ($after -split $wtVictimSplit, 2)[0]
+        # ORIGIN/MAIN'S SPLIT, ON PURPOSE (review round e48b0ecc). The closer split below is not
+        # quote-aware, and here it cut `"<tmp>/a (1)/wt3"` short and lost the deny this reading made.
+        $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
         $oldPfx = ($seg.Raw -split ('(?s)\bworktree\s+' + $wtVerb + '\b'), 2)[0]
+        $oldVictims = @(Get-WorktreeVictimTokens $after)
 
         # EVERY INVOCATION ON THE LINE, NOT THE FIRST RAW MATCH (BACKLOG #5643). The reading above slices
         # the RAW line at its FIRST `worktree remove|move`, so a quoted mention before the real command
@@ -4050,9 +4057,15 @@ What to do instead:
                     DashCText  = $inv.CmdWin
                 }
                 $rawEnd = $map[$sm.Index + $sm.Length]
-                if ($rawEnd -eq $oldEnd) { $oldWindow = $win; continue }
+                # THE SAME MATCH AS THE FIRST READING: hand it the window, and add only a victim that the
+                # closer split reads differently (`<wt>}` there, `<wt>` here), so a glued closer on the
+                # only invocation is still judged without repeating the first reading's own victims.
+                $sameAsOld = ($rawEnd -eq $oldEnd)
+                if ($sameAsOld) { $oldWindow = $win }
                 $a2 = ($seg.Raw.Substring($rawEnd) -split $wtVictimSplit, 2)[0]
                 foreach ($v in @(Get-WorktreeVictimTokens $a2)) {
+                    if ($sameAsOld -and @($oldVictims | Where-Object {
+                                [string]::Equals($_, $v, [System.StringComparison]::Ordinal) }).Count -gt 0) { continue }
                     $added += [pscustomobject]@{
                         Seg = $seg; WtVerb = $sm.Groups['wtverb'].Value; VictimRaw = $v
                         PrefixForVars = $seg.Raw.Substring(0, $map[$sm.Index]); Window = $win
@@ -4060,7 +4073,7 @@ What to do instead:
                 }
             }
         }
-        foreach ($victimRaw in @(Get-WorktreeVictimTokens $after)) {
+        foreach ($victimRaw in $oldVictims) {
             [pscustomobject]@{
                 Seg = $seg; WtVerb = $wtVerb; VictimRaw = $victimRaw
                 PrefixForVars = $oldPfx; Window = $oldWindow
@@ -4140,8 +4153,11 @@ What to do instead:
         #   * NOT FOLLOWED BY EITHER BASE, at least: a chdir on an EARLIER LINE of the command, a
         #     `Set-Location -Path <dir>` (read as the directory `-Path <dir>`), and a Set-Location inside
         #     a PowerShell `& { }` block, which does move the session but reads as a subshell here.
-        #   * A VICTIM GLUED TO A CLOSER -- FIXED 2026-11-13 (review round cfbde907): `<wt>}`, `<wt>)`
-        #     and `<wt>&` now end at the closer. Still not quote-aware.
+        #   * A VICTIM GLUED TO A CLOSER -- NARROWED 2026-11-13 (review round cfbde907), NOT FIXED. In the
+        #     ADDED reading `<wt>}`, `<wt>)` and `<wt>&` end at the closer; the first reading keeps
+        #     origin/main's split, because the closer split is not quote-aware, and the added reading
+        #     adds the closer-split victim beside it. Still open, at least: a victim glued to a closing
+        #     BACKTICK (`` x=`git worktree remove <wt>` ``).
         #   * A `cd` WHOSE TARGET LEAF IS LITERALLY `git`. The `$at` git-token regex below matches
         #     inside that PATH, so $pfx is truncated and the prefix is misread. A `~/git` or
         #     `C:\git` directory is ordinary on a developer's box, so this is the most reachable of
@@ -4154,9 +4170,11 @@ What to do instead:
         #     where this note said it belonged. The three bail-outs (`popd`, `cd -`, a subshell
         #     prefix) now guard both branches, so the FAILED-`cd` and SUBSHELL entries above are
         #     unchanged by it.
-        #   * THE PRE-SPLITTER ONE LINE ABOVE, `-split '(?:&&|\|\||;|\|)'`, is NOT quote-aware. A
-        #     quoted victim path containing `;` or `&&` is truncated before the quote-aware scan ever
-        #     runs, so the awareness gained above does not extend to that character class.
+        #   * THE PRE-SPLITTERS ARE NOT QUOTE-AWARE. The first reading splits with
+        #     `(?:&&|\|\||;|\|)`, so a quoted victim path containing `;` or `&&` is truncated before the
+        #     quote-aware scan runs. The added reading splits with $wtVictimSplit, defined above the
+        #     segment loop, which also cuts at a `}`, `)` or lone `&`, so there a quoted path holding
+        #     one of those is truncated too, and only the first reading judges it.
         #
         # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
         # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.
