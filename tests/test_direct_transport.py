@@ -1843,16 +1843,26 @@ async def _warns_then_refuses_every_send(
     **overrides: Any,
 ) -> None:
     """Construction WARNS on the validity window and builds (a refusal there would fail the lane's
-    build at start); the send then refuses before building or dialling."""
+    build at start); the send then refuses before building or dialling. Expired is a permanent
+    configuration fault whose code names the setting and bound; not yet valid is a retried
+    transient failure, so the lane is not held once notBefore passes."""
     _install_fake(monkeypatch)
     with caplog.at_level("WARNING", logger="messagefoundry.transports.direct"):
         d = DirectDestination(_dest(pki, **overrides))
     [warning] = [r.getMessage() for r in caplog.records if expected in r.getMessage()]
     assert "@" not in warning and "Test Direct CA" not in warning
-    with pytest.raises(NegativeAckError) as caught:
+    expired = "has expired" in expected
+    assert ("dead_letter" in warning) is expired and ("retried" in warning) is not expired
+    with pytest.raises(DeliveryError) as caught:
         await d.send(_SYNTHETIC_HL7)
-    assert caught.value.code == "direct-cert-validity" and caught.value.config_fault is True
     assert expected in str(caught.value)
+    if expired:
+        assert isinstance(caught.value, NegativeAckError)
+        assert caught.value.permanent is True and caught.value.config_fault is True
+        setting = expected.split("'")[1]
+        assert caught.value.code == f"direct-cert-validity:{setting}:expired"
+    else:
+        assert not isinstance(caught.value, NegativeAckError)  # the transient, retried class
     assert _FakeSMTP.instances == []
 
 
@@ -2150,7 +2160,7 @@ async def test_a_cert_that_expires_after_construction_holds_the_queue_at_send(
         await d.send(_SYNTHETIC_HL7)
     exc = caught.value
     assert exc.permanent is True and exc.config_fault is True
-    assert exc.code == "direct-cert-validity"
+    assert exc.code == f"direct-cert-validity:{setting}:expired"
     assert f"'{setting}' has expired" in str(exc)
     assert builds == [] and _FakeSMTP.instances == []
 
@@ -2189,11 +2199,18 @@ async def _assert_stopped_and_kept(store: Any, outcome: Any, item: Any, sink: An
     # Kept: pending, the claim's attempt given back, no error. Never dead-lettered.
     assert (status, attempts, last_error) == (OutboxStatus.PENDING.value, 0, None)
     assert [name for name, _ in sink.stopped] == [DEST]
-    assert "configuration fault" in sink.stopped[0][1]
+    # The alert says which certificate and which bound failed, and nothing of the cert itself.
+    detail = sink.stopped[0][1]
+    assert "configuration fault (direct-cert-validity:recipient_cert:expired)" in detail
+    assert "@" not in detail
 
 
 async def test_the_worker_stops_the_lane_and_keeps_the_queue_on_an_expiry_at_send(
-    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path, store: Any
+    monkeypatch: pytest.MonkeyPatch,
+    pki: dict[str, Any],
+    tmp_path: Path,
+    store: Any,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     # BACKLOG #5631, end to end through the delivery worker step: the cert expires after
     # construction, and the default credential_fault_policy stops the lane and keeps the row.
@@ -2204,8 +2221,72 @@ async def test_the_worker_stops_the_lane_and_keeps_the_queue_on_an_expiry_at_sen
     d = DirectDestination(_dest(pki, recipient_cert=path))
     later = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=60)
     monkeypatch.setattr(direct, "_utcnow", lambda: later)
-    await _assert_stopped_and_kept(store, *await _deliver_one_through_the_worker(store, d))
+    with caplog.at_level("ERROR", logger="messagefoundry.pipeline.wiring_runner"):
+        await _assert_stopped_and_kept(store, *await _deliver_one_through_the_worker(store, d))
+    # The worker's lane-stop line carries the same code, so the log says which cert failed too.
+    assert any(
+        "direct-cert-validity:recipient_cert:expired" in r.getMessage() for r in caplog.records
+    )
     assert _FakeSMTP.instances == []
+
+
+async def test_a_not_yet_valid_cert_retries_through_the_worker_and_does_not_hold_the_lane(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path, store: Any
+) -> None:
+    """A cert installed before its notBefore: the send is the transient class, so the worker
+    re-pends the row with a retry deadline and does not stop the lane. Once notBefore passes,
+    the next attempt delivers with no operator step."""
+    from messagefoundry.pipeline.wiring_runner import _ItemOutcome
+    from messagefoundry.store.store import OutboxStatus
+    from messagefoundry.transports import direct
+    from tests.test_credential_fault_stop import _row_state
+
+    _install_fake(monkeypatch)
+    path = _recipient(
+        pki,
+        tmp_path,
+        "early",
+        valid_from=datetime.timedelta(minutes=10),
+        valid_to=datetime.timedelta(days=30),
+    )
+    d = DirectDestination(_dest(pki, recipient_cert=path))
+    outcome, item, sink = await _deliver_one_through_the_worker(store, d)
+    assert outcome[0] is _ItemOutcome.PROCESSED and outcome[1] is not None  # re-pended, retried
+    status, _attempts, last_error = await _row_state(store, item.message_id)
+    assert status == OutboxStatus.PENDING.value
+    assert last_error is not None and "'recipient_cert' is not yet valid" in last_error
+    assert sink.stopped == [] and _FakeSMTP.instances == []
+    # notBefore passes: the same connector now delivers.
+    later = datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1)
+    monkeypatch.setattr(direct, "_utcnow", lambda: later)
+    await d.send(_SYNTHETIC_HL7)
+    assert len(_FakeSMTP.instances) == 1
+
+
+def test_the_construction_warning_is_not_logged_for_a_connector_that_is_then_refused(
+    pki: dict[str, Any], tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An expired cert that ALSO names another mailbox: construction refuses on the binding, and
+    # must not first have logged that sends will be refused for a connector that never existed.
+    path = _recipient(
+        pki,
+        tmp_path,
+        "expired_other",
+        addresses=("other@hisp.example",),
+        valid_from=datetime.timedelta(days=-30),
+        valid_to=datetime.timedelta(days=-1),
+    )
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.direct"):
+        _refusal(pki, recipient_cert=path)
+    assert not [r for r in caplog.records if "has expired" in r.getMessage()]
+
+
+def test_in_window_material_logs_no_validity_warning(
+    pki: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.direct"):
+        DirectDestination(_dest(pki))
+    assert not [r for r in caplog.records if "valid" in r.getMessage()]
 
 
 async def test_a_restart_with_an_already_expired_cert_dead_letters_nothing(

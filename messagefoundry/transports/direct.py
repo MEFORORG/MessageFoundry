@@ -29,9 +29,13 @@ host/sender/recipient, an unreadable/malformed signing key, cert, recipient cert
 signing key that does not match its cert, a recipient cert whose key is not RSA, key material of a
 type or strength off the floor (``_require_key_strength``), a recipient cert the trust check refuses
 (docs/CONNECTIONS.md, *Recipient trust*, lists what it checks), a trial S/MIME build that fails, or a
-cleartext-credential misconfiguration **raises here**, so it fails at ``check``/dry-run/start —
-never as a wire-time surprise. The blocking crypto + SMTP
-exchange runs off the event loop via ``asyncio.to_thread``.
+cleartext-credential misconfiguration **raises here**, so it fails at ``check``/dry-run/start.
+
+**One certificate property is NOT refused here: the validity window** (BACKLOG #5631). Construction
+only logs a WARNING for a recipient cert or issuing anchor outside it, and each send refuses: an
+expired one as a permanent configuration fault whose code starts ``direct-cert-validity``, a
+not-yet-valid one as a retried transient failure. ``DirectDestination._send`` says why. The
+blocking crypto + SMTP exchange runs off the event loop via ``asyncio.to_thread``.
 
 **STARTTLS posture is inherited from EMAIL.** The signed+encrypted S/MIME body already protects PHI at
 rest and in flight, but the SMTP session still carries envelope metadata (and any AUTH credentials), so
@@ -57,7 +61,7 @@ import ssl
 from collections.abc import Mapping, Sequence
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from cryptography import x509
 from cryptography.exceptions import InternalError, InvalidSignature, UnsupportedAlgorithm
@@ -295,34 +299,64 @@ def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
 
-def _validity_problem(cert: x509.Certificate, setting: str, now: datetime.datetime) -> str | None:
-    """Why ``cert`` is outside its validity window at ``now``, or None. Names the setting and the
-    bound that failed, never the certificate's subject."""
+#: The ``NegativeAckError.code`` prefix of a send refused on an expired certificate. The full code
+#: appends the setting and the bound, ``direct-cert-validity:<setting>:expired``, so the delivery
+#: worker's lane-stop log line and alert detail, which carry the code, say which certificate failed.
+CERT_VALIDITY_CODE = "direct-cert-validity"
+
+
+class _WindowProblem(NamedTuple):
+    """A certificate outside its validity window: which setting, which bound, and the refusal
+    text. Names the setting and the bound only, never a subject or a subjectAltName value."""
+
+    setting: str
+    expired: bool  # False: not yet valid, which time alone cures
+
+    @property
+    def text(self) -> str:
+        if self.expired:
+            return f"Direct destination '{self.setting}' has expired (its notAfter has passed)"
+        return (
+            f"Direct destination '{self.setting}' is not yet valid (its notBefore is in the future)"
+        )
+
+    @property
+    def code(self) -> str:
+        return (
+            f"{CERT_VALIDITY_CODE}:{self.setting}:{'expired' if self.expired else 'not-yet-valid'}"
+        )
+
+
+def _window_problem(
+    cert: x509.Certificate, setting: str, now: datetime.datetime
+) -> _WindowProblem | None:
+    """Why ``cert`` is outside its validity window at ``now``, or None."""
     if now < cert.not_valid_before_utc:
-        return f"Direct destination '{setting}' is not yet valid (its notBefore is in the future)"
+        return _WindowProblem(setting, expired=False)
     if now > cert.not_valid_after_utc:
-        return f"Direct destination '{setting}' has expired (its notAfter has passed)"
+        return _WindowProblem(setting, expired=True)
     return None
 
 
 def _validity_refusal(
     recipient: x509.Certificate, anchors: Sequence[x509.Certificate]
-) -> str | None:
+) -> _WindowProblem | None:
     """Why ``recipient``, or every one of its issuing ``anchors``, is outside its validity window
-    now, or None. Construction only warns on it; every send refuses on it, because an engine runs
-    for longer than a certificate lives. Any one issuing anchor in its window will do, so a CA
-    renewed under the same name and key carries on when the bundle's older copy expires."""
+    now, or None. Any one issuing anchor in its window will do, so a CA renewed under the same name
+    and key carries on when the bundle's older copy expires. Where none is, a not-yet-valid copy is
+    reported before an expired one, because time alone cures it. An empty ``anchors``, which the
+    trust check never leaves, reads as an expired anchor rather than as none failing."""
     now = _utcnow()
-    problem = _validity_problem(recipient, "recipient_cert", now)
+    problem = _window_problem(recipient, "recipient_cert", now)
     if problem is not None:
         return problem
-    # An empty ``anchors`` is refused too, never read as "none failed".
-    problem = "Direct destination 'recipient_cert' has no issuing 'trust_anchor'"
+    found: list[_WindowProblem] = []
     for anchor in anchors:
-        problem = _validity_problem(anchor, "trust_anchor", now)
+        problem = _window_problem(anchor, "trust_anchor", now)
         if problem is None:
             return None
-    return problem
+        found.append(problem)
+    return min(found, key=lambda p: p.expired, default=_WindowProblem("trust_anchor", True))
 
 
 #: What reading a certificate's extensions raises, at least, when ``cryptography`` cannot read them
@@ -666,6 +700,24 @@ class DirectDestination(DestinationConnector):
                 connection=config.name,
                 context=self._tls_context,
             ).enforce_construction()
+        # LAST, after every construction refusal has passed, so it never speaks for a connector
+        # that was not built. The validity window warns here and refuses at send (Manager decision,
+        # batch 224): a build refusal would record the lane failed at start (ADR 0031) rather than
+        # stopped with its queue kept. The send-time refusal is what _send describes.
+        window = _validity_refusal(self._recipient_cert, self._recipient_anchors)
+        if window is not None:
+            logger.warning(
+                "Direct %s:%s: %s. %s",
+                self.host,
+                self.port,
+                window.text,
+                "Every send is refused as a permanent configuration fault until the certificate "
+                "is renewed: under credential_fault_policy = stop the lane stops and keeps its "
+                "queue, under dead_letter each message dead-letters"
+                if window.expired
+                else "Each send is refused and retried, as a transient failure, until it becomes "
+                "valid",
+            )
 
     def _load_private_key(self, value: Any, password: Any) -> Any:
         """Load the sender's signing private key (PEM/DER, optionally passphrase-protected). PHI/secret-
@@ -840,19 +892,6 @@ class DirectDestination(DestinationConnector):
         # A pinned self-signed cert may assert CA=true (openssl req -x509 sets it by default); any
         # other recipient that does is a CA certificate, not a mailbox's end-entity key.
         pinned = self._recipient_cert in issuers
-        # The validity window WARNS here and refuses at send (Manager decision, batch 224). A
-        # refusal here would fail this connection's build: an engine start then records the lane
-        # failed and its worker charges every queued row an attempt until it dead-letters, where
-        # the send-time refusal stops the lane and keeps the queue.
-        expired = _validity_refusal(self._recipient_cert, issuers)
-        if expired is not None:
-            logger.warning(
-                "Direct %s:%s: %s; every send will be refused, stopping the lane, until the "
-                "certificate is renewed",
-                self.host,
-                self.port,
-                expired,
-            )
         problem = (
             (None if pinned else _recipient_ca_problem(self._recipient_cert))
             or _recipient_usage_problem(self._recipient_cert)
@@ -985,19 +1024,23 @@ class DirectDestination(DestinationConnector):
         # build error as `__cause__`, and `from None` would still leave it on `__context__`. Only the
         # type NAME survives the handler. See `encode_wire_body` in transports/base.py.
         #
-        # Validity first (BACKLOG #5631): a recipient cert or its issuing anchor that has expired
-        # since construction refuses every queued message alike, and a renewed cert fixes them all,
-        # so it is a permanent CONFIGURATION fault. Under the default credential_fault_policy the
-        # delivery worker stops the lane and keeps the queue, rather than dead-lettering each row.
-        # No log line here: the worker logs the refusal, throttled, under either policy.
-        expired = _validity_refusal(self._recipient_cert, self._recipient_anchors)
-        if expired is not None:
-            raise NegativeAckError(
-                f"Direct {self.host}:{self.port} refused: {expired}",
-                code="direct-cert-validity",
-                permanent=True,
-                config_fault=True,
-            )
+        # Validity first (BACKLOG #5631), before anything is built or dialled.
+        #
+        # EXPIRED refuses every queued message alike, and only a renewed cert fixes them, so it is a
+        # permanent CONFIGURATION fault. Its code names the setting and the bound. Under the default
+        # credential_fault_policy = stop the delivery worker stops the lane, keeps the queue, and
+        # logs one ERROR line and alert carrying that code, so this arm adds no log line of its
+        # own. Under dead_letter the row's last_error holds the text below.
+        #
+        # NOT YET VALID is cured by time alone (a cert installed early, a clock behind its CA), so
+        # it is the transient class and retries on the lane's RetryPolicy. As a configuration fault
+        # it would hold the lane for an operator after notBefore passed.
+        window = _validity_refusal(self._recipient_cert, self._recipient_anchors)
+        if window is not None:
+            refused = f"Direct {self.host}:{self.port} refused: {window.text}"
+            if not window.expired:
+                raise DeliveryError(f"{refused}; retried until it becomes valid")
+            raise NegativeAckError(refused, code=window.code, permanent=True, config_fault=True)
         msg: EmailMessage | None = None
         failure = ""
         try:
@@ -1005,8 +1048,9 @@ class DirectDestination(DestinationConnector):
         except _BUILD_ERRORS as exc:
             failure = type(exc).__name__
         if msg is None:
-            # The worker's permanent path dead-letters without a log line, so say it here. Type name
-            # only, for the same reason as the error text.
+            # A permanent refusal that is not a lane-stopping fault dead-letters. The worker logs
+            # that dead-letter through its throttled refusal log; this line says it was the S/MIME
+            # build. Type name only, for the same reason as the error text.
             logger.warning(
                 "Direct %s:%s: S/MIME build failed (%s); dead-lettering without retry",
                 self.host,
