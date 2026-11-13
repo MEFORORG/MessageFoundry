@@ -1633,8 +1633,11 @@ def _windows_roaming_appdata() -> str | None:
         return None
     try:
         return buf.value.decode("mbcs")
-    except UnicodeDecodeError as exc:
-        raise OSError("SHGetFolderPathA gave a folder its code page does not decode") from exc
+    except UnicodeDecodeError:
+        # The error holds the folder's bytes, the account's name among them, so it ends with the
+        # handler and the raise below carries no cause or context (encode_wire_body in base.py).
+        pass
+    raise OSError("SHGetFolderPathA gave a folder its code page does not decode")
 
 
 def _refuse_encrypted_libpq_root_cert(
