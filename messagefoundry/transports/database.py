@@ -1586,9 +1586,11 @@ _CSIDL_APPDATA = 0x1A
 def _windows_roaming_appdata() -> str | None:
     """``SHGetFolderPathA``'s ``CSIDL_APPDATA`` folder, the call libpq makes, rather than the
     ``APPDATA`` variable, which a service's environment may not carry. libpq is built without
-    ``UNICODE``, so it calls the ANSI export and opens the ANSI path it gets back; for a folder
+    ``UNICODE``, so it calls the ANSI export and stats the ANSI path it gets back; for a folder
     the code page cannot hold, that names a different file than the wide export would. The bytes
-    are decoded in that code page (``mbcs``), as Windows maps them when libpq opens the file.
+    are decoded in that code page (``mbcs``). OpenSSL then opens the file by trying the bytes as
+    UTF-8 first and the ANSI path only when that finds no file, so for bytes that are also valid
+    UTF-8 it can load a file other than the one checked here.
 
     ``None`` when the call reports a failure, as libpq then reads no default file, and possibly
     empty when it succeeds. Raises ``OSError`` off Windows, and when ``ctypes``, ``shell32`` or its
