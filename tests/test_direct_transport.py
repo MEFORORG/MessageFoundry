@@ -2263,6 +2263,25 @@ async def test_a_not_yet_valid_cert_retries_through_the_worker_and_does_not_hold
     assert len(_FakeSMTP.instances) == 1
 
 
+async def test_an_expired_anchor_wins_over_a_not_yet_valid_recipient(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # Time cures the recipient's notBefore but never the anchor's notAfter, so the send must stop
+    # the lane on the anchor rather than retry on the recipient.
+    _install_fake(monkeypatch)
+    ca_key, ca = _issuer(valid_to=datetime.timedelta(days=-1))
+    _, recipient = _mint_leaf(
+        "recipient@hisp.example", ca_key, ca, valid_from=datetime.timedelta(days=1)
+    )
+    d = DirectDestination(
+        _dest(pki, **_files(tmp_path, "mixed", recipient_cert=recipient, trust_anchor=ca))
+    )
+    with pytest.raises(NegativeAckError) as caught:
+        await d.send(_SYNTHETIC_HL7)
+    assert caught.value.code == "direct-cert-validity:trust_anchor:expired"
+    assert caught.value.config_fault is True
+
+
 def test_the_construction_warning_is_not_logged_for_a_connector_that_is_then_refused(
     pki: dict[str, Any], tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

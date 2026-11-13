@@ -343,20 +343,26 @@ def _validity_refusal(
 ) -> _WindowProblem | None:
     """Why ``recipient``, or every one of its issuing ``anchors``, is outside its validity window
     now, or None. Any one issuing anchor in its window will do, so a CA renewed under the same name
-    and key carries on when the bundle's older copy expires. Where none is, a not-yet-valid copy is
-    reported before an expired one, because time alone cures it. An empty ``anchors``, which the
-    trust check never leaves, reads as an expired anchor rather than as none failing."""
+    and key carries on when the bundle's older copy expires; where none is, a not-yet-valid copy
+    is the anchors' answer, because time alone cures it. Between the recipient's answer and the
+    anchors', an expiry wins, because time cannot cure it, so a not-yet-valid recipient issued by an
+    expired anchor stops the lane rather than retrying. An empty ``anchors``, which the trust check
+    never leaves, reads as an expired anchor rather than as none failing."""
     now = _utcnow()
-    problem = _window_problem(recipient, "recipient_cert", now)
-    if problem is not None:
-        return problem
+    anchor_problem: _WindowProblem | None = _WindowProblem("trust_anchor", True)
     found: list[_WindowProblem] = []
     for anchor in anchors:
         problem = _window_problem(anchor, "trust_anchor", now)
         if problem is None:
-            return None
+            anchor_problem = None
+            break
         found.append(problem)
-    return min(found, key=lambda p: p.expired, default=_WindowProblem("trust_anchor", True))
+    else:
+        if found:
+            anchor_problem = min(found, key=lambda p: p.expired)
+    problems = [p for p in (_window_problem(recipient, "recipient_cert", now), anchor_problem) if p]
+    # max on a bool key keeps the first of equals, so the recipient leads a tie.
+    return max(problems, key=lambda p: p.expired, default=None)
 
 
 #: What reading a certificate's extensions raises, at least, when ``cryptography`` cannot read them
@@ -712,11 +718,14 @@ class DirectDestination(DestinationConnector):
                 self.port,
                 window.text,
                 "Every send is refused as a permanent configuration fault until the certificate "
-                "is renewed: under credential_fault_policy = stop the lane stops and keeps its "
-                "queue, under dead_letter each message dead-letters"
+                "is renewed and the connector rebuilt (a new path and a reload, or a restart; "
+                "the connector keeps the certificates it read): under credential_fault_policy = "
+                "stop the lane stops and keeps its queue, under dead_letter each message "
+                "dead-letters"
                 if window.expired
-                else "Each send is refused and retried, as a transient failure, until it becomes "
-                "valid",
+                else "Each send is refused as a transient failure and retried on the lane's "
+                "RetryPolicy; a row that reaches its attempt cap before notBefore passes "
+                "dead-letters",
             )
 
     def _load_private_key(self, value: Any, password: Any) -> Any:
@@ -1034,12 +1043,13 @@ class DirectDestination(DestinationConnector):
         #
         # NOT YET VALID is cured by time alone (a cert installed early, a clock behind its CA), so
         # it is the transient class and retries on the lane's RetryPolicy. As a configuration fault
-        # it would hold the lane for an operator after notBefore passed.
+        # it would hold the lane for an operator after notBefore passed. Each attempt still counts
+        # toward the row's attempt cap, so a row that reaches it first dead-letters.
         window = _validity_refusal(self._recipient_cert, self._recipient_anchors)
         if window is not None:
             refused = f"Direct {self.host}:{self.port} refused: {window.text}"
             if not window.expired:
-                raise DeliveryError(f"{refused}; retried until it becomes valid")
+                raise DeliveryError(f"{refused}; retried on the lane's RetryPolicy")
             raise NegativeAckError(refused, code=window.code, permanent=True, config_fault=True)
         msg: EmailMessage | None = None
         failure = ""

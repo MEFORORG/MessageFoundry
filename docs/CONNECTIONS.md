@@ -3175,7 +3175,8 @@ these messages, and the SMTP relay accepts them before anyone tries.
 **Fail-loud at construction, except the validity window.** Crypto material is loaded and cross-checked when
 the connector is built, so `messagefoundry check` / dry-run / start catches each of these rather than the
 first message. The one certificate property checked at send instead is the validity window, under **The
-validity window is checked at every send** below. Caught at construction: a malformed
+validity window is checked at every send** below. Caught at construction, at least (the trust check's own
+refusals are listed under **Recipient trust** below): a malformed
 key/cert, a `signing_key` whose public half **does not match** `signing_cert`, a `recipient_cert` whose key
 is **not RSA**, and a `recipient_cert` **not issued by** any supplied `trust_anchor` (PHI is never encrypted
 to a certificate from an untrusted issuer). All three of `signing_key`, `recipient_cert` and every
@@ -3221,7 +3222,11 @@ any one of them inside its window will do. No clock skew is allowed. The two bou
   ERROR log line and `connection_stopped` alert carry that code, so they say which certificate expired.
   Under `credential_fault_policy = "dead_letter"` the message dead-letters, as other configuration faults do.
 - **Not yet valid** is a transient `DeliveryError`, retried on the lane's `RetryPolicy`, because time alone
-  cures it. Once `notBefore` passes, the next attempt delivers with no operator step.
+  cures it: an attempt after `notBefore` passes delivers with no operator step, and the lane is not held.
+  Each attempt still counts toward the row's attempt cap (`max_attempts`), so a row that reaches the cap
+  before `notBefore` passes dead-letters. Install a certificate only once it is valid.
+- Where the recipient cert and every issuing anchor both fail, an expiry wins: a not-yet-valid recipient
+  whose only anchor has expired stops the lane, because time cannot cure it.
 
 Construction only **logs a WARNING** naming the setting and the bound, once every construction refusal has
 passed, so `messagefoundry check`, a reload and
