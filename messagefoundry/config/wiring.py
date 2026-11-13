@@ -1737,8 +1737,9 @@ def resolve_env_settings(
         else:
             # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the
             # loosening registers, the build-time capture checks) reads spec.settings, so changing
-            # a literal only in this copy would split one setting into two readings. One that is
-            # not a bool or None was already refused at load, by Registry.bool_literal_problems.
+            # a literal only in this copy would split one setting into two readings. The loader
+            # refuses one that is not a bool (Registry.bool_literal_problems); a Registry built in
+            # code and never validated is not checked there.
             resolved[name] = value
     problems: list[str] = []
     if missing:
@@ -5209,14 +5210,11 @@ def Ftp(
     # vault BACKLOG #3234: a literal tls is turned into the protocol below, so the load's
     # bool_literal_problems never sees it. bool() read "false" as FTPS and None as plain FTP, the
     # insecure side, so anything but a bool is refused first, before the CA check reads it too.
-    refused: str | None = None
-    if not isinstance(tls, EnvRef):
-        try:
-            require_flag(tls, "Ftp tls")
-        except ValueError as exc:  # names the key and the type, never the value
-            refused = str(exc)
-    if refused is not None:
-        raise WiringError(f"{refused} (write True, False or an env() reference)")
+    if not isinstance(tls, (bool, EnvRef)):
+        raise WiringError(
+            f"Ftp tls must be true or false, not {type(tls).__name__} (write True, False or an "
+            "env() reference)"
+        )
     # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
     # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
@@ -6418,6 +6416,9 @@ class Registry:
                 "declared, so this graph would receive and send nothing; declare one, or run "
                 "'messagefoundry-toolkit init' to scaffold a starter config"
             )
+        # Before the other rules: some read the same literals laxly, and validate raises only the
+        # first problem, so a symptom would hide the bad literal (vault BACKLOG #3234).
+        yield from self.bool_literal_problems()
         for conn in self.inbound.values():
             if conn.router not in self.routers:
                 yield f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
@@ -6435,7 +6436,6 @@ class Registry:
                 yield str(exc)
         yield from self.encoding_problems()
         yield from self.dialling_pin_problems()
-        yield from self.bool_literal_problems()
         for port, first, second in self.port_collisions():  # low-13
             yield f"inbound connections {first!r} and {second!r} both bind port {port}"
 
@@ -6501,10 +6501,18 @@ class Registry:
         by now, so turning it into a bool here would split one setting into two readings, and a
         refused graph never runs. Here and not in the factories, because a ``with_*`` composer
         writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
-        registered. ``None`` passes: an explicit ``None`` is the setting's default to every reader
-        of a default-on flag (``bool_setting``, vault BACKLOG #3230), and ``env()`` references are
-        read strictly once resolved (:func:`resolve_env_settings`). The value is withheld."""
-        strict = _bool_settings().defaults
+        registered. ``None`` passes where the setting has one default on every factory: there an
+        explicit ``None`` is that default to ``bool_setting`` (vault BACKLOG #3230). It is refused on
+        a composer's flag, whose reader takes ``None`` as off while the composer's own default is on,
+        and on a setting with no single default. ``env()`` references are read strictly once
+        resolved (:func:`resolve_env_settings`). The value is withheld.
+
+        Only a graph that is validated sees this, as the loader's is; a :class:`Registry` built in
+        code and handed straight to a runner is not checked here."""
+        try:
+            strict = _bool_settings().defaults
+        except WiringError as exc:  # a factory whose annotations do not resolve; report, not raise
+            return [str(exc)]
         declared: list[tuple[str, str, Mapping[str, Any]]] = [
             ("inbound connection", c.name, c.spec.settings) for c in self.inbound.values()
         ]
@@ -6517,7 +6525,9 @@ class Registry:
         problems: list[str] = []
         for kind, name, settings in declared:
             for key, value in settings.items():
-                if key not in strict or value is None or isinstance(value, EnvRef):
+                if key not in strict or isinstance(value, EnvRef):
+                    continue
+                if value is None and strict[key] is not None and key not in _COMPOSER_BOOL_SETTINGS:
                     continue
                 try:
                     require_flag(value, f"setting {key!r}")

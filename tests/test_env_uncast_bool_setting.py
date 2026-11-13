@@ -152,6 +152,27 @@ def test_a_literal_is_not_read_here() -> None:
 
 _LITERAL_CASES = [
     pytest.param(
+        "from messagefoundry import MLLP, inbound\n"
+        "inbound('IB_X', MLLP(port=0, no_ack='false'), router='r')\n",
+        "inbound connection 'IB_X': setting 'no_ack' must be true or false, not str",
+        id="inbound-mllp-str",
+    ),
+    pytest.param(
+        "from messagefoundry import Rest, outbound\n"
+        "from messagefoundry.transports.smart import with_smart_backend\n"
+        "outbound('OB_X', with_smart_backend(Rest(url='https://partner.example.org/in'), "
+        "token_url='https://t', client_id='c', private_key='k', enabled=None))\n",
+        "outbound connection 'OB_X': setting 'smart_enabled' must be true or false, not NoneType",
+        id="composer-none",
+    ),
+    pytest.param(
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_X', Rest(url='https://partner.example.org/in', verify_tls=0, "
+        "tls_ca_file='ca.pem', tls_ca_pin='" + "a" * 64 + "'))\n",
+        "outbound connection 'OB_X': setting 'verify_tls' must be true or false, not int",
+        id="before-the-pin-check",
+    ),
+    pytest.param(
         "from messagefoundry import Rest, outbound\n"
         "outbound('OB_X', Rest(url='https://partner.example.org/in', tls_allow_expired='false'))\n",
         "outbound connection 'OB_X': setting 'tls_allow_expired' must be true or false, not str",
