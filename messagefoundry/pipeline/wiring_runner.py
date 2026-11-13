@@ -5381,9 +5381,8 @@ class RegistryRunner:
                     await self.start_inbound(name)
                 else:
                     await self.start_outbound(name)
-            except (
-                RunnerNotRunningError
-            ) as exc:  # a refusal, not a failed start: no record, no page
+            except RunnerNotRunningError as exc:
+                # A refusal, not a failed start: no record, no page.
                 log.info("schedule: %s connection %r not started: %s", kind, name, exc)
             except Exception as exc:
                 if kind == "outbound":
