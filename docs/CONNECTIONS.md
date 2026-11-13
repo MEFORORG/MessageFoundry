@@ -3190,10 +3190,6 @@ the relay can still refuse a `sender` or recipient at send time.
 chains directly to a supplied anchor, or is a self-signed correspondent cert pinned as its own anchor. Full
 multi-level path building is deferred. On top of issuance, construction refuses at least:
 
-- a `recipient_cert` that has **expired** or is **not yet valid**, and one whose every issuing
-  `trust_anchor` is. A bundle may hold an older copy of a CA beside its renewal under the same name and
-  key; any one of them inside its window will do, at construction and at each send. No clock skew is
-  allowed;
 - an issuing `trust_anchor` that is **not a CA** (no `basicConstraints` asserting `CA=true`), or whose
   `keyUsage` does not assert `keyCertSign`. A recipient cert pinned as its own anchor (the same certificate)
   is exempt from both, because it issues nothing else;
@@ -3212,17 +3208,20 @@ Errors name the *setting* and the property that failed (and, for an unnamed addr
 addresses `recipients` holds, counting each comma-joined address apart), never the material, a cert subject or
 a `subjectAltName` value, any of which can identify a patient's provider.
 
-Because construction reads the clock, an expired Direct certificate refuses `messagefoundry check`, a dry run,
-a reload and an engine start or restart for the whole configuration, with no change to it, as any other
-construction refusal does. Renew a partner's certificate before it expires.
+**The validity window is checked at every send, not refused at construction.** The send refuses when the
+`recipient_cert` has **expired** or is **not yet valid**, or when every issuing `trust_anchor` is. A bundle
+may hold an older copy of a CA beside its renewal under the same name and key, and any one of them inside its
+window will do. No clock skew is allowed. The refusal is a permanent `NegativeAckError` marked as a
+configuration fault (code `direct-cert-validity`), raised before anything is built or dialled. Under the
+default `credential_fault_policy = "stop"` the delivery worker stops the lane and keeps the queue; under
+`credential_fault_policy = "dead_letter"` the message dead-letters, as other configuration faults do.
 
-**Validity is checked again at every send.** A recipient cert or issuing anchor
-that expires while the engine runs refuses every queued message alike, so the send raises a permanent
-`NegativeAckError` marked as a configuration fault (code `direct-cert-validity`) before anything is built or
-dialled. Under the default `credential_fault_policy = "stop"` the delivery worker stops the lane and keeps
-the queue; under `credential_fault_policy = "dead_letter"` the message dead-letters, as other configuration
-faults do. The connector holds the certificates it read at construction, so a renewed file takes effect only
-when the connector is built again: point the setting at a new path and reload, or restart the engine.
+Construction only **logs a WARNING** naming the setting and the bound, so `messagefoundry check`, a reload and
+an engine start or restart still build the connection with an out-of-window certificate. That is deliberate:
+a build refusal would record the lane failed at start (ADR 0031) rather than stopped with its queue kept,
+which is what the send-time refusal does. `test_connection` does not read
+the window. The connector holds the certificates it read when it was built, so a renewed file takes effect
+only when the connector is built again: point the setting at a new path and reload, or restart the engine.
 
 **Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
 `allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. An SMTP

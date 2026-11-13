@@ -53,6 +53,7 @@ from cryptography.hazmat.primitives.asymmetric import (
 )
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -1834,6 +1835,27 @@ def _refusal(pki: dict[str, Any], **overrides: Any) -> str:
     return text
 
 
+async def _warns_then_refuses_every_send(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pki: dict[str, Any],
+    expected: str,
+    **overrides: Any,
+) -> None:
+    """Construction WARNS on the validity window and builds (a refusal there would fail the lane's
+    build at start); the send then refuses before building or dialling."""
+    _install_fake(monkeypatch)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.direct"):
+        d = DirectDestination(_dest(pki, **overrides))
+    [warning] = [r.getMessage() for r in caplog.records if expected in r.getMessage()]
+    assert "@" not in warning and "Test Direct CA" not in warning
+    with pytest.raises(NegativeAckError) as caught:
+        await d.send(_SYNTHETIC_HL7)
+    assert caught.value.code == "direct-cert-validity" and caught.value.config_fault is True
+    assert expected in str(caught.value)
+    assert _FakeSMTP.instances == []
+
+
 @pytest.mark.parametrize(
     "valid_from, valid_to, expected",
     [
@@ -1846,7 +1868,9 @@ def _refusal(pki: dict[str, Any], **overrides: Any) -> str:
     ],
     ids=["expired", "not-yet-valid"],
 )
-def test_a_recipient_cert_outside_its_validity_window_is_refused(
+async def test_a_recipient_cert_outside_its_validity_window_warns_and_refuses_every_send(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     pki: dict[str, Any],
     tmp_path: Path,
     valid_from: datetime.timedelta,
@@ -1854,14 +1878,21 @@ def test_a_recipient_cert_outside_its_validity_window_is_refused(
     expected: str,
 ) -> None:
     path = _recipient(pki, tmp_path, "window", valid_from=valid_from, valid_to=valid_to)
-    assert expected in _refusal(pki, recipient_cert=path)
+    await _warns_then_refuses_every_send(monkeypatch, caplog, pki, expected, recipient_cert=path)
 
 
-def test_an_expired_issuing_anchor_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+async def test_an_expired_issuing_anchor_warns_and_refuses_every_send(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pki: dict[str, Any],
+    tmp_path: Path,
+) -> None:
     ca_key, ca = _issuer(valid_to=datetime.timedelta(days=-1))
     _, recipient = _mint_leaf("recipient@hisp.example", ca_key, ca)
     files = _files(tmp_path, "old_ca", recipient_cert=recipient, trust_anchor=ca)
-    assert "'trust_anchor' has expired" in _refusal(pki, **files)
+    await _warns_then_refuses_every_send(
+        monkeypatch, caplog, pki, "'trust_anchor' has expired", **files
+    )
 
 
 def _renewed_bundle(
@@ -2001,8 +2032,10 @@ def test_a_recipient_whose_eku_is_any_extended_key_usage_constructs(
         ),
         x509.UnsupportedGeneralNameType("synthetic x400Address"),
         ValueError("synthetic malformed extension"),
+        UserWarning("synthetic three-letter country"),
+        CryptographyDeprecationWarning("synthetic deprecated encoding"),
     ],
-    ids=["duplicate", "unsupported-general-name", "malformed"],
+    ids=["duplicate", "unsupported-general-name", "malformed", "user-warning", "deprecation"],
 )
 def test_an_extension_that_does_not_read_is_a_value_error_naming_the_setting(
     raised: Exception,
@@ -2120,6 +2153,83 @@ async def test_a_cert_that_expires_after_construction_holds_the_queue_at_send(
     assert exc.code == "direct-cert-validity"
     assert f"'{setting}' has expired" in str(exc)
     assert builds == [] and _FakeSMTP.instances == []
+
+
+@pytest.fixture
+async def store(tmp_path: Path) -> Any:
+    from messagefoundry.store.store import MessageStore
+
+    s = await MessageStore.open(tmp_path / "direct.db")
+    yield s
+    await s.close()
+
+
+async def _deliver_one_through_the_worker(store: Any, connector: DirectDestination) -> Any:
+    """Seed one outbound row and run one delivery of it through the real worker step, as
+    tests/test_credential_fault_stop.py does for its stub connector. Returns the outcome."""
+    from tests.test_credential_fault_stop import DEST, _RecordingSink, _runner, _seed_outbound
+
+    await _seed_outbound(store)
+    sink = _RecordingSink()
+    runner = _runner(store, sink)
+    runner._destinations[DEST] = connector
+    item = await store.claim_next_fifo(DEST, now=1.0)
+    assert item is not None
+    outcome = await runner._process_delivery_item(DEST, item)
+    return outcome, item, sink
+
+
+async def _assert_stopped_and_kept(store: Any, outcome: Any, item: Any, sink: Any) -> None:
+    from messagefoundry.pipeline.wiring_runner import _ItemOutcome
+    from messagefoundry.store.store import OutboxStatus
+    from tests.test_credential_fault_stop import DEST, _row_state
+
+    assert outcome[0] is _ItemOutcome.STOPPED
+    status, attempts, last_error = await _row_state(store, item.message_id)
+    # Kept: pending, the claim's attempt given back, no error. Never dead-lettered.
+    assert (status, attempts, last_error) == (OutboxStatus.PENDING.value, 0, None)
+    assert [name for name, _ in sink.stopped] == [DEST]
+    assert "configuration fault" in sink.stopped[0][1]
+
+
+async def test_the_worker_stops_the_lane_and_keeps_the_queue_on_an_expiry_at_send(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path, store: Any
+) -> None:
+    # BACKLOG #5631, end to end through the delivery worker step: the cert expires after
+    # construction, and the default credential_fault_policy stops the lane and keeps the row.
+    from messagefoundry.transports import direct
+
+    _install_fake(monkeypatch)
+    path = _recipient(pki, tmp_path, "worker", valid_to=datetime.timedelta(days=30))
+    d = DirectDestination(_dest(pki, recipient_cert=path))
+    later = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=60)
+    monkeypatch.setattr(direct, "_utcnow", lambda: later)
+    await _assert_stopped_and_kept(store, *await _deliver_one_through_the_worker(store, d))
+    assert _FakeSMTP.instances == []
+
+
+async def test_a_restart_with_an_already_expired_cert_dead_letters_nothing(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path, store: Any
+) -> None:
+    """A start or restart after the cert expired. The connector still BUILDS, through the same
+    factory an engine start calls, so the lane is not recorded failed (whose worker would charge
+    each queued row an attempt until it dead-lettered); its first send stops the lane instead."""
+    from messagefoundry.transports.base import build_destination
+
+    _install_fake(monkeypatch)
+    path = _recipient(
+        pki,
+        tmp_path,
+        "restart",
+        valid_from=datetime.timedelta(days=-30),
+        valid_to=datetime.timedelta(days=-1),
+    )
+    built = build_destination(
+        _dest(pki, recipient_cert=path), egress=EgressSettings(deny_by_default=False)
+    )
+    assert isinstance(built, DirectDestination)
+    await _assert_stopped_and_kept(store, *await _deliver_one_through_the_worker(store, built))
+    assert _FakeSMTP.instances == []
 
 
 async def test_a_cert_inside_its_window_at_send_still_delivers(

@@ -65,6 +65,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from messagefoundry.config.models import ConnectorType, Destination, bool_setting
@@ -304,17 +305,13 @@ def _validity_problem(cert: x509.Certificate, setting: str, now: datetime.dateti
     return None
 
 
-#: What reading a certificate's extensions raises, at least, when ``cryptography`` cannot read them
-#: (measured on 50.0.2): ``ValueError`` for a malformed one, and two that are not ``ValueError``
-#: subclasses, ``DuplicateExtension`` and ``UnsupportedGeneralNameType`` (an x400Address, say).
-#: ``pki._UNREAD_CA_EXTENSIONS`` holds a wider tuple for its own CA reading; this one is Direct's.
 def _validity_refusal(
     recipient: x509.Certificate, anchors: Sequence[x509.Certificate]
 ) -> str | None:
     """Why ``recipient``, or every one of its issuing ``anchors``, is outside its validity window
-    now, or None. Run at construction and again at every send, because an engine runs for longer
-    than a certificate lives. Any one issuing anchor in its window will do, so a CA renewed under
-    the same name and key carries on when the bundle's older copy expires."""
+    now, or None. Construction only warns on it; every send refuses on it, because an engine runs
+    for longer than a certificate lives. Any one issuing anchor in its window will do, so a CA
+    renewed under the same name and key carries on when the bundle's older copy expires."""
     now = _utcnow()
     problem = _validity_problem(recipient, "recipient_cert", now)
     if problem is not None:
@@ -328,10 +325,18 @@ def _validity_refusal(
     return problem
 
 
+#: What reading a certificate's extensions raises, at least, when ``cryptography`` cannot read them
+#: (measured on 50.0.2): ``ValueError`` for a malformed one, and two that are not ``ValueError``
+#: subclasses, ``DuplicateExtension`` and ``UnsupportedGeneralNameType`` (an x400Address, say). Where
+#: warnings are errors, a ``UserWarning`` (a three-letter country in a directory name) or a
+#: ``CryptographyDeprecationWarning`` too, as ``pki._UNREAD_CA_EXTENSIONS`` records for its own
+#: CA reading; this tuple is Direct's, so a change to that private one cannot widen this contract.
 _UNREAD_EXTENSIONS: tuple[type[Exception], ...] = (
     ValueError,
     x509.DuplicateExtension,
     x509.UnsupportedGeneralNameType,
+    UserWarning,
+    CryptographyDeprecationWarning,
 )
 
 
@@ -547,9 +552,9 @@ class DirectDestination(DestinationConnector):
             )
         _require_key_strength(recipient_key, "recipient_cert")
         # Trust anchor — the CA(s) the recipient cert must chain to. Verified at construction so a cert
-        # from an untrusted issuer, out of its validity window, or naming another mailbox is refused
-        # before we ever encrypt PHI to it. Every anchor that issues it is kept for the send-time
-        # re-check, which needs any one of them inside its window.
+        # from an untrusted issuer or naming another mailbox is refused before we ever encrypt PHI
+        # to it. Every anchor that issues it is kept for the send-time validity check, which needs
+        # any one of them inside its window; construction only warns on the window.
         self._recipient_anchors = self._verify_recipient_trusted(
             _read_file("trust_anchor", s.get("trust_anchor"))
         )
@@ -775,7 +780,7 @@ class DirectDestination(DestinationConnector):
     def _verify_recipient_trusted(self, anchor_data: bytes) -> tuple[x509.Certificate, ...]:
         """Refuse a recipient cert this connector should not encrypt PHI to, and return every
         supplied anchor that issued it and may issue certificates. :func:`_validity_refusal`
-        requires one of them inside its validity window, here and at each send.
+        requires one of them inside its validity window at each send; here it only warns.
 
         The issuance check is **one level**: the recipient cert chains directly to a supplied
         anchor, or is a self-signed cert that IS the anchor (ADR 0085 defers path building). What
@@ -835,9 +840,21 @@ class DirectDestination(DestinationConnector):
         # A pinned self-signed cert may assert CA=true (openssl req -x509 sets it by default); any
         # other recipient that does is a CA certificate, not a mailbox's end-entity key.
         pinned = self._recipient_cert in issuers
+        # The validity window WARNS here and refuses at send (Manager decision, batch 224). A
+        # refusal here would fail this connection's build: an engine start then records the lane
+        # failed and its worker charges every queued row an attempt until it dead-letters, where
+        # the send-time refusal stops the lane and keeps the queue.
+        expired = _validity_refusal(self._recipient_cert, issuers)
+        if expired is not None:
+            logger.warning(
+                "Direct %s:%s: %s; every send will be refused, stopping the lane, until the "
+                "certificate is renewed",
+                self.host,
+                self.port,
+                expired,
+            )
         problem = (
-            _validity_refusal(self._recipient_cert, issuers)
-            or (None if pinned else _recipient_ca_problem(self._recipient_cert))
+            (None if pinned else _recipient_ca_problem(self._recipient_cert))
             or _recipient_usage_problem(self._recipient_cert)
             or _address_binding_problem(self._recipient_cert, self.recipients)
         )
@@ -1052,7 +1069,9 @@ class DirectDestination(DestinationConnector):
     def _probe(self) -> None:
         # Reachability/auth only: connect + (STARTTLS) + EHLO + optional login + NOOP, then quit. NO
         # MAIL FROM / DATA, so a connection test never sends a real Direct message (the EMAIL probe
-        # pattern). Crypto material was already validated at construction.
+        # pattern). Crypto material was already validated at construction, except its validity
+        # window, which construction only warns on and this probe does not read: an expired
+        # certificate is reported by the send, as a direct-cert-validity refusal (BACKLOG #5631).
         try:
             with self._connect() as smtp:
                 smtp.ehlo_or_helo_if_needed()
