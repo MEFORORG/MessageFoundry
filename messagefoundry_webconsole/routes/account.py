@@ -46,7 +46,7 @@ from .._auth import (
     clear_session_cookie,
     login_redirect_response,
     must_enrol_first,
-    reauth_before_input,
+    refuse_unless_ui_action_proof_held,
     register_ui_action,
     rekey_continuations,
     require_ui,
@@ -55,6 +55,7 @@ from .._auth import (
     require_ui_step_up_action,
     session_token,
     set_session_cookie,
+    ui_action_proof_held,
     webauthn_rp,
 )
 from .._service import _service
@@ -102,21 +103,20 @@ register_ui_action(
 _MFA_CONFIRM_PAGE = "/ui/account/mfa/confirm"
 
 
-async def _confirm_form(
-    request: Request, service: AuthService, identity: Identity, *, owed: bool | None = None
-) -> tuple[bool, str | None]:
-    """What a page renders in the confirm-code form's place: ``(enrolment_code, reauth_href)``.
+async def _code_form(
+    request: Request, service: AuthService, identity: Identity
+) -> tuple[bool, bool]:
+    """``(code_form, enrolment_code)`` for a page that would carry the confirm-code form.
 
     BACKLOG #5931. ADR 0077 binds enroll and confirm to two separate single-use proofs. The enroll
-    proof is spent staging the secret, and a refused code spends the confirm proof, so a code form
-    rendered then posts into the confirm gate with no grant and the typed code is lost. While the
-    session holds no MFA_CONFIRM grant, ``reauth_href`` is the re-auth link the page shows instead.
-    Peeks only: the verify gate still spends the grant, and the GET form's own gate is unchanged.
-    ``owed`` is read only when the form renders, unless the caller already knows it."""
-    href = await reauth_before_input(request, STEP_UP_ACTION_MFA_CONFIRM, _MFA_CONFIRM_PAGE)
-    if href is None and owed is None:
-        owed = await service.enrolment_code_required(session_token(request), identity)
-    return bool(owed), href
+    proof is spent staging the secret, and the verify gate spends the confirm proof before it
+    checks the code, so a code form rendered then would post into the gate with no grant and the
+    typed code would be lost. While no MFA_CONFIRM proof is held, ``code_form`` is False and the
+    page links to the confirm page instead, whose GET sends the operator to that re-auth first.
+    Peeks only. ``enrolment_code`` is read only for a page that renders the form."""
+    if not await ui_action_proof_held(request, STEP_UP_ACTION_MFA_CONFIRM):
+        return False, False
+    return True, await service.enrolment_code_required(session_token(request), identity)
 
 
 # --- L5a: WebAuthn passkeys (ADR 0068, WP-14b) -------------------------------
@@ -534,10 +534,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         # The staged secret renders ONCE (with the confirm form); it is inert until confirmed.
         # ADR 0207: with the enrolment-code field when this session's first factor owes one.
-        owed, href = await _confirm_form(request, service, identity)
+        # Under the default action binding the enroll proof was just spent and no confirm proof is
+        # held, so the page links on to the confirm re-auth instead (BACKLOG #5931).
+        code_form, owed = await _code_form(request, service, identity)
         return HTMLResponse(
             pages.mfa_enroll_page(
-                enroll.secret, enroll.otpauth_uri, enrolment_code=owed, reauth_href=href
+                enroll.secret, enroll.otpauth_uri, enrolment_code=owed, code_form=code_form
             )
         )
 
@@ -549,10 +551,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> HTMLResponse:
         # The unlock re-entry point: the secret is already staged server-side (and in the user's
         # authenticator), so this form only collects the code — the secret is never re-shown.
-        # The gate stays window-only (ADR 0077: spending the grant here would loop); the peek below
-        # only decides whether the form or the re-auth link renders.
-        owed, href = await _confirm_form(request, service, identity)
-        return HTMLResponse(pages.mfa_confirm_page(enrolment_code=owed, reauth_href=href))
+        # The gate stays window-only and spends nothing (ADR 0077: spending the grant here would
+        # loop). BACKLOG #5931: without a held MFA_CONFIRM proof the page sends the operator to the
+        # re-auth for one BEFORE they type a code the verify gate would refuse and drop. The re-auth
+        # mints it and lands back here, where it is held.
+        await refuse_unless_ui_action_proof_held(request, STEP_UP_ACTION_MFA_CONFIRM)
+        owed = await service.enrolment_code_required(session_token(request), identity)
+        return HTMLResponse(pages.mfa_confirm_page(enrolment_code=owed))
 
     @app.post("/ui/account/mfa/verify")
     async def ui_mfa_verify(
@@ -560,7 +565,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
             require_ui_reauth_only_action(
-                STEP_UP_ACTION_MFA_CONFIRM, reauth_next=lambda _r: "/ui/account/mfa/confirm"
+                STEP_UP_ACTION_MFA_CONFIRM, reauth_next=lambda _r: _MFA_CONFIRM_PAGE
             )
         ),
     ) -> Response:
@@ -588,11 +593,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 enrolment_code=form.get("enrolment_code", "")[:_ENROLMENT_CODE_MAX] or None,
             )
         except EnrolmentCodeRefused as exc:
-            # ADR 0207: the one reply, on the form it came from, so the holder can retry; the
-            # refusal spent no TOTP step and left the staged secret in place.
-            owed, href = await _confirm_form(request, service, identity, owed=True)
+            # ADR 0207: the one reply, so the holder can retry; the refusal spent no TOTP step and
+            # left the staged secret in place. The gate spent the confirm proof, though, so under
+            # the default action binding the retry goes through a fresh re-auth (BACKLOG #5931).
+            code_form, _owed = await _code_form(request, service, identity)
             return HTMLResponse(
-                pages.mfa_confirm_page(error=str(exc), enrolment_code=owed, reauth_href=href),
+                pages.mfa_confirm_page(error=str(exc), enrolment_code=True, code_form=code_form),
                 status_code=400,
             )
         except ValueError as exc:
@@ -616,11 +622,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # vouch for a directory account (BACKLOG #3061), or a second-step lock, said in
             # /ui/reauth's words (BACKLOG #3810 finding 4).
             error = _refusal_error(elevation, "Invalid code.")
-            # ADR 0207: keep the enrolment-code field when the session still owes one, so a wrong
-            # TOTP code does not cost the holder a second round trip for the field.
-            owed, href = await _confirm_form(request, service, identity)
+            # ADR 0207: keep the enrolment-code field when the session still owes one. Under the
+            # default action binding the gate spent the confirm proof before the code was checked,
+            # so the page links to a fresh re-auth instead of a form that would drop the next code
+            # (BACKLOG #5931); the form renders only under the opt-out.
+            code_form, owed = await _code_form(request, service, identity)
             return HTMLResponse(
-                pages.mfa_confirm_page(error=error, enrolment_code=owed, reauth_href=href),
+                pages.mfa_confirm_page(error=error, enrolment_code=owed, code_form=code_form),
                 status_code=400,
             )
         # Activated: the recovery codes render ONCE — never re-fetchable. The confirm re-keyed the

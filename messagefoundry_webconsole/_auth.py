@@ -74,8 +74,8 @@ __all__ = [
     "must_change_target",
     "must_enrol_first",
     "oidc_flow_cookie_name",
-    "reauth_before_input",
     "reauth_landing",
+    "refuse_unless_ui_action_proof_held",
     "register_ui_action",
     "rekey_continuations",
     "rotation_comes_first",
@@ -91,6 +91,7 @@ __all__ = [
     "set_oidc_flow_cookie",
     "set_session_cookie",
     "spend_ui_action_step_up",
+    "ui_action_proof_held",
     "ActionSpend",
     "RepeatRefused",
     "proof_spent_for",
@@ -1519,31 +1520,34 @@ def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPExce
     """
     target = next_path if next_path is not None else request.url.path
     _issue_continuation(request, target)
-    return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": _reauth_location(target)})
+    nxt = quote(target, safe="/")
+    return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": f"/ui/reauth?next={nxt}"})
 
 
-def _reauth_location(target: str) -> str:
-    """The ``/ui/reauth`` URL toward ``target``, a whole path carried in one query parameter."""
-    return "/ui/reauth?next=" + quote(target, safe="/")
+async def ui_action_proof_held(request: Request, action: str) -> bool:
+    """Whether a submit to a gate bound to ``action`` would pass that gate's proof check now,
+    WITHOUT spending anything: the session holds the live grant, or the org opted out and the
+    window is fresh. ``True`` with no auth service, as the gates are no-ops then.
 
-
-async def reauth_before_input(request: Request, action: str, next_path: str) -> str | None:
-    """Where a page sends the operator BEFORE it collects input for a gate bound to ``action``.
-
-    ``None`` when that gate's proof check would pass now: the session holds the live grant, or the
-    org opted out and the window is fresh. Nothing is spent here, so the gate still spends the one
-    proof at submit. The gate's new-client-IP refusal is not run, because it records the address;
-    a submit from a new address can still be sent to re-auth. Otherwise the ``/ui/reauth`` URL toward ``next_path``, an unlock page,
-    with the continuation recorded as the gate's own refusal records it, so the re-auth mints the
-    grant and lands on that page. The case it exists for is a body-carrying POST whose refusal
-    would drop what the operator typed (BACKLOG #5931: the first TOTP enrolment code)."""
+    For a page that collects input for a body-carrying POST, so it can ask for the proof before
+    the operator types rather than drop what they typed (BACKLOG #5931). The gate's new-client-IP
+    refusal is not run, because it records the address, so a submit from a new address can still
+    be sent to re-auth."""
     auth = get_auth(request)
-    if auth is None or await _ui_action_step_up_ok(
+    return auth is None or await _ui_action_step_up_ok(
         auth, session_token(request), action, spend=False
-    ):
-        return None
-    _issue_continuation(request, next_path)
-    return _reauth_location(next_path)
+    )
+
+
+async def refuse_unless_ui_action_proof_held(request: Request, action: str) -> None:
+    """Send an action-bound unlock page's GET to ``/ui/reauth`` while its proof is not held.
+
+    The refusal a non-spending gate on the page would make: it issues this page as the
+    continuation, exactly as :func:`_reauth_redirect` does for a gate, so the re-auth mints the
+    grant and lands back here, where the proof is then held and the page renders. Spends nothing,
+    so it cannot loop the way a spending gate on the page would (ADR 0077)."""
+    if not await ui_action_proof_held(request, action):
+        raise _reauth_redirect(request)
 
 
 async def _refuse_from_new_address(

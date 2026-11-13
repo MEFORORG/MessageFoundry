@@ -1076,20 +1076,20 @@ def enrolment_code_input(owed: bool = True) -> Markup:
     )
 
 
-def _mfa_code_form(enrolment_code: bool, reauth_href: str | None) -> Markup:
-    """The confirm-code form, or, with ``reauth_href``, a link to the re-auth that must come first.
+def _mfa_code_form(enrolment_code: bool, code_form: bool) -> Markup:
+    """The confirm-code form, or, without ``code_form``, a link to the confirm page.
 
     The link stands in for the form while the session holds no confirm proof (BACKLOG #5931): a code
-    posted then would be refused at the gate and lost, so the operator confirms it's them before
-    typing it. ``reauth_href`` is built by the route from a fixed path, never from input."""
-    if reauth_href is not None:
+    posted then would be refused at the gate and lost. The confirm page asks the operator to confirm
+    it's them first, then takes the code."""
+    if not code_form:
         return el(
             "div",
             el(
                 "p",
                 "Next, confirm it's you. Then enter a code from your authenticator to turn MFA on.",
             ),
-            el("p", el("a", "Continue", href=reauth_href, class_="btn-link")),
+            el("p", el("a", "Continue", href="/ui/account/mfa/confirm", class_="btn-link")),
         )
     return el(
         "form",
@@ -1117,14 +1117,24 @@ def mfa_enroll_page(
     otpauth_uri: str,
     *,
     enrolment_code: bool = False,
-    reauth_href: str | None = None,
+    code_form: bool = True,
 ) -> Markup:
     """The staged-enrollment page: the TOTP secret + otpauth URI (shown once for authenticator entry)
     and the confirm-code form. No QR image — the /ui surface is zero-dependency (ADR 0065), so the
     secret is entered manually or the URI pasted; the desktop console renders the QR.
-    ``enrolment_code`` adds the ADR 0207 field, for a session that owes one. ``reauth_href`` puts
-    the re-auth link in the form's place (:func:`_mfa_code_form`)."""
-    confirm = _mfa_code_form(enrolment_code, reauth_href)
+    ``enrolment_code`` adds the ADR 0207 field, for a session that owes one. ``code_form=False``
+    puts a link to the confirm page in the form's place (:func:`_mfa_code_form`), with a warning
+    that this page is the only one that shows the secret."""
+    confirm = _mfa_code_form(enrolment_code, code_form)
+    warning = (
+        Markup("")
+        if code_form
+        else el(
+            "p",
+            "Add the secret to your authenticator app before you continue. It is not shown again.",
+            class_="banner",
+        )
+    )
     body = el(
         "div",
         el("h1", "Enroll an authenticator"),
@@ -1136,6 +1146,7 @@ def mfa_enroll_page(
         ),
         el("p", "Secret: ", el("code", secret)),
         el("p", "URI: ", el("code", otpauth_uri)),
+        warning,
         confirm,
         el("p", el("a", "← My account", href="/ui/account")),
         class_="card",
@@ -1205,14 +1216,14 @@ def mfa_confirm_page(
     *,
     error: str | None = None,
     enrolment_code: bool = False,
-    reauth_href: str | None = None,
+    code_form: bool = True,
 ) -> Markup:
     """The standalone confirm-code form (the unlock re-entry point after a step-up re-auth): the
     secret is already staged server-side and in the user's authenticator, so it is NOT re-shown.
-    ``enrolment_code`` adds the ADR 0207 field, for a session that owes one. ``reauth_href`` puts
-    the re-auth link in the form's place (:func:`_mfa_code_form`)."""
+    ``enrolment_code`` adds the ADR 0207 field, for a session that owes one. ``code_form=False``
+    puts a link back to this page's GET in the form's place (:func:`_mfa_code_form`)."""
     banner = el("p", error, class_="banner") if error else Markup("")
-    form = _mfa_code_form(enrolment_code, reauth_href)
+    form = _mfa_code_form(enrolment_code, code_form)
     body = el(
         "div",
         el("h1", "Confirm enrollment"),
