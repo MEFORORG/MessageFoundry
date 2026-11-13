@@ -5238,7 +5238,7 @@ jobs:
           # the egress check fails fast on the FIRST denied dest, so a missing entry wedges service start.
           # fhir-prod.example.org is allowlisted HOST-ONLY: its prod URL (https://fhir-prod.example.org/fhir)
           # has no explicit port, so urlsplit().port is None and a ":443" suffix would NOT match (see
-          # _http_egress_allowed). A bare host matches any port, which is what we want for a default-port URL.
+          # http_egress_allowed). A bare host matches any port, which is what we want for a default-port URL.
           # `prod` FAIL-CLOSES on unbounded PHI RETENTION too (#186a, ASVS 14.2.4): both PHI-body windows —
           # [retention].messages_days (inbound bodies) and [retention].dead_letter_days (dead-lettered
           # outbound bodies, replayable until purged) — default to 0 = keep-forever, and a PRODUCTION PHI
