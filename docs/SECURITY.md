@@ -2293,9 +2293,10 @@ the same permission set on the same method reds CI until it is listed here.
 > look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
 > that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
 > by a reload. `test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row` in
-> `tests/test_multishard_smoke.py` runs that case against two plain `serve` processes over one
-> store, each with its own graph and API port. It is not run under `serve --shard`, whose engine
-> shards split one config, so on engine shards the case is read from the code (BACKLOG #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
+> `tests/test_multishard_smoke.py` runs the wrong-engine cause against two plain `serve` processes
+> over one store, each with its own graph and API port. It is not run under `serve --shard`, whose
+> engine shards split one config, so on engine shards that cause is read from the code (BACKLOG
+> #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
 > flag request refused for its direction. Such a row's detail carries
 > `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its
 > direction (BACKLOG #3378). `POST /connections/{name}/flag` writes it for a direction of
@@ -6080,9 +6081,8 @@ says under *Time since the IdP sign-in is bounded too*. **A Kerberos session has
 session.** A sign-in that finds the roles or the channel scope changed ends the account's other
 sessions. At the directory re-bind, enough wrong passwords end the session through its re-proof
 budget (BACKLOG #1138). A disabled account's sign-in is refused, and ends no session. The step-up,
-MFA and passkey legs also look the account up in the directory, as
-[step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) states, and their
-refusal ends no session. Every federated
+MFA and passkey legs also look the account up in the directory. They refuse an account the
+directory does not confirm, and that refusal ends no session. Every federated
 account is also a directory account, so the reconciler reaches both legs. One exception: it skips a
 federated binding on a row with no directory id. When it revokes, it never disables or deletes the
 engine account itself.
