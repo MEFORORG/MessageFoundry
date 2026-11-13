@@ -11,7 +11,8 @@
   order, can instead deadlock with the batch, and the server aborts one of the two. The
   pass also reads candidates in keyset batches ordered by received time and message id instead of
   all at once, and runs the decrypt, strip and encrypt in a worker thread with no store connection
-  held, rather than on the event loop. A key-service outage ends the strip phase with what it had
-  committed, rather than failing every row in turn; the rest of the retention pass, and its audit
-  row, still run. Each batch commits on its own, so a pass that fails part way logs, at WARNING,
-  what earlier batches had already stripped.
+  held, rather than on the event loop. A key-service outage (several rows in a row the service gives
+  no verdict on) or a failed batch ends the strip phase with what it had committed, rather than
+  failing every row in turn or the whole pass; the rest of the retention pass still runs, and its
+  audit row records the early end. A strip cancelled part way, as at engine stop, logs at WARNING
+  what its earlier batches had already stripped, which no audit row then records.

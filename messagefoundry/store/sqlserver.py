@@ -850,6 +850,16 @@ _MSSQL_USER_RESEAL: Final = (
     " enrolment_code_expires_at=?, enrolment_code_issuer=?, authz_seal=?"
     " OUTPUT inserted.id WHERE id=? AND authz_seal=?"
 )
+#: The embedded-document strip's write locks, taken in this order inside its batch transaction
+#: (BACKLOG #5651): the message rows first, as a body purge takes them, then their queue rows.
+#: ``q.status`` is not in ``ix_queue_message``, so the queue read reaches, and update-locks, the
+#: clustered rows a replay updates. ``{marks}`` is only ``?`` placeholders, one per message id.
+_MSSQL_STRIP_LOCK_MESSAGES: Final = (
+    "SELECT m.id FROM messages m WITH (UPDLOCK, ROWLOCK) WHERE m.id IN ({marks})"
+)
+_MSSQL_STRIP_LOCK_QUEUE: Final = (
+    "SELECT q.status FROM queue q WITH (UPDLOCK, ROWLOCK) WHERE q.message_id IN ({marks})"
+)
 # The approval statements (BACKLOG #2592); store.py's twins state the contract. The writes are used
 # only by `_write_approval`.
 _MSSQL_APPROVAL_COLUMNS: Final = (
@@ -863,17 +873,6 @@ _MSSQL_APPROVAL_INSERT: Final = (
 )
 #: Reports through ``OUTPUT``, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283),
 #: rather than ``cursor.rowcount`` (vault BACKLOG #3193).
-#: The embedded-document strip's write locks, taken in this order inside its batch transaction
-#: (BACKLOG #5651): the message rows first, as a body purge takes them, then their queue rows.
-#: ``q.status`` is not in ``ix_queue_message``, so the queue read reaches, and update-locks, the
-#: clustered rows a replay updates. ``{marks}`` is only ``?`` placeholders, one per message id.
-_MSSQL_STRIP_LOCK_MESSAGES: Final = (
-    "SELECT m.id FROM messages m WITH (UPDLOCK, ROWLOCK) WHERE m.id IN ({marks})"
-)
-_MSSQL_STRIP_LOCK_QUEUE: Final = (
-    "SELECT q.status FROM queue q WITH (UPDLOCK, ROWLOCK) WHERE q.message_id IN ({marks})"
-)
-
 _MSSQL_APPROVAL_UPDATE: Final = (
     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
     " seal = ? OUTPUT inserted.id"

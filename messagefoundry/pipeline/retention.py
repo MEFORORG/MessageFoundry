@@ -254,6 +254,9 @@ class RetentionPass:
     documents_messages_stripped: int = 0
     documents_stripped: int = 0
     documents_bytes_reclaimed: int = 0
+    # BACKLOG #5651: the strip phase ended before its last batch (a key-service outage or a failed
+    # batch); the counts above are what it had committed. A stop worth an audit row of its own.
+    documents_strip_ended_early: bool = False
     document_prune_overrides: Mapping[str, int] = field(default_factory=dict)
     # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata-only, on the same
     # window as connection events. Never an open/acknowledged instance.
@@ -322,6 +325,7 @@ class RetentionPass:
             or self.state_purged > 0
             or self.conn_events_purged > 0
             or self.documents_messages_stripped > 0
+            or self.documents_strip_ended_early
             or self.alert_instances_purged > 0
             or self.app_logs_deleted > 0
             or self.app_logs_compressed > 0
@@ -631,8 +635,8 @@ class RetentionRunner:
                 ended_early=part.ended_early,
             )
             if part.ended_early:
-                # A key-service outage (BACKLOG #5651): every later threshold group would meet it
-                # too. End only this phase; the rest of the pass and its audit row still run.
+                # BACKLOG #5651: a key-service outage or a failed batch. End only this phase; the
+                # rest of the pass and its audit row, which records the early end, still run.
                 break
         state_purged = 0
         if not _deadline_hit() and s.state_max_age_days > 0:
@@ -807,6 +811,7 @@ class RetentionRunner:
             documents_messages_stripped=strip.messages_stripped,
             documents_stripped=strip.documents_stripped,
             documents_bytes_reclaimed=strip.bytes_reclaimed,
+            documents_strip_ended_early=strip.ended_early,
             document_prune_overrides=doc_overrides,
             alert_instances_purged=alert_instances_purged,
             app_logs_deleted=app_logs_deleted,
@@ -1389,6 +1394,7 @@ class RetentionRunner:
                 "documents_messages_stripped": result.documents_messages_stripped,
                 "documents_stripped": result.documents_stripped,
                 "documents_bytes_reclaimed": result.documents_bytes_reclaimed,
+                "documents_strip_ended_early": result.documents_strip_ended_early,
                 # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata only.
                 "alert_instances_purged": result.alert_instances_purged,
                 # Application log files deleted this pass (#120) + the window — metadata only, no PHI.

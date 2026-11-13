@@ -503,12 +503,13 @@ async def test_the_scan_reads_candidates_in_bounded_keyset_batches(
         assert rec["raw"] == MFB64_BODY and rec["documents_pruned"] is None
 
 
-async def test_a_pass_that_fails_part_way_logs_what_it_had_committed(
+async def test_a_batch_that_fails_ends_the_call_with_what_had_committed(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5651: each batch commits on its own, so when a later batch raises, the earlier
-    batches' strips stay committed and the runner writes no audit row for them. The pass says so at
-    WARNING, with the counts and no byte of a body, and re-raises."""
+    """BACKLOG #5651: each batch commits on its own, so when a later batch fails, the earlier
+    batches' strips stay committed. The call then returns them, flagged ``ended_early``, so the
+    runner can audit them, and says so at WARNING with the error's type and the counts, never the
+    error's text or a byte of a body."""
     monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
     real = document_strip.transform_strip_batch
     calls: list[int] = []
@@ -516,26 +517,25 @@ async def test_a_pass_that_fails_part_way_logs_what_it_had_committed(
     def flaky(cipher: Any, rows: Any, **kwargs: Any) -> Any:
         calls.append(len(rows))
         if len(calls) == 2:
-            raise RuntimeError("synthetic transform failure")
+            raise RuntimeError("synthetic transform failure SECRET-TEXT")
         return real(cipher, rows, **kwargs)
 
     monkeypatch.setattr(document_strip, "transform_strip_batch", flaky)
     first = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-F1")
     second = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=1.0, control="C-F2")
 
-    with (
-        caplog.at_level(logging.WARNING, logger="messagefoundry.store.document_strip"),
-        pytest.raises(RuntimeError, match="synthetic"),
-    ):
-        await store.strip_embedded_documents(
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.document_strip"):
+        result = await store.strip_embedded_documents(
             older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
         )
 
+    assert (result.messages_stripped, result.ended_early) == (1, True)
     assert binary.is_document_tombstone((await _get(store, first))["raw"])  # batch one committed
     assert (await _get(store, second))["raw"] == MFB64_BODY
-    [record] = [r for r in caplog.records if "failed part way" in r.getMessage()]
-    assert "1 documents in 1 messages" in record.getMessage()
-    assert DOC.decode()[:20] not in record.getMessage()
+    [record] = [r for r in caplog.records if "ended early" in r.getMessage()]
+    text = record.getMessage()
+    assert "RuntimeError" in text and "1 documents in 1 messages" in text
+    assert "SECRET-TEXT" not in text and DOC.decode()[:20] not in text
 
 
 async def test_a_failed_audit_of_refused_cells_still_logs_what_was_committed(
@@ -568,10 +568,10 @@ async def test_a_failed_audit_of_refused_cells_still_logs_what_was_committed(
 async def test_a_key_service_outage_stops_the_pass(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5651: a decrypt the key service gave no verdict on ends the strip call at the first
-    row, rather than failing, and timing out, once per row. The call returns, flagged
-    ``ended_early``, instead of raising."""
-    for i in range(3):
+    """BACKLOG #5651: ``OUTAGE_ROWS`` decrypts in a row that the key service gave no verdict on end
+    the strip call there, rather than failing, and timing out, once per row. The call returns,
+    flagged ``ended_early``, instead of raising."""
+    for i in range(5):
         await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=float(i), control=f"C-O{i}")
     calls: list[str] = []
 
@@ -586,7 +586,32 @@ async def test_a_key_service_outage_stops_the_pass(
     )
 
     assert result == StripResult(ended_early=True)
-    assert len(calls) == 1
+    assert len(calls) == document_strip.OUTAGE_ROWS
+
+
+async def test_one_row_the_key_service_gives_no_verdict_on_is_skipped(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: one row that always gets no verdict (an oversized cell, say) is skipped like
+    any unreadable row. It must not end the call, or every later pass would stop at it."""
+    bad = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-NV1")
+    good = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=1.0, control="C-NV2")
+    from messagefoundry.store.cell_tag import open_message_cell as real
+
+    def one_bad(cipher: Any, column: str, stored: Any, **kwargs: Any) -> Any:
+        if kwargs["message_id"] == bad:
+            raise CipherUnavailableError("synthetic: no verdict on this one cell")
+        return real(cipher, column, stored, **kwargs)
+
+    monkeypatch.setattr(document_strip, "open_message_cell", one_bad)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert (result.messages_stripped, result.ended_early) == (1, False)
+    assert (await _get(store, bad))["raw"] == MFB64_BODY
+    assert binary.is_document_tombstone((await _get(store, good))["raw"])
 
 
 async def test_a_key_service_outage_ends_only_the_strip_phase_of_a_retention_pass(
@@ -595,8 +620,13 @@ async def test_a_key_service_outage_ends_only_the_strip_phase_of_a_retention_pas
     """BACKLOG #5651: an outage in the strip phase does not fail the retention pass: the pass
     completes and still writes its single ``retention_purge`` audit row, here for a body purge the
     same pass made."""
-    # Two days old: past its one-day strip window, inside the three-day body window.
-    kept = await _delivered(store, channel_id="IB_PRUNE", raw=MFB64_BODY, now=3 * DAY, control="O1")
+    # Two days old: past their one-day strip window, inside the three-day body window.
+    kept = [
+        await _delivered(
+            store, channel_id="IB_PRUNE", raw=MFB64_BODY, now=3 * DAY, control=f"O1{i}"
+        )
+        for i in range(document_strip.OUTAGE_ROWS)
+    ]
     # Five days old: its body is purged by the same pass.
     await _delivered(store, channel_id="IB_KEEP", raw=MFB64_BODY, now=0.0, control="O2")
     calls: list[str] = []
@@ -616,10 +646,12 @@ async def test_a_key_service_outage_ends_only_the_strip_phase_of_a_retention_pas
 
     result = await runner.run_once()
 
-    assert calls == [kept]  # the strip phase ran, and stopped at its first row
+    assert sorted(calls) == sorted(kept)  # the strip phase ran, and ended at the outage
     assert result.messages_purged == 1 and result.documents_messages_stripped == 0
+    assert result.documents_strip_ended_early
     audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
     assert len(audit) == 1
+    assert json.loads(audit[0]["detail"])["documents_strip_ended_early"] is True
 
 
 _LOCK_ROW = {"id": "M-LOCK", "channel_id": "IB", "raw": MFB64_BODY, "received_at": 0.0}
