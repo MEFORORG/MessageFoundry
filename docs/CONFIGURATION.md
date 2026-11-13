@@ -172,7 +172,7 @@ backend-limited.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `backend` | enum | `sqlite` | `sqlite` · `postgres` · `sqlserver` · (later `mysql`/`oracle`) — all three implemented; see the [capability matrix](#per-backend-capability-matrix) |
-| `path` | str | `./messagefoundry.db` | SQLite only |
+| `path` | str | `./messagefoundry.db` | The SQLite store file. A relative path is anchored on every backend, as the `[environments].base_dir` row says. |
 | `synchronous` | enum | `normal` | SQLite: `normal`/`full` |
 | `secure_delete` | bool | `true` | **SQLite only** (vault BACKLOG #2619). Sets `PRAGMA secure_delete` on the writer connection, so SQLite overwrites a deleted row or a purged body with zeros. With it off, a retention purge or a consumed queue row leaves the old bytes in the file's free space, readable by anyone holding the file and, for a sealed body, the key. The cost is extra write I/O for each page a delete frees: measured on one Windows machine, a 6 KB insert-then-delete went from about 0.15 ms to about 0.20 ms in a bare SQLite loop. Pages freed before it was on keep their bytes until a `VACUUM`. Off on a file-backed store is a loosening that `security_loosenings()` names; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Ignored by the server-DB backends. |
 | `group_commit_window_ms` | float (ms) | `0.0` | **SQLite only** ([ADR 0055](adr/0055-group-commit-durable-write.md)). When `> 0` a dedicated committer coroutine **coalesces** the grouped stage-handoff mutations (`enqueue_ingress`, `route_handoff`, `transform_handoff`, `mark_done`, `complete_with_response`, `dead_letter_now`, `mark_failed`) into **one** durable commit, amortizing the per-commit fsync (a large win under `synchronous = full`, muted under the default `normal`). A member waits up to this window for siblings to join before the batch commits; the claim / reference-snapshot / audit writes stay **standalone** (never grouped — the hash chain must not batch). `0` (the default) = **off**, byte-identical to the inline-commit path. Ignored by the server-DB backends, which coalesce through their connection pool instead. |
@@ -1651,11 +1651,9 @@ refuses that spelling at load. A connection port that arrives as text is compare
 uncast `env()` value supplied as text, at least from a `MEFOR_VALUE_*` variable or a quoted string
 in `<env>.toml`, hands a `port` setting the text `06661`, which matches `host:06661` and not
 `host:6661`, while the connector dials port 6661. So write a pinned port in plain digits, and cast
-an `env()` port to an integer (`cast=int` in Python, `cast = "int"` in `connections.toml`). A URL,
-or a connection whose `port` setting is unset, matches only an entry that names no port, even where
-its connector then dials a default, such as 443 for an `https` URL or 22 for SFTP; `Email()` and
-`Direct()` are matched as port 587 when they name none. So list `host`, not `host:443`, for a
-default-port URL. An entry matches nothing at least when it holds more than one colon outside brackets, such as
+an `env()` port to an integer (`cast=int` in Python, `cast = "int"` in `connections.toml`). A URL
+that names no port matches only an entry that names no port, even though its connector then dials a
+default, such as 443 for `https`. So list `host`, not `host:443`, for a default-port URL. An entry matches nothing at least when it holds more than one colon outside brackets, such as
 `::1` or `fe80::1:443`, because its last group could be read as a port; when its brackets hold
 anything but an IPv6 literal, whitespace around it aside (`[ ::1 ]` reads as `[::1]`); or when a colon has no port after it, such as `db:` from a
 `MEFOR_EGRESS_ALLOWED_DB` built from an empty variable. A `%` zone id, such as `fe80::1%eth0`, matches nothing, in an entry or
