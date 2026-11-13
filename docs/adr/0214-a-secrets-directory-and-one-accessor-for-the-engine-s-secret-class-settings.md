@@ -153,6 +153,16 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 ## Amendments
 
+- **2026-11-13, the folders above the directory are read (vault BACKLOG #5656, #5657).** The risk
+  above that says *"Nor are the folders above the directory checked"* is now partly closed. The
+  check walks the folders on the directory's path and refuses a junction or link among them that
+  another account can change, and on Windows it reads the folder that holds the directory and
+  refuses one a broad group may delete a file in, change the access list of, or owns. It still
+  does not read whether a broad group may rename that folder or one above it, which `DELETE`
+  allows, nor the access lists of the folders above the one that holds the directory, so the
+  risk's replacement of the directory by such a group stands for those. A file in the directory
+  is not walked again; the directory's own check is its walk. `docs/PHI.md` section 2, *The
+  folders above a key file*, states the rule.
 - **2026-11-13, a link is refused on every platform (vault BACKLOG #5636).** Decision 3's "a link
   on Windows" now reads "a link": `broad_access_problem` reads the named path without following a
   link on POSIX too, so a secrets directory, or a file in it, that is itself a link is refused

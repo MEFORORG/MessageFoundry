@@ -112,7 +112,7 @@ MAX_FILE_BYTES: Final = 64 * 1024
 #: The remedy every access refusal ends with.
 _REMEDY: Final = (
     "Restrict it to SYSTEM, Administrators and the account the engine runs as, as real files and "
-    "directories rather than links, with no junction or link in the folders above them (Windows: "
+    "directories rather than links, with no junction or link above them that another account can change (Windows: "
     "in a folder no broad group may delete a file in or change the access list of; POSIX: the "
     "engine's own account, mode 0700 for the directory and 0600 for a file, in a folder that "
     "account or root owns and only it may write, or that has the sticky bit)"

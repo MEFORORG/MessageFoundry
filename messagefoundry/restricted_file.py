@@ -9,9 +9,10 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
   that could not be created that way is never left behind, and there is no fallback to writing the
   file first and tightening it afterwards.
 * :func:`broad_access_problem` answers, before a key file is used, whether a known broad group or
-  an application package can read it or change it, whether it or a folder above it is a link, and
-  whether the directory holding it lets another account replace it. On POSIX it also asks whether
-  another account owns the file, and on Windows whether a broad group does.
+  an application package can read it or change it, whether it is a link, whether a link above it
+  is one another account can change, and whether the directory holding it lets another account
+  replace it. On POSIX it also asks whether another account owns the file, and on Windows whether
+  a broad group does.
 
 :func:`key_file_handle_problem` is the stricter Windows read check the key custody reads use: the
 owner and the exact list, read through the open handle.
@@ -46,7 +47,9 @@ from __future__ import annotations
 
 import errno
 import functools
+import ntpath
 import os
+import posixpath
 import stat
 import sys
 import time
@@ -61,14 +64,23 @@ from messagefoundry.auth.anchor_path import (
     _SHARED_SERVICE_SIDS,
     ACCESS_ALLOWED_ACE_TYPE,
     ADMINISTRATORS_SID,
+    DIRECTORY,
     LINK,
+    PATH,
     SHARE_CAUSE,
     SYSTEM_SID,
+    ChainFinding,
+    PosixStat,
     WalkCause,
+    WinSecurity,
+    WinTrust,
     _win_probe,
     describe_sid,
+    evaluate_windows_object,
+    posix_path_verdict,
     query_drive_target,
     windows_chain,
+    windows_host_readers,
 )
 
 if TYPE_CHECKING:
@@ -495,30 +507,71 @@ def _windows_holder_problem(security: _WinPathSecurity) -> str | None:
     )
 
 
-def _windows_chain_problem(chain: Sequence[tuple[str, str]], cause: WalkCause | None) -> str | None:
-    """Why the walk of a key file's path (:func:`~messagefoundry.auth.anchor_path.windows_chain`)
-    does not show the file is where its path says, or ``None`` (vault BACKLOG #5657).
-
-    A junction or a link on the path is refused, as the key file's own link is: the file is then
-    wherever that link's target says, and an account that can change the target moves it. A walk
-    that could not finish is refused too, except where it reached a network share, which the walk
-    does not read past and whose own access list the check still reads. Neither answer names a path:
-    a cause's ``kind`` names none. Kept free of I/O so the decision is testable on every platform."""
-    if any(kind == LINK for _obj, kind in chain):
-        return "a folder on its path is a junction or a link, so where the file is depends on it"
+def _windows_cause_problem(cause: WalkCause | None) -> str | None:
+    """Why a walk of a key file's path (:func:`~messagefoundry.auth.anchor_path.windows_chain`)
+    that stopped with ``cause`` does not show where the file is, or ``None`` (vault BACKLOG #5657).
+    A walk that reached a network share passes: the walk does not read past it, and the file's own
+    access list is still read. Any other cause is refused. A cause's ``kind`` names no path."""
     if cause is not None and cause.kind != SHARE_CAUSE:
         return f"the folders on its path could not be walked ({cause.kind})"
+    return None
+
+
+#: What a link finding is about, by the kind of object it names, for the refusal text.
+_LINK_FINDING_SUBJECT: Mapping[str, str] = MappingProxyType(
+    {
+        LINK: "a junction or link on its path",
+        DIRECTORY: "the folder that holds a junction or link on its path",
+    }
+)
+
+
+def _link_finding_problem(finding: ChainFinding) -> str:
+    """The refusal for one anchor-path ``finding`` about a link on a key file's path. The finding's
+    reason names accounts and modes, never a path, so it is quoted."""
+    subject = _LINK_FINDING_SUBJECT.get(finding.kind, "a part of its path")
+    if not finding.insecure:
+        return f"{subject} could not be judged: {finding.reason}"
+    return (
+        f"{subject} can be changed by an account other than the engine's own and the host's "
+        f"administrators, so where the file is depends on it: {finding.reason}"
+    )
+
+
+def _windows_link_problem(
+    chain: Sequence[tuple[str, str]],
+    read_security: Callable[[str, str], WinSecurity],
+    trust: WinTrust,
+) -> str | None:
+    """Why a junction or link in a walked ``chain`` lets another account move the key file, or
+    ``None`` (vault BACKLOG #5657). A link is judged by who can change it: its own owner and access
+    list, and the folder that holds it, which could delete or rename it, each by the trust-anchor
+    rule (:func:`~messagefoundry.auth.anchor_path.evaluate_windows_object`). So a junction only
+    SYSTEM, Administrators, TrustedInstaller or the engine's own account can change passes, such as
+    ``C:\\Users\\All Users`` or a folder an administrator mounted a volume on. A finding that could
+    not be settled is refused too. Kept free of ctypes so the decision is testable everywhere."""
+    for obj, kind in chain:
+        if kind != LINK:
+            continue
+        for judged, as_kind in ((obj, LINK), (ntpath.dirname(obj), DIRECTORY)):
+            findings = evaluate_windows_object(
+                judged, as_kind, read_security(judged, as_kind), trust
+            )
+            if findings:
+                return _link_finding_problem(findings[0])
     return None
 
 
 def _windows_surroundings_problem(
     path: Path, read_path: Callable[[Path], _WinPathSecurity]
 ) -> str | None:
-    """Why the folders on ``path`` let another account move or replace it, or ``None``: a junction
-    or link above it (:func:`_windows_chain_problem`), then the directory that holds it
+    """Why the folders on ``path`` let another account move or replace it, or ``None``: a walk that
+    did not finish (:func:`_windows_cause_problem`), a junction or link above it that another
+    account can change (:func:`_windows_link_problem`), then the directory that holds it
     (:func:`_windows_holder_problem`). Windows only. Win32 collapses ``..`` before it follows a link,
     so the holder is the lexical parent, and only it and the folders above it are walked: the
-    caller has read ``path`` itself."""
+    caller has read ``path`` itself. The host's trust readers are built only for a path with a
+    link on it."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the folders on a Windows path are walked on Windows only")
     try:
@@ -530,10 +583,23 @@ def _windows_surroundings_problem(
     chain, cause = windows_chain(
         str(full.parent), os.getcwd, _win_probe, drive_target=query_drive_target
     )
-    problem = _windows_chain_problem(chain, cause)
+    problem = _windows_cause_problem(cause)
+    if problem is None and any(kind == LINK for _obj, kind in chain):
+        host = windows_host_readers()
+        problem = _windows_link_problem(
+            chain, host.read_security, WinTrust(host.engine_sid, host.admin_member)
+        )
     if problem is not None:
         return problem
-    problem = _windows_holder_problem(read_path(full.parent))
+    holder = read_path(full.parent)
+    if holder.status != 0:
+        detail = f": {holder.status_text}" if holder.status_text else ""
+        return (
+            f"the permissions of the directory that holds it could not be read (Win32 error "
+            f"{holder.status}{detail}); give the account the engine runs as the right to read "
+            "that folder's permissions"
+        )
+    problem = _windows_holder_problem(holder)
     return None if problem is None else f"the directory that holds it is not restricted: {problem}"
 
 
@@ -607,26 +673,81 @@ def _posix_parent(path: Path) -> Path:
     return path / ".." if path.name in {"", ".."} else path.parent
 
 
-def _posix_ancestor_link_problem(path: Path) -> str | None:
-    """Why a folder on ``path`` is a link, or could not be examined, or ``None`` (vault BACKLOG
-    #5656). Each folder is read with ``lstat``, from the root down, the last part left out: the
-    caller reads that itself. Nothing is normalized first, because ``..`` after a link leads where
-    the link's target says; a folder already read is no link, so ``..`` after it is lexical."""
-    try:
-        full = path if path.is_absolute() else Path(os.getcwd()) / path
-    except OSError as exc:  # a working directory that was removed
-        return f"its path could not be examined ({exc.strerror or type(exc).__name__})"
-    folder = Path(full.anchor)
-    for name in full.parts[1:-1]:
-        folder /= name
-        try:
-            if stat.S_ISLNK(os.lstat(folder).st_mode):
-                return "a folder on its path is a link, so where the file is depends on it"
-        except OSError as exc:
-            return (
-                f"a folder on its path could not be examined ({exc.strerror or type(exc).__name__})"
-            )
+def _posix_link_problem(
+    path: str,
+    *,
+    cwd: str | Callable[[], str],
+    euid: int,
+    lstat_fn: Callable[[str], PosixStat],
+    readlink_fn: Callable[[str], str],
+) -> str | None:
+    """Why a link on ``path`` lets another account move the key file, or ``None`` (vault BACKLOG
+    #5656). The walk is :func:`~messagefoundry.auth.anchor_path.posix_path_verdict`, ``..`` and
+    links followed as the kernel does, and only its findings about a link are kept: one about the
+    link itself (another account owns it in a folder others may write), one about the folder that
+    holds a link (another account owns it, or a group or other may write it without the sticky
+    bit), and one about a part of the path it could not read. So a link only root or the engine's
+    own account can change passes, such as macOS ``/tmp`` or an ostree host's ``/home``. The file
+    system type is not judged here. Kept free of I/O so the decision is testable everywhere."""
+    links: list[str] = []
+
+    def recording(part: str) -> PosixStat:
+        status = lstat_fn(part)
+        if stat.S_ISLNK(status.mode):
+            links.append(part)
+        return status
+
+    verdict = posix_path_verdict(
+        path,
+        cwd=cwd,
+        euid=euid,
+        lstat_fn=recording,
+        readlink_fn=readlink_fn,
+        fstype_fn=lambda _part: ("/", "ext4"),  # the file system's type is not this rule's
+    )
+    holders = {posixpath.dirname(link) for link in links}
+    for finding in verdict.findings:
+        about_holder = finding.kind == DIRECTORY and finding.path in holders
+        if finding.kind in (LINK, PATH) or (about_holder and (finding.owner or finding.writable)):
+            if finding.kind == LINK and finding.owner:
+                # Its reason quotes the folder's path; this text names none.
+                return (
+                    "a link on its path is owned by another account and sits in a folder others "
+                    "may write, so where the file is depends on it"
+                )
+            return _link_finding_problem(finding)
     return None
+
+
+def _posix_host_link_problem(path: Path) -> str | None:
+    """:func:`_posix_link_problem` for ``path`` on this host. A read that fails is a finding whose
+    reason quotes the error, so the error is rebuilt without the file name it carries. POSIX only."""
+    if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
+        raise OSError("a POSIX path is walked on POSIX only")
+
+    def lstat_fn(part: str) -> PosixStat:
+        try:
+            status = os.lstat(part)
+        except OSError as exc:
+            raise OSError(exc.errno, exc.strerror) from None
+        return PosixStat(status.st_uid, status.st_mode)
+
+    def readlink_fn(part: str) -> str:
+        try:
+            return os.readlink(part)
+        except OSError as exc:
+            raise OSError(exc.errno, exc.strerror) from None
+
+    try:
+        return _posix_link_problem(
+            os.fspath(path),
+            cwd=os.getcwd,
+            euid=os.geteuid(),
+            lstat_fn=lstat_fn,
+            readlink_fn=readlink_fn,
+        )
+    except OSError as exc:  # the working directory, which the walk does not guard
+        return f"its path could not be examined ({exc.strerror or type(exc).__name__})"
 
 
 #: The extended attribute that holds a Linux file's POSIX access control list.
@@ -784,11 +905,12 @@ def broad_access_problem(
         return own
     # The holder's owner and mode are one stat, so they are read again even when holder_judged:
     # a directory widened since its own check is still caught at the read.
-    problem = None if holder_judged else _posix_ancestor_link_problem(path)
+    problem = None if holder_judged else _posix_host_link_problem(path)
     if problem is not None:
         return problem
     try:
-        # stat: the walk above found no link, so this reads the directory the path names.
+        # stat, following a link, so the directory judged is the one the file is actually in. A
+        # link on the way was judged by the walk above, unless holder_judged skipped it.
         parent = os.stat(_posix_parent(path))
     except OSError as exc:
         return (

@@ -2730,7 +2730,8 @@ secret. Each file in that directory holds one setting and is named exactly as it
   it also refuses a directory or file owned by an account other than the engine's own or root,
   and one held in a directory that such an account owns or that a group or other may write
   without the sticky bit, since any account that may write it may replace what it holds. On every
-  platform it refuses a directory with a junction or a link in the folders above it, and on
+  platform it refuses a directory with a junction or a link above it that another account can
+  change, and on
   Windows one held in a folder a broad group may delete a file in or change the access list of, or
   that such a group owns; [PHI.md](PHI.md) section 2, *The folders above a key file*, states that
   rule and what it does not read. It also

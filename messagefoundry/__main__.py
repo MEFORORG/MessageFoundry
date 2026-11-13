@@ -7952,7 +7952,7 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
         remedy=(
             "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
             "the key again with `messagefoundry protect-key` to a new path in a folder no broad "
-            "group may delete a file in, with no junction or link on its path"
+            "group may delete a file in, with no junction or link on its path that another account can change"
         ),
         enforcing=enforcing,
     )
@@ -7990,13 +7990,15 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             f"Where it names the directory's mode, remove the write bits: chmod go-w {directory}. "
             "Where it names the directory's owner, give it to the account the engine runs as: "
             f"chown {shlex.quote(_engine_account_name())} {directory}. "
+            "Where it names a link on its path, keep the store where no link another account "
+            "can change is above it, since a new pair would be minted in the same place. "
         )
     else:
         remedy += (
             "Where the refusal names the directory that holds it, that is the store's directory: "
             "remove a broad group's right to delete files in it or change its access list, and "
             "give it an owner that is not such a group. Where it names a folder on its path, keep "
-            "the store where no junction or link is above it. A new pair would be minted in the "
+            "the store where no junction or link another account can change is above it. A new pair would be minted in the "
             "same place again. "
         )
     return remedy + (

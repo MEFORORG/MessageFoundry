@@ -63,8 +63,8 @@ _PEM_MARKER: Final = "-----BEGIN"
 #: The remedy for a key file an operator supplied.
 KEY_FILE_REMEDY: Final = (
     "Restrict it to the account the engine runs as, as a file rather than a link, with no junction "
-    "or link in the folders above it (Windows: in a directory no broad group may delete a file in "
-    "or change the access list of; POSIX: a file that account owns, in a directory that account "
+    "or link above it that another account can change (Windows: in a directory no broad group "
+    "may delete a file in or change the access list of; POSIX: a file that account owns, in a directory that account "
     "or root owns and only it may write, or that has the sticky bit; for a key kept behind a link, "
     "such as a certbot live/ path, copy the file to a real folder on each renewal)"
 )
@@ -99,7 +99,7 @@ def key_file_problem(path: str, *, what: str, remedy: str, absent_ok: bool = Fal
 
     A known broad group or an application package must not be able to read or change the file
     (:func:`~messagefoundry.restricted_file.broad_access_problem`). That check also reads the
-    folders above the file: a junction or a link among them is refused, and so is a directory
+    folders above the file: a junction or a link among them that another account can change is refused, and so is a directory
     holding it that lets a broad group replace it (vault BACKLOG #5656, #5657). On POSIX it also
     refuses a link, a file another account owns, and a directory holding it that another account
     owns or that a group or other may write with no sticky bit. ``what`` names the file for

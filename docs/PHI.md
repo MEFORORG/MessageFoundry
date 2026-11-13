@@ -415,10 +415,15 @@ than a path is not checked
   account may own the file, as the administrator who copied in your own TLS key may. LOCAL SERVICE
   and NETWORK SERVICE are accounts that many services share, and the check does not report them.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On every platform the check walks
-  the folders on the key file's path, from the root down, and refuses a key file with a junction
-  or a link among them, as it refuses a key file that is itself a link: the file is then wherever
-  that link leads. On Windows a folder a volume is mounted on reads as a junction, and is refused
-  too; a POSIX mount point is not a link and passes. On
+  the folders on the key file's path, from the root down, and judges each junction or link among
+  them by who can change it, since the file is wherever that link leads. A link passes when only
+  the engine's own account and the host's administrators can change it or the folder that holds
+  it: on Windows SYSTEM, Administrators and TrustedInstaller, by the trust-anchor rule; on POSIX
+  root, with the owner and mode rules the trust-anchor check uses. So macOS `/tmp`, an ostree
+  host's `/home`, `C:\Users\All Users` and a folder an administrator mounted a volume on pass. A
+  link that another account owns or may write, or that sits in a folder another account may
+  delete or re-point it in, is refused, and so is one whose access could not be read. A key file
+  that is itself a link is refused whoever can change it. A POSIX mount point is not a link. On
   Windows it also reads the access list of the directory that holds the file, and refuses it when
   one of the groups above or an application package may delete a file in it, change its access
   list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when

@@ -31,7 +31,10 @@ from messagefoundry.auth.anchor_path import (
     FILE,
     LINK,
     SHARE_CAUSE,
+    PosixStat,
     WalkCause,
+    WinSecurity,
+    WinTrust,
     windows_chain,
 )
 from messagefoundry.config.wiring import _WinPathSecurity
@@ -656,7 +659,7 @@ def test_a_holder_a_broad_group_owns_is_refused() -> None:
     assert "its owner is " in problem and f"Users ({_USERS})" in problem
 
 
-def _walk(path: str) -> tuple[list[tuple[str, str]], WalkCause | None]:
+def _walk(path: str) -> list[tuple[str, str]]:
     """The walk of a Windows ``path`` over a stand-in file system with one junction, at
     ``C:\\data\\linked``, onto ``D:\\elsewhere``."""
 
@@ -665,23 +668,126 @@ def _walk(path: str) -> tuple[list[tuple[str, str]], WalkCause | None]:
             return LINK, "D:\\elsewhere"
         return (FILE if part.endswith(".key") else DIRECTORY), None
 
-    return windows_chain(path, "C:\\", probe)
+    chain, cause = windows_chain(path, "C:\\", probe)
+    assert cause is None
+    return chain
 
 
-def test_the_walk_of_a_key_files_path_refuses_a_junction_above_it() -> None:
-    assert restricted_file._windows_chain_problem(*_walk("C:\\data\\real\\store.key")) is None
-    problem = restricted_file._windows_chain_problem(*_walk("C:\\data\\linked\\store.key"))
-    assert "a folder on its path is a junction or a link" in str(problem)
-    # Win32 collapses ``..`` before any link is followed, so this never passes through the junction.
-    assert restricted_file._windows_chain_problem(*_walk("C:\\data\\linked\\..\\x.key")) is None
+#: The engine's own account in the stand-in readers below.
+_ENGINE_SID = "S-1-5-80-9-9-9"
+
+
+def _link_problem(*, link: WinSecurity, holder: WinSecurity, path: str) -> str | None:
+    """:func:`_windows_link_problem` over :func:`_walk`, with ``link`` read for the junction and
+    ``holder`` for the folder that holds it; every other object reads as SYSTEM's alone."""
+    clean = WinSecurity(_SYSTEM, ((_ALLOW, 0, _FULL, _SYSTEM),))
+
+    def read_security(obj: str, _kind: str) -> WinSecurity:
+        return {"c:\\data\\linked": link, "c:\\data": holder}.get(obj.lower(), clean)
+
+    trust = WinTrust(_ENGINE_SID, admin_member=lambda _sid: False)
+    return restricted_file._windows_link_problem(_walk(path), read_security, trust)
+
+
+#: A junction or folder only SYSTEM and Administrators may change, as ``C:\Users\All Users``.
+_SYSTEMS = WinSecurity(_SYSTEM, ((_ALLOW, 0, _FULL, _SYSTEM), (_ALLOW, 0, _FULL, _ADMINS)))
+
+
+def test_a_junction_only_system_administrators_or_the_engine_can_change_passes() -> None:
+    """Vault BACKLOG #5657, the owner's ruling of the Manager's question 2: a link above the key is
+    judged by who can change it, so a SYSTEM junction or a volume an administrator mounted passes."""
+    assert _link_problem(link=_SYSTEMS, holder=_SYSTEMS, path="C:\\data\\linked\\k.key") is None
+    engines = WinSecurity(_ENGINE_SID, ((_ALLOW, 0, _FULL, _ENGINE_SID),))
+    assert _link_problem(link=engines, holder=_SYSTEMS, path="C:\\data\\linked\\k.key") is None
+    # A path with no junction on it reads no security at all.
+    assert _link_problem(link=_SYSTEMS, holder=_SYSTEMS, path="C:\\data\\real\\k.key") is None
+
+
+def test_a_junction_a_broad_group_can_change_is_refused() -> None:
+    writable_link = WinSecurity(_SYSTEM, ((_ALLOW, 0, 0x00000002, _USERS),))  # FILE_WRITE_DATA
+    problem = str(_link_problem(link=writable_link, holder=_SYSTEMS, path="C:\\data\\linked\\k"))
+    assert "a junction or link on its path can be changed by an account other than" in problem
+    assert f"({_USERS})" in problem
+    deletable = WinSecurity(_SYSTEM, ((_ALLOW, 0, 0x00000040, _USERS),))  # FILE_DELETE_CHILD
+    problem = str(_link_problem(link=_SYSTEMS, holder=deletable, path="C:\\data\\linked\\k"))
+    assert "the folder that holds a junction or link on its path can be changed" in problem
+    owned = WinSecurity(_USERS, ((_ALLOW, 0, _FULL, _SYSTEM),))
+    assert "owned by" in str(_link_problem(link=owned, holder=_SYSTEMS, path="C:\\data\\linked\\k"))
+    unread = WinSecurity(None, (), "error 5")
+    assert "could not be judged" in str(
+        _link_problem(link=unread, holder=_SYSTEMS, path="C:\\data\\linked\\k")
+    )
 
 
 def test_a_walk_that_did_not_finish_is_refused_except_at_a_share() -> None:
-    assert restricted_file._windows_chain_problem([], WalkCause.plain(SHARE_CAUSE)) is None
+    assert restricted_file._windows_cause_problem(None) is None
+    assert restricted_file._windows_cause_problem(WalkCause.plain(SHARE_CAUSE)) is None
     stopped = WalkCause("C:\\a secret path could not be read", "a name could not be read")
-    problem = str(restricted_file._windows_chain_problem([], stopped))
+    problem = str(restricted_file._windows_cause_problem(stopped))
     assert "could not be walked (a name could not be read)" in problem
     assert "secret path" not in problem  # a cause's kind names no path; its text may
+
+
+def _posix_link(
+    path: str, objects: dict[str, tuple[int, int]], links: dict[str, str]
+) -> str | None:
+    """:func:`_posix_link_problem` over a stand-in file system: ``objects`` maps a path to its
+    ``(uid, mode)``, ``links`` a link to its target. The engine is :data:`_ENGINE_UID`."""
+
+    def lstat_fn(part: str) -> PosixStat:
+        if part not in objects:
+            raise OSError(errno.ENOENT, "No such file or directory")
+        uid, mode = objects[part]
+        return PosixStat(uid, mode)
+
+    return restricted_file._posix_link_problem(
+        path, cwd="/", euid=_ENGINE_UID, lstat_fn=lstat_fn, readlink_fn=links.__getitem__
+    )
+
+
+_ROOT_DIR = (0, stat.S_IFDIR | 0o755)
+_KEY_TREE: dict[str, tuple[int, int]] = {
+    "/": _ROOT_DIR,
+    "/private": _ROOT_DIR,
+    "/private/tmp": (0, stat.S_IFDIR | 0o1777),
+    "/private/tmp/keys": (_ENGINE_UID, stat.S_IFDIR | 0o700),
+    "/private/tmp/keys/k.key": (_ENGINE_UID, _KEY),
+}
+
+
+def test_a_posix_link_only_root_or_the_engine_can_change_passes() -> None:
+    """Vault BACKLOG #5656: macOS ``/tmp`` is root's link to ``/private/tmp`` in a folder only root
+    may write, so a key under it passes; the old walk refused every link above the key."""
+    tree = {**_KEY_TREE, "/tmp": (0, stat.S_IFLNK | 0o755)}
+    assert _posix_link("/tmp/keys/k.key", tree, {"/tmp": "private/tmp"}) is None
+    # The engine's own link, in a sticky folder others may write, passes too.
+    mine = {**tree, "/private/tmp/mine": (_ENGINE_UID, stat.S_IFLNK | 0o777)}
+    assert _posix_link("/private/tmp/mine/k.key", mine, {"/private/tmp/mine": "keys"}) is None
+
+
+def test_a_posix_link_another_account_can_change_is_refused() -> None:
+    # A link in a folder a group may write, with no sticky bit: any member may re-point it.
+    shared = {
+        **_KEY_TREE,
+        "/srv": (0, stat.S_IFDIR | 0o775),
+        "/srv/keys": (0, stat.S_IFLNK | 0o777),
+    }
+    problem = str(_posix_link("/srv/keys/k.key", shared, {"/srv/keys": "/private/tmp/keys"}))
+    assert "the folder that holds a junction or link on its path can be changed" in problem
+    assert "group or others can write to it" in problem
+    # A link another account owns, in a sticky folder others may write: its owner may re-point it.
+    theirs = {**_KEY_TREE, "/private/tmp/theirs": (_OTHER_UID, stat.S_IFLNK | 0o777)}
+    problem = str(_posix_link("/private/tmp/theirs/k.key", theirs, {"/private/tmp/theirs": "keys"}))
+    assert "a link on its path is owned by another account" in problem
+    assert "/private" not in problem  # a refusal names no path
+    # A folder holding a link that another account owns.
+    owned = {
+        **_KEY_TREE,
+        "/srv": (_OTHER_UID, stat.S_IFDIR | 0o755),
+        "/srv/keys": (0, stat.S_IFLNK),
+    }
+    problem = str(_posix_link("/srv/keys/k.key", owned, {"/srv/keys": "/private/tmp/keys"}))
+    assert f"uid {_OTHER_UID}" in problem
 
 
 # --- the Windows arm, for real --------------------------------------------------------------------
@@ -1142,21 +1248,45 @@ def _icacls(path: Path, *args: str) -> None:
 @windows_only
 def test_windows_refuses_a_restricted_key_beneath_a_junction(tmp_path: Path) -> None:
     """Vault BACKLOG #5657: the check read the key file alone, never the folders on its path. A
-    junction needs no privilege to make, so this arm never skips."""
-    import subprocess
-
+    junction is judged by who can change it: the engine's own junction in its own folder passes,
+    and one in a folder Users may delete entries in is refused. A junction needs no privilege to
+    make, so this arm never skips."""
     real = tmp_path / "real"
     real.mkdir()
     key = real / "store.key"
     write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
     assert broad_access_problem(key) is None  # the control: the same file by its own path
-    junction = tmp_path / "junction"
-    subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(junction), str(real)], check=True, capture_output=True
-    )
-    problem = str(broad_access_problem(junction / "store.key"))
-    assert "a folder on its path is a junction or a link" in problem
+    _junction(tmp_path / "mine", real)
+    assert broad_access_problem(tmp_path / "mine" / "store.key") is None
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    _icacls(shared, "/grant", f"*{_USERS}:(DC)")
+    _junction(shared / "theirs", real)
+    problem = str(broad_access_problem(shared / "theirs" / "store.key"))
+    assert "the folder that holds a junction or link on its path can be changed" in problem
     assert str(tmp_path) not in problem  # a refusal names no path
+
+
+def _junction(link: Path, target: Path) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True
+    )
+
+
+@windows_only
+def test_windows_a_key_through_a_junction_only_system_can_change_passes() -> None:
+    """``C:\\Users\\All Users`` is a junction SYSTEM owns onto ``C:\\ProgramData``, which only
+    SYSTEM and Administrators may change, so the folders above a key reached through it pass."""
+    all_users = Path("C:/Users/All Users")
+    if not os.path.lexists(all_users):
+        pytest.skip("this host has no All Users junction")
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    read_path = _win32_config_source_probes().read_path
+    # The key need not exist: only the folders above it are walked and read.
+    assert restricted_file._windows_surroundings_problem(all_users / "k.key", read_path) is None
 
 
 @windows_only
@@ -1425,20 +1555,26 @@ def test_posix_refuses_a_restricted_key_beneath_a_linked_folder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Vault BACKLOG #5656: only the last part of the path was read without following a link, so a
-    linked folder above it was followed and the directory it led to judged instead."""
+    linked folder above it was followed whoever could re-point it. A link in a folder a group or
+    other may write is refused now; the engine's own link in its own folder passes."""
     real = tmp_path / "real"
     real.mkdir(mode=0o700)
     write_restricted_file(real / "store.key", b"KEY-MATERIAL-STAND-IN")
     assert broad_access_problem(real / "store.key") is None  # the control
-    (tmp_path / "linked").symlink_to(real, target_is_directory=True)
-    link = "a folder on its path is a link"
-    assert link in str(broad_access_problem(tmp_path / "linked" / "store.key"))
+    (tmp_path / "mine").symlink_to(real, target_is_directory=True)
+    assert broad_access_problem(tmp_path / "mine" / "store.key") is None
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)  # whatever the umask: any account may re-point a link in it
+    (shared / "theirs").symlink_to(real, target_is_directory=True)
+    link = "the folder that holds a junction or link on its path can be changed"
+    assert link in str(broad_access_problem(shared / "theirs" / "store.key"))
     # ``..`` after a link leads where the link's target says, so it is not collapsed away.
-    assert link in str(broad_access_problem(tmp_path / "linked" / ".." / "real" / "store.key"))
+    assert link in str(broad_access_problem(shared / "theirs" / ".." / "real" / "store.key"))
     # A relative path is walked from the working directory.
     monkeypatch.chdir(tmp_path)
-    assert link in str(broad_access_problem(Path("linked") / "store.key"))
-    assert broad_access_problem(Path("real") / "store.key") is None
+    assert link in str(broad_access_problem(Path("shared") / "theirs" / "store.key"))
+    assert broad_access_problem(Path("mine") / "store.key") is None
 
 
 def test_a_missing_file_is_a_read_problem_not_a_pass(tmp_path: Path) -> None:
@@ -1655,6 +1791,7 @@ def test_the_generated_key_remedy_names_the_store_dir_with_commands_on_posix_onl
         assert f"names the directory's mode, remove the write bits: chmod go-w {quoted}" in remedy
         assert "names the directory's owner" in remedy
         assert f"chown 'mefor svc' {quoted}" in remedy
+        assert "names a link on its path" in remedy  # vault BACKLOG #5656
 
 
 def _write_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> None:

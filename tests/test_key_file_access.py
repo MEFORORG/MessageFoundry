@@ -60,6 +60,7 @@ from messagefoundry.store.crypto import generate_key
 from tests._harness_engine import free_port
 from tests._phi_gate_provisions import PHI_GATE_PROVISIONS_TOML, setenv_declared_egress
 from tests.test_api_tls import _self_signed, _self_signed_combined
+from tests.test_engine_secrets import _folder_link, _shared_folder
 from tests.test_restricted_file import _broaden
 
 # The two serve gates every enforcing start meets (tests/_phi_gate_provisions.py says why).
@@ -277,24 +278,18 @@ def test_a_posix_key_in_a_directory_others_may_replace_it_in_is_refused(tmp_path
     assert problem is not None and "the directory that holds it has mode 0775" in problem
 
 
-def test_a_key_beneath_a_junction_or_a_link_is_refused(tmp_path: Path) -> None:
+def test_a_key_beneath_a_junction_or_a_link_others_can_change_is_refused(tmp_path: Path) -> None:
     """Vault BACKLOG #5656 and #5657: the check judged the key file, and on POSIX the directory a
-    link led to, but never the folders on its path. A junction needs no privilege on Windows."""
+    link led to, but never the folders on its path. A link in a folder a broad group may delete
+    entries in is refused. A junction needs no privilege on Windows."""
     real = tmp_path / "real"
     real.mkdir(mode=0o700)  # owner-only whatever the umask, so the POSIX holder rule passes it
     key = _key(real / "client.key", broad=False)
     assert connection_key_file_problem(_soap_graph(key), {}) is None  # the control
-    linked = tmp_path / "linked"
-    if sys.platform == "win32":
-        import subprocess
-
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(linked), str(real)], check=True, capture_output=True
-        )
-    else:
-        linked.symlink_to(real, target_is_directory=True)
-    problem = connection_key_file_problem(_soap_graph(linked / "client.key"), {})
-    assert problem is not None and "a folder on its path is a" in problem
+    shared = _shared_folder(tmp_path / "shared")
+    _folder_link(shared / "linked", real)
+    problem = connection_key_file_problem(_soap_graph(shared / "linked" / "client.key"), {})
+    assert problem is not None and "junction or link on its path can be changed" in problem
 
 
 # --- the registry preflight -----------------------------------------------------------------------

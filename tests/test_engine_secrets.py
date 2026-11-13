@@ -758,6 +758,21 @@ def test_a_broad_right_to_delete_a_file_in_the_directory_is_refused() -> None:
     assert _windows_access_problem(delete_child, _REACH_MASK) is None
 
 
+def _shared_folder(path: Path) -> Path:
+    """A folder at ``path`` in which a broad group may delete or re-point an entry: Users granted
+    FILE_DELETE_CHILD on Windows, mode 0777 elsewhere."""
+    path.mkdir()
+    if sys.platform == "win32":
+        import subprocess
+
+        subprocess.run(
+            ["icacls", str(path), "/grant", f"*{_USERS}:(DC)"], check=True, capture_output=True
+        )
+    else:
+        path.chmod(0o777)
+    return path
+
+
 def _folder_link(link: Path, target: Path) -> None:
     """A folder link at ``link`` onto ``target``: a junction on Windows, which needs no privilege,
     and a symbolic link elsewhere."""
@@ -780,9 +795,12 @@ def test_a_secrets_directory_beneath_a_junction_or_a_link_is_refused(tmp_path: P
     _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)
     opened = open_secrets_directory(_env(directory))  # the control
     assert opened is not None and opened.read("MEFOR_STORE_PASSWORD") == _FROM_FILE
-    _folder_link(tmp_path / "linked", real)
-    with pytest.raises(SecretsDirectoryError, match="a folder on its path is a"):
-        open_secrets_directory(_env(tmp_path / "linked" / "secrets"))
+    _folder_link(tmp_path / "mine", real)  # the engine's own link in its own folder passes
+    assert open_secrets_directory(_env(tmp_path / "mine" / "secrets")) is not None
+    shared = _shared_folder(tmp_path / "shared")
+    _folder_link(shared / "linked", real)
+    with pytest.raises(SecretsDirectoryError, match="junction or link on its path can be changed"):
+        open_secrets_directory(_env(shared / "linked" / "secrets"))
 
 
 def test_the_folders_above_the_directory_are_read_for_it_and_not_again_for_each_file(
@@ -804,9 +822,7 @@ def test_the_folders_above_the_directory_are_read_for_it_and_not_again_for_each_
 
     walked: list[str] = []
     walk_name = (
-        "_windows_surroundings_problem"
-        if sys.platform == "win32"
-        else "_posix_ancestor_link_problem"
+        "_windows_surroundings_problem" if sys.platform == "win32" else "_posix_host_link_problem"
     )
     real_walk = getattr(restricted_file, walk_name)
 
