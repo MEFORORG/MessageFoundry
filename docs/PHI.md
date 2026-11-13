@@ -409,15 +409,33 @@ than a path is not checked
   local Users group and the logon classes such as INTERACTIVE. It is a list of known groups. It
   does not prove that only the accounts you meant can reach the file. `protect-key
   --grant-account` refuses the same list, and refuses a name that is a group or a domain.
-- On Windows it does not vet the file's owner or an account you granted yourself. LOCAL SERVICE
+- On Windows it refuses a key file whose owner is one of those groups or an application package,
+  or whose owner cannot be read, since an owner may rewrite the access list (vault BACKLOG #5657).
+  It does not vet an owner that is one account, or an account you granted yourself: any one
+  account may own the file, as the administrator who copied in your own TLS key may. LOCAL SERVICE
   and NETWORK SERVICE are accounts that many services share, and the check does not report them.
+- **The folders above a key file** (vault BACKLOG #5656, #5657). On every platform the check walks
+  the folders on the key file's path, from the root down, and refuses a key file with a junction
+  or a link among them, as it refuses a key file that is itself a link: the file is then wherever
+  that link leads. A folder a volume is mounted on reads as a junction, and is refused too. On
+  Windows it also reads the access list of the directory that holds the file, and refuses it when
+  one of the groups above or an application package may delete a file in it, change its access
+  list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when
+  its owner is such a group or cannot be read. A right to list or traverse the directory, or to add
+  a file to it, is not refused, so a store directory the engine makes under `C:\ProgramData`, which
+  inherits that folder's grant to Users, passes. A walk that reaches a network share stops there:
+  the share's folders are not walked, and the file's own access list is still read. A walk that
+  stops for any other reason, such as a folder it cannot read, is refused. It does not read, at
+  least: whether a broad group may rename the directory that holds the file or a folder above it
+  (`DELETE` on that folder, as a data drive's root often grants Authenticated Users, or
+  `FILE_DELETE_CHILD` on the folder above), the access lists of the folders above the one that
+  holds the file, or what one named account may do to any of them. Restrict those folders yourself.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
   in the group, and one held in a directory that another account owns or that a group or other may
-  write without the sticky bit (vault BACKLOG #5636). Only the last part of the path is read
-  without following a link: a link in a directory above it is followed, and the directory that
-  holds the file is judged as the one the link leads to. Only that directory is read, not the ones
-  above it. A directory a group or other account may write is accepted when it has the sticky
+  write without the sticky bit (vault BACKLOG #5636). A link in a folder above it is refused as the
+  item above says. Only the directory that holds the file has its owner and mode read, not the
+  ones above it. A directory a group or other account may write is accepted when it has the sticky
   bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
   mints its own TLS key beside the store. **When it mints its own pair and the store directory does
   not exist yet, the engine creates it on POSIX with no group or other write bit (`0755` at most,
