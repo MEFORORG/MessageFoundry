@@ -2308,15 +2308,13 @@ the same permission set on the same method reds CI until it is listed here.
 > all, every one of these routes answers 503 `engine not started` before any scope check, the same
 > answer for every name. Names still show elsewhere. At least the Prometheus exposition above
 > lists them.
-> `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
-> an inbound in its own scope, and every other target gets that 403, before the engine looks the
-> name up. An in-scope inbound that `Registry.inbound_names()` holds, or any in-scope name when no
-> graph is loaded, reaches the engine. It answers 409 for every name when no graph is loaded, for a
-> name `inbound_names()` does not hold, and once a shutdown's drain has begun. On an engine that is
-> not one of several engine shards, that set is its own graph's inbounds. On an engine shard it is every
-> inbound in the whole config, so an in-scope inbound a sibling engine shard holds gets no denial
-> row: this engine shard's `Engine.set_connection_flag` writes the flag and its
-> `connection_flag_set` row to the shared store, and the route answers 200. The JSON
+> On `POST /connections/{name}/flag` (BACKLOG #1152), a scoped caller gets the 403 and a denial row
+> above for a name outside its scope, a direction of `outbound`, or, with a graph loaded, a
+> name `Registry.inbound_names()` does not hold. On an engine shard that set is every inbound in the
+> whole config, so unlike the routes above, an in-scope inbound that a sibling engine shard holds is
+> not refused by this one: the route answers 200, and `Engine.set_connection_flag` writes the flag
+> and its `connection_flag_set` row to the shared store. What that method refuses is in its
+> docstring. The JSON
 > route validates the body before any of this, so a direction other than `inbound` or `outbound`
 > gets a 422 there with no denial row, scoped caller or not. The web console's twin reads the
 > direction itself: for such a direction it gives a scoped caller the 403 and a denial row, and an
