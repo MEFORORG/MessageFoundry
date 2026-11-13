@@ -70,6 +70,7 @@ from messagefoundry.transports.bounded_read import (
 # Reuse rest.py's hardened opener + URL redaction (no new HTTP plumbing) — exactly as fhir.py/soap.py
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
 from messagefoundry.transports.rest import (
+    AUTH_CHALLENGE_REFUSED_ON_CONNECT,
     ECH_HOP_WAYS_ACROSS,
     HttpAuthError,
     ProxyConfig,
@@ -139,6 +140,7 @@ def request_token(
     timeout: float,
     endpoint: str,
     connector: str,
+    digest_proxy: bool,
 ) -> tuple[str, float]:
     """Send the token request and return ``(access_token, ttl)``, raising
     :class:`~messagefoundry.transports.base.DeliveryError` for a transport failure or a bad reply.
@@ -147,8 +149,17 @@ def request_token(
     still raises its own ``ValueError``, as it did before BACKLOG #2054. ``connector`` names the hop
     in a refusal of the reply body, and holds no URL (BACKLOG #2060). A web proxy's Digest challenge
     the engine will not answer raises the subclass ``rest.auth_challenge_refused`` builds, a
-    permanent configuration fault (BACKLOG #2989), on an ``http`` or an ``https`` token endpoint."""
-    body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint, connector=connector)
+    permanent configuration fault (BACKLOG #2989). ``digest_proxy`` says whether the hop's web proxy
+    is set up for Digest, as :func:`~messagefoundry.transports.rest.is_refused_proxy_digest_tunnel`
+    takes it; the caller decides it from its configuration, never from the opener."""
+    body = _read_token_reply(
+        opener,
+        req,
+        timeout=timeout,
+        endpoint=endpoint,
+        connector=connector,
+        digest_proxy=digest_proxy,
+    )
     return _parse_token_reply(body, endpoint=endpoint)
 
 
@@ -159,6 +170,7 @@ def _read_token_reply(
     timeout: float,
     endpoint: str,
     connector: str,
+    digest_proxy: bool,
 ) -> str:
     try:
         with opener.open(req, timeout=timeout) as resp:
@@ -172,10 +184,9 @@ def _read_token_reply(
     except urllib.error.HTTPError as exc:
         raise DeliveryError(f"{endpoint} returned HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
-        if is_refused_proxy_digest_tunnel(opener, exc):
-            # BACKLOG #2989: an https:// token endpoint's Digest proxy 407 arrives here, not in
-            # the HttpAuthError arm below; the predicate says why no retry can clear it.
-            raise auth_challenge_refused(endpoint) from exc
+        if is_refused_proxy_digest_tunnel(exc, digest_proxy=digest_proxy):
+            # ADR 0095 B.1 says why no retry can clear it (BACKLOG #2989).
+            raise auth_challenge_refused(endpoint, AUTH_CHALLENGE_REFUSED_ON_CONNECT) from exc
         raise DeliveryError(f"{endpoint} unreachable: {exc.reason}") from exc
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{endpoint} failed: {exc}") from exc
@@ -185,8 +196,7 @@ def _read_token_reply(
         # That is a ValueError, and it escaped this function's DeliveryError contract. Fixed text: the
         # refusal names the peer's own algorithm token, which stays on the cause only.
         # BACKLOG #2989: the same classification the delivery hop gives this refusal. A plain
-        # DeliveryError here retried a refusal that no retry can clear. Only an http:// token
-        # endpoint reaches this arm; the https:// one's 407 is the URLError arm above.
+        # DeliveryError here retried a refusal that no retry can clear.
         raise auth_challenge_refused(endpoint) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as
@@ -338,6 +348,13 @@ class _TokenEndpointProvider(abc.ABC):
         # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener and
         # no Proxy-Authorization (byte-identical).
         token_proxy = proxy.for_host(token_url) if proxy else None
+        # Decided here, from the configuration the opener is built from, so the CONNECT 407 match
+        # in request_token never depends on what the opener exposes (BACKLOG #2989).
+        self._digest_proxy = (
+            token_proxy is not None
+            and token_proxy.credentialed
+            and token_proxy.config.digest is not None
+        )
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
         # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
@@ -425,6 +442,7 @@ class _TokenEndpointProvider(abc.ABC):
             timeout=self.timeout_seconds,
             endpoint=f"{hop} {_redact_url(self.token_url)}",
             connector=hop,
+            digest_proxy=self._digest_proxy,
         )
 
     @abc.abstractmethod
