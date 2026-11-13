@@ -2176,8 +2176,11 @@ The check reads the port from `PORT` on psqlODBC and MySQL Connector/ODBC, the t
 list that read it. It reads the driver **name** as written, and cannot see which library that
 name loads.
 
-A `host:port` or `[v6]:port` `server` is never a listed host: an entry splits at its first colon,
-so no entry can name it, and it is refused as unlisted.
+A `host:port` or `[v6]:port` `server` is never a listed host: an entry's host holds no port, so no
+entry can name it, and it is refused as unlisted. An IPv6 `server` such as `::1` or `[::1]` is
+named by a bracketed entry, `[::1]` or `[::1]:6432`, compared as an address, so `[0:0:0:0:0:0:0:1]`
+names it too; an unbracketed entry with more than one colon, such as `::1` or `fe80::1:443`, matches
+nothing (BACKLOG #5915).
 
 `db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
 port compared, and the preset's driver rule above applies to them.
