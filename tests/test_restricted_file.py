@@ -26,6 +26,14 @@ import messagefoundry.restricted_file as restricted_file
 import messagefoundry.secrets_dpapi as dpapi_mod
 import messagefoundry.store.store as store_mod
 from messagefoundry.__main__ import _write_private_key, main
+from messagefoundry.auth.anchor_path import (
+    DIRECTORY,
+    FILE,
+    LINK,
+    SHARE_CAUSE,
+    WalkCause,
+    windows_chain,
+)
 from messagefoundry.config.wiring import _WinPathSecurity
 from messagefoundry.restricted_file import (
     RestrictedFileError,
@@ -572,6 +580,108 @@ def test_the_directory_that_holds_a_path_is_read_through_the_kernel_for_dot_name
     assert restricted_file._posix_parent(Path("a") / "..") == Path("a") / ".." / ".."
 
 
+# --- the Windows owner, the holding directory and the path above (vault BACKLOG #5657) -----------
+
+#: ``C:\ProgramData``'s own list, as ``icacls`` shows it on a stock host: Users may list and
+#: traverse it and add a file or a folder to it, which replaces nothing. A key under it must pass.
+_PROGRAMDATA_ACES: tuple[tuple[int, int, str], ...] = (
+    (_ALLOW, _FULL, _SYSTEM),
+    (_ALLOW, _FULL, _ADMINS),
+    (_ALLOW, 0x10000000, "S-1-3-0"),  # CREATOR OWNER, GENERIC_ALL, inherit-only
+    (_ALLOW, 0x001200A9, _USERS),  # read and execute
+    (_ALLOW, 0x00000116, _USERS),  # WD, AD, WEA, WA
+)
+
+
+@pytest.mark.parametrize("owner", [_CREATOR, _SYSTEM, _ADMINS, "S-1-5-20"])
+def test_a_key_file_any_one_account_owns_has_no_owner_problem(owner: str) -> None:
+    """The control: an operator's own TLS key is often owned by the administrator who copied it in,
+    so the owner rule names no allowed accounts, only refused ones."""
+    listed = _WinPathSecurity(owner_sid=owner, aces=((_ALLOW, _FULL, _SYSTEM),))
+    assert restricted_file._windows_access_problem(listed) is None
+
+
+@pytest.mark.parametrize(
+    ("owner", "named"),
+    [
+        (_USERS, f"Users ({_USERS})"),
+        ("S-1-1-0", "Everyone"),
+        ("S-1-5-11", "(S-1-5-11)"),
+        ("S-1-15-2-1", "an application package"),
+    ],
+)
+def test_a_key_file_a_broad_group_or_a_package_owns_is_refused(owner: str, named: str) -> None:
+    """An owner may rewrite the list, so a broad owner is as open as a broad grant of full
+    control. The old check read the entries only and passed this list."""
+    listed = _WinPathSecurity(owner_sid=owner, aces=((_ALLOW, _FULL, _SYSTEM),))
+    problem = str(restricted_file._windows_access_problem(listed))
+    assert (
+        "its owner is " in problem and named in problem and "can change its access list" in problem
+    )
+
+
+def test_a_key_file_whose_owner_could_not_be_read_is_refused() -> None:
+    listed = _WinPathSecurity(owner_sid=None, aces=((_ALLOW, _FULL, _SYSTEM),))
+    assert "its owner could not be read" in str(restricted_file._windows_access_problem(listed))
+
+
+def test_a_holder_like_programdata_or_a_data_drive_lets_no_broad_group_replace_a_key() -> None:
+    """The controls for the holder refusals below: listing, traversing, adding a file, and the
+    Modify a data drive's root hands Authenticated Users, delete no file in the directory."""
+    assert restricted_file._windows_holder_problem(_security(*_PROGRAMDATA_ACES)) is None
+    modify = _security((_ALLOW, _FULL, _SYSTEM), (_ALLOW, 0x001301BF, "S-1-5-11"))
+    assert restricted_file._windows_holder_problem(modify) is None
+
+
+@pytest.mark.parametrize(
+    "right",
+    [
+        0x00000040,  # FILE_DELETE_CHILD
+        0x00040000,  # WRITE_DAC: it can give itself FILE_DELETE_CHILD
+        0x00080000,  # WRITE_OWNER: likewise, by taking the directory over
+        0x10000000,  # GENERIC_ALL
+    ],
+)
+def test_a_holder_that_lets_a_broad_group_replace_a_key_is_refused(right: int) -> None:
+    holder = _security(*_PROGRAMDATA_ACES, (_ALLOW, right, _USERS))
+    problem = str(restricted_file._windows_holder_problem(holder))
+    assert f"Users ({_USERS}) can delete or replace a file in it" in problem
+
+
+def test_a_holder_a_broad_group_owns_is_refused() -> None:
+    holder = _WinPathSecurity(owner_sid=_USERS, aces=_PROGRAMDATA_ACES)
+    problem = str(restricted_file._windows_holder_problem(holder))
+    assert "its owner is " in problem and f"Users ({_USERS})" in problem
+
+
+def _walk(path: str) -> tuple[list[tuple[str, str]], WalkCause | None]:
+    """The walk of a Windows ``path`` over a stand-in file system with one junction, at
+    ``C:\\data\\linked``, onto ``D:\\elsewhere``."""
+
+    def probe(part: str) -> tuple[str, str | None]:
+        if part.lower() == "c:\\data\\linked":
+            return LINK, "D:\\elsewhere"
+        return (FILE if part.endswith(".key") else DIRECTORY), None
+
+    return windows_chain(path, "C:\\", probe)
+
+
+def test_the_walk_of_a_key_files_path_refuses_a_junction_above_it() -> None:
+    assert restricted_file._windows_chain_problem(*_walk("C:\\data\\real\\store.key")) is None
+    problem = restricted_file._windows_chain_problem(*_walk("C:\\data\\linked\\store.key"))
+    assert "a folder on its path is a junction or a link" in str(problem)
+    # Win32 collapses ``..`` before any link is followed, so this never passes through the junction.
+    assert restricted_file._windows_chain_problem(*_walk("C:\\data\\linked\\..\\x.key")) is None
+
+
+def test_a_walk_that_did_not_finish_is_refused_except_at_a_share() -> None:
+    assert restricted_file._windows_chain_problem([], WalkCause.plain(SHARE_CAUSE)) is None
+    stopped = WalkCause("C:\\a secret path could not be read", "a name could not be read")
+    problem = str(restricted_file._windows_chain_problem([], stopped))
+    assert "could not be walked (a name could not be read)" in problem
+    assert "secret path" not in problem  # a cause's kind names no path; its text may
+
+
 # --- the Windows arm, for real --------------------------------------------------------------------
 
 
@@ -1021,6 +1131,83 @@ def test_windows_read_check_on_real_files(tmp_path: Path) -> None:
     assert "it is a link" in str(broad_access_problem(link))
 
 
+def _icacls(path: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(["icacls", str(path), *args], check=True, capture_output=True)
+
+
+@windows_only
+def test_windows_refuses_a_restricted_key_beneath_a_junction(tmp_path: Path) -> None:
+    """Vault BACKLOG #5657: the check read the key file alone, never the folders on its path. A
+    junction needs no privilege to make, so this arm never skips."""
+    import subprocess
+
+    real = tmp_path / "real"
+    real.mkdir()
+    key = real / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control: the same file by its own path
+    junction = tmp_path / "junction"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(real)], check=True, capture_output=True
+    )
+    problem = str(broad_access_problem(junction / "store.key"))
+    assert "a folder on its path is a junction or a link" in problem
+    assert str(tmp_path) not in problem  # a refusal names no path
+
+
+@windows_only
+def test_windows_refuses_a_key_in_a_directory_users_may_delete_files_in(tmp_path: Path) -> None:
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    key = holder / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control
+    _icacls(holder, "/grant", f"*{_USERS}:(DC)")
+    problem = str(broad_access_problem(key))
+    assert "the directory that holds it is not restricted" in problem
+    assert f"Users ({_USERS}) can delete or replace a file in it" in problem
+
+
+@windows_only
+def test_windows_a_key_in_a_directory_the_engine_makes_under_programdata_passes(
+    tmp_path: Path,
+) -> None:
+    """A default install keeps its data under ``C:\\ProgramData``, and the engine makes its store
+    directory there with no access list of its own, so it inherits the folder's. A key the engine
+    mints in it must pass. The folder stands in for ``C:\\ProgramData``, with its list, plus this
+    account, which an unelevated test run needs to reach it."""
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    me = _win32_config_source_probes().self_sid
+    assert me is not None
+    data = tmp_path / "ProgramData"
+    data.mkdir()
+    _icacls(
+        data,
+        "/inheritance:r",
+        "/grant:r",
+        f"*{_SYSTEM}:(OI)(CI)F",
+        f"*{_ADMINS}:(OI)(CI)F",
+        "*S-1-3-0:(OI)(CI)(IO)F",
+        f"*{_USERS}:(OI)(CI)RX",
+        f"*{me}:(OI)(CI)F",
+    )
+    _icacls(data, "/grant", f"*{_USERS}:(CI)(WD,AD,WEA,WA)")
+    state = data / "MessageFoundry"
+    state.mkdir()  # as the engine makes its store directory on Windows: no mode, so it inherits
+    key = state / "api.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None
+    # The control: a folder that hands its new folders a broad delete right is refused.
+    _icacls(data, "/grant", f"*{_USERS}:(CI)(DC)")
+    widened = data / "Widened"
+    widened.mkdir()
+    write_restricted_file(widened / "api.key", b"KEY-MATERIAL-STAND-IN")
+    assert "can delete or replace a file in it" in str(broad_access_problem(widened / "api.key"))
+
+
 # --- the POSIX arm, for real ----------------------------------------------------------------------
 
 
@@ -1229,6 +1416,27 @@ def test_posix_refuses_a_key_whose_directory_cannot_be_examined(
 
     monkeypatch.setattr(os, "stat", refuse_the_holder)
     assert "the directory that holds it could not be examined" in str(broad_access_problem(key))
+
+
+@posix_only
+def test_posix_refuses_a_restricted_key_beneath_a_linked_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #5656: only the last part of the path was read without following a link, so a
+    linked folder above it was followed and the directory it led to judged instead."""
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    write_restricted_file(real / "store.key", b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(real / "store.key") is None  # the control
+    (tmp_path / "linked").symlink_to(real, target_is_directory=True)
+    link = "a folder on its path is a link"
+    assert link in str(broad_access_problem(tmp_path / "linked" / "store.key"))
+    # ``..`` after a link leads where the link's target says, so it is not collapsed away.
+    assert link in str(broad_access_problem(tmp_path / "linked" / ".." / "real" / "store.key"))
+    # A relative path is walked from the working directory.
+    monkeypatch.chdir(tmp_path)
+    assert link in str(broad_access_problem(Path("linked") / "store.key"))
+    assert broad_access_problem(Path("real") / "store.key") is None
 
 
 def test_a_missing_file_is_a_read_problem_not_a_pass(tmp_path: Path) -> None:

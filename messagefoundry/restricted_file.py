@@ -9,8 +9,9 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
   that could not be created that way is never left behind, and there is no fallback to writing the
   file first and tightening it afterwards.
 * :func:`broad_access_problem` answers, before a key file is used, whether a known broad group or
-  an application package can read it or change it, and on POSIX also whether it is a link, another
-  account owns it, or the directory holding it lets another account replace it.
+  an application package can read it or change it, whether it or a folder above it is a link, and
+  whether the directory holding it lets another account replace it. On POSIX it also asks whether
+  another account owns the file, and on Windows whether a broad group does.
 
 :func:`key_file_handle_problem` is the stricter Windows read check the key custody reads use: the
 owner and the exact list, read through the open handle.
@@ -60,8 +61,14 @@ from messagefoundry.auth.anchor_path import (
     _SHARED_SERVICE_SIDS,
     ACCESS_ALLOWED_ACE_TYPE,
     ADMINISTRATORS_SID,
+    LINK,
+    SHARE_CAUSE,
     SYSTEM_SID,
+    WalkCause,
+    _win_probe,
     describe_sid,
+    query_drive_target,
+    windows_chain,
 )
 
 if TYPE_CHECKING:
@@ -357,6 +364,18 @@ _REACH_MASK = (
 #: secret file can send its setting back to a less protected source (vault BACKLOG #2595).
 _DIRECTORY_REACH_MASK = _REACH_MASK | 0x00000040  # FILE_DELETE_CHILD
 
+#: Rights on the directory that HOLDS a key file that let their holder replace the file: delete it
+#: whatever its own access list says (FILE_DELETE_CHILD), or give itself that right (WRITE_DAC,
+#: WRITE_OWNER; GENERIC_ALL holds all three). Narrower than :data:`_DIRECTORY_REACH_MASK` on
+#: purpose: listing, traversing and adding a file replace nothing, and ordinary folders grant Users
+#: those, ``C:\\ProgramData`` included (vault BACKLOG #5657).
+_HOLDER_REPLACE_MASK = (
+    0x00000040  # FILE_DELETE_CHILD
+    | 0x00040000  # WRITE_DAC
+    | 0x00080000  # WRITE_OWNER
+    | 0x10000000  # GENERIC_ALL
+)
+
 #: Groups and logon classes that many accounts hold, beyond the ones the trust-anchor check already
 #: names (``auth.trust_anchors._is_broad_sid``: Everyone, Authenticated Users, Users, Guests, the
 #: INTERACTIVE, NETWORK, BATCH and SERVICE logon classes, Domain Users and Domain Guests). **At
@@ -418,8 +437,8 @@ def _screened_principal(sid: str) -> str | None:
     """What ``sid`` is, when a key file may name it neither as a read grant nor as its owner: an
     application package, or a broad group. ``None`` when it may be named. One screen for both on
     the create, so a later screen reaches grants and owners alike there. The check before a key file
-    is used, :func:`_windows_access_problem`, calls the two predicates itself and judges entries,
-    not the owner."""
+    is used, :func:`_windows_access_problem`, calls the two predicates itself, for the entries and
+    for the owner."""
     if _is_package_sid(sid):
         return "an application package"
     if _is_broad_group(sid):
@@ -427,18 +446,28 @@ def _screened_principal(sid: str) -> str | None:
     return None
 
 
-def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK) -> str | None:
+def _windows_access_problem(
+    security: _WinPathSecurity, mask: int = _REACH_MASK, *, reach: str = "can read or change it"
+) -> str | None:
     """Why a broad group or an application package can read or change the file this access list
-    belongs to, or ``None``.
+    belongs to, or ``None``. ``reach`` says what an entry within ``mask`` lets its holder do.
 
     A list that could not be read is a problem too, and so is an entry of a kind this check cannot
-    interpret: a check that did not finish has not shown the file restricted. Kept free of ctypes
-    so the decision is testable on every platform."""
+    interpret: a check that did not finish has not shown the file restricted. So is an owner that
+    could not be read, or one that is a broad group or an application package, because an owner may
+    rewrite the list whatever it says (vault BACKLOG #5657). Any one account may own the file: an
+    operator's own TLS key is often owned by the administrator who copied it in, so there is no list
+    of allowed owners. Kept free of ctypes so the decision is testable on every platform."""
     if security.status != 0:
         detail = f": {security.status_text}" if security.status_text else ""
         return f"its access list could not be read (Win32 error {security.status}{detail})"
     if not security.dacl_present:
         return "it has no access list at all, so every account on the host can read or change it"
+    owner = security.owner_sid
+    if owner is None:
+        return "its owner could not be read"
+    if (what := _screened_principal(owner)) is not None:
+        return f"its owner is {what}, and an owner can change its access list"
     if security.aces is None:
         return "its access list could not be read in full"
     for ace_type, ace_mask, sid in security.aces:
@@ -449,10 +478,61 @@ def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK)
             # account, so who it lets in is unknown.
             return "its access list holds a conditional entry this check cannot interpret"
         if ace_mask & mask and _is_broad_group(sid):
-            return f"{describe_sid(sid)} can read or change it"
+            return f"{describe_sid(sid)} {reach}"
         if ace_mask & mask and _is_package_sid(sid):
-            return f"the application package {sid} can read or change it"
+            return f"the application package {sid} {reach}"
     return None
+
+
+def _windows_holder_problem(security: _WinPathSecurity) -> str | None:
+    """Why the directory this access list belongs to lets a broad group or an application package
+    replace a key file in it (:data:`_HOLDER_REPLACE_MASK`), or ``None`` (vault BACKLOG #5657).
+    The same reading as :func:`_windows_access_problem`, its owner rule included."""
+    return _windows_access_problem(
+        security, _HOLDER_REPLACE_MASK, reach="can delete or replace a file in it"
+    )
+
+
+def _windows_chain_problem(chain: Sequence[tuple[str, str]], cause: WalkCause | None) -> str | None:
+    """Why the walk of a key file's path (:func:`~messagefoundry.auth.anchor_path.windows_chain`)
+    does not show the file is where its path says, or ``None`` (vault BACKLOG #5657).
+
+    A junction or a link on the path is refused, as the key file's own link is: the file is then
+    wherever that link's target says, and an account that can change the target moves it. A walk
+    that could not finish is refused too, except where it reached a network share, which the walk
+    does not read past and whose own access list the check still reads. Neither answer names a path:
+    a cause's ``kind`` names none. Kept free of I/O so the decision is testable on every platform."""
+    if any(kind == LINK for _obj, kind in chain):
+        return "a folder on its path is a junction or a link, so where the file is depends on it"
+    if cause is not None and cause.kind != SHARE_CAUSE:
+        return f"the folders on its path could not be walked ({cause.kind})"
+    return None
+
+
+def _windows_surroundings_problem(
+    path: Path, read_path: Callable[[Path], _WinPathSecurity]
+) -> str | None:
+    """Why the folders on ``path`` let another account move or replace it, or ``None``: a junction
+    or link above it (:func:`_windows_chain_problem`), then the directory that holds it
+    (:func:`_windows_holder_problem`). Windows only. Win32 collapses ``..`` before it follows a link,
+    so the holder is the lexical parent, and only it and the folders above it are walked: the
+    caller has read ``path`` itself."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the folders on a Windows path are walked on Windows only")
+    try:
+        full = Path(os.path.abspath(path))
+    except OSError as exc:  # the working directory
+        return f"the folders on its path could not be walked ({exc.strerror or type(exc).__name__})"
+    if full.parent == full:
+        return None  # a volume root: nothing holds it
+    chain, cause = windows_chain(
+        str(full.parent), os.getcwd, _win_probe, drive_target=query_drive_target
+    )
+    problem = _windows_chain_problem(chain, cause)
+    if problem is not None:
+        return problem
+    problem = _windows_holder_problem(read_path(full.parent))
+    return None if problem is None else f"the directory that holds it is not restricted: {problem}"
 
 
 def _posix_access_problem(mode: int) -> str | None:
@@ -483,19 +563,28 @@ def _posix_key_file_problem(
     bit, since every account that may write it may also delete the file and put another in its
     place. The engine's own account and root are the owners allowed. Kept free of I/O so the
     decision is testable on every platform."""
+    return _posix_own_problem(mode=mode, uid=uid, euid=euid) or _posix_holder_problem(
+        parent_mode=parent_mode, parent_uid=parent_uid, euid=euid
+    )
+
+
+def _posix_own_problem(*, mode: int, uid: int, euid: int) -> str | None:
+    """The part of :func:`_posix_key_file_problem` that reads the file alone: a link, another
+    owner, a group or other read or write bit."""
     if stat.S_ISLNK(mode):
         return "it is a link, so the file behind it was not examined"
     # The same owner rule as the config-source guard (config/wiring.py, _enforce_posix_paths).
-    allowed = (euid, _POSIX_ROOT_UID)
-    if uid not in allowed:
+    if uid not in (euid, _POSIX_ROOT_UID):
         return (
             f"it is owned by uid {uid}, neither the account the engine runs as (uid {euid}) nor "
             "root, so its owner can change its mode or replace it"
         )
-    problem = _posix_access_problem(mode)
-    if problem is not None:
-        return problem
-    if parent_uid not in allowed:
+    return _posix_access_problem(mode)
+
+
+def _posix_holder_problem(*, parent_mode: int, parent_uid: int, euid: int) -> str | None:
+    """The part of :func:`_posix_key_file_problem` that reads the directory holding the file."""
+    if parent_uid not in (euid, _POSIX_ROOT_UID):
         return (
             f"the directory that holds it is owned by uid {parent_uid}, neither the account the "
             f"engine runs as (uid {euid}) nor root, so that account can replace it"
@@ -514,6 +603,25 @@ def _posix_parent(path: Path) -> Path:
     """The directory that holds ``path``. ``Path.parent`` is lexical, so for a path ending in
     ``..``, or one with no name such as ``.``, the directory above is reached through the kernel."""
     return path / ".." if path.name in {"", ".."} else path.parent
+
+
+def _posix_ancestor_link_problem(path: Path) -> str | None:
+    """Why a folder on ``path`` is a link, or could not be examined, or ``None`` (vault BACKLOG
+    #5656). Each folder is read with ``lstat``, from the root down, the last part left out: the
+    caller reads that itself. Nothing is normalized first, because ``..`` after a link leads where
+    the link's target says; a folder already read is no link, so ``..`` after it is lexical."""
+    full = path if path.is_absolute() else Path(os.getcwd()) / path
+    folder = Path(full.anchor)
+    for name in full.parts[1:-1]:
+        folder /= name
+        try:
+            if stat.S_ISLNK(os.lstat(folder).st_mode):
+                return "a folder on its path is a link, so where the file is depends on it"
+        except OSError as exc:
+            return (
+                f"a folder on its path could not be examined ({exc.strerror or type(exc).__name__})"
+            )
+    return None
 
 
 #: The extended attribute that holds a Linux file's POSIX access control list.
@@ -620,23 +728,32 @@ def linux_file_system_type(fd: int) -> int:
     return field.from_buffer(buffer).value & 0xFFFFFFFF
 
 
-def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
+def broad_access_problem(
+    path: Path, *, directory: bool = False, holder_judged: bool = False
+) -> str | None:
     """Why ``path`` is open beyond the accounts a key file is for, or ``None`` when it is not.
 
     With ``directory``, ``path`` is a directory that holds such files, and on Windows a broad
     group's right to delete a file inside it (FILE_DELETE_CHILD) is a problem too. On POSIX the
-    group and other write bits, which the check already refuses, are that right.
+    group and other write bits, which the check already refuses, are that right. With
+    ``holder_judged``, the caller has already judged the directory that holds ``path``, with
+    ``directory``, so neither it nor the folders above it are read again.
 
     Windows: an allow entry that lets a known broad group read the file, change it, or take it
-    over. The groups are at least Everyone, Authenticated Users and the local Users group; the
-    whole list is :func:`_is_broad_group`, and it is a list of known groups, not a proof that only
-    the intended accounts can reach the file. An application package or capability SID
-    (:func:`_is_package_sid`) is reported the same way. POSIX (:func:`_posix_key_file_problem`): a
-    file owned by an account other than the engine's own or root, a group or other read or write
-    bit, and a directory holding it that such an account owns or that a group or other may write
-    with no sticky bit. Only the directory that holds ``path`` is read, not the ones above it. A file
-    whose access cannot be read is reported as a problem, and so is a path that is itself a link, on
-    every platform, because the file behind it was not judged.
+    over, and an owner that is such a group. The groups are at least Everyone, Authenticated Users
+    and the local Users group; the whole list is :func:`_is_broad_group`, and it is a list of known
+    groups, not a proof that only the intended accounts can reach the file. An application package
+    or capability SID (:func:`_is_package_sid`) is reported the same way. POSIX
+    (:func:`_posix_key_file_problem`): a file owned by an account other than the engine's own or
+    root, a group or other read or write bit, and a directory holding it that such an account owns
+    or that a group or other may write with no sticky bit.
+
+    On both, the folders above ``path`` are read too (vault BACKLOG #5656, #5657): a junction or a
+    link among them is refused, and so, on Windows, is a directory holding ``path`` that lets a broad
+    group delete a file in it or change its access list (:func:`_windows_holder_problem`). Only the
+    directory that holds ``path`` has its access read, not the ones above it. A file whose access
+    cannot be read is reported as a problem, and so is a path that is itself a link, on every
+    platform, because the file behind it was not judged.
 
     The answer names accounts and modes only, never the path or the file's contents."""
     try:
@@ -649,24 +766,29 @@ def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
 
         if status.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
             return "it is a link, so the access list of the file behind it was not read"
-        return _windows_access_problem(
-            _win32_config_source_probes().read_path(path),
-            _DIRECTORY_REACH_MASK if directory else _REACH_MASK,
+        read_path = _win32_config_source_probes().read_path
+        problem = _windows_access_problem(
+            read_path(path), _DIRECTORY_REACH_MASK if directory else _REACH_MASK
         )
+        if problem is not None or holder_judged:
+            return problem
+        return _windows_surroundings_problem(path, read_path)
+    own = _posix_own_problem(mode=status.st_mode, uid=status.st_uid, euid=os.geteuid())
+    if own is not None or holder_judged:
+        return own
+    problem = _posix_ancestor_link_problem(path)
+    if problem is not None:
+        return problem
     try:
-        # stat, so a linked directory is judged by the directory the file is actually in.
+        # stat: the walk above found no link, so this reads the directory the path names.
         parent = os.stat(_posix_parent(path))
     except OSError as exc:
         return (
             "the directory that holds it could not be examined "
             f"({exc.strerror or type(exc).__name__})"
         )
-    return _posix_key_file_problem(
-        mode=status.st_mode,
-        uid=status.st_uid,
-        parent_mode=parent.st_mode,
-        parent_uid=parent.st_uid,
-        euid=os.geteuid(),
+    return _posix_holder_problem(
+        parent_mode=parent.st_mode, parent_uid=parent.st_uid, euid=os.geteuid()
     )
 
 

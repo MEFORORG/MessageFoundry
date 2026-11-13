@@ -758,6 +758,61 @@ def test_a_broad_right_to_delete_a_file_in_the_directory_is_refused() -> None:
     assert _windows_access_problem(delete_child, _REACH_MASK) is None
 
 
+def _folder_link(link: Path, target: Path) -> None:
+    """A folder link at ``link`` onto ``target``: a junction on Windows, which needs no privilege,
+    and a symbolic link elsewhere."""
+    if sys.platform == "win32":
+        import subprocess
+
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_a_secrets_directory_beneath_a_junction_or_a_link_is_refused(tmp_path: Path) -> None:
+    """Vault BACKLOG #5656 and #5657: the check read the directory alone, never the folders on its
+    path, so one reached through a junction or a link passed."""
+    real = tmp_path / "real"
+    real.mkdir()
+    directory = _directory(real)
+    _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)
+    opened = open_secrets_directory(_env(directory))  # the control
+    assert opened is not None and opened.read("MEFOR_STORE_PASSWORD") == _FROM_FILE
+    _folder_link(tmp_path / "linked", real)
+    with pytest.raises(SecretsDirectoryError, match="a folder on its path is a"):
+        open_secrets_directory(_env(tmp_path / "linked" / "secrets"))
+
+
+def test_the_folders_above_the_directory_are_read_for_it_and_not_again_for_each_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory's own check reads the folders above it and the folder that holds it; each
+    file's check does not read them again, since the folder that holds it is the one just judged."""
+    import messagefoundry.restricted_file as restricted_file
+
+    directory = _directory(tmp_path)
+    _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)
+    _put(directory, "MEFOR_AI_API_KEY", _FROM_FILE)
+    real = restricted_file.broad_access_problem
+    asked: list[tuple[str, bool, bool]] = []
+
+    def spy(path: Path, *, directory: bool = False, holder_judged: bool = False) -> str | None:
+        asked.append((path.name, directory, holder_judged))
+        return real(path, directory=directory, holder_judged=holder_judged)
+
+    monkeypatch.setattr(restricted_file, "broad_access_problem", spy)
+    opened = open_secrets_directory(_env(directory))
+    assert opened is not None
+    assert opened.read("MEFOR_STORE_PASSWORD") == opened.read("MEFOR_AI_API_KEY") == _FROM_FILE
+    assert asked == [
+        ("secrets", True, False),
+        ("MEFOR_STORE_PASSWORD", False, True),
+        ("MEFOR_AI_API_KEY", False, True),
+    ]
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list, set with icacls")
 def test_a_directory_users_may_delete_files_in_is_refused(tmp_path: Path) -> None:
     import subprocess

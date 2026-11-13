@@ -233,12 +233,14 @@ def test_a_key_path_holding_a_nul_is_refused_not_raised() -> None:
 
 def test_the_remedies_are_one_line_and_name_the_posix_causes() -> None:
     """A refusal is printed and logged as one line, so neither remedy may hold a line break, and
-    each names the link and directory causes the POSIX check refuses (vault BACKLOG #5636)."""
+    each names the link and directory causes the POSIX check refuses (vault BACKLOG #5636), and the
+    junction and folder causes the Windows check refuses (#5657)."""
     from messagefoundry import engine_secrets
 
     for remedy in (key_file_access.KEY_FILE_REMEDY, engine_secrets._REMEDY):
         assert "\n" not in remedy and "\r" not in remedy
         assert "link" in remedy and "sticky bit" in remedy
+        assert "junction" in remedy and "delete a file in" in remedy
 
 
 _posix_only = pytest.mark.skipif(
@@ -273,6 +275,26 @@ def test_a_posix_key_in_a_directory_others_may_replace_it_in_is_refused(tmp_path
     holder.chmod(0o775)
     problem = connection_key_file_problem(_soap_graph(key), {})
     assert problem is not None and "the directory that holds it has mode 0775" in problem
+
+
+def test_a_key_beneath_a_junction_or_a_link_is_refused(tmp_path: Path) -> None:
+    """Vault BACKLOG #5656 and #5657: the check judged the key file, and on POSIX the directory a
+    link led to, but never the folders on its path. A junction needs no privilege on Windows."""
+    real = tmp_path / "real"
+    real.mkdir()
+    key = _key(real / "client.key", broad=False)
+    assert connection_key_file_problem(_soap_graph(key), {}) is None  # the control
+    linked = tmp_path / "linked"
+    if sys.platform == "win32":
+        import subprocess
+
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(linked), str(real)], check=True, capture_output=True
+        )
+    else:
+        linked.symlink_to(real, target_is_directory=True)
+    problem = connection_key_file_problem(_soap_graph(linked / "client.key"), {})
+    assert problem is not None and "a folder on its path is a" in problem
 
 
 # --- the registry preflight -----------------------------------------------------------------------

@@ -658,6 +658,13 @@ SITES: dict[str, Site] = {
         "Joins the fixed name '..' to a path its caller already holds, to stat the directory above "
         "it; no input chooses the joined part (vault BACKLOG #5636).",
     ),
+    "messagefoundry/restricted_file.py::_posix_ancestor_link_problem": Site(
+        2,
+        INTERNAL,
+        "Puts a relative path its caller holds under the working directory, then rebuilds that "
+        "same path one part at a time to lstat each folder; every part comes from the caller's "
+        "own path (vault BACKLOG #5656).",
+    ),
     "messagefoundry_toolkit/generators/_core.py::write_corpus": Site(
         2,
         OPERATOR,
