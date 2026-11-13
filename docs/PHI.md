@@ -2413,8 +2413,10 @@ Properties of the anonymizer:
   loose string search. An invisible character is one in Unicode category Cc or Cf: NUL, DEL, a
   C0 or C1 control, the soft hyphen, U+200B, U+FEFF and the like. A component or subcomponent
   is a site code when it is one whole as written, trimmed of whitespace and invisible
-  characters, with its invisible characters dropped, or split at each invisible character,
-  escaped or not, so `97<NUL>1234` and `971234<NUL>X` count. It is also a site code when it is
+  characters, with its invisible characters dropped, or split at each invisible character that
+  is not also whitespace, escaped or not, so `97<NUL>1234` and `971234<NUL>X` count. A tab, VT,
+  FF, the separators 0x1C to 0x1F and NEL (U+0085) are whitespace and do not split a part as
+  written, so at least `971234<U+001F>X` and `971234<NEL>X` pass. It is also a site code when it is
   one decoded from its escape sequences, with `\H\` and `\N\` kept as `_` or dropped, and then
   with its invisible characters dropped or not, trimmed, whole or split again on the
   delimiters, the escape character, whitespace or an invisible character, so `97\XAD\1234` and
@@ -2423,7 +2425,9 @@ Properties of the anonymizer:
   part as written, so one code written two ways gets two unrelated surrogates. The split on
   whitespace and escaped delimiters applies only to a part that holds an escape character: free
   text such as `Call 971234 today` keeps the code, while `Call 971234 today\.br\` loses the whole
-  part, text included, to digits. Such a part is also read as written, as a raw viewer shows
+  part, text included, to digits. An escape anywhere in a component counts: the component is
+  read whole too, so an escape in one subcomponent can trigger the whitespace split of the whole
+  component, and `Call 971234&today\.br\` loses all of it, its `&` included. Such a part is also read as written, as a raw viewer shows
   it: split at the escape character, each piece trimmed and read whole, and each escape body
   (the text after an opening escape character) further split at every character that is not a
   digit, since a site code is digits only. So `\X41\971234`, `\X2D\971234`, `971234\X2D\`,
@@ -2451,7 +2455,7 @@ both are described below:
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IPv4 address, survives | The whole message |
-| A routable IPv6 address appears. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast without the P flag, or in a documentation range (`2001:db8::/32`, `3fff::/20`). A multicast address with the P flag set is refused, whether or not it embeds a prefix: that includes the RFC 3306 and RFC 3956 forms and source-specific `ff3x::/32`. An IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. An allowed address is not routable on the internet, but it can still name a site or a device: a unique-local address carries its site's random Global ID, and a link-local one built from a MAC carries that MAC. The forms it cannot read are below (BACKLOG #5654) | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first, so a surrogate the anonymizer wrote is never read as one. An IPv6 address in a field a rule rewrites, or in the MSH header, is not checked |
+| A routable IPv6 address appears. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast without the P flag, or in a documentation range (`2001:db8::/32`, `3fff::/20`). A multicast address with the P flag set is refused, whether or not it embeds a prefix: that includes the RFC 3306 and RFC 3956 forms and source-specific `ff3x::/32`. An IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. An allowed address is not routable on the internet, but it can still name a site or a device: a unique-local address carries its site's random Global ID, and a link-local one built from a MAC carries that MAC. The forms it cannot read are below (BACKLOG #5654) | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first, so in a field no rule rewrites a surrogate the anonymizer wrote is never read as one. The retarget-residue scan does read surrogate output, from the name, address and provider pools, and no test pins that no pool value reads as an IPv6 address. An IPv6 address in a field a rule rewrites, or in the MSH header, is not checked |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
@@ -2506,6 +2510,10 @@ still pass:
   one in a component never pairs with a sequence in the next.
 - The site-code check and the scrub read no part wider than a component either, so a site code
   whose escape pairs across a component separator passes both (BACKLOG #5632).
+- The site-code check and the scrub drop no invisible character from the pieces of a part read
+  as written split at the escape character, so a code that an invisible character interrupts
+  there passes both: at least `97<U+00AD>1234\X2D\`, `97<U+200B>1234\X41\` and
+  `\X97<U+00AD>1234\` (BACKLOG #5632).
 - The IPv6 check misses some routable addresses. At least these pass: one joined to an allowed
   address, such as `fe80::1.4000:a1::5`, and one split by a highlighting or control escape, such
   as `4000:a1:\H\:5` or `4000:a1\X00\::5` (BACKLOG #5654).
