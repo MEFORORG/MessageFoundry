@@ -63,6 +63,7 @@ from messagefoundry.store.crypto import (
     MARKER_PREFIX,
     AuditKeyVersionRefusedError,
     AuditKeyVersionUnverifiedError,
+    AuditMacMalformedError,
     AuditMacVerifier,
     CipherError,
     CipherItem,
@@ -84,6 +85,7 @@ from messagefoundry.store.keyprovider_vault import (
     checked_transit_key_name,
     is_vault_bad_request,
     is_vault_forbidden,
+    is_vault_timeout_reply,
     is_vault_unavailable,
     require_transit_key_type,
     store_vault_hop,
@@ -616,7 +618,8 @@ class TransitCipher(_UnmarkedPolicy):
         ``vault_transit`` mode. Fail-closed: any Transit error raises :class:`CipherError`
         (type-only — the canonical row bytes are PHI-derived and never surfaced). A reply that
         :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept raises
-        :class:`CipherError` too, so no malformed MAC is written. A well-formed MAC can still read
+        :class:`CipherError` too, so no malformed MAC is written; for a non-empty string it is the
+        subclass :class:`~messagefoundry.store.crypto.AuditMacMalformedError`. A well-formed MAC can still read
         as a break later, for example one a proxy or the wrong key answered."""
         inp = base64.b64encode(data).decode("ascii")
         try:
@@ -632,7 +635,10 @@ class TransitCipher(_UnmarkedPolicy):
         # does not accept would be written as a row :meth:`verify_audit_hmac` reads as a break
         # (BACKLOG #2720), so the append fails loudly here instead.
         if not isinstance(mac, str) or transit_mac_version(mac) is None:
-            raise CipherError(
+            # A non-empty string is its own subclass, which the walk's handover-tag check reads as
+            # a mismatch (BACKLOG #8222); an empty or non-string reply stays plain.
+            error = AuditMacMalformedError if isinstance(mac, str) and mac else CipherError
+            raise error(
                 f"Transit returned an audit HMAC that is not a well-formed Transit MAC "
                 f"(key={self._audit_key!r})"
             )
@@ -673,8 +679,9 @@ class TransitCipher(_UnmarkedPolicy):
         place of ``InvalidRequest``. A ``MemoryError`` that hvac raises while it joins a truthy
         ``errors`` value, before it raises any ``InvalidRequest``, is not read as a refusal either.
 
-        A failure of the verify call not read as a refused version, and not one
-        :func:`is_vault_unavailable` reads as an outage, is checked once the handler has let go
+        A failure of the verify call not read as a refused version, and not an outage
+        (:meth:`_is_outage`: one :func:`is_vault_unavailable` reads as one, or an HTTP 408 or
+        504), is checked once the handler has let go
         of the failed request (BACKLOG #2720): a verify over FIXED input must succeed
         (:meth:`_fixed_input_verifies`), and then the row's own verify is asked once more
         (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
@@ -854,11 +861,13 @@ class TransitCipher(_UnmarkedPolicy):
         return isinstance(answered, str) and not answered.startswith(f"vault:v{key_version}:")
 
     def _is_outage(self, exc: Exception) -> bool:
-        """:func:`is_vault_unavailable` for an audit-MAC verify failure. Runs inside the caller's
-        handler, so a classifier that raises is logged by type alone and read as an outage, the
-        reading that keeps a failure a walk that could not run."""
+        """Whether an audit-MAC verify failure is an outage: one :func:`is_vault_unavailable`
+        reads as one, or an HTTP 408 or 504 (:func:`is_vault_timeout_reply`, BACKLOG #8222), which
+        on one row's verify is the service timing out, so the walk could not run. Runs inside the
+        caller's handler, so a classifier that raises is logged by type alone and read as an
+        outage, the reading that keeps a failure a walk that could not run."""
         try:
-            return is_vault_unavailable(exc)
+            return is_vault_unavailable(exc) or is_vault_timeout_reply(exc)
         except Exception as fault:  # noqa: BLE001 -- see the docstring
             log.warning(
                 "Transit failure classifier raised %s; read as an outage", type(fault).__name__

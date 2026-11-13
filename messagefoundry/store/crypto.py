@@ -673,6 +673,16 @@ class CipherUnavailableError(CipherError):
     it did before."""
 
 
+class AuditMacMalformedError(CipherError):
+    """A MAC provider answered an audit MAC request with a non-empty string that is not a
+    well-formed MAC, such as a Transit reply naming no key version (BACKLOG #8222).
+
+    Its caller decides what that means. Appending a row refuses it, so no malformed MAC is written.
+    The chain walk's check of a range row's handover tag reads it as a tag that does not match, a
+    break at that row, as it read such a reply before engine PR 2903; the store open does not
+    catch it, so the open fails."""
+
+
 class AuditKeyVersionRefusedError(CipherError):
     """A Transit check of a stored audit MAC, made at the key version that MAC names, got HTTP 400
     read as a refusal of that version, while

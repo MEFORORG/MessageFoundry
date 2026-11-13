@@ -587,3 +587,33 @@ In-process fake Transit, never a real server, in `tests/test_transit_bound_attes
 Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
 
 - `test_audit_hmac_refuses_a_reply_its_own_check_would_reject`.
+
+## Amendment 2026-11-13 -- a timeout on one row's verify could not run; a malformed handover reply is a break
+
+Owner ruling 2026-11-13, "Fix forward", on engine PR 2903 (BACKLOG #8222 items 1 and 5). It
+changes two readings of the 2026-11-11 amendment.
+
+1. **A 408 or 504 on one row's verify is an outage.** Item 4 above sent every failure that is
+   neither a refused version nor an outage `is_vault_unavailable` names to `_recheck_refused_row`,
+   so a persistent 504 on one row, while the fixed input verified, was a break. hvac raises a 408,
+   a 413 and a 504 as one class, `UnexpectedError`, with no status, so the store's Vault client
+   (`keyprovider_vault._build_client`) now records each failed reply's status on hvac's error
+   (`_record_reply_status`). `TransitCipher._is_outage` reads a 408 or 504 as an outage
+   (`is_vault_timeout_reply`), so the walk could not run and no tamper alert fires. Every other
+   status hvac raises as `UnexpectedError`, a 413 among them, and an error with no recorded status,
+   still go to `_recheck_refused_row` as item 4 says, so a planted oversize row stays a break.
+2. **A malformed reply to a handover tag is a break in the walk.** Item 1 above makes
+   `audit_hmac` raise for a reply `transit_mac_version` does not accept. For a non-empty string it
+   now raises the subclass `AuditMacMalformedError`, and the walk's handover-tag check
+   (`_walk_tag_ok`) reads it as a tag that does not match: a break at that range row, as before
+   engine PR 2903. An empty or non-string reply is still a plain `CipherError`, and the walk could
+   not run. The store open (`settle_audit_ranges`) still lets the subclass propagate, so the open
+   fails, as since engine PR 2903.
+
+Evidence, in `tests/test_transit_bound_attestation.py`:
+`test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verifies`,
+`test_a_413_on_one_rows_verify_is_still_a_break`,
+`test_a_persistent_504_on_one_rows_verify_could_not_run_on_the_startup_walk`,
+`test_the_store_vault_client_records_the_reply_status_on_hvacs_error`,
+`test_a_malformed_transit_reply_to_a_handover_tag_is_a_break_in_the_walk` and
+`test_an_empty_or_non_text_transit_reply_to_a_handover_tag_still_could_not_run`.

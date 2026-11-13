@@ -133,6 +133,7 @@ from messagefoundry.store.crypto import (
     AesGcmCipher,
     AuditKeyVersionRefusedError,
     AuditMacFn,
+    AuditMacMalformedError,
     AuditMacVerifier,
     AuditScheme,
     Cipher,
@@ -6944,6 +6945,18 @@ def _audit_tag_ok(epoch: AuditEpoch, secret: tuple[bytes | None, AuditMacFn | No
     return hmac.compare_digest(audit_mac_bytes(epoch.handover), audit_mac_bytes(expected))
 
 
+def _walk_tag_ok(epoch: AuditEpoch, secret: tuple[bytes | None, AuditMacFn | None]) -> bool:
+    """:func:`_audit_tag_ok` for the chain walk: a provider reply that is a non-empty string but no
+    well-formed MAC (:class:`~messagefoundry.store.crypto.AuditMacMalformedError`) is a tag that
+    does not match, a break at that range row, never a walk that could not run (BACKLOG #8222).
+    Any other provider failure still ends the walk. The store open calls :func:`_audit_tag_ok`
+    itself, so there the same reply fails the open."""
+    try:
+        return _audit_tag_ok(epoch, secret)
+    except AuditMacMalformedError:
+        return False
+
+
 #: Why a keyed process reports a chain with no genesis row at sequence number 1.
 _AUDIT_NO_GENESIS: Final = (
     "the chain does not open with a genesis row naming its key; a store that holds a key requires "
@@ -7251,7 +7264,7 @@ def verify_audit_rows(
                 )
             )
         out_secret = _audit_secret_for(outgoing, mac_keys, mac_fn)
-        if out_secret is not None and not _audit_tag_ok(epoch, out_secret):
+        if out_secret is not None and not _walk_tag_ok(epoch, out_secret):
             breaks.append(
                 (
                     pos,
