@@ -24,8 +24,9 @@ import pytest
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app, create_managed_app
 from messagefoundry.api.app import _run_teardown, _TeardownStep
-from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
+from messagefoundry.config.settings import AlertsSettings, ApprovalsSettings, EgressSettings
 from messagefoundry.pipeline import engine as engine_module
+from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.engine import Engine
 
 _WAIT_S = 10.0
@@ -238,6 +239,7 @@ async def test_a_step_that_ends_cancelled_on_its_own_is_not_taken_for_a_cancel()
 
 #: The managed lifespan's shutdown steps, every optional one present, in the order they run.
 _MANAGED_ORDER = [
+    "the alert control callback's removal",
     "the upload retention runner's stop",
     "the store-reading tasks",
     "the long-operations drain",
@@ -254,9 +256,10 @@ _MANAGED_ORDER = [
 ]
 
 
-def _every_managed_step(*, harness: bool) -> list[_TeardownStep]:
+def _every_managed_step(*, harness: bool, notifier: Any = None) -> list[_TeardownStep]:
     """The real managed step list with every optional part present. The parts are stand-ins,
-    because building the list calls none of them; ``harness`` adds the harness-only executor."""
+    because building the list calls none of them; ``harness`` adds the harness-only executor,
+    and ``notifier`` replaces the alert notifier's stand-in."""
     state = SimpleNamespace(
         outliving_operations=object(),
         upload_store=object(),
@@ -274,8 +277,20 @@ def _every_managed_step(*, harness: bool) -> list[_TeardownStep]:
         upload_retention_runner=part,
         security_notifier=part,
         remove_security_signals=lambda: None,
-        notifier=part,
+        notifier=part if notifier is None else notifier,
     )
+
+
+async def test_the_control_callback_removal_stops_control_on_its_own_notifier() -> None:
+    """BACKLOG #5909: the step ends connection control on the notifier it was built for, and is
+    never cut, so it adds no cut grace to the NSSM window the test below counts."""
+    stopped: list[str] = []
+    notifier: Any = SimpleNamespace(stop_control=lambda: stopped.append("stop_control"))
+    steps = _every_managed_step(harness=False, notifier=notifier)
+    [step] = [s for s in steps if s.label == "the alert control callback's removal"]
+    assert not step.bounded
+    await step.run(0.0)
+    assert stopped == ["stop_control"]
 
 
 def test_the_shutdown_budget_fits_the_nssm_stop_window() -> None:
@@ -573,6 +588,113 @@ async def test_an_engine_stop_that_raises_does_not_skip_the_steps_after_it(
     finally:
         await spies.stop_if_needed()
     assert spies.calls == ["outliving", "approvals", "flush", "stop", "executor"]
+
+
+async def test_control_is_stopped_before_engine_stop_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5909: the managed lifespan wires the notifier's control callback after
+    engine.start() and, before this, never cleared it, so a control_action rule firing on an alert
+    raised during engine.stop() still reached the runner being stopped."""
+    notifier = NotifierAlertSink([])
+    monkeypatch.setattr(app_module, "notifier_from_settings", lambda *_a, **_k: notifier)
+    app = create_managed_app(
+        db_path=tmp_path / "control.db",
+        alerts_settings=AlertsSettings(),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    seen_at_stop: list[tuple[object, int]] = []
+    caplog.set_level(logging.INFO, logger="messagefoundry.pipeline.alert_sinks")
+    async with app.router.lifespan_context(app):
+        # The control: the lifespan wired a callback for the running engine.
+        assert notifier._control_cb is not None
+        engine = app.state.engine
+        real_stop = engine.stop
+
+        async def _stop() -> None:
+            # A control_action rule firing on an alert the stop raises, as the sink's decision
+            # path dispatches it.
+            notifier._dispatch_control("restart", "IB_TEST_ADT", default_target=False)
+            seen_at_stop.append((notifier._control_cb, len(notifier._control_tasks)))
+            await real_stop()
+
+        engine.stop = _stop
+    assert seen_at_stop == [(None, 0)], (
+        "engine.stop() ran with the control callback wired, so the rule dispatched a restart"
+    )
+    # Logged as the shutdown it is, not as a missing wiring.
+    assert "not run: shutting down" in caplog.text
+    assert "no control callback is wired" not in caplog.text
+
+
+async def test_control_is_stopped_before_the_first_drain_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5909: the callback's removal used to sit just before engine.stop(), after every
+    drain, so a control_action restart dispatched during a drain could take the reload lock that
+    engine.stop() then waited on. Each step records whether the callback was wired as it began."""
+    notifier = NotifierAlertSink([])
+    monkeypatch.setattr(app_module, "notifier_from_settings", lambda *_a, **_k: notifier)
+    seen: list[tuple[str, bool]] = []
+    labels: dict[int, str] = {}
+    real_run, real_invoke = app_module._run_teardown, app_module._invoke
+
+    async def _run(steps: list[_TeardownStep], budget: float) -> None:
+        labels.update((id(step.run), step.label) for step in steps)
+        await real_run(steps, budget)
+
+    async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
+        seen.append((labels[id(run)], notifier._control_cb is not None))
+        return await real_invoke(run, bound)
+
+    monkeypatch.setattr(app_module, "_run_teardown", _run)
+    monkeypatch.setattr(app_module, "_invoke", _invoke)
+    app = create_managed_app(
+        db_path=tmp_path / "first.db",
+        alerts_settings=AlertsSettings(),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    async with app.router.lifespan_context(app):
+        pass
+    # The control: the callback was wired when the teardown began, so the removal cleared it.
+    assert seen[0] == ("the alert control callback's removal", True)
+    wired = [label for label, cb_wired in seen[1:] if cb_wired]
+    assert wired == [], f"steps ran with the control callback still wired: {wired}"
+    assert {"the store-reading tasks", "the long-operations drain"} <= {label for label, _ in seen}
+
+
+async def test_the_notifier_close_cancels_a_control_task_still_running() -> None:
+    """BACKLOG #5909: the alert notifier's close used to drain only its delivery queue, and left a
+    control task it had dispatched running past the shutdown."""
+    sink = NotifierAlertSink([])
+    entered = asyncio.Event()
+
+    async def _hung_restart(action: str, target: str, *, default_target: bool) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    sink.set_control_callback(_hung_restart)
+    sink.start()
+    sink._dispatch_control("restart", "IB_TEST_ADT", default_target=False)
+    [task] = list(sink._control_tasks)
+    await asyncio.wait_for(entered.wait(), _WAIT_S)
+    await asyncio.wait_for(sink.aclose(), _WAIT_S)
+    assert task.cancelled()
+    assert not sink._control_tasks
+
+
+def test_wiring_a_callback_again_ends_the_shutdown_clear() -> None:
+    """A sink whose control was stopped and then wired again logs a later clear as the wiring
+    fault it is, not as a shutdown."""
+    sink = NotifierAlertSink([])
+
+    async def _cb(action: str, target: str, *, default_target: bool) -> None:
+        return None
+
+    sink.stop_control()
+    assert sink._control_stopped
+    sink.set_control_callback(_cb)
+    assert not sink._control_stopped
 
 
 async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(
