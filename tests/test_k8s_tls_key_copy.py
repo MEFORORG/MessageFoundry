@@ -196,12 +196,15 @@ def _engine_tls_files(pod: dict[str, Any]) -> dict[str, _Seen]:
         else:
             raise AssertionError(f"{path} is in a directory this test does not read")
         if "secret" in volume:
-            mode, uid = _secret_mode(pod, volume, path.name), 0  # the kubelet writes it as root
+            # The kubelet serves each Secret entry as a root-owned link into its ..data directory,
+            # and the mode it serves the entry at is checked by _secret_mode.
+            _secret_mode(pod, volume, path.name)
+            kind_mode, uid = stat.S_IFLNK | 0o777, 0
         elif "emptyDir" in volume:
-            mode, uid = _installed_mode(pod, volume["name"], path), owner
+            kind_mode, uid = stat.S_IFREG | _installed_mode(pod, volume["name"], path), owner
         else:
             raise AssertionError(f"{path} is on a volume of a kind this test does not read")
-        seen[str(path)] = _Seen(stat.S_IFREG | mode, uid, parent_mode, parent_uid)
+        seen[str(path)] = _Seen(kind_mode, uid, parent_mode, parent_uid)
     return seen
 
 
@@ -253,9 +256,9 @@ def test_the_pre_fix_pod_is_refused_by_the_same_resolver_and_rule() -> None:
     """The positive control: the shape that shipped before is refused, so a pass below means
     something."""
     pod = yaml.safe_load(_PRE_FIX_POD)
-    files = _engine_tls_files(pod)
-    assert stat.S_IMODE(files["/etc/mefor/tls/api.key"].mode) == 0o440
-    assert "0440" in _refused(files)["/etc/mefor/tls/api.key"]
+    volume = _volumes(pod)["tls"]
+    assert _secret_mode(pod, volume, "api.key") == 0o440
+    assert "it is a link" in _refused(_engine_tls_files(pod))["/etc/mefor/tls/api.key"]
     assert _engine_secret_mounts(pod) == ["/etc/mefor/tls"]
 
 
@@ -344,9 +347,8 @@ def test_copy_tls_can_read_the_root_owned_secret(name: str, pod: dict[str, Any])
 def test_fsgroup_widens_a_0400_secret_the_engine_would_mount() -> None:
     """The control for the fsGroup widening: a 0400 Secret on the engine is still refused."""
     pod = yaml.safe_load(_PRE_FIX_POD.replace("defaultMode: 0440", "defaultMode: 0400"))
-    files = _engine_tls_files(pod)
-    assert stat.S_IMODE(files["/etc/mefor/tls/api.key"].mode) == 0o440
-    assert "/etc/mefor/tls/api.key" in _refused(files)
+    assert _secret_mode(pod, _volumes(pod)["tls"], "api.key") == 0o440
+    assert "/etc/mefor/tls/api.key" in _refused(_engine_tls_files(pod))
 
 
 @pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)

@@ -2740,7 +2740,7 @@ secret. Each file in that directory holds one setting and is named exactly as it
   `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
   not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
   named for no setting is cited by its position, never spelled, since its name may be a value.
-- **The access check is a list of known broad groups.** On Windows it does not refuse one named
+- **On Windows the access check is a list of known broad groups.** It does not refuse one named
   account that can write the directory, the way the config-directory checks do, and it does not
   read the folder that holds the directory. On POSIX it reads that one folder, as the rule above
   says. On no platform does it read the folders above that: an account that can write one of

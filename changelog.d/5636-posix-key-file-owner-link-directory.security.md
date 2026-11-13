@@ -2,9 +2,10 @@
   an account other than the engine's own or root, and one held in a directory that such an account
   owns or that a group or other account may write without the sticky bit.** Before, it judged the
   mode bits of the file a link named, so a mode `0600` key another account owned, or one in a
-  directory others could replace it in, would have passed. The check is the one `serve` and
-  `supervise` apply to the store key file, the generated and the operator's API TLS key, and each
-  connection's key file, and the one the secrets directory and its files get. A link is now judged
+  directory others could replace it in, would have passed. On POSIX the check applies to at least
+  the generated and the operator's API TLS key and each connection's key file, which `serve` and
+  `supervise` judge, and to the secrets directory and its files. A minted TLS key in a store
+  directory a group may write, such as one made under umask `002`, is now refused too. A link is now judged
   as itself, so a dangling link to a key is refused rather than passed as a missing file. Only the
   directory that holds the file is read, not the ones above it. The shipped manifests
   `docker/k8s/statefulset.yaml` and `docker/k8s/ha-postgres.yaml` add a `tls-dir` initContainer

@@ -61,7 +61,10 @@ _IDENTITY_SETTINGS: Final[tuple[tuple[str, str, bool], ...]] = (
 _PEM_MARKER: Final = "-----BEGIN"
 
 #: The remedy for a key file an operator supplied.
-KEY_FILE_REMEDY: Final = "Restrict it to the account the engine runs as"
+KEY_FILE_REMEDY: Final = (
+    "Restrict it to the account the engine runs as (POSIX: a file, not a link, that account owns, in a\n"
+    "directory only that account or root may write, or one with the sticky bit)"
+)
 
 
 #: Windows errors CPython raises as FileNotFoundError for a path it could not reach:

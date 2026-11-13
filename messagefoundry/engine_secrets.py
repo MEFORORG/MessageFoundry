@@ -112,7 +112,8 @@ MAX_FILE_BYTES: Final = 64 * 1024
 #: The remedy every access refusal ends with.
 _REMEDY: Final = (
     "Restrict it to SYSTEM, Administrators and the account the engine runs as (POSIX: the "
-    "engine's own account, mode 0700 for the directory and 0600 for a file)"
+    "engine's own account, mode 0700 for the directory and 0600 for a file, as real files and\n"
+    "directories rather than links, in a folder only that account or root may write)"
 )
 
 
@@ -176,8 +177,8 @@ _REMOVED: Final = "was removed after the directory was listed; start again"
 
 
 def _not_a_regular_file(path: Path) -> str | None:
-    """Why ``path`` is not a regular file to read, or ``None`` when it is. This follows a link, so on
-    Windows it runs only after the access check has refused one."""
+    """Why ``path`` is not a regular file to read, or ``None`` when it is. This follows a link, so it
+    runs only after the access check has refused one."""
     try:
         mode = path.stat().st_mode
     except FileNotFoundError:
