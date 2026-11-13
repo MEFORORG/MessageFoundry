@@ -516,9 +516,10 @@ async def test_a_list_of_fifty_unmarked_rows_reports_once(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5650: a keyless run can leave an unmarked value in every row it wrote. A list over
-    50 of them withholds all 50, yet logs one WARNING from the cipher, one from this module and
-    writes one audit row, as a moved cell is reported once per interval. The cipher's refusal hook,
-    its alert, still fires per read; the alert sink throttles that."""
+    50 of them withholds all 50 and writes 50 audit rows, one per row in its own scope, yet logs
+    one WARNING from the cipher and one from this module. The cipher's refusal hook, its alert,
+    still fires per read; the alert sink throttles that. Control: an untagged column keeps the
+    cipher's WARNING on every refusal."""
     from messagefoundry.store import crypto  # noqa: PLC0415
 
     monkeypatch.setattr(cell_tag, "_reported", {})
@@ -536,10 +537,22 @@ async def test_a_list_of_fifty_unmarked_rows_reports_once(
     assert len(failures) == 50
     sink = _DeadLetterSink()
     await report_cell_tag_failures(sink, failures)
-    assert sink.audits == [MESSAGE_TAG_FAILED_ACTION]
+    assert sink.audits == [MESSAGE_TAG_FAILED_ACTION] * 50
     warned = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len([r for r in warned if r.name == crypto.__name__]) == 1
     assert len([r for r in warned if r.name == cell_tag.__name__]) == 1
+    caplog.clear()
+    for _ in range(2):  # control: a column cell_tag does not bind logs every refusal
+        with pytest.raises(UnmarkedCipherError):
+            cipher.decrypt("PLANTED", aad=cell_aad("users", "totp_secret", "u1"))
+    assert len([r for r in caplog.records if r.name == crypto.__name__]) == 2
+
+
+def test_the_ciphers_tagged_cell_list_matches_cell_tags() -> None:
+    """The cipher names the row-tagged cells itself (cell_tag imports it); the two must agree."""
+    from messagefoundry.store import crypto  # noqa: PLC0415
+
+    assert frozenset(cell_tag._ROW_TAGGED) == crypto._ROW_TAGGED_CELLS
 
 
 async def test_an_unmarked_report_never_mutes_a_moved_cells_audit(

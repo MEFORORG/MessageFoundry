@@ -243,10 +243,9 @@ class UnmarkedCellError(CellTagError):
     It counts as drift, so it writes the tag-failed audit row and is contained as drift is: a list
     withholds the row, a handoff dead-letters it. Its alert is the cipher's own unmarked-value
     refusal, already raised when the cipher refused it, so :func:`open_tagged_cell` raises no
-    second, ``integrity_drift``, alert for it. Its WARNING and its audit row are written once per
-    cell column per interval, not once per row, naming the first row met in that interval: a
-    keyless run can leave one in every row it wrote, so later rows of the same column in the
-    interval are contained but not reported one by one."""
+    second, ``integrity_drift``, alert for it. Its audit row is written per row, once per interval,
+    as a moved cell's is. Its WARNING is logged once per cell column per interval, naming the first
+    row met: a keyless run can leave one in every row it wrote."""
 
     cipher_alerted = True
 
@@ -396,10 +395,16 @@ _reported_lock = threading.Lock()
 
 def _memo_key(err: CellTagError) -> _Key:
     # By class, not only by drift: a corrupt or unmarked read never mutes a moved cell (BACKLOG #5650).
-    # An unmarked value is reported per cell column, not per row: a keyless run can leave one in
-    # every row it wrote, and a list over them would otherwise log and audit each (BACKLOG #5650).
-    row = "" if isinstance(err, UnmarkedCellError) else err.row_ref
-    return (err.table, err.column, row, type(err))
+    return (err.table, err.column, err.row_ref, type(err))
+
+
+def _warning_key(err: CellTagError) -> _Key:
+    # An unmarked value's WARNING is per cell column, not per row: a keyless run can leave one in
+    # every row it wrote, and a list over them would otherwise log each. Its audit row stays per
+    # row (_memo_key), so every row is still audited in its own scope (BACKLOG #5650).
+    if isinstance(err, UnmarkedCellError):
+        return (err.table, err.column, "", type(err))
+    return _memo_key(err)
 
 
 def _is_recent(memo: _Memo, key: _Key, now: float) -> bool:
@@ -414,9 +419,10 @@ def _remember(memo: _Memo, key: _Key, now: float) -> None:
         memo.pop(next(iter(memo)))
 
 
-def _first_in_interval(memo: _Memo, err: CellTagError) -> bool:
-    """Whether ``err``'s cell has not been reported in ``memo`` within the interval; records it."""
-    key, now = _memo_key(err), time.monotonic()
+def _first_in_interval(memo: _Memo, err: CellTagError, key: _Key | None = None) -> bool:
+    """Whether ``err``'s cell (or ``key``) has not been reported in ``memo`` within the interval;
+    records it."""
+    key, now = (key if key is not None else _memo_key(err)), time.monotonic()
     with _reported_lock:
         if _is_recent(memo, key, now):
             return False
@@ -427,7 +433,7 @@ def _first_in_interval(memo: _Memo, err: CellTagError) -> bool:
 def _alert(cipher: object, err: CellTagError) -> None:
     """Log a WARNING and, for drift the cipher did not already alert on, raise ``integrity_drift``
     through the cipher's tag-failure hook, once per cell per interval. Never raises."""
-    if not _first_in_interval(_reported, err):
+    if not _first_in_interval(_reported, err, _warning_key(err)):
         return
     if not err.drift or err.cipher_alerted:
         # The text, not the error: a record keeps its args, and the error's chain reaches PHI.
