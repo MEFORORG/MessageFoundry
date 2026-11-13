@@ -202,11 +202,15 @@ DEFAULT_CLAIM_OWNER = "engine"
 _GATES: weakref.WeakSet[ApprovalGate] = weakref.WeakSet()
 _GATES_LOCK = threading.Lock()
 
-#: The approval ids a gate in this process has claimed, per store object (BACKLOG #1562). Every app
-#: over one engine shares its store, so a second app's reconcile finds the first app's claims here
-#: and never moves one: a claim of this life is no leftover, and ``engine_restart`` is written only
-#: for a row this process never claimed. Entries are never removed while the store lives; weak, so
-#: an entry goes when its store object is collected, and a new engine opens a new store object.
+#: The approval ids a gate in this process has claimed, per store object (BACKLOG #1562). THE RULE,
+#: stated here once: neither the startup nor the put-off reconcile moves a row whose id is in the
+#: set for the store object its gate was built over, or a row any gate in this process is running
+#: (:func:`_releasing_in_process`, which spans store objects). Every app over one engine shares its
+#: store object, so a second app's reconcile leaves the first app's claims alone and writes
+#: ``engine_restart`` only for a row neither guard covers. Two store objects over one database in
+#: one process share no set, so a claim of one that no gate is running is not covered for the
+#: other. An id is noted before its claim is written and never removed while the store object
+#: lives; weak, so an entry goes when its store object is collected.
 _CLAIMED_HERE: weakref.WeakKeyDictionary[object, set[str]] = weakref.WeakKeyDictionary()
 
 
@@ -581,13 +585,12 @@ class ApprovalGate:
         # (BACKLOG #3252); _catch_up_reconcile runs it once the owner is known.
         # The lock keeps two lists from running it at once.
         self._reconcile_owed = False
-        # The ids this process has claimed over this store (_CLAIMED_HERE), keyed by the store
-        # this gate was built over and shared with every other gate over it. Neither reconcile
-        # moves one, so neither takes this life's claims for leftovers, whatever the clocks say.
+        # This gate's share of _CLAIMED_HERE, keyed by the store it was built over (the rule is
+        # stated there).
         with _GATES_LOCK:
             self._claimed_here = _CLAIMED_HERE.setdefault(store, set())
-        # The put-off reconcile also leaves rows claimed since this gate was built, as on main: a
-        # sibling engine shard under the same default owner may be running one.
+        # The put-off reconcile also leaves rows claimed since this gate was built: a sibling
+        # engine shard process under the same default owner may be running one.
         self._born = clock()
         self._owner_lock = asyncio.Lock()
         # With no resolver the requester's permissions cannot be re-read, so approve() refuses every
@@ -642,8 +645,7 @@ class ApprovalGate:
         self._inflight.pop(task, None)
 
     def _note_claim(self, approval_id: str) -> None:
-        """Record that this process claimed ``approval_id`` over this gate's store (BACKLOG
-        #1562), so no reconcile in this process takes it for a leftover."""
+        """Note ``approval_id`` in :data:`_CLAIMED_HERE` for this gate's store (BACKLOG #1562)."""
         with _GATES_LOCK:
             self._claimed_here.add(approval_id)
 
@@ -689,9 +691,8 @@ class ApprovalGate:
         An embedded app can start before its engine holds its graph, when the owner is not known.
         This runs on each queue list until it completes, so the engine shard's leftover rows
         surface as ``interrupted`` once its name is known, or once a claim fixes the default. It
-        never moves a row a gate in this process claimed, nor a row claimed since this gate was
-        built, so a claim made since, here or by a sibling under the same owner, is never taken
-        for a leftover. A failure or a cancel leaves
+        follows :data:`_CLAIMED_HERE`'s rule, and also leaves a row claimed since this gate was
+        built, which a sibling under the same owner may be running. A failure or a cancel leaves
         it owed for the next list; a failure is logged."""
         if not self._reconcile_owed:
             return
@@ -750,11 +751,9 @@ class ApprovalGate:
     async def reconcile_after_restart(self) -> RestartReconciliation:
         """Move this process's leftover ``executing`` rows to ``interrupted`` (BACKLOG #1562).
 
-        Call it at startup, before the API serves approvals. It never moves a row a gate in this
-        process claimed over this store (:data:`_CLAIMED_HERE`), so a second app over the same
-        engine leaves the first app's claims ``executing``. While the owner is not known yet it
-        moves nothing and puts the work off to :meth:`_catch_up_reconcile`, which runs it once
-        the owner is known, under the same rule (BACKLOG #3252). A
+        Call it at startup, before the API serves approvals. It follows :data:`_CLAIMED_HERE`'s
+        rule. While the owner is not known yet it moves nothing and puts the work off to
+        :meth:`_catch_up_reconcile`, which runs it once the owner is known (BACKLOG #3252). A
         row this process claimed in its previous life and never settled is a release whose outcome
         the gate never recorded. At least three things leave one: the process died mid-run, both of
         :meth:`_settle`'s writes failed (the operation ran), or a claim committed but its reply was
@@ -792,9 +791,9 @@ class ApprovalGate:
         return await self._reconcile(me, claimed_before=None)
 
     async def _reconcile(self, me: str, *, claimed_before: float | None) -> RestartReconciliation:
-        """The body of :meth:`reconcile_after_restart` under owner ``me``. A row a gate in this
-        process claimed is left alone: it is this life's. With ``claimed_before``, so is a row
-        claimed at or after that time, as main's put-off reconcile does."""
+        """The body of :meth:`reconcile_after_restart` under owner ``me``, under
+        :data:`_CLAIMED_HERE`'s rule. With ``claimed_before``, a row claimed at or after that time
+        is left alone too."""
         interrupted: list[str] = []
         unsettled: list[str] = []
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
@@ -803,10 +802,9 @@ class ApprovalGate:
         for row in await self._verified_rows(
             await self._store.list_executing_approvals(claim_owner=me)
         ):
-            # Asked after the read: a claim is noted before it is written, so a row the read
-            # found 'executing' after a claim here is always seen here.
-            if self._claimed_in_process(row.id):
-                continue  # claimed by this process, so not a leftover
+            # Asked after the read, so a claim the read found is already noted (_CLAIMED_HERE).
+            if self._claimed_in_process(row.id) or _releasing_in_process(row.id):
+                continue
             if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
                 continue  # claimed since this gate was built, perhaps by a sibling still running
             approval_id = row.id
@@ -1708,9 +1706,7 @@ class ApprovalGate:
             ),
             client=client,  # ADR 0150: the approver's address, matching this row's actor
         )
-        # Noted before the claim's write is even created, and never forgotten: a claim whose
-        # outcome this process never recorded is still this life's, not a leftover for a sibling
-        # app's start.
+        # Noted before the claim's write is even created (_CLAIMED_HERE).
         self._note_claim(approval_id)
         claim = asyncio.ensure_future(
             self._store.decide_pending_approval(

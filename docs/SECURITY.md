@@ -3209,8 +3209,10 @@ An app embedded around an engine (`create_app(engine=...)`) can start before its
 graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and
 the first queue read that finds the owner known runs it, over rows claimed before its gate was
 built (BACKLOG #3252). Neither that reconcile nor the one at start moves a row an approval gate in
-this process claimed over the same store object, which in practice means the same engine object,
-whatever order the apps were built and started in. A release made before the engine holds its graph claims
+this process claimed over the same store object, or a release any gate in this process is
+running, whatever order the apps were built and started in. Two Engine objects over one database in
+one process are not protected: each has its own store object, so one's unsettled claim that no
+gate is running reads as a leftover to the other. A release made before the engine holds its graph claims
 under `engine` and keeps that owner for the app's life, so start the engine before the app serves
 approvals.
 

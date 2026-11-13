@@ -350,6 +350,24 @@ async def test_a_later_start_leaves_an_unsettled_claim_of_this_life(engine: Engi
     assert await _audit(engine, "approval.interrupted", this_life) == []
 
 
+async def test_a_release_running_over_another_store_object_is_not_reconciled(
+    engine: Engine,
+) -> None:
+    """Residual 5: a gate built over a different store object for the same database shares no
+    claimed-id set, but a release it is running is still left alone, as the interrupt route
+    leaves it. Control: a row no gate in this process claimed still moves."""
+    wrapped = _gate(engine)  # built over a _StandingStore, a store object of its own
+    live, release, leave = await _running_release(wrapped)
+    leftover = await _stranded(engine, "engine")
+    try:
+        found = await ApprovalGate(engine.store, ON).reconcile_after_restart()
+        assert found.interrupted == (leftover,)
+        assert str((await _row(engine, live))["status"]) == "executing"
+    finally:
+        leave.set()
+        await asyncio.wait_for(release, 10.0)
+
+
 async def test_a_clock_step_neither_hides_a_leftover_nor_exposes_a_claim(engine: Engine) -> None:
     """Residual 5: the reconcile reads no clock. A claim this process made with its clock stepped
     far back stays 'executing' at a later start, and a leftover whose claim time is ahead of now
