@@ -1745,7 +1745,7 @@ lists nothing, pages `authority-seal-transit` and writes no audit row.
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
 | `GET` | `/approvals/executing` | `approvals:approve` | `require` — releases still claimed as `executing`, up to the store read's cap, with their claim owner and what an interrupt would judge of that owner now; params are not listed (BACKLOG #1562) |
-| `POST` | `/approvals/{approval_id}/interrupt` | `approvals:approve` | `require_step_up` — moves a stranded `executing` release to `interrupted`, refused while its owner may be live; an owner with no heartbeat to read needs `attest_owner_stopped`, unless this process claimed the release and runs it no more; never runs the operation (BACKLOG #1562) |
+| `POST` | `/approvals/{approval_id}/interrupt` | `approvals:approve` | `require_step_up` — moves a stranded `executing` release to `interrupted`, refused while its owner may be live; an owner with no heartbeat to read needs `attest_owner_stopped`, unless this process won the release's claim under the answering gate's own owner and runs it no more; never runs the operation (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
 | `POST` | `/dr/activate` | `dr:operate` | `require_step_up` |
 | `POST` | `/dr/release` | `dr:operate` | `require_step_up` |
@@ -3175,17 +3175,17 @@ a slow one. An operator settles it instead, through two routes (owner-delegated 
 - `POST /approvals/{id}/interrupt` moves one to `interrupted`, so it takes the resolve above. It
   needs `approvals:approve` and a fresh step-up, and it refuses the original requester, **403**, as
   the resolve does, comparing user ids; a row with no recorded requester id is refused, **409**. It
-  never runs the operation and never records an outcome. It judges the owner in three tiers:
+  never runs the operation and never records an outcome. It judges the owner by these rows, in order:
 
 | Owner | The interrupt |
 |---|---|
 | This process is running the release, or still writing its outcome | refused, **409** |
-| This process claimed the release over the same store object under this gate's owner, the claim was not refused, and no gate in it runs it now | moves the row, no attestation needed, before any heartbeat is read |
+| A gate in this process won the release's claim over the same store object, the row's claim time is the one that claim wrote, its owner is the answering gate's own, and no gate in this process runs it now | moves the row, no attestation needed, before any heartbeat is read |
 | `node:<id>`, and that node's heartbeat is fresh | refused, **409** |
 | `node:<id>`, and the heartbeats cannot be read | refused, **503**; try again |
 | `node:<id>`, on an engine that is not a cluster node and reads no heartbeats | refused, **409**; interrupt from a cluster node |
 | `node:<id>`, and the heartbeat has lapsed or the node is gone | moves the row |
-| `shard:<id>`, `engine`, no owner, or any other name | moves the row only with `{"attest_owner_stopped": true}`, a JSON `true` and nothing a parser could coerce to one (any other value is **422**), the operator's word that no process under that name is running; otherwise **409** |
+| `shard:<id>`, `engine`, no owner, or any other name, when no row above applies | moves the row only with `{"attest_owner_stopped": true}`, a JSON `true` and nothing a parser could coerce to one (any other value is **422**), the operator's word that no process under that name is running; otherwise **409** |
 
 A cluster node whose `[cluster].node_id` is not pinned comes back under a new id, so its old claims
 read as a lapsed heartbeat here and can be interrupted without an attestation. The heartbeat is the
@@ -3215,9 +3215,9 @@ whatever order the apps were built and started in. Two Engine objects over one d
 process are not protected: each has its own store object, so one's unsettled claim that no gate is
 running reads as a leftover to the other. A later app start in the same process does not recover an
 unsettled claim of this life that no gate is running. An operator can move it through `POST
-/approvals/{id}/interrupt` with no attestation, as the tier table above says. A release made before
-the engine holds its graph claims under `engine` and keeps that owner for the app's life, so start
-the engine before the app serves approvals.
+/approvals/{id}/interrupt` with no attestation only from a gate whose owner is the claim's, as the
+tier table above says. A release made before the engine holds its graph claims under `engine` and
+keeps that owner for the app's life, so start the engine before the app serves approvals.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

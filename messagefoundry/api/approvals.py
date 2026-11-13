@@ -202,16 +202,19 @@ DEFAULT_CLAIM_OWNER = "engine"
 _GATES: weakref.WeakSet[ApprovalGate] = weakref.WeakSet()
 _GATES_LOCK = threading.Lock()
 
-#: The approval ids a gate in this process has claimed, per store object (BACKLOG #1562). THE RULE,
-#: stated here once: neither the startup nor the put-off reconcile moves a row whose id is in the
-#: set for the store object its gate was built over, or a row any gate in this process is running
+#: The claims a gate in this process WON, per store object: approval id to the ``decided_at`` the
+#: claim wrote (BACKLOG #1562). THE RULE, stated here once: a row "claimed here" is one whose id is
+#: recorded for the store object its gate was built over AND whose ``decided_at`` equals the
+#: recorded one, so the row's claim is exactly this process's write. Neither the startup nor the
+#: put-off reconcile moves such a row, or a row any gate in this process is running
 #: (:func:`_releasing_in_process`, which spans store objects). Every app over one engine shares its
 #: store object, so a second app's reconcile leaves the first app's claims alone and writes
 #: ``engine_restart`` only for a row neither guard covers. Two store objects over one database in
-#: one process share no set, so a claim of one that no gate is running is not covered for the
-#: other. An id is noted before its claim is written and never removed while the store object
-#: lives; weak, so an entry goes when its store object is collected.
-_CLAIMED_HERE: weakref.WeakKeyDictionary[object, set[str]] = weakref.WeakKeyDictionary()
+#: one process share no record, so a claim of one that no gate is running is not covered for the
+#: other. An entry is added only once its claim commits as won, never for a lost, refused,
+#: cancelled or faulted claim, and is not removed while the store object lives; weak, so an entry
+#: goes when its store object is collected.
+_CLAIMED_HERE: weakref.WeakKeyDictionary[object, dict[str, float]] = weakref.WeakKeyDictionary()
 
 
 def _releasing_in_process(approval_id: str) -> bool:
@@ -588,7 +591,7 @@ class ApprovalGate:
         # This gate's share of _CLAIMED_HERE, keyed by the store it was built over (the rule is
         # stated there).
         with _GATES_LOCK:
-            self._claimed_here = _CLAIMED_HERE.setdefault(store, set())
+            self._claimed_here = _CLAIMED_HERE.setdefault(store, {})
         # The put-off reconcile also leaves rows claimed since this gate was built: a sibling
         # engine shard process under the same default owner may be running one.
         self._born = clock()
@@ -644,21 +647,16 @@ class ApprovalGate:
     def _forget(self, task: asyncio.Future[Any]) -> None:
         self._inflight.pop(task, None)
 
-    def _note_claim(self, approval_id: str) -> None:
-        """Note ``approval_id`` in :data:`_CLAIMED_HERE` for this gate's store (BACKLOG #1562)."""
+    def _note_claim(self, approval_id: str, decided_at: float) -> None:
+        """Record a claim this gate won, with the ``decided_at`` it wrote (:data:`_CLAIMED_HERE`)."""
         with _GATES_LOCK:
-            self._claimed_here.add(approval_id)
+            self._claimed_here[approval_id] = decided_at
 
-    def _forget_claim(self, approval_id: str) -> None:
-        """Drop ``approval_id`` from :data:`_CLAIMED_HERE`: its claim was refused, so this process
-        does not hold it."""
+    def _claimed_in_process(self, row: ApprovalRow) -> bool:
+        """Whether ``row`` is claimed here, by :data:`_CLAIMED_HERE`'s rule."""
         with _GATES_LOCK:
-            self._claimed_here.discard(approval_id)
-
-    def _claimed_in_process(self, approval_id: str) -> bool:
-        """Whether a gate in this process claimed ``approval_id`` over this gate's store."""
-        with _GATES_LOCK:
-            return approval_id in self._claimed_here
+            recorded = self._claimed_here.get(row.id)
+        return recorded is not None and row.decided_at == recorded
 
     def _release_done(self, approval_id: str) -> None:
         """One release of ``approval_id`` in this gate stopped running. Counted, so a second
@@ -808,8 +806,9 @@ class ApprovalGate:
         for row in await self._verified_rows(
             await self._store.list_executing_approvals(claim_owner=me)
         ):
-            # Asked after the read, so a claim the read found is already noted (_CLAIMED_HERE).
-            if self._claimed_in_process(row.id) or _releasing_in_process(row.id):
+            # A won claim is recorded only once its commit returns; until then its release is
+            # tracked in _releasing, so one of the two covers it here.
+            if self._claimed_in_process(row) or _releasing_in_process(row.id):
                 continue
             if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
                 continue  # claimed since this gate was built, perhaps by a sibling still running
@@ -1712,14 +1711,13 @@ class ApprovalGate:
             ),
             client=client,  # ADR 0150: the approver's address, matching this row's actor
         )
-        # Noted before the claim's write is even created (_CLAIMED_HERE).
-        self._note_claim(approval_id)
+        claimed_at = self._clock()
         claim = asyncio.ensure_future(
             self._store.decide_pending_approval(
                 approval_id,
                 status="executing",
                 approver=approver,
-                decided_at=self._clock(),
+                decided_at=claimed_at,
                 audit=attempted,
                 claim_owner=self._owner_for_claim(),
             )
@@ -1735,7 +1733,6 @@ class ApprovalGate:
             # The row changed outside the store after it was read, and the store refused the claim
             # (BACKLOG #2592). Nothing ran, and nothing was written. The cause carries the row kind
             # only, never a value.
-            self._forget_claim(approval_id)
             await self._approval_seal_failed(approval_id)
             raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except asyncio.CancelledError:
@@ -1775,8 +1772,9 @@ class ApprovalGate:
             if not claimed and not handed_off:
                 self._release_done(approval_id)
         if not claimed:
-            self._forget_claim(approval_id)  # another caller holds the claim, not this process
             raise ApprovalError(409, "request was already decided")
+        # Won: recorded with the claim time it wrote (_CLAIMED_HERE).
+        self._note_claim(approval_id, claimed_at)
         handed_off = False
         try:
             # Encodable once, here, so the audit row and the caller's answer carry one form, and
@@ -2705,18 +2703,17 @@ class ApprovalGate:
         (d20261029T205247402-81159c) rules what this does, in three tiers:
 
         - a release THIS process is running, or whose outcome it is still writing, is refused, 409;
-          one this process claimed over this store under this gate's owner, whose claim was not
-          refused, and that no gate here runs (``ended_here``) moves with no attestation, before
-          any heartbeat is read. That case was added on a Lander hold on engine PR 2930, not by
-          the decision above;
+          one claimed here (:data:`_CLAIMED_HERE`'s rule) under this gate's own owner, that no
+          gate here runs (``ended_here``), moves with no attestation, before any heartbeat is
+          read. That case was added on a Lander hold on engine PR 2930, not by the decision above;
         - a release a cluster node claimed (``node:<id>``) is refused while that node's heartbeat is
           fresh, 409, and when the heartbeats cannot be read, 503, or are not read by this engine,
           409. A lapsed heartbeat, or no such node, lets it move. A node whose ``node_id`` was not
           pinned comes back under a new id, so its old claims read as lapsed here;
         - any other owner, an engine shard (``shard:<id>``), a plain engine (``engine``), no owner
           at all, or one this gate does not recognise, is a name no heartbeat covers. Unless it is
-          ``ended_here``, it moves only on ``attest_owner_stopped``, the operator's word that the owning process is stopped,
-          which the audit row records; without it, 409.
+          ``ended_here``, it moves only on ``attest_owner_stopped``, the operator's word that the
+          owning process is stopped, which the audit row records; without it, 409.
 
         It never runs the operation, and it moves only to ``interrupted``, never to an outcome:
         what the release did is still for an operator to record through
@@ -2804,8 +2801,8 @@ class ApprovalGate:
         tiers). ``heartbeats`` caches each node's verdict across one listing."""
         if _releasing_in_process(row.id):
             return "releasing_here"
-        if self._claimed_in_process(row.id) and row.claim_owner == self.claim_owner:
-            # Noted by this process (_CLAIMED_HERE), not refused, under this gate's own owner, and
+        if self._claimed_in_process(row) and row.claim_owner == self.claim_owner:
+            # Claimed here (_CLAIMED_HERE), under this gate's own owner, and
             # run by none of its gates: the release has ended here without an outcome.
             return "ended_here"
         prefix, _, node_id = (row.claim_owner or "").partition(":")

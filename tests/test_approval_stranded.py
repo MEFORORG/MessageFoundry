@@ -436,6 +436,108 @@ async def test_a_claim_lost_to_a_live_peer_is_not_ended_here(engine: Engine) -> 
     assert str((await _row(engine, approval_id))["status"]) == "executing"
 
 
+async def test_a_losing_approve_cannot_wipe_the_winners_claim(engine: Engine) -> None:
+    """Two approves of one request race to the claim; the loser's 409 leaves the winner's record
+    alone. When the winner later ends unsettled, its row reads ``ended_here``, and a second gate's
+    start reconcile over the same store object leaves it 'executing'."""
+    arrived: list[str] = []
+    both = asyncio.Event()
+    entered, leave = asyncio.Event(), asyncio.Event()
+
+    class _BothClaimAtOnce(_SettlesFail):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw.get("status") == "executing":
+                arrived.append(approval_id)
+                if len(arrived) == 2:
+                    both.set()
+                await both.wait()  # both approves read the row as pending first
+            return await super().decide_pending_approval(approval_id, **kw)
+
+    async def _holds(_p: Mapping[str, Any]) -> dict[str, Any]:
+        entered.set()
+        await leave.wait()
+        return {"ran": True}
+
+    gate = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
+    gate._store = _BothClaimAtOnce(engine.store)
+    gate.register("dead_letter_replay", "op", _holds, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    first = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+    second = asyncio.create_task(
+        gate.approve(approval_id, approver="checker-2", approver_user_id="checker-2-id")
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 10.0)  # the winner runs, and holds
+        done, _ = await asyncio.wait(
+            {first, second}, timeout=10.0, return_when=asyncio.FIRST_COMPLETED
+        )
+        [lost] = done  # the loser, refused while the winner still runs
+        with pytest.raises(ApprovalError) as refused:
+            lost.result()
+        assert refused.value.status == 409
+    finally:
+        leave.set()
+        await asyncio.wait({first, second}, timeout=10.0)
+    assert str((await _row(engine, approval_id))["status"]) == "executing"  # settles failed
+    [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
+    assert listed["liveness"] == "ended_here"
+    found = await ApprovalGate(engine.store, ON).reconcile_after_restart()
+    assert approval_id not in found.interrupted
+    assert str((await _row(engine, approval_id))["status"]) == "executing"
+
+
+async def test_a_cancelled_lost_claim_does_not_make_a_siblings_row_ended_here(
+    engine: Engine,
+) -> None:
+    """An approve cancelled while it claims, whose claim then loses to a sibling under the same
+    owner that is running the release, is not this process's claim: the sibling's live row still
+    needs the attestation, never ``ended_here``."""
+    reached, let_go = asyncio.Event(), asyncio.Event()
+
+    class _SiblingWinsWhileCancelled(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw.get("status") == "executing" and kw.get("approver") == "checker":
+                assert await self._store.decide_pending_approval(
+                    approval_id,
+                    status="executing",
+                    approver="sibling-approver",
+                    decided_at=time.time(),
+                    claim_owner="engine",
+                )
+                reached.set()
+                await let_go.wait()
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    gate = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
+    gate._store = _SiblingWinsWhileCancelled(engine.store)
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    task = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    )
+    await asyncio.wait_for(reached.wait(), 10.0)
+    task.cancel()
+    let_go.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await gate.drain()
+    row = await _row(engine, approval_id)
+    assert str(row["status"]) == "executing" and row["approver"] == "sibling-approver"
+    [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
+    assert listed["liveness"] == "attestation_required"
+    with pytest.raises(ApprovalError) as refused:
+        await gate.interrupt_stranded(approval_id, actor="operator", actor_user_id="operator-id")
+    assert refused.value.status == 409 and "attest_owner_stopped" in refused.value.detail
+
+
 async def test_a_release_running_over_another_store_object_is_not_reconciled(
     engine: Engine,
 ) -> None:

@@ -63,8 +63,8 @@ class ExecutingApprovalList(BaseModel):
 
 class ApprovalInterruptRequest(RequestModel):
     """``attest_owner_stopped`` is the operator's word that the process owning the claim is not
-    running. Only an owner with no heartbeat to read needs it; the audit row records it either
-    way. Strict: only JSON ``true`` or ``false``, so ``"yes"``, ``"true"`` or ``1`` is a 422,
+    running. Only an owner with no heartbeat to read needs it, and not for a release judged
+    ``ended_here``; the audit row records it either way. Strict: only JSON ``true`` or ``false``, so ``"yes"``, ``"true"`` or ``1`` is a 422,
     never an attestation."""
 
     attest_owner_stopped: StrictBool = False
