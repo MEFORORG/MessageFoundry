@@ -1864,12 +1864,12 @@ def test_an_expired_issuing_anchor_is_refused(pki: dict[str, Any], tmp_path: Pat
     assert "'trust_anchor' has expired" in _refusal(pki, **files)
 
 
-def test_an_expired_anchor_beside_its_renewed_successor_constructs(
-    pki: dict[str, Any], tmp_path: Path
-) -> None:
-    # A CA renewed under the same name and key: the bundle holds both, and the recipient verifies
-    # against either. The search must not stop at the expired one, which comes first.
-    ca_key, old = _issuer(valid_to=datetime.timedelta(days=-1))
+def _renewed_bundle(
+    tmp_path: Path, old_valid_to: datetime.timedelta
+) -> tuple[dict[str, str], x509.Certificate, x509.Certificate]:
+    """A CA renewed under the same name and key, the older copy first in the bundle, and a
+    recipient both verify. Returns the overrides, the old copy and the renewed one."""
+    ca_key, old = _issuer(valid_to=old_valid_to)
     _, renewed = _issuer(key=ca_key)
     _, recipient = _mint_leaf("recipient@hisp.example", ca_key, renewed)
     bundle = tmp_path / "renewed_bundle.pem"
@@ -1878,8 +1878,33 @@ def test_an_expired_anchor_beside_its_renewed_successor_constructs(
         + renewed.public_bytes(serialization.Encoding.PEM)
     )
     files = _files(tmp_path, "renewed", recipient_cert=recipient)
-    d = DirectDestination(_dest(pki, trust_anchor=str(bundle), **files))
-    assert d._recipient_anchor == renewed
+    return {"trust_anchor": str(bundle), **files}, old, renewed
+
+
+def test_an_expired_anchor_beside_its_renewed_successor_constructs(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # The search must not stop at the expired copy, which comes first.
+    overrides, old, renewed = _renewed_bundle(tmp_path, datetime.timedelta(days=-1))
+    d = DirectDestination(_dest(pki, **overrides))
+    assert d._recipient_anchors == (old, renewed)
+
+
+async def test_an_older_anchor_expiring_after_construction_leaves_its_successor_in_use(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # Both copies are valid at construction; the older one then expires. The send goes ahead on
+    # the renewed copy rather than stopping the lane.
+    from messagefoundry.transports import direct
+
+    _install_fake(monkeypatch)
+    overrides, _, _ = _renewed_bundle(tmp_path, datetime.timedelta(days=10))
+    d = DirectDestination(_dest(pki, **overrides))
+    later = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=20)
+    monkeypatch.setattr(direct, "_utcnow", lambda: later)
+    await d.send(_SYNTHETIC_HL7)
+    [smtp] = _FakeSMTP.instances
+    assert len(smtp.sent) == 1
 
 
 @pytest.mark.parametrize(
@@ -1923,7 +1948,24 @@ def test_a_self_signed_recipient_pinned_as_its_own_anchor_is_exempt_from_the_ca_
     cert = _cert_for(key.public_key(), "recipient@hisp.example", key)
     path = _files(tmp_path, "pinned", recipient_cert=cert)["recipient_cert"]
     d = DirectDestination(_dest(pki, recipient_cert=path, trust_anchor=path))
-    assert d._recipient_anchor == cert
+    assert d._recipient_anchors == (cert,)
+
+
+def test_a_ca_certificate_as_the_recipient_is_refused(pki: dict[str, Any], tmp_path: Path) -> None:
+    # A CA cert with no keyUsage and a SAN for the mailbox passes every other recipient check.
+    ca = x509.BasicConstraints(ca=True, path_length=0)
+    path = _recipient(pki, tmp_path, "ca_recipient", extensions=[ca])
+    assert "'recipient_cert' is a CA certificate" in _refusal(pki, recipient_cert=path)
+
+
+def test_a_pinned_self_signed_recipient_asserting_ca_constructs(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # openssl req -x509 sets CA=true by default, and a pinned correspondent issues nothing else.
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    cert = _cert_for(key.public_key(), "recipient@hisp.example", key, ca=True)
+    path = _files(tmp_path, "pinned_ca", recipient_cert=cert)["recipient_cert"]
+    DirectDestination(_dest(pki, recipient_cert=path, trust_anchor=path))
 
 
 def test_a_recipient_whose_key_usage_forbids_key_encipherment_is_refused(
@@ -1938,7 +1980,46 @@ def test_a_recipient_whose_eku_omits_email_protection_is_refused(
 ) -> None:
     eku = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH])
     path = _recipient(pki, tmp_path, "eku_tls", extensions=[eku])
-    assert "does not list emailProtection" in _refusal(pki, recipient_cert=path)
+    assert "lists neither emailProtection" in _refusal(pki, recipient_cert=path)
+
+
+def test_a_recipient_whose_eku_is_any_extended_key_usage_constructs(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # RFC 5280, the extended key usage section: anyExtendedKeyUsage stands for every purpose.
+    eku = x509.ExtendedKeyUsage([ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE])
+    DirectDestination(
+        _dest(pki, recipient_cert=_recipient(pki, tmp_path, "eku_any", extensions=[eku]))
+    )
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        x509.DuplicateExtension(
+            "synthetic duplicate", x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+        ),
+        x509.UnsupportedGeneralNameType("synthetic x400Address"),
+        ValueError("synthetic malformed extension"),
+    ],
+    ids=["duplicate", "unsupported-general-name", "malformed"],
+)
+def test_an_extension_that_does_not_read_is_a_value_error_naming_the_setting(
+    raised: Exception,
+) -> None:
+    # Two of these are not ValueError subclasses, so unmapped they escaped the construction
+    # contract carrying the library's text. A stand-in cert, because the builder will not mint them.
+    from messagefoundry.transports import direct
+
+    class _Unreadable:
+        @property
+        def extensions(self) -> Any:
+            raise raised
+
+    stand_in: Any = _Unreadable()
+    with pytest.raises(ValueError, match="'recipient_cert' carries an extension") as caught:
+        direct._extension(stand_in, x509.KeyUsage, "recipient_cert")
+    assert "synthetic" not in str(caught.value)
 
 
 def test_a_recipient_whose_usages_allow_email_encryption_constructs(
@@ -1967,7 +2048,7 @@ def test_a_cert_the_ca_issued_to_another_subscriber_is_refused(
 ) -> None:
     # Issued by the trusted CA, in its window, with no usage objection: only the binding fails.
     path = _recipient(pki, tmp_path, "other", addresses=addresses, dns_names=dns_names)
-    assert "does not name 'recipients' entry 1 of 1" in _refusal(pki, recipient_cert=path)
+    assert "does not name recipient address 1 of 1" in _refusal(pki, recipient_cert=path)
 
 
 def test_every_recipient_must_be_named_and_the_refusal_gives_the_position(
@@ -1975,7 +2056,10 @@ def test_every_recipient_must_be_named_and_the_refusal_gives_the_position(
 ) -> None:
     path = _recipient(pki, tmp_path, "one_of_two")
     recipients = ["recipient@hisp.example", "second@hisp.example"]
-    assert "entry 2 of 2" in _refusal(pki, recipient_cert=path, recipients=recipients)
+    assert "address 2 of 2" in _refusal(pki, recipient_cert=path, recipients=recipients)
+    # One entry holding two comma-joined addresses: the position counts addresses.
+    joined = [", ".join(recipients)]
+    assert "address 2 of 2" in _refusal(pki, recipient_cert=path, recipients=joined)
 
 
 @pytest.mark.parametrize(
@@ -2002,7 +2086,6 @@ async def test_a_cert_that_expires_after_construction_holds_the_queue_at_send(
     monkeypatch: pytest.MonkeyPatch,
     pki: dict[str, Any],
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
     setting: str,
 ) -> None:
     """Construction passed, then the clock moved past one cert's notAfter. The send must neither
@@ -2011,6 +2094,14 @@ async def test_a_cert_that_expires_after_construction_holds_the_queue_at_send(
     from messagefoundry.transports import direct
 
     _install_fake(monkeypatch)
+    builds: list[str] = []
+    real_build = DirectDestination._build_smime
+
+    def counted_build(self: DirectDestination, payload: str) -> EmailMessage:
+        builds.append(payload)
+        return real_build(self, payload)
+
+    monkeypatch.setattr(DirectDestination, "_build_smime", counted_build)
     soon = datetime.timedelta(days=30)
     if setting == "recipient_cert":
         overrides = {"recipient_cert": _recipient(pki, tmp_path, "soon", valid_to=soon)}
@@ -2021,17 +2112,14 @@ async def test_a_cert_that_expires_after_construction_holds_the_queue_at_send(
     d = DirectDestination(_dest(pki, **overrides))
     later = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=60)
     monkeypatch.setattr(direct, "_utcnow", lambda: later)
-    with (
-        caplog.at_level("WARNING", logger="messagefoundry.transports.direct"),
-        pytest.raises(NegativeAckError) as caught,
-    ):
+    builds.clear()  # the construction probe built one
+    with pytest.raises(NegativeAckError) as caught:
         await d.send(_SYNTHETIC_HL7)
     exc = caught.value
     assert exc.permanent is True and exc.config_fault is True
     assert exc.code == "direct-cert-validity"
     assert f"'{setting}' has expired" in str(exc)
-    assert _FakeSMTP.instances == []
-    assert any("keeping the queue" in r.getMessage() for r in caplog.records)
+    assert builds == [] and _FakeSMTP.instances == []
 
 
 async def test_a_cert_inside_its_window_at_send_still_delivers(

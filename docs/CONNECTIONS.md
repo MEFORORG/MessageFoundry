@@ -3190,30 +3190,39 @@ the relay can still refuse a `sender` or recipient at send time.
 chains directly to a supplied anchor, or is a self-signed correspondent cert pinned as its own anchor. Full
 multi-level path building is deferred. On top of issuance, construction refuses at least:
 
-- a `recipient_cert`, or the `trust_anchor` that issues it, that has **expired** or is **not yet valid**. A
-  bundle may hold an expired CA beside its renewed successor; the successor is used;
+- a `recipient_cert` that has **expired** or is **not yet valid**, and one whose every issuing
+  `trust_anchor` is. A bundle may hold an older copy of a CA beside its renewal under the same name and
+  key; any one of them inside its window will do, at construction and at each send. No clock skew is
+  allowed;
 - an issuing `trust_anchor` that is **not a CA** (no `basicConstraints` asserting `CA=true`), or whose
   `keyUsage` does not assert `keyCertSign`. A recipient cert pinned as its own anchor (the same certificate)
   is exempt from both, because it issues nothing else;
-- a `recipient_cert` whose `keyUsage` does not assert `keyEncipherment`, or whose `extendedKeyUsage` does
-  not list `emailProtection`. Each is checked **only where the cert carries it**: a cert with neither
-  extension is accepted;
-- a `recipient_cert` that does not name **every** `recipients` entry. An address is named by a
+- a `recipient_cert` that is itself a CA certificate (`basicConstraints` asserting `CA=true`), unless it is
+  pinned as its own anchor;
+- a `recipient_cert` whose `keyUsage` does not assert `keyEncipherment`, or whose `extendedKeyUsage`
+  lists neither `emailProtection` nor `anyExtendedKeyUsage`. Each is checked **only where the cert carries
+  it**: a cert with neither extension is accepted;
+- a `recipient_cert` that does not name **every** address in `recipients`. An address is named by a
   `subjectAltName` `rfc822Name` equal to it, or a `dNSName` equal to its domain (an organisation
   certificate). The domain compares case-insensitively and the local part exactly. A CA issues many
   subscribers' certificates, so issuance alone does not say this one belongs to the mailbox the message
   goes to. A cert with no `subjectAltName` names no address and is refused.
 
-Errors name the *setting* and the property that failed (and, for an unnamed address, the entry's position in
-`recipients`), never the material, a cert subject or a `subjectAltName` value, any of which can identify a
-patient's provider.
+Errors name the *setting* and the property that failed (and, for an unnamed address, its position among the
+addresses `recipients` holds, counting each comma-joined address apart), never the material, a cert subject or
+a `subjectAltName` value, any of which can identify a patient's provider.
 
-**Validity is checked again at every send.** A recipient cert or issuing anchor that expires while the
-engine runs refuses every queued message alike, and a renewed certificate fixes them all, so the send raises
-a permanent `NegativeAckError` marked as a configuration fault (code `direct-cert-validity`) before anything
-is built or dialled. Under the default `credential_fault_policy = "stop"` the delivery worker stops the lane
-and keeps the queue; under `credential_fault_policy = "dead_letter"` the message dead-letters, as other
-configuration faults do.
+Because construction reads the clock, an expired Direct certificate refuses `messagefoundry check`, a dry run,
+a reload and an engine start or restart for the whole configuration, with no change to it, as any other
+construction refusal does. Renew a partner's certificate before it expires.
+
+**Validity is checked again at every send.** A recipient cert or issuing anchor
+that expires while the engine runs refuses every queued message alike, so the send raises a permanent
+`NegativeAckError` marked as a configuration fault (code `direct-cert-validity`) before anything is built or
+dialled. Under the default `credential_fault_policy = "stop"` the delivery worker stops the lane and keeps
+the queue; under `credential_fault_policy = "dead_letter"` the message dead-letters, as other configuration
+faults do. The connector holds the certificates it read at construction, so a renewed file takes effect only
+when the connector is built again: point the setting at a new path and reload, or restart the engine.
 
 **Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
 `allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. An SMTP
