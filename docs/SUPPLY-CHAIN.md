@@ -118,7 +118,8 @@ flowchart TB
 **Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Each
 group's title names the workflow its boxes belong to. The job boxes outside a group are in
 `release.yml` too. The merge checks group shows at least the checks that bear on the package. A
-dotted arrow is a publish step that runs when its repository variable is set. Here and below, a
+dotted arrow is a publish step that runs when its variable is set as a repository or
+organization variable; a copy on the `pypi` environment cannot turn it on. Here and below, a
 variable counts as set only when its value is `true`, in any case, since Actions compares strings
 ignoring case; any other value, `1` included, reads as unset.
 
@@ -148,7 +149,7 @@ Facts the labels leave out:
   ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
 - **One approval per engine tag.** The toolkit, engine and harness uploads are steps of one
   `publish-pypi` job, so one approval of the `pypi` environment covers all three. The harness
-  upload runs only when the `PUBLISH_HARNESS` repository variable is set.
+  upload runs only when the `PUBLISH_HARNESS` repository or organization variable is set.
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
   too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
   that is the toolkit and the engine only. A separate job publishes it last, so no
@@ -157,30 +158,41 @@ Facts the labels leave out:
   the wheel first. Unset, the console upload is skipped and the console's release is still
   published once the `pypi` approval is given, as the engine's is with `PUBLISH_HARNESS` unset.
   With either variable set, its draft publisher reads it again when it runs and refuses to publish
-  the release while that run skipped the upload. On an engine tag the toolkit and engine are on
-  PyPI by then. The refusal's own text omits part of the remedy, and it does not say which cause
-  fired. At least these two can, alone or together:
+  the release unless that run's upload step succeeded. On an engine tag the toolkit and engine
+  are on PyPI by then. The refusal's text names two causes, a remedy with the upload and one
+  without, but not which cause fired, and points here for the routes left past GitHub's re-run
+  window. At least these two can fire, alone or together:
   - The `pypi` environment holds its own copy of the variable, with a value other than `true`.
-    Look at that environment's variables in the repository settings to see whether it does.
+    Look at that environment's variables in the repository settings to see whether it holds one
+    now; a copy removed since the run cannot be seen there.
   - The build job read the variable before it was set, or the upload read it while it was unset
     and it was set again before the publisher ran. Treat this as possible whenever the refusal
-    fires; the remedy below clears it either way, so it need not be told apart.
+    fires; the remedies below clear it either way, so it need not be told apart.
 
   To finish the release with the upload, remove any copy from the `pypi` environment, then re-run
   the build job (`release-harness` on an engine tag, `release-webconsole` on a console tag), which
-  re-runs the jobs after it and reads the variable afresh in each, so it clears both. A
-  "Re-run failed jobs" reuses the upload's skipped outcome and is refused again. To finish it
-  without the upload, remove any copy from the `pypi` environment, unset the variable and re-run
-  the publisher, then set it again before the next release, or that release skips its upload too
-  and still goes public.
+  re-runs the jobs after it, so the upload asks for the `pypi` approval again, and reads the
+  variable afresh in each, so it clears both. While the variable still reads `true`, a "Re-run
+  failed jobs" reuses the upload's outcome and is refused again.
+
+  To finish it without the upload, first check that no other release run that reads the variable
+  is queued, waiting or in progress, and that none can start before the restore below. Note
+  whether the repository holds the variable and its value. Remove any copy from the `pypi`
+  environment, give the repository variable a value that is not `true` in any letter case, such
+  as `false`, and re-run the publisher. A repository variable takes precedence over an
+  organization variable of the same name, so this changes the value for this repository only. Do
+  not edit or delete an organization copy, which other repositories may read. Once that re-run
+  has finished, whatever its result, and before the next release, restore the repository variable
+  to the value you noted, deleting it if the repository had none, or that release skips its upload
+  too and still goes public.
 
   GitHub allows a re-run only within 30 days of a run's first attempt, so past that no re-run
   finishes the release. When this refusal is what holds the draft, at least two routes are left:
   the publisher's own command run by hand, `gh release edit <tag> --draft=false --repo
-  MEFORORG/MessageFoundry`, which publishes the draft without that upload, as unsetting the
-  variable would; and a new version under a new tag. Run by hand on a draft held for any other
-  reason, such as a failed build job or a refused approval, the same command publishes a release
-  with an asset missing or a package not on PyPI.
+  MEFORORG/MessageFoundry`, which publishes the draft without that upload; and a new version
+  under a new tag. Run by hand on a draft held for any other reason, such as a failed build job
+  or a refused approval, the same command publishes a release with an asset missing or a package
+  not on PyPI.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check
