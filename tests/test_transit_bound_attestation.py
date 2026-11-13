@@ -1007,8 +1007,8 @@ def test_a_refused_version_on_the_second_ask_keeps_its_label() -> None:
         cipher.verify_audit_hmac(b"row", _PLANTED)
 
 
-# --- BACKLOG #8222 items 1 and 5: a timeout on both asks is an outage; the walk reads a malformed
-# handover reply as a break, and the open still refuses on it ------------------------------------
+# --- BACKLOG #8222 items 1 and 5: in the walk, a timeout on both asks is an outage and a malformed
+# handover reply a break; the open reads both as origin/main does ---------------------------------
 
 
 def _status_error(status: int) -> Exception:
@@ -1044,12 +1044,12 @@ def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verif
     status: int,
 ) -> None:
     """A 504 or 408 on both asks of one row's verify, while the verify over fixed input succeeds,
-    is the service timing out, not Transit refusing that row: the check could not run, never a
-    break (BACKLOG #8222 item 1, owner ruling 2026-11-13). Before this it read as a break."""
+    raises :class:`AuditVerifyTimedOutError`, which the chain walk reads as could not run; other
+    callers read it as not verifying (BACKLOG #8222 item 1). Before this it returned ``False``."""
     _needs_hvac()
     from hvac.exceptions import UnexpectedError
 
-    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError, AuditVerifyTimedOutError
 
     cipher = _scripted_cipher([_status_error(status), _status_error(status)])
     rechecked: list[bool] = []
@@ -1060,7 +1060,7 @@ def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verif
         return bool(real_fixed())
 
     cipher._fixed_input_verifies = counted
-    with pytest.raises(CipherError) as caught:
+    with pytest.raises(AuditVerifyTimedOutError) as caught:
         cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row"))
     assert not isinstance(caught.value, AuditKeyVersionRefusedError)
     assert isinstance(caught.value.__cause__, UnexpectedError)

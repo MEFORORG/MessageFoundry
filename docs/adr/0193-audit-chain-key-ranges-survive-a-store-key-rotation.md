@@ -12,8 +12,8 @@
   row MAC with Transit's verify call. It supersedes the 2026-10-27 amendment's item 2 and its
   *Why regenerating pinned stands in for Transit's verify call*, and closes that amendment's edge.
   **Amended 2026-11-13** (BACKLOG #8222): see *Amendment 2026-11-13*, which changes how the
-  2026-11-11 amendment's items 4 and 5 read a timeout on both asks of one row's verify and a
-  malformed reply to
+  2026-11-11 amendment's items 4 and 5 read, in the chain walk only, a timeout on both asks of one
+  row's verify and a malformed reply to
   a handover tag.
 - **Date:** 2026-09-23
 - **Related:** BACKLOG #1904 (the defect), #1905 (keyless chain after `provision-admin`), #190 (the

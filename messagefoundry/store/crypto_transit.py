@@ -687,9 +687,9 @@ class TransitCipher(_UnmarkedPolicy):
         (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
         the row as refused, the answer is ``False``, a break at that row, as a forged MAC is; a
         Vault that answers HTTP 413 past ``max_request_size`` to a planted oversize row is one
-        such case. Both asks failing with an HTTP 408 or 504 raises
-        :class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError` instead, which only the
-        chain walk reads as could not run (BACKLOG #8222). Every other
+        such case. Both asks failing with an HTTP 408 or 504, when the fixed input verifies after
+        the second, raises :class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError` instead,
+        which only the chain walk reads as could not run (BACKLOG #8222). Every other
         failure, a failed fixed-input verify among them, and a reply of an
         unexpected shape, raises plain :class:`CipherError`, so the walk could not run and no
         tamper alert fires. Blocking."""
