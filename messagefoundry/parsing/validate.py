@@ -33,8 +33,9 @@ line's text: ``segment ORC at line N ...``, ``unknown segment at line N`` or ``u
 N``. Where the structure has HL7's "any HL7 segment" slot, which hl7apy's tables spell
 ``ANYHL7SEGMENT`` and its grouping never fills (MFN_M01 and QVR_Q17 among others), a dropped
 segment whose ID the message's version defines is not refused, and passes unvalidated; an ID the
-version does not define is still refused. Segment order is not checked: hl7apy keeps each segment
-where the message has it, so a message with its segments out of order passes.
+version does not define is still refused. The exemption is per structure, not per slot: it does
+not count against the slot's cardinality or position. Segment order is not checked as such:
+hl7apy keeps each segment where the message has it, so an out-of-order message may pass.
 
 It is slower and far stricter than :mod:`~messagefoundry.parsing.peek`, so it runs only when
 a channel sets ``validation.strict = true`` and is kept off the routing hot path.
@@ -319,11 +320,24 @@ def _split_lines(norm: str) -> _Lines:
 
 
 def _holds_any_segment(ref: _Reference) -> bool:
-    """True if ``ref`` has the "any HL7 segment" slot at any group depth (module docstring)."""
     return any(
         name == "ANYHL7SEGMENT" or (marker == "GRP" and _holds_any_segment(sub))
         for name, sub, _cardinality, marker in ref[1]
     )
+
+
+# Cached over hl7apy's shipped tables, as _references is. It reads the table itself rather than
+# through _references, so a failure of the issue 151 rewrite cannot reach this check.
+@cache
+def _has_any_segment_slot(name: str, classname: str, hl7_version: str) -> bool:
+    """True if the structure has the "any HL7 segment" slot at any group depth (module docstring)."""
+    from hl7apy import load_reference
+
+    return _holds_any_segment(load_reference(name, classname, hl7_version))
+
+
+# Structures whose tree the dropped-segment check could not read, so each is logged once.
+_compare_failures: set[tuple[str, str | None]] = set()
 
 
 def _dropped_lines(lines: _Lines, message: Any) -> list[str]:
@@ -351,9 +365,7 @@ def _dropped_lines(lines: _Lines, message: Any) -> list[str]:
         elif _SEGMENT_ID.fullmatch(name) is None:
             refusals.append(f"unrecognised line {number}")
         elif name in defined:
-            # Read only once a defined segment was dropped; _references caches the table.
-            ref = _references(message.name, message.classname, message.version)[0]
-            if not _holds_any_segment(ref):
+            if not _has_any_segment_slot(message.name, message.classname, message.version):
                 refusals.append(
                     f"segment {name} at line {number} has no place in this message's structure"
                 )
@@ -492,12 +504,16 @@ def validate(
         try:
             refusals = _dropped_lines(lines, message)
         except Exception as exc:  # defensive, and closed: an unread tree is not a validated one
-            logger.warning(
-                "dropped-segment check could not compare the tree for %s v%s",
-                getattr(message, "name", None),
-                version,
-                exc_info=True,
-            )
+            # Once per structure, as the shim's path above: a persistent fault repeats per message.
+            key = (getattr(message, "name", ""), version)
+            if key not in _compare_failures:
+                _compare_failures.add(key)
+                logger.warning(
+                    "dropped-segment check could not compare the tree for %s v%s",
+                    key[0],
+                    version,
+                    exc_info=True,
+                )
             refusals = [
                 f"could not compare the parsed tree with the message ({type(exc).__name__})"
             ]

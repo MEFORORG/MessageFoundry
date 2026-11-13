@@ -74,10 +74,13 @@ itself can still name a line's first three characters (`Invalid name for Segment
 rule and wording are in the module docstring of
 [parsing/validate.py](../messagefoundry/parsing/validate.py).
 
-**A message structure with an "any HL7 segment" slot accepts any defined segment, unvalidated.**
-`hl7apy` marks that slot (`MFN_M01`, `QVR_Q17` and others) but never fills it, so in such a message
-a segment the message's HL7 version defines is not refused and passes unvalidated, wherever it
-sits. A segment ID the version does not define is still refused.
+**A defined segment in a message whose structure has an "any HL7 segment" slot passes
+unvalidated.** `hl7apy`'s table for the message's version marks that slot (in 2.5.1 at least
+`MFN_M01` and `QVR_Q17`; which structures carry it varies by version) but its grouping never fills
+it. So in such a message the comparison does not refuse a segment that version defines, in any
+number and wherever it sits, and does not list it in `unvalidated_segments`. A segment ID the
+version does not define is still refused. Where the slot is required, `hl7apy`'s own check can
+still refuse the message (`Missing required child ... ANYHL7SEGMENT`, `MFN_M03` for one).
 
 **Z-segments are tolerated, unvalidated, and listed.** A Z-segment is left out of what strict
 validation checks, is forwarded without any check, and is listed in

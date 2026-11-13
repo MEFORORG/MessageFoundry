@@ -131,12 +131,15 @@ _QVR_Q17 = "MSH|^~\\&|A|B|C|D|20260101||QVR^Q17^QVR_Q17|N1|P|2.5.1\rQPD|Q17^Quer
     [
         pytest.param(_MFN_M01 + "\rLOC|LOC1^Loc||C", id="mfn-m01-with-loc"),
         pytest.param(_QVR_Q17 + "\rPID|1\rRCP|I", id="qvr-q17-with-pid"),
+        # The ruling exempts per structure, not per slot, so the slot's cardinality is not held.
+        pytest.param(_MFN_M01 + "\rLOC|LOC1^Loc||C\rLOC|LOC2^Loc||C", id="past-the-slot-bound"),
     ],
 )
 def test_a_defined_segment_in_an_any_hl7_segment_slot_is_not_refused(message: str) -> None:
     """hl7apy marks the "any HL7 segment" slot ANYHL7SEGMENT and its grouping never fills it."""
     result = validate(message)
     assert result.ok, result.errors
+    assert result.unvalidated_segments == ()  # not listed: only Z-segments are
 
 
 @pytest.mark.parametrize(
@@ -162,11 +165,14 @@ def test_a_comparison_that_raises_is_logged_and_refused(
         raise RuntimeError("synthetic")
 
     monkeypatch.setattr(validate_module, "_dropped_lines", boom)
+    monkeypatch.setattr(validate_module, "_compare_failures", set())  # logged once per structure
     with caplog.at_level("WARNING", logger=validate_module.logger.name):
         result = validate(_adt(_MSH, _EVN, _PID, _PV1))
     assert not result.ok
     assert result.errors == ["could not compare the parsed tree with the message (RuntimeError)"]
-    assert any(record.exc_info for record in caplog.records)
+    [record] = [r for r in caplog.records if "dropped-segment check" in r.getMessage()]
+    assert record.levelname == "WARNING"
+    assert record.exc_info is not None
 
 
 def test_z_segments_do_not_mask_a_refusal() -> None:
