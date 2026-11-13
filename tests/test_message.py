@@ -344,12 +344,12 @@ def test_add_segment_custom_separators() -> None:
 
 
 def test_add_segment_bare_id_is_settable() -> None:
-    # Regression: a bare segment id (no field separator) must graft a SETTABLE segment. Previously
-    # count_segments() saw it but a subsequent set() raised "cannot set absent segment" because the
-    # grafted segment had no data field for the write path to address.
+    # A bare segment id (no field separator) grafts a settable segment, normalized to the
+    # trailing-separator form, so Peek (which skips a fieldless line) numbers the graft as Message does.
     m = Message.parse(ORU)
     m.add_segment("ZAL")  # bare id, no fields
     assert m.count_segments("ZAL") == 1
+    assert m.encode().split("\r")[-2] == "ZAL|"  # the normalization itself
     m.set("ZAL-2", "hello")
     assert m.field("ZAL-2") == "hello"
     assert Message.parse(m.encode()).field("ZAL-2") == "hello"
@@ -391,8 +391,12 @@ def test_occurrence_one_write_lands_on_a_bare_segment(
     assert m.field("PID-3") is None
     op(m)
     assert _pid_lines(m) == [bare_after, _POPULATED_PID], label
-    # The write reads back where the read side looks for it.
-    assert Message.parse(m.encode()).field("PID-3", occurrence=2) == "X^Y~Q"
+    # The write reads back at occurrence 1, before and after a round trip, and occurrence 2 is intact.
+    written = m.field("PID-3")
+    assert written is not None and written == bare_after.removeprefix("PID|||"), label
+    reparsed = Message.parse(m.encode())
+    assert reparsed.field("PID-3") == written
+    assert reparsed.field("PID-3", occurrence=2) == "X^Y~Q"
 
 
 def test_occurrence_one_write_on_a_lone_bare_segment() -> None:

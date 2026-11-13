@@ -263,7 +263,8 @@ def _segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | No
     """List index of the ``occurrence``-th (1-based) segment with ``seg_id``, or None if absent.
 
     Tolerant scan (mirrors the ``str(segment[0])`` iteration python-hl7's legacy ``Message`` read and
-    presence path used): a blank segment is skipped, never an error. The
+    presence path used), and since BACKLOG #5917 also the scan every :func:`set_field` write uses: a
+    fieldless bare segment counts as an occurrence, and a blank segment is never an error. The
     *raising* scan python-hl7 does for ``segment()``/``extract_field``/whole-field assignment lives in
     :func:`raise_if_blank_segment_scan`.
     """
@@ -331,10 +332,10 @@ def scan_segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int 
     segment (handled by :func:`raise_if_blank_segment_scan`, called first) and (b) **skips a fieldless
     bare segment** (``seg[0][0]`` is the id's first character, never the id) so it is not counted as an
     occurrence. So a bare ``PID`` directly before a populated ``PID`` makes the populated one
-    occurrence 1, exactly as the legacy path selects it. The ``Message`` read, presence and write paths
-    (:func:`set_field` included, BACKLOG #5917) use :func:`_segment_index`, which counts the bare
-    segment, preserving the legacy read↔extract split while keeping a write on the segment its read
-    and presence check name.
+    occurrence 1, exactly as the legacy path selects it. The ``Message`` reads and writes
+    (:func:`set_field` included, BACKLOG #5917) use :func:`_segment_index`, and ``Message``'s presence
+    check counts the same way, so all three count the bare segment. That keeps the legacy
+    read↔extract split while keeping a write on the segment its read and presence check name.
     """
     seen = 0
     for i, seg in enumerate(msg["segments"]):

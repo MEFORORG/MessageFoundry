@@ -299,6 +299,15 @@ What that costs, stated so nobody reads the record as more than it is:
   built-in parser reads field 2 to the end of that line and writes it back as it came. A header
   ending in that separator (`MSH|^~\&|`) now keeps an empty field 3, so a rewrite keeps its
   trailing separator too. No case in the record has either shape.
+- **A third divergence is outside the record (BACKLOG #5917).** python-hl7's whole-field
+  assignment at occurrence 1 resolved the segment through its `segments()` matcher, which skips a
+  fieldless line such as a bare `PID`, while the `Message` read, presence and count paths count
+  it. A `Message` write at any occurrence now counts it too, so a write lands on the segment the
+  read side names, and a component or repetition write no longer copies a bare line's empty
+  field over the populated segment that follows. The blank-line `IndexError` at occurrence 1 is
+  kept. `Peek.field` still skips a fieldless line, as python-hl7 did, so after a write that
+  populates a bare line, `Peek` numbers that line as occurrence 1. No case in the record writes to a
+  segment id that has a fieldless line.
 
 ### Other things that moved with it
 

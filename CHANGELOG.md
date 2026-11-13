@@ -35,6 +35,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
 
 ### Fixed
+- **A `Message` write at occurrence 1 now lands on a fieldless bare segment.** On a body such as
+  `PID` followed by `PID|1||X^Y~Q`, reads and `count_segments` call the bare line occurrence 1, but
+  `set`, `set_data` and `add_repetition` skipped it. A whole-field write edited the populated `PID`,
+  and a component or repetition write copied the bare line's empty field over it, so
+  `set("PID-3.2", "NEW")` gave `PID|1||^NEW`. A lone bare segment raised `KeyError`. Every write
+  now edits the segment the read side names, extending a bare line in place. `Peek.field` still
+  skips a fieldless line, so a populated bare line becomes `Peek`'s occurrence 1 after the write.
+  (`BACKLOG #5917`)
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
   restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
   forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a

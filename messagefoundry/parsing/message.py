@@ -286,7 +286,9 @@ class Message:
         write emits a raw MLLP frame byte (ADR 0205 rules 2 and 3).
 
         ``occurrence`` (1-based) selects which segment of that id to write — ``occurrence=2`` edits
-        the **second** ``OBX``. ``repetition`` (1-based) scopes the write to one field repetition: a
+        the **second** ``OBX``. It counts the way :meth:`field` and :meth:`count_segments` do, so a
+        fieldless bare line such as ``PID`` is an occurrence and a write to it extends it in place
+        (``Peek.field`` skips such a line, as python-hl7 did). ``repetition`` (1-based) scopes the write to one field repetition: a
         component write edits that repetition (padding earlier reps if needed) and preserves the
         others (default — and ``repetition=1`` — edit the first, preserve the rest; review H-9); a
         whole-field write with ``repetition`` replaces just that repetition's text (and the value may
@@ -446,11 +448,12 @@ class Message:
             raise ValueError(f"segment must begin with a 3-char segment id, got {segment_id!r}")
         if segment_id == "MSH":
             raise ValueError("refusing to add a second MSH segment")
-        # A bare segment id (no field separator -> a single token) would graft a fieldless segment,
-        # which Peek.field's python-hl7 matcher skips once the message is re-encoded, so a router
-        # would not see the segment a handler grafted. Normalize a bare id to an empty segment (id +
-        # one empty field), identical to add_segment("TXA|"). (The Message write path itself counts a
-        # fieldless segment since BACKLOG #5917, so this is not what makes the segment settable.)
+        # A bare segment id (no field separator -> a single token) would graft a fieldless segment.
+        # Peek.field's python-hl7 matcher skips a fieldless line, so on the re-encoded message a later
+        # segment of the same id would be Peek's occurrence 1 while Message calls it occurrence 2.
+        # Normalize a bare id to an empty segment (id + one empty field), identical to
+        # add_segment("TXA|"), so the two number the graft alike. (The Message write path counts a
+        # fieldless segment since BACKLOG #5917, so this is not what makes the graft settable.)
         if len(tokens) == 1:
             tokens.append("")
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
