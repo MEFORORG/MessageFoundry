@@ -24,10 +24,10 @@ from typing import Any, cast
 import pytest
 
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import Loopback, Registry, build_inbound_connection
-from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
+from messagefoundry.config.wiring import MLLP, Loopback, Registry, build_inbound_connection
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome, _RoutedPrep
 from messagefoundry.store import FailOutcome, MessageStatus, MessageStore, OutboxStatus, Stage
-from messagefoundry.store.crypto import CipherError, CipherUnavailableError
+from messagefoundry.store.crypto import CipherError, CipherUnavailableError, StoreKeylessError
 from messagefoundry.store.store import OutboxItem
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -270,44 +270,158 @@ async def test_the_fused_path_settles_the_row_as_the_split_path_does(
 async def test_a_reload_before_prepare_that_drops_the_whole_feed_reverts_the_row(
     store: MessageStore,
 ) -> None:
-    # The concurrent batch path reads `ic` at batch start and awaits a semaphore before it calls
-    # _prepare_routed. A reload in that wait that drops the inbound AND its handler must revert the
-    # row, as a missing inbound always is, not dead-letter it as a missing handler.
+    # The concurrent batch path awaits a semaphore before it calls _prepare_routed. A reload in
+    # that wait that drops the inbound AND its handler must revert the row, as a missing inbound
+    # always is, not dead-letter it as a missing handler.
     calls: list[str] = []
     runner = RegistryRunner(
         _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )
     item = await _routed_item(store)
-    stale_ic = runner.registry.inbound[LOOP]
     runner.registry = _swapped_graph("inbound")  # drops the inbound, its router and the handler
 
-    prep = await runner._prepare_routed(LOOP, stale_ic, item)
+    prep = await runner._prepare_routed(LOOP, item)
 
     assert prep.inbound_gone and not prep.missing_handler
     assert calls == []
 
 
-@pytest.mark.parametrize("read", ["metadata", "reply"])
-async def test_a_key_service_outage_re_pends_rather_than_dead_letters(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, read: str
+async def test_prepare_reads_the_inbound_type_from_the_live_graph(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A cipher that gave no verdict on the value (an unreachable Vault Transit) is the key service
-    # failing, not the row. That stays an infrastructure fault, so the row re-pends and drains once
-    # the service is back, rather than every loopback row in the outage being dead-lettered.
-    async def unavailable(*args: Any, **kwargs: Any) -> Any:
-        raise CipherUnavailableError("transit unreachable")
+    # A reload in the concurrent path's semaphore wait that keeps the inbound's name but makes it
+    # a loopback must feed the Handler its replies: prepare decides by the graph it transforms
+    # under, never by an inbound the batch read before the wait.
+    calls: list[str] = []
+    runner = RegistryRunner(
+        _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    item = await _routed_item(store)
+    reads: list[str] = []
 
-    if read == "metadata":
-        monkeypatch.setattr(store, "message_metadata_json", unavailable)
-    else:
-        monkeypatch.setattr(store, "message_metadata_json", _metadata('{"correlation_id": "c-1"}'))
-        monkeypatch.setattr(store, "correlate_response", unavailable)
+    async def read(message_id: str) -> str | None:
+        reads.append(message_id)
+        return None
+
+    monkeypatch.setattr(store, "message_metadata_json", read)
+    plain = Registry()
+    plain.add_inbound(build_inbound_connection(LOOP, MLLP(port=0), router="route_loop"))
+    plain.add_router("route_loop", lambda msg: [HANDLER])
+    plain.add_handler(HANDLER, lambda msg: None)
+    runner.registry = plain
+    await runner._prepare_routed(LOOP, item)
+    assert reads == [], "a non-loopback inbound read loopback metadata"
+
+    runner.registry = _registry(calls)
+    prep = await runner._prepare_routed(LOOP, item)
+    assert reads == [item.message_id] and prep.outcome is not None
+
+
+@pytest.mark.parametrize("value", ["false", "0", '""', "[]", "{}", "null"])
+async def test_a_falsy_correlation_id_still_means_no_correlation(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    # Before BACKLOG #5708 any falsy correlation id ran the Handler with no replies. Only a
+    # non-string that carries a value is unreadable.
+    monkeypatch.setattr(store, "message_metadata_json", _metadata(f'{{"correlation_id": {value}}}'))
     calls: list[str] = []
     runner = RegistryRunner(
         _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )
     item = await _routed_item(store)
 
-    with pytest.raises(CipherUnavailableError):
-        await runner._prepare_routed(LOOP, runner.registry.inbound[LOOP], item)
+    prep = await runner._prepare_routed(LOOP, item)
+
+    assert prep.outcome is not None and prep.unreadable is None
+    assert calls == ["ran"]
+
+
+def _transit_unreachable() -> CipherError:
+    try:
+        raise OSError("connection refused")
+    except OSError as cause:
+        err = CipherError("transit call failed")
+        err.__cause__ = cause
+        return err
+
+
+_OUTAGES: dict[str, Callable[[], Exception]] = {
+    "unavailable": lambda: CipherUnavailableError("transit unreachable"),
+    "transit-oserror": _transit_unreachable,
+}
+
+
+@pytest.mark.parametrize(
+    ("outage", "read"),
+    [(o, r) for o in sorted(_OUTAGES) for r in ("metadata", "reply")]
+    + [("keyless-open", "metadata")],
+)
+async def test_a_key_service_outage_re_pends_rather_than_dead_letters(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, read: str, outage: str
+) -> None:
+    # A cipher that gave no verdict on the value (an unreachable Vault Transit), or a keyless open
+    # that hands encrypted metadata back unchanged, is the engine failing, not the row. That stays
+    # an infrastructure fault, so the row re-pends and drains once the fault is fixed, rather than
+    # every loopback row in the outage being dead-lettered.
+    async def failing(*args: Any, **kwargs: Any) -> Any:
+        raise _OUTAGES[outage]()
+
+    if outage == "keyless-open":
+        monkeypatch.setattr(store, "message_metadata_json", _metadata("mfenc:v4:AAAA"))
+    elif read == "metadata":
+        monkeypatch.setattr(store, "message_metadata_json", failing)
+    else:
+        monkeypatch.setattr(store, "message_metadata_json", _metadata('{"correlation_id": "c-1"}'))
+        monkeypatch.setattr(store, "correlate_response", failing)
+    calls: list[str] = []
+    runner = RegistryRunner(
+        _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    item = await _routed_item(store)
+
+    expected: type[Exception] = StoreKeylessError if outage == "keyless-open" else CipherError
+    with pytest.raises(expected):
+        await runner._process_routed_item(LOOP, item)
     assert calls == []
+    # Raised to the worker's backoff with the row still claimed: never dead-lettered.
+    assert await _routed_status(store, item.message_id) == OutboxStatus.INFLIGHT.value
+
+
+async def test_a_stale_inbound_gone_re_arms_a_lane_a_reload_restored(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The concurrent path decides `inbound_gone` in prepare and applies it later, after earlier
+    # siblings' handoffs await. A reload that restores the inbound in that window finds this
+    # worker alive and spawns nothing, so the worker must re-arm its lane as it returns.
+    runner = RegistryRunner(
+        _registry([]),
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    try:
+        # Quiesce the lane's own workers so the row below is this test's alone.
+        for workers in (runner._router_workers, runner._transform_workers):
+            task = workers[LOOP]
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        item = await _routed_item(store)
+
+        async def stale_apply() -> None:
+            outcome = await runner._apply_routed(LOOP, item, _RoutedPrep(inbound_gone=True))
+            assert outcome[0] is _ItemOutcome.STOPPED
+
+        # Run the apply AS the transform worker, as the batch path does, with the inbound present.
+        stand_in = asyncio.ensure_future(stale_apply())
+        runner._transform_workers[LOOP] = stand_in
+        await stand_in
+        await asyncio.sleep(0)
+        rearmed = runner._transform_workers[LOOP]
+        assert rearmed is not stand_in and not rearmed.done(), "the restored lane stayed down"
+        # Reverted retry-forever, never dead-lettered.
+        assert await _routed_status(store, item.message_id) == OutboxStatus.PENDING.value
+    finally:
+        await runner.stop()
