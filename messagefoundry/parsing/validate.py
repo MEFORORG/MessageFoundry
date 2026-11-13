@@ -32,11 +32,15 @@ segment's 1-based position counting as the tolerant parser does (empty lines ski
 line's text: ``segment ORC at line N ...``, ``unknown segment at line N`` or ``unrecognised line
 N``. Where the structure has HL7's "any HL7 segment" slot, which hl7apy's tables spell
 ``ANYHL7SEGMENT`` and its grouping never fills (MFN_M01 and QVR_Q17 among others), a dropped
-segment whose ID the message's version defines is not refused, and passes unvalidated; an ID the
-version does not define is still refused. The exemption is per structure, not per slot: it does
-not count against the slot's cardinality or position. It holds only where MSH-9.1 names the
-structure's own message code, so a structure borrowed through MSH-9.3 (``ADT^A01^MFN_M01``) gets
-none. Segment order is not checked as such:
+segment whose ID the message's version defines, followed by a field separator, is not refused; it
+is listed in :attr:`ValidationResult.unvalidated_segments` as a Z-segment is. An ID the version
+does not define, and a bare defined ID with no field separator, are still refused. The exemption
+is per structure, not per slot: it does not count against the slot's cardinality or position. It
+holds only where MSH-9.1 names the structure's own message code, so a structure borrowed through
+MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none; one borrowed under the same
+code (``MFN^M02^MFN_M01``) still gets it. Where the slot sits inside a nested group (PRR_PC5,
+PPV_PCA), such a segment can still break hl7apy's grouping of what follows. Segment order is not
+checked as such:
 hl7apy keeps each segment where the message has it, so an out-of-order message may pass.
 
 It is slower and far stricter than :mod:`~messagefoundry.parsing.peek`, so it runs only when
@@ -291,13 +295,15 @@ class _Lines:
     """``norm`` split as the tolerant parser splits it, with the Z-segments set apart.
 
     ``segments`` holds each other line's ID, as the tolerant parser files it, and its 1-based
-    position; ``z_segments`` the same for each Z-segment; ``strict_text`` is the body hl7apy
-    parses, the Z-segment lines left out so that one inside a group does not break hl7apy's
-    grouping of the segments around it. The lines are whole and unmodified: this text is only
-    validated, never forwarded."""
+    position; ``z_segments`` the same for each Z-segment; ``bare`` the positions in ``segments``
+    of the lines with no field separator; ``strict_text`` is the body hl7apy parses, the
+    Z-segment lines left out so that one inside a group does not break hl7apy's grouping of the
+    segments around it. The lines are whole and unmodified: this text is only validated, never
+    forwarded."""
 
     segments: list[tuple[str, int]]
     z_segments: list[tuple[str, int]]
+    bare: frozenset[int]
     strict_text: str
 
 
@@ -308,6 +314,7 @@ def _split_lines(norm: str) -> _Lines:
     field_sep = lines[0][3:4] or "|"
     segments: list[tuple[str, int]] = []
     z_segments: list[tuple[str, int]] = []
+    bare: set[int] = set()
     kept_lines: list[str] = []
     for number, line in enumerate(lines, start=1):
         name = line.split(field_sep, 1)[0]
@@ -318,7 +325,9 @@ def _split_lines(norm: str) -> _Lines:
         else:
             segments.append((name, number))
             kept_lines.append(line)
-    return _Lines(segments, z_segments, "\r".join(kept_lines))
+            if line == name:
+                bare.add(number)
+    return _Lines(segments, z_segments, frozenset(bare), "\r".join(kept_lines))
 
 
 def _holds_any_segment(ref: _Reference) -> bool:
@@ -343,7 +352,9 @@ def _exempts_defined_segments(message: Any) -> bool:
 
     hl7apy takes the structure from MSH-9.3 when one is given, so ``ADT^A01^MFN_M01`` would
     borrow MFN_M01's slot for an ADT body. The exemption holds only where MSH-9.1 names the
-    structure's own message code, which fails closed on a borrowed one."""
+    structure's own message code, which fails closed on a structure borrowed under another code.
+    One borrowed under the same code (``MFN^M02^MFN_M01``) still gets it: MSH-9.2 is not
+    compared, since a wildcard structure (MFN_Znn, RTB_Knn) serves many trigger events."""
     code = message.msh.msh_9.msh_9_1.to_er7()
     return code == message.name.split("_", 1)[0] and _has_any_segment_slot(
         message.name, message.classname, message.version
@@ -354,15 +365,16 @@ def _exempts_defined_segments(message: Any) -> bool:
 _compare_failures: set[tuple[str, str | None]] = set()
 
 
-def _dropped_lines(lines: _Lines, message: Any) -> list[str]:
-    """Refusals for the segments in ``lines`` that ``message``'s hl7apy tree lacks.
+def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[str, int]]]:
+    """Refusals for the segments in ``lines`` that ``message``'s hl7apy tree lacks, and the
+    ``(segment ID, position)`` of each one the "any HL7 segment" exemption let through.
 
     Worded as the module docstring sets out. An ID is printed only when the message's own HL7
     version defines it: any other, such as ``KIM``, is likely a wrapped field, so it reads
     ``unknown segment``, the rule ``docs/PHI.md`` sets for the anonymization report. Which
     occurrence of a repeated ID was dropped is not knowable from the tree, so the later ones are
     named; the count per ID is exact. In a structure with an "any HL7 segment" slot, a defined ID
-    is not refused, as the module docstring says.
+    followed by a field separator is not refused, as the module docstring says.
     """
     import hl7apy
 
@@ -370,22 +382,29 @@ def _dropped_lines(lines: _Lines, message: Any) -> list[str]:
     if not kept:
         # A message type hl7apy has no structure for (a site's ZZZ^Z01, say) builds an empty tree
         # that hl7apy's validator passes, so nothing at all was validated.
-        return ["no segment could be validated: hl7apy has no structure for this message type"]
+        return (
+            ["no segment could be validated: hl7apy has no structure for this message type"],
+            [],
+        )
     defined = hl7apy.load_library(message.version).SEGMENTS
+    exempts = _exempts_defined_segments(message)
     refusals: list[str] = []
+    exempted: list[tuple[str, int]] = []
     for name, number in lines.segments:
         if kept[name] > 0:
             kept[name] -= 1
         elif _SEGMENT_ID.fullmatch(name) is None:
             refusals.append(f"unrecognised line {number}")
         elif name in defined:
-            if not _exempts_defined_segments(message):
+            if exempts and number not in lines.bare:
+                exempted.append((name, number))
+            else:
                 refusals.append(
                     f"segment {name} at line {number} has no place in this message's structure"
                 )
         else:
             refusals.append(f"unknown segment at line {number}")
-    return refusals
+    return refusals, exempted
 
 
 @dataclass(frozen=True)
@@ -396,9 +415,10 @@ class ValidationResult:
     the text that function itself normalizes, so a caller can answer a size refusal as one without
     re-deriving that measurement (BACKLOG #2105).
 
-    ``unvalidated_segments`` lists the Z-segments strict validation left unchecked, each as its
-    ``(segment ID, 1-based position)``; the module docstring has the rule. No engine surface
-    shows it yet."""
+    ``unvalidated_segments`` lists the segments strict validation left unchecked, the Z-segments
+    and those the "any HL7 segment" exemption let through, each as its ``(segment ID, 1-based
+    position)`` in position order; the module docstring has the rule. No engine surface shows it
+    yet."""
 
     ok: bool
     version: str | None
@@ -514,19 +534,21 @@ def validate(
     # hl7apy validated only the tree it built, so a line it dropped while grouping went
     # unchecked, and the tolerant parser forwards it all the same.
     # Only when nothing else refused, keeping the one-error contract.
+    exempted: list[tuple[str, int]] = []
     if not errors:
         try:
-            refusals = _dropped_lines(lines, message)
+            refusals, exempted = _dropped_lines(lines, message)
         except Exception as exc:  # defensive, and closed: an unread tree is not a validated one
             # Once per structure, as the shim's path above: a persistent fault repeats per message.
+            # The class name only, never exc_info: the exception text can quote message content.
             key = (getattr(message, "name", ""), version)
             if key not in _compare_failures:
                 _compare_failures.add(key)
                 logger.warning(
-                    "dropped-segment check could not compare the tree for %s v%s",
+                    "dropped-segment check could not compare the tree for %s v%s (%s)",
                     key[0],
                     version,
-                    exc_info=True,
+                    type(exc).__name__,
                 )
             refusals = [
                 f"could not compare the parsed tree with the message ({type(exc).__name__})"
@@ -539,7 +561,7 @@ def validate(
         ok=not errors,
         version=version,
         errors=errors,
-        unvalidated_segments=tuple(lines.z_segments),
+        unvalidated_segments=tuple(sorted(lines.z_segments + exempted, key=lambda s: s[1])),
     )
 
 

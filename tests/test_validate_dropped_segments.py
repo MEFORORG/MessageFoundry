@@ -127,19 +127,69 @@ _QVR_Q17 = "MSH|^~\\&|A|B|C|D|20260101||QVR^Q17^QVR_Q17|N1|P|2.5.1\rQPD|Q17^Quer
 
 
 @pytest.mark.parametrize(
-    "message",
+    ("message", "listed"),
     [
-        pytest.param(_MFN_M01 + "\rLOC|LOC1^Loc||C", id="mfn-m01-with-loc"),
-        pytest.param(_QVR_Q17 + "\rPID|1\rRCP|I", id="qvr-q17-with-pid"),
+        pytest.param(_MFN_M01 + "\rLOC|LOC1^Loc||C", (("LOC", 4),), id="mfn-m01-with-loc"),
+        pytest.param(_QVR_Q17 + "\rPID|1\rRCP|I", (("PID", 3),), id="qvr-q17-with-pid"),
         # The ruling exempts per structure, not per slot, so the slot's cardinality is not held.
-        pytest.param(_MFN_M01 + "\rLOC|LOC1^Loc||C\rLOC|LOC2^Loc||C", id="past-the-slot-bound"),
+        pytest.param(
+            _MFN_M01 + "\rLOC|LOC1^Loc||C\rLOC|LOC2^Loc||C",
+            (("LOC", 4), ("LOC", 5)),
+            id="past-the-slot-bound",
+        ),
+        # Listed in position order alongside the Z-segments.
+        pytest.param(
+            _MFN_M01 + "\rZLC|1\rLOC|LOC1^Loc||C",
+            (("ZLC", 4), ("LOC", 5)),
+            id="with-a-z-segment",
+        ),
     ],
 )
-def test_a_defined_segment_in_an_any_hl7_segment_slot_is_not_refused(message: str) -> None:
+def test_a_defined_segment_in_an_any_hl7_segment_slot_is_not_refused_and_is_listed(
+    message: str, listed: tuple[tuple[str, int], ...]
+) -> None:
     """hl7apy marks the "any HL7 segment" slot ANYHL7SEGMENT and its grouping never fills it."""
     result = validate(message)
     assert result.ok, result.errors
-    assert result.unvalidated_segments == ()  # not listed: only Z-segments are
+    assert result.unvalidated_segments == listed
+
+
+def test_a_bare_defined_id_in_a_wildcard_message_is_refused() -> None:
+    """A lone ``ORC`` line, with no field separator, is refused as it is in any other message."""
+    result = validate(_MFN_M01 + "\rORC")
+    assert not result.ok
+    assert result.errors == ["segment ORC at line 4 has no place in this message's structure"]
+
+
+def test_a_structure_borrowed_under_the_same_message_code_keeps_the_exemption() -> None:
+    """MSH-9.2 is not compared, so ``MFN^M02^MFN_M01`` is exempted as ``MFN^M01`` is.
+
+    This pins the current behaviour the module docstring states: only a borrow under another
+    message code (``ADT^A01^MFN_M01``) loses the exemption."""
+    borrowed = _MFN_M01.replace("MFN^M01^MFN_M01", "MFN^M02^MFN_M01")
+    result = validate(borrowed + "\rORC|NW|ORD1\r" + _PV1)
+    assert result.ok, result.errors
+    assert result.unvalidated_segments == (("ORC", 4), ("PV1", 5))
+
+
+_PRR_PC5 = (
+    "MSH|^~\\&|A|B|C|D|20260101||PRR^PC5^PRR_PC5|N1|P|2.5.1\rMSA|AA|1\r"
+    "QRD|20260101|R|I|Q1|||1^RD|1^Who|RES^Res|DEP^Dep\r" + _PID + "\r"
+    "PRB|AD|20260101|P1^Prob|1\rORC|NW|1\rOBR|1|X||PANEL^Panel"
+)
+
+
+def test_a_choice_alternative_slot_passes_without_its_segment() -> None:
+    """In PRR_PC5 the slot is one alternative of a choice with OBR, so OBR alone passes."""
+    result = validate(_PRR_PC5 + "\rNTE|1")
+    assert result.ok, result.errors
+
+
+def test_a_segment_in_a_nested_slot_can_break_hl7apys_grouping() -> None:
+    """A defined segment where PRR_PC5's nested slot sits misplaces what follows it."""
+    result = validate(_PRR_PC5 + "\rDG1|1\rNTE|1")
+    assert not result.ok
+    assert result.errors == ["Missing required child PRR_PC5_PATIENT.PID"]
 
 
 @pytest.mark.parametrize(
@@ -179,8 +229,8 @@ def test_a_version_whose_structure_has_no_slot_still_refuses() -> None:
 def test_a_comparison_that_raises_is_logged_and_refused(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    def boom(*_args: object) -> list[str]:
-        raise RuntimeError("synthetic")
+    def boom(*_args: object) -> tuple[list[str], list[tuple[str, int]]]:
+        raise RuntimeError("synthetic DOE^JANE")
 
     monkeypatch.setattr(validate_module, "_dropped_lines", boom)
     monkeypatch.setattr(validate_module, "_compare_failures", set())  # logged once per structure
@@ -191,7 +241,10 @@ def test_a_comparison_that_raises_is_logged_and_refused(
     assert result.errors == ["could not compare the parsed tree with the message (RuntimeError)"]
     [record] = [r for r in caplog.records if "dropped-segment check" in r.getMessage()]
     assert record.levelname == "WARNING"
-    assert record.exc_info is not None
+    # The class name only: the exception text can quote message content (CLAUDE.md section 9).
+    assert record.exc_info is None
+    assert "RuntimeError" in record.getMessage()
+    assert "DOE" not in record.getMessage() and "synthetic" not in record.getMessage()
 
 
 def test_z_segments_do_not_mask_a_refusal() -> None:
@@ -260,7 +313,8 @@ def test_the_generated_valid_corpus_drops_no_line() -> None:
                 norm = normalize(_core.generate_message(code, trigger, index)).strip("\r")
                 lines = _split_lines(norm)
                 parsed = _tolerant_parse(lines.strict_text)
-                assert (_dropped_lines(lines, parsed), lines.z_segments) == ([], []), (
+                refusals, exempted = _dropped_lines(lines, parsed)
+                assert (refusals, exempted, lines.z_segments) == ([], [], []), (
                     code,
                     trigger,
                     index,
