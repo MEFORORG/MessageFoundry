@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.13.9"
+$GateVersion = "2026.11.13.10"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -907,7 +907,10 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
         if ($winHits.Count -ne [regex]::Matches($DashCText, (Get-GitDashCPresencePattern)).Count) { return }
         $dashCs = @($winHits | ForEach-Object { $_.Groups[1].Value })
         # A value the shell would still expand (`${HOME}`, `$(pwd)`, a backtick) is unknown too.
-        foreach ($wc in $dashCs) { if ($wc -match '[''"\x24\x60]') { return } }
+        # Each value must be a literal the shell hands git unchanged: Test-ShellLiteralPath, the validator
+        # Get-WindowFoldRaw already uses, which also refuses a UNC path that can stall git (review round
+        # cfbde907), a leading `-`, `~`, `%VAR%` and wildcards.
+        foreach ($wc in $dashCs) { if (-not (Test-ShellLiteralPath $wc)) { return } }
         $absoluteOwn = @($dashCs | Where-Object { [System.IO.Path]::IsPathRooted($_) }).Count -gt 0
         if (-not $absoluteOwn) {
             if ($cd -match '[''"]') { return }
@@ -3231,7 +3234,9 @@ re-dispatch. If you were only going to READ, do it directly -- reads are never b
 # commit message, all stay ALLOW.
 #
 # AND A `{` (review of BACKLOG #5643). A PowerShell script block opening directly on git, `& {git
-# worktree remove <governed>}` or `. {git ...}`, had no recognised git token, so no rule saw it.
+# ...}` or `. {git ...}`, had no recognised git token, so no rule saw it. Recognising the token is
+# all this does: whether a rule then refuses the command depends on that rule reading the rest of it,
+# and rule 3d's own limits are in its residual list.
 $gitInvocation = '(^|[\s;&|({''"\\/`])git(\.exe)?["'']?(\s|$)'
 
 # ---------------------------------------------------------------------------------------------------
@@ -3958,6 +3963,12 @@ What to do instead:
     # ONE TARGET PER CANDIDATE VICTIM, not one per segment: Get-WorktreeVictimTokens can name more
     # than one, and the body below judges each. Its every `continue` therefore moves on to the next
     # candidate, which is what makes a candidate that resolves to nothing unable to hide another.
+    # WHERE A VICTIM ENDS (review round cfbde907): at a command separator, and also at a `}` or `)` that
+    # closes a script block or substitution, and at a lone `&`. Without the last three `& {git worktree
+    # remove <wt>}`, `$(git worktree remove <wt>)` and `git worktree remove <wt>&` read `<wt>}`, `<wt>)`
+    # and `<wt>&`, which name nothing, and were allowed. Not quote-aware, like the split it widens.
+    # A `}` or `)` that closes the shell's own `${...}` or `$(...)` inside the victim is not a closer.
+    $wtVictimSplit = '(?:&&|\|\||;|\||(?<!\$\{[^}]*)\}|(?<!\$\([^)]*)\)|(?<![<>&])&(?![>&]))'
     $wtTargets = foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         # CASE-INSENSITIVE ON WINDOWS (review of BACKLOG #5643): there `Git` and `GIT` run git.exe, and
         # a case-sensitive test let `Git worktree remove <governed>` through. Elsewhere it stays exact.
@@ -3985,7 +3996,7 @@ What to do instead:
         # pattern outright. Validated against the flag, both quote styles, an embedded space, an
         # unterminated quote and empty input before it was written here.
         $after = ($seg.Raw -replace ('(?s)^.*?\bworktree\s+' + $wtVerb + '\b'), '')
-        $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
+        $after = ($after -split $wtVictimSplit, 2)[0]
         $oldPfx = ($seg.Raw -split ('(?s)\bworktree\s+' + $wtVerb + '\b'), 2)[0]
 
         # EVERY INVOCATION ON THE LINE, NOT THE FIRST RAW MATCH (BACKLOG #5643). The reading above slices
@@ -4023,6 +4034,14 @@ What to do instead:
                 if ($ownEnd -gt $sm.Index) { continue }
                 if ($seg.Scan.Substring($ownEnd, $sm.Index - $ownEnd) -match
                     '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))') { continue }
+                # AND THE git WORD MUST START ITS COMMAND (review round cfbde907): `git worktree remove
+                # <o>/nope ; echo git worktree remove <wt>` read the printed `git` as an invocation and
+                # refused the line for what it named. Between the window start and the git WORD only
+                # whitespace, environment assignments and a directory part of the program path may stand.
+                # The git word is found inside the match, which can begin on the character before it.
+                $gitWordAt = $inv.Own.Index + [Math]::Max(0, $inv.Own.Value.IndexOf('git', [System.StringComparison]::OrdinalIgnoreCase))
+                $ownLead = $(if ($gitWordAt -gt $inv.Start) { $seg.Scan.Substring($inv.Start, $gitWordAt - $inv.Start) } else { "" })
+                if ($ownLead -notmatch '^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:\S*[\\/])?$') { continue }
                 # THE OWN WINDOW IS ALWAYS OFFERED. A base can only add a deny, so offering it costs at
                 # most a false deny; where its `-C` cannot be read the resolver answers nothing and only
                 # the first base is tried.
@@ -4032,7 +4051,7 @@ What to do instead:
                 }
                 $rawEnd = $map[$sm.Index + $sm.Length]
                 if ($rawEnd -eq $oldEnd) { $oldWindow = $win; continue }
-                $a2 = ($seg.Raw.Substring($rawEnd) -split '(?:&&|\|\||;|\|)', 2)[0]
+                $a2 = ($seg.Raw.Substring($rawEnd) -split $wtVictimSplit, 2)[0]
                 foreach ($v in @(Get-WorktreeVictimTokens $a2)) {
                     $added += [pscustomobject]@{
                         Seg = $seg; WtVerb = $sm.Groups['wtverb'].Value; VictimRaw = $v
@@ -4112,9 +4131,17 @@ What to do instead:
         #     is tried. The added reading does NOT judge, at least: one inside a quoted span the scan
         #     blanks (an interpreter payload is recursed separately), one with no git token before it
         #     on its segment, one whose git token `$gitInvocation` does not recognise, and one behind a
-        #     separator inside a substitution such as `$(cd x; pwd)`. The FIRST reading still judges
+        #     separator inside a substitution such as `$(cd x; pwd)`, one whose git word is not at
+        #     command position (`command git`, `sudo git`, a printed `echo git`), and one whose owning
+        #     git token is itself inside a substitution in its flags (`-c x=$(git rev-parse HEAD)`),
+        #     which then loses the outer `-C`. The FIRST reading still judges
         #     whatever the line's first raw match is, a quoted mention included, so a mention can still
         #     be refused for what it names.
+        #   * NOT FOLLOWED BY EITHER BASE, at least: a chdir on an EARLIER LINE of the command, a
+        #     `Set-Location -Path <dir>` (read as the directory `-Path <dir>`), and a Set-Location inside
+        #     a PowerShell `& { }` block, which does move the session but reads as a subshell here.
+        #   * A VICTIM GLUED TO A CLOSER -- FIXED 2026-11-13 (review round cfbde907): `<wt>}`, `<wt>)`
+        #     and `<wt>&` now end at the closer. Still not quote-aware.
         #   * A `cd` WHOSE TARGET LEAF IS LITERALLY `git`. The `$at` git-token regex below matches
         #     inside that PATH, so $pfx is truncated and the prefix is misread. A `~/git` or
         #     `C:\git` directory is ordinary on a developer's box, so this is the most reachable of

@@ -212,3 +212,42 @@ def test_an_upper_case_git_is_judged_on_windows(rig: SimpleNamespace) -> None:
 
 def _reason_tool(rig: SimpleNamespace, command: str, cwd: Path) -> str:
     return assert_denied(run_gate(shell(command, cwd, tool="PowerShell"), rig.repos))
+
+
+# ------------------------------------------------------------------ review round cfbde907
+
+
+def test_a_script_block_victim_glued_to_its_brace_is_judged(rig: SimpleNamespace) -> None:
+    reason = _reason_tool(rig, f"& {{git worktree remove {rig.wt2.as_posix()}}}", rig.tmp)
+    assert "worktree remove" in reason, reason
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["echo $(git worktree remove {w})", "git worktree remove {w}&", "(git worktree remove {w})"],
+)
+def test_a_victim_glued_to_a_closer_is_judged(rig: SimpleNamespace, template: str) -> None:
+    reason = _reason(rig, template.format(w=rig.wt2.as_posix()), rig.tmp)
+    assert "worktree remove" in reason, reason
+
+
+def test_a_victim_glued_to_a_closer_that_names_nothing_is_allowed(rig: SimpleNamespace) -> None:
+    assert _allowed(rig, f"echo $(git worktree remove {rig.outside.as_posix()}/nope)", rig.tmp)
+
+
+def test_a_unc_own_dash_C_is_not_asked_of_git(rig: SimpleNamespace) -> None:
+    """Asking git about an unreachable UNC path can stall it; the own reading declines one."""
+    cmd = f"git -C {rig.outside2.as_posix()} status ; git -C //nohost-zz9/share worktree remove x"
+    assert _allowed(rig, cmd, rig.outside)
+
+
+def test_a_printed_git_worktree_remove_after_a_real_one_is_not_judged(
+    rig: SimpleNamespace,
+) -> None:
+    """ALLOW on origin/main, a false DENY on 4d2a53bf62: `echo` removes nothing."""
+    for sep in (";", "|"):
+        cmd = (
+            f"git worktree remove {rig.outside.as_posix()}/nope {sep} "
+            f"echo git worktree remove {rig.wt2.as_posix()}"
+        )
+        assert _allowed(rig, cmd, rig.tmp), sep
