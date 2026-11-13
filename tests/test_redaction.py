@@ -2391,7 +2391,8 @@ def test_an_end_tag_scrub_regression_redacts_what_main_did(
         # A leaf key whose value two log handlers joined across the line.
         ('"family":\nkplm7' + " w" * 150 + " <given></given zqxa> vornb7", "vornb7"),
         # A base64 token glued to a tag name by ``/``, split under the support bundle's floor.
-        ("<family>Smith</QUJDREVGR0hJS0xN/TU9QUVJTVFVWV1hZWgabcdefghij", "TU9QUVJTVFVWV1hZWg"),
+        ("<family>Smith</QUJDREVGR0hJS0xN/TU9QUVJTVFVWV1hZWgabcdefghij", "QUJDREVGR0hJS0xN"),
+        ("<family>Smith</familyQUJDREVGR0hJSkt/TU5PUFFSU1RVVldYWVo>", "QUJDREVGR0hJSkt"),
     ],
 )
 def test_an_end_tag_scrub_takes_no_punctuation_a_reader_needs(
@@ -2448,7 +2449,9 @@ def test_a_credential_anywhere_keeps_every_end_tag_remainder() -> None:
     assert "abc123def456" not in secretscrub.scrub_credentials(out)
 
 
-_DIFF_VALUES = ("Zqxa", "Vornb", "s3cr3tvalue99", "Kplm7", "Qwerty12")
+_DIFF_VALUES = (
+    "Zqxa", "Vornb", "s3cr3tvalue99", "Kplm7", "Qwerty12", "QUJDREVGR0hJSkt", "TU5PUFFSU1RVVldYWVo",
+)  # fmt: skip
 _DIFF_STARTS = (
     "<family>", "<given>", "<name>", "<family> ", "<family>(", "<ns:family>", "<name><given>",
     '<identifier><system value="urn:x">', "<telecom>", "x <family>",
@@ -2465,7 +2468,7 @@ _DIFF_LABELS = (
 )  # fmt: skip
 _DIFF_SEPARATORS = (
     " ", " ", "", "\t", "\n", "\r\n", "<", "<b>", ">", "> ", "</family>", "<given>", '"', "'", ",",
-    ";", "&", "|", "^", "\n\n", "{", "}", "[", "]", "$", "*", "\\", ".", "-", "_",
+    ";", "&", "|", "^", "\n\n", "{", "}", "[", "]", "$", "*", "\\", ".", "-", "_", "/",
 )  # fmt: skip
 
 

@@ -1558,8 +1558,10 @@ _XML_END_TAG_REST = re.compile(r"[^<>]*+>?")
 #: loses at most the rest of its own line.
 _XML_END_TAG_PARTS = re.compile(r"([ \t]*+)([^<>\r\n]*+)(>?)")
 #: A character that keeps every end tag's remainder in a text as it stands: anything but a word
-#: character, whitespace and the ``<``, ``>`` and ``/`` of tags (:func:`_end_tag_rest_kept`).
-_END_TAG_PUNCTUATION = re.compile(r"[^\w\s</>]")
+#: character, whitespace, ``<``, ``>`` and the ``/`` of an end tag (:func:`_end_tag_rest_kept`). Any
+#: other ``/`` counts: a base64 run carries one, and a scrub that split such a run at a kept tag
+#: name left its head under the support bundle's length floor, where main hid it whole.
+_END_TAG_PUNCTUATION = re.compile(r"[^\w\s</>]|(?<!<)/")
 #: The letter runs of a text, lower-cased, that :func:`_end_tag_rest_kept` checks against
 #: :data:`_ANCHOR_WORDS`.
 _LETTER_RUN = re.compile(r"[a-z]+")
