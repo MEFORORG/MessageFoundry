@@ -704,6 +704,18 @@ async def test_two_halts_of_one_break_stop_and_alert_once(store: MessageStore) -
     # it holds the lock, and finds nothing left running.
     sink = _RecordingSink()
     runner, source = _graph(store, sink)
+    real_lanes = runner._log_halt_lanes
+    reads: list[tuple[list[str], list[str]]] = []
+
+    def recording_lanes() -> tuple[list[str], list[str]]:
+        lanes = real_lanes()
+        reads.append(lanes)
+        return lanes
+
+    runner._log_halt_lanes = recording_lanes  # type: ignore[method-assign]
+    # Read as running. Otherwise, once the first halt stops the only listener, the second finds
+    # nothing left and returns on the stop-finished check before it ever reaches the re-read.
+    runner._running = True
     await runner._reload_lock.acquire()
     try:
         first = await _halt_waiting_on_the_lock(runner)
@@ -713,9 +725,116 @@ async def test_two_halts_of_one_break_stop_and_alert_once(store: MessageStore) -
         runner._reload_lock.release()
     await asyncio.gather(first, second)
 
+    # The re-read is what keeps the second halt from stopping again: it read both lanes running
+    # before it waited, and read nothing once it held the lock behind the first halt's stop.
+    running = ([INBOUND], [OUTBOUND])
+    assert reads == [running, running, running, ([], [])]
     assert source.stopped is True and OUTBOUND in runner._outbound_paused
     assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
-    assert len(sink.log_failures) == 2  # one page per break
+    # One page per break. The second halt set the latch again before the first held the lock, so
+    # the first did not act on a cleared latch and sent no cleared-latch page.
+    assert [f[0] for f in sink.log_failures] == ["file", "file"]
+
+
+async def test_a_halt_whose_latch_a_probe_cleared_still_stops_and_says_so(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704. A reload or start that holds the reload lock can probe the log, find it
+    # writable and clear the latch while a halt waits. The halt fails closed: it still stops, sets
+    # the latch again so every door back in probes once more, and pages under its own label that
+    # it acted on a cleared latch, so the operator is not left with a stopped engine and a log that
+    # reads as working.
+    sink = _RecordingSink()
+    runner, source = _graph(store, sink)
+    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: None)
+    await runner._reload_lock.acquire()
+    try:
+        halt = await _halt_waiting_on_the_lock(runner)
+        assert runner._log_recovery_ok()  # no guard installed: the probe passes, the latch clears
+        assert not runner._log_write_stopped
+        runner._log_halted.clear()  # as a start does on a passing probe
+    finally:
+        runner._reload_lock.release()
+    await halt
+
+    assert runner._log_write_stopped, "the halt left the latch cleared over a stopped engine"
+    assert source.stopped is True and OUTBOUND in runner._outbound_paused
+    assert INBOUND in runner._log_halted
+    assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
+    assert [(f[0], f[3]) for f in sink.log_failures] == [("file", 2), ("file:latch-cleared", 2)]
+    assert "found it writable" in sink.log_failures[1][2]
+
+
+async def test_a_raise_in_the_early_internal_halt_still_pages_and_stops(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704. The early internal-stage halt runs after the latch is set. A raise from it
+    # must not abort the halt: the latch would turn every later event away with the listeners
+    # still bound and no page sent.
+    sink = _RecordingSink()
+    runner, source = _graph(store, sink)
+    real_halt = runner._halt_inbound_processing
+    calls = 0
+
+    def raises_once(names: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("boom")
+        real_halt(names)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "_halt_inbound_processing", raises_once)
+    await runner._stop_all_for_log_failure(sink="file", reason="disk full")
+
+    assert calls == 2  # the early call raised; the one under the lock ran
+    assert INBOUND in runner._log_halted
+    assert source.stopped is True and OUTBOUND in runner._outbound_paused
+    assert sink.log_failures == [("file", "unwritable", "disk full", 2)]
+
+
+class _DeadGuard:
+    """A guard whose probe write never lands: the log is still unwritable."""
+
+    def revalidate(self) -> bool:
+        return False
+
+    def status(self) -> list[object]:
+        return []
+
+
+def test_the_rebind_gate_refuses_and_halts_an_unhalted_inbound_while_the_log_is_dead(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704. With the latch set, an inbound not yet in `_log_halted` (one a reload added
+    # after the halt marked the graph) is refused while the probe fails, and halted, so its own
+    # workers stop at their gate whether or not another halt comes.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._log_write_stopped = True
+    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: _DeadGuard())
+
+    assert runner._resume_inbound_processing(INBOUND) is False
+    assert INBOUND in runner._log_halted
+    assert runner._log_write_stopped
+
+
+def test_the_rebind_gate_passes_an_unhalted_inbound_once_the_probe_clears_the_latch(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704, the other branch: the probe passes (no guard installed), so the latch clears,
+    # and an inbound nothing halted binds without being marked.
+    runner, _source = _graph(store, _RecordingSink())
+    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: None)
+    runner._log_write_stopped = True
+
+    assert runner._resume_inbound_processing(INBOUND) is True
+    assert INBOUND not in runner._log_halted
+    assert not runner._log_write_stopped
+
+
+def test_the_rebind_gate_is_a_no_op_with_no_latch_and_no_halt(store: MessageStore) -> None:
+    runner, _source = _graph(store, _RecordingSink())
+    assert runner._resume_inbound_processing(INBOUND) is True
+    assert INBOUND not in runner._log_halted
 
 
 async def test_the_escalation_bridges_from_a_worker_thread_onto_the_engine_loop(

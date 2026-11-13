@@ -5860,8 +5860,15 @@ class RegistryRunner:
         # bound and ACKing into halted lanes. Sync and await-free, so it needs no lock: a reload
         # mid-flight re-applies `_log_halted` to its dispatchers, and the gate also refuses, while
         # this latch is set, an inbound that reload adds. Marking here also stops the router and
-        # transform work that would otherwise run unlogged for as long as the halt waits.
-        self._halt_inbound_processing(self.registry.inbound)
+        # transform work that would otherwise run unlogged for as long as the halt waits. Guarded, so
+        # a raise here still reaches the page below and the stop under the lock, which marks the
+        # internal stages again.
+        try:
+            self._halt_inbound_processing(self.registry.inbound)
+        except Exception:
+            log.exception(
+                "log-failure halt: the early internal-stage halt raised for sink %r", sink
+            )
         detail = f"application log sink {sink!r} is unwritable ({reason})"
         inbounds, outbounds = self._log_halt_lanes()
         # Alert BEFORE stopping, and through the NOTIFIER rather than a log line: the sink this is
@@ -5888,6 +5895,15 @@ class RegistryRunner:
                 # probes the log itself and resets the internal-stage marks. A teardown that left
                 # state behind (it raised, or was cancelled) is not this case: the halt still runs.
                 return
+            # The latch is read again now the lock is held (BACKLOG #5704). A reload or start that
+            # held the lock may have probed the log, found it writable and cleared the latch (a
+            # start also clears `_log_halted`). This halt still stops: it fails closed on the break
+            # it was told of rather than on a probe it did not run. It sets the latch again, so
+            # every door back in probes the log once more, and it pages that it acted on a cleared
+            # latch, under its own label so the realert throttle, which keys on the label, does not
+            # fold that page into the first one.
+            latch_was_cleared = not self._log_write_stopped
+            self._log_write_stopped = True
             # What to stop is read again now the lock is held (BACKLOG #5704): the lists above only
             # sized the page. A reload that held the lock may have removed a connection, or engine-
             # parked an outbound (`_gate_parked` / `_schedule_parked`), and stopping that lane again
@@ -5910,6 +5926,21 @@ class RegistryRunner:
                     # fail-closed halt, so a partial stop is strictly better than an abandoned one.
                     log.exception("log-failure stop: inbound %r did not stop cleanly", name)
             self._pause_delivery_lanes(outbounds)
+        if latch_was_cleared:
+            try:
+                self._alert_sink.log_write_failed(
+                    f"{sink}:latch-cleared",
+                    stage="unwritable",
+                    reason=(
+                        f"the halt for application log sink {sink!r} ({reason}) waited for the "
+                        "reload lock, and a reload or start probed the log meanwhile and found it "
+                        "writable; the halt stopped the connections anyway, and restarting them "
+                        "probes the log again"
+                    ),
+                    stopped=len(inbounds) + len(outbounds),
+                )
+            except Exception:
+                log.exception("alert sink raised on the cleared-latch page for sink %r", sink)
         for name in inbounds + outbounds:
             try:
                 # ADR 0014's connection_stopped reports a stop but was never DRIVEN by a log-write
