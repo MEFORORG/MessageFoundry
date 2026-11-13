@@ -5892,6 +5892,16 @@ class RegistryRunner:
                     sink,
                 )
                 return
+            # Both lists again, now the lock is held (BACKLOG #5704). The ones above only sized the
+            # page. A reload that held the lock may have removed a connection, or parked an outbound
+            # (`_gate_parked` / `_schedule_parked`), and stopping that lane again here would turn its
+            # engine park into an operator pause that no later reload lifts.
+            inbounds = [name for name in self.registry.inbound if name in self._sources]
+            outbounds = [
+                name
+                for name in self.registry.outbound
+                if self._owns_destination(name) and name not in self._outbound_paused
+            ]
             # THE INTERNAL STAGES FIRST, and they are not an afterthought — they are the half that
             # makes this an enforcement. See :meth:`_halt_inbound_processing`.
             #
@@ -6171,7 +6181,8 @@ class RegistryRunner:
         — and it must live HERE rather than in a reload: a reload deliberately never rebuilds the
         dispatchers, so a paused ingress lane would otherwise stay paused for the life of the process
         and the halt would be unrecoverable without a restart. Per-inbound, so restarting A leaves B
-        halted until B is restarted too. A no-op when this inbound was never halted.
+        halted until B is restarted too. A no-op when this inbound was never halted and the latch
+        is clear; with the latch set it probes the log, as the last paragraph says.
 
         **REFUSES while the log is still unwritable** (:meth:`_log_recovery_ok`). Re-arming there
         would hand back exactly the state the halt exists to prevent — measured: a restart with the
@@ -7100,9 +7111,6 @@ class RegistryRunner:
         re-runs teardown on residual state and ``_reconcile_graph`` carries a ``has_residual_state``
         branch (ADR 0157 D7).
         """
-        # A halt still waiting for the reload lock stands down rather than pause lanes into a run
-        # this teardown ends (BACKLOG #5704; see _log_halt_epoch).
-        self._log_halt_epoch += 1
         demote = reason is TeardownReason.DEMOTE
         budget = (
             max(
@@ -7116,6 +7124,12 @@ class RegistryRunner:
             await self._teardown_body(demote, budget)
         finally:
             self._running = False
+            # A halt waiting for the reload lock stands down rather than pause lanes into a run this
+            # teardown ended (BACKLOG #5704; see _log_halt_epoch). At the END, not the start: the
+            # body cancels the halt tasks that exist when it begins, so the halt this must reach is
+            # one an escalation queued before the guard was unsubscribed, which latches at one of
+            # the body's awaits.
+            self._log_halt_epoch += 1
 
     async def _teardown_body(self, demote: bool, budget: float) -> None:
         """The teardown sequence itself. Split out ONLY so the ``finally`` above contains no await —

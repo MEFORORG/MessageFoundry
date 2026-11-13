@@ -641,27 +641,59 @@ async def _halt_waiting_on_the_lock(runner: RegistryRunner) -> asyncio.Future[No
     return halt
 
 
-async def test_a_halt_that_loses_the_lock_to_a_stop_pauses_nothing_into_the_next_run(
-    store: MessageStore,
+async def test_a_halt_that_latches_during_a_stop_pauses_nothing_into_the_next_run(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # BACKLOG #5704. stop() takes the reload lock too, and its teardown clears the operator pauses on
-    # purpose. A halt that waited behind it and then paused its lanes would write them back, and the
-    # next start replays that set, so the engine would come up with delivery paused for a halt that
+    # BACKLOG #5704. stop() holds the reload lock, and its teardown clears the operator pauses on
+    # purpose. The teardown cancels the halt tasks that exist when it begins, but an escalation
+    # queued before it unsubscribed from the guard runs at one of its awaits, and that halt latches
+    # and waits for the lock. Pausing its lanes once stop() released the lock would write them back,
+    # and the next start replays that set, so delivery would come up paused for a halt that
     # belonged to the run stop() ended. The next start probes the log itself.
     sink = _RecordingSink()
     runner, _source = _graph(store, sink)
-    await runner._reload_lock.acquire()
-    try:
-        halt = await _halt_waiting_on_the_lock(runner)
-        await runner._teardown_unsafe()  # stop()'s body, which wins the lock first
-    finally:
-        runner._reload_lock.release()
-    await halt
+    real_body = runner._teardown_body
+    halts: list[asyncio.Future[None]] = []
+
+    async def body_with_a_late_escalation(demote: bool, budget: float) -> None:
+        await real_body(demote, budget)
+        runner._spawn_log_sink_response(
+            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+        )
+        halts.extend(runner._log_guard_tasks)
+        await asyncio.sleep(0)  # the halt latches inside the teardown, then waits for the lock
+
+    monkeypatch.setattr(runner, "_teardown_body", body_with_a_late_escalation)
+    await runner.stop()
+    assert len(halts) == 1 and runner._log_write_stopped, "the late halt never latched"
+    await halts[0]
 
     assert runner._outbound_paused == set(), "the halt paused a lane into the next run"
     assert runner._log_halted == set()
     assert sink.stopped == []
     assert len(sink.log_failures) == 1  # the halt's one page, sent before it waited
+
+
+async def test_a_halt_keeps_an_engine_park_a_reload_made_while_it_waited(
+    store: MessageStore,
+) -> None:
+    # BACKLOG #5704. The halt sizes its page from the lanes it reads before it waits, but stops what
+    # it reads once it holds the lock. A reload that held the lock may have engine-parked an
+    # outbound (here, the deployed=False gate); stopping that lane again would drop its park marker
+    # and turn it into an operator pause that no later reload lifts.
+    sink = _RecordingSink()
+    runner, _source = _graph(store, sink)
+    await runner._reload_lock.acquire()
+    try:
+        halt = await _halt_waiting_on_the_lock(runner)
+        runner._park_outbound_lane(OUTBOUND)  # the reload's gate, under its lock
+        runner._gate_parked.add(OUTBOUND)
+    finally:
+        runner._reload_lock.release()
+    await halt
+
+    assert OUTBOUND in runner._gate_parked, "the halt turned an engine park into an operator pause"
+    assert sorted(name for name, _ in sink.stopped) == [INBOUND]
 
 
 async def test_a_halt_superseded_by_a_newer_one_does_not_halt_twice(store: MessageStore) -> None:
