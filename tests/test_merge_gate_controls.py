@@ -1486,8 +1486,9 @@ def test_the_cla_pre_check_step_names_a_script_that_exists() -> None:
 
 
 def test_the_cla_pre_check_fails_open_on_a_fault_only(tmp_path: Path) -> None:
-    """Owner ruling 2026-11-13, "Wire, fail-open on fault": exit 3 (fault) passes with a warning;
-    exit 1, exit 2 (python3 could not open the script) and any other non-zero fail. Run the step's own script with a stub in place of the pre-check,
+    """Owner ruling 2026-11-13, "fail-open on fault, fail-closed on a determinate refusal": exit 1
+    with the refusal annotation fails; exit 3, or exit 1 without it, passes with a warning; exit 2
+    (python3 could not open the script) and any other non-zero fail. Run the step's own script with a stub in place of the pre-check,
     so the wrapper is what is measured. Event data stays in `env:`, never in `run:`."""
     pre, _ = _cla_steps()
     script = str(pre["run"])
@@ -1495,15 +1496,30 @@ def test_the_cla_pre_check_fails_open_on_a_fault_only(tmp_path: Path) -> None:
     call = "python3 scripts/security/cla_precheck.py"
     assert script.count(call) == 1, f"the step must call the pre-check exactly once: {script!r}"
     bash = _require_bash(tmp_path)
-    # 2 is python3's own "cannot open the script", so it must FAIL; 3 is the script's fault code.
-    for code, expect in ((0, 0), (1, 1), (2, 2), (3, 0), (4, 4)):
+    refused = "::error title=CLA pre-check refused::commit x"
+    # (exit code, what the script printed, the step's exit, whether it warned "not enforced").
+    # Exit 1 fails only WITH the refusal annotation; a bare exit 1 (an import-time traceback) is a
+    # fault. 2 is python3's own "cannot open the script", so it must FAIL; 3 is the fault code.
+    cases = (
+        (0, "CLA pre-check: 1 commit(s) read", 0, False),
+        (1, refused, 1, False),
+        (1, "Traceback (most recent call last):", 0, True),
+        (1, "  ::error title=CLA pre-check refused:: not at line start", 0, True),
+        (2, "python3: cannot open file", 2, False),
+        (3, "::warning title=CLA pre-check fault::x", 0, True),
+        (4, "", 4, False),
+    )
+    for code, printed, expect, warned in cases:
+        stub = f"( printf '%s\\n' '{printed}'; exit {code} )"
         # GitHub runs a bash `run:` with `-e`, so the wrapper must survive it.
-        wrapped = "set -e\n" + script.replace(call, f"(exit {code})")
+        wrapped = "set -e\n" + script.replace(call, stub)
         proc = subprocess.run(  # noqa: S603 -- the repository's own workflow script, under test
             [bash, "-c", wrapped], capture_output=True, check=False, cwd=tmp_path, timeout=60
         )
-        assert proc.returncode == expect, (code, proc.returncode, _text(proc))
-        assert ("::warning title=CLA pre-check not enforced::" in _text(proc)) == (code == 3)
+        out = _text(proc)
+        assert proc.returncode == expect, (code, printed, proc.returncode, out)
+        assert ("::warning title=CLA pre-check not enforced::" in out) == warned, (code, out)
+        assert printed in out, "the wrapper must still show the pre-check's own output"
 
 
 # ===================================================================================================

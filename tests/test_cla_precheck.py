@@ -166,40 +166,57 @@ def test_an_empty_user_object_is_chosen_as_javascript_chooses_it() -> None:
     assert (who.name, who.author_linked) == ("", True)
 
 
-def test_an_unlinked_author_under_a_linked_allowlisted_committer_is_a_notice_not_a_refusal() -> (
-    None
-):
-    """The action attributes this commit to the committer, as the order above says. Whether that
-    should refuse is not ruled, so the script reports it and passes."""
+def test_an_unlinked_author_under_a_linked_allowlisted_committer_is_refused() -> None:
+    """Owner ruling 2026-11-13: the CLA binds the AUTHOR. The action attributes this commit to the
+    allowlisted committer, whose email is trivially set, so the author is never asked to sign."""
     refusals, notices = _verdict("committer_attribution")
-    assert refusals == ()
-    assert len(notices) == 1 and "wshallwshall" in notices[0]
+    assert notices == ()
+    assert len(refusals) == 1 and "wshallwshall" in refusals[0]
 
 
-def test_the_dropped_id_is_github_actions_bot_and_the_notice_says_so() -> None:
+def test_an_unlinked_author_under_the_dropped_bot_committer_is_refused() -> None:
     """41898282 is github-actions[bot]; web-flow is 19864447 (tests/fixtures/branch_main.json)."""
     refusals, notices = _verdict("actions_bot_committer")
-    assert refusals == ()
-    assert (
-        len(notices) == 1 and "github-actions[bot]" in notices[0] and "web-flow" not in notices[0]
-    )
+    assert notices == ()
+    assert len(refusals) == 1 and "github-actions[bot]" in refusals[0]
+    assert "web-flow" not in refusals[0]
 
 
 def test_a_linked_author_wins_over_an_actions_bot_committer() -> None:
     assert _verdict("author_linked_committer_actions_bot") == ((), ())
 
 
-def test_a_read_short_of_total_count_is_refused_not_excused() -> None:
-    refusals, _ = _verdict("short_read")
-    assert (
-        len(refusals) == 1
-        and "read 2 distinct commits where the pull request has 300" in refusals[0]
-    )
+def _fault(scenario: str) -> str | None:
+    read = fetch_commits(_Replay(scenario), "MEFORORG", "MessageFoundry", 7)
+    verdict = evaluate(read, _ALLOWLIST, _no_signatures)
+    assert verdict.refusals == (), verdict.refusals
+    return verdict.fault
 
 
-def test_a_repeated_commit_does_not_count_as_the_one_it_displaced() -> None:
-    refusals, _ = _verdict("repeated_commit")
-    assert len(refusals) == 1 and "100 distinct commits" in refusals[0]
+def test_a_read_short_of_total_count_is_a_fault_until_the_cap_is_measured() -> None:
+    """Owner ruling 2026-11-13: a short read is a fault (warn and pass), not a refusal, because a
+    GitHub-side cap would otherwise fail every large pull request closed."""
+    fault = _fault("short_read")
+    assert fault and "read 2 distinct commits where the pull request has 300" in fault
+
+
+def test_a_repeated_commit_is_a_fault_too() -> None:
+    fault = _fault("repeated_commit")
+    assert fault and "100 distinct commits" in fault
+
+
+def test_a_malformed_first_page_commit_keeps_its_slot() -> None:
+    """The reviewer's case: page one is [malformed, octo], page two [new-person, unsigned]. The
+    malformed commit must still count toward the first page, or new-person slides into the
+    action's simulated view and its refusal is lost."""
+    malformed = {"oid": f"{1:040x}", "author": None, "committer": None}
+    pages = [
+        _page([malformed, _commit(2, "Octo", "octo-contributor", 90000001)], 3, True),
+        _page([_commit(3, "New Person", "new-person", 90000003)], 3, False),
+    ]
+    verdict = evaluate(fetch_commits(_serve(pages), "M", "N", 7), _ALLOWLIST, _no_signatures)
+    assert verdict.fault
+    assert len(verdict.refusals) == 1 and "new-person" in verdict.refusals[0]
 
 
 def test_an_author_first_seen_past_the_hundredth_commit_is_refused() -> None:

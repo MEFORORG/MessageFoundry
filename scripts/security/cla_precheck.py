@@ -24,37 +24,40 @@ login, is dropped as allowlisted and never needs a signature. This script finds 
 refuses, and so it does for any unlinked commit the action files under an entry it skips. It builds
 the action's committer list as the action does, from the FIRST PAGE only, first commit seen under
 each key. It reads EVERY commit, paging on ``hasNextPage``, and refuses an author the action's list
-never holds, or a read with fewer distinct commits than GitHub's ``totalCount``. It faults when the
-pull request's head moved while it read.
+never holds. It refuses an unlinked AUTHOR even when the committer is allowlisted or
+``github-actions[bot]``: the CLA binds the author (owner ruling 2026-11-13). It faults when the pull
+request's head moved while it read, and when it read fewer distinct commits than GitHub's
+``totalCount``.
 
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
-the CLA action, FAIL-OPEN ON A FAULT (owner ruling 2026-11-13, "Wire, fail-open on fault"): exit 3
-warns and passes, so a GitHub outage, bad input or a bug in this script cannot wedge every pull
-request, its own revert included; exit 1, a refusal, fails the check. Exit 2 is NOT a fault: it is
-what the interpreter returns when it cannot open the script, so a renamed or deleted script fails
-the check instead of switching it off. The runner runs this with its system ``python3``, so the
-script keeps to Python 3.12 syntax; tests/test_cla_precheck.py parses it at that grammar. It does
-not patch the vendored bundle; the provenance gate forbids that.
+the CLA action: FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling
+2026-11-13). The workflow fails the check on exit 1 only when the output carries this script's
+refusal annotation; any other exit 1, such as an import-time traceback, warns and passes, as exit 3
+does, so a GitHub outage, bad input or a bug in this script cannot wedge every pull request, its own
+revert included. Exit 2 is NOT a fault: it is what the interpreter returns when it cannot open the
+script, so a renamed or deleted script fails the check instead of switching it off. The runner runs
+this with its system ``python3``, so the script keeps to Python 3.12 syntax;
+tests/test_cla_precheck.py parses it at that grammar. It does not patch the vendored bundle; the
+provenance gate forbids that.
 
 AN AUTHOR THE ACTION NEVER SEES, first seen past its one page, is refused only when absent from the
 signature file the action keeps (``signedContributors`` ids, read over REST from the base
 repository's signature branch). A file GitHub answers 404 for holds no signatures, as the action
 itself assumes; any other unreadable answer is a fault. It is read only when such an author exists.
 
-WHAT IT DOES NOT REFUSE. It reports as a NOTICE, without refusing, at least these shapes the owner
-has not ruled on:
+WHAT IT DOES NOT REFUSE, at least: an unlinked commit filed under a linked account's entry, which
+is reported as a NOTICE because that account is checked in its place; and an unlinked author under
+a linked committer that is neither allowlisted nor ``github-actions[bot]``, which it does not report.
 
-  * an unlinked author attributed to a linked, allowlisted committer;
-  * an unlinked author whose commit the action drops because the committer is ``github-actions[bot]``;
-  * an unlinked commit filed under a linked account's entry, which is checked in its place.
-
-It CANNOT see a commit linked through a spoofed email. GitHub links a commit to an account by its
-email alone, so an author email set to an allowlisted account's address reads as that account, here
-and in the action alike. Only commit signature verification separates the two, and neither checks it.
+It CANNOT see a spoofed AUTHOR email. GitHub links a commit to an account by its email alone, so an
+author email set to an allowlisted account's address reads as that account, here and in the action
+alike. Only commit signature verification separates the two, and neither checks it. A spoofed
+COMMITTER email under an unlinked author is refused, by the author rule above.
 
 UNMEASURED: whether GitHub caps a pull request's commit connection (its REST listing stops at 250)
-and, if it does, whether ``totalCount`` reports the capped or the real count. The short-read refusal
-holds only where ``totalCount`` is the real count.
+and, if it does, whether ``totalCount`` reports the capped or the real count. Until it is measured a
+read short of ``totalCount`` is a FAULT (owner ruling 2026-11-13), so the commits past a cap are not
+checked, and the run warns and passes.
 
 INPUT COMES ONLY FROM THE ENVIRONMENT, never from the command line or a templated ``run:`` line,
 so a workflow step can pass event data through ``env:`` (zizmor's template-injection rule):
@@ -69,9 +72,11 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   CLA_SIGNATURES_PATH the action's ``path-to-signatures``
   CLA_SIGNATURES_BRANCH the action's ``branch``
 
-EXIT CODES: 0 nothing refused; 1 refused; 3 a fault (bad input, network, a reply in the wrong
-shape, or an exception this script did not anticipate). The split lets a workflow choose how to
-treat a fault without parsing text.
+EXIT CODES: 0 nothing refused; 1 refused, with a ``CLA pre-check refused`` annotation; 3 a fault
+caught by this script (bad input, network, a reply in the wrong shape, a short read, or an exception
+raised inside ``run``). At least one other path exits 1 with no refusal annotation: an error before
+``main`` runs, such as at import. The interpreter itself exits 2 when it cannot open the script.
+The workflow tells these apart by the annotation, not the code alone.
 """
 
 from __future__ import annotations
@@ -350,17 +355,23 @@ def evaluate(
     refusals: list[str] = []
     notices: list[str] = []
     distinct = len({str(commit.get("oid", "")) for commit in read.commits})
+    # A FAULT, not a refusal, until GitHub's commit cap is measured (owner ruling 2026-11-13): if
+    # GitHub stops the connection short of totalCount, refusing would fail every large PR closed.
     if complete and distinct != read.total:
-        refusals.append(
-            f"read {distinct} distinct commits where the pull request has {read.total}; a commit "
-            "not read once cannot be checked"
+        faults.append(
+            f"read {distinct} distinct commits where the pull request has {read.total}; the "
+            "unread commits are not checked"
         )
-    attributions: list[Attribution] = []
+    # One slot per commit, None for a malformed one, so the first-page slice below never shifts a
+    # second-page commit into the action's view.
+    slots: list[Attribution | None] = []
     for commit in read.commits:
         try:
-            attributions.append(attribute(commit))
+            slots.append(attribute(commit))
         except PrecheckFault as exc:
             faults.append(str(exc))
+            slots.append(None)
+    attributions = [who for who in slots if who is not None]
 
     def skipped(entry: Attribution) -> bool:
         """Does the action skip this committer entry: the id it drops, or an allowlisted name?"""
@@ -368,8 +379,9 @@ def evaluate(
 
     # The action's committer list: the FIRST page only, one entry per `login || name`, first seen.
     entries: dict[str, Attribution] = {}
-    for who in attributions[: read.first_page]:
-        entries.setdefault(who.name, who)
+    for slot in slots[: read.first_page]:
+        if slot is not None:
+            entries.setdefault(slot.name, slot)
     # Keyed on the name AND the account, so a linked author does not cover an unlinked commit that
     # merely shares its name.
     never_checked: set[tuple[str, int | None]] = set()
@@ -403,15 +415,17 @@ def evaluate(
             )
         if who.author_linked or unlinked:
             continue
+        # The CLA binds the AUTHOR (owner ruling 2026-11-13). An allowlisted or bot committer does
+        # not stand in for an unlinked author, and a committer email is trivially set.
         if who.database_id == ACTIONS_BOT_ID:
-            notices.append(
-                f"commit {who.oid} has an unlinked author and is committed by github-actions[bot], "
-                "so the action drops it from the CLA check"
+            refusals.append(
+                f"commit {who.oid} has an author linked to no GitHub account and is committed by "
+                "github-actions[bot], so the action drops it and its author is never checked"
             )
         elif matches_allowlist(who.name, allowlist):
-            notices.append(
-                f"commit {who.oid} has an unlinked author and is attributed to the allowlisted "
-                f"committer {who.name!r}, so its author is never asked to sign"
+            refusals.append(
+                f"commit {who.oid} has an author linked to no GitHub account and is attributed to "
+                f"the allowlisted committer {who.name!r}, so its author is never asked to sign"
             )
     return Verdict(tuple(refusals), tuple(notices), "; ".join(faults) or None)
 

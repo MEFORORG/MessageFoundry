@@ -177,9 +177,11 @@ jobs:
       # same events as the action's step; the action's `if:` alone adds `!cancelled()`, so after an
       # earlier step fails the action still runs and this step does not.
       #
-      # FAIL-OPEN ON A FAULT, BY OWNER RULING 2026-11-13 ("Wire, fail-open on fault"). Exit 1 is a
-      # refusal and fails the required `cla` context. Exit 3 is a fault -- a GitHub outage, a
-      # malformed reply, bad input, a bug in the script -- and warns and passes, because this
+      # FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling 2026-11-13). Exit 1
+      # WITH the script's `CLA pre-check refused` annotation is a refusal and fails the required
+      # `cla` context; exit 1 without it (an import-time traceback) is a fault. Exit 3 is a fault --
+      # a GitHub outage, a malformed reply, bad input, a bug in the script. A fault warns and passes,
+      # because this
       # workflow runs from the DEFAULT branch: a step that failed on every fault would wedge every
       # pull request, including the one reverting it. EXIT 2 IS NOT A FAULT AND FAILS: it is what
       # python3 returns when it cannot open the script, so a renamed script fails loudly instead of
@@ -202,11 +204,20 @@ jobs:
           CLA_SIGNATURES_BRANCH: 'cla-signatures'
         run: |
           set +e
-          python3 scripts/security/cla_precheck.py
+          out="$(python3 scripts/security/cla_precheck.py 2>&1)"
           rc=$?
           set -e
-          if [ "$rc" -eq 3 ]; then
-            echo "::warning title=CLA pre-check not enforced::the pre-check faulted (exit 3), so this run rests on the CLA action alone"
+          printf '%s\n' "$out"
+          # Bash builtins only. A refusal is the annotation at the START of a line.
+          refused=no
+          case $'\n'"$out" in
+            *$'\n::error title=CLA pre-check refused::'*) refused=yes ;;
+          esac
+          if [ "$rc" -eq 1 ] && [ "$refused" = yes ]; then
+            exit 1
+          fi
+          if [ "$rc" -eq 3 ] || [ "$rc" -eq 1 ]; then
+            echo "::warning title=CLA pre-check not enforced::the pre-check faulted (exit $rc, no refusal), so this run rests on the CLA action alone"
             exit 0
           fi
           exit "$rc"
