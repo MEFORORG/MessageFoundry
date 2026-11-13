@@ -3805,14 +3805,17 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 (`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
 a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. A 2xx whose body is
 over the byte bound cannot be checked for a FailedSOPSequence, so it is a permanent refusal and is not sent
-again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). A 2xx does not by itself
-confirm the store (BACKLOG #5914), so each of these is also a permanent refusal: a non-empty 2xx body
-that is not parseable JSON, repeats a key at any depth, is nested too deep, or is not a dataset object
-or a non-empty array of them (code `unparseable-reply`); a FailedSOPSequence in a shape dicom+json does
-not allow (code `failed-sop`); and a 202 with no **ReferencedSOPSequence** (`00081199`) item carrying a
-ReferencedSOPInstanceUID (`00081155`), an empty 202 included (code `unconfirmed-202`). An empty 2xx
-other than a 202 (empty, or JSON whitespace after a leading BOM) is delivered, `no_reply` when
-capturing, and a 200 is not required to carry a ReferencedSOPSequence. **PHI:** the response can
+again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). Each of these 2xx replies is
+also a permanent refusal, in both capture modes (BACKLOG #5914): a non-empty 2xx body that is not
+parseable JSON, repeats a key at any depth, is nested too deep, or is not a dataset object or a
+non-empty array of them (code `unparseable-reply`); a FailedSOPSequence that is not an object, has a
+`Value` that is not an array, or carries a `BulkDataURI` or `InlineBinary` key (code `failed-sop`);
+and a 202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID
+(`00081155`) has a `Value` of one or more non-blank strings, an empty 202 included (code
+`unconfirmed-202`). **Not every 2xx that fails to confirm the store is refused.** A 200 is not
+required to carry a ReferencedSOPSequence, so a 200 whose dataset confirms nothing, `{}` included,
+is delivered; and an empty 2xx other than a 202 (empty, or JSON whitespace after a leading BOM) is
+delivered, `no_reply` when capturing. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python
@@ -4932,7 +4935,7 @@ reading this page already applies to a file the scan never opened.
 | REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed. A Digest challenge the engine will not answer, on the delivery or the token hop (`auth-challenge-refused`, ADR 0095 Amendment B; on an `https://` token endpoint, a Digest proxy's 407 to the `CONNECT`), and a send-time hop refusal (`insecure-hop-refused`) are configuration faults: under the default `credential_fault_policy` the lane stops and the queue stays. A 2xx reply body that is over the bound, cut short or misframed is never sent again; the *A 2xx reply over the byte bound* table under REST says whether it is delivered or refused | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
 | SOAP destination | `timeout_seconds` 30 s | as REST | as REST | as REST |
 | FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | the destination as REST, configuration faults and the 2xx reply rule included; a lookup failure, a refused Digest challenge among them, raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
-| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST (a web proxy's Digest challenge only, since DICOMweb has no origin Digest), and a 2xx that does not confirm the store is a permanent refusal (*Status classification* under DICOMweb) | `RetryPolicy` |
+| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST (a web proxy's Digest challenge only, since DICOMweb has no origin Digest), and some 2xx replies that do not confirm the store are a permanent refusal; which ones is *Status classification* under DICOMweb | `RetryPolicy` |
 | DICOM C-STORE SCP (inbound) | `timeout_seconds` 30 s applied to **all three** pynetdicom timers (ACSE, DIMSE, network) and to the off-loop commit future, and as a fixed deadline on the association request, on each later read, and on each whole send ([DICOM.md](DICOM.md) section 3) | on the timers, the association is released by pynetdicom; a read deadline ends the association by closing the connection, not by a release; the AE is shut down cooperatively on stop | an over-cap object fails the DIMSE operation before the durable commit | n/a — the modality re-sends |
 | DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent; the third end with no response in a row of one object over 32 MiB → permanent (`unanswered-over-ceiling`, vault BACKLOG #4908) | `RetryPolicy`, except that permanent class, which dead-letters whatever the policy says |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |

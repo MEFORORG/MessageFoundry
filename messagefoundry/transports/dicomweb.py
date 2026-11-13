@@ -22,10 +22,12 @@ It needs **no** ``pydicom``: the object rides as opaque bytes, so DICOMweb works
   into a known study) when a ``study_uid`` is configured. ``Accept: application/dicom+json``.
 - Response classification refines the HTTP-status retry model: a 2xx whose ``application/dicom+json`` body
   carries a per-instance **FailedSOPSequence** (``00081198``) → the instance was rejected → permanent
-  dead-letter; so does any other 2xx that does not confirm the store (:func:`_stowrs_refusal` holds
-  the rule). Other 4xx, a 409 (all
-  instances failed) or a refused 3xx is permanent; 5xx / 408 / 429 / connection-timeout is a
-  transient retry. **The HTTP status wins when in doubt; a 5xx stays transient.**
+  dead-letter. So is a 2xx body that is not parseable dicom+json, and a 202 that names no stored
+  instance; an empty 2xx other than a 202, and a 200 dataset with no ReferencedSOPSequence, are
+  still delivered (:func:`_stowrs_refusal` holds the rule; docs/CONNECTIONS.md *DICOMweb*, *Status
+  classification*, states it in full). Other 4xx, a 409 (all instances failed) or a refused 3xx is
+  permanent; 5xx / 408 / 429 / connection-timeout is a transient retry. **A 5xx stays transient.**
+  The HTTP status no longer wins over a 2xx body that refuses it (BACKLOG #5914).
 
 **PHI:** a STOW-RS ``dicom+json`` response can name patient/study identifiers, so it is **never** echoed
 into a log/error — only the HTTP status and a redacted URL are. **Idempotency:** delivery is
@@ -106,10 +108,12 @@ _DICOM_PART_TYPE = "application/dicom"
 _DICOM_JSON = "application/dicom+json"
 # DICOM Tag (group,element) for the STOW-RS FailedSOPSequence in the dicom+json response (DICOM PS3.18).
 _FAILED_SOP_SEQUENCE = "00081198"
-# ReferencedSOPSequence: the instances the server stored. A 202 must name at least one (#5914), by
-# an item carrying a ReferencedSOPInstanceUID.
+# ReferencedSOPSequence: the instances the server stored. A 202 must name at least one (#5914);
+# see _names_an_instance.
 _REFERENCED_SOP_SEQUENCE = "00081199"
 _REFERENCED_SOP_INSTANCE_UID = "00081155"
+# PS3.18 Annex F: these carry an element's value as bulk data, which a sequence (SQ) never does.
+_SQ_FORBIDDEN_KEYS = frozenset({"BulkDataURI", "InlineBinary"})
 # Written by name, never as a raw character an editor can silently drop (as fhir.py's _BOM).
 _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 _JSON_WHITESPACE = (
@@ -182,21 +186,40 @@ def _reply_is_empty(body: str) -> bool:
 
 def _sequence_items(datasets: list[dict[str, Any]], tag: str) -> list[Any] | None:
     """Every item of the ``tag`` sequence across the datasets, in order, or ``None`` when the
-    element is present in a shape dicom+json does not allow (not an object, or a ``Value`` that is
-    not an array). An absent element, or one with no ``Value``, is an empty sequence (PS3.18
-    F.2.5). Only the shape is read, never an item's contents (PHI-safe)."""
+    element is present in a shape dicom+json does not allow (not an object, a ``Value`` that is
+    not an array, or a ``BulkDataURI`` or ``InlineBinary`` key). An absent element, or one with no
+    ``Value`` and neither bulk-data key, is an empty sequence (PS3.18 F.2.5). Only the shape is
+    read, never an item's contents (PHI-safe)."""
     items: list[Any] = []
     for ds in datasets:
         if tag not in ds:
             continue
         element = ds[tag]
-        if not isinstance(element, dict):
+        # A sequence never carries bulk data, so one that does is malformed rather than empty.
+        if not isinstance(element, dict) or not _SQ_FORBIDDEN_KEYS.isdisjoint(element):
             return None
         value = element.get("Value", [])
         if not isinstance(value, list):
             return None
         items.extend(value)
     return items
+
+
+def _names_an_instance(item: Any) -> bool:
+    """True when a ReferencedSOPSequence item is a dataset whose ReferencedSOPInstanceUID has a
+    ``Value`` of one or more strings, none empty or blank. A UID with no Value, an empty or null
+    Value, or a non-string entry confirms nothing (BACKLOG #5914). Reads no UID beyond its type."""
+    if not isinstance(item, dict):
+        return False
+    element = item.get(_REFERENCED_SOP_INSTANCE_UID)
+    if not isinstance(element, dict):
+        return False
+    value = element.get("Value")
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(uid, str) and uid.strip() for uid in value)
+    )
 
 
 def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
@@ -210,11 +233,14 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
     - ``failed-sop``: a FailedSOPSequence (``00081198``) with any item, or in a shape dicom+json
       does not allow -- that direction fails closed.
     - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply names
-      no stored instance: no ReferencedSOPSequence (``00081199``) item that is a dataset carrying
-      a ReferencedSOPInstanceUID (``00081155``). An empty 202 is one.
+      no stored instance: no ReferencedSOPSequence (``00081199``) item that is a dataset whose
+      ReferencedSOPInstanceUID (``00081155``) has a non-empty string Value
+      (:func:`_names_an_instance`). An empty 202 is one.
 
     An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
-    the ReferencedSOPSequence rule (BACKLOG #5914 ruling).
+    the ReferencedSOPSequence rule (BACKLOG #5914 ruling), so a 200 whose dataset confirms nothing,
+    ``{}`` included, is delivered. docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states
+    the rule in full.
 
     Returned as ``(code, reason)``; both are fixed strings that name no reply content."""
     unconfirmed = ("unconfirmed-202", f"no ReferencedSOPSequence confirming the store; {_NOT_SENT}")
@@ -233,7 +259,7 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
         return "failed-sop", "a FailedSOPSequence (instance rejected)"
     if status == 202:
         referenced = _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or []
-        if not any(isinstance(i, dict) and _REFERENCED_SOP_INSTANCE_UID in i for i in referenced):
+        if not any(_names_an_instance(i) for i in referenced):
             return unconfirmed
     return None
 
