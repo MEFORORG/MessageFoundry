@@ -19,37 +19,36 @@ the "highest-priority deferred gate" and records that verify-before-add "is toda
 human remembering". CLAUDE.md section 5 states the rule in prose, and prose is what a session
 rationalizes past at 2am.
 
-WHAT IT SWEEPS: by default the root ``pyproject.toml`` and every ``packaging/*/pyproject.toml``, and in
-each of them ``[build-system].requires``, ``[project].dependencies``, every
-``[project.optional-dependencies]`` extra, every PEP 735 ``[dependency-groups]`` group, and the
-``[tool.uv]`` requirement lists (``declared_distributions`` names them all). The groups were added
+WHAT IT SWEEPS: by default the root ``pyproject.toml`` and every ``packaging/*/pyproject.toml``, each
+with a ``hatch.toml`` beside it merged over ``[tool.hatch]`` the way hatchling merges it. The tables
+read in each file are listed once, in ``declared_distributions``. The PEP 735 groups were added
 2026-07-29 with the hash-pinned CI toolchain (ADR 0034 section 3): those names are not shipped in the
 wheel, but they are resolved into ``uv.lock`` and installed into the runner that executes the BLOCKING
 security gates, which makes a squatted scanner name a sharper target than a runtime dependency rather
-than a softer one. The build requirements, the uv tables, hatch build-target and build-hook
-``dependencies`` and the packaging files were added by BACKLOG #5641.
+than a softer one. The build-time tables and the packaging files were added by BACKLOG #5641.
 
 REFUSED RATHER THAN VETTED (each a finding, never a silent skip; ``unnameable_entries``): a declared
 entry the gate cannot name (a bare URL, a path, a non-string, a table or list of the wrong TOML
 type); a direct reference (``name @ url``), whose bytes come from the URL rather than from the PyPI
 project the name would be vetted against; ``[project].dynamic`` naming the dependency lists, which a
-build plugin fills from a file this gate never opens; an in-tree build backend
-(``backend-path``) or an in-tree hatch ``custom`` build or metadata hook, any of which can
-return requirements from code; a non-empty source or index key in ``[tool.uv]`` or
-``[tool.uv.pip]``, which sends a vetted name somewhere other than pypi.org; and a
-``[tool.uv].workspace``, whose members this gate does not sweep. A ``hatch.toml`` beside a swept
-pyproject is read and merged over ``[tool.hatch]`` the way hatchling merges it; a ``uv.toml`` is not
-read. This repository's own distributions
-(``FIRST_PARTY``) are excluded by exact name, each with its reason and what the exclusion gives up.
+build plugin fills from a file this gate never opens; an in-tree build backend (``backend-path``) or
+an in-tree hatch ``custom`` build or metadata hook, any of which can return requirements from code; a
+non-empty source or index key in ``[tool.uv]`` or ``[tool.uv.pip]``, which sends a vetted name
+somewhere other than pypi.org; and a ``[tool.uv].workspace``, whose members this gate does not sweep.
 
-NOT SWEPT, at least: npm manifests (``ide/package.json``, ``ci/npm-tools/package.json``), and tools
-a workflow or script installs by command line (a ``pipx install`` or ``uv tool install``), hatch
-environment tables, any requirements file, a ``uv.toml``, a ``setup.py`` (its ``setup_requires`` runs
-under a setuptools backend), and a hatch custom builder target
-(``[tool.hatch.build.targets.custom]``), which runs in-tree code that can return build requirements. An invented name there passes this gate. ``npm audit``
-answers known advisories, the npm counterpart of pip-audit, and so has pip-audit's blindness to a
-freshly registered name. The npm boundary is pinned by a named test in
-``tests/test_new_dependency_check.py``; none of these is a check this gate performs.
+EXCLUDED: this repository's own distributions (``FIRST_PARTY``), by exact PEP 503 name, and only
+where every declaration of the name is in the ``[project].dependencies`` or
+``[project.optional-dependencies]`` of a ``packaging/*/pyproject.toml``. The comment above
+``FIRST_PARTY`` gives the reason and what the exclusion gives up.
+
+NOT SWEPT, at least: npm manifests (``ide/package.json``, ``ci/npm-tools/package.json``); tools a
+workflow or script installs by command line (a ``pipx install`` or ``uv tool install``); hatch
+environment tables; any requirements file; a ``uv.toml``; a ``setup.py``, whose ``setup_requires``
+runs under a setuptools backend; and a hatch custom builder target
+(``[tool.hatch.build.targets.custom]``), which runs in-tree code that can return build requirements.
+An invented name in any of these passes this gate. For npm, ``npm audit`` answers known advisories,
+the npm counterpart of pip-audit, and so shares its blindness to a freshly registered name. The npm
+boundary is pinned by a named test in ``tests/test_new_dependency_check.py``.
 
 WHAT IT CHECKS, per declared distribution:
   * EXISTS         -- PyPI serves a project page for the name at all.
@@ -154,7 +153,8 @@ ALLOWLIST: dict[str, str] = {}
 # not yet uploaded, or first uploaded in a recent release, would read as absent or "freshly
 # registered" and red the gate on every pull request. Matched by exact PEP 503 name only, so a
 # near-miss of one of these names is fetched and vetted like any other. ``main`` applies it only to a
-# name declared solely in packaging/*/pyproject.toml; declared anywhere else, it is vetted.
+# name declared solely in the [project].dependencies or [project.optional-dependencies] of a
+# packaging/*/pyproject.toml; declared anywhere else, a build-time table there included, it is vetted.
 #
 # WHAT THIS EXCLUSION GIVES UP, stated so nobody reads it as covered: release.yml does not upload every
 # one of these on every release (the harness and the web console are each behind their own switch), so
@@ -213,10 +213,21 @@ _UV_REQUIREMENT_LISTS = (
 _UV_SOURCE_KEYS = ("sources", "index", "index-url", "extra-index-url", "find-links")
 
 
+_RUNTIME_TABLES = ("[project].dependencies", "[project.optional-dependencies]")
+
+
 def scan(
-    pyproject_text: str, *, source: str = "pyproject.toml", hatch_toml_text: str | None = None
+    pyproject_text: str,
+    *,
+    source: str = "pyproject.toml",
+    hatch_toml_text: str | None = None,
+    build_time_names: set[str] | None = None,
 ) -> tuple[dict[str, str], list[Finding]]:
     """One pass over a pyproject: (``declared_distributions``, ``unnameable_entries``) for it.
+
+    ``build_time_names``, when given, receives every PEP 503 name declared in a table other than
+    ``[project].dependencies`` and ``[project.optional-dependencies]``: the names a build frontend or
+    uv fetches from the index whatever this tree builds, which ``main`` never excludes as first-party.
 
     ``hatch_toml_text`` is a ``hatch.toml`` beside the pyproject. hatchling loads it and merges its
     top-level tables over ``[tool.hatch]`` with a shallow ``dict.update``, so this does the same: a
@@ -254,6 +265,8 @@ def scan(
             )
         else:
             declared.setdefault(normalize(name), spec)
+            if build_time_names is not None and not where.startswith(_RUNTIME_TABLES):
+                build_time_names.add(normalize(name))
 
     def table(container: dict[str, object], key: str, where: str) -> dict[str, object]:
         value = container.get(key, {})
@@ -439,8 +452,10 @@ def declared_distributions(pyproject_text: str) -> dict[str, str]:
       ``[tool.uv.extra-build-dependencies]`` list, and each ``[tool.uv].dependency-metadata``
       entry's ``requires-dist``: uv fetches what they name.
     * hatch ``[tool.hatch.build]``, build-target and build-hook ``dependencies``: the backend asks
-      PEP 517 isolation to
-      install them in the same release build jobs.
+      PEP 517 isolation to install them in the same release build jobs. Read in hatchling 1.33.0,
+      the pinned backend: ``BuilderConfig.dependencies`` in ``hatchling/builders/config.py`` returns
+      the target's ``dependencies`` and ``self.build_config.get("dependencies", [])``, the
+      ``[tool.hatch.build]`` list, and then each build hook's ``config.get("dependencies", [])``.
 
     An entry it cannot name is not here; ``unnameable_entries`` reports it, and ``main`` reads both
     from one ``scan``.
@@ -793,6 +808,7 @@ def main(argv: list[str] | None = None) -> int:
         # A file that cannot be read or parsed is "could not see" (2), never "failed vetting" (1),
         # which is what a traceback would exit with.
         hatch_toml = path.parent / "hatch.toml"
+        build_time: set[str] = set()
         try:
             names, problems = scan(
                 path.read_text(encoding="utf-8"),
@@ -800,6 +816,7 @@ def main(argv: list[str] | None = None) -> int:
                 hatch_toml_text=(
                     hatch_toml.read_text(encoding="utf-8") if hatch_toml.is_file() else None
                 ),
+                build_time_names=build_time,
             )
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             # The refusals from the files already read are named too, so one run reports both.
@@ -817,12 +834,12 @@ def main(argv: list[str] | None = None) -> int:
         for name, spec in names.items():
             declared.setdefault(name, spec)
             declared_in.setdefault(name, path)
-            if not sibling_file:
-                outside_packaging.add(name)
+        outside_packaging |= build_time if sibling_file else set(names)
         unnameable.extend(problems)
-    # The exclusion exists for one packaging wheel naming a sibling. A first-party name declared
-    # anywhere else -- a root extra an end user installs from PyPI, say -- is vetted like any other,
-    # because there the name may be unclaimed and existence is exactly the question.
+    # The exclusion exists for one packaging wheel's RUNTIME requirement naming a sibling. A
+    # first-party name anywhere else -- a root extra an end user installs from PyPI, or a build-time
+    # table a build frontend always fetches from the index -- is vetted like any other, because there
+    # the name may be unclaimed and existence is exactly the question.
     first_party = {k: v for k, v in FIRST_PARTY.items() if normalize(k) not in outside_packaging}
     # Named before PyPI is asked anything, so an unreachable PyPI cannot hide them.
     for finding in unnameable:

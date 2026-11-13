@@ -267,10 +267,12 @@ jobs:
       # check as the "highest-priority deferred gate" while verify-before-add stayed "enforced only by
       # the human remembering".
       #
-      # Stdlib-only (no install). Fails CLOSED: if PyPI is unreachable it exits 2 rather than passing,
-      # and it exits 2 if it examined zero distributions, so a schema change cannot read as a clean
-      # sweep. Its known blind spot — a real package that is not the INTENDED one — is documented in
-      # the script and pinned by tests/test_new_dependency_check.py.
+      # Stdlib-only (no install). Fails CLOSED: if PyPI is unreachable or a pyproject cannot be read it
+      # exits 2 rather than passing, and it exits 2 if it examined zero distributions and refused
+      # none, so a schema change cannot read as a clean sweep (a refusal exits 1). What it sweeps,
+      # refuses and does not read, and its blind spots -- a real package that is not the INTENDED one
+      # among them -- are listed in the script's module docstring and pinned by
+      # tests/test_new_dependency_check.py.
       - name: Verify every declared dependency is a real, established distribution
         run: python scripts/security/new_dependency_check.py
 
@@ -1757,10 +1759,12 @@ jobs:
       # check as the "highest-priority deferred gate" while verify-before-add stayed "enforced only by
       # the human remembering".
       #
-      # Stdlib-only (no install). Fails CLOSED: if PyPI is unreachable it exits 2 rather than passing,
-      # and it exits 2 if it examined zero distributions, so a schema change cannot read as a clean
-      # sweep. Its known blind spot — a real package that is not the INTENDED one — is documented in
-      # the script and pinned by tests/test_new_dependency_check.py.
+      # Stdlib-only (no install). Fails CLOSED: if PyPI is unreachable or a pyproject cannot be read it
+      # exits 2 rather than passing, and it exits 2 if it examined zero distributions and refused
+      # none, so a schema change cannot read as a clean sweep (a refusal exits 1). What it sweeps,
+      # refuses and does not read, and its blind spots -- a real package that is not the INTENDED one
+      # among them -- are listed in the script's module docstring and pinned by
+      # tests/test_new_dependency_check.py.
       - name: Verify every declared dependency is a real, established distribution
         if: ${{ !cancelled() }}
         run: python scripts/security/new_dependency_check.py

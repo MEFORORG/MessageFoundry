@@ -1015,6 +1015,36 @@ def test_a_first_party_name_outside_packaging_is_vetted(
     assert sorted(asked) == ["fastapi", "messagefoundry-webconsole"], "the sibling stays excluded"
 
 
+@pytest.mark.parametrize(
+    "build_table",
+    [
+        '[build-system]\nrequires = ["hatchling==1.33.0", "messagefoundry-webconsole"]\n',
+        '[tool.uv]\nconstraint-dependencies = ["messagefoundry-webconsole<1"]\n',
+        '[tool.hatch.build.targets.wheel]\ndependencies = ["messagefoundry-webconsole"]\n',
+    ],
+    ids=["build-system-requires", "uv-constraint", "hatch-target-dependencies"],
+)
+def test_a_first_party_name_in_a_packaging_build_table_is_vetted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, build_table: str
+) -> None:
+    """A build frontend fetches a build-time table from the index, so the sibling reason fails."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    sub = tmp_path / "packaging" / "messagefoundry-harness"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        f'{build_table}[project]\nname = "messagefoundry-harness"\n'
+        'dependencies = ["messagefoundry-toolkit==1"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_gate, "_ROOT", tmp_path)
+    asked = _stub_registry(monkeypatch, absent=frozenset({"messagefoundry-webconsole"}))
+    assert main([]) == 1
+    assert "messagefoundry-webconsole" in asked
+    assert "messagefoundry-toolkit" not in asked, "the runtime sibling reference stays excluded"
+
+
 def test_a_near_miss_of_a_first_party_name_is_still_vetted() -> None:
     """The exclusion is by exact PEP 503 name, so a typo of our own name is fetched like any other."""
     findings, examined = vet(
