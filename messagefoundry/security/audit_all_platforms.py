@@ -165,6 +165,21 @@ def _body(line: str) -> str:
     return line.splitlines()[0] if line else ""
 
 
+def _continues(body: str) -> bool:
+    """Whether pip's ``join_lines`` joins the line after ``body`` onto it."""
+    return body.endswith("\\") and not body.lstrip().startswith("#")
+
+
+def _text(body: str) -> str:
+    """What ``body`` adds to its logical line, without its indentation.
+
+    pip's ``join_lines`` strips the backslashes from both ends of a line it joins, so a line of
+    only backslashes, or of indentation then backslashes, adds no text and a logical line starts
+    after it (vault BACKLOG #3786 R1, R2); its indentation still reaches the joined line.
+    """
+    return (body.strip("\\") if _continues(body) else body).lstrip()
+
+
 def _kinds(lines: list[str]) -> list[str]:
     """Classify each physical line as pip joins them into logical lines.
 
@@ -172,18 +187,15 @@ def _kinds(lines: list[str]) -> list[str]:
     goes on to a line that is neither a hash or other option nor a comment, so a marker there would
     escape the strip; ``other`` for any other line that starts a logical line (blank, a comment, or
     only backslashes); ``joined`` for any other line that continues one. A line ending in a
-    backslash continues onto the next,
-    unless it is a comment. pip's ``join_lines`` strips the backslashes from both ends of a line it
-    joins, so a line of nothing but indentation and backslashes adds nothing: the logical line starts
-    on the line after it (vault BACKLOG #3786 R1, R2).
+    backslash continues onto the next, unless it is a comment (:func:`_text`).
     """
     kinds: list[str] = []
     continued = in_requirement = False
     for line in lines:
         body = _body(line)
         head = body.lstrip()
-        continues = body.endswith("\\") and not head.startswith("#")
-        text = (body.strip("\\") if continues else body).lstrip()
+        continues = _continues(body)
+        text = _text(body)
         if not continued:
             in_requirement = is_requirement_line(text)
             kind = "requirement" if in_requirement else "option" if text[:1] == "-" else "other"
@@ -513,7 +525,7 @@ def _drop(
     dropping = False
     for line, kind in zip(lines, kinds, strict=True):
         if kind in _STARTS:
-            head = _body(line).lstrip()
+            head = _text(_body(line))
             name = _pin_name(head) if kind == "requirement" else None
             dropping = False
             if name is not None and name in names:
@@ -604,9 +616,7 @@ _PIP_AUDIT_TEXT_OPTIONS = frozenset(
 _PIP_AUDIT_OPTIONS = _PIP_AUDIT_FLAGS | _PIP_AUDIT_FIXED_VALUE_OPTIONS | _PIP_AUDIT_TEXT_OPTIONS
 
 
-#: The short forms of those that take a value, with the long form each stands for. After the lock,
-#: ``_opens_the_gate`` refuses ``-r`` and ``--requirement`` before these tables are read. Both stay
-#: listed as pip-audit declares them, and ``_names_own_option`` reads every long option.
+#: The short forms of those that take a value, with the long form each stands for.
 _PIP_AUDIT_SHORT_VALUE_OPTIONS = {
     "-r": "--requirement",
     "-o": "--output",
@@ -735,20 +745,15 @@ def _run(cmd: list[str], *, pass_environment: Sequence[str] = ()) -> int:
 
 
 def _distinct_count(requirements: Sequence[str]) -> int:
-    """How many of ``requirements`` pip-audit audits as separate pins (vault BACKLOG #3786 R4).
+    """How many different requirement strings ``requirements`` holds (vault BACKLOG #3786 R4).
 
-    pip-audit 2.10.1's ``_collect_preresolved_deps`` audits a name once and passes over a second
-    requirement with the same name and specifier, which a lock that pinned one version under two
-    markers holds once they are stripped; a second with another specifier fails the audit. It
-    compares the name as written, not as PEP 503 folds it. So this counts names as written, and a
-    requirement that starts with a URL, which names no package before its ``:``, by its whole text.
+    pip-audit 2.10.1's ``_collect_preresolved_deps`` passes over a second requirement with the same
+    name, as written, and the same specifier, which a lock that pinned one version under two
+    markers holds once they are stripped. This counts such a pair once only where both read the
+    same; it does not model pip-audit's comparison, so it counts two where they differ only in how
+    the specifier is written.
     """
-    return len(
-        {
-            m[0] if (m := _NAME.match(r)) and r[m.end() : m.end() + 1] != ":" else r
-            for r in requirements
-        }
-    )
+    return len(set(requirements))
 
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
@@ -849,8 +854,9 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
     if refusal:
         print(f"::error::{lock}: {refusal}", file=sys.stderr)
         return 2
-    # _strip rewrote lines one for one and kept each one's continuation, so their kinds stand: the
-    # check above refuses a copy where they do not.
+    # _strip rewrote lines one for one, so _drop reads them by the lock's kinds. Where the strip
+    # left a pin ending in a backslash, the copy joins lines the kinds keep apart; the check above
+    # refuses that where it changes the count, and the check after _drop reads the copy it leaves.
     kept, skipped = _drop(stripped_lines, kinds, private)
     unmatched = private - {name for name, _ in skipped}
     if unmatched:

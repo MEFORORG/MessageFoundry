@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.childenv import python_module_argv
+from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.security import audit_all_platforms as audit_module
 from messagefoundry.security.audit_all_platforms import (
     _URL_SCHEMES,
@@ -65,6 +66,13 @@ idna==3.20 \\
 uvloop==0.23.0 \\
     --hash=sha256:dddd
 """
+
+
+@pytest.fixture(autouse=True)
+def _no_stream_hardening(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``main`` hardens the process's console streams, which cannot be undone, so the tests that
+    call it in-process skip that; the one that tests it puts it back on streams of its own."""
+    monkeypatch.setattr(audit_module, "harden_console_streams", lambda **_: None, raising=False)
 
 
 def _recorder(status: int) -> tuple[list[list[str]], Callable[[list[str]], int]]:
@@ -972,6 +980,14 @@ def test_skip_private_finds_a_pin_after_a_backslash_line(tmp_path: Path) -> None
     assert seen[-1][1] == f"\\\n{_EVIL}\n"
 
 
+def test_skip_private_reads_a_continuing_pin_as_pip_does(tmp_path: Path) -> None:
+    """pip strips a joined line's leading backslashes too, so this line names ``priv``."""
+    lock = f"\\priv==1 \\\n    --hash=sha256:{_DIGEST}\n{_EVIL}\n"
+    status, seen = _seen_by(tmp_path, ["--skip-private", "priv"], lock)
+    assert status == 0
+    assert seen[-1][1] == f"{_EVIL}\n"
+
+
 def test_identical_pins_are_counted_once_as_pip_audit_audits_them(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -988,20 +1004,11 @@ def test_identical_pins_are_counted_once_as_pip_audit_audits_them(
     assert printed == [2]
 
 
-@pytest.mark.parametrize(
-    "head",
-    [
-        # pip-audit keys on the name as written, so it audits both spellings.
-        f"Foo_Bar==1 --hash=sha256:{_DIGEST}\nfoo-bar==1 --hash=sha256:{_DIGEST}\n",
-        # A URL names no package before its ":".
-        f"https://h/a-1.0-py3-none-any.whl --hash=sha256:{_DIGEST}\n"
-        f"https://h/b-1.0-py3-none-any.whl --hash=sha256:{_DIGEST}\n",
-    ],
-    ids=["two-spellings", "two-urls"],
-)
-def test_requirements_pip_audit_keeps_apart_are_counted_apart(
-    head: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_two_spellings_of_a_name_are_counted_apart(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """pip-audit compares the name as written, so it audits both spellings."""
+    head = f"Foo_Bar==1 --hash=sha256:{_DIGEST}\nfoo-bar==1 --hash=sha256:{_DIGEST}\n"
     status, _, printed, read, _ = _counted_and_read(tmp_path, capsys, head)
     assert status == 0
     assert printed == [len(reqs) for reqs in read] == [3]
@@ -1026,6 +1033,8 @@ def test_a_lock_character_stdout_cannot_encode_does_not_raise(
     raw = io.BytesIO()
     out = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
     monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(io.BytesIO(), encoding="cp1252"))
+    monkeypatch.setattr(audit_module, "harden_console_streams", harden_console_streams)
     src = tmp_path / "x.lock"
     src.write_text(f"foo==1 ; sys_platform == '{_HAN}' --hash=sha256:{_DIGEST}\n", encoding="utf-8")
     ran, run = _recorder(0)
