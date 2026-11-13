@@ -1156,7 +1156,7 @@ same as one that is up. The engine does count a UDP send that returns an error o
 such as no route to the collector (BACKLOG #5923): it sets `send_failing`, and the record is
 counted in `unsent`, or kept in the spool while it has room. A datagram this host drops after the
 send reported success is not counted; on Linux that can include a full local transmit queue or a
-neighbour address that never resolves. A datagram too large to send, and a send error that is not
+neighbour address that never resolves (reasoned, not measured; ADR 0200 Amendment B). A datagram too large to send, and a send error that is not
 a network error, are counted in `undeliverable`. Queue and spool losses are counted as on every
 protocol. `delivery_confirmed` is `false`, a
 forwarder with no fault seen reads `unconfirmed` and never `healthy`. In the `unconfirmed` and

@@ -9,8 +9,9 @@
   ASVS 16.4.3 is the re-score's question, and G15's *"a gate whose predicate is a config key rather
   than the verb is not rule 4"* is the objection it must answer. **Amendment A is accepted**
   (owner ruling 2026-10-08, recorded on engine PR 2183); it changes decision 2's wording.
-  **Amendment B** (2026-11-13) records a code change that makes the UDP delivery bullets too
-  strong; it changes no decision.
+  **Amendment B** (2026-11-13) records a code change (BACKLOG #5923) that leaves three Decision 1
+  statements out of date: UDP detection, where a send error is undeliverable, and start deferral.
+  Decision 1's text is left as written, and the amendment holds where they disagree.
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1966 (this build) and #1199 (the 16.4.3 research that named the spool as the
   missing durability half) · [ADR 0080](0080-offbox-forwarding-tls-defaults.md) (native TLS-syslog) ·
@@ -234,14 +235,15 @@ that is this host through.
 an IP-literal collector it is now also one local socket call, measured at well under a
 millisecond on a Windows host. For a name it is one `gethostname` call.
 
-## Amendment B (2026-11-13) -- UDP now counts a send that fails on this host (BACKLOG #5923)
+## Amendment B (2026-11-13) -- UDP now counts a send that returns an error on this host (BACKLOG #5923)
 
-This amendment records a code change. It changes no decision above, and the decision text stays
-as written. At least these statements above no longer match the code:
+This amendment records a code change. Decision 1's text is left as written, so at least these of
+its statements no longer match the code; where they disagree, this amendment holds:
 
 - **"UDP detects nothing" is now too strong.** The UDP arm uses the same failure-tracking handler
   as TCP and TLS, so a `sendto` that returns an error, such as no route to the collector, is now
-  counted as a failed send and handled as on TCP and TLS. Not every loss on this host is detected:
+  counted as a failed send: spooled with a spool, counted as unsent without one, as on TCP and
+  TLS. Unlike a stream socket, the UDP socket is kept, not reset. Not every loss on this host is detected:
   a datagram the kernel drops after `sendto` reported success is not. On Linux that can include a
   full local transmit queue or a neighbour address that never resolves (reasoned from the kernel,
   not measured). Nor is a datagram that leaves this host and never reaches the collector, which
@@ -253,6 +255,7 @@ as written. At least these statements above no longer match the code:
   deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process
   running with no forwarder. A name that does not exist is still permanent.
 
-On every arm the standard library's traceback to stderr on a failed send is gone; a throttled
-ERROR line with no record content reports failures instead. What each case counts and reports is
-stated once, for operators, in [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]`.
+On every arm the standard library's traceback to stderr on a failed send is gone. Outside the
+shutdown drain, a throttled ERROR line with no record content reports failed sends instead; a
+send that fails during the drain gets no line. The counts each case moves are stated for
+operators in [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]`.
