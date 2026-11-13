@@ -49,7 +49,8 @@ _OLD_LATER_MSH_PAST_BOM = re.compile(r"[\r\n]" + BOM + r"+MSH")
 _OLD_LEADING_BOM = re.compile(rb"\s*\xef\xbb\xbf")
 #: BACKLOG #5918: the later MSH lines the ingress guard and the byte scan now read, marks and all.
 _OLD_LATER_MSH_CR = re.compile(r"\r" + BOM + r"*MSH")
-_OLD_LATER_MSH_BYTES_PAST_BOM = re.compile(rb"[\r\n](?:\xef\xbb\xbf)+MSH")
+#: The byte scan reads any run of the mark's three bytes, a superset that only costs a decode.
+_OLD_LATER_MSH_BYTES_PAST_BOM = re.compile(rb"[\r\n][\xef\xbb\xbf]+MSH")
 
 
 def _old_holds_more_than_one_message(text: str) -> bool:
@@ -178,7 +179,7 @@ def test_the_batch_split_is_unchanged() -> None:
 #: The earliest boundary each multi-spelling ``_Boundary`` names, written as one plain regex.
 _EARLIEST_OUTBOUND = re.compile(r"[\r\n]" + BOM + r"*MSH")
 _EARLIEST_NORMALIZED = re.compile(r"\r" + BOM + r"*MSH")
-_EARLIEST_RAW_BYTES = re.compile(rb"[\r\n](?:\xef\xbb\xbf)*MSH")
+_EARLIEST_RAW_BYTES = re.compile(rb"[\r\n][\xef\xbb\xbf]*MSH")
 
 
 def _earliest(pattern: re.Pattern[Any], text: Any, start: int) -> int:
@@ -211,17 +212,11 @@ def test_the_predicate_returns_the_earliest_boundary(start: int) -> None:
     ] == []
 
 
-def test_a_boundary_spelling_longer_than_one_break_is_refused() -> None:
-    # _next_boundary begins its searches one before the first MSH, so it would miss a CRLF spelling.
-    with pytest.raises(ValueError, match="one line-break character"):
-        split._Boundary("MSH", ("\r\nMSH",))
-
-
 def test_a_clean_outbound_payload_pays_one_scan() -> None:
     # Item 3.2. A str subclass counts the substring scans the delivery reading makes through find,
     # count and `in`; a payload with no MSH after its lead must stop at the first, and one holding
     # a second message still answers. A regex search is not counted: the lead match reads only the
-    # lead, and the marked-boundary search runs only past this scan.
+    # lead, and the boundary pattern is searched only once this scan has found an MSH.
     class Counted(str):
         scans = 0
 
@@ -261,7 +256,9 @@ def test_walking_a_batch_reads_the_text_a_bounded_number_of_times(lead: str) -> 
     # BACKLOG #5918 review: with only marked boundaries, a search that scanned on for a plain
     # boundary read to the end of the text on every call, so a split was quadratic. Walking every
     # boundary of an N-message batch, as split_batch does, must read the text a bounded number of
-    # times in all. A str subclass totals the characters each find reads.
+    # times in all. A str subclass totals the characters each find reads, which is the MSH
+    # prescan; the boundary pattern opens with a line break no mark holds, so its own search is
+    # linear, and the regex is not counted here.
     class Counted(str):
         read = 0
 

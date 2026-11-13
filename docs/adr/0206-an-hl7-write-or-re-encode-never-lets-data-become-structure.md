@@ -564,9 +564,9 @@ guard refuses such a body from a listener. The File and remote-file sources spli
 its messages under a charset that decodes the mark to U+FEFF, such as UTF-8. Under a single-byte
 charset the mark's bytes decode to three other characters, so the file is still one message, as
 before; the byte scan's match there costs only the decode. A mark inside a line, or before another
-segment, is still not a boundary. `_next_boundary` now walks the `MSH` occurrences in order and
-reads back past any marks to the line break, so splitting a batch stays linear in its length
-however its boundaries are spelled.
+segment, is still not a boundary. Each `_Boundary` is now one pattern that opens with a line
+break, which no mark holds, so `_next_boundary` stays linear in the text however its boundaries
+are spelled, after one scan for `MSH` settles a text holding none.
 
 **Not changed.** The dry run's `split_messages` splits a latin-1 view of the bytes, where a UTF-8
 mark is three characters, so it does not cut at a marked later `MSH`. It hands the file over whole,
