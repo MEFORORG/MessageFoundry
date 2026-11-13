@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Fuzz a RUNNING engine through a harness driver, pure Python (``python -m harness --fuzz``).
+"""Fuzz a RUNNING engine through the MLLP harness driver, pure Python (``python -m harness --fuzz``).
 
 The repository's top-level ``fuzz/`` package fuzzes parsers in-process under Atheris, which needs
 a native toolchain and does not run on Windows. This package is the other half: it takes the

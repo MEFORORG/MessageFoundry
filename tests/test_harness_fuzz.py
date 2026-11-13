@@ -61,10 +61,10 @@ def server(tmp_path: Path) -> Iterator[tuple[str, Endpoints]]:
         yield served
 
 
-def _first(seed: int, layer: str, *, wire: bool = True) -> Case:
+def _first(seed: int, layer: str) -> Case:
     """The first case of ``seed`` in ``layer``."""
     for i in range(500):
-        case = make_case(seed, i, wire=wire)
+        case = make_case(seed, i)
         if case.layer == layer:
             return case
     raise AssertionError(f"no {layer} case in the first 500 of seed {seed}")
@@ -93,25 +93,20 @@ def _fuzz_args(api_url: str, eps: Endpoints, out: Path, *extra: str) -> list[str
 
 
 def test_the_same_seed_gives_the_same_bytes() -> None:
-    for wire in (True, False):
-        first = [make_case(SEED, i, wire=wire) for i in range(200)]
-        assert first == [make_case(SEED, i, wire=wire) for i in range(200)]
-        # Control: the seed matters, so the equality above is not a constant generator. Same
-        # transport shape on both sides, so framing alone cannot make the two differ.
-        other = [make_case(SEED + 1, i, wire=wire).data for i in range(200)]
-        assert sum(a.data != b for a, b in zip(first, other, strict=True)) > 190
+    first = [make_case(SEED, i) for i in range(200)]
+    assert first == [make_case(SEED, i) for i in range(200)]
+    # Control: the seed matters, so the equality above is not a constant generator.
+    other = [make_case(SEED + 1, i).data for i in range(200)]
+    assert sum(a.data != b for a, b in zip(first, other, strict=True)) > 190
 
 
-def test_every_layer_fires_and_frame_edits_stay_off_a_payload_transport() -> None:
-    wire_layers = {make_case(SEED, i).layer for i in range(200)}
-    assert wire_layers == set(LAYERS)
-    payload_cases = [make_case(SEED, i, wire=False) for i in range(200)]
-    assert "frame" not in {c.layer for c in payload_cases}
-    assert {c.layer for c in payload_cases} == set(LAYERS) - {"frame"}
+def test_every_layer_fires() -> None:
+    cases = [make_case(SEED, i) for i in range(200)]
+    assert {c.layer for c in cases} == set(LAYERS)
     # A field edit goes through the model, which re-encodes a whole message: the header survives.
-    field = [c for c in payload_cases if c.layer == "field"]
+    field = [c for c in cases if c.layer == "field"]
     assert field and all(c.mutation.startswith("field.") for c in field)
-    assert all(c.data.startswith(b"MSH|") for c in field)
+    assert all(c.data.startswith(b"\x0bMSH|") for c in field)
 
 
 _SUBPROCESS_DUMP = (
@@ -233,7 +228,6 @@ class _ManglingTransport(Transport):
     def __init__(self, real: Transport, target: bytes) -> None:
         self.real = real
         self.kind = real.kind
-        self.wire = real.wire
         self.target = target
 
     def send(self, data: bytes) -> Exchange:
@@ -387,7 +381,6 @@ class _EchoTransport(Transport):
     """Answers every complete frame AA, echoing the control id it carries."""
 
     kind = "mllp"
-    wire = True
 
     def __init__(self, delay: float = 0.0) -> None:
         self.delay = delay
@@ -632,13 +625,36 @@ def test_replay_refuses_a_file_for_another_transport(tmp_path: Path) -> None:
         replay(cast(EngineClient, client), transport, [stray], config, emit=lambda _: None)
 
 
-def test_a_payload_driver_is_pluggable(tmp_path: Path) -> None:
+@pytest.mark.parametrize("kind", ["file", "http", "tcp", "x12", "dicom"])
+def test_only_the_mllp_driver_builds_a_transport(kind: str, tmp_path: Path) -> None:
+    # BACKLOG #5638, #5639: a stock driver has no inbound probe and no reply invariant of its own
+    # kind, so a campaign through one could pass with nothing checked. It is refused before any
+    # case is built or sent, and so before anything lands at the endpoint.
     eps = Endpoints({"file_in": str(tmp_path / "in")})
-    transport = build_transport("file", eps, "file_in", timeout=1.0)
-    assert (transport.kind, transport.wire) == ("file", False)
-    exchange = transport.send(make_case(SEED, 0, wire=False).data)
-    assert exchange.outcome == CLOSED
-    assert len(list((tmp_path / "in").iterdir())) == 1
+    with pytest.raises(KeyError, match="only the 'mllp' driver"):
+        build_transport(kind, eps, "file_in", timeout=1.0)
+    assert not (tmp_path / "in").exists()
+
+
+def test_a_non_mllp_driver_is_a_setup_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = main(
+        [
+            "--fuzz",
+            "--engine",
+            "http://127.0.0.1:9",
+            "--endpoint",
+            f"file_in={tmp_path / 'in'}",
+            "--fuzz-driver",
+            "file",
+            "--fuzz-endpoint",
+            "file_in",
+        ]
+    )
+    assert rc == 2
+    assert "only the 'mllp' driver" in capsys.readouterr().err
+    assert not (tmp_path / "in").exists()
 
 
 # --- CLI setup errors ----------------------------------------------------------------------------
@@ -652,8 +668,8 @@ def test_fuzz_and_scenario_are_mutually_exclusive(capsys: pytest.CaptureFixture[
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
-        (["--fuzz-driver", "carrier-pigeon", "--fuzz-endpoint", "mllp_in"], "no harness driver"),
-        (["--fuzz-driver", "file"], "name the endpoint"),
+        (["--fuzz-driver", "carrier-pigeon", "--fuzz-endpoint", "mllp_in"], "only the 'mllp'"),
+        (["--fuzz-driver", "file"], "only the 'mllp' driver"),
         (["--fuzz-endpoint", "no_such_endpoint"], "no_such_endpoint"),
         (["--fuzz-seed", "-1"], "non-negative"),
         (["--endpoint", "garbage"], "KEY=VALUE"),

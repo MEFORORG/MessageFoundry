@@ -16,8 +16,7 @@ Layers:
           oversized, delimiter-laden or non-ASCII values, extra repetitions, dropped or added
           segments, odd header values. Never raw slicing.
 ``frame`` MLLP framing edits on the wire bytes (missing start or end block, junk before the start
-          block, two frames, an end block without its CR, a frame split in two). Only a transport
-          that sends wire bytes can carry this layer.
+          block, two frames, an end block without its CR, a frame split in two).
 """
 
 from __future__ import annotations
@@ -59,10 +58,9 @@ _MAX_LONG_VALUE = 64 * 1024
 
 @dataclass(frozen=True)
 class Case:
-    """One fuzz case: ``data`` is exactly what the transport sends (the payload, or the framed wire
-    bytes for a wire transport). ``control_id`` is MSH-10 as the tolerant parser reads it from the
-    first frame the engine would decode (the payload, for a payload transport), or None when there
-    is none; it is a prediction, the ACK's MSA-2 is the truth."""
+    """One fuzz case: ``data`` is exactly what the transport sends, the framed MLLP wire bytes.
+    ``control_id`` is MSH-10 as the tolerant parser reads it from the first frame the engine would
+    decode, or None when there is none; it is a prediction, the ACK's MSA-2 is the truth."""
 
     seed: int
     iteration: int
@@ -90,9 +88,8 @@ def case_control_id(seed: int, iteration: int) -> str:
     return f"FZ{seed % 10**9:09d}{iteration:09d}"
 
 
-def make_case(seed: int, iteration: int, *, wire: bool = True) -> Case:
-    """Build case ``iteration`` of campaign ``seed``. ``wire`` says the transport sends framed MLLP
-    bytes, which both frames every payload and allows the ``frame`` layer."""
+def make_case(seed: int, iteration: int) -> Case:
+    """Build case ``iteration`` of campaign ``seed``, framed as MLLP wire bytes."""
     if seed < 0 or iteration < 0:
         raise ValueError("seed and iteration are non-negative")
     rng = random.Random(f"harness-fuzz|{seed}|{iteration}")  # nosec B311 (synthetic, seeded)
@@ -102,8 +99,7 @@ def make_case(seed: int, iteration: int, *, wire: bool = True) -> Case:
     )
     message.set("MSH-10", case_control_id(seed, iteration))
 
-    layers = [layer for layer in LAYERS if wire or layer != FRAME]
-    layer = rng.choices(layers, weights=[_WEIGHTS[layer] for layer in layers])[0]
+    layer = rng.choices(LAYERS, weights=[_WEIGHTS[layer] for layer in LAYERS])[0]
     mutation = NONE
     if layer == FIELD:
         mutation, message = _mutate_field(rng, message)
@@ -112,7 +108,7 @@ def make_case(seed: int, iteration: int, *, wire: bool = True) -> Case:
     payload = str(message).encode("utf-8")
     if layer == BYTE:
         mutation, payload = _mutate_bytes(rng, payload)
-    data = frame(payload) if wire else payload
+    data = frame(payload)
     if layer == FRAME:
         mutation, data = _mutate_frame(rng, payload)
     return Case(
@@ -122,7 +118,7 @@ def make_case(seed: int, iteration: int, *, wire: bool = True) -> Case:
         layer=layer,
         mutation=mutation,
         data=data,
-        control_id=_first_control_id(data) if wire else control_id_of(payload),
+        control_id=_first_control_id(data),
     )
 
 
