@@ -2894,6 +2894,25 @@ class ShardCertEngineReport:
         return "\n".join(lines)
 
 
+def _count_balance(acked: int, delivering: int, sink_received: int, *, killed: bool) -> bool:
+    """The two-box tiers' sink count balance: the sink's socket-observed copies against the
+    accept-ACK'd intake fanned out (``acked * delivering``). Equal on a no-kill run; at least that
+    across a kill, where at-least-once may re-deliver. A fan-out below 1 balances nothing, so it
+    fails."""
+    if delivering < 1:
+        return False
+    expected = acked * delivering
+    return sink_received >= expected if killed else sink_received == expected
+
+
+def _balance_word(ok: bool, sink_received: int, expected: int) -> str:
+    """``OK``, or which way the balance missed: a SURPLUS is a duplicate or a late, uncounted ACK,
+    not a lost copy."""
+    if ok:
+        return "OK"
+    return "SURPLUS" if sink_received > expected else "LOSS"
+
+
 @dataclass
 class ShardCertDriverReport:
     """The DRIVER half's outcome — the sink/tracker-derived verdict signals (identical to the co-located
@@ -2932,12 +2951,9 @@ class ShardCertDriverReport:
         ``acked_not_delivered`` alone cannot see this loss: the tracker counts DISTINCT messages, so
         one copy of each reaching the sink clears it while the other ``delivering - 1`` copies are
         lost (BACKLOG #5640)."""
-        if self.delivering < 1:
-            return False
-        expected = self.acked * self.delivering
-        if self.killed_shard is None:
-            return self.sink_received == expected
-        return self.sink_received >= expected
+        return _count_balance(
+            self.acked, self.delivering, self.sink_received, killed=self.killed_shard is not None
+        )
 
     @property
     def ok(self) -> bool:
@@ -2967,7 +2983,7 @@ class ShardCertDriverReport:
             f"  routing={self.routing} fanout(delivering)={self.delivering}  "
             f"S={self.sink_received} (expect A*delivering={self.acked * self.delivering}"
             f"{'' if self.killed_shard is None else ' or more, across the kill'}) -> "
-            f"{'OK' if self.count_balance_ok else 'LOSS'}",
+            f"{_balance_word(self.count_balance_ok, self.sink_received, self.acked * self.delivering)}",
             f"  acked_not_delivered={self.acked_not_delivered} (0 = no acknowledged loss)",
             f"  lane_inversions={self.lane_inversions} lanes_observed={self.lanes_observed} "
             f"lane_repeats(dups)={self.lane_repeats}",
@@ -3368,11 +3384,18 @@ def _remote_engine_poller(
 
     By default the poll is https, signed in as the rig Administrator the engine box provisioned
     (:data:`~harness.load.rigadmin.REMOTE_RIG_SESSION`, which refuses before any sign-in unless the
-    environment holds that credential), and verified against ``cacert`` -- the engine box's
-    certificate PEM, shipped to this box -- or this box's default trust when ``cacert`` is None. A
-    stock engine serves TLS (ADR 0172) with sign-in on, so a plaintext, credential-free poll there
-    could only fail (BACKLOG #5640, #5977). ``EnginePoller._cacert_for`` still declines to pin a
-    non-loopback URL to this run's own anchor, because the engine box is not this run's.
+    environment holds that credential), and verified against ``cacert``. A stock engine serves TLS
+    (ADR 0172) with sign-in on, so a plaintext, credential-free poll there could only fail
+    (BACKLOG #5640, #5977).
+
+    The certificate is the rig's to provision. The engine box's harness serves the pair named by
+    ``MEFOR_HARNESS_TLS_CERT_FILE`` / ``MEFOR_HARNESS_TLS_KEY_FILE`` (:mod:`harness.load.tlsmat`),
+    and the pair it mints when those are unset names only loopback, so it cannot verify
+    ``engine_host``. So the engine box exports a pair whose names cover ``engine_host``, and this
+    box passes that certificate (or its issuer) as ``cacert``. When ``cacert`` is None, a
+    non-loopback ``engine_host`` is verified against this box's default trust, and a loopback one
+    against this process's own anchor (``EnginePoller._cacert_for``), which matches the engine
+    half's only when both shells export the same pair.
 
     ``allow_insecure`` keeps the old posture for an engine box that serves plain http: http, and
     no credential, since the client refuses to put one on a cleartext hop to another box."""
@@ -3465,14 +3488,22 @@ async def run_shardcert_driver(
     # The FAN-OUT is the count balance's multiplier, so it comes from the engine box's own post and
     # NEVER from `dests` (a partitioned run delivers 1 copy whatever its destination count). Only an
     # engine half that predates the key falls back, to 1, and says so: at a real fan-out above 1 a
-    # no-kill run then fails the strict balance rather than passing on a guess.
+    # no-kill run then fails the strict balance rather than passing on a guess. A kill run's balance
+    # is only a lower bound, which a guessed 1 would turn into no check at all, so there the
+    # fallback is 0, which fails the balance outright.
     if "delivering" in ready:
         delivering = int(ready["delivering"])
-    else:
+    elif killed is None:
         delivering = 1
         notes.append(
             "SHARDS_READY carried no `delivering` (an older engine half): the count balance assumes "
-            "fan-out 1, so a no-kill run at a real fan-out above 1 reads LOSS"
+            "fan-out 1, so a no-kill run at a real fan-out above 1 reads SURPLUS"
+        )
+    else:
+        delivering = 0
+        notes.append(
+            "SHARDS_READY carried no `delivering` (an older engine half): a kill run's count balance "
+            "cannot be checked without the fan-out, so it FAILS"
         )
     if "routing" in ready:
         routing = str(ready["routing"])
@@ -4204,8 +4235,11 @@ class ShardCertDriveReport:
         on). The strand / dead-at-any-stage authority is the ENGINE half's report, which reads the store
         DIRECTLY (store-truth) and owns that verdict; the sinks are the DRIVE box's only reliable truth.
         The poller terms remain as ADVISORY cross-check fields (see ``render``/``to_json_dict``)."""
-        fanout = self.acked * self.delivering
-        return self.sink_received == fanout and self.acked > 0 and self.sink_received > 0
+        return (
+            _count_balance(self.acked, self.delivering, self.sink_received, killed=False)
+            and self.acked > 0
+            and self.sink_received > 0
+        )
 
     @property
     def ok(self) -> bool:

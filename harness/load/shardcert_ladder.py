@@ -87,6 +87,7 @@ from harness.load.shardcert import (
     FIDELITY_SENT_FLOOR,
     INBOUND_BAND_CHECK_BASIS,
     PRODUCT_STORE_POOL_SIZE,
+    RemoteEngineSignInError,
     RungFidelity,
     ShardCertDriveReport,
     ShardCertEngineReport,
@@ -3477,6 +3478,7 @@ async def run_drive_ladder(
     sink_host: str,
     base_coord: FileDropCoord,
     allow_insecure: bool = False,
+    cacert: str | None = None,
     # NB: the DEFAULT is a real 300s soak — the "off" switch is ``do_soak=False`` (CLI ``--no-soak``), NOT a
     # dropped/zero ``soak_hold_seconds`` (0 arms a degenerate 0s soak, it does not skip).
     soak_hold_seconds: float = 300.0,
@@ -3537,11 +3539,12 @@ async def run_drive_ladder(
                 coord=rung_coord,
                 drain_timeout=rung.drain_timeout,
                 allow_insecure=allow_insecure,
+                cacert=cacert,
                 shards_ready_timeout=shards_ready_timeout,
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
             )
-        except CoordTimeout as exc:
+        except (CoordTimeout, RemoteEngineSignInError) as exc:
             # The engine half never handed off this rung within the window (dead / desynced) — a two-box
             # RENDEZVOUS failure, NOT a bench result. Post LADDER_STOP so the engine stops climbing
             # IMMEDIATELY on its next pre-arm check instead of hanging on the next rung's DRIVE_START, and
@@ -3635,6 +3638,7 @@ async def run_drive_ladder(
                 coord=soak_coord,
                 drain_timeout=soak_drain_timeout,
                 allow_insecure=allow_insecure,
+                cacert=cacert,
                 shards_ready_timeout=shards_ready_timeout,
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
@@ -3652,7 +3656,7 @@ async def run_drive_ladder(
                 soak_coord, timeout_seen=engine_rung_report_timeout
             )
             soak_outcome = build_rung_outcome(soak_rung, drive, gate, report_msg)
-        except CoordTimeout as exc:
+        except (CoordTimeout, RemoteEngineSignInError) as exc:
             # A soak rendezvous failure does NOT set climb_aborted (the CLIMB already pinned the ceiling), but
             # it IS a setup degradation: the soak never produced a measurement, so it must read as ABORTED
             # (exit 2), never a clean PASS with soak=null (B2). Also tell the ENGINE on the RUNG coord so its

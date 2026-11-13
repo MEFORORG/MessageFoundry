@@ -133,9 +133,10 @@ _INSECURE_HINT = (
 #: Printed beside a two-box drive's sign-in refusal. The drive signs in to engines another process
 #: provisioned, so the credential must be supplied (`harness.load.rigadmin.REMOTE_RIG_SESSION`).
 _SIGN_IN_HINT = (
-    "(hint: set MEFOR_RIG_ADMIN_USERNAME and MEFOR_RIG_ADMIN_PASSWORD to the engine box's rig "
-    "credential, and pass --cacert with the engine box's certificate PEM unless this box already "
-    "trusts it.)"
+    "(hint: set MEFOR_RIG_ADMIN_USERNAME and MEFOR_RIG_ADMIN_PASSWORD to the same values on both "
+    "boxes before the engine half starts; unset, the engine half draws a password nobody can read. "
+    "The engine box must serve a certificate whose names cover --engine-host "
+    "(MEFOR_HARNESS_TLS_CERT_FILE / MEFOR_HARNESS_TLS_KEY_FILE there), passed here as --cacert.)"
 )
 
 
@@ -1257,14 +1258,15 @@ def _add_two_box_cacert_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--cacert",
         default=None,
-        help="the engine box's API certificate PEM, which verifies the https /stats poll (default: "
-        "this box's trust store). The engine box is not one this process started, so this run's own "
-        "certificate cannot verify it. Not with --insecure",
+        help="the certificate PEM (or its issuer) that verifies the engine box's https /stats poll. "
+        "The engine box must serve a pair whose names cover --engine-host: export "
+        "MEFOR_HARNESS_TLS_CERT_FILE / MEFOR_HARNESS_TLS_KEY_FILE there, because the pair it mints "
+        "otherwise names only loopback. Default: this box's trust store. Not with --insecure",
     )
 
 
 def _reject_cacert_with_insecure(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.insecure and args.cacert:
+    if args.insecure and args.cacert is not None:
         parser.error("--cacert and --insecure do not combine: --insecure polls plaintext http")
 
 
@@ -2157,12 +2159,14 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         "raised drain window cannot silently outgrow it, as the old fixed 300s did). Missing the gate is a "
         "false NEGATIVE (an early sink tally can render FROZEN_TAIL), never a fabricated collapse",
     )
+    _add_two_box_cacert_arg(parser)
     _add_coord_args(parser)
     parser.add_argument("--report-json", help="write the consolidated JSON report to this path")
     args = parser.parse_args(argv)
+    _reject_cacert_with_insecure(parser, args)
 
     from harness.load.coord import CoordTimeout, FileDropCoord
-    from harness.load.shardcert import RemoteEngineSignInError, parse_rate_ladder
+    from harness.load.shardcert import parse_rate_ladder
     from harness.load.shardcert_ladder import run_drive_ladder
     from messagefoundry.apiclient import ApiError
 
@@ -2194,6 +2198,7 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
                 sink_host=args.sink_host,
                 base_coord=coord,
                 allow_insecure=args.insecure,
+                cacert=args.cacert,
                 soak_hold_seconds=args.soak_hold_seconds,
                 soak_drain_timeout=soak_drain_timeout,
                 soak_rate_override=args.soak_rate,
@@ -2204,9 +2209,6 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         )
     except ValueError as exc:  # a mis-sized fleet / bad ladder — fail loud, setup error
         print(f"shardcert-drive-ladder: {exc}", file=sys.stderr)
-        return 2
-    except RemoteEngineSignInError as exc:  # a rung's drive could not sign in to the engine box
-        print(f"shardcert-drive-ladder: {_exc_text(exc)}\n{_SIGN_IN_HINT}", file=sys.stderr)
         return 2
     except ApiError as exc:  # plaintext http to a remote engine without --insecure
         print(

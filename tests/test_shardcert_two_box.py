@@ -563,8 +563,10 @@ def test_driver_verdict_refuses_a_broadcast_run_that_lost_outbound_copies() -> N
     assert not one_copy_each.ok
     assert not _driver_report(sink_received=39).ok
     # No kill: strict. A copy more than the fan-out is a duplicate the run must not certify.
-    assert not _driver_report(sink_received=41).ok
-    assert "expect A*delivering=40" in one_copy_each.render()
+    surplus = _driver_report(sink_received=41)
+    assert not surplus.ok
+    assert "expect A*delivering=40) -> LOSS" in one_copy_each.render()
+    assert "-> SURPLUS" in surplus.render()
 
 
 def test_driver_verdict_on_a_kill_run_allows_redelivery_but_not_loss() -> None:
@@ -631,6 +633,57 @@ async def test_driver_defaults_an_older_payload_to_fanout_one_with_a_note(
     assert report.delivering == 1
     assert report.routing == BROADCAST
     assert any("older engine half" in n for n in report.notes), report.notes
+
+
+async def test_driver_kill_run_without_the_fanout_fails_the_balance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A kill run's balance is a lower bound, so a guessed fan-out of 1 would pass a run that lost
+    three of every four copies. Without the key it fails instead, and says why."""
+    _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id="oldkill")
+    _post_ready(coord, killed="a", drop=("delivering", "routing", "handlers", "dests"))
+    report = await sc.run_shardcert_driver(
+        engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
+    )
+    assert report.delivering == 0
+    assert not report.count_balance_ok
+    assert any("cannot be checked" in n for n in report.notes), report.notes
+    # The same report with a real fan-out and every copy delivered would balance.
+    assert _driver_report(killed_shard="a", lane_repeats=0).ok
+
+
+async def test_drive_ladder_threads_cacert_and_aborts_on_a_sign_in_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rung whose drive cannot sign in is a setup abort, as a rendezvous failure is: the engine
+    box is told to stop, and the report survives with exit code 2 rather than being lost."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import LADDER_STOP
+
+    seen: list[dict[str, Any]] = []
+
+    async def refusing_drive(**kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise sc.RemoteEngineSignInError("could not sign in to the engine box's API: refused")
+
+    monkeypatch.setattr(ladder, "run_shardcert_drive", refusing_drive)
+    coord = FileDropCoord(tmp_path, run_id="lad")
+    report = await ladder.run_drive_ladder(
+        engine_host="10.0.0.5",
+        rates=[10.0, 20.0],
+        hold_seconds=0.05,
+        drain_timeout=1.0,
+        driver_count=1,
+        sink_count=1,
+        sink_host="127.0.0.1",
+        base_coord=coord,
+        cacert="engine-box.pem",
+        do_soak=False,
+    )
+    assert [kw["cacert"] for kw in seen] == ["engine-box.pem"]
+    assert report.exit_code == 2
+    assert coord.read(LADDER_STOP) is not None
 
 
 # --- BACKLOG #5640 / #5977 (https and session half): the two-box drain poll ------------------------
