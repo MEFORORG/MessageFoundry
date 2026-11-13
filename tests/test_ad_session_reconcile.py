@@ -7498,7 +7498,7 @@ async def test_the_rowless_revoke_retry_shares_one_deferred_seal_report_scope(
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_disabled"
         )
-        ended = await service._revoke_with_row(revocation, maps_held=True)
+        ended = await service._revoke_with_row(revocation, maps_held=True, not_attempted=0)
         assert ended.retried
         assert len(carries) == 2
         assert carries[0] is not None and carries[0] is carries[1], (

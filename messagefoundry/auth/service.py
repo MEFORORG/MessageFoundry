@@ -10316,7 +10316,6 @@ class AuthService:
             client=client,
         )
         refused: Exception | None = None
-        seal_refused = False
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
             # row running at once only one writes.
@@ -10333,11 +10332,25 @@ class AuthService:
             written = False
         except RowSealError as exc:
             # The row verified at the pre-read above, then failed its seal at the write, so the
-            # store's write helper refused it and wrote nothing (vault BACKLOG #3069 note T2).
-            # Handled with a refused row, below.
-            refused = exc
-            seal_refused = True
-            written = False
+            # store's write helper refused it and wrote nothing (vault BACKLOG #3069 note T2). A
+            # sign-in raises it. The reconciler takes the rule the refused row below takes: a raise
+            # would cost the pass what it costs there, so it logs, pages and goes on. It is
+            # reported as the loader reports a failing record, too, since the pre-read verified it
+            # and so reported nothing.
+            if not audit_soft:
+                raise
+            _log.error(
+                "directory reconcile: account %s (%s, renaming to %s) failed its integrity check "
+                "at the rename's write, so nothing was written and nobody was told; the pass goes "
+                "on (vault BACKLOG #3069)",
+                user_id,
+                scrub_log_argument(before.username),
+                scrub_log_argument(new_username),
+                exc_info=exc,
+            )
+            await self._user_seal_failed(user_id)
+            self._note_refused_reconciler_row("auth.ad_username_refreshed")
+            return
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
             # (see this method's docstring and the measured note in `store/postgres.py`).
@@ -10403,11 +10416,6 @@ class AuthService:
             # the engine would apply it on a pass or sign-in that reaches the rename and is not
             # refused, with its row and its notice. A defect still raises. The sort is
             # ``write_audit_soft``'s, called with the same sets ``_audit_reconciler_row`` passes.
-            #
-            # A row that failed its seal at the write (``seal_refused``) takes the same rule (vault
-            # BACKLOG #3069 note T2): nothing was written, so a raise would cost the pass what it
-            # costs above. It is reported as the loader reports a failing record, too, since the
-            # pre-read verified it and so reported nothing.
             if not audit_soft:
                 raise refused
             cause = refused
@@ -10418,11 +10426,7 @@ class AuthService:
             await write_audit_soft(
                 _refused,
                 log=_log,
-                message="directory reconcile: account %s (%s, renaming to %s) failed its "
-                "integrity check at the rename's write, so nothing was written and nobody was "
-                "told; the pass goes on (vault BACKLOG #3069)"
-                if seal_refused
-                else "directory reconcile: the auth.ad_username_refreshed audit row for account "
+                message="directory reconcile: the auth.ad_username_refreshed audit row for account "
                 "%s (%s, renaming to %s) could not be written, so its rename was rolled back and "
                 "nobody was told; the engine would apply it on a pass or sign-in that reaches the "
                 "rename and is not refused (BACKLOG #3018)",
@@ -10431,11 +10435,9 @@ class AuthService:
                     scrub_log_argument(before.username),
                     scrub_log_argument(new_username),
                 ),
-                errors=(RowSealError,) if seal_refused else audit_write_errors(),
+                errors=audit_write_errors(),
                 defects=AUDIT_WRITE_DEFECTS,
             )
-            if seal_refused:
-                await self._user_seal_failed(user_id)
             # BACKLOG #3018 step 2: the refused row pages, as the pass's other refused rows do.
             self._note_refused_reconciler_row("auth.ad_username_refreshed")
             return
@@ -11126,7 +11128,7 @@ class AuthService:
         return _RowWrite(result, True, retried=True, held=held, refused=None)
 
     async def _revoke_with_row(
-        self, revocation: reconcile.SessionRevocation, *, maps_held: bool, not_attempted: int = 0
+        self, revocation: reconcile.SessionRevocation, *, maps_held: bool, not_attempted: int
     ) -> _RowWrite[int]:
         """End the account's sessions with their ``auth.ad_session_revoked`` row, through
         :meth:`_write_with_row`; ``result`` is how many ended. The row commits in the revoke's own
@@ -11202,8 +11204,7 @@ class AuthService:
                     change=f"ad_reconcile_{revocation.reason}",
                     actor=revocation.username,
                     not_attempted=not_attempted,
-                    attempts_made=1,
-                    started_at=started_at,
+                    first_attempt_at=started_at,
                 )
             return ended.count
 
@@ -12005,17 +12006,15 @@ class AuthService:
         actor: str | None = None,
         client: str | None = None,
         not_attempted: int = 0,
-        attempts_made: int = 0,
-        started_at: float | None = None,
+        first_attempt_at: float | None = None,
     ) -> RevokeResult:
         """Revoke every session of ``user_id`` after a ``change`` that has already committed, such
         as a password change, a disable or a role change (vault BACKLOG #3023).
 
-        ``attempts_made`` and ``started_at`` are for a caller that already made the first attempt
-        itself, with its audit row (:meth:`_revoke_with_row`): that attempt counts toward
-        :data:`_POST_COMMIT_REVOKE_ATTEMPTS`, and the budget runs from ``started_at``, the event
-        loop's clock when it began. The call's own first attempt runs whatever those say, as a
-        first attempt does.
+        ``first_attempt_at`` is for a caller that made the first attempt itself, with its audit row
+        (:meth:`_revoke_with_row`): the event loop's clock when that attempt began. It counts
+        toward :data:`_POST_COMMIT_REVOKE_ATTEMPTS`, and the budget runs from it. This call's own
+        attempt always runs, as a first attempt does.
 
         Nothing undoes the change if this fails, so a store refusal (``_session_write_errors``) is
         run again while :data:`_POST_COMMIT_REVOKE_ATTEMPTS` and
@@ -12029,10 +12028,10 @@ class AuthService:
         and skips the retry and the row, as in :meth:`_rotate_session_hash` (vault BACKLOG
         #3802)."""
         loop = asyncio.get_running_loop()
-        give_up_at = (
-            loop.time() if started_at is None else started_at
-        ) + _POST_COMMIT_REVOKE_BUDGET_SECONDS
-        attempt = attempts_made
+        if first_attempt_at is None:
+            give_up_at, attempt = loop.time() + _POST_COMMIT_REVOKE_BUDGET_SECONDS, 0
+        else:
+            give_up_at, attempt = first_attempt_at + _POST_COMMIT_REVOKE_BUDGET_SECONDS, 1
         # A seal refusal the committing attempt met is reported once, by it; one only failed
         # attempts met is reported by each of them (decision d20261110T063908944-857965, item 4).
         async with deferred_revoke_reports():

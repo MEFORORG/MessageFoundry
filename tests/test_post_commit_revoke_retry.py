@@ -28,13 +28,13 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth import service as service_module
-from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import SESSIONS_REVOKE_FAILED_ACTION, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.store import MessageStore
+from tests.test_ad_session_reconcile import _ad_settings, _principal
 
 _PASSWORD = "Str0ng-Synthetic-Pass!!"
 _NEW_PASSWORD = "An0ther-Synthetic-Pass!!"
@@ -44,6 +44,8 @@ Caller = Callable[[AuthService, MessageStore, Any], Awaitable[None]]
 #: The account a caller changes: it builds the service, and returns it with the account's login
 #: identity, where the caller needs one, and the hashes of its two live sessions.
 Account = Callable[[MessageStore], Awaitable[tuple[AuthService, Any, list[str]]]]
+#: A batch change under test, ready to run, with the hashes of every session it should end.
+Change = tuple[Callable[[], Awaitable[None]], list[str]]
 
 
 async def _change_password(service: AuthService, _store: MessageStore, identity: Any) -> None:
@@ -116,43 +118,18 @@ async def _roleless_account(store: MessageStore) -> tuple[AuthService, Any, list
     repairs."""
     service = AuthService(store, AuthSettings(require_mfa=False))
     await service.initialize()  # seeds the Administrator role the grant writes
-    await store.create_user(
-        user_id="u1",
-        username="bob",
-        auth_provider="local",
-        email="bob@example.org",
-        password_hash=hash_password(_PASSWORD),
-        password_generated=False,
-        audits=(),
-    )
+    await _create_u1(store)
     return service, None, await _sessions(store, "u1")
 
 
 _GROUP = "cn=mf-ops,dc=x"
-_PRINCIPAL = AdPrincipal(
-    username="bob",
-    display_name=None,
-    email="bob@example.org",
-    dn="CN=bob,DC=x",
-    groups=frozenset({_GROUP}),
-    directory_object_id="0b6c2a52-3f1e-5a8d-9b7c-1d2e3f4a5b6c",
-)
+_PRINCIPAL = _principal("bob", _GROUP)
 
 
 async def _directory_account(store: MessageStore) -> tuple[AuthService, Any, list[str]]:
     """Directory account u1, holding viewer, with two live sessions, and a role map that maps its
     group to operator, written through the store so the setup ends no session."""
-    service = AuthService(
-        store,
-        AuthSettings(
-            require_mfa=False,
-            ad_enabled=True,
-            ad_server="ldaps://x",
-            ad_user_search_base="DC=x",
-            ad_bind_dn="CN=svc,DC=x",
-            ad_bind_password="x",
-        ),
-    )
+    service = AuthService(store, _ad_settings(require_mfa=False))
     await service.initialize()
     await _directory_user(store, "u1", "bob", _PRINCIPAL.directory_object_id)
     await store.set_user_roles("u1", ["viewer"], assigned_by="test", audits=())
@@ -236,10 +213,8 @@ CALLERS = [
 ]
 
 
-async def _local_account(store: MessageStore, service: AuthService) -> tuple[Any, list[str]]:
-    """Account u1 with two live sessions; returns its identity and both session hashes."""
-    for role in ("viewer", "operator"):
-        await store.upsert_role(role_id=role, display_name=role)
+async def _create_u1(store: MessageStore) -> None:
+    """Local account u1, named bob, holding no role."""
     await store.create_user(
         user_id="u1",
         username="bob",
@@ -249,6 +224,13 @@ async def _local_account(store: MessageStore, service: AuthService) -> tuple[Any
         password_generated=False,
         audits=(),
     )
+
+
+async def _local_account(store: MessageStore, service: AuthService) -> tuple[Any, list[str]]:
+    """Account u1 with two live sessions; returns its identity and both session hashes."""
+    for role in ("viewer", "operator"):
+        await store.upsert_role(role_id=role, display_name=role)
+    await _create_u1(store)
     await store.set_user_roles("u1", ["viewer"], assigned_by="test", audits=())
     hashes: list[str] = []
     identity: Any = None
@@ -448,9 +430,7 @@ def _refusing_for(store: MessageStore, refused_id: str) -> None:
     store.revoke_user_sessions = revoke  # type: ignore[method-assign]
 
 
-async def _custom_role_batch(
-    store: MessageStore,
-) -> tuple[Callable[[], Awaitable[None]], list[str]]:
+async def _custom_role_batch(store: MessageStore) -> Change:
     """A custom-role edit by alice over holders h1 and h2."""
     service = AuthService(store, AuthSettings(require_mfa=False))
     role_id, sessions = await _two_holders_of_a_custom_role(store, service)
@@ -467,9 +447,7 @@ async def _custom_role_batch(
     return edit, list(sessions.values())
 
 
-async def _ad_role_map_batch(
-    store: MessageStore,
-) -> tuple[Callable[[], Awaitable[None]], list[str]]:
+async def _ad_role_map_batch(store: MessageStore) -> Change:
     """An AD role-map save by alice over directory accounts h1 and h2."""
     service = AuthService(store, AuthSettings(require_mfa=False))
     await service.initialize()  # seeds the role the map names
@@ -492,7 +470,7 @@ async def _ad_role_map_batch(
     ],
 )
 async def test_a_batch_stops_at_the_account_given_up_on_and_counts_the_rest(
-    batch: Callable[[MessageStore], Awaitable[tuple[Callable[[], Awaitable[None]], list[str]]]],
+    batch: Callable[[MessageStore], Awaitable[Change]],
 ) -> None:
     """A custom-role edit or an AD role-map save revokes each account in turn. The first account's
     revoke refused every time is recorded and raised at once, so a failing store costs one
