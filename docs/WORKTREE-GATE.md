@@ -127,14 +127,12 @@ for the checkouts named in its allowlist:
    A governed checkout whose `remove.ps1` predates `-Path` gets a line saying so. A `move` gets
    its own text: there is no checked route for a move.
 
-**Rule 3d judges at least every `git worktree remove` or `move` it can find on the line.** At least
-these are still not judged: one inside a quoted span, one with no git token before it, and one whose
-git token the gate does not recognise. Its victim is resolved against the line's first `-C`, and also against that invocation's
-own `-C` tokens where they can be read: a chdir before the invocation that the hook cannot follow, with
-no absolute `-C` of the invocation's own, leaves only the first reading, so at least there another
-command's `-C` can still decide where the victim is. Until BACKLOG #5643 only the first match on the
-raw line was judged, so a quoted mention before the real command, or a second command, let a governed
-worktree be removed.
+**Rule 3d judges more of the `git worktree remove` and `move` invocations on a line.** Until BACKLOG
+#5643 only the first match on the raw line was judged, so a quoted mention before the real command, or
+a second command, let a governed worktree be removed. Each further invocation it finds is now judged too,
+with its victim resolved against the line's first `-C` and, where the gate can read them, against that
+invocation's own `-C` tokens. At least some invocations are still not judged, and in some only the
+first `-C` is used; the residual list beside rule 3d in the hook names them and is the source of record.
 
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.

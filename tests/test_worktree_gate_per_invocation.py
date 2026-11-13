@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Rule 3d of the worktree gate judges every ``git worktree remove`` or ``move`` on a line.
+"""Rule 3d of the worktree gate judges more of the ``git worktree remove`` and ``move`` invocations on a line.
 
 BACKLOG #5643: rule 3d sliced the raw line at its FIRST ``worktree remove|move`` and judged one
 invocation, resolving a relative victim from the line's first ``-C``, so a quoted mention, a second
@@ -12,7 +12,9 @@ so a gate that denied everything could not pass.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +22,11 @@ import pytest
 
 from tests.test_worktree_gate import assert_denied, run_gate
 from tests.test_worktree_gate_hijack import _make_repo, shell
+
+pytestmark = pytest.mark.skipif(
+    shutil.which("pwsh") is None or shutil.which("git") is None,
+    reason="needs pwsh (PowerShell 7) and git on PATH",
+)
 
 
 @pytest.fixture
@@ -140,3 +147,68 @@ def test_a_remove_with_a_separator_class_character_before_it_is_judged(
     """Measured ALLOW before: the added reading skipped any `[;&|(){}]` between git and `worktree`."""
     cmd = f"echo 'git worktree remove x' ; git {between} worktree remove {rig.wt2.as_posix()}"
     assert "worktree remove" in _reason(rig, cmd, rig.outside)
+
+
+# ------------------------------------------------------------------ review round 8d822d77
+
+
+def _rel(rig: SimpleNamespace) -> dict[str, str]:
+    return {"o2": rig.outside2.as_posix(), "tmp": rig.tmp.as_posix()}
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "echo 'git -C {o2} worktree remove x' ; git 2>&1 worktree remove ../Primary-wt2",
+        "git -C {o2} status ; git -C {tmp} 2>&1 worktree remove Primary-wt2",
+        "git -C {o2} status ; git 2>&1 worktree remove ../Primary-wt2",
+        "git -C {o2} status ; git -c x.y=$(echo z) worktree remove ../Primary-wt2",
+        "git -C {o2} status ; git 2>&1 worktree move ../Primary-wt2 ../moved",
+    ],
+)
+def test_a_relative_victim_behind_an_in_invocation_character_is_judged(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """Measured ALLOW before: the own base was dropped, and the first base was another command's."""
+    reason = _reason(rig, template.format(**_rel(rig)), rig.outside)
+    assert "worktree" in reason, reason
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "git -C {o2} status ; git 2>&1 worktree remove ../nope",
+        "git -C {o2} status ; git 2>&1 worktree move ../nope ../moved",
+    ],
+)
+def test_a_relative_ungoverned_victim_behind_one_is_still_allowed(
+    rig: SimpleNamespace, template: str
+) -> None:
+    assert _allowed(rig, template.format(**_rel(rig)), rig.outside)
+
+
+def test_an_echoed_worktree_remove_after_a_git_command_is_not_judged(rig: SimpleNamespace) -> None:
+    """ALLOW on c4d0d4d06f, a false DENY on 3c60a7985a: `echo` removes nothing."""
+    cmd = (
+        f"git worktree remove {rig.outside.as_posix()}/nope ; "
+        f"echo worktree remove {rig.wt2.as_posix()}"
+    )
+    assert _allowed(rig, cmd, rig.tmp)
+
+
+def test_a_powershell_script_block_opening_on_git_is_judged(rig: SimpleNamespace) -> None:
+    """`{` was not in the git-token prefix class, so no rule saw the removal. The space before the
+    closing brace is load-bearing: a `}` touching the victim is still read as part of it (a stated
+    residual, like `$(...)`)."""
+    reason = _reason_tool(rig, f"& {{git worktree remove {rig.wt2.as_posix()} }}", rig.tmp)
+    assert "worktree remove" in reason, reason
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="git.exe answers to `Git` on Windows only")
+def test_an_upper_case_git_is_judged_on_windows(rig: SimpleNamespace) -> None:
+    reason = _reason(rig, f"Git worktree remove {rig.wt2.as_posix()}", rig.tmp)
+    assert "worktree remove" in reason, reason
+
+
+def _reason_tool(rig: SimpleNamespace, command: str, cwd: Path) -> str:
+    return assert_denied(run_gate(shell(command, cwd, tool="PowerShell"), rig.repos))
