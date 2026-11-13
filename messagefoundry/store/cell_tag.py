@@ -243,8 +243,10 @@ class UnmarkedCellError(CellTagError):
     It counts as drift, so it writes the tag-failed audit row and is contained as drift is: a list
     withholds the row, a handoff dead-letters it. Its alert is the cipher's own unmarked-value
     refusal, already raised when the cipher refused it, so :func:`open_tagged_cell` raises no
-    second, ``integrity_drift``, alert for it. The cipher's WARNING names only the cell, so this
-    one is still logged, once per interval, naming the row."""
+    second, ``integrity_drift``, alert for it. Its WARNING and its audit row are written once per
+    cell column per interval, not once per row, naming the first row met in that interval: a
+    keyless run can leave one in every row it wrote, so later rows of the same column in the
+    interval are contained but not reported one by one."""
 
     cipher_alerted = True
 
@@ -264,13 +266,24 @@ def _tag_failure_kind(cipher: Cipher, stored: str, exc: CipherError) -> type[Cel
         return UnmarkedCellError
     if not is_tag_failure(cipher, stored):
         return None
-    # Only a tag that failed under every held key can mean the cell was sealed elsewhere. A cipher
-    # that cannot name its keys (Vault Transit) still says when the value's own tag failed: its
-    # UnauthenticatedCipherError is Transit's AEAD refusal. Its other errors are not told apart by
-    # class, a corrupt row among them, so they keep their own error.
-    if isinstance(exc, UnauthenticatedCipherError):
+    if callable(getattr(cipher, "holds_key_for", None)):
+        # Only a tag that failed under every held key can mean the cell was sealed elsewhere.
+        return CellTagError if isinstance(exc, UnauthenticatedCipherError) else CorruptCellError
+    # A cipher that cannot name its keys says when the value's own tag failed only when it
+    # declares that it does (Vault Transit, whose UnauthenticatedCipherError is Transit's AEAD
+    # refusal). A wrapper that just forgot holds_key_for may raise it for a key that is not
+    # supplied, so its error stays its own. Other errors are not told apart by class, a corrupt
+    # row among them, so they keep their own error too.
+    if isinstance(exc, UnauthenticatedCipherError) and _declares_tag_refusals(cipher):
         return CellTagError
-    return CorruptCellError if callable(getattr(cipher, "holds_key_for", None)) else None
+    return None
+
+
+def _declares_tag_refusals(cipher: object) -> bool:
+    """Whether ``cipher``, which cannot name its keys, declares that its
+    :class:`~messagefoundry.store.crypto.UnauthenticatedCipherError` is the value's own tag
+    failing, never a key it does not hold (``names_no_keys``, set by the Vault Transit cipher)."""
+    return getattr(cipher, "names_no_keys", False) is True
 
 
 def open_tagged_cell(
@@ -383,7 +396,10 @@ _reported_lock = threading.Lock()
 
 def _memo_key(err: CellTagError) -> _Key:
     # By class, not only by drift: a corrupt or unmarked read never mutes a moved cell (BACKLOG #5650).
-    return (err.table, err.column, err.row_ref, type(err))
+    # An unmarked value is reported per cell column, not per row: a keyless run can leave one in
+    # every row it wrote, and a list over them would otherwise log and audit each (BACKLOG #5650).
+    row = "" if isinstance(err, UnmarkedCellError) else err.row_ref
+    return (err.table, err.column, row, type(err))
 
 
 def _is_recent(memo: _Memo, key: _Key, now: float) -> bool:

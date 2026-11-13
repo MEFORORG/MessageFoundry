@@ -51,6 +51,8 @@ import base64
 import contextlib
 import logging
 import os
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -311,8 +313,36 @@ def _names_aead_failure(exc: Exception) -> bool:
     key-version refusal or a malformed ciphertext among them, and any other status, is False."""
     if not is_vault_bad_request(exc):
         return False
-    errors, _oversize = _reply_errors(exc)
+    errors, oversize = _reply_errors(exc)
+    if oversize is not None:
+        _log_unread_decrypt_body(oversize)
+        return False
     return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
+
+
+#: How long a decrypt 400 whose body went unread is logged once per process (BACKLOG #5650).
+_UNREAD_BODY_LOG_INTERVAL_S = 3600.0
+_unread_body_logged_at: float | None = None
+_unread_body_lock = threading.Lock()
+
+
+def _log_unread_decrypt_body(length: int) -> None:
+    """Log, once per :data:`_UNREAD_BODY_LOG_INTERVAL_S`, that a data-key decrypt 400 was not read
+    for its AEAD reason because its body is past :data:`_REPARSED_BODY_MAX_CHARS`, so the refusal
+    stays the cipher's plain error. A proxy can cause it on every read; once is the signal."""
+    global _unread_body_logged_at
+    now = time.monotonic()
+    with _unread_body_lock:
+        last = _unread_body_logged_at
+        if last is not None and now - last < _UNREAD_BODY_LOG_INTERVAL_S:
+            return
+        _unread_body_logged_at = now
+    log.warning(
+        "a Transit data-key decrypt got a 400 whose %d-character body is past the %d-character "
+        "bound; not read as a tag refusal, so the value keeps the cipher's plain error",
+        length,
+        _REPARSED_BODY_MAX_CHARS,
+    )
 
 
 def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
@@ -345,6 +375,10 @@ class TransitCipher(_UnmarkedPolicy):
     """Bulk at-rest cipher whose crypto runs inside Vault/OpenBao Transit — the DEK never enters heap."""
 
     encrypts = True
+    #: This cipher cannot name the keys it holds, and its UnauthenticatedCipherError is Vault's
+    #: AEAD refusal of the value itself, never a key it lacks, so
+    #: :func:`~messagefoundry.store.cell_tag.open_tagged_cell` reads it as tag drift (BACKLOG #5650).
+    names_no_keys = True
 
     def __init__(
         self,

@@ -531,6 +531,8 @@ async def _layered_with_decrypt_raising(
             # the recall alone: open_tagged_cell then classifies by the error's class, not by a
             # plaintext cell's is_tag_failure short cut (BACKLOG #5650).
             patched.setattr(cipher, "is_encrypted", lambda _stored: True)
+            # And it declares, as Transit does, that it cannot name its keys.
+            patched.setattr(cipher, "names_no_keys", True, raising=False)
             r = await c.get("/search/layered", params={"presets": pid}, headers=h)
     return r, raised, pid
 

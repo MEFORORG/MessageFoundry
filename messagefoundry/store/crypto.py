@@ -111,6 +111,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -466,13 +467,38 @@ class _UnmarkedPolicy:
         else:
             cause = "a stripped marker or a planted row"
             fix = "set [store].allow_unmarked_ciphertext to accept unmarked values"
-        _log.warning(
-            "refused an unmarked value in cipher column %s.%s: %s; %s", table, column, cause, fix
-        )
+        if table == UPLOADED_FILE_AAD_TABLE or _first_unmarked_in_interval(table, column):
+            # Once per row cell column per interval: a list over a keyless run's rows meets one in
+            # every row, and it names no row anyway (BACKLOG #5650). An upload is one file a read.
+            _log.warning(
+                "refused an unmarked value in cipher column %s.%s: %s; %s",
+                table,
+                column,
+                cause,
+                fix,
+            )
         self.report_unmarked(table, column)
         raise UnmarkedCipherError(
             f"refused an unmarked value in cipher column {table}.{column} ({cause}); {fix}"
         )
+
+
+#: How long the unmarked-value WARNING for one cell column is logged once per process.
+_UNMARKED_LOG_INTERVAL_S = 3600.0
+_unmarked_logged: dict[tuple[str, str], float] = {}
+_unmarked_lock = threading.Lock()
+
+
+def _first_unmarked_in_interval(table: str, column: str) -> bool:
+    """Whether the unmarked-value WARNING for ``table.column`` has not been logged within the
+    interval; records it. The refusal itself, and its hook, are never throttled here."""
+    key, now = (table, column), time.monotonic()
+    with _unmarked_lock:
+        last = _unmarked_logged.get(key)
+        if last is not None and now - last < _UNMARKED_LOG_INTERVAL_S:
+            return False
+        _unmarked_logged[key] = now
+    return True
 
 
 def allows_unmarked(cipher: Cipher) -> bool:
