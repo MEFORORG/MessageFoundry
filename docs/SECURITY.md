@@ -2309,8 +2309,12 @@ the same permission set on the same method reds CI until it is listed here.
 > lists them.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
-> name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
-> reaches the engine, which answers 409 for a name the running graph does not have. The JSON
+> name up. An in-scope inbound that `Registry.inbound_names()` holds, or any in-scope name when no
+> graph is loaded, reaches the engine, which answers 409 for a name `inbound_names()` does not hold.
+> On an unsharded engine that set is its own graph's inbounds. On an engine shard it is every
+> inbound in the whole config, so an in-scope inbound a sibling engine shard holds gets no denial
+> row: this engine shard's `Engine.set_connection_flag` writes the flag and its
+> `connection_flag_set` row to the shared store, and the route answers 200. The JSON
 > route validates the body before any of this, so a direction other than `inbound` or `outbound`
 > gets a 422 there with no denial row, scoped caller or not. The web console's twin reads the
 > direction itself: for such a direction it gives a scoped caller the 403 and a denial row, and an
@@ -7903,7 +7907,8 @@ synchronization without an operator-chosen peer; the default is a no-op.
 
 ### Outbound TLS trust anchor — pinned internal CA (`[tls]`, #190, ADR 0093)
 
-An outbound connector that verifies a downstream **server** certificate (MLLP/DICOM-SCU/FTPS) anchors
+A hop that verifies a downstream **server** certificate and reads `[tls]` (the hops the
+[`[tls]` section of CONFIGURATION.md](CONFIGURATION.md#tls--outbound-client-trust-anchors) lists) anchors
 trust in the **OS trust store** by default. A hospital estate whose internal endpoints present certs
 from a **private / internal CA** not in the box-global store can pin that CA once via the small opt-in
 `[tls]` section rather than installing it box-wide or repeating a per-connection `tls_ca_file`:
