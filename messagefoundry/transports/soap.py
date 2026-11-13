@@ -862,7 +862,7 @@ class SoapDestination(DestinationConnector):
             headers["Authorization"] = auth
         return headers
 
-    # --- WS-* envelope assembly (all non-deterministic values minted here, in send()) -------------
+    # --- WS-* envelope assembly (non-deterministic values minted here, per send, in its worker) ---
 
     def _build_wsa_header(self) -> str:
         # wsa:Action is sourced from soap_action — the single source of truth, never a divergent second
@@ -1023,8 +1023,10 @@ class SoapDestination(DestinationConnector):
         fragment gate and lint first, then the secrets, then the POST, so a refused fragment or a
         token that does not appear exactly once raises before a byte crosses, and the refusal
         reaches ``send`` with its type unchanged. The GIL caveat below holds for these passes too:
-        each ``str.count``, ``str.replace`` and the SAX feed is C work that can hold the loop while
-        it runs, bounded by the payload's size, not removed.
+        at least the fragment's case-folded copy, its encode, the envelope concatenation and each
+        token's ``str.count`` and ``str.replace`` are single full-length C calls that can hold the
+        loop while they run. Moving them here bounds that wait by the payload's size; it does not
+        remove it.
 
         A fault can arrive inside a 2xx body, so the reply is classified. Transport-level faults
         (non-2xx, URL/timeout) already raised inside _post, for both modes. The RAW reply is
@@ -1046,7 +1048,7 @@ class SoapDestination(DestinationConnector):
         not a bound on another. Later #2827 changes added scans, at least ``_find_fault``'s and the
         code-element checks in ``_code_text``, so they are not a reading of this code."""
         # WS-* mode: the Handler returned only the <Body> fragment; wrap + stamp here (post-queue
-        # boundary), so the per-call MessageID/Timestamp/Nonce never live in a pure transform.
+        # boundary), so the per-call MessageID and Timestamp never live in a pure transform.
         if self._ws_mode:
             payload = self._wrap_envelope(payload)
         # ADR 0015 amendment (#236): swap placeholder tokens for the real secret HERE — after the
@@ -1070,7 +1072,7 @@ class SoapDestination(DestinationConnector):
         if self._hop_guard is not None:
             # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
             self._hop_guard.assert_delivery_url(self.url, connector="SOAP")
-        # payload is the FINAL wire body (in WS-* mode send() already wrapped + stamped the envelope),
+        # payload is the FINAL wire body (in WS-* mode _post_and_classify already wrapped + stamped it),
         # so signing over these bytes covers exactly what the partner receives.
         data = encode_wire_body(payload, self.encoding, transport="SOAP")
         headers = self._headers
