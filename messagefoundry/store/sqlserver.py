@@ -3503,8 +3503,10 @@ class SqlServerStore:
     # BACKLOG #1780: set by open(read_only=True), which then writes nothing at open. A class
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
-    # ADR 0196: set when open() failed to bind this store's salt into the cipher. That cipher may
-    # already count for another store, so close() must not settle its reserve here (BACKLOG #5720).
+    # ADR 0196: True from the start of a writable open() until it binds this store's salt into the
+    # cipher. Until then the cipher may count for another store, or for none, so close() must not
+    # settle it here: a settle would write a foreign reserve into this store, or switch on the
+    # bound of a cipher a retried open then could not bind (BACKLOG #5720).
     _cipher_foreign: bool = False
     backend = StoreBackend.SQLSERVER
     # H1 fence state (ADR 0157). Class defaults so a store built via object.__new__ (several offline
@@ -4270,6 +4272,7 @@ class SqlServerStore:
         )
         store._pool_executor = executor
         store._read_only = read_only
+        store._cipher_foreign = not read_only  # cleared once open() binds the salt (#5720)
         try:
             await store._ensure_schema(create=create, read_only=read_only)
             # Right after the schema, so a later open step that fails still leaves the report
@@ -4290,11 +4293,8 @@ class SqlServerStore:
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
-                try:
-                    await bind_store_salt(store._cipher, store._ensure_store_salt)
-                except BaseException:
-                    store._cipher_foreign = True  # close() must not settle it here (BACKLOG #5720)
-                    raise
+                await bind_store_salt(store._cipher, store._ensure_store_salt)
+                store._cipher_foreign = False  # bound to this store: close() settles it (#5720)
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -4318,10 +4318,9 @@ class SqlServerStore:
         except BaseException as exc:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included, and
             # settle the invocation block this open reserved rather than forfeit it: close() does
-            # both (BACKLOG #5720). close() releases the executor in a finally: wait_closed() cannot
-            # complete while the pool is wedged, so releasing the executor only on the success path
-            # would leak its threads in exactly the case this except exists for. The fallback below
-            # releases it if close() raised before reaching that finally.
+            # both (BACKLOG #5720). close() closes the pool and releases the executor in finally
+            # blocks: wait_closed() cannot complete while the pool is wedged, so releasing the
+            # executor only on the success path would leak its threads in exactly this case.
             async def _cleanup() -> None:
                 try:
                     await store.close()
@@ -4332,10 +4331,6 @@ class SqlServerStore:
                         "closing the pool after a failed open also failed (%s)",
                         type(cleanup).__name__,
                     )
-                finally:
-                    if store._pool_executor is not None:
-                        store._pool_executor.shutdown(wait=False)
-                        store._pool_executor = None
 
             await run_open_cleanup(exc, _cleanup)
             raise
@@ -5580,9 +5575,10 @@ class SqlServerStore:
                 # LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT). The DSN cannot carry it (#1626).
                 timeout=settings.connect_timeout,
             )
-        except Exception:
+        except BaseException:
             # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
-            # never comes up (bad DSN, connect timeout, auth failure), so it has to be released here too.
+            # never comes up (bad DSN, connect timeout, auth failure, or a cancel while it dials:
+            # BACKLOG #5720), so it has to be released here too.
             executor.shutdown(wait=False)
             raise
         return pool, executor
@@ -5787,24 +5783,27 @@ class SqlServerStore:
                 await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
-        # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
-        # opened, so it never affects the async path). ADR 0071 B5.
-        self.close_sync_handoff_pool()
-        # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op when the
-        # prepared path never opened one).
-        await self._close_claim_holders()
-        # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point. wait_closed() cannot
-        # complete while the pool is wedged -- which is precisely the state these threads are stuck in --
-        # so releasing them only on the success path would leak the whole pool's worth of threads in the
-        # one case that matters. shutdown(wait=False) does not join: a wedged ODBC call is not
-        # interruptible, and the process is going away regardless.
         try:
-            self._pool.close()
-            await self._pool.wait_closed()
+            # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none
+            # were opened, so it never affects the async path). ADR 0071 B5.
+            self.close_sync_handoff_pool()
+            # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op when the
+            # prepared path never opened one).
+            await self._close_claim_holders()
         finally:
-            if self._pool_executor is not None:
-                self._pool_executor.shutdown(wait=False)
-                self._pool_executor = None
+            # In a finally, so a teardown above that raises still closes the pool (BACKLOG #5720).
+            # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point. wait_closed()
+            # cannot complete while the pool is wedged -- which is precisely the state these threads
+            # are stuck in -- so releasing them only on the success path would leak the whole pool's
+            # worth of threads in the one case that matters. shutdown(wait=False) does not join: a
+            # wedged ODBC call is not interruptible, and the process is going away regardless.
+            try:
+                self._pool.close()
+                await self._pool.wait_closed()
+            finally:
+                if self._pool_executor is not None:
+                    self._pool_executor.shutdown(wait=False)
+                    self._pool_executor = None
 
     # --- ADR 0071 B5: synchronous fused-handoff connection source ------------
     def open_sync_handoff_pool(self, stage: str, size: int) -> _SyncHandoffPool:

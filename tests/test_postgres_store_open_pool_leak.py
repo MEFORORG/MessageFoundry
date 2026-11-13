@@ -280,3 +280,26 @@ async def test_a_cancel_during_the_cleanup_still_closes_the_pool(
 
     assert settles == [False, True]
     assert pool.closed == 1
+
+
+async def test_an_open_that_fails_before_the_salt_bind_settles_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720 round 1: a failure BEFORE the bind (here the pin check) must not settle
+    either. The cipher is not yet this store's, and a settle would switch on the bound of a
+    cipher a retried open then could not bind."""
+    pool = _FakePool()
+    _install_fake_asyncpg(monkeypatch, pool)
+    settles: list[bool] = []
+    _keyed_open_steps(monkeypatch, settles)
+
+    async def _pin_refused(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("pin refused")
+
+    monkeypatch.setattr("messagefoundry.store.postgres.check_open_store_pin", _pin_refused)
+
+    with pytest.raises(RuntimeError, match="pin refused"):
+        await PostgresStore.open(_settings())
+
+    assert settles == []
+    assert pool.closed == 1

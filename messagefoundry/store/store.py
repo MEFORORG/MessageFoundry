@@ -8136,7 +8136,11 @@ async def run_open_cleanup(
     failure is itself a cancel; otherwise this returns, and the caller re-raises ``failure``.
 
     The cleanup's own failure is logged by class only, so it never replaces the open's error
-    (vault BACKLOG #3054). Past ``timeout`` the cleanup is left running and logged."""
+    (vault BACKLOG #3054). Past ``timeout`` the cleanup is left running and logged, and the
+    caller raises without waiting further. A ``GeneratorExit`` cannot await at all, so on one
+    nothing is run."""
+    if isinstance(failure, GeneratorExit):
+        return
     task: asyncio.Task[None] = asyncio.ensure_future(cleanup())
     _OPEN_CLEANUPS.add(task)
     task.add_done_callback(_report_open_cleanup)
@@ -11034,8 +11038,9 @@ class MessageStore:
         # checked.
         self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
         self._seal_pager = SealPager()
-        # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
-        # may already count for another store, so close() must not settle its reserve here.
+        # ADR 0196: True from the start of a writable open's salt step until the bind holds. Until
+        # then the cipher may count for another store, or for none, so close() must not settle it
+        # here (BACKLOG #5720).
         self._cipher_foreign = False
         # BACKLOG #1780: set by open(read_only=True). The handle is `mode=ro`, so it writes nothing
         # at open or at close: no salt, no invocation reserve, no audit genesis row.
@@ -11304,16 +11309,16 @@ class MessageStore:
                 message_events=message_events,
             )
             store._read_only = read_only
+            # Foreign until the bind below holds: a failure before it must not settle a cipher
+            # this open never bound (BACKLOG #5720).
+            store._cipher_foreign = not read_only
             if not read_only:
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
-                try:
-                    await bind_store_salt(cipher, store._ensure_store_salt)
-                except BaseException:
-                    store._cipher_foreign = True
-                    raise
+                await bind_store_salt(cipher, store._ensure_store_salt)
+                store._cipher_foreign = False
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is

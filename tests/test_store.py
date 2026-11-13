@@ -1514,3 +1514,66 @@ async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connect
         for conn in opened:  # so a red run does not hang interpreter exit on a leaked worker
             await conn.close()
     assert left == [], f"a cancelled cleanup left live aiosqlite worker(s): {', '.join(left)}"
+
+
+async def test_run_open_cleanup_stops_waiting_at_its_bound(caplog) -> None:
+    """BACKLOG #5720: a wedged cleanup is left running past the bound and logged, so a failed open
+    still raises; the cleanup is kept referenced until it ends."""
+    from messagefoundry.store.store import _OPEN_CLEANUPS, run_open_cleanup
+
+    release = asyncio.Event()
+
+    async def wedged() -> None:
+        await release.wait()
+
+    await run_open_cleanup(RuntimeError("open boom"), wedged, timeout=0.05)
+    assert "did not finish within" in caplog.text
+    assert len(_OPEN_CLEANUPS) == 1
+    release.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not _OPEN_CLEANUPS
+
+
+async def test_run_open_cleanup_raises_a_cancel_that_lands_while_it_runs() -> None:
+    """BACKLOG #5720: a cancel landing mid-cleanup waits for the cleanup, then is raised, chained
+    to the open's own failure; a failure that is itself a cancel is left to the caller."""
+    from messagefoundry.store.store import run_open_cleanup
+
+    started = asyncio.Event()
+    finished: list[str] = []
+
+    async def slow() -> None:
+        started.set()
+        await asyncio.sleep(0.1)
+        finished.append("done")
+
+    failure = RuntimeError("open boom")
+    task = asyncio.create_task(run_open_cleanup(failure, slow))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+    assert finished == ["done"]
+    assert raised.value.__cause__ is failure
+
+    started.clear()
+    task = asyncio.create_task(run_open_cleanup(asyncio.CancelledError(), slow))
+    await started.wait()
+    task.cancel()
+    await task  # the caller re-raises its own cancel
+    assert finished == ["done", "done"]
+
+
+async def test_run_open_cleanup_runs_nothing_on_generator_exit() -> None:
+    """BACKLOG #5720: a coroutine closed with ``GeneratorExit`` cannot await, so the cleanup is not
+    started at all rather than raising "coroutine ignored GeneratorExit"."""
+    from messagefoundry.store.store import run_open_cleanup
+
+    ran: list[str] = []
+
+    async def cleanup() -> None:
+        ran.append("ran")
+
+    await run_open_cleanup(GeneratorExit(), cleanup)
+    assert ran == []

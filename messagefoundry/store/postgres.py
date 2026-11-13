@@ -2080,8 +2080,10 @@ class PostgresStore:
     # BACKLOG #1780: set by open(read_only=True), which then writes nothing at open. A class
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
-    # ADR 0196: set when open() failed to bind this store's salt into the cipher. That cipher may
-    # already count for another store, so close() must not settle its reserve here (BACKLOG #5720).
+    # ADR 0196: True from the start of a writable open() until it binds this store's salt into the
+    # cipher. Until then the cipher may count for another store, or for none, so close() must not
+    # settle it here: a settle would write a foreign reserve into this store, or switch on the
+    # bound of a cipher a retried open then could not bind (BACKLOG #5720).
     _cipher_foreign: bool = False
     backend = StoreBackend.POSTGRES
 
@@ -2223,6 +2225,7 @@ class PostgresStore:
             message_events=message_events,
         )
         store._read_only = read_only
+        store._cipher_foreign = not read_only  # cleared once open() binds the salt (#5720)
         try:
             await store._ensure_schema(create=create, read_only=read_only)
             if not read_only:
@@ -2230,11 +2233,8 @@ class PostgresStore:
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
-                try:
-                    await bind_store_salt(store._cipher, store._ensure_store_salt)
-                except BaseException:
-                    store._cipher_foreign = True  # close() must not settle it here (BACKLOG #5720)
-                    raise
+                await bind_store_salt(store._cipher, store._ensure_store_salt)
+                store._cipher_foreign = False  # bound to this store: close() settles it (#5720)
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is

@@ -294,3 +294,76 @@ async def test_an_open_whose_salt_bind_failed_settles_nothing(
     assert settles == []
     assert pool.closed == 1
     assert fake_executor.shutdown_calls == [False]
+
+
+async def test_an_open_that_fails_before_the_salt_bind_settles_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720 round 1: a failure BEFORE the bind (here the pin check) must not settle
+    either. The cipher is not yet this store's."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    settles: list[bool] = []
+    fake_executor = _keyed_open_steps(monkeypatch, settles)
+
+    async def _pin_refused(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("pin refused")
+
+    monkeypatch.setattr(sqlserver_module, "check_open_store_pin", _pin_refused)
+
+    with pytest.raises(RuntimeError, match="pin refused"):
+        await SqlServerStore.open(_settings())
+
+    assert settles == []
+    assert pool.closed == 1
+    assert fake_executor.shutdown_calls == [False]
+
+
+async def test_a_teardown_that_raises_in_close_still_closes_the_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720 round 1: close() closes the pool and releases the executor in finally
+    blocks, so a claim-holder teardown that raises no longer skips them."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    monkeypatch.setattr(SqlServerStore, "_ensure_schema", _boom_ensure_schema)
+    fake_executor = _FakeExecutor()
+    monkeypatch.setattr(
+        sqlserver_module, "_build_pool_executor", lambda settings, maxsize=None: fake_executor
+    )
+
+    async def _holders_boom(self: SqlServerStore) -> None:
+        raise ConnectionResetError("claim holder close boom")
+
+    monkeypatch.setattr(SqlServerStore, "_close_claim_holders", _holders_boom)
+
+    with pytest.raises(RuntimeError, match="schema boom"):
+        await SqlServerStore.open(_settings())
+
+    assert pool.closed == 1
+    assert pool.wait_closed_called == 1
+    assert fake_executor.shutdown_calls == [False]
+
+
+async def test_a_cancel_while_the_pool_dials_releases_the_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720 round 1: ``_create_pool`` caught ``Exception`` only, so a cancel while
+    ``aioodbc.create_pool`` dialled left the executor it had just built."""
+
+    async def _create_pool(**kwargs: Any) -> Any:
+        raise asyncio.CancelledError
+
+    module = types.ModuleType("aioodbc")
+    module.connect = _connect_rcsi_on  # type: ignore[attr-defined]
+    module.create_pool = _create_pool  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "aioodbc", module)
+    fake_executor = _FakeExecutor()
+    monkeypatch.setattr(
+        sqlserver_module, "_build_pool_executor", lambda settings, maxsize=None: fake_executor
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await SqlServerStore.open(_settings())
+
+    assert fake_executor.shutdown_calls == [False]
