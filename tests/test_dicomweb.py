@@ -453,6 +453,8 @@ async def test_dicomweb_capture_empty_response_is_no_reply() -> None:
 
 # Nested arrays past json's recursion limit: json.loads raises RecursionError, not ValueError.
 _TOO_DEEP = "[" * 100_000 + "]" * 100_000
+# Stands in for PHI in a reply body; it must never reach the refusal text.
+_REPLY_CANARY = "Secretpatient^Replycanary"
 _REPEATED_KEY = '{"00081198": {"vr": "SQ", "Value": [{}]}, "00081198": {"vr": "SQ", "Value": []}}'
 
 
@@ -464,9 +466,11 @@ _REPEATED_KEY = '{"00081198": {"vr": "SQ", "Value": [{}]}, "00081198": {"vr": "S
         "not json",
         '{"00081199": ',  # truncated
         _REPEATED_KEY,  # json.loads keeps the last (empty) FailedSOPSequence
+        # The ruling refuses a repeated key at any depth, inside a sequence item too.
+        '{"00081199": {"vr": "SQ", "Value": [{"00081155": 1, "00081155": 2}]}}',
         _TOO_DEEP,
     ],
-    ids=["xml", "text", "truncated", "repeated-key", "too-deep"],
+    ids=["xml", "text", "truncated", "repeated-key", "nested-repeated-key", "too-deep"],
 )
 @pytest.mark.parametrize("status", [200, 202])
 async def test_dicomweb_unparseable_2xx_reply_is_a_permanent_refusal(
@@ -487,21 +491,25 @@ async def test_dicomweb_unparseable_2xx_reply_is_a_permanent_refusal(
     "body",
     [
         "",
+        "\r\n",
         "{}",
         json.dumps({"00081190": {"vr": "UR", "Value": [f"{BASE}/studies/1.2.3"]}}),
         json.dumps({"00081199": {"vr": "SQ", "Value": []}}),
         json.dumps({"00081199": {"vr": "SQ"}}),
         json.dumps({"00081199": {"vr": "SQ", "Value": "x"}}),
+        json.dumps({"00081199": {"vr": "SQ", "Value": [None, "x"]}}),  # no item is a dataset
         json.dumps([{"00081199": {"vr": "SQ", "Value": []}}]),
         "42",
     ],
     ids=[
         "empty",
+        "whitespace",
         "empty-object",
         "no-sequence",
         "empty-sequence",
         "no-value",
         "bad-value",
+        "non-dataset-items",
         "list-empty-sequence",
         "scalar",
     ],
@@ -518,13 +526,40 @@ async def test_dicomweb_202_without_a_referenced_sop_is_a_permanent_refusal(
 
 
 async def test_dicomweb_202_with_a_referenced_sop_delivers() -> None:
-    # A 202 that names the stored instance (warnings only) is a delivery.
+    # A 202 that names the stored instance (warnings only) is a delivery, in both capture modes.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
     dest = _dest(capture_response=True)
     dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
     resp = await dest.send(PAYLOAD)
     assert isinstance(resp, DeliveryResponse)
     assert resp.outcome == "accepted"
     assert resp.detail == "HTTP 202"
+
+
+@pytest.mark.parametrize("status", [200, 202])
+async def test_dicomweb_a_leading_bom_is_not_a_refusal(status: int) -> None:
+    dest = _dest()
+    dest._opener = _FakeOpener(body=("﻿" + STORED_OK).encode(), status=status)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
+async def test_dicomweb_a_whitespace_200_is_not_a_refusal() -> None:
+    # As an empty 200 is not: neither can carry a FailedSOPSequence.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=b"\r\n", status=200)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
+async def test_dicomweb_refusal_text_leads_with_its_code() -> None:
+    # A stored error is cut at about 200 characters; a long base URL must not cut the code off.
+    dest = _dest()
+    dest.base_url = BASE + "/" + "x" * 300  # only the refusal text reads it after construction
+    dest._opener = _FakeOpener(body=b"not json", status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert str(exc.value).startswith("DICOMweb unparseable-reply: HTTP 200")
 
 
 async def test_dicomweb_202_failed_sop_wins_over_a_referenced_sop() -> None:
@@ -543,19 +578,26 @@ async def test_dicomweb_200_does_not_require_a_referenced_sop() -> None:
     assert await dest.send(PAYLOAD) is None
 
 
-async def test_dicomweb_reply_refusals_are_content_free(caplog: pytest.LogCaptureFixture) -> None:
-    for body, status in (
-        (f"<Patient>{_PHI_CANARY}</Patient>", 200),
-        (json.dumps({"00100010": {"vr": "PN", "Value": [{"Alphabetic": _PHI_CANARY}]}}), 202),
-        (f'{{"a": "{_PHI_CANARY}", "a": 1}}', 200),
-    ):
-        dest = _dest(capture_response=True)
-        dest._opener = _FakeOpener(body=body.encode(), status=status)  # type: ignore[assignment]
-        with caplog.at_level(logging.DEBUG), pytest.raises(NegativeAckError) as exc:
-            await dest.send(PAYLOAD)
-        assert "Secretpatient" not in str(exc.value)
-        assert "Secretpatient" not in (exc.value.code or "")
-    assert "Secretpatient" not in "\n".join(r.getMessage() for r in caplog.records)
+@pytest.mark.parametrize(
+    ("body", "status", "code"),
+    [
+        (f"<Patient>{_REPLY_CANARY}</Patient>", 200, "unparseable-reply"),
+        (
+            json.dumps({"00100010": {"vr": "PN", "Value": [{"Alphabetic": _REPLY_CANARY}]}}),
+            202,
+            "unconfirmed-202",
+        ),
+        (f'{{"a": "{_REPLY_CANARY}", "a": 1}}', 200, "unparseable-reply"),
+    ],
+    ids=["xml", "unconfirmed-202", "repeated-key"],
+)
+async def test_dicomweb_reply_refusals_are_content_free(body: str, status: int, code: str) -> None:
+    dest = _dest(capture_response=True)
+    dest._opener = _FakeOpener(body=body.encode(), status=status)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == code  # control: the canary body reached the classifier
+    assert "Secretpatient" not in str(exc.value)
 
 
 # --- test_connection / reachability probe ------------------------------------

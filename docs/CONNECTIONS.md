@@ -3805,7 +3805,12 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 (`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
 a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. A 2xx whose body is
 over the byte bound cannot be checked for a FailedSOPSequence, so it is a permanent refusal and is not sent
-again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). **PHI:** the response can
+again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). A 2xx does not by itself
+confirm the store (BACKLOG #5914), so each of these is also a permanent refusal: a non-empty 2xx body
+that is not parseable JSON, repeats a key at any depth, or is nested too deep (code
+`unparseable-reply`); and a 202 that names no stored instance in a **ReferencedSOPSequence**
+(`00081199`), an empty 202 included (code `unconfirmed-202`). An empty 200 is delivered (`no_reply` when
+capturing), and a 200 is not required to carry a ReferencedSOPSequence. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python

@@ -4487,7 +4487,8 @@ def DICOMweb(
     — it reuses the hardened HTTP plumbing (no-redirect TLS-verifying opener, cleartext-credential
     refusal, the retry/dead-letter classification, the ``[egress].allowed_http`` gate) and adds only the
     STOW-RS multipart framing + the ``application/dicom+json`` response classification (a per-instance
-    ``FailedSOPSequence`` → permanent dead-letter; 5xx/408/429/connection errors → retry). This is the
+    ``FailedSOPSequence`` → permanent dead-letter, as is an unparseable 2xx body or a 202 naming no
+    ReferencedSOPSequence; 5xx/408/429/connection errors → retry). This is the
     modern HTTP imaging lane that **exceeds** both Mirth's and Corepoint's DICOM options. Put secrets in
     ``env()`` (``bearer_token``/``basic_*``), never in ``headers``. The DICOMweb server **must be
     idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever).

@@ -23,8 +23,9 @@ It needs **no** ``pydicom``: the object rides as opaque bytes, so DICOMweb works
 - Response classification refines the HTTP-status retry model: a 2xx whose ``application/dicom+json`` body
   carries a per-instance **FailedSOPSequence** (``00081198``) → the instance was rejected → permanent
   dead-letter; so does a non-empty 2xx body that is not parseable JSON (or repeats a key), and a 202
-  that names no stored instance in a ReferencedSOPSequence (``00081199``); other 4xx / a 409 (all instances failed) / a refused 3xx → permanent; 5xx / 408 / 429 /
-  connection-timeout → transient retry. **The HTTP status wins when in doubt; a 5xx stays transient.**
+  that names no stored instance in a ReferencedSOPSequence (``00081199``). Other 4xx, a 409 (all
+  instances failed) or a refused 3xx is permanent; 5xx / 408 / 429 / connection-timeout is a
+  transient retry. **The HTTP status wins when in doubt; a 5xx stays transient.**
 
 **PHI:** a STOW-RS ``dicom+json`` response can name patient/study identifiers, so it is **never** echoed
 into a log/error — only the HTTP status and a redacted URL are. **Idempotency:** delivery is
@@ -164,17 +165,18 @@ def _reject_url_control_chars(value: str, field: str) -> None:
         raise ValueError(f"DICOMweb {field} contains an illegal control character")
 
 
-def _has_sequence_items(datasets: list[Any], tag: str) -> bool:
-    """True if any dataset carries ``tag`` as a sequence with at least one item. Reads only the
-    *presence* of items, never their contents (PHI-safe)."""
+def _sequence_items(datasets: list[Any], tag: str) -> list[Any]:
+    """Every item of the ``tag`` sequence across the datasets, in order. Only the shape is read,
+    never an item's contents (PHI-safe)."""
+    items: list[Any] = []
     for ds in datasets:
         if isinstance(ds, dict):
             element = ds.get(tag)
             if isinstance(element, dict):
                 value = element.get("Value")
-                if isinstance(value, list) and value:
-                    return True
-    return False
+                if isinstance(value, list):
+                    items.extend(value)
+    return items
 
 
 def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
@@ -186,24 +188,29 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
       recursion limit (a ``RecursionError``, which a ``ValueError`` arm does not reach).
     - ``failed-sop``: a non-empty FailedSOPSequence (``00081198``) -- an instance was rejected.
     - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply names
-      no stored instance in a non-empty ReferencedSOPSequence (``00081199``), an empty 202
-      included.
+      no stored instance: no ReferencedSOPSequence (``00081199``) item that is a dataset. An empty
+      202 is one.
 
-    An empty body on any other 2xx is not refused: send() reports it as ``no_reply``. A 200 is not
-    held to the ReferencedSOPSequence rule (BACKLOG #5914 ruling).
+    A body that is empty, or whitespace once a leading BOM is dropped, is not refused on any other
+    2xx; with ``capture_response`` on, send() reports it as ``no_reply``. A 200 is not held to the
+    ReferencedSOPSequence rule (BACKLOG #5914 ruling). Any FailedSOPSequence item refuses, whatever
+    its shape: that direction fails closed.
 
     Returned as ``(code, reason)``; both are fixed strings that name no reply content."""
     unconfirmed = ("unconfirmed-202", "no ReferencedSOPSequence confirming the store")
-    if not body:
+    text = body.removeprefix("﻿")  # a BOM json.loads refuses, as fhir.py strips it
+    if not text.strip():
         return unconfirmed if status == 202 else None
-    obj, refusal = json_loads_or_refusal(body, object_pairs_hook=refuse_repeated_keys)
+    obj, refusal = json_loads_or_refusal(text, object_pairs_hook=refuse_repeated_keys)
     if refusal is not None:
         return "unparseable-reply", "a reply that is not parseable dicom+json"
     # The response is a single dicom+json dataset object (defensively also accept a list).
     datasets = obj if isinstance(obj, list) else [obj]
-    if _has_sequence_items(datasets, _FAILED_SOP_SEQUENCE):
+    if _sequence_items(datasets, _FAILED_SOP_SEQUENCE):
         return "failed-sop", "a FailedSOPSequence (instance rejected)"
-    if status == 202 and not _has_sequence_items(datasets, _REFERENCED_SOP_SEQUENCE):
+    if status == 202 and not any(
+        isinstance(item, dict) for item in _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE)
+    ):
         return unconfirmed
     return None
 
@@ -422,18 +429,9 @@ class DicomWebDestination(DestinationConnector):
     ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
         dicom_bytes = recover_dicom_object_bytes(payload, label="DICOMweb STOW-RS")
         # urllib is blocking — keep it off the event loop (the delivery worker awaits this).
-        body, status, refused = await asyncio.to_thread(self._post, dicom_bytes)
-        # A non-2xx already raised inside _post (transient retry / permanent dead-letter). Here status is
-        # 2xx, but a 2xx does not by itself confirm the store (BACKLOG #5914). The parse returns rather
-        # than raises, so this refusal is raised outside any handler and no decode error -- which
-        # holds the whole body -- rides its __context__. PHI-safe: the text names no body content.
-        if refused is not None:
-            code, reason = refused
-            raise NegativeAckError(
-                f"DICOMweb {_redact_url(self.base_url)} returned HTTP {status} with {reason}",
-                code=code,
-                permanent=True,
-            )
+        body, status = await asyncio.to_thread(self._post, dicom_bytes)
+        # A non-2xx, or a 2xx that does not confirm the store, already raised inside _post (transient
+        # retry / permanent dead-letter).
         if not self.capture_response:
             return None
         if not body:
@@ -491,7 +489,7 @@ class DicomWebDestination(DestinationConnector):
                 f"({type(exc).__name__})"
             ) from exc
 
-    def _post(self, dicom_bytes: bytes) -> tuple[str, int, tuple[str, str] | None]:
+    def _post(self, dicom_bytes: bytes) -> tuple[str, int]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
@@ -513,8 +511,8 @@ class DicomWebDestination(DestinationConnector):
                 # ASVS 15.2.2: bounded on the socket read. A STOW-RS reply is a small result
                 # document, so the 16 MiB ceiling refuses only a peer that is broken or hostile.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
-                # re-send. A FailedSOPSequence can sit inside a 2xx, so send() reads this body in
-                # both capture modes, and the refusal is permanent.
+                # re-send. A FailedSOPSequence can sit inside a 2xx, so the body is classified
+                # below in both capture modes, and the refusal is permanent.
                 body = read_2xx_reply_text(
                     resp,
                     connector=self._hop,
@@ -522,9 +520,6 @@ class DicomWebDestination(DestinationConnector):
                     body_is_needed=True,
                 )
                 status = int(getattr(resp, "status", 200))
-                # Classified here, on the worker thread: a reply up to the read cap parses
-                # off the event loop. It returns rather than raises (BACKLOG #5914).
-                return body, status, _stowrs_refusal(body, status)
         except urllib.error.HTTPError as exc:
             # Non-2xx: classify transient vs permanent. Raised for BOTH capturing and non-capturing — a
             # non-2xx is a transport/server failure, not a captured reply. PHI-safe: never the body.
@@ -562,6 +557,21 @@ class DicomWebDestination(DestinationConnector):
                 f"DICOMweb {_redact_url(self.base_url)} sent a malformed HTTP reply "
                 f"({type(exc).__name__})"
             ) from exc
+        # BACKLOG #5914: a 2xx does not by itself confirm the store. Classified on this worker thread,
+        # after the response is closed, and outside the try: no urllib arm above can retype a fault
+        # here, and with no handler active no decode error -- which holds the whole body -- rides
+        # the refusal's __context__. The code leads the text, so a cut stored error keeps it; the
+        # text names no reply content.
+        refused = _stowrs_refusal(body, status)
+        if refused is not None:
+            code, reason = refused
+            raise NegativeAckError(
+                f"DICOMweb {code}: HTTP {status} with {reason}; not sent again, and the partner may "
+                f"hold the instance, so check it before a replay ({_redact_url(self.base_url)})",
+                code=code,
+                permanent=True,
+            )
+        return body, status
 
 
 register_destination(ConnectorType.DICOMWEB, DicomWebDestination)

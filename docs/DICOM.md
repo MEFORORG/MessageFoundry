@@ -273,7 +273,8 @@ The modern HTTP imaging lane — `POST {base}/studies` (or `…/studies/{study_u
 `transports/rest.py`'s hardened HTTP plumbing (no-redirect TLS-verifying opener, cleartext-credential refusal,
 the retry/dead-letter classification, the `[egress].allowed_http` gate) and adds only the multipart framing
 (with a per-request collision-checked random boundary) + `application/dicom+json` response handling (a per-instance
-`FailedSOPSequence` → permanent dead-letter). **No new dependency** and **no `[dicom]` extra** — the object rides
+`FailedSOPSequence` → permanent dead-letter, as is an unparseable 2xx body or a 202 with no
+ReferencedSOPSequence; see CONNECTIONS.md *DICOMweb*). **No new dependency** and **no `[dicom]` extra** — the object rides
 as opaque bytes. This **exceeds** both incumbents (neither Mirth nor Corepoint ships DICOMweb send out of the box).
 
 ---
