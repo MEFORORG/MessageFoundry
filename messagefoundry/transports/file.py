@@ -100,6 +100,36 @@ _FileSig = tuple[int, int]
 #: ``(st_dev, st_ino)``: which file a handle or a name leads to. On Windows ``os.stat`` fills them from
 #: the volume serial number and the file ID, so the compare works the same there (BACKLOG #2535).
 _FileId = tuple[int, int]
+#: ``(size, mtime_ns, st_dev, st_ino)`` from one ``lstat``: a stuck reject's memory (BACKLOG #5717).
+#: The identity half tells a new file dropped under the same name, with the same size and mtime, from
+#: the one that could not be moved. Where a share reports no file ID it is zero, and size and mtime
+#: carry the compare alone.
+_FileMark = tuple[int, int, int, int]
+
+# Failures that may clear by themselves, so a reject whose move hit one is NOT remembered as stuck and
+# is examined again on the next scan, as before BACKLOG #5717. At least: another process holds the file
+# open or locked, the file vanished, the disk or quota is full, or a share timed out or dropped. Any
+# other failure (access denied, a read-only volume, a link) is taken as lasting until the file changes.
+_TRANSIENT_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in (
+        "EAGAIN",
+        "EBUSY",
+        "EDQUOT",
+        "EINTR",
+        "EIO",
+        "ENOENT",
+        "ENOSPC",
+        "ESTALE",
+        "ETIMEDOUT",
+        "ETXTBSY",
+        "EWOULDBLOCK",
+    )
+    if hasattr(errno, name)
+)
+# ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_NETNAME_DELETED, ERROR_SEM_TIMEOUT. Windows maps
+# the first two to EACCES, which alone would read as lasting, so the Windows code is checked first.
+_TRANSIENT_WINERRORS = frozenset({32, 33, 64, 121})
 
 # Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). None/0 in
 # settings, in any spelling, disables the cap; see docs/CONNECTIONS.md.
@@ -746,6 +776,11 @@ class FileSource(SourceConnector):
         # BACKLOG #2507: paths already refused as links, so each is warned about once. See
         # _log_unconfined. In memory only and never logged.
         self._refused: set[str] = set()
+        # BACKLOG #5717: rejects whose move to .error failed for a lasting reason, keyed by path, with
+        # the lstat mark each showed when it was examined. Under move and delete only. A scan skips
+        # such a file unread and uncharged until its mark changes. Bounded like _refused and forgets a
+        # path once a scan no longer lists it. In memory only and never logged.
+        self._stuck: dict[str, _FileMark] = {}
         # The connection, as the `.processed` age sweep names it in a log line (BACKLOG #1188).
         self._label = config.name or str(self.directory)
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
@@ -1035,8 +1070,11 @@ class FileSource(SourceConnector):
         )
         candidates = await self._run_fs(self._candidates)
         self._prune_settle(candidates)
-        if self._refused:
-            self._refused.intersection_update(str(p) for p in candidates)
+        if self._refused or self._stuck:
+            listed = {str(p) for p in candidates}
+            self._refused.intersection_update(listed)
+            for key in self._stuck.keys() - listed:
+                del self._stuck[key]
         disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, path in enumerate(candidates):
             if self._stop.is_set():
@@ -1047,9 +1085,14 @@ class FileSource(SourceConnector):
             # partial-write check, so the key recorded below describes the bytes actually read. The size
             # cap is NOT charged here: it is charged on the handle the read opens (BACKLOG #2507).
             try:
-                before = await self._run_fs(_file_sig, path)
+                mark = await self._run_fs(_file_mark, path)
             except OSError as exc:
                 self._log_unreadable(path, exc)
+                continue
+            before: _FileSig = mark[:2]
+            if self._stuck and self._still_stuck(path, mark):
+                # BACKLOG #5717: a reject that could not be moved to .error, unchanged since. Not read,
+                # moved or charged, so it cannot hold back the healthy drops behind it.
                 continue
             # #142 leave-in-place dedup: skip a file this connection already ingested. In-memory set
             # first (no I/O), then the durable ledger (survives restart / a fresh process). Keyed on a
@@ -1082,12 +1125,13 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     self.max_file_bytes,
                 )
-                archived = await self._run_fs(self._move, path, self.error_dir, exc.file_id)
-                if archived:  # a failed move is logged by _move; nothing to record
-                    await self._emit_event(
-                        "file_oversize",
-                        reason=f"{exc} exceeds max_file_bytes {self.max_file_bytes}",
-                    )
+                await self._quarantine(
+                    path,
+                    exc.file_id,
+                    mark,
+                    "file_oversize",
+                    f"{exc} exceeds max_file_bytes {self.max_file_bytes}",
+                )
                 disposed += 1
                 continue
             except OSError as exc:
@@ -1131,11 +1175,13 @@ class FileSource(SourceConnector):
                         safe_name(path.name),
                         safe_exc(exc, file_name=path.name),
                     )
-                    archived = await self._run_fs(self._move, path, self.error_dir, read_id)
-                    if archived:  # a failed move is logged by _move; nothing to record
-                        await self._emit_event(
-                            "file_decompress_failed", reason=safe_exc(exc, file_name=path.name)
-                        )
+                    await self._quarantine(
+                        path,
+                        read_id,
+                        mark,
+                        "file_decompress_failed",
+                        safe_exc(exc, file_name=path.name),
+                    )
                     disposed += 1
                     continue
             if not _content_matches_declared(self.content_type, raw):
@@ -1156,12 +1202,13 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     declared,
                 )
-                archived = await self._run_fs(self._move, path, self.error_dir, read_id)
-                if archived:  # a failed move is logged by _move; nothing to record
-                    await self._emit_event(
-                        "file_content_mismatch",
-                        reason=f"does not match declared content type {declared}",
-                    )
+                await self._quarantine(
+                    path,
+                    read_id,
+                    mark,
+                    "file_content_mismatch",
+                    f"does not match declared content type {declared}",
+                )
                 disposed += 1
                 continue
             try:
@@ -1178,11 +1225,9 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     safe_exc(exc, file_name=path.name),
                 )
-                archived = await self._run_fs(self._move, path, self.error_dir, read_id)
-                if archived:  # a failed move is logged by _move; nothing to record
-                    await self._emit_event(
-                        "file_scan_rejected", reason=safe_exc(exc, file_name=path.name)
-                    )
+                await self._quarantine(
+                    path, read_id, mark, "file_scan_rejected", safe_exc(exc, file_name=path.name)
+                )
                 disposed += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
@@ -1244,6 +1289,53 @@ class FileSource(SourceConnector):
             with self._store_call():
                 await self.processed_ledger.prune()
 
+    async def _quarantine(
+        self, path: Path, read_id: _FileId | None, mark: _FileMark, kind: str, reason: str
+    ) -> None:
+        """Move a rejected file to ``.error``, record the event when a copy was archived, and remember
+        the file as stuck when it stays for a lasting reason (BACKLOG #5717).
+
+        The caller charges the per-tick budget whatever happened here, so a scan still reads at most
+        ``poll_max_files`` files that end in a reject. Before #5717 a reject that could not be moved
+        was read and charged again on every scan, so enough of them sorting first spent the whole
+        budget each time and the healthy drops behind them were never reached. Remembered here, it is
+        read and charged once, then skipped (:meth:`_still_stuck`) until it changes.
+
+        ``mark`` is the stat taken before the read, so a file that changed since is examined again.
+        Only ``move`` and ``delete`` remember. ``leave`` keeps examining such a file on every scan, as
+        it always has: there a read-only share is expected, and nothing here changes it. A failure that
+        may clear by itself (:data:`_TRANSIENT_WINERRORS`, :data:`_TRANSIENT_ERRNOS`) is not
+        remembered either, so the next scan tries the move again."""
+        archived, stays = await self._run_fs(self._archive_to, path, self.error_dir, read_id)
+        if archived:
+            await self._emit_event(kind, reason=reason)
+        if not stays or self.after_read == "leave":
+            return
+        key = str(path)
+        if key not in self._stuck and len(self._stuck) >= SETTLE_SEEN_MAX:
+            return  # full: this one is examined again next scan, as before #5717
+        self._stuck[key] = mark
+        logger.warning(
+            "file source %s: rejected file %s stays in place; it is not read again until it changes "
+            "or the engine restarts",
+            self.directory,
+            safe_name(path.name),
+        )
+
+    def _still_stuck(self, path: Path, mark: _FileMark) -> bool:
+        """True when ``path`` is a remembered stuck reject that still shows ``mark``. A changed file
+        is forgotten here, so it settles and is examined afresh (BACKLOG #5717)."""
+        key = str(path)
+        seen = self._stuck.get(key)
+        if seen is None:
+            return False
+        if seen == mark:
+            if logger.isEnabledFor(logging.DEBUG):  # safe_name hashes, so skip it unread
+                logger.debug("file source: still skipping stuck reject %s", safe_name(path.name))
+            return True
+        del self._stuck[key]
+        return False
+
     async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
         """Record a quarantine in the connection-event log (BACKLOG #1621), **fail-soft**.
 
@@ -1293,6 +1385,12 @@ class FileSource(SourceConnector):
         NOT charge. If they did, a permanently stuck file that sorts early would eat the whole budget on
         every scan and the healthy files behind it would never be ingested. A budget can only be charged
         by something that makes progress.
+
+        A reject charges even when its move to ``.error`` fails, so a scan still reads at most
+        ``poll_max_files`` files that end in a reject. Under ``move`` and ``delete`` such a file, when
+        the failure is a lasting one, is then remembered and skipped unread and uncharged until it
+        changes (:meth:`_quarantine`, BACKLOG #5717), so it is charged once rather than on every scan.
+        Under ``leave`` it is read and charged on every scan, as before.
 
         This bounds the INGEST, not the listing: ``_candidates`` still globs and sorts the whole
         directory, because picking the first N in name/mtime order requires seeing all of them. The
@@ -1633,23 +1731,31 @@ class FileSource(SourceConnector):
 
         A check that fails for an ordinary reason also leaves the file in place: moving a file that
         cannot be checked is not known to be safe."""
+        return self._try_pin(path, read_id)[0]
+
+    def _try_pin(self, path: Path, read_id: _FileId | None) -> tuple[_Pin | None, bool]:
+        """:meth:`_pinned`, plus whether a refusal is LASTING (BACKLOG #5717): a link is, a file
+        replaced since the read is not (the next scan reads the new one), and an ``OSError`` is as
+        :func:`_lasting` says."""
         try:
-            return _pin_confined(path, self.directory, self._root_real, read_id)
+            return _pin_confined(path, self.directory, self._root_real, read_id), False
         except _Unconfined:
             self._log_unconfined(path)
+            return None, True
         except _Replaced:
             logger.warning(
                 "file source: %s was replaced after it was read; left in place for the next scan to "
                 "read",
                 safe_name(path.name),
             )
+            return None, False
         except OSError as exc:
             logger.warning(
                 "could not check %s before moving or deleting it (left in place for the next scan): %s",
                 safe_name(path.name),
                 _describe_os_error(exc, file_name=path.name),
             )
-        return None
+            return None, _lasting(exc)
 
     @staticmethod
     def _log_unreadable(path: Path, exc: OSError) -> None:
@@ -1749,9 +1855,17 @@ class FileSource(SourceConnector):
         the claim, not after: a link or a rename keeps the drop's own mtime, which a partner's copy
         tool may have preserved from long ago, and a sweep running between the claim and a later stamp
         would delete a copy archived a moment earlier."""
-        pin = self._pinned(path, read_id)
+        return self._archive_to(path, dest_dir, read_id, stamp=stamp)[0]
+
+    def _archive_to(
+        self, path: Path, dest_dir: Path, read_id: _FileId | None = None, *, stamp: bool = False
+    ) -> tuple[bool, bool]:
+        """:meth:`_move`, returning ``(archived, stays)``. ``stays`` is True when the original is
+        still at ``path`` for a reason :func:`_lasting` judges will not clear by itself, which is what
+        lets a quarantine remember a stuck reject (BACKLOG #5717). Each failure is logged here."""
+        pin, lasting = self._try_pin(path, read_id)
         if pin is None:
-            return False
+            return False, lasting
         with pin:
             if stamp:
                 self._stamp_archive_time(pin, path)
@@ -1768,7 +1882,7 @@ class FileSource(SourceConnector):
                     dest_dir.name,
                     _describe_os_error(exc, file_name=path.name),
                 )
-                return False
+                return False, _lasting(exc)
             if not gone:
                 try:
                     _remove_pinned(pin)
@@ -1780,7 +1894,8 @@ class FileSource(SourceConnector):
                         dest_dir.name,
                         safe_exc(exc, file_name=path.name),
                     )
-        return True  # archived, even if the original stayed and will be re-read
+                    return True, _lasting(exc)
+        return True, False  # archived, and the original is gone
 
     def _stamp_archive_time(self, pin: _Pin, path: Path) -> None:
         """Set the pinned file's mtime to now, so the ``.processed`` sweep ages it from its archive.
@@ -3268,6 +3383,21 @@ def _file_sig(path: Path) -> _FileSig:
     and a link is left for the read to refuse rather than opened here."""
     st = path.lstat()
     return st.st_size, st.st_mtime_ns
+
+
+def _file_mark(path: Path) -> _FileMark:
+    """:func:`_file_sig` and the file's identity from the same ``lstat`` (BACKLOG #5717). May raise
+    ``OSError`` if the file is gone."""
+    st = path.lstat()
+    return st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino
+
+
+def _lasting(exc: OSError) -> bool:
+    """Whether a failed move or delete is expected to fail the same way until the file or its
+    directory changes, as opposed to clearing by itself (BACKLOG #5717)."""
+    if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
+        return False
+    return exc.errno not in _TRANSIENT_ERRNOS
 
 
 register_destination(ConnectorType.FILE, FileDestination)
