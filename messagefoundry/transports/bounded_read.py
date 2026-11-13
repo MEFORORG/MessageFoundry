@@ -268,8 +268,8 @@ class AmbiguousFramingError(EgressReplyError):
     ``http.client`` happens to consult first. The shapes are listed on :func:`reply_framing_fault`.
 
     Also raised for a body in a content coding other than ``identity`` (BACKLOG #5910). That body
-    is framed legally, but the engine does not decode it, so it would read the wrong bytes just
-    the same.
+    is framed legally and read whole, but the engine does not decode it, so the caller would take
+    compressed bytes as the reply's text. Its reason names the coding fault, not a length.
 
     Also raised part-way through a chunked body, at the first chunk-size line, chunk terminator or
     trailer line that breaks the RFC 9112 section 7.1 grammar. By then some bytes have been read,
@@ -484,9 +484,11 @@ def reply_framing_fault(reader: object) -> str | None:
       coding, so a ``gzip`` body from a peer, a proxy or an operator-set request header would be
       decoded as text with ``errors="replace"``. A SOAP Fault or a STOW-RS ``FailedSOPSequence``
       inside a 2xx would then go unseen and the message read as delivered. ``strict_requests``
-      refuses the same codings on the Vault hop with its own check, which runs on every status;
-      this one, like the rest of this list, skips a reply with no body, and also a
-      ``Content-Length: 0`` one, which has no coded bytes to misread. Checked after the
+      refuses the same codings on the Vault hop with its own check, which runs on every status.
+      This one skips a reply to ``HEAD``, a ``204``, a ``304`` and any ``1xx``, as described
+      below, and a ``Content-Length: 0`` reply, which has no coded bytes to misread. An empty
+      chunked or close-framed body that names a coding is still refused, because its emptiness is
+      known only after the read. Checked after the
       ``Transfer-Encoding`` and ``Content-Length`` rules above, so a framing fault is the reason
       given when both apply. An operator-supplied ``Accept-Encoding`` request header is not
       overridden: a reply it brings back coded is refused here instead. Raised through
@@ -1885,7 +1887,8 @@ def read_bounded_text(
 REPLY_TOO_LARGE_CODE = "reply-too-large"
 #: The ``code`` it raises for a body that stopped short of the length the peer declared.
 REPLY_TRUNCATED_CODE = "reply-truncated"
-#: The ``code`` it raises for a body framed in a way RFC 9112 does not allow.
+#: The ``code`` it raises for a body framed in a way RFC 9112 does not allow, or in a content
+#: coding the engine does not decode (BACKLOG #5910).
 REPLY_MISFRAMED_CODE = "reply-misframed"
 
 
@@ -1943,7 +1946,8 @@ def read_2xx_reply_text(
     The partner answered 2xx, so a body the engine cannot read must not cause a re-send. Three
     kinds are handled, and each has its own code: a body over the bound (:data:`REPLY_TOO_LARGE_CODE`,
     vault BACKLOG #2180), a body cut short of its declared length (:data:`REPLY_TRUNCATED_CODE`),
-    and a misframed body (:data:`REPLY_MISFRAMED_CODE`), the last two since BACKLOG #2989. What
+    and a misframed body (:data:`REPLY_MISFRAMED_CODE`), the last two since BACKLOG #2989. A body
+    in a content coding counts as misframed since BACKLOG #5910. What
     each causes depends on ``body_is_needed``, which says who reads the body. This is the one
     place in code that states the rule:
 
@@ -1959,7 +1963,8 @@ def read_2xx_reply_text(
       recorded as delivered.
 
     Who decided the rule for each kind, and on what authority, is recorded once, in ADR 0095
-    Amendment B.1.
+    Amendment B.1. That amendment does not cover the content-coded body, which BACKLOG #5910
+    added under the misframed code.
 
     Which FHIR writes need the body is stated at the call in ``transports/fhir.py``.
 

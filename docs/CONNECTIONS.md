@@ -1811,12 +1811,18 @@ partner declared, or one framed in a way RFC 9112 does not allow, follows the sa
 table says delivered, the body is dropped, the message gets a `reply_dropped` event that says
 what was wrong with it, and then a WARNING says the same. Where it says
 permanent refusal, the code is `reply-truncated` or `reply-misframed` instead of `reply-too-large`.
-A non-empty body in a content coding other than `identity`, such as `gzip`, is refused as
-`reply-misframed` too, because the engine does not decode it (BACKLOG #5910). Either way the request is sent once. A partner or a middlebox that closes the connection cleanly
+Either way the request is sent once. A partner or a middlebox that closes the connection cleanly
 before the declared length counts as cut short, so where the body is needed that message
 dead-letters once. The owner's ruling covers the over-size body only; who decided these two, and
 on what authority, is recorded in ADR 0095 Amendment B.1. At least a read that times out, or one
 that a connection reset cuts off, is a separate case, and the lane still retries it.
+
+**A 2xx reply body in a content coding (BACKLOG #5910).** The engine decodes no content coding, so
+a 2xx body whose `Content-Encoding` names anything but `identity`, such as `gzip`, counts as
+misframed and follows the same table: dropped with a `reply_dropped` event where the table says
+delivered, refused with `reply-misframed` where it says permanent refusal. Only a `Content-Length:
+0` reply is exempt; an empty chunked or close-framed body labelled with a coding is still refused.
+ADR 0095 Amendment B.1 does not record this case; BACKLOG #5910 added it.
 
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed

@@ -2104,9 +2104,9 @@ def test_a_gzipped_rest_reply_in_a_2xx_is_refused() -> None:
     _assert_captured_2xx_refusal(raised.value)
 
 
-def test_a_gzipped_rest_reply_with_capture_off_is_dropped_not_resent() -> None:
-    """Nothing reads the body with capture off, so the 2xx stands as delivered, and the drop
-    says why rather than the request being sent again."""
+def test_a_gzipped_rest_reply_with_capture_off_is_dropped_with_its_fault() -> None:
+    """Nothing reads the body with capture off, so send returns the drop, naming the coding,
+    rather than raising. What the worker does with a drop is tested with the worker."""
     raw = _coded(b"200 OK", b"gzip", b'{"status": "rejected"}')
     with _serve(raw) as url:
         dest = build_destination(
@@ -2130,6 +2130,13 @@ def test_a_zero_length_coded_2xx_is_not_refused() -> None:
     assert read_bounded(_wire(raw), connector="c") == b""
 
 
+def test_an_empty_chunked_coded_2xx_is_still_refused() -> None:
+    """Only a declared length of zero is exempt: a chunked body's emptiness is known only after
+    the read, and docs/CONNECTIONS.md says so."""
+    raw = _OK + b"Content-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+    assert reply_framing_fault(_wire(raw)) == _CODED_REASON
+
+
 def test_a_framing_fault_is_named_before_a_content_coding() -> None:
     """A smuggling-shaped framing keeps its own reason when the reply is also coded."""
     raw = _OK + b"Content-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
@@ -2138,7 +2145,9 @@ def test_a_framing_fault_is_named_before_a_content_coding() -> None:
     )
 
 
-_DICOM_PAYLOAD = RawMessage.from_bytes(b"\x00" * 128 + b"DICM" + b"synthetic", "dicom").encode()
+def _dicom_payload() -> str:
+    # Built per test, so a parsing change that refuses the stub fails these tests, not collection.
+    return RawMessage.from_bytes(b"\x00" * 128 + b"DICM" + b"synthetic", "dicom").encode()
 
 
 def _dicomweb(url: str) -> DicomWebDestination:
@@ -2156,7 +2165,7 @@ def test_a_gzipped_stowrs_failure_in_a_2xx_is_not_recorded_as_delivered() -> Non
     with _serve(_coded(b"200 OK", b"gzip", _STOW_FAILED)) as url:
         dest = _dicomweb(url)
         with pytest.raises(DeliveryError) as raised:
-            asyncio.run(dest.send(_DICOM_PAYLOAD))
+            asyncio.run(dest.send(_dicom_payload()))
     _assert_captured_2xx_refusal(raised.value)
 
 
@@ -2167,7 +2176,7 @@ def test_a_gzipped_stowrs_failure_is_seen_without_the_coding() -> None:
     with _serve(raw) as url:
         dest = _dicomweb(url)
         with pytest.raises(NegativeAckError) as raised:
-            asyncio.run(dest.send(_DICOM_PAYLOAD))
+            asyncio.run(dest.send(_dicom_payload()))
     assert raised.value.code == "failed-sop"
 
 
