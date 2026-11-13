@@ -479,7 +479,7 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `dir` | str | `environments` | directory holding `<env>.toml` flat key→value tables for non-secret values, **versioned** in the repo. A table anywhere inside an array value stops the load, naming the key and index, even for a key nothing references (vault BACKLOG #1820). Arrays of scalars, nested ones included, load. Resolved against `base_dir` (below). |
-| `base_dir` | str | `""` (= the working dir) | **Anchor** `dir` resolves against. Empty keeps the original behavior (relative to the process working directory). Set it to the **config-repo root** so env-value resolution no longer depends on where `serve` was launched. A relative value is taken against the working dir; an absolute value is used as-is — **on Windows it must be drive-qualified** (`C:/repo`); a leading-slash `/repo` is drive-relative and still inherits the launch drive (logged as a warning). Overridable per run with `serve --project-root`. **It also anchors the store path** (BACKLOG #5926, #5927): `serve` and at least the offline commands that open the store, such as `backup`, `audit-verify` and `rotate-key`, take a relative `[store].path`, or a relative `--db`, under it, on every store backend. An absolute path and SQLite's `:memory:` stay put, and with no root the value is unchanged, so it still resolves against the working directory. Those offline commands take no `--project-root`, so they see only the `base_dir` the settings file or the environment sets; a site that starts `serve` with `--project-root` passes them an absolute `--db`. |
+| `base_dir` | str | `""` (= the working dir) | **Anchor** `dir` resolves against. Empty keeps the original behavior (relative to the process working directory). Set it to the **config-repo root** so env-value resolution no longer depends on where `serve` was launched. A relative value is taken against the working dir; an absolute value is used as-is — **on Windows it must be drive-qualified** (`C:/repo`); a leading-slash `/repo` is drive-relative and still inherits the launch drive (logged as a warning). Overridable per run with `serve --project-root`. **It also anchors the store path** (BACKLOG #5926, #5927): `serve` and at least the offline commands that open the store, such as `backup`, `audit-verify` and `rotate-key`, take a relative `[store].path`, or a relative `--db`, under it, on every store backend. An absolute path and SQLite's `:memory:` stay put, and with no root the value is unchanged, so it still resolves against the working directory. On Windows a leading-slash `/data/mf.db` is drive-relative, not absolute, so it is taken under the root, with a warning. Those offline commands take no `--project-root`, so they see only the `base_dir` the settings file or the environment sets, and a relative `base_dir` is taken against each command's own working directory. So they open the store `serve` opens only where both reach the same root. A site that starts `serve` with `--project-root`, or with a relative `base_dir`, sets an absolute `[store].path` or `base_dir` in the settings file, or passes an absolute `--db` to a command that takes one. |
 
 - A graph value that differs by environment is authored as `env("acme_adt_host")`; the running
   instance resolves it from `<base_dir>/<dir>/<active-env>.toml` overlaid by **`MEFOR_VALUE_<KEY>`**
@@ -1642,13 +1642,15 @@ as `[2001:db8::10]:6661`. An IP literal compares canonically, as an address, in 
 the connection, so `[0:0:0:0:0:0:0:1]` names `::1`; a name compares without regard to case.
 Nothing looser matches: an IPv4-mapped IPv6 address does not name the IPv4 address, a name with a
 trailing dot does not name the name without it, and a shorthand such as `127.1` is a name, not
-`127.0.0.1`. An entry matches nothing when it holds more than one colon outside brackets, such as
+`127.0.0.1`. A port compares as written, as text, so `host:06661` does not name port 6661, and a
+URL that names no port matches only an entry that names none: list `host`, not `host:443`, for
+a default-port URL. An entry matches nothing at least when it holds more than one colon outside brackets, such as
 `::1` or `fe80::1:443`, because its last group could be read as a port; when its brackets hold
 anything but an IPv6 literal; or when a colon has no port after it, such as `db:` from an `env()`
 that expanded to nothing. A `%` zone id, such as `fe80::1%eth0`, matches nothing, in an entry or
 in the connection's host. The connection's host is compared as the connection names it: a URL
 brackets an IPv6 literal, but a `host` setting must name it bare, as `::1`, because a bracketed
-`[::1]` there matches no entry. `allowed_db` adds one rule, in its row.
+`[::1]` there matches no entry. `allowed_db` differs, as its row says.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -1656,7 +1658,7 @@ brackets an IPv6 literal, but a `host` setting must name it bare, as `::1`, beca
 | `allowed_tcp` | list | `[]` | allowed raw-TCP destinations; each entry is `host` (any port), `host:port`, `[v6]` or `[v6]:port`, read as stated above the key table. **Covers three connectors, not one:** `Tcp(...)`, `X12(...)` and the **DICOM C-STORE SCU** (`DICOM()` outbound) all resolve to this list — they are all raw sockets ([`transports/egress.py`](../messagefoundry/transports/egress.py), `_allowlist_for`). Populate it for every one of them, or under the deny default your X12/PACS destinations are refused at load. An inbound `Tcp(...)`/`X12(...)`/`DICOM()` is a local listener and is not connect-gated. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_TCP` |
 | `allowed_file_dirs` | list | `[]` | allowed File output directories; a destination's directory must resolve at/under one of these |
 | `allowed_http` | list | `[]` | allowed HTTP destination hosts; each entry is `host` (any port), `host:port`, `[v6]` or `[v6]:port`, read as stated above the key table (ADR 0003). **Covers the whole HTTP family, not just REST/SOAP:** `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` (STOW-RS), the read-only `fhir_lookup` / `FhirLookup(...)` (ADR 0043), **and** the SMART / OAuth2 **token endpoints** — a token endpoint is a second egress host and is checked against this same list, so list it too. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_HTTP` |
-| `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry is `host` (any port) or `host:port` (ADR 0003), read as stated above the key table. **A `server` holding a colon is never a listed host**, and is refused as unlisted whatever the dialect, so an IPv6 literal, bracketed or not, can never be listed: name such a server by host name. [CONNECTIONS.md](CONNECTIONS.md) says why (BACKLOG #5915). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
+| `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry is `host` (any port) or `host:port` (ADR 0003), read as stated above the key table. **A `server` holding a colon is never a listed host**, and is refused as unlisted whatever the dialect, so an IPv6 literal, bracketed or not, can never be listed: name such a server by host name. A port an entry pins compares as a number, so `db:05432` names port 5432. [CONNECTIONS.md](CONNECTIONS.md) says why, and how the port is read (BACKLOG #5915). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
 | `allowed_remote` | list | `[]` | allowed RemoteFile (SFTP/FTP/FTPS) hosts — gates the connector in **both** directions (source poll + destination upload); each entry is `host` (any port), `host:port`, `[v6]` or `[v6]:port`, read as stated above the key table. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_REMOTE` |
 | `allowed_smtp` | list | `[]` | allowed **email (SMTP)** destination hosts for the `Email(...)` outbound ([ADR 0029](adr/0029-email-smtp-destination.md)); each entry is `host` (any port), `host:port`, `[v6]` or `[v6]:port`, read as stated above the key table. Distinct from `[alerts].smtp_allowed_hosts`, which gates the **alert notifier's** own SMTP dial. **Whether it counts toward the open-egress startup gate depends on `[security].block_unlisted_outbound`**; see "Which lists the startup gate counts" above the key table. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SMTP` |
 | `allowed_direct` | list | `[]` | allowed **Direct** (S/MIME-over-SMTP HISP relay) destination hosts ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)); each entry is `host` (any port), `host:port`, `[v6]` or `[v6]:port`, read as stated above the key table. Kept deliberately **separate from `allowed_smtp`** so an operator can permit a Direct HISP relay without opening generic email egress — a distinct trust relationship carrying encrypted PHI. **Counts toward the open-egress startup gate on the same terms as `allowed_smtp`**. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DIRECT` |
@@ -1757,18 +1759,22 @@ brackets an IPv6 literal, but a `host` setting must name it bare, as `::1`, beca
      about how the proxy reuses its connections to the partner, so a misframed reply could otherwise
      be read as the answer to the next engine request through that proxy.
   4. pass each partner reply on without adding a content coding, and each engine request on
-     without adding `Accept-Encoding`. The engine decodes no content coding (BACKLOG #5910), so a
-     2xx delivery reply whose `Content-Encoding` names anything but `identity`, such as `gzip`,
-     counts as misframed. Where the destination reads the reply body, that is a refusal for good
-     with the code `reply-misframed`; where it does not, the body is dropped with a
-     `reply_dropped` event. So a compressing proxy turns every content-coded 2xx delivery reply
-     into one of those. The reply table under REST in [CONNECTIONS.md](CONNECTIONS.md) says which
-     destination does which.
+     without adding or changing `Accept-Encoding`. The engine decodes no content coding (BACKLOG
+     #5910), so a 2xx delivery reply whose `Content-Encoding` names anything but `identity`, such
+     as `gzip`, counts as misframed. Where the outbound connection reads the reply body, that is
+     a refusal for good with the code `reply-misframed`; where it does not, the body is dropped
+     with a `reply_dropped` event. The reply table under REST in
+     [CONNECTIONS.md](CONNECTIONS.md) says which connection does which. `reply_framing_fault` in
+     `transports/bounded_read.py` lists the replies the check skips, at least a `204` and a
+     `Content-Length: 0` reply. Other reads fail on a coded reply too: an `http://` SMART or
+     OAuth2 token read raises a transient error, so a delivery that mints its bearer retries and
+     then dead-letters the message. The egress response body row of
+     [SECURITY.md](SECURITY.md) lists those reads.
 
 **An `Accept-Encoding` header you set does the same, proxy or no proxy.** The engine sends
 `Accept-Encoding: identity` and does not override one you supply, static in `headers` or stamped
 per message through `dynamic_headers`. A partner that honours yours and codes its reply has every
-content-coded 2xx delivery reply refused or dropped as item 4 says. Leave `Accept-Encoding` unset.
+coded 2xx delivery reply refused or dropped as item 4 says. Leave `Accept-Encoding` unset.
 
 The engine checks its own hop. Its reply reader refuses an ambiguous reply
 (`transports/bounded_read.py`), but it cannot see what the proxy received from the partner. The
