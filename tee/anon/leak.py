@@ -49,6 +49,7 @@ from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind, retarge
 from .surrogates import (
     COMPONENT_KEEPING_KINDS,
     Seps,
+    decoded_readings,
     message_has_site_code,
     read_message_seps,
     unescape,
@@ -170,40 +171,74 @@ def _can_cut_a_shape(field_sep: str) -> bool:
     return field_sep.isdigit() or field_sep.isspace() or field_sep in "-()"
 
 
-#: A run of hex digits, colons and dots holding at least two colons: the text an IPv6 address can be
-#: written in. Each run is handed to ``ipaddress``, which decides whether it is one.
-_IPV6_CANDIDATE: re.Pattern[str] = re.compile(r"[0-9A-Fa-f.:]*:[0-9A-Fa-f.:]*:[0-9A-Fa-f.:]*")
+#: A maximal run of hex digits, colons and dots: the text an IPv6 address can be written in. A run
+#: with fewer than two colons is skipped, and ``ipaddress`` decides whether the rest hold one. The
+#: run is matched whole, never with a colon pinned inside it, so the scan stays linear.
+_IPV6_RUN: re.Pattern[str] = re.compile(r"[0-9A-Fa-f.:]+")
 #: The IPv6 networks that identify no site: the unspecified and loopback addresses, link-local,
-#: unique-local, multicast and the documentation range. An IPv4-mapped address is judged by its
-#: IPv4 part instead (:func:`_has_routable_ipv6`).
+#: unique-local, multicast and the two documentation ranges. An IPv4-mapped or IPv4-compatible
+#: address is judged by its IPv4 part instead (:func:`_has_routable_ipv6`).
 _ALLOWED_IPV6: tuple[ipaddress.IPv6Network, ...] = tuple(
     ipaddress.IPv6Network(net)
-    for net in ("::/128", "::1/128", "fe80::/10", "fc00::/7", "ff00::/8", "2001:db8::/32")
+    for net in (
+        "::/128",
+        "::1/128",
+        "fe80::/10",
+        "fc00::/7",
+        "ff00::/8",
+        "2001:db8::/32",
+        "3fff::/20",
+    )
 )
+#: The deprecated IPv4-compatible block, whose low 32 bits are an IPv4 address.
+_IPV4_COMPATIBLE = ipaddress.IPv6Network("::/96")
+
+
+def _ipv6_candidates(run: str) -> Iterator[str]:
+    """The texts in ``run`` an IPv6 address may be written as: the run, without the dots that end
+    a sentence, without a trailing ``.port`` or ``.word``, and each of those with a colon a label
+    or a list joined to a ``::`` at either end taken off, so ``Addr:::ffff:808:808``,
+    ``2a01:4f8::5.443`` and ``2a01:4f8:::`` still hold their address."""
+    bases = [run, run.strip("."), run.rsplit(".", 1)[0]]
+    for base in dict.fromkeys(bases):
+        yield base
+        yield base.removeprefix(":") if base.startswith(":::") else base
+        yield base.removesuffix(":") if base.endswith(":::") else base
+        yield base.strip(":.")
+
+
 #: The reason a routable IPv6 address gets (BACKLOG #5654).
 IPV6_REASON = "routable IPv6 address"
 
 
 def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bool:
     """True if ``text`` holds an IPv6 address outside :data:`_ALLOWED_IPV6` (BACKLOG #5654). An
-    IPv4-mapped address counts when ``ipv4_is_routable`` says its dotted IPv4 part is routable, so
-    the IPv4 allow list stays the publish guard's own. A run is tried as written and with the dots
-    and colons that end a sentence or a list taken off its ends, so ``2001:db8::`` still parses
-    and a trailing colon does not hide an address."""
-    for match in _IPV6_CANDIDATE.finditer(text):
+    IPv4-mapped or IPv4-compatible address counts when ``ipv4_is_routable`` says its dotted IPv4
+    part is routable, so the IPv4 allow list stays the publish guard's own. Every text
+    :func:`_ipv6_candidates` gives is tried, and any one that parses to a routable address is a
+    hit, so a fail-closed check refuses on any reading. What it misses, and what it refuses
+    though it holds no address, is listed in docs/PHI.md section 9."""
+    for match in _IPV6_RUN.finditer(text):
         run = match.group()
-        for candidate in dict.fromkeys((run, run.strip("."), run.strip(".:"))):
+        if run.count(":") < 2:
+            continue
+        for candidate in dict.fromkeys(_ipv6_candidates(run)):
             try:
                 address = ipaddress.IPv6Address(candidate)
             except ValueError:
                 continue
-            mapped = address.ipv4_mapped
-            if mapped is not None:
-                if ipv4_is_routable(str(mapped)):
+            embedded = address.ipv4_mapped
+            if (
+                embedded is None
+                and address in _IPV4_COMPATIBLE
+                and address > ipaddress.IPv6Address(1)
+            ):
+                embedded = ipaddress.IPv4Address(int(address))
+            if embedded is not None:
+                if ipv4_is_routable(str(embedded)):
                     return True
             elif not any(address in net for net in _ALLOWED_IPV6):
                 return True
-            break
     return False
 
 
@@ -745,11 +780,12 @@ def _is_mrn_type(comp: str, seps: Seps, field_sep: str) -> bool:
     """True if ``comp`` is ``MR`` or ``MRN`` as written, decoded whole as a ``Message`` component
     read decodes it, or as any one of its subcomponents, as written or decoded. ``Peek`` reads the
     first subcomponent of a component that has them, and a ``Message`` subcomponent read can read
-    any of them, so each counts (BACKLOG #5654). Each reading is stripped of surrounding
-    whitespace, so a padded ``MR\\X20\\`` counts too."""
-    leaves = comp.split(seps.subcomponent)
-    decoded = [unescape(part, seps, field_sep) for part in (comp, *leaves)]
-    return any(form.strip().upper() in _MRN_TYPES for form in (comp, *leaves, *decoded))
+    any of them, so each counts (BACKLOG #5654). Each part is also read in every one of
+    :func:`.surrogates.decoded_readings`, the readings the site-code check takes, and each reading
+    is stripped of surrounding whitespace, so a padded ``MR\\X20\\`` and an ``X\\S\\MR`` count too."""
+    parts = (comp, *comp.split(seps.subcomponent))
+    forms = [form for part in parts for form in (part, *decoded_readings(part, seps, field_sep))]
+    return any(form.strip().upper() in _MRN_TYPES for form in forms)
 
 
 def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:

@@ -475,20 +475,11 @@ def surrogate_field_recorded(
 
 def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     """True if ``part``, one component or one subcomponent, is a site code on any reading a
-    consumer can take (BACKLOG #5632): as written, decoded from its HL7 escape sequences
-    (:func:`unescape`), or decoded and then split again on the message's delimiters and its field
-    separator, since a consumer that unescapes the part sees an escaped delimiter as a real one.
-    Each reading must be a site code whole, by ``fullmatch``, so a site-code run inside a longer
-    value still reads as no site code."""
-    if SITE_CODE_RE.fullmatch(part):
-        return True
-    if not seps.escape or seps.escape not in part:
-        return False
-    decoded = unescape(part, seps, field_sep)
-    delimiters = re.escape(field_sep + seps.component + seps.repetition + seps.subcomponent)
-    # A site code holds digits only, so the decoded part matches whole only when it splits to
-    # itself: the pieces cover that reading too.
-    return any(SITE_CODE_RE.fullmatch(piece) for piece in re.split(f"[{delimiters}]", decoded))
+    consumer can take (BACKLOG #5632): as written, trimmed or not, or any of
+    :func:`decoded_readings`. Each reading must be a site code whole, by ``fullmatch``, so a
+    site-code run inside a longer value still reads as no site code."""
+    forms = (part, part.strip(), *decoded_readings(part, seps, field_sep))
+    return any(SITE_CODE_RE.fullmatch(form) for form in forms)
 
 
 def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|") -> str:
@@ -503,8 +494,9 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
     escaped delimiter or written with a hex escape is replaced too, and the whole part as written,
     escape sequences included, gives way to digits of its own width (BACKLOG #5632). A subcomponent
     is replaced on its own; a component that still reads as a site code decoded whole, because an
-    escape pairs across its subcomponent separator, is replaced whole. ``field_sep`` is the
-    message's field separator, which ``\\F\\`` decodes to."""
+    escape pairs across its subcomponent separator, is replaced whole. The surrogate is keyed on
+    the part as written, so one site code written two ways gets two unrelated surrogates.
+    ``field_sep`` is the message's field separator, which ``\\F\\`` decodes to."""
     if not value or not _SITE_PREFIXES:
         return value
     if not any(p in value for p in _SITE_PREFIXES) and not (seps.escape and seps.escape in value):
@@ -667,6 +659,28 @@ def unescape(value: str, seps: Seps, field_sep: str) -> str:
     return "".join(out)
 
 
+def decoded_readings(part: str, seps: Seps, field_sep: str) -> list[str]:
+    """The decoded readings a consumer can take of ``part``, one component or one subcomponent,
+    for the detectors that must fail closed on any of them (BACKLOG #5632, #5654): the part
+    decoded (:func:`unescape`), and decoded with ``\\H\\`` and ``\\N\\`` dropped, as a display
+    that shows highlighting rather than a character reads it; each of those, and each piece of it
+    split again on the message's delimiters, its field separator, a carriage return or a line
+    feed, since a consumer that unescapes the part sees an escaped delimiter or line break as a
+    real one; and each stripped of surrounding whitespace. Empty when ``part`` holds no escape
+    character, since then every reading is the part as written."""
+    escape = seps.escape
+    if not escape or escape not in part:
+        return []
+    shown = part.replace(f"{escape}H{escape}", "").replace(f"{escape}N{escape}", "")
+    breaks = re.escape(field_sep + seps.component + seps.repetition + seps.subcomponent)
+    forms: list[str] = []
+    for decoded in dict.fromkeys(
+        (unescape(part, seps, field_sep), unescape(shown, seps, field_sep))
+    ):
+        forms.extend(form.strip() for form in (decoded, *re.split(f"[{breaks}\r\n]", decoded)))
+    return list(dict.fromkeys(forms))
+
+
 def _unescape_field(field: str, seps: Seps, field_sep: str, *, by_component: bool) -> str:
     """``field`` with each subcomponent decoded on its own, or with ``by_component`` each component
     decoded whole, and the separators kept as written."""
@@ -768,8 +782,9 @@ def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[lis
 
 
 def message_has_site_code(text: str, rules: tuple[FieldRule, ...] = ()) -> bool:
-    """True if any whole field/component/subcomponent **is exactly** a site code — the field-anchored
-    leak-check that matches the scrub (ADR 0030 §5). Using ``fullmatch`` per component (not a broad
+    """True if any whole field/component/subcomponent **is** a site code, on any reading
+    :func:`_reads_as_site_code` takes — the field-anchored leak-check that matches the scrub (ADR
+    0030 §5). Using ``fullmatch`` per component (not a broad
     substring search) means a value that merely *contains* a site-code run — a timestamp, a fabricated
     date, a long order number — is not falsely flagged, while a genuine scrub *miss* still is. Falls
     back to a broad search only for unstructured (no-MSH) text. Always False when no site-code prefix
@@ -804,8 +819,8 @@ def message_has_site_code(text: str, rules: tuple[FieldRule, ...] = ()) -> bool:
 def scrub_message_site_codes(text: str, keyer: Keyer, rules: tuple[FieldRule, ...] = ()) -> str:
     """Field-anchored site-code safety pass over a whole ``\\r``-delimited message (ADR 0030 §5).
 
-    Splits on the message's own separators and replaces any whole **component** that is exactly a
-    site code, anywhere in the message — the net under the rule map for a site code lurking in an
+    Splits on the message's own separators and replaces any whole component or subcomponent that is
+    a site code on any reading :func:`scrub_site_codes` names, anywhere in the message — the net under the rule map for a site code lurking in an
     unexpected field. MSH-1 (field separator) and MSH-2 (encoding characters) are left untouched so
     the header stays parseable. The broad, unanchored catch-all stays in the publish leak-gate as
     defense-in-depth; here we never over-redact a coincidental site-code run inside a longer value.

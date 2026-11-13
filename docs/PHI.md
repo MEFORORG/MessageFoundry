@@ -2411,9 +2411,11 @@ Properties of the anonymizer:
   CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. A component or subcomponent is a site code when it is one whole as
-  written, decoded from its escape sequences, or decoded and split again on the delimiters, so a
-  code joined to `\S\` or written with a hex escape is replaced, escapes and all, by digits of the
-  same width (BACKLOG #5632). With no site prefix loaded it matches nothing, and
+  written or trimmed, or decoded from its escape sequences, with `\H\` and `\N\` kept as `_` or
+  dropped, and then trimmed, whole or split again on the delimiters, a carriage return or a line
+  feed. So a code joined to `\S\`, padded with `\X20\` or written with a hex escape is replaced,
+  escapes and all, by digits of the same width (BACKLOG #5632). The surrogate is keyed on the
+  part as written, so one code written two ways gets two unrelated surrogates. With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
@@ -2434,7 +2436,7 @@ both are described below:
 | The leak-check refuses when | Where it looks |
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
-| A known partner, vendor or site token, or a routable IP address, survives. An IPv6 address counts unless it is unspecified, loopback, link-local, unique-local, multicast or in the documentation range `2001:db8::/32`; an IPv4-mapped one counts when its IPv4 part is routable (BACKLOG #5654) | The whole message |
+| A known partner, vendor or site token, or a routable IP address, survives. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast or in a documentation range (`2001:db8::/32`, `3fff::/20`); an IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. The forms it cannot read are below (BACKLOG #5654) | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
@@ -2460,8 +2462,8 @@ reading the first one where a component has several. An escape can pair across t
 separator in the first reading and not in the second, so the check takes both. The shape
 detectors read each unmapped value as written, then each of its components decoded whole and each
 of its subcomponents decoded on its own. The MRN-typed check reads the id type as written,
-decoded whole, and as each of its subcomponents, as written and decoded, each stripped of
-surrounding spaces, so `X&MR` and `MR\X20\` count (BACKLOG #5654). The check for a shape cut
+decoded whole, and as each of its subcomponents, in the same readings the site-code scrub takes
+(below), so `X&MR`, `MR\X20\` and `X\S\MR` count (BACKLOG #5654). The check for a shape cut
 across fields reads each line as written and with each field decoded a subcomponent and a
 component at a time, and counts a cut only where two fields meet (BACKLOG #5533 item 8). The
 token scan reads the whole message as written, then decoded a subcomponent at a time, then
@@ -2482,8 +2484,16 @@ still pass:
   one in a component never pairs with a sequence in the next.
 - The site-code check and the scrub read no part wider than a component either, so a site code
   whose escape pairs across a component separator passes both (BACKLOG #5632).
+- The IPv6 check reads runs of hex digits, colons and dots, as written and decoded. An address
+  glued to other hex digits or letters, such as one written straight after a hex word, is not
+  read as an address, and nor is one a run joins to another (BACKLOG #5654).
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
+
+The IPv6 check also refuses some text that holds no routable address. At least these: a hex word
+joined to `::`, such as `ADD::`; a hex word joined by a colon to an allowed address, such as
+`Feed:fe80::1`; and, in a message whose field or component separator is `:`, digits on either
+side of an empty field, such as `1::1234`.
 
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three

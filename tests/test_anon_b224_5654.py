@@ -43,8 +43,19 @@ def _zpd(value: str, head: str = _HEAD) -> str:
         "M1^^^H^MR\\X20\\",
         "M1^^^H^\\X20\\MRN",
         "M1^^^H^ MR ",
+        "M1^^^H^X\\S\\MR",
+        "M1^^^H^MR\\H\\",
     ],
-    ids=["second-sub", "second-sub-escaped", "third-sub", "padded-hex", "lead-pad", "spaces"],
+    ids=[
+        "second-sub",
+        "second-sub-escaped",
+        "third-sub",
+        "padded-hex",
+        "lead-pad",
+        "spaces",
+        "escaped-component-separator",
+        "highlighting-dropped",
+    ],
 )
 def test_an_mrn_type_past_the_first_subcomponent_or_padded_is_a_hit(
     leak: ModuleType, value: str
@@ -83,8 +94,25 @@ _GLOBAL = ":".join(["2a01", "4f8", "", "5"])
         f"[{_GLOBAL}]:443",
         _GLOBAL.replace(":", "\\X3A\\"),
         "::ffff:" + ":".join(["808", "808"]),
+        "Addr:::ffff:" + ":".join(["808", "808"]),
+        f"x {_GLOBAL}.443",
+        f"{_GLOBAL}.Bad",
+        f"{_GLOBAL[:-1]}:",
+        "::" + ".".join(["8"] * 4),
     ],
-    ids=["plain", "upper", "sentence", "bracketed", "escaped-colons", "mapped-hex"],
+    ids=[
+        "plain",
+        "upper",
+        "sentence",
+        "bracketed",
+        "escaped-colons",
+        "mapped-hex",
+        "label-colon",
+        "addr-dot-port",
+        "dot-word",
+        "list-colon",
+        "compatible-routable",
+    ],
 )
 def test_a_routable_ipv6_address_is_a_hit(leak: ModuleType, written: str) -> None:
     report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
@@ -110,6 +138,8 @@ def test_a_routable_ipv6_address_is_a_hit(leak: ModuleType, written: str) -> Non
         "10:30:45",
         "a:b",
         "1:2:3:4:5:6:7:8:9",
+        "::10.0.0.1",
+        "3fff::1",
     ],
     ids=[
         "loopback",
@@ -123,8 +153,22 @@ def test_a_routable_ipv6_address_is_a_hit(leak: ModuleType, written: str) -> Non
         "a-time",
         "one-colon",
         "too-many-groups",
+        "compatible-private",
+        "documentation-3fff",
     ],
 )
 def test_an_allowed_or_non_address_is_no_ipv6_hit(leak: ModuleType, written: str) -> None:
     report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
     assert leak.IPV6_REASON not in report.hits, report.hits
+
+
+@_LEAKS
+def test_a_long_hex_run_is_scanned_in_linear_time(leak: ModuleType) -> None:
+    """A hex-encoded payload is one long run of candidate characters. The run is matched whole,
+    so the scan does not backtrack over it; the old pattern took seconds at 60 KB."""
+    import time
+
+    payload = "0123456789ABCDEF" * 40_000 + "::"
+    started = time.perf_counter()
+    assert not leak._has_routable_ipv6(payload, lambda ip: True)
+    assert time.perf_counter() - started < 5

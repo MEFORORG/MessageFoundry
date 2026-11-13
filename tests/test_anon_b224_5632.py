@@ -69,6 +69,10 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "97\\.fi\\1234",
         "97\\X&\\1234",
         "A^971234\\S\\X&B",
+        "971234\\X20\\",
+        "\\.br\\971234",
+        "X\\X0D\\971234",
+        "97\\H\\1234",
     ],
     ids=[
         "component-escape",
@@ -80,6 +84,10 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "dropped-command",
         "pairs-across-subcomponents",
         "inside-a-subcomponent",
+        "padded",
+        "after-a-break",
+        "after-a-carriage-return",
+        "highlighting-dropped",
     ],
 )
 
