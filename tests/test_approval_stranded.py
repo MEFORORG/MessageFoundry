@@ -538,6 +538,34 @@ async def test_a_cancelled_lost_claim_does_not_make_a_siblings_row_ended_here(
     assert refused.value.status == 409 and "attest_owner_stopped" in refused.value.detail
 
 
+async def test_a_claim_whose_reply_was_lost_is_still_claimed_here(engine: Engine) -> None:
+    """A claim whose COMMIT landed but whose reply raised is this process's: the row reads
+    ``ended_here``, and a second gate's start reconcile over the same store object leaves it."""
+
+    class _ReplyLost(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            landed = bool(await self._store.decide_pending_approval(approval_id, **kw))
+            if kw.get("status") == "executing":
+                raise OSError("PROBE: the reply was lost")
+            return landed
+
+    gate = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
+    gate._store = _ReplyLost(engine.store)
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    with pytest.raises(ApprovalError) as fault:
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert fault.value.status == 503
+    assert str((await _row(engine, approval_id))["status"]) == "executing"
+    [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
+    assert listed["liveness"] == "ended_here"
+    found = await ApprovalGate(engine.store, ON).reconcile_after_restart()
+    assert approval_id not in found.interrupted
+
+
 async def test_a_release_running_over_another_store_object_is_not_reconciled(
     engine: Engine,
 ) -> None:

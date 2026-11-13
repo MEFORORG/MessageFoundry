@@ -1745,7 +1745,7 @@ lists nothing, pages `authority-seal-transit` and writes no audit row.
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
 | `GET` | `/approvals/executing` | `approvals:approve` | `require` — releases still claimed as `executing`, up to the store read's cap, with their claim owner and what an interrupt would judge of that owner now; params are not listed (BACKLOG #1562) |
-| `POST` | `/approvals/{approval_id}/interrupt` | `approvals:approve` | `require_step_up` — moves a stranded `executing` release to `interrupted`, refused while its owner may be live; an owner with no heartbeat to read needs `attest_owner_stopped`, unless this process won the release's claim under the answering gate's own owner and runs it no more; never runs the operation (BACKLOG #1562) |
+| `POST` | `/approvals/{approval_id}/interrupt` | `approvals:approve` | `require_step_up` — moves a stranded `executing` release to `interrupted`, refused while its owner may be live; an owner with no heartbeat to read needs `attest_owner_stopped`, unless this process claimed the release over the same store object, under the answering gate's own owner, and runs it no more; never runs the operation (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
 | `POST` | `/dr/activate` | `dr:operate` | `require_step_up` |
 | `POST` | `/dr/release` | `dr:operate` | `require_step_up` |

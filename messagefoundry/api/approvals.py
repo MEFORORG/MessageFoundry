@@ -211,9 +211,10 @@ _GATES_LOCK = threading.Lock()
 #: store object, so a second app's reconcile leaves the first app's claims alone and writes
 #: ``engine_restart`` only for a row neither guard covers. Two store objects over one database in
 #: one process share no record, so a claim of one that no gate is running is not covered for the
-#: other. An entry is added only once its claim commits as won, never for a lost, refused,
-#: cancelled or faulted claim, and is not removed while the store object lives; weak, so an entry
-#: goes when its store object is collected.
+#: other. An entry is added when a claim returns won, cancelled or not, and when a claim's write
+#: raised, since its COMMIT may have landed: the ``decided_at`` match then counts the row only if it
+#: carries this claim's own write. A lost or refused claim adds none. An entry is not removed while
+#: the store object lives; weak, so an entry goes when its store object is collected.
 _CLAIMED_HERE: weakref.WeakKeyDictionary[object, dict[str, float]] = weakref.WeakKeyDictionary()
 
 
@@ -806,7 +807,7 @@ class ApprovalGate:
         for row in await self._verified_rows(
             await self._store.list_executing_approvals(claim_owner=me)
         ):
-            # A won claim is recorded only once its commit returns; until then its release is
+            # A claim is recorded once its write returns or raises; until then its release is
             # tracked in _releasing, so one of the two covers it here.
             if self._claimed_in_process(row) or _releasing_in_process(row.id):
                 continue
@@ -1746,6 +1747,7 @@ class ApprovalGate:
                 self._settle_cancelled_claim(
                     claim,
                     approval_id,
+                    claimed_at=claimed_at,
                     operation=operation,
                     approver=approver,
                     requester=requester,
@@ -1756,6 +1758,8 @@ class ApprovalGate:
             )
             raise
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+            # The COMMIT may have landed with its reply lost (_CLAIMED_HERE says why this is safe).
+            self._note_claim(approval_id, claimed_at)
             # Mapped here rather than inside the claim's future: a cancelled claim's settle logs
             # its own fault, and the same fault must be logged once (BACKLOG #2087).
             raise self._store_fault(
@@ -2086,6 +2090,7 @@ class ApprovalGate:
         claim: asyncio.Future[bool],
         approval_id: str,
         *,
+        claimed_at: float,
         operation: str,
         approver: str,
         requester: str,
@@ -2104,6 +2109,7 @@ class ApprovalGate:
             await self._approval_seal_failed(approval_id)
             return
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
+            self._note_claim(approval_id, claimed_at)  # it may have landed (_CLAIMED_HERE)
             # "Most likely": a COMMIT can land with its reply lost, and then the row and its
             # approval.release_attempted row are both in the store, with nothing run. That row
             # reads 'executing' (vault BACKLOG #3193).
@@ -2118,6 +2124,7 @@ class ApprovalGate:
             self._alert_lost_audit(approval_id, "approval.release_attempted")
             return
         if claimed:
+            self._note_claim(approval_id, claimed_at)  # won (_CLAIMED_HERE)
             await self._compensate_failed_execution(
                 approval_id,
                 operation=operation,
@@ -2700,7 +2707,7 @@ class ApprovalGate:
     ) -> dict[str, Any]:
         """Move a release stranded in ``executing`` to ``interrupted``, so it takes the ordinary
         resolve path (BACKLOG #1562). The owner-delegated decision of 2026-10-29
-        (d20261029T205247402-81159c) rules what this does, in three tiers:
+        (d20261029T205247402-81159c) rules what this does, in these cases, in order:
 
         - a release THIS process is running, or whose outcome it is still writing, is refused, 409;
           one claimed here (:data:`_CLAIMED_HERE`'s rule) under this gate's own owner, that no

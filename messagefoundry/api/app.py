@@ -7339,8 +7339,8 @@ def create_app(
         """Move a release stranded in ``executing`` to ``interrupted`` (BACKLOG #1562), so it can
         be resolved. Refused while its owner may be live: this process runs it, or its cluster
         node still heartbeats. An owner with no heartbeat to read needs ``attest_owner_stopped``,
-        except a release this process won the claim of under the answering gate's own owner and
-        no longer runs (``ended_here``).
+        except a release this process claimed over the same store object, under the answering
+        gate's own owner, and no longer runs (``ended_here``).
         Audited as ``approval.interrupted`` in the same write; the operation is never run."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
