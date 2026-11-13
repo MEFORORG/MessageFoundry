@@ -139,11 +139,59 @@ def test_a_none_on_a_bool_setting_takes_the_setting_default(key: str, want: bool
     assert resolve_env_settings({key: env("k", default=None)}, {})[key] is want
 
 
-def test_a_literal_is_not_read_here() -> None:
-    # Every pre-resolve reader (the loosening registers, the build-time capture checks) reads the
-    # spec's literal, so reading it differently in the resolved copy would split one setting.
-    out = resolve_env_settings({"tls_allow_expired": "false", "verify_tls": None}, {})
-    assert out == {"tls_allow_expired": "false", "verify_tls": None}
+@pytest.mark.parametrize(
+    ("value", "kind"),
+    [("false", "str"), ("true", "str"), ("maybe", "str"), (None, "NoneType"), (0, "int")],
+)
+def test_a_literal_that_is_not_a_bool_is_refused(value: object, kind: str) -> None:
+    # Vault BACKLOG #3234, the code-first route: a connector reads "false" with bool() as True, and
+    # None as False, the insecure side of verify_tls. Refused rather than read, because every
+    # pre-resolve reader has already read the spec's literal, and changing it only in the resolved
+    # copy would split one setting into two readings. The value is withheld, its type named.
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings({"verify_tls": value, "url": "https://h"}, {}, connection="OB_X")
+    msg = str(ei.value)
+    assert f"setting 'verify_tls' of connection 'OB_X' must be true or false, not {kind}" in msg
+    assert "fix them in the config" in msg
+    if value == "maybe":
+        assert "maybe" not in msg
+
+
+def test_a_literal_bool_and_a_literal_on_another_setting_pass_unread() -> None:
+    # The control: a real bool passes, and so does any literal on a setting no factory types bool.
+    settings = {"verify_tls": False, "tls_allow_expired": True, "url": "false", "port": 0}
+    assert resolve_env_settings(settings, {}) == settings
+
+
+def test_a_refused_literal_is_reported_with_the_other_problems() -> None:
+    with pytest.raises(WiringError) as ei:
+        resolve_env_settings({"persistent": "no", "host": env("missing_host")}, {})
+    msg = str(ei.value)
+    assert "'persistent'" in msg and "missing_host" in msg
+
+
+@pytest.mark.parametrize(
+    ("factory", "spec"),
+    [
+        ("Rest", "Rest(url='https://partner.example.org/in', tls_allow_expired='false')"),
+        ("MLLP", "MLLP(host='h.example.org', port=1, persistent='false')"),
+        ("Rest", "Rest(url='https://partner.example.org/in', verify_tls=None)"),
+    ],
+    ids=["rest-str", "mllp-str", "rest-none"],
+)
+def test_the_build_check_refuses_a_code_first_literal_that_is_not_a_bool(
+    tmp_path: Path, factory: str, spec: str
+) -> None:
+    # End to end: `messagefoundry check` reaches the resolve step through build_check_registry, so
+    # the config is refused before any connector reads the text.
+    reg = _outbound_graph(tmp_path, factory, spec)
+    with pytest.raises(WiringError, match="must be true or false"):
+        build_check_registry(
+            reg,
+            inbound_bind_host="127.0.0.1",
+            env_values={},
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 def test_every_bool_setting_name_is_bool_on_every_factory_that_declares_it() -> None:
@@ -410,9 +458,17 @@ def test_an_env_ftp_tls_unknown_spelling_is_refused_value_withheld() -> None:
     assert planted not in str(di.value)
 
 
-def test_a_literal_ftp_tls_is_mapped_as_before() -> None:
+def test_a_literal_bool_ftp_tls_is_mapped() -> None:
     assert Ftp(host="h", remote_dir="/in", tls=True).settings["protocol"] == "ftps"
     assert Ftp(host="h", remote_dir="/in").settings["protocol"] == "ftp"
+
+
+@pytest.mark.parametrize(("value", "kind"), [("false", "str"), (None, "NoneType"), (1, "int")])
+def test_a_literal_ftp_tls_that_is_not_a_bool_is_refused(value: Any, kind: str) -> None:
+    # bool() read tls="false" as FTPS and tls=None as plain FTP, the insecure side (#3234).
+    with pytest.raises(WiringError) as ei:
+        Ftp(host="h", remote_dir="/in", tls=value)
+    assert f"Ftp tls must be true or false, not {kind}" in str(ei.value)
 
 
 def test_the_derived_ftp_protocol_ref_has_a_stable_repr() -> None:

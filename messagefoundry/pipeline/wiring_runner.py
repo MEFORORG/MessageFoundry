@@ -14504,9 +14504,12 @@ def check_http_sync_reply(
             "deployed=False — it will never run, so every HTTP turn could only time out"
         )
     # BACKLOG #3724: read once resolved, as refuse_capture_conflicts reads them. An env() ref is truthy
-    # whatever it resolves to, and the connector captures on either flag.
-    capture_flags = {
-        key: oc.spec.settings.get(key) for key in ("capture_response", "capture_out_params")
+    # whatever it resolves to, and the connector captures on either flag. Only the flags the spec
+    # holds: an absent one written as None would be refused as a bool setting that is not a bool.
+    capture_flags: dict[str, Any] = {
+        key: oc.spec.settings[key]
+        for key in ("capture_response", "capture_out_params")
+        if key in oc.spec.settings
     }
     if env_values is not None:
         capture_flags = resolve_env_settings(capture_flags, env_values, connection=target)

@@ -520,10 +520,11 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   own default, such as on for `verify_tls`. On the SMART and OAuth2 composers' `enabled` flag it
   reads as off, and signing refuses it. On `Ftp(tls=...)` a `None`, from the default or from your
   own cast, reads as FTPS, as every `env()` there did before: only a false spelling turns TLS off.
-  Not every reading is covered. A code-first literal is passed as written. At least some checks read
-  a setting before `env()` resolves, so they see the reference and not its value. A cast you write
-  yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a boolean
-  `cast=bool`, or a real `True`/`False` literal.
+  A code-first literal on a boolean setting must be a real `True` or `False`; a string such as
+  `"false"`, a number or `None` stops the load. Not every reading is covered. At least some checks
+  read a setting before `env()` resolves, so they see the reference and not its value. A cast you
+  write yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a
+  boolean `cast=bool`.
 - **A `default=` is static.** Only one `env()` link is resolved, so a default that holds another
   `env()` reference, directly or inside a table or list, would never resolve. Such a default stops
   the load, in a code-first module and in `connections.toml`, and the error names the key and
