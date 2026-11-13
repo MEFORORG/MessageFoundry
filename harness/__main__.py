@@ -1580,11 +1580,13 @@ def _run_shardcert_driver(argv: list[str]) -> int:
                     "sent": report.sent,
                     "acked": report.acked,
                     "sink_received": report.sink_received,
-                    # The count balance's inputs: S against A x delivering (BACKLOG #5640).
+                    # The per-message copy check (BACKLOG #5640) and its inputs; sink_received and
+                    # timeouts are the reported aggregate, not gated.
                     "delivering": report.delivering,
                     "routing": report.routing,
+                    "acked_copies_missing": report.acked_copies_missing,
+                    "copies_ok": report.copies_ok,
                     "timeouts": report.timeouts,
-                    "count_balance_ok": report.count_balance_ok,
                     # Carries any fallback the driver took for an older engine half's payload.
                     "notes": report.notes,
                     "acked_not_delivered": report.acked_not_delivered,

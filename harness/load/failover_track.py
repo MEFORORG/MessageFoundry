@@ -150,6 +150,20 @@ class FailoverTracker:
         """Acknowledged messages that never reached the sink — the headline loss number (must be 0)."""
         return len(self._acked - self._delivered)
 
+    def acked_copies_missing(self, delivering: int) -> int:
+        """Copies of acknowledged messages that never arrived: for each ACKed seq, ``delivering``
+        minus the DISTINCT lanes it reached, summed. Must be 0.
+
+        Exact per message, where a count of all deliveries is not: a re-delivery on a lane the seq
+        already reached adds nothing, and copies of another message (a duplicate, or a send whose
+        ACK this side never saw) cannot stand in for a lost one. :meth:`acked_not_delivered` is the
+        ``delivering = 1`` case of this check."""
+        copies: dict[int, int] = {}
+        for seen in self._lane_seen.values():
+            for seq in seen:
+                copies[seq] = copies.get(seq, 0) + 1
+        return sum(max(0, delivering - copies.get(seq, 0)) for seq in self._acked)
+
     @property
     def acked_all_delivered(self) -> bool:
         return self._acked <= self._delivered

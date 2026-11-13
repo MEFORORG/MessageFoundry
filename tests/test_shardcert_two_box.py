@@ -546,50 +546,84 @@ def _driver_report(**over: Any) -> sc.ShardCertDriverReport:
         "drain_seconds": 0.1,
         "delivering": 4,
         "routing": BROADCAST,
+        "acked_copies_missing": 0,
     }
     fields.update(over)
     return sc.ShardCertDriverReport(**fields)
 
 
-def test_driver_verdict_refuses_a_broadcast_run_that_lost_outbound_copies() -> None:
-    """The tracker counts DISTINCT messages, so one copy of each reaching the sink cleared
-    ``acked_not_delivered`` while three of every four broadcast copies were lost. The verdict now
-    balances the sink count against the fan-out, as the multi-process drive's ``no_loss`` does.
+def _tracker(acked: Sequence[int], lanes: Mapping[str, Sequence[int]]) -> Any:
+    """A FailoverTracker fed these ACKs and these per-lane deliveries, in order."""
+    from harness.load.failover_track import FailoverTracker
 
-    Mutation: drop the count-balance term from ``ok``. Red: the one-copy run passes."""
+    tracker = FailoverTracker()
+    for seq in acked:
+        tracker.on_ack(seq)
+    for lane, seqs in lanes.items():
+        for seq in seqs:
+            tracker.on_delivery(lane, seq)
+    return tracker
+
+
+_FOUR_LANES = ("a|d0", "a|d1", "a|d2", "a|d3")
+
+
+def test_tracker_counts_each_acked_copy_that_never_arrived() -> None:
+    """Per ACKed seq, the fan-out minus the DISTINCT lanes it reached. A full broadcast run is 0;
+    one copy of each, the old false pass, is 3 per message."""
+    acked = range(10)
+    full = _tracker(acked, {lane: list(acked) for lane in _FOUR_LANES})
+    assert full.acked_copies_missing(4) == 0
+    one_copy_each = _tracker(acked, {"a|d0": list(acked)})
+    assert one_copy_each.acked_not_delivered() == 0  # the old verdict's only loss signal is clean
+    assert one_copy_each.acked_copies_missing(4) == 30
+
+
+def test_tracker_copy_check_cannot_be_offset_by_a_surplus() -> None:
+    """The aggregate count let a surplus stand in for a lost copy: A=10, D=4, one copy of ACKed seq 3
+    lost, and all 4 copies of a timed-out send 10 delivered, gave S=43 inside [40, 44]. Re-delivery
+    on a lane the seq already reached, as across a kill, adds nothing either.
+
+    Mutation: count total deliveries instead of distinct lanes. Red: the missing copy reads 0."""
+    acked = list(range(10))
+    lanes = {lane: [*acked, 10] for lane in _FOUR_LANES}
+    lanes["a|d2"] = [s for s in lanes["a|d2"] if s != 3]
+    lanes["a|d0"] = [*lanes["a|d0"], 3, 5]  # re-deliveries on lanes those seqs already reached
+    tracker = _tracker(acked, lanes)
+    assert tracker.acked_copies_missing(4) == 1
+    assert tracker.lane_repeats == 2
+
+
+def test_driver_verdict_refuses_a_run_that_lost_an_acked_copy() -> None:
+    """The verdict gates on the per-message copy check, on a no-kill run and across a kill alike,
+    whatever the aggregate ``sink_received`` reads.
+
+    Mutation: drop ``copies_ok`` from ``ok``. Red: both lossy runs pass."""
     assert _driver_report().ok
-    one_copy_each = _driver_report(sink_received=10)
-    assert one_copy_each.acked_not_delivered == 0  # the old verdict's only loss signal is clean
-    assert not one_copy_each.ok
-    assert not _driver_report(sink_received=39).ok
-    # No kill: strict. A copy more than the fan-out is a duplicate the run must not certify.
-    surplus = _driver_report(sink_received=41)
-    assert not surplus.ok
-    assert "expect A*delivering=40) -> LOSS" in one_copy_each.render()
-    assert "-> SURPLUS" in surplus.render()
+    lossy = _driver_report(acked_copies_missing=1, sink_received=43, timeouts=1)
+    assert not lossy.ok
+    assert "acked_copies_missing=1 -> LOSS" in lossy.render()
+    assert "aggregate (reported, not gated): S=43 A*delivering=40 timeouts=1" in lossy.render()
+    assert not _driver_report(killed_shard="a", acked_copies_missing=1, sink_received=40).ok
 
 
-def test_driver_verdict_on_a_kill_run_allows_redelivery_but_not_loss() -> None:
-    """Across a kill, at-least-once may re-deliver, so the sink may hold MORE copies than the
-    fan-out implies; it may never hold fewer."""
+def test_driver_verdict_on_a_kill_run_allows_redelivery() -> None:
+    """Across a kill, at-least-once may re-deliver: repeats and a surplus are allowed when every
+    ACKed copy arrived."""
     assert _driver_report(killed_shard="a", sink_received=44, lane_repeats=4).ok
-    assert not _driver_report(killed_shard="a", sink_received=39).ok
 
 
-def test_driver_verdict_allows_copies_of_sends_whose_ack_was_lost() -> None:
-    """A send whose ACK this side never saw may still have been committed and delivered, so on a
-    no-kill run the sink may hold up to ``(A + timeouts) * D`` copies; past that is a duplicate.
-    Below ``A * D`` is still loss, timeouts or not."""
+def test_driver_verdict_ignores_the_aggregate_when_every_copy_arrived() -> None:
+    """A send whose ACK this side never saw may still be delivered. Its copies raise the aggregate
+    above A*D, and the run still passes, since every ACKed copy arrived and no lane repeated."""
     assert _driver_report(sink_received=44, timeouts=1).ok
-    beyond = _driver_report(sink_received=45, timeouts=1)
-    assert not beyond.ok
-    assert "up to (A+timeouts=1)*delivering=44) -> SURPLUS" in beyond.render()
-    assert not _driver_report(sink_received=39, timeouts=5).ok
 
 
-def test_driver_verdict_refuses_a_vacuous_fanout() -> None:
-    """A fan-out below 1 balances 0 == 0 and would certify a run that delivered nothing."""
-    assert not _driver_report(delivering=0, sink_received=0).ok
+def test_driver_verdict_refuses_an_unknown_fanout() -> None:
+    """A fan-out below 1 checks nothing and would certify a run that delivered nothing."""
+    unknown = _driver_report(delivering=0)
+    assert not unknown.ok
+    assert "-> UNCHECKED" in unknown.render()
 
 
 def _post_ready(coord: FileDropCoord, *, drop: Sequence[str] = (), **over: Any) -> None:
@@ -629,46 +663,24 @@ async def test_driver_learns_the_fanout_from_shards_ready(
     assert "routing=partitioned" in report.render()
 
 
-async def test_driver_defaults_an_older_payload_to_fanout_one_with_a_note(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("killed", [None, "a"])
+async def test_driver_fails_an_older_payload_without_the_fanout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, killed: str | None
 ) -> None:
-    """An engine half that predates the keys sends neither. The driver reads that as fan-out 1 and
-    says so, rather than guessing ``dests``. On a no-kill run at a real fan-out above 1 the sink
-    then holds more copies than 1 per message, so the strict balance fails closed (pinned by the
-    report below at the real fan-out's sink count)."""
-    _install_fakes(monkeypatch)
-    coord = FileDropCoord(tmp_path, run_id="old")
-    _post_ready(coord, drop=("delivering", "routing", "handlers", "dests"))
-    report = await sc.run_shardcert_driver(
-        engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
-    )
-    assert report.delivering == 1
-    assert report.routing == BROADCAST
-    assert any("older engine half" in n for n in report.notes), report.notes
-    # At the assumed fan-out of 1, a run that really delivered all 4 copies of 10 messages fails.
-    assumed = _driver_report(delivering=report.delivering, sink_received=40)
-    assert not assumed.ok
-    assert "-> SURPLUS" in assumed.render()
+    """An engine half that predates the keys sends neither. A guessed fan-out of 1 would pass a run
+    that lost every copy but one, so the driver takes 0, which fails the copy check, and says why.
 
-
-async def test_driver_kill_run_without_the_fanout_fails_the_balance(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A kill run's balance is a lower bound, so a guessed fan-out of 1 would pass a run that lost
-    three of every four copies. Without the key it fails instead, and says why."""
+    Mutation: default ``delivering`` to 1. Red: the report's fan-out reads 1."""
     _install_fakes(monkeypatch)
-    coord = FileDropCoord(tmp_path, run_id="oldkill")
-    _post_ready(coord, killed="a", drop=("delivering", "routing", "handlers", "dests"))
+    coord = FileDropCoord(tmp_path, run_id=f"old{killed}")
+    _post_ready(coord, killed=killed, drop=("delivering", "routing", "handlers", "dests"))
     report = await sc.run_shardcert_driver(
         engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
     )
     assert report.delivering == 0
-    assert not report.count_balance_ok
-    assert any("cannot be checked" in n for n in report.notes), report.notes
-    # Even a sink holding every copy cannot balance against an unknown fan-out, and says so.
-    unknown = _driver_report(killed_shard="a", delivering=0, sink_received=40)
-    assert not unknown.ok
-    assert "-> UNCHECKED" in unknown.render()
+    assert not report.copies_ok
+    assert report.routing == BROADCAST
+    assert any("cannot be made without the fan-out" in n for n in report.notes), report.notes
 
 
 async def test_drive_ladder_threads_cacert_and_escapes_an_abort_note(
@@ -891,8 +903,8 @@ def test_shardcert_drive_cli_threads_cacert(
 def test_shardcert_driver_cli_report_json_banks_the_count_balance(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The driver's JSON artifact carries the count balance's inputs and verdict, and the notes
-    that record any fallback, so the banked run shows why it passed or failed.
+    """The driver's JSON artifact carries the copy check, its inputs, the reported aggregate and the
+    notes that record any fallback, so the banked run shows why it passed or failed.
 
     Mutation: drop any of the keys from the JSON dump. Red: the assert names it."""
     import json
@@ -922,6 +934,8 @@ def test_shardcert_driver_cli_report_json_banks_the_count_balance(
     assert banked["delivering"] == 4
     assert banked["routing"] == BROADCAST
     assert banked["timeouts"] == 1
-    assert banked["count_balance_ok"] is True
+    assert banked["sink_received"] == 41
+    assert banked["acked_copies_missing"] == 0
+    assert banked["copies_ok"] is True
     assert banked["notes"] == ["SHARDS_READY carried no `routing`"]
     assert banked["verdict"] == "PASS"

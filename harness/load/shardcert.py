@@ -2900,31 +2900,13 @@ class ShardCertEngineReport:
         return "\n".join(lines)
 
 
-def _count_balance(
-    acked: int, delivering: int, sink_received: int, *, killed: bool, timeouts: int = 0
-) -> bool:
-    """The two-box tiers' sink count balance: the sink's socket-observed copies against the
-    accept-ACK'd intake fanned out (``acked * delivering``). At least that always; across a kill,
-    where at-least-once may re-deliver, nothing more is asked. On a no-kill run at most
-    ``(acked + timeouts) * delivering``: a send whose ACK this side never saw (``timeouts``) may
-    still have been committed and delivered, so its copies are not a duplicate. ``timeouts=0`` is
-    the strict equality. A fan-out below 1 balances nothing, so it fails."""
-    if delivering < 1:
-        return False
-    expected = acked * delivering
-    if sink_received < expected:
-        return False
-    return killed or sink_received <= (acked + max(timeouts, 0)) * delivering
-
-
-def _balance_word(ok: bool, sink_received: int, expected: int, delivering: int) -> str:
-    """``OK``, ``UNCHECKED`` where no fan-out is known, or which way the balance missed: a SURPLUS
-    (more copies than even the unACKed sends explain) is a duplicate, not a lost copy."""
-    if ok:
-        return "OK"
-    if delivering < 1:
-        return "UNCHECKED"
-    return "SURPLUS" if sink_received > expected else "LOSS"
+def _count_balance(acked: int, delivering: int, sink_received: int) -> bool:
+    """The multi-process drive's sink count balance: the sinks' socket-observed copies equal the
+    accept-ACK'd intake fanned out (``acked * delivering``). An AGGREGATE, because that tier's
+    senders and sinks are separate processes and no one process sees both sides of a message. The
+    two-box driver, which does, gates on :meth:`FailoverTracker.acked_copies_missing` instead. A
+    fan-out below 1 balances nothing, so it fails."""
+    return delivering >= 1 and sink_received == acked * delivering
 
 
 @dataclass
@@ -2954,39 +2936,35 @@ class ShardCertDriverReport:
     #: The routing shape SHARDS_READY named; without it ``delivering`` is ambiguous (see
     #: ``ShardCertDriveReport.routing``).
     routing: str
+    #: Copies of ACKed messages that never arrived: per ACKed seq, ``delivering`` minus the
+    #: distinct lanes it reached (:meth:`FailoverTracker.acked_copies_missing`). Must be 0.
+    acked_copies_missing: int
     #: Sends whose ACK this side never saw (a connection closed, or the stop grace ran out). The
-    #: engine may still have committed and delivered them, so they bound the no-kill surplus.
+    #: engine may still have delivered them; REPORTED beside ``sink_received``, never gated.
     timeouts: int = 0
     notes: list[str] = field(default_factory=list)
 
     @property
-    def count_balance_ok(self) -> bool:
-        """The sink's socket-observed copies (``S``) balance the accept-ACK'd intake fanned out
-        (``A * delivering``): ``A*D <= S <= (A + timeouts)*D`` on a no-kill run, and at least ``A*D``
-        across a kill, where at-least-once may re-deliver. Modelled on
-        :attr:`ShardCertDriveReport.no_loss`, plus the timeout allowance (see :func:`_count_balance`).
+    def copies_ok(self) -> bool:
+        """Every ACKed message reached ``delivering`` distinct lanes (BACKLOG #5640).
 
-        ``acked_not_delivered`` alone cannot see this loss: the tracker counts DISTINCT messages, so
-        one copy of each reaching the sink clears it while the other ``delivering - 1`` copies are
-        lost (BACKLOG #5640)."""
-        return _count_balance(
-            self.acked,
-            self.delivering,
-            self.sink_received,
-            killed=self.killed_shard is not None,
-            timeouts=self.timeouts,
-        )
+        Checked per message, so nothing can make up for a lost copy: not a re-delivery across a
+        kill (it lands on a lane the seq already reached), not a duplicate, and not the copies of a
+        send whose ACK this side never saw. ``acked_not_delivered`` alone cannot see this loss: it
+        counts DISTINCT messages, so one copy of each clears it. A fan-out below 1 is unknown, so it
+        fails. The aggregate ``sink_received`` against ``acked * delivering`` is only reported."""
+        return self.delivering >= 1 and self.acked_copies_missing == 0
 
     @property
     def ok(self) -> bool:
-        """Driver-side pass bar: zero acknowledged loss (distinct messages AND every fanned-out copy),
-        drained pipeline (remote ``/stats``), per-lane FIFO (non-vacuous), no dead-letters. Duplicates
-        are allowed only across a kill. The stranded-row check lives on the ENGINE report (it needs
-        direct store access)."""
+        """Driver-side pass bar: every ACKed message delivered on each of its ``delivering`` lanes
+        (:attr:`copies_ok`, on a kill run too), drained pipeline (remote ``/stats``), per-lane FIFO
+        (non-vacuous), no dead-letters. Duplicates are allowed only across a kill. The stranded-row
+        check lives on the ENGINE report (it needs direct store access)."""
         dup_ok = self.lane_repeats == 0 if self.killed_shard is None else True
         return (
             self.acked > 0
-            and self.count_balance_ok
+            and self.copies_ok
             and self.acked_not_delivered == 0
             and self.drained
             and self.in_pipeline_final == 0
@@ -3003,24 +2981,10 @@ class ShardCertDriverReport:
             f"  sent={self.sent} acked={self.acked} delivered_distinct={self.delivered_distinct} "
             f"sink_received={self.sink_received}",
             f"  routing={self.routing} fanout(delivering)={self.delivering}  "
-            f"S={self.sink_received} (expect A*delivering={self.acked * self.delivering}"
-            + (
-                " or more, across the kill"
-                if self.killed_shard is not None
-                else (
-                    f" up to (A+timeouts={self.timeouts})*delivering="
-                    f"{(self.acked + self.timeouts) * self.delivering}"
-                    if self.timeouts > 0
-                    else ""
-                )
-            )
-            + ") -> "
-            + _balance_word(
-                self.count_balance_ok,
-                self.sink_received,
-                self.acked * self.delivering,
-                self.delivering,
-            ),
+            f"acked_copies_missing={self.acked_copies_missing} -> "
+            + ("UNCHECKED" if self.delivering < 1 else "OK" if self.copies_ok else "LOSS"),
+            f"  aggregate (reported, not gated): S={self.sink_received} "
+            f"A*delivering={self.acked * self.delivering} timeouts={self.timeouts}",
             f"  acked_not_delivered={self.acked_not_delivered} (0 = no acknowledged loss)",
             f"  lane_inversions={self.lane_inversions} lanes_observed={self.lanes_observed} "
             f"lane_repeats(dups)={self.lane_repeats}",
@@ -3509,8 +3473,8 @@ async def run_shardcert_driver(
     The lanes per engine shard + sink port band are learned from SHARDS_READY (default ``lanes=1`` /
     ``sink_ports=1`` so an older engine's payload still drives), so the driver's connection set matches
     the served graph exactly. So are the fan-out ``delivering`` and ``routing`` that the verdict's
-    count balance needs; an older payload without them reads as fan-out 1 on a no-kill run and 0
-    (an unchecked balance, which fails) on a kill run, with a note.
+    per-message copy check needs; an older payload without ``delivering`` reads as fan-out 0, an
+    unchecked verdict that fails, with a note.
 
     The drain poll is https with the remote rig session unless ``allow_insecure``; ``cacert`` is the
     engine box's certificate PEM (see :func:`_remote_engine_poller`)."""
@@ -3525,25 +3489,17 @@ async def run_shardcert_driver(
     killed = str(killed_raw) if killed_raw is not None else None
     n = len(ids_list)
     notes: list[str] = []
-    # The FAN-OUT is the count balance's multiplier, so it comes from the engine box's own post and
-    # NEVER from `dests` (a partitioned run delivers 1 copy whatever its destination count). Only an
-    # engine half that predates the key falls back, to 1, and says so: at a real fan-out above 1 a
-    # no-kill run then fails the strict balance rather than passing on a guess. A kill run's balance
-    # is only a lower bound, which a guessed 1 would turn into no check at all, so there the
-    # fallback is 0, which fails the balance outright.
+    # The FAN-OUT is how many lanes each ACKed message must reach, so it comes from the engine box's
+    # own post and NEVER from `dests` (a partitioned run delivers 1 copy whatever its destination
+    # count). An engine half that predates the key gets 0, which fails the copy check and says so: a
+    # guessed 1 would pass a run that lost every copy but one.
     if "delivering" in ready:
         delivering = int(ready["delivering"])
-    elif killed is None:
-        delivering = 1
-        notes.append(
-            "SHARDS_READY carried no `delivering` (an older engine half): the count balance assumes "
-            "fan-out 1, so a no-kill run at a real fan-out above 1 reads SURPLUS"
-        )
     else:
         delivering = 0
         notes.append(
-            "SHARDS_READY carried no `delivering` (an older engine half): a kill run's count balance "
-            "cannot be checked without the fan-out, so it FAILS"
+            "SHARDS_READY carried no `delivering` (an older engine half): the per-message copy check "
+            "cannot be made without the fan-out, so it FAILS"
         )
     if "routing" in ready:
         routing = str(ready["routing"])
@@ -3640,6 +3596,7 @@ async def run_shardcert_driver(
         drain_seconds=drain_s,
         delivering=delivering,
         routing=routing,
+        acked_copies_missing=tracker.acked_copies_missing(delivering),
         timeouts=ctr.timeouts,
         notes=notes,
     )
@@ -4277,7 +4234,7 @@ class ShardCertDriveReport:
         DIRECTLY (store-truth) and owns that verdict; the sinks are the DRIVE box's only reliable truth.
         The poller terms remain as ADVISORY cross-check fields (see ``render``/``to_json_dict``)."""
         return (
-            _count_balance(self.acked, self.delivering, self.sink_received, killed=False)
+            _count_balance(self.acked, self.delivering, self.sink_received)
             and self.acked > 0
             and self.sink_received > 0
         )
