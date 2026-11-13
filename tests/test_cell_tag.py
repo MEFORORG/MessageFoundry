@@ -467,14 +467,15 @@ def test_a_planted_unmarked_cell_is_drift_with_the_ciphers_alert_alone(
     cipher.set_tag_failure_hook(lambda table, reason: tagged.append(reason))
     cipher.set_refusal_hook(lambda table, column: unmarked.append((table, column)))
     assert open_message_cell(cipher, "raw", "", message_id="um0", channel_id="A") == ""
-    for opener in (cipher, _NoKeyringView(cipher)):
+    # A row id per opener, so the second is not muted by the first's report and its check is real.
+    for opener, row in ((cipher, "um1"), (_NoKeyringView(cipher), "um1t")):
         unmarked.clear()
         with pytest.raises(UnmarkedCellError, match="unmarked") as planted:
             open_message_cell(
                 opener,  # type: ignore[arg-type]
                 "raw",
                 "MSH|^~\\&|PLANTED",
-                message_id="um1",
+                message_id=row,
                 channel_id="A",
             )
         assert planted.value.drift and isinstance(planted.value, CellTagError)
@@ -482,8 +483,14 @@ def test_a_planted_unmarked_cell_is_drift_with_the_ciphers_alert_alone(
         assert "PLANTED" not in str(planted.value)
         assert unmarked == [("messages", "raw")] and not tagged  # one alert: the cipher's
     # The cipher's WARNING names only the cell; this one names the row, once per interval.
-    named = [r for r in caplog.records if r.name == cell_tag.__name__ and "um1" in r.getMessage()]
-    assert len(named) == 1 and "PLANTED" not in named[0].getMessage()
+    for row in ("um1", "um1t"):
+        named = [
+            r
+            for r in caplog.records
+            if r.name == cell_tag.__name__ and f"row {row} " in r.getMessage()
+        ]
+        assert len(named) == 1 and "PLANTED" not in named[0].getMessage()
+        assert all(isinstance(arg, str) for arg in named[0].args or ())
 
 
 async def test_an_unmarked_report_never_mutes_a_moved_cells_audit(

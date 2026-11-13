@@ -111,12 +111,16 @@ encrypted cells withheld. The engine keeps running. A refusal usually writes an 
 audit row and raises an `integrity_drift` alert, with at least these exceptions. Under
 `vault_transit`, a message or saved-search cell that Transit refuses with its AEAD authentication
 failure is refused, audited and alerted as any other moved cell is, but Transit's other refusals
-and its outages keep the cipher's own error, with no integrity audit row or alert (BACKLOG #5650).
-Transit gives the same refusal when the data key it is pointed at is not the one that sealed the
-cell, so a recreated key, or another Vault's key of the same name, would read as a moved cell for
-every such cell. An unmarked value refused in a message or saved-search cell is audited, and its
-alert is the cipher's own unmarked-value refusal. On most of the read path, each process reports a row that keeps failing again only
-after an interval: five minutes for a sealed row, and an hour for a message or saved-search cell.
+and its outages keep the cipher's own error for such a cell, with no integrity audit row or alert
+(BACKLOG #5650). A queue payload cell still classifies through `is_tag_failure`, which counts every
+marked Transit value as held, so under `vault_transit` any failure to open one, an outage
+included, reads as a queue tag failure. Transit gives the same AEAD refusal when the data key it is
+pointed at is not the one that sealed the cell, so a recreated key, or another Vault's key of the
+same name, would read as a moved cell for every such cell. An unmarked value refused in a message
+or saved-search cell is audited, and its alert is the cipher's own unmarked-value refusal, which
+the cipher raises on every read, with no interval of its own. On most of the read path, each
+process reports a row that keeps failing again only after an interval: five minutes for a sealed
+row, and an hour for a message or saved-search cell's audit row and WARNING.
 A directory reconcile pass is an exception: the engine itself reports an AD map Vault transit
 cannot verify or reach on every pass that meets it, with no interval of its own (ADR 0217). How a
 session revoke reports a seal refusal, what limits those reports, and the gaps still open are

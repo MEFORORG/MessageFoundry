@@ -414,7 +414,8 @@ def _alert(cipher: object, err: CellTagError) -> None:
     if not _first_in_interval(_reported, err):
         return
     if not err.drift or err.cipher_alerted:
-        _log.warning("%s; the read was refused", err)
+        # The text, not the error: a record keeps its args, and the error's chain reaches PHI.
+        _log.warning("%s; the read was refused", str(err))
         return
     reason = f"a {err.table}.{err.column} cell failed its integrity tag (row {err.row_ref})"
     _log.warning("%s; the read was refused", reason)
