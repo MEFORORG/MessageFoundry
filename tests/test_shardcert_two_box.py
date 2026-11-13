@@ -28,6 +28,13 @@ import pytest
 
 import harness.__main__ as hmain
 import harness.load.shardcert as sc
+from harness.config.shardcert._shape import (
+    BROADCAST,
+    PARTITIONED,
+    PARTITIONED_FANOUT,
+    destinations_for_seq,
+    fifo_lane_destination,
+)
 from harness.load.coord import DRIVE_START, SHARDS_READY, FileDropCoord
 
 
@@ -45,6 +52,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
         awaited_ports=[],
         resets=[],
         queues=[],
+        pollers=[],
     )
 
     class FakeNode:
@@ -127,8 +135,19 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
             *,
             origin: Any = None,
             allow_insecure: bool = False,
+            cacert: str | None = None,
         ) -> None:
             self.final = types.SimpleNamespace(done=0, dead=0, in_pipeline=0)
+            # What the two-box drives built their poller with: the scheme, the credential marker and
+            # the anchor are the BACKLOG #5640 / #5977 wiring the tests below pin.
+            rec.pollers.append(
+                {
+                    "urls": list(urls),
+                    "token": token,
+                    "allow_insecure": allow_insecure,
+                    "cacert": cacert,
+                }
+            )
 
         async def open(self) -> None:
             return None
@@ -508,3 +527,508 @@ def test_shardcert_driver_cli_threads_args(monkeypatch: pytest.MonkeyPatch, tmp_
     assert captured["sink_host"] == "10.0.0.9"
     coord = captured["coord"]
     assert isinstance(coord, FileDropCoord) and coord.run_id == "cli"
+
+
+# --- BACKLOG #5640: the driver verdict counts the outbound COPIES, not just distinct messages -------
+
+
+def _driver_report(**over: Any) -> sc.ShardCertDriverReport:
+    """A clean two-box driver report at a broadcast fan-out of 4: 10 acked messages, 40 copies."""
+    fields: dict[str, Any] = {
+        "shards": ("a", "b"),
+        "killed_shard": None,
+        "sent": 10,
+        "acked": 10,
+        "delivered_distinct": 10,
+        "sink_received": 40,
+        "acked_not_delivered": 0,
+        "lane_inversions": 0,
+        "lanes_observed": 4,
+        "lane_repeats": 0,
+        "engine_done": 10,
+        "engine_dead": 0,
+        "in_pipeline_final": 0,
+        "drained": True,
+        "drain_seconds": 0.1,
+        "delivering": 4,
+        "routing": BROADCAST,
+        "acked_copies_missing": 0,
+    }
+    fields.update(over)
+    return sc.ShardCertDriverReport(**fields)
+
+
+def _tracker(acked: Sequence[int], lanes: Mapping[str, Sequence[int]]) -> Any:
+    """A FailoverTracker fed these ACKs and these per-lane deliveries, in order."""
+    from harness.load.failover_track import FailoverTracker
+
+    tracker = FailoverTracker()
+    for seq in acked:
+        tracker.on_ack(seq)
+    for lane, seqs in lanes.items():
+        for seq in seqs:
+            tracker.on_delivery(lane, seq)
+    return tracker
+
+
+_FOUR_LANES = ("a_00", "a_01", "a_02", "a_03")
+
+
+def _broadcast(fanout: int) -> Any:
+    """The expected-destination function the driver builds for a broadcast run at this fan-out."""
+    return lambda seq: destinations_for_seq(seq, routing=BROADCAST, dests=8, fanout=fanout)
+
+
+def test_tracker_counts_each_acked_copy_that_never_arrived() -> None:
+    """Per ACKed seq, the expected destinations no copy arrived at. A full broadcast run is 0; one
+    copy of each, the old false pass, is 3 per message."""
+    acked = range(10)
+    full = _tracker(acked, {lane: list(acked) for lane in _FOUR_LANES})
+    assert full.acked_copies_missing(_broadcast(4), fifo_lane_destination) == 0
+    one_copy_each = _tracker(acked, {"a_00": list(acked)})
+    assert one_copy_each.acked_not_delivered() == 0  # the old verdict's only loss signal is clean
+    assert one_copy_each.acked_copies_missing(_broadcast(4), fifo_lane_destination) == 30
+
+
+def test_tracker_copy_check_cannot_be_offset_by_a_surplus() -> None:
+    """The aggregate count let a surplus stand in for a lost copy: A=10, D=4, one copy of ACKed seq 3
+    lost, and all 4 copies of a timed-out send 10 delivered, gave S=43 inside [40, 44]. Re-delivery
+    on a lane the seq already reached, as across a kill, adds nothing either.
+
+    Mutation: count total deliveries instead of distinct destinations. Red: the copy reads 0."""
+    acked = list(range(10))
+    lanes = {lane: [*acked, 10] for lane in _FOUR_LANES}
+    lanes["a_02"] = [s for s in lanes["a_02"] if s != 3]
+    lanes["a_00"] = [*lanes["a_00"], 3, 5]  # re-deliveries on lanes those seqs already reached
+    tracker = _tracker(acked, lanes)
+    assert tracker.acked_copies_missing(_broadcast(4), fifo_lane_destination) == 1
+    assert tracker.lane_repeats == 2
+
+
+def test_tracker_copy_at_an_unexpected_destination_does_not_offset_a_lost_one() -> None:
+    """Broadcast with H=8 handlers and D=4 delivering: handler 5 should self-filter. If it regresses
+    and delivers seq 7 while handler 2's copy of seq 7 is lost, seq 7 still arrives under 4 distinct
+    labels, which a count of labels read as complete. Against the expected set it is 1 missing.
+
+    Mutation: count distinct labels instead of expected-destination membership. Red: it reads 0."""
+    acked = list(range(10))
+    lanes = {lane: list(acked) for lane in _FOUR_LANES}
+    lanes["a_02"] = [s for s in acked if s != 7]
+    lanes["a_05"] = [7]
+    tracker = _tracker(acked, lanes)
+    assert tracker.acked_copies_missing(_broadcast(4), fifo_lane_destination) == 1
+
+
+def test_tracker_partitioned_copy_at_the_wrong_destination_is_missing() -> None:
+    """A partitioned message has ONE destination, ``destinations_for_seq`` with fan-out 1. A copy
+    that arrives at any other destination is not its copy: the run lost the expected one."""
+    from harness.config.shardcert._shape import fifo_lane
+
+    def expected(seq: int) -> list[int]:
+        return destinations_for_seq(seq, routing=PARTITIONED, dests=8, fanout=1)
+
+    acked = list(range(20))
+    right: dict[str, list[int]] = {}
+    wrong: dict[str, list[int]] = {}
+    for s in acked:
+        right.setdefault(fifo_lane("a", expected(s)[0]), []).append(s)
+        wrong.setdefault(fifo_lane("a", (expected(s)[0] + 1) % 8), []).append(s)
+    assert _tracker(acked, right).acked_copies_missing(expected, fifo_lane_destination) == 0
+    assert _tracker(acked, wrong).acked_copies_missing(expected, fifo_lane_destination) == 20
+
+
+def test_destinations_for_seq_matches_the_served_router() -> None:
+    """The driver's expected set and the served router's choice come from one function, so they
+    cannot drift: the shape's own selectors agree with it at every seq."""
+    from harness.config.shardcert._shape import ShardCertShape
+    from harness.load.ids import SHARDCERT_IDS
+    from messagefoundry.parsing.message import Message
+
+    def shape(routing: str, delivering: int) -> ShardCertShape:
+        return ShardCertShape(
+            shards=("a",),
+            inbound_base=3600,
+            dests=8,
+            sink_host="127.0.0.1",
+            sink_port=3700,
+            sink_ports=1,
+            transform="edit",
+            persistent=False,
+            lanes_per_shard=1,
+            handlers=8,
+            delivering=delivering,
+            routing=routing,
+        )
+
+    part, fan = shape(PARTITIONED, 8), shape(PARTITIONED_FANOUT, 3)
+    for seq in range(64):
+        msg = Message.parse(
+            f"MSH|^~\\&|A|B|C|D|20260101000000||ADT^A01|{SHARDCERT_IDS.format(seq)}|P|2.5.1\r"
+        )
+        assert [part.destination_index(msg)] == destinations_for_seq(
+            seq, routing=PARTITIONED, dests=8, fanout=1
+        )
+        assert fan.destination_indices(msg) == destinations_for_seq(
+            seq, routing=PARTITIONED_FANOUT, dests=8, fanout=3
+        )
+
+
+def test_driver_verdict_refuses_a_run_that_lost_an_acked_copy() -> None:
+    """The verdict gates on the per-message copy check, on a no-kill run and across a kill alike,
+    whatever the aggregate ``sink_received`` reads.
+
+    Mutation: drop ``copies_ok`` from ``ok``. Red: both lossy runs pass."""
+    assert _driver_report().ok
+    lossy = _driver_report(acked_copies_missing=1, sink_received=43, timeouts=1)
+    assert not lossy.ok
+    assert "acked_copies_missing=1 -> LOSS" in lossy.render()
+    assert "aggregate (reported, not gated): S=43 A*delivering=40 timeouts=1" in lossy.render()
+    assert not _driver_report(killed_shard="a", acked_copies_missing=1, sink_received=40).ok
+
+
+def test_driver_verdict_on_a_kill_run_allows_redelivery() -> None:
+    """Across a kill, at-least-once may re-deliver: repeats and a surplus are allowed when every
+    ACKed copy arrived."""
+    assert _driver_report(killed_shard="a", sink_received=44, lane_repeats=4).ok
+
+
+def test_driver_verdict_ignores_the_aggregate_when_every_copy_arrived() -> None:
+    """A send whose ACK this side never saw may still be delivered. Its copies raise the aggregate
+    above A*D, and the run still passes, since every ACKed copy arrived and no lane repeated."""
+    assert _driver_report(sink_received=44, timeouts=1).ok
+
+
+def test_driver_verdict_refuses_an_unknown_fanout() -> None:
+    """A fan-out below 1 checks nothing and would certify a run that delivered nothing."""
+    unknown = _driver_report(delivering=0)
+    assert not unknown.ok
+    assert "-> UNCHECKED" in unknown.render()
+
+
+def _post_ready(coord: FileDropCoord, *, drop: Sequence[str] = (), **over: Any) -> None:
+    ready: dict[str, Any] = {
+        "shards": ["a", "b"],
+        "inbound_base": 3600,
+        "lanes": 1,
+        "api_ports": [9001, 9002],
+        "sink_base": 3700,
+        "sink_ports": 1,
+        "sink_port": 3700,
+        "killed": None,
+        "dests": 4,
+        "handlers": 4,
+        "delivering": 4,
+        "routing": BROADCAST,
+    }
+    ready.update(over)
+    for key in drop:
+        del ready[key]
+    coord.post(SHARDS_READY, ready)
+
+
+async def test_driver_learns_the_fanout_from_shards_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``delivering`` and ``routing`` come from SHARDS_READY, the engine box's one source of truth,
+    and never from ``dests``: a partitioned run's fan-out is 1 whatever its destination count."""
+    _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id="fan")
+    _post_ready(coord, dests=8, handlers=1, delivering=1, routing=PARTITIONED)
+    report = await sc.run_shardcert_driver(
+        engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
+    )
+    assert report.delivering == 1
+    assert report.routing == PARTITIONED
+    assert "routing=partitioned" in report.render()
+
+
+@pytest.mark.parametrize("killed", [None, "a"])
+async def test_driver_fails_an_older_payload_without_the_fanout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, killed: str | None
+) -> None:
+    """An engine half that predates the keys sends neither. A guessed fan-out of 1 would pass a run
+    that lost every copy but one, so the driver takes 0, which fails the copy check, and says why.
+
+    Mutation: default ``delivering`` to 1. Red: the report's fan-out reads 1."""
+    _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id=f"old{killed}")
+    _post_ready(coord, killed=killed, drop=("delivering", "routing", "handlers", "dests"))
+    report = await sc.run_shardcert_driver(
+        engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
+    )
+    assert report.delivering == 0
+    assert not report.copies_ok
+    assert report.routing == BROADCAST
+    assert any("cannot be made without the fan-out" in n for n in report.notes), report.notes
+
+
+async def test_drive_ladder_threads_cacert_and_escapes_an_abort_note(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every rung's drive gets ``cacert``, and a rung abort's note is escaped before render prints
+    it: the abort text can carry a peer's control sequence."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import LADDER_STOP, CoordTimeout
+
+    seen: list[dict[str, Any]] = []
+
+    async def refusing_drive(**kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise CoordTimeout("SHARDS_READY not seen: \x1b]0;forged\x07refused")
+
+    monkeypatch.setattr(ladder, "run_shardcert_drive", refusing_drive)
+    coord = FileDropCoord(tmp_path, run_id="lad")
+    report = await ladder.run_drive_ladder(
+        engine_host="10.0.0.5",
+        rates=[10.0, 20.0],
+        hold_seconds=0.05,
+        drain_timeout=1.0,
+        driver_count=1,
+        sink_count=1,
+        sink_host="127.0.0.1",
+        base_coord=coord,
+        cacert="engine-box.pem",
+        do_soak=False,
+    )
+    assert [kw["cacert"] for kw in seen] == ["engine-box.pem"]
+    assert report.exit_code == 2
+    assert coord.read(LADDER_STOP) is not None
+    rendered = report.render()
+    assert "refused" in rendered
+    assert "\x1b" not in rendered and "\x07" not in rendered
+
+
+# --- BACKLOG #5640 / #5977 (https and session half): the two-box drain poll ------------------------
+
+
+async def test_driver_polls_the_engine_box_over_https_with_the_remote_rig_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The engine box serves TLS with sign-in on, so the default drain poll is https, signed in as
+    the rig Administrator another process provisioned, verified against ``cacert``.
+
+    Mutation: build the URLs with ``http://`` or pass ``None`` as the token. Red: the assert."""
+    from harness.load.rigadmin import REMOTE_RIG_SESSION
+
+    rec = _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id="tls")
+    _post_ready(coord)
+    await sc.run_shardcert_driver(
+        engine_host="10.0.0.5",
+        hold_seconds=0.05,
+        drain_timeout=1.0,
+        coord=coord,
+        cacert="engine-box.pem",
+    )
+    assert rec.pollers == [
+        {
+            "urls": ["https://10.0.0.5:9001", "https://10.0.0.5:9002"],
+            "token": REMOTE_RIG_SESSION,
+            "allow_insecure": False,
+            "cacert": "engine-box.pem",
+        }
+    ]
+
+
+async def test_driver_insecure_keeps_the_plaintext_poll_without_a_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--insecure`` stays the opt-in for an engine box that serves plain http, and carries no
+    credential on that cleartext hop."""
+    rec = _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id="plain")
+    _post_ready(coord)
+    await sc.run_shardcert_driver(
+        engine_host="10.0.0.5",
+        hold_seconds=0.05,
+        drain_timeout=1.0,
+        coord=coord,
+        allow_insecure=True,
+    )
+    assert rec.pollers[0]["urls"] == ["http://10.0.0.5:9001", "http://10.0.0.5:9002"]
+    assert rec.pollers[0]["token"] is None
+    assert rec.pollers[0]["allow_insecure"] is True
+
+
+def test_remote_poller_refuses_insecure_with_a_cacert() -> None:
+    """A certificate means nothing on a plaintext hop; asking for both is a mistake, said loud."""
+    with pytest.raises(ValueError, match="--cacert"):
+        sc._remote_engine_poller("10.0.0.5", [9001], allow_insecure=True, cacert="x.pem")
+
+
+def _refusing_poller(built: list[dict[str, Any]], exc: Exception) -> type:
+    class RefusingPoller:
+        def __init__(self, urls: Any, token: Any = None, **kw: Any) -> None:
+            built.append({"urls": list(urls), "token": token, **kw})
+
+        async def open(self) -> None:
+            raise exc
+
+        async def close(self) -> None:
+            return None
+
+    return RefusingPoller
+
+
+async def test_driver_sign_in_refusal_is_a_named_setup_error_before_any_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A refused sign-in used to surface only after the whole hold. The poller now opens before
+    DRIVE_START, and its refusal is a named error rather than a traceback."""
+    from harness.load.rigadmin import RigAdminError
+
+    _install_fakes(monkeypatch)
+    built: list[dict[str, Any]] = []
+    refusal = RigAdminError("set MEFOR_RIG_ADMIN_USERNAME and MEFOR_RIG_ADMIN_PASSWORD")
+    monkeypatch.setattr(sc, "EnginePoller", _refusing_poller(built, refusal))
+    coord = FileDropCoord(tmp_path, run_id="refused")
+    _post_ready(coord)
+    with pytest.raises(sc.RemoteEngineSignInError, match="MEFOR_RIG_ADMIN_PASSWORD"):
+        await sc.run_shardcert_driver(
+            engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
+        )
+    assert len(built) == 1
+    assert coord.read(DRIVE_START) is None, "the driver offered load to an engine it cannot poll"
+
+
+def test_shardcert_driver_cli_threads_cacert_and_reports_a_sign_in_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--cacert`` reaches the driver, and a refused sign-in exits 2 with its reason in words."""
+    captured: dict[str, object] = {}
+
+    async def refusing_driver(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        raise sc.RemoteEngineSignInError("could not sign in to the engine box's API: refused")
+
+    monkeypatch.setattr("harness.load.shardcert.run_shardcert_driver", refusing_driver)
+    rc = hmain.main(
+        [
+            "shardcert-driver",
+            "--engine-host",
+            "10.0.0.5",
+            "--cacert",
+            "engine-box.pem",
+            "--coord-dir",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 2
+    assert captured["cacert"] == "engine-box.pem"
+    assert captured["allow_insecure"] is False
+    assert "could not sign in to the engine box's API" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("sub", "extra"),
+    [
+        ("shardcert-driver", []),
+        ("shardcert-drive", []),
+        ("shardcert-drive-ladder", ["--rate-ladder", "10,20"]),
+    ],
+)
+@pytest.mark.parametrize("cacert", ["x.pem", ""])
+def test_two_box_cli_refuses_insecure_with_cacert(
+    sub: str,
+    extra: list[str],
+    cacert: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        hmain.main(
+            [
+                sub,
+                "--engine-host",
+                "10.0.0.5",
+                *extra,
+                "--insecure",
+                "--cacert",
+                cacert,
+                "--coord-dir",
+                str(tmp_path),
+            ]
+        )
+    assert exc.value.code == 2
+    # The named refusal, not argparse's unknown-argument error.
+    assert "do not combine" in capsys.readouterr().err
+
+
+def test_shardcert_drive_cli_threads_cacert(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_drive(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return types.SimpleNamespace(render=lambda: "", ok=True)
+
+    monkeypatch.setattr("harness.load.shardcert.run_shardcert_drive", fake_drive)
+    rc = hmain.main(
+        [
+            "shardcert-drive",
+            "--engine-host",
+            "10.0.0.5",
+            "--cacert",
+            "engine-box.pem",
+            "--coord-dir",
+            str(tmp_path),
+        ]
+    )
+    assert rc == 0
+    assert captured["cacert"] == "engine-box.pem"
+
+
+def test_shardcert_drive_cli_exits_2_on_a_sign_in_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no ENGINE_DRAINED gate the poll is the tally's barrier, so a refusal is a setup error."""
+
+    async def refusing_drive(**kwargs: Any) -> Any:
+        raise sc.RemoteEngineSignInError("could not sign in to the engine box's API: refused")
+
+    monkeypatch.setattr("harness.load.shardcert.run_shardcert_drive", refusing_drive)
+    rc = hmain.main(["shardcert-drive", "--engine-host", "10.0.0.5", "--coord-dir", str(tmp_path)])
+    assert rc == 2
+    assert "could not sign in to the engine box's API" in capsys.readouterr().err
+
+
+def test_shardcert_driver_cli_report_json_banks_the_count_balance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The driver's JSON artifact carries the copy check, its inputs, the reported aggregate and the
+    notes that record any fallback, so the banked run shows why it passed or failed.
+
+    Mutation: drop any of the keys from the JSON dump. Red: the assert names it."""
+    import json
+
+    report = _driver_report(
+        sink_received=41, timeouts=1, notes=["SHARDS_READY carried no `routing`"]
+    )
+
+    async def fake_driver(**kwargs: Any) -> Any:
+        return report
+
+    monkeypatch.setattr("harness.load.shardcert.run_shardcert_driver", fake_driver)
+    out = tmp_path / "driver.json"
+    rc = hmain.main(
+        [
+            "shardcert-driver",
+            "--engine-host",
+            "10.0.0.5",
+            "--coord-dir",
+            str(tmp_path),
+            "--report-json",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    banked = json.loads(out.read_text(encoding="utf-8"))
+    assert banked["delivering"] == 4
+    assert banked["routing"] == BROADCAST
+    assert banked["timeouts"] == 1
+    assert banked["sink_received"] == 41
+    assert banked["acked_copies_missing"] == 0
+    assert banked["copies_ok"] is True
+    assert banked["notes"] == ["SHARDS_READY carried no `routing`"]
+    assert banked["verdict"] == "PASS"

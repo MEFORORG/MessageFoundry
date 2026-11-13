@@ -150,6 +150,26 @@ def _mix64(x: int) -> int:
     return x
 
 
+def destinations_for_seq(seq: int, *, routing: str, dests: int, fanout: int) -> list[int]:
+    """The destination indices message ``seq`` is delivered to, for the router and for a verdict alike.
+
+    BROADCAST: ``0 .. fanout-1`` (handler ``j`` owns destination ``j``; the rest self-filter).
+    PARTITIONED (``fanout`` 1) and PARTITIONED-FANOUT: the first ``fanout`` entries of a partial
+    Fisher-Yates over ``[0, dests)``, every pick drawn through :func:`_mix64`. At ``fanout == 1`` the
+    single pick is ``_mix64(seq) % dests``. See :meth:`ShardCertShape.destination_index` and
+    :meth:`ShardCertShape.destination_indices` for why the mix is load-bearing.
+
+    One function, so the two-box driver's per-message copy check expects exactly the destinations the
+    served router picks."""
+    if routing == BROADCAST:
+        return list(range(fanout))
+    pool = list(range(dests))
+    for i in range(fanout):
+        j = i + (_mix64((seq + i * _FANOUT_STRIDE) & _M64) % (dests - i))
+        pool[i], pool[j] = pool[j], pool[i]
+    return pool[:fanout]
+
+
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     raw = os.environ.get(name)
     if not raw:
@@ -306,7 +326,7 @@ class ShardCertShape:
                 "Refusing to fall back to destination 0: that would funnel every message onto one FIFO "
                 "lane and fabricate a plateau."
             )
-        return _mix64(seq) % self.dests
+        return destinations_for_seq(seq, routing=PARTITIONED, dests=self.dests, fanout=1)[0]
 
     def destination_indices(self, msg: Message | RawMessage) -> list[int]:
         """PARTITIONED-FANOUT: the ``fanout`` (== D) DISTINCT destinations one accepted message delivers to.
@@ -335,11 +355,9 @@ class ShardCertShape:
                 "Refusing to fall back to destination 0: that would funnel messages onto one FIFO lane and "
                 "fabricate a plateau."
             )
-        pool = list(range(self.dests))
-        for i in range(self.fanout):
-            j = i + (_mix64((seq + i * _FANOUT_STRIDE) & _M64) % (self.dests - i))
-            pool[i], pool[j] = pool[j], pool[i]
-        return pool[: self.fanout]
+        return destinations_for_seq(
+            seq, routing=PARTITIONED_FANOUT, dests=self.dests, fanout=self.fanout
+        )
 
     @property
     def txn_per_message(self) -> int:
@@ -520,6 +538,13 @@ def fifo_lane(shard: str, dest_index: int, lane_index: int | None = None) -> str
     if lane_index is None:
         return f"{shard}_{dest_index:02d}"
     return f"{shard}_L{lane_index:02d}_{dest_index:02d}"
+
+
+def fifo_lane_destination(label: str) -> int | None:
+    """The destination index a :func:`fifo_lane` label names (its last ``_`` field), or ``None`` for
+    a label it did not write, such as an empty MSH-6 under the ``cheap`` transform."""
+    _, sep, tail = label.rpartition("_")
+    return int(tail) if sep and tail.isdigit() else None
 
 
 def apply_transform(

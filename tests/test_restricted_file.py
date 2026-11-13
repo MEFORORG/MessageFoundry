@@ -510,6 +510,68 @@ def test_the_posix_check_is_the_group_and_other_read_and_write_bits() -> None:
     assert restricted_file._posix_access_problem(stat.S_IFREG | 0o711) is None
 
 
+_ENGINE_UID = 10001
+_OTHER_UID = 10002
+_KEY = stat.S_IFREG | 0o600
+_HOLDER = stat.S_IFDIR | 0o700
+
+
+def _posix_key(
+    mode: int = _KEY,
+    uid: int = _ENGINE_UID,
+    parent_mode: int = _HOLDER,
+    parent_uid: int = _ENGINE_UID,
+) -> str | None:
+    return restricted_file._posix_key_file_problem(
+        mode=mode, uid=uid, parent_mode=parent_mode, parent_uid=parent_uid, euid=_ENGINE_UID
+    )
+
+
+def test_the_posix_key_file_decision_passes_an_owner_only_file_in_an_owner_only_directory() -> None:
+    """The control for the refusals below (vault BACKLOG #5636)."""
+    assert _posix_key() is None
+    assert _posix_key(uid=0, parent_uid=0) is None  # root owns what it can reach anyway
+    assert _posix_key(parent_mode=stat.S_IFDIR | 0o755) is None  # read and search change nothing
+    # A sticky directory that others may write still lets nobody else delete or rename the file.
+    assert _posix_key(parent_mode=stat.S_IFDIR | 0o1777, parent_uid=0) is None
+
+
+def test_the_posix_key_file_decision_refuses_a_link() -> None:
+    assert "it is a link" in str(_posix_key(mode=stat.S_IFLNK | 0o777))
+    # The link is refused whoever owns it and wherever it is.
+    assert "it is a link" in str(_posix_key(mode=stat.S_IFLNK | 0o600, uid=0))
+
+
+def test_the_posix_key_file_decision_refuses_a_file_another_account_owns() -> None:
+    problem = str(_posix_key(uid=_OTHER_UID))
+    assert f"owned by uid {_OTHER_UID}" in problem and f"(uid {_ENGINE_UID})" in problem
+
+
+def test_the_posix_key_file_decision_still_refuses_a_group_or_other_bit() -> None:
+    assert "0640" in str(_posix_key(mode=stat.S_IFREG | 0o640))
+    assert "0604" in str(_posix_key(mode=stat.S_IFREG | 0o604))
+
+
+def test_the_posix_key_file_decision_refuses_a_directory_another_account_owns() -> None:
+    problem = str(_posix_key(parent_uid=_OTHER_UID))
+    assert "the directory that holds it" in problem and f"uid {_OTHER_UID}" in problem
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o730, 0o707, 0o703, 0o777, 0o2775])
+def test_the_posix_key_file_decision_refuses_a_directory_a_group_or_other_may_write(
+    mode: int,
+) -> None:
+    problem = str(_posix_key(parent_mode=stat.S_IFDIR | mode))
+    assert f"has mode {mode:04o} with no sticky bit" in problem
+
+
+def test_the_directory_that_holds_a_path_is_read_through_the_kernel_for_dot_names() -> None:
+    assert restricted_file._posix_parent(Path("a") / "b.key") == Path("a")
+    assert restricted_file._posix_parent(Path("b.key")) == Path(".")
+    assert restricted_file._posix_parent(Path(".")) == Path("..")
+    assert restricted_file._posix_parent(Path("a") / "..") == Path("a") / ".." / ".."
+
+
 # --- the Windows arm, for real --------------------------------------------------------------------
 
 
@@ -1110,6 +1172,65 @@ def test_a_name_that_is_a_link_is_refused_and_nothing_is_created_behind_it(tmp_p
     assert not target.exists()
 
 
+@posix_only
+def test_posix_refuses_a_restricted_key_reached_through_a_link(tmp_path: Path) -> None:
+    """Vault BACKLOG #5636: the check followed the link and judged the file behind it."""
+    key = tmp_path / "real.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control: the file itself passes
+    link = tmp_path / "linked.key"
+    os.symlink(key, link)
+    assert "it is a link" in str(broad_access_problem(link))
+
+
+@posix_only
+def test_posix_refuses_a_restricted_key_in_a_directory_others_may_write(tmp_path: Path) -> None:
+    holder = tmp_path / "holder"
+    holder.mkdir(mode=0o700)
+    key = holder / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control
+    holder.chmod(0o777)
+    assert "with no sticky bit" in str(broad_access_problem(key))
+    holder.chmod(0o1777)  # the sticky bit keeps others from deleting or renaming the file
+    assert broad_access_problem(key) is None
+    holder.chmod(0o770)
+    assert "has mode 0770" in str(broad_access_problem(key))
+
+
+@posix_only
+def test_posix_refuses_a_restricted_key_another_account_owns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another account is stood in for by the engine's: no test may chown a file away."""
+    real = os.geteuid()
+    if real == 0:
+        pytest.skip("root is an allowed owner, so a root-owned stand-in proves nothing")
+    key = tmp_path / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control: the engine's own account owns it
+    monkeypatch.setattr(os, "geteuid", lambda: real + 1)
+    assert f"owned by uid {real}" in str(broad_access_problem(key))
+
+
+@posix_only
+def test_posix_refuses_a_key_whose_directory_cannot_be_examined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = tmp_path / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control
+    real_stat = os.stat
+
+    def refuse_the_holder(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path) == tmp_path:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", refuse_the_holder)
+    assert "the directory that holds it could not be examined" in str(broad_access_problem(key))
+
+
 def test_a_missing_file_is_a_read_problem_not_a_pass(tmp_path: Path) -> None:
     assert "could not be examined" in str(broad_access_problem(tmp_path / "absent.key"))
 
@@ -1273,6 +1394,159 @@ def _serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> int:
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
+
+
+@pytest.mark.parametrize(("platform", "mode"), [("linux", 0o755), ("win32", None)])
+def test_the_engine_asks_for_a_state_dir_no_one_else_may_write_on_posix_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
+) -> None:
+    """The seam, on every platform (vault BACKLOG #5636). POSIX asks for 0755: no group or other
+    write bit, and still readable, so a client running as another account can read the pinned
+    certificate. Windows passes no mode, so the directory inherits its parent's access list. The
+    real create runs without a mode."""
+    from messagefoundry.api import tls as tls_mod
+
+    seen: list[object] = []
+    real_mkdir = Path.mkdir
+
+    def record(self: Path, *args: Any, **kwargs: Any) -> None:
+        seen.append(kwargs.pop("mode", args[0] if args else None))
+        real_mkdir(self, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record)
+    monkeypatch.setattr(sys, "platform", platform)
+    tls_mod._make_state_dir(tmp_path / "store")
+    monkeypatch.undo()
+    assert seen == [mode] and (tmp_path / "store").is_dir()
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_the_generated_key_remedy_names_the_store_dir_on_posix_only(
+    monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    """The chmod and chown are POSIX commands, and the store directory is judged on POSIX only, so
+    the clause is printed there alone, with the paths shell-quoted so they can be pasted as printed.
+    A mode cause gets chmod go-w, an owner cause gets chown to the engine's account, and moving the
+    store, which would start a new, empty one, is not offered."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.setattr(cli, "_engine_account_name", lambda: "mefor svc")
+    monkeypatch.setattr(sys, "platform", platform)
+    remedy = cli._generated_tls_key_remedy(Path("/srv/mefor data"))
+    assert "[store].path" not in remedy
+    if platform == "win32":
+        assert "chmod" not in remedy and "chown" not in remedy
+    else:
+        # The space makes shlex quote the whole path; Path spells the separators per host.
+        quoted = f"'{Path('/srv/mefor data')}'"
+        assert f"names the directory's mode, remove the write bits: chmod go-w {quoted}" in remedy
+        assert "names the directory's owner" in remedy
+        assert f"chown 'mefor svc' {quoted}" in remedy
+
+
+def _write_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> None:
+    """The settings file in ``tmp_path``, whose folder the start-path guard requires owner-only,
+    and the stubs ``serve`` needs. Written before any umask a test sets, so the file is not
+    group-writable."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+
+def _serve_store(store_dir: Path) -> int:
+    """``serve`` with its store in ``store_dir``, after :func:`_write_settings`."""
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]
+    return main([*argv, "--db", str(store_dir / "messagefoundry.db")])
+
+
+@posix_only
+def test_serve_under_umask_002_makes_a_store_dir_no_group_may_write_and_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #5636. A store directory the engine creates itself has no group or other
+    write bit, so the key-file check passes the key it mints there, under umask 002 as under any
+    other."""
+    from messagefoundry.api.tls import _generated_pair
+
+    store_dir = tmp_path / "store"
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    _write_settings(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML)
+    old = os.umask(0o002)
+    try:
+        assert _serve_store(store_dir) == 0
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(store_dir.stat().st_mode) == 0o755
+    _cert, key = _generated_pair(store_dir)
+    assert broad_access_problem(key) is None
+    assert "is not restricted" not in capsys.readouterr().err
+
+
+@posix_only
+def test_serve_reports_an_existing_store_dir_a_group_may_write_by_enforcement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #5636. A store directory that existed already keeps its mode, and the
+    generated-key gate reports it: enforce refuses with exit 2, warn warns and starts. The remedy
+    names the directory and the command."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    store_dir.chmod(0o775)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    _write_settings(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML)
+    assert _serve_store(store_dir) == 2
+    err = capsys.readouterr().err
+    assert "the directory that holds it has mode 0775 with no sticky bit" in err
+    assert f"chmod go-w {store_dir}" in err and "refusing to start" in err
+    assert stat.S_IMODE(store_dir.stat().st_mode) == 0o775  # never changed by the engine
+
+    warn = 'security.enforcement = "warn"\n' + PHI_GATE_PROVISIONS_TOML
+    _write_settings(tmp_path, monkeypatch, warn)
+    assert _serve_store(store_dir) == 0
+    err = capsys.readouterr().err
+    assert "warning: the generated TLS private key" in err and "mode 0775" in err
+
+
+@pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])
+def test_cert_commands_ask_for_an_owner_only_out_dir_on_posix_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
+) -> None:
+    """The seam, on every platform: POSIX asks for 0700, Windows for no mode so the directory
+    inherits its parent's access list. The real create runs without a mode, so no protected list
+    is attached to this test's directory."""
+    import messagefoundry.__main__ as cli
+
+    seen: list[object] = []
+    real_mkdir = Path.mkdir
+
+    def record(self: Path, **kwargs: Any) -> None:
+        seen.append(kwargs.pop("mode", None))
+        real_mkdir(self, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record)
+    # The key write has its own per-platform arms, which the faked platform must not reach.
+    monkeypatch.setattr(cli, "_write_private_key", lambda path, pem: path.write_bytes(pem))
+    monkeypatch.setattr(sys, "platform", platform)
+    out = tmp_path / "tls"
+    assert cli._write_cert_files(out, out / "k.pem", b"KEY-STAND-IN\n", [], as_json=False) is None
+    monkeypatch.undo()
+    assert seen == [mode]
+
+
+@posix_only
+def test_cert_self_signed_makes_its_out_dir_owner_only_whatever_the_umask(tmp_path: Path) -> None:
+    """Under umask 002 a plain mkdir gives 0775, and the key-file gate refuses the key the
+    engine's own tool wrote there (vault BACKLOG #5636)."""
+    out = tmp_path / "tls"
+    old = os.umask(0o002)
+    try:
+        assert main(["cert", "self-signed", "--cn", "dev.local", "--out-dir", str(out)]) == 0
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o700
+    [key] = [p for p in out.iterdir() if "key" in p.name]
+    assert broad_access_problem(key) is None
 
 
 def test_serve_refuses_a_generated_tls_key_a_broad_account_can_read(

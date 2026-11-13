@@ -215,8 +215,8 @@ that runner from git history before adding an entry.
 `python -m harness --fuzz` fuzzes a RUNNING engine in pure Python, so it runs on Windows too (the
 repo-root `fuzz/` package is the in-process Atheris parser fuzzer; this one is `harness/fuzz/`). It
 takes the generators' synthetic HL7, applies seeded mutations at three layers -- bytes, fields
-(through the parsed `Message` model) and MLLP frames -- and sends each case through a harness
-driver. After every `--fuzz-batch` cases it checks that `/health` answers `ok`; that every
+(through the parsed `Message` model) and MLLP frames -- and sends each case through the MLLP
+harness driver. After every `--fuzz-batch` cases it checks that `/health` answers `ok`; that every
 positive ACK (AA/CA) names, in MSA-2, a control id the store holds with a disposition; that the
 store grew across the batch by at least the number of ACKs and NAKs sent (a NAK's row often has no
 control id, so it is counted, not matched); that every complete frame sent got exactly one reply,
@@ -229,11 +229,10 @@ python -m harness --fuzz --engine URL --cacert PEM --token T --fuzz-seed 7 --fuz
 python -m harness --fuzz-replay <path printed by the failure> --engine URL --cacert PEM --token T
 ```
 
-`--fuzz-driver KIND` and `--fuzz-endpoint KEY` pick the driver and the endpoint (`mllp` defaults to
-`mllp_in`; any other driver must name one). Only `mllp` carries the frame layer and counts replies
-per frame; through another driver a send error or a reply that is not an ACK still fails the case,
-but nothing is matched to the store. Point the mllp driver at an inbound that answers in HL7: one
-with `ack_mode = "none"` never replies, and every case would fail the reply rule. The store checks read
+`--fuzz-endpoint KEY` picks the endpoint (`mllp_in` by default). The driver is always `mllp`:
+`--fuzz-driver` takes no other value, and the `harness/fuzz/transport.py` module docstring says
+why. Point it at an inbound that answers in HL7: one with `ack_mode = "none"` never replies, and
+every case would fail the reply rule. The store checks read
 `GET /messages` about twice per case, so on an auth-enabled engine the per-user read limit (120 a
 minute by default) sets the pace: the fuzzer waits out a 429 rather than failing. Exit 0 when every
 invariant held, 1 when one broke, 2 on a setup error (including a 4xx mid-run). A failure prints the

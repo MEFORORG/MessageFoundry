@@ -220,6 +220,7 @@ def _build_client(
     # builds.
     context_factory = assert_hvac_tls_suites(kwargs, connector=_VAULT_TRANSIT_CONNECTOR)
     client: Any = hvac.Client(**kwargs)
+    _record_reply_status(client)
     # BACKLOG #2053 (ASVS 4.2.1): read every Transit reply through bounded_read rather than
     # urllib3's lenient body reader. Mounted AFTER construction, so the arguments asserted above
     # are still the ones the hop uses. The adapter also gives every connection a context from the
@@ -289,6 +290,49 @@ def is_vault_bad_request(exc: BaseException) -> bool:
     except ImportError:
         return False
     return isinstance(exc, InvalidRequest)
+
+
+#: The attribute :func:`_record_reply_status` sets on an hvac error: the HTTP status of the reply.
+_REPLY_STATUS_ATTR = "mefor_reply_status"
+
+#: The statuses hvac raises as ``UnexpectedError`` that the audit chain walk, on both asks of one
+#: row's verify, reads as the service timing out, not as Transit refusing that row (BACKLOG #8222).
+#: A 413 is not here: Vault answers it to a planted oversize row, which is evidence about the row.
+_TIMEOUT_STATUSES = frozenset({408, 504})
+
+
+def _record_reply_status(client: Any) -> None:
+    """Make every hvac error ``client`` raises for a reply carry that reply's HTTP status, as
+    :data:`_REPLY_STATUS_ATTR` (BACKLOG #8222). hvac raises one ``UnexpectedError`` for every status
+    it does not name, a 413 and a 504 alike, and keeps no status on it. Wraps the adapter's
+    ``_raise_for_error``, which hvac 2.4.0 calls with the reply; where a client has none, no
+    status is recorded, and :func:`is_vault_timeout_reply` is ``False`` for every error, which
+    keeps the louder reading (``tests/test_transit_bound_attestation.py`` pins that the store's
+    real client records it)."""
+    adapter: Any = getattr(client, "adapter", None)
+    raise_for_error = getattr(adapter, "_raise_for_error", None)
+    if raise_for_error is None:
+        return
+
+    def recording(method: str, url: str, response: Any) -> None:
+        try:
+            raise_for_error(method, url, response)
+        except Exception as exc:  # re-raised as is; only the status is added
+            status = getattr(response, "status_code", None)
+            if type(status) is int:
+                setattr(exc, _REPLY_STATUS_ATTR, status)
+            raise
+
+    adapter._raise_for_error = recording
+
+
+def is_vault_timeout_reply(exc: BaseException) -> bool:
+    """Whether ``exc`` was raised for a reply of HTTP 408 or 504, a gateway or server that timed
+    out, by the status :func:`_record_reply_status` recorded (BACKLOG #8222). Any class: hvac
+    raises ``UnexpectedError`` for those statuses, or ``TypeError`` or ``AttributeError`` where it
+    cannot read a JSON body's ``errors``, and the status is recorded on whichever it raised.
+    ``False`` for an error with no recorded status."""
+    return getattr(exc, _REPLY_STATUS_ATTR, None) in _TIMEOUT_STATUSES
 
 
 def is_vault_forbidden(exc: BaseException) -> bool:

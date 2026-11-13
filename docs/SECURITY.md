@@ -1296,7 +1296,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 |---|---|---|---|---|---|
 | Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on; `Encrypt=strict` with the `[store].ssl_root_cert` pin | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
 | Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
-| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_admin_reset_totp`, `_store_transit_bound`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`, which pass the instance's posture at `enforce` and none at `warn` (BACKLOG #2532), and `_admin_revoke_sessions` (BACKLOG #2614), which came later and does the same, so the cells to its right count it with the BACKLOG #2532 commands; at least `support/bundle.py`, `verify/checks.py` and `verify/smoke.py`, which pass none | the two store drivers above | the same refusals as `serve` at `enforce`. With no posture the weakened-TLS check fails closed, and the PostgreSQL revocation guard does not run; at `warn` the BACKLOG #2532 commands run that guard themselves, at least once per open (`admin-reset-totp` opens twice and logs it twice), and before the open, so the WARNING is logged even when that open then refuses for its key, cipher or driver | at `enforce` the BACKLOG #2532 commands refuse as the two store rows above. At `warn` they refuse a weakened store even with `MEFOR_ALLOW_INSECURE_TLS`, where `serve` would cross, and log `serve`'s WARNING for an unrevoked off-loopback PostgreSQL hop. A command that passes none refuses a weakened store whatever the dial says, and on a first deployment would cross an off-loopback PostgreSQL hop with no revocation check. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known. CORRECTED: until BACKLOG #2532 this row read that every command here passed no posture | No |
+| Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_admin_reset_totp`, `_store_transit_bound`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`, which pass the instance's posture at `enforce` and none at `warn` (BACKLOG #2532), and `_admin_revoke_sessions` (BACKLOG #2614), which came later and does the same, so the cells to its right count it with the BACKLOG #2532 commands; at least `support/bundle.py`, `verify/checks.py` and `verify/smoke.py`, which pass none | the two store drivers above | the same refusals as `serve` at `enforce`. With no posture the weakened-TLS check fails closed, and the PostgreSQL revocation guard does not run; at `warn` the BACKLOG #2532 commands run that guard themselves, at least once per open (`admin-reset-totp` opens twice, and a third time to record a notice whose send failed (BACKLOG #5634), and logs it once per open), and before the open, so the WARNING is logged even when that open then refuses for its key, cipher or driver | at `enforce` the BACKLOG #2532 commands refuse as the two store rows above. At `warn` they refuse a weakened store even with `MEFOR_ALLOW_INSECURE_TLS`, where `serve` would cross, and log `serve`'s WARNING for an unrevoked off-loopback PostgreSQL hop. A command that passes none refuses a weakened store whatever the dial says, and on a first deployment would cross an off-loopback PostgreSQL hop with no revocation check. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known. CORRECTED: until BACKLOG #2532 this row read that every command here passed no posture | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
 | `DATABASE` connector, SQL Server preset | `transports/database.py` `_build_dsn`, from `DatabaseDestination` and `DatabaseSource` | ODBC | weakened-TLS refusal through `_weakened_tls_permitted`, and `_assert_send_hop` at the byte crossing | refuses; a per-connection `tls_hop_attested` allows, audited | No |
 | `DATABASE` connector, generic dialect | `transports/database.py` `generic_cleartext_hop_guard` | ODBC, TLS set by the operator's driver keywords | `InsecureHopGuard`, the shared `insecure_hop_disposition` gradient (engine PR 761) | refuses an off-loopback hop whose `odbc_params` set no TLS mode (a key or certificate keyword alone does not count) or a no-TLS value; `cleartext_accepted` warns | No; the default (no TLS mode) is refused |
@@ -7603,7 +7603,17 @@ notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notic
 notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
-`messagefoundry/pipeline/security_notify.py`. **Still open, at least:**
+`messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
+`admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
+store it holds open, so a takeover notice whose `auth.first_administrator_provisioned` row reads
+`holder_notice: dispatched` and whose send failed gets its own undelivered row too, except in at
+least these cases: that write fails, or the run is interrupted mid-send. The command's own result
+says so as well: `holder_notice_send_failed` in `--json`, and a WARNING line in text. Both say
+the notifier requested to record the notice as undelivered, that is, its send raised, so delivery is
+unconfirmed; a send can raise after the relay has queued the mail. That row can
+come before the provision row in the chain, because the notice is sent while the provision runs.
+`admin-reset-totp` has closed its store by the time the notice is sent, so it opens the store
+again for the row, and only when a send failed. **Still open, at least:**
 
 - At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
   fails in its final drain is recorded. That close is one bounded step of the shutdown. When the
@@ -7614,7 +7624,18 @@ source of record is `SecurityEventNotifier._record_undelivered` in
 - A notice that reaches the notifier once it has begun to close is refused and recorded with
   `reason: closing`. The close waits only for records started before it finishes. One started
   later can meet the closed store, and is then lost like any failed record write.
-- An offline command such as `provision-admin` wires no audit writer, so it records nothing.
+- `admin-reset-totp` loses the record of a failed notice in at least these cases: its reopen of
+  the store fails, or the write fails. The run being interrupted can lose it too. The command waits
+  for the reopen and the write together for at most `_OFFLINE_NOTICE_RECORD_SECONDS` in
+  `messagefoundry/__main__.py`, and then logs that the outcome is unknown. While the command
+  still runs, a record past that limit may land or fail, and what it does is logged when it does,
+  unless the wait was interrupted rather than timed out. A failed write is answered before the
+  close, and the close comes after any answer, so a slow close never costs the row or reports it
+  missed. A committed row is reported missed only where the
+  write itself raised, which can happen after a server-side COMMIT. The reopen and the write run
+  on their own loop in a daemon thread, so the limit covers a synchronous key-provider hop inside
+  the open too. A record still running at the time limit is not guaranteed either way: the process
+  exit may wait for it, or it may be lost with no log line.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
@@ -8108,9 +8129,10 @@ hold. Transit refuses it with HTTP 400 while it still answers under the latest v
 then reports a break at that row and keeps going. `audit-verify` names the row and exits 1. With
 `[integrity].audit_verify_on_start` on, the startup check also raises its `audit-chain` alert.
 So is a row whose own request Transit refuses, such as one Vault answers with HTTP 413 past
-`max_request_size`; ADR 0193's 2026-11-11 amendment, item 4, says how a refusal is told from the
-service failing. Other failures still stop the walk as a check that could not run. Those include
-at least an outage and a dropped connection.
+`max_request_size`; ADR 0193's 2026-11-11 amendment, item 4, as its 2026-11-13 amendment, item
+1, amends it, says how a refusal is told from the service failing. Other failures still stop the
+walk as a check that could not run. Those include at least an outage, a dropped connection, and an
+HTTP 408 or 504 on both asks of a row's verify, in the walk only.
 
 **Retiring an old version of the audit key breaks the chain.** Transit's verify also refuses a
 version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under

@@ -1971,7 +1971,8 @@ def test_cli_wires_the_notifier_drains_it_and_reports_the_takeover(
     _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
     recorder = _Recorder()
     monkeypatch.setattr(
-        "messagefoundry.__main__._offline_security_notifier", lambda _settings, _posture: recorder
+        "messagefoundry.__main__._offline_security_notifier",
+        lambda _settings, _posture, **_kw: recorder,
     )
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--db", str(db)]
@@ -2001,7 +2002,8 @@ def test_cli_says_nobody_was_told_when_the_account_had_no_address(
     _keyed_store_with_roleless_account(db, key, email=None)
     recorder = _Recorder()
     monkeypatch.setattr(
-        "messagefoundry.__main__._offline_security_notifier", lambda _settings, _posture: recorder
+        "messagefoundry.__main__._offline_security_notifier",
+        lambda _settings, _posture, **_kw: recorder,
     )
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     assert (
@@ -2023,8 +2025,24 @@ def test_cli_says_nobody_was_told_when_the_account_had_no_address(
     assert recorder.events == []
 
 
+def _undelivered_rows(db: Path, key: str) -> list[tuple[str, dict[str, str]]]:
+    """The ``auth.security_notice_undelivered`` rows in the keyed store, as (actor, detail)."""
+    from messagefoundry.pipeline.security_notify import SECURITY_NOTICE_UNDELIVERED_ACTION
+
+    async def read() -> list[tuple[str, dict[str, str]]]:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            rows = await store.list_audit(limit=50, action=SECURITY_NOTICE_UNDELIVERED_ACTION)
+            return [(str(r["actor"]), json.loads(str(r["detail"]))) for r in rows]
+        finally:
+            await store.close()
+
+    return asyncio.run(read())
+
+
 def test_cli_sends_through_the_real_notifier_before_it_exits(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """End to end through the real ``SecurityEventNotifier``: built from a service config, started,
     fed, and drained before the command's loop ends. Only the SMTP send itself is stubbed."""
@@ -2050,6 +2068,58 @@ def test_cli_sends_through_the_real_notifier_before_it_exits(
     argv += ["--email", "operator@example.invalid"]
     assert main([*argv, "--db", str(db), "--json"]) == 0
     assert sent == [(["holder@example.invalid"], _SUBJECTS[FIRST_ADMINISTRATOR_TAKEOVER])]
+    # BACKLOG #5634's control: a notice that was sent leaves no undelivered row.
+    assert _undelivered_rows(db, key) == []
+    assert json.loads(capsys.readouterr().out)["holder_notice_send_failed"] is False
+
+
+@pytest.mark.parametrize("as_json", [True, False])
+def test_cli_records_a_takeover_notice_whose_send_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    as_json: bool,
+) -> None:
+    """BACKLOG #5634: the provision row says ``dispatched``, which is never a delivery receipt, so
+    a send that then fails must leave its own undelivered row, with the account as actor. Before
+    the fix the offline notifier had no audit sink, and the failure reached stderr only."""
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    db = tmp_path / "p.db"
+    _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
+    cfg = tmp_path / "service.toml"
+    cfg.write_text(
+        '[alerts]\nemail_smtp_host = "smtp.example.invalid"\nemail_from = "mefor@example.invalid"\n',
+        encoding="utf-8",
+    )
+
+    def boom(**_kwargs: object) -> None:
+        raise OSError("relay down")
+
+    monkeypatch.setattr("messagefoundry.pipeline.security_notify.send_plain_email", boom)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    argv = ["provision-admin", "--username", "site-admin", "--service-config", str(cfg)]
+    argv += ["--email", "operator@example.invalid"]
+    assert main([*argv, "--db", str(db), *(["--json"] if as_json else [])]) == 0
+    out = capsys.readouterr().out
+    # The result says so too: the notifier drained before it printed (finding 7 of the review).
+    if as_json:
+        assert json.loads(out)["holder_notice_send_failed"] is True
+    else:
+        assert "is unconfirmed" in out and "no failed send" not in out
+
+    async def read() -> dict[str, object]:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            return await _provision_audit(store)
+        finally:
+            await store.close()
+
+    assert asyncio.run(read())["holder_notice"] == HOLDER_NOTICE_DISPATCHED
+    assert _undelivered_rows(db, key) == [
+        ("site-admin", {"notice": "first_administrator_takeover", "reason": "send_failed"})
+    ]
 
 
 def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
@@ -2063,7 +2133,10 @@ def test_cli_warns_when_the_holder_had_an_address_and_no_channel_is_wired(
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--db", str(db), "--json"]
     assert main([*argv, "--email", "operator@example.invalid"]) == 0
-    assert json.loads(capsys.readouterr().out)["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
+    body = json.loads(capsys.readouterr().out)
+    assert body["holder_notice"] == HOLDER_NOTICE_NO_CHANNEL
+    # Nothing was dispatched, so whether it was delivered is no answer, not false (BACKLOG #5634).
+    assert body["holder_notice_send_failed"] is None
 
 
 # --- vault BACKLOG #3849 B5: the grant raises administrator_granted -----------------------------

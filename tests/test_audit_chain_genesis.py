@@ -484,9 +484,9 @@ async def test_every_row_is_compared_when_a_row_sits_below_the_genesis_row(
     computed: list[object] = []
     real = store_module._audit_row_mac
 
-    def counting(row: Any, prev: Any, key: Any, mac: Any) -> Any:
+    def counting(row: Any, prev: Any, key: Any, mac: Any, **kw: Any) -> Any:
         computed.append(row["seq"])
-        return real(row, prev, key, mac)
+        return real(row, prev, key, mac, **kw)
 
     monkeypatch.setattr(store_module, "_audit_row_mac", counting)
     try:

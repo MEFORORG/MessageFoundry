@@ -108,9 +108,7 @@ def run(
             emit(f"time budget of {config.seconds:g}s reached after {next_iteration} case(s)")
             break
         stop = min(next_iteration + config.batch, config.iterations)
-        cases = [
-            make_case(config.seed, i, wire=transport.wire) for i in range(next_iteration, stop)
-        ]
+        cases = [make_case(config.seed, i) for i in range(next_iteration, stop)]
         sent, held = session.batch(cases, deadline)
         next_iteration += sent
         if not held:
@@ -141,7 +139,7 @@ def replay(
             data = path.read_bytes()
         except OSError as exc:
             raise SetupError(f"cannot read {path}: {exc}") from exc
-        payload = first_frame(data) if transport.wire else data
+        payload = first_frame(data)
         cases.append(
             Case(
                 seed=config.seed,
@@ -231,8 +229,7 @@ class _Session:
         """Send one case; return its acknowledgement count and its broken invariants."""
         self.result.cases += 1
         self.result.layers[case.layer] += 1
-        expected = len(frames(case.data)) if self.transport.wire else None
-        verdict = judge(self.transport.send(case.data), expected=expected)
+        verdict = judge(self.transport.send(case.data), expected=len(frames(case.data)))
         for ack in verdict.acks:
             self.result.replies[ack.code] += 1
         if verdict.problem:

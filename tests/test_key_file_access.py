@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
@@ -228,6 +229,50 @@ def test_a_key_path_holding_a_nul_is_refused_not_raised() -> None:
     )
     problem = connection_key_file_problem(graph, {"k": "a\x00b.key"})
     assert problem is not None and "could not be examined" in problem
+
+
+def test_the_remedies_are_one_line_and_name_the_posix_causes() -> None:
+    """A refusal is printed and logged as one line, so neither remedy may hold a line break, and
+    each names the link and directory causes the POSIX check refuses (vault BACKLOG #5636)."""
+    from messagefoundry import engine_secrets
+
+    for remedy in (key_file_access.KEY_FILE_REMEDY, engine_secrets._REMEDY):
+        assert "\n" not in remedy and "\r" not in remedy
+        assert "link" in remedy and "sticky bit" in remedy
+
+
+_posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="the POSIX arm; the ubuntu-latest leg runs it"
+)
+
+
+@_posix_only
+def test_a_posix_link_to_a_restricted_key_is_refused_dangling_or_not(tmp_path: Path) -> None:
+    """Vault BACKLOG #5636 and #5656. The check judged the file a link names; a dangling link read
+    as a missing file and passed under ``absent_ok``. Both are refused as a link now."""
+    restricted = _key(tmp_path / "restricted.key", broad=False)
+    assert connection_key_file_problem(_soap_graph(restricted), {}) is None  # the control
+    linked = tmp_path / "linked.key"
+    linked.symlink_to(restricted)
+    problem = connection_key_file_problem(_soap_graph(linked), {})
+    assert problem is not None and "it is a link" in problem
+    dangling = tmp_path / "dangling.key"
+    dangling.symlink_to(tmp_path / "nothing-here.key")
+    assert not key_file_access._absent(str(dangling))
+    problem = connection_key_file_problem(_soap_graph(dangling), {})
+    assert problem is not None and "it is a link" in problem
+
+
+@_posix_only
+def test_a_posix_key_in_a_directory_others_may_replace_it_in_is_refused(tmp_path: Path) -> None:
+    """Vault BACKLOG #5656: the check judged the key file alone, not the directory holding it."""
+    holder = tmp_path / "holder"
+    holder.mkdir(mode=0o700)
+    key = _key(holder / "client.key", broad=False)
+    assert connection_key_file_problem(_soap_graph(key), {}) is None  # the control
+    holder.chmod(0o775)
+    problem = connection_key_file_problem(_soap_graph(key), {})
+    assert problem is not None and "the directory that holds it has mode 0775" in problem
 
 
 # --- the registry preflight -----------------------------------------------------------------------
