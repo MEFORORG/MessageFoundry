@@ -3214,19 +3214,20 @@ a `subjectAltName` value, any of which can identify a patient's provider.
 **The validity window is checked at every send, not refused at construction.** The send refuses, before
 anything is built or dialled, when the `recipient_cert` is outside its window, or when every issuing
 `trust_anchor` is. A bundle may hold an older copy of a CA beside its renewal under the same name and key, and
-any one of them inside its window will do. No clock skew is allowed. The two bounds are treated differently:
+any one of them inside its window will do. No clock skew is allowed.
 
-- **Expired** is a permanent `NegativeAckError` marked as a configuration fault, with code
-  `direct-cert-validity:recipient_cert:expired` or `direct-cert-validity:trust_anchor:expired`. Under the
-  default `credential_fault_policy = "stop"` the delivery worker stops the lane and keeps the queue, and its
-  ERROR log line and `connection_stopped` alert carry that code, so they say which certificate expired.
-  Under `credential_fault_policy = "dead_letter"` the message dead-letters, as other configuration faults do.
-- **Not yet valid** is a transient `DeliveryError`, retried on the lane's `RetryPolicy`, because time alone
-  cures it: an attempt after `notBefore` passes delivers with no operator step, and the lane is not held.
-  Each attempt still counts toward the row's attempt cap (`max_attempts`), so a row that reaches the cap
-  before `notBefore` passes dead-letters. Install a certificate only once it is valid.
-- Where the recipient cert and every issuing anchor both fail, an expiry wins: a not-yet-valid recipient
-  whose only anchor has expired stops the lane, because time cannot cure it.
+Either bound is a permanent `NegativeAckError` marked as a configuration fault, with code
+`direct-cert-validity:<setting>:expired` or `direct-cert-validity:<setting>:not-yet-valid`, `<setting>` being
+`recipient_cert` or `trust_anchor`. Under the default `credential_fault_policy = "stop"` the delivery worker
+stops the lane and keeps the queue, spending none of a row's attempts, and its ERROR log line and
+`connection_stopped` alert carry that code, so they say which certificate failed and how. Under
+`credential_fault_policy = "dead_letter"` the message dead-letters, as other configuration faults do.
+
+- **Expired:** renew the certificate, point the setting at the new file, and reload, or restart.
+- **Not yet valid:** once `notBefore` has passed, an operator starts the lane again; the same connector then
+  delivers, with no change to its settings.
+- Where the recipient cert and every issuing anchor both fail, an expiry is the one reported, because it is
+  the one that needs a renewal: a not-yet-valid recipient whose only anchor has expired reports the anchor.
 
 Construction only **logs a WARNING** naming the setting and the bound, once every construction refusal has
 passed, so `messagefoundry check`, a reload and
@@ -4924,7 +4925,7 @@ reading this page already applies to a file the scan never opened.
 | DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` is the fragment size the SCP offers, not a limit on an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit. A PDU longer than `max_pdu_size`, or an object past twice the effective `max_object_bytes`, aborts the association | the modality re-sends; nothing is half-committed |
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter; an object over 32 MiB whose store ends with no response three times in a row → dead-letter, whatever `RetryPolicy` says (vault BACKLOG #4908) |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
-| DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL, plus the send-time certificate check: an expired `recipient_cert` or issuing `trust_anchor` is a configuration fault (`direct-cert-validity:<setting>:expired`) that stops the lane and keeps the queue under the default `credential_fault_policy`; a not-yet-valid one is transient → retry |
+| DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL, plus the send-time certificate check: a `recipient_cert` or issuing `trust_anchor` outside its validity window is a configuration fault (`direct-cert-validity:<setting>:expired` or `:not-yet-valid`) that stops the lane and keeps the queue under the default `credential_fault_policy` |
 | DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings); a `db_lookup` call fetches at most `max_rows` (500) plus one, and [refuses a larger result](#a-lookup-that-selects-too-many-rows-fails-the-message) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
 | Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | a borrow that cannot be satisfied within `DatabaseRef(acquire_timeout=…)` (default 30 s) raises `StoreAcquireTimeout`, failing that set's sync | the sync task is isolated per reference set; the previous snapshot keeps serving reads and the AlertSink fires. The bound also keeps one wedged source from stalling the sequential pass over the other sets |
 | Internal sources — Timer / Loopback / PassThrough | n/a — they open no socket and reach no external system | n/a | n/a |
@@ -4975,7 +4976,7 @@ reading this page already applies to a file the scan never opened.
 | DICOM C-STORE SCP (inbound) | `timeout_seconds` 30 s applied to **all three** pynetdicom timers (ACSE, DIMSE, network) and to the off-loop commit future, and as a fixed deadline on the association request, on each later read, and on each whole send ([DICOM.md](DICOM.md) section 3) | on the timers, the association is released by pynetdicom; a read deadline ends the association by closing the connection, not by a release; the AE is shut down cooperatively on stop | an over-cap object fails the DIMSE operation before the durable commit | n/a — the modality re-sends |
 | DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent; the third end with no response in a row of one object over 32 MiB → permanent (`unanswered-over-ceiling`, vault BACKLOG #4908) | `RetryPolicy`, except that permanent class, which dead-letters whatever the policy says |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |
-| DIRECT (S/MIME over SMTP) | `timeout_seconds` 30 s on the `smtplib` constructor | as EMAIL; key/cert material is loaded once at construction | as EMAIL, plus the send-time certificate check before anything is built or dialled: expired → configuration fault (`direct-cert-validity:<setting>:expired`), the lane stops and the queue stays under the default `credential_fault_policy`; not yet valid → transient | `RetryPolicy`, except the expired class, which stops the lane (or dead-letters under `credential_fault_policy = "dead_letter"`) |
+| DIRECT (S/MIME over SMTP) | `timeout_seconds` 30 s on the `smtplib` constructor | as EMAIL; key/cert material is loaded once at construction | as EMAIL, plus the send-time certificate check before anything is built or dialled: expired or not yet valid → configuration fault (`direct-cert-validity:<setting>:<bound>`), the lane stops and the queue stays under the default `credential_fault_policy` | `RetryPolicy`, except that certificate class, which stops the lane (or dead-letters under `credential_fault_policy = "dead_letter"`) |
 | DATABASE destination / poll source / `db_lookup` | `connect_timeout` 15 s (**login** timeout only, both dialects) and `acquire_timeout` 30 s on the pool borrow — **no per-statement timeout exists on this connector**. For `db_lookup` there is additionally a 30 s Handler-side **result bridge** (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker; it does **not** cancel the statement, which completes on the loop and only then releases its connection | every acquire is paired with a `pool.release()` in `finally`; the pool is closed on connection stop | an acquire expiry raises a **transient** PHI-free `DeliveryError`; SQLSTATE drives transient vs permanent | `RetryPolicy`. `db_lookup` itself is **single-shot** — it raises into the Handler |
 | Reference-set sync (`DatabaseRef`) | `connect_timeout` 15 s (**login** timeout) and `acquire_timeout` 30 s on the pool borrow | the connection is released and the throwaway pool closed in nested `finally` blocks | a sync error (including an acquire expiry) is logged, the AlertSink fires and the previous snapshot keeps serving | one attempt per `refresh_seconds` (default 3600) — **no inner retry** |
 | Internal sources — Timer / Loopback / PassThrough | n/a — no socket, no timeout | the worker task is cooperatively cancelled on stop | n/a | n/a |

@@ -32,9 +32,9 @@ type or strength off the floor (``_require_key_strength``), a recipient cert the
 cleartext-credential misconfiguration **raises here**, so it fails at ``check``/dry-run/start.
 
 **One certificate property is NOT refused here: the validity window** (BACKLOG #5631). Construction
-only logs a WARNING for a recipient cert or issuing anchor outside it, and each send refuses: an
-expired one as a permanent configuration fault whose code starts ``direct-cert-validity``, a
-not-yet-valid one as a retried transient failure. ``DirectDestination._send`` says why. The
+only logs a WARNING for a recipient cert or issuing anchor outside it, and each send refuses it,
+expired or not yet valid, as a permanent configuration fault whose code starts
+``direct-cert-validity``. ``DirectDestination._send`` says why. The
 blocking crypto + SMTP exchange runs off the event loop via ``asyncio.to_thread``.
 
 **STARTTLS posture is inherited from EMAIL.** The signed+encrypted S/MIME body already protects PHI at
@@ -299,8 +299,9 @@ def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
 
-#: The ``NegativeAckError.code`` prefix of a send refused on an expired certificate. The full code
-#: appends the setting and the bound, ``direct-cert-validity:<setting>:expired``, so the delivery
+#: The ``NegativeAckError.code`` prefix of a send refused on a certificate outside its validity
+#: window. The full code appends the setting and the bound,
+#: ``direct-cert-validity:<setting>:expired`` or ``...:not-yet-valid``, so the delivery
 #: worker's lane-stop log line and alert detail, which carry the code, say which certificate failed.
 CERT_VALIDITY_CODE = "direct-cert-validity"
 
@@ -310,7 +311,7 @@ class _WindowProblem(NamedTuple):
     text. Names the setting and the bound only, never a subject or a subjectAltName value."""
 
     setting: str
-    expired: bool  # False: not yet valid, which time alone cures
+    expired: bool  # False: not yet valid
 
     @property
     def text(self) -> str:
@@ -325,6 +326,15 @@ class _WindowProblem(NamedTuple):
         return (
             f"{CERT_VALIDITY_CODE}:{self.setting}:{'expired' if self.expired else 'not-yet-valid'}"
         )
+
+
+def _same_name_and_key(a: x509.Certificate, b: x509.Certificate) -> bool:
+    """Whether ``a`` and ``b`` carry the same subject and the same public key, whatever else
+    differs (serial, validity, extensions). Both keys already loaded for the strength floor."""
+    spki = serialization.PublicFormat.SubjectPublicKeyInfo
+    return a.subject == b.subject and a.public_key().public_bytes(
+        serialization.Encoding.DER, spki
+    ) == b.public_key().public_bytes(serialization.Encoding.DER, spki)
 
 
 def _window_problem(
@@ -345,8 +355,8 @@ def _validity_refusal(
     now, or None. Any one issuing anchor in its window will do, so a CA renewed under the same name
     and key carries on when the bundle's older copy expires; where none is, a not-yet-valid copy
     is the anchors' answer, because time alone cures it. Between the recipient's answer and the
-    anchors', an expiry wins, because time cannot cure it, so a not-yet-valid recipient issued by an
-    expired anchor stops the lane rather than retrying. An empty ``anchors``, which the trust check
+    anchors', an expiry wins, because time cannot cure it, so the refusal names the fix an operator
+    needs: a not-yet-valid recipient issued by an expired anchor reports the anchor. An empty ``anchors``, which the trust check
     never leaves, reads as an expired anchor rather than as none failing."""
     now = _utcnow()
     anchor_problem: _WindowProblem | None = _WindowProblem("trust_anchor", True)
@@ -717,15 +727,15 @@ class DirectDestination(DestinationConnector):
                 self.host,
                 self.port,
                 window.text,
-                "Every send is refused as a permanent configuration fault until the certificate "
-                "is renewed and the connector rebuilt (a new path and a reload, or a restart; "
-                "the connector keeps the certificates it read): under credential_fault_policy = "
-                "stop the lane stops and keeps its queue, under dead_letter each message "
-                "dead-letters"
-                if window.expired
-                else "Each send is refused as a transient failure and retried on the lane's "
-                "RetryPolicy; a row that reaches its attempt cap before notBefore passes "
-                "dead-letters",
+                "Every send is refused as a permanent configuration fault: under "
+                "credential_fault_policy = stop the lane stops and keeps its queue, under "
+                "dead_letter each message dead-letters. "
+                + (
+                    "Renew the certificate and rebuild the connector (a new path and a reload, "
+                    "or a restart; the connector keeps the certificates it read)"
+                    if window.expired
+                    else "Start the lane again once notBefore has passed"
+                ),
             )
 
     def _load_private_key(self, value: Any, password: Any) -> Any:
@@ -867,6 +877,7 @@ class DirectDestination(DestinationConnector):
             _require_key_strength(_cert_public_key(anchor, "trust_anchor"), "trust_anchor")
         issuers: list[x509.Certificate] = []
         anchor_problem: str | None = None
+        pinned = False
         for anchor in anchors:
             try:
                 # verify_directly_issued_by checks the issuer/subject name match AND that the anchor's
@@ -877,7 +888,11 @@ class DirectDestination(DestinationConnector):
                 continue  # try the next anchor
             # An issuer that fails the CA check, or whose extensions do not read, does not end the
             # search: a bundle can hold an old CA beside its successor under the same name and key.
-            if anchor == self._recipient_cert:
+            # A PINNED correspondent: the anchor is the recipient's own name and key. Compared by
+            # subject and public key, not DER bytes, so a correspondent that renews its self-signed
+            # cert under the same name and key stays pinned while the old copy is the anchor.
+            if _same_name_and_key(anchor, self._recipient_cert):
+                pinned = True
                 issuers.append(anchor)
                 continue
             try:
@@ -900,7 +915,6 @@ class DirectDestination(DestinationConnector):
             )
         # A pinned self-signed cert may assert CA=true (openssl req -x509 sets it by default); any
         # other recipient that does is a CA certificate, not a mailbox's end-entity key.
-        pinned = self._recipient_cert in issuers
         problem = (
             (None if pinned else _recipient_ca_problem(self._recipient_cert))
             or _recipient_usage_problem(self._recipient_cert)
@@ -1035,22 +1049,22 @@ class DirectDestination(DestinationConnector):
         #
         # Validity first (BACKLOG #5631), before anything is built or dialled.
         #
-        # EXPIRED refuses every queued message alike, and only a renewed cert fixes them, so it is a
-        # permanent CONFIGURATION fault. Its code names the setting and the bound. Under the default
-        # credential_fault_policy = stop the delivery worker stops the lane, keeps the queue, and
-        # logs one ERROR line and alert carrying that code, so this arm adds no log line of its
-        # own. Under dead_letter the row's last_error holds the text below.
-        #
-        # NOT YET VALID is cured by time alone (a cert installed early, a clock behind its CA), so
-        # it is the transient class and retries on the lane's RetryPolicy. As a configuration fault
-        # it would hold the lane for an operator after notBefore passed. Each attempt still counts
-        # toward the row's attempt cap, so a row that reaches it first dead-letters.
+        # Either bound refuses every queued message alike, so both are a permanent CONFIGURATION
+        # fault (Manager decision, batch 224). Not yet valid is cured by time, but as a transient
+        # retry each attempt counted toward the row's attempt cap and dead-lettered rows; stopped,
+        # the lane keeps the queue and an operator starts it again once notBefore has passed. The
+        # code names the setting and the bound. Under the default credential_fault_policy = stop
+        # the delivery worker stops the lane, keeps the queue, and logs one ERROR line and alert
+        # carrying that code, so this arm adds no log line of its own. Under dead_letter the row's
+        # last_error holds the text below.
         window = _validity_refusal(self._recipient_cert, self._recipient_anchors)
         if window is not None:
-            refused = f"Direct {self.host}:{self.port} refused: {window.text}"
-            if not window.expired:
-                raise DeliveryError(f"{refused}; retried on the lane's RetryPolicy")
-            raise NegativeAckError(refused, code=window.code, permanent=True, config_fault=True)
+            raise NegativeAckError(
+                f"Direct {self.host}:{self.port} refused: {window.text}",
+                code=window.code,
+                permanent=True,
+                config_fault=True,
+            )
         msg: EmailMessage | None = None
         failure = ""
         try:
