@@ -31,7 +31,6 @@ __all__ = [
     "discover_delimiters",
     "find_isa_start",
     "isa_end",
-    "isa_delimiters_distinct",
     "isa_separators_line_up",
     "iter_segments",
     "skip_leading_noise",
@@ -140,12 +139,12 @@ def isa_separators_line_up(buf: str | bytes | bytearray, isa: int) -> bool:
             return True
         if found != sep:
             return False
-    return isa_delimiters_distinct(buf, isa)
+    return _isa_delimiters_distinct(buf, isa)
 
 
-def isa_delimiters_distinct(buf: str | bytes | bytearray, isa: int) -> bool:
-    """The distinctness half of :func:`isa_separators_line_up`, for a caller that has already read
-    every gate position and found the separator there: whether the element separator, the component
+def _isa_delimiters_distinct(buf: str | bytes | bytearray, isa: int) -> bool:
+    """The distinctness half of :func:`isa_separators_line_up`. Only for a caller that has already
+    read every gate position and found the separator there, so ISA12 is present: whether the element separator, the component
     separator, the segment terminator and, from 00501, the repetition separator that are present are
     mutually distinct."""
     sep = buf[isa + 3 : isa + 4]

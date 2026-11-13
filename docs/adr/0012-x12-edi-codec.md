@@ -335,15 +335,23 @@ interchange with no `IEA` does not swallow the next one. The frame ends at that 
 whitespace between is discarded, and the `ISA` opens the next frame. A segment that opens with a
 literal `ISA` that fails the check, such as `ISA~`, `ISAX*1~`, `ISA*NOTE*~` or a `<terminator>ISA`
 inside binary segment data, is data in the interchange being walked, so a complete interchange is
-never cut there; the check stops at the first gate position that differs (`ISA~` fails at its +6).
-While the bytes that decide it have not arrived, the reader holds the open frame rather than cut it
-or walk past it, and resumes the check where it stopped on the next read. The price: an
-interchange with no `IEA` followed directly by a corrupted `ISA` is framed together with that
-corrupted interchange, through its `IEA`. Another known gap: a complete interchange whose segments
-from a literal `ISA` to the end of what the sender has sent line up at every gate position that has
-arrived is held in the reader until more bytes decide it, as above, where `split` frames it whole.
-Each segment start is checked as the walk reaches it, never by a search ahead, so the work
-stays linear however interchanges are separated. A later `ISA` behind anything else, at least a BOM,
+not cut there; the check stops at the first gate position that differs (`ISA~` fails at its +6).
+From that segment on, the walk is also bounded by the next `ISA` that passes, anywhere, as a
+suspect's is, so junk or a cut-off header between an interchange with no `IEA` and the next one
+does not let it swallow that one: a complete interchange reaches its own `IEA` first. While the
+bytes that decide a segment-start `ISA` have not arrived, the reader holds the open frame rather
+than cut it or walk past it, and resumes the check where it stopped on the next read. The costs,
+in at least these cases: an interchange with no `IEA` is framed together with whatever failing run
+follows it, through that run's `IEA` where it has one with the same terminator, or up to the next
+`ISA` that passes; a passing `ISA` at a segment start, such as a whole interchange carried inside
+binary data, still cuts the interchange around it, as before; and while the reader holds at a
+segment-start `ISA` whose header is still arriving, it holds the open frame too, so a connection
+that ends or reaches the frame deadline then drops both with no message row, where the earlier rule
+yielded the frame at once. Another known gap: a complete interchange whose segments from a literal
+`ISA` to the end of what the sender has sent line up at every gate position that has arrived is
+held in the reader until more bytes decide it, as above, where `split` frames it whole.
+Each segment start is checked as the walk reaches it, and the bound's search resumes where the
+last one stopped, so the work stays linear however interchanges are separated. A later `ISA` behind anything else, at least a BOM,
 junk or MLLP envelope bytes, or one in the middle of a segment, does not end the walk: an
 interchange with no `IEA` followed that way is still framed together with what follows it, a known
 gap. A second known gap: "ISA", then 101 copies of one character, then CR LF passes the check for

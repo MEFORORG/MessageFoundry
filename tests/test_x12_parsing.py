@@ -673,6 +673,28 @@ def test_a_passing_isa_that_opens_a_segment_ends_a_passing_walk() -> None:
             assert frames == [swallowed.encode(), good.encode()]
 
 
+@pytest.mark.parametrize(
+    "between",
+    [
+        pytest.param("\r\nISA segment missing\r\n", id="junk-opening-with-isa"),
+        pytest.param(interchange(control="000000002")[:11], id="cut-off-header"),
+        pytest.param(_corrupt(interchange(control="000000002", term="'")), id="other-terminator"),
+    ],
+)
+def test_a_failing_isa_after_an_interchange_with_no_iea_does_not_let_it_swallow_the_next(
+    between: str,
+) -> None:
+    # A failing ISA that opens a segment is data in the walk, but from it on the walk is bounded by
+    # the next ISA that passes, as a suspect's is. Without that bound, a run with no terminator
+    # in it hid the good interchange's ISA from every segment start, and the walk took it whole.
+    a = _without_iea(interchange())
+    good = interchange(control="000000003")
+    assert split(a + between + good) == [a + between, good]
+    data = (a + between + good).encode()
+    for chunk in (4096, 107, 7, 1):
+        assert _frames_of(data, chunk) == [(a + between).encode(), good.encode()], chunk
+
+
 def test_split_takes_a_lowercase_isa_as_data_as_the_reader_does() -> None:
     # The separator check never reads the literal. split took a lowercase "isa" header as an
     # interchange and walked it past a passing ISA in its element data; the reader only starts a
@@ -1093,9 +1115,11 @@ def test_the_isa_check_at_each_segment_start_stays_linear(segment: str, chunk: i
     counter = _CountingBuffer()
     frames, _ = _drip(data, chunk, counter)
     assert frames == [data]
-    # One-byte reads cost about four bytes read and four scanned per input byte with or without
-    # these segments; re-reading each held header from its first gate on every feed reads about ten.
-    assert counter.read < 6 * len(data) and counter.scanned < 5 * len(data), (
+    # One-byte reads cost about four bytes read per input byte, and about eight scanned once the
+    # first failing ISA bounds the walk (the bound's search and the terminator's, each feed), the
+    # same per byte at 200, 400 or 800 such segments. Re-reading each held header from its first
+    # gate on every feed reads about ten; a search ahead to the buffer end grows with the count.
+    assert counter.read < 6 * len(data) and counter.scanned < 10 * len(data), (
         counter.read,
         counter.scanned,
     )
