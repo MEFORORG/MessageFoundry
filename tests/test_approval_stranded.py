@@ -10,6 +10,7 @@
 - The restart keeps the claim time in ``decided_at`` (residual 6) and reads other owners' rows
   apart from its own (residual 7). It claims no outcome from the audit trail: residual 3 was
   dropped by Manager decision d20261109T215156567-4334fc, since ``list_audit`` checks no row MAC.
+  A second app over the same engine leaves the first app's live releases alone (residual 5).
 - The interrupt refuses the original requester and reads ``attest_owner_stopped`` strictly (the
   same decision).
 """
@@ -263,6 +264,30 @@ async def test_a_restart_never_reads_the_audit_trail(engine: Engine) -> None:
     gate = ApprovalGate(_NoTrail(engine.store), ON, resolve_identity=_resolve)
     assert (await gate.reconcile_after_restart()).interrupted == (approval_id,)
     assert reads == []
+
+
+async def test_a_second_app_leaves_the_first_apps_live_release_executing(engine: Engine) -> None:
+    """Residual 5: a second create_app lifespan over the same engine reconciles under the same
+    owner, so it used to take the first app's running release for a leftover and move it to
+    'interrupted'. A release any gate in this process is running is left alone. Control: a row
+    left over from before still moves."""
+    first = create_app(engine, approvals=ON)
+    async with first.router.lifespan_context(first):
+        gate: ApprovalGate = first.state.approval_gate
+        # The gate's account reads, answered without provisioning users, as the contract does.
+        gate._store = _StandingStore(engine.store)
+        gate._resolve_identity = _resolve
+        live, release, leave = await _running_release(gate)
+        leftover = await _stranded(engine, "engine")
+        try:
+            second = create_app(engine, approvals=ON)
+            async with second.router.lifespan_context(second):
+                assert str((await _row(engine, live))["status"]) == "executing"
+                assert str((await _row(engine, leftover))["status"]) == "interrupted"
+        finally:
+            leave.set()
+        await asyncio.wait_for(release, 10.0)
+    assert str((await _row(engine, live))["status"]) == "approved"
 
 
 # --- GET /approvals/executing and the three tiers (residuals 1 and 4) ------------------------------

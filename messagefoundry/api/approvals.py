@@ -55,6 +55,7 @@ import json
 import logging
 import math
 import time
+import weakref
 from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
@@ -190,6 +191,17 @@ _PARAMS_REFUSALS: Mapping[ReleaseBlocked, tuple[str, str]] = {
 #: Fixed, so a plain ``serve`` recognises its own claims after a restart. Two such engines over one
 #: store would share it; that layout is unsupported for other reasons too (``__main__`` says why).
 DEFAULT_CLAIM_OWNER = "engine"
+
+#: Every gate in this process (BACKLOG #1562). A reconcile leaves alone a release any of them is
+#: running, so a second app over the same engine never takes the first app's live releases for
+#: leftovers. Approval ids are unique, so gates over different stores cannot collide here.
+_GATES: weakref.WeakSet[ApprovalGate] = weakref.WeakSet()
+
+
+def _releasing_in_process(approval_id: str) -> bool:
+    """Whether a gate in this process is running the release of ``approval_id`` now."""
+    return any(approval_id in gate._releasing for gate in list(_GATES))
+
 
 #: Whether cluster node ``node_id`` heartbeats (BACKLOG #1562): ``True`` for a fresh heartbeat,
 #: ``False`` for a lapsed one or no such node, ``None`` when this engine reads no cluster heartbeats
@@ -545,7 +557,8 @@ class ApprovalGate:
         # every such release reads owner_heartbeat_unavailable and is refused.
         self._node_liveness = node_liveness
         # The releases this gate is running, from before the claim until the outcome write ends:
-        # interrupt_stranded refuses each, because this process records that outcome itself.
+        # interrupt_stranded refuses each, because this process records that outcome itself, and
+        # no gate's reconcile in this process moves one (_GATES).
         self._releasing: Counter[str] = Counter()
         self._ops: dict[str, _Operation] = {}
         # Wall-clock seconds, injectable so a test can drive the expiry ceiling and the dwell floor.
@@ -576,6 +589,7 @@ class ApprovalGate:
         # When a failed store read of each kind is logged again (BACKLOG #3157): the queue page
         # reads the store on every load, so an outage would otherwise log a traceback per load.
         self._read_faults_reported = SealFailureThrottle()
+        _GATES.add(self)
 
     async def _shielded[T](
         self,
@@ -703,11 +717,11 @@ class ApprovalGate:
     async def reconcile_after_restart(self) -> RestartReconciliation:
         """Move this process's leftover ``executing`` rows to ``interrupted`` (BACKLOG #1562).
 
-        Call it once at startup, before the API serves approvals, and once per engine process: a
-        second app over the same engine would take this process's live releases for leftovers.
-        While the owner is not known yet it moves nothing and puts the work off to
-        :meth:`_catch_up_reconcile`, which runs it once the owner is known and over older claims
-        only (BACKLOG #3252). A
+        Call it at startup, before the API serves approvals. A release any gate in this process
+        is still running is left alone, so a second app over the same engine leaves the first
+        app's live releases ``executing``. While the owner is not known yet it moves nothing and
+        puts the work off to :meth:`_catch_up_reconcile`, which runs it once the owner is known
+        and over older claims only (BACKLOG #3252). A
         row this process claimed in its previous life and never settled is a release whose outcome
         the gate never recorded. At least three things leave one: the process died mid-run, both of
         :meth:`_settle`'s writes failed (the operation ran), or a claim committed but its reply was
@@ -745,8 +759,9 @@ class ApprovalGate:
         return await self._reconcile(me, claimed_before=None)
 
     async def _reconcile(self, me: str, *, claimed_before: float | None) -> RestartReconciliation:
-        """The body of :meth:`reconcile_after_restart` under owner ``me``. With
-        ``claimed_before``, a row claimed at or after that time is left alone: it is this life's."""
+        """The body of :meth:`reconcile_after_restart` under owner ``me``. A row a gate in this
+        process is still releasing is left alone. With ``claimed_before``, so is a row claimed at
+        or after that time: it is this life's."""
         interrupted: list[str] = []
         unsettled: list[str] = []
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
@@ -755,6 +770,8 @@ class ApprovalGate:
         for row in await self._verified_rows(
             await self._store.list_executing_approvals(claim_owner=me)
         ):
+            if _releasing_in_process(row.id):
+                continue  # still running in this process, so not a leftover
             if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
                 continue  # claimed by this process since it started, so not a leftover
             approval_id = row.id
