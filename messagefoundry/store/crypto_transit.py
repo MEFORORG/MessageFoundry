@@ -149,7 +149,9 @@ _REPARSED_BODY_MAX_CHARS = 64 * 1024
 #: texts, ``crypto/cipher``'s GCM for ``aes256-gcm96`` and ``golang.org/x/crypto``'s
 #: ``chacha20poly1305`` for both ChaCha key types, the three
 #: :data:`~messagefoundry.store.keyprovider_vault.TRANSIT_KEY_TYPES_DATA` admits. Transit returns
-#: the error's text as the 400's one reason. Matched whole, never as a substring.
+#: the error's text as the 400's one reason. Matched whole, never as a substring. The two texts are
+#: the Go libraries' own; that Transit returns them unwrapped was not read from the Vault or OpenBao
+#: source here, so a release that wraps them would leave a refused tag plain CipherError, as before.
 _AEAD_FAILURE_TEXTS = frozenset(
     {"cipher: message authentication failed", "chacha20poly1305: message authentication failed"}
 )

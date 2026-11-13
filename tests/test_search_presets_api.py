@@ -499,9 +499,10 @@ async def _layered_with_decrypt_raising(
 ) -> tuple[httpx.Response, list[StarletteHTTPException], str]:
     """One layered recall of a fresh preset whose criteria ``decrypt`` raises ``exc``: the
     response, the HTTP exceptions the app raised, and the preset id. Vault Transit's cipher has no
-    ``holds_key_for``, so ``open_tagged_cell`` re-raises its errors as they are. The keyless
-    store's cipher has none either, so its ``decrypt`` stands in for Transit's, and the error takes
-    the store's real path."""
+    ``holds_key_for``, so ``open_tagged_cell`` keeps its errors as they are, except its
+    ``UnauthenticatedCipherError`` and ``UnmarkedCipherError`` (BACKLOG #5650). The keyless store's
+    cipher has none either, so its ``decrypt`` stands in for Transit's, and the error takes the
+    store's real path."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
@@ -518,7 +519,7 @@ async def _layered_with_decrypt_raising(
 
         assert isinstance(engine.store, MessageStore)
         cipher = engine.store._cipher
-        assert not hasattr(cipher, "holds_key_for")  # else open_tagged_cell reads it as drift
+        assert not hasattr(cipher, "holds_key_for")  # Transit's shape: no key it can name
 
         def _raise(stored: str, **_kw: object) -> str:
             raise exc

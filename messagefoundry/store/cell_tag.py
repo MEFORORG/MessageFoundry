@@ -372,7 +372,7 @@ def withhold_message_cells(
 _REPORT_INTERVAL_S: Final = 3600.0
 #: The most cells remembered; the oldest is forgotten first.
 _REPORTED_MAX: Final = 4096
-type _Key = tuple[str, str, str, str]
+type _Key = tuple[str, str, str, type[CellTagError]]
 type _Memo = dict[_Key, float]
 _reported: _Memo = {}
 _reported_audit: _Memo = {}
@@ -383,7 +383,7 @@ _reported_lock = threading.Lock()
 
 def _memo_key(err: CellTagError) -> _Key:
     # By class, not only by drift: a corrupt or unmarked read never mutes a moved cell (BACKLOG #5650).
-    return (err.table, err.column, err.row_ref, type(err).__name__)
+    return (err.table, err.column, err.row_ref, type(err))
 
 
 def _is_recent(memo: _Memo, key: _Key, now: float) -> bool:

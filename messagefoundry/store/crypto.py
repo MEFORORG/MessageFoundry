@@ -649,10 +649,12 @@ class UnauthenticatedCipherError(CipherError):
     not UTF-8 stay plain :class:`CipherError`, since they are a corrupt row, so
     :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift.
 
-    The Vault Transit cipher raises it from ``decrypt`` and ``decrypt_many`` only for Vault's HTTP
-    400 whose reason is the AEAD's own authentication failure (BACKLOG #5650); every other Transit
-    failure, a key-version refusal, a 403 and a 404 among them, stays plain :class:`CipherError`,
-    and an outage is :class:`CipherUnavailableError`."""
+    The Vault Transit cipher gives it where Vault's reason for refusing a value is wholly the AEAD's
+    own authentication failure (BACKLOG #5650): ``decrypt`` raises it for an HTTP 400 that says so,
+    and ``decrypt_many`` returns it for a batch result whose per-value ``error`` says so, whatever
+    the batch reply's status. Every other Transit failure, a key-version refusal, a 403 and a 404
+    among them, stays plain :class:`CipherError`, and an outage is
+    :class:`CipherUnavailableError`."""
 
 
 class CipherUnavailableError(CipherError):
