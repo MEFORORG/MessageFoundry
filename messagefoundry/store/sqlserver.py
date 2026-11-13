@@ -4319,8 +4319,8 @@ class SqlServerStore:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included, and
             # settle the invocation block this open reserved rather than forfeit it: close() does
             # both (BACKLOG #5720). close() closes the pool and releases the executor in finally
-            # blocks: wait_closed() cannot complete while the pool is wedged, so releasing the
-            # executor only on the success path would leak its threads in exactly this case.
+            # blocks, so a teardown step that raises does not skip them. A wait_closed() that
+            # never returns still holds the executor until run_open_cleanup's bound gives up.
             async def _cleanup() -> None:
                 try:
                     await store.close()
@@ -5777,19 +5777,23 @@ class SqlServerStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # The teardown below runs in a finally, so a cancel during the settle still closes the pool
+        # (BACKLOG #5720).
         try:
-            # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one ours.
-            if not self._cipher_foreign and not self._read_only:
-                await self.checkpoint_cipher_invocations(settle=True)
-        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
-        try:
-            # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none
-            # were opened, so it never affects the async path). ADR 0071 B5.
-            self.close_sync_handoff_pool()
-            # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op when the
-            # prepared path never opened one).
-            await self._close_claim_holders()
+            try:
+                # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one.
+                if not self._cipher_foreign and not self._read_only:
+                    await self.checkpoint_cipher_invocations(settle=True)
+            except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
+                log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
+            try:
+                # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when
+                # none were opened, so it never affects the async path). ADR 0071 B5.
+                self.close_sync_handoff_pool()
+            finally:
+                # ADR 0114 sub-lever B: close the store-owned dedicated claim holders (a no-op
+                # when the prepared path never opened one).
+                await self._close_claim_holders()
         finally:
             # In a finally, so a teardown above that raises still closes the pool (BACKLOG #5720).
             # THE EXECUTOR IS RELEASED IN A finally, and that ordering is the point. wait_closed()

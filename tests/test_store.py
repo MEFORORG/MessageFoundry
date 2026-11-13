@@ -1526,13 +1526,17 @@ async def test_run_open_cleanup_stops_waiting_at_its_bound(caplog) -> None:
     async def wedged() -> None:
         await release.wait()
 
-    await run_open_cleanup(RuntimeError("open boom"), wedged, timeout=0.05)
-    assert "did not finish within" in caplog.text
-    assert len(_OPEN_CLEANUPS) == 1
-    release.set()
+    before = set(_OPEN_CLEANUPS)
+    try:
+        await run_open_cleanup(RuntimeError("open boom"), wedged, timeout=0.05)
+        assert "did not finish within" in caplog.text
+        ours = _OPEN_CLEANUPS - before
+        assert len(ours) == 1
+    finally:
+        release.set()
     for _ in range(10):
         await asyncio.sleep(0)
-    assert not _OPEN_CLEANUPS
+    assert not (ours & _OPEN_CLEANUPS)
 
 
 async def test_run_open_cleanup_raises_a_cancel_that_lands_while_it_runs() -> None:

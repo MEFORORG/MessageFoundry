@@ -2908,13 +2908,17 @@ class PostgresStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # The teardown below runs in a finally, so a cancel during the settle still closes the pool
+        # (BACKLOG #5720).
         try:
-            # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one ours.
-            if not self._cipher_foreign and not self._read_only:
-                await self.checkpoint_cipher_invocations(settle=True)
-        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
-        await self._pool.close()
+            try:
+                # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one.
+                if not self._cipher_foreign and not self._read_only:
+                    await self.checkpoint_cipher_invocations(settle=True)
+            except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
+                log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
+        finally:
+            await self._pool.close()
 
     async def warm_pool(self) -> None:
         # Pre-open pooled connections so a connection burst (the post-promotion delivery workers, or a

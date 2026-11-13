@@ -8132,8 +8132,9 @@ async def run_open_cleanup(
     Shared by the three backends' ``open`` (BACKLOG #5720). The cleanup runs as its own task and
     is waited on with :func:`asyncio.wait`, which never cancels what it waits on, so a cancel
     delivered to the caller while it runs cannot cut a settlement or a pool close short. Such a
-    cancel is raised once the cleanup is done, chained to the open's own ``failure``, unless that
-    failure is itself a cancel; otherwise this returns, and the caller re-raises ``failure``.
+    cancel is raised once the cleanup is done, chained to the open's own ``failure``, when that
+    failure is an ``Exception``; a cancel, an interrupt or an exit is left for the caller to
+    re-raise as it is. Otherwise this returns, and the caller re-raises ``failure``.
 
     The cleanup's own failure is logged by class only, so it never replaces the open's error
     (vault BACKLOG #3054). Past ``timeout`` the cleanup is left running and logged, and the
@@ -8159,7 +8160,7 @@ async def run_open_cleanup(
             await asyncio.wait({task}, timeout=remaining)
         except asyncio.CancelledError:
             cancelled = True
-    if cancelled and not isinstance(failure, asyncio.CancelledError):
+    if cancelled and isinstance(failure, Exception):
         raise asyncio.CancelledError from failure
 
 
@@ -11038,9 +11039,9 @@ class MessageStore:
         # checked.
         self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
         self._seal_pager = SealPager()
-        # ADR 0196: True from the start of a writable open's salt step until the bind holds. Until
-        # then the cipher may count for another store, or for none, so close() must not settle it
-        # here (BACKLOG #5720).
+        # ADR 0196: True from the start of a writable open until its salt bind holds. Until then
+        # the cipher may count for another store, or for none, so close() must not settle it here
+        # (BACKLOG #5720).
         self._cipher_foreign = False
         # BACKLOG #1780: set by open(read_only=True). The handle is `mode=ro`, so it writes nothing
         # at open or at close: no salt, no invocation reserve, no audit genesis row.
@@ -12954,35 +12955,40 @@ class MessageStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # The teardown below runs in a finally, so a cancel during the settle still closes every
+        # connection, whose worker threads are non-daemon (BACKLOG #5720).
         try:
-            # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
-            if not self._cipher_foreign and not self._read_only:
-                await self.checkpoint_cipher_invocations(settle=True)
-        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
-        # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members and
-        # resolves their futures before the write connection is closed — otherwise an in-flight handoff
-        # would hang forever on a future no committer will ever complete.
-        if self._group_commit is not None:
             try:
-                await self._group_commit.aclose()
+                # A read-only handle reserved nothing and cannot write the settlement (#1780).
+                if not self._cipher_foreign and not self._read_only:
+                    await self.checkpoint_cipher_invocations(settle=True)
             except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-                log.warning("error closing group-commit committer", exc_info=True)
-        # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
-        # state), then the writer. Best-effort: one failing close must not strand the rest.
-        for conn in self._read_conns:
-            try:
-                await conn.close()
-                await _await_connection_worker_exit(conn)
-            except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-                log.warning("error closing read-pool connection", exc_info=True)
-        self._read_conns = []
-        self._read_pool = None
-        await self._db.close()
-        # Each close above returns before the worker thread it stops has actually gone, and those
-        # threads are non-daemon, so a `close`d store could still hold threads interpreter exit has
-        # to join. Wait them out so "the store is closed" means every thread it owned is gone.
-        await _await_connection_worker_exit(self._db)
+                log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
+        finally:
+            # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members
+            # and resolves their futures before the write connection is closed — otherwise an
+            # in-flight handoff would hang forever on a future no committer will ever complete.
+            if self._group_commit is not None:
+                try:
+                    await self._group_commit.aclose()
+                except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
+                    log.warning("error closing group-commit committer", exc_info=True)
+            # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
+            # state), then the writer. Best-effort: one failing close must not strand the rest.
+            for conn in self._read_conns:
+                try:
+                    await conn.close()
+                    await _await_connection_worker_exit(conn)
+                except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
+                    log.warning("error closing read-pool connection", exc_info=True)
+            self._read_conns = []
+            self._read_pool = None
+            await self._db.close()
+            # Each close above returns before the worker thread it stops has actually gone, and
+            # those threads are non-daemon, so a `close`d store could still hold threads interpreter
+            # exit has to join. Wait them out so "the store is closed" means every thread it owned
+            # is gone.
+            await _await_connection_worker_exit(self._db)
 
     # --- write path ----------------------------------------------------------
 
