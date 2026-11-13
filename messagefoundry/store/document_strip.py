@@ -193,18 +193,18 @@ async def run_strip_pass(
                 reclaimed += done.reclaimed
             if len(rows) < limit:
                 break
-    except Exception:
+    except BaseException:
+        # BaseException, so a cancelled pass (engine stop) is recorded too.
         log.warning(
             "document strip failed part way; it had already stripped and committed %d documents "
             "in %d messages, which no retention audit row records",
             documents,
             messages,
         )
-        await report(failures)
         raise
     finally:
         log_unreadable_skips(unreadable)
-    await report(failures)
+        await report(failures)
     return StripResult(
         messages_stripped=messages, documents_stripped=documents, bytes_reclaimed=reclaimed
     )

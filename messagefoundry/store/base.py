@@ -1818,10 +1818,11 @@ class QueueStore(StoreLifecycle, Protocol):
         :class:`StripResult` (counts + bytes reclaimed; no message content).
 
         Every backend runs it through :func:`~messagefoundry.store.document_strip.run_strip_pass`
-        (BACKLOG #5651): keyset batches by id, the crypto in a worker thread with no connection
-        held, and a write-back guarded on the row still being unpruned and still holding the exact
-        stored ``raw`` the batch read. A body purge or key rotation that commits between the read
-        and the write wins, and the row is not counted."""
+        (BACKLOG #5651): keyset batches on ``(received_at, id)``, the crypto in a worker thread with
+        no connection held, and a write-back guarded on the row still being unpruned, still holding
+        the exact stored ``raw`` the batch read, and still not in flight. A body purge, key
+        rotation or replay that commits between the read and the write wins, and the row is not
+        counted."""
         ...
 
     async def purge_dead_letters(

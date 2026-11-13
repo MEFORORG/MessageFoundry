@@ -18,6 +18,7 @@ for parity (AC-4): SQLite always; Postgres / SQL Server skipif-gated on ``MEFOR_
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -396,7 +397,7 @@ def _concurrent_writer(
             return
         done.append(True)
         if isinstance(store, MessageStore):
-            with sqlite3.connect(tmp_path / _DB_NAME, timeout=30) as db:
+            with contextlib.closing(sqlite3.connect(tmp_path / _DB_NAME, timeout=30)) as db, db:
                 db.execute(sql, params)
             return
         if threading.get_ident() == loop_thread:

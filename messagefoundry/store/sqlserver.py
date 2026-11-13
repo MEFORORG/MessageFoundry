@@ -10259,21 +10259,26 @@ class SqlServerStore:
             # read and is not in flight, so a purge, key rotation or replay committed in between
             # wins. The raw comparison pins a binary collation, and appends a sentinel to both
             # sides because = ignores trailing spaces. Whether a row landed is read from OUTPUT,
-            # which a session's SET NOCOUNT ON cannot hide, unlike rowcount.
+            # which a session's SET NOCOUNT ON cannot hide, unlike rowcount. The comparand is cast
+            # to NVARCHAR(MAX): a long string may bind as ntext, which supports neither + nor =.
+            # The rollback runs after the cursor block, as _execute_output's does, so no OUTPUT
+            # statement handle is still open on the connection.
             landed: list[StripUpdate] = []
-            async with self._acquire() as conn, self._cursor(conn) as cur:
+            async with self._acquire() as conn:
                 try:
-                    for u in updates:
-                        await cur.execute(
-                            "UPDATE messages SET raw=?, documents_pruned=? OUTPUT inserted.id"
-                            " WHERE id=? AND documents_pruned IS NULL"
-                            " AND (raw + N'|') COLLATE Latin1_General_100_BIN2 = (? + N'|')"
-                            " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id=messages.id"
-                            " AND q.status IN (?, ?))",
-                            (u.new_cell, stamp, u.message_id, u.stored, *inflight),
-                        )
-                        if await cur.fetchall():
-                            landed.append(u)
+                    async with self._cursor(conn) as cur:
+                        for u in updates:
+                            await cur.execute(
+                                "UPDATE messages SET raw=?, documents_pruned=? OUTPUT inserted.id"
+                                " WHERE id=? AND documents_pruned IS NULL"
+                                " AND (raw + N'|') COLLATE Latin1_General_100_BIN2"
+                                " = (CAST(? AS NVARCHAR(MAX)) + N'|')"
+                                " AND NOT EXISTS (SELECT 1 FROM queue q"
+                                " WHERE q.message_id=messages.id AND q.status IN (?, ?))",
+                                (u.new_cell, stamp, u.message_id, u.stored, *inflight),
+                            )
+                            if await cur.fetchall():
+                                landed.append(u)
                     await self._commit(conn)
                 except Exception:
                     await self._rollback_or_discard(conn)
