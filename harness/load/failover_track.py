@@ -152,7 +152,8 @@ class FailoverTracker:
 
     def acked_copies_missing(self, delivering: int) -> int:
         """Copies of acknowledged messages that never arrived: for each ACKed seq, ``delivering``
-        minus the DISTINCT lanes it reached, summed. Must be 0.
+        minus the DISTINCT lane labels it arrived under, summed. Must be 0. A label is the key
+        :meth:`on_delivery` was given (MSH-6 in the shardcert), not the port the copy reached.
 
         Exact per message, where a count of all deliveries is not: a re-delivery on a lane the seq
         already reached adds nothing, and copies of another message (a duplicate, or a send whose

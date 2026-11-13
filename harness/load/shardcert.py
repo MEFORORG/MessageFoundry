@@ -2946,7 +2946,8 @@ class ShardCertDriverReport:
 
     @property
     def copies_ok(self) -> bool:
-        """Every ACKed message reached ``delivering`` distinct lanes (BACKLOG #5640).
+        """Every ACKed message arrived under ``delivering`` distinct lane labels (BACKLOG #5640).
+        The label is the MSH-6 key the harness stamps on each copy, not the sink port it reached.
 
         Checked per message, so nothing can make up for a lost copy: not a re-delivery across a
         kill (it lands on a lane the seq already reached), not a duplicate, and not the copies of a
@@ -2957,8 +2958,8 @@ class ShardCertDriverReport:
 
     @property
     def ok(self) -> bool:
-        """Driver-side pass bar: every ACKed message delivered on each of its ``delivering`` lanes
-        (:attr:`copies_ok`, on a kill run too), drained pipeline (remote ``/stats``), per-lane FIFO
+        """Driver-side pass bar: every ACKed message delivered under each of its ``delivering`` lane
+        labels (:attr:`copies_ok`, on a kill run too), drained pipeline (remote ``/stats``), per-lane FIFO
         (non-vacuous), no dead-letters. Duplicates are allowed only across a kill. The stranded-row
         check lives on the ENGINE report (it needs direct store access)."""
         dup_ok = self.lane_repeats == 0 if self.killed_shard is None else True
