@@ -1745,7 +1745,7 @@ lists nothing, pages `authority-seal-transit` and writes no audit row.
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
 | `GET` | `/approvals/executing` | `approvals:approve` | `require` — releases still claimed as `executing`, up to the store read's cap, with their claim owner and what an interrupt would judge of that owner now; params are not listed (BACKLOG #1562) |
-| `POST` | `/approvals/{approval_id}/interrupt` | `approvals:approve` | `require_step_up` — moves a stranded `executing` release to `interrupted`, refused while its owner may be live; an owner with no heartbeat to read needs `attest_owner_stopped`; never runs the operation (BACKLOG #1562) |
+| `POST` | `/approvals/{approval_id}/interrupt` | `approvals:approve` | `require_step_up` — moves a stranded `executing` release to `interrupted`, refused while its owner may be live; an owner with no heartbeat to read needs `attest_owner_stopped`, unless this process claimed the release and runs it no more; never runs the operation (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
 | `POST` | `/dr/activate` | `dr:operate` | `require_step_up` |
 | `POST` | `/dr/release` | `dr:operate` | `require_step_up` |
@@ -3180,7 +3180,7 @@ a slow one. An operator settles it instead, through two routes (owner-delegated 
 | Owner | The interrupt |
 |---|---|
 | This process is running the release, or still writing its outcome | refused, **409** |
-| This process claimed the release over the same store object and no gate in it runs it now | moves the row, no attestation needed |
+| This process claimed the release over the same store object under this gate's owner, the claim was not refused, and no gate in it runs it now | moves the row, no attestation needed, before any heartbeat is read |
 | `node:<id>`, and that node's heartbeat is fresh | refused, **409** |
 | `node:<id>`, and the heartbeats cannot be read | refused, **503**; try again |
 | `node:<id>`, on an engine that is not a cluster node and reads no heartbeats | refused, **409**; interrupt from a cluster node |
@@ -3190,7 +3190,7 @@ a slow one. An operator settles it instead, through two routes (owner-delegated 
 A cluster node whose `[cluster].node_id` is not pinned comes back under a new id, so its old claims
 read as a lapsed heartbeat here and can be interrupted without an attestation. The heartbeat is the
 `fresh` reading `/cluster/nodes` shows. A fresh heartbeat on this process's own node id refuses too,
-even for a row this process is not running.
+even for a row this process is not running, unless the table's second row applies.
 
 The move is guarded on `executing` and on the claim owner it judged, so a row that moved or changed
 owner since answers **409** and moves nothing. Its `approval.interrupted` row is in the same write,
@@ -3215,9 +3215,9 @@ whatever order the apps were built and started in. Two Engine objects over one d
 process are not protected: each has its own store object, so one's unsettled claim that no gate is
 running reads as a leftover to the other. A later app start in the same process does not recover an
 unsettled claim of this life that no gate is running. An operator can move it through `POST
-/approvals/{id}/interrupt` with no attestation, since this process knows it claimed the release and
-runs it no more. A release made before the engine holds its graph claims under `engine` and keeps
-that owner for the app's life, so start the engine before the app serves approvals.
+/approvals/{id}/interrupt` with no attestation, as the tier table above says. A release made before
+the engine holds its graph claims under `engine` and keeps that owner for the app's life, so start
+the engine before the app serves approvals.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

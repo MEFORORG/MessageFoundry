@@ -649,6 +649,12 @@ class ApprovalGate:
         with _GATES_LOCK:
             self._claimed_here.add(approval_id)
 
+    def _forget_claim(self, approval_id: str) -> None:
+        """Drop ``approval_id`` from :data:`_CLAIMED_HERE`: its claim was refused, so this process
+        does not hold it."""
+        with _GATES_LOCK:
+            self._claimed_here.discard(approval_id)
+
     def _claimed_in_process(self, approval_id: str) -> bool:
         """Whether a gate in this process claimed ``approval_id`` over this gate's store."""
         with _GATES_LOCK:
@@ -1729,6 +1735,7 @@ class ApprovalGate:
             # The row changed outside the store after it was read, and the store refused the claim
             # (BACKLOG #2592). Nothing ran, and nothing was written. The cause carries the row kind
             # only, never a value.
+            self._forget_claim(approval_id)
             await self._approval_seal_failed(approval_id)
             raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except asyncio.CancelledError:
@@ -1768,6 +1775,7 @@ class ApprovalGate:
             if not claimed and not handed_off:
                 self._release_done(approval_id)
         if not claimed:
+            self._forget_claim(approval_id)  # another caller holds the claim, not this process
             raise ApprovalError(409, "request was already decided")
         handed_off = False
         try:
@@ -1934,8 +1942,9 @@ class ApprovalGate:
         other state, or not read, it pages ``audit_write_failed``. If the status write moves the
         row, the audit row is written alone. If that fails as well, the loss is
         logged at ERROR with the detail and pages ``audit_write_failed``. If the status
-        write fails too, the row may still read ``executing`` until this process restarts, when
-        :meth:`reconcile_after_restart` moves it to ``interrupted`` (BACKLOG #2087 limb 4).
+        write fails too, the row may still read ``executing`` until an operator interrupts it
+        (``ended_here``) or this process restarts, when :meth:`reconcile_after_restart` moves it
+        to ``interrupted`` (BACKLOG #2087 limb 4).
 
         ``flag`` names a detail field that records whether the row moved: ``True`` when it moved
         with this row, ``False`` when another caller had already moved it, and ``None`` when the
@@ -2696,15 +2705,17 @@ class ApprovalGate:
         (d20261029T205247402-81159c) rules what this does, in three tiers:
 
         - a release THIS process is running, or whose outcome it is still writing, is refused, 409;
-          one this process claimed over this store and no longer runs (``ended_here``) moves with
-          no attestation;
+          one this process claimed over this store under this gate's owner, whose claim was not
+          refused, and that no gate here runs (``ended_here``) moves with no attestation, before
+          any heartbeat is read. That case was added on a Lander hold on engine PR 2930, not by
+          the decision above;
         - a release a cluster node claimed (``node:<id>``) is refused while that node's heartbeat is
           fresh, 409, and when the heartbeats cannot be read, 503, or are not read by this engine,
           409. A lapsed heartbeat, or no such node, lets it move. A node whose ``node_id`` was not
           pinned comes back under a new id, so its old claims read as lapsed here;
         - any other owner, an engine shard (``shard:<id>``), a plain engine (``engine``), no owner
-          at all, or one this gate does not recognise, is a name no heartbeat covers. It moves only
-          on ``attest_owner_stopped``, the operator's word that the owning process is stopped,
+          at all, or one this gate does not recognise, is a name no heartbeat covers. Unless it is
+          ``ended_here``, it moves only on ``attest_owner_stopped``, the operator's word that the owning process is stopped,
           which the audit row records; without it, 409.
 
         It never runs the operation, and it moves only to ``interrupted``, never to an outcome:
@@ -2793,9 +2804,9 @@ class ApprovalGate:
         tiers). ``heartbeats`` caches each node's verdict across one listing."""
         if _releasing_in_process(row.id):
             return "releasing_here"
-        if self._claimed_in_process(row.id):
-            # Claimed by this process (_CLAIMED_HERE) and run by none of its gates: the release
-            # has ended here without an outcome, so no attestation is needed to say so.
+        if self._claimed_in_process(row.id) and row.claim_owner == self.claim_owner:
+            # Noted by this process (_CLAIMED_HERE), not refused, under this gate's own owner, and
+            # run by none of its gates: the release has ended here without an outcome.
             return "ended_here"
         prefix, _, node_id = (row.claim_owner or "").partition(":")
         if prefix != "node" or not node_id:

@@ -400,6 +400,42 @@ async def test_an_ended_claim_of_this_life_is_interrupted_without_attestation(
                 await asyncio.wait_for(release, 10.0)
 
 
+async def test_a_claim_lost_to_a_live_peer_is_not_ended_here(engine: Engine) -> None:
+    """A claim this process tried and lost is not its own: the release a peer cluster node won
+    and runs, with a fresh heartbeat, is judged on that heartbeat and refused, not taken for
+    ``ended_here``."""
+
+    class _PeerClaimsFirst(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw.get("claim_owner") == "node:me":
+                # The peer's claim lands between this gate's read and its claim.
+                assert await self._store.decide_pending_approval(
+                    approval_id,
+                    status="executing",
+                    approver="peer-approver",
+                    decided_at=time.time(),
+                    claim_owner="node:peer",
+                )
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    gate = _gate(engine, owner="node:me", liveness=_liveness(True))
+    gate._store = _PeerClaimsFirst(engine.store)
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    with pytest.raises(ApprovalError) as lost:
+        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert lost.value.status == 409
+    [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
+    assert listed["liveness"] == "owner_heartbeat_fresh"
+    with pytest.raises(ApprovalError) as refused:
+        await gate.interrupt_stranded(approval_id, actor="operator", actor_user_id="operator-id")
+    assert refused.value.status == 409
+    assert str((await _row(engine, approval_id))["status"]) == "executing"
+
+
 async def test_a_release_running_over_another_store_object_is_not_reconciled(
     engine: Engine,
 ) -> None:
