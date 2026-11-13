@@ -421,8 +421,12 @@ The one row that *does* vary:
 
 ### `[tls]` — outbound client trust anchors
 Instance-wide **client trust-anchor policy** (#190, [ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)) —
-a small shared fallback for the outbound connectors that verify a downstream *server* certificate (MLLP,
-DICOM, FTPS today). The inbound FTPS poller dials out and verifies its server too, so it reads this block
+a small shared fallback for the hops that verify a downstream *server* certificate through
+`resolve_trust_anchor` (`config/tls_policy.py`). They include at least the outbound MLLP, DICOM and
+FTPS connections, the HTTP-family connections (REST, SOAP, FHIR, DICOMweb) and their token endpoints,
+the SMTP connections (Email, Direct), the `fhir_lookup` executor, the alerts SMTP sink, the security
+notifier and the engine AI broker (below); the `TrustAnchorPolicy` docstring there names the module
+of each receiver beyond the connections. The inbound FTPS poller dials out and verifies its server too, so it reads this block
 as well (vault BACKLOG #2370): a `pinned` mode or a `crl_file` must suit its partner. By default the OS trust store roots verify the peer; a hospital estate whose internal
 endpoints present a private/internal-CA certificate can pin that CA **once** here instead of installing it
 box-globally or repeating a per-connection `tls_ca_file`. This selects **which** roots verify the peer — it
@@ -435,6 +439,7 @@ byte-identical SSL context.
 |---|---|---|---|
 | `internal_ca_file` | path | — | PEM path to the org's internal CA. **Not a secret** — a path, like `tls_cert_file` / `forward_tls_ca_file`. Unset (default) = no internal anchor; every hop uses the OS trust store. |
 | `trust_anchor_mode` | enum | `system` | how `internal_ca_file` composes with the OS default roots on a non-loopback internal hop. `system` (default) = **OS trust store only**, `internal_ca_file` ignored (byte-identical). `augment` = OS roots **and** the internal CA (a mixed public + private estate). `pinned` = **only** the internal CA, not the public bundle (a fully-private estate; strictest). `pinned` **without** `internal_ca_file` is **refused at load** — with nothing to pin it would silently fall back to the full OS trust store, i.e. the operator excludes public roots and gets all of them. |
+| `crl_file` | path | — | PEM file of CRLs checked against the peer's certificate on every non-loopback hop this block reaches (BACKLOG #299, vault BACKLOG #2370), in any `trust_anchor_mode`. **Not a secret** — a path, like `internal_ca_file`. Unset (default) = this block adds no revocation checking. A hop that loads it refuses a peer whose issuer has **no** CRL in the file, not only a revoked one, so the file must cover every issuer those hops present and be refreshed before its `nextUpdate`; both failures refuse the handshake. A missing or blank path is refused when settings load; an expired or unloadable CRL is refused when a hop is built. A loopback hop loads no CRL. Hops that do not read this block have their own CRL settings, at least `[store].ssl_crl_file`, `[auth].ad_tls_crl_file`, `[auth].oidc_tls_crl_file` and `[logging].forward_tls_crl_file`. How a replaced file reaches running hops, and what a reload refuses, is under [`[cert_monitor]`](#cert_monitor). |
 
 **The engine AI broker reads this block too** (BACKLOG #5527). On an app this section reaches,
 as `messagefoundry serve` hands it, `POST /ai/chat` verifies an `[ai].endpoint` whose host is not
@@ -954,11 +959,18 @@ with answers, or one instance under the bare `directory-reconciler-unreached`
 source on a rolled-up pass, which the `ad_reconcile_outage_passes` row states. Nothing resolves
 either automatically.
 Resolve a per-account one by hand once the WARNING says the account was answered for on each of its
-last probes, which takes `2 * ad_reconcile_outage_passes - 1` answers in a row (vault BACKLOG #3709),
-or once the account has no live session left, since the account then leaves the reconciler's record
-with no WARNING. A new run of failures that starts before that WARNING pages nothing more, so
-resolving earlier can leave it unpaged. Resolve the
-bare one once each account its rows name has been.
+last probes, which takes `2 * ad_reconcile_outage_passes - 1` answers in a row (vault BACKLOG #3709).
+That WARNING is logged only by the engine process that paged the account, and only while that
+process still holds the account's probe window in memory (`AuthService._note_unreached_accounts`).
+So at least these leave the instance open with no WARNING ever logged for it: a restart of that
+process; a process other than the one that paged, such as another engine shard, which never logs
+it; the account's last live session ending, since the account then leaves the reconciler's record;
+and the cap on that record (`LEDGER_MAX` in `auth/reconcile.py`, applied by `prune_ledger`), which
+can drop the account's window. In those cases, resolve it once the account holds no live session,
+or once you have confirmed the directory answers for it, for example once its sign-in succeeds
+again. A new run of failures that starts before that WARNING pages nothing more in the process that
+paged, so resolving earlier can leave it unpaged. Resolve the bare one once each account its
+`auth.ad_reconcile_unreached` rows name meets one of those same conditions.
 
 A lasting directory outage opens its own `ad_reconcile_aborted` instance, with reason
 `directory_unavailable` and source `directory-reconciler-outage` (BACKLOG #3709), once a run of
