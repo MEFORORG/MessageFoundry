@@ -387,3 +387,40 @@ async def test_the_reopening_sink_opens_nothing_for_a_sent_notice_and_survives_a
     assert [
         r.getMessage() for r in caplog.records if "could not be recorded" in r.getMessage()
     ] == ["an undelivered security notice could not be recorded in the audit log (OSError)"]
+
+
+async def test_the_reopening_sink_keeps_a_committed_row_when_the_close_fails(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A close that fails after the row committed must not log the row as missed."""
+    from messagefoundry.__main__ import _ReopeningNoticeAudit
+
+    class _BadClose:
+        async def record_audit(self, action: str, **kw: Any) -> None:
+            await store.record_audit(action, **kw)
+
+        async def close(self) -> None:
+            raise OSError("close failed")
+
+    async def opener() -> Any:
+        return _BadClose()
+
+    def boom(**_: Any) -> None:
+        raise OSError("relay down")
+
+    monkeypatch.setattr(_SEND, boom)
+    notifier = SecurityEventNotifier(
+        host="smtp.example.org",
+        port=25,
+        sender="mf@example.org",
+        audit=_ReopeningNoticeAudit(opener),
+    )
+    notifier.start()
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    await notifier.aclose()
+    assert [(a, actor) for a, actor, _ in await _undelivered(store)] == [
+        (SECURITY_NOTICE_UNDELIVERED_ACTION, "amy")
+    ]
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("could not be recorded" in m for m in messages)
+    assert "a store reopened for an offline notice did not close cleanly (OSError)" in messages

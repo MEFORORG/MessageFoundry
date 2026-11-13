@@ -8474,10 +8474,12 @@ class _ReopeningNoticeAudit:
     store has closed before its notice is drained, as ``admin-reset-totp``'s has (BACKLOG #5634).
 
     A notice that is sent opens nothing. The open and the close are each bounded by
-    :data:`_OFFLINE_ALERT_REOPEN_SECONDS`, as the alert step bounds its reopen, so a store that
-    stops answering holds the command's report up by that long, not by its driver's own timeout. A
-    failure raises into :meth:`SecurityEventNotifier._record_undelivered`, which logs it by class
-    and swallows it: the notice was best effort, and so is its record."""
+    :data:`_OFFLINE_ALERT_REOPEN_SECONDS`, as the alert step bounds its reopen. The write between
+    them is not: a store that opens and then blocks the write holds the command's report up for its
+    driver's own timeout. A failed open or write raises into
+    :meth:`SecurityEventNotifier._record_undelivered`, which logs it by class and swallows it: the
+    notice was best effort, and so is its record. A failed close is logged here and raises nothing,
+    so it never reports a committed row as missed."""
 
     def __init__(self, opener: Callable[[], Awaitable[Store]]) -> None:
         self._opener = opener
@@ -8498,7 +8500,15 @@ class _ReopeningNoticeAudit:
                 action, actor=actor, channel_id=channel_id, detail=detail, client=client, now=now
             )
         finally:
-            await _within(store.close(), _OFFLINE_ALERT_REOPEN_SECONDS, _log_late_close)
+            try:
+                await _within(store.close(), _OFFLINE_ALERT_REOPEN_SECONDS, _log_late_close)
+            except Exception as exc:  # noqa: BLE001 - the row, or the write's own error, stands
+                # Caught here rather than raised: after a committed row it would log a miss that
+                # did not happen, and after a failed write it would replace that write's error.
+                logging.getLogger(__name__).warning(
+                    "a store reopened for an offline notice did not close cleanly (%s)",
+                    type(exc).__name__,
+                )
 
 
 async def _raise_offline_administrator_granted(

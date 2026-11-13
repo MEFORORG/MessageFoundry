@@ -7606,7 +7606,8 @@ source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
 store it holds open, so a takeover notice whose `auth.first_administrator_provisioned` row reads
-`holder_notice: dispatched` and whose send failed has its own undelivered row too. That row can
+`holder_notice: dispatched` and whose send failed gets its own undelivered row too, unless that
+write fails or the run is interrupted mid-send. That row can
 come before the provision row in the chain, because the notice is sent while the provision runs.
 `admin-reset-totp` has closed its store by the time the notice is sent, so it opens the store
 again for the row, and only when a send failed. **Still open, at least:**
@@ -7620,8 +7621,10 @@ again for the row, and only when a send failed. **Still open, at least:**
 - A notice that reaches the notifier once it has begun to close is refused and recorded with
   `reason: closing`. The close waits only for records started before it finishes. One started
   later can meet the closed store, and is then lost like any failed record write.
-- Where `admin-reset-totp`'s reopen for that row fails, or takes longer than five seconds, the failed
-  notice is not recorded. The miss is logged by class only.
+- Where `admin-reset-totp`'s reopen for that row fails, or does not open within
+  `_OFFLINE_ALERT_REOPEN_SECONDS` in `messagefoundry/__main__.py`, the failed notice is not
+  recorded, and the miss is logged by class only. The write itself is not bounded, so a store that
+  opens and then blocks it holds the command's report up for its driver's own timeout.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
