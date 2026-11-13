@@ -1693,6 +1693,7 @@ class _LogHaltSnapshot:
 
     names: tuple[str, ...]  # the inbounds the halt marked, none of them marked before it
     held_lanes: frozenset[tuple[Stage, str]]  # pooled lanes already STOPPED or PAUSED
+    stopped_lanes: frozenset[tuple[Stage, str]]  # of those, the ones STOPPED
     live_workers: frozenset[tuple[str, str]]  # per_lane (kind, inbound) workers still running
     stop_held: frozenset[str]  # inbounds a STOP already held
 
@@ -2265,6 +2266,9 @@ class RegistryRunner:
         # Per-inbound rather than one process-wide flag because the RE-ARM is per-connection: a
         # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
         self._log_halted: set[str] = set()
+        # Pooled internal lanes a #122 halt in flight left as they were (STOPPED or PAUSED), which
+        # the rebind gate's re-arm leaves alone too (BACKLOG #5704).
+        self._log_halt_kept: set[tuple[Stage, str]] = set()
         # Inbounds whose rebind the log gate refused and unbound, kept until a halt alerts them or
         # they re-arm, so a halt that counted one as bound still sends its stop alert (BACKLOG #5704).
         self._log_refused_rebinds: set[str] = set()
@@ -5878,6 +5882,20 @@ class RegistryRunner:
         # decision d20261113T223440713-c2359d).
         marked = [name for name in self.registry.inbound if name not in self._log_halted]
         before = self._log_halt_snapshot(marked)
+        # The lanes left as they were, for as long as this halt runs, so a rebind gate that re-arms
+        # a marked inbound leaves them alone too (:meth:`_resume_inbound_processing`).
+        self._log_halt_kept.update(before.held_lanes)
+        try:
+            await self._log_halt_run(
+                sink=sink, reason=reason, start_count=start_count, before=before
+            )
+        finally:
+            self._log_halt_kept.difference_update(before.held_lanes)
+
+    async def _log_halt_run(
+        self, *, sink: str, reason: str, start_count: int, before: _LogHaltSnapshot
+    ) -> None:
+        """:meth:`_stop_all_for_log_failure` once it has latched and read its snapshot."""
         # THE SOURCE-SIDE HALF (BACKLOG #5704): the internal stages go down NOW, with the latch and
         # before any await, rather than once the stop below holds the reload lock. A reload holding
         # that lock has unbound every listener and rebinds each through its gate,
@@ -5903,14 +5921,11 @@ class RegistryRunner:
         except Exception:
             log.exception("alert sink raised on log_write_failed for sink %r", sink)
         async with self._reload_lock:
-            # A reload that held the lock may have removed an inbound this halt marked; its mark
-            # names nothing now, and a later re-add must not inherit it.
-            self._log_halted.intersection_update(self.registry.inbound)
             if self._start_count != start_count:
                 # A start ran while this waited (BACKLOG #5704). It probed the log itself and set
                 # the latch and the internal-stage marks from that probe, so the break belonged to
                 # the run before it, and the marks are the start's to keep.
-                self._log_halt_stand_down(
+                await self._log_halt_stand_down(
                     sink, reason, detail, why="a start ran while it waited and probed the log"
                 )
                 return
@@ -5920,7 +5935,7 @@ class RegistryRunner:
                 # would bring delivery up paused for a halt from the run that stop ended. That start
                 # probes the log itself and resets the internal-stage marks. A teardown that left
                 # state behind (it raised, or was cancelled) is not this case: the halt still runs.
-                self._log_halt_stand_down(
+                await self._log_halt_stand_down(
                     sink, reason, detail, why="the runner stopped while it waited"
                 )
                 return
@@ -5929,7 +5944,7 @@ class RegistryRunner:
                 # log, found it writable and cleared the latch (BACKLOG #5704, decision
                 # d20261113T215259180-f5da2d, ADR 0189 option 4): no halt reason outlives a sink a
                 # door re-validated. A later break latches and halts again.
-                self._log_halt_stand_down(
+                await self._log_halt_stand_down(
                     sink,
                     reason,
                     detail,
@@ -5945,7 +5960,9 @@ class RegistryRunner:
             refused = [
                 name
                 for name in inbounds
-                if name in self._log_refused_rebinds and name not in self._sources
+                if name in self._log_refused_rebinds
+                and name in self.registry.inbound
+                and name not in self._sources
             ]
             self._log_refused_rebinds.difference_update(refused)
             inbounds, outbounds = self._log_halt_lanes_guarded(sink)
@@ -6011,6 +6028,7 @@ class RegistryRunner:
         operator pause). Per-lane: each router, transform or response worker still running, and
         each inbound a STOP already holds."""
         held_lanes: set[tuple[Stage, str]] = set()
+        stopped_lanes: set[tuple[Stage, str]] = set()
         live_workers: set[tuple[str, str]] = set()
         names = list(names)
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
@@ -6018,6 +6036,8 @@ class RegistryRunner:
             if dispatcher is None:
                 continue
             for name in names:
+                if dispatcher.stopped(name):
+                    stopped_lanes.add((stage, name))
                 if dispatcher.stopped(name) or dispatcher.paused(name):
                     held_lanes.add((stage, name))
         for kind in ("router", "transform", "response"):
@@ -6030,11 +6050,12 @@ class RegistryRunner:
         return _LogHaltSnapshot(
             names=tuple(names),
             held_lanes=frozenset(held_lanes),
+            stopped_lanes=frozenset(stopped_lanes),
             live_workers=frozenset(live_workers),
             stop_held=stop_held,
         )
 
-    def _log_halt_stand_down(
+    async def _log_halt_stand_down(
         self,
         sink: str,
         reason: str,
@@ -6050,9 +6071,11 @@ class RegistryRunner:
         the state ``restore`` recorded, so a listener the halt never stopped is not left bound and
         ACKing over halted stages (decision d20261113T223440713-c2359d). A pooled lane that was
         STOPPED or PAUSED stays as it is, and every other lane the halt paused is resumed. A
-        per-lane worker running then is spawned again if it exited. No operator hold is released:
-        the halt created none. An inbound a log gate refused and left unbound while the halt waited
-        keeps its mark, so its stages stay halted under a listener that is down, and gets its
+        per-lane worker running then is spawned again if it exited, after the rows a returned
+        worker left INFLIGHT are re-pended, as a reload does first. No operator hold is released:
+        the halt created none. An inbound a reload removed keeps its mark, so a re-add goes through
+        the rebind gate's re-arm. An inbound a log gate refused and left unbound while the halt
+        waited keeps its mark, so its stages stay halted under a listener that is down, and gets its
         ``connection_stopped`` alert, as the halt's main path sends one.
 
         It then pages once on the sink's own label, so it updates the open alert the first page
@@ -6068,13 +6091,24 @@ class RegistryRunner:
                 and name not in self._sources
             ]
             self._log_refused_rebinds.difference_update(refused)
+            respawn: list[tuple[str, str]] = []
             for name in restore.names:
                 if name in refused or name not in self._log_halted:
-                    continue  # refused, removed, or a rebind gate already re-armed it
+                    continue  # refused, or a rebind gate already re-armed it
+                if name not in self.registry.inbound:
+                    continue  # removed: the mark stays for a re-add's gate
                 try:
-                    self._log_halt_restore(name, restore)
+                    respawn.extend(self._log_halt_restore(name, restore))
                 except Exception:
                     log.exception("log-failure stand-down: inbound %r did not re-arm cleanly", name)
+            if respawn:
+                # A worker the halt's mark ended may have abandoned rows INFLIGHT (a store-fault
+                # hold); a new worker claiming past them would break per-lane FIFO.
+                await self._recover_stopped_worker_residue()
+                for kind, name in respawn:
+                    task = self._inbound_worker_dict(kind).get(name)
+                    if task is None or task.done():
+                        self._spawn_inbound_worker(kind, name)
         self._log_halt_alert_stopped(refused, detail)
         try:
             self._alert_sink.log_write_failed(
@@ -6094,28 +6128,41 @@ class RegistryRunner:
         except Exception:
             log.exception("alert sink raised on the stand-down page for sink %r", sink)
 
-    def _log_halt_restore(self, name: str, before: _LogHaltSnapshot) -> None:
-        """Put one inbound's internal stages back as ``before`` recorded them; see
-        :meth:`_log_halt_stand_down`."""
-        self._log_halted.discard(name)
+    def _log_halt_restore(self, name: str, before: _LogHaltSnapshot) -> list[tuple[str, str]]:
+        """Put one inbound's pooled internal lanes back as ``before`` recorded them, and return the
+        per-lane workers to spawn again; see :meth:`_log_halt_stand_down`. The mark is lifted only
+        once the lanes are, so a raise leaves it for the rebind gate's re-arm."""
+        keep_mark = False
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
             dispatcher = self._dispatchers.get(stage)
-            if dispatcher is None or (stage, name) in before.held_lanes:
+            if dispatcher is None:
+                continue
+            if (stage, name) in before.held_lanes:
+                if (stage, name) in before.stopped_lanes and dispatcher.paused(name):
+                    # STOPPED before the halt, PAUSED now: a reload's broadcast re-armed it and its
+                    # re-apply of the marks paused it. With the STOP's hold gone, the reload had
+                    # re-armed it, so it resumes; with the hold still there, it keeps the mark, so
+                    # an operator start re-arms it as it would have the STOP.
+                    if ("inbound", name) in self._stop_held:
+                        keep_mark = True
+                    else:
+                        dispatcher.resume_lane(name)
                 continue
             if not dispatcher.stopped(name):
                 # Called directly, not through _resume_pooled_lane, which releases a hold. A lane
                 # a STOP reached while the halt waited is STOPPED, and stays so with its hold.
                 dispatcher.resume_lane(name)
+        if not keep_mark:
+            self._log_halted.discard(name)
         if self._claim_mode == "pooled" or not self._running:
-            return
+            return []
         if name not in before.stop_held and ("inbound", name) in self._stop_held:
-            return  # a STOP held this inbound while the halt waited: re-arming it is an operator's
-        for kind in ("router", "transform", "response"):
-            if (kind, name) not in before.live_workers:
-                continue
-            task = self._inbound_worker_dict(kind).get(name)
-            if task is None or task.done():
-                self._spawn_inbound_worker(kind, name)
+            return []  # a STOP held this inbound while the halt waited: re-arming it is an operator's
+        return [
+            (kind, name)
+            for kind in ("router", "transform", "response")
+            if (kind, name) in before.live_workers
+        ]
 
     def _log_halt_lanes(self) -> tuple[list[str], list[str]]:
         """The bound inbounds and the running owned outbounds a #122 halt stops, as
@@ -6417,9 +6464,18 @@ class RegistryRunner:
         if not halted:
             return True  # nothing here was halted, and the latch is clear or the probe cleared it
         self._log_halted.discard(name)
+        # A lane a halt in flight kept as it was (a STOP, an operator pause) is not re-armed here,
+        # and with one kept no hold is released either, since a hold names the inbound and not the
+        # lane: without that halt's mark this re-arm would not have reached them (BACKLOG #5704).
+        kept = any((stage, name) in self._log_halt_kept for stage in Stage)
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
             dispatcher = self._dispatchers.get(stage)
-            if dispatcher is not None:
+            if dispatcher is None or (stage, name) in self._log_halt_kept:
+                continue
+            if kept:
+                if not dispatcher.stopped(name):
+                    dispatcher.resume_lane(name)
+            else:
                 self._resume_pooled_lane(dispatcher, stage, name)
         return True
 

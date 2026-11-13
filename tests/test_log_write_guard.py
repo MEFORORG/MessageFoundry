@@ -2655,15 +2655,24 @@ def test_the_guards_scrub_composition_still_covers_the_installed_filter_chain() 
 # --- BACKLOG #5704: a stand-down restores exactly the state before the halt -------------------
 
 
+@pytest.mark.parametrize("rebind", [False, True])
 @pytest.mark.parametrize("claim_mode", CLAIM_MODES)
 async def test_a_stand_down_leaves_a_poison_stopped_lane_stopped(
-    store: MessageStore, tmp_path: Path, claim_mode: str, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore,
+    tmp_path: Path,
+    claim_mode: str,
+    rebind: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Decision d20261113T223440713-c2359d. An inbound nobody touched has its internal lane STOPPED
     # by internal_error=STOP on a poison message, with the STOP's hold recorded. A halt latches,
     # and a probe clears the latch while it waits, so it stands down. The stand-down restores the
     # state from before the halt: the lane stays STOPPED and the hold stays. Re-arming it through
     # the operator-restart path would retry the poison message with no operator acting on it.
+    # With `rebind`, a reload holding the lock unbinds and rebinds the inbound while the halt
+    # waits, and its gate's probe is what clears the latch: the gate leaves the lane alone too.
+    if rebind and claim_mode == "per_lane":
+        pytest.skip("a per_lane rebind respawns a STOP-ended worker on main too, by design")
     outdir, logdir = tmp_path / "out", tmp_path / "logs"
     outdir.mkdir()
     logdir.mkdir()
@@ -2691,7 +2700,12 @@ async def test_a_stand_down_leaves_a_poison_stopped_lane_stopped(
             )
             await asyncio.sleep(0)
             assert runner._log_write_stopped and not halt.done()
-            assert runner._log_recovery_ok()  # a probe while it waits clears the latch
+            if rebind:
+                await runner._stop_inbound_unsafe(INBOUND)
+                await runner._start_inbound_unsafe(INBOUND)  # its gate probes and clears the latch
+            else:
+                assert runner._log_recovery_ok()  # a probe while it waits clears the latch
+            assert not runner._log_write_stopped
         finally:
             runner._reload_lock.release()
         await halt
@@ -2705,6 +2719,7 @@ async def test_a_stand_down_leaves_a_poison_stopped_lane_stopped(
             assert not runner._transform_workers[INBOUND].done(), "a live worker was not restored"
         assert INBOUND in runner._sources and sink.stopped == []
     finally:
+        monkeypatch.undo()  # so the teardown unsubscribes the guard the runner subscribed
         await runner.stop()
 
 
@@ -2741,13 +2756,16 @@ async def test_a_stand_down_keeps_an_inbound_a_gate_refused_halted_and_alerts_it
     ]
 
 
-async def test_a_halt_drops_the_mark_of_an_inbound_a_reload_removed_while_it_waited(
-    store: MessageStore,
+async def test_a_stand_down_keeps_the_mark_of_an_inbound_a_reload_removed_while_it_waited(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # BACKLOG #5704. The halt marks the graph as it latches; a reload holding the lock then removes
-    # INBOUND. Its mark names nothing now, and a later re-add of that name must not inherit it.
+    # BACKLOG #5704. The halt marks the graph and pauses its lanes as it latches; a reload holding
+    # the lock then removes INBOUND, and a probe clears the latch. The mark stays: a pooled lane
+    # the halt paused outlives the removal, and a re-add re-arms it only through the rebind gate's
+    # halted branch. Dropping the mark would leave a re-added listener over a lane nothing resumes.
     sink = _RecordingSink()
     runner, _source = _graph(store, sink)
+    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: None)
     runner._running = True
     try:
         await runner._reload_lock.acquire()
@@ -2756,11 +2774,12 @@ async def test_a_halt_drops_the_mark_of_an_inbound_a_reload_removed_while_it_wai
             assert INBOUND in runner._log_halted
             del runner.registry.inbound[INBOUND]
             del runner._sources[INBOUND]
+            assert runner._log_recovery_ok()
         finally:
             runner._reload_lock.release()
         await halt
     finally:
         runner._running = False
 
-    assert INBOUND not in runner._log_halted
-    assert runner._log_write_stopped and OUTBOUND in runner._outbound_paused
+    assert INBOUND in runner._log_halted, "a removed inbound's mark was dropped"
+    assert sink.stopped == []
