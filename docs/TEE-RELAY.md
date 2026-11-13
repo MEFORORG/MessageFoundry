@@ -128,8 +128,11 @@ invisible record of anything a downstream rejected for a message Epic was told `
 ### Export for review (incl. AI analysis)
 
 `python -m tee export` writes the log as **JSON** — a `summary` (counts by leg / outcome / ACK code,
-NAK count, distinct messages, time range) plus the matching `rows`. It is **metadata only — never the
-captured message bodies** (so it's safe to hand to a reviewer or an AI session). Default is stdout; use
+NAK count, distinct messages, time range) plus the matching `rows`. It never holds the captured
+message bodies, but it is **not PHI-safe**: each row's `detail` is the partner's MSA-3 ACK text,
+written verbatim apart from control characters and a 500-character cap, and that text can name a
+patient. Treat an export as PHI, and check it before you hand it to a reviewer or an AI session.
+Default is stdout; use
 `--out FILE` to write a file. Narrow it with `--since` / `--before` (an age like `24h`/`7d` or a UTC date
 `YYYY-MM-DD`), `--naks-only`, and `--limit N`.
 
@@ -193,7 +196,10 @@ captured bodies under full-disk encryption, as [section 10](PHI.md#10-secure-dep
 `VACUUM` may build its rebuilt copy in a temp file in SQLite's temp directory. That directory can
 be on another volume. Purge does not keep the copy in memory, because a large capture DB would
 then fail every purge. To keep the copy on a protected volume, point SQLite's temp directory there
-before you run purge. SQLite reads `SQLITE_TMPDIR` on POSIX and `TMP` on Windows.
+before you run purge. SQLite reads `SQLITE_TMPDIR` on POSIX and `TMP` on Windows. If the directory
+you set is missing or not writable, SQLite silently falls back to its default temp directories,
+such as `/var/tmp` and `/tmp` on POSIX or `TEMP` on Windows, and nothing reports it. Check that the
+directory exists and the purge account can write to it.
 
 If the scrub does not finish, purge prints `error: ...` and exits 1. The error names the counts it
 deleted and the step that failed. At least these failures do that:
@@ -205,8 +211,9 @@ deleted and the step that failed. At least these failures do that:
 
 The scrub runs only after the delete has committed. So when one of those errors prints, the rows
 it counts are gone, but their bytes may still be in the DB file or its `-wal` file. A failure
-before the commit, such as the delete itself timing out, deletes nothing. Any other failure, such
-as Ctrl-C, ends purge with a traceback and no counts.
+before the commit, such as the delete itself timing out, deletes nothing. Other failures end purge with a traceback, at least these: Ctrl-C, which
+prints no counts; and an error while closing the store after a scrub error, which prints the
+`error: ...` line with the counts and then a traceback.
 
 To finish an unfinished scrub, run `python -m tee purge --db ./tee.db --scrub-only` once the cause
 is gone. It deletes nothing and needs no `-y`, and it refuses a `--db` path that does not exist. It exits 1 with `error: ...` if the scrub still

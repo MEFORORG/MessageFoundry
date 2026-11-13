@@ -115,7 +115,7 @@ class NakRow:
 @dataclass(frozen=True)
 class CaptureRow:
     """One captured full message **body** (PHI), for the #14 parity-comparison reader. Returned only by
-    the explicit :meth:`RelayStore.captures` read — never by the PHI-safe :meth:`RelayStore.export`."""
+    the explicit :meth:`RelayStore.captures` read — never by the body-free :meth:`RelayStore.export`."""
 
     at: float
     direction: str
@@ -142,7 +142,8 @@ def _is_nak(row: aiosqlite.Row) -> bool:
 
 
 def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
-    """One relay_log row as a plain JSON-able dict (metadata only — never a message body)."""
+    """One relay_log row as a plain JSON-able dict. Never a message body, but ``detail`` is
+    emitted verbatim and can carry the partner's MSA-3 ACK text, which can name a patient."""
     return {
         "at": row["at"],
         "at_iso": _iso(row["at"]),
@@ -490,10 +491,13 @@ class RelayStore:
         naks_only: bool = False,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """A **PHI-safe, structured** snapshot of the relay LOG for review / AI analysis.
+        """A **body-free, structured** snapshot of the relay LOG for review / AI analysis.
 
         Returns ``{"summary": {...}, "rows": [...]}`` — never the captured message **bodies** (only the
-        leg metadata: outcomes, ACK codes, control ids, types, sizes, sanitized details). The summary
+        leg metadata: outcomes, ACK codes, control ids, types, sizes, details). It is **not**
+        PHI-safe: ``detail`` is emitted verbatim (control characters scrubbed, 500 characters at
+        most) and can carry the partner's MSA-3 ACK text, which can name a patient, so treat an
+        export as PHI. The summary
         aggregates the whole time window; ``rows`` is optionally narrowed to NAKs and the most-recent
         ``limit``. Filtering is done in Python (the log is small), so the SQL stays static."""
         async with self._lock:
