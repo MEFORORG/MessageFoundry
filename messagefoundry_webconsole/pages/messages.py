@@ -21,6 +21,7 @@ from messagefoundry.api.models import (
     MessageList,
     MessageSearchResults,
 )
+from messagefoundry.parsing import normalize
 from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
@@ -38,10 +39,10 @@ __all__ = [
     "message_resend_unknown",
     "message_search",
     "messages",
-    "restore_eol",
     "parse_tree_page",
     "parse_tree_too_large",
     "parse_tree_unavailable",
+    "restore_eol",
 ]
 
 #: The tail-placement caution ADR 0090 §3 requires the console affordance to carry, worded to the two
@@ -67,13 +68,18 @@ EDIT_EOL_TERMINATORS: Mapping[str, str] = MappingProxyType({"cr": "\r", "lf": "\
 
 
 def _eol_style(raw: str) -> str | None:
-    """The one terminator style ``raw`` uses, or None when it has no line break or mixes styles.
+    """The terminator style to restore ``raw``'s line breaks to, or None for none.
 
-    None renders no ``eol`` field, so the route resubmits the line breaks as the browser sent them:
-    a mixed body has no single style to restore, and guessing one would rewrite its bytes."""
+    A body that mixes styles takes the one most of its breaks use, which rewrites the fewest of
+    them; the browser's CRLF would rewrite every one. A tie names none. A body with no line break
+    is CR when it is HL7 (it starts with MSH), since an added segment must end in CR; otherwise
+    there is no style to restore and None renders no ``eol`` field."""
     crlf = raw.count("\r\n")
     counts = {"crlf": crlf, "cr": raw.count("\r") - crlf, "lf": raw.count("\n") - crlf}
-    used = [style for style, n in counts.items() if n]
+    top = max(counts.values())
+    if top == 0:
+        return "cr" if raw.startswith("MSH") else None
+    used = [style for style, n in counts.items() if n == top]
     return used[0] if len(used) == 1 else None
 
 
@@ -83,8 +89,8 @@ def restore_eol(raw: str, eol: str) -> str | None:
     terminator = EDIT_EOL_TERMINATORS.get(eol)
     if terminator is None:
         return None
-    lf = raw.replace("\r\n", "\n").replace("\r", "\n")
-    return lf if terminator == "\n" else lf.replace("\n", terminator)
+    cr = normalize(raw)  # every break to HL7's CR, the engine's own rule
+    return cr if terminator == "\r" else cr.replace("\r", terminator)
 
 
 class _MsgFilterValues(TypedDict):
@@ -788,6 +794,9 @@ def message_edit(
     # wiring lives in app.js (no inline script — the /ui CSP forbids it).
     editor = el(
         "textarea",
+        # The HTML parser drops one line feed right after <textarea>, so this one goes and a body
+        # that starts with a line break keeps it (BACKLOG #5930).
+        "\n",
         text(shown),
         name="raw",
         id="edit-raw",

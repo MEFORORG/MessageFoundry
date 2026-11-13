@@ -465,17 +465,46 @@ async def test_direct_edit_resend_keeps_crlf_terminators(engine: Engine, tmp_pat
     assert stored == crlf
 
 
-def test_terminator_style_is_named_only_for_a_single_style() -> None:
+def test_terminator_style_chosen_for_each_original() -> None:
     from messagefoundry_webconsole.pages.messages import _eol_style, restore_eol
 
     assert [_eol_style(s) for s in ("a\rb\r", "a\nb", "a\r\nb\r\n")] == ["cr", "lf", "crlf"]
-    # No break, or a mix, names no style: there is nothing single to restore.
-    assert _eol_style("MSH|^~\\&|S") is None
+    # A mix takes the style most breaks use; a tie names none.
+    assert _eol_style("a\rb\rc\r\n") == "cr"
+    assert _eol_style("a\nb\nc\r\n") == "lf"
     assert _eol_style("a\rb\nc") is None
-    assert _eol_style("a\r\nb\rc") is None
+    # No break: CR for an HL7 body, whose added segments must end in CR; otherwise none.
+    assert _eol_style("MSH|^~\\&|S") == "cr"
+    assert _eol_style('{"id": 1}') is None
     assert restore_eol("a\r\nb\rc\n", "cr") == "a\rb\rc\r"
+    assert restore_eol("a\r\nb\rc\n", "lf") == "a\nb\nc\n"
     assert restore_eol("a\r\nb\rc\n", "crlf") == "a\r\nb\r\nc\r\n"
     assert restore_eol("a\r\nb", "nel") is None
+
+
+async def test_edit_page_renders_no_terminator_field_without_a_style(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine, raw="a\rb\nc", control_id="T1")  # a tie: no style to restore
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")
+        r = await c.get(f"/ui/messages/{mid}/edit")
+    assert r.status_code == 200
+    assert 'name="eol"' not in r.text
+
+
+async def test_edit_page_keeps_a_leading_line_break(engine: Engine) -> None:
+    # The parser drops one LF after <textarea>; the editor emits a spare so the body's own survives.
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine, raw="\n" + _LF_JSON, control_id="L1")
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")
+        r = await c.get(f"/ui/messages/{mid}/edit")
+    assert r.status_code == 200
+    assert ">\n\n{" in r.text  # the spare LF, then the body's own leading LF
 
 
 async def test_edit_resend_refuses_an_unlisted_terminator_style(engine: Engine) -> None:
