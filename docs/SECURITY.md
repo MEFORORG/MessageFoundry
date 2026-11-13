@@ -2293,7 +2293,8 @@ the same permission set on the same method reds CI until it is listed here.
 > look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
 > that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
 > by a reload. `test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row` in
-> `tests/test_multishard_smoke.py` runs the wrong-engine cause against two plain `serve` processes
+> `tests/test_multishard_smoke.py` runs the wrong-engine cause on `GET /connections/{name}/metadata`
+> only, against two plain `serve` processes
 > over one store, each with its own graph and API port. It is not run under `serve --shard`, whose
 > engine shards split one config, so on engine shards that cause is read from the code (BACKLOG
 > #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
@@ -2310,8 +2311,9 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound that `Registry.inbound_names()` holds, or any in-scope name when no
-> graph is loaded, reaches the engine, which answers 409 for a name `inbound_names()` does not hold.
-> On an unsharded engine that set is its own graph's inbounds. On an engine shard it is every
+> graph is loaded, reaches the engine. It answers 409 for every name when no graph is loaded, for a
+> name `inbound_names()` does not hold, and once a shutdown's drain has begun. On an engine that is
+> not one of several engine shards, that set is its own graph's inbounds. On an engine shard it is every
 > inbound in the whole config, so an in-scope inbound a sibling engine shard holds gets no denial
 > row: this engine shard's `Engine.set_connection_flag` writes the flag and its
 > `connection_flag_set` row to the shared store, and the route answers 200. The JSON
@@ -7907,8 +7909,9 @@ synchronization without an operator-chosen peer; the default is a no-op.
 
 ### Outbound TLS trust anchor — pinned internal CA (`[tls]`, #190, ADR 0093)
 
-A hop that verifies a downstream **server** certificate and reads `[tls]` (the hops the
-[`[tls]` section of CONFIGURATION.md](CONFIGURATION.md#tls--outbound-client-trust-anchors) lists) anchors
+A hop that verifies a downstream **server** certificate and reads `[tls]` (the
+[`[tls]` section of CONFIGURATION.md](CONFIGURATION.md#tls--outbound-client-trust-anchors) names at least
+which hops do) anchors
 trust in the **OS trust store** by default. A hospital estate whose internal endpoints present certs
 from a **private / internal CA** not in the box-global store can pin that CA once via the small opt-in
 `[tls]` section rather than installing it box-wide or repeating a per-connection `tls_ca_file`:
