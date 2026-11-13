@@ -573,7 +573,8 @@ All against an in-process fake Transit client with key versions, never a real se
    `valid: false` is a break. A reply with no bool `valid` is a `CipherError`.
    **[AMENDED 2026-11-13, BACKLOG #8222: a second failure that is an HTTP 408 or 504, after a
    first failure that was not a 413, is now a `CipherError` and the walk could not run, not a
-   break; on the genesis row at open it refuses the open. A 413 on either ask is still a break.
+   break; on the genesis row at open it refuses the open. A 408 or 504 after a first-ask 413, and a
+   413 on the second ask, are read as this item says.
    See *Amendment 2026-11-13*, item 1. The words above are kept as decided.]**
 5. **A range row's handover tag is not moved.** `_audit_tag_ok` still regenerates the tag under
    the outgoing key and compares it. **[AMENDED 2026-11-13, BACKLOG #8222: a non-empty reply that
@@ -612,9 +613,9 @@ Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
    JSON body it cannot read among them. `_recheck_refused_row` raises a plain `CipherError` when
    the second ask fails with a 408 or 504 (`is_vault_timeout_reply`) and the first did not fail
    with a 413 (`is_vault_too_large_reply`), so the walk could not run and no tamper alert fires.
-   The decision is on the second ask, so a timeout that clears there is read as that answer. A 413
-   on either ask, every other second failure, and one with no recorded status, are read as item 4
-   says, so a planted oversize row stays a break. On the genesis row at open, a persistent timeout
+   A first-ask timeout that clears on the second ask is read as that answer. A 408 or 504 after a
+   first-ask 413, every other second failure, a 413 among them, and one with no recorded status,
+   are read as item 4 says. On the genesis row at open, a persistent timeout
    now refuses the open, as any outage there does, where item 4 logged a break and opened.
 2. **A malformed reply to a handover tag is a tag that does not match.** Item 1 above makes
    `audit_hmac` raise for a reply `transit_mac_version` does not accept. For a non-empty string it

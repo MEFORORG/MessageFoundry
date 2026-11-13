@@ -687,8 +687,8 @@ class TransitCipher(_UnmarkedPolicy):
         (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
         the row as refused, the answer is ``False``, a break at that row, as a forged MAC is; a
         Vault that answers HTTP 413 past ``max_request_size`` to a planted oversize row is one
-        such case, a 413 on either ask included; an HTTP 408 or 504 on the second ask, after a
-        first ask that was not a 413, is not (BACKLOG #8222). Every other
+        such case. An HTTP 408 or 504 on the second ask, after a first ask that was not a 413, is
+        not (BACKLOG #8222). Every other
         failure, a failed fixed-input verify among them, and a reply of an
         unexpected shape, raises plain :class:`CipherError`, so the walk could not run and no
         tamper alert fires. Blocking."""
@@ -769,7 +769,7 @@ class TransitCipher(_UnmarkedPolicy):
         A failure that leaves unsettled is ``False``, logged, only when a verify over fixed input
         succeeds once more after it and it is not an HTTP 408 or 504
         (:func:`is_vault_timeout_reply`) after a first ask that was not an HTTP 413
-        (:func:`is_vault_too_large_reply`), since a 413 on either ask is evidence about the row;
+        (:func:`is_vault_too_large_reply`), since a first-ask 413 is evidence about the row;
         otherwise it raises :class:`CipherError`, since the
         service failed between the asks or timed out on the row. A timeout that cleared on the
         second ask is read as that answer, so a passing blip is not a walk that could not run
