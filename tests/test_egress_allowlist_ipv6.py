@@ -6,8 +6,8 @@ IP literals by their canonical form (BACKLOG #5915).
 The shipped matcher split every entry at its first colon and compared lowercased host text, so
 no IPv6 entry, ``[::1]:6432`` included, could match an IPv6 host: the host it read held no colon,
 and ``[::1]:6432`` matched only a host spelled ``[``. (``[egress].allowed_ech_sidecar`` has its own
-parse, ``pinned_host_port``, and was never read here.) It is a security matcher, so the change is canonical equivalence only: each case
-under "never equated" stays a refusal.
+parse, ``pinned_host_port``, and was never read here.) It is a security matcher, so the change is
+canonical equivalence only: each case under "never equated" stays a refusal.
 
 Each case taking the ``match`` fixture runs through both the egress gate's ``host_port_allowed``
 and the AI broker's ``endpoint_host_allowed``; the rest run on the arm they name.
@@ -207,10 +207,21 @@ def _check_db(server: str, entry: str, *, dialect: str = "generic") -> None:
 
 
 @pytest.mark.parametrize("dialect", _DIALECTS)
-@pytest.mark.parametrize("server", ["::1", "0:0:0:0:0:0:0:1", "fe80::1:443", "[::1]"])
-@pytest.mark.parametrize("entry", ["[::1]:6432", "[::1]", "::1"])
+@pytest.mark.parametrize(
+    ("server", "entry"),
+    [
+        # Each entry names the server's address, so only the database arm's colon rule refuses it.
+        ("::1", "[::1]"),
+        ("::1", "[::1]:6432"),
+        ("0:0:0:0:0:0:0:1", "[::1]"),
+        ("fe80::1", "[FE80::1]:6432"),
+        ("2001:db8::5", "[2001:db8::5]"),
+        # A bracketed server is unlisted as the matcher already reads it, before the colon rule.
+        ("[::1]", "[::1]"),
+    ],
+)
 def test_database_ipv6_server_is_unlisted(server: str, entry: str, dialect: str) -> None:
-    # Unbracketed or bracketed; docs/CONNECTIONS.md, allowed_db, says why.
+    # docs/CONNECTIONS.md, allowed_db, says why.
     with pytest.raises(WiringError, match=_UNLISTED):
         _check_db(server, entry, dialect=dialect)
 
