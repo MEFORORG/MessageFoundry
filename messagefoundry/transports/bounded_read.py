@@ -84,7 +84,8 @@ hand a wrong body to the caller as the peer's answer, with no truncation for the
 see.
 :func:`reply_framing_fault` refuses them before any body byte is read, under RFC 9112 section 6.
 See its docstring for the shapes and for why each one is refused. It also refuses a header block
-the HTTP reader did not parse cleanly, because a framing header after a malformed line is lost.
+the HTTP reader did not parse cleanly, because a framing header after a malformed line is lost,
+and a body in a content coding other than ``identity``, which nothing here decodes (BACKLOG #5910).
 
 **A chunked body is decoded here, not by** ``http.client`` (BACKLOG #1979). ``http.client`` parses
 each chunk-size line with ``int(line, 16)``, so ``-5``, ``1_0``, ``+5``, ``0x5`` and `` 5 `` all
@@ -265,6 +266,10 @@ class AmbiguousFramingError(EgressReplyError):
     calls them an error: ``Transfer-Encoding`` beside ``Content-Length``, a ``+5`` or ``5, 5``
     length, and ``Transfer-Encoding`` on HTTP/1.0. There, a correct read depends on which field
     ``http.client`` happens to consult first. The shapes are listed on :func:`reply_framing_fault`.
+
+    Also raised for a body in a content coding other than ``identity`` (BACKLOG #5910). That body
+    is framed legally, but the engine does not decode it, so it would read the wrong bytes just
+    the same.
 
     Also raised part-way through a chunked body, at the first chunk-size line, chunk terminator or
     trailer line that breaks the RFC 9112 section 7.1 grammar. By then some bytes have been read,
@@ -478,10 +483,14 @@ def reply_framing_fault(reader: object) -> str | None:
       #5910). The stdlib sends ``Accept-Encoding: identity`` and ``http.client`` decodes no content
       coding, so a ``gzip`` body from a peer, a proxy or an operator-set request header would be
       decoded as text with ``errors="replace"``. A SOAP Fault or a STOW-RS ``FailedSOPSequence``
-      inside a 2xx would then go unseen and the message read as delivered. The same rule, parsed
-      the same way, refuses it on the Vault hop in ``strict_requests``. An operator-supplied
-      ``Accept-Encoding`` request header is not overridden: a reply it brings back coded is refused
-      here instead.
+      inside a 2xx would then go unseen and the message read as delivered. ``strict_requests``
+      refuses the same codings on the Vault hop with its own check, which runs on every status;
+      this one, like the rest of this list, skips a reply with no body, and also a
+      ``Content-Length: 0`` one, which has no coded bytes to misread. Checked after the
+      ``Transfer-Encoding`` and ``Content-Length`` rules above, so a framing fault is the reason
+      given when both apply. An operator-supplied ``Accept-Encoding`` request header is not
+      overridden: a reply it brings back coded is refused here instead. Raised through
+      :class:`AmbiguousFramingError`, so on a 2xx it is the ``reply-misframed`` refusal.
 
     A reply to ``HEAD`` is not checked: ``http.client`` returns no body for it whatever the headers
     say. A ``204``, a ``304`` and any ``1xx`` have no body either, and ``http.client`` sets
@@ -513,21 +522,36 @@ def reply_framing_fault(reader: object) -> str | None:
     status = getattr(reader, "status", None)
     if isinstance(status, int) and _status_has_no_body(status):
         return "Transfer-Encoding on a response that has no body" if te_fields else None
-    # BACKLOG #5910: parsed as strict_requests._read_body parses it, so the two hops agree.
-    content_codings = {
-        c.strip(" \t").lower()
-        for field in (get_all("Content-Encoding") or [])
-        for c in str(field).split(",")
-    }
-    if content_codings - {"", "identity"}:
-        return "a content coding other than identity, which the engine does not decode"
+    framing_fault = _length_framing_fault(reader, te_fields, cl_fields)
+    if framing_fault is not None:
+        # Checked first, so a smuggling-shaped framing is named as such even on a coded reply.
+        return framing_fault
+    if getattr(reader, "length", None) == 0:
+        return None  # an empty body has no coded bytes to misread
+    # BACKLOG #5910. The same token parse strict_requests._read_body applies on the Vault hop.
+    if set(_codings(get_all("Content-Encoding") or [])) - {"identity"}:
+        return _CONTENT_CODED_REASON
+    return None
+
+
+#: The fixed reason :func:`reply_framing_fault` gives a content-coded body (BACKLOG #5910).
+_CONTENT_CODED_REASON = "a content coding other than identity, which the engine does not decode"
+
+
+def _codings(fields: Collection[object]) -> list[str]:
+    """The non-empty codings named across ``fields``, each stripped of OWS and lower-cased."""
+    codings = (c.strip(" \t").lower() for field in fields for c in str(field).split(","))
+    return [c for c in codings if c]
+
+
+def _length_framing_fault(reader: object, te_fields: list[str], cl_fields: list[str]) -> str | None:
+    """The ``Transfer-Encoding`` and ``Content-Length`` half of :func:`reply_framing_fault`."""
     if te_fields:
         if getattr(reader, "version", None) == 10:
             return "Transfer-Encoding on an HTTP/1.0 response"
         if cl_fields:
             return "Transfer-Encoding and Content-Length together"
-        codings = [c.strip(" \t").lower() for field in te_fields for c in field.split(",")]
-        codings = [c for c in codings if c]
+        codings = _codings(te_fields)
         if not codings or codings[-1] != "chunked":
             return "Transfer-Encoding whose final coding is not chunked"
         if "chunked" in codings[:-1]:

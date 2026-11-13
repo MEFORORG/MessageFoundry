@@ -41,9 +41,10 @@ import pytest
 from messagefoundry.auth.oidc_http import IdpReplyCutShortError, IdpReplyUnusableError
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import FHIR, Rest, Soap
+from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
+from messagefoundry.parsing import RawMessage
 from messagefoundry.transports import build_destination
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError, ReplyBodyDropped
 from messagefoundry.transports.bounded_read import (
     REPLY_MISFRAMED_CODE,
     AmbiguousFramingError,
@@ -59,6 +60,7 @@ from messagefoundry.transports.bounded_read import (
     read_bounded,
     reply_framing_fault,
 )
+from messagefoundry.transports.dicomweb import DicomWebDestination
 from messagefoundry.transports.fhir import FhirDestination
 from messagefoundry.transports.rest import RestDestination
 from messagefoundry.transports.soap import SoapDestination
@@ -1998,8 +2000,8 @@ def test_a_sanctioned_class_is_a_value_only_inside_its_own_module() -> None:
 #
 # urllib asks for no content coding, and http.client decodes none. A peer, a proxy or an operator
 # header that brings back a gzip body would have its compressed bytes decoded as text with
-# errors="replace", so a SOAP Fault or a STOW-RS FailedSOPSequence inside a 2xx went unseen and the
-# message read as delivered. reply_framing_fault refuses any coding but identity, by the rule
+# errors="replace", so a SOAP Fault or a STOW-RS FailedSOPSequence inside a 2xx would go unseen and
+# the message would read as delivered. reply_framing_fault refuses any coding but identity, by the rule
 # strict_requests._read_body applies to the Vault hop.
 
 _SOAP_FAULT = (
@@ -2040,7 +2042,7 @@ def test_a_content_coding_other_than_identity_is_refused(fields: list[bytes]) ->
         read_bounded(resp, connector="c")
     _assert_framing_refusal(raised.value)
     # Fixed text only: the header value never reaches the error.
-    assert "SECRET" not in str(raised.value)
+    assert "secret" not in str(raised.value).lower()
     assert raised.value.reason == _CODED_REASON
 
 
@@ -2102,47 +2104,70 @@ def test_a_gzipped_rest_reply_in_a_2xx_is_refused() -> None:
     _assert_captured_2xx_refusal(raised.value)
 
 
-def test_a_gzipped_stowrs_failure_in_a_2xx_is_not_recorded_as_delivered() -> None:
-    from messagefoundry.config.wiring import DICOMweb
-    from messagefoundry.parsing import RawMessage
-    from messagefoundry.transports.dicomweb import DicomWebDestination
-
-    payload = RawMessage.from_bytes(b"\x00" * 128 + b"DICM" + b"synthetic", "dicom").encode()
-    raw = _coded(b"200 OK", b"gzip", _STOW_FAILED)
+def test_a_gzipped_rest_reply_with_capture_off_is_dropped_not_resent() -> None:
+    """Nothing reads the body with capture off, so the 2xx stands as delivered, and the drop
+    says why rather than the request being sent again."""
+    raw = _coded(b"200 OK", b"gzip", b'{"status": "rejected"}')
     with _serve(raw) as url:
         dest = build_destination(
             Destination(
-                name="OB_DCMWEB",
-                type=ConnectorType.DICOMWEB,
-                settings=DICOMweb(url=url).settings,
+                name="OB_REST",
+                type=ConnectorType.REST,
+                settings=Rest(url=url, capture_response=False).settings,
             ),
             egress=EgressSettings(deny_by_default=False),
         )
-        assert isinstance(dest, DicomWebDestination)
+        result = asyncio.run(dest.send('{"a": 1}'))
+    assert isinstance(result, ReplyBodyDropped)
+    assert result.fault is not None
+    assert _CODED_REASON in result.fault
+
+
+def test_a_zero_length_coded_2xx_is_not_refused() -> None:
+    """An empty body has no coded bytes to misread, like a 204's."""
+    raw = b"HTTP/1.1 202 Accepted\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n"
+    assert reply_framing_fault(_wire(raw)) is None
+    assert read_bounded(_wire(raw), connector="c") == b""
+
+
+def test_a_framing_fault_is_named_before_a_content_coding() -> None:
+    """A smuggling-shaped framing keeps its own reason when the reply is also coded."""
+    raw = _OK + b"Content-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+    assert reply_framing_fault(_wire(raw + _CHUNKS)) == (
+        "Transfer-Encoding and Content-Length together"
+    )
+
+
+_DICOM_PAYLOAD = RawMessage.from_bytes(b"\x00" * 128 + b"DICM" + b"synthetic", "dicom").encode()
+
+
+def _dicomweb(url: str) -> DicomWebDestination:
+    d = build_destination(
+        Destination(
+            name="OB_DCMWEB", type=ConnectorType.DICOMWEB, settings=DICOMweb(url=url).settings
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(d, DicomWebDestination)
+    return d
+
+
+def test_a_gzipped_stowrs_failure_in_a_2xx_is_not_recorded_as_delivered() -> None:
+    with _serve(_coded(b"200 OK", b"gzip", _STOW_FAILED)) as url:
+        dest = _dicomweb(url)
         with pytest.raises(DeliveryError) as raised:
-            asyncio.run(dest.send(payload))
+            asyncio.run(dest.send(_DICOM_PAYLOAD))
     _assert_captured_2xx_refusal(raised.value)
 
 
 def test_a_gzipped_stowrs_failure_is_seen_without_the_coding() -> None:
     """The control for the test above: the same failure sent plain is caught by its own rule, so
     the refusal there is the content coding and not some other fault in the fixture."""
-    from messagefoundry.config.wiring import DICOMweb
-    from messagefoundry.parsing import RawMessage
-
-    payload = RawMessage.from_bytes(b"\x00" * 128 + b"DICM" + b"synthetic", "dicom").encode()
     raw = _OK + b"Content-Length: %d\r\n\r\n" % len(_STOW_FAILED) + _STOW_FAILED
     with _serve(raw) as url:
-        dest = build_destination(
-            Destination(
-                name="OB_DCMWEB",
-                type=ConnectorType.DICOMWEB,
-                settings=DICOMweb(url=url).settings,
-            ),
-            egress=EgressSettings(deny_by_default=False),
-        )
+        dest = _dicomweb(url)
         with pytest.raises(NegativeAckError) as raised:
-            asyncio.run(dest.send(payload))
+            asyncio.run(dest.send(_DICOM_PAYLOAD))
     assert raised.value.code == "failed-sop"
 
 

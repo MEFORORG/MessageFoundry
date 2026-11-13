@@ -1811,7 +1811,8 @@ partner declared, or one framed in a way RFC 9112 does not allow, follows the sa
 table says delivered, the body is dropped, the message gets a `reply_dropped` event that says
 what was wrong with it, and then a WARNING says the same. Where it says
 permanent refusal, the code is `reply-truncated` or `reply-misframed` instead of `reply-too-large`.
-Either way the request is sent once. A partner or a middlebox that closes the connection cleanly
+A non-empty body in a content coding other than `identity`, such as `gzip`, is refused as
+`reply-misframed` too, because the engine does not decode it (BACKLOG #5910). Either way the request is sent once. A partner or a middlebox that closes the connection cleanly
 before the declared length counts as cut short, so where the body is needed that message
 dead-letters once. The owner's ruling covers the over-size body only; who decided these two, and
 on what authority, is recorded in ADR 0095 Amendment B.1. At least a read that times out, or one
