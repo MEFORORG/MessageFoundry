@@ -29,10 +29,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import logging
 import socket
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,8 @@ import httpx
 from harness.config.shardcert._shape import (
     BROADCAST,
     PARTITIONED_FANOUT,
+    destinations_for_seq,
+    fifo_lane_destination,
     load_routing,
     reported_shape,
 )
@@ -60,13 +63,19 @@ from harness.load.coord import (
 )
 from harness.load.corpus import SEQ_BASE_STRIDE, build_corpus
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EMPTY_POOL_STATS, EnginePoller, PoolStats
+from harness.load.enginepoll import (
+    EMPTY_POOL_STATS,
+    SIGN_IN_ERRORS,
+    EnginePoller,
+    EngineSample,
+    PoolStats,
+)
 from harness.load.failover import EngineNode, _get_status_json, _insecure_bind_args
 from harness.load.failover_track import FailoverTracker
 from harness.load.ids import SHARDCERT_IDS
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix, load_profile_text
-from harness.load.rigadmin import RIG_SESSION
+from harness.load.rigadmin import REMOTE_RIG_SESSION, RIG_SESSION
 from harness.load.sender import PersistentConnection
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context
@@ -76,6 +85,8 @@ from messagefoundry.pipeline.sharding import (
     shard_ids,
 )
 from messagefoundry.terminal_text import escape_for_terminal
+
+_log = logging.getLogger(__name__)
 
 _CONFIG_DIR = "harness/config/shardcert"
 
@@ -2891,6 +2902,15 @@ class ShardCertEngineReport:
         return "\n".join(lines)
 
 
+def _count_balance(acked: int, delivering: int, sink_received: int) -> bool:
+    """The multi-process drive's sink count balance: the sinks' socket-observed copies equal the
+    accept-ACK'd intake fanned out (``acked * delivering``). An AGGREGATE, because that tier's
+    senders and sinks are separate processes and no one process sees both sides of a message. The
+    two-box driver, which does, gates on :meth:`FailoverTracker.acked_copies_missing` instead. A
+    fan-out below 1 balances nothing, so it fails."""
+    return delivering >= 1 and sink_received == acked * delivering
+
+
 @dataclass
 class ShardCertDriverReport:
     """The DRIVER half's outcome — the sink/tracker-derived verdict signals (identical to the co-located
@@ -2912,16 +2932,45 @@ class ShardCertDriverReport:
     in_pipeline_final: int
     drained: bool
     drain_seconds: float | None
+    #: D, the FAN-OUT: copies of each accepted message the served graph delivers, learned from
+    #: SHARDS_READY. Never ``dests``: under ``partitioned`` it is 1 whatever the destination count.
+    delivering: int
+    #: The routing shape SHARDS_READY named; without it ``delivering`` is ambiguous (see
+    #: ``ShardCertDriveReport.routing``).
+    routing: str
+    #: Copies of ACKed messages that never arrived: per ACKed seq, the destinations the served router
+    #: picks for it (``destinations_for_seq``) that no copy's lane label names
+    #: (:meth:`FailoverTracker.acked_copies_missing`). Must be 0.
+    acked_copies_missing: int
+    #: Sends whose ACK this side never saw (a connection closed, or the stop grace ran out). The
+    #: engine may still have delivered them; REPORTED beside ``sink_received``, never gated.
+    timeouts: int = 0
     notes: list[str] = field(default_factory=list)
 
     @property
+    def copies_ok(self) -> bool:
+        """Every ACKed message arrived at each destination the served router picks for it
+        (BACKLOG #5640). A copy's destination is read from its lane label, the MSH-6 key the harness
+        stamps, not from the sink port it reached.
+
+        Checked per message and per expected destination, so nothing can make up for a lost copy:
+        not a re-delivery across a kill (it lands on a lane the seq already reached), not a
+        duplicate, not a copy under a destination the message was never routed to, and not the
+        copies of a send whose ACK this side never saw. ``acked_not_delivered`` alone cannot see this loss: it
+        counts DISTINCT messages, so one copy of each clears it. A fan-out below 1 is unknown, so it
+        fails. The aggregate ``sink_received`` against ``acked * delivering`` is only reported."""
+        return self.delivering >= 1 and self.acked_copies_missing == 0
+
+    @property
     def ok(self) -> bool:
-        """Driver-side pass bar: zero acknowledged loss, drained pipeline (remote ``/stats``), per-lane
-        FIFO (non-vacuous), no dead-letters. Duplicates are allowed only across a kill. The stranded-row
+        """Driver-side pass bar: every ACKed message delivered to each of its expected destinations
+        (:attr:`copies_ok`, on a kill run too), drained pipeline (remote ``/stats``), per-lane FIFO
+        (non-vacuous), no dead-letters. Duplicates are allowed only across a kill. The stranded-row
         check lives on the ENGINE report (it needs direct store access)."""
         dup_ok = self.lane_repeats == 0 if self.killed_shard is None else True
         return (
             self.acked > 0
+            and self.copies_ok
             and self.acked_not_delivered == 0
             and self.drained
             and self.in_pipeline_final == 0
@@ -2937,6 +2986,11 @@ class ShardCertDriverReport:
             + (f"  killed={self.killed_shard}" if self.killed_shard else "  (baseline, no kill)"),
             f"  sent={self.sent} acked={self.acked} delivered_distinct={self.delivered_distinct} "
             f"sink_received={self.sink_received}",
+            f"  routing={self.routing} fanout(delivering)={self.delivering}  "
+            f"acked_copies_missing={self.acked_copies_missing} -> "
+            + ("UNCHECKED" if self.delivering < 1 else "OK" if self.copies_ok else "LOSS"),
+            f"  aggregate (reported, not gated): S={self.sink_received} "
+            f"A*delivering={self.acked * self.delivering} timeouts={self.timeouts}",
             f"  acked_not_delivered={self.acked_not_delivered} (0 = no acknowledged loss)",
             f"  lane_inversions={self.lane_inversions} lanes_observed={self.lanes_observed} "
             f"lane_repeats(dups)={self.lane_repeats}",
@@ -3324,6 +3378,82 @@ async def run_shardcert_engine(
     )
 
 
+class RemoteEngineSignInError(RuntimeError):
+    """The load-gen box could not open its poller on the engine box's API: the engine did not
+    answer, refused the rig's sign-in, or this process holds no rig credential. A setup failure,
+    raised before any load is offered."""
+
+
+def _remote_engine_poller(
+    engine_host: str, api_ports: Sequence[int], *, allow_insecure: bool, cacert: str | None
+) -> EnginePoller:
+    """The drain poller both two-box drive paths read the ENGINE box's ``/stats`` through.
+
+    By default the poll is https, signed in as the rig Administrator the engine box provisioned
+    (:data:`~harness.load.rigadmin.REMOTE_RIG_SESSION`, which refuses before any sign-in unless the
+    environment holds that credential), and verified against ``cacert``. A stock engine serves TLS
+    (ADR 0172) with sign-in on, so a plaintext, credential-free poll there could only fail
+    (BACKLOG #5640, #5977).
+
+    The certificate is the rig's to provision. The engine box's harness serves the pair named by
+    ``MEFOR_HARNESS_TLS_CERT_FILE`` / ``MEFOR_HARNESS_TLS_KEY_FILE`` (:mod:`harness.load.tlsmat`),
+    and the pair it mints when those are unset names only loopback, so it cannot verify
+    ``engine_host``. So the engine box exports a pair whose names cover ``engine_host``, and this
+    box passes that certificate (or its issuer) as ``cacert``. When ``cacert`` is None, a
+    non-loopback ``engine_host`` is verified against this box's default trust, and a loopback one
+    against this process's own anchor (``EnginePoller._cacert_for``), which matches the engine
+    half's only when both shells export the same pair.
+
+    ``allow_insecure`` keeps the old posture for an engine box that serves plain http: http, and
+    no credential, since the client refuses to put one on a cleartext hop to another box."""
+    if allow_insecure:
+        if cacert is not None:
+            raise ValueError(
+                "--cacert and --insecure do not combine: a certificate verifies nothing on a "
+                "plaintext http hop"
+            )
+        urls = [f"http://{engine_host}:{p}" for p in api_ports]
+        return EnginePoller(urls, None, origin=time.perf_counter(), allow_insecure=True)
+    urls = [f"https://{engine_host}:{p}" for p in api_ports]
+    return EnginePoller(urls, REMOTE_RIG_SESSION, origin=time.perf_counter(), cacert=cacert)
+
+
+async def _open_remote_poller(
+    engine_host: str, api_ports: Sequence[int], *, allow_insecure: bool, cacert: str | None
+) -> EnginePoller:
+    """Build and open :func:`_remote_engine_poller`, so the sign-in happens BEFORE any load.
+
+    Opened at drain, as both paths used to, a refused sign-in surfaced only after the whole hold.
+    A refusal is raised as :class:`RemoteEngineSignInError`, in words, the way
+    ``connscale/remote.py`` reports one."""
+    poller = _remote_engine_poller(
+        engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
+    )
+    try:
+        await poller.open()
+    except SIGN_IN_ERRORS as exc:
+        raise RemoteEngineSignInError(
+            f"could not sign in to the engine box's API at {engine_host}: {exc}"
+        ) from exc
+    return poller
+
+
+async def _teardown_step(label: str, step: Awaitable[object]) -> None:
+    """Await one teardown step, logging rather than swallowing a failure, so every later step
+    still runs and the failure is not lost either. The class and escaped text only."""
+    try:
+        await step
+    # Broad on purpose, and logged: a teardown step that fails in any way must not stop the next
+    # one from closing its socket or listener, and the run's own outcome is already decided.
+    except Exception as exc:
+        _log.warning(
+            "shardcert teardown: %s failed: %s: %s",
+            label,
+            type(exc).__name__,
+            escape_for_terminal(str(exc), single_line=True),
+        )
+
+
 async def run_shardcert_driver(
     *,
     engine_host: str,
@@ -3335,18 +3465,25 @@ async def run_shardcert_driver(
     shards_ready_timeout: float = 300.0,
     inbound_ready_timeout: float = 60.0,
     allow_insecure: bool = False,
+    cacert: str | None = None,
 ) -> ShardCertDriverReport:
     """The LOAD-GEN-box half (WS-C option #2). Waits for :data:`SHARDS_READY`, binds the correlation
     sink LOCALLY (``sink_host`` — the load-gen box) over the advertised port band, opens one persistent
-    MLLP connection per (shard, lane) inbound against the ENGINE box
-    (``engine_host:inbound_base + i*lanes + l`` — the lanes-aware many-thin-lane shape), posts
-    :data:`DRIVE_START`, drives the aggregate load (NO kill — the engine owns that), then drains against
-    the engine's REMOTE ``/stats`` and computes the sink/tracker verdict. It NEVER spawns an engine and
-    NEVER touches the store — the whole point is CPU isolation from the engine box.
+    MLLP connection per (engine shard, lane) inbound against the ENGINE box
+    (``engine_host:inbound_base + i*lanes + l`` — the lanes-aware many-thin-lane shape), signs in to the
+    engine box's API, posts :data:`DRIVE_START`, drives the aggregate load (NO kill — the engine owns
+    that), then drains against the engine's REMOTE ``/stats`` and computes the sink/tracker verdict. It
+    NEVER spawns an engine and NEVER touches the store — the whole point is CPU isolation from the
+    engine box.
 
-    The lanes-per-shard + sink port band are learned from SHARDS_READY (default ``lanes=1`` /
+    The lanes per engine shard + sink port band are learned from SHARDS_READY (default ``lanes=1`` /
     ``sink_ports=1`` so an older engine's payload still drives), so the driver's connection set matches
-    the served graph exactly."""
+    the served graph exactly. So are the fan-out ``delivering`` and ``routing`` that the verdict's
+    per-message copy check needs; an older payload without ``delivering`` reads as fan-out 0, an
+    unchecked verdict that fails, with a note.
+
+    The drain poll is https with the remote rig session unless ``allow_insecure``; ``cacert`` is the
+    engine box's certificate PEM (see :func:`_remote_engine_poller`)."""
     ready = await coord.await_message(SHARDS_READY, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
@@ -3357,12 +3494,44 @@ async def run_shardcert_driver(
     killed_raw = ready.get("killed")
     killed = str(killed_raw) if killed_raw is not None else None
     n = len(ids_list)
+    notes: list[str] = []
+    # The FAN-OUT is how many lanes each ACKed message must reach, so it comes from the engine box's
+    # own post and NEVER from `dests` (a partitioned run delivers 1 copy whatever its destination
+    # count). An engine half that predates the key gets 0, which fails the copy check and says so: a
+    # guessed 1 would pass a run that lost every copy but one.
+    if "delivering" in ready:
+        delivering = int(ready["delivering"])
+    else:
+        delivering = 0
+        notes.append(
+            "SHARDS_READY carried no `delivering` (an older engine half): the per-message copy check "
+            "cannot be made without the fan-out, so it FAILS"
+        )
+    if "routing" in ready:
+        routing = str(ready["routing"])
+    else:
+        routing = BROADCAST
+        notes.append(
+            "SHARDS_READY carried no `routing` (an older engine half, which served broadcast only): "
+            "recorded as broadcast"
+        )
+    # A partitioned router picks each message's destinations out of `dests`, so the copy check needs it.
+    dests = int(ready["dests"]) if "dests" in ready else 0
+    if routing != BROADCAST and dests < 1 and delivering >= 1:
+        delivering = 0
+        notes.append(
+            "SHARDS_READY carried no `dests` for a partitioned run: the per-message copy check cannot "
+            "know each message's destinations, so it FAILS"
+        )
 
     ids = SHARDCERT_IDS
     metrics = LiveMetrics(counters=Counters(), ack=Histogram(), e2e=Histogram())
     correlator = Correlator(capacity=1 << 20, metrics=metrics)
     tracker = FailoverTracker()
-    corpus = build_corpus(load_profile_text(_CORPUS_PROFILE, where="<shardcert>"), ids)
+    # Off the event loop, as runner.py builds its corpus: the build is CPU work.
+    corpus = await asyncio.to_thread(
+        build_corpus, load_profile_text(_CORPUS_PROFILE, where="<shardcert>"), ids
+    )
     mix = TypeMix({"ADT^A01": 1.0})
     # The sink binds on the LOAD-GEN box (`sink_host`) over the advertised port band — it IS the engine's
     # outbound destination and holds the verdict signal (tracker/correlator), so it lives with the drive
@@ -3373,11 +3542,15 @@ async def run_shardcert_driver(
     )
     conns: list[PersistentConnection] = []
     poller: EnginePoller | None = None
-    notes: list[str] = []
     try:
+        # Sign in to the engine box's API FIRST, so a refusal is a setup error before any load rather
+        # than a drain failure after the whole hold.
+        poller = await _open_remote_poller(
+            engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
+        )
         await sink.start()
-        # One persistent connection per (shard, lane) inbound (N*lanes total), dialing the ENGINE box's
-        # inbound IP at base + i*lanes + l — the lanes-aware many-thin-lane shape.
+        # One persistent connection per (engine shard, lane) inbound (N*lanes total), dialing the
+        # ENGINE box's inbound IP at base + i*lanes + l — the lanes-aware many-thin-lane shape.
         for i in range(n):
             for lane in range(lanes):
                 pc = PersistentConnection(
@@ -3391,7 +3564,7 @@ async def run_shardcert_driver(
                 pc.start()
                 conns.append(pc)
         # Prove the exact off-box reachability the drive will use before posting DRIVE_START — every
-        # (shard, lane) inbound port.
+        # (engine shard, lane) inbound port.
         for i in range(n):
             for lane in range(lanes):
                 port = inbound_base + i * lanes + lane
@@ -3407,37 +3580,16 @@ async def run_shardcert_driver(
         )
         await asyncio.gather(*(c.stop(2.0) for c in conns))
 
-        # Drain against the engines' REMOTE /stats — the authoritative drain signal, polled off-box.
-        # allow_insecure: the remote engine API is plaintext http, so the poller needs it (loopback
-        # never does) — else poller.open() fail-closes on the non-loopback http URL.
-        # STILL http, KNOWINGLY. This is the TWO-BOX path: the engine runs on another host that
-        # this process never spawned, so the run's own anchor (harness.load.tlsmat) cannot cover it
-        # and EnginePoller._cacert_for deliberately declines to pin a non-loopback URL.
-        #
-        # #1276 makes that remote engine serve TLS too, so this rig needs its own answer -- either
-        # the two boxes share one certificate (export MEFOR_HARNESS_TLS_CERT_FILE/KEY_FILE on both,
-        # which the tlsmat inheritance already honours) or the rig ships the engine box's cert to the
-        # load box. That is a rig-provisioning decision, not a code one, and it is NOT exercised by
-        # any CI workflow -- so it is left visible here rather than half-converted to https, which
-        # would fail verification against a cert this box has never seen.
-        urls = [f"http://{engine_host}:{p}" for p in api_ports]
-        # NO SESSION ON THIS HOP, KNOWINGLY, and for the reason above. The engine box serves with
-        # sign-in on, and a client refuses to put a credential on a cleartext hop to another box.
-        # So once this rig has its certificate answer, this poller takes RIG_SESSION over https,
-        # and the load box is given the engine box's rig credential (harness.load.rigadmin).
-        poller = EnginePoller(urls, None, origin=time.perf_counter(), allow_insecure=allow_insecure)
-        await poller.open()
+        # Drain against the engines' REMOTE /stats — the authoritative drain signal, polled off-box
+        # over the poller opened above (https and the remote rig session unless --insecure).
         drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
         final = poller.final
     finally:
         if poller is not None:
-            with contextlib.suppress(Exception):
-                await poller.close()
+            await _teardown_step("drain poller close", poller.close())
         for pc in conns:
-            with contextlib.suppress(Exception):
-                await pc.stop(0.5)
-        with contextlib.suppress(Exception):
-            await sink.stop()
+            await _teardown_step("sender stop", pc.stop(0.5))
+        await _teardown_step("sink stop", sink.stop())
 
     ctr = metrics.counters
     return ShardCertDriverReport(
@@ -3456,6 +3608,17 @@ async def run_shardcert_driver(
         in_pipeline_final=(final.in_pipeline if final else -1),
         drained=drain_s is not None,
         drain_seconds=drain_s,
+        delivering=delivering,
+        routing=routing,
+        # Each ACKed message must arrive at exactly the destinations the served router picks for it,
+        # so a copy under some other destination cannot stand in for a lost one.
+        acked_copies_missing=tracker.acked_copies_missing(
+            lambda seq: destinations_for_seq(
+                seq, routing=routing, dests=dests, fanout=max(delivering, 0)
+            ),
+            fifo_lane_destination,
+        ),
+        timeouts=ctr.timeouts,
         notes=notes,
     )
 
@@ -3514,7 +3677,7 @@ class ShardCertSinkReport:
     """One SINK process's outcome — the delivered/order tally over ITS owned destination-port chunk.
 
     **The invariant this tier rests on, stated so it holds in BOTH routing modes:** a FIFO lane key is
-    ``(source shard, [lane,] DESTINATION)`` (``_shape.fifo_lane``, stamped into MSH-6). The DESTINATION
+    ``(source engine shard, [lane,] DESTINATION)`` (``_shape.fifo_lane``, stamped into MSH-6). The DESTINATION
     determines the outbound port, and :func:`_partition_band` tiles the port band into non-overlapping
     chunks — one owning sink each. Therefore **the per-sink lane-key SETS ARE DISJOINT**, in both modes, and
     the sinks' union IS the run's lane set.
@@ -3522,19 +3685,19 @@ class ShardCertSinkReport:
     What DIFFERS by mode is only how much of that set one sink sees:
 
     * ``broadcast`` — every accepted message fans to every DELIVERED dest, so a sink owning a port in
-      ``[0, D)`` observes every SOURCE lane, and ``lanes_observed`` is (shards × lanes_per_shard × its own
-      dests). Sinks owning the non-delivering tail at ``D < dests`` legitimately see nothing.
+      ``[0, D)`` observes every SOURCE lane, and ``lanes_observed`` is (engine shards × lanes_per_shard ×
+      its own dests). Sinks owning the non-delivering tail at ``D < dests`` legitimately see nothing.
     * ``partitioned`` — a message goes to exactly ONE dest, so a sink observes only the lane keys whose
       destination is in ITS chunk: a FRACTION of the lane set, never all of it.
 
     An earlier version of this docstring asserted the broadcast case as if it were the invariant ("every lane
     fans to every delivered dest, so a sink observes EVERY lane"), and the coordinator's MAX aggregation was
     derived from it. Under ``partitioned`` at ``dests <= 8`` each sink owns ONE destination, so its
-    ``lanes_observed`` is just the number of shards feeding that dest — and a MAX over the sinks reads 4 where
+    ``lanes_observed`` is just the number of engine shards feeding that dest — and a MAX over the sinks reads 4 where
     the truth is 256, or false-FAILS the ``>= 2`` non-vacuity bar outright. The coordinator now unions the
     lane-key SETS instead (see :func:`run_shardcert_drive`), which is why ``lane_keys`` is reported here.
 
-    Counts + the bound port numbers + the SYNTHETIC lane labels (shard/lane/dest — stamped by this harness's
+    Counts + the bound port numbers + the SYNTHETIC lane labels (engine shard/lane/dest — stamped by this harness's
     own ``apply_transform``, never patient data) only. Never control-ids / bodies (PHI rule)."""
 
     sink_index: int
@@ -3646,8 +3809,7 @@ async def run_shardcert_sink(
         if post_complete_grace > 0:
             await asyncio.sleep(post_complete_grace)
     finally:
-        with contextlib.suppress(Exception):
-            await sink.stop()
+        await _teardown_step("sink stop", sink.stop())
 
     ctr = metrics.counters
     report = ShardCertSinkReport(
@@ -3810,7 +3972,9 @@ async def run_shardcert_driver_worker(
     # so the tier walks the lanes K-deep in bursts instead of spreading K concurrent messages over K distinct
     # lanes. Long-run per-lane load is unaffected (still R/L), but the bursty arrival process aliases against
     # the soak's 0.5s in_pipeline sampler and can flip a healthy soak's flat-or-draining slope gate.
-    corpus = build_corpus(
+    # Off the event loop, as runner.py builds its corpus: the build is CPU work.
+    corpus = await asyncio.to_thread(
+        build_corpus,
         load_profile_text(_CORPUS_PROFILE, where="<shardcert>"),
         ids,
         driver_index * SEQ_BASE_STRIDE,
@@ -3851,8 +4015,7 @@ async def run_shardcert_driver_worker(
         await asyncio.gather(*(c.stop(2.0) for c in conns))
     finally:
         for pc in conns:
-            with contextlib.suppress(Exception):
-                await pc.stop(0.5)
+            await _teardown_step("sender stop", pc.stop(0.5))
 
     ctr = metrics.counters
     ack = metrics.ack.summary()
@@ -3949,7 +4112,7 @@ class ShardCertDriveReport:
     # TOPOLOGY: shared outbound destination CONNECTIONS = the sink port-band width. NOT the fan-out —
     # `delivering` is (BACKLOG #209). Never put this in delivery arithmetic.
     dests: int
-    # H: handlers the router SELECTS per (shard, lane). Cost model only — never delivery arithmetic.
+    # H: handlers the router SELECTS per (engine shard, lane). Cost model only — never delivery arithmetic.
     handlers: int
     # D: destinations an accepted message actually delivers to. *** THE FAN-OUT ***
     delivering: int
@@ -4025,7 +4188,7 @@ class ShardCertDriveReport:
     @property
     def inbound_band_narrower(self) -> bool:
         """``G < L`` — the INBOUND pool is the narrow one, so this rung's ceiling may be an INGRESS ceiling.
-        True at the SHIPPED DEFAULTS (4 shards x 1 lane = 4 bands vs 8 dests), which is exactly why it is a
+        True at the SHIPPED DEFAULTS (4 engine shards x 1 lane = 4 bands vs 8 dests), which is exactly why it is a
         recorded WARNING rather than a refusal."""
         return self.dests > 0 and self.inbound_bands < self.dests
 
@@ -4086,13 +4249,16 @@ class ShardCertDriveReport:
 
         Deliberately does NOT gate on the poller terms (``drained``, ``engine_dead``, ``engine_done``):
         they are read from the engine ``/stats`` REMOTELY and are UNRELIABLE on a unified store — the
-        gauges SUM ``done``/``dead`` over all shard APIs (4× overcount) and ``await_drain`` zeroes/misses
+        gauges SUM ``done``/``dead`` over all engine shard APIs (4× overcount) and ``await_drain`` zeroes/misses
         under load (the exact metric ``mf-bench-attribution-policy`` + the C1 runbook say to NEVER gate
         on). The strand / dead-at-any-stage authority is the ENGINE half's report, which reads the store
         DIRECTLY (store-truth) and owns that verdict; the sinks are the DRIVE box's only reliable truth.
         The poller terms remain as ADVISORY cross-check fields (see ``render``/``to_json_dict``)."""
-        fanout = self.acked * self.delivering
-        return self.sink_received == fanout and self.acked > 0 and self.sink_received > 0
+        return (
+            _count_balance(self.acked, self.delivering, self.sink_received)
+            and self.acked > 0
+            and self.sink_received > 0
+        )
 
     @property
     def ok(self) -> bool:
@@ -4153,7 +4319,7 @@ class ShardCertDriveReport:
             f"H={self.handlers} (txn/msg={self.txn_per_message}, events/msg={self.events_per_message})",
             # ARTIFACT 5: G beside L, always — a plateau cannot be attributed without both.
             f"  pools: G={self.inbound_bands} inbound bands "
-            f"({len(self.shards)} shards x {self.lanes} lanes) vs L={self.dests} outbound lanes"
+            f"({len(self.shards)} engine shards x {self.lanes} lanes) vs L={self.dests} outbound lanes"
             + ("   <= INBOUND IS THE NARROW POOL" if self.inbound_band_narrower else ""),
             f"  rate={self.aggregate_rate:g}/s hold={self.hold_seconds:g}s offered={self.offered} "
             f"sent={self.sent} acked(A)={a} sink_received(S)={self.sink_received}",
@@ -4324,6 +4490,7 @@ async def run_shardcert_drive(
     drain_timeout: float = 90.0,
     reap_grace: float = 10.0,
     allow_insecure: bool = False,
+    cacert: str | None = None,
     await_engine_drained: bool = False,
     engine_drained_timeout: float | None = None,
 ) -> ShardCertDriveReport:
@@ -4427,6 +4594,25 @@ async def run_shardcert_drive(
         override=drive_complete_timeout,
     )
     try:
+        # (0) Sign in to the engine box's API before spawning any child (https and the remote rig
+        #     session unless --insecure; ``cacert`` is the engine box's certificate PEM). The poller's
+        #     drain wait is the barrier that holds the sinks' tally until the engine has delivered,
+        #     unless the ENGINE_DRAINED gate below is armed. So without that gate a refusal is a setup
+        #     error, raised before any child exists: tallying with no barrier would read the in-flight
+        #     tail as loss. With the gate armed, the poller's terms are advisory only, so a refusal is
+        #     a note and the run goes on.
+        try:
+            poller = await _open_remote_poller(
+                engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
+            )
+        except RemoteEngineSignInError as exc:
+            if not await_engine_drained:
+                raise
+            notes.append(
+                "advisory /stats poller not opened, so drained/engine_done/engine_dead are unread: "
+                + escape_for_terminal(str(exc), single_line=True)
+            )
+
         # (1) Spawn the M sink children over CONTIGUOUS chunks of the [sink_base, sink_base+sink_ports)
         #     (== dests) band; await each SINK_BOUND.<m>.
         for m in range(sink_count):
@@ -4494,29 +4680,12 @@ async def run_shardcert_drive(
         driver_dones = await _await_indexed(
             coord, DRIVER_DONE, driver_count, timeout=driver_done_wait
         )
-        # STILL http, KNOWINGLY. This is the TWO-BOX path: the engine runs on another host that
-        # this process never spawned, so the run's own anchor (harness.load.tlsmat) cannot cover it
-        # and EnginePoller._cacert_for deliberately declines to pin a non-loopback URL.
-        #
-        # #1276 makes that remote engine serve TLS too, so this rig needs its own answer -- either
-        # the two boxes share one certificate (export MEFOR_HARNESS_TLS_CERT_FILE/KEY_FILE on both,
-        # which the tlsmat inheritance already honours) or the rig ships the engine box's cert to the
-        # load box. That is a rig-provisioning decision, not a code one, and it is NOT exercised by
-        # any CI workflow -- so it is left visible here rather than half-converted to https, which
-        # would fail verification against a cert this box has never seen.
-        urls = [f"http://{engine_host}:{p}" for p in api_ports]
-        # allow_insecure threads the plaintext-http-to-remote posture: the engine box's API is http and
-        # off-box, so without it EngineClient fail-closes and poller.open() raises AFTER the children are
-        # spawned. (A loopback co-located engine never needs it.) The finally below still tears the
-        # children down on any early failure, but threading this is what makes the run succeed.
-        # NO SESSION ON THIS HOP, KNOWINGLY, and for the reason above. The engine box serves with
-        # sign-in on, and a client refuses to put a credential on a cleartext hop to another box.
-        # So once this rig has its certificate answer, this poller takes RIG_SESSION over https,
-        # and the load box is given the engine box's rig credential (harness.load.rigadmin).
-        poller = EnginePoller(urls, None, origin=time.perf_counter(), allow_insecure=allow_insecure)
-        await poller.open()
-        drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
-        final = poller.final
+        # The poller was opened, and signed in, at step (0); without it the advisory terms stay unread.
+        drain_s: float | None = None
+        final: EngineSample | None = None
+        if poller is not None:
+            drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
+            final = poller.final
 
         # (4b) PR-C2 ladder drain gate (default OFF): before releasing the sinks to tally, wait for the
         # ENGINE half's RELIABLE store-truth drain signal. The remote poller above is advisory (zeroes
@@ -4557,9 +4726,8 @@ async def run_shardcert_drive(
         sink_dones = await _await_indexed(coord, SINK_DONE, sink_count, timeout=sink_done_timeout)
     finally:
         if poller is not None:
-            with contextlib.suppress(Exception):
-                await poller.close()
-        # Reap CONCURRENTLY so an early failure (e.g. a poller.open() raise while M+K children are still
+            await _teardown_step("drain poller close", poller.close())
+        # Reap CONCURRENTLY so an early failure (e.g. a coord timeout while M+K children are still
         # live, some blocked on DRIVE_COMPLETE) tears the whole tier down in ~one reap_grace, not
         # (M+K)*reap_grace — no lingering child processes on the load-gen box between ladder steps.
         if procs:
@@ -4595,9 +4763,9 @@ async def run_shardcert_drive(
     # to every delivered dest, so a sink observes EVERY lane"). Under PARTITIONED a message goes to exactly
     # ONE destination, so a sink sees only the lanes whose dest is in its own port chunk. `sink_count` defaults
     # to `min(8, sink_ports)` and `sink_ports` defaults to `dests`, so at dests <= 8 each sink owns exactly ONE
-    # destination and its lanes_observed is just the shard count feeding it — MAX then reads 4 where the truth
-    # is 32, and reads 1 (FAILING the >= 2 non-vacuity bar on a perfectly healthy, lossless, in-order rung) as
-    # soon as a dest has a single feeding shard.
+    # destination and its lanes_observed is just the engine shard count feeding it — MAX then reads 4 where the
+    # truth is 32, and reads 1 (FAILING the >= 2 non-vacuity bar on a perfectly healthy, lossless, in-order
+    # rung) as soon as a dest has a single feeding engine shard.
     #
     # A bare SUM is not the fix either, even though the keys ARE disjoint by construction (the key contains the
     # DESTINATION, and _partition_band gives each destination exactly one owning sink): the ONE case where they

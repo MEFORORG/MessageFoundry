@@ -109,9 +109,24 @@ refused cell does not open, so its message or delivery is refused on read or dea
 moved message still shows in the other channel's message list by its plaintext columns, with its
 encrypted cells withheld. The engine keeps running. A refusal usually writes an `integrity.*`
 audit row and raises an `integrity_drift` alert, with at least these exceptions. Under
-`vault_transit`, a cell that fails its tag keeps the cipher's own error, with no integrity audit
-row or alert. On most of the read path, each process reports a row that keeps failing again only
-after an interval: five minutes for a sealed row, and an hour for a message or saved-search cell.
+`vault_transit`, a message or saved-search cell that Transit refuses with its AEAD authentication
+failure is refused, audited and alerted as any other moved cell is, but Transit's other refusals
+and its outages keep the cipher's own error for such a cell, with no integrity audit row or alert
+(BACKLOG #5650). That reading holds only while Vault or OpenBao returns the AEAD library's own
+error text, unwrapped, as every reason of a single decrypt's 400. That shape was not read from
+either project's source at a commit, so a release that wraps or prefixes the text would turn such a
+refusal back into the cipher's own error, unaudited and unalerted. A queue payload cell still
+classifies through `is_tag_failure`, which counts every marked Transit value as held, so under
+`vault_transit` any failure to open one, an outage included, reads as a queue tag failure. Transit
+gives the same AEAD refusal when the data key it is pointed at is not the one that sealed the cell,
+so a recreated key, or another Vault's key of the same name, would read as a moved cell for every
+such cell. An unmarked value refused in a message or saved-search cell is audited, and its alert is
+the cipher's own unmarked-value refusal, which the cipher raises on every read, with no interval of
+its own. Its audit row is written per row, as a moved cell's is; its WARNING once an hour per cell
+column. A batch result's per-value error changes only the class of error the cipher-cell walk
+records. On most of the read path, each process reports a row that keeps failing again only after
+an interval: five minutes for a sealed row, and an hour for a message or saved-search cell's audit
+row and WARNING.
 A directory reconcile pass is an exception: the engine itself reports an AD map Vault transit
 cannot verify or reach on every pass that meets it, with no interval of its own (ADR 0217). How a
 session revoke reports a seal refusal, what limits those reports, and the gaps still open are
@@ -394,17 +409,39 @@ than a path is not checked
   local Users group and the logon classes such as INTERACTIVE. It is a list of known groups. It
   does not prove that only the accounts you meant can reach the file. `protect-key
   --grant-account` refuses the same list, and refuses a name that is a group or a domain.
-- It does not vet the file's owner or an account you granted yourself. LOCAL SERVICE and NETWORK
-  SERVICE are accounts that many services share, and the check does not report them.
-- On POSIX the test is a group or other read or write bit, whoever is in the group. A volume that
-  makes every file group-readable on each mount, such as a Kubernetes volume with `fsGroup`, lets
-  the first start mint a key and makes every later start refuse it. Supplying your own certificate
-  does not avoid this under `"enforce"`: an `[api].tls_key_file` on such a volume is judged by the
-  same test. A Kubernetes Secret volume is one such volume. The shipped manifests
-  (`docker/k8s/statefulset.yaml`, `docker/k8s/ha-postgres.yaml`) therefore mount the Secret only on
-  a `copy-tls` initContainer, which copies the API pair into a memory-backed `emptyDir` at mode
-  `0600`, owned by the engine's account. The engine mounts that `emptyDir`, not the Secret. A key
-  you add for a connection has to be copied the same way.
+- On Windows it does not vet the file's owner or an account you granted yourself. LOCAL SERVICE
+  and NETWORK SERVICE are accounts that many services share, and the check does not report them.
+- On POSIX the check refuses a key file whose own name is a link, one owned by an account other
+  than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
+  in the group, and one held in a directory that another account owns or that a group or other may
+  write without the sticky bit (vault BACKLOG #5636). Only the last part of the path is read
+  without following a link: a link in a directory above it is followed, and the directory that
+  holds the file is judged as the one the link leads to. Only that directory is read, not the ones
+  above it. A directory a group or other account may write is accepted when it has the sticky
+  bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
+  mints its own TLS key beside the store. **When it mints its own pair and the store directory does
+  not exist yet, the engine creates it on POSIX with no group or other write bit (`0755` at most,
+  whatever the umask), so a client running as another account can still read the certificate it
+  pins.** It creates no directory when an operator certificate or an upstream terminator is
+  configured. A store directory that already existed keeps its mode, and if a group or other
+  account may write it without the sticky bit, the generated-key check reports it as it reports
+  the key: under `"enforce"` the start is refused with exit 2, under `"warn"` it is a warning.
+  Remove the write bits with `chmod go-w` on the directory, or, where the refusal names its owner,
+  `chown` it to the account the engine runs as. The log spool, which often creates the store
+  directory first, gives the directories it makes above its own no group or other write bit too.
+  A group that may write the store directory could also replace the
+  certificate clients pin, the mint lock and the store itself, which this check does not look at.
+  A volume that makes every file group-readable on each mount, such as a Kubernetes volume with
+  `fsGroup`, widens the key and its directory again on every mount, so every start after the first
+  refuses a key on it, the engine's own included.
+  Supplying your own certificate does not avoid this under `"enforce"`: an `[api].tls_key_file`
+  on such a volume is judged by the same test. A Kubernetes Secret volume is one such volume, and
+  it serves each file as a link. The shipped manifests (`docker/k8s/statefulset.yaml`,
+  `docker/k8s/ha-postgres.yaml`) therefore mount the Secret only on a `copy-tls` initContainer.
+  A `tls-dir` initContainer makes `/etc/mefor/tls/engine` at `0700` as uid 10001, and `copy-tls`
+  copies the API pair there at mode `0600`, owned by the engine's account, because the kubelet
+  sets the `emptyDir` root's mode. The engine mounts that `emptyDir`, not the Secret. A key you add
+  for a connection has to be copied the same way.
 - The create has no warn mode. On a filesystem that cannot hold the restriction, such as a FAT
   volume or a mount that reports every file as mode `0777`, the engine cannot mint its TLS key and
   does not start, whatever `[security].enforcement` says. Put the store on a filesystem that holds

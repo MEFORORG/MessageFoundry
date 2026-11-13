@@ -138,7 +138,7 @@ against one case that matters, described under
 - **Docker single host:** [`compose.yaml`](compose.yaml) — Topology A (in-process TLS). Copy
   `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
-  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set both `image:` fields (`copy-tls` and `engine`) to your config-baked image.
+  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all three `image:` fields (`tls-dir`, `copy-tls` and `engine`) to your config-baked image.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)

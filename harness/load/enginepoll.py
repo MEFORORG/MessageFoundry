@@ -673,15 +673,17 @@ class EnginePoller:
         # Accept a single URL (back-compat) or a list. The first URL is the "primary" whose `client`
         # is exposed for one-off preflight reads (served-ports check). `allow_insecure` (default False)
         # is REQUIRED to poll a REMOTE engine over plaintext http (a co-located loopback engine is
-        # always allowed) — the two-box shardcert drives poll the engine box's http API off-box, so
-        # they thread it True; without it EngineClient fail-closes on the non-loopback http URL.
+        # always allowed) — the two-box shardcert drives thread it True only under their --insecure,
+        # for an engine box that serves plain http; without it EngineClient fail-closes on the
+        # non-loopback http URL.
         #
         # It buys UNAUTHENTICATED READS ONLY (BACKLOG #1179): EngineClient refuses to put a bearer
         # token on a cleartext non-loopback hop, so passing `allow_insecure=True` AND a `token`
-        # raises at open() rather than sending the token in the clear. Both two-box call sites pass
-        # `token=None`, which is why the clamp costs them nothing. It also does not make a
-        # TLS-serving engine answer http -- a stock engine serves TLS (ADR 0172), and the two-box
-        # rig's certificate story is BACKLOG #1276 part B.
+        # raises at open() rather than sending the token in the clear. The two-box drives
+        # (`shardcert._remote_engine_poller`) pass `token=None` with `allow_insecure=True`, and
+        # otherwise poll https with REMOTE_RIG_SESSION and the operator's `cacert` (BACKLOG #5640).
+        # It also does not make a TLS-serving engine answer http -- a stock engine serves TLS
+        # (ADR 0172).
         urls = [engine_urls] if isinstance(engine_urls, str) else list(engine_urls)
         if not urls:
             raise ValueError("EnginePoller needs at least one engine URL")

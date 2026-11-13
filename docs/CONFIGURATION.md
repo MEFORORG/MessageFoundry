@@ -421,20 +421,24 @@ The one row that *does* vary:
 
 ### `[tls]` — outbound client trust anchors
 Instance-wide **client trust-anchor policy** (#190, [ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)) —
-a small shared fallback for the outbound connectors that verify a downstream *server* certificate (MLLP,
-DICOM, FTPS today). The inbound FTPS poller dials out and verifies its server too, so it reads this block
+a small shared fallback for hops that verify a downstream *server* certificate. The hops it reaches
+include at least the outbound MLLP, DICOM and FTPS connections, the HTTP-family connections (REST,
+SOAP, FHIR, DICOMweb), the REST, SOAP and FHIR token endpoints, the SMTP connections (Email, Direct),
+the `fhir_lookup` executor, the alerts SMTP sink, the security notifier and the engine AI broker
+(below); the `TrustAnchorPolicy` docstring in `config/tls_policy.py` names the modules of at
+least the receivers beyond the connections. The inbound FTPS poller dials out and verifies its server too, so it reads this block
 as well (vault BACKLOG #2370): a `pinned` mode or a `crl_file` must suit its partner. By default the OS trust store roots verify the peer; a hospital estate whose internal
 endpoints present a private/internal-CA certificate can pin that CA **once** here instead of installing it
 box-globally or repeating a per-connection `tls_ca_file`. This selects **which** roots verify the peer — it
 **never disables verification** — so it composes with (never weakens) the connectors' fail-closed no-CA /
-`tls_verify=false` / cleartext-hop refusals. A connection naming its **own** `tls_ca_file` always wins
-verbatim, and a loopback hop is exempt. The default is a no-op: a config with no `[tls]` block builds a
+`tls_verify=false` / cleartext-hop refusals. A connection's own `tls_ca_file` overrides `internal_ca_file` and `pinned` for its trust roots; it does not escape `crl_file`. A loopback hop is exempt. The default is a no-op: a config with no `[tls]` block builds a
 byte-identical SSL context.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `internal_ca_file` | path | — | PEM path to the org's internal CA. **Not a secret** — a path, like `tls_cert_file` / `forward_tls_ca_file`. Unset (default) = no internal anchor; every hop uses the OS trust store. |
 | `trust_anchor_mode` | enum | `system` | how `internal_ca_file` composes with the OS default roots on a non-loopback internal hop. `system` (default) = **OS trust store only**, `internal_ca_file` ignored (byte-identical). `augment` = OS roots **and** the internal CA (a mixed public + private estate). `pinned` = **only** the internal CA, not the public bundle (a fully-private estate; strictest). `pinned` **without** `internal_ca_file` is **refused at load** — with nothing to pin it would silently fall back to the full OS trust store, i.e. the operator excludes public roots and gets all of them. |
+| `crl_file` | path | — | PEM file of CRLs for the hops this block reaches (BACKLOG #299, #2370). **Not a secret** — a path, like `internal_ca_file`. Unset (default) = this block adds no revocation checking. A missing or blank path is refused when settings load. A CRL the check rejects refuses whatever loads it when that is built (a REST connection behind an ECH sidecar included); **What a signature refusal stops** in [`[cert_monitor]`](#cert_monitor) says which findings only warn and what a refusal stops. On that ECH connection the sidecar opens the TLS to the partner, so no CRL from this block is checked against the partner's certificate. CRLs in a CA file count as well: see **A CRL inside a CA file counts too** in [`[cert_monitor]`](#cert_monitor). |
 
 **The engine AI broker reads this block too** (BACKLOG #5527). On an app this section reaches,
 as `messagefoundry serve` hands it, `POST /ai/chat` verifies an `[ai].endpoint` whose host is not
@@ -953,12 +957,22 @@ of its last `2 * ad_reconcile_outage_passes - 1` probes have failed, whether in 
 with answers, or one instance under the bare `directory-reconciler-unreached`
 source on a rolled-up pass, which the `ad_reconcile_outage_passes` row states. Nothing resolves
 either automatically.
-Resolve a per-account one by hand once the WARNING says the account was answered for on each of its
-last probes, which takes `2 * ad_reconcile_outage_passes - 1` answers in a row (vault BACKLOG #3709),
-or once the account has no live session left, since the account then leaves the reconciler's record
-with no WARNING. A new run of failures that starts before that WARNING pages nothing more, so
-resolving earlier can leave it unpaged. Resolve the
-bare one once each account its rows name has been.
+A per-account one is resolved by hand, on the rule below. The WARNING that rule names says the account was
+answered for on each of its last probes, which takes `2 * ad_reconcile_outage_passes - 1` answers in
+a row (vault BACKLOG #3709). Each engine process pages and latches an account on its own, and logs that WARNING only for an
+account it latched itself, while it still holds that latch in memory
+(`AuthService._reconcile_unreached_paged`). So where several engine processes share the store,
+such as engine shards, read the log of every process that paged. At least these end a process's
+latch with no WARNING ever logged: a restart of that process; the account leaving the
+reconciler's record, which that process's next pass applies, for example once the account holds no
+unrevoked, unexpired session (an idle one counts until its absolute expiry or the reaper deletes it; the paragraph below that starts "A
+pass judges only accounts that hold a session" lists more); and the cap on that record (`LEDGER_MAX` in `auth/reconcile.py`, applied by
+`prune_ledger`), which can drop the account's window and its latch, and which nothing reports.
+Once every process that paged has logged the WARNING or ended its latch,
+resolve the instance by hand: a later run of failures pages again. Before then, a new run of
+failures pages nothing more in a process that still holds the latch, so resolving earlier can
+leave it unpaged. Resolve the bare one once that holds for each account its
+`auth.ad_reconcile_unreached` rows name.
 
 A lasting directory outage opens its own `ad_reconcile_aborted` instance, with reason
 `directory_unavailable` and source `directory-reconciler-outage` (BACKLOG #3709), once a run of
@@ -1357,7 +1371,7 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 | `pooled_fusing_workers` | int (≥1) | 8 | worker count for **each** per-stage fusing executor (ADR 0071 B5). Every fused stage gets its own `ThreadPoolExecutor` of this width plus a matching-width dedicated synchronous pyodbc handoff pool (one connection per worker, so a fused hop never blocks acquiring). Small by default — a fused hop holds a worker across DB latency, so this *is* the fused-stage concurrency; it also clamps the fused stages' effective `pooled_max_processing_lanes` to ~2× this value, so the claimer doesn't reserve 256 slots for a handful of workers. Inert unless `fuse_thread_hops` is on. |
 | `batch_handoff_statements` | bool | `true` | **Per-hop SQL statement batching** ([ADR 0075](adr/0075-per-hop-sql-statement-batching.md)). **Default-ON** (promoted 2026-07-08; retained as an emergency off-switch) and SQL-Server-scoped: each per-hop staged handoff (`route_handoff` / `transform_handoff`) folds the non-result-returning DML of its body into the fewest `pyodbc.execute()` T-SQL batches — the same ordered `(sql, params)` sequence, one round-trip per batch, still committing **exactly once per hop**. It cuts network round-trips, **not** transactions: no commit boundary moves, the claim stays its own poison-guard transaction, and the ACK-on-receipt fence is untouched. Each result-consuming statement whose value gates later control flow (the guard `DELETE`, the finalize `GROUP BY`, the finalize `sp_getapplock` rc-check) stays its own execute. Postgres and SQLite have no batched path and run byte-identically. **Read once at engine construction (restart to change).** Env: `MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS`. |
 | `snapshot_on_send` | bool | `true` | **Copy-on-`Send`** ([ADR 0104](adr/0104-copy-on-send-outbound-message-model-recognition-first-handler-message-type-and-hl7-field-picker.md)) — snapshot each `Send`'s payload at construction so a **divergent fan-out** (mutate between `Send`s) delivers per-destination state instead of a last-write collapse. **Default-ON** since the BACKLOG #230 default-flip: the conservative estate AST scan flagged 1 of 152 handlers and human triage found that one mutates an independent clone, so genuine divergence is **0** and the flip changes delivered bytes for no handler; and `Message.copy()` is now genuine copy-on-write, so the common single-`Send` / no-post-mutation path is zero-copy and a deepcopy fires only on an actual divergence. Set `false` to restore the pre-ADR-0104 last-write behaviour. Backend-agnostic. **Read once at engine construction (restart to change).** Env: `MEFOR_PIPELINE_SNAPSHOT_ON_SEND`. |
-| `credential_fault_policy` | enum | `stop` | **Partner-account-lockout protection** (#109, [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)). What an outbound File/FTP/SFTP sender does on a **permanent credential/auth fault** (bad password, key rejected). `stop` (default) halts the lane **immediately** (not after a streak) and **retains the queued rows un-errored** (they stay pending/claimable, never dead-lettered), so a backlog can't re-authenticate in a loop and trip the partner's account lockout — reusing the STOP muscle (`connection_stopped` alert; reload/restart re-arms the lane once the credential is fixed). `dead_letter` keeps the historical fail-fast (dead-letter just the offending row and advance). The policy also governs a permanent **configuration** fault (BACKLOG #2083): an FTP server that refuses `AUTH TLS`, `PBSZ`/`PROT P` or the greeting, or demands TLS of a plain session. Every queued row would meet that refusal too, so `stop` stops the lane and keeps the queue, and the alert names the configuration. A REST, SOAP, FHIR or DICOMweb outbound raises the same fault when its HTTP Digest handler refuses a challenge (BACKLOG #2323, code `auth-challenge-refused`). That needs Digest set up on the connection, for the endpoint or for the web proxy. The refused challenges are at least these: a Digest challenge naming a hash other than SHA-256, a malformed one, one with no realm or nonce, one whose `qop` does not offer `auth`, and one in a scheme other than Digest or Basic, such as NTLM. The token hop of an OAuth2 or SMART connection raises it too when its web proxy is set up for Digest and answers an `https://` token endpoint's `CONNECT` with 407, which urllib cannot answer (Amendment B.1 names the remedy). A send-time insecure-hop refusal raises the same fault with code `insecure-hop-refused` on those HTTP-family outbounds (BACKLOG #2989) and on MLLP and X12 outbounds (BACKLOG #5719, #5718). On an outbound that does not classify it yet, a send-time hop refusal is still an internal error, under that outbound's `internal_error` policy. Other unanswered challenges do not raise it; [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md) Amendment B and B.1 list them. A **content**-permanent reject (AR/CR, no-such-dir) is unaffected — it still dead-letters. |
+| `credential_fault_policy` | enum | `stop` | **Partner-account-lockout protection** (#109, [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)). What an outbound File/FTP/SFTP sender does on a **permanent credential/auth fault** (bad password, key rejected). `stop` (default) halts the lane **immediately** (not after a streak) and **retains the queued rows un-errored** (they stay pending/claimable, never dead-lettered), so a backlog can't re-authenticate in a loop and trip the partner's account lockout — reusing the STOP muscle (`connection_stopped` alert; reload/restart re-arms the lane once the credential is fixed). `dead_letter` keeps the historical fail-fast (dead-letter just the offending row and advance). The policy also governs a permanent **configuration** fault (BACKLOG #2083): an FTP server that refuses `AUTH TLS`, `PBSZ`/`PROT P` or the greeting, or demands TLS of a plain session. Every queued row would meet that refusal too, so `stop` stops the lane and keeps the queue, and the alert names the configuration. A REST, SOAP, FHIR or DICOMweb outbound raises the same fault when its HTTP Digest handler refuses a challenge (BACKLOG #2323, code `auth-challenge-refused`). That needs Digest set up on the connection, for the endpoint or for the web proxy. The refused challenges are at least these: a Digest challenge naming a hash other than SHA-256, a malformed one, one with no realm or nonce, one whose `qop` does not offer `auth`, and one in a scheme other than Digest or Basic, such as NTLM. The token hop of an OAuth2 or SMART connection raises it too, in the one `CONNECT` case Amendment B.1 states. A send-time insecure-hop refusal raises the same fault with code `insecure-hop-refused` on those HTTP-family outbounds (BACKLOG #2989) and on MLLP and X12 outbounds (BACKLOG #5719, #5718). On an outbound that does not classify it yet, a send-time hop refusal is still an internal error, under that outbound's `internal_error` policy. Other unanswered challenges do not raise it; [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md) Amendment B and B.1 list them. A **content**-permanent reject (AR/CR, no-such-dir) is unaffected — it still dead-letters. |
 | `schedule_tick_seconds` | float (>0) | 30.0 | **Active-window scheduler tick** (#147, [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)). The reconcile granularity for a connection's per-connection `schedule` (a window boundary is honoured within one tick). Only affects connections that declare a `schedule`; connections with none are byte-identical always-on. |
 
 ### `[sandbox]`
@@ -2726,7 +2740,10 @@ secret. Each file in that directory holds one setting and is named exactly as it
 - **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
   that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
   POSIX, a group or other read or write bit) can read or change, a directory in which such a
-  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link on Windows. It also
+  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link, on every platform. On POSIX
+  it also refuses a directory or file owned by an account other than the engine's own or root,
+  and one held in a directory that such an account owns or that a group or other may write
+  without the sticky bit, since any account that may write it may replace what it holds. It also
   refuses a relative path, a file that is not a regular file, a file named for no setting above
   (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
   whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
@@ -2737,11 +2754,12 @@ secret. Each file in that directory holds one setting and is named exactly as it
   `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
   not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
   named for no setting is cited by its position, never spelled, since its name may be a value.
-- **The access check is a list of known broad groups.** It does not refuse one named account that
-  can write the directory, the way the config-directory checks do, and it does not read the
-  folders above the directory: a broad group that can write one of those could replace the
-  directory. Restrict the directory, and the folders above it, as below rather than relying on
-  the check.
+- **On Windows the access check is a list of known broad groups.** It does not refuse one named
+  account that can write the directory, the way the config-directory checks do, and it does not
+  read the folder that holds the directory. On POSIX it reads that one folder, as the rule above
+  says. On no platform does it read the folders above that: an account that can write one of
+  those could replace the directory. Restrict the directory, and the folders above it, as below
+  rather than relying on the check.
 - **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
   [`[store].encryption_key_file`](#store).
@@ -2760,17 +2778,20 @@ default; where to put it is the platform's choice (ADR 0214, slice C).
   except as the Vault Agent route below says. Make each grant inheritable by files (`(OI)` in
   `icacls` terms): a file an administrator creates in the directory then gets the service account's
   read, where a grant that is not inheritable leaves the new file unreadable to the engine.
-- **POSIX.** Make it mode `0700` and each file `0600`, owned by the engine's account.
+- **POSIX.** Make it mode `0700` and each file `0600`, owned by the engine's account, as real
+  files and directories rather than links. Keep it in a folder owned by root or the engine's
+  account that no group or other account may write, unless that folder has the sticky bit.
 - **A container.** Mount a host directory read-only, as `docker/compose.yaml` shows for
   `/run/mefor/secrets`, and own it as the TLS directory there is owned: uid 10001, the directory
   `0700` and each file `0600`. The engine refuses a directory or file whose mode has a group or
-  other read or write bit, and a bind mount keeps the host's modes, so a mode the runtime sets on
-  a path it creates for you passes only when it has no such bit.
+  other read or write bit, or that another account owns, and a bind mount keeps the host's modes
+  and owners, so a mode the runtime sets on a path it creates for you passes only when it has no
+  such bit. A Kubernetes Secret volume serves each file as a link, so it is refused here.
 - **systemd credentials.** A unit can point the variable at its credentials directory with
   `Environment=MEFOR_SECRETS_DIRECTORY=%d` and one `LoadCredential=` per setting, the credential
   named as the variable. That is not measured here; Linux is not a supported v1 deployment target
-  ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md)). Check the directory's and files' modes
-  against the rule above before you rely on it.
+  ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md)). Check the directory's and files' modes and
+  owners against the rule above before you rely on it.
 
 **A Vault token in this directory** (BACKLOG #2851). The Vault clients never read
 `~/.vault-token`, and no setting names a token file: the token is the file named
