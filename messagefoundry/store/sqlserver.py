@@ -62,7 +62,7 @@ from dataclasses import replace
 from functools import partial
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, Final, assert_never
+from typing import Any, Final, Literal, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -2184,8 +2184,11 @@ _ORPHAN_SWEEP_HEAD: Final = (
 
 async def _log_orphans_deleted(cur: Any) -> None:
     """Log the row a :func:`_trusted_user_key` batch ends with, when it deleted any rows (BACKLOG
-    #2733). The count only, per table: the deleted rows name accounts, and the line names none."""
+    #2733). The count only, per table: the deleted rows name accounts, and the line names none.
+    It only reports, so a batch that returned no row fails nothing: the delete has already run."""
     rows = await cur.fetchall()
+    if not rows:
+        return
     table, deleted = str(rows[0][0]), int(rows[0][1])
     if deleted:
         log.warning(
@@ -2196,7 +2199,10 @@ async def _log_orphans_deleted(cur: Any) -> None:
         )
 
 
-async def _hold_account_row(cur: Any, user_id: str, hints: str) -> None:
+_AccountRowHints = Literal["UPDLOCK, ROWLOCK", "HOLDLOCK, ROWLOCK", "XLOCK, ROWLOCK"]
+
+
+async def _hold_account_row(cur: Any, user_id: str, hints: _AccountRowHints) -> None:
     """Lock the account's ``users`` row under ``hints`` inside the caller's transaction, the one
     spelling of the account-first lock every write keyed to an account takes before its own row
     (BACKLOG #2733, #4974): ``UPDLOCK`` for a writer of the account or its sessions, ``HOLDLOCK``
@@ -15795,11 +15801,13 @@ class SqlServerStore:
         # then refuse it and fail the whole delete with a raw 547. XLOCK, not UPDLOCK: a sign-in's
         # HOLDLOCK read (create_session) shares a U lock, so a session could commit inside the
         # delete; it cannot share X, so it waits and then finds the account gone, the lock rule
-        # create_session states (#1474, #2592). Every path that writes a row keyed to the account
-        # takes the account row before that row, so none holds a row this delete then waits for:
-        # the passkey and role writes (_read_user_record), the sign-in, the session writes
-        # (_write_session_txn, revoke_user_sessions) and the sign-in address writes
-        # (remember_login_address, reset_login_addresses).
+        # create_session states (#1474, #2592). A write whose statement checks a key against the
+        # account row, an INSERT of a row keyed to it or an UPDATE that sets user_id, would hold its
+        # row while that check waited on this lock, and this delete waits on that row. Each such
+        # write read for this change takes the account row first: the passkey and role writes
+        # (_read_user_record), the sign-in, the session rewrites (_write_session_txn) and the
+        # sign-in address writes (remember_login_address, reset_login_addresses). Writes that set no
+        # user_id run no such check, so they hold their row only until they commit.
         await _hold_account_row(cur, user_id, "XLOCK, ROWLOCK")
         await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))

@@ -3111,6 +3111,9 @@ def _sqlserver_batch_store(monkeypatch: pytest.MonkeyPatch, fail: Exception) -> 
         async def execute(self, *_args: object, **_kwargs: object) -> None:
             return None
 
+        async def fetchall(self) -> list[object]:
+            return []  # BACKLOG #2733: the orphan sweeps' count row, read and left unanswered
+
     @contextlib.asynccontextmanager
     async def _acquire(_self: object) -> Any:
         yield _Conn()

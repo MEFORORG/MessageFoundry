@@ -1409,9 +1409,10 @@ async def _race_a_held_user_delete(
 async def test_a_sign_in_inside_a_user_delete_waits_and_is_refused(store) -> None:
     """BACKLOG #2733: a sign-in started while ``delete_user`` holds the account row waits for the
     delete, then is refused by the session key for the missing account, and the delete completes.
-    The delete took the row under ``UPDLOCK``, which the sign-in's ``HOLDLOCK`` read shares, so
-    the session committed inside the delete and the delete's last statement failed with error 547;
-    on that code the step finishes while the delete is held, and this test fails there."""
+    The delete took the row under ``UPDLOCK``, which the sign-in's ``HOLDLOCK`` read shares, so a
+    session could commit inside the delete, and one that committed after the delete's sessions
+    delete failed its last statement with error 547. On that code the sign-in here finishes while
+    the delete is held, and this test fails on the probe."""
     from messagefoundry.auth.service import _is_integrity_refusal
 
     account = "del-sign-in"
