@@ -8485,19 +8485,14 @@ class _ReopeningNoticeAudit:
     it. Nothing inside the command's own loop could bound the wait: the open's key-provider hop is
     synchronous, and a worker-thread call still running would hold that loop's executor shutdown.
 
-    **What happens at exit to a record still running at the bound depends on where it is**, in at
-    least these two cases. On SQLite, once the reopen has reached aiosqlite's worker thread, which
-    is not a daemon, the interpreter waits for that thread at exit, after the command has printed
-    its result, until the driver's own timeouts end it, as :func:`_run_offline_alert_step` says of
-    its step. On PostgreSQL, whose driver runs on this thread's own loop, and on any backend
-    before the reopen reaches a driver thread, for example inside a synchronous key-provider hop,
-    nothing holds the exit: the daemon thread is stopped with it, and the record is lost with no
-    log line.
+    A record still running at the time limit is not guaranteed either way: the process exit may
+    wait for it, or it may be lost with no log line.
 
     The row counts as written only when the write returned. Anything else is a miss, whatever ended
     the thread, and raises into :meth:`SecurityEventNotifier._record_undelivered`, which logs the
     class and swallows it: the notice was best effort, and so is its record. A committed row is
-    never reported as missed, so a failed close is logged in the thread and raises nothing. An
+    reported as missed only where ``record_audit`` raised, which can happen after a server-side
+    COMMIT; a failed close is logged in the thread and raises nothing. An
     outcome that arrives after the bound has passed is logged when it does, by class only. One
     whose wait was cancelled instead, by an interrupt, is not logged."""
 
@@ -8598,12 +8593,11 @@ class _ReopeningNoticeAudit:
 class _CountingNoticeAudit:
     """A :class:`NoticeAuditSink` that forwards to ``inner`` and counts the undelivered records the
     notifier asked for, so ``provision-admin`` can say that delivery of a notice it reported as
-    dispatched is unconfirmed (BACKLOG #5634). The notifier records only a notice whose send raised
-    or that it dropped, so a count above zero is one of those, whether or not the forwarded write
-    then succeeded. A send can raise after the relay queued the mail, so it is not proof the
-    notice never left. A
-    count of zero is not a delivery receipt: at least a drop past the notifier's record cap, or a
-    drain ended by an interrupt, asks for no record."""
+    dispatched is unconfirmed (BACKLOG #5634). For a dispatched notice the notifier records only a
+    send that raised, so a count above zero is one, whether or not the forwarded write then
+    succeeded. A send can raise after the relay queued the mail, so it is not proof the notice
+    never left. A count of zero is not a delivery receipt: at least a drain ended by an interrupt
+    asks for no record."""
 
     def __init__(self, inner: NoticeAuditSink) -> None:
         self._inner = inner
@@ -9804,7 +9798,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # BACKLOG #5634: the notifier drained before run() returned, so its count is final here. None
     # unless a notice was dispatched. False is not a delivery receipt: it says only that the
-    # notifier recorded no undelivered notice, and at least a drop past its record cap records none.
+    # notifier recorded no undelivered notice, and at least a drain ended by an interrupt records none.
     holder_send_failed: bool | None = (
         bool(notice_audit) and notice_audit[0].undelivered > 0
         if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED
@@ -9859,7 +9853,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 # BACKLOG #2019: null on a fresh create; see ProvisionedAdministrator.holder_notice.
                 "holder_notice": outcome.holder_notice,
                 # BACKLOG #5634: true when the notifier recorded a notice this run dispatched as
-                # undelivered: its send raised, or it was dropped. Delivery is then unconfirmed,
+                # undelivered, because its send raised. Delivery is then unconfirmed,
                 # not disproved: a send can raise after the relay queued the mail. False when it
                 # recorded none, which is not a delivery receipt; null when no notice was
                 # dispatched. `holder_notice` keeps what the audit row records.

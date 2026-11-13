@@ -7630,12 +7630,11 @@ again for the row, and only when a send failed. **Still open, at least:**
   `messagefoundry/__main__.py`, and then logs a miss by class only. While the command still runs,
   a record past that limit may land or fail, and what it does is logged when it does, unless the
   wait was interrupted rather than timed out. The close comes after the answer, so a slow close
-  never costs the row or reports it missed. The reopen and the write run on their own loop in a
-  daemon thread, so the limit covers a synchronous key-provider hop inside the open too. **At exit
-  a record still running behaves in at least two ways.** On SQLite, once the reopen has reached
-  the driver's worker thread, the exit waits for it, after the command has printed its result. On
-  PostgreSQL, and on any backend before the reopen reaches a driver thread, the exit does not wait:
-  the record is lost with no log line.
+  never costs the row or reports it missed. A committed row is reported missed only where the
+  write itself raised, which can happen after a server-side COMMIT. The reopen and the write run
+  on their own loop in a daemon thread, so the limit covers a synchronous key-provider hop inside
+  the open too. A record still running at the time limit is not guaranteed either way: the process
+  exit may wait for it, or it may be lost with no log line.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
