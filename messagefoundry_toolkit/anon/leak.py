@@ -19,8 +19,8 @@ already-pseudonymized field is never re-flagged:
   nobody thought to map is **recorded** (carried into the :class:`LeakError` on a refusal, and exposed
   via ``on_report``) rather than passing unrecorded; and
 * **high-precision structural PHI-shape detectors** over those unmapped values (dashed SSN,
-  punctuated NANP phone, a CX whose CX.5 id type is ``MR``/``MRN``, and a line whose segment id is
-  malformed), plus a dashed SSN or punctuated phone that the message's own field separator cut
+  punctuated NANP phone, an ``MR``/``MRN`` id type in a whole component or in CX.5, and a line
+  whose segment id is malformed), plus a dashed SSN or punctuated phone that the message's own field separator cut
   across fields, when at least one of them is unmapped (BACKLOG #3465) — narrow by design to
   avoid the mass false-positives a broad digit-run search would produce on HL7 bodies (ADR 0030
   §5). A name, an undashed number or a date in an unmapped field
@@ -63,6 +63,7 @@ from .surrogates import (
     decoded_readings,
     message_has_site_code,
     read_message_seps,
+    trim,
     unescape,
     unescaped_fields,
     unescaped_message,
@@ -762,39 +763,46 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
 
 
 def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
-    """True if any repetition of ``value`` has a non-empty component 1 and a 5th component, CX.5
-    the identifier type code, that reads as ``MR``/``MRN`` — an unmapped medical-record number by
-    HL7 structure, far more precise than a bare digit-run heuristic. The id type is read only
-    where HL7 puts it, so ``MR`` in any other component, as in ``70553^PET&MR^C4`` or
-    ``A1^^^^ MR``, does not count (BACKLOG #5654). A fail-closed detector refuses on any reading
-    of CX.5, so an id type counts in each of :func:`_is_mrn_type`'s readings: as written, in any
-    of its subcomponents as written, decoded whole, and stripped. So ``M\\X52\\`` (BACKLOG
-    #5532), ``MR&local`` and ``MR\\X20\\`` count. A decoded part is never split again, so a word
-    ``MR`` that an escaped delimiter or whitespace sets apart, as in ``PET\\T\\MR`` or ``X\\S\\MR``,
-    does not count. The id counts when it is non-empty as written, so one that decodes to
+    """True if any repetition of ``value`` has a non-empty component 1 and an ``MR``/``MRN`` id
+    type — an unmapped medical-record number by HL7 structure, far more precise than a bare
+    digit-run heuristic. Two readings count (BACKLOG #5654):
+
+    * any component, component 1 included, that is ``MR`` or ``MRN`` whole, as written or
+      decoded and trimmed, so ``12345^MR``, ``MRN^12345`` and an XCN ``1234^DOE^JOHN^^^MR`` count,
+      as they did before; and
+    * CX.5, the identifier type code, in any of its subcomponents too, as written or decoded and
+      trimmed, so ``ID^^^AUTH^MR&local`` counts.
+
+    ``M\\X52\\`` (BACKLOG #5532) and ``MR\\X20\\`` count in either. A decoded part is never split
+    again, so ``PET&MR`` outside CX.5, and a word ``MR`` that an escaped delimiter or whitespace
+    sets apart, as in ``PET\\T\\MR`` or ``X\\S\\MR``, do not count. :func:`.surrogates.trim`
+    says what is trimmed. The id counts when it is non-empty as written, so one that decodes to
     nothing, such as ``\\Z98765\\``, counts."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
-        if comps[0] and len(comps) >= 5 and _is_mrn_type(comps[4], seps, field_sep):
+        if not comps[0]:
+            continue
+        if any(_is_mrn_type(comp, seps, field_sep, subcomponents=False) for comp in comps):
+            return True
+        if len(comps) >= 5 and _is_mrn_type(comps[4], seps, field_sep, subcomponents=True):
             return True
     return False
 
 
-def _is_mrn_type(comp: str, seps: Seps, field_sep: str) -> bool:
-    """True if ``comp`` is ``MR`` or ``MRN`` as written, decoded whole as a ``Message`` component
-    read decodes it, or as any one of its subcomponents, as written or decoded. ``Peek`` reads the
-    first subcomponent of a component that has them, and a ``Message`` subcomponent read can read
-    any of them, so each counts (BACKLOG #5654). Each part is also read in every one of
-    :func:`.surrogates.decoded_readings` with no split, and each reading is stripped of
-    surrounding whitespace, so a padded ``MR\\X20\\`` counts too, while the word ``MR`` in
-    ``PET\\T\\MR`` or ``MR BRAIN W\\T\\WO`` does not."""
-    parts = (comp, *comp.split(seps.subcomponent))
+def _is_mrn_type(comp: str, seps: Seps, field_sep: str, *, subcomponents: bool) -> bool:
+    """True if ``comp`` is ``MR`` or ``MRN`` as written or decoded whole, as a ``Message`` component
+    read decodes it, each reading trimmed (:func:`.surrogates.trim`) and never split again. With
+    ``subcomponents``, any one of its subcomponents counts the same way: ``Peek`` reads the first
+    subcomponent of a component that has them, and a ``Message`` subcomponent read can read any
+    of them (BACKLOG #5654)."""
+    split = subcomponents and seps.subcomponent in comp
+    parts = (comp, *comp.split(seps.subcomponent)) if split else (comp,)
     forms = [
         form
         for part in parts
         for form in (part, *decoded_readings(part, seps, field_sep, resplit=False))
     ]
-    return any(form.strip().upper() in _MRN_TYPES for form in forms)
+    return any(trim(form).upper() in _MRN_TYPES for form in forms)
 
 
 def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:

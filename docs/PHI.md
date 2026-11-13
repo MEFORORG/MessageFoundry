@@ -2412,8 +2412,8 @@ Properties of the anonymizer:
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. A component or subcomponent is a site code when it is one whole as
   written or trimmed, or decoded from its escape sequences, with `\H\` and `\N\` kept as `_` or
-  dropped, and then trimmed, whole or split again on the delimiters, the escape character or on
-  whitespace, which a
+  dropped, and then trimmed, whole or split again on the delimiters, the escape character,
+  whitespace or a C0 control character or DEL, such as a decoded `\X00\`; whitespace is what a
   break command such as `\.br\` decodes to. So a code joined to `\S\`, padded with `\X20\` or written with a hex escape is replaced,
   escapes and all, by digits of the same width (BACKLOG #5632). The surrogate is keyed on the
   part as written, so one code written two ways gets two unrelated surrogates. The split on
@@ -2444,7 +2444,7 @@ both are described below:
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
-| A value with a non-empty first component whose 5th component, CX.5 the identifier type code, is `MR` or `MRN`. An `MR` in any other component, such as the modality in `70553^PET&MR^C4`, does not count (BACKLOG #5654) | Fields no rule maps |
+| A value with a non-empty first component and an `MR` or `MRN` id type: any component that is `MR` or `MRN` whole, such as `12345^MR`, or CX.5, the identifier type code, in any of its subcomponents too, such as `ID^^^AUTH^MR&local`. An `MR` subcomponent outside CX.5, such as the modality in `70553^PET&MR^C4`, does not count (BACKLOG #5654) | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
@@ -2465,9 +2465,10 @@ component read and one subcomponent on a subcomponent read, and `Peek` decodes a
 reading the first one where a component has several. An escape can pair across the subcomponent
 separator in the first reading and not in the second, so the check takes both. The shape
 detectors read each unmapped value as written, then each of its components decoded whole and each
-of its subcomponents decoded on its own. The MRN-typed check reads CX.5 as written, decoded
-whole, and as each of its subcomponents, as written and decoded, with `\H\` and `\N\` kept as
-`_` or dropped, each trimmed, so `MR&local` and `MR\X20\` there count. Unlike the site-code scrub
+of its subcomponents decoded on its own. The MRN-typed check reads every component whole, and
+CX.5 also as each of its subcomponents, each as written and decoded, with `\H\` and `\N\` kept
+as `_` or dropped, and each trimmed of whitespace, C0 control characters and DEL, so `MR\X20\`
+and `MR\X00\` count. Unlike the site-code scrub
 (above), it never splits a decoded part again, so the word in `PET\T\MR` or `MR BRAIN W\T\WO`
 does not count, and an id type that only an escaped delimiter or a break command sets apart,
 such as `X\S\MR` or `X\.br\MR`, passes (BACKLOG #5654). The check for a shape cut

@@ -67,12 +67,45 @@ def test_an_mrn_type_past_the_first_subcomponent_or_padded_is_a_hit(
 @_LEAKS
 @pytest.mark.parametrize(
     "value",
-    ["70553^PET&MR^C4", "A1^Smith&mr", "A1^^^ MR", "MR", "A1^^^^X^MR"],
-    ids=["second-component-sub", "name-sub", "fourth-component", "component-1-alone", "sixth"],
+    ["70553^PET&MR^C4", "A1^Smith&mr", "A1^X\\T\\MR"],
+    ids=["second-component-sub", "name-sub", "escaped-sub"],
 )
-def test_an_mr_outside_cx_5_is_no_hit(leak: ModuleType, value: str) -> None:
-    """The id type is read where HL7 puts it, CX.5, so an ``MR`` elsewhere is ordinary text."""
+def test_an_mr_subcomponent_outside_cx_5_is_no_hit(leak: ModuleType, value: str) -> None:
+    """Outside CX.5 only a whole component counts, so an ``MR`` subcomponent there is text."""
     assert leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"}) == []
+
+
+@_LEAKS
+@pytest.mark.parametrize(
+    "value",
+    [
+        "12345^MR",
+        "MRN^12345",
+        "12345^^^MR",
+        "1234^DOE^JOHN^^^MR",
+        "A1^^^ MR",
+        "A1^^^^X^MR",
+        "12345^M\\X52\\",
+        "12345^MR\\X00\\",
+        "M1^^^H^MR\\X7F\\",
+    ],
+    ids=[
+        "second",
+        "first-as-type",
+        "fourth",
+        "xcn-sixth",
+        "fourth-padded",
+        "sixth",
+        "second-escaped",
+        "nul-padded",
+        "del-padded-cx-5",
+    ],
+)
+def test_a_whole_component_mr_anywhere_is_a_hit(leak: ModuleType, value: str) -> None:
+    """A component that is ``MR`` or ``MRN`` whole counts in any position, as on main, trimmed of
+    whitespace and control characters."""
+    hits = leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"})
+    assert any("MRN" in hit and "ZPD-4" in hit for hit in hits), hits
 
 
 @_NO_SCANNER

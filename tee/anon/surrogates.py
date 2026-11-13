@@ -484,7 +484,7 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     and :func:`scrub_site_codes` then replaces the whole part."""
     forms = (
         part,
-        part.strip(),
+        trim(part),
         *decoded_readings(part, seps, field_sep, resplit=True),
     )
     return any(SITE_CODE_RE.fullmatch(form) for form in forms)
@@ -676,13 +676,14 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
     for the detectors that must fail closed on any of them (BACKLOG #5632, #5654): the part
     decoded (:func:`unescape`), and decoded with ``\\H\\`` and ``\\N\\`` dropped, as a display
     that shows highlighting rather than a character reads it, each stripped of surrounding
-    whitespace. Empty when ``part`` holds no escape character, since then the only reading is the
-    part as written.
+    whitespace, C0 control characters and DEL (:func:`trim`). Empty when ``part`` holds no
+    escape character, since then the only reading is the part as written.
 
     With ``resplit`` each reading is also split again on the message's delimiters, its field
-    separator, its escape character and whitespace, and each piece is a reading too: a consumer
-    that unescapes the part sees an escaped delimiter as a real one, and :func:`unescape` writes a
-    break command such as ``\\.br\\`` as a space where the engine writes a line break. The
+    separator, its escape character and those characters, and each piece is a reading too: a
+    consumer that unescapes the part sees an escaped delimiter as a real one, drops or stops at a
+    control character such as ``\\X00\\``, and :func:`unescape` writes a break command such as
+    ``\\.br\\`` as a space where the engine writes a line break. The
     site-code check takes it, since a site code is digits only, so a word split out of free text
     is no false hit. The MRN-typed check does not: a split-out word ``MR`` or ``Mr`` in ordinary
     text, such as ``PET\\T\\MR`` or ``MR BRAIN W\\T\\WO``, would refuse the message."""
@@ -695,9 +696,22 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
     for decoded in dict.fromkeys(
         (unescape(part, seps, field_sep), unescape(shown, seps, field_sep))
     ):
-        pieces = re.split(f"[{breaks}\\s]", decoded) if resplit else []
-        forms.extend(form.strip() for form in (decoded, *pieces))
+        pieces = re.split(f"[{breaks}{_TRIM_CLASS}]", decoded) if resplit else []
+        forms.extend(trim(form) for form in (decoded, *pieces))
     return list(dict.fromkeys(forms))
+
+
+#: What surrounds a reading without being part of it, as a regular-expression class body:
+#: whitespace, every C0 control character and DEL. A consumer trims, drops or stops at them, so a
+#: value padded or split by one, such as ``971234\\X00\\``, reads as the value alone (BACKLOG
+#: #5632, #5654).
+_TRIM_CLASS = "\\s\\x00-\\x1f\\x7f"
+_TRIM_ENDS: re.Pattern[str] = re.compile(f"^[{_TRIM_CLASS}]+|[{_TRIM_CLASS}]+$")
+
+
+def trim(text: str) -> str:
+    """``text`` without the whitespace, C0 control characters and DEL at either end."""
+    return _TRIM_ENDS.sub("", text)
 
 
 def _unescape_field(field: str, seps: Seps, field_sep: str, *, by_component: bool) -> str:
