@@ -24,7 +24,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
@@ -60,19 +60,23 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
     _UNANSWERED_OUTCOMES,
     AUTHORITY_SEAL_FAILED_ACTION,
+    SESSIONS_REVOKE_FAILED_ACTION,
     AuthService,
     DirectoryObjectIdMissing,
     _AuditWatermark,
     _RevocationApplied,
     _UserLookup,
 )
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import (
     _REVOKE_CARRY,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AuditAppend,
     MessageStore,
     RevokeResult,
     UnknownRoleError,
@@ -6182,9 +6186,12 @@ async def test_the_pass_judges_the_scope_stored_after_its_probes() -> None:
             *,
             watermark: _AuditWatermark | None,
             maps_held: bool = True,
+            not_attempted: int = 0,
         ) -> _RevocationApplied:
             planned.append(revocation)
-            return await apply(revocation, watermark=watermark, maps_held=maps_held)
+            return await apply(
+                revocation, watermark=watermark, maps_held=maps_held, not_attempted=not_attempted
+            )
 
         service._apply_reconcile_revocation = spy  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()
@@ -6209,11 +6216,14 @@ async def test_a_scope_revocation_is_skipped_when_the_scope_moved_before_it_appl
             *,
             watermark: _AuditWatermark | None,
             maps_held: bool = True,
+            not_attempted: int = 0,
         ) -> _RevocationApplied:
             await store.set_user_channel_scope(
                 revocation.user_id, json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD
             )
-            return await apply(revocation, watermark=watermark, maps_held=maps_held)
+            return await apply(
+                revocation, watermark=watermark, maps_held=maps_held, not_attempted=not_attempted
+            )
 
         service._apply_reconcile_revocation = login_then_apply  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()
@@ -6726,17 +6736,26 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
         await store.close()
 
 
-def _seal_refusing_rename(store: MessageStore, user_id: str) -> list[str]:
-    """Make ``set_user_username`` raise ``RowSealError`` for ``user_id`` alone, as the store's
+def _seal_refusing_rename(store: MessageStore, refused_id: str) -> list[str]:
+    """Make ``set_user_username`` raise ``RowSealError`` for ``refused_id`` alone, as the store's
     write helper does for a row that fails its seal at the write. Returns the ids it refused."""
     real = store.set_user_username
     refused: list[str] = []
 
-    async def renaming(uid: str, username: str, **kw: Any) -> bool:
-        if uid == user_id:
-            refused.append(uid)
-            raise RowSealError("user", uid)
-        return await real(uid, username, **kw)
+    async def renaming(
+        user_id: str,
+        username: str,
+        *,
+        expected_username: str,
+        now: float | None = None,
+        audits: Sequence[AuditAppend],
+    ) -> bool:
+        if user_id == refused_id:
+            refused.append(user_id)
+            raise RowSealError("user", user_id)
+        return await real(
+            user_id, username, expected_username=expected_username, now=now, audits=audits
+        )
 
     store.set_user_username = renaming  # type: ignore[method-assign]
     return refused
@@ -6780,6 +6799,141 @@ async def test_a_rename_whose_row_fails_its_seal_at_the_write_does_not_end_the_p
                 from_plan=False,
                 audit_soft=False,
             )
+    finally:
+        await store.close()
+
+
+# --- vault BACKLOG #3023 residual (1): the reconciler's revoke is the post-commit revoke's ----------
+
+
+async def _two_absent_accounts() -> tuple[MessageStore, AuthService, list[str]]:
+    """``jdoe`` and ``asmith`` signed in, then gone from the directory, so a pass at one strike
+    plans a revocation for each. Returns their tokens' hashes."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({n: _principal(n) for n in ("jdoe", "asmith")})
+        settings = _ad_settings(ad_session_recheck_strikes=1)
+        service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        hashes = []
+        for name in ("jdoe", "asmith"):
+            token = await _signed_in_ad_user(service, store, name)
+            assert token is not None
+            hashes.append(hash_token(token))
+        ldap.present.clear()
+    except BaseException:
+        await store.close()
+        raise
+    return store, service, hashes
+
+
+def _refusing_revokes(store: MessageStore, times: int | None) -> list[str]:
+    """Make ``revoke_user_sessions`` raise ``StoreAcquireTimeout`` on its first ``times`` calls
+    (``None``: every call). Returns the account id of each call."""
+    real = store.revoke_user_sessions
+    calls: list[str] = []
+
+    async def revoke(user_id: str, **kwargs: Any) -> RevokeResult:
+        calls.append(user_id)
+        if times is None or len(calls) <= times:
+            raise StoreAcquireTimeout("synthetic pool shortage")
+        return await real(user_id, **kwargs)
+
+    store.revoke_user_sessions = revoke  # type: ignore[method-assign]
+    return calls
+
+
+async def _live_sessions(store: MessageStore, hashes: list[str]) -> list[str]:
+    live = []
+    for h in hashes:
+        row = await store.get_session(h)
+        if row is not None and row.revoked_at is None:
+            live.append(h)
+    return live
+
+
+async def test_a_reconciler_revoke_refused_twice_lands_on_its_third_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attempt with the row and the retry without it are both refused; a third attempt, as
+    ``_revoke_after_commit`` makes, ends the sessions. Before, the pass raised after the second,
+    with the sessions live and no row saying so."""
+    monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_BACKOFF_SECONDS", 0.0)
+    store, service, hashes = await _two_absent_accounts()
+    try:
+        calls = _refusing_revokes(store, 2)
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None and len(plan.revocations) == 2
+        assert calls[:3] == [calls[0]] * 3, "the first account's revoke was not run three times"
+        assert await _live_sessions(store, hashes) == []
+        assert not await store.list_audit(action=SESSIONS_REVOKE_FAILED_ACTION)
+    finally:
+        await store.close()
+
+
+async def test_a_reconciler_revoke_refused_every_time_is_recorded_and_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refused on every attempt, the revoke is given up on after the attempts the post-commit
+    revoke allows, its ``auth.sessions_revoke_failed`` row counts the revocation it left, and the
+    pass raises, as a failed revoke always did."""
+    monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_BACKOFF_SECONDS", 0.0)
+    store, service, hashes = await _two_absent_accounts()
+    try:
+        calls = _refusing_revokes(store, None)
+        with pytest.raises(StoreAcquireTimeout):
+            await service.reconcile_directory_sessions()
+        assert len(calls) == service_module._POST_COMMIT_REVOKE_ATTEMPTS
+        assert set(calls) == {calls[0]}, "the pass went on to the next account"
+        assert await _live_sessions(store, hashes) == hashes
+        [missed] = await store.list_audit(action=SESSIONS_REVOKE_FAILED_ACTION)
+        first = await store.get_user(calls[0])
+        assert first is not None and missed["actor"] == first.username
+        assert json.loads(missed["detail"]) == {
+            "user_id": calls[0],
+            "change": "ad_reconcile_directory_absent",
+            "attempts": service_module._POST_COMMIT_REVOKE_ATTEMPTS,
+            "error": "StoreAcquireTimeout",
+            "accounts_not_attempted": 1,
+        }
+    finally:
+        await store.close()
+
+
+async def test_a_reconciler_revoke_past_the_budget_is_not_run_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget holds: past it, the retry without the row, which always runs, is the last
+    attempt. Budget 0 stands in for a slow refusal."""
+    monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_BUDGET_SECONDS", 0.0)
+    store, service, _hashes = await _two_absent_accounts()
+    try:
+        calls = _refusing_revokes(store, None)
+        with pytest.raises(StoreAcquireTimeout):
+            await service.reconcile_directory_sessions()
+        assert len(calls) == 2
+        [missed] = await store.list_audit(action=SESSIONS_REVOKE_FAILED_ACTION)
+        assert json.loads(missed["detail"])["attempts"] == 2
+    finally:
+        await store.close()
+
+
+async def test_a_defect_in_the_reconciler_revoke_retry_is_raised_at_once() -> None:
+    """A defect is not a store refusal: the retry without the row raises it at once, unretried and
+    unrecorded."""
+    store, service, _hashes = await _two_absent_accounts()
+    try:
+        calls: list[str] = []
+
+        async def broken(user_id: str, **kwargs: Any) -> RevokeResult:
+            calls.append(user_id)
+            raise sqlite3.ProgrammingError("synthetic bad bind")
+
+        store.revoke_user_sessions = broken  # type: ignore[method-assign]
+        with pytest.raises(sqlite3.ProgrammingError):
+            await service.reconcile_directory_sessions()
+        assert len(calls) == 2, "the attempt with the row, then one retry without it"
+        assert not await store.list_audit(action=SESSIONS_REVOKE_FAILED_ACTION)
     finally:
         await store.close()
 

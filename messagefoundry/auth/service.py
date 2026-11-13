@@ -9553,7 +9553,7 @@ class AuthService:
             )
         applied: list[reconcile.SessionRevocation] = []
         reported: list[reconcile.SessionRevocation] = []
-        for revocation in plan.revocations:
+        for n, revocation in enumerate(plan.revocations):
             if (
                 self._reconcile_outcomes.get(revocation.user_id)
                 is reconcile.ProbeOutcome.UNDETERMINED
@@ -9570,7 +9570,10 @@ class AuthService:
                 self._advance_referral_standing("forfeit")
             # An account with no watermark recorded gets None, which reports.
             outcome = await self._apply_reconcile_revocation(
-                revocation, watermark=watermarks.get(revocation.user_id), maps_held=maps_held
+                revocation,
+                watermark=watermarks.get(revocation.user_id),
+                maps_held=maps_held,
+                not_attempted=len(plan.revocations) - n - 1,
             )
             if outcome != "skipped":
                 applied.append(revocation)
@@ -11123,7 +11126,7 @@ class AuthService:
         return _RowWrite(result, True, retried=True, held=held, refused=None)
 
     async def _revoke_with_row(
-        self, revocation: reconcile.SessionRevocation, *, maps_held: bool
+        self, revocation: reconcile.SessionRevocation, *, maps_held: bool, not_attempted: int = 0
     ) -> _RowWrite[int]:
         """End the account's sessions with their ``auth.ad_session_revoked`` row, through
         :meth:`_write_with_row`; ``result`` is how many ended. The row commits in the revoke's own
@@ -11138,7 +11141,13 @@ class AuthService:
         to the row (ADR 0217 (b)). The retry without the row is a second revoke, so the two run in
         one :func:`~messagefoundry.store.store.deferred_revoke_reports` scope, and a seal refusal
         both attempts met is reported once, by the one that commits (decision
-        d20261110T063908944-857965, item 4)."""
+        d20261110T063908944-857965, item 4).
+
+        The retry without the row goes through :meth:`_revoke_after_commit` (vault BACKLOG #3023),
+        so a store refusal of it is run again within that method's attempts and budget, counting
+        the attempt with the row, and one given up on writes its ``auth.sessions_revoke_failed``
+        row. ``not_attempted`` is how many revocations of this pass come after this one, which a
+        raise here leaves unapplied; that row records it."""
 
         def row(count: int) -> AuditAppend:
             # The detail is a literal here, where the audit scope census reads it (vault BACKLOG
@@ -11175,13 +11184,27 @@ class AuthService:
                 ),
             )
 
+        started_at = asyncio.get_running_loop().time()
+
         async def revoke(with_row: bool) -> int:
             def audit(result: RevokeResult) -> AuditAppend:
                 return row(result.count)
 
-            ended = await self._store.revoke_user_sessions(
-                revocation.user_id, audit=audit if with_row else no_audit_row
-            )
+            if with_row:
+                ended = await self._store.revoke_user_sessions(revocation.user_id, audit=audit)
+            else:
+                # Vault BACKLOG #3023 residual (1): the retry without the row is the post-commit
+                # revoke's, so it gets that revoke's attempts, budget and miss row, the attempt
+                # with the row counted as the first. That retry itself always runs, as it did:
+                # the first attempt's error may be the row's, not the revoke's.
+                ended = await self._revoke_after_commit(
+                    revocation.user_id,
+                    change=f"ad_reconcile_{revocation.reason}",
+                    actor=revocation.username,
+                    not_attempted=not_attempted,
+                    attempts_made=1,
+                    started_at=started_at,
+                )
             return ended.count
 
         async def write_row(count: int) -> None:
@@ -11298,6 +11321,7 @@ class AuthService:
         *,
         watermark: _AuditWatermark | None,
         maps_held: bool,
+        not_attempted: int = 0,
     ) -> _RevocationApplied:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
@@ -11439,7 +11463,9 @@ class AuthService:
         )
         revoke_error: Exception | None = None
         try:
-            ended = await self._revoke_with_row(revocation, maps_held=maps_held)
+            ended = await self._revoke_with_row(
+                revocation, maps_held=maps_held, not_attempted=not_attempted
+            )
         except Exception as exc:  # noqa: BLE001 -- raised below, after the notice
             revoke_error = exc
         if revoke_error is not None:
@@ -11979,9 +12005,17 @@ class AuthService:
         actor: str | None = None,
         client: str | None = None,
         not_attempted: int = 0,
+        attempts_made: int = 0,
+        started_at: float | None = None,
     ) -> RevokeResult:
         """Revoke every session of ``user_id`` after a ``change`` that has already committed, such
         as a password change, a disable or a role change (vault BACKLOG #3023).
+
+        ``attempts_made`` and ``started_at`` are for a caller that already made the first attempt
+        itself, with its audit row (:meth:`_revoke_with_row`): that attempt counts toward
+        :data:`_POST_COMMIT_REVOKE_ATTEMPTS`, and the budget runs from ``started_at``, the event
+        loop's clock when it began. The call's own first attempt runs whatever those say, as a
+        first attempt does.
 
         Nothing undoes the change if this fails, so a store refusal (``_session_write_errors``) is
         run again while :data:`_POST_COMMIT_REVOKE_ATTEMPTS` and
@@ -11995,8 +12029,10 @@ class AuthService:
         and skips the retry and the row, as in :meth:`_rotate_session_hash` (vault BACKLOG
         #3802)."""
         loop = asyncio.get_running_loop()
-        give_up_at = loop.time() + _POST_COMMIT_REVOKE_BUDGET_SECONDS
-        attempt = 0
+        give_up_at = (
+            loop.time() if started_at is None else started_at
+        ) + _POST_COMMIT_REVOKE_BUDGET_SECONDS
+        attempt = attempts_made
         # A seal refusal the committing attempt met is reported once, by it; one only failed
         # attempts met is reported by each of them (decision d20261110T063908944-857965, item 4).
         async with deferred_revoke_reports():
