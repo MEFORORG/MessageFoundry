@@ -1114,15 +1114,16 @@ class LogForwarderInfo(BaseModel):
     :class:`~messagefoundry.logging_setup.ForwarderStatus`. Under engine shards each process has
     its own forwarder, and this is the one that answered.
 
-    **A UDP forwarder is never ``healthy``.** No failed send is counted over UDP, so the engine cannot see
-    a record lost on the wire. ``delivery_confirmed`` is then ``False``, a forwarder with no fault
-    seen reads ``unconfirmed``, and ``lost`` counts queue and spool losses only.
+    **A UDP forwarder is never ``healthy``.** Over UDP only a send that fails on this host is counted
+    (BACKLOG #5923), so the engine cannot see a record lost on the wire. ``delivery_confirmed`` is
+    then ``False``, a forwarder with no fault seen reads ``unconfirmed``, and ``lost`` counts queue
+    and spool losses and those local send failures.
 
     **Counts and fixed words only**: never a record, a collector address or an error text."""
 
     state: str  # "healthy" | "unconfirmed" | "degraded" | "not_installed"
     installed: bool
-    delivery_confirmed: bool = True  # False over UDP: a failed send is not visible at all
+    delivery_confirmed: bool = True  # False over UDP: a datagram lost on the wire is not visible
     start_failure: str | None = None  # "permanent" | "transient"; why it is not installed
     send_failing: bool = False  # the last send, or a deferred start's connect, hit a network error
     lost: int = 0  # the five loss counts below, added up; a floor

@@ -16,6 +16,7 @@ import os
 import queue
 import socket
 import ssl
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -23,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import log_spool, logging_setup
+from messagefoundry import log_spool
 from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_setup import (
     SyslogForward,
@@ -509,10 +510,15 @@ def _assert_reads_not_installed_permanently() -> None:
     assert status.state == "not_installed"
 
 
+@pytest.mark.parametrize("protocol", ["tcp", "udp"])
 def test_a_transient_lookup_failure_is_still_deferred_on_cpython_3149(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    spool_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    protocol: str,
 ) -> None:
-    """A lookup that failed for a temporary reason is deferred to the spool, as before 3.14.9."""
+    """A lookup that failed for a temporary reason is deferred to the spool, as before 3.14.9. UDP
+    too since BACKLOG #5923: its arm reports send failures now, so a spool can wait behind it."""
 
     def _try_again(*args: Any, **kwargs: Any) -> Any:
         raise socket.gaierror(socket.EAI_AGAIN, "temporary failure in name resolution")
@@ -524,7 +530,7 @@ def test_a_transient_lookup_failure_is_still_deferred_on_cpython_3149(
         forward=SyslogForward(
             host="siem.example.org",
             port=6514,
-            protocol="tcp",
+            protocol=protocol,
             spool_dir=str(spool_dir),
             spool_max_bytes=1_000_000,
         ),
@@ -1334,6 +1340,12 @@ class _FailingDatagramSocket:
         pass
 
 
+def _swap_socket(target: Any, fake: _FailingDatagramSocket) -> None:
+    """Put ``fake`` in place of ``target``'s real socket, closing the real one so it does not leak."""
+    target.socket.close()
+    target.socket = fake
+
+
 def _udp_forwarder(spool: LogSpool | None) -> tuple[Any, _ForwardQueueHandler]:
     """A UDP forwarder whose listener is stopped, so a test drives it by hand."""
     target = _build_syslog_handler(SyslogForward(host="127.0.0.1", port=9, protocol="udp"))
@@ -1363,7 +1375,7 @@ def test_a_failed_udp_send_keeps_the_spooled_record_instead_of_deleting_it(
     target, fwd = _udp_forwarder(spool)
     try:
         assert spool.append(SpoolEntry(level="WARNING", line="spooled at stop"))
-        target.socket = _FailingDatagramSocket(OSError(errno.ENETUNREACH, "network unreachable"))
+        _swap_socket(target, _FailingDatagramSocket(OSError(errno.ENETUNREACH, "unreachable")))
         fwd._listener._replay()
         assert spool.pending, "the entry was deleted although it was never sent"
         assert fwd._listener.send_failing is True
@@ -1376,7 +1388,7 @@ def test_a_failed_udp_send_keeps_the_spooled_record_instead_of_deleting_it(
 def test_a_failed_udp_send_with_no_spool_is_counted_as_unsent() -> None:
     target, fwd = _udp_forwarder(None)
     try:
-        target.socket = _FailingDatagramSocket(OSError(errno.ENETUNREACH, "network unreachable"))
+        _swap_socket(target, _FailingDatagramSocket(OSError(errno.ENETUNREACH, "unreachable")))
         fwd._listener.handle(logging.makeLogRecord({"msg": "live", "levelname": "WARNING"}))
         assert fwd._listener.unsent == 1
     finally:
@@ -1396,7 +1408,7 @@ def test_an_oversized_udp_datagram_is_undeliverable_so_replay_does_not_wedge(
         assert spool.append(SpoolEntry(level="WARNING", line="too big"))
         assert spool.append(SpoolEntry(level="WARNING", line="next"))
         failing = _FailingDatagramSocket(OSError(errno.EMSGSIZE, "message too long"))
-        target.socket = failing
+        _swap_socket(target, failing)
         fwd._listener._replay()
         assert len(failing.sent) == 2  # the second entry was tried: nothing wedged
         assert fwd._listener.undeliverable == 2
@@ -1414,8 +1426,9 @@ def test_a_failed_send_prints_no_traceback_and_no_record_content_to_stderr(
     protocol: str,
 ) -> None:
     """The stdlib ``handleError`` writes a traceback, the call stack and the record's message and
-    arguments to stderr on every failed send, outside every log control (CLAUDE.md section 9). The
-    override reports once per interval, with no record content, whatever ``raiseExceptions`` says."""
+    arguments to stderr on every failed send, outside every log control (CLAUDE.md section 9). Now
+    the listener reports once per interval, with no record content, whatever ``raiseExceptions``
+    says, and the running count carries the failures the throttle held back."""
     monkeypatch.setattr(logging, "raiseExceptions", True)
 
     def _no_connect(self: Any) -> None:
@@ -1426,51 +1439,89 @@ def test_a_failed_send_prints_no_traceback_and_no_record_content_to_stderr(
             raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
 
     monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _no_connect)
-    handler = _TimeoutSysLogHandler(
+    target = _TimeoutSysLogHandler(
         address=("127.0.0.1", 9),
         socktype=socket.SOCK_DGRAM if protocol == "udp" else socket.SOCK_STREAM,
         defer_connect=True,
     )
+    fwd = _build_queued_forwarder(target, fmt="text", spool=None)
     try:
+        assert fwd._listener.stop_within(1.0)  # drive the listener by hand, deterministically
+        fwd._listener._drain_deadline = None
         with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
             for n in range(5):
-                handler.emit(
-                    logging.makeLogRecord(
-                        {"msg": "PID|1||MRN%s^^^SECRET", "args": (n,), "levelname": "WARNING"}
-                    )
+                record = logging.makeLogRecord(
+                    {"msg": f"PID|1||MRN{n}^^^SECRET", "levelname": "WARNING"}
                 )
+                fwd._listener.handle(record)
         assert capsys.readouterr().err == ""
         reports = [r for r in caplog.records if "off-box log forwarding" in r.getMessage()]
         assert len(reports) == 1  # throttled
         text = reports[0].getMessage()
         assert "MRN" not in text and "SECRET" not in text
-        assert handler.send_failed is True
+        assert "errno" in text  # the cause, as type and errno
+        assert fwd._listener.unsent == 5
     finally:
-        handler.close()
+        fwd.close()
 
 
-def test_a_report_raised_from_inside_the_error_path_does_not_recurse(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_handle_error_logs_nothing_itself(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The report is itself a log record. If writing it fails back into this handler, the inner
-    ``handleError`` returns at once. The throttle is set to zero so only the guard can stop it."""
-    monkeypatch.setattr(logging_setup, "_FORWARD_SEND_ERROR_REPORT_INTERVAL", 0.0)
-    calls: list[int] = []
+    """``handleError`` runs under the target's lock. A log call from there would take the queue
+    handler's lock in the opposite order to ``logging.shutdown``, which holds that lock across
+    ``close``, and a failed send during the shutdown drain would deadlock the process at exit. It
+    only records the cause; the listener reports after the send returns."""
+    monkeypatch.setattr(logging, "raiseExceptions", True)
 
-    def _failing(self: Any) -> None:  # every reconnect gets a socket that fails too
+    def _failing(self: Any) -> None:
         self.socket = _FailingDatagramSocket(OSError(errno.ENETUNREACH, "unreachable"))
 
     monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _failing)
     handler = _TimeoutSysLogHandler(address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM)
-
-    def _report_back_through(*_args: Any, **_kwargs: Any) -> None:
-        calls.append(1)
-        handler.emit(logging.makeLogRecord({"msg": "the report", "levelname": "WARNING"}))
-
-    monkeypatch.setattr(logging_setup._log, "warning", _report_back_through)
     try:
-        handler.emit(logging.makeLogRecord({"msg": "first", "levelname": "WARNING"}))
-        assert calls == [1]
+        with caplog.at_level(logging.DEBUG):
+            handler.emit(logging.makeLogRecord({"msg": "PID|1||MRN1", "levelname": "WARNING"}))
+        assert caplog.records == []
         assert capsys.readouterr().err == ""
+        assert handler.send_failed is True
+        assert handler.send_error_cause == f"OSError, errno {errno.ENETUNREACH}"
     finally:
         handler.close()
+
+
+@pytest.mark.timeout(60)  # a regression deadlocks; fail it rather than hang the run
+def test_a_failed_send_during_the_shutdown_drain_does_not_deadlock() -> None:
+    """What ``logging.shutdown`` does, against a TCP collector that refuses: hold the queue
+    handler's lock, then close it. The listener's failed send must not wait on that lock while it
+    holds the target's, or close() never returns."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]  # closed again below, so nothing listens there
+    target = _TimeoutSysLogHandler(
+        address=("127.0.0.1", port),
+        socktype=socket.SOCK_STREAM,
+        timeout=1.0,
+        defer_connect=True,
+    )
+    fwd = _build_queued_forwarder(target, fmt="text", spool=None)
+    # On the root logger, as configure_logging puts it, so a report the failed send raises comes
+    # back through this queue handler, as it does in a running engine.
+    logging.getLogger().addHandler(fwd)
+    fwd.handle(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
+    done: list[bool] = []
+
+    def _shutdown_like() -> None:
+        fwd.acquire()
+        try:
+            fwd.close()
+        finally:
+            fwd.release()
+        done.append(True)
+
+    closer = threading.Thread(target=_shutdown_like, daemon=True)
+    closer.start()
+    closer.join(30.0)
+    assert done == [True], "close() under the queue handler's lock did not return"
