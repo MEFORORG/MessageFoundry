@@ -182,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes (which `-Discard` parks instead), and the git repositories inside the tree listed in the next section. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree, whatever `-Force` says. |
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. A detached HEAD no ref holds. An unlanded ledger number. Whatever `-Force` says: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, a caller standing in the tree or running a copy of the script that lives in it, a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` (one above the primary does not count; see below) | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
@@ -346,9 +346,10 @@ free:
 - A tree that passes all four still goes through the route's own content rules above. On `-Name`,
   older untracked files and ignored files go with it.
 
-**The occupancy check is on `-Path` only.** `-Name` has none, and it also keeps its blanket
-`git worktree prune`, which `-Path` does not run because a blanket prune drops other worktrees'
-registrations too.
+**The occupancy check is on `-Path` only.** `-Name` has none. Neither route runs a blanket
+`git worktree prune`: `git worktree remove` already drops the target's own registration, and a
+prune also drops other worktrees' registrations whose directories are missing for the moment, with
+their HEAD reflogs. `-Name` ran one until BACKLOG #5648.
 
 ### `-Name` removes the sibling this copy made
 
@@ -368,7 +369,9 @@ pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts  
 ```
 
 The untracked `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
-uncommitted **tracked** changes and a git repository inside the tree block removal; `-Discard`
+uncommitted **tracked** changes, a file flagged skip-worktree or assume-unchanged, and a git
+repository inside the tree block removal. With `-Force` the run prints each flagged file it
+discards. `-Discard`
 parks the tracked changes instead, as described above. Uncommitted work
 written in the last six hours blocks it whatever `-Force` says, as do the other in-use refusals in
 the table above.
