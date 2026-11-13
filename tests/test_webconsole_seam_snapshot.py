@@ -521,9 +521,9 @@ def test_a_weaker_restore_eol_body_moves_the_edit_resend_row(
 ) -> None:
     """``_resubmit_form`` rewrites the edited body's line breaks through ``restore_eol``, so the
     repeat key and the spend key hash what is resubmitted (BACKLOG #5930). A body change to that
-    helper, under the same name, must move the edit-resend row. It did not while the route called
-    it as a module attribute, which the helper walk does not follow. This pins the function body
-    only: the ``EDIT_EOL_TERMINATORS`` mapping it reads is module data, which the walk skips."""
+    helper, under the same name, must move the edit-resend row. It did not while ``restore_eol``
+    was not a global of ``routes/core.py``. This pins the function body only: the
+    ``EDIT_EOL_TERMINATORS`` mapping it reads is module data, which the walk skips."""
     route = "POST /ui/messages/{message_id}/edit-resend"
     module = _load_script(monkeypatch, "_seam_gen_restore_eol")
     rows = dict(module.console_route_gates())

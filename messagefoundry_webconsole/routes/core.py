@@ -1594,17 +1594,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         The submitted body's line breaks are rewritten here to the original's terminator style, the
         ``eol`` field the editor rendered (BACKLOG #5930), so the repeat key and the spend key both
         hash the body that is resubmitted. An ``eol`` that ``restore_eol`` does not know leaves the
-        body as sent, and the route refuses it. An empty ``eol`` counts as unknown. The parser
-        calls ``restore_eol`` by its bare name, because the seam's helper walk follows global names
-        and not module attributes.
-
-        The parser drops every blank field except ``eol``, which it keeps for the route to refuse.
-        Without that, an empty ``eol`` would resubmit the browser's CRLF unchanged."""
+        body as sent, and the route refuses it. Blank fields are kept, so an empty ``eol`` is
+        refused too. ``restore_eol`` is a global of this module so the seam digest hashes its body;
+        ``console_route_gates`` in ``scripts/webconsole_seam_snapshot.py`` says what it misses."""
         cache = request.scope.setdefault("mf_2625", {})
         cached = cache.get("form")
         if isinstance(cached, dict):
             return cached
-        form = {k: v for k, v in await _form_pairs(request) if v or k == "eol"}
+        form = dict(await _form_pairs(request))
         if "eol" in form and "raw" in form:
             restored = restore_eol(form["raw"], form["eol"])
             if restored is not None:
