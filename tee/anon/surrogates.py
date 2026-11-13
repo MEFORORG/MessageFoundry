@@ -481,13 +481,17 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     no escape character is read only whole, so a site-code run inside a longer value, such as
     ``Call 971234 today``, reads as no site code. A part that holds one is also read split on
     whitespace and on escaped delimiters, so ``Call 971234 today\\.br\\`` reads as a site code,
-    and :func:`scrub_site_codes` then replaces the whole part."""
-    forms = (
-        part,
-        trim(part),
-        *decoded_readings(part, seps, field_sep, resplit=True),
-    )
-    return any(SITE_CODE_RE.fullmatch(form) for form in forms)
+    and :func:`scrub_site_codes` then replaces the whole part. Each escape body as written, the
+    text between an escape character and the next, is read too, also without the letter or
+    dotted command that opens it, so a site code inside a body that decodes to nothing, such as
+    ``\\Z971234\\`` or ``\\.sp971234\\``, is found: a raw viewer, or a receiver that defines the
+    escape, shows it."""
+    forms = [trim(part), *decoded_readings(part, seps, field_sep, resplit=True)]
+    if seps.escape and seps.escape in part:
+        # The odd pieces are the escape bodies; the text around them is already read decoded.
+        for body in part.split(seps.escape)[1::2]:
+            forms += (body, body[1:], body[3:] if body.startswith(".") else body)
+    return any(SITE_CODE_RE.fullmatch(trim(form)) for form in forms)
 
 
 def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|") -> str:
@@ -706,12 +710,17 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
 #: value padded or split by one, such as ``971234\\X00\\``, reads as the value alone (BACKLOG
 #: #5632, #5654).
 _TRIM_CLASS = "\\s\\x00-\\x1f\\x7f"
-_TRIM_ENDS: re.Pattern[str] = re.compile(f"^[{_TRIM_CLASS}]+|[{_TRIM_CLASS}]+$")
+#: The same characters as a set for ``str.strip``, which runs in linear time where an end-anchored
+#: regular expression backtracks over a long run of them inside the text. Every character
+#: ``str.isspace`` takes is below U+3001.
+_TRIM_CHARS = "".join(
+    chr(code) for code in range(0x3001) if chr(code).isspace() or code < 0x20 or code == 0x7F
+)
 
 
 def trim(text: str) -> str:
     """``text`` without the whitespace, C0 control characters and DEL at either end."""
-    return _TRIM_ENDS.sub("", text)
+    return text.strip(_TRIM_CHARS)
 
 
 def _unescape_field(field: str, seps: Seps, field_sep: str, *, by_component: bool) -> str:

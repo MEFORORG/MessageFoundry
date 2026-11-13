@@ -88,6 +88,9 @@ def test_an_mr_subcomponent_outside_cx_5_is_no_hit(leak: ModuleType, value: str)
         "12345^M\\X52\\",
         "12345^MR\\X00\\",
         "M1^^^H^MR\\X7F\\",
+        "12345^MR&L",
+        "12345^^^MR&L",
+        "12345^MRN&ISO",
     ],
     ids=[
         "second",
@@ -99,6 +102,9 @@ def test_an_mr_subcomponent_outside_cx_5_is_no_hit(leak: ModuleType, value: str)
         "second-escaped",
         "nul-padded",
         "del-padded-cx-5",
+        "second-first-sub",
+        "fourth-first-sub",
+        "mrn-first-sub",
     ],
 )
 def test_a_whole_component_mr_anywhere_is_a_hit(leak: ModuleType, value: str) -> None:

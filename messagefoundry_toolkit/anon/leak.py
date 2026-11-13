@@ -767,9 +767,9 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     type — an unmapped medical-record number by HL7 structure, far more precise than a bare
     digit-run heuristic. Two readings count (BACKLOG #5654):
 
-    * any component, component 1 included, that is ``MR`` or ``MRN`` whole, as written or
-      decoded and trimmed, so ``12345^MR``, ``MRN^12345`` and an XCN ``1234^DOE^JOHN^^^MR`` count,
-      as they did before; and
+    * any component, component 1 included, that is ``MR`` or ``MRN`` whole or as its first
+      subcomponent, as written or decoded and trimmed, so ``12345^MR``, ``MRN^12345``,
+      ``12345^MR&L`` and an XCN ``1234^DOE^JOHN^^^MR`` count, as they did before; and
     * CX.5, the identifier type code, in any of its subcomponents too, as written or decoded and
       trimmed, so ``ID^^^AUTH^MR&local`` counts.
 
@@ -791,12 +791,15 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
 
 def _is_mrn_type(comp: str, seps: Seps, field_sep: str, *, subcomponents: bool) -> bool:
     """True if ``comp`` is ``MR`` or ``MRN`` as written or decoded whole, as a ``Message`` component
-    read decodes it, each reading trimmed (:func:`.surrogates.trim`) and never split again. With
-    ``subcomponents``, any one of its subcomponents counts the same way: ``Peek`` reads the first
-    subcomponent of a component that has them, and a ``Message`` subcomponent read can read any
-    of them (BACKLOG #5654)."""
-    split = subcomponents and seps.subcomponent in comp
-    parts = (comp, *comp.split(seps.subcomponent)) if split else (comp,)
+    read decodes it, or as its first subcomponent, as ``Peek`` reads a component that has them,
+    each reading trimmed (:func:`.surrogates.trim`) and never split again. With
+    ``subcomponents``, any one of its subcomponents counts the same way, since a ``Message``
+    subcomponent read can read any of them (BACKLOG #5654)."""
+    leaves = comp.split(seps.subcomponent)
+    if len(leaves) == 1:
+        parts: tuple[str, ...] = (comp,)
+    else:
+        parts = (comp, *leaves) if subcomponents else (comp, leaves[0])
     forms = [
         form
         for part in parts

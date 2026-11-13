@@ -79,6 +79,10 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "971234\\X00\\",
         "971234\\X7F\\X",
         "X\\X01\\971234",
+        "\\Z971234\\",
+        "X\\Z971234\\Y",
+        "\\.sp971234\\",
+        "\\971234\\",
     ],
     ids=[
         "component-escape",
@@ -100,6 +104,10 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "nul-padded",
         "del-split",
         "c0-split",
+        "z-escape-body",
+        "z-escape-body-inside",
+        "out-of-range-spacing-command",
+        "bare-escape-body",
     ],
 )
 
@@ -143,6 +151,18 @@ def test_the_field_separator_escape_decodes_to_the_message_s_own(
     assert not surrogates.message_has_site_code(
         surrogates.scrub_message_site_codes(text, Keyer(_SALT), ())
     )
+
+
+def test_trimming_a_long_whitespace_run_is_linear() -> None:
+    """A run of spaces inside a value does not make the trim backtrack: the old end-anchored
+    pattern took over a second at 16k spaces."""
+    import time
+
+    started = time.perf_counter()
+    for surrogates in (engine_surrogates, tee_surrogates):
+        assert surrogates.trim("A" + " " * 16_000 + "B") == "A" + " " * 16_000 + "B"
+        assert surrogates.trim(" \x00　MR\x7f\t") == "MR"
+    assert time.perf_counter() - started < 0.5
 
 
 @_NO_SCANNER
