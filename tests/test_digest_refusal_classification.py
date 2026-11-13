@@ -960,7 +960,7 @@ def test_the_typed_tunnel_refusal_survives_a_copy() -> None:
 @pytest.mark.usefixtures("no_bypass")
 def test_no_built_http_token_endpoint_reaches_the_web_proxy() -> None:
     """ADR 0095 B.1's ``http://`` token-endpoint case is overtaken. An off-box one is refused when
-    the provider is built (vault BACKLOG #3533 item 4), and a loopback one is dialled direct, so
+    the provider is built (vault BACKLOG #3533 item 4, engine PR 2576), and a loopback one is dialled direct, so
     the web proxy's Digest handler never sees its request."""
     with _Challenger(407, _MD5) as proxy:
         proxy_config = _digest_proxy_config(proxy.url, auth="digest")

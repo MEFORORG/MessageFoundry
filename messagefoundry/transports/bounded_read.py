@@ -666,9 +666,11 @@ class StrictHTTPResponse(http.client.HTTPResponse):
     the response's stream, and never calls ``begin``. A guard that ``begin`` put on would miss that
     head. Built here, it covers both reads with no copy of ``_tunnel``.
 
-    **Only the bare-CR check reaches a** ``CONNECT`` **reply.** ``_tunnel`` keeps the raw header
-    lines and parses none, so :func:`reply_framing_fault` never sees that head. At least a header
-    line with no colon, and a control character in a value, still open the tunnel.
+    **Of the framing checks, only the bare-CR check reaches a** ``CONNECT`` **reply.** ``_tunnel``
+    keeps the raw header lines and parses none, so :func:`reply_framing_fault` never sees that
+    head. At least a header line with no colon, and a control character in a value, still open the
+    tunnel. The ``CONNECT`` reply's status is also recorded, as :attr:`status_read`, which
+    ``_StrictHTTPSConnection._tunnel`` reads to type a refused tunnel (BACKLOG #2989).
     """
 
     def __init__(

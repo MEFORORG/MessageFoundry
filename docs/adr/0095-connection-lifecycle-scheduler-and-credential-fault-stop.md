@@ -366,7 +366,7 @@ still a `DeliveryError`, so each caller's contract holds. This is narrower than 
 `https://` token endpoint is reached through a `CONNECT` tunnel, and urllib raises the proxy's 407
 there as an `OSError` before any handler sees it, so that case still reads as unreachable and is
 retried. That gap is left open.
-*Overtaken 2026-10-26 (vault BACKLOG #3533 item 4): no build reaches the `http://` case. An
+*Overtaken 2026-10-28 (vault BACKLOG #3533 item 4, engine PR 2576): no build reaches the `http://` case. An
 `http://` token endpoint must now be on the box, and a loopback hop is dialled direct, so its
 request never meets the proxy (`test_no_built_http_token_endpoint_reaches_the_web_proxy`).*
 *Closed 2026-11-06 (vault BACKLOG #2989, #3532 item 1): where the token hop's web proxy is set up
