@@ -13074,10 +13074,9 @@ def create_managed_app(
                 # in the finally below, before engine.stop() closes the store it records in).
                 # BACKLOG #5908: this factory and the AuthService constructor below run in a worker
                 # thread, so the event loop already running the store and the alert notifier is not
-                # blocked. The factory reads at least the SMTP password through the secret provider.
-                # The constructor does at least these: resolves the directory secrets, loads the
-                # LDAPS and OIDC CA and CRL files, and checks a CA file's access control, which runs
-                # icacls on Windows. A raise from either reaches the teardown below, as it did when
+                # blocked. The factory blocks as the alert notifier's does, above. The constructor
+                # does at least these: resolves the directory secrets, loads the LDAPS and OIDC CA
+                # and CRL files, and checks a CA file's access control, which runs icacls on Windows. A raise from either reaches the teardown below, as it did when
                 # they ran inline. A cancel does too, while the thread runs on to its own end: the
                 # work was never cancellable midway, and inline it held the loop instead.
                 if auth_settings.notify_security_events and alerts_settings is not None:

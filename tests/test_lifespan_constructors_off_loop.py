@@ -3,10 +3,8 @@
 """BACKLOG #5908: the managed lifespan builds its two notifiers and the AuthService in a worker
 thread, so their blocking work does not stall the event loop during startup.
 
-The two notifier factories read at least the SMTP password through the secret provider, a Vault
-read under [secrets]. The AuthService constructor does at least these: resolves the directory
-secrets, loads the LDAPS and OIDC CA and CRL files, and checks a CA file's access control, which
-runs icacls on Windows. Each spy records the thread it ran on; the loop's own thread is the one
+What each build blocks on is stated once, in the lifespan's comments in messagefoundry/api/app.py.
+Each spy records the thread it ran on; the loop's own thread is the one
 this test runs on. A failure raised in the worker thread must still unwind what the lifespan
 opened, so the store and the alert notifier close as they did when the build ran inline.
 """
@@ -24,6 +22,7 @@ from messagefoundry.api import create_managed_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AlertsSettings, AuthSettings, EgressSettings
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+from messagefoundry.pipeline.security_notify import SecurityEventNotifier
 from messagefoundry.store import open_store
 
 _SECURITY = "security_notifier_from_settings"
@@ -36,6 +35,7 @@ class _Seen:
         self.store: Any = None
         self.store_closed = False
         self.notifier: Any = None
+        self.security_notifier: SecurityEventNotifier | None = None
         # Set only by a close of a STARTED sink, so a never-started one cannot pass as drained.
         self.notifier_drained = False
 
@@ -62,9 +62,18 @@ def _app(
         seen.notifier = sink
         return sink
 
-    def _security_notifier(*_args: Any, **_kwargs: Any) -> None:
+    def _security_notifier(*_args: Any, **_kwargs: Any) -> SecurityEventNotifier:
         _probe(_SECURITY)
-        return None
+        # A real, unstarted notifier: bare AlertsSettings configures no SMTP, so the real factory
+        # would return None and leave the lifespan's start() of it untested.
+        notifier = SecurityEventNotifier(
+            host="smtp.example.test",
+            port=587,
+            sender="mf@example.test",
+            allowed_hosts=("smtp.example.test",),
+        )
+        seen.security_notifier = notifier
+        return notifier
 
     class _SpyAuthService(AuthService):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -99,6 +108,8 @@ def _app(
 
 async def _close_leftovers(seen: _Seen) -> None:
     # Red, the lifespan left these open; close them so the test process can still exit.
+    if seen.security_notifier is not None and seen.security_notifier._task is not None:
+        await seen.security_notifier.aclose()
     if seen.notifier is not None and seen.notifier._task is not None:
         await seen.notifier.aclose()
     if seen.store is not None and not seen.store_closed:
@@ -119,7 +130,10 @@ async def test_the_lifespan_builds_both_notifiers_and_the_auth_service_off_the_l
             assert not on_loop, f"built on the event loop's thread: {on_loop}"
             # start() stays on the loop: the notifier built in the thread is the one running.
             assert seen.notifier is not None and seen.notifier._task is not None
+            assert seen.security_notifier is not None
+            assert seen.security_notifier._task is not None
         assert seen.store_closed
+        assert seen.security_notifier._task is None, "the security notifier was not drained"
     finally:
         await _close_leftovers(seen)
 
