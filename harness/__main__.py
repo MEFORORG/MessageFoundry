@@ -11,7 +11,7 @@
                                                 against the scenarios that cover it or the reason
                                                 it is exempt (no engine needed); exit 1 on a gap.
 ``python -m harness --fuzz``          -> fuzz a running engine: seeded byte, field and MLLP-frame
-                                                mutations of generated HL7 through a harness driver,
+                                                mutations of generated HL7 through the MLLP driver,
                                                 checking health, ACK-implies-stored, reply shape and no
                                                 5xx after each batch. Exits 0 (held) / 1 (an invariant
                                                 broke; the seed and a replay file are printed) / 2
@@ -250,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--fuzz",
         action="store_true",
-        help="fuzz a running engine with seeded mutations through a harness driver and exit "
+        help="fuzz a running engine with seeded mutations through the MLLP driver and exit "
         "(see the fuzz section of harness/README.md)",
     )
     parser.add_argument("--fuzz-seed", type=int, default=0, help="fuzz: campaign seed (>= 0)")
@@ -266,12 +266,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--fuzz-driver",
         default="mllp",
-        help="fuzz: driver kind (a harness/drivers/ KIND; mllp also mutates the framing)",
+        choices=("mllp",),
+        help="fuzz: driver kind; only mllp is accepted (harness/fuzz/transport.py says why)",
     )
     parser.add_argument(
         "--fuzz-endpoint",
-        help="fuzz: the harness endpoint key the driver sends to (see harness/endpoints/); "
-        "mllp defaults to mllp_in, any other driver must name one",
+        help="fuzz: the harness endpoint key the mllp driver sends to (see harness/endpoints/; "
+        "default mllp_in)",
     )
     parser.add_argument(
         "--fuzz-out",

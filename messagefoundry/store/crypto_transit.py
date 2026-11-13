@@ -65,7 +65,9 @@ from messagefoundry.store.crypto import (
     MARKER_PREFIX,
     AuditKeyVersionRefusedError,
     AuditKeyVersionUnverifiedError,
+    AuditMacMalformedError,
     AuditMacVerifier,
+    AuditVerifyTimedOutError,
     CipherError,
     CipherItem,
     CipherUnavailableError,
@@ -87,6 +89,7 @@ from messagefoundry.store.keyprovider_vault import (
     checked_transit_key_name,
     is_vault_bad_request,
     is_vault_forbidden,
+    is_vault_timeout_reply,
     is_vault_unavailable,
     require_transit_key_type,
     store_vault_hop,
@@ -698,7 +701,8 @@ class TransitCipher(_UnmarkedPolicy):
         ``vault_transit`` mode. Fail-closed: any Transit error raises :class:`CipherError`
         (type-only — the canonical row bytes are PHI-derived and never surfaced). A reply that
         :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept raises
-        :class:`CipherError` too, so no malformed MAC is written. A well-formed MAC can still read
+        :class:`CipherError` too, so no malformed MAC is written; for a non-empty string it is the
+        subclass :class:`~messagefoundry.store.crypto.AuditMacMalformedError`. A well-formed MAC can still read
         as a break later, for example one a proxy or the wrong key answered."""
         inp = base64.b64encode(data).decode("ascii")
         try:
@@ -714,7 +718,10 @@ class TransitCipher(_UnmarkedPolicy):
         # does not accept would be written as a row :meth:`verify_audit_hmac` reads as a break
         # (BACKLOG #2720), so the append fails loudly here instead.
         if not isinstance(mac, str) or transit_mac_version(mac) is None:
-            raise CipherError(
+            # A non-empty string is its own subclass, which the chain walk's handover-tag check
+            # reads as a mismatch (BACKLOG #8222); an empty or non-string reply stays plain.
+            error = AuditMacMalformedError if isinstance(mac, str) and mac else CipherError
+            raise error(
                 f"Transit returned an audit HMAC that is not a well-formed Transit MAC "
                 f"(key={self._audit_key!r})"
             )
@@ -755,14 +762,17 @@ class TransitCipher(_UnmarkedPolicy):
         place of ``InvalidRequest``. A ``MemoryError`` that hvac raises while it joins a truthy
         ``errors`` value, before it raises any ``InvalidRequest``, is not read as a refusal either.
 
-        A failure of the verify call not read as a refused version, and not one
-        :func:`is_vault_unavailable` reads as an outage, is checked once the handler has let go
+        A failure of the verify call not read as a refused version, and not an outage
+        (:meth:`_is_outage`), is checked once the handler has let go
         of the failed request (BACKLOG #2720): a verify over FIXED input must succeed
         (:meth:`_fixed_input_verifies`), and then the row's own verify is asked once more
         (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
         the row as refused, the answer is ``False``, a break at that row, as a forged MAC is; a
         Vault that answers HTTP 413 past ``max_request_size`` to a planted oversize row is one
-        such case. Every other failure, a failed fixed-input verify among them, and a reply of an
+        such case. Both asks failing with an HTTP 408 or 504, when the fixed input verifies after
+        the second, raises :class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError` instead,
+        which only the chain walk reads as could not run (BACKLOG #8222). Every other
+        failure, a failed fixed-input verify among them, and a reply of an
         unexpected shape, raises plain :class:`CipherError`, so the walk could not run and no
         tamper alert fires. Blocking."""
         version = transit_mac_version(stored)
@@ -841,7 +851,11 @@ class TransitCipher(_UnmarkedPolicy):
         answer is read as usual, and a failure goes through :meth:`_settled_verify_failure` again.
         A failure that leaves unsettled is ``False``, logged, only when a verify over fixed input
         succeeds once more after it; otherwise it raises :class:`CipherError`, since the service
-        failed between the asks. Blocking."""
+        failed between the asks. When that fixed-input verify succeeds and both asks failed with an
+        HTTP 408 or 504 (:func:`is_vault_timeout_reply`), it raises
+        :class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError` in place of ``False``
+        (BACKLOG #8222: owner ruling 2026-11-13 on a row's timeout, read as both asks by a Manager
+        decision, and in the chain walk only). Blocking."""
         if not self._fixed_input_verifies():
             raise self._verify_failed(failed) from failed
         again: Exception | None = None
@@ -856,6 +870,11 @@ class TransitCipher(_UnmarkedPolicy):
             return self._verify_answer(response)
         if not self._fixed_input_verifies():
             raise self._verify_failed(again) from again
+        if is_vault_timeout_reply(failed) and is_vault_timeout_reply(again):
+            raise AuditVerifyTimedOutError(
+                f"Transit audit HMAC verify timed out on both asks (key={self._audit_key!r}): "
+                f"{vault_failure_text(again)}"
+            ) from again
         log.warning(
             "Transit refused the audit MAC verify of one row twice while a verify over fixed "
             "input succeeded before and after (key=%r): %s; read as a break at that row",

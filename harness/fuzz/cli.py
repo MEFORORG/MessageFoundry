@@ -11,7 +11,7 @@ from pathlib import Path
 
 from harness.endpoints import Endpoints
 from harness.fuzz.campaign import FuzzConfig, SetupError, replay, run
-from harness.fuzz.transport import build_transport
+from harness.fuzz.transport import DEFAULT_ENDPOINT, build_transport
 from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.terminal_text import escape_for_terminal
 
@@ -59,7 +59,7 @@ def main(
         transport = build_transport(driver, endpoints, endpoint, timeout=reply_timeout)
     except (KeyError, ValueError) as exc:
         return fail_setup(f"bad endpoint or option: {exc}")
-    target = f"{driver} endpoint {endpoint or 'default'!r}"
+    target = f"{driver} endpoint {endpoint or DEFAULT_ENDPOINT!r}"
     try:
         with EngineClient(engine_url, cacert=cacert) as client:
             if token:

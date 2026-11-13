@@ -733,6 +733,25 @@ class UnmarkedCipherError(CipherError):
     :class:`UnauthenticatedCipherError`'s does."""
 
 
+class AuditVerifyTimedOutError(CipherError):
+    """A Transit check of one stored audit MAC failed with HTTP 408 or 504 on both asks, while a
+    verify over fixed input succeeded before and after (BACKLOG #8222).
+
+    The chain walk lets it end the walk, so the walk could not run. Every other caller of
+    ``_audit_row_mac`` (``store.py``), the store open among them, reads it as the MAC not verifying,
+    as before BACKLOG #8222."""
+
+
+class AuditMacMalformedError(CipherError):
+    """A MAC provider answered an audit MAC request with a non-empty string that is not a
+    well-formed MAC, such as a Transit reply naming no key version (BACKLOG #8222).
+
+    Its caller decides what that means. Appending a row refuses it, so no malformed MAC is written.
+    The chain walk's check of a range row's handover tag reads it as a tag that does not match, a
+    break at that row, as it read such a reply before engine PR 2903. The store open does not catch
+    it, so the open refuses, as on engine PR 2903; that path is unruled and on the owner's queue."""
+
+
 class AuditKeyVersionRefusedError(CipherError):
     """A Transit check of a stored audit MAC, made at the key version that MAC names, got HTTP 400
     read as a refusal of that version, while
