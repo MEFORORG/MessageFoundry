@@ -786,9 +786,14 @@ def _folder_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
-def test_a_secrets_directory_beneath_a_junction_or_a_link_is_refused(tmp_path: Path) -> None:
+def test_a_secrets_directory_beneath_a_junction_or_a_link_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Vault BACKLOG #5656 and #5657: the check read the directory alone, never the folders on its
     path, so one reached through a junction or a link passed."""
+    from tests.test_restricted_file import judge_links_only_under
+
+    judge_links_only_under(monkeypatch, tmp_path)
     real = tmp_path / "real"
     real.mkdir(mode=0o700)  # owner-only whatever the umask, so the POSIX holder rule passes it
     directory = _directory(real)

@@ -416,14 +416,23 @@ than a path is not checked
   and NETWORK SERVICE are accounts that many services share, and the check does not report them.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On every platform the check walks
   the folders on the key file's path, from the root down, and judges each junction or link among
-  them by who can change it, since the file is wherever that link leads. A link passes when only
-  the engine's own account and the host's administrators can change it or the folder that holds
-  it: on Windows SYSTEM, Administrators and TrustedInstaller, by the trust-anchor rule; on POSIX
-  root, with the owner and mode rules the trust-anchor check uses. So macOS `/tmp`, an ostree
-  host's `/home`, `C:\Users\All Users` and a folder an administrator mounted a volume on pass. A
-  link that another account owns or may write, or that sits in a folder another account may
-  delete or re-point it in, is refused, and so is one whose access could not be read. A key file
-  that is itself a link is refused whoever can change it. A POSIX mount point is not a link. On
+  them by who can change it, since the file is wherever that link leads. The folders above a link
+  are read only where a link is, and the rule is the trust-anchor check's. On Windows a link is
+  refused when an account other than the engine's own, SYSTEM, Administrators and TrustedInstaller
+  owns it, or may change it, or may delete, rename or re-point anything in any folder from the
+  one that holds it up to the volume root (`DELETE` on a volume root is not counted, since a root
+  cannot be renamed). On POSIX a link's own owner and mode change nothing, since a symbolic link
+  cannot be re-pointed in place: it passes unless the folder that holds it, or one above, is owned
+  by an account other than the engine's own or root, or may be written by a group or other without
+  the sticky bit, or the link is owned by another account in a sticky folder others may write. So
+  macOS `/tmp`, an ostree host's `/home`, `C:\Users\All Users` and a folder an administrator
+  mounted a volume on pass, and a link under a folder others may write, at any depth, is refused.
+  So is a link whose access, or a folder whose access, could not be read. A key file that is itself
+  a link is refused whoever can change it. A POSIX mount point is not a link. The TLS pair the
+  engine mints is one only it writes, so on Windows its key's owner must also be the engine's own
+  account, SYSTEM or Administrators: a pair another account planted in the store directory, which
+  the add-file right below allows, is refused (on POSIX every key file's owner must already be the
+  engine's own account or root). On
   Windows it also reads the access list of the directory that holds the file, and refuses it when
   one of the groups above or an application package may delete a file in it, change its access
   list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when
@@ -437,12 +446,12 @@ than a path is not checked
   read, is refused, and so is a holder whose access list the engine's account may not read: give
   that account read access to the folder's permissions. An inherit-only entry on the directory is read as if it applied to the
   directory itself, so such an entry granting a broad group one of those rights refuses it too. It
-  does not read, at least: whether a broad group may rename the directory that holds the file or a
-  folder above it (`DELETE` on that folder, as a data drive's root often grants Authenticated
-  Users, or `FILE_DELETE_CHILD` on the folder above); a file a broad group added to the directory,
-  which the add-file right it may hold allows, before the engine first minted its own TLS pair
-  there, which the engine would then reuse; the access lists of the folders above the one that
-  holds the file; or what one named account may do to any of them. Restrict those folders yourself.
+  does not read, at least, where no link is on the path: whether a broad group may rename the
+  directory that holds the file or a folder above it (`DELETE` on that folder, as a data drive's
+  root often grants Authenticated Users, or `FILE_DELETE_CHILD` on the folder above); the access
+  lists of the folders above the one that holds the file; or what one named account may do to the
+  holder. Nor does it refuse a key file an operator supplied that a named account other than the
+  engine planted through the add-file right. Restrict those folders yourself.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
   in the group, and one held in a directory that another account owns or that a group or other may

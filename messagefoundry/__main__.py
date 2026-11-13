@@ -7909,7 +7909,13 @@ def _refuse_an_unauditable_write(store: Store) -> None:
 
 
 def _key_file_access_gate(
-    path: str, *, what: str, remedy: str, enforcing: bool, absent_ok: bool = False
+    path: str,
+    *,
+    what: str,
+    remedy: str,
+    enforcing: bool,
+    absent_ok: bool = False,
+    engine_owned: bool = False,
 ) -> bool:
     """May ``serve`` use the key file at ``path``? ``False`` means refuse the start.
 
@@ -7918,10 +7924,12 @@ def _key_file_access_gate(
     ``[security].enforcement = enforce`` a problem is an error and the answer is ``False``; under
     ``warn`` it is a warning and the start goes on. ``what`` names the file for the operator and
     ``remedy`` says what to do about it. With ``absent_ok`` a missing file passes, for the loader
-    to fail on."""
+    to fail on. ``engine_owned`` is :func:`key_file_problem`'s, for a file only the engine writes."""
     from messagefoundry.config.key_file_access import key_file_problem
 
-    problem = key_file_problem(path, what=what, remedy=remedy, absent_ok=absent_ok)
+    problem = key_file_problem(
+        path, what=what, remedy=remedy, absent_ok=absent_ok, engine_owned=engine_owned
+    )
     if problem is None:
         return True
     if enforcing:
@@ -8023,6 +8031,7 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
         what=f"the generated TLS private key {plan.key_file}",
         remedy=_generated_tls_key_remedy(state_dir),
         enforcing=enforcing,
+        engine_owned=True,  # only the engine mints this pair, so a planted one is refused
     )
 
 

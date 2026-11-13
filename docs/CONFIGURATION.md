@@ -2747,9 +2747,10 @@ secret. Each file in that directory holds one setting and is named exactly as it
   named for no setting is cited by its position, never spelled, since its name may be a value.
 - **On Windows the access check is a list of known broad groups.** It does not refuse one named
   account that can write the directory, the way the config-directory checks do. It reads the
-  access of the folder that holds the directory, as the rule above says, and on no platform the
-  access of the folders above that: an account that can write one of those could replace the
-  directory. Restrict the directory, and the folders above it, as below rather than relying on
+  access of the folder that holds the directory, as the rule above says. It reads the folders
+  above that only where a junction or link is on the path, to judge who can change the link;
+  where none is, an account that can write one of those folders could replace the directory
+  unrefused. Restrict the directory, and the folders above it, as below rather than relying on
   the check.
 - **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,

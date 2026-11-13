@@ -94,7 +94,9 @@ def _absent(path: str) -> bool:
     return False
 
 
-def key_file_problem(path: str, *, what: str, remedy: str, absent_ok: bool = False) -> str | None:
+def key_file_problem(
+    path: str, *, what: str, remedy: str, absent_ok: bool = False, engine_owned: bool = False
+) -> str | None:
     """Why the engine may not use the key file at ``path``, or ``None`` when it may.
 
     A known broad group or an application package must not be able to read or change the file
@@ -105,7 +107,9 @@ def key_file_problem(path: str, *, what: str, remedy: str, absent_ok: bool = Fal
     owns or that a group or other may write with no sticky bit. ``what`` names the file for
     the operator and ``remedy`` says what to do about it; the reason never carries the file's
     contents. With ``absent_ok``, a missing file passes: the loader that opens it refuses it and
-    says why, which is the fault the operator needs to hear about. It prints and logs nothing:
+    says why, which is the fault the operator needs to hear about. With ``engine_owned``, the file is
+    one only the engine writes, and on Windows its owner must be the engine, SYSTEM or
+    Administrators (vault BACKLOG #5657). It prints and logs nothing:
     each caller refuses under ``enforce`` and warns under ``warn``."""
     from messagefoundry.restricted_file import broad_access_problem
 
@@ -115,7 +119,7 @@ def key_file_problem(path: str, *, what: str, remedy: str, absent_ok: bool = Fal
         return f"{what} is not restricted: its path could not be examined (a NUL in it). {remedy}"
     if absent_ok and _absent(path):
         return None
-    problem = broad_access_problem(Path(path))
+    problem = broad_access_problem(Path(path), engine_owned=engine_owned)
     if problem is None:
         return None
     return f"{what} is not restricted: {problem}. {remedy}"

@@ -278,7 +278,9 @@ def test_a_posix_key_in_a_directory_others_may_replace_it_in_is_refused(tmp_path
     assert problem is not None and "the directory that holds it has mode 0775" in problem
 
 
-def test_a_key_beneath_a_junction_or_a_link_others_can_change_is_refused(tmp_path: Path) -> None:
+def test_a_key_beneath_a_junction_or_a_link_others_can_change_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Vault BACKLOG #5656 and #5657: the check judged the key file, and on POSIX the directory a
     link led to, but never the folders on its path. A link in a folder a broad group may delete
     entries in is refused. A junction needs no privilege on Windows."""

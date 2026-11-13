@@ -3,8 +3,10 @@
   key file's path is judged by who can change it, with the trust-anchor rules: one only the
   engine's own account and the host's administrators (root; SYSTEM, Administrators and
   TrustedInstaller) can change passes, such as macOS `/tmp` or `C:\Users\All Users`, and one
-  another account can change, or that sits in a folder another account may re-point it in, is
-  refused. On Windows a key file, or the directory that holds it, whose owner is a broad group or
+  another account can change, or that sits at any depth under a folder another account may
+  rename or re-point it in, is refused. On Windows the TLS pair the engine mints must be owned by
+  the engine's own account, SYSTEM or Administrators, so a pair another account planted in the
+  store directory is refused. On Windows a key file, or the directory that holds it, whose owner is a broad group or
   an application package, or cannot be read, is refused, and so is a key file in a directory that
   lets a broad group delete a file in it or change its access list. Before, the Windows check read
   the key file's own access list alone, and the POSIX check followed a linked folder above the
