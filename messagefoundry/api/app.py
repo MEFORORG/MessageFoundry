@@ -1732,15 +1732,14 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     Its alert-state writes are then given a bounded drain, as engine.stop() gives them, so the
     alert that explains the refusal is recorded before the store closes.
 
-    The delivery drain is bounded by most of the unwind's budget, everything but the alert-state
-    drain's floor, and not by the shutdown teardown's notifier floor: a crash loop pages on every
-    attempt (#2597; test_the_alert_fires_even_when_the_start_then_fails pins that only for failures
-    at or after engine.start(), which the managed teardown unwinds, not this), and a tight cut here
-    would drop the page that explains this refusal. A blackholed webhook or SMTP host would
-    otherwise hold the store open past NSSM's stop window (#1257). Its own wait ends at
-    _INNER_SHARE of that bound and logs one ERROR with the count not confirmed delivered, before
-    the teardown would cut the step. The cut ends only the asyncio side: a transport's send running
-    in a worker thread runs on to its own socket timeout."""
+    The delivery drain is bounded, so a blackholed webhook or SMTP host cannot hold the store open
+    past NSSM's stop window (#1257). Its bound is the unwind's budget less the alert-state drain's
+    floor, not the shutdown teardown's notifier floor. A crash loop pages on every attempt (#2597),
+    and a tight cut would drop the page that explains this refusal. The test that pins #2597,
+    test_the_alert_fires_even_when_the_start_then_fails, fails at or after engine.start(), so it
+    runs the managed teardown, not this. The drain's own wait ends at _INNER_SHARE of its bound,
+    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered.
+    The cut ends only the asyncio side: a send in a worker thread runs on to its socket timeout."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
@@ -1754,6 +1753,8 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
             except TimeoutError:
                 if not deadline.expired():
                     raise
+                if not notifier.undelivered:
+                    return  # the last send ended at the deadline: nothing was lost
                 # A count only: an alert's content can carry a partner's text (docs/PHI.md).
                 _log.error(
                     "startup unwind: the alert notifier did not drain within %.2fs; %d alert(s) "

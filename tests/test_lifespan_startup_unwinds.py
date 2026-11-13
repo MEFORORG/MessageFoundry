@@ -352,6 +352,8 @@ async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
     monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.5)
     transport = _BlackholedTransport()
     sink = NotifierAlertSink([transport])
+    # Every level and logger, before the emits, so the content check below covers them all.
+    caplog.set_level(logging.DEBUG)
     sink.connection_stopped("IB_TEST_ADT", detail="PROBE-DETAIL-TEXT")
     sink.connection_stopped("IB_TEST_ORU", detail="PROBE-DETAIL-TEXT")
     closed: list[float] = []
@@ -362,8 +364,6 @@ async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
             closed.append(loop.time())
 
     store: Any = _Store()
-    # Every level and logger, so the content check below covers them all.
-    caplog.set_level(logging.DEBUG)
     began = loop.time()
     await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     # The control: the drain did reach the hung send, so the cut is what ended it.
@@ -383,8 +383,8 @@ async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
 
 
 async def test_a_close_cancelled_on_a_full_queue_still_stops_the_drain() -> None:
-    """BACKLOG #5907: a close cancelled while its sentinel waited on a full queue left the drain
-    task delivering, so the unwind's cut did not stop it."""
+    """BACKLOG #5907: an alert notifier close cancelled while its sentinel waited on a full queue
+    left the drain task delivering, so the unwind's cut did not stop it."""
     transport = _BlackholedTransport()
     sink = NotifierAlertSink([transport])
     sink._queue = asyncio.Queue(maxsize=1)  # full after one queued alert
@@ -396,6 +396,6 @@ async def test_a_close_cancelled_on_a_full_queue_still_stops_the_drain() -> None
     assert task is not None
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(sink.aclose(), 0.2)
-    await asyncio.wait((task,), timeout=10.0)
+    # Waited for inside the close, so it has ended by the time the close returns.
     assert task.cancelled()
     assert sink._task is None

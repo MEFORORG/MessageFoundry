@@ -361,16 +361,12 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
             self._task = asyncio.create_task(self._run())
 
     async def aclose(self) -> None:
-        task = self._task
-        if task is None:
+        if self._task is None:
             return
+        await self._queue.put(None)  # sentinel: drain what's queued, then stop
         try:
-            await self._queue.put(None)  # sentinel: drain what's queued, then stop
-            await task
+            await self._task
         finally:
-            # A close cancelled while the sentinel waits on a full queue still stops the drain
-            # (BACKLOG #5907), rather than leaving it delivering after the caller moved on.
-            task.cancel()
             self._task = None
 
     async def _run(self) -> None:
@@ -2543,10 +2539,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         """Drain and stop the delivery task, then cancel every control task still running and wait
         for it to end (BACKLOG #5909), so none outlives the sink. The lifespan closes this sink
         after engine.stop(), so such a task can only meet a stopped runner. Runs even when the sink
-        was never started."""
+        was never started. A close cancelled while its sentinel waits on a full queue cancels the
+        delivery task too and waits for it (BACKLOG #5907), so the startup unwind's cut does not
+        leave it sending after the store closed. Only this sink does that: an undelivered alert is
+        counted by :attr:`undelivered`, while a security notice's loss must reach its audit row."""
+        drain = self._task
         try:
             await super().aclose()
         finally:
+            if drain is not None and not drain.done():
+                drain.cancel()
+                self._task = None
+                await asyncio.gather(drain, return_exceptions=True)
             pending = [task for task in self._control_tasks if not task.done()]
             for task in pending:
                 task.cancel()
