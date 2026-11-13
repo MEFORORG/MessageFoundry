@@ -97,9 +97,6 @@ register_ui_action(
     action=STEP_UP_ACTION_MFA_CONFIRM,
     label="Confirm your authenticator app",
 )
-#: The confirm-code form: the unlock page the confirm gate's refusal re-enters at, and the page the
-#: re-auth toward the MFA_CONFIRM grant lands on.
-_MFA_CONFIRM_PAGE = "/ui/account/mfa/confirm"
 
 
 async def _confirm_proof_held(request: Request) -> bool:
@@ -557,7 +554,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
             require_ui_reauth_only_action(
-                STEP_UP_ACTION_MFA_CONFIRM, reauth_next=lambda _r: _MFA_CONFIRM_PAGE
+                STEP_UP_ACTION_MFA_CONFIRM, reauth_next=lambda _r: "/ui/account/mfa/confirm"
             )
         ),
     ) -> Response:
