@@ -93,11 +93,10 @@ def _run(env: Mapping[str, str], transport: cla_precheck.Transport) -> int:
     return run(env, transport, _no_signatures)
 
 
-def _verdict(scenario: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    verdict = evaluate(
-        fetch_commits(_Replay(scenario), "MEFORORG", "MessageFoundry", 7), _ALLOWLIST
-    )
-    return verdict.refusals, verdict.notices
+def _verdict(scenario: str) -> tuple[str, ...]:
+    """The refusals for one scenario."""
+    read = fetch_commits(_Replay(scenario), "MEFORORG", "MessageFoundry", 7)
+    return evaluate(read, _ALLOWLIST).refusals
 
 
 def test_it_pages_past_the_hundredth_commit_and_refuses_the_impersonator_there() -> None:
@@ -114,20 +113,29 @@ def test_it_pages_past_the_hundredth_commit_and_refuses_the_impersonator_there()
 
 def test_the_same_two_pages_with_a_linked_author_pass() -> None:
     """The neighbour of the test above: same size, page two linked, nothing refused."""
-    assert _verdict("linked_on_page_two") == ((), ())
+    assert _verdict("linked_on_page_two") == ()
 
 
-def test_an_unlinked_name_outside_the_allowlist_is_not_this_scripts_business() -> None:
-    """The action itself asks that author to sign, so the pre-check stays out of the way."""
-    assert _verdict("unlinked_name_not_allowlisted") == ((), ())
-
-
-def test_an_unlinked_name_equal_to_a_linked_login_here_is_a_notice() -> None:
-    """The action keys committers on `login || name`, so the unlinked commit folds into the linked
-    account. Not ruled, so reported and passed."""
-    refusals, notices = _verdict("name_folded_into_linked")
-    assert refusals == ()
-    assert len(notices) == 1 and "octo-contributor" in notices[0]
+@pytest.mark.parametrize(
+    ("scenario", "author"),
+    [
+        ("unlinked_name_not_allowlisted", "Somebody Else"),
+        ("name_folded_into_linked", "octo-contributor"),
+        ("committer_attribution", "Unlinked Author"),
+        ("actions_bot_committer", "Unlinked Author"),
+    ],
+)
+def test_an_unlinked_author_is_refused_whatever_the_committer_or_namesake(
+    scenario: str, author: str
+) -> None:
+    """Owner ruling 2026-11-13: the CLA binds the AUTHOR, so a commit whose author is linked to no
+    account is refused, whether its committer is allowlisted, the bot, any other account, or nobody,
+    and whether or not its git name matches a signed login. The refusal names the AUTHOR's git name,
+    never the committer the action attributes it to."""
+    refusals = _verdict(scenario)
+    assert len(refusals) == 1, refusals
+    assert f"git author, {author!r}," in refusals[0]
+    assert "wshallwshall" not in refusals[0] or author == "wshallwshall"
 
 
 def test_the_attribution_order_is_author_then_committer_then_raw_author() -> None:
@@ -166,24 +174,24 @@ def test_an_empty_user_object_is_chosen_as_javascript_chooses_it() -> None:
     assert (who.name, who.author_linked) == ("", True)
 
 
-def test_an_unlinked_author_under_a_linked_allowlisted_committer_is_refused() -> None:
-    """Owner ruling 2026-11-13: the CLA binds the AUTHOR. The action attributes this commit to the
-    allowlisted committer, whose email is trivially set, so the author is never asked to sign."""
-    refusals, notices = _verdict("committer_attribution")
-    assert notices == ()
-    assert len(refusals) == 1 and "wshallwshall" in refusals[0]
-
-
-def test_an_unlinked_author_under_the_dropped_bot_committer_is_refused() -> None:
-    """41898282 is github-actions[bot]; web-flow is 19864447 (tests/fixtures/branch_main.json)."""
-    refusals, notices = _verdict("actions_bot_committer")
-    assert notices == ()
-    assert len(refusals) == 1 and "github-actions[bot]" in refusals[0]
-    assert "web-flow" not in refusals[0]
+def test_an_unlinked_author_under_a_signed_ordinary_committer_is_refused() -> None:
+    """The case the earlier rules missed: committer octo is signed and not allowlisted, so the
+    action checks octo in the author's place. The author never signed, so it refuses."""
+    commit = {
+        "oid": f"{5:040x}",
+        "author": {"name": "Mallory", "user": None},
+        "committer": {
+            "name": "Octo",
+            "user": {"login": "octo-contributor", "databaseId": 90000001},
+        },
+    }
+    refusals = evaluate(fetch_commits(_serve([_page([commit], 1, False)]), "M", "N", 7), _ALLOWLIST)
+    assert len(refusals.refusals) == 1 and "'Mallory'" in refusals.refusals[0]
+    assert "octo-contributor" not in refusals.refusals[0]
 
 
 def test_a_linked_author_wins_over_an_actions_bot_committer() -> None:
-    assert _verdict("author_linked_committer_actions_bot") == ((), ())
+    assert _verdict("author_linked_committer_actions_bot") == ()
 
 
 def _fault(scenario: str) -> str | None:
@@ -221,7 +229,7 @@ def test_a_malformed_first_page_commit_keeps_its_slot() -> None:
 
 def test_an_author_first_seen_past_the_hundredth_commit_is_refused() -> None:
     """BACKLOG #5645: the action never reads commit 101, so its new author is never checked."""
-    refusals, _ = _verdict("new_author_past_100")
+    refusals = _verdict("new_author_past_100")
     assert len(refusals) == 1 and "new-person" in refusals[0]
 
 
@@ -400,12 +408,11 @@ def test_the_script_keeps_to_the_runners_python_3_12_grammar() -> None:
     ast.parse(source, feature_version=(3, 12))
 
 
-def test_the_first_commit_seen_under_a_name_is_the_entry_the_action_keeps() -> None:
-    """An unlinked commit named github-actions[bot] BEFORE the linked bot commit becomes the
-    action's entry, with no id. With the bot off the allowlist the action asks it to sign, so
-    refusing would be false; with the bot on the allowlist the action skips it, so it refuses."""
+def test_an_unlinked_author_is_refused_whichever_order_or_allowlist() -> None:
+    """Under rule 1 the verdict on an unlinked author depends on neither the action's first-seen
+    order nor the allowlist: it refuses with the bot on the allowlist and off it."""
     read = fetch_commits(_Replay("bot_name_before_bot_commit"), "MEFORORG", "MessageFoundry", 7)
-    assert evaluate(read, ["wshallwshall"]).refusals == ()
+    assert len(evaluate(read, ["wshallwshall"]).refusals) == 1
     assert len(evaluate(read, _ALLOWLIST).refusals) == 1
 
 

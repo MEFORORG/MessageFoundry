@@ -173,7 +173,7 @@ jobs:
       # WHAT THE VENDORED ACTION CANNOT SEE (BACKLOG #5644, #5645). The action reads one page of 100
       # commits, and matches its allowlist on a commit's free-text git name when no account is
       # linked. scripts/security/cla_precheck.py reads every commit and refuses what the action would
-      # pass unsigned; its docstring lists what it refuses and what it only reports. It runs on the
+      # pass unsigned; its docstring states the two rules it refuses on. It runs on the
       # same events as the action's step; the action's `if:` alone adds `!cancelled()`, so after an
       # earlier step fails the action still runs and this step does not.
       #

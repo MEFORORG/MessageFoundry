@@ -20,14 +20,19 @@ WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/di
     is linked to, that name is free text the pull request's author chose.
 
 So a commit authored and committed under unlinked emails, with the git name set to an allowlisted
-login, is dropped as allowlisted and never needs a signature. This script finds that commit and
-refuses, and so it does for any unlinked commit the action files under an entry it skips. It builds
-the action's committer list as the action does, from the FIRST PAGE only, first commit seen under
-each key. It reads EVERY commit, paging on ``hasNextPage``, and refuses an author the action's list
-never holds. It refuses an unlinked AUTHOR even when the committer is allowlisted or
-``github-actions[bot]``: the CLA binds the author (owner ruling 2026-11-13). It faults when the pull
-request's head moved while it read, and when it read fewer distinct commits than GitHub's
-``totalCount``.
+login, is dropped as allowlisted and never needs a signature. This script applies two rules to
+EVERY commit, paging on ``hasNextPage``:
+
+  1. A commit whose AUTHOR is linked to no GitHub account is refused, whatever its committer or
+     git name. The CLA binds the author, and an unlinked author can never be shown to have signed
+     (owner ruling 2026-11-13). Measured before the ruling: every commit on merged PRs 2909 and
+     2432 has a linked author, so the rule refuses nothing in current flows.
+  2. A linked author first seen past the action's one page is refused only when absent from the
+     signature file the action keeps (below). The action's list is built as the action builds it,
+     from the FIRST PAGE only, first commit seen under each key.
+
+It faults when the pull request's head moved while it read, and when it read fewer distinct
+commits than GitHub's ``totalCount``.
 
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
 the CLA action: FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling
@@ -40,24 +45,19 @@ this with its system ``python3``, so the script keeps to Python 3.12 syntax;
 tests/test_cla_precheck.py parses it at that grammar. It does not patch the vendored bundle; the
 provenance gate forbids that.
 
-AN AUTHOR THE ACTION NEVER SEES, first seen past its one page, is refused only when absent from the
-signature file the action keeps (``signedContributors`` ids, read over REST from the base
-repository's signature branch). A file GitHub answers 404 for holds no signatures, as the action
-itself assumes; any other unreadable answer is a fault. It is read only when such an author exists.
-
-WHAT IT DOES NOT REFUSE, at least: an unlinked commit filed under a linked account's entry, which
-is reported as a NOTICE because that account is checked in its place; and an unlinked author under
-a linked committer that is neither allowlisted nor ``github-actions[bot]``, which it does not report.
+THE SIGNATURE FILE (rule 2) holds ``signedContributors`` ids, read over REST from the base
+repository's signature branch. A file GitHub answers 404 for holds no signatures, as the action
+itself assumes; any other unreadable answer is a fault. It is read only when rule 2 needs it.
 
 It CANNOT see a spoofed AUTHOR email. GitHub links a commit to an account by its email alone, so an
 author email set to an allowlisted account's address reads as that account, here and in the action
-alike. Only commit signature verification separates the two, and neither checks it. A spoofed
-COMMITTER email under an unlinked author is refused, by the author rule above.
+alike. Only commit signature verification separates the two, and neither checks it.
 
 UNMEASURED: whether GitHub caps a pull request's commit connection (its REST listing stops at 250)
 and, if it does, whether ``totalCount`` reports the capped or the real count. Until it is measured a
-read short of ``totalCount`` is a FAULT (owner ruling 2026-11-13), so the commits past a cap are not
-checked, and the run warns and passes.
+read short of ``totalCount`` is a FAULT (owner ruling 2026-11-13) and warns and passes. If
+``totalCount`` reports the CAPPED count, the read is not short, so commits past the cap go unchecked
+with NO warning at all.
 
 INPUT COMES ONLY FROM THE ENVIRONMENT, never from the command line or a templated ``run:`` line,
 so a workflow step can pass event data through ``env:`` (zizmor's template-injection rule):
@@ -155,6 +155,8 @@ class Attribution:
     database_id: int | None
     author_linked: bool
     committer_linked: bool
+    #: The raw git author name, whoever the action attributes the commit to.
+    author_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -169,7 +171,6 @@ class PullRequestRead:
 @dataclass(frozen=True)
 class Verdict:
     refusals: tuple[str, ...]
-    notices: tuple[str, ...]
     #: Set when part of the verdict could not be reached. The refusals that WERE reached still stand.
     fault: str | None = None
 
@@ -215,6 +216,7 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
         database_id=raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None,
         author_linked=author_user is not None,
         committer_linked=committer_user is not None,
+        author_name=str(author.get("name") or ""),
     )
 
 
@@ -329,8 +331,8 @@ def evaluate(
     *,
     complete: bool = True,
 ) -> Verdict:
-    """Refusals and notices for one read. ``signatures`` returns the signed account ids; it is
-    called only for an author the action never sees, and with none every such author refuses.
+    """Refusals for one read, by the two rules in the module docstring. ``signatures`` returns the
+    signed account ids; it is called only under rule 2, and with none every such author refuses.
 
     A fault partway (an unreadable signature file, a malformed commit) is recorded in
     ``Verdict.fault`` and the rest is still judged, so a refusal already proven stands. With
@@ -353,7 +355,6 @@ def evaluate(
         return None if ids is None else who.database_id in ids
 
     refusals: list[str] = []
-    notices: list[str] = []
     distinct = len({str(commit.get("oid", "")) for commit in read.commits})
     # A FAULT, not a refusal, until GitHub's commit cap is measured (owner ruling 2026-11-13): if
     # GitHub stops the connection short of totalCount, refusing would fail every large PR closed.
@@ -371,63 +372,31 @@ def evaluate(
         except PrecheckFault as exc:
             faults.append(str(exc))
             slots.append(None)
-    attributions = [who for who in slots if who is not None]
-
-    def skipped(entry: Attribution) -> bool:
-        """Does the action skip this committer entry: the id it drops, or an allowlisted name?"""
-        return entry.database_id == ACTIONS_BOT_ID or matches_allowlist(entry.name, allowlist)
-
-    # The action's committer list: the FIRST page only, one entry per `login || name`, first seen.
-    entries: dict[str, Attribution] = {}
-    for slot in slots[: read.first_page]:
-        if slot is not None:
-            entries.setdefault(slot.name, slot)
-    # Keyed on the name AND the account, so a linked author does not cover an unlinked commit that
-    # merely shares its name.
-    never_checked: set[tuple[str, int | None]] = set()
-    for who in attributions:
-        unlinked = not who.author_linked and not who.committer_linked
-        entry = entries.get(who.name)
-        if entry is None:
-            # Past the first page, under a name the action never saw, so it checks nobody here.
-            if unlinked and skipped(who):
-                refusals.append(
-                    f"commit {who.oid} is linked to no GitHub account, and its git author name "
-                    f"{who.name!r} is one the action skips, so it would pass unsigned"
-                )
-            elif not skipped(who) and (who.name, who.database_id) not in never_checked:
-                never_checked.add((who.name, who.database_id))
-                if has_signed(who) is False:
-                    refusals.append(
-                        f"commit {who.oid} is past the {read.first_page} commits the action "
-                        f"reads, its author {who.name!r} appears in none of them, and the CLA "
-                        "signature file holds no signature for that account"
-                    )
-        elif unlinked and skipped(entry):
+    # The action's committer list: the FIRST page only, one key per `login || name`. A linked
+    # author is attributed to their own account, so only the key set matters for rule 2.
+    seen_by_action = {slot.name for slot in slots[: read.first_page] if slot is not None}
+    checked: set[int] = set()  # linked accounts already judged under rule 2
+    for who in (slot for slot in slots if slot is not None):
+        if not who.author_linked:
+            # Rule 1: the CLA binds the AUTHOR, and an unlinked author cannot have signed.
             refusals.append(
-                f"commit {who.oid} is linked to no GitHub account, and the action files it under "
-                f"{who.name!r}, an entry it skips, so it would pass unsigned"
+                f"commit {who.oid} has a git author, {who.author_name!r}, linked to no GitHub "
+                "account, so that author cannot be shown to have signed the CLA; link the "
+                "author's email to an account, or re-author the commit"
             )
-        elif unlinked and entry is not who and (entry.author_linked or entry.committer_linked):
-            notices.append(
-                f"commit {who.oid} is linked to no GitHub account, and the action files it under "
-                f"the linked account {who.name!r}, which is checked in its place"
-            )
-        if who.author_linked or unlinked:
             continue
-        # The CLA binds the AUTHOR (owner ruling 2026-11-13). An allowlisted or bot committer does
-        # not stand in for an unlinked author, and a committer email is trivially set.
-        if who.database_id == ACTIONS_BOT_ID:
+        if who.name in seen_by_action or who.database_id is None or who.database_id in checked:
+            continue
+        # Rule 2: a linked author the action never reads, unless it would skip them anyway.
+        checked.add(who.database_id)
+        skipped = who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
+        if not skipped and has_signed(who) is False:
             refusals.append(
-                f"commit {who.oid} has an author linked to no GitHub account and is committed by "
-                "github-actions[bot], so the action drops it and its author is never checked"
+                f"commit {who.oid} is past the {read.first_page} commits the action reads, its "
+                f"author {who.name!r} appears in none of them, and the CLA signature file holds "
+                "no signature for that account"
             )
-        elif matches_allowlist(who.name, allowlist):
-            refusals.append(
-                f"commit {who.oid} has an author linked to no GitHub account and is attributed to "
-                f"the allowlisted committer {who.name!r}, so its author is never asked to sign"
-            )
-    return Verdict(tuple(refusals), tuple(notices), "; ".join(faults) or None)
+    return Verdict(tuple(refusals), "; ".join(faults) or None)
 
 
 def _escape_command(text: str) -> str:
@@ -603,8 +572,6 @@ def run(
     except PrecheckFault as exc:
         print(f"::warning title=CLA pre-check fault::{_escape_command(str(exc))}")
         return EXIT_FAULT
-    for notice in verdict.notices:
-        print(f"::notice title=CLA pre-check::{_escape_command(notice)}")
     fault = "; ".join(f for f in (read_fault, verdict.fault) if f)
     if fault:
         print(f"::warning title=CLA pre-check fault::{_escape_command(fault)}")
