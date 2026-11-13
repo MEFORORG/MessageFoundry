@@ -2129,8 +2129,10 @@ transport error string, and either can name a patient. The store escapes every c
 engine's log alphabet with a copy of `messagefoundry/controlchars.py`'s `scrub_control_chars`
 (`tee/controlchars.py`, kept byte-identical by a test), so at least C0, DEL, C1 and bidirectional
 controls are stored as backslash escapes; tab is kept. It then cuts the escaped text to at most 500
-characters, never inside an escape. `tee naks` and `tee export` escape the control id, message
-type and ACK code the same way when they print them. The relay's own process log writes the same detail unescaped
+characters, never inside an escape. `tee naks` escapes the control id, message type and ACK code the
+same way when it prints them, and writes any character its console encoding cannot hold as a
+backslash escape. `tee export` writes the values as stored, and its JSON writer escapes every
+control and non-ASCII character. The relay's own process log writes the same detail unescaped
 (open item). Its `purge` scrubs deleted bodies from the DB and `-wal`
 files, at file level only; [TEE-RELAY.md, Purge](TEE-RELAY.md#purge) states what the scrub
 does and does not reach, and where `VACUUM`'s temp copy may go. On POSIX the `-wal` and `-shm`

@@ -157,31 +157,23 @@ class CaptureRow:
 
 
 def _clean_detail(detail: str | None) -> str | None:
-    """Escape a logged detail string's control characters with the vendored engine helper,
-    then cut it to at most ``_MAX_DETAIL`` characters, at a character boundary of the original so
-    an escape is never cut in half. docs/PHI.md, section 7, the tee relay paragraph, says what is
-    escaped."""
+    """Escape a logged detail string's control characters with the vendored engine helper, and
+    keep at most ``_MAX_DETAIL`` characters, cut at a character boundary of the original so an
+    escape is never cut in half. Only the first ``_MAX_DETAIL`` characters are read: every escape
+    is at least one character, so nothing past them can reach the result, and the work stays
+    bounded however long the partner's text is. docs/PHI.md, section 7, the tee relay paragraph,
+    says what is escaped."""
     if detail is None:
         return None
-    escaped = scrub_control_chars(detail)
-    if len(escaped) <= _MAX_DETAIL:
-        return escaped
     pieces: list[str] = []
     used = 0
-    for ch in detail:
+    for ch in detail[:_MAX_DETAIL]:
         piece = scrub_control_chars(ch)
         if used + len(piece) > _MAX_DETAIL:
             break
         pieces.append(piece)
         used += len(piece)
     return "".join(pieces)
-
-
-def _shown(value: str | None) -> str | None:
-    """A stored identifier (MSH-10, MSH-9, an ACK code) as naks and export emit it: escaped, so a
-    control character from the partner's bytes can neither drive a terminal nor break a strict
-    console encoding. The stored value itself is kept as received, for correlation."""
-    return None if value is None else scrub_control_chars(value)
 
 
 def _iso(at: float) -> str:
@@ -196,17 +188,18 @@ def _is_nak(row: aiosqlite.Row) -> bool:
 
 def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
     """One relay_log row as a plain JSON-able dict. Never a message body, but ``detail`` can name a
-    patient (docs/PHI.md, section 7, the tee relay paragraph). Identifiers are escaped (_shown)."""
+    patient (docs/PHI.md, section 7, the tee relay paragraph). Values are as stored; the JSON
+    writer's own escaping keeps control and non-ASCII characters out of the file."""
     return {
         "at": row["at"],
         "at_iso": _iso(row["at"]),
         "direction": row["direction"],
         "leg": row["leg"],
-        "control_id": _shown(row["control_id"]),
-        "message_type": _shown(row["message_type"]),
+        "control_id": row["control_id"],
+        "message_type": row["message_type"],
         "size_bytes": row["size_bytes"],
         "outcome": row["outcome"],
-        "ack_code": _shown(row["ack_code"]),
+        "ack_code": row["ack_code"],
         "detail": row["detail"],
     }
 

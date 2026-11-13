@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import pickle
@@ -12,6 +13,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1043,23 +1045,65 @@ def test_naks_escapes_a_control_id_and_type_from_partner_bytes(tmp_path: Path) -
     assert b"control_id=C\\u0080\\u0099" in result.stdout
 
 
-async def test_export_escapes_identifiers_but_the_store_keeps_them(tmp_path: Path) -> None:
+async def test_export_writes_identifiers_as_stored_and_its_json_escapes_them(
+    tmp_path: Path,
+) -> None:
     store = await _open(tmp_path)
     try:
-        await _record(store, control_id="C\u0080", message_type="ADT\x1b[31m")
-        row = (await store.export())["rows"][0]
-        assert row["control_id"] == "C\\u0080"
-        assert row["message_type"] == "ADT\\u001b[31m"
-        cur = await store._db.execute("SELECT control_id FROM relay_log")  # noqa: SLF001
-        stored = await cur.fetchone()
-        assert stored is not None and stored["control_id"] == "C\u0080"  # kept for correlation
+        await _record(store, control_id="C\u0080", message_type="ADT\x1b[31m", ack_code="A\u0080")
+        data = await store.export()
+        row = data["rows"][0]
+        assert (row["control_id"], row["message_type"]) == ("C\u0080", "ADT\x1b[31m")
+        assert data["summary"]["by_ack_code"] == {"A\u0080": 1}  # rows and summary agree
+        text = json.dumps(data, indent=2)
+        assert text.isascii() and "\x1b" not in text
+        assert json.loads(text)["rows"][0]["control_id"] == "C\u0080"  # round-trips for joins
+    finally:
+        await store.close()
+
+
+def test_naks_survives_printable_text_a_cp1252_console_cannot_hold(tmp_path: Path) -> None:
+    # Escaping leaves printable non-ASCII alone; a localized error string can hold CJK text.
+    db_path = tmp_path / "tee.db"
+
+    async def seed() -> None:
+        store = await RelayStore.open(str(db_path))
+        try:
+            await _record(store, outcome="transport_error", ack_code=None, detail="\u63a5\u7d9a")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252:strict", "PYTHONUTF8": "0"}
+    result = subprocess.run(
+        [sys.executable, "-m", "tee", "naks", "--db", str(db_path)],
+        capture_output=True,
+        env=env,
+        cwd=Path(__file__).resolve().parents[1],
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    assert b"\\u63a5\\u7d9a" in result.stdout
+
+
+async def test_a_16_mib_detail_is_cut_without_escaping_the_whole_of_it(tmp_path: Path) -> None:
+    # An ACK frame may be up to 16 MiB. Escaping all of it before the cut took seconds on the
+    # event loop with the store lock held; only the first 500 characters can reach the result.
+    store = await _open(tmp_path)
+    try:
+        started = time.monotonic()
+        await _record(store, outcome="nak", ack_code="AE", detail="\u0080" * (16 * 1024 * 1024))
+        assert time.monotonic() - started < 5.0
+        stored = (await store.recent_naks())[0].detail
+        assert stored is not None and len(stored) <= 500
     finally:
         await store.close()
 
 
 @pytest.mark.parametrize(
     "detail",
-    ["\u0080" * 600, "a" * 499 + "\x00tail", "b" * 497 + "\U0001f600" * 3],
+    ["\u0080" * 600, "a" * 499 + "\x00tail", "b" * 497 + "\U000e0001" * 3],
     ids=["all-c1", "control-at-the-cut", "astral-at-the-cut"],
 )
 async def test_detail_is_at_most_500_characters_after_escaping_and_never_cuts_an_escape(

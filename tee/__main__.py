@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import io
 import json
 import logging
 import os
@@ -436,10 +437,14 @@ async def _naks(args: argparse.Namespace) -> int:
     if not rows:
         print("no NAKs or transport errors logged")
         return 0
+    # Escaping keeps printable non-ASCII text, which a narrow console encoding such as cp1252 may
+    # not hold, so write anything it cannot encode as a backslash escape rather than fail.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(errors="backslashreplace")
     for row in rows:
         when = datetime.fromtimestamp(row.at, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         # Identifiers come from partner bytes, so escape them like the stored detail: a control
-        # character could otherwise drive the terminal or break a strict console encoding.
+        # character could otherwise drive the terminal.
         code = scrub_control_chars(row.ack_code or row.outcome)
         control_id = scrub_control_chars(row.control_id or "-")
         message_type = scrub_control_chars(row.message_type or "-")

@@ -124,9 +124,9 @@ messagefoundry_toolkit/** text=auto eol=lf
 # This is NOT the shipped-set rule above and must not be folded into it: `tee/` does not ship, so
 # `test_every_shipped_path_is_pinned_to_lf` never reaches it. The rule here is narrower and its own
 # thing -- two files compared for byte equality must share one line-ending policy, wherever they
-# live. Scoped to `anon/` rather than all of `tee/` because that is exactly the compared surface:
-# every path the parity test reads is `tee/anon/<name>`, and a future file added to that directory
-# and to _BYTE_IDENTICAL is covered without widening the pin to tee's own unvendored modules.
+# live. Scoped to the compared paths rather than all of `tee/`: the parity test reads at least
+# `tee/anon/<name>` and `tee/controlchars.py` (pinned below). A future file added to `tee/anon/` and
+# to _BYTE_IDENTICAL is covered; one vendored anywhere else in `tee/` needs its own pin.
 tee/anon/** text=auto eol=lf
 # tee/controlchars.py is a vendored copy of messagefoundry/controlchars.py, compared the same way
 # by the same test (BACKLOG #5637), so it takes the same pin.
