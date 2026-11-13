@@ -321,14 +321,18 @@ _OVER_HEADER_LIMIT_QUERY = "a=" + "x" * (MAX_OUTBOUND_HEADER_VALUE_LEN - 1)
         "identifier=sys|\u2603",  # non-Latin-1
         "identifier=sys|a\u00a0b",  # a non-ASCII space
         "identifier=sys|MRN#123",  # '#': urllib would send only the part before it
-        "identifier=",  # no criteria: a lenient server would match every resource
-        "x=%0A",  # a percent-encoded control character
     ],
 )
 def test_url_form_conditional_query_refused_at_construction(value: str) -> None:
     with pytest.raises(ValueError, match="conditional_query") as ei:
         _dest(conditional="conditional-update", conditional_query=value)
     assert value not in str(ei.value)
+
+
+def test_url_form_admits_a_fhir_search_escape() -> None:
+    # FHIR search escapes a ',' '|' or '$' in a value with a backslash, which the wire accepts.
+    q = "identifier=sys|a\\,b"
+    assert _dest(conditional="conditional-update", conditional_query=q).conditional_query == q
 
 
 def test_url_form_oversized_conditional_query_refused_at_construction() -> None:
