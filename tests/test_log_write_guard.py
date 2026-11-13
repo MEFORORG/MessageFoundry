@@ -865,6 +865,24 @@ async def test_an_internal_halt_that_always_raises_still_unbinds_and_pauses(
     assert sink.log_failures == [("file", "unwritable", "disk full", 2)]
 
 
+async def test_a_lane_read_that_always_raises_still_unbinds_and_pauses(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704. Both lane reads are guarded. A raise from them must not leave the latch set
+    # over bound listeners: the read under the lock falls back to everything still running.
+    sink = _RecordingSink()
+    runner, source = _graph(store, sink)
+
+    def raises() -> tuple[list[str], list[str]]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "_log_halt_lanes", raises)
+    await runner._stop_all_for_log_failure(sink="file", reason="disk full")
+
+    assert source.stopped is True and OUTBOUND in runner._outbound_paused
+    assert sink.log_failures == [("file", "unwritable", "disk full", None)]
+
+
 class _DeadGuard:
     """A guard whose probe write never lands: the log is still unwritable."""
 

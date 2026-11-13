@@ -5736,8 +5736,10 @@ class RegistryRunner:
                 # not a raise — reload() rolls the WHOLE graph back on an exception from here, and one
                 # unwritable log must not turn a routine reload into a full intake rollback.
                 self._log_write_refused_restart(name)
-                await self._stop_inbound_unsafe(name)
+                # Recorded before the await: the stop pops the source first, so a raise from it
+                # still leaves the listener unbound, and a waiting halt must still alert it.
                 self._log_refused_rebinds.add(name)
+                await self._stop_inbound_unsafe(name)
                 return
             self._ensure_inbound_workers(name)
 
@@ -5934,7 +5936,17 @@ class RegistryRunner:
                 if name in self._log_refused_rebinds and name not in self._sources
             ]
             self._log_refused_rebinds.difference_update(refused)
-            inbounds, outbounds = self._log_halt_lanes()
+            try:
+                inbounds, outbounds = self._log_halt_lanes()
+            except Exception:
+                # Guarded like the read before the wait. With no list, every bound listener is
+                # unbound and every registry outbound not already paused is paused, without the
+                # ownership check that may be what raised: failing closed, not stopping nothing.
+                log.exception(
+                    "log-failure halt: reading the lanes to stop raised for sink %r", sink
+                )
+                inbounds = list(self._sources)
+                outbounds = [n for n in self.registry.outbound if n not in self._outbound_paused]
             # THE INTERNAL STAGES, again, for the graph as it stands now: a reload that held the lock
             # may have added an inbound it did not bind. EVERY REGISTRY INBOUND, deliberately wider
             # than `inbounds` (the BOUND ones, for the per-connection stop): an inbound whose
@@ -5991,6 +6003,7 @@ class RegistryRunner:
                 continue  # a reload's rebind gate already re-armed it
             if name not in self.registry.inbound:
                 self._log_halted.discard(name)  # a reload removed it: nothing to re-arm
+                self._log_refused_rebinds.discard(name)
                 continue
             try:
                 if self._resume_inbound_processing(name) and self._running:
@@ -6296,16 +6309,14 @@ class RegistryRunner:
         is still to come. This covers only an inbound whose listener binds: the caller binds first
         and unbinds on a refusal, and an added inbound that never binds never reaches this gate."""
         halted = name in self._log_halted
-        if not halted and not self._log_write_stopped:
-            return True
-        if not self._log_recovery_ok():
+        if (halted or self._log_write_stopped) and not self._log_recovery_ok():
             if not halted:
                 self._halt_inbound_processing([name])
             return False
+        self._log_refused_rebinds.discard(name)  # it re-arms, so no halt alerts it as refused
         if not halted:
-            return True  # the probe cleared the latch: the log works, and nothing here was halted
+            return True  # nothing here was halted, and the latch is clear or the probe cleared it
         self._log_halted.discard(name)
-        self._log_refused_rebinds.discard(name)
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
             dispatcher = self._dispatchers.get(stage)
             if dispatcher is not None:
