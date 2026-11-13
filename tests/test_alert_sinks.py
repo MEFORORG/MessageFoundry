@@ -175,7 +175,8 @@ async def test_a_send_cancelled_on_its_own_does_not_end_the_drain(
     A transport that cancels its own task with current_task().cancel() leaves the cancel count on
     that task, not on the drain; it was read as the drain's cancel, which ended the drain with
     nothing logged. ``cancels_own_task_and_returns`` returns before the cancel lands, so the send
-    went out: the observer hears it, no loss is logged, and its task's late cancel ends nothing."""
+    went out: the observer hears it, no loss is logged, and its task's late cancel is logged and
+    ends nothing."""
     heard: list[str] = []
     returns = how == "cancels_own_task_and_returns"
 
@@ -198,31 +199,42 @@ async def test_a_send_cancelled_on_its_own_does_not_end_the_drain(
     assert [e["connection"] for e in good.events] == ["OB_X", "OB_Y"]
     lost = [r for r in caplog.records if "alert transport odd was cancelled" in r.getMessage()]
     assert len(lost) == (0 if returns else 2), caplog.text
+    late = [r for r in caplog.records if "transport odd ended cancelled" in r.getMessage()]
+    assert len(late) == (2 if returns else 0), caplog.text
     assert sorted(heard) == (["good", "good", "odd", "odd"] if returns else ["good", "good"])
 
 
 async def test_a_lost_send_is_logged_while_a_sibling_still_hangs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A send that cancels itself is logged as it ends, not once its siblings end: a hung sibling,
-    or a drain cut while it hangs, does not hold back or drop the line."""
+    """A send that cancels its own task is logged as it ends, not once its siblings end: a hung
+    sibling, or a drain cut while it hangs, does not hold back or drop the line."""
 
-    class _SelfCancelled(_RecordingTransport):
+    class _CancelsItself(_RecordingTransport):
         async def send(self, event: dict[str, Any], **kw: Any) -> None:
-            raise asyncio.CancelledError
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
 
     hung = _HungTransport("webhook")
-    sink = NotifierAlertSink([_SelfCancelled("email"), hung])
+    sink = NotifierAlertSink([_CancelsItself("email"), hung])
     sink.start()
     try:
         sink.connection_stopped("OB_X", detail="boom")
         await asyncio.wait_for(hung.entered.wait(), 5.0)
-        await asyncio.sleep(0)
+        for _ in range(3):
+            await asyncio.sleep(0)
         assert "alert transport email was cancelled" in caplog.text
         assert not hung.cancelled  # the control: the sibling is still hung
-    finally:
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(sink.aclose(), 0.2)
+        assert hung.cancelled
+        assert caplog.text.count("alert transport email was cancelled") == 1
+    finally:
+        if sink._task is not None:
+            sink._task.cancel()
+            await asyncio.gather(sink._task, return_exceptions=True)
 
 
 async def test_a_cut_drain_waits_for_every_send_to_finish_its_cancel_cleanup() -> None:

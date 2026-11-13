@@ -329,9 +329,9 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
     drain loop. Items are handled one at a time; :class:`NotifierAlertSink` runs each item's sends
     concurrently inside its :meth:`_handle` (BACKLOG #5907), and a cancel of the drain task returns
     from that only once every one of those sends' tasks has ended. A cancel does not stop a worker
-    thread a send started with ``asyncio.to_thread``, so that runs on to its own timeout. Lifecycle: :meth:`start` once an event
-    loop is running (the ASGI lifespan does this), :meth:`aclose` on shutdown (enqueues a ``None``
-    sentinel, drains what's queued, then stops)."""
+    thread a send started with ``asyncio.to_thread``, so that runs on to its own timeout.
+    Lifecycle: :meth:`start` once an event loop is running (the ASGI lifespan does this),
+    :meth:`aclose` on shutdown (enqueues a ``None`` sentinel, drains what's queued, then stops)."""
 
     def __init__(self, *, max_queue: int = _MAX_QUEUE) -> None:
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
@@ -2680,26 +2680,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # send in a child task and passes every cancel of this task on to every send.
         # return_exceptions=True makes it wait for every child task to end, a send's async cancel
         # cleanup included, before the drain's cancel leaves here: without it the first send to
-        # end would return the cancel at once, and a sibling's cleanup could outlive aclose(). A
-        # cancel does not stop a worker thread a send started with to_thread; that runs on to its
-        # own socket timeout either way.
-        results = await asyncio.gather(
-            *(
-                deliver(transport)
-                for transport in self._transports
-                if targets is None or transport.name in targets
-            ),
-            return_exceptions=True,
-        )
-        for result in results:
+        # end would return the cancel at once, and a sibling's cleanup could outlive aclose().
+        # (The class docstring says what a cancel does not stop.)
+        chosen = [t for t in self._transports if targets is None or t.name in targets]
+        results = await asyncio.gather(*(deliver(t) for t in chosen), return_exceptions=True)
+        for transport, result in zip(chosen, results, strict=True):
             if isinstance(result, asyncio.CancelledError):
-                # A drain cancel during the gather is raised by the gather itself. A cancel here
-                # is a send that cancelled its own task and returned before the cancel landed, so
-                # the send went out and the observer heard it; only a drain cancel goes on.
-                if drain_cancelled():
-                    raise result
+                # A drain cancel during the gather is raised by the gather itself, so this is a
+                # child that ended cancelled outside the send's own handler: at least a send that
+                # cancelled its own task and returned before the cancel landed, or an observer
+                # that raised CancelledError. Say so rather than drop it; the drain goes on.
+                log.warning(
+                    "alert transport %s ended cancelled after its send for %s/%r",
+                    transport.name,
+                    event.get("type"),
+                    event.get("connection"),
+                )
             elif isinstance(result, BaseException):
-                raise result  # deliver handles every Exception, so this is a BaseException
+                raise result  # what deliver let out, raised once every send has ended
 
 
 def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:
