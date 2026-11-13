@@ -859,7 +859,9 @@ def _refuse_unsendable_conditional_query(query: str, conditional: str | None, ba
     the whole lane one message at a time, each as a permanent per-message refusal. Each form is
     judged by its own sink. ``conditional-update`` puts the query unencoded in the request line,
     which http.client sends as ASCII and refuses with any space in it, so whitespace and non-ASCII
-    are refused. ``if-none-exist`` puts it in the ``If-None-Exist`` header, which http.client
+    are refused. It must also pass :func:`_entry_query_ok`, the shape a Bundle entry's query meets:
+    at least a ``#`` would otherwise be split off client-side as a fragment, so the server would
+    run a shorter search than the one configured. ``if-none-exist`` puts it in the ``If-None-Exist`` header, which http.client
     encodes as Latin-1 and where a space is legal, so only non-Latin-1 is refused. Control
     characters were already refused by :func:`_reject_config_control_chars`.
 
@@ -870,10 +872,11 @@ def _refuse_unsendable_conditional_query(query: str, conditional: str | None, ba
     """
     setting = "FHIR destination 'conditional_query'"
     if conditional == "conditional-update":
-        if not query.isascii() or any(ch.isspace() for ch in query):
+        if not query.isascii() or not _entry_query_ok(query):
             raise ValueError(
-                f"{setting} must be ASCII with no whitespace for conditional='conditional-update' "
-                "(it is sent unencoded in the request URL); percent-encode the search parameters"
+                f"{setting} must be ASCII name=value pairs joined by '&', with no whitespace, '#' "
+                "or backslash, for conditional='conditional-update' (it is sent unencoded in the "
+                "request URL); percent-encode the search parameters"
             )
         shortest = len(base) + len("/X?") + len(query)
         if shortest > MAX_OUTBOUND_URL_LEN:

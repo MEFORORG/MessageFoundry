@@ -320,6 +320,9 @@ _OVER_HEADER_LIMIT_QUERY = "a=" + "x" * (MAX_OUTBOUND_HEADER_VALUE_LEN - 1)
         "identifier=sys|\u00e9",  # non-ASCII, though Latin-1
         "identifier=sys|\u2603",  # non-Latin-1
         "identifier=sys|a\u00a0b",  # a non-ASCII space
+        "identifier=sys|MRN#123",  # '#': urllib would send only the part before it
+        "identifier=",  # no criteria: a lenient server would match every resource
+        "x=%0A",  # a percent-encoded control character
     ],
 )
 def test_url_form_conditional_query_refused_at_construction(value: str) -> None:
