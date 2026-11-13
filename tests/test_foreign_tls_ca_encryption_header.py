@@ -343,7 +343,6 @@ def test_libpqs_root_certificate_controls_still_build(
     assert "SSLmode=verify-full;" in _build_psql()
 
 
-@pytest.mark.usefixtures("_no_libpq_root")
 def test_pgsslrootcert_system_reads_the_file_older_libpq_opens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -604,9 +603,9 @@ def test_libpqs_windows_home_comes_from_the_ansi_shell_call(
 def test_a_ctypes_failure_is_a_valueerror_from_the_build(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    """Red before these were caught: an ``ImportError`` of ``ctypes`` and a ``ctypes.ArgumentError``
-    from the call escaped the builder as themselves, not as a ``ValueError`` (vault BACKLOG #8153
-    item 18)."""
+    """An ``ImportError`` of ``ctypes`` and a ``ctypes.ArgumentError`` from the call are an
+    ``OSError`` the build refuses as a ``ValueError`` (vault BACKLOG #8153 item 18). Red before
+    the import was caught: its ``ModuleNotFoundError`` escaped the builder as itself."""
     import ctypes
 
     if failure == "import":
