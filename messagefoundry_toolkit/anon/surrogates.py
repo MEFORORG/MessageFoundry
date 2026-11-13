@@ -517,9 +517,9 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
 
     A part is a site code on any reading :func:`_reads_as_site_code` takes, so one joined to an
     escaped delimiter or written with a hex escape is replaced too, and the whole part as written,
-    escape sequences included, gives way to digits of its own width (BACKLOG #5632). A subcomponent
-    is replaced on its own; a component that still reads as a site code decoded whole, because an
-    escape pairs across its subcomponent separator, is replaced whole. The surrogate is keyed on
+    escape sequences included, gives way to digits of its own width (BACKLOG #5632). A component
+    with subcomponents that reads as a site code whole, as received, is replaced whole, its
+    subcomponent separators included; otherwise each subcomponent is replaced on its own. The surrogate is keyed on
     the part as written, so one site code written two ways gets two unrelated surrogates.
     ``field_sep`` is the message's field separator, which ``\\F\\`` decodes to."""
     if not value or not _SITE_PREFIXES:
@@ -538,8 +538,12 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|")
         return _fake(part) if _reads_as_site_code(part, seps, field_sep) else part
 
     def _component(comp: str) -> str:
-        comp = seps.subcomponent.join(_one(sub) for sub in comp.split(seps.subcomponent))
-        return _one(comp) if seps.subcomponent in comp else comp
+        # The whole-component reading is decided on the component as received: replacing a
+        # subcomponent first can remove the escape that makes the component split on whitespace,
+        # which would leave a code in a sibling subcomponent, as in ``Call 971234&97\X31\234``.
+        if seps.subcomponent in comp and _reads_as_site_code(comp, seps, field_sep):
+            return _fake(comp)
+        return seps.subcomponent.join(_one(sub) for sub in comp.split(seps.subcomponent))
 
     return seps.repetition.join(
         seps.component.join(_component(comp) for comp in rep.split(seps.component))

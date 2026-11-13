@@ -227,6 +227,27 @@ def test_trimming_a_long_whitespace_run_is_linear() -> None:
     assert time.perf_counter() - started < 0.5
 
 
+@_SURROGATES
+def test_a_code_beside_an_escaped_code_in_a_sibling_subcomponent_is_scrubbed(
+    surrogates: ModuleType, site_prefix: str
+) -> None:
+    """Replacing the escaped subcomponent first removed the escape that makes the component
+    split on whitespace, so the raw code beside it survived and the check passed."""
+    text = _zpd("Call 971234&97\\X31\\234")
+    scrubbed = surrogates.scrub_message_site_codes(text, Keyer(_SALT), ())
+    assert "971234" not in scrubbed.split("\r")[-1], scrubbed
+    assert not surrogates.message_has_site_code(scrubbed)
+
+
+@_NO_SCANNER
+@_SIDES
+def test_anonymize_checked_emits_no_code_beside_an_escaped_code(
+    anon: ModuleType, site_prefix: str
+) -> None:
+    out = anon.anonymize_checked(_zpd("Call 971234&97\\X31\\234"), salt=_SALT)
+    assert "971234" not in out
+
+
 @_NO_SCANNER
 @_SIDES
 def test_anonymize_checked_emits_no_escaped_site_code(anon: ModuleType, site_prefix: str) -> None:
