@@ -1070,7 +1070,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     check_privileges.add_argument(
         "--db",
         default=None,
-        help="store path (overrides [store].path; a relative path is read from the current directory)",
+        help="store path (overrides [store].path; a relative path is read under "
+        "[environments].base_dir when one is set, else from the current directory)",
     )
     check_privileges.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -1947,9 +1948,11 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
     ``--project-root`` here, so a base_dir set in the file or the environment is applied too, as
     each engine shard's ``serve`` applies it to its own ``[store].path``. No engine shard's
     directory can take the name: those are ``engine`` or start ``shard-``."""
-    from messagefoundry.config.anchor import anchored_store_path
+    from messagefoundry.config.anchor import anchored_store_path, resolve_project_root
 
-    store_path = anchored_store_path(db_base, settings.environments.base_dir, cwd=Path.cwd())
+    cwd = Path.cwd()
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=cwd)
+    store_path = anchored_store_path(db_base, root, cwd=cwd)
     return str(_forward_spool_root(settings, store_path) / "supervisor")
 
 
@@ -2715,7 +2718,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     from messagefoundry.api import create_managed_app
     from messagefoundry.auth.trust_anchors import collect_anchor_specs
-    from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
+    from messagefoundry.config.anchor import (
+        anchor_under_root,
+        anchored_store_path,
+        resolve_project_root,
+    )
     from messagefoundry.config.memory_encryption import (
         READOUT_DISCLAIMER,
         platform_memory_encryption_readout,
@@ -2826,11 +2833,9 @@ def _serve(args: argparse.Namespace) -> int:
     # Anchor a relative [store].path under the root too (whether it came from --db or the settings
     # file): one DB location follows the project root, an absolute path stays put (AC-1/AC-7). Done on
     # the loaded settings so a file-authored relative path is anchored exactly like a relative --db.
-    # The same join the offline commands' anchor_settings_store_path makes (config/anchor.py), over
-    # the root already resolved above so it is resolved, and any drive-relative warning given, once.
-    settings.store.path = (
-        anchor_under_root(settings.store.path, effective_root, cwd=cwd) or settings.store.path
-    )
+    # The rule the offline commands apply too (config/anchor.py), over the root already resolved
+    # above, so it is resolved, and any drive-relative warning given, once.
+    settings.store.path = anchored_store_path(settings.store.path, effective_root, cwd=cwd)
 
     # THE SINGLE DEFINITION of "this instance is exposed" (BACKLOG #326): an off-loopback bind, a
     # declared upstream TLS terminator, or a set [api].trusted_proxies (vault BACKLOG #2251). It is
@@ -5214,12 +5219,14 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
         generated_state_dir,
         record_generated_pair_replacements,
     )
-    from messagefoundry.config.anchor import anchored_store_path
+    from messagefoundry.config.anchor import anchored_store_path, resolve_project_root
     from messagefoundry.config.settings import hop_posture_from_ai, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store import open_store
 
-    store_path = anchored_store_path(db_base, settings.environments.base_dir, cwd=Path.cwd())
+    cwd = Path.cwd()
+    root = resolve_project_root(settings.environments.base_dir or None, cwd=cwd)
+    store_path = anchored_store_path(db_base, root, cwd=cwd)
 
     state_dir = generated_state_dir(store_path)
     replaced: list[GeneratedPairReplaced] = []
@@ -12222,6 +12229,11 @@ def _restore(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config)
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
+    from messagefoundry.config.anchor import anchor_settings_store_path
+
+    # The key custody directory sits beside the store serve opens, so resolve the path the way
+    # serve does before the keys are looked up there (BACKLOG #5927).
+    anchor_settings_store_path(settings, cwd=Path.cwd())
 
     try:
         # `run_restore` carries no `allow_unencrypted` knob at all (unlike `run_restore_verify`): the

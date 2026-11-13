@@ -653,21 +653,43 @@ def test_anchored_store_path_follows_the_root(tmp_path: Path) -> None:
     from messagefoundry.config.anchor import anchored_store_path
 
     root = tmp_path / "repo"
-    assert anchored_store_path("mf.db", str(root), cwd=tmp_path / "wd") == str(root / "mf.db")
+    assert anchored_store_path("mf.db", root, cwd=tmp_path / "wd") == str(root / "mf.db")
 
 
 def test_anchored_store_path_keeps_an_absolute_path(tmp_path: Path) -> None:
     from messagefoundry.config.anchor import anchored_store_path
 
     abs_db = str((tmp_path / "fastvol" / "store.db").resolve())
-    assert anchored_store_path(abs_db, str(tmp_path / "repo"), cwd=tmp_path) == abs_db
+    assert anchored_store_path(abs_db, tmp_path / "repo", cwd=tmp_path) == abs_db
 
 
 def test_anchored_store_path_with_no_root_is_unchanged(tmp_path: Path) -> None:
     from messagefoundry.config.anchor import anchored_store_path
 
     assert anchored_store_path("mf.db", None, cwd=tmp_path) == "mf.db"
-    assert anchored_store_path("mf.db", "", cwd=tmp_path) == "mf.db"
+
+
+def test_anchored_store_path_leaves_a_path_naming_no_file_alone(tmp_path: Path) -> None:
+    from messagefoundry.config.anchor import anchored_store_path
+
+    # Joined, `:memory:` would become a file (an NTFS stream on Windows) and "" the root itself.
+    assert anchored_store_path(":memory:", tmp_path / "repo", cwd=tmp_path) == ":memory:"
+    assert anchored_store_path("", tmp_path / "repo", cwd=tmp_path) == ""
+
+
+def test_anchored_store_path_keeps_a_drive_relative_path_under_the_root(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The same AC-8 rule anchor_under_root applies to every other member: warn, stay under root.
+    from messagefoundry.config.anchor import anchored_store_path
+
+    root = tmp_path / "repo"
+    anchored = anchored_store_path("/data/mf.db", root, cwd=tmp_path)
+    if Path("/data/mf.db").is_absolute():  # POSIX: a leading slash is absolute and stays put
+        assert anchored == "/data/mf.db"
+    else:
+        assert anchored == str(root / "data" / "mf.db")
+        assert "drive-relative" in caplog.text
 
 
 def test_anchor_settings_store_path_tolerates_no_settings(tmp_path: Path) -> None:
@@ -797,3 +819,31 @@ def test_support_bundle_reads_the_anchored_store(
     monkeypatch.setattr(support_mod, "build_bundle", _spy)
     assert main(["support-bundle", "--service-config", str(svc), "--out", "b.zip"]) == 2
     assert seen == [str(root / "mf.db")]
+
+
+def test_restore_resolves_keys_beside_the_anchored_store(
+    away_from_root: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import messagefoundry.pipeline.dr_backup as dr_backup
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    root, svc = away_from_root
+    seen: list[str] = []
+
+    async def _spy(_archive: str, *, store_settings: object, **_kw: object) -> object:
+        seen.append(store_settings.path)  # type: ignore[attr-defined]
+        raise KeyProviderError("stop after the capture")
+
+    monkeypatch.setattr(dr_backup, "run_restore", _spy)
+    main(["restore", "a.mfbak", "--to", "new.db", "--service-config", str(svc)])
+    assert seen == [str(root / "mf.db")]
+
+
+def test_verify_checks_the_anchored_store(away_from_root: tuple[Path, Path]) -> None:
+    from messagefoundry.verify.runner import _load_settings, _writable_dir
+
+    root, svc = away_from_root
+    settings, error = _load_settings(str(svc))
+    assert error is None and settings is not None
+    assert settings.store.path == str(root / "mf.db")
+    assert _writable_dir(settings) == root.resolve()
