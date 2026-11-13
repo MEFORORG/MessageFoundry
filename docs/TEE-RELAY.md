@@ -196,6 +196,12 @@ still cannot. A run that deletes nothing also scrubs, at least, when the DB has 
 relay that has written since the last checkpoint scrubs too. A run skips the scrub only when it
 deletes nothing, the flag is clear, and neither of those holds.
 
+`purge --scrub-only` is the command that always runs the scrub, whatever the flag and the hints
+say, and it exits 1 if the scrub cannot finish. **Run purges one at a time.** A scrub clears the
+flag when it finishes, so it can also clear a flag that another purge, running at the same time,
+set for rows the scrub did not cover. A later plain purge then skips the scrub unless a hint
+holds; `--scrub-only` still runs it.
+
 **The scrub is file-level only.** A checkpoint frees the `-wal` file's blocks and `VACUUM` shrinks
 the DB file, but neither overwrites the freed blocks. So the bytes can stay readable on the raw
 volume, and nothing here touches a copy or backup taken before the purge. [PHI.md section

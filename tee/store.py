@@ -491,7 +491,12 @@ class RelayStore:
         nothing, or :meth:`scrub` finishes any unfinished scrub, or raises again if it still cannot.
         A run also scrubs on the :meth:`_has_residue` hint. It skips the scrub only when it deleted
         nothing, the flag is clear and the hint is not set, so a routine sweep does not rewrite the
-        DB for nothing.
+        DB for nothing. :meth:`scrub` (``purge --scrub-only``) always runs the scrub, whatever the
+        flag and the hint say, and raises if it cannot finish.
+
+        Run purges one at a time: a scrub clears the flag when it finishes, so it can also clear a
+        flag that a concurrent purge set for rows this scrub did not cover, and a later plain purge
+        then skips the scrub unless the hint is set.
         """
         async with self._lock:
             # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
