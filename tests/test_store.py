@@ -1572,3 +1572,34 @@ async def test_a_failed_open_after_the_bind_still_settles(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="reference cache boom"):
         await MessageStore.open(tmp_path / "bound.db")
     assert settles == [False, True]
+
+
+async def test_cleanup_failed_open_releases_when_the_settle_is_cancelled() -> None:
+    """BACKLOG #5720: a cancel ending the settle is not an ``Exception``, so the release must sit
+    in a ``finally`` behind it, or the pool and the executor leak."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    released: list[str] = []
+
+    async def cancelled_settle(**_kwargs: object) -> None:
+        raise asyncio.CancelledError
+
+    async def release() -> None:
+        released.append("released")
+
+    await cleanup_failed_open(RuntimeError("open boom"), release, checkpoint=cancelled_settle)
+    assert released == ["released"]
+
+
+async def test_cleanup_failed_open_runs_nothing_on_generator_exit() -> None:
+    """BACKLOG #5720: a coroutine being closed cannot await, so the cleanup returns at once and
+    the caller re-raises the ``GeneratorExit`` unchanged."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    released: list[str] = []
+
+    async def release() -> None:
+        released.append("released")
+
+    await cleanup_failed_open(GeneratorExit(), release)
+    assert released == []

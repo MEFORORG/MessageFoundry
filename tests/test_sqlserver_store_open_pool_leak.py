@@ -343,9 +343,11 @@ async def test_a_cancel_during_the_cleanup_still_releases_everything(
     task = asyncio.create_task(SqlServerStore.open(_settings()))
     await asyncio.wait_for(settling.wait(), 5)
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as raised:
         await task
 
     assert settles == [False, True]
     assert pool.closed == 1
+    assert pool.wait_closed_called == 1
     assert executor.shutdown_calls == [False]
+    assert isinstance(raised.value.__cause__, RuntimeError)

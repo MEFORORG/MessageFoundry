@@ -284,8 +284,9 @@ async def test_a_cancel_during_the_cleanup_still_closes_the_pool(
 async def test_a_settle_failure_after_a_failed_open_is_logged_by_class_only(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5720, vault BACKLOG #3054: the failed open's settle names the class only, and the
-    open's own error still propagates."""
+    """BACKLOG #5720, vault BACKLOG #3054: a settle failure that reaches the failed open's cleanup
+    is named by class only, and the open's own error still propagates. This covers the cleanup's
+    own guard; a failed add() inside ``checkpoint_invocations`` is logged there, as before."""
     pool = _FakePool()
     _install_fake_asyncpg(monkeypatch, pool)
     settles: list[bool] = []

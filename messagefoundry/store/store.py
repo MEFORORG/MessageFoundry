@@ -1955,28 +1955,37 @@ async def cleanup_failed_open(
     checkpoint: Callable[..., Awaitable[object]] | None = None,
 ) -> None:
     """Run a failed store open's cleanup to completion through :func:`_run_to_completion`, so a
-    cancel cannot cut it short and leak what the open built (BACKLOG #5720). ``settle`` is the
-    store's ``checkpoint_cipher_invocations``, passed only once the open has bound the cipher to
-    this store's salt: it then squares the block the open reserved. ``release`` closes what the
-    open built and logs its own failures by class. A settle failure is logged by class too, so
-    neither replaces the open's error (vault BACKLOG #3054). Raises a cancel that landed during
-    the cleanup when ``exc`` is not one; the caller re-raises ``exc`` otherwise."""
+    cancel cannot cut it short and leak what the open built (BACKLOG #5720). ``checkpoint`` is
+    the store's ``checkpoint_cipher_invocations``, passed only once the open has bound the cipher
+    to this store's salt: it then squares the block the open reserved. ``release`` closes what the
+    open built, whatever the settle raised, and logs its own failures by class. A settle failure
+    that reaches here is logged by class too, so neither replaces the open's error (vault BACKLOG
+    #3054). Raises a cancel that landed during the cleanup when ``exc`` is an ``Exception``; the
+    caller re-raises ``exc`` otherwise.
+
+    A ``GeneratorExit`` runs nothing: a coroutine being closed cannot await, so the cleanup could
+    not run there and awaiting would replace the exit with a ``RuntimeError``."""
+    if isinstance(exc, GeneratorExit):
+        return
 
     async def body() -> None:
-        if checkpoint is not None:
-            try:
-                await checkpoint(settle=True)
-            except Exception as failure:  # noqa: BLE001 — cleanup must never mask the open's error
-                log.warning(
-                    "could not settle the AES-GCM invocation bound after a failed store open (%s)",
-                    type(failure).__name__,
-                )
-        await release()
+        try:
+            if checkpoint is not None:
+                try:
+                    await checkpoint(settle=True)
+                except Exception as failure:  # noqa: BLE001 — never mask the open's error
+                    log.warning(
+                        "could not settle the AES-GCM invocation bound after a failed store open"
+                        " (%s)",
+                        type(failure).__name__,
+                    )
+        finally:
+            await release()
 
     # body() catches Exception, so _run_to_completion's revoke wording can only be logged for a
     # BaseException that is not one, or a cancel of the body's own task.
     cancelled, _failure = await _run_to_completion(body)
-    if cancelled and not isinstance(exc, asyncio.CancelledError):
+    if cancelled and isinstance(exc, Exception):
         raise asyncio.CancelledError from exc
 
 
@@ -11009,8 +11018,9 @@ class MessageStore:
         # checked.
         self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
         self._seal_pager = SealPager()
-        # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
-        # may already count for another store, so close() must not settle its reserve here.
+        # ADR 0196: True from the start of a writable open until it binds this store's salt into
+        # the cipher (BACKLOG #5720). Until then the cipher may count for another store, or for
+        # none, so close() must not settle its reserve here.
         self._cipher_foreign = False
         # BACKLOG #1780: set by open(read_only=True). The handle is `mode=ro`, so it writes nothing
         # at open or at close: no salt, no invocation reserve, no audit genesis row.
