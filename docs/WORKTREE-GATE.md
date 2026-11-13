@@ -133,16 +133,11 @@ under each spelling. Until BACKLOG #5642 a single-quoted path kept its quotes, n
 allowed. At least these spellings are still NOT read as the shell reads them, and some are allowed:
 a quoted `-C`, `--work-tree`, `GIT_WORK_TREE`, `--git-dir` or `GIT_DIR` value that contains a space,
 which is truncated at the space (the residual listed in the hook beside rule 3d; a quoted `cd` target
-with a space is read whole); a path with an adjacent quoted piece, such as `'<path>'/` or `<path>''`, which keeps
-its quotes; and `Push-Location <x>; Pop-Location`, which is read as standing in `<x>`. A quoted path
+with a space is read whole); a word joined from more than one quoted or unquoted piece, such as
+`'<a>'/'<b>'`, `'<a>''<b>'` or `<path>''`, which keeps its quotes and is read as before #5642 (some such
+spellings are allowed, as on origin/main); `-C ""`, which the readers do not match; and `Push-Location <x>; Pop-Location`, which is read as standing in `<x>`. A quoted path
 inside a quoted message, such as a commit message, keeps its own quotes, as it did before #5642,
 and so does a quoted path after a quote the line never closes.
-
-**A command too costly to judge in time is refused (rule 3e).** The hook is killed after 15 s, and a
-killed hook lets the command through unjudged. So the gate keeps its own clock: once 7 s are spent,
-it stops judging before its next git call or scan, refuses, and asks for the command to be split. The
-clock does not interrupt a single step already running, so one git call against an unreachable host can
-still outlast the timeout.
 
 **Rule 3d judges every invocation on the line.** Each `git worktree remove` or `move` outside quotes is
 judged. Its victim is resolved against the line's first `-C`, and also against that invocation's

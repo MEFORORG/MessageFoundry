@@ -11,9 +11,6 @@ from the wrong place, so the gate judged a different path from the one the shell
 * BACKLOG #5643 -- rule 3d sliced the raw line at its FIRST `worktree remove|move` and judged one
   invocation, resolving a relative victim from the line's first `-C`, so a quoted mention, a second
   invocation or another command's `-C` let a governed linked worktree be removed or moved.
-* A line holding more git invocations than the gate can judge inside its hook timeout is refused,
-  because a killed hook lets the command through (review of BACKLOG #5643).
-
 (BACKLOG #5655, per-invocation rules 3 and 3b, was taken back out of this branch and goes to a
  later Builder as one design; its tests went with it.)
 
@@ -328,60 +325,7 @@ def test_an_earlier_quote_character_does_not_make_a_message_live(rig: SimpleName
     assert _allowed(rig, cmd, rig.outside)
 
 
-# ------------------------------------------------------------------ rule 3e: the time budget
-#
-# A hook killed by its 15 s timeout lets the command through, so each shape below must come back
-# DENIED, by any rule, well inside that timeout. The bound includes pwsh start-up, which the gate's own
-# clock cannot see. Each was measured past 15 s before the budget, with the trailing reset unjudged.
-
-_HOOK_BOUND_S = 13
-
-
-def _denied_in_time(rig: SimpleNamespace, cmd: str, cwd: Path) -> str:
-    import time
-
-    started = time.monotonic()
-    reason = _reason(rig, cmd, cwd)
-    elapsed = time.monotonic() - started
-    assert elapsed < _HOOK_BOUND_S, f"the verdict took {elapsed:.1f}s; the install timeout is 15s"
-    return reason
-
-
-def test_a_line_of_150_worktree_removes_is_refused_in_time(rig: SimpleNamespace) -> None:
-    """Measured 24.3 s before."""
-    removes = " ; ".join(f"git worktree remove {rig.tmp.as_posix()}/nope{i}" for i in range(150))
-    _denied_in_time(rig, f"{removes} ; git reset --hard", rig.primary)
-
-
-def test_one_git_token_with_200_worktree_remove_words_is_refused_in_time(
-    rig: SimpleNamespace,
-) -> None:
-    """Measured 18.7 s before: a count of git tokens saw two."""
-    words = " ".join(f"worktree remove {rig.tmp.as_posix()}/n{i}" for i in range(200))
-    _denied_in_time(rig, f"git {words} ; git reset --hard", rig.primary)
-
-
-def test_twenty_removes_behind_a_97_kb_prefix_are_refused_in_time(rig: SimpleNamespace) -> None:
-    """Measured 25.7 s before: every invocation rescanned its own long prefix."""
-    filler = " ".join(f"'w{i:05d}'" for i in range(97 * 1024 // 9))
-    removes = " && ".join(f"git worktree remove ../n{i}" for i in range(19))
-    cmd = (
-        f"cd '{rig.outside.as_posix()}' && echo {filler} && {removes} && "
-        f"git -C {rig.primary.as_posix()} reset --hard"
-    )
-    _denied_in_time(rig, cmd, rig.outside)
-
-
-def test_200_identical_remove_lines_are_refused_in_time(rig: SimpleNamespace) -> None:
-    """Measured 24.0 s before: a count over distinct lines saw one."""
-    lines = "\n".join([f"git worktree remove {rig.tmp.as_posix()}/nope"] * 200)
-    _denied_in_time(rig, f"{lines}\ngit reset --hard", rig.primary)
-
-
-def test_commits_with_two_line_messages_are_not_double_counted(rig: SimpleNamespace) -> None:
-    """The count read the physical and the logical view of each commit, refusing 11 commits."""
-    cmd = "\n".join(f'git commit --allow-empty -q -m "a{i}\nb{i}"' for i in range(11))
-    assert _allowed(rig, cmd, rig.outside)
+# ------------------------------------------------------------------ joined quote pieces
 
 
 def test_a_quote_pair_joined_to_a_further_piece_is_not_stripped(rig: SimpleNamespace) -> None:
@@ -403,3 +347,11 @@ def test_an_echoed_cd_does_not_move_rule_3ds_own_base(rig: SimpleNamespace) -> N
     """The real victim is the governed `<tmp>/Primary-wt2`; `echo cd` moves no shell."""
     cmd = f"echo cd {rig.outside2.as_posix()} && git worktree remove ../Primary-wt2"
     assert "worktree remove" in _reason(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize("word", ["'{tmp}'/'Primary'", "'{tmp}/Pri''mary'"])
+def test_a_word_joined_from_quoted_pieces_keeps_its_quotes(rig: SimpleNamespace, word: str) -> None:
+    """The shell hands git `<tmp>/Primary`, the governed primary. DENY on origin/main; stripping only
+    the outer pair read a path naming nothing and allowed it."""
+    cmd = f"git -C {word.format(tmp=rig.tmp.as_posix())} reset --hard"
+    assert_denied(run_gate(shell(cmd, rig.primary), rig.repos))
