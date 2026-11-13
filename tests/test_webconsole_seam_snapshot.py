@@ -516,6 +516,34 @@ def test_a_gate_body_or_a_helper_it_calls_moves_the_rendering(
     assert module._render_callable(gate, {}) != helper_before
 
 
+def test_a_weaker_restore_eol_body_moves_the_edit_resend_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_resubmit_form`` rewrites the edited body's line breaks through ``restore_eol``, so the
+    repeat key and the spend key hash what is resubmitted (BACKLOG #5930). A body change to that
+    helper, under the same name, must move the edit-resend row. It did not while ``restore_eol``
+    was not a global of ``routes/core.py``. This pins the function body only: the
+    ``EDIT_EOL_TERMINATORS`` mapping it reads is module data, which the walk skips."""
+    route = "POST /ui/messages/{message_id}/edit-resend"
+    module = _load_script(monkeypatch, "_seam_gen_restore_eol")
+    rows = dict(module.console_route_gates())
+    with module.repo_console() as console:
+        core = importlib.import_module(".routes.core", console.__name__)
+        original = core.restore_eol
+
+        # Same def name as the real helper, so only the body differs.
+        def restore_eol(raw: str, eol: str) -> str | None:
+            return raw
+
+        restore_eol.__module__ = original.__module__
+        restore_eol.__qualname__ = original.__qualname__
+        monkeypatch.setattr(core, "restore_eol", restore_eol)
+    planted = dict(module.console_route_gates())
+    assert planted[route] != rows[route]
+    # The control: the plant changed the edit-resend row and nothing else.
+    assert {k for k in rows if rows[k] != planted[k]} == {route}
+
+
 def test_a_rebound_engine_function_or_a_wrapped_body_moves_the_rendering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
