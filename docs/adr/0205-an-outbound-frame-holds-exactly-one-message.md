@@ -200,11 +200,12 @@ separators raw).
   -> `tests/test_one_frame_one_message.py::test_every_leaf_escaper_hex_escapes_c0_and_del_except_tab`,
   `tests/test_one_frame_one_message.py::test_P2_control_a_decoded_cr_is_still_refused`,
   `tests/test_one_frame_one_message.py::test_the_structural_escapes_are_unchanged`
-  *(Note 2026-11-13, BACKLOG #5928:* `convert_case` now edits the wire text and keeps a `\X0D\`
-  escape as sent, so it no longer raises on one. The second test above now asserts that the edit
-  keeps the escape and writes no raw CR, and that a decoded CR written as data, by `msg.set` on a
-  component or by `replace_literal`'s `new`, is still refused with the message unchanged. The
-  criterion is unchanged.)
+  *(Note 2026-11-13, vault BACKLOG #5928: `convert_case` now edits the wire text and keeps a
+  `\X0D\` escape as sent, so it no longer raises on one. The second test above now asserts that
+  the edit keeps the escape and writes no raw CR, and that a decoded CR written as data is still
+  refused with the message unchanged: by `msg.set` on a component, and by `replace_literal` when a
+  match would write a `new` holding it. A `replace_literal` that matches nothing writes nothing and
+  does not check `new`. The criterion is unchanged.)*
 - **AC-7** -- IF a whole-field write, `add_repetition` or `add_segment` holds `0x0B`, `0x1C` or NUL,
   THEN THE SYSTEM SHALL raise `ValueError` and write nothing.
   -> `tests/test_one_frame_one_message.py::test_writes_that_take_structure_refuse_frame_bytes_and_nul`,

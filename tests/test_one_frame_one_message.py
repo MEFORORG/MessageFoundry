@@ -222,15 +222,14 @@ def test_P2_a_hex_escaped_nul_does_not_re_enter_raw() -> None:
 
 
 def test_P2_control_a_decoded_cr_is_still_refused() -> None:
-    # An action edit keeps a hex-escaped CR escaped (BACKLOG #5928), so no raw CR reaches the wire
-    # and the value cannot split into a forged segment.
+    # convert_case edits the wire text and keeps a hex-escaped CR escaped (BACKLOG #5928), so no raw
+    # CR reaches the wire and the value cannot split into a forged segment.
     msg = Message.parse(MSH + CR + "PID|1||111||doe" + BS + "X0D" + BS + "EVN^jane" + CR)
     actions.convert_case(msg, "PID-5.1", "upper")
-    pid = msg.encode().split(CR)[1]
-    assert pid == "PID|1||111||DOE" + BS + "X0D" + BS + "EVN^jane"
+    assert _pid5(msg) == "DOE" + BS + "X0D" + BS + "EVN^jane"
     assert [line[:3] for line in msg.encode().split(CR) if line] == ["MSH", "PID"]
-    # The control: a decoded CR written back as data is still refused, by a leaf write and by an
-    # action that writes its argument as data, and the message is left unchanged.
+    # The control: a decoded CR written back as data is still refused, by a component write and by
+    # replace_literal when a match would write its new text, and the message is left unchanged.
     before = msg.encode()
     with pytest.raises(ValueError, match="segment separator"):
         msg.set("PID-5.1", "doe" + CR + "EVN")
