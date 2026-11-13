@@ -1349,6 +1349,122 @@ def test_configure_logging_tls_forwarder_roundtrip(tmp_path: Any) -> None:
         server.close()
 
 
+# --- BACKLOG #5924: RFC 5425 / RFC 6587 octet-counted framing on the stream arms ---------------
+
+
+def _octet_counted_frames(data: bytes) -> list[bytes]:
+    """Parse ``MSG-LEN SP SYSLOG-MSG`` frames (RFC 6587 section 3.4.1, RFC 5425 section 4.3) the
+    way a strict collector does, failing on anything left over."""
+    frames: list[bytes] = []
+    rest = data
+    while rest:
+        length, sep, rest = rest.partition(b" ")
+        assert sep == b" " and length.isdigit() and not length.startswith(b"0"), data
+        size = int(length)
+        assert len(rest) >= size, data
+        frames.append(rest[:size])
+        rest = rest[size:]
+    return frames
+
+
+# Two records, one multi-byte, so a length counted in characters rather than UTF-8 bytes misframes.
+_FRAMED_LINES = ("first record", "café 中文 record")
+
+
+def _expected_payload(handler: logging.handlers.SysLogHandler, line: str) -> bytes:
+    pri = handler.encodePriority(handler.facility, handler.mapPriority("WARNING"))
+    return b"<%d>" % pri + line.encode("utf-8")
+
+
+def _emit_framed_lines(handler: logging.handlers.SysLogHandler) -> None:
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    try:
+        for line in _FRAMED_LINES:
+            handler.emit(logging.LogRecord("t", logging.WARNING, __file__, 1, line, (), None))
+    finally:
+        handler.close()
+
+
+def test_the_tcp_forwarder_sends_octet_counted_frames_not_nul_terminated_ones() -> None:
+    import socket
+
+    from messagefoundry.logging_setup import _build_syslog_handler
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(10.0)
+        handler = _build_syslog_handler(
+            SyslogForward(host="127.0.0.1", port=listener.getsockname()[1], protocol="tcp")
+        )
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(10.0)
+            _emit_framed_lines(handler)
+            received = bytearray()
+            while chunk := conn.recv(4096):
+                received += chunk
+    assert b"\x00" not in received
+    assert _octet_counted_frames(bytes(received)) == [
+        _expected_payload(handler, line) for line in _FRAMED_LINES
+    ]
+
+
+def test_the_tls_forwarder_sends_octet_counted_frames(tmp_path: Any) -> None:
+    from messagefoundry.logging_setup import _build_syslog_handler
+
+    certs = _make_tls_certs(tmp_path)
+    server = _TlsSyslogServer(certs.ca, certs.key)
+    server.start()
+    try:
+        handler = _build_syslog_handler(
+            SyslogForward(
+                host="127.0.0.1",
+                port=server.port,
+                protocol="tls",
+                tls_ca_file=certs.ca,
+                tls_verify=True,
+            )
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        expected = [_expected_payload(handler, line) for line in _FRAMED_LINES]
+        want = sum(len(b"%d " % len(p)) + len(p) for p in expected)
+        try:
+            for line in _FRAMED_LINES:
+                handler.emit(logging.LogRecord("t", logging.WARNING, __file__, 1, line, (), None))
+            # Wait for the bytes BEFORE closing: an abrupt client close can reset the connection
+            # and lose what the server had not read yet (the TLS 1.3 session tickets go unread).
+            deadline = time.monotonic() + 10.0
+            while len(server.received) < want and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            handler.close()
+    finally:
+        server.close()
+    received = bytes(server.received)
+    assert b"\x00" not in received
+    assert _octet_counted_frames(received) == expected
+
+
+def test_the_udp_forwarder_stays_unframed() -> None:
+    """RFC 5426 carries one message per datagram, with no length prefix."""
+    import socket
+
+    from messagefoundry.logging_setup import _build_syslog_handler
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as collector:
+        collector.bind(("127.0.0.1", 0))
+        collector.settimeout(10.0)
+        handler = _build_syslog_handler(
+            SyslogForward(host="127.0.0.1", port=collector.getsockname()[1], protocol="udp")
+        )
+        _emit_framed_lines(handler)
+        datagrams = [collector.recv(4096) for _ in _FRAMED_LINES]
+    assert [d.rstrip(b"\x00") for d in datagrams] == [
+        _expected_payload(handler, line) for line in _FRAMED_LINES
+    ]
+
+
 # --- BACKLOG #1199: the durable off-box hand-off (queue handler + listener) ----
 # The defect these cover: attached directly to the root logger, the syslog handler's blocking send ran
 # on the thread that logged the record -- the asyncio event loop. On a first deployment a stalled-but-

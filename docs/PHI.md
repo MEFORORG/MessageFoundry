@@ -2023,7 +2023,9 @@ needs **no local agent**. TLS verification is on by default (`forward_tls_verify
 hostname); when `forward_tls_ca_file` is given, **only** that anchor is trusted (system roots are not
 loaded), and a config-load validator **refuses** `protocol = "tls"` with verification on and no CA file.
 `forward_tls_client_cert` adds a mutual-TLS client chain. `forward_tls_verify = false` is the documented
-insecure opt-out (no cert or hostname check).
+insecure opt-out (no cert or hostname check). The `tcp` and `tls` arms send octet-counted frames
+(BACKLOG #5924); [`CONFIGURATION.md`](CONFIGURATION.md) `[logging]`, `forward_protocol`, states the
+framing and the collectors it does not fit.
 
 **Hop gate `[BUILT — #1163]`.** Because the forwarded stream gets only best-effort PHI redaction and
 still carries usernames, connection names, message ids, client addresses and the tamper-evident audit chain, `serve`

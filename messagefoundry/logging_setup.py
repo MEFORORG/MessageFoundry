@@ -16,7 +16,8 @@ A copy of every record can also be **forwarded off-box** to a syslog/SIEM collec
 (``[logging].forward_*``; sec-offbox-log, ASVS 16.x) so log evidence survives a host compromise; PHI
 redaction + control-char scrubbing apply to the forwarded stream exactly as to stdout. The off-box
 transport is UDP (RFC 5426), plaintext TCP (RFC 6587), or **native TLS** (RFC 5425 — an ``ssl``-wrapped
-TCP socket, ADR 0080), so evidence can be encrypted on the wire without a local forwarding agent. That
+TCP socket, ADR 0080); both stream arms send octet-counted frames (:meth:`_TimeoutSysLogHandler.emit`,
+BACKLOG #5924), so evidence can be encrypted on the wire without a local forwarding agent. That
 socket is reached through a **bounded hand-off queue drained by its own thread**
 (:class:`_ForwardQueueHandler`), so the network send never runs on the thread that logged the record.
 
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import errno
 import json
 import logging
 import logging.handlers
@@ -792,6 +794,11 @@ _FORWARD_DRAIN_TIMEOUT = 5.0
 #: dropped item because an alert is a rare, operator-facing event rather than log traffic.
 _FORWARD_DROP_REPORT_INTERVAL = 60.0
 
+#: Minimum seconds between two "a send failed" reports from :meth:`_TimeoutSysLogHandler.handleError`
+#: (BACKLOG #5923). Rate limited for the same reason as the drop report: the report is a log record
+#: that comes back through this forwarder.
+_FORWARD_SEND_ERROR_REPORT_INTERVAL = _FORWARD_DROP_REPORT_INTERVAL
+
 #: How many queued records :meth:`_ForwardQueueListener.enqueue_sentinel` will discard to make room for
 #: the stop sentinel before giving up and letting the bounded join report the thread instead.
 _SENTINEL_PUT_ATTEMPTS = 100
@@ -859,7 +866,9 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     thread indefinitely. That thread is the forwarder's listener thread (:class:`_ForwardQueueHandler`);
     :data:`_FORWARD_TCP_TIMEOUT` says what the bound still buys once the send is off the event loop.
 
-    It also makes ``emit``'s reconnect branch reachable — see :meth:`handleError`."""
+    It also makes ``emit``'s reconnect branch reachable — see :meth:`handleError` — and frames a
+    stream send by octet counting (:meth:`emit`). Every forwarder arm is this class or its TLS
+    subclass, UDP included, so the listener reads every arm's send errors (BACKLOG #5923)."""
 
     #: ANNOTATION ONLY (no value), so nothing is created at runtime and the base class's own attribute
     #: is inherited untouched. ``SysLogHandler.socket`` is set at runtime and is absent from typeshed,
@@ -886,6 +895,11 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         **kwargs: Any,
     ) -> None:
         self._sock_timeout = timeout
+        # handleError's report state (BACKLOG #5923): its throttle, and a per-thread latch so a
+        # report that fails back into this handler returns at once instead of recursing.
+        self._last_error_report: float | None = None
+        self._unreported_errors = 0
+        self._reporting = threading.local()
         # Forward the timeout to the stdlib ctor as well (BACKLOG #350). SysLogHandler.createSocket
         # applies `self.timeout` via settimeout() *before* sock.connect(), so this is the only thing
         # that bounds the STARTUP connect; our own settimeout in createSocket runs after connect has
@@ -907,6 +921,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             # before createSocket, and leaves `socket` None on a failed connect, so the handler is
             # whole: the first send retries the connect, fails, and the listener spools.
             if not defer_connect or is_permanent_connect_error(exc):
+                self.close()  # deregisters the half-built handler; its socket is already None
                 raise
             self.startup_error = exc
 
@@ -917,6 +932,38 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         sock = getattr(self, "socket", None)
         if self._sock_timeout is not None and sock is not None:
             sock.settimeout(self._sock_timeout)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Send ``record`` as ``<PRI>`` plus the formatted line in UTF-8, framed for the transport.
+
+        **A stream send is octet-counted** (BACKLOG #5924): ``MSG-LEN SP SYSLOG-MSG``, where MSG-LEN
+        is the byte count of the encoded ``<PRI>msg``, as RFC 5425 section 4.3 requires for TLS and
+        RFC 6587 section 3.4.1 describes for plain TCP. The stdlib handler sends the line with a NUL
+        after it and no length, which a conforming collector cannot frame. There is no framing
+        setting: a collector that splits a raw TCP stream on LF alone cannot parse these frames,
+        and it could not parse the NUL-terminated ones either.
+
+        **A datagram stays unframed**, one message per datagram as RFC 5426 has it, with the
+        stdlib's trailing NUL kept as before.
+
+        Otherwise this is the stdlib ``emit`` for a network address: the same priority, the same
+        encoding, the same lazy reconnect, and every failure routed to :meth:`handleError`."""
+        try:
+            msg = self.format(record)
+            if self.ident:
+                msg = self.ident + msg
+            pri = self.encodePriority(self.facility, self.mapPriority(record.levelname))
+            payload = b"<%d>" % pri + msg.encode("utf-8")
+            if not self.socket:
+                self.createSocket()
+            if self.socktype == socket.SOCK_DGRAM:
+                if self.append_nul:
+                    payload += b"\x00"
+                self.socket.sendto(payload, self.address)
+            else:
+                self.socket.sendall(b"%d %b" % (len(payload), payload))
+        except Exception:
+            self.handleError(record)
 
     def handleError(self, record: logging.LogRecord) -> None:
         """Drop the socket after a network error, so the **next** record reconnects (BACKLOG #1199).
@@ -934,12 +981,22 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         on the listener thread; the bounded queue fills and :meth:`_ForwardQueueHandler.enqueue`
         reports the drops. With a spool (BACKLOG #1966, ADR 0200) this also sets :attr:`send_failed`,
         and the listener backs off and keeps the record on disk instead of losing it.
+
+        **A datagram too large to send** (``EMSGSIZE``) sets :attr:`send_error`, never
+        :attr:`send_failed` (BACKLOG #5923). It fails the same way on every retry, so read as a
+        network failure it would hold every later spooled entry behind it for good.
+
+        **It never calls the stdlib** ``handleError`` (BACKLOG #5923), which writes a traceback, the
+        call stack and the record's message and arguments to stderr on every failed send, outside
+        every log control, unless the process-wide ``logging.raiseExceptions`` is off. What it does
+        instead is :meth:`_report_send_error`: a throttled log line with no record content.
         """
         exc = sys.exception()
-        if exc is not None and not isinstance(exc, OSError):
-            # Not the network's fault, so no reconnect; but never counted as sent (BACKLOG #1966).
+        if exc is not None and (not isinstance(exc, OSError) or exc.errno == errno.EMSGSIZE):
+            # Not the network's fault, or deterministic, so no reconnect; but never counted as
+            # sent (BACKLOG #1966, #5923).
             self.send_error = True
-        if isinstance(exc, OSError):
+        elif isinstance(exc, OSError):
             self.send_failed = True
             sock = getattr(self, "socket", None)
             if sock is not None:
@@ -948,7 +1005,41 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
                 # it) is achieved above, and logging from inside the logging error path would recurse.
                 with contextlib.suppress(OSError):
                     sock.close()
-        super().handleError(record)
+        self._report_send_error(exc)
+
+    def _report_send_error(self, exc: BaseException | None) -> None:
+        """Report a failed send at most once per :data:`_FORWARD_SEND_ERROR_REPORT_INTERVAL`.
+
+        The line names the exception's type and errno and nothing else: no record field, and not
+        the exception's text, which for a formatting error can quote the record. The report is a log
+        record that comes back through this forwarder, so it is throttled, and a report that fails
+        back into this handler on the same thread returns at once instead of recursing (the
+        ``logging_guard`` sinks' latch)."""
+        if getattr(self._reporting, "active", False):
+            return
+        now = time.monotonic()
+        last = self._last_error_report
+        if last is not None and now - last < _FORWARD_SEND_ERROR_REPORT_INTERVAL:
+            self._unreported_errors += 1
+            return
+        self._last_error_report = now
+        unreported, self._unreported_errors = self._unreported_errors, 0
+        if exc is None:
+            cause = "no exception recorded"
+        elif isinstance(exc, OSError) and exc.errno is not None:
+            cause = f"{type(exc).__name__}, errno {exc.errno}"
+        else:
+            cause = type(exc).__name__
+        self._reporting.active = True
+        try:
+            _log.warning(
+                "off-box log forwarding: a send to the collector failed (%s); %d more failure(s) "
+                "since the last report were not reported. Record content is not shown here.",
+                cause,
+                unreported,
+            )
+        finally:
+            self._reporting.active = False
 
 
 def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
@@ -1148,10 +1239,11 @@ def _build_syslog_handler(
     The handler this returns is **not** attached to a logger directly. :func:`configure_logging` puts
     it behind :class:`_ForwardQueueHandler`, which is what keeps the send off the caller's thread.
 
-    **The UDP arm stays the plain stdlib handler**, deliberately. Its socket is unconnected and it
-    sends with ``sendto``, so there is no connection to lose mid-run and nothing for
-    :meth:`_TimeoutSysLogHandler.handleError`'s reconnect to repair; the permanent-break defect that
-    override closes is a stream-socket defect.
+    **The UDP arm is a** :class:`_TimeoutSysLogHandler` **too** (BACKLOG #5923), with no timeout.
+    The plain stdlib handler carried no failure flag, so the listener counted a local ``sendto``
+    failure (no route, a down interface) as delivered, and with a spool behind it replay deleted
+    the spooled entry unsent. The spool is kept on UDP: it holds what the drain deadline spooled
+    at stop. A datagram to a collector that is down still raises nothing, which no flag can see.
 
     ``defer_connect`` (BACKLOG #1966, set when a spool is behind the handler) absorbs a failed
     startup connect instead of raising it: the handler is returned unconnected, carrying the error
@@ -1173,15 +1265,9 @@ def _build_syslog_handler(
             timeout=_FORWARD_TCP_TIMEOUT,
             defer_connect=defer_connect,
         )
-    handler = logging.handlers.SysLogHandler(
-        address=(forward.host, forward.port), socktype=socket.SOCK_DGRAM
-    )
-    try:
-        _retry_a_swallowed_lookup(handler)
-    except OSError:
-        handler.close()
-        raise
-    return handler
+    # No defer_connect: a UDP createSocket connects nothing, so only a lookup can fail here, and
+    # that arm raised at start before this change too.
+    return _TimeoutSysLogHandler(address=(forward.host, forward.port), socktype=socket.SOCK_DGRAM)
 
 
 def _is_audit_record(item: object) -> bool:
@@ -1408,8 +1494,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         """Send one record through the target; ``False`` if it hit a network error.
 
         ``SysLogHandler.emit`` swallows the error, so the answer is read off the flag
-        :meth:`_TimeoutSysLogHandler.handleError` sets. A UDP handler has no such flag and reports
-        every send as sent, which is the most a connectionless socket can know."""
+        :meth:`_TimeoutSysLogHandler.handleError` sets, on every arm, UDP included (BACKLOG #5923).
+        A target without the flags (a test double) reports every send as sent."""
         target = self._target
         if isinstance(target, _TimeoutSysLogHandler):
             target.send_failed = False
@@ -1943,9 +2029,10 @@ class ForwarderStatus:
     #: and there is no spool to wait behind), or ``""``.
     start_failure: str = ""
     #: Whether a send that does not reach the collector is visible here at all. ``False`` over
-    #: UDP, where no failed send is counted (a datagram to a dead collector raises nothing, and
-    #: the UDP handler's own send errors are not read either): ``send_failing``, ``unsent`` and so ``lost`` then stay
-    #: at zero while every record is lost on the wire, and only queue and spool losses count.
+    #: UDP, where a datagram to a dead collector raises nothing: ``send_failing``, ``unsent`` and
+    #: so ``lost`` can then stay at zero while every record is lost on the wire. Only a local
+    #: ``sendto`` error (no route, a down interface) counts there (BACKLOG #5923), besides queue
+    #: and spool losses.
     delivery_confirmed: bool = True
     #: Whether the last send hit a network error. Also true from a deferred start, where the
     #: connect failed, until the first good send. A spool keeps the records while it has room.

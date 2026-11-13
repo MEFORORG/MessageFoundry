@@ -8,6 +8,7 @@ Synthetic HL7 only. The planted value is a made-up PID segment, never real PHI.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 import logging.handlers
@@ -22,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import log_spool
+from messagefoundry import log_spool, logging_setup
 from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_setup import (
     SyslogForward,
@@ -1313,3 +1314,163 @@ def test_a_replayed_lone_surrogate_is_sent_escaped_not_dropped(spool_dir: Path) 
             assert not spool.pending
         finally:
             fwd.close()
+
+
+# --- BACKLOG #5923: the UDP arm reports its own send errors, and handleError prints nothing ------
+
+
+class _FailingDatagramSocket:
+    """A UDP socket whose ``sendto`` raises ``error``, recording what it was handed."""
+
+    def __init__(self, error: OSError) -> None:
+        self.error = error
+        self.sent: list[bytes] = []
+
+    def sendto(self, data: bytes, _address: Any) -> int:
+        self.sent.append(data)
+        raise self.error
+
+    def close(self) -> None:
+        pass
+
+
+def _udp_forwarder(spool: LogSpool | None) -> tuple[Any, _ForwardQueueHandler]:
+    """A UDP forwarder whose listener is stopped, so a test drives it by hand."""
+    target = _build_syslog_handler(SyslogForward(host="127.0.0.1", port=9, protocol="udp"))
+    fwd = _build_queued_forwarder(target, fmt="text", spool=spool)
+    assert fwd._listener.stop_within(1.0)
+    fwd._listener._drain_deadline = None  # replay runs only outside a drain
+    fwd._listener._retry_at = 0.0
+    return target, fwd
+
+
+def test_the_udp_arm_is_the_flagged_handler_so_the_listener_reads_its_failures() -> None:
+    handler = _build_syslog_handler(SyslogForward(host="127.0.0.1", port=514, protocol="udp"))
+    try:
+        assert isinstance(handler, _TimeoutSysLogHandler)
+        assert handler.socktype == socket.SOCK_DGRAM
+    finally:
+        handler.close()
+
+
+def test_a_failed_udp_send_keeps_the_spooled_record_instead_of_deleting_it(
+    spool_dir: Path,
+) -> None:
+    """A local ``sendto`` failure (no route, a down interface) must not read as delivered: replay
+    would then advance past the entry and delete spooled log evidence that never left."""
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    target, fwd = _udp_forwarder(spool)
+    try:
+        assert spool.append(SpoolEntry(level="WARNING", line="spooled at stop"))
+        target.socket = _FailingDatagramSocket(OSError(errno.ENETUNREACH, "network unreachable"))
+        fwd._listener._replay()
+        assert spool.pending, "the entry was deleted although it was never sent"
+        assert fwd._listener.send_failing is True
+        assert fwd._listener.send_failures == 1
+        assert fwd._listener.undeliverable == 0
+    finally:
+        fwd.close()
+
+
+def test_a_failed_udp_send_with_no_spool_is_counted_as_unsent() -> None:
+    target, fwd = _udp_forwarder(None)
+    try:
+        target.socket = _FailingDatagramSocket(OSError(errno.ENETUNREACH, "network unreachable"))
+        fwd._listener.handle(logging.makeLogRecord({"msg": "live", "levelname": "WARNING"}))
+        assert fwd._listener.unsent == 1
+    finally:
+        fwd.close()
+
+
+def test_an_oversized_udp_datagram_is_undeliverable_so_replay_does_not_wedge(
+    spool_dir: Path,
+) -> None:
+    """EMSGSIZE is deterministic: the same entry fails the same way on every retry. Marked as a
+    network failure it would hold every later spooled entry behind it for good, so it is dropped as
+    undeliverable and the next entry is sent."""
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    target, fwd = _udp_forwarder(spool)
+    try:
+        assert spool.append(SpoolEntry(level="WARNING", line="too big"))
+        assert spool.append(SpoolEntry(level="WARNING", line="next"))
+        failing = _FailingDatagramSocket(OSError(errno.EMSGSIZE, "message too long"))
+        target.socket = failing
+        fwd._listener._replay()
+        assert len(failing.sent) == 2  # the second entry was tried: nothing wedged
+        assert fwd._listener.undeliverable == 2
+        assert fwd._listener.send_failures == 0
+        assert not spool.pending
+    finally:
+        fwd.close()
+
+
+@pytest.mark.parametrize("protocol", ["udp", "tcp"])
+def test_a_failed_send_prints_no_traceback_and_no_record_content_to_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    protocol: str,
+) -> None:
+    """The stdlib ``handleError`` writes a traceback, the call stack and the record's message and
+    arguments to stderr on every failed send, outside every log control (CLAUDE.md section 9). The
+    override reports once per interval, with no record content, whatever ``raiseExceptions`` says."""
+    monkeypatch.setattr(logging, "raiseExceptions", True)
+
+    def _no_connect(self: Any) -> None:
+        self.socket = None
+        if self.socktype == socket.SOCK_DGRAM:
+            self.socket = _FailingDatagramSocket(OSError(errno.ENETUNREACH, "unreachable"))
+        else:
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _no_connect)
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9),
+        socktype=socket.SOCK_DGRAM if protocol == "udp" else socket.SOCK_STREAM,
+        defer_connect=True,
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.logging_setup"):
+            for n in range(5):
+                handler.emit(
+                    logging.makeLogRecord(
+                        {"msg": "PID|1||MRN%s^^^SECRET", "args": (n,), "levelname": "WARNING"}
+                    )
+                )
+        assert capsys.readouterr().err == ""
+        reports = [r for r in caplog.records if "off-box log forwarding" in r.getMessage()]
+        assert len(reports) == 1  # throttled
+        text = reports[0].getMessage()
+        assert "MRN" not in text and "SECRET" not in text
+        assert handler.send_failed is True
+    finally:
+        handler.close()
+
+
+def test_a_report_raised_from_inside_the_error_path_does_not_recurse(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The report is itself a log record. If writing it fails back into this handler, the inner
+    ``handleError`` returns at once. The throttle is set to zero so only the guard can stop it."""
+    monkeypatch.setattr(logging_setup, "_FORWARD_SEND_ERROR_REPORT_INTERVAL", 0.0)
+    calls: list[int] = []
+
+    def _failing(self: Any) -> None:  # every reconnect gets a socket that fails too
+        self.socket = _FailingDatagramSocket(OSError(errno.ENETUNREACH, "unreachable"))
+
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _failing)
+    handler = _TimeoutSysLogHandler(address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM)
+
+    def _report_back_through(*_args: Any, **_kwargs: Any) -> None:
+        calls.append(1)
+        handler.emit(logging.makeLogRecord({"msg": "the report", "levelname": "WARNING"}))
+
+    monkeypatch.setattr(logging_setup._log, "warning", _report_back_through)
+    try:
+        handler.emit(logging.makeLogRecord({"msg": "first", "levelname": "WARNING"}))
+        assert calls == [1]
+        assert capsys.readouterr().err == ""
+    finally:
+        handler.close()

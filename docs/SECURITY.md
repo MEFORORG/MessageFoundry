@@ -7845,7 +7845,8 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   is the explicit opt-out, and with no `forward_host` forwarding stays **off** (byte-identical stdout-only
   startup). So an operator who configures a collector can't silently forget the enable flag.
 - **Native TLS transport (`forward_protocol = "tls"`; RFC 5425, ADR 0080).** The hop can be encrypted
-  **without a local agent** — an `ssl`-wrapped TCP socket. The collector's certificate is verified against an
+  **without a local agent** — an `ssl`-wrapped TCP socket, sending RFC 5425 octet-counted frames
+  (BACKLOG #5924; the framing is stated in [`CONFIGURATION.md`](CONFIGURATION.md), `forward_protocol`). The collector's certificate is verified against an
   explicit PEM trust anchor (`forward_tls_ca_file`; **only** that CA is trusted, not the system bundle) with
   hostname checking on by default; `forward_tls_verify = false` is the documented insecure opt-out and
   `forward_tls_client_cert` adds mutual TLS. The handshake is bounded by the same socket timeout as a plain
