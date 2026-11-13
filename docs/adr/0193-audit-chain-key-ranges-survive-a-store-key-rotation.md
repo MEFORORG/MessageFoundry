@@ -578,8 +578,9 @@ All against an in-process fake Transit client with key versions, never a real se
    See *Amendment 2026-11-13*, item 1. The words above are kept as decided.]**
 5. **A range row's handover tag is not moved.** `_audit_tag_ok` still regenerates the tag under
    the outgoing key and compares it. **[AMENDED 2026-11-13, BACKLOG #8222: a non-empty reply that
-   is no well-formed MAC is now logged and read as a tag that does not match, in the walk and at
-   open. See *Amendment 2026-11-13*, item 2.]**
+   is no well-formed MAC is now logged and read as a tag that does not match in the walk. The store
+   open still refuses on it; that path is unruled and on the owner's queue. See *Amendment
+   2026-11-13*, item 2.]**
 6. **The in-process key paths are unchanged.** A plain MAC provider, an in-heap key and the keyless
    mode still recompute and compare in constant time.
 
@@ -603,10 +604,11 @@ Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
 - **Status:** Accepted -- built with the change (BACKLOG #8222 items 1 and 5). The owner ruling
   of 2026-11-13, "Fix forward", on engine PR 2903 (comment 6840783854) ruled that a 504 or 408 on
   one row's verify reads as could not run. Reading that only when both asks time out is a Manager
-  decision, not the owner's words. The ruling left the store-open path to the build, so the
-  open's reading in item 2 is the build's choice.
+  decision, not the owner's words. The ruling does not cover the store-open path, which is
+  unruled and on the owner's queue, so the open is unchanged.
 - **Supersedes:** in the 2026-11-11 amendment, item 4's reading of a persistent 408 or 504 as a
-  break, and, at store open, the refused open engine PR 2903 made of a malformed handover reply.
+  break, and, in the walk only, the could-not-run engine PR 2903 made of a malformed handover
+  reply.
 
 1. **A 408 or 504 on both asks of one row's verify could not run.** Under item 4 above, a failure on
    both asks while the fixed input verified was a break, a persistent 504 among them. hvac raises a
@@ -618,16 +620,16 @@ Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
    tamper alert fires. Every other pair of failures, a timeout on one ask only among them, is read
    as item 4 says. On the genesis row at open, a persistent timeout
    now refuses the open, as any outage there does, where item 4 logged a break and opened.
-2. **A malformed reply to a handover tag is a tag that does not match.** Item 1 above makes
-   `audit_hmac` raise for a reply `transit_mac_version` does not accept. For a non-empty string it
-   now raises the subclass `AuditMacMalformedError`. `_handover_tag_ok`, which both the walk
-   (`verify_audit_rows`) and the store open (`settle_audit_ranges`) call, logs it and reads it as a
-   tag that does not match, as a forged tag is: a break at that range row in the walk, and at open
-   a logged ERROR on a store that opens with its ranges untrusted, so `rotate-key` refuses. That is
-   how both read such a reply before engine PR 2903. The open is not left to refuse: it runs before
-   every walk, `audit-verify`'s read-only open included, so a refused open would keep any walk from
-   reporting the break. An empty or non-string reply is still a plain `CipherError`: the walk could
-   not run, and the open refuses.
+2. **A malformed reply to a handover tag is a break in the walk; the open still refuses.** Item 1
+   above makes `audit_hmac` raise for a reply `transit_mac_version` does not accept. For a
+   non-empty string it now raises the subclass `AuditMacMalformedError`. The walk
+   (`verify_audit_rows`, through `_handover_tag_ok`) logs it and reads it as a tag that does not
+   match, a break at that range row, as before engine PR 2903. The store open
+   (`settle_audit_ranges`) still calls `_audit_tag_ok` with no catch, so the open refuses, as on
+   engine PR 2903; that path is unruled and on the owner's queue. The open runs before every walk,
+   `audit-verify`'s read-only open included, so for a planted range row the walk's reading is not
+   observable while the open refuses. An empty or non-string reply is still a plain `CipherError`:
+   the walk could not run, and the open refuses.
 
 Evidence, in `tests/test_transit_bound_attestation.py`:
 `test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verifies`,
@@ -639,6 +641,6 @@ Evidence, in `tests/test_transit_bound_attestation.py`:
 `test_a_504_hvac_could_not_parse_still_reads_as_a_timeout`,
 `test_a_504_through_the_store_clients_request_path_reads_as_a_timeout`,
 `test_a_malformed_transit_reply_to_a_handover_tag_is_a_break_in_the_walk`,
-`test_a_malformed_handover_reply_at_open_opens_the_store_with_a_logged_break` and
+`test_a_malformed_handover_reply_at_open_still_refuses_the_open` and
 `test_an_empty_or_non_text_transit_reply_to_a_handover_tag_still_could_not_run`.
 

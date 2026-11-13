@@ -1320,13 +1320,13 @@ class _MalformedHandoverTransit(_RotatingTransit):
         return super().generate_hmac(hash_input=hash_input, **kw)
 
 
-async def test_a_malformed_handover_reply_at_open_opens_the_store_with_a_logged_break(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+async def test_a_malformed_handover_reply_at_open_still_refuses_the_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A planted range row closing the Transit range, whose handover tag Transit answers with no
-    well-formed MAC, is read at open as a tag that does not match: a logged ERROR on a store that
-    opens, so ``audit-verify`` still reports the break. Engine PR 2903 refused the open, which
-    left no walk to report it (BACKLOG #8222 item 5)."""
+    well-formed MAC, still refuses the store open, as on engine PR 2903: the open path is unruled
+    and on the owner's queue (BACKLOG #8222 item 5). This pins the limit: while the open refuses,
+    the walk's reading of such a row as a break is not observable for it."""
     _needs_hvac()
     from messagefoundry.store.crypto import audit_key_id, generate_key
     from messagefoundry.store.store import (
@@ -1359,21 +1359,10 @@ async def test_a_malformed_handover_reply_at_open_opens_the_store_with_a_logged_
         "INSERT INTO audit_log (seq, ts, actor, action, detail, row_hash) VALUES (?, ?, ?, ?, ?, ?)",
         (seq, time.time(), "cli:tester", AUDIT_KEY_EPOCH_ACTION, detail, "0" * 64),
     )
-    malformed = f"key-range row at seq={seq} with no well-formed MAC"
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
-        store = await _transit_store(db)
-        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
-        caplog.clear()
-        try:
-            ok, msg = await store.verify_audit_chain()
-        finally:
-            await store.close()
-    walk_lines = [r.getMessage() for r in caplog.records]
-    assert any(f"seq={seq} is not authorised by the key it closes" in m for m in errors), errors
-    assert not ok and f"seq={seq}," in str(msg), msg
-    # The walk itself read the malformed reply at that row as a tag that does not match, rather
-    # than any other break the planted row also carries.
-    assert any(malformed in line for line in walk_lines), walk_lines
+    from messagefoundry.store.crypto import AuditMacMalformedError
+
+    with pytest.raises(AuditMacMalformedError):
+        await _transit_store(db)
 
 
 #: Vault's own text for an audit-MAC call refused for its version, as hvac carries it.

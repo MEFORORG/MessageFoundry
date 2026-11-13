@@ -6948,12 +6948,13 @@ def _audit_tag_ok(epoch: AuditEpoch, secret: tuple[bytes | None, AuditMacFn | No
 def _handover_tag_ok(
     epoch: AuditEpoch, secret: tuple[bytes | None, AuditMacFn | None], seq: object
 ) -> bool:
-    """:func:`_audit_tag_ok` for the range row at ``seq``, in the chain walk and at store open
-    alike. A provider reply that is a non-empty string but no well-formed MAC
+    """:func:`_audit_tag_ok` for the range row at ``seq`` in the chain walk: a provider reply that
+    is a non-empty string but no well-formed MAC
     (:class:`~messagefoundry.store.crypto.AuditMacMalformedError`) is logged and read as a tag that
-    does not match, as a forged tag is: a break in the walk, and at open a logged ERROR on a store
-    that opens with its ranges untrusted, so ``audit-verify`` can still report the break (BACKLOG
-    #8222). Any other provider failure propagates."""
+    does not match, a break at that row (BACKLOG #8222). Any other provider failure propagates.
+    The store open (``settle_audit_ranges``) calls :func:`_audit_tag_ok` itself, so there the same
+    reply still refuses the open; that path is unruled and on the owner's queue, and while it
+    refuses, the walk's reading is not observable for a planted range row."""
     try:
         return _audit_tag_ok(epoch, secret)
     except AuditMacMalformedError as exc:
@@ -7581,7 +7582,7 @@ async def settle_audit_ranges(
                 problem = f"the audit key-range row at seq={seq} {refusal}"  # BACKLOG #3420
                 break
             out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
-            if out_secret is not None and not _handover_tag_ok(parsed, out_secret, seq):
+            if out_secret is not None and not _audit_tag_ok(parsed, out_secret):
                 problem = (
                     f"the audit key-range row at seq={seq} is not authorised by the key it closes"
                 )
