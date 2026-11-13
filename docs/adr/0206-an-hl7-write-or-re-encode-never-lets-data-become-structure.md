@@ -161,7 +161,10 @@ open points settled below.
   it is not changed here. At least four template
   writes into a whole field still take decoded text as structure and are not changed here: the
   wrapper form `set_field(msg, ...)`, and templates into `add_repetition`, `append_to_field` and
-  `replace_literal`, each of which writes with `set` or `add_repetition`.
+  `replace_literal`, each of which writes with `set` or `add_repetition`. *(Note 2026-11-13,
+  BACKLOG #5928: this no longer holds for `replace_literal`. It now writes `new` as data, as
+  `set_data` writes it, so a `new` holding `^` is an escaped `^` and never a component. The other
+  three are unchanged.)*
 - **The lint's reach (rule 3).** It follows the value's data flow: the written expression, and
   every binding in the write's own scope of a name that flows into it, as `unsafe-db-lookup`
   follows a name (BACKLOG #1658). A conditional's test, a comprehension's filter, a subscript or
