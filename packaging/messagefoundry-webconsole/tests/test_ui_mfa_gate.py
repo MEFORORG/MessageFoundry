@@ -1008,8 +1008,16 @@ _PENDING_REFUSED_POSTS = (
 )
 
 #: A password form that can never rotate: the two new passwords differ. On the password route it
-#: keeps a control from signing the session out; every other route ignores the body.
-_NO_ROTATION = {"current_password": PW, "new_password": PW2, "new_password2": PW2 + "-x"}
+#: keeps a control from signing the session out. The code is for the TOTP verify route: an empty
+#: one is answered ahead of the gate (BACKLOG #5931), so a code keeps that case on the gate itself,
+#: and ``test_an_empty_verify_code_still_meets_the_gates_pending_refusal`` covers the empty one.
+#: Every other route ignores the body.
+_NO_ROTATION = {
+    "current_password": PW,
+    "new_password": PW2,
+    "new_password2": PW2 + "-x",
+    "code": "000000",
+}
 
 
 def _spy_admin_write(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -1097,6 +1105,37 @@ async def test_a_satisfied_session_is_still_charged_on_the_same_posts(
 
     assert len(calls) == 1, f"allow_admin_write calls: {calls}"
     assert await _denials_for(engine, path) == 0
+
+
+@pytest.mark.parametrize("pending", [True, False], ids=["pending", "satisfied"])
+async def test_an_empty_verify_code_still_meets_the_gates_pending_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, pending: bool
+) -> None:
+    """RED when: the empty-code check ahead of the verify gate (BACKLOG #5931) skips the gate's
+    base. A pending session on an account with a factor is refused, audited once and not charged;
+    a satisfied one is charged once and not audited. Both land on the confirm re-auth."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    t0 = 1_000_000.0
+    _pin_totp_clock(monkeypatch, t0)
+    secret = await _enroll_totp(service)
+    path = "/ui/account/mfa/verify"
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).headers["location"] == "/ui/mfa"
+        if not pending:
+            t1 = t0 + totp.DEFAULT_PERIOD
+            _pin_totp_clock(monkeypatch, t1)
+            assert (
+                await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
+            ).status_code == 303
+        calls = _spy_admin_write(service, monkeypatch)
+        r = await c.post(path, data={"code": ""}, headers=SAME_ORIGIN)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+
+    assert len(calls) == (0 if pending else 1), f"allow_admin_write calls: {calls}"
+    assert await _denials_for(engine, path) == (1 if pending else 0)
 
 
 #: The password page is not among them any more: under require_mfa an account with no TOTP is sent

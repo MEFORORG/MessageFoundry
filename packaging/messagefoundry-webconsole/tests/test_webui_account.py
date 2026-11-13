@@ -5,6 +5,7 @@ review-driven regressions."""
 
 from __future__ import annotations
 
+import inspect
 import time
 
 import httpx
@@ -21,11 +22,13 @@ from _webui_support import (
 )
 
 from messagefoundry.api import create_app
+from messagefoundry.api.security import is_route_gate
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole.routes import account as account_routes
 
 # --- L4b: self-service account (change password + TOTP MFA lifecycle), #75 phase 4 -----------------
 #
@@ -372,7 +375,8 @@ async def test_empty_code_continue_with_a_held_grant_spends_nothing(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5931 (Lander hold on PR 2933): the code-less Continue posted while the confirm grant
-    is already held, from another tab or after Back, goes to the re-auth and costs nothing.
+    is already held, from another tab or after Back, goes to the re-auth. It spends no grant, checks
+    no code, writes no ``auth.mfa_failed`` row and draws no ``allow_reauth_attempt``.
 
     RED when: the empty code reaches the confirm gate or ``confirm_mfa_enrollment``. The gate would
     spend the held grant, the check of ``""`` would write a false ``auth.mfa_failed`` row and draw
@@ -414,6 +418,58 @@ async def test_empty_code_continue_with_a_held_grant_spends_nothing(
         assert r.status_code == 200 and "shown once" in r.text
         user = await service.store.get_user(uid)
         assert user is not None and user.totp_enabled
+
+
+def test_the_empty_code_check_runs_the_verify_gates_own_base(engine: Engine) -> None:
+    """RED when: the copy of the verify gate's base the empty-code check runs drifts from the base
+    ``require_ui_reauth_only_action`` builds for the gate (BACKLOG #5931). The seam digest hashes
+    source, not the values a gate closes over, so this compares those values directly."""
+    app = create_app(engine, auth=None, serve_ui=True, webauthn_rp_from_request=True)
+    route = next(
+        r
+        for r in app.routes
+        if getattr(r, "path", None) == "/ui/account/mfa/verify"
+        and "POST" in getattr(r, "methods", ())
+    )
+    calls = [d.call for d in route.dependant.dependencies]  # type: ignore[attr-defined]
+    gate = next(c for c in calls if is_route_gate(c))
+    assert calls.index(account_routes._empty_code_goes_to_reauth) < calls.index(gate)
+    gate_vars = inspect.getclosurevars(gate).nonlocals
+    real = inspect.getclosurevars(gate_vars["base"]).nonlocals
+    copy = inspect.getclosurevars(account_routes._confirm_gate_base()).nonlocals
+    assert real.keys() == copy.keys()
+    assert {k: v for k, v in real.items() if k != "pending_refusal"} == {
+        k: v for k, v in copy.items() if k != "pending_refusal"
+    }
+    real_pending = inspect.getclosurevars(real["pending_refusal"]).nonlocals
+    assert real_pending["action"] == gate_vars["action"]
+    assert real_pending["reauth_next"](None) == "/ui/account/mfa/confirm"
+    assert copy["pending_refusal"] is account_routes._refuse_pending_confirm
+
+
+async def test_an_empty_code_under_the_opt_out_is_checked_as_before(engine: Engine) -> None:
+    """Under ``[auth].require_action_step_up = false`` there is no grant to spend, so an empty code
+    is not sent to the re-auth: the route checks it and answers "Invalid code." as main does
+    (BACKLOG #5931)."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            require_action_step_up=False,
+            admin_write_min_interval_seconds=0,
+            mfa_verify_min_elapsed_seconds=0,
+        ),
+    )
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200 and 'name="code"' in r.text
+        r = await c.post(
+            "/ui/account/mfa/verify", data={"code": ""}, headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert r.status_code == 400 and "Invalid code." in r.text and 'name="code"' in r.text
 
 
 async def test_enroll_page_keeps_the_code_form_under_the_opt_out(engine: Engine) -> None:
