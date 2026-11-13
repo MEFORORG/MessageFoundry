@@ -13,11 +13,13 @@ import inspect
 import logging
 import random
 import re
+import re._constants as sre_constants
+import re._parser as sre_parser
 import string
 import threading
 import time
 from collections.abc import Callable, Iterator
-from typing import Any, SupportsIndex
+from typing import Any, NamedTuple, SupportsIndex
 
 import pytest
 from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
@@ -34,7 +36,6 @@ from messagefoundry.redaction import (
 )
 from tests._cpu_clock import CPU_SAMPLE_FLOOR_SECONDS
 from tests.test_log_redaction_secret_domain import PCT_STARTED
-from tests.test_security_static import _has_nested_quantifier
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|FAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -658,39 +659,70 @@ def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
 # (``tests/test_security_static.py``, ``_UNSCANNABLE_RE_PATTERNS``). The budget arm above times
 # ``redact`` on two inputs, and no input it carries puts the separator-aware field run on a long
 # delimiter-free token. The arms below read the compiled patterns themselves, for real declared
-# delimiter sets and for the hardcoded pair, with a character meter and no clock.
+# delimiter sets and for the hardcoded pair, with a character meter and no clock, plus one structural
+# read for the shape the meters cannot see.
 
 #: Headers whose declared delimiters reach outside the defaults, so ``redact`` runs the
-#: separator-aware pass on them. The second and third declare ``-`` and ``\`` as the field separator,
-#: the class metacharacters ``re.escape`` must neutralise before they are spliced into a character
-#: class. The sniff refuses ``[`` and ``]`` (``_UNSAFE_DELIMITERS``).
-_LINEARITY_HEADERS = ("MSH*$@#%*SENDINGAPP", "MSH-^~\\&-SENDINGAPP", "MSH\\^~#&\\SENDINGAPP")
+#: separator-aware pass on them, keyed by test id. The dash and backslash headers declare a class
+#: metacharacter as the field separator, which ``re.escape`` must neutralise before it is spliced
+#: into a character class. The sniff refuses ``[`` and ``]`` (``_UNSAFE_DELIMITERS``).
+_LINEARITY_HEADERS = {
+    "custom-star": "MSH*$@#%*SENDINGAPP",
+    "custom-dash": "MSH-^~\\&-SENDINGAPP",
+    "custom-backslash": "MSH\\^~#&\\SENDINGAPP",
+}
 
 #: Length of the inputs the meters read. Small on purpose: the meter counts characters rather than
 #: timing them, so a short input discriminates as well as a long one, and the quadratic controls stay
-#: cheap to run.
+#: cheap to run. A multiple of 8, because the controls also read half of it and the segment meter
+#: builds its line from 4-character headers.
 _LINEARITY_CHARS = 2_000
 
-#: What ends the segment meter's line: a line break, then one more segment. A regression that anchors
-#: the segment to the end of the string rather than of the line is linear on a line that ends the
-#: string, so the metered line must not.
-_SEGMENT_LINE_END = "\rPID{}xyz"
+#: What ends one of the segment meter's two lines: a line break, then one more segment. A regression
+#: that anchors the segment to the end of the string is linear on a line that ends the string, and
+#: one that requires a line break is linear on a line that has one, so the meter reads both lines.
+_SEGMENT_LINE_END = "\rOBX{}xyz"
 
 
-def _linearity_delimiters(header: str) -> frozenset[str]:
-    """The delimiter set ``redact`` builds the separator-aware patterns over for ``header``: the
-    sniffed declaration unioned with the defaults, read through the same two steps ``redact`` takes."""
+class _LinearityCase(NamedTuple):
+    """The patterns an arm case reads, and what the meters need to build their inputs."""
+
+    delimiters: frozenset[str]
+    separator: str
+    segment: re.Pattern[str]
+    field_run: re.Pattern[str]
+
+
+def _linearity_case(case: str) -> _LinearityCase:
+    """A header's separator-aware pair, read through the same sniff and union ``redact`` uses, or
+    ``"hardcoded"`` for the default-delimiter pair every ``redact`` call runs first."""
+    if case == "hardcoded":
+        return _LinearityCase(
+            redaction._DEFAULT_DELIMITERS, "|", redaction._HL7_SEGMENT, redaction._HL7_FIELD_RUN
+        )
+    header = _LINEARITY_HEADERS[case]
     declared = redaction._sniff_delimiters(header)
     assert not declared <= redaction._DEFAULT_DELIMITERS, (
         f"{header!r} declares only default delimiters, so redact never runs the separator-aware pass "
         f"on it and an arm reading it measures nothing"
     )
-    return declared | redaction._DEFAULT_DELIMITERS
+    delimiters = declared | redaction._DEFAULT_DELIMITERS
+    sniffed = redaction._MSH_DELIMITERS.search(header)
+    assert sniffed is not None
+    return _LinearityCase(
+        delimiters, sniffed.group("fs"), *redaction._delimiter_patterns(delimiters)
+    )
 
 
-def _class_chars(delimiters: frozenset[str]) -> str:
-    """``delimiters`` escaped for a character class, in the spelling ``_delimiter_patterns`` uses."""
-    return "".join(re.escape(delimiter) for delimiter in sorted(delimiters))
+def _field_run_guard(field_run: re.Pattern[str]) -> tuple[str, str]:
+    """``(guard, class spelling)``: the field run's leading lookbehind and the delimiter spelling
+    inside it, read from the compiled pattern rather than re-derived, so a control edits what ships."""
+    opener = r"(?<![^\s"
+    assert field_run.pattern.startswith(opener), (
+        f"{field_run.pattern!r} no longer opens with the guard the controls edit"
+    )
+    guard = field_run.pattern[: field_run.pattern.index("])") + 2]
+    return guard, guard[len(opener) : -2]
 
 
 def _delimiter_free_run(delimiters: frozenset[str], chars: int) -> str:
@@ -703,55 +735,76 @@ def _delimiter_free_run(delimiters: frozenset[str], chars: int) -> str:
 
 
 def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], chars: int) -> int:
-    """Characters ``field_run`` reads across one delimiter-free token of ``chars`` characters: for
-    every start the engine admits past the pattern's leading assertion, the distance from that start
-    to the end of the token, which the run's first repetition must read before the start can succeed
-    or fail.
+    """Characters ``field_run`` reads, on the larger of two inputs of about ``chars`` characters.
 
-    **Which starts are admitted is read from the compiled pattern, not modelled.** The token is
-    followed by two more delimited fields, so a start the engine admits is a start that MATCHES, and
-    one the guard refuses does not. On the hostile input, where nothing follows the token, those same
-    starts are tried and each reads to the end of the token before failing. The distance charged per
-    start is the model: the meter does not see a start that re-reads its token more than once, the
-    nested-quantifier shape, which :func:`test_the_field_run_and_segment_patterns_nest_no_quantifier`
-    reads instead."""
-    run = _delimiter_free_run(delimiters, chars)
+    **One delimiter-free token.** Each start the engine admits past the guard is charged the rest of
+    the token, which the run's first repetition reads before the start can succeed or fail. Which
+    starts are admitted is read from the compiled pattern, not modelled: the token is followed by two
+    more delimited fields, so an admitted start MATCHES and a refused one does not.
+
+    **One-character words.** The guard admits a start after each space, which is correct; what keeps
+    it cheap is that the run class stops at the next space. Each start is charged what it matched, so
+    a run class widened over whitespace, which matches from every word to the end, is charged that.
+
+    The charge per start is the model. A start that re-reads its token more than once, the nested
+    shape, is not seen; :func:`test_the_field_run_and_segment_patterns_nest_no_repetition` reads it."""
     delimiter = min(delimiters)
-    probe = f"{run}{delimiter}x{delimiter}y"
+    fields = f"{delimiter}x{delimiter}y"
+    run = _delimiter_free_run(delimiters, chars)
+    probe = run + fields
     assert field_run.fullmatch(probe), (
         f"{field_run.pattern!r} does not take the probe from its first character, so an admitted start "
         f"would not show as a match and the meter would read zero"
     )
-    return sum(chars - start for start in range(chars) if field_run.match(probe, start))
+    token = sum(chars - start for start in range(chars) if field_run.match(probe, start))
+    words = "a " * (chars // 2 - 1) + "a" + fields
+    spaced = sum(
+        match.end() - start
+        for start in range(len(words))
+        if (match := field_run.match(words, start)) is not None
+    )
+    return max(token, spaced)
 
 
 def _segment_reads(segment: re.Pattern[str], separator: str, chars: int) -> int:
-    """Characters ``segment`` reads across ``chars`` characters of segment headers over ``separator``
-    (``ABC*ABC*...``), ended by :data:`_SEGMENT_LINE_END`.
+    """Characters ``segment`` reads, on the larger of two inputs of ``chars`` characters: a line of
+    segment headers over ``separator`` (``OBX*OBX*...``) that ends the string, and one ended by
+    :data:`_SEGMENT_LINE_END`.
 
     The sweep is ``finditer``'s: from each position the segment header occurs at, a match reads its
     own span and the sweep resumes after it, and a start that fails is charged the rest of its line,
     which ``[^\\r\\n]*`` reads before anything after it can fail. Which starts match is read from the
     compiled pattern. The header oracle is spelled here rather than borrowed from the pattern, so a
-    pattern that stops matching a header is charged for the start instead of skipping it."""
+    pattern that stops matching a header is charged for the start instead of skipping it. That is
+    also the meter's stated false red: a linear pattern that refuses ``OBX`` early would be charged
+    as if it had read to the end of the line, so a change to what counts as a segment re-derives
+    this meter rather than reading its red as quadratic."""
     end = _SEGMENT_LINE_END.format(separator)
-    assert (chars - len(end)) % 4 == 0
-    text = f"ABC{separator}" * ((chars - len(end)) // 4) + end
-    header = re.compile(rf"\b[A-Z][A-Z0-9]{{2}}{re.escape(separator)}")
-    assert len(header.findall(text)) == (chars - len(end)) // 4 + 1
-    reads = 0
-    pos = 0
-    while (found := header.search(text, pos)) is not None:
-        start = found.start()
-        match = segment.match(text, start)
-        if match is None:
-            line_end = text.find("\r", start)
-            reads += (len(text) if line_end < 0 else line_end) - start
-            pos = start + 1
-        else:
-            reads += match.end() - start
-            pos = max(match.end(), start + 1)
-    return reads
+    assert chars % 4 == 0 and (chars - len(end)) % 4 == 0, (
+        f"{chars} does not split into 4-character headers, so the meter cannot build its lines; "
+        f"_LINEARITY_CHARS must be a multiple of 8"
+    )
+    header = re.compile(rf"\bOBX{re.escape(separator)}")
+    readings = []
+    for text in (
+        f"OBX{separator}" * (chars // 4),
+        f"OBX{separator}" * ((chars - len(end)) // 4) + end,
+    ):
+        assert len(text) == chars and header.search(text) is not None
+        reads = 0
+        pos = 0
+        while (found := header.search(text, pos)) is not None:
+            start = found.start()
+            match = segment.match(text, start)
+            if match is None:
+                line_end = text.find("\r", start)
+                reads += (len(text) if line_end < 0 else line_end) - start
+                pos = start + 1
+            else:
+                reads += match.end() - start
+                pos = max(match.end(), start + 1)
+        readings.append(reads)
+    return max(readings)
 
 
 def _check_reads(reads: int, what: str) -> None:
@@ -776,25 +829,8 @@ def _assert_read_red_and_quadratic(reads: Callable[[int], int], what: str) -> No
     )
 
 
-#: Every case the arms read: each header's separator-aware pair, and the hardcoded pair every
-#: ``redact`` call runs first.
+#: Every case the arms read: each header's separator-aware pair, and the hardcoded pair.
 _LINEARITY_CASES = (*_LINEARITY_HEADERS, "hardcoded")
-
-
-def _patterns_case(case: str) -> tuple[frozenset[str], str, str, re.Pattern[str], re.Pattern[str]]:
-    """``(delimiters, their class spelling, field separator, segment, field run)`` for a case of
-    :data:`_LINEARITY_CASES`."""
-    if case == "hardcoded":
-        return (
-            redaction._DEFAULT_DELIMITERS,
-            "|^~&",
-            "|",
-            redaction._HL7_SEGMENT,
-            redaction._HL7_FIELD_RUN,
-        )
-    delimiters = _linearity_delimiters(case)
-    segment, field_run = redaction._delimiter_patterns(delimiters)
-    return delimiters, _class_chars(delimiters), case[3], segment, field_run
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
@@ -802,70 +838,119 @@ def test_the_field_run_and_segment_patterns_read_each_character_once(case: str) 
     """The linear-scan property BACKLOG #1437 bought, measured on each pattern rather than argued
     (#2958 step 4). The argument is stated once, at ``_delimiter_patterns``. The meters read
     characters, not a clock, so a loaded runner cannot move either arm, and the controls below show
-    each arm red on the regression it guards."""
-    delimiters, _spelling, separator, segment, field_run = _patterns_case(case)
-    _check_reads(_field_run_reads(field_run, delimiters, _LINEARITY_CHARS), "the field run")
-    _check_reads(_segment_reads(segment, separator, _LINEARITY_CHARS), "the segment pattern")
+    each arm red on the regression it guards. They see the shapes their docstrings name, at least,
+    and not every regression a pattern could take."""
+    pair = _linearity_case(case)
+    _check_reads(
+        _field_run_reads(pair.field_run, pair.delimiters, _LINEARITY_CHARS), "the field run"
+    )
+    _check_reads(
+        _segment_reads(pair.segment, pair.separator, _LINEARITY_CHARS), "the segment pattern"
+    )
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
-@pytest.mark.parametrize("regression", ["guard removed", "guard narrowed"])
-def test_a_field_run_without_its_exact_complement_guard_is_read_red(
+@pytest.mark.parametrize(
+    "regression", ["guard-removed", "guard-narrowed", "run-class-widened-over-spaces"]
+)
+def test_a_field_run_whose_guard_is_not_the_exact_complement_is_read_red(
     case: str, regression: str
 ) -> None:
     """Live positive control for the field-run arm: the shipped pattern with one edit, read by the
     same assertion, must fail it, and its reads must grow quadratically rather than by a constant.
 
-    ``guard removed`` is the pre-#1437 shape (on the hardcoded case, ``_PRE_GUARD_FIELD_RUN``).
-    ``guard narrowed`` keeps a lookbehind but one that is not the exact complement of the run class:
-    it also admits a start after a digit, so a token holding digits is re-read from every one."""
-    delimiters, spelling, _separator, _segment, field_run = _patterns_case(case)
-    guard = rf"(?<![^\s{spelling}])"
-    assert field_run.pattern.startswith(guard) and field_run.pattern.count(guard) == 1, (
-        f"{field_run.pattern!r} no longer opens with the guard this control removes, so it would "
-        f"regress nothing"
-    )
-    replacement = "" if regression == "guard removed" else rf"(?<![^\s{spelling}0-9])"
-    regressed = re.compile(replacement + field_run.pattern.removeprefix(guard))
-    if case == "hardcoded" and regression == "guard removed":
-        assert regressed.pattern == _PRE_GUARD_FIELD_RUN.pattern
+    ``guard-removed`` is the pre-#1437 shape (on the hardcoded case, ``_PRE_GUARD_FIELD_RUN``).
+    ``guard-narrowed`` admits a start after a digit too, so a token holding digits is re-read from
+    every one. ``run-class-widened-over-spaces`` leaves the guard alone and lets the run cross a
+    space, so each start the guard admits after a space reads to the end of the line."""
+    pair = _linearity_case(case)
+    guard, spelling = _field_run_guard(pair.field_run)
+    body = pair.field_run.pattern.removeprefix(guard)
+    if regression == "guard-removed":
+        regressed = re.compile(body)
+        if case == "hardcoded":
+            assert regressed.pattern == _PRE_GUARD_FIELD_RUN.pattern
+    elif regression == "guard-narrowed":
+        regressed = re.compile(rf"(?<![^\s{spelling}0-9])" + body)
+    else:
+        widened = body.replace(rf"[^\s{spelling}]", rf"[^\r\n{spelling}]")
+        assert widened != body
+        regressed = re.compile(guard + widened)
     _assert_read_red_and_quadratic(
-        lambda chars: _field_run_reads(regressed, delimiters, chars), f"the {regression} field run"
+        lambda chars: _field_run_reads(regressed, pair.delimiters, chars),
+        f"the {regression} field run",
     )
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
-@pytest.mark.parametrize(("regression", "tail"), [("line feed required", r"\n"), ("anchored", "$")])
-def test_a_segment_pattern_that_needs_more_after_its_run_is_read_red(
-    case: str, regression: str, tail: str
-) -> None:
+@pytest.mark.parametrize(
+    "tail", [r"\r", r"\n", "$"], ids=["carriage-return-required", "line-feed-required", "anchored"]
+)
+def test_a_segment_pattern_that_needs_more_after_its_run_is_read_red(case: str, tail: str) -> None:
     """Live positive control for the segment arm: the shipped pattern with something required after
-    its ``[^\\r\\n]*``, a line feed or the end of the string. Every header start then reads to the end
-    of its line and fails, and the next header reads it again: the many-starts shape, quadratic in the
-    line."""
-    _delimiters, _spelling, separator, segment, _field_run = _patterns_case(case)
-    assert segment.pattern.endswith(r"[^\r\n]*"), (
-        f"{segment.pattern!r} no longer ends in the open repetition this control extends"
+    its ``[^\\r\\n]*``, a line break or the end of the string. Every header start on a line without
+    it then reads to the end of the line and fails, and the next header reads it again: the
+    many-starts shape, quadratic in the line."""
+    pair = _linearity_case(case)
+    assert pair.segment.pattern.endswith(r"[^\r\n]*"), (
+        f"{pair.segment.pattern!r} no longer ends in the open repetition this control extends"
     )
-    regressed = re.compile(segment.pattern + tail)
+    regressed = re.compile(pair.segment.pattern + tail)
     _assert_read_red_and_quadratic(
-        lambda chars: _segment_reads(regressed, separator, chars),
-        f"the {regression} segment pattern",
+        lambda chars: _segment_reads(regressed, pair.separator, chars),
+        f"the {tail!r}-terminated segment pattern",
     )
+
+
+def _nested_repetitions(pattern: str) -> list[str]:
+    """Every repetition in ``pattern`` with no fixed count that sits inside another such repetition
+    and can give characters back: anything but a possessive one. That is the shape that lets one
+    start re-read its token many times, whether either repetition is greedy or lazy. Read from the
+    parsed pattern."""
+    repeats = (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT, sre_constants.POSSESSIVE_REPEAT)
+    found: list[str] = []
+
+    def walk(items: Any, inside: bool) -> None:
+        for op, arg in items:
+            if op in repeats:
+                low, high, body = arg
+                open_count = low != high
+                if open_count and inside and op != sre_constants.POSSESSIVE_REPEAT:
+                    found.append(f"{op} {{{low},{high}}}")
+                if open_count and inside and op == sre_constants.POSSESSIVE_REPEAT:
+                    continue
+                walk(body, inside or open_count)
+            elif op == sre_constants.SUBPATTERN:
+                walk(arg[3], inside)
+            elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
+                walk(arg[1], inside)
+            elif op == sre_constants.BRANCH:
+                for option in arg[1]:
+                    walk(option, inside)
+
+    walk(sre_parser.parse(pattern), False)
+    return found
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
-def test_the_field_run_and_segment_patterns_nest_no_quantifier(case: str) -> None:
+@pytest.mark.parametrize(
+    "nesting",
+    [r"(?:{}+)*", r"(?:{}+?)*", r"(?:{}+)*?"],
+    ids=["greedy-in-greedy", "lazy-in-greedy", "greedy-in-lazy"],
+)
+def test_the_field_run_and_segment_patterns_nest_no_repetition(case: str, nesting: str) -> None:
     """The regression the meters cannot see: a repetition inside a repeated group, which re-reads one
-    token many times from a single start. Read with the ReDoS scanner's own matcher, which cannot
-    reach the separator-aware patterns statically, on the patterns as compiled."""
-    _delimiters, spelling, _separator, segment, field_run = _patterns_case(case)
-    for pattern in (segment, field_run):
-        assert not _has_nested_quantifier(pattern.pattern), pattern.pattern
-    nested = field_run.pattern.replace(rf"[^\s{spelling}]*+", rf"(?:[^\s{spelling}]+)*", 1)
-    assert nested != field_run.pattern and _has_nested_quantifier(nested), (
-        "the nested-quantifier control did not regress the field run, so the assertion above "
-        "measures nothing"
+    token many times from a single start. Read from the patterns as compiled, since the ReDoS scanner
+    cannot reach the separator-aware ones statically, with a control per nesting shape: the field
+    run's first repetition rewritten into each must be found."""
+    pair = _linearity_case(case)
+    for pattern in (pair.segment, pair.field_run):
+        assert _nested_repetitions(pattern.pattern) == [], pattern.pattern
+    _guard, spelling = _field_run_guard(pair.field_run)
+    run = rf"[^\s{spelling}]"
+    nested = pair.field_run.pattern.replace(run + "*+", nesting.format(run), 1)
+    assert nested != pair.field_run.pattern and _nested_repetitions(nested), (
+        f"the {nesting} control did not regress the field run, so the assertion above measures nothing"
     )
 
 
