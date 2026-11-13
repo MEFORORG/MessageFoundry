@@ -196,8 +196,8 @@ separators raw).
   `tests/test_one_frame_one_message.py::test_P2_a_hex_escaped_nul_does_not_re_enter_raw`,
   `tests/test_one_frame_one_message.py::test_P10_mllp_in_edit_mllp_out_is_one_frame`
   *(Note 2026-11-13, vault BACKLOG #5928: `convert_case` keeps an escape as sent, so it does not
-  hand the leaf escaper a control decoded from one. The first two probes still check that it
-  keeps the hex escape. Each probe then writes the decoded value back as data twice: with
+  hand the leaf escaper a control decoded from one. Each probe still edits with it first and
+  checks that the escape is kept, by its wire form or by one frame. Each probe then writes the decoded value back as data twice: with
   `copy_field` from the escaped component into another one, and with a component `msg.set` of the
   decoded read onto the component that arrived with the escape. The second write does not depend
   on how any action is built. With escaping of controls removed from `escape_leaf`, all three
@@ -211,7 +211,8 @@ separators raw).
   *(Note 2026-11-13, vault BACKLOG #5928: `convert_case` now edits the wire text and keeps a
   `\X0D\` escape as sent, so it no longer raises on one. The second test above now asserts that
   the edit keeps the escape and writes no raw CR, and that a decoded CR written as data is still
-  refused with the message unchanged: by `msg.set` on a component, by `copy_field` from a
+  refused with the message unchanged: by `msg.set` on a component, given a literal CR and given
+  the decoded read of the component's own `\X0D\`, by `copy_field` from a
   component whose `\X0D\` decodes to a CR, and by `replace_literal` when a match would write a
   `new` holding it. A `replace_literal` that matches nothing writes nothing and
   does not check `new`. The criterion is unchanged.)*
@@ -253,6 +254,9 @@ Every criterion's test except AC-3 and the controls failed on the code before th
 by running them against `origin/main` `ed2b60bf89` with the new names stubbed to the old behaviour.
 The AC-12 and AC-13 tests, except the clean-payload control, failed on this branch at `94c0daaad9`,
 before the review round.
+*(Note 2026-11-13, vault BACKLOG #5928: the AC-5 test bodies were rewritten after that
+measurement and were not run against `ed2b60bf89`. What was measured for them instead is in the
+AC-5 note above.)*
 
 ## Options considered
 

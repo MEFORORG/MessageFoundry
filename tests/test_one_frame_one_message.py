@@ -228,7 +228,7 @@ def test_P2_a_hex_escaped_frame_byte_survives_a_component_edit_escaped() -> None
 def test_P2_a_hex_escaped_nul_does_not_re_enter_raw() -> None:
     msg = Message.parse(MSH + CR + "PID|1||111||doe" + BS + "X00" + BS + "^jane" + CR)
     actions.convert_case(msg, "PID-5.1", "upper")
-    assert NUL not in msg.encode()
+    assert _pid5(msg) == "DOE" + BS + "X00" + BS + "^jane"
     _write_back_decoded(msg, "PID-5.1", "PID-5.3")
     assert NUL not in msg.encode()
     assert msg.field("PID-5.1") == msg.field("PID-5.3") == "DOE" + NUL
@@ -246,7 +246,10 @@ def test_P2_control_a_decoded_cr_is_still_refused() -> None:
     before = msg.encode()
     with pytest.raises(ValueError, match="segment separator"):
         msg.set("PID-5.1", "doe" + CR + "EVN")
-    assert msg.field("PID-5.1") == "DOE" + CR + "EVN"
+    decoded = msg.field("PID-5.1")
+    assert decoded == "DOE" + CR + "EVN"
+    with pytest.raises(ValueError, match="segment separator"):
+        msg.set("PID-5.1", decoded)
     with pytest.raises(ValueError, match="segment separator"):
         actions.copy_field(msg, "PID-5.1", "PID-5.3")
     with pytest.raises(ValueError, match="segment separator"):
@@ -266,9 +269,12 @@ def test_P10_mllp_in_edit_mllp_out_is_one_frame() -> None:
     )
     assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(Message.parse(body).encode()))) == 1
     msg = Message.parse(body)
-    _write_back_decoded(msg, "PID-18.1", "PID-19.1")
-    assert msg.field("PID-18.1") == msg.field("PID-19.1") == "last" + EB + SB
+    actions.convert_case(msg, "PID-18.1", "upper")
     assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(msg.encode()))) == 1
+    _write_back_decoded(msg, "PID-18.1", "PID-19.1")
+    # The frame oracle runs before any check of the copy, so a defect in copy_field cannot hide it.
+    assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(msg.encode()))) == 1
+    assert msg.field("PID-18.1") == msg.field("PID-19.1") == "LAST" + EB + SB
 
 
 @pytest.mark.parametrize(

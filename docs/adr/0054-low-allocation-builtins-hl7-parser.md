@@ -321,9 +321,9 @@ What that costs, stated so nobody reads the record as more than it is:
   mutation writes to. Its recorded answers still hold, because python-hl7 already read that
   line's fields as `None`; only its count would now be 0, and the record holds no count.
   *(Note 2026-11-13, vault BACKLOG #5928: `actions.copy_segment` now resolves its occurrence
-  through `segment_index`, so it skips a fieldless line as the `Message` reads do. The sentence
-  above that names `actions.copy_segment` as numbering occurrences without the skip no longer
-  holds.)*
+  through `segment_index`, so it numbers occurrences with the skip, as the `Message` reads do. It
+  still reads the chosen line from the encoded lines. The `copy_segment` example above describes
+  it before this change; the general caveat it illustrates still holds for other code.)*
 
 ### Other things that moved with it
 
