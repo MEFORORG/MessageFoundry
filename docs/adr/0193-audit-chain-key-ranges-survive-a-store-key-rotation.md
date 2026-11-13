@@ -572,9 +572,10 @@ All against an in-process fake Transit client with key versions, never a real se
    `CipherError` and the walk could not run, for each failure it reads as a break; on the genesis
    row at open, such a break is logged by `settle_audit_ranges` and the store opens. Transit's
    `valid: false` is a break. A reply with no bool `valid` is a `CipherError`.
-   **[AMENDED 2026-11-13, BACKLOG #8222: when both asks fail with an HTTP 408 or 504, the result
-   is now a `CipherError` and the walk could not run, not a break; on the genesis row at open it
-   refuses the open. Every other pair of failures is read as this item says.
+   **[AMENDED 2026-11-13, BACKLOG #8222: in the chain walk only, when both asks fail with an HTTP
+   408 or 504 and the fixed input verifies, the walk could not run, not a break. Everywhere else,
+   the store open's genesis check among them, and every other pair of failures, read as this item
+   says.
    See *Amendment 2026-11-13*, item 1. The words above are kept as decided.]**
 5. **A range row's handover tag is not moved.** `_audit_tag_ok` still regenerates the tag under
    the outgoing key and compares it. **[AMENDED 2026-11-13, BACKLOG #8222: a non-empty reply that
@@ -599,27 +600,29 @@ Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
 
 - `test_audit_hmac_refuses_a_reply_its_own_check_would_reject`.
 
-## Amendment 2026-11-13 -- a timeout on both asks of a row's verify could not run; the walk reads a malformed handover reply as a mismatch
+## Amendment 2026-11-13 -- in the walk, a timeout on both asks of a row's verify could not run and a malformed handover reply is a mismatch
 
 - **Status:** Accepted -- built with the change (BACKLOG #8222 items 1 and 5). The owner ruling
   of 2026-11-13, "Fix forward", on engine PR 2903 (comment 6840783854) ruled that a 504 or 408 on
   one row's verify reads as could not run. Reading that only when both asks time out is a Manager
-  decision, not the owner's words. The ruling does not cover the store-open path, which is
-  unruled and on the owner's queue, so the open is unchanged.
-- **Supersedes:** in the 2026-11-11 amendment, item 4's reading of a persistent 408 or 504 as a
-  break, and, in the walk only, the could-not-run engine PR 2903 made of a malformed handover
-  reply.
+  decision, not the owner's words, and so is applying it to the chain walk only. The ruling does
+  not cover the store-open path, which is unruled and on the owner's queue, so the open reads both
+  items as engine PR 2903 does.
+- **Supersedes:** in the chain walk only, the 2026-11-11 amendment item 4's reading of a persistent
+  408 or 504 as a break, and the could-not-run engine PR 2903 made of a malformed handover reply.
 
-1. **A 408 or 504 on both asks of one row's verify could not run.** Under item 4 above, a failure on
+1. **In the walk, a 408 or 504 on both asks of one row's verify could not run.** Under item 4 above, a failure on
    both asks while the fixed input verified was a break, a persistent 504 among them. hvac raises a
    408, a 413 and a 504 as one class, `UnexpectedError`, with no status, so the store's Vault client
    (`keyprovider_vault._build_client`) now records each failed reply's status on hvac's error
    (`_record_reply_status`), whichever class hvac raised, `TypeError` or `AttributeError` for a
-   JSON body it cannot read among them. `_recheck_refused_row` raises a plain `CipherError` when
-   both asks fail with a 408 or 504 (`is_vault_timeout_reply`), so the walk could not run and no
-   tamper alert fires. Every other pair of failures, a timeout on one ask only among them, is read
-   as item 4 says. On the genesis row at open, a persistent timeout
-   now refuses the open, as any outage there does, where item 4 logged a break and opened.
+   JSON body it cannot read among them. When both asks fail with a 408 or 504
+   (`is_vault_timeout_reply`) and the fixed input verifies after the second, `_recheck_refused_row`
+   raises `AuditVerifyTimedOutError` in place of `False`. Only the chain walk
+   (`_audit_row_mac(..., in_walk=True)`) lets it propagate, so the walk could not run and no tamper
+   alert fires. Every other caller of `_audit_row_mac`, the store open's genesis check and the
+   one-row checks among them, logs it and reads it as a MAC that does not verify, as item 4 says.
+   Every other pair of failures, a timeout on one ask only among them, is read as item 4 says.
 2. **A malformed reply to a handover tag is a break in the walk; the open still refuses.** Item 1
    above makes `audit_hmac` raise for a reply `transit_mac_version` does not accept. For a
    non-empty string it now raises the subclass `AuditMacMalformedError`. The walk
@@ -637,6 +640,7 @@ Evidence, in `tests/test_transit_bound_attestation.py`:
 `test_a_413_on_one_rows_verify_is_still_a_break`,
 `test_a_timeout_on_only_one_ask_is_still_a_break`,
 `test_a_persistent_504_on_one_rows_verify_could_not_run_on_the_startup_walk`,
+`test_a_both_asks_timeout_on_the_genesis_verify_at_open_logs_a_break_and_opens`,
 `test_the_store_vault_client_records_the_reply_status_on_hvacs_error`,
 `test_a_504_hvac_could_not_parse_still_reads_as_a_timeout`,
 `test_a_504_through_the_store_clients_request_path_reads_as_a_timeout`,

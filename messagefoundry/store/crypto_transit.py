@@ -65,6 +65,7 @@ from messagefoundry.store.crypto import (
     AuditKeyVersionUnverifiedError,
     AuditMacMalformedError,
     AuditMacVerifier,
+    AuditVerifyTimedOutError,
     CipherError,
     CipherItem,
     CipherUnavailableError,
@@ -635,8 +636,8 @@ class TransitCipher(_UnmarkedPolicy):
         # does not accept would be written as a row :meth:`verify_audit_hmac` reads as a break
         # (BACKLOG #2720), so the append fails loudly here instead.
         if not isinstance(mac, str) or transit_mac_version(mac) is None:
-            # A non-empty string is its own subclass, which the handover-tag check reads as a
-            # mismatch (BACKLOG #8222); an empty or non-string reply stays plain.
+            # A non-empty string is its own subclass, which the chain walk's handover-tag check
+            # reads as a mismatch (BACKLOG #8222); an empty or non-string reply stays plain.
             error = AuditMacMalformedError if isinstance(mac, str) and mac else CipherError
             raise error(
                 f"Transit returned an audit HMAC that is not a well-formed Transit MAC "
@@ -686,7 +687,9 @@ class TransitCipher(_UnmarkedPolicy):
         (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
         the row as refused, the answer is ``False``, a break at that row, as a forged MAC is; a
         Vault that answers HTTP 413 past ``max_request_size`` to a planted oversize row is one
-        such case. Both asks failing with an HTTP 408 or 504 is not (BACKLOG #8222). Every other
+        such case. Both asks failing with an HTTP 408 or 504 raises
+        :class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError` instead, which only the
+        chain walk reads as could not run (BACKLOG #8222). Every other
         failure, a failed fixed-input verify among them, and a reply of an
         unexpected shape, raises plain :class:`CipherError`, so the walk could not run and no
         tamper alert fires. Blocking."""
@@ -765,10 +768,12 @@ class TransitCipher(_UnmarkedPolicy):
         the row's own verify once more, so a failure that cleared is not read as the row's: an
         answer is read as usual, and a failure goes through :meth:`_settled_verify_failure` again.
         A failure that leaves unsettled is ``False``, logged, only when a verify over fixed input
-        succeeds once more after it, unless both asks failed with an HTTP 408 or 504
-        (:func:`is_vault_timeout_reply`); otherwise it raises :class:`CipherError`, since the
-        service failed between the asks or timed out on both (BACKLOG #8222: owner ruling
-        2026-11-13 on a row's timeout, read as both asks by a Manager decision). Blocking."""
+        succeeds once more after it; otherwise it raises :class:`CipherError`, since the service
+        failed between the asks. When that fixed-input verify succeeds and both asks failed with an
+        HTTP 408 or 504 (:func:`is_vault_timeout_reply`), it raises
+        :class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError` in place of ``False``
+        (BACKLOG #8222: owner ruling 2026-11-13 on a row's timeout, read as both asks by a Manager
+        decision, and in the chain walk only). Blocking."""
         if not self._fixed_input_verifies():
             raise self._verify_failed(failed) from failed
         again: Exception | None = None
@@ -781,9 +786,13 @@ class TransitCipher(_UnmarkedPolicy):
             again = exc.with_traceback(None)
         if again is None:
             return self._verify_answer(response)
-        timed_out_twice = is_vault_timeout_reply(failed) and is_vault_timeout_reply(again)
-        if timed_out_twice or not self._fixed_input_verifies():
+        if not self._fixed_input_verifies():
             raise self._verify_failed(again) from again
+        if is_vault_timeout_reply(failed) and is_vault_timeout_reply(again):
+            raise AuditVerifyTimedOutError(
+                f"Transit audit HMAC verify timed out on both asks (key={self._audit_key!r}): "
+                f"{vault_failure_text(again)}"
+            ) from again
         log.warning(
             "Transit refused the audit MAC verify of one row twice while a verify over fixed "
             "input succeeded before and after (key=%r): %s; read as a break at that row",

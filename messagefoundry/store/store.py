@@ -136,6 +136,7 @@ from messagefoundry.store.crypto import (
     AuditMacMalformedError,
     AuditMacVerifier,
     AuditScheme,
+    AuditVerifyTimedOutError,
     Cipher,
     CipherError,
     CipherInfo,
@@ -6774,7 +6775,12 @@ _AUDIT_CHAINED_COLUMNS: Final = ("ts", "actor", "action", "channel_id", "detail"
 
 
 def _audit_row_mac(
-    row: Mapping[str, Any], prev: Any, key: bytes | None, mac: AuditMacFn | None
+    row: Mapping[str, Any],
+    prev: Any,
+    key: bytes | None,
+    mac: AuditMacFn | None,
+    *,
+    in_walk: bool = False,
 ) -> str | None:
     """The hash ``row`` should carry, chained from ``prev``, or ``None`` when a chained column holds a
     value of a type no engine build writes -- which the walk reports as a break rather than raising.
@@ -6784,7 +6790,12 @@ def _audit_row_mac(
     whether ``row``'s stored hash is the MAC of the row's bytes: the stored hash is returned when it
     verifies, and ``None`` when it does not (BACKLOG #2720). No MAC is regenerated, so a row made
     under an older Transit key version still verifies after the key rotates. That check may raise
-    :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError`."""
+    :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError`.
+
+    A check that timed out on both asks
+    (:class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError`) propagates only for the chain
+    walk (``in_walk``), where the walk could not run; every other caller, the store open among
+    them, reads it as ``None``, a MAC that does not verify, as before BACKLOG #8222."""
     fields = {column: row[column] for column in _AUDIT_CHAINED_COLUMNS}
     try:
         # `mac is None` first: the in-heap key path skips the Protocol check, which is not free.
@@ -6797,7 +6808,14 @@ def _audit_row_mac(
     # A non-text hash is checked as the empty string, which is never a MAC, so it still costs the
     # one round trip a malformed MAC does. `is True`: a truthy non-bool answer fails closed.
     checked = stored if isinstance(stored, str) else ""
-    return stored if mac.verify(data, checked) is True and checked else None
+    try:
+        verified = mac.verify(data, checked)
+    except AuditVerifyTimedOutError as exc:
+        if in_walk:
+            raise
+        log.warning("%s; read as a MAC that does not verify", exc)
+        return None
+    return stored if verified is True and checked else None
 
 
 def _audit_digest_line(r: Mapping[str, Any]) -> bytes:
@@ -7215,7 +7233,7 @@ def verify_audit_rows(
         refused: str | None = None
         if held:
             try:
-                expected = _audit_row_mac(r, prev, key, mac)
+                expected = _audit_row_mac(r, prev, key, mac, in_walk=True)
             except AuditKeyVersionRefusedError as exc:  # a break at this row; the walk goes on
                 expected, refused = None, str(exc)
         else:

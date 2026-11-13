@@ -1154,6 +1154,35 @@ async def test_a_persistent_504_on_one_rows_verify_could_not_run_on_the_startup_
     assert any("could not run" in line for line in lines), lines
 
 
+async def test_a_both_asks_timeout_on_the_genesis_verify_at_open_logs_a_break_and_opens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At store open the timeout reading does not apply (BACKLOG #8222: the open path is unruled):
+    a 504 on both asks of the genesis row's verify, while the fixed input verifies, is read as
+    origin/main reads it, a genesis row that does not verify, logged, on a store that opens."""
+    _needs_hvac()
+    from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
+
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "genesis-timeout.db"
+    store = await _transit_store(db)
+    await store.close()
+    real_verify = transit.verify_signed_data
+
+    def timing_out(*, hash_input: str, **kw: Any) -> dict[str, Any]:
+        if hash_input == _VERSION_PROBE_INPUT:
+            return real_verify(hash_input=hash_input, **kw)
+        raise _status_error(504)
+
+    monkeypatch.setattr(transit, "verify_signed_data", timing_out)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+        store = await _transit_store(db)
+    await store.close()
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("genesis row does not verify under the key it names" in m for m in errors), errors
+
+
 def _dml_last_row_hash(db: Path) -> str:
     """The stored MAC of the newest audit row, read directly from the SQLite file."""
     with sqlite3.connect(db) as conn:

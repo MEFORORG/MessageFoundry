@@ -295,8 +295,8 @@ def is_vault_bad_request(exc: BaseException) -> bool:
 #: The attribute :func:`_record_reply_status` sets on an hvac error: the HTTP status of the reply.
 _REPLY_STATUS_ATTR = "mefor_reply_status"
 
-#: The statuses hvac raises as ``UnexpectedError`` that one audit row's verify, on both asks,
-#: reads as the service timing out, not as Transit refusing that row (BACKLOG #8222).
+#: The statuses hvac raises as ``UnexpectedError`` that the audit chain walk, on both asks of one
+#: row's verify, reads as the service timing out, not as Transit refusing that row (BACKLOG #8222).
 #: A 413 is not here: Vault answers it to a planted oversize row, which is evidence about the row.
 _TIMEOUT_STATUSES = frozenset({408, 504})
 
