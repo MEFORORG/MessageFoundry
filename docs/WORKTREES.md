@@ -370,8 +370,8 @@ pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts  
 
 The untracked `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
 uncommitted **tracked** changes, a file flagged skip-worktree or assume-unchanged, and a git
-repository inside the tree block removal. With `-Force` the run prints each flagged file it
-discards. `-Discard`
+repository inside the tree block removal. With `-Force` the run names the flagged files it lets
+go. `-Discard`
 parks the tracked changes instead, as described above. Uncommitted work
 written in the last six hours blocks it whatever `-Force` says, as do the other in-use refusals in
 the table above.
@@ -763,8 +763,10 @@ A merged worktree is proposed for removal only when all of these hold:
   its own `refs/worktree`, `refs/bisect` or `refs/rewritten` hold, no allocation naming it whose
   item is not provably on `origin/main` (the retired-allocator tombstone aside), and no claim naming
   it. A registry or record that cannot be read holds it too. The readers are the ones the nightly
-  `.claude/worktrees` removal uses, in `worktree-gates.ps1`. Routing the removal through
-  `remove.ps1` instead would not help: `-Path` refuses every tree under `.claude/worktrees`.
+  `.claude/worktrees` removal uses, in `worktree-gates.ps1`. For a tree under
+  `.claude/worktrees`, routing the removal through `remove.ps1` instead would not help: `-Path`
+  refuses every such tree. The report shares those readers, not the nightly step's whole gate set,
+  so a tree that step refuses for an ignored file or a nested checkout can still be proposed here.
 
 Any merged worktree that fails one of those goes to NEEDS A HUMAN LOOK with its reasons. The session
 check is the liveness fence `prune-merged.ps1` uses, with the same limit. It cannot see a session

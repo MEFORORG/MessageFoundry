@@ -142,7 +142,7 @@
     -Name KEEPS ITS OLD RULES OTHERWISE. Of the -Path-only refusals it shares only the detached HEAD
     one: tracked changes refuse without -Force, and so do files flagged skip-worktree or
     assume-unchanged (BACKLOG #5648), which git status does not read. -Force overrides both, and the
-    run prints each flagged file it discarded. Untracked files older than six hours and ignored
+    run names the flagged files it lets go. Untracked files older than six hours and ignored
     files other than the repositories named above go with the worktree, and there is no occupancy
     check. NEITHER ROUTE RUNS A BLANKET `git worktree prune` (-Name ran one until BACKLOG #5648 and
     #7619): `git worktree remove` already drops the target's own registration, and a prune also drops
@@ -1012,8 +1012,9 @@ if ($Discard -and $untrackedNested.Count -gt 0) {
 
 # Files flagged skip-worktree (S) or assume-unchanged (lower case), read once for both routes. git status
 # does not look at one, so an edit to one is invisible to every status read above.
-$flagged = Get-FlaggedFiles $WorktreePath
-if ($null -eq $flagged) { throw "git ls-files failed in '$WorktreePath'. Nothing was removed." }
+$flaggedRead = Get-FlaggedFiles $WorktreePath
+if (-not $flaggedRead.Read) { throw "git ls-files failed in '$WorktreePath'. Nothing was removed." }
+$flagged = $flaggedRead.Lines
 
 if ($byPath) {
     # EVERYTHING GIT WOULD DELETE IS SHOWN, whatever status.showUntrackedFiles says: tracked changes,
@@ -1101,9 +1102,11 @@ else {
                 "status does not read, so an edit to one would be lost unseen. -Force discards them, and it " +
                 "is the operator's switch. Nothing was removed.")
         }
-        Write-Host ("-Force: discarding $($flagged.Count) file(s) flagged skip-worktree or assume-unchanged in " +
-            "'$WorktreePath', unread:") -ForegroundColor Yellow
-        $flagged | ForEach-Object { Write-Host "  flagged $($_.Substring(2))" -ForegroundColor Yellow }
+        # Said before the checks below, any of which can still refuse; the line says "if", not "did".
+        Write-Host ("-Force: not refusing $($flagged.Count) file(s) flagged skip-worktree or assume-unchanged in " +
+            "'$WorktreePath'. They go, unread, if the worktree is removed:") -ForegroundColor Yellow
+        $flagged | Select-Object -First 20 | ForEach-Object { Write-Host "  flagged $($_.Substring(2))" -ForegroundColor Yellow }
+        if ($flagged.Count -gt 20) { Write-Host "  ... and $($flagged.Count - 20) more" -ForegroundColor Yellow }
     }
 }
 

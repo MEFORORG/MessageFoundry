@@ -31,7 +31,7 @@
     THE RE-CHECKS, per path. The first one that fails REFUSES that path and the run moves on; a refusal
     is data, not a failure. At least these:
       * none of GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE is set: the base list
-        remove.ps1 refuses on its -Path and -List routes (its -Discard adds GIT_OBJECT_DIRECTORY and
+        remove.ps1 refuses on every route (its -Discard adds GIT_OBJECT_DIRECTORY and
         GIT_ALTERNATE_OBJECT_DIRECTORIES, because that route writes objects; this step writes none).
         The first three make `git -C <path>` answer for another repository or working tree than the
         one named; GIT_INDEX_FILE keeps the checkout but compares it against another index, which can

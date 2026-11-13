@@ -449,7 +449,7 @@ def test_name_refuses_a_flagged_file_and_force_overrides_it_by_name(fx: Fixture,
     # -Force overrides it, and the override names what it discarded.
     forced = run(fx, "-Name", "flagged", "-Force")
     assert forced.returncode == 0, forced.stdout + forced.stderr
-    assert "-Force: discarding 1 file(s) flagged" in forced.stdout, forced.stdout
+    assert "-Force: not refusing 1 file(s) flagged" in forced.stdout, forced.stdout
     assert "flagged seed.txt" in forced.stdout
     assert not wt.exists()
 
@@ -460,6 +460,14 @@ def test_name_runs_no_blanket_prune_so_another_stale_registration_survives(fx: F
     gone = fx.add("gone")
     shutil.rmtree(gone)
     assert fx.is_registered(gone), "PRECONDITION: the stale registration must exist"
+    # The negative control: a prune in this fixture WOULD drop it, so its survival below means something.
+    dry = subprocess.run(
+        ["git", "-C", str(fx.primary), "worktree", "prune", "--dry-run", "--verbose"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "repo-gone" in dry.stdout + dry.stderr, dry
     wt = fx.add("mine")
 
     proc = run(fx, "-Name", "mine")

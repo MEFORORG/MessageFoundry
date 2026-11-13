@@ -278,17 +278,18 @@ function Test-ClaudeManagedPath([string]$Path) {
 # status does not show an edit to either, and neither does git's own check in `worktree remove`, so an
 # edit there would go with the tree unseen. Returns the count, or -1 when it cannot be read.
 function Get-FlaggedFileCount([string]$Path) {
-    $lines = Get-FlaggedFiles $Path
-    if ($null -eq $lines) { return -1 }
-    return $lines.Count
+    $r = Get-FlaggedFiles $Path
+    if (-not $r.Read) { return -1 }
+    return $r.Lines.Count
 }
 
-# The flagged `ls-files -v` lines themselves (tag, space, path), for a caller that names them; $null
-# when they cannot be read. Wrap nothing: the array comes back whole, empty included.
+# The flagged `ls-files -v` lines themselves (tag, space, path), for a caller that names them: an
+# object with Read ($false when git could not list them) and Lines, so an empty answer and a failed
+# read cannot be confused however the caller wraps it.
 function Get-FlaggedFiles([string]$Path) {
     $lines = @(& git -C $Path ls-files -v 2>$null)
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return , @($lines | Where-Object { $_ -cmatch '^([a-z]|S) ' })
+    if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Read = $false; Lines = [string[]]@() } }
+    return [pscustomobject]@{ Read = $true; Lines = [string[]]@($lines | Where-Object { $_ -cmatch '^([a-z]|S) ' }) }
 }
 
 # The newest write to the WORKING TREE: the tree's own folder, each entry directly under it, and the

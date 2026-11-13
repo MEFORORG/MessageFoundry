@@ -291,23 +291,7 @@ def _build(tmp: Path) -> Fx:
     def worktree(
         slug: str, *, merged_ago: timedelta | None, base: str = "main", fork: bool = False
     ) -> str:
-        path = primary.parent / f"repo-{slug}"
-        _git(primary, "worktree", "add", "-q", "-b", slug, str(path))
-        head = _commit(path, f"{slug}.txt", slug)
-        _git(path, "push", "-q", "origin", slug)
-        fx.paths[slug] = path
-        if merged_ago is not None:
-            fx.merged.append(
-                {
-                    "headRefName": slug,
-                    "headRefOid": head,
-                    "number": 100 + len(fx.merged),
-                    "mergedAt": _iso(merged_ago),
-                    "baseRefName": base,
-                    "isCrossRepository": fork,
-                }
-            )
-        return head
+        return _add_tree(fx, slug, merged_ago=merged_ago, base=base, fork=fork)
 
     old = timedelta(days=3)
     # Merged, clean, pushed; its remote branch was deleted on merge, so only the PR head proves it.
@@ -352,13 +336,17 @@ def _fake_gh(fx: Fx) -> tuple[Path, Path]:
 
 
 def _run(
-    fx: Fx, *extra: str, repo: Path | None = None, idle: str = "0"
+    fx: Fx,
+    *extra: str,
+    repo: Path | None = None,
+    idle: str = "0",
+    more_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run the report. Every fixture worktree was touched seconds ago, so the activity window is
     OFF by default here; the test that pins the window turns it back on."""
     # The shared _ENV: no inherited GIT_* variable, CLAUDE_CONFIG_DIR or MEFOR_COORD_ROOT, so the claim
     # and allocation reads resolve to the fixture's own coordination root, never the shared real one.
-    env = {k: v for k, v in _ENV.items() if k != "MEFOR_HYGIENE_GH"}
+    env = {k: v for k, v in _ENV.items() if k != "MEFOR_HYGIENE_GH"} | (more_env or {})
     return subprocess.run(
         [
             "pwsh",
@@ -468,24 +456,33 @@ def test_it_writes_both_files_and_proposes_only_the_safe_removals(fx: Fx) -> Non
         assert not Path(w["path"]).exists()
 
 
-def _add_merged(fx: Fx, slug: str) -> Path:
-    """A worktree merged three days ago at its exact pushed tip: everything else would propose it."""
+def _add_tree(
+    fx: Fx, slug: str, *, merged_ago: timedelta | None, base: str = "main", fork: bool = False
+) -> str:
+    """A pushed worktree with one commit, and its merged PR when ``merged_ago`` is given."""
     path = fx.primary.parent / f"repo-{slug}"
     _git(fx.primary, "worktree", "add", "-q", "-b", slug, str(path))
     head = _commit(path, f"{slug}.txt", slug)
     _git(path, "push", "-q", "origin", slug)
     fx.paths[slug] = path
-    fx.merged.append(
-        {
-            "headRefName": slug,
-            "headRefOid": head,
-            "number": 100 + len(fx.merged),
-            "mergedAt": _iso(timedelta(days=3)),
-            "baseRefName": "main",
-            "isCrossRepository": False,
-        }
-    )
-    return path
+    if merged_ago is not None:
+        fx.merged.append(
+            {
+                "headRefName": slug,
+                "headRefOid": head,
+                "number": 100 + len(fx.merged),
+                "mergedAt": _iso(merged_ago),
+                "baseRefName": base,
+                "isCrossRepository": fork,
+            }
+        )
+    return head
+
+
+def _add_merged(fx: Fx, slug: str) -> Path:
+    """A worktree merged three days ago at its exact pushed tip: everything else would propose it."""
+    _add_tree(fx, slug, merged_ago=timedelta(days=3))
+    return fx.paths[slug]
 
 
 def _record(fx: Fx, kind: str, name: str, body: dict[str, Any]) -> None:
@@ -566,6 +563,24 @@ def test_an_unreadable_claim_holds_every_merged_tree_back(fx: Fx) -> None:
 
     # Control: the same claim registry, without the broken file, clears it.
     (fx.primary / ".git" / "mefor-coord" / "claims" / "bad.json").unlink()
+    proc = _run(fx, "-Gh", str(fake), "-GhRepo", "acme/repo")
+    assert proc.returncode == 0, proc.stderr
+    assert _rows(_report(fx))["repo-m-clean"]["verdict"] == "REMOVE"
+
+
+def test_a_git_redirect_in_the_environment_holds_every_merged_tree_back(fx: Fx) -> None:
+    """GIT_INDEX_FILE makes ls-files read another index, so a flagged edit would read as none."""
+    fake, _ = _fake_gh(fx)
+    other = fx.root / "other.index"
+    other.write_bytes(b"")
+    proc = _run(
+        fx, "-Gh", str(fake), "-GhRepo", "acme/repo", more_env={"GIT_INDEX_FILE": str(other)}
+    )
+    assert proc.returncode == 0, proc.stderr
+    row = _rows(_report(fx))["repo-m-clean"]
+    assert row["verdict"] == "HUMAN", row
+    assert any("GIT_INDEX_FILE is set" in r for r in row["reasons"]), row["reasons"]
+
     proc = _run(fx, "-Gh", str(fake), "-GhRepo", "acme/repo")
     assert proc.returncode == 0, proc.stderr
     assert _rows(_report(fx))["repo-m-clean"]["verdict"] == "REMOVE"
