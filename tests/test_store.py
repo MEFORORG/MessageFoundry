@@ -1751,7 +1751,16 @@ async def test_the_sync_close_stops_every_worker_and_the_committer(tmp_path, mon
     committer = store._group_commit
     assert committer is not None and committer._task is not None
     task = committer._task
+    from messagefoundry.store.store import _Member
+
+    async def never() -> None:
+        return None
+
+    parked = _Member(run=never, future=asyncio.get_running_loop().create_future())
+    committer._pending.append(parked)
     store._close_sync()
+    # Failed, never cancelled: the member's caller is not itself shutting down.
+    assert isinstance(parked.future.exception(), RuntimeError)
     assert store._read_conns == []
     assert store._read_pool is None
     assert committer._task is None

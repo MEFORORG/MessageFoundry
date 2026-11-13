@@ -593,14 +593,16 @@ class _GroupCommitter:
 
     def stop_now(self) -> None:
         """Stop the committer without awaiting, for a close that cannot await (BACKLOG #5720):
-        enrolled members' futures are cancelled rather than left unresolved."""
+        enrolled members' futures fail rather than being left unresolved."""
         self._closed = True
         if self._task is not None:
             self._task.cancel()
             self._task = None
         for member in self._pending:
             if not member.future.done():
-                member.future.cancel()
+                # A failure, never a cancel: the member's caller is not itself shutting down, as
+                # _flush's rollback path says.
+                member.future.set_exception(RuntimeError("group commit stopped at store close"))
         self._pending = []
 
     async def aclose(self) -> None:
@@ -1932,6 +1934,7 @@ async def _run_to_completion(
     level: int = logging.ERROR,
     cancel_deadline: float | None = None,
     already_cancelled: bool = False,
+    on_deadline: Callable[[], None] | None = None,
 ) -> tuple[bool, BaseException | None]:
     """Run ``body`` as a task waited on with :func:`asyncio.wait`, which never cancels what it
     waits on, and waited on again after each cancel, so a cancel cannot cut it short. Returns
@@ -1944,8 +1947,9 @@ async def _run_to_completion(
 
     ``cancel_deadline`` (BACKLOG #5720) bounds the wait from the first cancel, or from the start
     with ``already_cancelled``. Nothing is bounded before a cancel, so a slow but healthy body
-    finishes. Past the deadline the body is cancelled, which runs its ``finally`` blocks, and is
-    no longer waited for; that one WARNING is the whole report."""
+    finishes. Past the deadline the body is cancelled and no longer waited for, and
+    ``on_deadline`` runs: a synchronous release that does not depend on the body's remaining
+    awaits, any of which may hang too. That one WARNING is the whole report."""
     task = asyncio.ensure_future(body())
     _DETACHED.add(task)
     task.add_done_callback(_DETACHED.discard)
@@ -1965,6 +1969,11 @@ async def _run_to_completion(
             )
             task.add_done_callback(_retrieve_detached)
             task.cancel()
+            if on_deadline is not None:
+                try:
+                    on_deadline()
+                except Exception as exc:  # noqa: BLE001 — cleanup must never mask the real failure
+                    log.warning("the forced release of %s failed (%s)", what, type(exc).__name__)
             return cancelled, None
         try:
             await asyncio.wait({task}, timeout=remaining)
@@ -8228,6 +8237,7 @@ async def close_to_completion(
             consequence="",
             level=logging.WARNING,
             cancel_deadline=TEARDOWN_CANCEL_DEADLINE,
+            on_deadline=sync_teardown,
         )
     except GeneratorExit:
         _run_sync_teardown(sync_teardown, "the store's close")
@@ -8266,6 +8276,7 @@ async def run_open_cleanup(
             level=logging.WARNING,
             cancel_deadline=TEARDOWN_CANCEL_DEADLINE,
             already_cancelled=isinstance(failure, asyncio.CancelledError),
+            on_deadline=sync_teardown,
         )
     except GeneratorExit:
         _run_sync_teardown(sync_teardown, "a store open")

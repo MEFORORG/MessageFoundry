@@ -348,6 +348,7 @@ async def test_a_cancel_bounds_a_hanging_settle_inside_one_deadline(
 
     assert settles == [False, True]
     assert pool.closed == 1
+    assert pool.terminated == 1  # the deadline forces the release, whatever the steps still await
     bounded = [r for r in caplog.records if "did not finish within" in r.getMessage()]
     assert len(bounded) == 1, caplog.text
     assert "cleanup after a failed store open failed" not in caplog.text  # one WARNING, no echo
