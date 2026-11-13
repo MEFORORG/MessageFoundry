@@ -9,7 +9,9 @@ of the GraphQL connection the script queries. No test reaches the network.
 from __future__ import annotations
 
 import functools
+import http.client
 import json
+import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -26,11 +28,13 @@ from scripts.security.cla_precheck import (
     evaluate,
     fetch_commits,
     matches_allowlist,
+    parse_allowlist,
     run,
 )
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "cla_precheck" / "replies.json"
 _ALLOWLIST = ["wshallwshall", "dependabot[bot]", "github-actions[bot]"]
+_HEAD = "ab" * 20
 _ENV = {
     "GITHUB_REPOSITORY": "MEFORORG/MessageFoundry",
     "CLA_PR_NUMBER": "7",
@@ -58,8 +62,9 @@ class _Replay:
 
 
 def _verdict(scenario: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    commits, total = fetch_commits(_Replay(scenario), "MEFORORG", "MessageFoundry", 7)
-    verdict = evaluate(commits, total, _ALLOWLIST)
+    verdict = evaluate(
+        fetch_commits(_Replay(scenario), "MEFORORG", "MessageFoundry", 7), _ALLOWLIST
+    )
     return verdict.refusals, verdict.notices
 
 
@@ -67,10 +72,10 @@ def test_it_pages_past_the_hundredth_commit_and_refuses_the_impersonator_there()
     """BACKLOG #5645 (the 100-commit cap): the action reads one page. The impersonating commit is
     the 101st, so only a reader that follows hasNextPage sees it."""
     replay = _Replay("impersonation_on_page_two")
-    commits, total = fetch_commits(replay, "MEFORORG", "MessageFoundry", 7)
-    assert (len(commits), total) == (101, 101)
+    read = fetch_commits(replay, "MEFORORG", "MessageFoundry", 7)
+    assert (len(read.commits), read.total, read.head) == (101, 101, _HEAD)
     assert [call["cursor"] for call in replay.calls] == [None, "Y3Vyc29yOjEwMA=="]
-    refusals = evaluate(commits, total, _ALLOWLIST).refusals
+    refusals = evaluate(read, _ALLOWLIST).refusals
     assert len(refusals) == 1
     assert "wshallwshall" in refusals[0] and f"{101:040x}" in refusals[0]
 
@@ -85,6 +90,14 @@ def test_an_unlinked_name_outside_the_allowlist_is_not_this_scripts_business() -
     assert _verdict("unlinked_name_not_allowlisted") == ((), ())
 
 
+def test_an_unlinked_name_equal_to_a_linked_login_here_is_a_notice() -> None:
+    """The action keys committers on `login || name`, so the unlinked commit folds into the linked
+    account. Not ruled, so reported and passed."""
+    refusals, notices = _verdict("name_folded_into_linked")
+    assert refusals == ()
+    assert len(notices) == 1 and "octo-contributor" in notices[0]
+
+
 def test_the_attribution_order_is_author_then_committer_then_raw_author() -> None:
     """BACKLOG #5644's subject puts the committer first; the bundle puts the author's account first.
 
@@ -97,10 +110,8 @@ def test_the_attribution_order_is_author_then_committer_then_raw_author() -> Non
     }
     assert attribute(both).name == "author-acct"
     committer_only = {**both, "author": {"name": "A", "user": None}}
-    assert (attribute(committer_only).name, attribute(committer_only).database_id) == (
-        "committer-acct",
-        2,
-    )
+    who = attribute(committer_only)
+    assert (who.name, who.database_id) == ("committer-acct", 2)
     neither = {**committer_only, "committer": {"name": "C", "user": None}}
     who = attribute(neither)
     assert (who.name, who.database_id, who.author_linked, who.committer_linked) == (
@@ -109,6 +120,18 @@ def test_the_attribution_order_is_author_then_committer_then_raw_author() -> Non
         False,
         False,
     )
+
+
+def test_an_empty_user_object_is_chosen_as_javascript_chooses_it() -> None:
+    """JavaScript's `||` passes over null only, so an empty `{}` user is still chosen, and its name
+    is empty, never the committer's login."""
+    commit = {
+        "oid": "a",
+        "author": {"name": "A", "user": {}},
+        "committer": {"name": "C", "user": {"login": "committer-acct", "databaseId": 2}},
+    }
+    who = attribute(commit)
+    assert (who.name, who.author_linked) == ("", True)
 
 
 def test_an_unlinked_author_under_a_linked_allowlisted_committer_is_a_notice_not_a_refusal() -> (
@@ -121,14 +144,17 @@ def test_an_unlinked_author_under_a_linked_allowlisted_committer_is_a_notice_not
     assert len(notices) == 1 and "wshallwshall" in notices[0]
 
 
-def test_web_flow_drops_an_unlinked_authors_commit_and_the_script_says_so() -> None:
-    refusals, notices = _verdict("web_flow_committer")
+def test_the_dropped_id_is_github_actions_bot_and_the_notice_says_so() -> None:
+    """41898282 is github-actions[bot]; web-flow is 19864447 (tests/fixtures/branch_main.json)."""
+    refusals, notices = _verdict("actions_bot_committer")
     assert refusals == ()
-    assert len(notices) == 1 and "web-flow" in notices[0]
+    assert (
+        len(notices) == 1 and "github-actions[bot]" in notices[0] and "web-flow" not in notices[0]
+    )
 
 
-def test_a_linked_author_wins_over_a_web_flow_committer() -> None:
-    assert _verdict("author_linked_committer_web_flow") == ((), ())
+def test_a_linked_author_wins_over_an_actions_bot_committer() -> None:
+    assert _verdict("author_linked_committer_actions_bot") == ((), ())
 
 
 def test_a_read_short_of_total_count_is_refused_not_excused() -> None:
@@ -136,19 +162,24 @@ def test_a_read_short_of_total_count_is_refused_not_excused() -> None:
     assert len(refusals) == 1 and "2 of the pull request's 300" in refusals[0]
 
 
-@pytest.mark.parametrize("scenario", ["stuck_cursor", "repeated_cursor", "graphql_error"])
+@pytest.mark.parametrize(
+    "scenario", ["stuck_cursor", "repeated_cursor", "graphql_error", "head_moved"]
+)
 def test_a_reply_that_cannot_be_trusted_is_a_fault(scenario: str) -> None:
     with pytest.raises(PrecheckFault):
         fetch_commits(_Replay(scenario), "MEFORORG", "MessageFoundry", 7)
 
 
-def test_wildcard_entries_match_unanchored_as_the_action_does() -> None:
+def test_wildcard_and_empty_entries_match_as_the_action_matches() -> None:
     """Mirrored, not endorsed: `bot*` matches anywhere in the name, which is why cla.yml's
-    allowlist holds no glob and why the script refuses on the action's own matching."""
+    allowlist holds no glob; an empty entry from a doubled comma matches an empty name; and the
+    wildcard stops at a carriage return, as JavaScript's `.` does."""
     assert matches_allowlist("robot-person", ["bot*"])
     assert not matches_allowlist("robot-person", ["bot"])
     assert matches_allowlist("wshallwshall", [" wshallwshall "])
     assert not matches_allowlist("wshallwshal", ["wshallwshall"])
+    assert matches_allowlist("", parse_allowlist("a,,b"))
+    assert not matches_allowlist("a\rb", ["a*b"])
 
 
 def test_run_exit_codes_and_annotations(capsys: pytest.CaptureFixture[str]) -> None:
@@ -159,13 +190,21 @@ def test_run_exit_codes_and_annotations(capsys: pytest.CaptureFixture[str]) -> N
     assert "::error title=CLA pre-check fault::" in capsys.readouterr().out
 
 
+def test_a_stale_head_is_a_fault(capsys: pytest.CaptureFixture[str]) -> None:
+    assert run({**_ENV, "CLA_HEAD_SHA": _HEAD}, _Replay("linked_on_page_two")) == EXIT_PASS
+    assert run({**_ENV, "CLA_HEAD_SHA": "cd" * 20}, _Replay("linked_on_page_two")) == EXIT_FAULT
+    assert "stale" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     ("override", "fault"),
     [
         ({"GITHUB_REPOSITORY": "not-a-repository"}, "GITHUB_REPOSITORY"),
         ({"CLA_PR_NUMBER": "7; echo"}, "CLA_PR_NUMBER"),
         ({"CLA_PR_NUMBER": "0"}, "CLA_PR_NUMBER"),
+        ({"CLA_PR_NUMBER": "9" * 5000}, "CLA_PR_NUMBER"),
         ({"CLA_ALLOWLIST": " , "}, "CLA_ALLOWLIST"),
+        ({"CLA_HEAD_SHA": "abc"}, "CLA_HEAD_SHA"),
     ],
 )
 def test_bad_environment_is_a_fault_before_any_call(
@@ -181,12 +220,24 @@ def test_without_a_transport_it_needs_a_token_and_https(capsys: pytest.CaptureFi
     assert run(_ENV) == EXIT_FAULT
     assert "GITHUB_TOKEN" in capsys.readouterr().out
     secret = "synthetic-token-value"
-    assert (
-        run({**_ENV, "GITHUB_TOKEN": secret, "GITHUB_GRAPHQL_URL": "http://example.test/graphql"})
-        == EXIT_FAULT
-    )
+    env = {**_ENV, "GITHUB_TOKEN": secret, "GITHUB_GRAPHQL_URL": "http://example.test/graphql"}
+    assert run(env) == EXIT_FAULT
     out = capsys.readouterr().out
     assert "https" in out and secret not in out
+
+
+def test_a_truncated_reply_is_a_fault_and_not_a_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An http.client error is not an OSError; uncaught, it would exit 1, the refusal code."""
+
+    def truncated(*_args: object, **_kwargs: object) -> object:
+        raise http.client.IncompleteRead(b"")
+
+    monkeypatch.setattr(urllib.request, "urlopen", truncated)
+    transport = cla_precheck.urllib_transport(
+        "https://example.test/graphql", "synthetic-token-value"
+    )
+    with pytest.raises(PrecheckFault):
+        transport("query", {})
 
 
 def test_a_commit_name_cannot_open_a_workflow_command_of_its_own(
@@ -194,11 +245,12 @@ def test_a_commit_name_cannot_open_a_workflow_command_of_its_own(
 ) -> None:
     """Every message is escaped, whatever commit text it quotes: `%`, CR and LF become `%25`, `%0D`
     and `%0A`, so the text stays one message. The oid stands in for any quoted field."""
-    allowlisted = "wshallwshall"
+    allowlisted = {"name": "wshallwshall", "user": None}
     page = {
         "data": {
             "repository": {
                 "pullRequest": {
+                    "headRefOid": _HEAD,
                     "commits": {
                         "totalCount": 1,
                         "pageInfo": {"endCursor": None, "hasNextPage": False},
@@ -206,12 +258,12 @@ def test_a_commit_name_cannot_open_a_workflow_command_of_its_own(
                             {
                                 "commit": {
                                     "oid": "x%\n::set-output name=a::b",
-                                    "author": {"name": allowlisted, "user": None},
-                                    "committer": {"name": allowlisted, "user": None},
+                                    "author": allowlisted,
+                                    "committer": allowlisted,
                                 }
                             }
                         ],
-                    }
+                    },
                 }
             }
         }

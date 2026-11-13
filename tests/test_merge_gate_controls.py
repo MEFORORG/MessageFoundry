@@ -225,7 +225,12 @@ def _evaluate(
             "_evaluate the new form rather than loosening this check -- an unmodelled operator "
             "silently changes what the gate is graded against."
         )
-    names = {**(_DEFAULT_CONTEXT if context is None else context), **literals}
+    # GitHub's `==` compares strings ignoring case, so every string is case-folded before Python's
+    # case-sensitive `==` sees it. NOT modelled: `!` binding tighter than `==` (`!a == b`).
+    names = {
+        key: value.casefold() if isinstance(value, str) else value
+        for key, value in {**(_DEFAULT_CONTEXT if context is None else context), **literals}.items()
+    }
     try:
         return bool(eval(expr, {"__builtins__": {}}, {"results": results, **names}))  # noqa: S307
     except NameError as exc:
@@ -1407,6 +1412,9 @@ def test_the_cla_step_keeps_its_pull_request_target_arm_and_merge_group_skip() -
     assert _cla_step_runs(condition, "pull_request_target", None, on_pull_request=False)
     assert not _cla_step_runs(condition, "merge_group", None, on_pull_request=False)
     assert not _cla_step_runs(condition, "issue_comment", "looks good", on_pull_request=True)
+    # GitHub's `==` ignores case, so a shouted recheck on a pull request runs the step too.
+    assert _cla_step_runs(condition, "issue_comment", "RECHECK", on_pull_request=True)
+    assert not _cla_step_runs(condition, "issue_comment", "RECHECK", on_pull_request=False)
 
 
 # ===================================================================================================
