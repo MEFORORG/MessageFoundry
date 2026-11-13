@@ -394,17 +394,24 @@ than a path is not checked
   local Users group and the logon classes such as INTERACTIVE. It is a list of known groups. It
   does not prove that only the accounts you meant can reach the file. `protect-key
   --grant-account` refuses the same list, and refuses a name that is a group or a domain.
-- It does not vet the file's owner or an account you granted yourself. LOCAL SERVICE and NETWORK
-  SERVICE are accounts that many services share, and the check does not report them.
-- On POSIX the test is a group or other read or write bit, whoever is in the group. A volume that
-  makes every file group-readable on each mount, such as a Kubernetes volume with `fsGroup`, lets
-  the first start mint a key and makes every later start refuse it. Supplying your own certificate
-  does not avoid this under `"enforce"`: an `[api].tls_key_file` on such a volume is judged by the
-  same test. A Kubernetes Secret volume is one such volume. The shipped manifests
-  (`docker/k8s/statefulset.yaml`, `docker/k8s/ha-postgres.yaml`) therefore mount the Secret only on
-  a `copy-tls` initContainer, which copies the API pair into a memory-backed `emptyDir` at mode
-  `0600`, owned by the engine's account. The engine mounts that `emptyDir`, not the Secret. A key
-  you add for a connection has to be copied the same way.
+- On Windows it does not vet the file's owner or an account you granted yourself. LOCAL SERVICE
+  and NETWORK SERVICE are accounts that many services share, and the check does not report them.
+- On POSIX the check refuses a key file reached through a link, one owned by an account other than
+  the engine's own or root, one whose mode has a group or other read or write bit, whoever is in
+  the group, and one held in a directory that another account owns or that a group or other may
+  write without the sticky bit (vault BACKLOG #5636). Only the directory that holds the file is
+  read, not the ones above it. The engine mints its own TLS key into a directory of its own,
+  `api-generated-key.d` beside the store, created at `0700`, so a group-writable store directory
+  does not refuse it. A volume that makes every file group-readable on each mount, such as a
+  Kubernetes volume with `fsGroup`, makes every start after the first refuse a key on it.
+  Supplying your own certificate does not avoid this under `"enforce"`: an `[api].tls_key_file`
+  on such a volume is judged by the same test. A Kubernetes Secret volume is one such volume, and
+  it serves each file as a link. The shipped manifests (`docker/k8s/statefulset.yaml`,
+  `docker/k8s/ha-postgres.yaml`) therefore mount the Secret only on a `copy-tls` initContainer.
+  A `tls-dir` initContainer makes `/etc/mefor/tls/engine` at `0700` as uid 10001, and `copy-tls`
+  copies the API pair there at mode `0600`, owned by the engine's account, because the kubelet
+  sets the `emptyDir` root's mode. The engine mounts that `emptyDir`, not the Secret. A key you add
+  for a connection has to be copied the same way.
 - The create has no warn mode. On a filesystem that cannot hold the restriction, such as a FAT
   volume or a mount that reports every file as mode `0777`, the engine cannot mint its TLS key and
   does not start, whatever `[security].enforcement` says. Put the store on a filesystem that holds

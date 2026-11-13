@@ -196,6 +196,12 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
 #: ``[api].tls_generated_dir`` setting: a knob for a question with one sensible answer.
 _GENERATED_CERT_NAME = GENERATED_CERT_NAME
 _GENERATED_KEY_NAME = "api-generated-key.pem"
+#: The directory the generated KEY is minted into, inside the state dir, created at ``0o700``. The
+#: key-file gate refuses a POSIX key in a directory a group or other account may write (vault
+#: BACKLOG #5636), and the state dir's mode is whatever the operator's umask or volume gave it, so a
+#: key minted straight into it could be refused by the engine's own next check. The certificate is
+#: public and stays in the state dir, where the tray and the docs name it.
+_GENERATED_KEY_DIR_NAME = "api-generated-key.d"
 #: The first-run mint's lock, beside the pair. It holds no data and is never deleted: the OS lock on
 #: it is the whole mechanism (see :func:`_generated_pair_lock`), so the file is only a handle.
 _GENERATED_LOCK_NAME = "api-generated.lock"
@@ -279,7 +285,10 @@ async def record_generated_pair_replacements(
 
 def _generated_pair(state_dir: Path) -> tuple[Path, Path]:
     """The ``(cert, key)`` paths of the first-run generated pair. The only place they are spelled."""
-    return state_dir / _GENERATED_CERT_NAME, state_dir / _GENERATED_KEY_NAME
+    return (
+        state_dir / _GENERATED_CERT_NAME,
+        state_dir / _GENERATED_KEY_DIR_NAME / _GENERATED_KEY_NAME,
+    )
 
 
 def generated_state_dir(store_path: str) -> Path:
@@ -667,6 +676,9 @@ def ensure_api_tls_material(
     events = replacements if replacements is not None else []
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
+        # The key's own directory, owner-only whatever the umask (see _GENERATED_KEY_DIR_NAME). An
+        # existing one keeps its mode, and the key-file gate judges it.
+        key_path.parent.mkdir(mode=0o700, exist_ok=True)
         with _generated_pair_lock(state_dir):
             _settle_under_the_lock(api, cert_path, key_path, events, renew=renew)
     except OSError as exc:

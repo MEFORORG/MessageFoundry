@@ -1396,6 +1396,31 @@ def _serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> int:
     return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
 
 
+@posix_only
+def test_serve_mints_a_tls_key_it_accepts_in_a_store_directory_a_group_may_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A store directory made under umask 002, or on an fsGroup volume, is group-writable. The
+    engine mints its key into a 0700 directory of its own there, so its own check passes it on the
+    first start and every later one (vault BACKLOG #5636)."""
+    from messagefoundry.api.tls import _generated_pair
+
+    tmp_path.chmod(0o775)
+    # The control: a key straight in this directory, as the engine minted it before, is refused.
+    beside = tmp_path / "beside.key"
+    write_restricted_file(beside, b"KEY-MATERIAL-STAND-IN")
+    assert "has mode 0775 with no sticky bit" in str(broad_access_problem(beside))
+    beside.unlink()
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    assert _serve(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML) == 0
+    _cert, key = _generated_pair(tmp_path)
+    assert key.parent != tmp_path and stat.S_IMODE(key.parent.stat().st_mode) == 0o700
+    assert broad_access_problem(key) is None
+    assert "is not restricted" not in capsys.readouterr().err
+    assert _serve(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML) == 0  # and it reuses the pair
+
+
 def test_serve_refuses_a_generated_tls_key_a_broad_account_can_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

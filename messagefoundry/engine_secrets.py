@@ -113,8 +113,8 @@ MAX_FILE_BYTES: Final = 64 * 1024
 _REMEDY: Final = (
     "Restrict it to SYSTEM, Administrators and the account the engine runs as (POSIX: the "
     "engine's own account, mode 0700 for the directory and 0600 for a file, as real files and "
-    "directories rather than links, in a folder only that account or root may write, or one with "
-    "the sticky bit)"
+    "directories rather than links, in a folder that account or root owns and only it may "
+    "write, or that has the sticky bit)"
 )
 
 

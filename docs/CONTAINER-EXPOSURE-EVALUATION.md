@@ -176,6 +176,7 @@ require_mfa = true                            # the default; off on an exposed i
 port = 8443
 tls_cert_file = "/etc/mefor/tls/api.crt"
 tls_key_file  = "/etc/mefor/tls/api.key"     # tls_key_password via MEFOR_API_TLS_KEY_PASSWORD if encrypted
+# (the shipped k8s manifests put the pair in /etc/mefor/tls/engine/ and set these through MEFOR_API_TLS_*)
 # tls_client_ca_file = "/etc/mefor/tls/console-ca.crt"  # opt-in mTLS for the console
 # Off loopback this bind also needs MEFOR_TLS_REVOCATION_ATTESTED=1 in the container's environment;
 # docs/SECURITY.md, "API revocation gate", says what setting it attests.
@@ -250,6 +251,8 @@ lists the shapes and rules.
 
 ```python
 # MLLP inbound in a container (data plane) — required when bind_host is off-loopback
+# These paths fit docker/compose.yaml's /etc/mefor/tls bind mount. Under the shipped k8s manifests,
+# copy-tls installs into /etc/mefor/tls/engine/, so name a copied key there (the API pair too).
 inbound("IB_ACME_ADT", MLLP(
     port=2575,
     tls=True,

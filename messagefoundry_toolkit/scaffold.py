@@ -628,7 +628,9 @@ _GITIGNORE = """\
 *.log
 # the one-time bootstrap admin credential engines before ADR 0183 Wave 2 wrote beside the store
 bootstrap-admin.txt
-# the API TLS pair the engine mints next to the store when no [api].tls_cert_file is set (ADR 0172)
+# the API TLS pair the engine mints next to the store when no [api].tls_cert_file is set (ADR 0172),
+# its key in an owner-only directory of its own
+api-generated-key.d/
 api-generated-key.pem
 api-generated-cert.pem
 # ...and the empty lock file that serialises that first-run mint across engine shards

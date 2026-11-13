@@ -4576,7 +4576,7 @@ jobs:
           # ensure_api_tls_material writes beside [store].path, and the relative --db below is anchored
           # under the project root, which on a hosted runner is $GITHUB_WORKSPACE.
           cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
-          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.d/api-generated-key.pem"
           # THE HARNESS PINS THAT SAME ONE ANCHOR, with no harness-code change. EnginePoller._cacert_for
           # resolves a LOOPBACK https URL to harness_tls_material()[0]; harness_tls_material reuses an
           # INHERITED pair when these two variables are both set and the certificate exists
@@ -4834,7 +4834,7 @@ jobs:
           # way: a CI-side client reaching the engine's API listener. Do not widen it to cover this --
           # that would turn a scoped outbound escape into a listener-verification off switch.
           cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
-          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.d/api-generated-key.pem"
           # One anchor for the readiness curl AND the harness poller; see the sqlite leg for why these
           # two variables are the lever (harness/load/tlsmat.py inherited branch).
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"

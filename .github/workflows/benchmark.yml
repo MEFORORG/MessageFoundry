@@ -97,7 +97,7 @@ jobs:
           # would also go green and is the wrong repair: verifying the certificate the engine actually
           # serves is part of "the engine came up".
           cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
-          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.d/api-generated-key.pem"
           # The harness pins that same pair through these two variables (harness/load/tlsmat.py,
           # inherited branch), exactly as ci.yml's load legs do. PR 1502 adds a `--cacert PEM` flag for
           # this; switch to `--cacert "$cert"` once it is on main.
@@ -264,7 +264,7 @@ jobs:
           # MEFOR_ALLOW_INSECURE_TLS in the job env is the engine's escape for the hop it DIALS to the
           # database. It has no reach over this hop, which is a client reaching the engine's API.
           cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
-          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.d/api-generated-key.pem"
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
           export MEFOR_HARNESS_TLS_KEY_FILE="$key"
           # No --db: the account goes into the server store MEFOR_STORE_* names, as serve opens it.
@@ -467,7 +467,7 @@ jobs:
           # MEFOR_ALLOW_INSECURE_TLS in the job env is the engine's escape for the hop it DIALS to the
           # database. It has no reach over this hop, which is a client reaching the engine's API.
           cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
-          key="$GITHUB_WORKSPACE/api-generated-key.pem"
+          key="$GITHUB_WORKSPACE/api-generated-key.d/api-generated-key.pem"
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
           export MEFOR_HARNESS_TLS_KEY_FILE="$key"
           # No --db: the account goes into the server store MEFOR_STORE_* names, as serve opens it.

@@ -110,6 +110,9 @@ def _self_signed(tmp_path: Path, *, password: str | None = None) -> tuple[Path, 
     # operator's key must be: under enforce `serve` refuses one a broad group can read (#3402).
     # The restricted create refuses an existing name, and a test may mint twice into one directory.
     key_path.unlink(missing_ok=True)
+    key_path.parent.mkdir(
+        mode=0o700, exist_ok=True
+    )  # the key's own directory, as the engine makes it
     write_restricted_file(
         key_path,
         approved_pkcs8_pem(key, password)
@@ -396,7 +399,7 @@ def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(
     # loopback secure-context WITHOUT auto-TLS". Loopback is exactly the case it named.
     assert "ssl_context_factory" in captured
     assert (tmp_path / "api-generated-cert.pem").exists()
-    assert (tmp_path / "api-generated-key.pem").exists()
+    assert (tmp_path / "api-generated-key.d" / "api-generated-key.pem").exists()
 
 
 def test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder(
@@ -4596,7 +4599,9 @@ def test_concurrent_first_starts_in_separate_processes_share_one_pair(tmp_path: 
     assert failures == [], failures
     printed = {out.strip() for out, _ in outcomes}
     assert len(printed) == 1, printed
-    _load_pair(state / _GENERATED_CERT_NAME, state / "api-generated-key.pem")
+    _load_pair(
+        state / _GENERATED_CERT_NAME, state / "api-generated-key.d" / "api-generated-key.pem"
+    )
 
 
 def test_a_start_arriving_mid_mint_waits_instead_of_discarding_the_key_being_written(
@@ -5052,6 +5057,9 @@ def _plant_generated_pair(
     # refuse a generated key a broad account can read, and a plain write is group- and
     # world-readable on POSIX, so a planted pair must not differ from a minted one on that axis.
     key_path.unlink(missing_ok=True)
+    key_path.parent.mkdir(
+        mode=0o700, exist_ok=True
+    )  # the key's own directory, as the engine makes it
     write_restricted_file(
         key_path,
         key.private_bytes(
@@ -5254,7 +5262,7 @@ def test_a_renewal_interrupted_between_its_replaces_recovers_and_is_reported(
         ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
     with pytest.raises(ssl.SSLError):  # CONTROL: the interruption really left a mismatched pair
         _load_pair(cert, key)
-    assert (tmp_path / (key.name + ".renewing")).exists()
+    assert key.with_name(key.name + ".renewing").exists()
     monkeypatch.setattr(tls, "_replace_generated", real)
 
     events: list[GeneratedPairReplaced] = []
@@ -5510,7 +5518,7 @@ def test_supervise_renews_once_before_it_spawns_any_shard(
         # (BACKLOG #3314); each engine shard reads its own from its settings.
         "crl_max_reloads",
     }  # nothing new handed to the shards
-    _load_pair(cert, tmp_path / "api-generated-key.pem")
+    _load_pair(cert, tmp_path / "api-generated-key.d" / "api-generated-key.pem")
 
     async def rows() -> list[Any]:
         store = await open_store(sqlite_settings(db))

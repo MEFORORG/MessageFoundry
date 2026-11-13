@@ -63,7 +63,8 @@ _PEM_MARKER: Final = "-----BEGIN"
 #: The remedy for a key file an operator supplied.
 KEY_FILE_REMEDY: Final = (
     "Restrict it to the account the engine runs as (POSIX: a file, not a link, that account owns, "
-    "in a directory only that account or root may write, or one with the sticky bit; for a key "
+    "in a directory that account or root owns and only it may write, or that has the sticky "
+    "bit; for a key "
     "kept behind a link, such as a certbot live/ path, copy the file there on each renewal)"
 )
 
