@@ -3201,11 +3201,11 @@ in fact still running it is recorded when that owner writes its outcome: the out
 the row moved and logs it, and the outcome row is written alone. If that outcome write raised
 instead, no outcome row is written alone, and it pages `audit_write_failed`, as the list above says.
 
-A row claimed before the column existed has no owner, and the first process to start treats it as its
-own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
-unsupported anyway. No reconcile in a process moves, and the interrupt refuses (**409**), a release
-any approval gate in that process is running, so a second app over the same engine leaves the first
-app's live releases alone.
+A row claimed before the column existed has no owner, and the first process to start treats it as
+its own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
+unsupported anyway. A second app over the same engine leaves alone a release a gate in this process
+is running, but still moves this process's other unsettled claims and records them with reason
+`engine_restart`, so build one app per engine.
 
 An app embedded around an engine (`create_app(engine=...)`) can start before its engine holds its
 graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and
