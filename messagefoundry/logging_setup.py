@@ -995,7 +995,9 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         elif isinstance(exc, OSError):
             self.send_failed = True
             sock = getattr(self, "socket", None)
-            if sock is not None:
+            # An unconnected datagram socket stays usable after a failed sendto, so only a stream
+            # socket is dropped; a UDP reset would cost a fresh lookup per record in an outage.
+            if sock is not None and self.socktype != socket.SOCK_DGRAM:
                 self.socket = None  # cleared first; a concurrent emit must not use a closing socket
                 # Already-broken sockets raise here. Closing was housekeeping; the point (stop reusing
                 # it) is achieved above, and logging from inside the logging error path would recurse.
@@ -1498,10 +1500,16 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             now = time.monotonic()
             last = self._last_send_failure_report
             # Throttled for the same reason as the report above. The count is a running total, so
-            # failures inside the window are in the next report's figure rather than lost.
-            if last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL:
+            # failures inside the window are in the next report's figure rather than lost. Not
+            # during the shutdown drain: logging.shutdown holds the queue handler's lock across
+            # close(), so a report then would park this thread until the join gave up on it.
+            # ERROR, not WARNING, so it survives [logging].level = "ERROR", as the stdlib's stderr
+            # traceback did.
+            if self._drain_deadline is None and (
+                last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL
+            ):
                 self._last_send_failure_report = now
-                _log.warning(
+                _log.error(
                     "off-box log forwarding: a send to the collector failed (%s; %d failed "
                     "send(s) so far). Record content is not shown here.",
                     cause,
@@ -2019,8 +2027,7 @@ class ForwarderStatus:
     #: UDP, where a datagram to a dead collector raises nothing: ``send_failing``, ``unsent`` and
     #: so ``lost`` can then stay at zero while every record is lost on the wire. What the engine
     #: can see there is what fails on this host (BACKLOG #5923): at least a ``sendto`` error (no
-    #: route, a down interface), a datagram too large to send, a failed lookup on a reconnect, and
-    #: queue and spool losses.
+    #: route, a down interface), a datagram too large to send, and queue and spool losses.
     delivery_confirmed: bool = True
     #: Whether the last send hit a network error. Also true from a deferred start, where the
     #: connect failed, until the first good send. A spool keeps the records while it has room.
@@ -2155,7 +2162,8 @@ def configure_logging(
     The forwarder is **best-effort and never blocks the engine**: UDP is fire-and-forget; a TCP or
     TLS collector **unreachable at startup** is deferred when a spool is configured (records spool
     until it answers) and skipped when none is (the connect error is logged on stdout and the service
-    starts without it); a certificate that fails verification or a name that does not resolve is
+    starts without it), and so is a UDP collector whose name lookup failed for a temporary reason
+    (BACKLOG #5923); a certificate that fails verification or a name that does not resolve is
     reported at ERROR and skipped either way; and the send itself runs on the forwarder's own listener thread
     (:class:`_ForwardQueueHandler`), so a collector that **stalls at runtime** costs the engine's
     threads nothing at all. A stalled collector instead fills a bounded hand-off queue, and records
@@ -2275,7 +2283,7 @@ def configure_logging(
                 # Deferred, not skipped (BACKLOG #1966): the spool holds records until it answers.
                 _log.warning(
                     "off-box log forwarding to %s:%d (%s) is not reachable yet: %s; records are "
-                    "spooled to %s and sent when the collector answers",
+                    "spooled to %s and sent once the collector can be reached",
                     forward.host,
                     forward.port,
                     forward.protocol,

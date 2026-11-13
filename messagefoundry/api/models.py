@@ -1116,8 +1116,9 @@ class LogForwarderInfo(BaseModel):
 
     **A UDP forwarder is never ``healthy``.** Over UDP only a send that fails on this host is counted
     (BACKLOG #5923), so the engine cannot see a record lost on the wire. ``delivery_confirmed`` is
-    then ``False``, a forwarder with no fault seen reads ``unconfirmed``, and ``lost`` counts queue
-    and spool losses and those local send failures.
+    then ``False``, and a forwarder with no fault seen reads ``unconfirmed``. A local send failure
+    raises ``send_failing``; it reaches ``lost`` only where nothing kept the record (no spool, or a
+    datagram too large to send), and a spool that took it holds it unsent.
 
     **Counts and fixed words only**: never a record, a collector address or an error text."""
 

@@ -482,8 +482,8 @@ def test_a_permanent_connect_failure_is_reported_at_error_and_not_deferred(
 def test_a_name_that_does_not_resolve_fails_permanently_under_the_real_create_socket(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], protocol: str
 ) -> None:
-    """The stdlib ``createSocket`` runs for real here and only the lookup is faked, so the UDP arm,
-    which builds the plain stdlib handler, is held to the simulated 3.14.9 behavior as well."""
+    """The stdlib ``createSocket`` runs for real here and only the lookup is faked, so every arm,
+    UDP included, is held to the simulated 3.14.9 behavior as well."""
 
     def _no_such_name(*args: Any, **kwargs: Any) -> Any:
         raise socket.gaierror(11001, "getaddrinfo failed")
@@ -658,7 +658,7 @@ def test_a_lookup_that_answers_on_the_retry_connects_through_our_create_socket(
 def test_a_udp_lookup_that_answers_on_the_retry_returns_a_handler_with_a_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The UDP arm builds the plain stdlib handler and retries in ``_build_syslog_handler``. A retry
+    """The UDP arm retries the lookup in ``_TimeoutSysLogHandler.__init__`` (BACKLOG #5923). A retry
     that answers must hand back that handler, open, with its socket."""
     _simulate_cpython_3149_syslog_init(monkeypatch)
     lookups = _first_lookup_of_the_collector_fails(
@@ -1522,6 +1522,11 @@ def test_a_failed_send_during_the_shutdown_drain_does_not_deadlock() -> None:
         done.append(True)
 
     closer = threading.Thread(target=_shutdown_like, daemon=True)
+    started = time.monotonic()
     closer.start()
     closer.join(30.0)
     assert done == [True], "close() under the queue handler's lock did not return"
+    # Not just "returned": a listener parked on the lock would return only after the join gave up
+    # (about 11 s here), and would be left running.
+    assert fwd._listener._thread is None, "the listener did not stop cleanly"
+    assert time.monotonic() - started < 5.0

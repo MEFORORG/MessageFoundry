@@ -1460,9 +1460,8 @@ def test_the_udp_forwarder_stays_unframed() -> None:
         )
         _emit_framed_lines(handler)
         datagrams = [collector.recv(4096) for _ in _FRAMED_LINES]
-    assert [d.rstrip(b"\x00") for d in datagrams] == [
-        _expected_payload(handler, line) for line in _FRAMED_LINES
-    ]
+    # The stdlib's trailing NUL, kept and documented (docs/CONFIGURATION.md forward_protocol).
+    assert datagrams == [_expected_payload(handler, line) + b"\x00" for line in _FRAMED_LINES]
 
 
 # --- BACKLOG #1199: the durable off-box hand-off (queue handler + listener) ----
