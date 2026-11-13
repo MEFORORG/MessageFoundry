@@ -332,6 +332,8 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
     def __init__(self, *, max_queue: int = _MAX_QUEUE) -> None:
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
+        # Queued or in flight, so a drain that is cut can say how many items it never delivered.
+        self._undelivered = 0
 
     def _enqueue(self, item: _T, *, dropped: str | None) -> bool:
         """Non-blocking enqueue; on a full queue, drop the item with a warning (``dropped`` names it).
@@ -345,7 +347,14 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
             if dropped is not None:
                 log.warning("%s queue full; dropping %s", type(self).__name__, dropped)
             return False
+        self._undelivered += 1
         return True
+
+    @property
+    def undelivered(self) -> int:
+        """How many items are queued or being handled, a count only (BACKLOG #5907). An item whose
+        handling was cancelled stays counted."""
+        return self._undelivered
 
     def start(self) -> None:
         if self._task is None:
@@ -366,6 +375,7 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
             if item is None:
                 return
             await self._handle(item)
+            self._undelivered -= 1
 
     @abc.abstractmethod
     async def _handle(self, item: _T) -> None:

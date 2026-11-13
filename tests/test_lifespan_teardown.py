@@ -239,6 +239,7 @@ async def test_a_step_that_ends_cancelled_on_its_own_is_not_taken_for_a_cancel()
 
 #: The managed lifespan's shutdown steps, every optional one present, in the order they run.
 _MANAGED_ORDER = [
+    "the alert control callback's removal",
     "the upload retention runner's stop",
     "the store-reading tasks",
     "the long-operations drain",
@@ -249,7 +250,6 @@ _MANAGED_ORDER = [
     "the config-write drain",
     "the security notifier's close",
     "the security-signal removal",
-    "the alert control callback's removal",
     "engine.stop()",
     "the instrumented executor's shutdown",
     "the alert notifier's close",
@@ -625,6 +625,42 @@ async def test_control_is_stopped_before_engine_stop_runs(
     # Logged as the shutdown it is, not as a missing wiring.
     assert "not run: shutting down" in caplog.text
     assert "no control callback is wired" not in caplog.text
+
+
+async def test_control_is_stopped_before_the_first_drain_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5909: the callback's removal used to sit just before engine.stop(), after every
+    drain, so a control_action restart dispatched during a drain could take the reload lock that
+    engine.stop() then waited on. Each step records whether the callback was wired as it began."""
+    notifier = NotifierAlertSink([])
+    monkeypatch.setattr(app_module, "notifier_from_settings", lambda *_a, **_k: notifier)
+    seen: list[tuple[str, bool]] = []
+    labels: dict[int, str] = {}
+    real_run, real_invoke = app_module._run_teardown, app_module._invoke
+
+    async def _run(steps: list[_TeardownStep], budget: float) -> None:
+        labels.update((id(step.run), step.label) for step in steps)
+        await real_run(steps, budget)
+
+    async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
+        seen.append((labels[id(run)], notifier._control_cb is not None))
+        return await real_invoke(run, bound)
+
+    monkeypatch.setattr(app_module, "_run_teardown", _run)
+    monkeypatch.setattr(app_module, "_invoke", _invoke)
+    app = create_managed_app(
+        db_path=tmp_path / "first.db",
+        alerts_settings=AlertsSettings(),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    async with app.router.lifespan_context(app):
+        pass
+    # The control: the callback was wired when the teardown began, so the removal cleared it.
+    assert seen[0] == ("the alert control callback's removal", True)
+    wired = [label for label, cb_wired in seen[1:] if cb_wired]
+    assert wired == [], f"steps ran with the control callback still wired: {wired}"
+    assert {"the store-reading tasks", "the long-operations drain"} <= {label for label, _ in seen}
 
 
 async def test_the_notifier_close_cancels_a_control_task_still_running() -> None:

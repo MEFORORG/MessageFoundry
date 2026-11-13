@@ -27,6 +27,7 @@ that happens to sit there changes.
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 import sys
 import textwrap
@@ -326,3 +327,55 @@ async def test_a_cancel_in_an_unguarded_startup_span_closes_the_store_and_notifi
         assert opened.engine_stops == 0
     finally:
         await _close_leftovers(opened)
+
+
+class _BlackholedTransport:
+    """A webhook or SMTP host that accepts the connection and never answers."""
+
+    name = "webhook"
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5907: the unwind drained the notifier's delivery with no cut before it closed the
+    store, so a blackholed alert host held the store open, and with it aiosqlite's non-daemon
+    worker (#1257). The budget is shrunk so the test is quick; the bound is read from it."""
+    monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", 1.5)
+    monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.5)
+    transport = _BlackholedTransport()
+    sink = NotifierAlertSink([transport])
+    sink.connection_stopped("IB_TEST_ADT", detail="PROBE-DETAIL-TEXT")
+    sink.connection_stopped("IB_TEST_ORU", detail="PROBE-DETAIL-TEXT")
+    closed: list[float] = []
+    loop = asyncio.get_running_loop()
+
+    class _Store:
+        async def close(self) -> None:
+            closed.append(loop.time())
+
+    store: Any = _Store()
+    caplog.set_level(logging.ERROR, logger="messagefoundry.api.app")
+    began = loop.time()
+    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    # The control: the drain did reach the hung send, so the cut is what ended it.
+    assert transport.entered.is_set()
+    assert closed, "the store was never closed"
+    # Within the unwind's budget, plus one cut grace.
+    assert closed[0] - began <= 1.0 + appmod._CUT_GRACE_SECONDS + 0.5
+    errors = [r for r in caplog.records if "did not drain" in r.getMessage()]
+    assert len(errors) == 1, caplog.text
+    assert "2 alert(s) left undelivered" in errors[0].getMessage()
+    # A count only, never the alert's content.
+    assert "PROBE-DETAIL-TEXT" not in caplog.text
+    assert "IB_TEST_ADT" not in caplog.text
+    # The teardown did not also cut the step: the notifier's own wait ended first.
+    assert "cutting it" not in caplog.text
+    assert sink._task is None

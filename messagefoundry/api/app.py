@@ -1352,6 +1352,9 @@ _INNER_SHARE: Final = 0.8
 #: How long a step cut at its bound gets to unwind its cancellation before the teardown stops waiting
 #: for it and moves on, leaving it to finish or fail on its own.
 _CUT_GRACE_SECONDS: Final = 0.1
+#: The startup unwind's alert-state drain floor (BACKLOG #5907). The unwind's notifier drain is
+#: bounded by the rest of its budget, so this is what that drain leaves the state writes.
+_UNWIND_STATE_DRAIN_FLOOR_SECONDS: Final = 0.5
 #: The part of the long-operations drain's share it spends waiting before it cancels, the rest being
 #: the grace for the rollback arms. A policy, not derived from the drain's defaults (vault BACKLOG
 #: #3740 item 17): their ratio, 0.5 s to 6 s, would leave the wait about 0.2 s under the shipped
@@ -1624,6 +1627,23 @@ def _managed_teardown_steps(
     was never built. A function of its own so a test can pin the order and count the bounded
     steps against the real list (vault BACKLOG #3740 items 15 and 16)."""
     steps: list[_TeardownStep] = []
+    if notifier is not None:
+        # BACKLOG #5909: first, before any drain. A control_action rule firing on an alert the
+        # shutdown raises must not restart a listener or worker on the runner being stopped, and a
+        # restart begun during the drains would take the reload lock engine.stop() then waits on.
+        # The runner refuses a restart itself once stopped (BACKLOG #5702); clearing the callback
+        # first means none is attempted. A restart already under way is left to finish, since a
+        # cancel partway could strand a listener; the notifier's close at the end cancels any
+        # control task still running. A synchronous call cannot overrun, so it is never cut and
+        # adds no cut grace to the budget.
+        steps.append(
+            _TeardownStep(
+                "the alert control callback's removal",
+                0.0,
+                _sync(lambda: notifier.stop_control()),
+                bounded=False,
+            )
+        )
     if upload_retention_runner is not None:
         # Handed part of its bound, so the runner's own wait ends, names any unaudited file and
         # cancels the sweep before the teardown cuts it. With the managed set of steps that bound
@@ -1676,22 +1696,6 @@ def _managed_teardown_steps(
     # with the graph still serving: engine.stop() raises it through Engine.on_graph_stopped, and
     # gives that write a bounded chance before the store closes.
     steps.append(_TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals)))
-    if notifier is not None:
-        # BACKLOG #5909: a control_action rule firing on an alert the engine's own stop raises must
-        # not restart a listener or worker on the runner being stopped. The runner refuses that
-        # itself once stopped (BACKLOG #5702); clearing the callback first means no restart is
-        # attempted. A restart already under way is left to finish, since the stop waits for it
-        # on the reload lock and a cancel partway could strand a listener; the notifier's close
-        # below cancels any control task still running. A synchronous call cannot overrun, so it
-        # is never cut and adds no cut grace to the budget.
-        steps.append(
-            _TeardownStep(
-                "the alert control callback's removal",
-                0.0,
-                _sync(lambda: notifier.stop_control()),
-                bounded=False,
-            )
-        )
     steps.append(
         _TeardownStep(
             "engine.stop()",
@@ -1722,34 +1726,58 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     """Close what the managed lifespan opened before its startup failed, ahead of engine.start()
     (BACKLOG #5907). The engine never started, so it is not stopped: the store is closed directly.
     The security signals are not removed here: their install is the guarded span's last statement,
-    so no failure the guard catches comes after it.
+    so no failure the guard catches comes after it. The alert control callback is not cleared
+    either: it is wired only after engine.start(), so no failure this unwinds comes after it.
 
     Each part is a :func:`_run_teardown` step, so a cancel that arrives during the unwind, or one
     re-delivered on every await as an anyio cancel scope does, reaches no step and the store still
     closes. The notifier is started before it is drained, as the open_store failure path does, so
     an alert raised before it would normally have started (the reason the start failed) is sent.
-    Its drain is never cut, as the per-span guards this replaced never cut it: a failed start has
-    no stop window to fit, and each transport bounds its own send. Its alert-state writes are then
-    given a bounded drain, as engine.stop() gives them, so the alert that explains the refusal is
-    recorded before the store closes. The budget below bounds only that drain."""
+    Its alert-state writes are then given a bounded drain, as engine.stop() gives them, so the
+    alert that explains the refusal is recorded before the store closes.
+
+    The delivery drain is bounded by most of the unwind's budget, everything but the alert-state
+    drain's floor, and not by the shutdown teardown's notifier floor: the crash-loop page that
+    explains the refusal is pinned (test_the_alert_fires_even_when_the_start_then_fails, #2597),
+    and a tight cut would drop it. A blackholed webhook or SMTP host would otherwise hold the store
+    open past NSSM's stop window (#1257). Its own wait ends at _INNER_SHARE of that bound and logs
+    one ERROR with the undelivered count, before the teardown would cut the step."""
+    budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
 
-        async def _close_notifier(_bound: float) -> None:
+        async def _close_notifier(bound: float) -> None:
             notifier.start()
-            await notifier.aclose()
+            wait = bound * _INNER_SHARE
+            try:
+                async with asyncio.timeout(wait):
+                    await notifier.aclose()
+            except TimeoutError:
+                # A count only: an alert's content can carry a partner's text (docs/PHI.md).
+                _log.error(
+                    "startup unwind: the alert notifier did not drain within %.2fs; %d alert(s) "
+                    "left undelivered",
+                    wait,
+                    notifier.undelivered,
+                )
 
         steps.append(
-            _TeardownStep("the alert notifier's close", 0.0, _close_notifier, bounded=False)
+            _TeardownStep(
+                "the alert notifier's close",
+                budget - _UNWIND_STATE_DRAIN_FLOOR_SECONDS,
+                _close_notifier,
+            )
         )
         steps.append(
             _TeardownStep(
-                "the alert-state drain", 0.5, lambda b: notifier.drain_state(b * _INNER_SHARE)
+                "the alert-state drain",
+                _UNWIND_STATE_DRAIN_FLOOR_SECONDS,
+                lambda b: notifier.drain_state(b * _INNER_SHARE),
             )
         )
     # Never cut: a store left open keeps aiosqlite's non-daemon worker alive (#1257).
     steps.append(_TeardownStep("the store's close", 0.0, lambda _b: store.close(), bounded=False))
-    await _run_teardown(steps, _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS)
+    await _run_teardown(steps, budget)
 
 
 @asynccontextmanager
