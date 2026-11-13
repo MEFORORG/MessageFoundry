@@ -496,7 +496,7 @@ async def _deliver_one(
             alert_sink=sink,
             egress=EgressSettings(deny_by_default=False),
         )
-        runner._destinations[DEST] = dest if exc is None else _Refusing(exc)
+        runner._destinations[DEST] = dest if exc is None else _Refusing(exc)  # type: ignore[assignment]
         item = await store.claim_next_fifo(DEST, now=1.0)
         assert item is not None
         outcome = await runner._process_delivery_item(DEST, item)
@@ -866,6 +866,32 @@ def test_the_connect_407_match_reads_the_status_and_the_built_digest_setup(
     assert is_refused_proxy_digest_tunnel(urllib.error.URLError(match), digest_proxy=True)
     refused = urllib.error.URLError(reason)  # type: ignore[arg-type]
     assert not is_refused_proxy_digest_tunnel(refused, digest_proxy=digest_proxy)
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_no_built_http_token_endpoint_reaches_the_web_proxy() -> None:
+    """ADR 0095 B.1's ``http://`` token-endpoint case is overtaken. An off-box one is refused when
+    the provider is built (vault BACKLOG #3533 item 4), and a loopback one is dialled direct, so
+    the web proxy's Digest handler never sees its request."""
+    with _Challenger(407, _MD5) as proxy:
+        proxy_config = _digest_proxy_config(proxy.url, auth="digest")
+        with active_hop_posture(_WARN_DIAL), pytest.raises(HttpAuthError):
+            OAuth2ClientCredentialsProvider(
+                token_url="http://auth.partner.invalid/token",
+                client_id="cid",
+                client_secret="s3cr3t",
+                proxy=proxy_config,
+            )
+        provider = OAuth2ClientCredentialsProvider(
+            token_url="http://127.0.0.1:9/token",
+            client_id="cid",
+            client_secret="s3cr3t",
+            proxy=proxy_config,
+        )
+        with pytest.raises(DeliveryError) as ei:
+            provider.access_token()
+    assert type(ei.value) is DeliveryError
+    assert proxy.requests == 0
 
 
 @pytest.mark.usefixtures("no_bypass")

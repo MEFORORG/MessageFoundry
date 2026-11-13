@@ -686,7 +686,8 @@ class StrictHTTPResponse(http.client.HTTPResponse):
         self.status_read: int | None = None
 
     def _read_status(self) -> tuple[str, int, str]:
-        version, status, reason = super()._read_status()
+        # http.client's own name for the status-line read; typeshed does not declare it.
+        version, status, reason = super()._read_status()  # type: ignore[misc]
         self.status_read = status
         return version, status, reason
 
@@ -734,7 +735,7 @@ class _StrictHTTPSConnection(http.client.HTTPSConnection):
 
         vars(self)["response_class"] = reply
         try:
-            super()._tunnel()
+            super()._tunnel()  # type: ignore[misc]
         except OSError as exc:
             status = replies[-1].status_read if replies else None
             # _tunnel's own refusal of a status is a bare OSError with no errno. A socket error
