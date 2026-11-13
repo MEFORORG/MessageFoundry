@@ -880,8 +880,9 @@ def _canonical_host(text: str) -> _CanonicalHost | None:
     when no entry may match it (BACKLOG #5915).
 
     An IP literal compares as its address, so ``0:0:0:0:0:0:0:1`` is ``::1``. Anything else
-    holding a ``:`` is not a host, a bracketed ``[::1]`` included, since the socket dialers read
-    that as a name they cannot resolve. A name compares lowercased. Canonical equivalence only,
+    holding a ``:``, a bracketed ``[::1]`` included, matches no entry: no entry's host is such a
+    name, and reading it as an address would be a guess about how its connector dials it. A name
+    compares lowercased. Canonical equivalence only,
     never looser: an IPv4-mapped IPv6 address is not the IPv4 address, a trailing-dot name is not
     the dotless one, and shorthand IPv4 such as ``127.1`` is a name, since :mod:`ipaddress` reads
     only the dotted quad. A ``%`` zone id gets ``None``: :mod:`ipaddress` reads ``fe80::1%eth0``

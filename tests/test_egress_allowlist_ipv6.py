@@ -9,8 +9,8 @@ match ``[::1]``. (``[egress].allowed_ech_sidecar`` has its own parse, ``pinned_h
 never read here.) It is a security matcher, so the change is canonical equivalence only: each case
 under "never equated" stays a refusal.
 
-Every case runs through both users of the one parse: the egress gate's ``host_port_allowed`` and
-the AI broker's ``endpoint_host_allowed``, so the two cannot drift.
+Each case taking the ``match`` fixture runs through both the egress gate's ``host_port_allowed``
+and the AI broker's ``endpoint_host_allowed``; the rest run on the arm they name.
 """
 
 from __future__ import annotations
@@ -94,6 +94,8 @@ def test_unbracketed_ipv6_entry_matches_nothing(match: Match, entry: str) -> Non
         "[::1]8123",
         "[db.example.org]",
         "[127.0.0.1]",
+        "[a:b]",
+        "[db.example.org:443]",
         "[]",
         ":443",
         "",
@@ -113,11 +115,6 @@ def test_no_port_never_matches_a_pin_spelled_none() -> None:
     assert host_port_allowed("::1", None, ["[::1]:None"]) is False
     assert host_port_allowed("db.example.org", None, ["db.example.org:None"]) is False
     assert host_port_allowed("::1", None, ["[::1]"]) is True
-
-
-def test_bracketed_host_value_is_not_an_address() -> None:
-    # A connection's `host` of `[::1]` is a name to a socket dialer, which cannot resolve it.
-    assert host_port_allowed("[::1]", 2575, ["[::1]"]) is False
 
 
 @pytest.mark.parametrize("url", ["https://ai.internal:abc/x", "https://ai.internal:99999/x"])
@@ -155,6 +152,17 @@ def test_zone_id_in_the_host_matches_nothing() -> None:
     # ipaddress parses `fe80::1%eth0` with a scope id; the matcher refuses it rather than drop it.
     assert host_port_allowed("fe80::1%eth0", 443, ["[fe80::1]"]) is False
     assert endpoint_host_allowed("https://[fe80::1%25eth0]:443/x", ["[fe80::1]"]) is False
+
+
+@pytest.mark.parametrize(
+    ("host", "entry"), [("fe80::1%eth0", "[fe80::1%eth0]"), ("::1%31", "[::1%31]:8443")]
+)
+def test_the_same_zone_on_both_sides_matches_nothing(host: str, entry: str) -> None:
+    # ipaddress would read both sides as one scoped address, so only the `%` refusal stops this.
+    # A URL's zone stays percent-encoded where it is read and is decoded before the dial, so
+    # `[::1%31]` would be compared as one host and dialled as `::11`.
+    assert host_port_allowed(host, 8443, [entry]) is False
+    assert endpoint_host_allowed("https://[::1%31]:8443/x", ["[::1%31]:8443"]) is False
 
 
 # --- the DATABASE arm reads the same parse ------------------------------------------------------
