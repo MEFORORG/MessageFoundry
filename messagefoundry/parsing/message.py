@@ -301,10 +301,11 @@ class Message:
         write emits a raw MLLP frame byte (ADR 0205 rules 2 and 3).
 
         ``occurrence`` (1-based) selects which segment of that id to write — ``occurrence=2`` edits
-        the **second** ``OBX``. It counts as :meth:`field`, :meth:`count_segments` and ``Peek.field``
-        do, skipping a fieldless bare line such as ``PID`` (BACKLOG #5917). ``repetition``
-        (1-based) scopes the write to one field repetition: a component write edits that repetition
-        (padding earlier reps if needed) and preserves the others (default — and ``repetition=1`` — edit the first, preserve the rest; review H-9); a
+        the **second** ``OBX``. It counts as :meth:`field` and :meth:`count_segments` do, and
+        occurrence 1 is the segment ``Peek.field`` reads (see ``_builtin_hl7.segment_index`` for a
+        fieldless bare line). ``repetition`` (1-based) scopes the write to one field repetition: a
+        component write edits that repetition (padding earlier reps if needed) and preserves the
+        others (default — and ``repetition=1`` — edit the first, preserve the rest; review H-9); a
         whole-field write with ``repetition`` replaces just that repetition's text (and the value may
         then not contain the repetition separator). Without ``repetition``, a whole-field write
         assigns the caller's text verbatim (their structure, repetitions and all). Raises

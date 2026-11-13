@@ -102,7 +102,11 @@ class SegmentGroup:
 
     @property
     def ordinal(self) -> int:
-        """This group's 1-based position among the boundary segments (the Nth ``OBR``)."""
+        """This group's 1-based position among the boundary segments (the Nth ``OBR`` line).
+
+        Positional, so a fieldless bare ``OBR`` line counts here though :meth:`Message.field` and
+        :meth:`Message.count_segments` skip it: after one, ``ordinal`` is not the occurrence
+        ``Message.field`` reads. Read the boundary through :meth:`field` instead (BACKLOG #5917)."""
         return self._ordinal
 
     def segment_ids(self) -> list[str]:
@@ -132,7 +136,9 @@ class SegmentGroup:
         ``occurrence`` (1-based) selects the Nth such segment **within the group**, so
         ``group.field("OBX-5", occurrence=2)`` reads the 2nd OBX of *this* order, not the message.
         Delegates to :meth:`Message.field` translated to the message-wide occurrence, so all the
-        separator/escaping/repetition behavior is identical. Returns None if absent."""
+        separator/escaping/repetition behavior is identical. Returns None if absent, which includes
+        every boundary field of a group opened by a fieldless bare boundary line, and a fieldless
+        member line is no occurrence (BACKLOG #5917)."""
         if occurrence < 1:
             raise ValueError("occurrence is 1-based (>= 1)")
         seg = self._segment_of_path(path)

@@ -360,9 +360,9 @@ def test_add_segment_bare_id_is_settable() -> None:
 
 
 # A fieldless bare ``PID`` line (no field separator) directly before a populated one (BACKLOG #5917).
-# Message skips a fieldless line for every occurrence-addressed read, presence check, count and write,
-# as Peek does, so a sender who plants a bare ``PID`` cannot steer a default-occurrence write (a
-# Handler's whole-field scrub, say) off the populated segment.
+# Message skips a fieldless line for its occurrence-addressed reads, presence check, count and
+# writes, as Peek does, so a planted bare ``PID`` cannot make a default-occurrence write land on a
+# different segment from the one Peek and Message read.
 _MSH = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 BARE_THEN_POPULATED = _MSH + "PID\rPID|1||X^Y~Q||DOE^JANE\r"
 
@@ -382,6 +382,18 @@ def test_a_fieldless_line_is_not_an_occurrence() -> None:
     # segments() stays positional: it lists every line, the fieldless one included, as Peek's does.
     assert m.segments() == ["MSH", "PID", "PID"]
     assert Peek.parse(BARE_THEN_POPULATED).segments() == m.segments()
+
+
+def test_a_split_fieldless_line_is_still_not_an_occurrence() -> None:
+    # The other tests reach _is_fieldless's lazy-raw branch; split every line first so its
+    # split-fields branch is pinned on the count, read and write paths too.
+    m = Message.parse(BARE_THEN_POPULATED)
+    for index in range(len(m.segments())):
+        _builtin_hl7._ensure_split(m._m, index)
+    assert m.count_segments("PID") == 1
+    assert m.field("PID-5") == "DOE^JANE"
+    m.set("PID-5", "")
+    assert _pid_lines(m) == ["PID", "PID|1||X^Y~Q||"]
 
 
 @pytest.mark.parametrize(

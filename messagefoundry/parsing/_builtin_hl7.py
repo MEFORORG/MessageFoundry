@@ -261,20 +261,19 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     msg["segments"][seg_index]["fields"] = list(parts)
 
 
-def _segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:
+def segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:
     """List index of the ``occurrence``-th (1-based) segment with ``seg_id``, or None if absent.
 
     The occurrence scan at least these by-id paths resolve through: ``Message`` reads, its presence
     check, :func:`set_field`, and the ``Peek`` path (:func:`extract_field`); :func:`count_segments`
-    and :func:`addressable_segment_ids` apply the same skip. Code outside this package that numbers
-    occurrences from encoded lines or :func:`segment_ids` does not, unless it calls
-    :data:`segment_index`. It uses python-hl7's
+    and :func:`addressable_segment_ids` apply the same skip. Code that numbers occurrences from
+    encoded lines or :func:`segment_ids` does not, unless it calls this. It uses python-hl7's
     ``segments()`` matcher, ``seg[0][0] == id``, which **skips a fieldless bare segment** (see
-    :func:`_is_fieldless`), so a bare ``PID`` directly before a populated ``PID`` leaves the populated
-    one occurrence 1, and a lone bare ``PID`` reads, counts and writes as an absent segment (BACKLOG
-    #5917; the history is in ADR 0054). This scan never raises; the blank
-    segment blow-up python-hl7's matcher also has lives in :func:`raise_if_blank_segment_scan`, which
-    the raising paths call first.
+    :func:`_is_fieldless`), so a bare ``PID`` directly before a populated ``PID`` leaves the
+    populated one occurrence 1, and a lone bare ``PID`` reads, counts and writes as an absent
+    segment. This is the one statement of that rule; BACKLOG #5917 and ADR 0054 hold its history.
+    This scan never raises; the blank segment blow-up python-hl7's matcher also has lives in
+    :func:`raise_if_blank_segment_scan`, which the raising paths call first.
     """
     seen = 0
     for i, seg in enumerate(msg["segments"]):
@@ -285,16 +284,11 @@ def _segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | No
     return None
 
 
-#: The public name of :func:`_segment_index`, for a caller outside this module that must number
-#: occurrences exactly as ``Message`` and ``Peek`` do (BACKLOG #5917).
-segment_index = _segment_index
-
-
 def _is_fieldless(msg: ParsedMessage, seg_index: int) -> bool:
     """Whether a segment line carries **no field separator at all** (just a bare id like ``PID``).
 
     This is the distinction python-hl7's ``segments()`` matcher turns on (see
-    :func:`_segment_index`): a fieldless line parses such that ``segment[0]`` is a plain ``str``
+    :func:`segment_index`): a fieldless line parses such that ``segment[0]`` is a plain ``str``
     (the id) rather than a ``Field``, so ``segment[0][0]`` is the id's first *character* — which never
     equals the id, so the segment is silently skipped by an id lookup. A line with even an empty
     trailing field (``PID|``) is *not* fieldless. Detected from the lazy raw line (no field sep) or,
@@ -318,7 +312,7 @@ def raise_if_blank_segment_scan(msg: ParsedMessage) -> None:
     segment. python-hl7's tolerant ``str(segment[0])`` iteration (its legacy ``Message`` reads,
     presence and occurrence>1 writes) does **not** — so this guard is invoked only on the raising
     paths (:func:`extract_field`, and :func:`set_field` at occurrence 1) to keep that asymmetry. It is
-    independent of the fieldless-segment skip, which every by-id path shares (:func:`_segment_index`,
+    independent of the fieldless-segment skip, which every by-id path shares (:func:`segment_index`,
     BACKLOG #5917): a blank line raises here, a bare id never does.
 
     **Only a truly empty line raises** (BACKLOG #1594). A line that merely *starts* with the field
@@ -377,7 +371,7 @@ def raw_field(msg: ParsedMessage, seg_id: str, fld: int, occurrence: int = 1) ->
     encoding chars), matching the hidden-offset model. This is the whole-field structural text — with
     any repetition delimiters — and is **not** unescaped (it is the inverse input to ``encode``).
     """
-    seg_index = _segment_index(msg, seg_id, occurrence)
+    seg_index = segment_index(msg, seg_id, occurrence)
     if seg_index is None:
         return ""
     _ensure_split(msg, seg_index)
@@ -426,9 +420,9 @@ def extract_field(
     """
     raise_if_blank_segment_scan(msg)
     # python-hl7's ``extract_field`` resolves the segment through ``segments()``, which skips a
-    # fieldless bare segment, as :func:`_segment_index` does. A zero-match segments() raises KeyError
+    # fieldless bare segment, as :func:`segment_index` does. A zero-match segments() raises KeyError
     # in python-hl7, mapped to None at the Peek layer; returning None here is the same result.
-    seg_index = _segment_index(msg, seg_id, occurrence)
+    seg_index = segment_index(msg, seg_id, occurrence)
     if seg_index is None:
         return None
     _ensure_split(msg, seg_index)
@@ -533,7 +527,7 @@ def segment_ids(msg: ParsedMessage) -> list[str]:
 
     Positional: one entry per line, a fieldless bare segment included, so an index here is an index
     for :func:`add_segment_line` and :func:`delete_segment_at`. To count or number occurrences, use
-    :func:`addressable_segment_ids`, which agrees with :func:`_segment_index`.
+    :func:`addressable_segment_ids`, which agrees with :func:`segment_index`.
     """
     return [seg["id"] for seg in msg["segments"]]
 
@@ -542,14 +536,14 @@ def addressable_segment_ids(msg: ParsedMessage) -> list[str | None]:
     """:func:`segment_ids` with each fieldless bare segment replaced by ``None``.
 
     The same length and positions as :func:`segment_ids`, but an entry matches an id only where
-    :func:`_segment_index` counts that line as an occurrence, so a count or an occurrence translation
+    :func:`segment_index` counts that line as an occurrence, so a count or an occurrence translation
     built on it agrees with every by-id read and write (BACKLOG #5917).
     """
     return [None if _is_fieldless(msg, i) else seg["id"] for i, seg in enumerate(msg["segments"])]
 
 
 def count_segments(msg: ParsedMessage, seg_id: str) -> int:
-    """How many ``seg_id`` segments :func:`_segment_index` can reach, so a fieldless bare line is not
+    """How many ``seg_id`` segments :func:`segment_index` can reach, so a fieldless bare line is not
     counted. Tests fieldlessness only on lines whose id matches, so no list is built."""
     return sum(
         1
@@ -982,7 +976,7 @@ def set_field(
     verbatim as a bare ``str`` (re-componentized lazily on a later read). Marks the message dirty so
     the next :func:`encode` rebuilds the raw. Raises ``KeyError`` if the segment occurrence is absent.
 
-    Every occurrence resolves through :func:`_segment_index`, the scan the reads and the ``Message``
+    Every occurrence resolves through :func:`segment_index`, the scan the reads and the ``Message``
     presence check use, so a fieldless bare segment is skipped here too: a bare ``PID`` before a
     populated one leaves the write on the populated one, and a lone bare ``PID`` is a ``KeyError``
     (BACKLOG #5917). For ``occurrence == 1`` a blank segment anywhere still raises ``IndexError``
@@ -992,7 +986,7 @@ def set_field(
     """
     if occurrence == 1:
         raise_if_blank_segment_scan(msg)
-    seg_index = _segment_index(msg, seg_id, occurrence)
+    seg_index = segment_index(msg, seg_id, occurrence)
     if seg_index is None:
         raise KeyError(f"cannot set absent segment {seg_id!r} occurrence {occurrence}")
     _ensure_split(msg, seg_index)
