@@ -486,12 +486,13 @@ async def test_dicomweb_unparseable_2xx_reply_is_a_permanent_refusal(
     assert exc.value.__context__ is None and exc.value.__cause__ is None
 
 
-# ReferencedSOPInstanceUID elements that name no instance, so confirm no 202 store (BACKLOG #5914).
 def _uid_body(uid: object) -> str:
     return json.dumps({"00081199": {"vr": "SQ", "Value": [{"00081155": uid}]}})
 
 
-_UNCONFIRMING_UID_BODIES = [
+# ReferencedSOPSequence bodies that name no stored instance, so confirm no 202 store (BACKLOG #5914):
+# first by a malformed ReferencedSOPInstanceUID element, then by a malformed sequence element.
+_UNCONFIRMING_BODIES = [
     pytest.param(_uid_body(uid), id=f"uid-{name}")
     for name, uid in [
         ("no-value", {"vr": "UI"}),
@@ -500,8 +501,8 @@ _UNCONFIRMING_UID_BODIES = [
         ("null-entry", {"vr": "UI", "Value": [None]}),
         ("empty-string", {"vr": "UI", "Value": [""]}),
         ("blank-string", {"vr": "UI", "Value": ["  "]}),
-        ("zero-width-space", {"vr": "UI", "Value": ["​"]}),
-        ("bom", {"vr": "UI", "Value": ["﻿"]}),
+        ("zero-width-space", {"vr": "UI", "Value": ["\N{ZERO WIDTH SPACE}"]}),
+        ("bom", {"vr": "UI", "Value": ["\N{ZERO WIDTH NO-BREAK SPACE}"]}),
         ("not-a-uid", {"vr": "UI", "Value": ["N/A"]}),
         ("empty-component", {"vr": "UI", "Value": ["1..2"]}),
         ("over-64", {"vr": "UI", "Value": ["1." * 32 + "1"]}),
@@ -510,8 +511,10 @@ _UNCONFIRMING_UID_BODIES = [
         ("non-string", {"vr": "UI", "Value": [42]}),
         ("value-not-array", {"vr": "UI", "Value": "1.2.3.4.5"}),
         ("element-not-object", "1.2.3.4.5"),
-        ("uid-with-bulk-uri", {"vr": "UI", "Value": ["1.2"], "BulkDataURI": "x"}),
+        ("bulk-uri", {"vr": "UI", "Value": ["1.2"], "BulkDataURI": "x"}),
         ("misspelt-value", {"vr": "UI", "value": ["1.2"]}),
+        ("wrong-vr", {"vr": "SQ", "Value": ["1.2"]}),
+        ("no-vr", {"Value": ["1.2"]}),
     ]
 ] + [
     pytest.param(json.dumps({"00081199": seq}), id=f"seq-{name}")
@@ -526,31 +529,26 @@ _UNCONFIRMING_UID_BODIES = [
 @pytest.mark.parametrize(
     "body",
     [
-        "",
-        "\r\n",
-        "{}",
-        json.dumps({"00081190": {"vr": "UR", "Value": [f"{BASE}/studies/1.2.3"]}}),
-        json.dumps({"00081199": {"vr": "SQ", "Value": []}}),
-        json.dumps({"00081199": {"vr": "SQ"}}),
-        json.dumps({"00081199": {"vr": "SQ", "Value": "x"}}),
-        json.dumps({"00081199": {"vr": "SQ", "Value": [None, "x"]}}),  # no item is a dataset
-        json.dumps([{"00081199": {"vr": "SQ", "Value": []}}]),
-        json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}),  # an item naming no instance
-        # BACKLOG #5914 repair: a ReferencedSOPInstanceUID key alone confirms no store.
-        *_UNCONFIRMING_UID_BODIES,
-    ],
-    ids=[
-        "empty",
-        "whitespace",
-        "empty-object",
-        "no-sequence",
-        "empty-sequence",
-        "no-value",
-        "bad-value",
-        "non-dataset-items",
-        "list-empty-sequence",
-        "item-without-instance-uid",
-        *(p.id for p in _UNCONFIRMING_UID_BODIES),
+        pytest.param("", id="empty"),
+        pytest.param("\r\n", id="whitespace"),
+        pytest.param("{}", id="empty-object"),
+        pytest.param(
+            json.dumps({"00081190": {"vr": "UR", "Value": [f"{BASE}/studies/1.2.3"]}}),
+            id="no-sequence",
+        ),
+        pytest.param(json.dumps({"00081199": {"vr": "SQ", "Value": []}}), id="empty-sequence"),
+        pytest.param(json.dumps({"00081199": {"vr": "SQ"}}), id="no-value"),
+        pytest.param(json.dumps({"00081199": {"vr": "SQ", "Value": "x"}}), id="bad-value"),
+        pytest.param(
+            json.dumps({"00081199": {"vr": "SQ", "Value": [None, "x"]}}), id="non-dataset-items"
+        ),
+        pytest.param(
+            json.dumps([{"00081199": {"vr": "SQ", "Value": []}}]), id="list-empty-sequence"
+        ),
+        pytest.param(
+            json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}), id="item-without-instance-uid"
+        ),
+        *_UNCONFIRMING_BODIES,
     ],
 )
 async def test_dicomweb_202_without_a_referenced_sop_is_a_permanent_refusal(
@@ -564,11 +562,49 @@ async def test_dicomweb_202_without_a_referenced_sop_is_a_permanent_refusal(
     assert exc.value.code == "unconfirmed-202"
 
 
-@pytest.mark.parametrize("body", _UNCONFIRMING_UID_BODIES)
-async def test_dicomweb_200_is_not_held_to_the_202_confirmation_rule(body: str) -> None:
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("body", _UNCONFIRMING_BODIES)
+async def test_dicomweb_200_is_not_held_to_the_202_confirmation_rule(
+    body: str, capture: bool
+) -> None:
     # The ruling: a 200 whose ReferencedSOPSequence confirms nothing is still a delivery.
-    dest = _dest()
+    dest = _dest(capture_response=capture)
     dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    resp = await dest.send(PAYLOAD)
+    if capture:
+        assert isinstance(resp, DeliveryResponse)
+        assert resp.outcome == "accepted"
+    else:
+        assert resp is None
+
+
+@pytest.mark.parametrize(
+    "uid",
+    [
+        pytest.param("1." * 31 + "12", id="exactly-64"),
+        pytest.param("1.2.3\0", id="nul-pad"),
+        pytest.param("1.2.3 ", id="space-pad"),
+        pytest.param("1.02.3", id="leading-zero"),
+    ],
+)
+async def test_dicomweb_202_confirms_by_a_uid_at_the_grammar_boundary(uid: str) -> None:
+    body = _uid_body({"vr": "UI", "Value": [uid]})
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
+async def test_dicomweb_202_confirms_when_one_item_of_several_names_an_instance() -> None:
+    body = json.dumps(
+        {
+            "00081199": {
+                "vr": "SQ",
+                "Value": [{}, {"00081155": {"vr": "UI", "Value": ["1.2.3.4.5"]}}],
+            }
+        }
+    )
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
     assert await dest.send(PAYLOAD) is None
 
 
@@ -674,6 +710,12 @@ async def test_only_the_reply_refusals_that_prove_nothing_carry_the_replay_advic
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(PAYLOAD)
     assert "before a replay" not in str(exc.value)
+    # A malformed FailedSOPSequence proves no rejection, so it carries the advice too.
+    dest._opener = _FakeOpener(body=b'{"00081198": {"vr": "SQ", "value": []}}', status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "failed-sop"
+    assert "before a replay" in str(exc.value)
     dest._opener = _FakeOpener(body=b"", status=202)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(PAYLOAD)

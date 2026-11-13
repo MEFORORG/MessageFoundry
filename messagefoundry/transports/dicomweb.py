@@ -111,8 +111,9 @@ _FAILED_SOP_SEQUENCE = "00081198"
 _REFERENCED_SOP_SEQUENCE = "00081199"
 _REFERENCED_SOP_INSTANCE_UID = "00081155"
 # PS3.18 Annex F: the only keys a sequence (SQ) or UID (UI) element may carry. BulkDataURI and
-# InlineBinary are for binary VRs only, so an element read here carrying any other key is malformed
-# and fails closed -- an allow-list, so a misspelt "value" cannot read as an empty sequence.
+# InlineBinary are never allowed on SQ or UI, so an element read here carrying any other key is
+# malformed and fails closed -- an allow-list, so a misspelt "value" cannot read as an empty
+# sequence.
 _ELEMENT_KEYS = frozenset({"vr", "Value"})
 # Written by name, never as a raw character an editor can silently drop (as fhir.py's _BOM).
 _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
@@ -151,7 +152,9 @@ def _uid_components_ok(value: str) -> bool:
 
 
 def _is_uid(value: object) -> bool:
-    """True when ``value`` is a string in the PS3.5 UID grammar :func:`_reject_non_uid` gates."""
+    """True when ``value`` is a string of dot-separated ASCII-digit components, at most 64
+    characters: the grammar :func:`_reject_non_uid` gates, which admits leading-zero components
+    although PS3.5 forbids them (that docstring says why)."""
     return isinstance(value, str) and len(value) <= _DICOM_UID_MAX_LEN and _uid_components_ok(value)
 
 
@@ -194,21 +197,27 @@ def _reply_is_empty(body: str) -> bool:
     return not body.lstrip(_BOM).strip(_JSON_WHITESPACE)
 
 
+def _element_values(element: Any) -> list[Any] | None:
+    """The ``Value`` array of a dicom+json SQ or UI element, ``[]`` when it has none, or ``None``
+    when the element is in a shape dicom+json does not allow: not an object, a ``Value`` that is not
+    an array, or any key but ``vr`` and ``Value``. One reader, so the two sides cannot drift."""
+    if not isinstance(element, dict) or not element.keys() <= _ELEMENT_KEYS:
+        return None
+    value = element.get("Value", [])
+    return value if isinstance(value, list) else None
+
+
 def _sequence_items(datasets: list[dict[str, Any]], tag: str) -> list[Any] | None:
     """Every item of the ``tag`` sequence across the datasets, in order, or ``None`` when the
-    element is present in a shape dicom+json does not allow (not an object, a ``Value`` that is
-    not an array, or any key but ``vr`` and ``Value``). An absent element, or one with no
-    ``Value`` and no other key, is an empty sequence (PS3.18 F.2.5). Only the shape is read,
+    element is present in a shape :func:`_element_values` refuses. An absent element, or one with
+    no ``Value`` and no other key, is an empty sequence (PS3.18 F.2.5). Only the shape is read,
     never an item's contents (PHI-safe)."""
     items: list[Any] = []
     for ds in datasets:
         if tag not in ds:
             continue
-        element = ds[tag]
-        if not isinstance(element, dict) or not element.keys() <= _ELEMENT_KEYS:
-            return None
-        value = element.get("Value", [])
-        if not isinstance(value, list):
+        value = _element_values(ds[tag])
+        if value is None:
             return None
         items.extend(value)
     return items
@@ -216,17 +225,21 @@ def _sequence_items(datasets: list[dict[str, Any]], tag: str) -> list[Any] | Non
 
 def _names_an_instance(item: Any) -> bool:
     """True when a ReferencedSOPSequence item is a dataset whose ReferencedSOPInstanceUID element
-    carries only ``vr`` and ``Value``, and whose ``Value`` is exactly one string (the attribute's VM
-    is 1) that passes :func:`_is_uid`. Anything else confirms nothing (BACKLOG #5914): no Value, an
-    empty or null one, a blank, non-string or non-UID entry, or more than one entry. The UID is
-    tested, never logged or returned (PHI-safe)."""
+    has ``vr`` ``UI``, passes :func:`_element_values`, and holds exactly one value (the attribute's
+    VM is 1): a string that passes :func:`_is_uid` once trailing NUL or space padding, which a
+    binary-to-JSON converter can leave, is dropped. Anything else confirms nothing (BACKLOG #5914):
+    no Value, an empty or null one, a blank, non-string or non-UID entry, or more than one entry.
+    The UID is tested, never logged or returned (PHI-safe)."""
     if not isinstance(item, dict):
         return False
     element = item.get(_REFERENCED_SOP_INSTANCE_UID)
-    if not isinstance(element, dict) or not element.keys() <= _ELEMENT_KEYS:
+    if not isinstance(element, dict) or element.get("vr") != "UI":
         return False
-    value = element.get("Value")
-    return isinstance(value, list) and len(value) == 1 and _is_uid(value[0])
+    value = _element_values(element)
+    if value is None or len(value) != 1:
+        return False
+    uid = value[0]
+    return isinstance(uid, str) and _is_uid(uid.rstrip("\0 "))
 
 
 def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
@@ -262,7 +275,13 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
     else:
         return "unparseable-reply", f"a reply that is not parseable dicom+json; {_NOT_SENT}"
     failed = _sequence_items(datasets, _FAILED_SOP_SEQUENCE)
-    if failed is None or failed:
+    if failed is None:
+        # A malformed sequence proves no rejection, so it carries the replay advice.
+        return (
+            "failed-sop",
+            f"a FailedSOPSequence in a shape dicom+json does not allow; {_NOT_SENT}",
+        )
+    if failed:
         return "failed-sop", "a FailedSOPSequence (instance rejected)"
     if status == 202:
         referenced = _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or []

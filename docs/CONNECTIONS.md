@@ -3811,8 +3811,9 @@ parseable JSON, repeats a key at any depth, is nested too deep, or is not a data
 non-empty array of them (code `unparseable-reply`); a FailedSOPSequence that is not an object, has a
 `Value` that is not an array, or carries any key but `vr` and `Value` (code `failed-sop`); and a
 202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID (`00081155`)
-element carries only `vr` and `Value`, with a `Value` of exactly one string in the UID grammar
-(dot-separated ASCII digits, at most 64 characters), an empty 202 included (code
+element has `vr` `UI`, carries no key but `vr` and `Value`, and has a `Value` of exactly one string
+in the UID grammar once trailing NUL or space padding is dropped (dot-separated ASCII digits, at
+most 64 characters), an empty 202 included (code
 `unconfirmed-202`). A ReferencedSOPSequence that is malformed in the ways a FailedSOPSequence can
 be names no instance. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
 required to carry a ReferencedSOPSequence, so a 200 dataset that confirms nothing and is not
