@@ -919,15 +919,8 @@ class SoapDestination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:  # metadata (#68): SOAP has no per-message header knob; unused
-        # WS-* mode: the Handler returned only the <Body> fragment; wrap + stamp here (post-queue
-        # boundary), so the per-call MessageID/Timestamp/Nonce never live in a pure transform.
-        if self._ws_mode:
-            payload = self._wrap_envelope(payload)
-        # ADR 0015 amendment (#236): swap placeholder tokens for the real secret HERE — after the
-        # payload left the store and (in WS-* mode) was wrapped, and before _post encodes + signs it —
-        # so the wire (and any detached JWS over those bytes) carries the secret while the store still
-        # holds only the token. No-op / byte-identical when no body_secrets are configured.
-        payload = self._apply_body_secrets(payload)
+        # BACKLOG #5913: the WS-* wrap and the body-secret substitution run in the same worker hop
+        # as the POST; _post_and_classify says in what order, and what that does not buy.
         body, status, headers, failure = await asyncio.to_thread(self._post_and_classify, payload)
         if not self.capture_response:
             if failure is not None:
@@ -1021,8 +1014,17 @@ class SoapDestination(DestinationConnector):
     def _post_and_classify(
         self, payload: str
     ) -> tuple[str, int, dict[str, str], DeliveryError | None]:
-        """:meth:`_post`, then the 2xx reply's classification and capture scrub, in the caller's
-        worker thread.
+        """The WS-* wrap and the body secrets, then :meth:`_post`, then the 2xx reply's
+        classification and capture scrub, all in the caller's one worker thread.
+
+        BACKLOG #5913: the wrap SAX-parses the Handler's fragment and the substitution counts and
+        replaces each token over the whole payload, so both run here rather than on the loop's
+        thread, as the reply passes below already did. Their order is unchanged: the wrap's
+        fragment gate and lint first, then the secrets, then the POST, so a refused fragment or a
+        token that does not appear exactly once raises before a byte crosses, and the refusal
+        reaches ``send`` with its type unchanged. The GIL caveat below holds for these passes too:
+        each ``str.count``, ``str.replace`` and the SAX feed is C work that can hold the loop while
+        it runs, bounded by the payload's size, not removed.
 
         A fault can arrive inside a 2xx body, so the reply is classified. Transport-level faults
         (non-2xx, URL/timeout) already raised inside _post, for both modes. The RAW reply is
@@ -1043,6 +1045,15 @@ class SoapDestination(DestinationConnector):
         ``_FAULT_RE`` finds nothing and the name scans never run. Those are that machine's readings,
         not a bound on another. Later #2827 changes added scans, at least ``_find_fault``'s and the
         code-element checks in ``_code_text``, so they are not a reading of this code."""
+        # WS-* mode: the Handler returned only the <Body> fragment; wrap + stamp here (post-queue
+        # boundary), so the per-call MessageID/Timestamp/Nonce never live in a pure transform.
+        if self._ws_mode:
+            payload = self._wrap_envelope(payload)
+        # ADR 0015 amendment (#236): swap placeholder tokens for the real secret HERE — after the
+        # payload left the store and (in WS-* mode) was wrapped, and before _post encodes + signs it —
+        # so the wire (and any detached JWS over those bytes) carries the secret while the store still
+        # holds only the token. No-op / byte-identical when no body_secrets are configured.
+        payload = self._apply_body_secrets(payload)
         body, status, headers = self._post(payload)
         failure = _classify_soap(status, body)
         # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
