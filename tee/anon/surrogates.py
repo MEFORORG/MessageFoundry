@@ -473,35 +473,58 @@ def surrogate_field_recorded(
     return surrogate_field(kind, value, keyer, seps)
 
 
-def scrub_site_codes(value: str, keyer: Keyer, seps: Seps) -> str:
-    """Field-anchored site-code safety pass (ADR 0030 §5): replace any **whole component** that is
-    exactly a site code with a fabricated non-site code of the same width, leaving a coincidental
-    site-code run inside a longer value (timestamps, order numbers) untouched. Applied to every field
-    as a net under the rule map, since a site code can lurk in an unexpected field. A no-op when no
-    site-code prefix is configured (a token-less build; the rule map remains the primary control).
-    """
+def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
+    """True if ``part``, one component or one subcomponent, is a site code on any reading a
+    consumer can take (BACKLOG #5632): as written, decoded from its HL7 escape sequences
+    (:func:`unescape`), or decoded and then split again on the message's delimiters and its field
+    separator, since a consumer that unescapes the part sees an escaped delimiter as a real one.
+    Each reading must be a site code whole, by ``fullmatch``, so a site-code run inside a longer
+    value still reads as no site code."""
+    if SITE_CODE_RE.fullmatch(part):
+        return True
+    if not seps.escape or seps.escape not in part:
+        return False
+    decoded = unescape(part, seps, field_sep)
+    delimiters = re.escape(field_sep + seps.component + seps.repetition + seps.subcomponent)
+    pieces = re.split(f"[{delimiters}]", decoded)
+    return any(SITE_CODE_RE.fullmatch(piece) for piece in (decoded, *pieces))
+
+
+def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|") -> str:
+    """Field-anchored site-code safety pass (ADR 0030 §5): replace any **whole component or
+    subcomponent** that is a site code with a fabricated non-site code of the same width, leaving a
+    coincidental site-code run inside a longer value (timestamps, order numbers) untouched. Applied
+    to every field as a net under the rule map, since a site code can lurk in an unexpected field.
+    A no-op when no site-code prefix is configured (a token-less build; the rule map remains the
+    primary control).
+
+    A part is a site code on any reading :func:`_reads_as_site_code` takes, so one joined to an
+    escaped delimiter or written with a hex escape is replaced too, and the whole part as written,
+    escape sequences included, gives way to digits of its own width (BACKLOG #5632). A subcomponent
+    is replaced on its own; a component that still reads as a site code decoded whole, because an
+    escape pairs across its subcomponent separator, is replaced whole. ``field_sep`` is the
+    message's field separator, which ``\\F\\`` decodes to."""
     if not value or not _SITE_PREFIXES:
         return value
-    if not any(p in value for p in _SITE_PREFIXES):
+    if not any(p in value for p in _SITE_PREFIXES) and not (seps.escape and seps.escape in value):
         return value
 
-    def _one(component: str) -> str:
-        if not SITE_CODE_RE.fullmatch(component):
-            return component
-        rng = keyer.rng("sitecode", component)
+    def _fake(part: str) -> str:
+        rng = keyer.rng("sitecode", part)
         prefix = rng.choice(_NON_SITE_PREFIXES)
-        return f"{prefix}{_fake_digits(rng, len(component) - len(prefix))}"
+        return f"{prefix}{_fake_digits(rng, len(part) - len(prefix))}"
 
-    reps = value.split(seps.repetition)
-    out_reps = []
-    for rep in reps:
-        comps = rep.split(seps.component)
-        comps = [
-            seps.subcomponent.join(_one(sub) for sub in comp.split(seps.subcomponent))
-            for comp in comps
-        ]
-        out_reps.append(seps.component.join(comps))
-    return seps.repetition.join(out_reps)
+    def _one(part: str) -> str:
+        return _fake(part) if _reads_as_site_code(part, seps, field_sep) else part
+
+    def _component(comp: str) -> str:
+        comp = seps.subcomponent.join(_one(sub) for sub in comp.split(seps.subcomponent))
+        return _one(comp) if seps.subcomponent in comp else comp
+
+    return seps.repetition.join(
+        seps.component.join(_component(comp) for comp in rep.split(seps.component))
+        for rep in value.split(seps.repetition)
+    )
 
 
 def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
@@ -744,7 +767,11 @@ def message_has_site_code(text: str, rules: tuple[FieldRule, ...] = ()) -> bool:
     is configured.
 
     ``rules`` are the rules the text was anonymized with. A field they filled with the ``DATE`` kind
-    is not checked, for the reason :func:`_date_output_test` gives."""
+    is not checked, for the reason :func:`_date_output_test` gives.
+
+    Each component and subcomponent is read as :func:`scrub_site_codes` reads it
+    (:func:`_reads_as_site_code`), so a site code joined to an escaped delimiter or written with a
+    hex escape is found, and the scrub's output reads as clean (BACKLOG #5632)."""
     parsed = read_message_seps(text)
     if parsed is None:
         return SITE_CODE_RE.search(text) is not None
@@ -757,7 +784,10 @@ def message_has_site_code(text: str, rules: tuple[FieldRule, ...] = ()) -> bool:
                 continue
             for rep in field.split(seps.repetition):
                 for comp in rep.split(seps.component):
-                    if any(SITE_CODE_RE.fullmatch(sub) for sub in comp.split(seps.subcomponent)):
+                    parts = comp.split(seps.subcomponent)
+                    if len(parts) > 1:
+                        parts.append(comp)
+                    if any(_reads_as_site_code(part, seps, field_sep) for part in parts):
                         return True
     return False
 
@@ -788,12 +818,12 @@ def scrub_message_site_codes(text: str, keyer: Keyer, rules: tuple[FieldRule, ..
         if fields[0].upper() == "MSH":
             # fields[0]="MSH", fields[1]=encoding chars (^~\&) — never scrub the header machinery.
             head = fields[:2]
-            tail = [scrub_site_codes(f, keyer, seps) for f in fields[2:]]
+            tail = [scrub_site_codes(f, keyer, seps, field_sep) for f in fields[2:]]
             out_segments.append(field_sep.join(head + tail))
         else:
             head = fields[:1]
             tail = [
-                f if is_date_output(fields, i) else scrub_site_codes(f, keyer, seps)
+                f if is_date_output(fields, i) else scrub_site_codes(f, keyer, seps, field_sep)
                 for i, f in enumerate(fields[1:], start=1)
             ]
             out_segments.append(field_sep.join(head + tail))
