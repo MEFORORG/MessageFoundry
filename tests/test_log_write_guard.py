@@ -682,16 +682,20 @@ async def test_a_halt_keeps_an_engine_park_a_reload_made_while_it_waited(
     # and turn it into an operator pause that no later reload lifts.
     sink = _RecordingSink()
     runner, _source = _graph(store, sink)
-    await runner._reload_lock.acquire()
+    runner._running = True  # a running engine, not the residual-state path of a stub graph
     try:
-        halt = await _halt_waiting_on_the_lock(runner)
-        # The internal stages went down as the halt latched, not once it holds the lock.
-        assert INBOUND in runner._log_halted
-        runner._park_outbound_lane(OUTBOUND)  # the reload's gate, under its lock
-        runner._gate_parked.add(OUTBOUND)
+        await runner._reload_lock.acquire()
+        try:
+            halt = await _halt_waiting_on_the_lock(runner)
+            # The internal stages went down as the halt latched, not once it holds the lock.
+            assert INBOUND in runner._log_halted
+            runner._park_outbound_lane(OUTBOUND)  # the reload's gate, under its lock
+            runner._gate_parked.add(OUTBOUND)
+        finally:
+            runner._reload_lock.release()
+        await halt
     finally:
-        runner._reload_lock.release()
-    await halt
+        runner._running = False
 
     assert OUTBOUND in runner._gate_parked, "the halt turned an engine park into an operator pause"
     assert sorted(name for name, _ in sink.stopped) == [INBOUND]
@@ -745,9 +749,9 @@ async def test_a_halt_whose_latch_a_probe_cleared_still_stops_and_says_so(
 ) -> None:
     # BACKLOG #5704. A reload or connection restart that holds the reload lock can probe the log,
     # find it writable and clear the latch while a halt waits. The halt fails closed: it still
-    # stops, sets the latch again so every door back in probes once more, and pages under its own
-    # label that it acted on a cleared latch, so the operator is not left with a stopped engine and
-    # a log that reads as working.
+    # stops, and pages under its own label that it acted on a cleared latch, so the operator is not
+    # left with a stopped engine and a log that reads as working. It leaves the latch cleared
+    # (ADR 0189: no halt reason outlives a sink a door re-validated).
     sink = _RecordingSink()
     runner, source = _graph(store, sink)
     monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: None)
@@ -760,7 +764,7 @@ async def test_a_halt_whose_latch_a_probe_cleared_still_stops_and_says_so(
         runner._reload_lock.release()
     await halt
 
-    assert runner._log_write_stopped, "the halt left the latch cleared over a stopped engine"
+    assert not runner._log_write_stopped, "the halt re-latched over a log a probe found writable"
     assert source.stopped is True and OUTBOUND in runner._outbound_paused
     assert INBOUND in runner._log_halted
     assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]

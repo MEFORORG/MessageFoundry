@@ -5863,13 +5863,11 @@ class RegistryRunner:
         # under the lock, the set was empty while that reload ran, so it would have rebound every
         # listener, and the stop below, reading its bound list before the lock, would have left them
         # bound and ACKing into halted lanes. Sync and await-free, so it needs no lock: a reload
-        # mid-flight re-applies `_log_halted` to its dispatchers, and while this latch is set the
-        # gate also probes, and refuses and marks on a failed probe, an inbound that reload BINDS
-        # without it being marked yet. An inbound a reload adds but does not bind passes no gate:
-        # the stop below marks it if that reload ran before it, and nothing marks one added by a
-        # reload after it. Marking here pauses the pooled internal lanes, or stops the per-lane
-        # workers at their loop-top gate, for as long as the halt waits. Guarded, so a raise here
-        # still reaches the page below and the stop under the lock.
+        # mid-flight re-applies `_log_halted` to its dispatchers; what the gate does for an inbound
+        # a reload adds is in :meth:`_resume_inbound_processing`, and the stop below marks the
+        # graph again once that reload is done. Marking here pauses the pooled internal lanes, or
+        # stops the per-lane workers at their loop-top gate, for as long as the halt waits.
+        # Guarded, so a raise here still reaches the page below and the stop under the lock.
         try:
             self._halt_inbound_processing(self.registry.inbound)
         except Exception:
@@ -5907,13 +5905,13 @@ class RegistryRunner:
                 return
             # The latch is read again now the lock is held (BACKLOG #5704). A reload, or a
             # connection restart, that held the lock may have probed the log, found it writable and
-            # cleared the latch. This halt still stops: it fails closed on the break
-            # it was told of rather than on a probe it did not run. It sets the latch again, so
-            # every door back in probes the log once more, and it pages that it acted on a cleared
-            # latch, under its own label so the realert throttle, which keys on the label, does not
-            # fold that page into the first one.
+            # cleared the latch. This halt still stops: it fails closed on the break it was told of
+            # rather than on a probe it did not run. It leaves the latch as that probe left it, as
+            # ADR 0189 lets no halt reason outlive a sink a door re-validated: a restart resumes
+            # without probing again, and a later break halts again. It pages that it acted on a
+            # cleared latch, under its own label so the realert throttle, which keys on the label,
+            # does not fold that page into the first one.
             latch_was_cleared = not self._log_write_stopped
-            self._log_write_stopped = True
             # What to stop is read again now the lock is held (BACKLOG #5704): the lists above only
             # sized the page. A reload that held the lock may have removed a connection, or engine-
             # parked an outbound (`_gate_parked` / `_schedule_parked`), and stopping that lane again
@@ -5951,9 +5949,9 @@ class RegistryRunner:
                     stage="unwritable",
                     reason=(
                         f"the halt for application log sink {sink!r} ({reason}) waited for the "
-                        "reload lock, and a reload or restart probed the log meanwhile and found it "
-                        "writable; the halt stopped the connections anyway, and restarting them "
-                        "probes the log again"
+                        "reload lock, and a reload or restart probed the log meanwhile and found "
+                        "it writable; the halt went ahead and stopped the connections still "
+                        "running, which a restart resumes"
                     ),
                     stopped=len(inbounds) + len(outbounds),
                 )
@@ -5974,13 +5972,17 @@ class RegistryRunner:
         ``(inbounds, outbounds)``. One reading, used before the halt waits for the reload lock (to
         size its page) and again once it holds it (to choose what it stops), so the two cannot drift
         apart in what they select (BACKLOG #5704)."""
-        inbounds = [name for name in self.registry.inbound if name in self._sources]
         outbounds = [
             name
             for name in self.registry.outbound
             if self._owns_destination(name) and name not in self._outbound_paused
         ]
-        return inbounds, outbounds
+        return self._log_halt_inbounds(), outbounds
+
+    def _log_halt_inbounds(self) -> list[str]:
+        """The bound inbounds a #122 halt unbinds: the mid-run halt, through
+        :meth:`_log_halt_lanes`, and the start-time one, :meth:`_unbind_for_log_failure`."""
+        return [name for name in self.registry.inbound if name in self._sources]
 
     def _pause_delivery_lanes(self, names: Iterable[str]) -> None:
         """Pause these outbound lanes for a #122 log-failure halt. Sync and await-free.
@@ -6199,7 +6201,7 @@ class RegistryRunner:
         :meth:`_start_inbound_unsafe`'s own refusal path stops the listener it just bound. Pages
         through the NOTIFIER rather than a log line, for the reason the whole control does: the thing
         that is broken is the log."""
-        bound, _ = self._log_halt_lanes()
+        bound = self._log_halt_inbounds()
         for name in bound:
             try:
                 await self._stop_inbound_unsafe(name)
