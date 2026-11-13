@@ -14,8 +14,6 @@ import json
 import logging
 import os
 import ssl
-import stat
-import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -40,11 +38,7 @@ from messagefoundry.file_lock import lock_exclusive as _try_lock
 from messagefoundry.file_lock import unlock as _unlock
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.redaction import log_timestamp
-from messagefoundry.restricted_file import (
-    RestrictedFileError,
-    replace_generated,
-    unlink_generated,
-)
+from messagefoundry.restricted_file import replace_generated, unlink_generated
 from messagefoundry.tls_handshake_failures import HandshakeFailures
 
 if TYPE_CHECKING:
@@ -202,13 +196,6 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
 #: ``[api].tls_generated_dir`` setting: a knob for a question with one sensible answer.
 _GENERATED_CERT_NAME = GENERATED_CERT_NAME
 _GENERATED_KEY_NAME = "api-generated-key.pem"
-#: The directory the generated KEY is minted into, inside the state dir, created at ``0o700`` on
-#: POSIX and inheriting the state dir's access list on Windows (:func:`_make_key_directory`). The
-#: key-file gate refuses a POSIX key in a directory a group or other account may write (vault
-#: BACKLOG #5636), and the state dir's mode is whatever the operator's umask or volume gave it, so a
-#: key minted straight into it could be refused by the engine's own next check. The certificate is
-#: public and stays in the state dir, where the tray and the docs name it.
-_GENERATED_KEY_DIR_NAME = "api-generated-key.d"
 #: The first-run mint's lock, beside the pair. It holds no data and is never deleted: the OS lock on
 #: it is the whole mechanism (see :func:`_generated_pair_lock`), so the file is only a handle.
 _GENERATED_LOCK_NAME = "api-generated.lock"
@@ -292,10 +279,7 @@ async def record_generated_pair_replacements(
 
 def _generated_pair(state_dir: Path) -> tuple[Path, Path]:
     """The ``(cert, key)`` paths of the first-run generated pair. The only place they are spelled."""
-    return (
-        state_dir / _GENERATED_CERT_NAME,
-        state_dir / _GENERATED_KEY_DIR_NAME / _GENERATED_KEY_NAME,
-    )
+    return state_dir / _GENERATED_CERT_NAME, state_dir / _GENERATED_KEY_NAME
 
 
 def generated_state_dir(store_path: str) -> Path:
@@ -456,7 +440,7 @@ def _discard_half_minted_pair(cert_path: Path, key_path: Path) -> None:
     construction. It is still logged at warning, because a deleted key must never be silent.
     """
     for orphan in (cert_path, key_path):
-        if not _present(orphan):
+        if not orphan.exists():
             continue
         log.warning(
             "discarding a half-minted TLS pair: %s exists without its counterpart, so it is "
@@ -678,9 +662,6 @@ def ensure_api_tls_material(
         return plan.material()
 
     cert_path, key_path = _generated_pair(state_dir)
-    # Before the unlocked reuse read too, so a planted link or an unreadable key directory is
-    # refused on every path, the reuse of a fresh pair included. Reads only; creates nothing.
-    _refuse_key_directory(key_path.parent)
     if _reusable_without_the_lock(cert_path, key_path, renew=renew):
         return str(cert_path), str(key_path)
     events = replacements if replacements is not None else []
@@ -688,8 +669,6 @@ def ensure_api_tls_material(
         state_dir.mkdir(parents=True, exist_ok=True)
         with _generated_pair_lock(state_dir):
             _settle_under_the_lock(api, cert_path, key_path, events, renew=renew)
-    except KeyDirectoryRefused:
-        raise  # never served through: the old pair would be read through the directory refused
     except OSError as exc:
         # A RENEWAL IS EARLY, SO ITS FAILURE MUST NOT STOP A START THE OLD PAIR CAN SERVE. That
         # covers a failed stage or first replace, a state dir the engine may read but not write,
@@ -721,11 +700,8 @@ def _settle_under_the_lock(
     Re-decided here: a process that waited for the lock finds the pair the holder just minted or
     renewed, and reuses it. Only here may a failed check lead to a discard.
     """
-    _make_key_directory(key_path.parent)
     _discard_staged_leftovers(cert_path, key_path)
-    # _present, not exists(): a key whose status cannot be read raises here rather than reading as
-    # missing, which would discard its certificate as half a pair.
-    if _present(cert_path) and _present(key_path):
+    if cert_path.exists() and key_path.exists():
         reason = _why_generated_pair_is_unusable(cert_path, key_path)
         if reason is None:
             due = _renewal_due(cert_path) if renew else None
@@ -736,94 +712,12 @@ def _settle_under_the_lock(
         _discard_unusable_pair(cert_path, key_path, reason)
         recovered: Literal["unusable", "half_pair"] | None = "unusable"
     else:
-        old = _cert_facts(cert_path) if _present(cert_path) else None
-        recovered = "half_pair" if _present(cert_path) or _present(key_path) else None
+        old = _cert_facts(cert_path) if cert_path.exists() else None
+        recovered = "half_pair" if cert_path.exists() or key_path.exists() else None
         _discard_half_minted_pair(cert_path, key_path)
     new = _mint_generated_pair(api, cert_path, key_path)
     if recovered is not None:
         events.append(_replaced(recovered, cert_path, old, new))
-
-
-def _make_key_directory(key_dir: Path) -> None:
-    """Make the generated key's own directory if it is missing. Call only under the lock.
-
-    POSIX: at ``0o700``, owner-only whatever the umask (see :data:`_GENERATED_KEY_DIR_NAME`).
-    Windows: with no mode, so it inherits the data directory's access list, the service account's
-    grant included; CPython 3.13 and later give a directory made with ``mode=0o700`` a protected list
-    of its own instead, which would shut that account out. An existing directory is left as it is,
-    and the key-file gate judges it.
-
-    POSIX: :func:`_refuse_key_directory` judges what is there, before and after the create, so a
-    key is never written into, or deleted from, a directory it refuses."""
-    if sys.platform == "win32":
-        key_dir.mkdir(exist_ok=True)
-        return
-    _refuse_key_directory(key_dir)
-    key_dir.mkdir(mode=0o700, exist_ok=True)
-    _refuse_key_directory(key_dir)
-
-
-class KeyDirectoryRefused(RestrictedFileError):
-    """The generated key's directory is not one the engine may read or mint a key in.
-
-    A :class:`RestrictedFileError`, so ``serve`` and ``supervise`` report it as a refusal and exit
-    2. :func:`ensure_api_tls_material` never falls back to the pair on disk for it, since that pair
-    would be read through the directory refused."""
-
-
-def _key_directory_problem(key_dir: Path) -> str | None:
-    """Why the engine may not use ``key_dir`` for its generated key, or ``None``. POSIX only:
-    ``None`` on Windows, and ``None`` when nothing is there yet.
-
-    The store directory may be one a group can write, so a link or a directory another account
-    planted under this name could otherwise hand the minted key to that account, or have the pair
-    read and deleted through it, before the key-file gate runs (vault BACKLOG #5636). Refused: a
-    link, a non-directory, an owner other than this account or root, a group or other write bit,
-    and a directory this account cannot search, whose key would otherwise read as missing and send
-    the certificate to the half-pair discard. A status that cannot be read is refused too."""
-    if sys.platform == "win32":
-        return None
-    try:
-        status = os.lstat(key_dir)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        return f"it could not be examined ({exc.strerror or type(exc).__name__})"
-    mode = status.st_mode
-    if stat.S_ISLNK(mode):
-        return "it is a link"
-    if not stat.S_ISDIR(mode):
-        return "it is not a directory"
-    if status.st_uid not in (os.geteuid(), 0):
-        return f"it is owned by uid {status.st_uid}, neither this account nor root"
-    if mode & 0o022:
-        return f"its mode is {stat.S_IMODE(mode):04o}, so a group or other account may write it"
-    if not os.access(key_dir, os.X_OK, effective_ids=os.access in os.supports_effective_ids):
-        return "this account cannot search it, so the key in it cannot be read"
-    return None
-
-
-def _refuse_key_directory(key_dir: Path) -> None:
-    """Raise :class:`KeyDirectoryRefused` naming ``key_dir`` when :func:`_key_directory_problem`
-    has a reason."""
-    problem = _key_directory_problem(key_dir)
-    if problem is not None:
-        raise KeyDirectoryRefused(
-            f"the generated TLS key directory {key_dir} cannot be used: {problem}. The engine will "
-            "not read or mint its TLS key there. Remove it, and the next start makes it again at "
-            "0700, owned by the account the engine runs as"
-        )
-
-
-def _present(path: Path) -> bool:
-    """Whether a name exists at ``path``, without following a link. Only a missing name is
-    ``False``: a status that cannot be read, such as a denied search, raises, so a key that could
-    not be read is never taken for a missing one and its certificate discarded as half a pair."""
-    try:
-        os.lstat(path)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    return True
 
 
 def _still_serves(cert_path: Path, key_path: Path) -> bool:

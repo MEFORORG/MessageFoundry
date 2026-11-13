@@ -1396,42 +1396,6 @@ def _serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> int:
     return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
 
 
-@posix_only
-def test_serve_mints_a_tls_key_it_accepts_in_a_store_directory_a_group_may_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A store directory made under umask 002 is group-writable. The engine mints its key into a
-    0700 directory of its own there, so its own check passes it on the first start and the next
-    (vault BACKLOG #5636). An fsGroup volume is not this case: the kubelet widens the key and its
-    directory again on every mount, so a later start refuses them."""
-    from messagefoundry.api.tls import _generated_pair
-
-    # The store in a directory of its own: the settings file stays in tmp_path, whose folder the
-    # start-path guard requires owner-only.
-    store_dir = tmp_path / "store"
-    store_dir.mkdir()
-    store_dir.chmod(0o775)
-    # The control: a key straight in this directory, as the engine minted it before, is refused.
-    beside = store_dir / "beside.key"
-    write_restricted_file(beside, b"KEY-MATERIAL-STAND-IN")
-    assert "has mode 0775 with no sticky bit" in str(broad_access_problem(beside))
-    beside.unlink()
-
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "messagefoundry.toml").write_text(PHI_GATE_PROVISIONS_TOML, encoding="utf-8")
-    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
-    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]
-    argv += ["--db", str(store_dir / "messagefoundry.db")]
-    assert main(argv) == 0
-    _cert, key = _generated_pair(store_dir)
-    assert key.parent != store_dir and stat.S_IMODE(key.parent.stat().st_mode) == 0o700
-    assert broad_access_problem(key) is None
-    assert "is not restricted" not in capsys.readouterr().err
-    assert main(argv) == 0  # and it reuses the pair
-
-
 @pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])
 def test_cert_commands_ask_for_an_owner_only_out_dir_on_posix_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
@@ -1471,20 +1435,6 @@ def test_cert_self_signed_makes_its_out_dir_owner_only_whatever_the_umask(tmp_pa
     assert stat.S_IMODE(out.stat().st_mode) == 0o700
     [key] = [p for p in out.iterdir() if "key" in p.name]
     assert broad_access_problem(key) is None
-
-
-def test_serve_reports_a_refused_key_directory_as_a_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Vault BACKLOG #5636: a key directory the engine may not use stops the start as a refusal,
-    exit 2, not as an uncaught error."""
-    from messagefoundry.api import tls as tls_mod
-
-    monkeypatch.setattr(tls_mod, "_key_directory_problem", lambda _d: "it is a link")
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    assert _serve(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML) == 2
-    err = capsys.readouterr().err
-    assert "the generated TLS key directory" in err and "refusing to start" in err
 
 
 def test_serve_refuses_a_generated_tls_key_a_broad_account_can_read(

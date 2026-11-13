@@ -12,9 +12,7 @@ import inspect
 import ipaddress
 import json
 import logging
-import os
 import ssl
-import stat
 import subprocess  # nosec B404 -- runs our own interpreter only
 import sys
 import threading
@@ -398,7 +396,7 @@ def test_serve_loopback_without_a_certificate_now_mints_and_serves_tls(
     # loopback secure-context WITHOUT auto-TLS". Loopback is exactly the case it named.
     assert "ssl_context_factory" in captured
     assert (tmp_path / "api-generated-cert.pem").exists()
-    assert (tmp_path / "api-generated-key.d" / "api-generated-key.pem").exists()
+    assert (tmp_path / "api-generated-key.pem").exists()
 
 
 def test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder(
@@ -4384,7 +4382,7 @@ def test_a_failed_cert_write_leaves_no_orphaned_key(
         ensure_api_tls_material(api, state_dir=tmp_path)
 
     monkeypatch.undo()  # read the directory with the real Path again
-    _cert_path, key_path = tls_mod._generated_pair(tmp_path)
+    key_path = tmp_path / tls_mod._GENERATED_KEY_NAME
     cert_path = tmp_path / tls_mod._GENERATED_CERT_NAME
     assert not key_path.exists(), "a lone key.pem would make every later start die on O_EXCL"
     assert not cert_path.exists()
@@ -4598,9 +4596,7 @@ def test_concurrent_first_starts_in_separate_processes_share_one_pair(tmp_path: 
     assert failures == [], failures
     printed = {out.strip() for out, _ in outcomes}
     assert len(printed) == 1, printed
-    _load_pair(
-        state / _GENERATED_CERT_NAME, state / "api-generated-key.d" / "api-generated-key.pem"
-    )
+    _load_pair(state / _GENERATED_CERT_NAME, state / "api-generated-key.pem")
 
 
 def test_a_start_arriving_mid_mint_waits_instead_of_discarding_the_key_being_written(
@@ -4769,114 +4765,6 @@ def test_a_pair_the_engine_cannot_read_is_refused_not_deleted(
     assert (Path(cert).read_bytes(), Path(key).read_bytes()) == before
 
 
-def _fake_posix_key_directory(
-    monkeypatch: pytest.MonkeyPatch, *, st_mode: int, st_uid: int = 10001, searchable: bool = True
-) -> None:
-    """Make the key-directory check see one status, as the engine's uid 10001, on any platform."""
-    from messagefoundry.api import tls as tls_mod
-
-    monkeypatch.setattr(os, "geteuid", lambda: 10001, raising=False)
-    status = SimpleNamespace(st_mode=st_mode, st_uid=st_uid)
-    monkeypatch.setattr(os, "lstat", lambda _path: status)
-    monkeypatch.setattr(os, "access", lambda *_a, **_k: searchable)
-    monkeypatch.setattr(tls_mod.sys, "platform", "linux")
-
-
-@pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])
-def test_the_key_directory_is_owner_only_on_posix_and_inherits_on_windows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
-) -> None:
-    """Vault BACKLOG #5636. On Windows, CPython gives a directory made with ``mode=0o700`` a
-    protected access list of its own, which would shut out the service account the data directory
-    grants; so no mode is passed there, and the directory inherits as the key's old home did."""
-    from messagefoundry.api import tls as tls_mod
-
-    seen: list[dict[str, object]] = []
-    monkeypatch.setattr(Path, "mkdir", lambda _self, **kwargs: seen.append(kwargs))
-    _fake_posix_key_directory(monkeypatch, st_mode=stat.S_IFDIR | 0o700)
-    monkeypatch.setattr(tls_mod.sys, "platform", platform)
-    tls_mod._make_key_directory(tmp_path / "keys")
-    assert seen == [{"exist_ok": True} if mode is None else {"mode": mode, "exist_ok": True}]
-
-
-@pytest.mark.parametrize(
-    ("st_mode", "st_uid", "searchable", "why"),
-    [
-        (stat.S_IFLNK | 0o777, 10001, True, "it is a link"),
-        (stat.S_IFREG | 0o600, 10001, True, "it is not a directory"),
-        (stat.S_IFDIR | 0o700, 10002, True, "owned by uid 10002"),
-        (stat.S_IFDIR | 0o770, 10001, True, "its mode is 0770"),
-        # Root-owned 0700, made by a start as root: allowed as an owner, but not searchable here.
-        (stat.S_IFDIR | 0o700, 0, False, "cannot search it"),
-    ],
-)
-def test_a_key_directory_the_engine_may_not_use_is_a_refusal_naming_it(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    st_mode: int,
-    st_uid: int,
-    searchable: bool,
-    why: str,
-) -> None:
-    """In a store directory a group may write, a link or directory planted under the key
-    directory's name would take the minted key before the key-file gate ran (vault BACKLOG #5636).
-    The control is the owner-only directory the test above accepts. The refusal is a
-    RestrictedFileError, which serve and supervise report as a refusal."""
-    from messagefoundry.api import tls as tls_mod
-    from messagefoundry.restricted_file import RestrictedFileError
-
-    monkeypatch.setattr(Path, "mkdir", lambda _self, **_kwargs: None)
-    _fake_posix_key_directory(monkeypatch, st_mode=st_mode, st_uid=st_uid, searchable=searchable)
-    with pytest.raises(tls_mod.KeyDirectoryRefused) as refused:
-        tls_mod._make_key_directory(tmp_path / "keys")
-    assert isinstance(refused.value, RestrictedFileError)
-    assert why in str(refused.value) and str(tmp_path / "keys") in str(refused.value)
-
-
-def test_a_refused_key_directory_stops_the_reuse_read_too(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A fresh pair is reused before the lock is taken, so the directory is judged before that
-    read as well, and the refusal is never answered by serving the pair through it."""
-    from messagefoundry.api import tls as tls_mod
-
-    api = ApiSettings()
-    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)  # a real, fresh pair
-    before = Path(cert).read_bytes()
-    read: list[object] = []
-    monkeypatch.setattr(tls_mod, "_reusable_without_the_lock", lambda *a, **k: read.append(a))
-    monkeypatch.setattr(tls_mod, "_key_directory_problem", lambda _d: "it is a link")
-    with pytest.raises(tls_mod.KeyDirectoryRefused, match="it is a link"):
-        ensure_api_tls_material(api, state_dir=tmp_path)
-    assert read == []  # refused before the reuse read
-    assert Path(cert).read_bytes() == before and Path(key).exists()
-
-
-def test_a_key_whose_status_cannot_be_read_never_discards_the_certificate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Path.exists() reads a denied status as missing, which sent the certificate to the half-pair
-    discard. The locked pass now lets the denial through and deletes nothing."""
-    from messagefoundry.api import tls as tls_mod
-
-    api = ApiSettings()
-    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
-    real_lstat = os.lstat
-
-    def deny_the_key(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
-        if os.fspath(path) == key:
-            raise PermissionError(errno.EACCES, "Permission denied")
-        return real_lstat(path, *args, **kwargs)
-
-    monkeypatch.setattr(tls_mod, "_key_directory_problem", lambda _d: None)
-    monkeypatch.setattr(tls_mod, "_reusable_without_the_lock", lambda *a, **k: False)
-    monkeypatch.setattr(os, "lstat", deny_the_key)
-    with pytest.raises(PermissionError):
-        tls_mod._settle_under_the_lock(api, Path(cert), Path(key), [], renew=True)
-    monkeypatch.undo()
-    assert Path(cert).exists() and Path(key).exists()
-
-
 def test_a_hung_mint_holder_times_out_with_a_named_lock_and_mints_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4891,9 +4779,7 @@ def test_a_hung_mint_holder_times_out_with_a_named_lock_and_mints_nothing(
     ):
         ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
     assert not (tmp_path / _GENERATED_CERT_NAME).exists()
-    _cert_path, key_path = tls_mod._generated_pair(tmp_path)
-    # Nothing at all: the key's directory too is made only under the lock.
-    assert not key_path.exists() and not key_path.parent.exists()
+    assert not (tmp_path / tls_mod._GENERATED_KEY_NAME).exists()
 
 
 _HOLD_THE_LOCK = """
@@ -5166,9 +5052,6 @@ def _plant_generated_pair(
     # refuse a generated key a broad account can read, and a plain write is group- and
     # world-readable on POSIX, so a planted pair must not differ from a minted one on that axis.
     key_path.unlink(missing_ok=True)
-    from messagefoundry.api.tls import _make_key_directory
-
-    _make_key_directory(key_path.parent)  # the key's own directory, made as the engine makes it
     write_restricted_file(
         key_path,
         key.private_bytes(
@@ -5231,7 +5114,7 @@ def test_a_generated_pair_renews_inside_its_last_third_and_not_before(
     renewed = [r for r in caplog.records if "renewed the generated" in r.getMessage()]
     assert len(renewed) == 1 and renewed[0].levelno == logging.WARNING
     assert "PRIVATE KEY" not in caplog.text
-    assert not list(tmp_path.rglob("*.renewing"))  # nothing staged is left behind
+    assert not list(tmp_path.glob("*.renewing"))  # nothing staged is left behind
 
 
 def test_a_second_start_after_a_renewal_reuses_the_renewed_pair(tmp_path: Path) -> None:
@@ -5371,7 +5254,7 @@ def test_a_renewal_interrupted_between_its_replaces_recovers_and_is_reported(
         ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
     with pytest.raises(ssl.SSLError):  # CONTROL: the interruption really left a mismatched pair
         _load_pair(cert, key)
-    assert key.with_name(key.name + ".renewing").exists()
+    assert (tmp_path / (key.name + ".renewing")).exists()
     monkeypatch.setattr(tls, "_replace_generated", real)
 
     events: list[GeneratedPairReplaced] = []
@@ -5382,7 +5265,7 @@ def test_a_renewal_interrupted_between_its_replaces_recovers_and_is_reported(
     _load_pair(cert, key)
     assert [e.reason for e in events] == ["unusable"]
     assert events[0].old_sha256 is not None  # the half-installed new certificate, identified
-    assert not list(tmp_path.rglob("*.renewing"))
+    assert not list(tmp_path.glob("*.renewing"))
 
 
 @pytest.mark.parametrize(("left", "keeps_old"), [(65, True), (-5, False)])
@@ -5418,7 +5301,7 @@ def test_a_renewal_that_fails_before_any_replace_keeps_a_still_valid_pair(
                 ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
     assert _snapshot(cert, key) == before
     assert events == []
-    assert not list(tmp_path.rglob("*.renewing"))
+    assert not list(tmp_path.glob("*.renewing"))
 
 
 @pytest.mark.parametrize("damage", ["foreign_cert", "lone_key", "lone_cert"])
@@ -5627,7 +5510,7 @@ def test_supervise_renews_once_before_it_spawns_any_shard(
         # (BACKLOG #3314); each engine shard reads its own from its settings.
         "crl_max_reloads",
     }  # nothing new handed to the shards
-    _load_pair(cert, tmp_path / "api-generated-key.d" / "api-generated-key.pem")
+    _load_pair(cert, tmp_path / "api-generated-key.pem")
 
     async def rows() -> list[Any]:
         store = await open_store(sqlite_settings(db))
