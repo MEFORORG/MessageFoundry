@@ -132,6 +132,11 @@ for the checkouts named in its allowlist:
 BACKLOG #5642 a single-quoted path kept its quotes, named nothing, and was allowed. A quoted path that
 contains a space is still truncated at the space; that residual is listed in the hook beside rule 3d.
 
+**Rule 3d judges every invocation on the line.** Each `git worktree remove` or `move` outside quotes is
+judged, with its victim resolved against that invocation's own `-C` tokens as well as against the
+line's first one. Until BACKLOG #5643 only the first match on the raw line was judged, so a quoted
+mention before the real command, or a second command, let a governed worktree be removed.
+
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
 

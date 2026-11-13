@@ -8,6 +8,9 @@ from the wrong place, so the gate judged a different path from the one the shell
 * BACKLOG #5642 -- the shared ``cd``, ``-C``, ``--work-tree``, ``--git-dir`` and ``GIT_DIR`` readers
   stripped DOUBLE quotes only, so a SINGLE-quoted path to the governed checkout resolved to a
   quote-tainted path that names nothing, and rules 3, 3b, 3c and 3d allowed it.
+* BACKLOG #5643 -- rule 3d sliced the raw line at its FIRST `worktree remove|move` and judged one
+  invocation, resolving a relative victim from the line's first `-C`, so a quoted mention, a second
+  invocation or another command's `-C` let a governed linked worktree be removed or moved.
 
 Each deny row was measured ALLOW on the gate before its fix, and each has an ALLOW control beside it
 so a gate that denied everything could not pass.
@@ -136,3 +139,56 @@ def test_a_single_quoted_ungoverned_git_dir_from_the_primary_matches_its_double_
     double = f'git --git-dir="{o}/.git" config core.hooksPath /nope'
     single = f"git --git-dir='{o}/.git' config core.hooksPath /nope"
     assert _allowed(rig, double, rig.primary) == _allowed(rig, single, rig.primary)
+
+
+# ------------------------------------------------------------------ BACKLOG #5643, rule 3d per invocation
+#
+# Rule 3d sliced the RAW line at its FIRST `worktree remove|move` and judged that one invocation,
+# resolving a relative victim from the line's FIRST `-C`. Each row below was measured ALLOW before.
+
+
+def test_a_quoted_mention_before_the_real_remove_does_not_hide_it(rig: SimpleNamespace) -> None:
+    cmd = f"echo 'git worktree remove x' ; git worktree remove {rig.wt2.as_posix()}"
+    assert "worktree remove" in _reason(rig, cmd, rig.outside)
+
+
+def test_a_second_remove_on_the_line_is_judged(rig: SimpleNamespace) -> None:
+    cmd = (
+        f"git worktree remove {rig.outside.as_posix()}/nope ; "
+        f"git worktree remove {rig.wt2.as_posix()}"
+    )
+    assert "worktree remove" in _reason(rig, cmd, rig.outside)
+
+
+def test_a_quoted_mention_before_a_real_move_does_not_hide_it(rig: SimpleNamespace) -> None:
+    cmd = (
+        f"echo 'git worktree move x y' ; "
+        f"git worktree move {rig.wt2.as_posix()} {rig.tmp.as_posix()}/moved"
+    )
+    assert "worktree move" in _reason(rig, cmd, rig.outside)
+
+
+def test_a_later_commands_dash_C_does_not_reroot_a_relative_victim(rig: SimpleNamespace) -> None:
+    cmd = f"git worktree remove Primary-wt2 ; git -C {rig.outside2.as_posix()} status"
+    assert "worktree remove" in _reason(rig, cmd, rig.tmp)
+
+
+def test_cumulative_dash_C_is_folded(rig: SimpleNamespace) -> None:
+    cmd = f"git -C {rig.tmp.as_posix()} -C Primary worktree remove ../Primary-wt2"
+    assert "worktree remove" in _reason(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "echo 'git worktree remove {wt2}'",
+        "git worktree remove {o}/nope ; git -C {wt2} status",
+        "git -C {o2} worktree remove Primary-wt2",
+    ],
+)
+def test_rule_3d_controls_stay_allowed(rig: SimpleNamespace, template: str) -> None:
+    """A mention is not a removal, and an explicit `-C` elsewhere still decides where the victim is."""
+    cmd = template.format(
+        wt2=rig.wt2.as_posix(), o=rig.outside.as_posix(), o2=rig.outside2.as_posix()
+    )
+    assert _allowed(rig, cmd, rig.tmp)
