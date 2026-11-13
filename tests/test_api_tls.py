@@ -4769,6 +4769,19 @@ def test_a_pair_the_engine_cannot_read_is_refused_not_deleted(
     assert (Path(cert).read_bytes(), Path(key).read_bytes()) == before
 
 
+def _fake_posix_key_directory(
+    monkeypatch: pytest.MonkeyPatch, *, st_mode: int, st_uid: int = 10001, searchable: bool = True
+) -> None:
+    """Make the key-directory check see one status, as the engine's uid 10001, on any platform."""
+    from messagefoundry.api import tls as tls_mod
+
+    monkeypatch.setattr(os, "geteuid", lambda: 10001, raising=False)
+    status = SimpleNamespace(st_mode=st_mode, st_uid=st_uid)
+    monkeypatch.setattr(os, "lstat", lambda _path: status)
+    monkeypatch.setattr(os, "access", lambda *_a, **_k: searchable)
+    monkeypatch.setattr(tls_mod.sys, "platform", "linux")
+
+
 @pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])
 def test_the_key_directory_is_owner_only_on_posix_and_inherits_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
@@ -4780,38 +4793,88 @@ def test_the_key_directory_is_owner_only_on_posix_and_inherits_on_windows(
 
     seen: list[dict[str, object]] = []
     monkeypatch.setattr(Path, "mkdir", lambda _self, **kwargs: seen.append(kwargs))
-    monkeypatch.setattr(os, "geteuid", lambda: 10001, raising=False)
-    owned = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=10001)
-    monkeypatch.setattr(os, "lstat", lambda _path: owned)
+    _fake_posix_key_directory(monkeypatch, st_mode=stat.S_IFDIR | 0o700)
     monkeypatch.setattr(tls_mod.sys, "platform", platform)
     tls_mod._make_key_directory(tmp_path / "keys")
     assert seen == [{"exist_ok": True} if mode is None else {"mode": mode, "exist_ok": True}]
 
 
 @pytest.mark.parametrize(
-    ("st_mode", "st_uid", "why"),
+    ("st_mode", "st_uid", "searchable", "why"),
     [
-        (stat.S_IFLNK | 0o777, 10001, "a link"),
-        (stat.S_IFDIR | 0o700, 10002, "uid 10002"),
-        (stat.S_IFDIR | 0o770, 10001, "mode 0770"),
-        (stat.S_IFREG | 0o600, 10001, "mode 0600"),
+        (stat.S_IFLNK | 0o777, 10001, True, "it is a link"),
+        (stat.S_IFREG | 0o600, 10001, True, "it is not a directory"),
+        (stat.S_IFDIR | 0o700, 10002, True, "owned by uid 10002"),
+        (stat.S_IFDIR | 0o770, 10001, True, "its mode is 0770"),
+        # Root-owned 0700, made by a start as root: allowed as an owner, but not searchable here.
+        (stat.S_IFDIR | 0o700, 0, False, "cannot search it"),
     ],
 )
-def test_a_planted_posix_key_directory_stops_the_mint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, st_mode: int, st_uid: int, why: str
+def test_a_key_directory_the_engine_may_not_use_is_a_refusal_naming_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    st_mode: int,
+    st_uid: int,
+    searchable: bool,
+    why: str,
 ) -> None:
     """In a store directory a group may write, a link or directory planted under the key
     directory's name would take the minted key before the key-file gate ran (vault BACKLOG #5636).
-    The control is the owner-only directory the test above accepts."""
+    The control is the owner-only directory the test above accepts. The refusal is a
+    RestrictedFileError, which serve and supervise report as a refusal."""
     from messagefoundry.api import tls as tls_mod
+    from messagefoundry.restricted_file import RestrictedFileError
 
     monkeypatch.setattr(Path, "mkdir", lambda _self, **_kwargs: None)
-    monkeypatch.setattr(os, "geteuid", lambda: 10001, raising=False)
-    monkeypatch.setattr(os, "lstat", lambda _path: SimpleNamespace(st_mode=st_mode, st_uid=st_uid))
-    monkeypatch.setattr(tls_mod.sys, "platform", "linux")
-    with pytest.raises(ValueError, match="will not mint its TLS key there") as refused:
+    _fake_posix_key_directory(monkeypatch, st_mode=st_mode, st_uid=st_uid, searchable=searchable)
+    with pytest.raises(tls_mod.KeyDirectoryRefused) as refused:
         tls_mod._make_key_directory(tmp_path / "keys")
-    assert why in str(refused.value)
+    assert isinstance(refused.value, RestrictedFileError)
+    assert why in str(refused.value) and str(tmp_path / "keys") in str(refused.value)
+
+
+def test_a_refused_key_directory_stops_the_reuse_read_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh pair is reused before the lock is taken, so the directory is judged before that
+    read as well, and the refusal is never answered by serving the pair through it."""
+    from messagefoundry.api import tls as tls_mod
+
+    api = ApiSettings()
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)  # a real, fresh pair
+    before = Path(cert).read_bytes()
+    read: list[object] = []
+    monkeypatch.setattr(tls_mod, "_reusable_without_the_lock", lambda *a, **k: read.append(a))
+    monkeypatch.setattr(tls_mod, "_key_directory_problem", lambda _d: "it is a link")
+    with pytest.raises(tls_mod.KeyDirectoryRefused, match="it is a link"):
+        ensure_api_tls_material(api, state_dir=tmp_path)
+    assert read == []  # refused before the reuse read
+    assert Path(cert).read_bytes() == before and Path(key).exists()
+
+
+def test_a_key_whose_status_cannot_be_read_never_discards_the_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Path.exists() reads a denied status as missing, which sent the certificate to the half-pair
+    discard. The locked pass now lets the denial through and deletes nothing."""
+    from messagefoundry.api import tls as tls_mod
+
+    api = ApiSettings()
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    real_lstat = os.lstat
+
+    def deny_the_key(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(path) == key:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(tls_mod, "_key_directory_problem", lambda _d: None)
+    monkeypatch.setattr(tls_mod, "_reusable_without_the_lock", lambda *a, **k: False)
+    monkeypatch.setattr(os, "lstat", deny_the_key)
+    with pytest.raises(PermissionError):
+        tls_mod._settle_under_the_lock(api, Path(cert), Path(key), [], renew=True)
+    monkeypatch.undo()
+    assert Path(cert).exists() and Path(key).exists()
 
 
 def test_a_hung_mint_holder_times_out_with_a_named_lock_and_mints_nothing(

@@ -1473,6 +1473,20 @@ def test_cert_self_signed_makes_its_out_dir_owner_only_whatever_the_umask(tmp_pa
     assert broad_access_problem(key) is None
 
 
+def test_serve_reports_a_refused_key_directory_as_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #5636: a key directory the engine may not use stops the start as a refusal,
+    exit 2, not as an uncaught error."""
+    from messagefoundry.api import tls as tls_mod
+
+    monkeypatch.setattr(tls_mod, "_key_directory_problem", lambda _d: "it is a link")
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    assert _serve(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML) == 2
+    err = capsys.readouterr().err
+    assert "the generated TLS key directory" in err and "refusing to start" in err
+
+
 def test_serve_refuses_a_generated_tls_key_a_broad_account_can_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
