@@ -1512,7 +1512,8 @@ class ReplyBodyDropped:
 
     A non-capturing ``send`` returns this instead of ``None`` when nothing reads the body (vault
     BACKLOG #2180). The body was over the byte bound, or, since BACKLOG #2989, cut short of its
-    declared length or misframed. The message is delivered. The delivery worker marks the row done
+    declared length or misframed, or, since BACKLOG #5910, in a content coding the engine does not
+    decode. The message is delivered. The delivery worker marks the row done
     with a ``reply_dropped`` event in one transaction, and only then logs a WARNING that names the
     message (vault BACKLOG #3040 items 2 and 5).
 
