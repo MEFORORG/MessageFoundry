@@ -299,15 +299,20 @@ What that costs, stated so nobody reads the record as more than it is:
   built-in parser reads field 2 to the end of that line and writes it back as it came. A header
   ending in that separator (`MSH|^~\&|`) now keeps an empty field 3, so a rewrite keeps its
   trailing separator too. No case in the record has either shape.
-- **A third divergence is outside the record (BACKLOG #5917).** python-hl7's whole-field
-  assignment at occurrence 1 resolved the segment through its `segments()` matcher, which skips a
-  fieldless line such as a bare `PID`, while the `Message` read, presence and count paths count
-  it. A `Message` write at any occurrence now counts it too, so a write lands on the segment the
-  read side names, and a component or repetition write no longer copies a bare line's empty
-  field over the populated segment that follows. The blank-line `IndexError` at occurrence 1 is
-  kept. `Peek.field` still skips a fieldless line, as python-hl7 did. Any write to a bare line, an
-  empty value included, gives it a field separator, so on the re-encoded message `Peek` numbers that
-  line as occurrence 1. No case in the record writes to a segment id that has a fieldless line.
+- **`Message` now agrees with `Peek` on a fieldless line (BACKLOG #5917).** python-hl7's
+  `segments()` matcher skips a line with no field separator, such as a bare `PID`, so `Peek.field`,
+  `extract_field` and an occurrence-1 whole-field write never counted it. Its tolerant iteration,
+  which the `Message` reads, presence check, `count_segments` and later-occurrence writes mirrored,
+  did count it. The built-in parser now has one occurrence scan, `_segment_index`, and it skips a
+  fieldless line on every by-id path, so `Message` and `Peek` number occurrences alike and a write
+  lands on the segment a read names. On a body with a bare `PID` before a populated one, a
+  `Message` read at occurrence 1 now returns the populated segment where python-hl7's `Message`
+  would have returned the empty bare line. `segments()` stays positional and still lists the bare
+  line; `delete_segments` still removes it. The blank-line `IndexError` on the raising paths
+  (`raise_if_blank_segment_scan`) is unchanged; it turns on an empty line, not a fieldless one.
+  One case in the record, `adv:empty-fields`, carries a fieldless line, a lone bare `EVN` that no
+  mutation writes to. Its recorded answers still hold, because python-hl7 already read that
+  line's fields as `None`; only its count would now be 0, and the record holds no count.
 
 ### Other things that moved with it
 
