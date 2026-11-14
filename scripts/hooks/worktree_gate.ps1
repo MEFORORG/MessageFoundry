@@ -825,7 +825,8 @@ function Get-ScanRawIndexMap($Seg) {
 # first reading exits on before these readings run. That last one is origin/main's too. Also, at
 # least: any line after an earlier line whose chdir sits in a subshell (`(cd x && ls)`), which makes
 # the earlier-line reading answer nothing; and a `--git-dir` after a `-c <key>=<v>` disarm, which is
-# not promoted. Known new false denies, left open: a later disarm judged by rule 3c's first chain can
+# not promoted; and a chdir ahead of an invocation joined by a bracket (`cd <p> && git -C <o> log
+# $(git reset --hard)`), whose prefix the chdir follower cannot read. Known new false denies, left open: a later disarm judged by rule 3c's first chain can
 # take an earlier command's `-C`, and a chdir inside a heredoc or here-string body in an earlier line
 # is read as a real one.
 #
@@ -876,13 +877,28 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     [pscustomobject]@{ ScanPrefix = "$last ; $pfx"; Window = $win }
 }
 
-# The index of the git WORD that owns the text at $At, read the way rule 3's verb hunt reads it
-# (`git`, `git.exe`, and on Windows any case, since `GIT` and `git.EXE` run git.exe there), or -1.
+# The index of the git WORD that owns the text at $At, or -1 (review round c17b991ada).
+#
+# A WORD AT COMMAND POSITION: after the line start, whitespace or a separator or opener, and followed
+# by whitespace or the end, so `--git-dir`, `$(pwd)/.git` and a `/git/` path segment are not one. The
+# `.exe` suffix is read in any case, and on Windows the word too, since `GIT` and `git.EXE` run
+# git.exe there.
+#
+# NOT INSIDE A GROUP THAT CLOSES BEFORE $At. The last such word is not always the owner: in
+# `git -C '<p>' -c user.name=$(git config user.name) reset --hard` the inner git sits in a `$( )`
+# that closes before `reset`, and taking it as owner dropped the quoted `-C`. A word with more
+# closers than openers between it and $At is skipped, and the search goes on leftwards.
 function Get-GitWordBefore([string]$Scan, [int]$At) {
     $opts = $(if ($IsWindows) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
             [System.Text.RegularExpressions.RegexOptions]::None })
-    $words = [regex]::Matches($Scan.Substring(0, $At), '\bgit(\.exe)?\b', $opts)
-    $(if ($words.Count -gt 0) { $words[$words.Count - 1].Index } else { -1 })
+    $words = [regex]::Matches($Scan.Substring(0, $At), '(?<=^|[\s;&|({])git(?i:\.exe)?(?=\s|$)', $opts)
+    for ($i = $words.Count - 1; $i -ge 0; $i--) {
+        $between = $Scan.Substring($words[$i].Index, $At - $words[$i].Index)
+        $closers = ([regex]::Matches($between, '[)}]')).Count
+        $openers = ([regex]::Matches($between, '[({]')).Count
+        if ($closers -le $openers) { return $words[$i].Index }
+    }
+    -1
 }
 
 # A TRUE command separator: `;`, `|`, `||`, `&&` or a lone `&`, never the `&` of `2>&1` or `&>`. Rule

@@ -336,3 +336,44 @@ def test_an_invocation_joined_by_a_bracket_reads_its_own_window(
     """ALLOW on origin/main and on the round-two head: the window began at the earlier git word."""
     reason = _reason(rig, _fmt(rig, template), rig.primary, tool)
     assert "SHARED PRIMARY" in reason, reason
+
+
+_SUBST = "user.name=$(git config user.name)"
+
+
+@pytest.mark.parametrize(
+    ("template", "where", "text", "tool"),
+    [
+        # A git word inside a substitution that closes before the verb does not own the window, so
+        # the invocation's own quoted -C or --work-tree is still read (review round c17b991ada).
+        ("git -C '{p}' -c {s} reset --hard", "outside", "SHARED PRIMARY", "Bash"),
+        ("git -C '{p}' --git-dir=$(pwd)/.git reset --hard", "outside", "SHARED PRIMARY", "Bash"),
+        (
+            "git --work-tree='{p}' --git-dir=${{PWD}}/.git reset --hard",
+            "outside",
+            "SHARED PRIMARY",
+            "Bash",
+        ),
+        ("git -C '{wt}' -c {s} checkout {b}", "outside", "LINKED WORKTREE", "Bash"),
+    ],
+)
+def test_a_git_word_in_a_closed_substitution_does_not_own_the_window(
+    rig: SimpleNamespace, template: str, where: str, text: str, tool: str
+) -> None:
+    cmd = _fmt(rig, template.replace("{s}", _SUBST))
+    reason = _reason(rig, cmd, _cwd(rig, where), tool)
+    assert text in reason, reason
+
+
+@pytest.mark.parametrize(
+    ("template", "tool"),
+    [
+        ("if (git -C {o} diff --quiet) {{ git -C {o} reset --hard }}", "PowerShell"),
+        ("git -C {o} -c {s} reset --hard", "Bash"),
+        ("git -C {o} --git-dir=$(pwd)/.git reset --hard", "Bash"),
+    ],
+)
+def test_bracket_controls_stay_allowed(rig: SimpleNamespace, template: str, tool: str) -> None:
+    """ALLOW on origin/main from the primary: each command acts on the ungoverned repository."""
+    cmd = _fmt(rig, template.replace("{s}", _SUBST))
+    assert _allowed(rig, cmd, rig.primary, tool)
