@@ -369,6 +369,27 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
     assert.strictEqual(permit.map.has(AI_POLICY_DENY_KEY), false, "a permit is not a deny to carry");
   });
 
+  test("D4c: a failed carrier write keeps the old key, and its deny stays in effect", async () => {
+    const store = memStore({ [LEGACY_AI_POLICY_KEY]: { ...policy({ mode: "off" }), cachedAt: 0 } });
+    const write = store.update;
+    let failing = true;
+    store.update = async (key: string, value: unknown): Promise<void> => {
+      if (failing && key === AI_POLICY_DENY_KEY) {
+        throw new Error("synthetic storage failure");
+      }
+      return write(key, value);
+    };
+    for (let i = 0; i < 2; i++) {
+      const p = await unreachable(store, LOCAL, cliByo, false);
+      assert.strictEqual(p.mode, "off", "the old key's deny must apply while the carrier cannot be written");
+      assert.ok(store.map.has(LEGACY_AI_POLICY_KEY), "the old key was deleted before its deny was carried");
+    }
+    failing = false;
+    assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "off");
+    assert.strictEqual(store.map.has(LEGACY_AI_POLICY_KEY), false, "once carried, the old key is deleted");
+    assert.ok(store.map.has(AI_POLICY_DENY_KEY));
+  });
+
   test("D5: two overlapping resolves cannot drop each other's deny", async () => {
     const store = memStore();
     await Promise.all([

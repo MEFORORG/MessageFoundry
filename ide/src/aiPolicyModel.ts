@@ -261,8 +261,8 @@ export function aiPolicyCacheKey(url: string): string {
 export const AI_POLICY_DENY_KEY = "messagefoundry.aiPolicyDenies";
 
 /**
- * The one unscoped cache key used before BACKLOG #5564. It is read once, to carry a deny it holds
- * into {@link AI_POLICY_DENY_KEY}, and is then deleted.
+ * The one unscoped cache key used before BACKLOG #5564. A deny it holds is carried into
+ * {@link AI_POLICY_DENY_KEY}, and the key is deleted only once that write has succeeded.
  */
 export const LEGACY_AI_POLICY_KEY = "messagefoundry.lastAiPolicy";
 
@@ -305,18 +305,27 @@ function withCarrier<T>(
     let carried: CarriedDenies = stored !== null && typeof stored === "object" ? { ...stored } : {};
     let migrated = false;
     // The unscoped key, once. A deny in it is carried with an unknown issuer, which any engine's
-    // authoritative permit clears: origin/main's rule for that key. Then the key is deleted.
+    // authoritative permit clears: origin/main's rule for that key.
     const legacy = store.get<CachedAiPolicy>(LEGACY_AI_POLICY_KEY);
-    if (legacy !== undefined) {
-      if (legacy !== null && typeof legacy === "object" && isPolicyDeny(legacy)) {
-        carried = { ...carried, [UNKNOWN_DENY_ISSUER]: policyOnly(legacy) };
-        migrated = true;
-      }
-      await store.update(LEGACY_AI_POLICY_KEY, undefined);
+    if (legacy !== undefined && legacy !== null && typeof legacy === "object" && isPolicyDeny(legacy)) {
+      carried = { ...carried, [UNKNOWN_DENY_ISSUER]: policyOnly(legacy) };
+      migrated = true;
     }
     const { next, result } = step(carried);
+    let persisted = true;
     if (migrated || JSON.stringify(next) !== JSON.stringify(carried)) {
-      await store.update(AI_POLICY_DENY_KEY, next);
+      try {
+        await store.update(AI_POLICY_DENY_KEY, next);
+      } catch {
+        // The result above already carries every deny read or recorded, so it is returned and
+        // still gates. Failing the resolve would only send the caller to a fallback with less.
+        persisted = false;
+      }
+    }
+    // The old key goes only once the carrier holding its deny is written: deleted first, a failed
+    // write would lose the deny, which fails open. Kept, it is migrated again next time.
+    if (legacy !== undefined && persisted) {
+      await store.update(LEGACY_AI_POLICY_KEY, undefined);
     }
     return result;
   });
