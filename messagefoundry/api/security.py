@@ -1096,7 +1096,7 @@ class WebSocketAcceptGate:
         await self.app(scope, receive, guarded_send)
 
 
-def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
+def _gate(dependency: _Gate, authenticate: _Step, *, defers_decision: bool = False) -> _Gate:
     """Mark a ``require*()`` closure as a gate, with the step that authenticates its caller.
 
     Returns the SAME function object. The route-gate walk recognises a gate by the mark
@@ -1104,8 +1104,13 @@ def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
     :func:`require`); neither attribute changes those.
 
     A factory whose gate refuses AHEAD of its sign-in check must put that refusal in its step too,
-    in the same order, as :func:`require_phi_read` does with the hop refusal."""
+    in the same order, as :func:`require_phi_read` does with the hop refusal.
+
+    ``defers_decision`` marks a gate that leaves its decision row to the route body
+    (:func:`route_decision`)."""
     setattr(dependency, _BEFORE_BODY_ATTR, BeforeBody(authenticate, authenticates=True))
+    if defers_decision:
+        setattr(dependency, _DEFERS_DECISION_ATTR, True)
     return mark_route_gate(dependency)
 
 
@@ -1227,7 +1232,11 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
     endpoint hands back a credential anyway. A pydantic generic such as ``Page[X]`` does not
     escape: its parametrized class carries ``X`` in its fields, which :func:`carries_credential`
     walks. ``tests/test_credential_reply_no_store.py`` checks every route on the built app,
-    including each endpoint's return annotation."""
+    including each endpoint's return annotation.
+
+    AND IT WRITES A DEFERRED GRANT ROW (BACKLOG #1197). A route whose gate leaves its decision to
+    the route body (:func:`route_decision`) gets the gate's grant row written after the endpoint,
+    when nothing in the body decided, as on a dual-control rejoin or a 404 before the spend."""
 
     def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
         super().__init__(path, endpoint, **kwargs)
@@ -1246,6 +1255,8 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
         handler = super().get_route_handler()
         if any(d.call is no_store_reply for d in self.dependant.dependencies):
             handler = _stamp_no_store(handler)
+        if any(_defers_decision(d.call) for d in self.dependant.dependencies):
+            handler = _settle_deferred_grant_after(handler)
         # ``body_field`` is the very condition FastAPI reads a body on before it solves
         # dependencies, so it is FastAPI's test and not a second opinion kept here.
         steps = steps_before_body(self.dependant) if self.body_field is not None else ()
@@ -1303,9 +1314,12 @@ async def _authenticate_session_before_body(request: Request) -> None:
 
 
 def require(
-    *permissions: Permission, mfa_gate: bool = True
+    *permissions: Permission, mfa_gate: bool = True, decided_in_route: bool = False
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Build a dependency that authenticates the caller and asserts each of ``permissions``.
+
+    ``decided_in_route=True`` leaves the grant row to the route body, for a route whose body can
+    still refuse the request (:func:`route_decision`, BACKLOG #1197).
 
     ``mfa_gate=False`` suppresses the ASVS 6.3.3 second-factor ACCESS gate for routes an MFA-pending
     session must still reach, because an un-enrolled user cannot satisfy a gate standing in front of
@@ -1321,10 +1335,10 @@ def require(
     async def dependency(request: Request) -> Identity:
         auth, identity = await _admit(request, permissions, mfa_gate=mfa_gate)
         if auth is not None:
-            await _record_grant(request, auth, identity, permissions)
+            await _grant_or_defer(request, auth, identity, permissions, defer=decided_in_route)
         return identity
 
-    return _gate(dependency, _authenticate_session_before_body)
+    return _gate(dependency, _authenticate_session_before_body, defers_decision=decided_in_route)
 
 
 async def _admit(
@@ -1456,7 +1470,12 @@ def _rebuild_gate_refusal(
 
 @asynccontextmanager
 async def _recorded_decision(
-    request: Request, auth: AuthService, identity: Identity, permissions: tuple[Permission, ...]
+    request: Request,
+    auth: AuthService,
+    identity: Identity,
+    permissions: tuple[Permission, ...],
+    *,
+    defer: bool = False,
 ) -> AsyncIterator[None]:
     """Record a derived gate's decision once its own checks, run inside this block, have decided.
 
@@ -1472,7 +1491,10 @@ async def _recorded_decision(
     keeps the per-request volume where the shipped trail already put it while the audit chain has no
     drain (BACKLOG #1421). The reason comes from the :class:`_GateRefusal` the check raised. Any
     other exception leaves the block with no decision row from it, which is right for the
-    :func:`_mfa_refusal` 403: it wrote its own ``auth.mfa_denied`` row where it was raised."""
+    :func:`_mfa_refusal` 403: it wrote its own ``auth.mfa_denied`` row where it was raised.
+
+    ``defer=True`` leaves a clean exit's decision to the route body instead of writing the grant
+    row (:func:`route_decision`)."""
     try:
         yield
     except _GateRefusal as refusal:
@@ -1486,7 +1508,103 @@ async def _recorded_decision(
                 client=client_ip(request),
             )
         raise
-    await _record_grant(request, auth, identity, permissions)
+    await _grant_or_defer(request, auth, identity, permissions, defer=defer)
+
+
+#: The ``request.state`` attribute holding a gate decision left to the route body (BACKLOG #1197).
+_DEFERRED_DECISION_STATE = "mefor_deferred_decision"
+#: Set on a gate dependency that leaves its decision to the route body.
+_DEFERS_DECISION_ATTR = "__mefor_defers_decision__"
+
+
+@dataclass(frozen=True)
+class _DeferredDecision:
+    """What a gate that admitted a request needs to write its decision row later."""
+
+    auth: AuthService
+    identity: Identity
+    permissions: tuple[Permission, ...]
+
+
+async def _grant_or_defer(
+    request: Request,
+    auth: AuthService,
+    identity: Identity,
+    permissions: tuple[Permission, ...],
+    *,
+    defer: bool,
+) -> None:
+    """Write the grant row now, or with ``defer`` leave it to :func:`route_decision`."""
+    if defer:
+        setattr(
+            request.state, _DEFERRED_DECISION_STATE, _DeferredDecision(auth, identity, permissions)
+        )
+    else:
+        await _record_grant(request, auth, identity, permissions)
+
+
+def _take_deferred_decision(request: Request) -> _DeferredDecision | None:
+    """The request's deferred decision, removed so that only one row is ever written for it."""
+    deferred: _DeferredDecision | None = getattr(request.state, _DEFERRED_DECISION_STATE, None)
+    if deferred is not None:
+        delattr(request.state, _DEFERRED_DECISION_STATE)
+    return deferred
+
+
+def _defers_decision(call: object) -> bool:
+    return getattr(call, _DEFERS_DECISION_ATTR, False) is True
+
+
+@asynccontextmanager
+async def route_decision(request: Request) -> AsyncIterator[None]:
+    """Record the decision a gate left to the route body, once the body's own check has decided.
+
+    BACKLOG #1197 (ASVS 16.3.2). Some routes refuse in their body, after their gate admitted the
+    request: the ``proof_in_route`` spend (:func:`spend_step_up_action`), the group-wide saves'
+    window check (:func:`refuse_unless_step_up_window_live`) and a reveal's new-address and
+    PHI-budget refusals (``_admit_reveal`` in ``api/app.py``). Their gate defers its grant row, and
+    the body's check runs inside this block, which writes what :func:`_recorded_decision` would
+    have: the grant row on a clean exit, or one ``auth.gate_refused`` row naming the GATE's
+    permission and the refusal's reason. So a refused request leaves exactly one decision row and
+    no grant row. The permission is the gate's because these checks have no permission of their
+    own: they refuse a request the gate admitted under that permission.
+
+    The first block a request enters takes the decision; a later one, or one on a route whose gate
+    deferred nothing, records nothing. When no block runs, :class:`AuthenticatedBeforeBodyRoute`
+    writes the grant row after the endpoint."""
+    deferred = _take_deferred_decision(request)
+    if deferred is None:
+        yield
+        return
+    async with _recorded_decision(request, deferred.auth, deferred.identity, deferred.permissions):
+        yield
+
+
+def _settle_deferred_grant_after(
+    handler: Callable[[Request], Coroutine[Any, Any, Response]],
+) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+    """Run the route, then write any grant row its gate deferred and its body did not decide.
+
+    Written after a refusal that is not the gate's too, as the gate wrote it before the body when
+    it did not defer. Not after a cancelled request, which answers nobody."""
+
+    async def settle(request: Request) -> None:
+        deferred = _take_deferred_decision(request)
+        if deferred is not None:
+            await _record_grant(request, deferred.auth, deferred.identity, deferred.permissions)
+
+    async def settled(request: Request) -> Response:
+        try:
+            response = await handler(request)
+        except Exception:
+            await settle(request)
+            raise
+        await settle(request)
+        return response
+
+    # As :func:`_stamp_no_store` does, so ``inspect.unwrap`` finds the handler behind it.
+    settled.__wrapped__ = handler  # type: ignore[attr-defined]
+    return settled
 
 
 #: The step-up refusal's detail for a session whose step-up is a password or directory re-proof.
@@ -2056,7 +2174,10 @@ def require_step_up_action(
     async def dependency(request: Request) -> Identity:
         auth, identity = await _admit(request, permissions, mfa_gate=True)
         if auth is not None:
-            async with _recorded_decision(request, auth, identity, permissions):
+            # A proof_in_route gate leaves the grant row to the route's spend (BACKLOG #1197).
+            async with _recorded_decision(
+                request, auth, identity, permissions, defer=proof_in_route
+            ):
                 token = bearer_token(request)
                 # BACKLOG #1148 (ASVS 2.4.2): charge the SAME per-actor anti-automation bucket
                 # require_step_up charges, in the SAME position — first, so a throttled write is
@@ -2091,7 +2212,7 @@ def require_step_up_action(
                     raise await _step_up_refusal(auth, token, action)
         return identity
 
-    return _gate(dependency, _authenticate_session_before_body)
+    return _gate(dependency, _authenticate_session_before_body, defers_decision=proof_in_route)
 
 
 async def spend_step_up_action(request: Request, action: str) -> None:
@@ -2104,13 +2225,15 @@ async def spend_step_up_action(request: Request, action: str) -> None:
     ``AuthService.refund_action_step_up``, as edit-resend does for a refusal before its store write
     (owner ruling 2026-10-13, #3241 R1), other than one in ``_EDIT_RESEND_SPENDING_REFUSALS`` in
     ``api/app.py`` (owner ruling 2026-11-07, #3241 added item 1). With no auth service attached it
-    does nothing, as the dependency does."""
+    does nothing, as the dependency does. It records the decision the dependency deferred
+    (:func:`route_decision`)."""
     auth = get_auth(request)
     if auth is None:
         return
     token = bearer_token(request)
-    if not await _action_step_up_ok(auth, token, action):
-        raise await _step_up_refusal(auth, token, action)
+    async with route_decision(request):
+        if not await _action_step_up_ok(auth, token, action):
+            raise await _step_up_refusal(auth, token, action)
 
 
 async def step_up_window_live(request: Request) -> bool:
@@ -2134,11 +2257,14 @@ async def refuse_unless_step_up_window_live(request: Request) -> None:
     Moving a route to ``proof_in_route=True`` drops its dependency's window check, so without this
     call that branch would take no step-up at all. The 403 carries ``X-Step-Up-Required`` and no
     ``X-Step-Up-Action``, so a client refreshes the window with a plain ``POST /me/reauth``. Does
-    nothing with no auth service attached, as the dependency then checks nothing."""
+    nothing with no auth service attached, as the dependency then checks nothing. It records the
+    decision the dependency deferred (:func:`route_decision`)."""
     auth = get_auth(request)
-    if auth is None or await step_up_window_live(request):
+    if auth is None:
         return
-    raise await _step_up_refusal(auth, bearer_token(request))
+    async with route_decision(request):
+        if not await step_up_window_live(request):
+            raise await _step_up_refusal(auth, bearer_token(request))
 
 
 def require_reauth_only_action(

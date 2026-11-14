@@ -275,6 +275,7 @@ from messagefoundry.api.security import (
     require_service_cert,
     require_step_up,
     require_step_up_action,
+    route_decision,
     spend_step_up_action,
     step_up_window_live,
     undeclared_route_refusal_counts,
@@ -5440,7 +5441,7 @@ def create_app(
     async def list_connections(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require(Permission.MONITORING_READ, decided_in_route=True)),
         # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
         # calls this handler in-process, and a call that leaves it out must get None.
         reveal: Annotated[ConnectionName | None, Query()] = None,
@@ -6116,7 +6117,7 @@ def create_app(
         name: ConnectionName,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require(Permission.MONITORING_READ, decided_in_route=True)),
         # A flag, not a name: the path already names the one connection, as the single-message
         # open's ``reveal_errors`` flag does. Annotated for the same reason as there.
         reveal: Annotated[bool, Query()] = False,
@@ -6512,25 +6513,29 @@ def create_app(
         #2620) and the per-actor PHI budget. The web console's reveal routes already took all three
         through ``require_ui(..., phi=True)`` before
         calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
-        route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
-        if reveal is None:
-            return
-        if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
-            auth = get_auth(request)
-            if auth is not None:
-                await auth.audit_permission_denied(
-                    identity,
-                    Permission.MESSAGES_VIEW_SUMMARY,
-                    request.url.path,
-                    client=client_ip(request),
-                )
-            raise HTTPException(403, "a reveal needs messages:view_summary")
-        if not (_matched_route_path(request) or "").startswith("/ui/"):
-            enforce_phi_read_hop(request)
-            # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
-            # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
-            await refuse_from_new_address(request)
-            enforce_phi_read_pacing(request, identity)
+        route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself.
+
+        The route's gate leaves its decision row to this check (BACKLOG #1197), so a request it
+        refuses records that refusal instead of a grant (:func:`route_decision`)."""
+        async with route_decision(request):
+            if reveal is None:
+                return
+            if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
+                auth = get_auth(request)
+                if auth is not None:
+                    await auth.audit_permission_denied(
+                        identity,
+                        Permission.MESSAGES_VIEW_SUMMARY,
+                        request.url.path,
+                        client=client_ip(request),
+                    )
+                raise HTTPException(403, "a reveal needs messages:view_summary")
+            if not (_matched_route_path(request) or "").startswith("/ui/"):
+                enforce_phi_read_hop(request)
+                # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
+                # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+                await refuse_from_new_address(request)
+                enforce_phi_read_pacing(request, identity)
 
     async def _redact_reasons(
         infos: list[_ReasonInfo],
@@ -6669,7 +6674,7 @@ def create_app(
     async def list_connection_events(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require(Permission.MONITORING_READ, decided_in_route=True)),
         connection: ConnectionName | None = Query(None),
         kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
         since: EpochSeconds | None = Query(None),
@@ -6737,7 +6742,7 @@ def create_app(
         name: ConnectionName,
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require(Permission.MONITORING_READ, decided_in_route=True)),
         kind: list[EventKindFilter] | None = Query(None, max_length=MAX_EVENT_KINDS),
         since: EpochSeconds | None = Query(None),
         limit: int = Query(100, ge=1, le=1000),
@@ -6803,7 +6808,9 @@ def create_app(
     async def list_active_alerts(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+        identity: Identity = Depends(
+            require(Permission.MONITORING_DIAGNOSE, decided_in_route=True)
+        ),
         limit: int = Query(200, ge=1, le=1000),
         reveal: Annotated[int | None, Query(ge=1)] = None,
     ) -> AlertInstanceList:

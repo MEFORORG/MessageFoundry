@@ -5096,8 +5096,11 @@ flowchart TB
   `auth.gate_refused`, naming the same permission and a `reason` of `throttled` or `step_up`. It
   writes that row only where it would have written the grant row, so a gate that writes no grant
   row writes no refusal row either. A refused second factor writes `auth.mfa_denied`, as the base
-  gate's does. A refusal a route body makes after its gate has passed, such as a step-up proof the
-  route spends itself, still follows a grant row.
+  gate's does. The step-up proof a `proof_in_route` route spends itself, the group-wide saves'
+  window check and a `reveal`'s new-address and PHI-budget refusals are decided the same way: the
+  route's gate leaves its row to that check, so a refused request writes only `auth.gate_refused`.
+  Other refusals a route body makes after its gate has passed, at least the PHI-read budget a
+  route body charges itself, still follow a grant row.
 - Routes that act on a Connection also check the identity's connection scope. That scope starts
   empty for every role except Administrator.
 - Sensitive routes add a step-up re-check on top of this flow. See
