@@ -899,7 +899,7 @@ administrator rights. What each one grants or changes:
 
 | Script | What it grants or changes |
 |---|---|
-| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. With `-LockConfigDir`, instead rewrites the permissions and owner of the config directory and of every file and folder in it, discarding each one's own entries, which nothing records. Sets the service's privilege list and its SID type. With `-EngineWheel`, first builds the engine install under `C:\Program Files\MessageFoundry\engine`: it runs the `-BasePython` interpreter and pip as administrator, installing the `requirements.lock` and engine wheel it checks against `-RequirementsLockSha256` and `-EngineWheelSha256`, binary wheels only ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*). |
+| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. With `-LockConfigDir`, instead rewrites the permissions and owner of the config directory and the folders it locks with it, and of the files and folders in them (see below). Sets the service's privilege list and its SID type. With `-EngineWheel`, first builds the engine install under `C:\Program Files\MessageFoundry\engine`: it runs the `-BasePython` interpreter and pip as administrator, installing the `requirements.lock` and engine wheel it checks against `-RequirementsLockSha256` and `-EngineWheelSha256`, binary wheels only ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*). |
 | `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back, working in a new administrator-only folder under the Windows folder's `Temp`. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
@@ -927,7 +927,10 @@ Other switches on `install-service.ps1` change more than the service:
 
 - `-LockConfigDir` turns off permission inheritance on the config directory and limits it to
   SYSTEM, Administrators and the service account. It also makes Administrators the owner of the
-  directory and of everything in it. It does the same to the value file's folder, and to the
+  directory and of each file and folder in it, and resets each one's permissions to inherit from
+  the directory, discarding the entries it carried itself; nothing records them. A link, a
+  junction and a hard-linked file are left as they are and named in a warning. It does the same
+  to the value file's folder, and to the
   settings file's folder when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
   Without the switch, the script only adds a read grant.
 - `-SuppressCrashDumps` writes machine-wide Windows Error Reporting keys under `HKLM`. They are

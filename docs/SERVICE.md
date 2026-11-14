@@ -733,8 +733,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   folder below it, resets each one's DACL to inherit only those grants, discarding its own
   entries, and reads each owner and DACL back. What the read-back finds is named in a warning
   instead of the "locked" line: at least an entry for another account, an owner it could not set,
-  and a junction, link or hard-linked file, which it leaves alone rather than change what it
-  reaches outside the dir. A write grant the run-as account held below the dir becomes read, and
+  a missing read for the run-as account, a deny entry on the dir, a junction or link, which it
+  does not enter, and a hard-linked file, whose own entries it keeps because its other names share
+  them. A write grant the run-as account held below the dir becomes read, and
   is named in a warning too. It is **opt-in** because the config dir often lives inside a developer's repo
   where stripping inheritance is surprising — for production, point `-Config` at a dedicated
   admin-owned directory and pass `-LockConfigDir`.

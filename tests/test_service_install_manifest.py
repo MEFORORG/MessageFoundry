@@ -1464,17 +1464,19 @@ def test_residue_outside_the_well_known_set_is_reported_not_hidden(tmp_path: Pat
 # installer printed "Config : locked to ...". The runtime guard (SEC-003) vets the directory and each
 # *.py, so the likely outcome is a service that refuses to start under a line saying it was locked.
 #
-# The owner step needs elevation and these run unelevated, so its warning is expected and filtered.
+# Only an elevated token may make Administrators an owner, so an unelevated run reads back an owner
+# problem for every item; _config_lockdown keeps those apart for the owner arm.
 
 _CONFIG_ACL_FNS = [
     "Set-SecureConfigAcl",
     "Get-WellKnownBroadSids",
     "Get-BroadAclResidue",
+    "Get-ReparsePointAncestor",
     "Reset-ConfigTreeAcl",
 ]
 
 
-def _config_lockdown(tmp_path: Path, prepare: str = "") -> dict:
+def _config_lockdown(tmp_path: Path, prepare: str = "", account: str = "$me") -> dict:
     """Run Set-SecureConfigAcl on a real config tree and read every DACL in it back.
 
     The tree is ``config\\mod.py`` and ``config\\sub\\inner.py``, with a folder ``outside`` beside
@@ -1520,7 +1522,7 @@ def _config_lockdown(tmp_path: Path, prepare: str = "") -> dict:
     $before = Read-Tree
     $warnings = @()
     $problems = @()
-    $emitted = & {{ Set-SecureConfigAcl -Path $cfg -Account $me }} 3>&1
+    $emitted = & {{ Set-SecureConfigAcl -Path $cfg -Account {account} }} 3>&1
     foreach ($o in @($emitted)) {{
       if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
       else {{ $problems += "$o" }}
@@ -1669,6 +1671,43 @@ def test_every_owner_in_the_config_tree_is_read_back(tmp_path: Path) -> None:
     else:
         for part in ("config'", "mod.py", "sub'", "inner.py"):
             assert part in named, f"an owner left unset was not returned for {part}: {named}"
+
+
+@_windows_only
+def test_a_root_that_could_not_be_locked_leaves_the_tree_alone(tmp_path: Path) -> None:
+    """The walk resets each child to inherit from the root, so after a failed root lock it would
+    WIDEN a child that was tighter than the root. An account icacls cannot resolve fails the
+    root grant; the owner-only module below must keep its own DACL."""
+    prepare = r"""
+    & icacls $cfg /grant '*S-1-5-32-547:(OI)(CI)M' | Out-Null
+    & icacls $paths.mod /inheritance:r /grant:r "${me}:F" | Out-Null
+"""
+    got = _config_lockdown(tmp_path, prepare, account="'NoSuchAccount-b234x'")
+    assert got["before"]["modProtected"] is True, "CONTROL FAILED: mod.py still inherits"
+    assert any("could not be locked" in p for p in got["problems"]), got["problems"]
+    assert got["after"]["modProtected"] is True, (
+        f"the walk ran over a root that was not locked and widened mod.py:\n{got['listing']}"
+    )
+    assert "S-1-5-32-547" not in got["after"]["mod"], got["listing"]
+
+
+@_windows_only
+def test_a_dot_backslash_account_locks_like_its_full_name(tmp_path: Path) -> None:
+    """icacls does not take '.\\name', which Set-ServiceAccount accepts, so the account is spelled
+    with this host's name first; otherwise -LockConfigDir could never finish for it."""
+    got = _config_lockdown(tmp_path, account="('.\\' + $me.Split('\\')[-1])")
+    assert got["problems"] == [], got["problems"]
+    assert got["meSid"] in got["after"]["cfg"], f"the account got no grant:\n{got['listing']}"
+
+
+@_windows_only
+def test_a_deny_entry_on_the_config_dir_is_returned(tmp_path: Path) -> None:
+    """A deny entry survives /remove:g, which removes grants only, and is passed down by the reset;
+    one against the run-as account stops the service reading its config under a clean line."""
+    got = _config_lockdown(
+        tmp_path, "    & icacls $cfg /deny '*S-1-5-32-547:(OI)(CI)(W)' | Out-Null"
+    )
+    assert any("deny" in p for p in got["problems"]), got["problems"]
 
 
 @_windows_only
