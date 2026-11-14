@@ -67,8 +67,8 @@ _DB_NAME = "embedded_doc_pruning.db"
 
 # --- backend fixtures (SQLite always; PG/SQLServer skipif-gated) ---------------
 #
-# The server cases run on the shared live databases of the postgres-store and sqlserver-store CI
-# legs (BACKLOG #5651). As in the sibling store suites, a setup failure closes the pool (BACKLOG
+# The server cases run on the shared live databases of at least the postgres-store,
+# postgres-store-windows and sqlserver-store CI legs (BACKLOG #5651). As in the sibling store suites, a setup failure closes the pool (BACKLOG
 # #1629), and the audit chain is read again from the emptied log, because a keyed chain an earlier
 # file left would make this keyless handle refuse every append.
 
@@ -114,16 +114,20 @@ async def _open_sqlserver(_tmp_path):  # pragma: no cover - only runs when gated
     try:
         async with s._pool.acquire() as conn:
             cur = await conn.cursor()
-            for table in (
-                "message_events",
-                "audit_log",
-                "queue",
-                "response",
-                "delivered_keys",
-                "messages",
-            ):
-                await cur.execute(f"DELETE FROM {table}")
-            await conn.commit()
+            try:
+                for table in (
+                    "message_events",
+                    "audit_log",
+                    "queue",
+                    "response",
+                    "delivered_keys",
+                    "messages",
+                ):
+                    await cur.execute(f"DELETE FROM {table}")
+                await conn.commit()
+            finally:
+                # Closed before the pool is, so no statement handle outlives its connection.
+                await cur.close()
         await load_audit_chain(s, read_only=False)
     except BaseException:
         await s.close()
@@ -459,6 +463,11 @@ async def test_a_write_between_the_strips_read_and_write_back_wins(
     rec = await _get(store, mid)
     assert rec["raw"] == raw_after  # the other writer's state stands
     assert rec["documents_pruned"] is None
+    if kind == "re-pended":
+        # raw is unchanged in this case, so prove the other writer committed rather than failed,
+        # which the strip would have contained as a skipped row with the same end state.
+        [row] = await store.outbox_for(mid)
+        assert row["status"] == _PENDING
 
 
 async def test_the_transform_runs_off_the_event_loop(
