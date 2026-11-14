@@ -6037,6 +6037,12 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
             audits=(),
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
+        # Vault BACKLOG #5635: an open request another test left, sealed under its own key,
+        # would stop this run. The fixture does not clear this table, so this test does.
+        async with seed._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("DELETE FROM pending_approvals")
+            await conn.commit()
     finally:
         await seed.close()
 

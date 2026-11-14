@@ -5,7 +5,10 @@
 The user, role, approval and directory-map re-seal passes leave a record whose seal they cannot
 check as it is, and only logged a count. So a run that left a role sealed under a retired key
 nobody supplied printed OK and exited 0, and an operator who then dropped that key stranded the
-role. Such a run is now PARTIAL: exit 1, no stamp, the rotation record left open.
+role. Such a run now stops short: the store pass refuses before it re-encrypts any cell, so the
+command exits 1, rolls nothing, writes no stamp and leaves the rotation record open. It refuses
+rather than going on, because the cell pass would re-encrypt such a user's TOTP secret, which the
+user's seal covers, and leave the record verifying under no key.
 
 A record whose seal fails under a key the run holds, or is malformed, is the control. No key
 re-seals it, so failing on it would fail every later run too (the BACKLOG #3181 precedent); the
@@ -16,6 +19,7 @@ Server suites run it on their own legs.
 from __future__ import annotations
 
 import asyncio
+import base64
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -27,8 +31,8 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline.secret_rotation import ROTATION_RECORD_ID, dek_fingerprint
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.row_seal import RowSealer
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.row_seal import RowSealer, RowSealError
+from messagefoundry.store.store import MessageStore, require_user_seal_for_write
 from tests._reseal_outcome_contract import (
     MALFORMED_SEAL,
     UNHELD_KEY_ID,
@@ -36,6 +40,9 @@ from tests._reseal_outcome_contract import (
     assert_reseal_outcome_contract,
 )
 from tests.test_rotate_key_rotation_record import _DEK, _OLD_DATE, _env, _key_id, _rows, _seed
+
+#: A synthetic TOTP secret, derived so a secret scanner does not read it as a credential.
+_TOTP = base64.b32encode(b"rotate-key-unheld-ab").decode("ascii")
 
 
 def _raw_for(path: Path) -> Any:
@@ -52,10 +59,14 @@ def _raw_for(path: Path) -> Any:
     return raw
 
 
+async def _open(db: Path, key: str, *retired: str) -> MessageStore:
+    cipher = make_cipher(key, retired)
+    return await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+
+
 async def _role_with_seal(db: Path, key: str, seal: str) -> str:
     """A custom role written by the store under ``key``, then given ``seal`` outside the store."""
-    cipher = make_cipher(key)
-    store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+    store = await _open(db, key)
     try:
         service = AuthService(store, AuthSettings())
         await service.initialize()
@@ -73,6 +84,20 @@ async def _role_with_seal(db: Path, key: str, seal: str) -> str:
     return role_id
 
 
+async def _user_seal_holds(db: Path, key: str, *retired: str) -> bool:
+    store = await _open(db, key, *retired)
+    try:
+        record = await store._read_user_record("u-totp")
+        assert record is not None
+        try:
+            await require_user_seal_for_write(store.row_sealer(), record)
+        except RowSealError:
+            return False
+        return True
+    finally:
+        await store.close()
+
+
 @pytest.fixture
 def rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, str, str]:
     monkeypatch.chdir(tmp_path)
@@ -82,7 +107,7 @@ def rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, st
     return db, uploads, key_a, key_b
 
 
-def test_a_role_under_a_retired_key_not_supplied_makes_the_run_partial(
+def test_a_role_under_a_retired_key_not_supplied_stops_the_run(
     rig: tuple[Path, Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -95,10 +120,10 @@ def test_a_role_under_a_retired_key_not_supplied_makes_the_run_partial(
 
     assert main(["rotate-key", "--db", str(db)]) == 1
     captured = capsys.readouterr()
-    assert "PARTIAL:" in captured.out and "OK:" not in captured.out
+    assert "OK:" not in captured.out
+    assert "rotation aborted" in captured.err
     assert "1 user, role, open approval or directory-map record(s) in roles" in captured.err
     assert UNHELD_KEY_ID in captured.err
-    assert "this run did not complete" in captured.out
     rows = asyncio.run(_rows(db, key_b, key_a))
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))  # no stamp
     assert rows[_DEK].last_rotated == _OLD_DATE
@@ -112,51 +137,54 @@ def test_a_role_under_a_retired_key_not_supplied_makes_the_run_partial(
     assert rows[ROTATION_RECORD_ID].fingerprint == ""
 
 
-def test_a_role_genuinely_sealed_under_a_key_not_supplied_holds_until_it_is(
+def test_a_user_sealed_under_a_key_not_supplied_survives_until_it_is(
     rig: tuple[Path, Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A role the store sealed under a third key: a run given only the store's first prior key is
-    PARTIAL, and the remedy the error names, a re-run with that third key supplied, completes and
-    leaves the role readable under the new key alone."""
+    """A user whose TOTP secret is under the first key and whose seal is under a third, as after a
+    start on that third key. A run given only the first key must not touch the secret the seal
+    covers, so the record still verifies under the third key after it. The remedy the error names,
+    a re-run with the third key supplied, then completes and leaves the record under the new key
+    alone. Before the abort, the first run re-encrypted the secret and no key opened it again."""
     db, uploads, key_a, key_b = rig
     key_c = generate_key()
 
-    async def seal_under_c() -> str:
-        cipher = make_cipher(key_c, [key_a])
-        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+    async def user_under_a() -> None:
+        store = await _open(db, key_a)
         try:
-            service = AuthService(store, AuthSettings())
-            await service.initialize()
-            created = await service.create_custom_role(
-                display_name="under-c", description=None, permissions=["messages:replay"], actor="t"
+            await store.create_user(
+                user_id="u-totp",
+                username="u-totp",
+                auth_provider="local",
+                password_generated=False,
+                audits=(),
             )
-            return created.id
+            await store.set_totp_secret("u-totp", secret=_TOTP)
         finally:
             await store.close()
 
-    role_id = asyncio.run(seal_under_c())
+    async def touch_under_c() -> None:
+        store = await _open(db, key_c, key_a)
+        try:
+            await store.set_user_channel_scope("u-totp", '["IB_A"]', source="manual")
+        finally:
+            await store.close()
+
+    asyncio.run(user_under_a())
+    asyncio.run(touch_under_c())
+    assert asyncio.run(_user_seal_holds(db, key_c, key_a))  # control
+
     _env(monkeypatch, key_b, key_a, uploads)
     assert main(["rotate-key", "--db", str(db)]) == 1
     captured = capsys.readouterr()
-    assert "PARTIAL:" in captured.out and "OK:" not in captured.out
-    # The built-in roles the open under the third key re-sealed are held too, not only this one.
-    assert "directory-map record(s) in roles name a seal key" in captured.err
+    assert "rotation aborted" in captured.err and "in users" in captured.err
+    assert asyncio.run(_user_seal_holds(db, key_c, key_a))  # the secret was not re-encrypted
 
     _env(monkeypatch, key_b, f"{key_a},{key_c}", uploads)
     assert main(["rotate-key", "--db", str(db)]) == 0, capsys.readouterr()
     assert "OK:" in capsys.readouterr().out
-
-    async def read_under_b_alone() -> bool:
-        cipher = make_cipher(key_b)
-        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
-        try:
-            return await AuthService(store, AuthSettings())._load_role(role_id) is not None
-        finally:
-            await store.close()
-
-    assert asyncio.run(read_under_b_alone())
+    assert asyncio.run(_user_seal_holds(db, key_b))
 
 
 def test_a_role_whose_seal_no_key_reseals_does_not_fail_the_run(
@@ -173,15 +201,15 @@ def test_a_role_whose_seal_no_key_reseals_does_not_fail_the_run(
     assert main(["rotate-key", "--db", str(db)]) == 0
     captured = capsys.readouterr()
     assert "OK:" in captured.out and "PARTIAL:" not in captured.out
-    assert "note: 1 user, role, open approval or directory-map record(s) failed" in captured.out
-    assert "NOT re-sealed" not in captured.err
+    assert "note: 1 user, role, open approval or directory-map record(s) were left" in captured.out
+    assert "rotation aborted" not in captured.err
     rows = asyncio.run(_rows(db, key_b))
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))
     assert rows[ROTATION_RECORD_ID].fingerprint == ""
 
 
 def test_names_unheld_key_tells_a_key_it_holds_from_one_it_does_not() -> None:
-    """The helper the command's PARTIAL rests on: the active key, a held retired key, an unheld
+    """The helper the command's refusal rests on: the active key, a held retired key, an unheld
     key, and a seal that names no key."""
     active, retired = b"a" * 32, b"r" * 32
     sealer = RowSealer(active, retired_keys=[retired])
@@ -195,7 +223,7 @@ def test_names_unheld_key_tells_a_key_it_holds_from_one_it_does_not() -> None:
         MALFORMED_SEAL,
         f"mfseal:v1::{'0' * 64}",
         f"mfseal:v1:zz:{'0' * 64}",
-        f"mfseal:v1:0123456789ABCDEF:{'0' * 64}",
+        f"mfseal:v1:{UNHELD_KEY_ID.upper()}:{'0' * 64}",
         "",
         None,
         7,

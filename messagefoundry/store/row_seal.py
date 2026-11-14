@@ -356,7 +356,7 @@ class RowSealer:
         verifies, since no key here could check it.
 
         ``rotate-key`` asks this of each row its re-seal passes left as they were: such a row may
-        be genuine and sealed under a retired key the run was not given, so the run is PARTIAL
+        be genuine and sealed under a retired key the run was not given, so the run stops short
         until a run that holds that key re-seals it. A row whose seal fails under a key this
         sealer holds, or that is malformed, answers ``False``: no key re-seals it, so it must not
         hold the rotation open. A key id that is not one :func:`row_seal_key_id` could return is
@@ -899,7 +899,7 @@ class ResealOutcome:
 
     ``unheld`` counts the user, role, open approval and directory-map seals that name a key the run
     did not hold, which may be a retired key it was not given: dropping that key would strand
-    them, so the run is PARTIAL. ``unheld_tables`` and ``unheld_key_ids`` say where they are and
+    them, so the store pass aborts. ``unheld_tables`` and ``unheld_key_ids`` say where they are and
     which seal key ids they name, both non-secret, so an operator can find them. ``refused`` counts
     the rest it left: a seal that fails under a key the run holds, or is malformed. No key re-seals
     those, so they never hold a rotation open; failing on them would fail every later run too."""

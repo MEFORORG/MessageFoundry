@@ -4934,11 +4934,30 @@ RESEALED_SEAL_COLUMNS: Final = (
 )
 
 
+def unheld_seal_refusal(outcome: ResealOutcome) -> CipherError:
+    """The refusal ``reencrypt_to_active`` raises, before it re-encrypts any cell, when its re-seal
+    passes left a seal naming a key this run does not hold (vault BACKLOG #5635). It stops there
+    because the cell pass would re-encrypt such a user's TOTP secret, which the user's seal covers,
+    and leave the record verifying under no key at all. A ``CipherError``, as a cell no supplied
+    key opens is, so ``rotate-key`` aborts with exit 1, rolls no audit range, writes no stamp and
+    leaves its rotation record open. The text names only tables and non-secret seal key ids."""
+    return CipherError(
+        f"{outcome.unheld} user, role, open approval or directory-map record(s) in "
+        f"{', '.join(outcome.unheld_tables)} name a seal key this run does not hold (seal key "
+        f"id(s) {', '.join(outcome.unheld_key_ids)}; each such seal starts mfseal:v1:<id>:), so "
+        "they were not re-sealed and no cell was re-encrypted. The causes include at least a prior "
+        "key that was not supplied, a key that is lost, and a seal written outside the store. "
+        "Supply the prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run; where no key "
+        "you hold opens the record, recreate or remove it, then re-run"
+    )
+
+
 def unrotated_seal_queries(placeholder: str, *, collate: str = "") -> tuple[tuple[str, str], ...]:
     """``(table, SELECT)`` for each of :data:`RESEALED_SEAL_COLUMNS`: its seals that are not blank
     and do not name the active key, whose ``LIKE`` pattern the one ``placeholder`` takes. Each
     backend runs these after its re-seal passes and hands the rows to ``classify_unrotated``.
-    ``collate`` is SQL Server's binary collation, so the filter matches as its passes match."""
+    ``collate`` is SQL Server's binary collation. The filter only saves work, and does not
+    mirror each pass's own: ``classify_unrotated`` decides what counts."""
     return tuple(
         (
             table,
@@ -12311,6 +12330,8 @@ class MessageStore:
         report_approval_reseal(*await self.reseal_approval_records())
         # Vault BACKLOG #5635: what the passes left under another key, for the command to read.
         self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if self._reseal_outcome.unheld:
+            raise unheld_seal_refusal(self._reseal_outcome)
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:

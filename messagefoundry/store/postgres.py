@@ -410,6 +410,7 @@ from messagefoundry.store.store import (
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    unheld_seal_refusal,
     unrotated_seal_queries,
     user_disabled_change,
     user_insert_params,
@@ -3932,6 +3933,8 @@ class PostgresStore:
         report_approval_reseal(*await self.reseal_approval_records())
         # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
         self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if self._reseal_outcome.unheld:
+            raise unheld_seal_refusal(self._reseal_outcome)
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             if is_row_tagged(table, column):

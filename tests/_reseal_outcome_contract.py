@@ -20,7 +20,10 @@ import time
 from typing import Any
 from uuid import uuid4
 
+import pytest
+
 from messagefoundry.auth.permissions import Role
+from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.row_seal import SEAL_PREFIX, ResealOutcome
 from messagefoundry.store.store import AD_ROLE_MAP
 from tests._session_seal_contract import RawSql
@@ -77,7 +80,9 @@ async def assert_reseal_outcome_contract(store: Any, raw: RawSql) -> None:
     await raw("UPDATE authority_set_seal SET seal=? WHERE name=?", (UNHELD_SEAL, AD_ROLE_MAP))
     await raw("UPDATE roles SET seal=? WHERE id=?", (MALFORMED_SEAL, forged_role))
 
-    await store.reencrypt_to_active()
+    # A seal under a key the run does not hold stops the pass before any cell, naming where.
+    with pytest.raises(CipherError, match=UNHELD_KEY_ID):
+        await store.reencrypt_to_active()
     after = store.reseal_outcome()
     assert (after.unheld - base.unheld, after.refused - base.refused) == (4, 1)
     assert {"users", "roles", "pending_approvals", "authority_set_seal"} <= set(after.unheld_tables)
@@ -85,6 +90,7 @@ async def assert_reseal_outcome_contract(store: Any, raw: RawSql) -> None:
 
     # A decided request releases nothing, so its seal is not counted at all.
     await raw("UPDATE pending_approvals SET status=? WHERE id=?", ("rejected", approval))
-    await store.reencrypt_to_active()
+    with pytest.raises(CipherError):
+        await store.reencrypt_to_active()
     decided = store.reseal_outcome()
     assert (decided.unheld, decided.refused) == (after.unheld - 1, after.refused)
