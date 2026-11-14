@@ -552,9 +552,9 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 .\scripts\service\import-db-ca.ps1 -CaPath C:\certs\internal-root-ca.crt
 ```
 
-The helper shows every certificate in the file, and refuses the whole file if any one is not a CA
-or carries a private key, if the file holds no self-signed root, or if any of its bytes would be
-left unread.
+The helper shows every certificate in the file, and refuses the whole file in at least these cases:
+any one is not a CA or carries a private key, the file holds no self-signed root, or a DER value in
+it does not end where its bytes end. The helper's own help lists the rest.
 
 **Where each CA goes.** This paragraph and the helper's own help are the statement of it; other
 documents point here. A self-signed root, whose signature verifies under its own key, goes into
@@ -565,8 +565,10 @@ Server hop still checks the chain up to the root. It **is** usable as a trust an
 engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which the PostgreSQL
 system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
 partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
-there without its root. That is why the helper refuses a file with no self-signed root: give it the
-root, alone or in the same `.p7b` chain.
+there without its root. The helper refuses a file unless at least one certificate in it is a
+self-signed root. It does not check that each other CA in the file chains to that root, and with
+`-Confirm` you may still decline the root and accept another CA, so give it the root of the CA you
+mean to trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
 
 The built-ins below check none of that, so use them only for a file holding one self-signed root
 CA you have checked yourself:

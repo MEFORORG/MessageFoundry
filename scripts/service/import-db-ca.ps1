@@ -28,9 +28,10 @@
     IS usable as a trust anchor by the engine's Python TLS on Windows: CPython's
     ssl.create_default_context(), which the PostgreSQL system-trust path calls, loads the CA and
     ROOT system stores, and Python 3.13 and later set partial-chain verification, so a chain that
-    reaches a certificate in LocalMachine\CA validates there without its root. A file with no
-    self-signed root is refused, so this script never adds an issuing CA without the root it
-    chains to.
+    reaches a certificate in LocalMachine\CA validates there without its root. A file is refused
+    unless at least one certificate in it is a self-signed root. That is the whole check: it does
+    not check that each other CA in the file chains to that root, and with -Confirm the operator
+    may still decline the root and accept another CA.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
@@ -39,7 +40,10 @@
     nothing reaches a store that the operator was not shown. The whole file is refused, and
     nothing is imported, when any certificate in it is not marked as a CA by its basic
     constraints, has a key usage that cannot sign certificates, or carries a private key, when it
-    holds no self-signed root, or when any of its bytes would be left unread. At least a .pfx, and
+    holds no self-signed root, when a DER value in it (the whole file, a PEM block, or decoded
+    base64) does not end where its bytes end, or when a control character other than tab, CR or
+    LF sits outside its PEM blocks. Other text outside PEM blocks, bare base64 among them, is
+    ignored, not refused. At least a .pfx, and
     a well-formed PEM block with any label but CERTIFICATE, X509 CERTIFICATE or PKCS7 (such as a
     PRIVATE KEY block), are refused before anything is parsed. Key material outside well-formed
     PEM armour is not looked for; no private key is ever loaded either way.
@@ -98,8 +102,8 @@ if (-not $WhatIfPreference) {
     $principal = [Security.Principal.WindowsPrincipal]::new(
         [Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw ("Importing into the machine trust store ($StoreLocation) requires an elevated " +
-            "(Administrator) PowerShell.")
+        throw ("Importing into the machine certificate stores ($StoreLocation and " +
+            "$($stores['CertificateAuthority'].Label)) requires an elevated (Administrator) PowerShell.")
     }
 }
 
@@ -187,8 +191,9 @@ function Read-DerHeader {
 # returned is the one shown, checked and added. A certificate or a PKCS#7 bundle (.p7b), signed or
 # not, is accepted as DER, as bare base64 of DER, or as PEM text whose blocks are all CERTIFICATE
 # (or its legacy spelling X509 CERTIFICATE) or PKCS7, in ASCII, UTF-8 or UTF-16 with a byte-order
-# mark. Every DER value must end exactly where its bytes end, and nothing but text may sit outside
-# PEM blocks, so the file is refused rather than read in part. The PEM is parsed here because
+# mark. A DER value that does not end where its bytes end, or a control character other than tab,
+# CR or LF outside PEM blocks, refuses the file; other text outside the blocks is ignored. The PEM
+# is parsed here because
 # Windows PowerShell 5.1's .NET Framework has no ImportFromPem, which would in any case skip a
 # private-key block silently. At least a PKCS#12 (.pfx) and a well-formed PEM block with another
 # label, such as PRIVATE KEY, are refused before any of it is parsed, so no private key is loaded:
@@ -215,8 +220,8 @@ function Read-CaBundle {
             $header = Read-DerHeader -Bytes $Der
             if (-not $header -or $header.End -ne $Der.Length) {
                 throw ("The file holds DER that does not end where its bytes end: trailing bytes, " +
-                    "several values run together, or an indefinite length. Nothing is read from " +
-                    "part of a file; split it into PEM blocks or one .p7b.")
+                    "several values run together, or an indefinite length. That DER is not read " +
+                    "in part; split it into PEM blocks or one .p7b.")
             }
             try {
                 $type = [System.Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($Der)
@@ -253,11 +258,12 @@ function Read-CaBundle {
         if ($blocks.Count -ne $labels.Count) {
             throw "The file has a PEM block that is not well formed."
         }
-        # Text outside the blocks, such as OpenSSL's 'subject=' lines, is ignored. Binary bytes
-        # there, such as DER in front of the PEM, would be left unread, so they refuse the file.
+        # Text outside the blocks, such as OpenSSL's 'subject=' lines, is ignored, and so is bare
+        # base64 there. A control character other than tab, CR or LF outside the blocks, such as
+        # DER in front of the PEM carries, refuses the file. Bytes above 0x7F are not checked.
         if ([regex]::Replace($text, $blockPattern, '') -match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]') {
-            throw ("The file holds binary data outside its PEM blocks, such as DER run together " +
-                "with PEM. Nothing is read from part of a file; give each certificate its own PEM block.")
+            throw ("The file holds a control character outside its PEM blocks, as DER run " +
+                "together with PEM does. Give each certificate its own PEM block.")
         }
         foreach ($block in $blocks) {
             # Either label may hold a PKCS#7 chain: AD CS web enrollment and certutil -encode
@@ -470,8 +476,9 @@ if ($approved.Count -gt 0) {
         Write-Host "A DB server cert chaining to the imported root now validates with" -ForegroundColor Green
         Write-Host "trust_server_certificate = false (no TrustServerCertificate=true needed)." -ForegroundColor Green
     } else {
-        Write-Warning ("No root was imported, so a DB server cert validates only if its root is already " +
-            "in $StoreLocation.")
+        Write-Warning ("No root was imported. Over SChannel and ODBC a DB server cert validates only if " +
+            "its root is already in $StoreLocation; the engine's Python TLS treats LocalMachine\CA " +
+            "differently (see this script's help, 'Where each CA goes').")
     }
     Write-Host ""
     Write-Host "Rotation: when the CA is replaced, import the NEW CA first (this leaves both trusted),"

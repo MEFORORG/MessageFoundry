@@ -80,14 +80,14 @@ def test_runbook_never_recommends_disabling_validation() -> None:
 
 
 def test_import_script_targets_machine_store() -> None:
-    """The helper imports into LocalMachine\\Root (the machine store), not the per-user store."""
+    """The helper imports into the machine stores (LocalMachine\\Root and LocalMachine\\CA), never
+    the per-user stores."""
     assert _IMPORT_SCRIPT.exists(), "import-db-ca.ps1 helper is missing"
     script = _IMPORT_SCRIPT.read_text(encoding="utf-8")
-    # The store the certificates are added through is the machine root store, never the per-user
-    # one (BACKLOG #5561: the script adds each checked certificate through X509Store)...
-    # A root goes into Root and any other CA into the intermediate store, both on the machine.
+    # The stores the certificates are added through are the machine Root and CA stores, never the
+    # per-user ones (BACKLOG #5561: the script adds each checked certificate through X509Store).
     assert "foreach ($name in 'Root', 'CertificateAuthority')" in script, (
-        "helper must bind its import target to the machine root store"
+        "helper must bind its import targets to the machine Root and CA stores"
     )
     assert "X509Certificates.StoreName]::$name" in script
     assert "X509Certificates.StoreLocation]::LocalMachine" in script
@@ -95,7 +95,7 @@ def test_import_script_targets_machine_store() -> None:
     # ...and the store every prompt names is read from that same object, so the two cannot drift.
     assert 'Label = "Cert:\\$($s.Location)\\$($s.Name)"' in script
     assert "$StoreLocation = $stores['Root'].Label" in script
-    # Requires elevation — part of the operator contract for writing the machine store.
+    # Requires elevation — part of the operator contract for writing the machine stores.
     assert "Administrator" in script
 
 

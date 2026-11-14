@@ -206,7 +206,7 @@ def files(
         "rsa_root": _pem(extra["rsa_root"]),
         "rekey_only": _pem(extra["rekey"]),
         "root_and_rekey": _pem(root, extra["rekey"]),
-        # Bytes that would be left unread: refused, never read in part.
+        # DER that does not end where its bytes end, and DER in front of PEM: refused.
         "der_trailing": root.public_bytes(der) + b"\x00trailing",
         "der_concat": root.public_bytes(der) + inter.public_bytes(der),
         "der_then_pem": root.public_bytes(der) + _pem(inter),
@@ -343,10 +343,11 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert "empty" in error("empty")
     assert "no certificate" in error("garbage")
     assert "'Unknown' content" in error("base64_junk")
-    # Bytes that would be left unread refuse the file; nothing is read from part of it.
+    # DER that does not end where its bytes end, and a control character outside PEM blocks,
+    # refuse the file.
     for name in ("der_trailing", "der_concat", "b64_trailing"):
         assert "does not end where its bytes end" in error(name), name
-    assert "binary data outside its PEM blocks" in error("der_then_pem")
+    assert "control character outside its PEM blocks" in error("der_then_pem")
 
 
 def _run_whatif(ca_path: Path) -> subprocess.CompletedProcess[str]:
