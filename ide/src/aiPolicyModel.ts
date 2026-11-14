@@ -190,8 +190,9 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
  * The globalState key prefix for a cached authoritative policy. The key is per ENGINE (BACKLOG
  * #5564): with one unscoped key, the answer one engine gave stood in for another, so a permit cached
  * from engine A enabled assistance while engine B was unreachable, and a deny cached from B was
- * replaced by A's answer. Each engine's policy now comes only from that engine's own answer or its
- * own cache; no state crosses engines. A key written before this change is not read.
+ * replaced by A's answer. Each engine's cache now holds only that engine's own answer. The one state
+ * that crosses engines is a deny, and it goes through the deny carrier ({@link AI_POLICY_DENY_KEY}),
+ * which also migrates a deny held under the key written before this change.
  */
 export const AI_POLICY_CACHE_PREFIX = "messagefoundry.lastAiPolicy@";
 
@@ -247,4 +248,132 @@ export function aiPolicyCacheKey(url: string): string {
     // Not a URL: keep the trimmed text, which still separates one setting value from another.
   }
   return AI_POLICY_CACHE_PREFIX + base;
+}
+
+/**
+ * The globalState key of the deny carrier (BACKLOG #5564). With the per-engine cache alone, a deny
+ * stayed behind when the target changed: clear `engineUrl` back to the default, or spell the same
+ * engine another way, and the new key held no deny. The carrier records every central "off" and
+ * every `ai:assist` deny an engine answers, with the engine that issued it, so the deny reaches each
+ * target that has no authoritative answer of its own. {@link carryDeniesOnline} and
+ * {@link carryDeniesOffline} say what applies it and what clears it.
+ */
+export const AI_POLICY_DENY_KEY = "messagefoundry.aiPolicyDenies";
+
+/**
+ * The one unscoped cache key used before BACKLOG #5564. It is read once, to carry a deny it holds
+ * into {@link AI_POLICY_DENY_KEY}, and is then deleted.
+ */
+export const LEGACY_AI_POLICY_KEY = "messagefoundry.lastAiPolicy";
+
+/**
+ * The issuer recorded for a deny migrated from {@link LEGACY_AI_POLICY_KEY}, which never named the
+ * engine that answered it. A real issuer is a cache key and starts with
+ * {@link AI_POLICY_CACHE_PREFIX}, so the two cannot collide.
+ */
+export const UNKNOWN_DENY_ISSUER = "unknown";
+
+/** The carried denies: the issuer (an engine's cache key, or {@link UNKNOWN_DENY_ISSUER}) to its deny. */
+export type CarriedDenies = Record<string, AiPolicy>;
+
+/** The globalState surface the carrier needs; vscode's Memento satisfies it. */
+export interface PolicyStore {
+  get<T>(key: string): T | undefined;
+  update(key: string, value: unknown): PromiseLike<void>;
+}
+
+/** A central "off" or an `ai:assist` deny: the two answers the carrier records. */
+export function isPolicyDeny(p: AiPolicy): boolean {
+  return p.mode === "off" || p.assistPermitted === false;
+}
+
+function policyOnly(p: CachedAiPolicy): AiPolicy {
+  const { cachedAt: _cachedAt, ...policy } = p;
+  return policy;
+}
+
+// Every read-modify-write of the carrier runs on this one chain, so two resolves that overlap cannot
+// both read the old map and have the later write drop the earlier one's deny.
+let carrierChain: Promise<unknown> = Promise.resolve();
+
+function withCarrier<T>(
+  store: PolicyStore,
+  step: (carried: CarriedDenies) => { next: CarriedDenies; result: T },
+): Promise<T> {
+  const run = carrierChain.then(async () => {
+    const stored = store.get<CarriedDenies>(AI_POLICY_DENY_KEY);
+    let carried: CarriedDenies = stored !== null && typeof stored === "object" ? { ...stored } : {};
+    let migrated = false;
+    // The unscoped key, once. A deny in it is carried with an unknown issuer, which any engine's
+    // authoritative permit clears: origin/main's rule for that key. Then the key is deleted.
+    const legacy = store.get<CachedAiPolicy>(LEGACY_AI_POLICY_KEY);
+    if (legacy !== undefined) {
+      if (legacy !== null && typeof legacy === "object" && isPolicyDeny(legacy)) {
+        carried = { ...carried, [UNKNOWN_DENY_ISSUER]: policyOnly(legacy) };
+        migrated = true;
+      }
+      await store.update(LEGACY_AI_POLICY_KEY, undefined);
+    }
+    const { next, result } = step(carried);
+    if (migrated || JSON.stringify(next) !== JSON.stringify(carried)) {
+      await store.update(AI_POLICY_DENY_KEY, next);
+    }
+    return result;
+  });
+  // A failed step must not leave every later resolve behind a rejected chain.
+  carrierChain = run.catch(() => undefined);
+  return run;
+}
+
+/**
+ * The carrier's step for a FRESH answer from the engine keyed `issuer`. `fresh` is the answer, and
+ * `merged` is it merged over that engine's own cache (what is cached for it).
+ *
+ *  1. **Clearing.** A carried deny is cleared only by an authoritative permit: a fresh answer that,
+ *     merged over the deny, enables assistance. Only the engine that issued the deny can clear it; a
+ *     deny with {@link UNKNOWN_DENY_ISSUER} is cleared by any engine.
+ *  2. **Recording.** A `merged` that is a deny is recorded under `issuer`.
+ *  3. **Applying.** Every carried deny is merged over the answer. So an `ai:assist` deny reaches an
+ *     answer that could not evaluate the permission (`null`), such as the same engine at an alias URL
+ *     the bearer is not cached for. An evaluated `true` or `false` is that engine's own answer and
+ *     stands, and so does its `mode`, which is identity-independent and always comes fresh.
+ *
+ * Returns the policy to gate on. The engine's own cache keeps `merged`, not this.
+ */
+export function carryDeniesOnline(
+  store: PolicyStore,
+  issuer: string,
+  fresh: AiPolicy,
+  merged: AiPolicy,
+): Promise<AiPolicy> {
+  return withCarrier(store, (carried) => {
+    const next: CarriedDenies = {};
+    for (const [key, deny] of Object.entries(carried)) {
+      const clearable = key === issuer || key === UNKNOWN_DENY_ISSUER;
+      if (!(clearable && assistantState(mergeAuthoritativePolicy(deny, fresh)).enabled)) {
+        next[key] = deny;
+      }
+    }
+    if (isPolicyDeny(merged)) {
+      next[issuer] = policyOnly(merged);
+    }
+    const result = Object.values(next).reduce((p, deny) => mergeAuthoritativePolicy(deny, p), merged);
+    return { next, result };
+  });
+}
+
+/**
+ * The carrier's step when the target is unreachable. `offline` is what {@link pickOfflinePolicy}
+ * chose. Any carried deny applies, whichever engine issued it: an unreachable target has no
+ * authoritative answer of its own, and neither a cached permit nor the local CLI may outrank a deny
+ * an engine gave. A choice that already disables assistance is returned as it is.
+ */
+export function carryDeniesOffline(store: PolicyStore, offline: AiPolicy): Promise<AiPolicy> {
+  return withCarrier(store, (carried) => {
+    if (!assistantState(offline).enabled) {
+      return { next: carried, result: offline };
+    }
+    const deny = Object.values(carried).find(isPolicyDeny);
+    return { next: carried, result: deny === undefined ? offline : { ...deny } };
+  });
 }

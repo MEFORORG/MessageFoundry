@@ -6,13 +6,18 @@ import * as path from "path";
 
 import {
   AI_POLICY_CACHE_PREFIX,
+  AI_POLICY_DENY_KEY,
   CACHED_PERMIT_MAX_AGE_MS,
+  LEGACY_AI_POLICY_KEY,
   aiPolicyCacheKey,
   assistantState,
   cachedPolicyOffline,
+  carryDeniesOffline,
+  carryDeniesOnline,
   mergeAuthoritativePolicy,
   pickOfflinePolicy,
   type AiPolicy,
+  type PolicyStore,
 } from "../../aiPolicyModel";
 
 // BACKLOG #330, defect 1 — the authoritative-merge guard, and its coupling to the gate it feeds.
@@ -253,6 +258,132 @@ suite("pickOfflinePolicy — a retarget does not bypass a cached deny (BACKLOG #
   });
 });
 
+/** A globalState stand-in whose writes yield first, so two overlapping resolves really interleave. */
+function memStore(seed: Record<string, unknown> = {}): PolicyStore & { map: Map<string, unknown> } {
+  const map = new Map<string, unknown>(Object.entries(seed));
+  return {
+    map,
+    get: <T>(key: string): T | undefined => map.get(key) as T | undefined,
+    update: async (key: string, value: unknown): Promise<void> => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      if (value === undefined) {
+        map.delete(key);
+      } else {
+        map.set(key, value);
+      }
+    },
+  };
+}
+
+// The same steps resolveAiPolicy takes (the source scan below pins that it takes them): an answer is
+// merged over the engine's own cache, cached, then passed through the carrier; offline, the own
+// cache or the CLI is picked, then passed through the carrier.
+async function answered(store: PolicyStore, url: string, fresh: AiPolicy): Promise<AiPolicy> {
+  const key = aiPolicyCacheKey(url);
+  const merged = mergeAuthoritativePolicy(store.get<AiPolicy>(key) ?? null, fresh);
+  await store.update(key, { ...merged, cachedAt: 0 });
+  return carryDeniesOnline(store, key, fresh, merged);
+}
+
+async function unreachable(store: PolicyStore, url: string, cli: AiPolicy | null, configured: boolean): Promise<AiPolicy> {
+  const cached = store.get<AiPolicy & { cachedAt?: number }>(aiPolicyCacheKey(url)) ?? null;
+  return carryDeniesOffline(store, pickOfflinePolicy(cached, cli, 0, configured));
+}
+
+suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
+  const CENTRAL = "https://central.example.test:8765";
+  const LOCAL = "https://127.0.0.1:8765";
+  const ALIAS = "https://localhost:8765";
+  const OTHER = "https://other.example.test:8765";
+  const cliByo = policy({ mode: "byo" });
+
+  test("D1: a cached central off survives clearing engineUrl back to the default target", async () => {
+    const store = memStore();
+    await answered(store, CENTRAL, policy({ mode: "off" }));
+    const p = await unreachable(store, LOCAL, cliByo, false);
+    assert.strictEqual(p.mode, "off", "the local CLI's byo must not outrank the central off");
+    assert.strictEqual(assistantState(p).enabled, false);
+  });
+
+  test("D1b: the default target's own cached permit does not outrank it either", async () => {
+    const store = memStore();
+    await answered(store, LOCAL, policy({ assistPermitted: true }));
+    await answered(store, CENTRAL, policy({ mode: "off" }));
+    const p = await unreachable(store, LOCAL, cliByo, false);
+    assert.strictEqual(assistantState(p).enabled, false);
+  });
+
+  test("D2: an alias URL of the same engine inherits its ai:assist deny, reachable or not", async () => {
+    const store = memStore();
+    await answered(store, LOCAL, policy({ assistPermitted: false }));
+    // The alias has no bearer cached, so the engine cannot evaluate the permission.
+    const online = await answered(store, ALIAS, policy({ assistPermitted: null }));
+    assert.strictEqual(online.assistPermitted, false, "a tokenless read at the alias kept the deny");
+    assert.strictEqual(assistantState(online).enabled, false);
+    const offline = await unreachable(store, ALIAS, cliByo, true);
+    assert.strictEqual(assistantState(offline).enabled, false);
+  });
+
+  test("D3: only the issuing engine's permit clears its deny", async () => {
+    const store = memStore();
+    await answered(store, CENTRAL, policy({ assistPermitted: false }));
+    // Another engine's evaluated grant is its own answer, so it enables there...
+    const other = await answered(store, OTHER, policy({ assistPermitted: true }));
+    assert.strictEqual(assistantState(other).enabled, true, "an evaluated grant is that engine's own answer");
+    // ...but it does not clear the central deny for a target with no answer of its own.
+    assert.strictEqual(assistantState(await unreachable(store, LOCAL, cliByo, false)).enabled, false);
+    // A tokenless read from the issuer does not clear it either.
+    await answered(store, CENTRAL, policy({ assistPermitted: null }));
+    assert.strictEqual(assistantState(await unreachable(store, LOCAL, cliByo, false)).enabled, false);
+    // The issuer's evaluated grant does.
+    await answered(store, CENTRAL, policy({ assistPermitted: true }));
+    assert.strictEqual(assistantState(await unreachable(store, LOCAL, cliByo, false)).enabled, true);
+  });
+
+  test("D3b: a central off is cleared only when that engine stops answering off", async () => {
+    const store = memStore();
+    await answered(store, CENTRAL, policy({ mode: "off" }));
+    await answered(store, OTHER, policy({ mode: "byo" }));
+    assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "off");
+    await answered(store, CENTRAL, policy({ mode: "byo" }));
+    assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "byo");
+  });
+
+  test("D4: the old unscoped key's deny is migrated once, with an unknown issuer, then deleted", async () => {
+    const store = memStore({ [LEGACY_AI_POLICY_KEY]: { ...policy({ mode: "off" }), cachedAt: 0 } });
+    const p = await unreachable(store, LOCAL, cliByo, false);
+    assert.strictEqual(p.mode, "off", "the pre-upgrade central off must not be dropped");
+    assert.strictEqual(store.map.has(LEGACY_AI_POLICY_KEY), false, "the old key is deleted");
+    assert.ok(store.map.has(AI_POLICY_DENY_KEY), "the deny is carried");
+    // Any engine's authoritative permit clears an unknown issuer's deny, as origin/main's key did.
+    await answered(store, OTHER, policy({ mode: "byo" }));
+    assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "byo");
+  });
+
+  test("D4b: an old ai:assist deny is migrated too, and an old permit is deleted without carrying", async () => {
+    const deny = memStore({ [LEGACY_AI_POLICY_KEY]: policy({ assistPermitted: false }) });
+    assert.strictEqual(assistantState(await unreachable(deny, LOCAL, cliByo, false)).enabled, false);
+    const permit = memStore({ [LEGACY_AI_POLICY_KEY]: policy({ assistPermitted: true }) });
+    assert.strictEqual(assistantState(await unreachable(permit, LOCAL, cliByo, false)).enabled, true);
+    assert.strictEqual(permit.map.has(LEGACY_AI_POLICY_KEY), false);
+    assert.strictEqual(permit.map.has(AI_POLICY_DENY_KEY), false, "a permit is not a deny to carry");
+  });
+
+  test("D5: two overlapping resolves cannot drop each other's deny", async () => {
+    const store = memStore();
+    await Promise.all([
+      answered(store, CENTRAL, policy({ mode: "off" })),
+      answered(store, OTHER, policy({ assistPermitted: false })),
+    ]);
+    const carried = store.map.get(AI_POLICY_DENY_KEY) as Record<string, AiPolicy>;
+    assert.deepStrictEqual(
+      Object.keys(carried).sort(),
+      [aiPolicyCacheKey(CENTRAL), aiPolicyCacheKey(OTHER)].sort(),
+      "the read-modify-write of the carrier interleaved",
+    );
+  });
+});
+
 // aiPolicy.ts imports vscode, so its behavioural tests run only in the Extension Host leg
 // (ai-policy.test.ts). These read its source so the two halves of BACKLOG #5564 are pinned on every
 // leg: the policy is read from the status bar's target, and every cache read and write is keyed.
@@ -302,14 +433,31 @@ suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG
     assert.ok(/cacheKey = aiPolicyCacheKey\(url\);/.test(code), "the key must be derived from the url asked");
   });
 
-  test("T5: no globalState key crosses engines: every policy access is this engine's own key", () => {
-    // Any globalState access at all must be the per-engine key; a global flag would let one engine's
-    // answer or absence decide another's.
+  test("T5: the cache is read and written only by this engine's key; the carrier only through the model", () => {
+    // A direct globalState access must be the per-engine key. The one state that crosses engines is
+    // the deny carrier, and aiPolicy.ts reaches it only through carryDeniesOnline / carryDeniesOffline.
     const all = code.match(/globalState\.(?:get<[^>]+>|get|update)\([^,)]*/g) ?? [];
     assert.strictEqual(all.length, 3, `expected only the merge read, the write and the offline read: ${all.join(" | ")}`);
     for (const call of all) {
       assert.ok(/\(cacheKey$/.test(call), `a globalState access not keyed by engine: ${call}`);
     }
+  });
+
+  test("T6: every answer and every offline choice passes through the deny carrier", () => {
+    assert.ok(
+      /return await carryDeniesOnline\(ctx\.globalState, cacheKey, fresh, merged\);/.test(code),
+      "an engine's answer must pass through the carrier before it gates assistance",
+    );
+    assert.ok(
+      /return carryDeniesOffline\(\s*ctx\.globalState,\s*pickOfflinePolicy\(cached, cli, now\(\), targetConfigured\),?\s*\);/.test(
+        code,
+      ),
+      "the offline choice must pass through the carrier",
+    );
+    // The only return statements in resolveAiPolicy are those two, so no path skips the carrier.
+    const body = /export async function resolveAiPolicy\([\s\S]*?\n\}/.exec(code);
+    assert.ok(body, "resolveAiPolicy moved — re-point this scan");
+    assert.strictEqual((body[0].match(/\breturn\b/g) ?? []).length, 2, "a return that skips the carrier");
   });
 
   test("T4: the offline path falls to the CLI only for an unconfigured target", () => {

@@ -397,4 +397,22 @@ suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
     assert.strictEqual(p.mode, "byo");
     assert.strictEqual(io.cliAsked(), true);
   });
+
+  test("T23: a central off survives clearing the engine setting back to the default target", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ mode: "off" })));
+    const p = await resolveAiPolicy(ctx, offlineWithCli(false));
+    assert.strictEqual(p.mode, "off", "the local CLI's byo outranked the central off");
+  });
+
+  test("T24: an alias URL inherits the deny, and only the issuing engine's grant clears it", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: false })));
+    const alias = await resolveAiPolicy(ctx, engineIo("http://localhost:8765", wire({})));
+    assert.strictEqual(assistantState(alias).enabled, false, "a tokenless read at the alias cleared the deny");
+    await resolveAiPolicy(ctx, engineIo(B, wire({ assist_permitted: true })));
+    assert.strictEqual(assistantState(await resolveAiPolicy(ctx, offlineWithCli(false))).enabled, false);
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: true })));
+    assert.strictEqual(assistantState(await resolveAiPolicy(ctx, offlineWithCli(false))).enabled, true);
+  });
 });

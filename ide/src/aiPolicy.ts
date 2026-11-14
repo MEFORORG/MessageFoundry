@@ -17,6 +17,8 @@ import {
   type AiPolicy,
   type CachedAiPolicy,
   aiPolicyCacheKey,
+  carryDeniesOffline,
+  carryDeniesOnline,
   evaluatedPermission,
   mergeAuthoritativePolicy,
   pickOfflinePolicy,
@@ -50,7 +52,9 @@ export interface AiPolicyWire {
 // ai:assist deny is not overridable simply by taking the engine offline (SEC-022). It is stamped with
 // when the engine answered, so a cached answer that ENABLES assistance expires (BACKLOG #1154; see
 // cachedPolicyOffline), and it is keyed by the engine that answered (aiPolicyCacheKey, BACKLOG #5564),
-// so one engine's answer never stands in for another's.
+// so one engine's answer never stands in for another's. A DENY is the exception: the deny carrier
+// (carryDeniesOnline / carryDeniesOffline) takes it to every target with no answer of its own, so a
+// retarget or another spelling of the URL cannot leave it behind.
 
 /**
  * Wire → resolved policy. `AiPolicyWire` is a claim about a response, not a guarantee: `JSON.parse`
@@ -124,6 +128,8 @@ export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
  * unreachable, that engine's last cached authoritative policy; (c) the local CLI [reads
  * messagefoundry.toml], only when no engine target is configured; (d) a fail-closed "unverified"
  * policy (assistance disabled) so a central "off" can't be bypassed by going offline or retargeting.
+ * Every result passes through the deny carrier, so a deny any engine issued reaches a target that
+ * has no authoritative answer of its own.
  *
  * The read is AUTHENTICATED (BACKLOG #330). `assist_permitted` is computed from the acting identity, so
  * a tokenless read can only ever answer `null` and the `ai:assist` deny branch could never fire — half
@@ -162,7 +168,9 @@ export async function resolveAiPolicy(
     // Remember the authoritative answer, stamped with when it was given (BACKLOG #1154).
     const stamped: CachedAiPolicy = { ...merged, cachedAt: now() };
     await ctx.globalState.update(cacheKey, stamped);
-    return merged;
+    // A deny another engine issued, or that this one answered at another spelling of its URL, still
+    // reaches an answer that could not evaluate the permission (carryDeniesOnline).
+    return await carryDeniesOnline(ctx.globalState, cacheKey, fresh, merged);
   } catch {
     // Engine unreachable or errored — fall back to the cached authoritative / CLI / fail-closed view.
   }
@@ -186,7 +194,11 @@ export async function resolveAiPolicy(
       // CLI unavailable too (no Python / no workspace / untrusted) — leave cli null.
     }
   }
-  return pickOfflinePolicy(cached, cli, now(), targetConfigured);
+  // Unreachable, so no answer of its own: any deny an engine issued applies (carryDeniesOffline).
+  return carryDeniesOffline(
+    ctx.globalState,
+    pickOfflinePolicy(cached, cli, now(), targetConfigured),
+  );
 }
 
 /** Fetch the current policy and surface it to the user (command: messagefoundry.showAiPolicy). */
