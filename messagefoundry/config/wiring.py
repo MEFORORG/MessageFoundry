@@ -1701,9 +1701,12 @@ def _refuse_non_bool_flags(
         else:
             continue
         # Raised outside the handler, so the chain stays empty (tests/test_from_none_is_not_redaction.py).
-        env_hint = " (no env() is resolved on this flag)" if isinstance(value, EnvRef) else ""
+        # Validation, a pydantic model, stores strict="false" as False, so the quoted-false hint
+        # would be untrue there.
+        hint = "" if key == "strict" else _quoted_false_hint(value)
+        env_hint = " (no env() is resolved on this flag)" if _is_nested_envref(value) else ""
         tail = "; write True or False, or None to inherit" if inherits else "; write True or False"
-        raise WiringError(f"{where}: {problem}{_quoted_false_hint(value)}{env_hint}{tail}")
+        raise WiringError(f"{where}: {problem}{hint}{env_hint}{tail}")
 
 
 def resolve_env_settings(

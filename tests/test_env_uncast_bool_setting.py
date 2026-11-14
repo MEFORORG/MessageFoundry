@@ -1074,6 +1074,10 @@ def test_the_refusal_names_the_remedy_that_fits_the_value() -> None:
     with pytest.raises(WiringError) as ei:
         _declare("inbound", capture_ack="default")
     assert str(ei.value).endswith("; write True or False, or None to inherit")
+    # strict is stored through a model that reads "false" as false, so no hint says otherwise.
+    with pytest.raises(WiringError) as ei:
+        _declare("inbound", strict="false")
+    assert _QUOTED_FALSE_HINT not in str(ei.value)
 
 
 def test_a_strict_quoted_false_is_refused_before_the_content_type_check() -> None:
@@ -1151,11 +1155,13 @@ def test_connections_toml_refuses_a_quoted_declaration_flag(
 
 
 @pytest.mark.parametrize(("direction", "key"), _TOML_FLAGS)
-def test_connections_toml_still_reads_a_real_false_declaration_flag(
+def test_connections_toml_still_reads_a_real_declaration_flag(
     tmp_path: Path, direction: str, key: str
 ) -> None:
+    # The value that is NOT the flag's default, so a loader that dropped the key would fail here.
+    want = key in ("strict", "simulate")
     (tmp_path / "connections.toml").write_text(
-        _toml_flag(direction, key, "false"), encoding="utf-8"
+        _toml_flag(direction, key, "true" if want else "false"), encoding="utf-8"
     )
     (tmp_path / "routes.py").write_text(
         "from messagefoundry import router\n@router('r')\ndef route(msg):\n    return []\n",
@@ -1164,4 +1170,4 @@ def test_connections_toml_still_reads_a_real_false_declaration_flag(
     reg = load_config(tmp_path, allow_empty=True)
     conn = reg.inbound["IB_X"] if direction == "inbound" else reg.outbound["OB_X"]
     got = reg.inbound["IB_X"].validation.strict if key == "strict" else getattr(conn, key)
-    assert got is False
+    assert got is want
