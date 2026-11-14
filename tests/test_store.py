@@ -1573,25 +1573,6 @@ async def test_a_failed_open_after_the_bind_still_settles(tmp_path, monkeypatch)
     assert settles == [False, True]
 
 
-async def test_cleanup_failed_open_releases_when_the_settle_is_cancelled() -> None:
-    """BACKLOG #5720: a cancel ending the settle is not an ``Exception``, so the release must sit
-    in a ``finally`` behind it, or the pool and the executor leak."""
-    from messagefoundry.store.store import cleanup_failed_open
-
-    released: list[str] = []
-
-    async def cancelled_settle(**_kwargs: object) -> None:
-        raise asyncio.CancelledError
-
-    async def release() -> None:
-        released.append("released")
-
-    await cleanup_failed_open(
-        RuntimeError("open boom"), release, lambda: None, checkpoint=cancelled_settle
-    )
-    assert released == ["released"]
-
-
 async def test_cleanup_failed_open_runs_only_the_forced_release_on_generator_exit() -> None:
     """BACKLOG #5720: a coroutine being closed cannot await, so the cleanup runs only the
     synchronous forced release, and the caller re-raises the ``GeneratorExit`` unchanged."""
@@ -1602,7 +1583,9 @@ async def test_cleanup_failed_open_runs_only_the_forced_release_on_generator_exi
     async def release() -> None:
         released.append("released")
 
-    await cleanup_failed_open(GeneratorExit(), release, lambda: released.append("forced"))
+    await cleanup_failed_open(
+        GeneratorExit(), release, lambda: released.append("forced"), cancels_before=0
+    )
     assert released == ["forced"]
 
 
@@ -1623,7 +1606,9 @@ async def _wedged_cleanup_ends_within_the_bound(
         await unwedge.wait()
 
     task = asyncio.create_task(
-        store_module.cleanup_failed_open(exc, wedged_release, lambda: forced.append("forced"))
+        store_module.cleanup_failed_open(
+            exc, wedged_release, lambda: forced.append("forced"), cancels_before=0
+        )
     )
     try:
         await asyncio.wait_for(started.wait(), 5)
@@ -1634,7 +1619,7 @@ async def _wedged_cleanup_ends_within_the_bound(
         unwedge.set()
         await asyncio.sleep(0)
     assert forced == ["forced"]
-    assert "did not finish within" in caplog.text
+    assert "did not finish within 0.05 s of a cancel" in caplog.text
     try:
         task.result()
     except BaseException as raised:  # noqa: BLE001 -- what the cleanup raised, a cancel included
@@ -1695,7 +1680,7 @@ async def test_an_exit_bounds_a_wedged_failed_open_cleanup_without_a_cancel(monk
 
     task = asyncio.create_task(
         store_module.cleanup_failed_open(
-            SystemExit(1), wedged_release, lambda: forced.append("forced")
+            SystemExit(1), wedged_release, lambda: forced.append("forced"), cancels_before=0
         )
     )
     try:
@@ -1724,7 +1709,10 @@ async def test_a_cancel_on_every_pass_still_reaches_the_forced_release(monkeypat
 
     task = asyncio.create_task(
         store_module.cleanup_failed_open(
-            RuntimeError("open boom"), wedged_release, lambda: forced.append("forced")
+            RuntimeError("open boom"),
+            wedged_release,
+            lambda: forced.append("forced"),
+            cancels_before=0,
         )
     )
     try:
@@ -1738,3 +1726,56 @@ async def test_a_cancel_on_every_pass_still_reaches_the_forced_release(monkeypat
         unwedge.set()
         await asyncio.sleep(0)
     assert forced == ["forced"]
+
+
+async def test_a_swallowed_earlier_cancel_does_not_turn_a_failed_open_into_a_cancel(
+    tmp_path, monkeypatch
+) -> None:
+    """BACKLOG #5720, decision d20261114T005827 (as BACKLOG #5004): a task that swallowed a cancel
+    before the open still counts it in ``cancelling()``. The open compares against the count it
+    started with, so its own ordinary failure stays that failure, not a ``CancelledError``."""
+
+    async def boom(self: MessageStore) -> None:
+        raise RuntimeError("reference cache boom")
+
+    monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
+
+    async def opener() -> BaseException | None:
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(1)  # the earlier cancel lands here and is swallowed
+        assert current.cancelling() == 1
+        try:
+            await MessageStore.open(tmp_path / "swallowed.db")
+        except BaseException as raised:  # noqa: BLE001 -- what the open raised
+            return raised
+        return None
+
+    raised = await asyncio.create_task(opener())
+    assert isinstance(raised, RuntimeError), raised
+
+
+async def test_an_exit_names_itself_in_the_forced_release_warning(monkeypatch, caplog) -> None:
+    """BACKLOG #5720: the forced-release WARNING names what started the bound, and the bound
+    itself, unrounded."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    unwedge = asyncio.Event()
+
+    async def wedged_release() -> None:
+        await unwedge.wait()
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            KeyboardInterrupt(), wedged_release, lambda: None, cancels_before=0
+        )
+    )
+    try:
+        await asyncio.wait({task}, timeout=3)
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    assert "did not finish within 0.05 s of KeyboardInterrupt" in caplog.text

@@ -274,11 +274,11 @@ async def test_a_cancelled_create_pool_releases_the_executor(
     assert executor.shutdown_calls == [False]
 
 
-async def test_a_failed_keyed_open_settles_the_block_it_reserved(
+async def test_a_failed_keyed_open_forfeits_the_block_it_reserved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5720: the cleanup closed the pool without settling the block the open reserved.
-    Red before the fix: ``settles`` is ``[False]``."""
+    """BACKLOG #5720, decision d20261114T005827: the cleanup releases the pool and executor and
+    settles nothing, so the reserved block is forfeited, as on main."""
     pool = _FakePool()
     _install_fake_aioodbc(monkeypatch, pool)
     executor = _fake_executor(monkeypatch)
@@ -289,7 +289,7 @@ async def test_a_failed_keyed_open_settles_the_block_it_reserved(
     with pytest.raises(RuntimeError, match="at-rest sweep boom"):
         await SqlServerStore.open(_settings())
 
-    assert settles == [False, True]
+    assert settles == [False]
     assert pool.closed == 1
     assert executor.shutdown_calls == [False]
 
@@ -322,31 +322,27 @@ async def test_an_open_that_fails_at_or_before_the_salt_bind_settles_nothing(
 async def test_a_cancel_during_the_cleanup_still_releases_everything(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5720: a cancel landing while the failed open settles must not skip the pool close
-    or the executor release, and the caller still sees the cancel."""
-    pool = _FakePool()
+    """BACKLOG #5720: a cancel landing while the failed open waits for its pool to close must not
+    skip the executor release, and the caller still sees the cancel."""
+    closing = asyncio.Event()
+
+    class _SlowPool(_FakePool):
+        async def wait_closed(self) -> None:
+            closing.set()
+            await asyncio.sleep(0.2)
+            await super().wait_closed()
+
+    pool = _SlowPool()
     _install_fake_aioodbc(monkeypatch, pool)
     executor = _fake_executor(monkeypatch)
-    settles: list[bool] = []
-    _keyed_open_steps(monkeypatch, settles)
-    settling = asyncio.Event()
-
-    async def _slow_checkpoint(self: SqlServerStore, *, settle: bool = False) -> None:
-        settles.append(settle)
-        if settle:
-            settling.set()
-            await asyncio.sleep(0.2)
-
-    monkeypatch.setattr(SqlServerStore, "checkpoint_cipher_invocations", _slow_checkpoint)
-    monkeypatch.setattr(SqlServerStore, "_encrypt_existing_rows", _sweep_boom)
+    monkeypatch.setattr(SqlServerStore, "_ensure_schema", _boom_ensure_schema)
 
     task = asyncio.create_task(SqlServerStore.open(_settings()))
-    await asyncio.wait_for(settling.wait(), 5)
+    await asyncio.wait_for(closing.wait(), 5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as raised:
         await task
 
-    assert settles == [False, True]
     assert pool.closed == 1
     assert pool.wait_closed_called == 1
     assert executor.shutdown_calls == [False]

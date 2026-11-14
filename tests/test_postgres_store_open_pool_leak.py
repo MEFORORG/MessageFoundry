@@ -209,12 +209,12 @@ async def test_a_cancelled_open_closes_the_pool(monkeypatch: pytest.MonkeyPatch)
     assert pool.closed == 1
 
 
-async def test_a_failed_keyed_open_settles_the_block_it_reserved(
+async def test_a_failed_keyed_open_forfeits_the_block_it_reserved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5720: the open reserves a block of AES-GCM invocations and then fails. Its cleanup
-    closed the pool without settling, so the whole block was charged to the key for nothing. Red
-    before the fix: ``settles`` is ``[False]``, the reserve and no settlement."""
+    """BACKLOG #5720, decision d20261114T005827: the open reserves a block of AES-GCM invocations
+    and then fails. Its cleanup closes the pool and settles nothing, so the block is forfeited, as
+    on main: a forfeit only over-counts, the conservative direction for the bound."""
     pool = _FakePool()
     _install_fake_asyncpg(monkeypatch, pool)
     settles: list[bool] = []
@@ -224,7 +224,7 @@ async def test_a_failed_keyed_open_settles_the_block_it_reserved(
     with pytest.raises(RuntimeError, match="at-rest sweep boom"):
         await PostgresStore.open(_settings())
 
-    assert settles == [False, True]
+    assert settles == [False]
     assert pool.closed == 1
 
 
@@ -250,67 +250,6 @@ async def test_an_open_that_fails_at_or_before_the_salt_bind_settles_nothing(
 
     assert settles == []
     assert pool.closed == 1
-
-
-async def test_a_cancel_during_the_cleanup_still_closes_the_pool(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """BACKLOG #5720: a cancel landing while the failed open cleans up must not cut the cleanup
-    short. The settle is the slow step here; the pool still closes, and the caller sees the cancel,
-    chained to the open's own failure."""
-    pool = _FakePool()
-    _install_fake_asyncpg(monkeypatch, pool)
-    settles: list[bool] = []
-    _keyed_open_steps(monkeypatch, settles)
-    settling = asyncio.Event()
-
-    async def _slow_checkpoint(self: PostgresStore, *, settle: bool = False) -> None:
-        settles.append(settle)
-        if settle:
-            settling.set()
-            await asyncio.sleep(0.2)
-
-    monkeypatch.setattr(PostgresStore, "checkpoint_cipher_invocations", _slow_checkpoint)
-    monkeypatch.setattr(PostgresStore, "_encrypt_existing_rows", _sweep_boom)
-
-    task = asyncio.create_task(PostgresStore.open(_settings()))
-    await asyncio.wait_for(settling.wait(), 5)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError) as raised:
-        await task
-
-    assert settles == [False, True]
-    assert pool.closed == 1
-    assert isinstance(raised.value.__cause__, RuntimeError)
-
-
-async def test_a_settle_failure_after_a_failed_open_is_logged_by_class_only(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """BACKLOG #5720, vault BACKLOG #3054: a settle failure that reaches the failed open's cleanup
-    is named by class only, and the open's own error still propagates. This covers the cleanup's
-    own guard; a failed add() inside ``checkpoint_invocations`` is logged there, as before."""
-    pool = _FakePool()
-    _install_fake_asyncpg(monkeypatch, pool)
-    settles: list[bool] = []
-    _keyed_open_steps(monkeypatch, settles)
-
-    async def _failing_settle(self: PostgresStore, *, settle: bool = False) -> None:
-        if settle:
-            raise ConnectionResetError("server db01 refused login mefor")
-
-    monkeypatch.setattr(PostgresStore, "checkpoint_cipher_invocations", _failing_settle)
-    monkeypatch.setattr(PostgresStore, "_encrypt_existing_rows", _sweep_boom)
-
-    with (
-        caplog.at_level(logging.DEBUG),
-        pytest.raises(RuntimeError, match="at-rest sweep boom"),
-    ):
-        await PostgresStore.open(_settings())
-
-    assert pool.closed == 1
-    assert "after a failed store open (ConnectionResetError)" in caplog.text
-    assert "db01" not in caplog.text
 
 
 async def test_a_cancelled_open_with_a_wedged_pool_close_ends_and_terminates(
@@ -348,3 +287,77 @@ async def test_a_cancelled_open_with_a_wedged_pool_close_ends_and_terminates(
         task.result()
     assert pool.closed == 1
     assert terminated == ["terminated"]
+
+
+async def test_a_cancel_during_the_cleanup_still_closes_the_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: a cancel landing while the failed open closes its pool must not cut the close
+    short, and the caller sees the cancel, chained to the open's own failure."""
+    closing = asyncio.Event()
+    pool = _FakePool()
+    real_close = pool.close
+
+    async def slow_close() -> None:
+        closing.set()
+        await asyncio.sleep(0.2)
+        await real_close()
+
+    pool.close = slow_close  # type: ignore[method-assign]
+    _install_fake_asyncpg(monkeypatch, pool)
+
+    async def _boom(self: PostgresStore, **_kwargs: object) -> bool:
+        raise RuntimeError("schema boom")
+
+    monkeypatch.setattr(PostgresStore, "_ensure_schema", _boom)
+
+    task = asyncio.create_task(PostgresStore.open(_settings()))
+    await asyncio.wait_for(closing.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+
+    assert pool.closed == 1
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+async def test_a_pool_without_terminate_keeps_the_opens_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5720, decision d20261114T005827: a pool with no ``terminate()`` must not replace
+    the open's error. The forced release looks it up only when it runs, inside the logged call."""
+    monkeypatch.setattr("messagefoundry.store.store.FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    unwedge = asyncio.Event()
+
+    class _NoTerminatePool:
+        closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+            await unwedge.wait()
+
+    pool = _NoTerminatePool()
+
+    async def _create_pool(**kwargs: Any) -> _NoTerminatePool:
+        return pool
+
+    module = types.ModuleType("asyncpg")
+    module.create_pool = _create_pool  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "asyncpg", module)
+
+    async def _cancelled(self: PostgresStore, **_kwargs: object) -> bool:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(PostgresStore, "_ensure_schema", _cancelled)
+    task = asyncio.create_task(PostgresStore.open(_settings()))
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=3)
+        assert task in done
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    with pytest.raises(asyncio.CancelledError):
+        task.result()
+    assert "forcing the release after a failed store open also failed (AttributeError)" in (
+        caplog.text
+    )
