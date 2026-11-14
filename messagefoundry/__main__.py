@@ -1379,11 +1379,11 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
 
     ``validate``/``graph``/``dryrun``/``check`` carried only ``--config`` before, so the commit/CI gate
     could resolve a DIFFERENT environment view than ``serve`` (review C3). These flags let the gate
-    anchor the same bundle root and select the same active environment ``serve`` does — value
-    resolution only, WITHOUT adopting serve's required-active-env / explicit-posture refusal (AC-6).
-    ``check`` is the exception for ``--env``, by ADR 0050's amended AC-6: its settings legs read it
-    as ``serve --env`` does, so its ``posture`` leg judges that name (vault BACKLOG #2355).
-    ``env_help`` replaces the ``--env`` help for it.
+    anchor the same bundle root, WITHOUT adopting serve's required-active-env / explicit-posture
+    refusal (AC-6). On ``validate``/``graph``/``dryrun``, ``--env`` feeds only the value-file check in
+    :func:`_resolve_offline_anchor`, as the default help says (vault BACKLOG #5554). ``check`` is the
+    exception, by ADR 0050's amended AC-6: its settings legs read it as ``serve --env`` does (vault
+    BACKLOG #2355). ``env_help`` replaces the ``--env`` help for it.
     """
     p.add_argument(
         "--project-root",
@@ -1396,8 +1396,10 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
         "--env",
         default=None,
         help=env_help
-        or "active environment NAME (selects environments/<env>.toml values). With no --env the gate "
-        "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal.",
+        or "active environment NAME, used only to require its value file: under --project-root, the "
+        "command exits 2 when the graph references env() and environments/<env>.toml is missing. "
+        "This command loads no values, resolves no env() reference and runs no posture check; "
+        "check --env does.",
     )
     p.add_argument(
         "--service-config",

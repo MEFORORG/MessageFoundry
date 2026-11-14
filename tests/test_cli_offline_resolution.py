@@ -10,6 +10,8 @@ one exception: `check --env`'s settings checks read the name as `serve --env` do
 
 from __future__ import annotations
 
+import argparse
+import functools
 import os
 import textwrap
 from pathlib import Path
@@ -17,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from tests.test_checks_gate_parity import _cli_check
 
 
 @pytest.fixture(autouse=True)
@@ -321,3 +324,75 @@ def test_graph_and_dryrun_honor_relative_config_under_root(
         ]
     )
     assert rc == 0
+
+
+# --- BACKLOG #5554: what --env does on each offline command -------------------------------------
+
+
+def _empty_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run from an empty directory, so no developer messagefoundry.toml is in reach."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+
+def test_check_env_alone_judges_posture_for_that_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A site naming its environment only on the command line: no messagefoundry.toml, no
+    # MEFOR_AI_ENVIRONMENT. A custom name with no production tier is the name serve refuses, so the
+    # gate must refuse it too, not skip posture and exit 0.
+    cfg = _config_dir(tmp_path)
+    _empty_cwd(tmp_path, monkeypatch)
+    rc, legs = _cli_check(capsys, "--config", str(cfg), "--env", "poc")
+    assert rc == 1, legs["posture"]
+    assert not legs["posture"]["ok"] and not legs["posture"]["skipped"], legs["posture"]
+    assert "production_instance" in str(legs["posture"]["detail"])
+    # Control: with no --env nothing names an instance, so posture skips and the gate passes.
+    rc, legs = _cli_check(capsys, "--config", str(cfg))
+    assert rc == 0 and legs["posture"]["skipped"], legs["posture"]
+
+
+@functools.cache
+def _subcommands() -> dict[str, argparse.ArgumentParser]:
+    from messagefoundry import __main__ as cli
+
+    parser, _dispatch = cli._build_parser()
+    subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    return dict(subparsers.choices)
+
+
+def _env_help(command: str) -> str:
+    actions = _subcommands()[command]._actions
+    action = next(a for a in actions if "--env" in a.option_strings)
+    assert action.help is not None
+    return " ".join(action.help.split())
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_help_says_the_flag_loads_no_values(command: str) -> None:
+    # validate, graph and dryrun read --env only for the value-file check under --project-root.
+    # Their help said it selected the file's values, which a site could take as an environment
+    # check; it must name what it does and point at check --env, which reads the values.
+    text = _env_help(command)
+    assert "selects environments/<env>.toml values" not in text
+    assert "loads no values" in text and "check --env" in text
+    # Control: check's own help still says it reads the name as serve does.
+    assert "read as serve --env reads it" in _env_help("check")
+
+
+def test_validate_env_resolves_no_value_where_check_env_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The behaviour the validate help now states: a value file that lacks a key the graph references
+    # passes validate --env, and fails check --env's build check, which resolves the values.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    (tmp_path / "environments").mkdir()
+    (tmp_path / "environments" / "dev.toml").write_text('other = "x"\n', encoding="utf-8")
+    _empty_cwd(tmp_path, monkeypatch)
+    argv = ["--project-root", str(tmp_path), "--config", str(cfg), "--env", "dev"]
+    assert main(["validate", *argv, "--json"]) == 0, capsys.readouterr()
+    capsys.readouterr()
+    rc, legs = _cli_check(capsys, *argv)
+    assert rc == 1 and not legs["build-check"]["ok"], legs["build-check"]
+    assert "peer_host" in str(legs["build-check"]["detail"])
