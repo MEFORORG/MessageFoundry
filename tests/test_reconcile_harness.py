@@ -126,3 +126,75 @@ def test_normalize_blanks_in_place_returns_canonical() -> None:
     assert msh[6] == "" and msh[9] == ""
     # MSH-9 (type, split idx 8) preserved.
     assert msh[8] == "ADT^A01"
+
+
+# --- BACKLOG #5569: a segment moved between parent groups must not compare equal -------------------
+
+# A synthetic two-order ORU^R01. Each OBR opens a group, and the OBX/NTE after it belong to that order.
+ORU = (
+    "MSH|^~\\&|LAB|MMH|EPIC|MMH|20240101120000||ORU^R01|CTRL0002|P|2.5.1\r"
+    "PID|1||MRN123^^^MMH^MR||DOE^JOHN^Q||19800101|M\r"
+    "OBR|1|ORD1||CBC^COMPLETE BLOOD COUNT\r"
+    "OBX|1|NM|WBC^WHITE CELLS||7.1|10*3/uL\r"
+    "NTE|1||HEMOLYZED SAMPLE\r"
+    "OBR|2|ORD2||BMP^BASIC METABOLIC PANEL\r"
+    "OBX|1|NM|NA^SODIUM||140|mmol/L"
+)
+
+_NTE = "NTE|1||HEMOLYZED SAMPLE"
+_NA = "OBX|1|NM|NA^SODIUM||140|mmol/L"
+
+
+def _nte_moved_to_bmp(extra: str = "") -> str:
+    """The CBC's comment moved under the BMP order: same segments, same count of each."""
+    return ORU.replace(_NTE + "\r", "").replace(_NA, _NA + "\r" + _NTE + extra)
+
+
+def test_an_nte_moved_to_another_order_is_a_difference() -> None:
+    moved = _nte_moved_to_bmp()
+    assert sorted(moved.split("\r")) == sorted(ORU.split("\r")), "the fixture must only reorder"
+    diffs = diff(ORU, moved)
+    assert diffs, "a segment moved to another OBR group compared equal"
+    assert {d.kind for d in diffs} == {"segment-order"}, [d.describe() for d in diffs]
+    assert diff(moved, ORU), "the mirror image must be a difference too"
+
+
+def test_an_obx_moved_to_another_order_is_a_difference() -> None:
+    # The WBC result now belongs to the BMP order. The OBX set ids are equal, so only position tells.
+    wbc = "OBX|1|NM|WBC^WHITE CELLS||7.1|10*3/uL\r"
+    bmp = "OBR|2|ORD2||BMP^BASIC METABOLIC PANEL\r"
+    moved = ORU.replace(wbc, "").replace(bmp, bmp + wbc)
+    assert sorted(moved.split("\r")) == sorted(ORU.split("\r")), "the fixture must only reorder"
+    assert diff(ORU, moved) != []
+
+
+def test_the_order_difference_names_where_the_two_sides_first_part() -> None:
+    (d,) = diff(ORU, _nte_moved_to_bmp())
+    # The fifth segment is the first place the segment-id sequences part: NTE on the left, the
+    # second OBR on the right.
+    assert (d.segment, d.occurrence, d.field_no) == ("NTE", 1, None)
+    assert d.left == "NTE[1]" and d.right == "OBR[2]", d.describe()
+
+
+def test_a_surplus_segment_alone_is_not_also_an_order_difference() -> None:
+    # An extra trailing NTE is right-only and nothing more: the shared segments still line up.
+    extra = ORU + "\rNTE|2||ADDED"
+    assert [d.kind for d in diff(ORU, extra)] == ["right-only-segment"]
+
+
+def test_a_move_beside_a_surplus_is_still_an_order_difference() -> None:
+    # The NTE moves to the BMP group AND the right gains a second NTE. The surplus must not hide
+    # the move.
+    kinds = {d.kind for d in diff(ORU, _nte_moved_to_bmp("\rNTE|2||ADDED"))}
+    assert kinds == {"segment-order", "right-only-segment"}, kinds
+
+
+def test_sort_segments_still_reconciles_a_reordered_run_inside_one_group() -> None:
+    # sort_segments sorts a CONTIGUOUS run, so reordered OBX inside one OBR stays clean when asked
+    # for, and the order check does not undo that.
+    wbc = "OBX|1|NM|WBC^WHITE CELLS||7.1|10*3/uL\r"
+    hgb = "OBX|2|NM|HGB^HEMOGLOBIN||13.5|g/dL\r"
+    two_obx = ORU.replace(wbc, wbc + hgb)
+    swapped = ORU.replace(wbc, hgb + wbc)
+    assert diff(two_obx, swapped) != []
+    assert diff(two_obx, swapped, NormalizeRules(sort_segments=frozenset({"OBX"}))) == []

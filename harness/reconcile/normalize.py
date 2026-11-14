@@ -97,7 +97,9 @@ class Difference:
     field_no: int | None  # None for whole-segment differences
     left: str | None
     right: str | None
-    kind: str  # "field" | "left-only-segment" | "right-only-segment" | "field-count"
+    # "field" | "left-only-segment" | "right-only-segment" | "field-count" | "segment-order". A
+    # "segment-order" row's left/right name the segment each side holds where the orders first part.
+    kind: str
 
     def describe(self) -> str:
         loc = f"{self.segment}[{self.occurrence}]" + (f"-{self.field_no}" if self.field_no else "")
@@ -179,6 +181,13 @@ def diff(left: str, right: str, rules: NormalizeRules | None = None) -> list[Dif
     Segments are aligned by ``(segment_id, ordinal occurrence)``: the Nth ``PID`` on the left is
     compared to the Nth ``PID`` on the right. A segment id present a different number of times on each
     side yields ``left-only-segment``/``right-only-segment`` rows for the surplus.
+
+    That alignment alone cannot see WHERE a segment sits, so an ``NTE`` or ``OBX`` moved from one
+    ``OBR`` group to another would compare equal although its clinical owner changed (BACKLOG
+    #5569). So the order of the segments both sides share is compared too, and a mismatch adds one
+    ``segment-order`` row naming the first place the two sequences part. ``sort_segments`` has
+    already sorted each contiguous run before this, so a run it was told to treat as unordered stays
+    clean.
     """
     rules = rules or NormalizeRules()
     lsegs = normalize(left, rules)
@@ -187,7 +196,7 @@ def diff(left: str, right: str, rules: NormalizeRules | None = None) -> list[Dif
     left_by_id = _group_by_id(lsegs)
     right_by_id = _group_by_id(rsegs)
 
-    out: list[Difference] = []
+    out: list[Difference] = _diff_order(lsegs, rsegs, left_by_id, right_by_id)
     for seg_id in sorted(left_by_id.keys() | right_by_id.keys()):
         l_occ = left_by_id.get(seg_id, [])
         r_occ = right_by_id.get(seg_id, [])
@@ -204,6 +213,42 @@ def diff(left: str, right: str, rules: NormalizeRules | None = None) -> list[Dif
             else:
                 out.extend(_diff_fields(seg_id, occ, l_occ[k], r_occ[k]))
     return out
+
+
+def _shared_order(
+    segs: list[list[str]], other_by_id: dict[str, list[list[str]]]
+) -> list[tuple[str, int]]:
+    """``(segment_id, ordinal)`` in message order, keeping only occurrences the other side also has.
+
+    A surplus occurrence is already a ``left-only``/``right-only`` row, so dropping it here keeps an
+    extra trailing segment from also reading as a reorder, while a move beside it still shows.
+    """
+    seen: dict[str, int] = {}
+    out: list[tuple[str, int]] = []
+    for fields in segs:
+        seg_id = fields[0] if fields else ""
+        occ = seen.get(seg_id, 0) + 1
+        seen[seg_id] = occ
+        if occ <= len(other_by_id.get(seg_id, ())):
+            out.append((seg_id, occ))
+    return out
+
+
+def _diff_order(
+    lsegs: list[list[str]],
+    rsegs: list[list[str]],
+    left_by_id: dict[str, list[list[str]]],
+    right_by_id: dict[str, list[list[str]]],
+) -> list[Difference]:
+    """One ``segment-order`` row when the shared segments sit in a different order, else none."""
+    l_order = _shared_order(lsegs, right_by_id)
+    r_order = _shared_order(rsegs, left_by_id)
+    if l_order == r_order:
+        return []
+    # Both lists hold the same (id, ordinal) set, so they part at an index inside both.
+    pos = next(i for i, (lo, ro) in enumerate(zip(l_order, r_order, strict=True)) if lo != ro)
+    (l_id, l_occ), (r_id, r_occ) = l_order[pos], r_order[pos]
+    return [Difference(l_id, l_occ, None, f"{l_id}[{l_occ}]", f"{r_id}[{r_occ}]", "segment-order")]
 
 
 def _group_by_id(segs: list[list[str]]) -> dict[str, list[list[str]]]:
