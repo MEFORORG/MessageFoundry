@@ -4,6 +4,11 @@ A small, type-diverse set of HL7 v2.x messages vendored from the **HAPI HL7v2** 
 test fixtures, for exercising MessageFoundry parsing/routing (e.g. feeding through MLLP with
 [`samples/send_mllp.py`](../../send_mllp.py)).
 
+`send_mllp.py` sends a whole file as ONE frame, and a listener refuses a frame holding more than
+one MSH. So only the one-message files below can be sent with it. `batch_18_messages.txt` and
+`oml_o21.hl7` hold several messages each: drop them in a `File(...)` inbox instead, which splits a
+file into one message each.
+
 ## Provenance
 
 - **Source:** https://github.com/hapifhir/hapi-hl7v2
@@ -12,9 +17,28 @@ test fixtures, for exercising MessageFoundry parsing/routing (e.g. feeding throu
   source linked into the engine — using them to drive tests is unaffected by the license.
   If any file is ever modified, MPL-2.0 requires that file to carry its source notice.
 
-All files except `batch_18_messages.txt` are copied **verbatim** (bytes unchanged) from the
-upstream paths below; the `hapi-osgi-test` tree carries byte-identical duplicates of several of
-these and was skipped.
+All files except `batch_18_messages.txt` and `oml_o21.hl7` are copied **verbatim** (bytes
+unchanged) from the upstream paths below; the `hapi-osgi-test` tree carries byte-identical
+duplicates of several of these and was skipped.
+
+Both modified files were scrubbed with the project's own de-identification framework
+([`messagefoundry_toolkit/anon/`](../../../messagefoundry_toolkit/anon/), ADR 0030), the same
+deterministic, salt-keyed surrogate machinery the tee relay and test harness use, over
+`DEFAULT_RULES` plus a committed rule overlay for each file. **No ad-hoc redaction logic was
+written** (§9: centralize the rules, don't reimplement beside the framework). Each overlay scrubs
+the fields this corpus needs that are not defaults, and lists every other field the corpus carries
+as reviewed and kept, so no field is undecided.
+[`tests/test_anon_hapi_samples.py`](../../../tests/test_anon_hapi_samples.py) holds each file to its
+overlay. The salt is not recorded: these surrogates are final, not reversible, and the files are
+not intended to be re-derived. Line endings, segment order and every line's field count are
+unchanged.
+
+**What the scrub does not replace.** A run of `DEFAULT_RULES` is not Safe Harbor
+de-identification, and ADR 0030 and [`docs/PHI.md`](../../../docs/PHI.md) §9 say why. In these files,
+at least: `MSH-7` and the other MSH routing fields keep their upstream values, a query time, an
+order's requested time in `batch_18_messages.txt` and an order's quantity and timing keep their
+timestamps, an identifier keeps its assigning authority (a hospital or system name), and the coded
+clinical content is kept.
 
 ### `batch_18_messages.txt` is MODIFIED — de-identified, not verbatim
 
@@ -28,32 +52,50 @@ telephone numbers, medical-record numbers and valid-format SSNs — whose intern
 (SSN area numbers agreeing with state of residence, real locality phone prefixes, named
 institutions) is not what a placeholder generator produces. Whatever its true provenance,
 shipping it unchanged is incompatible with this project's synthetic-data-only rule
-([`CLAUDE.md`](../../../CLAUDE.md) §9), so every identifier was replaced.
+([`CLAUDE.md`](../../../CLAUDE.md) §9).
 
-**How.** Scrubbed with the project's own de-identification framework
-([`messagefoundry_toolkit/anon/`](../../../messagefoundry_toolkit/anon/), ADR 0030) — the same deterministic,
-salt-keyed surrogate machinery the tee relay and test harness use — over `DEFAULT_RULES` plus a
-rule overlay for the fields this corpus uses that the default map does not cover: `GT1-8/16/17/18`,
-`IN1-4/5/6/7/11/18/44`, `OBR-35`, and the non-standard `DST` segment (`DST-2/7/9/27/35`), which
-mirrors `IN1` at a shifted offset. **No ad-hoc redaction logic was written** (§9: centralize the
-rules, don't reimplement beside the framework). The salt is not recorded — these surrogates are
-final, not reversible, and the file is not intended to be re-derived.
-
-The overlay itself was not committed with the corpus. Most of its fields are default rules now
-(BACKLOG #2645). The rest, `IN1-4` and the `DST` fields, are in
+**How.** It was scrubbed twice. The first pass used `DEFAULT_RULES` plus a hand-written overlay
+that was never committed. It left identifiers behind: `PID-2`, the order and accession numbers,
+the operator ids in `ORC-10/11`, the query subject and qualifier in `QRD-8/11`, the insurance group
+fields `IN1-8/9`, and the locations and dates the default map gained only later (BACKLOG #5557).
+So the whole file was scrubbed again, over every message, by `DEFAULT_RULES` plus
 [`tests/fixtures/anon/batch_18.anon.toml`](../../../tests/fixtures/anon/batch_18.anon.toml), which
-says why each is not a default. Its kinds were worked out again from this corpus, not recovered.
+says why each of its fields is not a default.
 
-**What was deliberately preserved**, because it is what the corpus is *for* — 18 messages, 133
+**What was deliberately preserved**, because it is what the corpus is *for*: 18 messages, 133
 lines, every segment in its original order with unchanged field counts, CRLF line endings, the
-`//` and `/* */` comments, `""` null markers, `~~` repetitions, the OBX narrative text, the
-`ORU`/`BAR`/`ACK`/`ORM`/`QRY` mix and the HL7 2.1–2.4 version spread. Both unusual MSH-2 encoding
-sequences survive intact, including the 3-character `MSH|^~}|` that no conformant parser accepts
-— it is a tolerant-parsing test case, and the anonymizer (correctly) refuses such a message, so
-MSH-2 was repaired for the scrub and the malformation restored afterward.
+`//` and `/* */` comments, the `~~` repetitions, the OBX narrative text, the
+`ORU`/`BAR`/`ACK`/`ORM`/`QRY` mix and the HL7 2.1 to 2.4 version spread. Both unusual MSH-2
+encoding sequences survive intact, including the 3-character `MSH|^~}|` that no conformant parser
+accepts. It is a tolerant-parsing test case, and the anonymizer (correctly) refuses such a
+message, so MSH-2 was repaired for the scrub and the malformation restored afterward.
 
-Routing/coded fields are untouched, so message type, trigger and version-based routing behave
-exactly as before. Only identifier *values* changed.
+**What the scrub changed beyond identifier values.** A scrubbed date keeps only its year. An empty
+placeholder such as `^^` in a field a rule scrubs now holds a surrogate: a fabricated id in an
+identifier field such as `PID-2`, or `[REDACTED]` in a location field. An identifier's check digit, and a namespace written in its
+second component, are blanked. Routing fields (MSH, message type, trigger, version) are untouched,
+so routing behaves exactly as before.
+
+### `oml_o21.hl7` is MODIFIED — de-identified, not verbatim
+
+> **Source notice (MPL-2.0 §3.3).** This file is a **modified** copy of
+> `hapi-test/.../ca/uhn/hl7v2/parser/example_oml_o21.hl7` from
+> https://github.com/hapifhir/hapi-hl7v2 at commit `de1503651040`, licensed MPL-2.0.
+> The modification is de-identification only, described below.
+
+Upstream this file carries the names of patients, of the staff who ordered, collected and
+interpreted, and of an insurer, across 13 messages (BACKLOG #5558). Most are placeholders, but
+not all of them plainly are, so it was scrubbed, by `DEFAULT_RULES` plus
+[`tests/fixtures/anon/oml_o21.anon.toml`](../../../tests/fixtures/anon/oml_o21.anon.toml).
+
+**What was deliberately preserved:** the 13 messages, the bare-CR segment endings and the empty
+lines between messages, the OML/OUL/ORL/ORU mix, the numeric results, and the order, group and
+specimen numbers, which upstream invented as placeholder runs and which tie each ORC to its OBR
+and SPM. The department names and the patients' assigning authorities are kept too.
+
+The parser parity record, `tests/golden/python_hl7_oracle.json`, still holds this file's upstream
+bytes as its own frozen input. Nothing can regenerate that record (ADR 0054), so this scrub does
+not reach it.
 
 ## Manifest
 
@@ -63,16 +105,19 @@ exactly as before. Only identifier *values* changed.
 | `adt_a03.txt` | ADT^A03 | 2.5 | 1 | `hapi-test/.../ca/uhn/hl7v2/parser/adt_a03.txt` |
 | `omd_o03.txt` | OMD^O03^OMD_O03 | 2.5 | 1 | `hapi-test/.../ca/uhn/hl7v2/parser/omd_o03.txt` |
 | `omd_o03_rep.txt` | OMD^O03^OMD_O03 | 2.5 | 1 | `hapi-test/.../ca/uhn/hl7v2/parser/omd_o03_rep.txt` |
-| `oml_o21.hl7` | OML^O21^OML_O21 | 2.5.1 | 1 | `hapi-test/.../ca/uhn/hl7v2/parser/example_oml_o21.hl7` |
+| `oml_o21.hl7` | mixed (see below) | 2.5, 2.5.1 | 13 | `hapi-test/.../ca/uhn/hl7v2/parser/example_oml_o21.hl7` |
 | `erp_z99_v231.hl7` | ERP^Z99^ERP_R09 (Z-event) | 2.3.1 | 1 | `hapi-test/.../ca/uhn/hl7v2/parser/cv.04_001_chem.hl7` |
-| `batch_18_messages.txt` | mixed (see below) | 2.1–2.4 | 18 | `hapi-test/.../ca/uhn/hl7v2/util/messages.txt` |
+| `batch_18_messages.txt` | mixed (see below) | 2.1 to 2.4 | 18 | `hapi-test/.../ca/uhn/hl7v2/util/messages.txt` |
 
-`batch_18_messages.txt` is **18 concatenated messages** (no FHS/BHS batch wrapper): 1×ORU^R01,
-10×BAR^P01, 1×ACK, 3×ORM^O01, 2×QRY^Q01 — a useful mix of versions (2.1/2.2/2.4) for testing a
+`batch_18_messages.txt` is **18 concatenated messages** (no FHS/BHS batch wrapper): 1 ORU^R01,
+10 BAR^P01, 1 ACK, 3 ORM^O01, 2 QRY^Q01 — a useful mix of versions (2.1/2.2/2.4) for testing a
 splitter and tolerant parsing.
 
-Across the set: **24 messages** covering ADT, OMD, OML, ORU, BAR, ACK, ORM, QRY and a custom
-Z-event, HL7 versions **2.1 → 2.5.1**.
+`oml_o21.hl7` is **13 concatenated messages**, separated by empty lines (no FHS/BHS batch
+wrapper): 7 OML^O21, 4 OUL^R22, 1 ORL^O34 and 1 ORU^R01, in HL7 2.5 and 2.5.1.
+
+Across the set: **36 messages** covering ADT, OMD, OML, OUL, ORL, ORU, BAR, ACK, ORM, QRY and a
+custom Z-event, HL7 versions **2.1 to 2.5.1**.
 
 > Note: HAPI's larger message corpus lives as inline strings inside its Java test sources, not
 > as standalone files; only the files above ship as discrete messages. XML-encoded HL7 messages
