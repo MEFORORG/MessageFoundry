@@ -437,47 +437,25 @@ than a path is not checked
   a link is refused whoever can change it. A POSIX mount point is not a link. The TLS pair the
   engine mints is one only it writes, so on Windows its key's owner must also be the engine's own
   account, SYSTEM or Administrators: a pair another account planted in the store directory, which
-  the add-file right below allows, is refused (on POSIX every key file's owner must already be the
-  engine's own account or root). On
-  Windows it also reads the access list of the directory that holds the file, and refuses it when
-  one of the groups above or an application package may delete a file in it, change its access
-  list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when
-  its owner is such a group or cannot be read. Where a junction, a symbolic link or a folder a
-  volume is mounted on is on the path, at least these are not read: when it is the directory that
-  holds the file, its target's owner and access list; the folders on its target's side above the
-  directory that holds the file; and, as where no link is on the path, whether a broad group may
-  rename the directory that holds the file, or its target when it is a link (`DELETE` on it), and
-  what one named account may do to that directory, or to its target when it is a link. So a
-  junction only the engine's account and the host's administrators can change, pointing to a
-  folder where a broad group may delete a file, passes: restrict the target and the folders above
-  it yourself. A `subst` drive letter is not judged as a link, so where no junction or link is
-  also on the path, no folder above the directory that holds the file is read, as where no link
-  is on the path.
-  A right to list or traverse the directory, or to add
-  a file to it, is not refused, so a store directory the engine makes under `C:\ProgramData`, which
-  inherits that folder's grant to Users, passes. A path spelled as a network share
-  (`\\host\share\...`) is walked no further than the share, so a junction behind it is not seen,
-  `\\localhost\C$\...` included; the file's own access list is still read. A mapped drive letter
-  is walked like a local volume, but the file server resolves its own junctions, so one on the
-  server is not seen either. A walk that stops for any other reason, such as a folder it cannot
-  read, is refused, and so is a holder whose access list the engine's account may not read: give
-  that account read access to the folder's permissions. An inherit-only entry on the directory is read as if it applied to the
-  directory itself, so such an entry granting a broad group one of those rights refuses it too. It
-  does not read, at least, where no link is on the path: whether a broad group may rename the
-  directory that holds the file or a folder above it (`DELETE` on that folder, as a data drive's
-  root often grants Authenticated Users, or `FILE_DELETE_CHILD` on the folder above); the access
-  lists of the folders above the one that holds the file; or what one named account may do to the
-  holder. Nor does it refuse a key file an operator supplied that a named account other than the
-  engine planted through the add-file right. Restrict those folders yourself.
+  a right to add a file there allows, is refused (on POSIX every key file's owner must already be the
+  engine's own account or root). On Windows it also reads the owner and access list of the
+  directory that holds the file, at the file's lexical path without following a link there, and
+  refuses it when one of the groups above or an application package may delete a file in it,
+  change its access list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or
+  `GENERIC_ALL`), or when its owner is such a group or cannot be read. An inherit-only entry on
+  the directory is read as if it applied to the directory itself, so such an entry granting a
+  broad group one of those rights refuses it too. A walk that stops anywhere but at a network
+  share, such as at a folder it cannot read, is refused, and so is a holder whose access list the
+  engine's account may not read: give that account read access to the folder's permissions.
+  It does not judge everything around the file; [ADR 0214's amendment](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments)
+  lists at least what it leaves out. Restrict the secrets directory, any link target and the
+  folders above them yourself.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
   in the group, and one held in a directory that another account owns or that a group or other may
   write without the sticky bit (vault BACKLOG #5636). A link in a folder above it is judged as the
-  item above says, which reads the owner and mode of the folders at and above that link, but not
-  the folders on its target's side above the directory that holds the file, so a root-owned link
-  to a folder under one any account may write passes: restrict those folders yourself. Where no
-  link is on the path, only the directory that holds the file has its owner and mode read, not the
-  ones above it. A directory a group or other account may write is accepted when it has the sticky
+  item above says, by the owner and mode of the folders at and above that link; ADR 0214's
+  amendment lists at least what the check leaves out. A directory a group or other account may write is accepted when it has the sticky
   bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
   mints its own TLS key beside the store. **When it mints its own pair and the store directory does
   not exist yet, the engine creates it on POSIX with no group or other write bit (`0755` at most,
