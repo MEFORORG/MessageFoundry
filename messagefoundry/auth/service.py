@@ -1883,10 +1883,12 @@ class _BindingChangedMidLogin(Exception):
     """An admin changed the account's federated binding while this login was still in flight.
 
     Two directions, one signal. A federated login whose account was UNBOUND under it (BACKLOG
-    #1474), and a Windows SSO login whose account was BOUND under it (vault BACKLOG #2609).
+    #1474), and a Windows SSO login whose account was BOUND under it (vault BACKLOG #2609). A login
+    whose account was DELETED under it raises it too (BACKLOG #2733).
 
-    Raised by :meth:`AuthService._issue_session` when the store refuses the conditional insert, and
-    caught by :meth:`AuthService._complete_ad_login`, which renders it as an audited refusal.
+    Raised by :meth:`AuthService._issue_session` when the store refuses the insert, and caught by
+    :meth:`AuthService._complete_ad_login` and :meth:`AuthService._login_local`, which render it as
+    an audited refusal.
 
     **Signalled by raising because the alternative loses the race it exists to close.** The store
     refuses inside the same transaction that re-reads the binding, so there is no point at which the
@@ -5880,20 +5882,19 @@ class AuthService:
             else:
                 after_pad.append(write)
 
+        async def unknown_row() -> None:
+            await self._audit(
+                "auth.login_failed",
+                actor=username,
+                detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
+                client=client,
+            )
+
         user = await self._load_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
             # distinguishable from a wrong password (defeats username enumeration via latency).
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
-
-            async def unknown_row() -> None:
-                await self._audit(
-                    "auth.login_failed",
-                    actor=username,
-                    detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
-                    client=client,
-                )
-
             await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         now = time.time()
@@ -6043,22 +6044,28 @@ class AuthService:
             # account. It is the MFA leg (``verify_mfa`` / ``finish_webauthn_assertion``) that clears
             # it when a factor is owed; this branch covers the accounts that owe none.
             await self._store.record_login_success(user.id, now=now)
-        token = await self._issue_session(
-            user.id,
-            client,
-            mfa_verified=not mfa_required,
-            # The sudo-timestamp model, for the local leg only: a sign-in that owes no factor opens
-            # the step-up window, and one that still owes a factor does not (WP-14). A sign-in from
-            # a first-seen address does not either (BACKLOG #288): that is the whole of its
-            # challenge, and the login itself still succeeds.
-            #
-            # A COMBINED sign-in seeds the window the way ``verify_mfa`` does, which marks the
-            # session re-authenticated once the code is proved whatever the address (ADR 0197).
-            seed_reauth=combined or (not mfa_required and address is not _LoginAddress.NEW),
-            mechanism=SessionMechanism.PASSWORD,
-            idp_auth_time=None,
-            supersedes_hash=hash_token(supersedes) if supersedes else None,
-        )
+        try:
+            token = await self._issue_session(
+                user.id,
+                client,
+                mfa_verified=not mfa_required,
+                # The sudo-timestamp model, for the local leg only: a sign-in that owes no factor
+                # opens the step-up window, and one that still owes a factor does not (WP-14). A
+                # sign-in from a first-seen address does not either (BACKLOG #288): that is the
+                # whole of its challenge, and the login itself still succeeds.
+                #
+                # A COMBINED sign-in seeds the window the way ``verify_mfa`` does, which marks the
+                # session re-authenticated once the code is proved whatever the address (ADR 0197).
+                seed_reauth=combined or (not mfa_required and address is not _LoginAddress.NEW),
+                mechanism=SessionMechanism.PASSWORD,
+                idp_auth_time=None,
+                supersedes_hash=hash_token(supersedes) if supersedes else None,
+            )
+        except _BindingChangedMidLogin:
+            # BACKLOG #2733: the account was deleted after the load above, so no session was
+            # minted. The answer, and its deferred row, are an unknown account's.
+            await later(unknown_row)
+            return LoginOutcome(ok=False, error="invalid credentials")
         await self._record_login_address(
             address, user, client=client, provider="local", mechanism=None
         )
@@ -11706,8 +11713,8 @@ class AuthService:
         require_federated_subject: tuple[str | None, str | None] | None = None,
         supersedes_hash: str | None = None,
     ) -> str:
-        """Mint a session token and persist the row. Callers passing
-        ``require_federated_subject`` must handle :class:`_BindingChangedMidLogin`.
+        """Mint a session token and persist the row. Every caller must handle
+        :class:`_BindingChangedMidLogin`, raised for an account deleted under the sign-in too.
 
         ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
         7.2.4, login side). It is ended after the new
@@ -11758,9 +11765,10 @@ class AuthService:
             idp_auth_time=idp_auth_time,
         )
         if not issued:
-            # Only reachable with a guard requested: an unbind or a bind revoked this account's
-            # sessions while this login was in flight, so issuing now would hand back a token the
-            # revocation could never have seen. Nothing was written, so there is nothing to undo.
+            # An unbind or a bind revoked this account's sessions while this login was in flight,
+            # so issuing now would hand back a token the revocation could never have seen; or the
+            # account was deleted under it (BACKLOG #2733). Nothing was written, so there is
+            # nothing to undo.
             raise _BindingChangedMidLogin()
         if mfa_verified:
             # No second factor pending (MFA is not required for this user, or the federated IdP

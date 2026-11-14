@@ -126,6 +126,12 @@ _LIVE_SESSION = (
 
 #: The global session epoch read (BACKLOG #5091), which the fakes answer with epoch 0.
 _GLOBAL_EPOCH_READ = f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"
+#: ``create_session``'s account read, which the fakes answer with an unbound account at epoch 0: a
+#: missing account is refused before the INSERT (BACKLOG #2733), which would leave it unchecked.
+_ACCOUNT_COLUMNS = ("oidc_issuer", "oidc_subject", "session_epoch")
+_ACCOUNT_READ = f"SELECT {', '.join(_ACCOUNT_COLUMNS)} FROM users"
+#: The account row the fakes answer that read with; ``None`` answers it with no row.
+_ACCOUNT_ROW: tuple[Any, ...] | None = (None, None, 0)
 
 
 def _reads_session_row(sql: str) -> bool:
@@ -153,6 +159,8 @@ class _MssqlCursor:
             return [_LIVE_SESSION]
         if self._last.startswith(_GLOBAL_EPOCH_READ):
             return [(0,)]
+        if self._last.startswith(_ACCOUNT_READ):
+            return [] if _ACCOUNT_ROW is None else [_ACCOUNT_ROW]
         return self._other_rows()
 
     def _other_rows(self) -> list[Any]:
@@ -442,6 +450,8 @@ class _PgConn:
         self._seen.append((sql, args))
         if _reads_session_row(sql):
             return dict(zip(_SESSION_COLUMNS, _LIVE_SESSION, strict=True))
+        if sql.startswith(_ACCOUNT_READ) and _ACCOUNT_ROW is not None:
+            return dict(zip(_ACCOUNT_COLUMNS, _ACCOUNT_ROW, strict=True))
         return None
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
@@ -528,3 +538,20 @@ async def test_the_checks_catch_a_miscount(monkeypatch: pytest.MonkeyPatch) -> N
         {int(n) for n in _PG_PLACEHOLDER.findall(sql)} != set(range(1, len(args) + 1))
         for sql, args in seen
     )
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+@pytest.mark.parametrize("account_found", [True, False])
+async def test_create_session_inserts_only_for_an_account_it_found(
+    monkeypatch: pytest.MonkeyPatch, backend: str, account_found: bool
+) -> None:
+    """BACKLOG #2733: ``create_session`` reaches its INSERT, so the placeholder checks above cover
+    it, only when its account read found the row. A missing account (one deleted under the sign-in)
+    is refused with ``False`` and no INSERT, rather than left to the session key's error."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    if not account_found:
+        monkeypatch.setitem(globals(), "_ACCOUNT_ROW", None)
+    store = _mssql_store(seen) if backend == "sqlserver" else _pg_store(seen)
+    assert await _CALLS["create_session"](store) is account_found
+    inserts = [sql for sql, _ in seen if sql.lstrip().startswith("INSERT INTO sessions")]
+    assert len(inserts) == (1 if account_found else 0), seen

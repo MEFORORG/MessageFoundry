@@ -11280,10 +11280,13 @@ class PostgresStore:
                     " FOR UPDATE",
                     user_id,
                 )
-            if require_federated_subject is not None:
-                bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
-                if bound != require_federated_subject:
-                    return False
+            # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+            # INSERT's foreign-key error.
+            if row is None or (
+                require_federated_subject is not None
+                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            ):
+                return False
             record = new_session_record(
                 token_hash=token_hash,
                 user_id=user_id,
@@ -11293,7 +11296,7 @@ class PostgresStore:
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
-                user_epoch=0 if row is None else int(row["session_epoch"]),
+                user_epoch=int(row["session_epoch"]),
                 # BACKLOG #5091: its own statement, after the row lock, so a sign-in that waited
                 # behind a revoke reads that revoke's global epoch beside its account epoch. A
                 # subquery in the locked read would keep its pre-wait snapshot, and the session
