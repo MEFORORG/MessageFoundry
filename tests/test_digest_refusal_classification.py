@@ -722,9 +722,12 @@ def test_an_https_token_endpoint_behind_a_proxy_without_digest_still_builds(
     auth: str | None,
 ) -> None:
     """THE CONTROLS for the build refusal: a proxy with a pre-emptive Basic credential, or none,
-    can let a token through the CONNECT, so it builds as before."""
+    can let a token through the CONNECT, so it builds as before, still through the proxy."""
+    from messagefoundry.transports.rest import _shared_no_redirect_opener
+
     provider = _token_provider_via("http://127.0.0.1:3128", auth=auth)
-    assert provider._opener is not None
+    assert provider._opener is not _shared_no_redirect_opener()
+    assert ("Proxy-Authorization" in provider._proxy_auth) is (auth == "basic")
 
 
 @pytest.mark.usefixtures("no_bypass")

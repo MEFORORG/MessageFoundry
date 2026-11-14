@@ -144,9 +144,10 @@ def request_token(
     A failure names ``endpoint`` and a status, reason or error class, never the request or the reply
     body, because the body carries the bearer token. A request that cannot be encoded for the wire
     still raises its own ``ValueError``, as it did before BACKLOG #2054. ``connector`` names the hop
-    in a refusal of the reply body, and holds no URL (BACKLOG #2060). A web proxy's Digest challenge
-    the engine will not answer raises the subclass ``rest.auth_challenge_refused`` builds, a
-    permanent configuration fault (BACKLOG #2989)."""
+    in a refusal of the reply body, and holds no URL (BACKLOG #2060). A Digest refusal raised by the
+    opener's proxy Digest handler becomes the permanent configuration fault
+    ``rest.auth_challenge_refused`` builds (BACKLOG #2989); no built provider's hop reaches that
+    handler, since a Digest proxy in front of an https token endpoint is refused at build."""
     body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint, connector=connector)
     return _parse_token_reply(body, endpoint=endpoint)
 
@@ -179,8 +180,9 @@ def _read_token_reply(
         # classifies it. No built configuration reaches this arm now: an http:// token endpoint must
         # be loopback and is dialled direct, and an https:// one meets the proxy only on a CONNECT,
         # where no Digest handler runs; _open_token_hop refuses a Digest proxy there at build (ADR
-        # 0095 B.1). Kept so a refusal that did arrive would still be this fault rather than escape the DeliveryError contract as a ValueError. Fixed
-        # text: the peer's algorithm token stays on the cause only.
+        # 0095 B.1). Kept so a refusal that did arrive would still be this fault rather than escape
+        # the DeliveryError contract as a ValueError. Fixed text: the peer's algorithm token stays
+        # on the cause only.
         raise auth_challenge_refused(endpoint) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as
@@ -324,8 +326,8 @@ class _TokenEndpointProvider(abc.ABC):
         trust_anchor: TrustAnchor,
         connection: str | None,
     ) -> None:
-        """Build the token hop's opener, refuse it if no token could be minted through its web proxy
-        or if it verifies with no revocation check, and set up the empty cache."""
+        """Build the token hop's opener, refuse it if an https token request would meet a web proxy
+        set up for Digest or if it verifies with no revocation check, and set up the empty cache."""
         self.token_url = token_url
         self.expiry_skew_seconds = max(0.0, expiry_skew_seconds)
         self.timeout_seconds = timeout_seconds
@@ -346,10 +348,11 @@ class _TokenEndpointProvider(abc.ABC):
         ):
             raise self._ERROR(
                 f"{hop_name_prefix(connection)}{self._LABEL} token endpoint is https and its web "
-                "proxy is set up for Digest (proxy_auth_type='digest'); the proxy's 407 arrives on "
-                "the CONNECT, which Digest cannot answer, so no token could be minted. Give the "
-                "token host a route that crosses no authenticating proxy, or use "
-                "proxy_auth_type='basic' (ADR 0095 B.1)"
+                "proxy is set up for Digest (proxy_auth_type='digest'); a 407 from the proxy "
+                "arrives on the CONNECT, where Digest cannot answer it. Give the token host a "
+                "route that crosses no authenticating proxy (proxy_no_proxy, or no proxy "
+                "credential where no other hop needs one), or use proxy_auth_type='basic' "
+                "(ADR 0095 B.1)"
             )
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
@@ -447,10 +450,9 @@ class _TokenEndpointProvider(abc.ABC):
     def access_token(self) -> str:
         """A valid bearer token — cached until it nears expiry, otherwise freshly acquired. Blocking
         (a token ``POST``); the connector calls it inside its off-loop ``send()`` worker. Raises
-        :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails,
-        except for a web proxy's refused Digest challenge, which raises the permanent configuration
-        fault :func:`~messagefoundry.transports.rest.auth_challenge_refused` builds (BACKLOG #2989).
-        """
+        :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails, or
+        the permanent configuration fault :func:`request_token` names for a refused Digest
+        challenge."""
         with self._lock:
             if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
                 return self._cached_token
