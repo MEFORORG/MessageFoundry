@@ -574,7 +574,10 @@ _KEY_MATERIAL = re.compile(
 # one. And
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
+# The user may be empty and the password runs to the LAST "@" before the next "/" or white space
+# (BACKLOG #5549), so ``pg://:pw@h`` and a password holding an unencoded "@" no longer print; why
+# that takes every span the old tail took, and stays linear, is on the same pattern there too.
+_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[^\s/]+@")
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")

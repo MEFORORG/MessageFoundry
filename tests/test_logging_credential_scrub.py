@@ -330,6 +330,20 @@ FAMILIES: tuple[Family, ...] = (
         patterns=("_DSN_PASSWORD",),
     ),
     Family(
+        # BACKLOG #5549: an empty username, which the one-or-more user class refused.
+        name="dsn_empty_username",
+        line="store dsn redis://:wt-dsn_dsn-96@cache.invalid:6379/0",
+        secret="wt-dsn_dsn-96",
+        patterns=("_DSN_PASSWORD",),
+    ),
+    Family(
+        # BACKLOG #5549: an unencoded "@" in the password; the first-"@" class printed its tail.
+        name="dsn_at_sign_in_password",
+        line="store dsn postgres://svc:wt-At_Head-97@wt-dsn_dsn-98@db.invalid:5432/mefor",
+        secret="wt-dsn_dsn-98",
+        patterns=("_DSN_PASSWORD",),
+    ),
+    Family(
         # A COMMA-JOINED list (``store/keyprovider.py::_split_retired``). The sentinel is the LAST
         # element, which a comma-terminated value class would have printed verbatim -- and unlike the
         # support-bundle surface there is no long-base64 sweep behind this one to catch it.

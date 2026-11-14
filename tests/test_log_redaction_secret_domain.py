@@ -429,6 +429,20 @@ FAMILIES: tuple[Family, ...] = (
         secret="pw-D5n_Pass-55",
         patterns=("_DSN_PASSWORD",),
     ),
+    # BACKLOG #5549: an empty username, and an unencoded "@" inside the password, whose tail the
+    # first-"@" class printed.
+    Family(
+        name="dsn_empty_username",
+        line="store dsn redis://:pw-D5n_Pass-56@cache.invalid:6379/0",
+        secret="pw-D5n_Pass-56",
+        patterns=("_DSN_PASSWORD",),
+    ),
+    Family(
+        name="dsn_at_sign_in_password",
+        line="store dsn postgres://svc:pw-At_Head-57@pw-D5n_Pass-58@db.invalid:5432/mefor",
+        secret="pw-D5n_Pass-58",
+        patterns=("_DSN_PASSWORD",),
+    ),
     Family(
         # The exact shape resolve_env_settings emits on a cast failure. The producer is fixed too, but
         # the redactor is the backstop for every producer nobody has enumerated, so it must catch it.
@@ -4324,6 +4338,63 @@ def test_the_digest_list_grows_linearly_in_line_length() -> None:
             )
             assert growth <= _MAX_GROWTH, (
                 f"{module.__name__}._BEARER grew {growth:.1f}x for 8x the length on {shape(40)!r}"
+            )
+
+
+#: ``_DSN_PASSWORD`` as it stood before BACKLOG #5549: one or more user characters, and a password
+#: ending at the first "@".
+_FIRST_AT_DSN = r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@"
+
+
+def test_the_dsn_tail_hides_every_span_the_first_at_tail_hid() -> None:
+    """Over DSN lines with "@", ":" and "/" in many places, every span the old tail took is inside one
+    the shipped tail takes, with the same group 1. And the two rows of #5549 are where they differ."""
+    old = re.compile(_FIRST_AT_DSN)
+    rng = random.Random(5549)
+    pieces = ("a", "b1", ":", "@", "/", " ", "?", "#", "-", ".", "pg://", "x://", "%40")
+    corpus = [
+        "".join(rng.choice(pieces) for _ in range(rng.randint(0, 3)))
+        + "pg://"
+        + "".join(rng.choice(pieces) for _ in range(rng.randint(2, 12)))
+        for _ in range(60000)
+    ]
+    compared = 0
+    for module in (scrub_mod, redact_mod):
+        new: re.Pattern[str] = module._DSN_PASSWORD
+        for line in corpus:
+            spans = [(m.span(), m.span(1)) for m in new.finditer(line)]
+            for m in old.finditer(line):
+                compared += 1
+                assert any(
+                    s[0] <= m.start() and m.end() <= s[1] and g == m.span(1) for s, g in spans
+                ), (module.__name__, line)
+    assert compared > 500, compared
+    for line, secret in (("pg://:zq-pw@h/db", "zq-pw"), ("pg://u:zq-p@zq-w@h/db", "zq-w")):
+        assert secret in _sub_dsn(old, line), line
+        for module in (scrub_mod, redact_mod):
+            assert secret not in _sub_dsn(module._DSN_PASSWORD, line), (module.__name__, line)
+
+
+def test_the_dsn_tail_grows_linearly_in_line_length() -> None:
+    """The password's repetition gives characters back to find its last "@". Three shapes: a run of
+    "@" pairs, a run with no "@", and many DSN heads each failing at its own end."""
+    shapes: tuple[Callable[[int], str], ...] = (
+        lambda length: "pg://:" + "a@" * (length // 2) + "x",
+        lambda length: "pg://u:" + "a:" * (length // 2),
+        lambda length: "pg://u:pa " * (length // 10),
+    )
+    for module in (scrub_mod, redact_mod):
+        pattern: re.Pattern[str] = module._DSN_PASSWORD
+
+        def sub(text: str, pattern: re.Pattern[str] = pattern) -> str:
+            return pattern.sub("x", text)
+
+        for shape in shapes:
+            growth = _growth_between(
+                sub, shape(_GROWTH_LENGTHS[0]), shape(_GROWTH_LENGTHS[1]), rounds=5
+            )
+            assert growth <= _MAX_GROWTH, (
+                f"{module.__name__}._DSN_PASSWORD grew {growth:.1f}x for 8x on {shape(40)!r}"
             )
 
 

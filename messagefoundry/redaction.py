@@ -260,7 +260,8 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: no value printed on any of nine log paths that the code before it hid. The price: where such a
 #: label sits in the run's own token and its value in the next one, as in
 #: ``a%7Cb%7Cc%2Cpassword: <value>``, the run takes the label and the value prints, as it did before
-#: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme.
+#: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme,
+#: so since BACKLOG #5549 it too reads an empty user and a password up to the last "@".
 #: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:
 #: **A second exception: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
@@ -279,7 +280,7 @@ _CREDENTIAL_AHEAD = re.compile(
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
     r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
     r"""|token|pass|pwd)))\b['"]?\s*[:=]"""
-    r"""|(?i:\bbearer)\s|://[^\s:/@]+:[^\s/@]+@"""
+    r"""|(?i:\bbearer)\s|://[^\s:/@]*+:[^\s/]+@"""
     r"""|(?i:\b(?:code|state|id_token|access_token|token|session_state)=)"""
 )
 

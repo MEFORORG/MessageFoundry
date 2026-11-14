@@ -1410,7 +1410,26 @@ _KEY_MATERIAL = re.compile(
 # including the glued run above and the non-letter leading runs, so neither narrowing can come back
 # without a red -- and a differential arm that fails if either earlier head ever redacts something this
 # one does not.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@")
+#
+# THE USERINFO HALF WAS NARROWER THAN A URL, AND TWO SHAPES PRINTED A PASSWORD (BACKLOG #5549). The
+# user took ``[^\s:/@]+``, at least one character, so ``postgres://:pw@host``, a password with an
+# EMPTY username, as a Redis or a PostgreSQL DSN may write it, was no match at all. And the password
+# took ``[^\s/@]+`` up to the FIRST "@", so a password holding an unencoded "@" was cut there and its
+# tail printed: ``postgres://u:p@ss@host`` came out as ``postgres://u:<redacted>@ss@host``. A URL
+# parser ends the userinfo at the LAST "@" of the authority, which is how a driver reads it.
+#
+# So the user may be empty, and the password runs to the last "@" before the next "/" or white space.
+# It still needs one character. Every span the old tail took, this one takes, and the same group 1:
+# the user class is unchanged and stops at the first ":", and the password starts there and ends at
+# the old "@" or a later one. So it hides more and never less. What it may now take that is no
+# password: on a line with an "@" after the host and no "/" between them, the text up to that "@",
+# as in ``pg://u:p@host,backup@h2``. Over-redaction is this module's allowed direction.
+#
+# STILL LINEAR. The password's repetition is greedy and gives back characters to find its "@", but
+# its run ends at the next "/" or white space, and every "://" holds a "/", so the runs of two DSNs
+# never share a character; with the head anchor's one start per run, each character is read a fixed
+# number of times. The user's repetition is possessive: it cannot hold the ":" that must follow it.
+_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[^\s/]+@")
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
 #: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,
