@@ -2688,14 +2688,17 @@ async def test_a_passkey_set_that_fails_its_seal_is_reported_by_the_rotation(
     "transports", ["not json", b"\xff", None], ids=["malformed", "undecodable", "control"]
 )
 async def test_a_usable_totp_rotates_beside_a_passkey_set_that_cannot_be_read(
-    transports: str | bytes | None, keyed: bool, tmp_path: Path
+    transports: str | bytes | None,
+    keyed: bool,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A covered account with a usable TOTP and a passkey row that does not parse, or a cell
     sqlite3 cannot decode: ``change_password`` lands, with one argon2 hash. The TOTP counts on the
     row the write locks, so the write reads no passkey; on a keyed store the user seal does not
-    cover the passkey rows, so the seal changes nothing. The control: the intact set rotates too.
-    RED when: the store's write reads the set before judging the TOTP, which raises after the
-    hash."""
+    cover the passkey rows, so the seal changes nothing. Nothing is warned, so no read was made.
+    The control: the intact set rotates too. RED when: the store's write reads the set before
+    judging the TOTP, which raises after the hash or, through the tolerant read, warns."""
     from messagefoundry.store.crypto import generate_key, make_cipher
 
     cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
@@ -2706,9 +2709,11 @@ async def test_a_usable_totp_rotates_beside_a_passkey_set_that_cannot_be_read(
         if transports is not None:
             await _corrupt_passkey_rows(store, identity.user_id, transports)
         before = await _password_hash(store, identity.user_id)
-        assert await service.change_password(identity, _NEW_PASSWORD) == []
+        with caplog.at_level(logging.WARNING):
+            assert await service.change_password(identity, _NEW_PASSWORD) == []
         assert hashes == [1]
         assert await _password_hash(store, identity.user_id) != before
+        assert not [r for r in caplog.records if "could not be read" in r.getMessage()]
     finally:
         await store.close()
 

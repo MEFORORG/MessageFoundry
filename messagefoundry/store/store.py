@@ -4145,8 +4145,8 @@ _SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
 def passkey_cell_undecodable(exc: BaseException) -> bool:
     """Whether ``exc`` is a driver failing to decode a passkey cell while fetching, before any row
     is parsed: pyodbc's ``UnicodeDecodeError``, or sqlite3's ``OperationalError`` told apart only by
-    its message (:func:`escalation_passkeys`). Every reader that counts such a set for nothing
-    asks it."""
+    its message. :func:`passkeys_or_none`, and every other reader that counts such a set for
+    nothing, asks it."""
     if isinstance(exc, UnicodeDecodeError):
         return True
     return isinstance(exc, sqlite3.OperationalError) and str(exc).startswith(_SQLITE_DECODE_FAILURE)
@@ -4307,7 +4307,7 @@ async def way_past_passkeys(
     (``drop_totp``) it is the other way round: the passkeys matter only while that TOTP counts
     (:func:`totp_removal`), so only then are they read. A set that cannot be read
     (:func:`passkeys_or_none`) is empty here, so it counts as no way past, whatever the seal."""
-    if record is None or _totp_is_way_past(record, totp_counts) != drop_totp:
+    if record is None or bool(_totp_is_way_past(record, totp_counts)) is not drop_totp:
         return []
     read = await passkeys_or_none(
         read_passkeys, record.row.id, "it counts as no way past the sign-in lock"
@@ -19107,7 +19107,7 @@ class MessageStore:
         return updated
 
     async def _account_passkeys(self, user_id: str) -> list[WebAuthnCredential]:
-        # Closed on the way out, a failed fetch included: escalation_passkeys survives a cell that
+        # Closed on the way out, a failed fetch included: passkeys_or_none survives a cell that
         # does not decode, and an open statement would hold back a WAL checkpoint until GC.
         async with self._db.execute(
             "SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,)

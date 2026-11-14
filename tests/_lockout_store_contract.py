@@ -542,13 +542,12 @@ async def _assert_unreadable_passkeys_beside_a_totp(
                 ), f"{case}: the TOTP went with only an unreadable passkey left"
                 user = await store.get_user(user_id)
                 assert user is not None and user.totp_enabled, case
-            # A keyed store's passkey write checks the set against its seal before it deletes, so
-            # there the usable arm never reaches the delete; the refused arm is declined before it.
-            if not usable or store.row_sealer() is None:
-                removed = await store.delete_webauthn_credential(
-                    user_id, pk, require_way_past=_opened_totp_state
-                )
-                assert removed is usable, f"{case}: the removal beside {secret}"
+            # Every leg runs this keyless: on a keyed store the passkey write checks the set
+            # against its seal before it deletes, so an unreadable set raises there.
+            removed = await store.delete_webauthn_credential(
+                user_id, pk, require_way_past=_opened_totp_state
+            )
+            assert removed is usable, f"{case}: the removal beside {secret}"
             await store.delete_all_webauthn_credentials(user_id)
             await store.delete_user(user_id)
 
