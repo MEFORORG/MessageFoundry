@@ -558,9 +558,14 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
 
 
 def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error() -> None:
-    # pyx12 4.1.0 raises X12Error when no segment terminator comes within 1 MiB, where 4.0.1 stopped
-    # reading there. The pass raises X12ValidationError, whose message holds none of the input.
+    # pyx12 4.1.0 raises X12Error when no segment terminator comes within 1 MiB; 4.0.1 had already
+    # stopped reading after about 8 KB. The pass raises X12ValidationError, and neither its message
+    # nor the pyx12 error it chains holds any of the input.
+    import pyx12.errors
+
     body = "Q" * (1024 * 1024 + 100)
     with pytest.raises(X12ValidationError) as caught:
         validate(_ISA + _GS + "ST*837*0001*005010X222A1~BHT*0019*00*" + body)
-    assert "QQQQ" not in str(caught.value)
+    cause = caught.value.__cause__
+    assert isinstance(cause, pyx12.errors.X12Error) and "terminator" in str(cause)
+    assert "QQQQ" not in str(caught.value) and "QQQQ" not in str(cause)
