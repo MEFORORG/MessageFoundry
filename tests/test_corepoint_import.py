@@ -893,7 +893,9 @@ def test_parse_roles_is_linear_on_a_run_of_one_span_kind(unit: str) -> None:
 
 
 def test_markup_stripped_statements_classify_in_the_fixture() -> None:
-    """Every markup-wrapped statement in the fixture reaches the vocabulary through the strip."""
+    """Every flat field write in the fixture reaches the vocabulary. They are plain text: a write in
+    markup the role layer does not read is never mapped (BACKLOG #5556), and the strip itself is
+    pinned by :func:`test_strip_markup_recovers_the_verb`."""
     src = _package_source()
     assert 'copy_field(msg, "PID-5.1", "NK1-2.1")' in src
     assert 'set_field(msg, "MSH-6", "ACME")' in src  # ItemCopy from a literal == set
@@ -1457,7 +1459,9 @@ def test_a_hostile_handle_name_cannot_escape_the_raise_or_its_comment() -> None:
 #
 # A ``<Line>`` whose ``@Data`` is rich text the role layer reads no span in fell back to the flat
 # reading, which has no handle gate and no write gate: a send of another handle rendered as
-# ``Send(dest, msg)``, and a write to another handle as a write to ``msg``. All fixtures synthetic.
+# ``Send(dest, msg)``, a write to another handle as a write to ``msg``, and the handle scan skipped
+# both. Now its send is refused, its write is not mapped, and the scan counts both. Plain text, the
+# superseded synthetic model, still takes the flat reading (ADR 0086). All fixtures synthetic.
 
 
 def _upper(data: str) -> str:
@@ -1553,6 +1557,59 @@ def test_a_send_in_unread_markup_is_counted_unmapped(tmp_path: Path) -> None:
     summary = import_corepoint(export, tmp_path / "out").to_json()
     assert summary["total_mapped"] == 0
     assert summary["total_unmapped"] == 1
+
+
+# Each a write of ``"X"`` to ``%OUT/PID-5`` in rich text with no span the role layer reads, which
+# the flat reading maps (its plain-text twin does, below).
+_UNREAD_MARKUP_WRITES = {
+    "entity-quoted-class": (
+        '<Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; '
+        '&amp;quot;X&amp;quot; %OUT/PID-5"/>'
+    ),
+    "attribute-before-class": _role_line(
+        "<span style='x' class='keyword'>ItemCopy</span> \"X\" %OUT/PID-5"
+    ),
+    "unquoted-class": _role_line('<span class=keyword>ItemCopy</span> "X" %OUT/PID-5'),
+    "another-tag": _role_line('<b>ItemCopy</b> "X" %OUT/PID-5'),
+    "entities-only": '<Line Data="ItemCopy &amp;quot;X&amp;quot; %OUT/PID-5"/>',
+}
+
+
+@pytest.mark.parametrize("line", _UNREAD_MARKUP_WRITES.values(), ids=_UNREAD_MARKUP_WRITES.keys())
+def test_a_write_in_markup_the_role_layer_does_not_read_is_not_mapped(line: str) -> None:
+    body = _handler_body(_handler_source(line + _role_send("input-handle", "%ADT", "OB_A")))
+    assert "set_field(msg" not in body
+    assert "# TODO: Corepoint ItemCopy — hand-finish (marked up in a form this import" in body
+
+
+def test_a_plain_text_write_still_maps() -> None:
+    """The control arm for the write tests: the same statement in plain text takes the flat
+    reading and maps, so the markup alone is what declines it."""
+    body = _handler_body(_handler_source('<Line Data="ItemCopy &quot;X&quot; %OUT/PID-5"/>'))
+    assert 'set_field(msg, "PID-5", "X")' in body
+
+
+def test_a_clone_in_unread_markup_holds_nothing() -> None:
+    """A ``MsgTreeCopy`` in unread markup may overwrite the input, so the role-marked send of the
+    input is refused, as it is when the same clone is role-marked."""
+    clone = _role_line("<b>MsgTreeCopy</b> %OUT/ to %ADT/")
+    body = _handler_body(_handler_source(clone + _role_send("input-handle", "%ADT", "OB_A")))
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+    # The control: without the clone, the same send is live.
+    live = _handler_body(_handler_source(_role_send("input-handle", "%ADT", "OB_A")))
+    assert 'sends.append(Send("OB_A", msg))' in live
+
+
+def test_a_send_in_unread_markup_counts_as_a_delivery_of_no_known_handle() -> None:
+    """The scan agrees with the render: an unread-markup send delivers a tree nobody can name, so
+    the list has no single delivered handle and a role-marked write to the input is not mapped, as
+    with a role-marked send of a ``$variable``."""
+    unread = _role_line('<b>MsgSend</b> %OUT to connection "OB_X"')
+    body = _handler_body(_handler_source(_WRITE_INPUT + unread))
+    assert 'set_field(msg, "MSH-6", "X")' not in body
+    # The control: the write alone maps onto msg.
+    assert 'set_field(msg, "MSH-6", "X")' in _handler_body(_handler_source(_WRITE_INPUT))
 
 
 def test_a_plain_text_send_still_renders_as_before() -> None:
@@ -3122,7 +3179,9 @@ def test_hostile_xml_values_cannot_inject_code() -> None:
     # &#10; is a character reference, so it survives XML attribute-value normalization as a real
     # newline — the sharpest available test of both the literal and the comment escape paths.
     src = _handler_source(
-        '<Line Data="ItemCopy &amp;quot;A&#10;import os&amp;quot; %ADT/MSH-6"/>'
+        # Plain text, so the write maps and its literal is the escape path under test (a write in
+        # entity markup is never mapped: BACKLOG #5556).
+        '<Line Data="ItemCopy &quot;A&#10;import os&quot; %ADT/MSH-6"/>'
         '<Line Data="ItemCustomScript %ADT/OBX-5&#10;os.system(&amp;quot;pwned&amp;quot;)"/>'
     )
     assert "\nimport os" not in src

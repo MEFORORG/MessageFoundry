@@ -724,9 +724,10 @@ def strip_markup(data: str) -> str:
 # ("/PID-5-1 (Patient Name)"), which makes every path unresolvable for entirely the wrong reason.
 # Tag and attribute names are case-insensitive in HTML, so ``<SPAN CLASS='keyword'>`` is a span too.
 # Matched case-sensitively it fell out of the role layer into the flat reading, which applies neither
-# the handle gate nor the write gates (BACKLOG #5556).
-_SPAN_OPEN = re.compile(r"<span\s+class=['\"]([A-Za-z-]+)['\"]\s*>", re.IGNORECASE)
-_SPAN_CLOSE = re.compile(r"</span\s*>", re.IGNORECASE)
+# the handle gate nor the write gates (BACKLOG #5556). ASCII only, as HTML folds case: without
+# ``re.ASCII`` a long s or a Kelvin sign would fold into ``span`` or a class name.
+_SPAN_OPEN = re.compile(r"<span\s+class=['\"]([A-Za-z-]+)['\"]\s*>", re.IGNORECASE | re.ASCII)
+_SPAN_CLOSE = re.compile(r"</span\s*>", re.IGNORECASE | re.ASCII)
 
 # Span class → the role this layer reasons about. Unlisted classes fall through to ``"text"`` so a
 # future exporter class is inert rather than a crash — and is still visible in the token stream.
@@ -815,6 +816,18 @@ def parse_roles(data: str) -> tuple[RoleToken, ...]:
         return ()
     flush(len(data))
     return tuple(tokens)
+
+
+def _unread_markup(data: str, roles: tuple[RoleToken, ...]) -> bool:
+    """Whether ``data`` is rich text (a tag or an entity the markup strip decodes) in which
+    :func:`parse_roles` read no span: an exporter's markup in a shape this import does not read.
+
+    Such a statement names no handle anyone can read, so it must not take the flat reading, which
+    has no handle gate and no write gate. THE one test, asked by the render's write and send arms
+    and by the handle scan alike, so the three cannot disagree on it (BACKLOG #5556). Plain text,
+    the superseded synthetic model, is not unread markup and still takes the flat reading (ADR 0086
+    §2(b″))."""
+    return not roles and strip_markup(data) != data.strip()
 
 
 @dataclass(frozen=True)
@@ -932,6 +945,11 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     cross-message write rendered as ``msg.set`` silently mutates the wrong message. A ``MsgSend`` of
     anything outside ``held`` is refused by :func:`_send_refusal` (BACKLOG #313).
 
+    A ``<Line>`` in markup the role layer does not read (:func:`_unread_markup`) names no handle, so
+    its send delivers ``""``, as a role-parsed send of no handle does, and its ``MsgTreeCopy`` may
+    have overwritten any tree, so a list holding one holds nothing (BACKLOG #5556). The render
+    refuses that send with :data:`_UNREAD_MARKUP_SEND_REFUSAL`.
+
     The scan skips ``@Disabled`` statements exactly where :func:`_parse_statement` does, and reads each
     verb and kind through the same helpers. It is **flow-insensitive**: it does not see statement order
     or whether a copy sits in a branch, so a send that runs before its clone is made, or a clone made
@@ -950,6 +968,15 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
         tokens = parse_roles(data) if data else ()
         if _label_statement(elem):
             return frozenset(), frozenset()  # see the docstring: nothing is held
+        if data and _unread_markup(data, tokens) and _local(elem.tag).lower() == "line":
+            # A send or a clone in markup the role layer does not read, which the render refuses
+            # or leaves unmapped: which tree it sends or overwrites is not known (BACKLOG #5556).
+            verb = _split_verb(strip_markup(data))[0]
+            if _statement_kind("line", verb) == "send":
+                delivered.add("")  # "" is never held, as for a role-parsed send of no handle
+            elif verb.lower() == "msgtreecopy":
+                return frozenset(), frozenset()
+            continue
         if not tokens:
             continue  # markup-free: no handle roles to learn from
         inputs.update(t.text for t in tokens if t.source_class == "input-handle")
@@ -1100,14 +1127,17 @@ _LABEL_STATEMENT_WHY = (
 _LABEL_SEND_REFUSAL = (
     f"MsgSend is {_LABEL_STATEMENT_WHY}; the import refuses to send msg in its place"
 )
-# Why a ``MsgSend`` on a ``<Line>`` whose ``@Data`` is rich text, but holds no span
-# :func:`parse_roles` reads, is refused. Nothing in it says which handle it sends, so it is refused
-# as :func:`_send_refusal` refuses a role-parsed send whose handle it cannot identify. Rendering it
-# as ``Send(dest, msg)`` delivered the input in place of whatever it named (BACKLOG #5556).
-_UNREAD_MARKUP_SEND_REFUSAL = (
-    "MsgSend is marked up in a form this import does not read, so it names no message handle this "
-    "import can identify as msg; the import refuses to send msg in its place"
+# Why a statement on a ``<Line>`` in markup the role layer does not read (:func:`_unread_markup`) is
+# not mapped, and why such a ``MsgSend`` is refused: nothing in it says which handle it writes or
+# sends, so it is treated as :func:`_send_refusal` treats a role-parsed send of a handle it cannot
+# identify. Read flat, a write landed on msg and a send delivered msg in place of whatever it named
+# (BACKLOG #5556).
+_UNREAD_MARKUP_WHY = (
+    "marked up in a form this import does not read, so it names no message handle this import "
+    "can identify as msg"
 )
+_REFUSES_MSG = "the import refuses to send msg in its place"
+_UNREAD_MARKUP_SEND_REFUSAL = f"MsgSend is {_UNREAD_MARKUP_WHY}; {_REFUSES_MSG}"
 
 # Kinds that continue an enclosing construct instead of standing alone, and what may adopt them.
 _BRANCH_PARENT = {"elif": "if", "else": "if", "except": "try", "match": "case"}
@@ -1509,15 +1539,16 @@ def _send_refusal(operands: tuple[Operand, ...], held: frozenset[str]) -> str:
 
     It fails CLOSED: a send is allowed only when :func:`_whole_tree` names a handle in ``held``, the
     same reading :func:`_message_handles` uses to fill ``delivered``. A ``$variable``, a partial path
-    or no handle at all is refused, because which message it sends is not known. A send with no
-    roles never reaches here: in rich text it is refused outright
+    or no handle at all is refused, because which message it sends is not known. A send on a
+    ``<Line>`` with no roles never reaches here: in unread markup it is refused outright
     (:data:`_UNREAD_MARKUP_SEND_REFUSAL`), and in plain text it renders as before (ADR 0086
-    §2(b″)). The handle is untrusted and unbounded, so it is flattened and elided before it enters
-    the text."""
+    §2(b″)). A send off a ``<Line>`` takes :data:`_LABEL_SEND_REFUSAL` instead, whatever its roles.
+    The handle is untrusted and unbounded, so it is flattened and elided before it enters the
+    text."""
     sent = _whole_tree(operands[0]) if operands else ""
     if sent and sent in held:
         return ""
-    refuse = "the import refuses to send msg in its place"
+    refuse = _REFUSES_MSG
     if not sent:
         return f"MsgSend names no message handle this import can identify as msg; {refuse}"
     handle = _comment_text(sent, 60)
@@ -1872,6 +1903,11 @@ def _parse_statement(
             )
         elif statement:
             mapped = _map_statement(verb, operands, statement)
+            if isinstance(mapped, Action) and _unread_markup(data, roles):
+                # The flat reading has no handle gate and no write gates, so in markup the role
+                # layer does not read a write to another handle would land on msg (BACKLOG #5556).
+                # Only a write it would emit is declined: a marker it already gives stays as it is.
+                mapped = UnmappedAction(verb, f"{_UNREAD_MARKUP_WHY}: {statement}")
         else:
             # No statement at all — reported rather than skipped, because a silently-ignored element is
             # exactly the accept-and-drop this importer refuses (count-and-log).
@@ -1899,11 +1935,9 @@ def _parse_statement(
             refusal = _LABEL_SEND_REFUSAL
         elif roles:
             refusal = _send_refusal(role_operands, held)
-        elif statement != data.strip():
-            # Rich text (a tag or an entity the markup strip decoded) in which the role layer reads
-            # no span: an exporter's markup in a shape this import does not read. Its handle is
-            # unknown, so it is refused as a role-parsed send of an unknown handle is, and not
-            # rendered by the flat reading, which has no handle gate (BACKLOG #5556).
+        elif _unread_markup(data, roles):
+            # Its handle is unknown, so it is refused as a role-parsed send of an unknown handle
+            # is, and not rendered by the flat reading, which has no handle gate (BACKLOG #5556).
             refusal = _UNREAD_MARKUP_SEND_REFUSAL
         else:
             # Plain text, the superseded synthetic model: renders as before (ADR 0086 §2(b″)).

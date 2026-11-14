@@ -197,15 +197,18 @@ handler keeps its `sends` list, so the handler neither filters silently nor gain
 is accurate. The summary counts the statement as unmapped.
 
 Field writes map onto `msg` only for the one handle the list delivers. A list that delivers two
-different handles maps no field write at all.
+different handles maps no field write at all. That holds for role-parsed writes: a plain-text write
+names no handle and takes the flat reading (the first gap below).
 
 At least these gaps remain:
 
 - A markup-free `MsgSend` carries no handle role, so it renders as before. *Narrowed 2026-11-14
-  (BACKLOG #5556):* this holds for plain text only. A `MsgSend` on a `<Line>` whose `@Data` is rich
-  text (a tag or an entity) holding no span the role layer reads is refused like a send of an
-  unknown handle, and span markup is matched case-insensitively, so `<SPAN CLASS='keyword'>` is
-  read as roles and passes the handle and write gates.
+  (BACKLOG #5556):* this holds for plain text only. Span markup is matched case-insensitively, in
+  ASCII, so `<SPAN CLASS='keyword'>` is read as roles and takes the handle and write gates. On a
+  `<Line>` whose `@Data` is rich text (a tag or an entity) holding no span the role layer reads, a
+  `MsgSend` is refused like a send of an unknown handle, a field write the flat reading would map
+  is left unmapped, and the handle scan counts the send as a delivery of no known handle and a
+  `MsgTreeCopy` as holding nothing.
 - The handle scan does not see statement order or branches. A send that runs before its clone is
   made, or a clone made on one branch only, still counts as `msg`.
 
@@ -555,9 +558,10 @@ At least these limits remain:
   that was not measured: the validated export is not in this repository.
 - The marker and the statement share one 200-character comment, so a statement longer than about
   90 characters is cut. Under a `@Disabled` ancestor the preview shows only the verb.
-- A statement with no role markup names no handle the scan can read. So a markup-free write still
-  maps onto `msg` and a markup-free send still sends it, in such a list as in any other (§2(b″)).
-  The same holds for a markup-free `MsgTreeCopy` on a `<Line>`.
+- A statement with no role markup names no handle the scan can read. So a plain-text write still
+  maps onto `msg` and a plain-text send still sends it, in such a list as in any other (§2(b″)).
+  The same holds for a plain-text `MsgTreeCopy` on a `<Line>`. Rich text the role layer reads no
+  span in is not plain text: §2(b″) says what happens to it (BACKLOG #5556).
 - The refusal at a send on a `<Line>`, and the reason on a declined write, still name the two
   older causes: no single input handle, or an overwritten input. The marker carries the true one.
   A send in a Block's or a Call's `@Data` names its own cause in its refusal.
