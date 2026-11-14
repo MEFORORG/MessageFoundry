@@ -822,7 +822,12 @@ function Get-ScanRawIndexMap($Seg) {
 # (Test-ShellLiteralPath); a chdir the resolver cannot follow (popd, a subshell, two chdirs, a
 # relative chdir after an earlier line's); git options after the verb; and a line whose ONLY git word
 # is a spelling the token pattern misses (`git.EXE reset --hard`, or `GIT` on Windows), which rule 3's
-# first reading exits on before these readings run. That last one is origin/main's too.
+# first reading exits on before these readings run. That last one is origin/main's too. Also, at
+# least: any line after an earlier line whose chdir sits in a subshell (`(cd x && ls)`), which makes
+# the earlier-line reading answer nothing; and a `--git-dir` after a `-c <key>=<v>` disarm, which is
+# not promoted. Known new false denies, left open: a later disarm judged by rule 3c's first chain can
+# take an earlier command's `-C`, and a chdir inside a heredoc or here-string body in an earlier line
+# is read as a real one.
 #
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
@@ -4938,7 +4943,12 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
                 $text = $(if ($null -ne $map) { $seg.Raw.Substring($map[$vIdx]) } else { $seg.Scan.Substring($vIdx) })
                 $movesHead = Test-VerbMovesHead $vGroup.Value $seg.Scan.Substring($vIdx + $vGroup.Length)
                 $carried = Resolve-CarriedGitDir ($seg.Prior + $seg.Scan.Substring(0, $vIdx))
-                foreach ($reading in @(Get-InvocationReading $seg.Scan $vIdx -GitAt $vm.Index -Prior $seg.Prior)) {
+                # THE OWNING GIT WORD, not the verb hunt's match start (review round f99d8271af): the hunt
+                # crosses `( ) { }`, so in `if (git -C <o> diff) { git reset --hard }` it starts at the
+                # first git and the reset read that command's `-C`.
+                $ownGit = Get-GitWordBefore $seg.Scan $vIdx
+                if ($ownGit -lt 0) { $ownGit = $vm.Index }
+                foreach ($reading in @(Get-InvocationReading $seg.Scan $vIdx -GitAt $ownGit -Prior $seg.Prior)) {
                     $ownRepo = ($reading.Window -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
                     [pscustomobject]@{
                         Verb  = $vGroup.Value

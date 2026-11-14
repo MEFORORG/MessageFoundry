@@ -139,15 +139,18 @@ Until BACKLOG #5642 the shared path readers stripped double quotes only, so a si
 `-C`, `--work-tree`, `GIT_WORK_TREE`, `--git-dir`, `GIT_DIR` or `cd` target named a path with quote
 characters in it and the command was allowed. Until BACKLOG #5655 rule 3 took the line's first `-C` as
 every invocation's target, so an earlier command's `-C`, or one inside a quoted argument, hid a later
-`git reset --hard` in the primary, and rule 3b judged only the first invocation. Each verb-bearing
-invocation, and each disarming one for rule 3c, is now also read from its own tokens, unquoted the way
-the shell does. That reading is added after the old one and can only add a refusal, so nothing the gate
-refused before is allowed now, and the old reading's false refusals stay. A misreading in the new one
-is a new false refusal; review measured and fixed three, and others are not ruled out. It does not
-close the class.
-At least these are still not read this way: a quoted path with a space in it, a `-C` value the shell
-would expand, a chdir the gate cannot follow, and git options after the verb. The ADDED READINGS note
-in the hook is the source of record.
+`git reset --hard` in the primary, and rule 3b judged only the first invocation. Many more
+invocations, verb-bearing ones for rules 3 and 3b and disarming ones for rule 3c, are now also read
+from their own tokens, unquoted the way the shell does. That reading is added after the old one and
+can only add a refusal, so nothing the gate refused before is allowed now, and the old reading's false
+refusals stay. A misreading in the new one is a new false refusal. Review fixed three and found at
+least two still open: an earlier command's `-C` deciding a later config write, and a chdir inside a
+heredoc or here-string body read as a real one. It does not close the class.
+At least these are still not read this way, and the gate still allows them: a quoted path with a space
+in it; a `-C` value the shell would expand; a chdir the gate cannot follow; any line after an earlier
+line whose chdir sits in a subshell, such as `(cd x && ls)`; a `--git-dir` written after a
+`-c <key>=<v>` disarm; git options after the verb; and a line whose only git word is `git.EXE`, or
+`GIT` on Windows. The ADDED READINGS note in the hook is the source of record.
 
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.

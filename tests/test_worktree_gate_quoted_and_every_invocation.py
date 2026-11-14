@@ -318,3 +318,21 @@ def test_review_round_two_controls_stay_allowed(
     """ALLOW on origin/main; the first build of the added readings refused each one."""
     cmd = _fmt(rig, template.replace("{kv}", "core." + "hooksPath=/nope"))
     assert _allowed(rig, cmd, _cwd(rig, where))
+
+
+# ------------------------------------------------------------------ review round f99d8271af
+
+
+@pytest.mark.parametrize(
+    ("template", "tool"),
+    [
+        ("if (git -C {o} diff --quiet) {{ git reset --hard }}", "PowerShell"),
+        ("git -C {o} log $(git reset --hard)", "Bash"),
+    ],
+)
+def test_an_invocation_joined_by_a_bracket_reads_its_own_window(
+    rig: SimpleNamespace, template: str, tool: str
+) -> None:
+    """ALLOW on origin/main and on the round-two head: the window began at the earlier git word."""
+    reason = _reason(rig, _fmt(rig, template), rig.primary, tool)
+    assert "SHARED PRIMARY" in reason, reason
