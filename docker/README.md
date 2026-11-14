@@ -232,8 +232,8 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 - **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** See
   [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) for hops it
   reaches, as an at-least list. It has no effect at `[security].enforcement = enforce`, the default,
-  and none on the alert webhook. It is a dev / trusted-lab switch, for example for
-  self-signed test containers.
+  and none on the alert webhook. It is a dev / trusted-lab switch, and on its own it weakens
+  nothing: at `warn` it only permits a per-hop weakening you also set, such as `verify_tls = false`.
 - **Cert-expiry monitor skips `env()`-referenced cert paths.** Use literal paths for any cert you want the
   built-in expiry alert to watch (the `[api]` cert is always literal and covered).
 - **In-engine TLS revocation is delegated** (ADR 0002). For enforced revocation use Topology B with an

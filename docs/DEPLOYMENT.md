@@ -615,7 +615,8 @@ Two other shapes were weighed and not built:
    **At least one hop can still cross outside that refusal** and needs a deliberate decision from you: a
    `dialect='generic'` DATABASE hop, outbound or a `DatabasePoll` inbound (driver-owned TLS: once a mode outside the no-TLS deny-list is set, the engine neither enforces nor verifies it) — see the exceptions under the [matrix](#channel--tls-posture-matrix).
    A Direct outbound connection with `use_tls=false` is decided outside that refusal too, by its own
-   gate, which refuses it under `enforce`. CORRECTED 2026-11-14: this listed Direct as a second hop
+   gate, which refuses it under `enforce`; neither `cleartext_accepted` nor `tls_hop_attested` reaches
+   that gate. CORRECTED 2026-11-14: this listed Direct as a second hop
    that can still cross.
    Separately, **at least nine** verifying TLS outbounds have a revocation gate of their own — and the
    rest do **not**, including the SQL Server store hop: see
@@ -882,7 +883,8 @@ posture and honour the escape, while at least `admin-reset-totp`, `audit-verify`
 
 An Email or Direct outbound connection that logs in (`username` set) gets none of the SMTP entries
 above: its login over cleartext, over `tls_verify = false` or over `tls_check_hostname = false` is
-refused before any of them, whatever is set. A login over verified TLS, the default, is not refused.
+refused before any of them, whatever is set. This rule does not refuse a login over verified TLS, the
+default; the [revocation gate](#revocation-guard-behavior) can still refuse that hop.
 
 **What the escape does not open.** At least these:
 
@@ -916,9 +918,11 @@ forward-proxy login is the exception, under `cleartext_accepted` alone, and
 the opposite claim, "secure by other means", and ALLOWs the hop. It is reported as a loosening; see
 [CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested).) *(b)* Where it does still apply it is
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
-enforce`. The engine reads the variable only through the clamp, `hop_insecure_escape_downgrades`
-and `weakened_tls_escape_permitted` built on it, and the cells in the first list call one of the two. A
-cell that knows no posture gets no escape either. That clamp once also required the
+enforce`. On 2026-11-14 the engine read the variable in one place, `insecure_tls_allowed`, and
+called that only from the clamp `hop_insecure_escape_downgrades`; at least
+`weakened_tls_escape_permitted` and its `weakened_tls_escape_permitted_here` form build on the clamp,
+and each cell in the first list reads the escape through one of those three. A cell that knows no
+posture gets no escape either. That clamp once also required the
 instance to be PHI; by design every instance is now treated as carrying patient data (BACKLOG
 #1279), so that conjunct is gone. Either way, on the shipped posture the escape is inert in every
 cell of the first list, and no entry there is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
