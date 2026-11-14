@@ -2374,7 +2374,11 @@ async def test_a_reload_racing_a_halt_cannot_rebind_a_listener_over_halted_stage
         message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
         await asyncio.sleep(0.3)
         assert await store.outbox_for(message_id) == [], "a halted inbound's row was processed"
-        assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
+        # As on origin/main, the halt alerts what it read before the wait: a listener the reload had
+        # already unbound is not in that list, and its refusal pages on its own (stopped=0).
+        counted = [INBOUND, OUTBOUND] if halt_while_bound else [OUTBOUND]
+        assert sorted(name for name, _ in sink.stopped) == counted
+        assert any(f[3] == 0 and INBOUND in f[2] for f in sink.log_failures)
     finally:
         await runner.stop()
 
@@ -2417,132 +2421,6 @@ async def test_the_halt_gates_every_inbound_as_it_latches_before_it_holds_the_lo
     await halt
 
 
-async def test_a_halt_that_latches_during_a_stop_pauses_nothing_into_the_next_run(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # stop() holds the reload lock, and its teardown clears the operator pauses on purpose. An
-    # escalation queued before it unsubscribed from the guard can latch a halt that waits for the
-    # lock. Pausing its lanes once stop() released the lock would write them back, and the next
-    # start would replay them, so delivery would come up paused for a halt from the run that ended.
-    sink = _RecordingSink()
-    runner, _source = _graph(store, sink)
-    real_body = runner._teardown_body
-    halts: list[asyncio.Future[None]] = []
-
-    async def body_with_a_late_escalation(demote: bool, budget: float) -> None:
-        await real_body(demote, budget)
-        runner._spawn_log_sink_response(
-            LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
-        )
-        halts.extend(runner._log_guard_tasks)
-        await asyncio.sleep(0)  # the halt latches inside the teardown, then waits for the lock
-
-    monkeypatch.setattr(runner, "_teardown_body", body_with_a_late_escalation)
-    await runner.stop()
-    assert len(halts) == 1 and runner._log_write_stopped, "the late halt never latched"
-    await halts[0]
-
-    assert runner._outbound_paused == set(), "the halt paused a lane into the next run"
-    assert sink.stopped == []
-    assert [(f[0], f[1], f[3]) for f in sink.log_failures] == [
-        ("file", "unwritable", 1),
-        ("file:stood-down", "stood-down", None),
-    ]
-    assert "the runner stopped" in sink.log_failures[1][2]
-
-
-async def test_a_halt_keeps_an_engine_park_a_reload_made_while_it_waited(
-    store: MessageStore,
-) -> None:
-    # The halt sizes its page from the lanes it reads before it waits, but stops what it reads
-    # once it holds the lock. A reload that held the lock may have engine-parked an outbound;
-    # pausing that lane again would turn its park into an operator pause no later reload lifts.
-    sink = _RecordingSink()
-    runner, _source = _graph(store, sink)
-    await runner._reload_lock.acquire()
-    try:
-        halt = await _halt_waiting_on_the_lock(runner)
-        runner._park_outbound_lane(OUTBOUND)  # the reload's gate, under its lock
-        runner._gate_parked.add(OUTBOUND)
-    finally:
-        runner._reload_lock.release()
-    await halt
-
-    assert OUTBOUND in runner._gate_parked, "the halt turned an engine park into an operator pause"
-    assert [name for name, _ in sink.stopped] == [INBOUND]
-
-
-async def test_two_halts_of_one_break_stop_and_alert_once(store: MessageStore) -> None:
-    # A probe can clear the latch while a halt waits, and the log can break again, so a second halt
-    # latches and waits behind the first. The first finds the latch set again and stops; the second
-    # reads what to stop once it holds the lock and finds nothing left running.
-    sink = _RecordingSink()
-    runner, source = _graph(store, sink)
-    # A running engine, as the halt meets one: the stub graph is never started, so once the first
-    # halt stops its only listener the second would read the runner as fully stopped.
-    runner._running = True
-    try:
-        await runner._reload_lock.acquire()
-        try:
-            first = await _halt_waiting_on_the_lock(runner)
-            runner._log_write_stopped = False  # a recovery probe re-validated the log meanwhile
-            second = await _halt_waiting_on_the_lock(runner)
-        finally:
-            runner._reload_lock.release()
-        await asyncio.gather(first, second)
-    finally:
-        runner._running = False
-
-    assert source.stopped is True and OUTBOUND in runner._outbound_paused
-    assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
-    assert [(f[0], f[1]) for f in sink.log_failures] == [("file", "unwritable")] * 2
-
-
-async def test_a_halt_whose_latch_a_probe_cleared_stands_down_and_lifts_only_its_marks(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Decision d20261113T215259180-f5da2d (ADR 0189 option 4). A lock holder probed the log and
-    # cleared the latch while the halt waited. The halt stops nothing, leaves the latch clear, and
-    # lifts the marks it set as it latched. A mark an earlier halt left on another inbound is not
-    # this halt's, and stays. Its page uses a label of its own, so the notifier's realert throttle,
-    # keyed on the type and the label, cannot drop it inside the first page's cooldown.
-    sink = _RecordingSink()
-    runner, source = _graph(store, sink)
-    other = "IB_EARLIER_HALT"
-    runner.registry.add_inbound(
-        InboundConnection(
-            other,
-            ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0}),
-            router="r",
-        )
-    )
-    runner._log_halted.add(other)  # an earlier halt's mark, not yet lifted by a restart
-    monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: None)
-    runner._running = True
-    try:
-        await runner._reload_lock.acquire()
-        try:
-            halt = await _halt_waiting_on_the_lock(runner)
-            assert INBOUND in runner._log_halted  # marked as it latched
-            assert runner._log_recovery_ok()  # no guard installed: the probe passes, latch clears
-        finally:
-            runner._reload_lock.release()
-        await halt
-    finally:
-        runner._running = False
-
-    assert not runner._log_write_stopped, "the halt re-latched over a log a probe found writable"
-    assert source.stopped is False and runner._outbound_paused == set()
-    assert not runner._inbound_log_halted(INBOUND), "a bound listener was left over a held gate"
-    assert other in runner._log_halted, "the stand-down lifted another halt's mark"
-    assert sink.stopped == []
-    assert [(f[0], f[1], f[3]) for f in sink.log_failures] == [
-        ("file", "unwritable", 2),
-        ("file:stood-down", "stood-down", None),
-    ]
-    assert "found the log writable" in sink.log_failures[1][2]
-
-
 async def test_a_raise_from_the_first_page_still_unbinds_and_pauses(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2561,11 +2439,11 @@ async def test_a_raise_from_the_first_page_still_unbinds_and_pauses(
     assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
 
 
-async def test_a_lane_read_that_raises_fails_closed_and_still_unbinds_and_pauses(
+async def test_an_ownership_check_that_raises_still_unbinds_and_holds_delivery(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A raise reading the lanes (here, the ownership check) must not leave the latch set over
-    # bound listeners: the read falls back to every bound listener and every outbound not paused.
+    # A raise from the ownership check must not abort the halt with the latch set over bound
+    # listeners: the listener still goes down, and the outbound whose check raised is skipped.
     sink = _RecordingSink()
     runner, source = _graph(store, sink)
 
@@ -2575,8 +2453,11 @@ async def test_a_lane_read_that_raises_fails_closed_and_still_unbinds_and_pauses
     monkeypatch.setattr(runner, "_owns_destination", raises)
     await runner._stop_all_for_log_failure(sink="file", reason="disk full")
 
-    assert source.stopped is True and OUTBOUND in runner._outbound_paused
-    assert sink.log_failures == [("file", "unwritable", "disk full", 2)]
+    assert source.stopped is True
+    # Not paused, so another engine shard's lane is never paused here, and still held: the
+    # ADR 0189 claim gate reads the latch.
+    assert OUTBOUND not in runner._outbound_paused and runner._delivery_halted
+    assert sink.log_failures == [("file", "unwritable", "disk full", 1)]
 
 
 def test_the_rebind_gate_refuses_and_marks_an_unmarked_inbound_while_the_log_is_dead(
@@ -2610,134 +2491,6 @@ def test_the_rebind_gate_is_a_no_op_with_no_latch_and_no_mark(store: MessageStor
     runner, _source = _graph(store, _RecordingSink())
     assert runner._resume_inbound_processing(INBOUND) is True
     assert INBOUND not in runner._log_halted
-
-
-async def test_a_stand_down_rebinds_a_listener_a_log_gate_refused_while_it_waited(
-    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # While a halt waits, a reload's rebind gate refuses INBOUND on a dead log and unbinds it; a
-    # later probe clears the latch. The listener was down only because the latch was set, so the
-    # stand-down rebinds it, and the engine processes again with no restart.
-    outdir, logdir = tmp_path / "out", tmp_path / "logs"
-    outdir.mkdir()
-    logdir.mkdir()
-    sink = _RecordingSink()
-    runner = _e2e_runner(store, outdir, logdir, "pooled", alert_sink=sink)
-    await runner.start()
-    try:
-        await runner._reload_lock.acquire()
-        try:
-            halt = await _halt_waiting_on_the_lock(runner)
-            monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: _DeadGuard())
-            await runner._stop_inbound_unsafe(INBOUND)  # the reload's step 1
-            await runner._start_inbound_unsafe(INBOUND)  # step 2: its gate refuses
-            assert INBOUND not in runner._sources
-            monkeypatch.setattr(wiring_runner, "active_log_guard", lambda: None)
-            assert runner._log_recovery_ok()  # then a later probe passes
-        finally:
-            runner._reload_lock.release()
-        await halt
-
-        assert INBOUND in runner._sources, "the stand-down left a refused listener down"
-        assert not runner._inbound_log_halted(INBOUND)
-        assert sink.stopped == []
-        assert ("file:stood-down", "stood-down", None) in [
-            (f[0], f[1], f[3]) for f in sink.log_failures
-        ]
-        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
-        assert await _until_processed(store, message_id), "the engine did not process again"
-    finally:
-        monkeypatch.undo()  # so the teardown unsubscribes the guard the runner subscribed
-        await runner.stop()
-
-
-@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
-async def test_a_halt_that_stands_down_on_a_running_engine_leaves_it_processing(
-    store: MessageStore, tmp_path: Path, claim_mode: str
-) -> None:
-    # A probe clears the latch while a halt waits on a running engine. The gate held a committed
-    # row back while the latch was set; nothing was paused or stopped, so once the stand-down lifts
-    # its marks the row flows to delivery.
-    outdir, logdir = tmp_path / "out", tmp_path / "logs"
-    outdir.mkdir()
-    logdir.mkdir()
-    sink = _RecordingSink()
-    runner = _e2e_runner(store, outdir, logdir, claim_mode, alert_sink=sink)
-    await runner.start()
-    try:
-        await runner._reload_lock.acquire()
-        try:
-            halt = await _halt_waiting_on_the_lock(runner)
-            message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
-            await asyncio.sleep(0.3)
-            assert await store.outbox_for(message_id) == [], "the gate let a row through"
-            assert runner._log_recovery_ok()  # the guard is healthy: the probe clears the latch
-        finally:
-            runner._reload_lock.release()
-        await halt
-
-        assert INBOUND in runner._sources and runner._outbound_paused == set()
-        assert not runner._inbound_log_halted(INBOUND)
-        assert sink.stopped == []
-        assert await _until_processed(store, message_id), "the stood-down engine did not drain"
-    finally:
-        await runner.stop()
-
-
-@pytest.mark.parametrize("rebind", [False, True])
-@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
-async def test_a_stand_down_leaves_a_poison_stopped_lane_stopped(
-    store: MessageStore, tmp_path: Path, claim_mode: str, rebind: bool
-) -> None:
-    # An inbound's internal lane is STOPPED by internal_error=STOP on a poison message, with the
-    # STOP's hold recorded. A halt latches, and a probe clears the latch while it waits, so it
-    # stands down. The halt never touched the lane, so the lane stays STOPPED and the hold stays:
-    # re-arming it would retry the poison message with no operator acting. With `rebind`, a reload
-    # holding the lock rebinds the inbound and its gate's probe is what clears the latch.
-    if rebind and claim_mode == "per_lane":
-        pytest.skip("a per_lane rebind respawns a STOP-ended worker on main too, by design")
-    outdir, logdir = tmp_path / "out", tmp_path / "logs"
-    outdir.mkdir()
-    logdir.mkdir()
-    sink = _RecordingSink()
-    runner = _e2e_runner(store, outdir, logdir, claim_mode, alert_sink=sink)
-    await runner.start()
-    try:
-        routed = runner._dispatchers.get(Stage.ROUTED)
-        if claim_mode == "pooled":
-            assert routed is not None
-            routed._to_stopped(INBOUND, routed._states[INBOUND], "poison")
-        else:
-            router = runner._router_workers[INBOUND]
-            router.cancel()
-            with suppress(asyncio.CancelledError):
-                await router
-        runner._hold_for_operator(INBOUND, "inbound")
-        sink.stopped.clear()  # the STOP's own alert
-
-        await runner._reload_lock.acquire()
-        try:
-            halt = await _halt_waiting_on_the_lock(runner)
-            if rebind:
-                await runner._stop_inbound_unsafe(INBOUND)
-                await runner._start_inbound_unsafe(INBOUND)  # its gate probes and clears the latch
-            else:
-                assert runner._log_recovery_ok()  # a probe while it waits clears the latch
-            assert not runner._log_write_stopped
-        finally:
-            runner._reload_lock.release()
-        await halt
-
-        assert ("inbound", INBOUND) in runner._stop_held, "the stand-down released the STOP's hold"
-        assert not runner._inbound_log_halted(INBOUND)
-        if claim_mode == "pooled":
-            assert routed is not None and routed.stopped(INBOUND), "the poison lane was re-armed"
-        else:
-            assert runner._router_workers[INBOUND].done(), "the poison router was respawned"
-            assert not runner._transform_workers[INBOUND].done(), "a live worker was ended"
-        assert INBOUND in runner._sources and sink.stopped == []
-    finally:
-        await runner.stop()
 
 
 async def test_a_gated_inbound_does_not_respawn_a_stop_held_worker(
@@ -2805,45 +2558,6 @@ async def test_with_no_halt_an_operator_restart_leaves_a_pooled_stopped_lane_as_
         await runner.stop()
 
 
-async def test_a_second_halt_latching_keeps_a_refusal_an_earlier_halt_will_stand_down_for(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # H1 waits; a reload's gate refuses INBOUND. A probe clears the latch and the log breaks again,
-    # so H2 latches. If H2 dropped the refusal, H1's stand-down (once another probe clears the
-    # latch) would find nothing to rebind or alert, and the listener would stay down in silence.
-    runner, _source = _graph(store, _RecordingSink())
-    await runner._reload_lock.acquire()
-    try:
-        first = await _halt_waiting_on_the_lock(runner)
-        runner._log_refused_rebinds.add(INBOUND)
-        runner._log_write_stopped = False  # a probe cleared the latch
-        second = await _halt_waiting_on_the_lock(runner)  # the log breaks again
-        assert INBOUND in runner._log_refused_rebinds, "a later halt dropped an earlier refusal"
-    finally:
-        runner._reload_lock.release()
-    await asyncio.gather(first, second)
-
-
-async def test_an_outbound_a_reload_paused_for_the_log_while_a_halt_waited_is_alerted_once(
-    store: MessageStore,
-) -> None:
-    # A reload holding the lock refuses its memoised probe and pauses OUTBOUND through
-    # `_pause_delivery_lanes`, which sends no alert. The waiting halt then reads no running
-    # outbound, but the log stopped OUTBOUND, so the halt alerts it, once.
-    sink = _RecordingSink()
-    runner, _source = _graph(store, sink)
-    await runner._reload_lock.acquire()
-    try:
-        halt = await _halt_waiting_on_the_lock(runner)
-        runner._pause_delivery_lanes([OUTBOUND])  # the reload's refused door, under its lock
-    finally:
-        runner._reload_lock.release()
-    await halt
-
-    assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
-    assert runner._log_paused_unalerted == set()
-
-
 def test_a_removed_inbounds_mark_does_not_gate_its_worker(store: MessageStore) -> None:
     # A reload removed a marked inbound: its worker must reach its claim, see the inbound gone and
     # return, so the mark gates it only while the inbound is in the graph. The latch gates it too.
@@ -2854,3 +2568,45 @@ def test_a_removed_inbounds_mark_does_not_gate_its_worker(store: MessageStore) -
     assert not runner._inbound_log_halted(INBOUND)
     runner._log_write_stopped = True
     assert runner._inbound_log_halted(INBOUND)
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_halt_overtaken_by_a_cleared_latch_still_completes_as_on_main(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    # A lock holder probes the log and clears the latch while a halt waits for the reload lock.
+    # The halt completes anyway, exactly as origin/main's does: it unbinds the listener it read
+    # before the wait, pauses the outbound, alerts both, and leaves the latch as the probe left
+    # it, clear. A lane a content STOP held keeps its STOP and its hold: the halt never touches
+    # either. Recovery is the operator's restart, which the probe already proved will pass.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    sink = _RecordingSink()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode, alert_sink=sink)
+    await runner.start()
+    try:
+        routed = runner._dispatchers.get(Stage.ROUTED)
+        if claim_mode == "pooled":
+            assert routed is not None
+            routed._to_stopped(INBOUND, routed._states[INBOUND], "poison")
+        runner._hold_for_operator(INBOUND, "inbound")
+        sink.stopped.clear()  # the STOP's own alert
+        await runner._reload_lock.acquire()
+        try:
+            halt = await _halt_waiting_on_the_lock(runner)
+            assert runner._log_recovery_ok()  # the guard is healthy: the probe clears the latch
+        finally:
+            runner._reload_lock.release()
+        await halt
+
+        assert not runner._log_write_stopped
+        assert INBOUND not in runner._sources and OUTBOUND in runner._outbound_paused
+        assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
+        assert [(f[0], f[1]) for f in sink.log_failures] == [("file", "unwritable")]
+        assert INBOUND in runner._log_halted  # its re-arm is the operator's restart
+        assert ("inbound", INBOUND) in runner._stop_held, "the halt released the STOP's hold"
+        if claim_mode == "pooled":
+            assert routed is not None and routed.stopped(INBOUND), "the halt re-armed the STOP"
+    finally:
+        await runner.stop()

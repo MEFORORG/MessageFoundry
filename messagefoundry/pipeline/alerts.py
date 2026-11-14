@@ -379,12 +379,9 @@ class AlertSink(Protocol):
     ) -> None:
         """An **application-log sink** failed a write (BACKLOG #122, ADR 0162). ``name`` labels the sink
         (``"stdout"`` / ``"file"``); ``stage`` is ``"rolled"`` (stage 1 — the broken file was renamed
-        aside and a fresh one opened, nothing stopped), ``"unwritable"`` (stage 2 — the replacement
-        failed too) or ``"stood-down"`` (a stage-2 halt that stopped nothing once it held the reload
-        lock, BACKLOG #5704). A stood-down page carries ``"<sink>:stood-down"`` as ``name``, a label of
-        its own, so a sink keying its realert throttle on the label cannot drop it inside the
-        cooldown the stage-2 page opened; ``reason`` is a ``safe_exc``-scrubbed cause; ``stopped`` is
-        how many connections the fail-closed stop halted (None when nothing was stopped).
+        aside and a fresh one opened, nothing stopped) or ``"unwritable"`` (stage 2 — the replacement
+        failed too); ``reason`` is a ``safe_exc``-scrubbed cause; ``stopped`` is how many connections
+        the fail-closed stop halted (None when nothing was stopped).
 
         **This alert is the operator's channel of last resort, and that is the point:** the sink it
         reports on is the one that just broke, so a log line about it may never land. The notifier's
