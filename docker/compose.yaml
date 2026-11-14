@@ -58,8 +58,12 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_STORE_POOL_SIZE: "40"         # default (ADR 0062); >= 2 required under [cluster]
   MEFOR_CLUSTER_ENABLED: "true"
   # DEV-ONLY: the local Postgres has no CA-trusted cert, so verification can't succeed here. This
-  # disables TLS verification across ALL transports — it is a CI/lab switch and must NEVER be set in
-  # a real deployment. Give a managed Postgres a CA-trusted cert and remove this line.
+  # escape has no effect at [security].enforcement = enforce, the default, and nothing in this file
+  # sets warn. At warn it permits a weakened hop that would otherwise be refused, the store's
+  # trust_server_certificate = true or encrypt = false among them (neither is set here). It does not
+  # reach every transport: docs/DEPLOYMENT.md, "The MEFOR_ALLOW_INSECURE_TLS escape hatch", lists the
+  # hops it reaches. It is a dev / trusted-lab switch and must NEVER be set in a real deployment.
+  # Give a managed Postgres a CA-trusted cert and remove this line.
   MEFOR_ALLOW_INSECURE_TLS: "1"
   # DEV-ONLY: the local Postgres image makes POSTGRES_USER a SUPERUSER, and the engines log in as it.
   # Under the shipped enforce dial an over-granted store login refuses to start (ADR 0199), so this
@@ -96,7 +100,9 @@ services:
       MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
       # MEFOR_EGRESS_ALLOWED_MLLP: "partner-a.example.org:6661"
       # MEFOR_EGRESS_ALLOWED_FILE_DIRS: "/var/lib/mefor/out"
-      # NOTE: never set MEFOR_ALLOW_INSECURE_TLS here — it is a CI-only switch and disables TLS verification.
+      # NOTE: never set MEFOR_ALLOW_INSECURE_TLS here. It is a dev / trusted-lab switch: at
+      # [security].enforcement = warn it permits weakened hops that would otherwise be refused
+      # (docs/DEPLOYMENT.md, "The MEFOR_ALLOW_INSECURE_TLS escape hatch").
       # --- secrets directory (optional; see the ./secrets volume below). A path, not a secret ---
       # MEFOR_SECRETS_DIRECTORY: "/run/mefor/secrets"
 
