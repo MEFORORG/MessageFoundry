@@ -70,6 +70,8 @@
       <!-- An UNMAPPED verb with a recoverable target: must become a TODO marker + passthrough stub. -->
       <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCustomScript&lt;/span&gt; %ADT/OBX-5"/>
 
+      <!-- A MsgSend in markup the role layer does not read (its class is entity-quoted): which
+           message it sends is not known, so it is refused, never sent as msg (BACKLOG #5556). -->
       <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;MsgSend&lt;/span&gt; $out [OB_ACME_ADT]"/>
     </List>
   </ActionList>

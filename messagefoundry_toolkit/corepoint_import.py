@@ -722,8 +722,11 @@ def strip_markup(data: str) -> str:
 # Spans NEST — the human ``detail`` label is written *inside* the ``path`` span it annotates — so the
 # role scan is a stack, not a flat non-greedy match. Matching flatly folds the label into the path
 # ("/PID-5-1 (Patient Name)"), which makes every path unresolvable for entirely the wrong reason.
-_SPAN_OPEN = re.compile(r"<span\s+class=['\"]([A-Za-z-]+)['\"]\s*>")
-_SPAN_CLOSE = re.compile(r"</span\s*>")
+# Tag and attribute names are case-insensitive in HTML, so ``<SPAN CLASS='keyword'>`` is a span too.
+# Matched case-sensitively it fell out of the role layer into the flat reading, which applies neither
+# the handle gate nor the write gates (BACKLOG #5556).
+_SPAN_OPEN = re.compile(r"<span\s+class=['\"]([A-Za-z-]+)['\"]\s*>", re.IGNORECASE)
+_SPAN_CLOSE = re.compile(r"</span\s*>", re.IGNORECASE)
 
 # Span class → the role this layer reasons about. Unlisted classes fall through to ``"text"`` so a
 # future exporter class is inert rather than a crash — and is still visible in the token stream.
@@ -1096,6 +1099,14 @@ _LABEL_STATEMENT_WHY = (
 # main (ADR 0086 §2(b.4)), so it raises here wherever main renders the send at all.
 _LABEL_SEND_REFUSAL = (
     f"MsgSend is {_LABEL_STATEMENT_WHY}; the import refuses to send msg in its place"
+)
+# Why a ``MsgSend`` on a ``<Line>`` whose ``@Data`` is rich text, but holds no span
+# :func:`parse_roles` reads, is refused. Nothing in it says which handle it sends, so it is refused
+# as :func:`_send_refusal` refuses a role-parsed send whose handle it cannot identify. Rendering it
+# as ``Send(dest, msg)`` delivered the input in place of whatever it named (BACKLOG #5556).
+_UNREAD_MARKUP_SEND_REFUSAL = (
+    "MsgSend is marked up in a form this import does not read, so it names no message handle this "
+    "import can identify as msg; the import refuses to send msg in its place"
 )
 
 # Kinds that continue an enclosing construct instead of standing alone, and what may adopt them.
@@ -1498,9 +1509,11 @@ def _send_refusal(operands: tuple[Operand, ...], held: frozenset[str]) -> str:
 
     It fails CLOSED: a send is allowed only when :func:`_whole_tree` names a handle in ``held``, the
     same reading :func:`_message_handles` uses to fill ``delivered``. A ``$variable``, a partial path
-    or no handle at all is refused, because which message it sends is not known. A markup-free
-    statement has no roles and never reaches here. The handle is untrusted and unbounded, so it is
-    flattened and elided before it enters the text."""
+    or no handle at all is refused, because which message it sends is not known. A send with no
+    roles never reaches here: in rich text it is refused outright
+    (:data:`_UNREAD_MARKUP_SEND_REFUSAL`), and in plain text it renders as before (ADR 0086
+    §2(b″)). The handle is untrusted and unbounded, so it is flattened and elided before it enters
+    the text."""
     sent = _whole_tree(operands[0]) if operands else ""
     if sent and sent in held:
         return ""
@@ -1884,8 +1897,17 @@ def _parse_statement(
             # later verb table left :func:`_label_statement` not naming it. That protects the
             # send alone. The scan asks that rule, so the list's handles still depend on it.
             refusal = _LABEL_SEND_REFUSAL
+        elif roles:
+            refusal = _send_refusal(role_operands, held)
+        elif statement != data.strip():
+            # Rich text (a tag or an entity the markup strip decoded) in which the role layer reads
+            # no span: an exporter's markup in a shape this import does not read. Its handle is
+            # unknown, so it is refused as a role-parsed send of an unknown handle is, and not
+            # rendered by the flat reading, which has no handle gate (BACKLOG #5556).
+            refusal = _UNREAD_MARKUP_SEND_REFUSAL
         else:
-            refusal = _send_refusal(role_operands, held) if roles else ""
+            # Plain text, the superseded synthetic model: renders as before (ADR 0086 §2(b″)).
+            refusal = ""
         return [Control("send", source, statement, args=args, refusal=refusal), *body]
     if kind in ("break", "exit"):
         return [Control(kind, source, statement), *body]

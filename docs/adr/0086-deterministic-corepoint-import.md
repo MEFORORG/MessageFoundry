@@ -201,7 +201,11 @@ different handles maps no field write at all.
 
 At least these gaps remain:
 
-- A markup-free `MsgSend` carries no handle role, so it renders as before.
+- A markup-free `MsgSend` carries no handle role, so it renders as before. *Narrowed 2026-11-14
+  (BACKLOG #5556):* this holds for plain text only. A `MsgSend` on a `<Line>` whose `@Data` is rich
+  text (a tag or an entity) holding no span the role layer reads is refused like a send of an
+  unknown handle, and span markup is matched case-insensitively, so `<SPAN CLASS='keyword'>` is
+  read as roles and passes the handle and write gates.
 - The handle scan does not see statement order or branches. A send that runs before its clone is
   made, or a clone made on one branch only, still counts as `msg`.
 

@@ -1332,15 +1332,20 @@ _WRITE_INPUT = _role_line(
 )
 
 
-def _role_send(handle_class: str, handle: str, dest: str) -> str:
+def _send_markup(handle_class: str, handle: str, dest: str) -> str:
+    """A role-marked ``MsgSend <handle> to connection "<dest>"``, as markup before escaping."""
     literal = _span("literal", '"' + dest + '"')
-    return _role_line(
+    return (
         _span("keyword", "MsgSend")
         + " "
         + _span(handle_class, handle)
         + " to connection "
         + literal
     )
+
+
+def _role_send(handle_class: str, handle: str, dest: str) -> str:
+    return _role_line(_send_markup(handle_class, handle, dest))
 
 
 def _handler_body(src: str) -> str:
@@ -1446,6 +1451,115 @@ def test_a_hostile_handle_name_cannot_escape_the_raise_or_its_comment() -> None:
     long_src = _handler_source(_role_send("other-handle", "%" + "X" * 5000, "OB_ACME"))
     raise_line = next(ln for ln in long_src.splitlines() if "raise NotImplementedError" in ln)
     assert len(raise_line) < 400
+
+
+# --- markup the role layer did not read (BACKLOG #5556) -----------------------------------------
+#
+# A ``<Line>`` whose ``@Data`` is rich text the role layer reads no span in fell back to the flat
+# reading, which has no handle gate and no write gate: a send of another handle rendered as
+# ``Send(dest, msg)``, and a write to another handle as a write to ``msg``. All fixtures synthetic.
+
+
+def _upper(data: str) -> str:
+    """The same markup with its tag and attribute names in upper case, as HTML allows."""
+    return data.replace("<span class=", "<SPAN CLASS=").replace("</span>", "</SPAN>")
+
+
+def _upper_send(handle_class: str, handle: str, dest: str) -> str:
+    return _role_line(_upper(_send_markup(handle_class, handle, dest)))
+
+
+_UPPER_WRITE_OUT = _role_line(
+    _upper(
+        _span("keyword", "ItemClear")
+        + " "
+        + _span("other-handle", "%OUT")
+        + _span("path", "/PID-19")
+    )
+)
+
+
+def test_a_send_in_upper_case_markup_of_another_handle_is_refused() -> None:
+    """Upper-case span markup is span markup: the send of ``%OUT`` is refused, never sent as msg."""
+    body = _handler_body(_handler_source(_upper_send("other-handle", "%OUT", "OB_ACME")))
+    assert "Send(" not in body
+    assert (
+        'raise NotImplementedError("Corepoint import: MsgSend to OB_ACME: MsgSend delivers %OUT'
+        in body
+    )
+
+
+def test_a_write_in_upper_case_markup_to_another_handle_is_not_mapped_onto_msg() -> None:
+    """The write gate applies too: a clear of ``%OUT`` is not a clear of ``msg``."""
+    body = _handler_body(_handler_source(_UPPER_WRITE_OUT))
+    assert "set_field(msg" not in body
+    assert "# TODO: Corepoint ItemClear" in body
+
+
+def test_upper_case_markup_of_the_input_handle_still_maps_and_sends() -> None:
+    """The control arm: the same upper-case markup on the input handle reads as roles, so its write
+    maps and its send stays live."""
+    write = _role_line(
+        _upper(
+            _span("keyword", "ItemCopy")
+            + " "
+            + _span("literal", '"X"')
+            + " to "
+            + _span("input-handle", "%ADT")
+            + _span("path", "/MSH-6")
+        )
+    )
+    body = _handler_body(_handler_source(write + _upper_send("input-handle", "%ADT", "OB_IN")))
+    assert 'set_field(msg, "MSH-6", "X")' in body
+    assert '    sends.append(Send("OB_IN", msg))  # Corepoint MsgSend' in body
+    assert "raise NotImplementedError" not in body
+
+
+# Each a send of ``%OUT`` to ``OB_ACME`` whose ``@Data`` is rich text with no span the role layer
+# reads. As the XML attribute value, so the entity forms are written escaped once more.
+_UNREAD_MARKUP_SENDS = {
+    "entity-quoted-class": (
+        '<Line Data="&lt;span class=&amp;quot;keyword&amp;quot;&gt;MsgSend&lt;/span&gt; %OUT '
+        'to connection &amp;quot;OB_ACME&amp;quot;"/>'
+    ),
+    "attribute-before-class": _role_line(
+        "<span style='x' class='keyword'>MsgSend</span> %OUT to connection \"OB_ACME\""
+    ),
+    "unquoted-class": _role_line('<span class=keyword>MsgSend</span> %OUT to connection "OB_ACME"'),
+    "another-tag": _role_line('<b>MsgSend</b> %OUT to connection "OB_ACME"'),
+    "entities-only": '<Line Data="MsgSend %OUT to connection &amp;quot;OB_ACME&amp;quot;"/>',
+}
+
+
+@pytest.mark.parametrize("line", _UNREAD_MARKUP_SENDS.values(), ids=_UNREAD_MARKUP_SENDS.keys())
+def test_a_send_in_markup_the_role_layer_does_not_read_is_refused(line: str) -> None:
+    body = _handler_body(_handler_source(line))
+    assert "Send(" not in body
+    assert "    sends = []" in body and body.rstrip().endswith("return sends")
+    assert (
+        '    raise NotImplementedError("Corepoint import: MsgSend to OB_ACME: MsgSend is marked up '
+        "in a form this import does not read" in body
+    )
+
+
+def test_a_send_in_unread_markup_raises_when_the_handler_runs(tmp_path: Path) -> None:
+    with pytest.raises(NotImplementedError, match="marked up in a form this import does not read"):
+        _run_handler(tmp_path, _UNREAD_MARKUP_SENDS["another-tag"])
+
+
+def test_a_send_in_unread_markup_is_counted_unmapped(tmp_path: Path) -> None:
+    export = tmp_path / "pkg.xml"
+    export.write_text(_package(_UNREAD_MARKUP_SENDS["another-tag"]), encoding="utf-8")
+    summary = import_corepoint(export, tmp_path / "out").to_json()
+    assert summary["total_mapped"] == 0
+    assert summary["total_unmapped"] == 1
+
+
+def test_a_plain_text_send_still_renders_as_before() -> None:
+    """The control arm, and the gap ADR 0086 §2(b″) records: a send in plain text, the superseded
+    synthetic model, carries no markup at all and still renders as a send of msg."""
+    body = _handler_body(_handler_source('<Line Data="MsgSend %OUT [OB_FLAT]"/>'))
+    assert '    sends.append(Send("OB_FLAT", msg))  # Corepoint MsgSend' in body
 
 
 def _root_copy(
@@ -2602,10 +2716,11 @@ def test_every_statement_is_accounted_for(tmp_path: Path) -> None:
     """Count-and-log: mapped + unmapped + disabled covers the fixture, nothing silently vanishes."""
     result = import_corepoint(FIXTURES / "acme_adt_package.xml", tmp_path)
     summary = result.to_json()
-    # 3 vocabulary calls from the flat list + 3 from the role list + 15 control constructs.
-    assert summary["total_mapped"] == 21
-    # 3 from the flat list + 5 role statements the guards correctly refuse to map.
-    assert summary["total_unmapped"] == 8
+    # 3 vocabulary calls from the flat list + 3 from the role list + 14 control constructs.
+    assert summary["total_mapped"] == 20
+    # 3 from the flat list + its MsgSend, refused (BACKLOG #5556) + 5 role statements the guards
+    # correctly refuse to map.
+    assert summary["total_unmapped"] == 9
     assert summary["total_disabled"] == 1
     # The whole fixture is accounted for: every source element lands in exactly one bucket.
     assert summary["total_mapped"] + summary["total_unmapped"] + summary["total_disabled"] == 30
@@ -2983,8 +3098,8 @@ def test_cli_imports_the_xml_package(tmp_path: Path, capsys: pytest.CaptureFixtu
     )
     assert code == 0
     summary = json.loads(capsys.readouterr().out)
-    assert summary["total_mapped"] == 21
-    assert summary["total_unmapped"] == 8
+    assert summary["total_mapped"] == 20
+    assert summary["total_unmapped"] == 9
     assert summary["total_disabled"] == 1
     assert (out / "IB_ACME_ADT.py").is_file()
 
