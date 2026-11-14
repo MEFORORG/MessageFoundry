@@ -382,7 +382,8 @@ def _is_main_masked(out: str, main: str) -> bool:
 def _replace_rest(text: str, start: int, stop: int, mask: bool) -> str:
     """The CONTROL: a rest REPLACED by the placeholder wherever it holds a word, the design the
     previous attempt took. It is not class-preserving, so the fuzz must find it leaking. It ignores
-    ``mask``."""
+    ``mask``, so it also replaces walked rests in texts holding the backstop's opener, and inside
+    :func:`redaction._masked_only`'s check with every rest kept."""
     rest = text[start:stop]
     return (
         f" {redaction._REDACTED}{'>' if rest.endswith('>') else ''}" if rest.strip(" >") else rest
@@ -393,11 +394,10 @@ def test_the_end_tag_mask_redacts_at_least_what_main_did_through_composed_joins(
     """THE GATE for #5925: over generated vocabulary elements with malformed end tags, joined to raw
     text and redacted again by every route, every output is main's with some letters and digits
     masked, so no value main hid prints. The gain count shows the mask is exercised; the replacing
-    control shows the corpus can produce the composed-join leak.
+    control shows the arm can find a leak.
 
     Measured at 1,500 trials: 0 leaks, 0 unmasked routes and 9,398 values hidden that main printed.
-    16,000 more trials over four other seeds, run by hand, also found 0 leaks and 0 unmasked
-    routes. The corpus holds the shapes code review found (camelCase credential labels and their
+    The corpus holds the shapes code review found (camelCase credential labels and their
     heads, a segment id glued to a tag's ``>``, surnames the end-of-text rules refuse, the
     backstop's opener over a tail a field run shortens). With the head check narrowed to capitals
     the same 1,500 trials found no leak, so that shape rests on the pins above, not on this arm.

@@ -1653,7 +1653,8 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     copied as it stood, and printed. It is MASKED, not replaced, for the reason the section on
     :data:`_SHAPE` gives: a placeholder changed the answer's length and dropped words a name run
     would have joined, so a redacted answer joined to a caller's raw text and redacted again printed
-    what main's hid. The mask keeps every character's class.
+    what main's hid. The mask keeps a letter's case and a digit a digit, not every class
+    (:data:`_SHAPE`'s section says which it does not).
 
     **That is not a proof that every reader sees main's answer.** A mask alone sends no text round
     again (:func:`_masked_only`), but masked text still reaches passes main ran on the unmasked
@@ -1681,7 +1682,7 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     Where the rules refuse, the rest stays as it stood, and that is the residual, at least these: a
     rest holding punctuation, a tab or a non-ASCII letter (``</family Zq, Doe>``); one holding a word
     some pass reads literally, a credential word inside a longer word, or a date (``</family
-    password: x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any word after a
+    Bearer x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any word after a
     line break inside the tag; every rest in a text that holds the backstop's opener when the XML
     pass reads it; every rest whose
     end tag an HL7 field run took before this pass ran, in at least these shapes: a run before the
@@ -2034,9 +2035,9 @@ def _masked_only(text: str, flat: str, *, widened: bool) -> bool:
     place (:func:`_end_tag_rest`, BACKLOG #5925): with every rest kept, they would have changed
     nothing, so the round ends.
 
-    **A mask is not a change that sends the text round again.** It keeps every character's class
-    (:data:`_SHAPE`), and :func:`_end_tag_rest` masks only where that is not expected to change
-    another pass's reading, which the differential fuzz measures and does not prove. The passes
+    **A mask is not a change that sends the text round again.** :func:`_end_tag_rest` masks only
+    where that is not expected to change another pass's reading, which the differential fuzz
+    measures and does not prove. The passes
     are not all fixed points on their own output, so a round main did not run
     reads differently: ``</given Doe>&Smith, Jones=PID|x`` left ``&[redacted]=PID|[redacted]`` on
     main, and a second round turns ``Doe>&[redacted]=PID|[redacted]`` into ``[redacted]``, so the
