@@ -230,9 +230,9 @@ async def test_fresh_session_is_mfa_pending_until_assertion() -> None:
         await store.close()
 
 
-async def test_assertion_stamps_mfa_only_never_reauth() -> None:
-    """ADR 0068 decision 1: the assertion satisfies ONLY the MFA leg — reauth_at stays untouched
-    (the password leg of /ui/reauth re-anchors; skipping that here is the loop-class defense)."""
+async def test_assertion_stamps_the_factor_and_re_anchors() -> None:
+    """Vault BACKLOG #2964 item 14 (owner ruling 2026-11-14, ADR 0068 Amendment of that date): the
+    assertion marks the factor and stamps ``reauth_at``, as ``verify_mfa`` does after a good code."""
     from messagefoundry.auth.tokens import hash_token
 
     store = await MessageStore.open(":memory:")
@@ -252,7 +252,7 @@ async def test_assertion_stamps_mfa_only_never_reauth() -> None:
         after = await store.get_session(hash_token(fresh))
         assert after is not None
         assert after.mfa_verified_at is not None
-        assert after.reauth_at is None  # NEVER stamped by the assertion
+        assert after.reauth_at is not None
     finally:
         await store.close()
 
@@ -1269,11 +1269,11 @@ async def test_extra_less_install_raises_legibly(monkeypatch: pytest.MonkeyPatch
 # --- the first-seen sign-in address record (vault BACKLOG #2145) ------------------------------------
 
 
-async def test_a_passkey_assertion_records_its_address_but_does_not_re_anchor() -> None:
+async def test_a_passkey_assertion_records_its_address_and_re_anchors() -> None:
     """The assertion finishes a sign-in that owed a factor, so its address joins the account's
-    known-address record and the next sign-in from it is not reported. It does not move the
-    session's anchor (ADR 0068 decision 1), so the mid-session signal still reports that address.
-    The two signals are independent, and this pins where they part."""
+    known-address record and the next sign-in from it is not reported. It also moves the session's
+    anchor there, as ``verify_mfa`` does (vault BACKLOG #2964 item 14), so the mid-session signal
+    does not report that address and the two signals agree."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
@@ -1295,7 +1295,7 @@ async def test_a_passkey_assertion_records_its_address_but_does_not_re_anchor() 
         assert elevation.ok and elevation.token is not None
 
         assert await store.list_known_login_addresses(uid, since=0.0) == ["10.5.5.6"]
-        assert await service.flag_new_client_ip(elevation.token, "10.5.5.6", path="/ui/x")
+        assert not await service.flag_new_client_ip(elevation.token, "10.5.5.6", path="/ui/x")
 
         async def _rows(action: str) -> int:
             return len(await store.list_audit(actor=ADMIN_USERNAME, action=action))
@@ -1306,6 +1306,135 @@ async def test_a_passkey_assertion_records_its_address_but_does_not_re_anchor() 
         # Neither NEW nor failed open: the second count tells KNOWN apart from an unjudged verdict.
         after = (await _rows("auth.login_new_ip"), await _rows("auth.login_address_unevaluated"))
         assert after == before
+    finally:
+        await store.close()
+
+
+async def _session_after(service: AuthService, token: str) -> tuple[str | None, bool]:
+    """The session's anchor and whether its step-up window is stamped."""
+    from messagefoundry.auth.tokens import hash_token
+
+    row = await service._store.get_session(hash_token(token))
+    assert row is not None
+    return row.client, row.reauth_at is not None
+
+
+async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2964 item 14 (owner ruling 2026-11-14): a passkey proved at the MFA gate from a
+    roamed address leaves the session anchored there with a stamped window, exactly as a TOTP code
+    proved by ``verify_mfa`` does. Each also restarts the new-address dedupe, so an address flagged
+    before the proof is judged afresh after it."""
+    from messagefoundry.auth import totp
+    from tests._totp_clock import pin_totp_clock
+
+    results: dict[str, tuple[str | None, bool]] = {}
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        out = await service.login(ADMIN_USERNAME, password, client="10.7.7.1")
+        assert out.ok and out.mfa_required and out.token is not None
+        assert await _session_after(service, out.token) == ("10.7.7.1", False)
+        assert await service.flag_new_client_ip(out.token, "10.7.7.2", path="/ui/x")
+        options = await service.begin_webauthn_assertion(out.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        passkey = await service.finish_webauthn_assertion(
+            out.token, auth.get_response(challenge), client="10.7.7.2", rp_id=RP, origin=ORIGIN
+        )
+        assert passkey.ok and passkey.token is not None
+        results["passkey"] = await _session_after(service, passkey.token)
+        assert not await service.flag_new_client_ip(passkey.token, "10.7.7.2", path="/ui/x")
+    finally:
+        await store.close()
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        enroll = await service.begin_mfa_enrollment(identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t0), token=token
+        )
+        assert confirmed.ok
+        out = await service.login(ADMIN_USERNAME, password, client="10.7.7.1")
+        assert out.ok and out.mfa_required and out.token is not None
+        assert await _session_after(service, out.token) == ("10.7.7.1", False)
+        assert await service.flag_new_client_ip(out.token, "10.7.7.2", path="/ui/x")
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        code = await service.verify_mfa(
+            out.token, totp.totp(enroll.secret, now=t1), client="10.7.7.2"
+        )
+        assert code.ok and code.token is not None
+        results["code"] = await _session_after(service, code.token)
+        assert not await service.flag_new_client_ip(code.token, "10.7.7.2", path="/ui/x")
+    finally:
+        await store.close()
+
+    assert results["passkey"] == results["code"] == ("10.7.7.2", True)
+
+
+async def test_a_passkey_registration_does_not_re_anchor() -> None:
+    """Control for vault BACKLOG #2964 item 14: enrolment keeps the anchor where it was. ADR 0197
+    Amendment A lets a holder of the password alone enrol, so a registration proves nothing about
+    the address it came from, and the mid-session signal still reports that address."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        _, _, password = await login_admin(service)
+        out = await service.login(ADMIN_USERNAME, password, client="10.8.8.1")
+        assert out.ok and out.identity is not None and out.token is not None
+        anchored, stamped = await _session_after(service, out.token)
+        assert anchored == "10.8.8.1"
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                out.identity, token=out.token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        challenge = base64url_to_bytes(opts["challenge"])
+        elevation = await service.finish_webauthn_registration(
+            out.identity,
+            SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(challenge),
+            label="k",
+            token=out.token,
+            rp_id=RP,
+            origin=ORIGIN,
+            client="10.8.8.2",
+        )
+        assert elevation.ok and elevation.token is not None
+        assert await _session_after(service, elevation.token) == ("10.8.8.1", stamped)
+        assert await service.flag_new_client_ip(elevation.token, "10.8.8.2", path="/ui/x")
+    finally:
+        await store.close()
+
+
+async def test_a_totp_enrolment_confirm_does_not_re_anchor() -> None:
+    """Control for vault BACKLOG #2964 item 14, the TOTP half: confirming an enrolment from a new
+    address leaves the anchor where it was, for the reason the passkey control gives."""
+    from tests._totp_clock import fresh_totp
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        _, _, password = await login_admin(service)
+        out = await service.login(ADMIN_USERNAME, password, client="10.9.9.1")
+        assert out.ok and out.identity is not None and out.token is not None
+        anchored, stamped = await _session_after(service, out.token)
+        assert anchored == "10.9.9.1"
+        enroll = await service.begin_mfa_enrollment(out.identity)
+        elevation = await service.confirm_mfa_enrollment(
+            out.identity, fresh_totp(enroll.secret), token=out.token, client="10.9.9.2"
+        )
+        assert elevation.ok and elevation.token is not None
+        assert await _session_after(service, elevation.token) == ("10.9.9.1", stamped)
+        assert await service.flag_new_client_ip(elevation.token, "10.9.9.2", path="/ui/x")
     finally:
         await store.close()
 

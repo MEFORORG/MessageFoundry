@@ -15138,9 +15138,9 @@ class AuthService:
           OIDC one minted while ``oidc_require_mfa_claim`` is off. Such a sign-in writes nothing
           here, and the factor leg below writes for it;
         * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``),
-          once the session has rotated, whether it finishes a sign-in or a step-up. Only
-          ``verify_mfa`` also moves the session's anchor (see :meth:`_same_host`), and not on an
-          OIDC session, whose anchor moves only at the IdP (BACKLOG #2142);
+          once the session has rotated, whether it finishes a sign-in or a step-up. Both also move
+          the session's anchor (see :meth:`_same_host`), but not on an OIDC session, whose anchor
+          moves only at the IdP (BACKLOG #2142);
         * a factor enrolment confirmed, first or later (``confirm_mfa_enrollment``,
           ``finish_webauthn_registration``); a first one is how a first sign-in under
           ``require_mfa`` finishes. Those callers pass the account as ``enrolment``, and an address
@@ -18146,10 +18146,10 @@ class AuthService:
         origin: str,
     ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
-        factor satisfied and re-key the session (ASVS 7.2.4) — **`mfa_verified` ONLY** (ADR 0068
-        decision 1: ``reauth_at`` + the WP-L3-13 client re-anchor come from the password leg of
-        ``POST /ui/reauth``, never from the assertion — the loop-class defense). Returns a
-        not-``ok`` :class:`Elevation` (never raises) for any invalid input, always audited.
+        factor satisfied, re-anchor it as :meth:`verify_mfa` does (``reauth_at`` and the WP-L3-13
+        client, not on an ``oidc`` session; vault BACKLOG #2964 item 14, owner ruling 2026-11-14,
+        ADR 0068 Amendment of that date) and re-key the session (ASVS 7.2.4). Returns a not-``ok``
+        :class:`Elevation` (never raises) for any invalid input, always audited.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
         what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
@@ -18317,6 +18317,16 @@ class AuthService:
                 await self._store.mark_session_mfa_verified(hash_token(token))
             if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
                 return Elevation(session_lost=True)
+            # Vault BACKLOG #2964 item 14 (owner ruling 2026-11-14): re-anchor the session to the
+            # address that proved the passkey, as verify_mfa does after a good code, so the two
+            # address signals agree. Not on an oidc session, whose anchor moves only at the IdP
+            # (BACKLOG #2142); tests/test_docs_security_pathways.py pins the branch.
+            if session.auth_mechanism != SessionMechanism.OIDC.value:
+                async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
+                    await self._store.mark_session_reauthed(hash_token(token), client=client)
+                if reauth_stamp.refused:  # BACKLOG #2592: as above, the session has been ended
+                    return Elevation(session_lost=True)
+                self._restart_new_ip_dedupe(hash_token(token))
             # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
             # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
             # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,

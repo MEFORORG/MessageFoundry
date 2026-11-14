@@ -752,3 +752,17 @@ decisions of this ADR change; the rest stand.
 **Who decided.** The design is ADR 0197 Amendment A, option N-G, accepted by the batch 121 Manager
 on 2026-09-28 under the owner's "No, fix it" ruling; it is not itself an owner ruling. This
 amendment records the build (BACKLOG #3373).
+
+## Amendment (2026-11-14) -- a passkey assertion re-anchors the session (vault BACKLOG #2964 item 14)
+
+Decision 1 said the assertion stamps `mfa_verified_at` only, and that `reauth_at` and the WP-L3-13
+re-anchor come from the password leg of `POST /ui/reauth`. That no longer holds.
+`finish_webauthn_assertion` now calls `mark_session_reauthed(client)` after a verified assertion,
+as `verify_mfa` does after a good code, and not on an `oidc` session (BACKLOG #2142). So the
+session's anchor and the account's known-address record agree after a passkey, and the assertion
+opens the step-up window, as a code does. An action-bound grant (ADR 0077) still comes only from the
+password, directory or IdP leg. Enrolment, TOTP confirm and passkey registration alike, still does
+not re-anchor: ADR 0197 Amendment A lets a holder of the password alone enrol.
+
+**Who decided.** The owner, 2026-11-14, answering "#2964 item 14 ... Which do you want?" with
+"Assertion only".

@@ -2173,9 +2173,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     # ADR 0068 decision 6: the browser passkey leg of step-up. A cookie-authed JSON POST
     # (the sanctioned /ui carve — the cookie stays confined to /ui deps; bearer_token()
-    # is untouched) that verifies an assertion and stamps the session's MFA leg ONLY —
-    # the operator still submits POST /ui/reauth (password) for reauth_at + the WP-L3-13
-    # client re-anchor. NOT registered as a continuation (body-carrying JSON — part of the
+    # is untouched) that verifies an assertion, marks the session's factor and, as a TOTP
+    # code does, re-anchors it (vault BACKLOG #2964 item 14; not an oidc session). An
+    # action-bound grant still comes only from the POST /ui/reauth password leg (ADR 0077).
+    # NOT registered as a continuation (body-carrying JSON — part of the
     # step-up mechanism itself). MFA-pending sessions pass (the assertion IS the proof);
     # must-change confinement is mirrored manually like /ui/mfa's, NOT like both /ui/reauth
     # handlers: a must-change session that still owes its factor must pass. For a passkey-only

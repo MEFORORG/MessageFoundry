@@ -677,7 +677,7 @@ def test_the_per_session_cap_is_the_value_security_md_states() -> None:
 
 
 async def test_a_rotation_without_a_reverification_keeps_the_dedupe() -> None:
-    """A rotation that proves nothing (a passkey assertion, an enrolment confirm) leaves
+    """A rotation that proves nothing (an enrolment confirm) leaves
     ``reauth_at`` alone, so the epoch and its flags carry across to the new token."""
     store = await MessageStore.open(":memory:")
     try:

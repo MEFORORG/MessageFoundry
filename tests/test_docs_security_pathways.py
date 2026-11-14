@@ -1025,8 +1025,9 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     assert _called(verify, "mark_session_reauthed"), (
         "verify_mfa no longer stamps reauth_at; the step-up paragraph says a TOTP opens a window."
     )
-    assert not _called(assertion, "mark_session_reauthed"), (
-        "a passkey assertion now stamps reauth_at; the doc says it marks the factor only."
+    assert _called(assertion, "mark_session_reauthed"), (
+        "a passkey assertion no longer stamps reauth_at; the step-up paragraph says it does, as a "
+        "code does (vault BACKLOG #2964 item 14)."
     )
     assert not _called(verify, "mfa_satisfied") and not any(
         isinstance(n, ast.Attribute) and n.attr == "mfa_verified_at" for n in ast.walk(verify)
@@ -1119,26 +1120,29 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     # BACKLOG #2142: verify_mfa stamps only under a branch on the session's mechanism, refuses a
     # satisfied oidc session's code through one helper (so the "asks nothing" pin above still holds
     # for every other session), and the paragraph says both.
-    guarded = [
-        n
-        for n in ast.walk(verify)
-        if isinstance(n, ast.If)
-        and any(
-            isinstance(a, ast.Attribute) and a.attr == "auth_mechanism" for a in ast.walk(n.test)
+    # Vault BACKLOG #2964 item 14: the passkey assertion stamps under the same branch.
+    for name, leg in (("verify_mfa", verify), ("finish_webauthn_assertion", assertion)):
+        guarded = [
+            n
+            for n in ast.walk(leg)
+            if isinstance(n, ast.If)
+            and any(
+                isinstance(a, ast.Attribute) and a.attr == "auth_mechanism"
+                for a in ast.walk(n.test)
+            )
+            and any(_called(stmt, "mark_session_reauthed") for stmt in ast.walk(n))
+        ]
+        unguarded = [
+            stmt
+            for stmt in ast.walk(leg)
+            if isinstance(stmt, ast.Expr)
+            and _called(stmt, "mark_session_reauthed")
+            and not any(stmt in ast.walk(g) for g in guarded)
+        ]
+        assert guarded and not unguarded, (
+            f"{name} stamps reauth_at outside its auth_mechanism branch; the doc says an oidc "
+            "session's factor opens no window."
         )
-        and any(_called(stmt, "mark_session_reauthed") for stmt in n.body)
-    ]
-    unguarded = [
-        stmt
-        for stmt in ast.walk(verify)
-        if isinstance(stmt, ast.Expr)
-        and _called(stmt, "mark_session_reauthed")
-        and not any(stmt in ast.walk(g) for g in guarded)
-    ]
-    assert guarded and not unguarded, (
-        "verify_mfa stamps reauth_at outside its auth_mechanism branch; the doc says an oidc code "
-        "opens no window."
-    )
     assert _called(verify, "_code_owes_nothing_to_oidc_session"), (
         "verify_mfa no longer refuses a satisfied oidc session's code; the doc says it does."
     )
@@ -1932,12 +1936,12 @@ def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -
         "6.8.4 fallback says no directory sign-in opens the step-up window."
     )
     # The AD re-bind and the IdP step-up stamp the window and never mark the second factor; the
-    # passkey marks the factor and never stamps the window. Controls: the TOTP leg does both.
+    # TOTP leg and, since vault BACKLOG #2964 item 14, the passkey do both.
     for func in (AuthService.reauth, AuthService.complete_oidc_step_up):
         assert _calls_method(func, "mark_session_reauthed"), func.__name__
         assert not _calls_method(func, "mark_session_mfa_verified"), func.__name__
     assert _calls_method(AuthService.finish_webauthn_assertion, "mark_session_mfa_verified")
-    assert not _calls_method(AuthService.finish_webauthn_assertion, "mark_session_reauthed")
+    assert _calls_method(AuthService.finish_webauthn_assertion, "mark_session_reauthed")
     assert _calls_method(AuthService.verify_mfa, "mark_session_mfa_verified")
     assert _calls_method(AuthService.verify_mfa, "mark_session_reauthed")
     # The passkey is not relied on for user verification: asked for at PREFERRED, never required.

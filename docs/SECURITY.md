@@ -3474,26 +3474,25 @@ can pass a different answer.
 **A session minted with no window can still get one before its first sensitive action.** The
 step-up stamps it, and so does a TOTP or recovery code proved at the MFA gate (`POST /ui/mfa` or
 `POST /auth/mfa-verify`), because `verify_mfa` calls `mark_session_reauthed` on every session but an
-`oidc` one. So a Windows SSO session whose holder answers the MFA gate with a code passes the window
-check for `step_up_max_age_seconds` with no further challenge. **An `oidc` session's code opens no
+`oidc` one. A passkey assertion (`POST /ui/reauth/webauthn`) does the same, since vault BACKLOG #2964
+item 14 (owner ruling 2026-11-14). So a Windows SSO session whose holder answers the MFA gate with a
+code or a passkey passes the window check for `step_up_max_age_seconds` with no further challenge. **An `oidc` session's code opens no
 window** (BACKLOG #2142, ADR 0142 Amendment F; a seat decision under owner delegation 2026-10-08, not
 an owner ruling). The code still meets a pending factor and re-keys the session, but the window opens
 only at the IdP. An action-bound route still asks while
 `[auth].require_action_step_up` is on (the default), because its single-use grant comes only from the
 step-up itself (see the Action-bound step-up grant row). A Windows SSO session's first
-window-gated action does force a step-up when it met the gate another way: owing no factor, or
-proving a passkey. That holds until its holder submits a code to the MFA gate, which an account
+window-gated action does force a step-up when it met the gate by owing no factor. That holds
+until its holder submits a code to the MFA gate, which an account
 holding a TOTP can do at any time the second-step lock is not live and, for a directory account, the
 directory confirms it (below). An `oidc` session's first window-gated action always forces the IdP
-step-up. A passkey assertion
-(`POST /ui/reauth/webauthn`) marks the factor only and stamps no window (ADR 0068 decision 1), so a
-passkey-only session still owes the password leg of `/ui/reauth`, or the IdP leg if it is an `oidc`
-session.
+step-up. A passkey assertion on an `oidc` session marks the factor and stamps no window, so that
+session still owes the IdP leg.
 `reauth_at` is refreshed by **`POST /me/reauth`** and the console's `POST /ui/reauth`, and for an
 `oidc` session by the **IdP step-up leg** (`POST /ui/reauth/oidc`, then the IdP's return to
 `GET /ui/oidc/callback`, which runs `complete_oidc_step_up`). So a session only needs to re-verify
 once its window lapses. **On any session but an `oidc` one, a TOTP or recovery code refreshes it
-too, at any time the second-step lock is not live**
+too, and so does a passkey assertion, at any time the second-step lock is not live**
 (a directory account also needs the directory to confirm it, next paragraph):
 neither `POST /auth/mfa-verify` nor `POST /ui/mfa` asks whether the session already met its factor, so
 an account holding a TOTP can renew its window with a code alone, with no password or directory
@@ -4482,12 +4481,11 @@ alone:
    dual-stack box never spuriously fires). An IPv4-mapped form such as `::ffff:10.0.0.5` compares
    as its IPv4 address, as the sign-in signal's does. The two signals share that folding and no
    baseline. This one compares a request with the address its session was last anchored at; the
-   sign-in signal compares a sign-in with the account's known-address record. A passkey proved
-   at the MFA gate or in a step-up adds its address to the record. A factor enrolment adds it when
-   the address is already known or the account has no baseline yet. Neither moves the anchor. A
-   passkey never re-anchors (ADR 0068 decision 1), and an enrolment proves a new authenticator, not
-   a credential already held. A TOTP or recovery code on an `oidc` session also records its address
-   and leaves the anchor where it was (BACKLOG #2142). So an address can be known to the sign-in signal and still new to
+   sign-in signal compares a sign-in with the account's known-address record. A factor enrolment
+   adds its address when the address is already known or the account has no baseline yet, and
+   does not move the anchor: an enrolment proves a new authenticator, not a credential already
+   held. A TOTP or recovery code or a passkey on an `oidc` session records its address and leaves
+   the anchor where it was (BACKLOG #2142). So an address can be known to the sign-in signal and still new to
    this one, which then asks for a step-up there. Turning it off is a named loosening
    ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)).
 
@@ -6856,7 +6854,7 @@ enrolment sentences against `AuthService.confirm_mfa_enrollment` and
 |---|---|---|---|
 | **Local password** | No outside provider. The engine checks the password itself, so it knows what it checked | Mints the session MFA-verified only when the sign-in owes no second factor, or when a combined sign-in proved a TOTP code or a passkey assertion in the same request. Otherwise the session is MFA-pending. At sign-in, the step-up window opens only in two cases. One is a sign-in that owes no factor and is not from a first-seen address. The other is a combined sign-in | `AuthService._login_local`: `mfa_verified=not mfa_required` and its `seed_reauth` expression |
 | **Engine TOTP or recovery code** | No outside provider. The engine checks the code itself | A good code marks the session's second factor and stamps the step-up window. Since BACKLOG #2142 it stamps no window on an `oidc` session, whose window opens only at the IdP. A directory account gets there only after the directory confirms the account (BACKLOG #2023). Confirming a TOTP enrolment also marks the factor, and for a directory account the engine asks the directory there too, before it checks the code (BACKLOG #3061) | `AuthService.verify_mfa`; `AuthService.confirm_mfa_enrollment` |
-| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. It marks the second factor and stamps no step-up window. For a directory account, the engine asks the directory before it marks the factor (BACKLOG #2239); [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) states when and what it refuses. Registering a passkey also marks the factor, and for a directory account the engine asks the directory there too, before it takes the challenge (BACKLOG #3061); the step-up window also gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion`; `AuthService.finish_webauthn_registration` |
+| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. It marks the second factor and, as a TOTP code does, stamps the step-up window, except on an `oidc` session (vault BACKLOG #2964 item 14). For a directory account, the engine asks the directory before it marks the factor (BACKLOG #2239); [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) states when and what it refuses. Registering a passkey also marks the factor, and for a directory account the engine asks the directory there too, before it takes the challenge (BACKLOG #3061); the step-up window also gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion`; `AuthService.finish_webauthn_registration` |
 | **Kerberos / SPNEGO** | A service ticket. It carries no factor-strength or sign-in-time value that `pyspnego` surfaces | One factor and no recent sign-in. The session is minted `mfa_verified=False`, with no step-up window. While `[security].require_mfa` is on (the default), such a directory session owes an engine factor whatever `require_mfa_scope` says | `AuthService._authenticate_kerberos`; `AuthService._complete_ad_login`, where `seed_reauth=False` is a constant; `AuthService._unverified_session_owes_factor` |
 | **AD bind, step-up only** | Whether the bind as the user succeeded. Nothing about the directory's own MFA | Not a sign-in since BACKLOG #1137. It re-proves the password behind a Kerberos session and stamps the step-up window. It grants no second factor: `reauth` stamps the window and never marks the factor. The directory's MFA is not delegated (BACKLOG #1144) | `AuthService.reauth` |
 | **OIDC sign-in, recency** | `auth_time` in the signed `id_token`. The engine asks for it by sending `max_age` on every authorization request | Refused, with no time assumed. A missing `auth_time` fails as `auth_time_missing`, and one older than `[auth].oidc_max_age_seconds` as `auth_time_stale`. An accepted session also ends at `auth_time + oidc_max_age_seconds` when that is sooner than its other caps | `_check_auth_time` in `auth/oidc/claims.py`; `AuthService._authenticate_oidc` |
