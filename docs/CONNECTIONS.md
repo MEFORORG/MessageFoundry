@@ -2956,12 +2956,11 @@ else, such as a DOCTYPE or a lowercase `<![cdata[`; and a `</` inside such marku
 those shapes, for a first child that is neither element (a SOAP 1.1 `faultstring` before the
 `faultcode`, a SOAP 1.2 `Reason` before the `Code`), or for a code element that holds no code, the
 code falls back to the earlier search's rule, from the Fault start tag to the first `</Fault>`
-after it: a `Value` ahead of the Fault's first `faultcode`, else that `faultcode`. Like the earlier
+after it, or the reply's end: the first `Value` ahead of the Fault's first `faultcode`, else that `faultcode`. Like the earlier
 search, the fallback steps over no markup: a `faultcode` or `Value` inside a comment counts, and a
-`</Fault>` inside one ends its range. So where the first child is not the code element, a
-`</soap:Fault>` inside a comment ahead of the `faultcode`
-(`<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>`)
-leaves no code and dead-letters. A Fault start tag inside terminated markup is stepped over when
+`</Fault>` inside one ends its range. For example,
+`<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>`
+reads no code and dead-letters, as the earlier search read it. A Fault start tag inside terminated markup is stepped over when
 the Fault is chosen, and a `</Fault>` or `</Code>` inside terminated markup does not end the
 first-child read, except where the Fault was itself taken from inside markup; only where every Fault start tag after the first Body start tag,
 or with none there every one, is inside such markup is the first of them taken as the Fault, so such

@@ -486,6 +486,23 @@ def test_with_no_first_child_code_the_fallback_reads_as_before(body: str) -> Non
         assert _outcome(_classify_soap(200, body)) == "soap-fault"
 
 
+def test_a_commented_fault_close_ends_the_fallback_range() -> None:
+    """The PR 2936 hold of 2026-11-14 (head 8c5a940a17): the shape the #5912 changelog and
+    CONNECTIONS.md name. The first child is a faultstring, so the fallback reads the code, and its
+    range ends at the commented Fault close tag, as main's did: no code, a permanent fault.
+    Control: without the comment the same reply reads the Server code and retries."""
+    body = (
+        "<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> -->"
+        "<faultcode>soap:Server</faultcode></soap:Fault>"
+    )
+    assert _fault_code(body) == "" == _ref_fault_code(body) == _pr2790_fault_code(body)
+    assert _outcome(_classify_soap(200, body)) == "soap-fault"
+    assert _outcome(_classify_soap(500, body)) == "soap-fault"
+    plain = body.replace("<!-- </soap:Fault> -->", "")
+    assert _fault_code(plain) == "soap:Server"
+    assert _outcome(_classify_soap(200, plain)) == "transient"
+
+
 #: BACKLOG #5912: where the first child holds the code, a Value outside the Code, here inside markup
 #: ahead of it, does not decide the fault, though the PR 2790 reading took it.
 _VALUE_IN_MARKUP_BEFORE_THE_CODE = {

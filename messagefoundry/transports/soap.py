@@ -159,8 +159,8 @@ _WSSE_FAULT_RE = re.compile(
 # and for a Code the Value that is its own first child, up to its close tag (_CODE_END_RE);
 # _fault_code says why, and when it falls back to the earlier search (_searched_code). For the
 # first-child read the Fault and Code close tags are searched for outside markup, with
-# _FAULT_END_OUTSIDE_MARKUP_RE and _CODE_END_OUTSIDE_MARKUP_RE, which hold these two patterns; the
-# fallback's range ends at the first plain _FAULT_END_RE match, markup not stepped over.
+# _FAULT_END_OUTSIDE_MARKUP_RE and _CODE_END_OUTSIDE_MARKUP_RE, which hold _FAULT_END_RE and
+# _CODE_END_RE; the fallback's range ends at the first plain _FAULT_END_RE match, markup not stepped over.
 _FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
 _CODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])", re.IGNORECASE)
 _CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
@@ -341,11 +341,13 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     Where the first-child read yields no code, because the first child is neither element, it
     cannot hold a code, or a ``<!`` the read does not step over (a DOCTYPE, a lowercase
     ``<![cdata[``, an unterminated comment) stops it, the code falls back to the earlier search
-    (:func:`_searched_code`), over the range that search read: from the Fault start tag to the
-    first Fault close tag, markup not stepped over. So, where :func:`_find_fault` takes the Fault
-    start tag the code before #5912 took, such a reply reads as it did then. A
-    Receiver fault the first-child read cannot place, after a SOAP 1.1 ``faultstring`` or a SOAP 1.2
-    ``Reason`` say, is retried rather than dead-lettered; and, as before #5912, a ``Value`` ahead of
+    (:func:`_searched_code`), by that search's rule for its range: from the Fault start tag
+    :func:`_find_fault` took to the first plain Fault close tag, or the reply's end, markup not
+    stepped over. So, where :func:`_find_fault` takes the Fault start tag the code before #5912
+    took, such a reply reads as it did then. A plain Receiver code the first-child read cannot
+    place, after a SOAP 1.1 ``faultstring`` or a SOAP 1.2 ``Reason`` say, is read and retried, unless
+    a Fault close tag inside a comment ahead of it ends the range first, when the fault reads no
+    code and dead-letters; and, as before #5912, a ``Value`` ahead of
     the code element, or after a code element that holds no code, decides the class there, so a
     Sender fault of such a shape may read as a Receiver one and retry. Only where both reads find nothing is
     the code ``""``, which :func:`_classify_soap` reads as a permanent fault, never as delivered.
@@ -363,7 +365,7 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     code = _first_child_code(body, gt + 1, end)
     if code:
         return code
-    # The earlier search's own range, so the fallback reads no more than it did.
+    # The earlier search's rule for its range's end: the first plain Fault close tag.
     plain_end = _FAULT_END_RE.search(body, start)
     return _searched_code(body, start, len(body) if plain_end is None else plain_end.start())
 
@@ -391,7 +393,8 @@ def _first_child_code(body: str, start: int, end: int) -> str:
 
 def _searched_code(body: str, start: int, end: int) -> str:
     """The code the earlier search finds in ``body[start:end]``, or ``""``: :func:`_fault_code`'s
-    fallback, the search the code ran before BACKLOG #5912, given that search's range. The first ``faultcode`` or ``Value`` start tag
+    fallback, the search the code ran before BACKLOG #5912, over a range that ends where that
+    search's did, at the first plain Fault close tag. The first ``faultcode`` or ``Value`` start tag
     there is the code element, a ``Value`` taken only before the first ``faultcode``, and only that
     first tag is read: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may
     carry an element of the other name. Markup is not stepped over, as it was not before."""
