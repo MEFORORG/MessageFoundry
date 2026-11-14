@@ -3319,7 +3319,7 @@ class MLLPSource(SourceConnector):
                         # per-connection task die silently or leak detail. Log redacted; drop the conn.
                         # A HANDLER fault no longer lands here: the inner arm above answers it
                         # (BACKLOG #1619). What still does includes a reply the listener's
-                        # encoding cannot carry.
+                        # encoding cannot carry and cannot replace characters in (BACKLOG #5799).
                         peer = writer.get_extra_info("peername")
                         logger.error(
                             "MLLP connection from %s failed unexpectedly: %s", peer, safe_exc(exc)

@@ -640,6 +640,26 @@ def test_frame_reply_still_raises_when_a_usable_charset_cannot_hold_the_reply() 
         frame_reply(MLLP_CODEC, "a" * 64, "idna", connection="IB_IDNA")
 
 
+@pytest.mark.parametrize("encoding", ["ascii", "latin-1", "cp1252"])
+def test_frame_reply_replaces_what_a_narrow_charset_cannot_hold(
+    encoding: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5799: the listener replies after the commit, so a raise here closed the connection
+    unanswered and the sender resent a message already stored. The reply now stays in its declared
+    charset with each character it cannot hold replaced, and is sent. Mutation: re-raise the
+    UnicodeEncodeError in frame_reply. Red: the call raises."""
+    reply = MSH + CR + "MSA|AA|CTRL1|中文" + CR
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.framing"):
+        wire = frame_reply(MLLP_CODEC, reply, encoding, connection="IB_NARROW_ADT")
+    assert _frames(MLLP_CODEC, wire) == [(MSH + CR + "MSA|AA|CTRL1|??" + CR).encode(encoding)]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "IB_NARROW_ADT" in warnings[0] and "replaced" in warnings[0]
+    # Neither the reply nor the setting reaches the log, and this is not the utf-8 fallback.
+    assert "CTRL1" not in warnings[0] and encoding not in warnings[0]
+    assert "utf-8" not in warnings[0]
+
+
 @pytest.mark.parametrize("declared", [b"latin-1", 8859])
 def test_a_listener_resolves_a_non_str_encoding_as_the_decode_does(declared: object) -> None:
     """BACKLOG #2431: a non-str name used to reach ``str.encode`` and raise ``TypeError``, so the AE

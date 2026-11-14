@@ -149,15 +149,20 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     For the same reason a reply whose charset NAME is unusable is sent in ``utf-8`` instead: a name
     that names no text codec, or one that refuses every conversion, would otherwise leave the ``AE``
     the runner built for exactly that misconfiguration unsent (BACKLOG #2431). A usable charset that
-    cannot hold one reply's characters still raises, which the listener's last-resort arm owns.
-    Usable is decided by probing the NAME, as ``decode_body`` decides it: a usable codec such as
-    ``idna`` can raise a bare ``UnicodeError`` for one reply, which still raises here.
-    ``connection`` names the listener in the warning the fallback logs, once per connection. The
-    charset setting itself is not logged, since it is configuration that may hold anything."""
+    cannot hold one reply's characters is not that misconfiguration, so the reply is not moved to
+    ``utf-8``: it stays in the declared charset, and each character the charset cannot hold becomes
+    the codec's replacement character, for the same reason a frame byte becomes a space (BACKLOG
+    #5799). Before, that reply raised to the listener's last-resort arm, which closed the connection
+    unanswered, so the sender resent a message already stored. A codec that cannot replace, such as
+    ``idna``, still raises its own error. Usable is decided by probing the NAME, as ``decode_body``
+    decides it: a usable codec can also raise a bare ``UnicodeError`` for one reply, which still
+    raises here. ``connection`` names the listener in the warning each fallback logs: the utf-8 one
+    once per connection, the replacement one per reply. The charset setting and the reply are never
+    logged: the setting is configuration that may hold anything, and the reply echoes the message."""
     try:
         body = reply.encode(encoding)
     except UnicodeEncodeError:
-        raise
+        body = _encode_replacing(reply, encoding, connection)
     except (LookupError, UnicodeError):
         if _is_text_codec(encoding):
             raise
@@ -175,3 +180,16 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
         )
     # The replacement is the leaf's rule, shared with the test harness's ACK writers.
     return codec.frame(codec.neutralise(body))
+
+
+def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
+    """``reply`` in ``encoding`` with each character the charset cannot hold replaced, for
+    :func:`frame_reply`. A codec that refuses the ``replace`` handler raises its own error, as the
+    strict encode did. The warning names the connection, never the reply or the setting."""
+    body = reply.encode(encoding, errors="replace")
+    logger.warning(
+        "inbound %r: the reply held characters its charset cannot encode; each was replaced "
+        "before framing",
+        connection,
+    )
+    return body
