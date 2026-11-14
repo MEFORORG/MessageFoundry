@@ -180,16 +180,25 @@ export function postToWebview(
   return webview.postMessage({ ...message, [CHANNEL_FIELD]: token });
 }
 
-/** The channel token of the webview's current render, or undefined before its first. */
-export function channelToken(webview: WebviewTarget): string | undefined {
-  return openTokens.get(webview);
+/**
+ * The render a page's request names: the channel token the page put in it, under
+ * {@link CHANNEL_FIELD}, or undefined when it names none. The page sends its own token because the
+ * one current when the host handles the request may already belong to a newer render (BACKLOG
+ * #5565). It authenticates nothing: it only addresses the reply.
+ */
+export function requestToken(message: unknown): string | undefined {
+  if (message === null || typeof message !== "object") {
+    return undefined;
+  }
+  const token = (message as Record<string, unknown>)[CHANNEL_FIELD];
+  return typeof token === "string" ? token : undefined;
 }
 
 /**
  * {@link postToWebview} for a reply computed across an `await`: it posts only while the render that
- * asked, named by the token {@link channelToken} gave when the request arrived, is still the one
- * showing. postToWebview stamps whatever token is current, so without this a reply that outlived a
- * re-render reached the NEW document as though addressed to it (BACKLOG #5565: a connection
+ * asked, named by {@link requestToken}, is still the one showing. postToWebview stamps whatever
+ * token is current, so without this a reply that outlived a re-render, or a request handled only
+ * after one, reached the NEW document as though addressed to it (BACKLOG #5565: a connection
  * editor's field rebuild for connection A drawn over connection B). Returns undefined when dropped.
  */
 export function postToSameRender(

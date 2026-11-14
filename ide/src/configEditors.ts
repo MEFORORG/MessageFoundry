@@ -15,7 +15,7 @@
 // a text view.
 import * as vscode from "vscode";
 import { configDir, runJson, serviceConfig, serviceConfigIsSet, workspaceDir } from "./cli";
-import { channelToken, postToSameRender, postToWebview } from "./webviewMessaging";
+import { postToSameRender, postToWebview, requestToken } from "./webviewMessaging";
 import { connectionFormHtml, formSchemaFor } from "./connectionEditor";
 import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
 import { connectionRemoveArgs, connectionServiceConfig, connectionUpsertArgs } from "./connectionWizardModel";
@@ -181,9 +181,9 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           // The form's transport or direction changed. Rebuild the descriptors here, as
           // connectionEditor.ts does: the edit form draws the schema-driven fields too (BACKLOG
           // #5565), and without an answer it kept the previous transport's fields.
-          // A select or an external edit can re-render the panel while this awaits; the reply is
-          // then for a page that no longer exists, and is dropped (postToSameRender).
-          const asked = channelToken(panel.webview);
+          // A select or an external edit can re-render the panel before or while this runs; the
+          // reply is then for a page that no longer exists, and is dropped (postToSameRender).
+          const asked = requestToken(m);
           const rebuilt = await formSchemaFor(ws, m.transport, m.direction, m.settings ?? {});
           if (rebuilt) {
             void postToSameRender(panel.webview, asked, { command: "fields", groups: rebuilt.groups });

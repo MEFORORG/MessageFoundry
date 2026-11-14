@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
 
 import { buildForm, type ConnectionSchema, type SchemaParam } from "../../connectionForm";
 import { connectionEditorScript } from "../../connectionEditorWebview";
-import { CHANNEL_FIELD, channelToken, openChannel, postToSameRender } from "../../webviewMessaging";
+import { CHANNEL_FIELD, openChannel, postToSameRender, requestToken } from "../../webviewMessaging";
 
 // BACKLOG #5565. Editing or cloning a connection drew the settings as legacy free-text rows from the
 // raw record, even when the engine had described itself. So an inline credential showed in a
@@ -77,6 +79,7 @@ const SCHEMA: ConnectionSchema = {
         // Applies inbound only: on this outbound record it is drawn off-direction.
         listen_secret: param({ secret: true, direction: "inbound" }),
         poll_statement: param({}),
+        keepalive: param({ type: "bool", default: false }),
       },
     },
     file: {
@@ -113,6 +116,8 @@ const RECORD = {
     listen_secret: OFFDIR_VALUE,
     // A text input strips line breaks from what it is given; an untouched save must keep them.
     poll_statement: "-- new rows\nSELECT id, payload\nFROM mf_inbox",
+    // A recorded bool: a checkbox has no empty state, so only a remove control can drop the key.
+    keepalive: true,
   },
 };
 
@@ -316,19 +321,110 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.strictEqual(settings.listen_secret, OFFDIR_VALUE, "the off-direction secret survives");
     assert.deepStrictEqual(settings.db_password, RECORD.settings.db_password, "the env default survives");
   });
+
+  test("edit: a recorded setting can be removed, a bool included, and kept again", () => {
+    const p = load({ groups });
+    const doc = p.window.document;
+    for (const key of ["keepalive", "port"]) {
+      const remove = doc.querySelector(`#settings [data-remove-key="${key}"]`);
+      assert.ok(remove, `no way to remove the recorded ${key}`);
+      remove.click();
+    }
+    const settings = saved(p, false);
+    assert.ok(!("keepalive" in settings), "a removed bool must not be written back");
+    assert.ok(!("port" in settings), "a removed setting must not be written back");
+    assert.strictEqual(settings.facility, "0042", "removing one setting keeps the others");
+    // The toggle undoes it.
+    const q = load({ groups });
+    const button = q.window.document.querySelector('#settings [data-remove-key="keepalive"]');
+    button.click();
+    button.click();
+    assert.strictEqual(saved(q, false).keepalive, true);
+  });
+
+  test("edit: a literal can be switched to env(), with the cast its type needs", () => {
+    const p = load({ groups });
+    const doc = p.window.document;
+    const toggle = doc.querySelector('#settings [data-env-toggle="port"]');
+    assert.ok(toggle, "no way to switch port to an environment reference");
+    toggle.checked = true;
+    toggle.dispatchEvent(new p.window.Event("change"));
+    const box = doc.querySelector('#settings [data-key="port"]');
+    assert.strictEqual(box.dataset.env, "1", "the control is not an env-key box");
+    assert.strictEqual(box.value, "", "the literal is not offered as an env key");
+    box.value = "MLLP_PORT";
+    assert.deepStrictEqual(saved(p, false).port, { env: "MLLP_PORT", cast: "int" });
+  });
+
+  test("edit: an env() reference can be switched to a literal, and back unchanged", () => {
+    const p = load({ groups });
+    const doc = p.window.document;
+    const flip = (on: boolean): void => {
+      const toggle = doc.querySelector('#settings [data-env-toggle="host"]');
+      assert.ok(toggle, "no way to switch host between env() and a literal");
+      toggle.checked = on;
+      toggle.dispatchEvent(new p.window.Event("change"));
+    };
+    flip(false);
+    const box = doc.querySelector('#settings [data-key="host"]');
+    assert.notStrictEqual(box.dataset.env, "1", "the control is still an env-key box");
+    box.value = "peer.example.test";
+    assert.strictEqual(saved(p, false).host, "peer.example.test");
+    // Switching back restores the recorded reference, its default included.
+    const q = load({ groups });
+    const qDoc = q.window.document;
+    for (const on of [false, true]) {
+      const toggle = qDoc.querySelector('#settings [data-env-toggle="host"]');
+      toggle.checked = on;
+      toggle.dispatchEvent(new q.window.Event("change"));
+    }
+    assert.deepStrictEqual(saved(q, false).host, RECORD.settings.host);
+  });
+
+  test("edit: a secret has no literal switch, so the form cannot write a new inline credential", () => {
+    const p = load({ groups });
+    const doc = p.window.document;
+    for (const key of ["tls_key_password", "db_password", "listen_secret"]) {
+      assert.strictEqual(doc.querySelector(`#settings [data-env-toggle="${key}"]`), null, key);
+    }
+  });
+
+  test("the fields request carries the token of the page that sent it", () => {
+    const p = load({ groups });
+    const transport = p.window.document.getElementById("transport");
+    transport.value = "file";
+    transport.dispatchEvent(new p.window.Event("change"));
+    const asked = p.posted.filter((m) => m.command === "fields");
+    assert.strictEqual(asked.length, 1);
+    assert.strictEqual(asked[0][CHANNEL_FIELD], TOKEN, "the request does not name its render");
+  });
 });
 
 suite("webviewMessaging.postToSameRender (BACKLOG #5565)", () => {
-  test("a reply computed across a re-render is dropped; one for the same render goes out", () => {
+  test("a reply to a request from a replaced render is dropped, even if handled after the re-render", () => {
     const sent: Payload[] = [];
     const webview = { postMessage: (m: Payload) => Promise.resolve(sent.push(m) > 0) };
-    openChannel(webview);
-    const asked = channelToken(webview);
-    assert.notStrictEqual(postToSameRender(webview, asked, { command: "fields" }), undefined);
-    openChannel(webview); // the panel re-rendered while the reply was being computed
-    assert.strictEqual(postToSameRender(webview, asked, { command: "fields" }), undefined);
+    const first = openChannel(webview).token;
+    const request = { command: "fields", [CHANNEL_FIELD]: first };
+    // The panel re-renders BEFORE the host handles the old page's request.
+    const second = openChannel(webview).token;
+    assert.strictEqual(postToSameRender(webview, requestToken(request), { command: "fields" }), undefined);
+    // A request from the current page is answered, stamped with its token.
+    const current = { command: "fields", [CHANNEL_FIELD]: second };
+    assert.notStrictEqual(postToSameRender(webview, requestToken(current), { command: "fields" }), undefined);
     assert.strictEqual(sent.length, 1);
-    assert.strictEqual(sent[0][CHANNEL_FIELD], asked);
+    assert.strictEqual(sent[0][CHANNEL_FIELD], second);
+    // A request that names no render is never answered.
+    assert.strictEqual(requestToken({ command: "fields" }), undefined);
+    assert.strictEqual(requestToken({ command: "fields", [CHANNEL_FIELD]: 7 }), undefined);
+  });
+
+  test("both hosts answer the render the request names, not the one current when it arrives", () => {
+    for (const file of ["connectionEditor.ts", "configEditors.ts"]) {
+      const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", file), "utf8");
+      assert.ok(/const asked = requestToken\(m\);/.test(src), `${file} does not read the request's token`);
+      assert.ok(!/channelToken\(/.test(src), `${file} still reads the token current on arrival`);
+    }
   });
 });
 

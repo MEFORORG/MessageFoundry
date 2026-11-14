@@ -6,7 +6,14 @@
 // evaluates the SAME source in a jsdom page (webview-receivers.test.ts), so what the tests exercise
 // is what ships.
 import { ENVREF_KEY_NAMES, FIELD_CONTROLS, PARAM_TYPES } from "./connectionForm";
-import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
+import {
+  CHANNEL_FIELD,
+  SHAPE_HELPERS,
+  WEBVIEW_GUARD_NOTE,
+  SCRIPT_STARTED_MARK,
+  embedJson,
+  guardScript,
+} from "./webviewMessaging";
 
 /** What the connection editor's script is seeded with, each embedded as JSON. */
 export interface ConnectionEditorScriptInputs {
@@ -133,7 +140,22 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       if (f.preserveValue !== undefined && f.preserveValue !== HELD_MARK) return f.preserveValue;
       return f.secretOnlyEnv || f.preserveValue === HELD_MARK ? HELD_SECRETS.get(f.key) : undefined;
     }
-    function renderField(f, into) {
+    // Keys the user chose to remove from the record; the save writes nothing for them. Cleared when
+    // the fields are rebuilt, since the rebuild request already left them out.
+    const REMOVED_KEYS = new Set();
+    // The cast an env() reference needs to read back as the field's declared type.
+    const ENV_CASTS = { int: 'int', float: 'float', bool: 'bool' };
+    // The descriptor a field gets when the user switches it between a literal and env(): empty, so
+    // the save writes nothing until a value or a key is typed.
+    function switchedMode(f, toEnv) {
+      const g = { ...f, isEnvRef: toEnv, value: undefined, envKey: undefined, envDefault: undefined, cast: undefined };
+      if (toEnv && ENV_CASTS[f.type]) g.cast = ENV_CASTS[f.type];
+      return g;
+    }
+    // recorded: the descriptor the record drew, kept across a switch so switching back restores it.
+    // replacing: the field's current element, when a switch redraws it in place.
+    function renderField(f, into, replacing, recorded) {
+      const drawn = recorded || f;
       const wrap = document.createElement('div'); wrap.className = 'field';
       const lab = document.createElement('label');
       lab.textContent = f.label + (f.required ? ' *' : f.conditionallyRequired ? ' †' : '');
@@ -177,8 +199,36 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       if (f.cast) { control.dataset.cast = f.cast; }
       HELD.set(control, f);
       SHOWN.set(control, control.value);
+      control.disabled = REMOVED_KEYS.has(f.key);
       const hint = document.createElement('div'); hint.className = 'sub'; hint.textContent = f.help || '';
       wrap.append(lab, control);
+      // Switch between a literal and env(), as the legacy row's env() box did. Not for a secret: the
+      // form must not be what writes a literal credential into the file (secretOnlyEnv).
+      if (f.envAllowed && !f.secret && !f.secretOnlyEnv) {
+        const envLabel = document.createElement('label'); envLabel.className = 'envbox';
+        const envCb = document.createElement('input'); envCb.type = 'checkbox'; envCb.checked = useEnv;
+        envCb.dataset.envToggle = f.key;
+        envLabel.append(envCb, document.createTextNode('env()'));
+        envCb.addEventListener('change', () => {
+          const next = envCb.checked === !!drawn.isEnvRef ? drawn : switchedMode(drawn, envCb.checked);
+          renderField(next, into, wrap, drawn);
+        });
+        wrap.append(envLabel);
+      }
+      // Remove a setting the record holds, as the legacy row's delete did. A checkbox has no empty
+      // state, so without this a recorded bool could only be set, never dropped to the default.
+      if (drawn.isEnvRef || drawn.value != null) {
+        const drop = document.createElement('button'); drop.className = 'secondary';
+        drop.dataset.removeKey = f.key;
+        const label = () => { drop.textContent = REMOVED_KEYS.has(f.key) ? 'Keep this setting' : 'Remove this setting'; };
+        label();
+        drop.addEventListener('click', () => {
+          if (REMOVED_KEYS.has(f.key)) REMOVED_KEYS.delete(f.key); else REMOVED_KEYS.add(f.key);
+          label();
+          control.disabled = REMOVED_KEYS.has(f.key);
+        });
+        wrap.append(drop);
+      }
       // An inline credential the form holds can be removed, as the legacy row's delete allowed:
       // leaving the box blank otherwise writes it back. A clone never copies it, so needs no button.
       if (useEnv && !CLONE && heldSecret(f) !== undefined) {
@@ -193,7 +243,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         wrap.append(remove);
       }
       wrap.append(hint);
-      into.appendChild(wrap);
+      if (replacing) into.replaceChild(wrap, replacing); else into.appendChild(wrap);
     }
 
     function secretHint(f) {
@@ -206,6 +256,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
 
     function renderGroups(groups) {
       const host = $('settings'); host.innerHTML = '';
+      REMOVED_KEYS.clear();
       for (const g of groups) {
         const box = document.createElement('details'); box.open = !g.collapsed;
         const sum = document.createElement('summary');
@@ -228,11 +279,14 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
     function requestFields() {
       if (!FIELD_GROUPS) { prefillHints(); return; }
+      // The request names this page's render, so the host can drop a reply that would reach a
+      // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
         command: 'fields',
         transport: $('transport').value,
         direction: $('direction').value,
         settings: collectSettings(true),
+        ${CHANNEL_FIELD}: MF_CHANNEL,
       });
     }
 
@@ -334,7 +388,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       const settings = {};
       for (const el of document.querySelectorAll('#settings [data-key]')) {
         const key = el.dataset.key;
-        if (!key) continue;
+        if (!key || REMOVED_KEYS.has(key)) continue;
         const f = HELD.get(el);
         if (el.dataset.env === '1') {
           const envKey = el.value.trim();
