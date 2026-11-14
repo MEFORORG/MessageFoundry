@@ -47,15 +47,23 @@
 # sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf carried it in all three.
 # No other platform under either index was inspected.
 #
-# NOT INSPECTED: the index engine PR 2778 (Dependabot, 2026-11-04) moves the pin to,
-# sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527. The Lander's review of
-# that PR recorded on 2026-11-04, in its hold comment: the tag python:3.14-slim-bookworm unchanged,
-# 516b51cb the official image for that tag that day, built from the same docker-library revision,
-# with Python 3.14.10 and the same 69 Debian packages at the same versions on linux/amd64,
-# ca-certificates 20250419~deb12u2 among them. That record holds no CA-bundle reading, and a Debian
-# package list cannot show the two pip-vendored certifi bundles at all. A later digest the pin
-# moves to is inspected by nothing: tests/test_container_build_pins.py refuses only the known-bad
-# digests, so check this block against the FROM line when it moves.
+# NOT INSPECTED, THE PREVIOUS PIN: the index engine PR 2778 (Dependabot, 2026-11-04) moved the pin
+# to, sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527. The Lander's review
+# of that PR recorded on 2026-11-04, in its hold comment: the tag python:3.14-slim-bookworm
+# unchanged, 516b51cb the official image for that tag that day, built from the same docker-library
+# revision, with Python 3.14.10 and the same 69 Debian packages at the same versions on
+# linux/amd64, ca-certificates 20250419~deb12u2 among them. That record holds no CA-bundle reading,
+# and a Debian package list cannot show the two pip-vendored certifi bundles at all. It is a record
+# of 516b51cb only, and says nothing about the pin below.
+#
+# NOT INSPECTED, THE CURRENT PIN: the index engine PR 2943 (Dependabot, 2026-11-14) moves the pin
+# to, sha256:3fe1a0b6c2d6b2ebb572906cdabeca75aeb558c0c17db5ffefbcf8094871c32b. This digest has no
+# CA-bundle reading and no package comparison, on any platform, so nothing records which CA roots
+# any of its three bundles trusts. The Lander's hold comment on that PR, on 2026-11-14, recorded
+# only that 3fe1a0b6 is the digest Docker Hub served for the unchanged tag that day, with Python
+# 3.14.10, and that its Debian base moved from 2026-10-27 to 2026-11-04. A later digest the pin
+# moves to is inspected by nothing either: tests/test_container_build_pins.py refuses only the
+# known-bad digests, so check this block against the FROM line when it moves.
 FROM python:3.14-slim-bookworm@sha256:3fe1a0b6c2d6b2ebb572906cdabeca75aeb558c0c17db5ffefbcf8094871c32b AS python-base
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------

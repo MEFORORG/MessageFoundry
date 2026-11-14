@@ -11,9 +11,11 @@
   `ca-certificates` 20250419~deb12u2 and pip 26.2.2, and none of those three carries the root.
   That move also took the image's Python from 3.14.8 to 3.14.10. The certifi installed into
   `/opt/venv` is the locked one in `docker/locks/`. Engine PR 2778 (Dependabot, 2026-11-04) then
-  moves the pin to `sha256:516b51cb...`, whose CA bundles were not inspected on any platform;
+  moved the pin to `sha256:516b51cb...`, whose CA bundles were not inspected on any platform;
   its only record is a linux/amd64 package comparison in the
   [engine PR 2778 hold comment](https://github.com/MEFORORG/MessageFoundry/pull/2778#issuecomment-6629228552),
-  which holds no CA-bundle reading. Rebuild an image built from a checkout that pins
+  which holds no CA-bundle reading. Engine PR 2943 (Dependabot, 2026-11-14) then moves the pin to
+  `sha256:3fe1a0b6...`, which has no CA-bundle reading and no package comparison on any
+  platform. Rebuild an image built from a checkout that pins
   `sha256:48b13b00...`. See the [`Dockerfile`](../docker/Dockerfile) header for the digests.
   (`BACKLOG #3905`)
