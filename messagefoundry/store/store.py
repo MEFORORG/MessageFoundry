@@ -4301,13 +4301,14 @@ async def way_past_passkeys(
     ``record``, the account row that lock holds (BACKLOG #3948 step 7).
 
     Where the write keeps the TOTP (not ``drop_totp``) and ``totp_counts`` counts it on ``record``,
-    the rule passes on the TOTP alone, so no passkey is read: a set that cannot be read must not
-    refuse a write the TOTP already allows. A TOTP judged before the lock that no longer counts
+    the rule passes on the TOTP alone, so no passkey is read for it: a set that cannot be read
+    must not refuse a write the TOTP already allows. A write that reads the set for its own sake
+    still does (the passkey delete re-seals over the new set). A TOTP judged before the lock that no longer counts
     under it (:meth:`TotpJudgement.moved`) falls back to the read. Where the write removes the TOTP
     (``drop_totp``) it is the other way round: the passkeys matter only while that TOTP counts
     (:func:`totp_removal`), so only then are they read. A set that cannot be read
     (:func:`passkeys_or_none`) is empty here, so it counts as no way past, whatever the seal."""
-    if record is None or bool(_totp_is_way_past(record, totp_counts)) is not drop_totp:
+    if record is None or bool(_totp_is_way_past(record, totp_counts)) != bool(drop_totp):
         return []
     read = await passkeys_or_none(
         read_passkeys, record.row.id, "it counts as no way past the sign-in lock"

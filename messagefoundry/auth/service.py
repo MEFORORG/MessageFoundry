@@ -15521,7 +15521,8 @@ class AuthService:
         before the hash. Where the TOTP counts, the store's write confirms it under its lock and
         reads no passkey (:func:`~messagefoundry.store.store.way_past_passkeys`); where it no
         longer counts there, the write reads the set, and one that cannot be read counts for
-        nothing, so the write declines after the hash and this raises the enrolment refusal."""
+        nothing, so the write declines after the hash and ``change_password`` raises the
+        enrolment refusal."""
         judged = await judge_totp(self._store.open_totp_secret, _opened_totp_state, user)
         if judged.state != "refused":
             return

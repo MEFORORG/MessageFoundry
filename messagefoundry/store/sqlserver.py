@@ -15356,7 +15356,8 @@ class SqlServerStore:
                 passkeys: list[WebAuthnCredential] = []
                 if conditional:
                     # The account row first, under UPDLOCK, so a concurrent removal waits. The
-                    # TOTP is what goes, so the set is read wherever that TOTP counts (way_past_passkeys).
+                    # TOTP is what goes, so the set is read wherever that TOTP counts
+                    # (way_past_passkeys).
                     passkeys = await way_past_passkeys(
                         await self._read_user_record(cur, user_id),
                         lambda: self._account_passkeys(cur, user_id),

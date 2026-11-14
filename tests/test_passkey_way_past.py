@@ -2695,8 +2695,9 @@ async def test_a_usable_totp_rotates_beside_a_passkey_set_that_cannot_be_read(
 ) -> None:
     """A covered account with a usable TOTP and a passkey row that does not parse, or a cell
     sqlite3 cannot decode: ``change_password`` lands, with one argon2 hash. The TOTP counts on the
-    row the write locks, so the write reads no passkey; on a keyed store the user seal does not
-    cover the passkey rows, so the seal changes nothing. Nothing is warned, so no read was made.
+    row the write locks, so the write reads no passkey; on a keyed store the seal's passkey
+    digest is then never compared, as the write checks no set. Nothing is warned, so no read was
+    made.
     The control: the intact set rotates too. RED when: the store's write reads the set before
     judging the TOTP, which raises after the hash or, through the tolerant read, warns."""
     from messagefoundry.store.crypto import generate_key, make_cipher
