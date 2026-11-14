@@ -153,8 +153,8 @@ _WSSE_FAULT_RE = re.compile(
 # SOAP 1.1 <faultcode>…</faultcode>; SOAP 1.2 <Code><Value>…</Value></Code>. Only the start tag's
 # NAME is a regex. BACKLOG #2827: the former `[^>]*>(.*?)</` tail rescanned to the end of the reply
 # from every start tag lacking a close, so a partner reply of repeated start tags cost the square of
-# its length. _code_text finds the `>` and `</` with str.find, once per code element, at most two
-# (the first-child read's, then the fallback's), and only inside the Fault _find_fault took, up to
+# its length. _code_text finds the `>` and `</` with str.find, once per read, at most twice (the
+# first-child read's, then the fallback's, which may be the same element), and only inside the Fault _find_fault took, up to
 # that Fault's close tag or the reply's end. BACKLOG #5912: the code element is the Fault's first child, a faultcode or a Code (_CODE_RE),
 # and for a Code the Value that is its own first child, up to its close tag (_CODE_END_RE);
 # _fault_code says why, and when it falls back to the earlier search (_searched_code). For the
@@ -345,9 +345,10 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     :func:`_find_fault` took to the first plain Fault close tag, or the reply's end, markup not
     stepped over. So, where :func:`_find_fault` takes the Fault start tag the code before #5912
     took, such a reply reads as it did then. A plain Receiver code the first-child read cannot
-    place, after a SOAP 1.1 ``faultstring`` or a SOAP 1.2 ``Reason`` say, is read and retried, unless
-    a Fault close tag inside a comment ahead of it ends the range first, when the fault reads no
-    code and dead-letters; and, as before #5912, a ``Value`` ahead of
+    place, after a SOAP 1.1 ``faultstring`` or a SOAP 1.2 ``Reason`` say, is read and retried only
+    where nothing ahead of it in that range ends the range or decides first: at least a Fault close
+    tag inside markup ends it, so the fault reads no code and dead-letters, and a ``faultcode`` or
+    ``Value`` inside markup decides; and, as before #5912, a ``Value`` ahead of
     the code element, or after a code element that holds no code, decides the class there, so a
     Sender fault of such a shape may read as a Receiver one and retry. Only where both reads find nothing is
     the code ``""``, which :func:`_classify_soap` reads as a permanent fault, never as delivered.
@@ -393,8 +394,9 @@ def _first_child_code(body: str, start: int, end: int) -> str:
 
 def _searched_code(body: str, start: int, end: int) -> str:
     """The code the earlier search finds in ``body[start:end]``, or ``""``: :func:`_fault_code`'s
-    fallback, the search the code ran before BACKLOG #5912, over a range that ends where that
-    search's did, at the first plain Fault close tag. The first ``faultcode`` or ``Value`` start tag
+    fallback, the search the code ran before BACKLOG #5912, over a range that ends by that search's
+    rule, at the first plain Fault close tag after the Fault start tag :func:`_find_fault` took. The
+    first ``faultcode`` or ``Value`` start tag
     there is the code element, a ``Value`` taken only before the first ``faultcode``, and only that
     first tag is read: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may
     carry an element of the other name. Markup is not stepped over, as it was not before."""

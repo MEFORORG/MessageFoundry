@@ -498,6 +498,13 @@ def test_a_commented_fault_close_ends_the_fallback_range() -> None:
     assert _fault_code(body) == "" == _ref_fault_code(body) == _pr2790_fault_code(body)
     assert _outcome(_classify_soap(200, body)) == "soap-fault"
     assert _outcome(_classify_soap(500, body)) == "soap-fault"
+    # The documented literal, with no trailing close tag, reads the same.
+    literal = (
+        "<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> -->"
+        "<faultcode>soap:Server</faultcode>"
+    )
+    assert _fault_code(literal) == ""
+    assert _outcome(_classify_soap(200, literal)) == "soap-fault"
     plain = body.replace("<!-- </soap:Fault> -->", "")
     assert _fault_code(plain) == "soap:Server"
     assert _outcome(_classify_soap(200, plain)) == "transient"
