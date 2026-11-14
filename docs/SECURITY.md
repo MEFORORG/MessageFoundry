@@ -5099,8 +5099,10 @@ flowchart TB
   gate's does. The step-up proof a `proof_in_route` route spends itself, the group-wide saves'
   window check and a `reveal`'s new-address and PHI-budget refusals are decided the same way: the
   route's gate leaves its row to that check, so a refused request writes only `auth.gate_refused`.
-  Other refusals a route body makes after its gate has passed, at least the PHI-read budget a
-  route body charges itself, still follow a grant row.
+  On such a route, a request the check never decides, or that the body refuses for another reason,
+  gets the grant row after the endpoint, so it can follow that refusal's own row. A refusal the
+  body makes after that check has decided, or on any other route after its gate has passed, at
+  least the PHI-read budget a route body charges itself, still follows a grant row.
 - Routes that act on a Connection also check the identity's connection scope. That scope starts
   empty for every role except Administrator.
 - Sensitive routes add a step-up re-check on top of this flow. See

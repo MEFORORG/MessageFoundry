@@ -13,6 +13,8 @@ and that leaves exactly one grant row.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -21,11 +23,16 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.routing import APIRoute
 
 from messagefoundry.api import create_app
 from messagefoundry.api.security import (
+    AuthenticatedBeforeBodyRoute,
+    _defers_decision,
+    _GateRefusal,
     refuse_unless_step_up_window_live,
     require_step_up_action,
+    route_decision,
     spend_step_up_action,
 )
 from messagefoundry.auth import Permission, Role
@@ -95,10 +102,17 @@ async def _app(engine: Engine) -> FastAPI:
     app = create_app(engine, auth=service)
     gate = Depends(require_step_up_action(_ACTION, Permission.USERS_MANAGE, proof_in_route=True))
 
-    async def spend(request: Request, skip: bool = False, _: Identity = gate) -> dict[str, str]:
-        if skip:
+    async def spend(request: Request, mode: str = "spend", _: Identity = gate) -> dict[str, str]:
+        if mode == "skip":
             # A refusal that is not the gate's, before the spend: the gate's grant stands.
             raise HTTPException(404, "no such thing")
+        if mode == "plain":
+            # The same, raised inside the decision block, as a reveal's hop refusal is.
+            async with route_decision(request):
+                raise HTTPException(403, "not this one")
+        if mode == "unblocked":
+            # A gate's refusal raised in the body outside any decision block.
+            raise _GateRefusal(429, "too many requests; please slow down", reason="throttled")
         await spend_step_up_action(request, _ACTION)
         return {"ok": "1"}
 
@@ -169,18 +183,84 @@ async def test_a_refused_spend_leaves_one_refusal_row(engine: Engine) -> None:
     ]
 
 
-async def test_a_route_that_never_reaches_its_spend_still_records_the_grant(
-    engine: Engine,
+@pytest.mark.parametrize(
+    ("mode", "status", "row"),
+    [
+        ("skip", 404, _granted(_MANAGE, _SPEND)),
+        ("plain", 403, _granted(_MANAGE, _SPEND)),
+        ("unblocked", 429, _refused(_MANAGE, _SPEND, "throttled")),
+    ],
+)
+async def test_a_request_the_body_does_not_decide_is_settled_after_the_endpoint(
+    engine: Engine, mode: str, status: int, row: tuple[str, dict[str, Any]]
 ) -> None:
-    """The gate's deferred grant is written after the endpoint when the body never decides, as on a
-    dual-control rejoin or a 404 before the spend. RED when: that settling step is lost, and such a
-    request leaves no decision row at all."""
+    """The gate's deferred decision is written after the endpoint when no decision block takes it.
+    A refusal that is not the gate's before the spend (as a dual-control rejoin or a 404 is), or
+    one raised inside a block with no reason of its own (as a reveal's hop refusal is), keeps its
+    grant row. A gate's refusal raised outside a block writes the refusal row. RED when: the
+    settling step is lost, so such a request leaves no decision row at all, or the block drops the
+    decision on a plain refusal."""
     app = await _app(engine)
     async with _client(app, _HOME) as c:
         token = await _login(c)
-        r = await c.post(_SPEND, params={"skip": "true"}, headers=_auth(token))
-        assert r.status_code == 404, r.text
-    assert await _decisions(engine, _SPEND) == [_granted(_MANAGE, _SPEND)]
+        r = await c.post(_SPEND, params={"mode": mode}, headers=_auth(token))
+        assert r.status_code == status, r.text
+    assert await _decisions(engine, _SPEND) == [row]
+
+
+#: The route-body checks that decide a deferred decision. A route whose body reaches one, directly
+#: or through a helper, must have a gate that defers, or its refusal follows a grant row again.
+_BODY_CHECKS = frozenset(
+    {"_admit_reveal", "spend_step_up_action", "refuse_unless_step_up_window_live"}
+)
+
+
+def _reaches_a_body_check() -> set[str]:
+    """Every function name in ``api/app.py`` and ``api/auth_routes.py`` that calls one of
+    :data:`_BODY_CHECKS`, directly or through another function of those modules."""
+    from messagefoundry.api import app as app_module
+    from messagefoundry.api import auth_routes
+
+    calls: dict[str, set[str]] = {}
+    for module in (app_module, auth_routes):
+        for node in ast.walk(ast.parse(inspect.getsource(module))):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                called = calls.setdefault(node.name, set())
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                        called.add(sub.func.id)
+    reaching = set(_BODY_CHECKS)
+    while grown := {name for name, called in calls.items() if called & reaching} - reaching:
+        reaching |= grown
+    return reaching - _BODY_CHECKS
+
+
+async def test_every_route_whose_body_decides_has_a_deferring_gate(engine: Engine) -> None:
+    """RED when: a route whose body reaches a decision block has a gate that does not defer, as a
+    new reveal route copying ``Depends(require(Permission.MONITORING_READ))`` would, or a deferring
+    gate sits where the route class cannot settle it: below the top level, or on another route
+    class. The count is the positive control: the five reveal routes and the eight
+    ``proof_in_route`` routes are found."""
+    app = create_app(engine, auth=AuthService(engine.store, AuthSettings()))
+    reaching = _reaches_a_body_check()
+    deciding = 0
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        top = [d.call for d in route.dependant.dependencies]
+        stack = list(route.dependant.dependencies)
+        while stack:
+            dependant = stack.pop()
+            stack.extend(dependant.dependencies)
+            if _defers_decision(dependant.call):
+                assert dependant.call in top, f"{route.path} nests a deferring gate"
+                assert isinstance(route, AuthenticatedBeforeBodyRoute), route.path
+        if route.endpoint.__name__ in reaching:
+            deciding += 1
+            assert any(_defers_decision(call) for call in top), (
+                f"{route.path} decides in its body behind a gate that does not defer"
+            )
+    assert deciding >= 13, deciding
 
 
 async def test_a_lapsed_window_leaves_one_refusal_row(engine: Engine) -> None:

@@ -1498,17 +1498,28 @@ async def _recorded_decision(
     try:
         yield
     except _GateRefusal as refusal:
-        audited = _audited_permission(request, permissions)
-        if audited is not None:
-            await auth.audit_gate_refused(
-                identity,
-                audited,
-                request.url.path,
-                reason=refusal.reason,
-                client=client_ip(request),
-            )
+        await _record_gate_refusal(request, auth, identity, permissions, refusal)
         raise
     await _grant_or_defer(request, auth, identity, permissions, defer=defer)
+
+
+async def _record_gate_refusal(
+    request: Request,
+    auth: AuthService,
+    identity: Identity,
+    permissions: tuple[Permission, ...],
+    refusal: _GateRefusal,
+) -> None:
+    """Write the ``auth.gate_refused`` row in the grant row's place, if the grant would have one."""
+    audited = _audited_permission(request, permissions)
+    if audited is not None:
+        await auth.audit_gate_refused(
+            identity,
+            audited,
+            request.url.path,
+            reason=refusal.reason,
+            client=client_ip(request),
+        )
 
 
 #: The ``request.state`` attribute holding a gate decision left to the route body (BACKLOG #1197).
@@ -1570,36 +1581,54 @@ async def route_decision(request: Request) -> AsyncIterator[None]:
     own: they refuse a request the gate admitted under that permission.
 
     The first block a request enters takes the decision; a later one, or one on a route whose gate
-    deferred nothing, records nothing. When no block runs, :class:`AuthenticatedBeforeBodyRoute`
-    writes the grant row after the endpoint."""
+    deferred nothing, records nothing. Any other exception from the block leaves the decision
+    deferred, and :class:`AuthenticatedBeforeBodyRoute` settles it after the endpoint, as it does
+    when no block runs. That keeps the row a refusal raised with no reason of its own had before.
+    This block writes the grant row before the route acts, which the settling cannot."""
     deferred = _take_deferred_decision(request)
     if deferred is None:
         yield
         return
-    async with _recorded_decision(request, deferred.auth, deferred.identity, deferred.permissions):
+    try:
         yield
+    except _GateRefusal as refusal:
+        await _record_gate_refusal(
+            request, deferred.auth, deferred.identity, deferred.permissions, refusal
+        )
+        raise
+    except Exception:
+        setattr(request.state, _DEFERRED_DECISION_STATE, deferred)
+        raise
+    await _record_grant(request, deferred.auth, deferred.identity, deferred.permissions)
 
 
 def _settle_deferred_grant_after(
     handler: Callable[[Request], Coroutine[Any, Any, Response]],
 ) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-    """Run the route, then write any grant row its gate deferred and its body did not decide.
+    """Run the route, then write the decision row its gate deferred and its body did not decide.
 
-    Written after a refusal that is not the gate's too, as the gate wrote it before the body when
-    it did not defer. Not after a cancelled request, which answers nobody."""
+    A :class:`_GateRefusal` the body raised outside a :func:`route_decision` block writes
+    ``auth.gate_refused``. Anything else writes the grant row, a refusal that is not the gate's
+    included, as the gate wrote it before the body when it did not defer. Nothing is written after
+    a cancelled request, which answers nobody."""
 
-    async def settle(request: Request) -> None:
+    async def settle(request: Request, refusal: Exception | None) -> None:
         deferred = _take_deferred_decision(request)
-        if deferred is not None:
-            await _record_grant(request, deferred.auth, deferred.identity, deferred.permissions)
+        if deferred is None:
+            return
+        auth, identity, permissions = deferred.auth, deferred.identity, deferred.permissions
+        if isinstance(refusal, _GateRefusal):
+            await _record_gate_refusal(request, auth, identity, permissions, refusal)
+        else:
+            await _record_grant(request, auth, identity, permissions)
 
     async def settled(request: Request) -> Response:
         try:
             response = await handler(request)
-        except Exception:
-            await settle(request)
+        except Exception as exc:
+            await settle(request, exc)
             raise
-        await settle(request)
+        await settle(request, None)
         return response
 
     # As :func:`_stamp_no_store` does, so ``inspect.unwrap`` finds the handler behind it.

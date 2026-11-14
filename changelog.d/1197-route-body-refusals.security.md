@@ -5,6 +5,8 @@
   each such refusal left an `auth.permission_granted` row and no refusal row. The route's gate now
   leaves its row to that check, so a refused request writes one `auth.gate_refused` row naming the
   gate's permission and a `reason` of `step_up` or `throttled`, and an admitted one writes the grant
-  row. A request whose body never reaches the check still gets its grant row, after the endpoint.
-  No request is allowed or refused differently. [SECURITY.md](../docs/SECURITY.md) says which
+  row. A request the check never decides, or that the body refuses for another reason, still gets
+  its grant row, after the endpoint; a reveal refused for want of `messages:view_summary` is one, so
+  its grant row now follows its `auth.permission_denied` row. No request is allowed or refused
+  differently. [SECURITY.md](../docs/SECURITY.md) says which
   refusals still follow a grant row. (`BACKLOG #1197`)
