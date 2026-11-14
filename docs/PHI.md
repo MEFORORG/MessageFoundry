@@ -447,11 +447,12 @@ than a path is not checked
   holds the file, its target's owner and access list; the folders on its target's side above the
   directory that holds the file; and, as where no link is on the path, whether a broad group may
   rename the directory that holds the file, or its target when it is a link (`DELETE` on it), and
-  what one named account may do to that directory or target. A `subst` drive letter is not judged
-  as a link, so where no junction or link is also on the path, no folder above the folder it
-  stands for is read. So a junction only the engine's account and the host's
-  administrators can change, pointing to a folder where a broad group may delete a file, passes:
-  restrict the target and the folders above it yourself.
+  what one named account may do to that directory, or to its target when it is a link. So a
+  junction only the engine's account and the host's administrators can change, pointing to a
+  folder where a broad group may delete a file, passes: restrict the target and the folders above
+  it yourself. A `subst` drive letter is not judged as a link, so where no junction or link is
+  also on the path, no folder above the directory that holds the file is read, as where no link
+  is on the path.
   A right to list or traverse the directory, or to add
   a file to it, is not refused, so a store directory the engine makes under `C:\ProgramData`, which
   inherits that folder's grant to Users, passes. A path spelled as a network share
