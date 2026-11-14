@@ -2192,8 +2192,8 @@ jobs:
     # on green suites, and a gate that cries wolf gets deleted. The engine Windows legs carry 66/55 for
     # a bigger suite; 40/30 was proportionate here and well clear at -n 4. It went to 45/35, then to
     # 60/48 on both legs. Since 2026-10-23 the caps are PER LEG: windows-2025 was 80/67 and is 115/100
-    # since 2026-11-14, every other leg stays 60/48. The paragraphs below are why -- that sentence about sizing a cap close to the
-    # observed run is the rule that moved it, applied to its own tier.
+    # since 2026-11-14, every other leg stays 60/48. The paragraphs below are why -- that sentence
+    # about sizing a cap close to the observed run is the rule that moved it, applied to its own tier.
     #
     # RE-DERIVED FOR THE WINDOWS LEG'S -n 3 EXPERIMENT (BACKLOG #1109, against #1304), because the
     # trigger at the bottom of this note fires on its own change. The paragraphs above are the caps'
@@ -2395,7 +2395,7 @@ jobs:
     # days. This note makes NO runway claim from that: a daily median on a bimodal leg does not
     # support one.
     #
-    # SUPERSEDED FOR windows-2025 ON 2026-11-14 (see "RE-DERIVED A FOURTH TIME" below); the 67/80
+    # SUPERSEDED FOR windows-2025 ON 2026-11-14 (see "RE-DERIVED A FOURTH TIME" below); the 80/67
     # sizing and the nesting row in the next paragraph are its record, not the caps in force.
     #
     # THE STEP CAP IS 67 = ceil_minute(1.35x 49:06). The kills were cut short, so their true durations
@@ -2423,10 +2423,11 @@ jobs:
     # RE-DERIVED A FOURTH TIME, 2026-11-14, FOR windows-2025 ONLY, TO 115/100, under an owner ruling
     # of 2026-11-14 in the Lander's session: asked "How should the slow windows harness leg be
     # fixed?", with raising the step timeout or splitting the tier as the options, the owner answered
-    # "Raise the timeout". The 51:32 trigger below had fired and nothing read it, as the next
-    # paragraph says will happen. The 67-minute cap then killed the step on PR 2947 with no F or E in
-    # the progress line, which turned the required `CI gate` red. Two of those kills were read here;
-    # a third was reported with the brief for this change and was not re-read:
+    # "Raise the timeout". The 51:32 trigger below had fired and nothing read it, as the "NOTHING
+    # READS THE TRIGGER BELOW FOR YOU" paragraph after this block says will happen. The 67-minute
+    # cap then killed the step on PR 2947 with no F or E in the progress line, which turned the
+    # required `CI gate` red. Two of those kills were read here; a third was reported with the brief
+    # for this change and was not re-read:
     #
     #   run 43602637847  job 132470698933  PR 2947, attempt 1  killed 67:08  last progress [99%]
     #   run 43602637847  job 132489474794  PR 2947, attempt 2  killed 67:08  last progress [98%]
@@ -2439,29 +2440,36 @@ jobs:
     #   run 43604145244  job 132475236591  PR 2942                 step 61:10  job 62:14
     #
     # That is five jobs read one at a time, NOT a pool by the 2026-10-07 method, so it gives a worst
-    # case and no distribution. The largest green is 5:58 under the kill, so this maximum is
-    # right-censored again for the reason recorded above.
+    # case and no distribution. The kills are runs that wanted longer than the cap, so the largest
+    # green, 61:10, is right-censored again for the reason recorded above; the gap to the cap is not
+    # the evidence for that, the kills are.
     #
     # THE STEP CAP IS 100. The 2026-10-23 method gives 93: the [98%] kill puts its full length at
     # about 67:08 / 0.98 = 68:30, an ESTIMATE for the reason given there, and ceil_minute(1.35x
-    # 68:30) = ceil(92.48) = 93. The 7 minutes above that are a CHOICE, not a derivation: the largest
-    # green rose from 47:58 to 61:10 in the 22 days since the last re-derivation, and every cap this
-    # note sized at the rule's minimum on this growing, censored leg has been outgrown. 100 is
-    # ceil_minute(1.35x 74:04), so it holds the 1.35 rule for a run about 5:30 longer than that
-    # estimate. The JOB cap is 115. Setup keeps the 2026-10-23 pool's maximum, 4:33, which is above
-    # every setup in the five jobs read here (0:50 to 1:01):
+    # 68:30) = ceil(92.48) = 93. That is the method on two of the three kills: the third kill's
+    # progress was not read, and 100 still covers it unless that kill stopped under about 91 percent.
+    # The 7 minutes above 93 are a CHOICE, not a derivation. The leg is growing: the 2026-10-23
+    # pool's largest green was 47:58 and the largest of the three read here is 61:10, 22 days later.
+    # Those are different instruments, a censored pool maximum and a three-run maximum, so the 13
+    # minutes between them is an order of magnitude, not a rate. Each cap this note sized at the
+    # rule's minimum on this leg has been outgrown. 100 is ceil_minute(1.35x 74:04), so it holds the
+    # 1.35 rule for a run about 5:30 longer than the 68:30 estimate. The JOB cap is 115. Setup keeps
+    # the 2026-10-23 pool's maximum, 4:33, far above the setup in each of the five jobs read here,
+    # about a minute:
     #
     #   windows-2025    setup 4:33, pad 4:30, step cap 100:00: 109:03 of 115:00, slack 5:57
     #
     # The job rule the engine note states gives less: the 2026-10-23 pool's largest job-minus-step
     # time, 4:40, is the worst overhead, and 100 + ceil_minute(1.5x 4:40) = 100 + 7 = 107. 115 is
     # taken over 107 so that the nesting row above holds with the pad, as each earlier row in this
-    # note does. Both are far under GitHub's 360-minute job limit. EVERY OTHER LEG KEEPS 48/60, and
-    # ubuntu's 2026-10-07 nesting row still holds: its steps in the same runs took 23:20 to 26:38.
+    # note does. Both are far under GitHub's 360-minute job limit. EVERY OTHER LEG KEEPS 60/48, and
+    # ubuntu's 2026-10-07 nesting row still holds: its GREEN steps in the same runs took 23:20 to
+    # 26:38. The main run's first ubuntu attempt failed at 20:03 and is left out; the 23:24 green is
+    # its re-run.
     #
-    # THE CAP IS STILL NOT THE FIX, and this change names no cause. What grew the leg 13 minutes in
-    # 22 days is not measured here; the slow-population question and the worker lever above are
-    # untouched, and splitting the tier was the option the owner did not take.
+    # THE CAP IS STILL NOT THE FIX, and this change names no cause. What is growing the leg is not
+    # measured here; the slow-population question and the worker lever above are untouched, and
+    # splitting the tier was the option the owner did not take.
     #
     # NOTHING READS THE TRIGGER BELOW FOR YOU, and pairing this step with scripts/ci/step_margin.py the
     # way the engine and web console steps are paired is not a few lines: it needs a `--mark` step and
@@ -2472,8 +2480,8 @@ jobs:
     # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 76:55 -- the 100-minute
     # cap divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates -- or if
     # any run is killed at the 100-minute step cap, or if TOOLING_WORKERS changes, and re-measure in
-    # any case after a week, because the leg's largest green grew 13 minutes in the 22 days before
-    # this was written. THE PARAGRAPH BELOW IS THE TRIGGER THIS REPLACES, kept as its record:
+    # any case after a week, because the leg was still growing when this was written. THE PARAGRAPH
+    # BELOW IS THE TRIGGER THIS REPLACES, kept as its record:
     #
     # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 51:32 -- the 67-minute cap
     # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates -- or if any
