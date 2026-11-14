@@ -57,7 +57,7 @@ from messagefoundry.credential import client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
 from messagefoundry.redaction import safe_exc
-from messagefoundry.store.base import audit_write_errors, store_call_errors
+from messagefoundry.store.base import sealed_read_errors, store_call_errors
 from messagefoundry.store.store import UserRecord
 
 log = logging.getLogger(__name__)
@@ -350,12 +350,13 @@ def initial_credential_window_hours(auth: AuthService) -> float | None:
 
 
 def account_read_errors() -> tuple[type[Exception], ...]:
-    """What the checked account read the console makes through ``AdminHandlers.checked_user`` can
-    raise past the 404, 423 and 503 its handler answers (BACKLOG #5559): at least
-    :func:`~messagefoundry.store.base.audit_write_errors`, the store and driver refusals of its
-    reads and of its seal-failure audit row, ``CipherError`` among them. A caller that must not read
-    a bug as a refusal re-raises :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first."""
-    return audit_write_errors()
+    """The refusals the checked account read the console makes through ``AdminHandlers.checked_user``
+    can raise past the 404, 423 and 503 its handler answers (BACKLOG #5559):
+    :func:`~messagefoundry.store.base.sealed_read_errors`, a refused store call or a record that
+    cannot be decrypted. Its seal-failure audit row is written soft, so that row's own failures do
+    not reach the caller. As that function says, a caller that must not read a bug as a refusal
+    re-raises :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first."""
+    return sealed_read_errors()
 
 
 #: The 503 detail a route gives when it needs an auth service and none is attached. The gates give
