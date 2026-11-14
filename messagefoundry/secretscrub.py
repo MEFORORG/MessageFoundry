@@ -675,6 +675,9 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # * a "://" inside. A URL's password may hold an apostrophe, so ``token='a postgres://u:p'w@h``
 #   closed on it, ``_DSN_PASSWORD`` no longer matched, and "w@h" printed. Found by the second review
 #   round; the plain class stops at the space and leaves the DSN whole.
+# * a closer right after a bytes prefix behind a separator, as in ``token='x y password=b'p w'``,
+#   where it is the later label's bytes literal opening (BACKLOG #5547, found by code review). One
+#   white space between the separator and the "b" is read too.
 #
 # These are the ways measured so far that a closer can belong to someone else, not a proof there are
 # no more.
@@ -696,8 +699,8 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # DETERMINISTIC AND POSSESSIVE, so linear: the two branches of the walk cannot match the same
 # character, and each takes a whole run, so a long run of spaces is walked once.
 _GUARDED_QUOTED_VALUE = (
-    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))++(?='(?!\\s*+[:=]))"
-    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))++(?="(?!\\s*+[:=]))'
+    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))++(?='(?!\\s*+[:=]))(?<![:=](?-i:b))(?<![:=]\\s(?-i:b))"
+    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))++(?="(?!\\s*+[:=]))(?<![:=](?-i:b))(?<![:=]\\s(?-i:b))'
 )
 
 # The braced value for ``_MEFOR_SECRET`` and ``_KEY_MATERIAL``, guarded the same way and for the same
@@ -1124,7 +1127,9 @@ _QUOTED_SCHEME_VALUE = "|".join(
 # A QUOTED PARAMETER STOPS AT A LATER LABEL, the way :data:`_RUN_ON_INNER` does, because its closer
 # may be that label's opening quote: in ``Digest username="u, password="p w"`` the username's quote
 # never closes, and a quoted string taken to the next quote would take the password's opening one and
-# leave "p w" to print. The walk checks :data:`_RUN_ON_LABEL` before each run and stops at any
+# leave "p w" to print. The walk checks :data:`_RUN_ON_LABEL` followed by a quote, a bytes prefix
+# allowed, before each run, so a label inside a closed parameter, as in ``uri="/cb?session=1"``, does
+# not end the list (found by code review); it stops at any
 # character outside ASCII, so a keyword spelled with a fold character stops it as well; a stopped
 # parameter needs its closer next, fails, and the list ends before it, or falls back if it was the
 # first. A backslash escape is taken whole, as RFC 9110 quotes one. The closer may not be followed by
@@ -1135,7 +1140,7 @@ _QUOTED_SCHEME_VALUE = "|".join(
 # quoted parameter ends at its closer, so two labels' lists cannot share one.
 _DIGEST_PARAM_QUOTED = (
     r"\"(?:[^\"\\\r\nA-Za-z0-9\x80-\U0010ffff]|\\[^\r\n\x80-\U0010ffff]"
-    r"|(?!" + _RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+\"(?!\s*+[:=])"
+    r"|(?!" + _RUN_ON_LABEL + r"(?-i:b)?[\"'])(?-i:[A-Za-z0-9])++)*+\"(?!\s*+[:=])"
 )
 _DIGEST_PARAM = r"[A-Za-z0-9_-]++=(?:" + _DIGEST_PARAM_QUOTED + r"|[A-Za-z0-9._~+/-]++)"
 _DIGEST_PARAMS = (
@@ -1228,14 +1233,15 @@ _MEFOR_SECRET = re.compile(
     # A quoted value with no space in it and at least one character, closer and all. With the braced
     # branch above, it takes exactly the span the old plain class and its trailing quote took, so later
     # passes see the same text they always did, wherever the old pattern matched this label at all.
-    # An empty value is refused, as the old class refused it.
-    + r"|"
-    + _BYTES_PREFIX
-    + r"(?:(?="
+    # An empty value is refused, as the old class refused it. A bytes literal (BACKLOG #5547) leaves
+    # its closer, as the guarded form does: the old class took only its "b" and the quote after it,
+    # so consuming the closer would take a quote an earlier value used to close on (code review).
+    + r"|(?="
     + _GUARDED_QUOTED_VALUE
     + r")['\"][^\s'\"]++['\"]|"
+    + _BYTES_PREFIX
     + _GUARDED_QUOTED_VALUE
-    + r")|"
+    + r"|"
     + _PLAIN_VALUE
     + r"['\"]?)"
 )
@@ -1425,18 +1431,25 @@ _KEY_MATERIAL = re.compile(
 # tail printed: ``postgres://u:p@ss@host`` came out as ``postgres://u:<redacted>@ss@host``. A URL
 # parser ends the userinfo at the LAST "@" of the authority, which is how a driver reads it.
 #
-# So the user may be empty, and the password runs to the last "@" before the next "/" or white space.
-# It still needs one character. Every span the old tail took, this one takes, and the same group 1:
+# So the user may be empty, and the password runs on to the last "@" before the next "/" or white
+# space, over "@"-joined segments, each after the first holding no ";". It still needs one character.
+# The ";" bound is for a connection string: in ``pg://u:pw@h;sslpassword=zp@x`` a run to the last
+# "@" took the member's label, so the member pass never read it and the tail after its own "@"
+# printed (found by code review). Every span the old tail took, this one takes, and the same group 1:
 # the user class is unchanged and stops at the first ":", and the password starts there and ends at
-# the old "@" or a later one. So it hides more and never less. What it may now take that is no
-# password: on a line with an "@" after the host and no "/" between them, the text up to that "@",
-# as in ``pg://u:p@host,backup@h2``. Over-redaction is this module's allowed direction.
+# the old "@" or a later one. So the pattern alone hides more and never less. What it may now take
+# that is no password: on a line with an "@" after the host and no "/" or ";" between them, the text
+# up to that "@", as in ``pg://u:p@host,backup@h2``. Over-redaction is this module's allowed
+# direction.
 #
-# STILL LINEAR. The password's repetition is greedy and gives back characters to find its "@", but
-# its run ends at the next "/" or white space, and every "://" holds a "/", so the runs of two DSNs
-# never share a character; with the head anchor's one start per run, each character is read a fixed
-# number of times. The user's repetition is possessive: it cannot hold the ":" that must follow it.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[^\s/]+@")
+# STILL LINEAR. Each segment is possessive and ends at an "@", so the repetition gives back whole
+# segments, one "@" test each, to find its last "@"; the run ends at the next "/" or white space, and
+# every "://" holds a "/", so the runs of two DSNs never share a character; with the head anchor's
+# one start per run, each character is read a fixed number of times. The user's repetition is
+# possessive: it cannot hold the ":" that must follow it.
+_DSN_PASSWORD = re.compile(
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[^\s/@]++(?:@[^\s/@;]*+)*@"
+)
 
 # A PEM OR OPENSSH PRIVATE KEY BLOCK (BACKLOG #5550): a begin marker, five dashes, ``BEGIN``, a key type
 # ending in ``PRIVATE KEY`` and five dashes again, then the base64 body over many lines, then the end
@@ -1446,18 +1459,23 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[
 # bytes repr, would put the private key on the write-time streams.
 #
 # THE BODY IS REPLACED AND BOTH MARKERS ARE KEPT, so a reader still sees that a key was there, and of
-# what kind. It runs from the begin marker up to the next ``-----``, over what a key body and its RFC
-# 1421 or PGP armor headers hold: base64, white space, ",", ":", "_", ".", "(", ")", "@", "<", ">", a
-# single "-", a backslash escape such as the ``\n`` a repr or a JSON string writes, and the PHI pass's
-# ``[redacted]``. It must open, past white space and escaped line breaks, a doubled escape included,
-# on four base64 characters. A header holding a character outside that set ends the body there.
+# what kind. With an end marker after it, the body is ANY text up to the next ``-----``, so RFC 1421
+# or PGP armor headers, a backslash escape such as the ``\n`` a repr or a JSON string writes, and the
+# PHI pass's ``[redacted]`` are all taken; the match ends at that marker, so nothing after the block
+# is read. It must open, past white space and escaped line breaks, a doubled escape included, on four
+# base64 characters.
 #
 # A BEGIN MARKER WITH NO END MARKER AFTER ITS BODY IS READ ONLY WHEN A LINE BREAK FOLLOWS IT, real or
 # escaped, as a key block's marker stands on its own line. That is a block a driver or a log line cut
-# short, and its body is taken up to the first character outside the set, which can over-redact the
-# next words of the message, the direction this module may fail in. A marker followed on its own line
-# by more text, as a diagnostic naming the marker writes it, needs the end marker, so the words after
-# it stay. A key pasted onto one line with spaces, as an environment value holds one, has both.
+# short, and its body is taken ONE WHOLE LINE AT A TIME, each line a run of base64 or base64url
+# characters ending at a line break or the end of the text. A first draft took any character of a
+# body set instead, so in ``...KEY-----\nMIIE\nretrying with password='p w'`` the body ran on to the
+# later label and took it, and since this pass runs first the label patterns never saw it and "p w"
+# printed (found by code review). A line of prose has a space or a quote in it, so the body ends
+# before it. A cut-short block with an armor header prints from that header on. A marker followed on
+# its own line by more text, as a diagnostic naming the marker writes it, needs the end marker, so
+# the words after it stay. A key pasted onto one line with spaces, as an environment value holds one,
+# has both.
 #
 # THE SECOND FORM IS THE MARKER THE PHI PASS LEFT, AND IT IS THE ONE THE INSTALLED CHAIN SEES.
 # ``logging_setup`` runs :func:`messagefoundry.redaction.redact` before this pass, and its name-run
@@ -1468,15 +1486,16 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[
 # block, which the PHI pass marks the same way, has its body redacted too.
 # Text between two blocks is taken when it opens on four base64 characters, as a second block's body.
 #
-# LINEAR. A match starts only at five dashes, the label is a bounded walk, and the body is possessive
-# over branches that open on different characters and ends at the next ``-----``, so two blocks'
-# bodies never share a character.
+# LINEAR. A match starts only at five dashes, the label is a bounded walk, and each body form is
+# possessive over branches that open on different characters and ends at or before the next
+# ``-----``, so two blocks' bodies never share a character; a block with no end marker is read twice,
+# once by each form.
 _PEM_PRIVATE_KEY = re.compile(
     r"(-----(?:BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?|(?P<phi>\[redacted\])[A-Z0-9 ]{0,40})-----)"
-    r"(?:(?P<line>)(?=[ \t]*+(?:\r?\n|\\++[rn])))?"
     r"(?=(?:\s|\\++[rn])*+[A-Za-z0-9+/]{4})"
-    r"(?:[A-Za-z0-9+/=\s,:_.()@<>]++|\\[^\r\n]|-(?!----)|\[redacted\])++"
-    r"(?(phi)(?=-----\[redacted\][A-Z0-9 ]{0,40}-----)|(?(line)|(?=-----END )))"
+    r"(?:(?:[^-]++|-(?!----))++(?(phi)(?=-----\[redacted\][A-Z0-9 ]{0,40}-----)|(?=-----END ))"
+    r"|(?(phi)(?!)|(?=[ \t]*+(?:\r?\n|\\++[rn])))"
+    r"(?:(?:\s|\\++[rn])*+[A-Za-z0-9+/=_\-]++(?=[ \t]*+(?:\r?\n|\\++[rn]|$)))++)"
 )
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG

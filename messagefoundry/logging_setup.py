@@ -390,7 +390,9 @@ _LABEL_WITH_ITS_VALUE_OUTSIDE = (
 #:
 #: A bytes literal's "b" is no query value (BACKLOG #5547): taking it left the quoted value after it
 #: with no label in front, so ``token=b'v w'`` printed "v w". Refused, the literal is left to
-#: ``CredentialScrubFilter``, which reads it whole, as it reads ``token='v w'``.
+#: ``CredentialScrubFilter``, which reads it whole under a key it holds as a label, as it reads
+#: ``token='v w'``. It holds no ``code``, ``state`` or ``session_state``, so under those keys a
+#: bytes literal prints, as it did before, and as a quoted value under them does.
 _QUERY_VALUE = (
     r"(?!(?-i:b)['\"])"
     r"(?:[A-Za-z0-9._\-]++|[^A-Za-z0-9._\-&\s\"'](?!" + _LABEL_WITH_ITS_VALUE_OUTSIDE + r"))++"

@@ -121,8 +121,8 @@ _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 _ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
 _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 _GUARDED_QUOTED_VALUE = (
-    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))++(?='(?!\\s*+[:=]))"
-    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))++(?="(?!\\s*+[:=]))'
+    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))++(?='(?!\\s*+[:=]))(?<![:=](?-i:b))(?<![:=]\\s(?-i:b))"
+    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))++(?="(?!\\s*+[:=]))(?<![:=](?-i:b))(?<![:=]\\s(?-i:b))'
 )
 _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
 _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
@@ -356,7 +356,7 @@ _QUOTED_SCHEME_VALUE = (
 # ``messagefoundry/secretscrub.py``; this copy builds them on its own ``_RUN_ON_LABEL``.
 _DIGEST_PARAM_QUOTED = (
     r"\"(?:[^\"\\\r\nA-Za-z0-9\x80-\U0010ffff]|\\[^\r\n\x80-\U0010ffff]"
-    r"|(?!" + _RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+\"(?!\s*+[:=])"
+    r"|(?!" + _RUN_ON_LABEL + r"(?-i:b)?[\"'])(?-i:[A-Za-z0-9])++)*+\"(?!\s*+[:=])"
 )
 _DIGEST_PARAM = r"[A-Za-z0-9_-]++=(?:" + _DIGEST_PARAM_QUOTED + r"|[A-Za-z0-9._~+/-]++)"
 _DIGEST_PARAMS = (
@@ -412,13 +412,12 @@ _MEFOR_SECRET = re.compile(
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
     # A non-empty quoted value with no space in it, closer and all: the span the old plain class took.
-    + r"|"
-    + _BYTES_PREFIX
-    + r"(?:(?="
+    + r"|(?="
     + _GUARDED_QUOTED_VALUE
     + r")['\"][^\s'\"]++['\"]|"
+    + _BYTES_PREFIX
     + _GUARDED_QUOTED_VALUE
-    + r")|"
+    + r"|"
     + _PLAIN_VALUE
     + r"['\"]?)"
 )
@@ -575,10 +574,12 @@ _KEY_MATERIAL = re.compile(
 # one. And
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
-# The user may be empty and the password runs to the LAST "@" before the next "/" or white space
-# (BACKLOG #5549), so ``pg://:pw@h`` and a password holding an unencoded "@" no longer print; why
+# The user may be empty and the password runs to the LAST "@" before the next "/" or white space,
+# over segments after the first that hold no ";" (BACKLOG #5549), so ``pg://:pw@h`` and a password holding an unencoded "@" no longer print; why
 # that takes every span the old tail took, and stays linear, is on the same pattern there too.
-_DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[^\s/]+@")
+_DSN_PASSWORD = re.compile(
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[^\s/@]++(?:@[^\s/@;]*+)*@"
+)
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")

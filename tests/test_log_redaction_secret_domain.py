@@ -4293,7 +4293,7 @@ _DIGEST_LATER_LABEL_LINES = (
 
 
 def _without_the_digest_label_check(module: ModuleType) -> re.Pattern[str]:
-    check = r"|(?!" + module._RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+"
+    check = r"|(?!" + module._RUN_ON_LABEL + r"(?-i:b)?[\"'])(?-i:[A-Za-z0-9])++)*+"
     assert check in module._BEARER.pattern, f"{module.__name__}._BEARER lost its digest label check"
     return re.compile(
         module._BEARER.pattern.replace(check, r"|(?-i:[A-Za-z0-9])++)*+"), module._BEARER.flags
@@ -4443,7 +4443,48 @@ def test_the_dsn_tail_grows_linearly_in_line_length() -> None:
 def test_a_private_key_block_body_is_hidden_and_its_markers_kept(line: str, note: str) -> None:
     out = scrub_credentials(line)
     assert "zq-pem_pem-81" not in out, (note, out)
-    assert out.count("-----") >= 2, out
+    # Every marker is kept: the body holds no five dashes, so any lost run of them is a marker.
+    assert out.count("-----") == line.count("-----"), out
+
+
+#: Lines where a span this batch widened once took a later label, or a quote an earlier value
+#: closed on, so a value printed that the code before it hid (found by code review). Each listed
+#: value must be hidden on every surface.
+_WIDENED_SPAN_LINES = (
+    (
+        f"bad key -----BEGIN RSA {_PK}-----\nMIIEowIB\nretrying with password='zq-R2a zq-R2b'",
+        ("zq-R2a", "zq-R2b"),
+    ),
+    (
+        f"bad key -----BEGIN RSA {_PK}-----\\nMIIEowIB\\nretrying with pwd={{zq-R2c zq-R2d}}",
+        ("zq-R2c", "zq-R2d"),
+    ),
+    ("pwd='hunter zq-R2e MEFOR_A=b'zq-R2f'", ("zq-R2e", "zq-R2f")),
+    ("store pg://u:zq-R2g@h;sslpassword=zp@zq-R2h;x=1", ("zq-R2g", "zq-R2h")),
+    (
+        'Authorization: Digest username="zq-R2i", nonce="zq-R2j", uri="/cb?session=1", '
+        'response="zq-R2k", cnonce="zq-R2l"',
+        ("zq-R2i", "zq-R2j", "zq-R2k", "zq-R2l"),
+    ),
+    ("token='zq-R2m y password=b'zq-R2n zq-R2o'", ("zq-R2m", "zq-R2n", "zq-R2o")),
+)
+
+
+@pytest.mark.parametrize(("line", "secrets"), _WIDENED_SPAN_LINES)
+def test_a_widened_span_takes_no_later_label(line: str, secrets: tuple[str, ...]) -> None:
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        assert not [s for s in secrets if s in out], f"{surface}: {out!r}"
+
+
+def test_a_pgp_block_with_any_armor_header_is_hidden() -> None:
+    line = (
+        f"-----BEGIN PGP {_PK} BLOCK-----\nComment: O'Brien Jörg key\n\n"
+        f"lQOYBF\nzq-pem_pem-81\n-----END PGP {_PK} BLOCK-----"
+    )
+    out = scrub_credentials(line)
+    assert "zq-pem_pem-81" not in out and "Brien" not in out, out
+    assert out.count("-----") == line.count("-----"), out
 
 
 @pytest.mark.parametrize(
