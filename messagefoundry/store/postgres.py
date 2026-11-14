@@ -412,6 +412,7 @@ from messagefoundry.store.store import (
     user_insert_params,
     user_reseal_params,
     verify_audit_rows,
+    way_past_passkeys,
     webauthn_insert_params,
     without_role,
     write_kept_session,
@@ -10235,16 +10236,22 @@ class PostgresStore:
         )
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             # The passkeys the condition reads are read in the write's own transaction, after the
-            # account row is locked, so a concurrent removal waits for this write.
+            # account row is locked, so a concurrent removal waits for this write; and only where
+            # the locked row's TOTP does not already count (way_past_passkeys).
+            passkeys: list[WebAuthnCredential] = []
             if conditional:
-                await self._read_user_record(conn, user_id)
+                passkeys = await way_past_passkeys(
+                    await self._read_user_record(conn, user_id),
+                    lambda: self._account_passkeys(conn, user_id),
+                    totp_counts=totp_counts,
+                )
             change = password_change(
                 password_hash=password_hash,
                 password_generated=password_generated,
                 must_change_password=must_change_password,
                 require_way_past=conditional,
                 now=now,
-                passkeys=await self._account_passkeys(conn, user_id) if conditional else (),
+                passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -10395,8 +10402,14 @@ class PostgresStore:
             passkeys: list[WebAuthnCredential] = []
             if conditional:
                 # The account row first, locked, so a concurrent passkey removal waits for this.
-                await self._read_user_record(conn, user_id)
-                passkeys = await self._account_passkeys(conn, user_id)
+                # The TOTP is what goes, so the set is read wherever that TOTP counts, and one
+                # that cannot be read is empty (way_past_passkeys).
+                passkeys = await way_past_passkeys(
+                    await self._read_user_record(conn, user_id),
+                    lambda: self._account_passkeys(conn, user_id),
+                    totp_counts=totp_counts,
+                    drop_totp=True,
+                )
             change = totp_removal(
                 now,
                 require_way_past=conditional,
@@ -10563,7 +10576,11 @@ class PostgresStore:
                 current = await self._read_user_record(conn, user_id)
                 if current is None or not removal_keeps_way_past(
                     current,
-                    await self._account_passkeys(conn, user_id),
+                    await way_past_passkeys(
+                        current,
+                        lambda: self._account_passkeys(conn, user_id),
+                        totp_counts=totp_counts,
+                    ),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
@@ -11280,10 +11297,13 @@ class PostgresStore:
                     " FOR UPDATE",
                     user_id,
                 )
-            if require_federated_subject is not None:
-                bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
-                if bound != require_federated_subject:
-                    return False
+            # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+            # INSERT's foreign-key error.
+            if row is None or (
+                require_federated_subject is not None
+                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            ):
+                return False
             record = new_session_record(
                 token_hash=token_hash,
                 user_id=user_id,
@@ -11293,7 +11313,7 @@ class PostgresStore:
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
-                user_epoch=0 if row is None else int(row["session_epoch"]),
+                user_epoch=int(row["session_epoch"]),
                 # BACKLOG #5091: its own statement, after the row lock, so a sign-in that waited
                 # behind a revoke reads that revoke's global epoch beside its account epoch. A
                 # subquery in the locked read would keep its pre-wait snapshot, and the session

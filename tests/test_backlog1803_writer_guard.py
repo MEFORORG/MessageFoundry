@@ -397,8 +397,11 @@ async def test_a_session_for_a_deleted_user_leaves_no_open_transaction(tmp_path:
                 audits=(),
             )
         await store.delete_user("alice")
-        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        # BACKLOG #2733: refused before the INSERT, through the refusal's own rollback.
+        assert (
             await store.create_session(token_hash="t" * 64, user_id="alice", expires_at=9e9)
+            is False
+        )
         await _assert_writer_clean(store, "bystander")
     finally:
         await store.close()

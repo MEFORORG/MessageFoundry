@@ -1883,16 +1883,19 @@ class _BindingChangedMidLogin(Exception):
     """An admin changed the account's federated binding while this login was still in flight.
 
     Two directions, one signal. A federated login whose account was UNBOUND under it (BACKLOG
-    #1474), and a Windows SSO login whose account was BOUND under it (vault BACKLOG #2609).
+    #1474), and a Windows SSO login whose account was BOUND under it (vault BACKLOG #2609). A login
+    whose account was DELETED under it raises it too (BACKLOG #2733).
 
-    Raised by :meth:`AuthService._issue_session` when the store refuses the conditional insert, and
-    caught by :meth:`AuthService._complete_ad_login`, which renders it as an audited refusal.
+    Raised by :meth:`AuthService._issue_session` when the store refuses the insert, and caught by
+    :meth:`AuthService._complete_ad_login` and :meth:`AuthService._login_local`, which render it as
+    an audited refusal.
 
     **Signalled by raising because the alternative loses the race it exists to close.** The store
     refuses inside the same transaction that re-reads the binding, so there is no point at which the
     caller could have asked "is it still bound?" and acted on the answer — a second call would be a
     second transaction. The exception carries the refusal out of a method whose whole contract is
-    "returns the token", without giving every other caller a ``None`` to handle.
+    "returns the token". The store's one ``False`` does not say which cause it was, so a directory
+    leg reports a deleted account as a binding change.
     """
 
 
@@ -5880,20 +5883,19 @@ class AuthService:
             else:
                 after_pad.append(write)
 
+        async def unknown_row() -> None:
+            await self._audit(
+                "auth.login_failed",
+                actor=username,
+                detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
+                client=client,
+            )
+
         user = await self._load_user_by_username(username)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value or user.disabled:
             # Equalize timing with the real-password path so a missing/disabled/AD account is not
             # distinguishable from a wrong password (defeats username enumeration via latency).
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
-
-            async def unknown_row() -> None:
-                await self._audit(
-                    "auth.login_failed",
-                    actor=username,
-                    detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
-                    client=client,
-                )
-
             await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
         now = time.time()
@@ -6043,22 +6045,28 @@ class AuthService:
             # account. It is the MFA leg (``verify_mfa`` / ``finish_webauthn_assertion``) that clears
             # it when a factor is owed; this branch covers the accounts that owe none.
             await self._store.record_login_success(user.id, now=now)
-        token = await self._issue_session(
-            user.id,
-            client,
-            mfa_verified=not mfa_required,
-            # The sudo-timestamp model, for the local leg only: a sign-in that owes no factor opens
-            # the step-up window, and one that still owes a factor does not (WP-14). A sign-in from
-            # a first-seen address does not either (BACKLOG #288): that is the whole of its
-            # challenge, and the login itself still succeeds.
-            #
-            # A COMBINED sign-in seeds the window the way ``verify_mfa`` does, which marks the
-            # session re-authenticated once the code is proved whatever the address (ADR 0197).
-            seed_reauth=combined or (not mfa_required and address is not _LoginAddress.NEW),
-            mechanism=SessionMechanism.PASSWORD,
-            idp_auth_time=None,
-            supersedes_hash=hash_token(supersedes) if supersedes else None,
-        )
+        try:
+            token = await self._issue_session(
+                user.id,
+                client,
+                mfa_verified=not mfa_required,
+                # The sudo-timestamp model, for the local leg only: a sign-in that owes no factor
+                # opens the step-up window, and one that still owes a factor does not (WP-14). A
+                # sign-in from a first-seen address does not either (BACKLOG #288): that is the
+                # whole of its challenge, and the login itself still succeeds.
+                #
+                # A COMBINED sign-in seeds the window the way ``verify_mfa`` does, which marks the
+                # session re-authenticated once the code is proved whatever the address (ADR 0197).
+                seed_reauth=combined or (not mfa_required and address is not _LoginAddress.NEW),
+                mechanism=SessionMechanism.PASSWORD,
+                idp_auth_time=None,
+                supersedes_hash=hash_token(supersedes) if supersedes else None,
+            )
+        except _BindingChangedMidLogin:
+            # BACKLOG #2733: the account was deleted after the load above, so no session was
+            # minted. The answer, and its deferred row, are an unknown account's.
+            await later(unknown_row)
+            return LoginOutcome(ok=False, error="invalid credentials")
         await self._record_login_address(
             address, user, client=client, provider="local", mechanism=None
         )
@@ -8164,8 +8172,8 @@ class AuthService:
                 # BACKLOG #1474. THE UNBIND'S SESSION SWEEP CANNOT SEE A SESSION THAT DOES NOT EXIST
                 # YET, which is the race this closes: an admin unbinding this account mid-login
                 # revokes what is live at that instant, and without the guard this login's own
-                # INSERT lands just after it. The Kerberos and password legs pass nothing here, so
-                # they take no extra read and no extra statement.
+                # INSERT lands just after it. The password leg passes no guard, so it skips the
+                # binding comparison; its account read still runs, for the session epoch.
                 #
                 # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so the
                 # sentence above holds for the password leg only. The refusal further up read
@@ -11706,8 +11714,8 @@ class AuthService:
         require_federated_subject: tuple[str | None, str | None] | None = None,
         supersedes_hash: str | None = None,
     ) -> str:
-        """Mint a session token and persist the row. Callers passing
-        ``require_federated_subject`` must handle :class:`_BindingChangedMidLogin`.
+        """Mint a session token and persist the row. Every caller must handle
+        :class:`_BindingChangedMidLogin`, raised for an account deleted under the sign-in too.
 
         ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
         7.2.4, login side). It is ended after the new
@@ -11758,9 +11766,10 @@ class AuthService:
             idp_auth_time=idp_auth_time,
         )
         if not issued:
-            # Only reachable with a guard requested: an unbind or a bind revoked this account's
-            # sessions while this login was in flight, so issuing now would hand back a token the
-            # revocation could never have seen. Nothing was written, so there is nothing to undo.
+            # An unbind or a bind revoked this account's sessions while this login was in flight,
+            # so issuing now would hand back a token the revocation could never have seen; or the
+            # account was deleted under it (BACKLOG #2733). Nothing was written, so there is
+            # nothing to undo.
             raise _BindingChangedMidLogin()
         if mfa_verified:
             # No second factor pending (MFA is not required for this user, or the federated IdP
@@ -15518,9 +15527,11 @@ class AuthService:
         not parse is no exception and a set that fails its seal is reported. Such a set counts for
         nothing, and so does one with a cell the driver cannot decode while fetching
         (:func:`passkey_cell_undecodable`), as the census counts it. Any other read error raises,
-        before the hash. Where the TOTP counts, the store's write still reads the set under its
-        lock, after the hash, so a row that does not parse or a cell that cannot be decoded raises
-        there."""
+        before the hash. Where the TOTP counts, the store's write confirms it under its lock and
+        reads no passkey (:func:`~messagefoundry.store.store.way_past_passkeys`); where it no
+        longer counts there, the write reads the set, and one that cannot be read counts for
+        nothing, so the write declines after the hash and ``change_password`` raises the
+        enrolment refusal."""
         judged = await judge_totp(self._store.open_totp_secret, _opened_totp_state, user)
         if judged.state != "refused":
             return
