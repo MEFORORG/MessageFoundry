@@ -115,20 +115,24 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // The inline credentials the record holds, by key. A transport or direction change never sends
     // them to the host (collectSettings' forHost), since a key the new schema does not declare would
     // come back as an ordinary field showing its value; a secret field of the same key takes it here.
-    const HELD_SECRETS = {};
+    const HELD_SECRETS = new Map();
     function heldSecret(f) {
       if (f.preserveValue !== undefined) return f.preserveValue;
-      return f.secretOnlyEnv && !f.isEnvRef ? HELD_SECRETS[f.key] : undefined;
+      return f.secretOnlyEnv ? HELD_SECRETS.get(f.key) : undefined;
     }
     function renderField(f, into) {
       const wrap = document.createElement('div'); wrap.className = 'field';
       const lab = document.createElement('label');
       lab.textContent = f.label + (f.required ? ' *' : f.conditionallyRequired ? ' †' : '');
       lab.title = f.help || '';
-      if (f.preserveValue !== undefined) HELD_SECRETS[f.key] = f.preserveValue;
+      if (f.preserveValue !== undefined) HELD_SECRETS.set(f.key, f.preserveValue);
       let control;
       const useEnv = f.isEnvRef || f.secretOnlyEnv;
-      if (f.control === 'checkbox' && !useEnv) {
+      // A checkbox only while the recorded value is a boolean: a checkbox would read any other value
+      // as false, and an untouched save would write false in its place (a "yes" the engine refuses
+      // at load becoming a setting it accepts). Any other value gets a text box, saved back as it is.
+      const boolish = f.value === undefined || f.value === null || typeof f.value === 'boolean';
+      if (f.control === 'checkbox' && !useEnv && boolish) {
         control = document.createElement('input'); control.type = 'checkbox';
         control.checked = f.value === true || (f.value === undefined && f.defaultValue === true);
       } else if (f.control === 'select' && !useEnv) {
@@ -159,7 +163,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         control.value = displayValue(useEnv ? (f.envKey || '') : f.value);
       }
       control.dataset.key = f.key;
-      control.dataset.kind = f.control;
+      control.dataset.kind = f.control === 'checkbox' && !boolish ? 'text' : f.control;
       if (useEnv) { control.dataset.env = '1'; }
       if (f.cast) { control.dataset.cast = f.cast; }
       HELD.set(control, f);
@@ -269,19 +273,20 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       try { return JSON.parse(text); } catch (e) { return text; }
     }
 
-    // Edited text for a schema field, read by the field's declared type (the rules coerce in
-    // connectionForm.ts states): a table, or a value the record held as a table, parses as JSON; a
-    // select takes the matching choice with its JSON type; a str stays text; a number that does not
-    // parse is posted verbatim, so the engine's validator refuses what the user typed.
+    // Edited text for a schema field, read by the field's declared type, as coerce in
+    // connectionForm.ts reads it: a table, or a value the record held as a table, parses as JSON; a
+    // select takes the matching choice with its JSON type; a number or a bool is converted when the
+    // text is one; anything else, and text that does not convert, is posted verbatim, so the
+    // engine's validator refuses what the user typed rather than this page guessing.
     function typedValue(f, raw) {
       if (f.control === 'table' || (f.value !== null && typeof f.value === 'object')) return parseTable(raw);
       if (f.control === 'select') {
         const hit = (f.choices || []).find((c) => String(c) === raw);
         return hit !== undefined ? hit : raw;
       }
-      if (f.type === 'str') return raw;
       if (f.type === 'int' || f.type === 'float') { const n = Number(raw); return Number.isFinite(n) ? n : raw; }
-      return coerce(raw);
+      if (f.type === 'bool') return raw === 'true' ? true : raw === 'false' ? false : raw;
+      return raw;
     }
 
     /**
@@ -297,7 +302,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       for (const el of document.querySelectorAll('#settings [data-key]')) {
         const key = el.dataset.key;
         if (!key) continue;
-        const f = HELD.get(el) || {};
+        const f = HELD.get(el);
         if (el.dataset.env === '1') {
           const envKey = el.value.trim();
           if (!envKey) {
@@ -311,7 +316,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           }
           const ref = { env: envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
-          if (f.envDefault !== undefined) ref.default = f.envDefault;
+          // A secret's env default is an inline credential too, so a clone does not copy it.
+          if (f.envDefault !== undefined && !(CLONE && f.secret)) ref.default = f.envDefault;
           settings[key] = ref;
           continue;
         }
@@ -330,7 +336,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         }
         const raw = el.value.trim();
         if (raw === '') continue;             // emptied -> omit the key entirely
-        settings[key] = HELD.has(el) ? typedValue(f, raw) : coerce(raw);
+        settings[key] = typedValue(f, raw);
       }
       for (const row of document.querySelectorAll('#settings .setting')) {
         const inputs = row.querySelectorAll('input[type=text]');

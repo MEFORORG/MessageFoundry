@@ -70,6 +70,8 @@ const SCHEMA: ConnectionSchema = {
         mode: param({ choices: ["fifo", "unordered"], default: "fifo" }),
         facility: param({}),
         suffix: param({ default: "x" }),
+        verify: param({ type: "bool", default: true }),
+        db_password: param({ secret: true }),
       },
     },
     file: {
@@ -99,6 +101,10 @@ const RECORD = {
     mode: "FIFO",
     facility: "0042",
     suffix: "",
+    // Not a boolean: the engine refuses it at load, and an untouched save must not turn it into one.
+    verify: "yes",
+    // A secret env reference whose default is itself an inline credential.
+    db_password: { env: "DB_PW", default: "synthetic-env-default-5565" },
   },
 };
 
@@ -227,12 +233,13 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
       // The table survives as a table, never "[object Object]" or a JSON string. The env
       // reference keeps its default; the select keeps a value outside its choices; the str of
       // digits stays a str; the explicit empty string stays.
-      const { tls_key_password: _secret, ...rest } = RECORD.settings;
-      const { tls_key_password: written, ...others } = settings;
+      const { tls_key_password: _secret, db_password: _ref, ...rest } = RECORD.settings;
+      const { tls_key_password: written, db_password: ref, ...others } = settings;
       assert.deepStrictEqual(others, rest);
-      // An edit keeps the credential the form never showed. A clone does not copy it: the GUI must
-      // not be what writes a new inline credential into the file.
+      // An edit keeps the credential the form never showed. A clone does not copy it, nor a secret
+      // env reference's inline default: the GUI must not be what writes a new inline credential.
       assert.strictEqual(written, clone ? undefined : SECRET);
+      assert.deepStrictEqual(ref, clone ? { env: "DB_PW" } : RECORD.settings.db_password);
     });
   }
 

@@ -158,7 +158,14 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
     };
 
     panel.webview.onDidReceiveMessage(
-      async (m: { command?: string; conn?: ConnObj; name?: string | null }) => {
+      async (m: {
+        command?: string;
+        conn?: ConnObj;
+        name?: string | null;
+        transport?: string;
+        direction?: string;
+        settings?: Record<string, unknown>;
+      }) => {
         const ws = workspaceDir();
         if (!ws) {
           return;
@@ -166,6 +173,18 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
         if (m?.command === "select") {
           desired = m.name ?? null; // null → the "＋ New connection" blank form
           await render();
+        } else if (
+          m?.command === "fields" &&
+          typeof m.transport === "string" &&
+          (m.direction === "inbound" || m.direction === "outbound")
+        ) {
+          // The form's transport or direction changed. Rebuild the descriptors here, as
+          // connectionEditor.ts does: the edit form draws the schema-driven fields too (BACKLOG
+          // #5565), and without an answer it kept the previous transport's fields.
+          const rebuilt = await formSchemaFor(ws, m.transport, m.direction, m.settings ?? {});
+          if (rebuilt) {
+            void postToWebview(panel.webview, { command: "fields", groups: rebuilt.groups });
+          }
         } else if (m?.command === "save" && m.conn) {
           // #234: the ONE save policy, shared with the command-opened form (connectionEditor.ts
           // save()) via planSave — merge the posted (rendered-fields-only) object over a save-time
