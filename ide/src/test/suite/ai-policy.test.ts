@@ -300,3 +300,62 @@ suite("resolveAiPolicy — the cached permit's age bound (BACKLOG #1154)", () =>
     assert.strictEqual(assistantState(stale).enabled, false);
   });
 });
+
+// BACKLOG #5564 — the cache is keyed by the engine that answered. This fake honours the key, unlike
+// fakeCtx above, so a cache shared across engines is visible.
+suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
+  const A = "http://127.0.0.1:8765";
+  const B = "http://127.0.0.1:9876";
+
+  function keyedCtx(): vscode.ExtensionContext {
+    const store = new Map<string, unknown>();
+    return {
+      globalState: {
+        get: (key: string): unknown => store.get(key),
+        update: async (key: string, v: unknown): Promise<void> => {
+          store.set(key, v);
+        },
+      },
+    } as unknown as vscode.ExtensionContext;
+  }
+
+  /** The engine at `url` answers `answer`, or is unreachable when `answer` is undefined. */
+  function engineIo(url: string, answer: AiPolicyWire | undefined): AiPolicyIo {
+    return {
+      url: () => url,
+      readToken: async () => "tok-abc",
+      getPolicy: async () => {
+        if (answer === undefined) {
+          throw new Error("engine unreachable");
+        }
+        return answer;
+      },
+      getCliPolicy: async () => {
+        throw new Error("no CLI here");
+      },
+    };
+  }
+
+  test("T17: a permit cached from engine A does not enable assistance against unreachable engine B", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: true })));
+    const offlineB = await resolveAiPolicy(ctx, engineIo(B, undefined));
+    assert.strictEqual(offlineB.mode, "unverified", "B has no cache of its own, so it fails closed");
+    assert.strictEqual(assistantState(offlineB).enabled, false);
+  });
+
+  test("T18: engine A's permit does not overwrite engine B's cached deny", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(B, wire({ mode: "off" })));
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: true })));
+    const offlineB = await resolveAiPolicy(ctx, engineIo(B, undefined));
+    assert.strictEqual(offlineB.mode, "off", "B's central off survives A answering");
+  });
+
+  test("T19: one engine keeps its own cache — A's deny still answers for A offline", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: false })));
+    const offlineA = await resolveAiPolicy(ctx, engineIo(`${A}/`, undefined));
+    assert.strictEqual(offlineA.assistPermitted, false, "the same engine, spelled with a slash, is one key");
+  });
+});

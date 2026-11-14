@@ -16,13 +16,14 @@ import {
   type AiPolicy,
   type CachedAiPolicy,
   UNVERIFIED_POLICY,
+  aiPolicyCacheKey,
   cachedPolicyOffline,
   evaluatedPermission,
   mergeAuthoritativePolicy,
 } from "./aiPolicyModel";
-import { engineUrl, runJson, workspaceDir } from "./cli";
+import { engineUrl, environments, runJson, workspaceDir } from "./cli";
 import { getJson } from "./engineClient";
-import { ASSIST_GATE_PLAN } from "./engineStatusModel";
+import { ASSIST_GATE_PLAN, resolveEngineStatusTarget } from "./engineStatusModel";
 import { assertTargetAllowed } from "./engineTarget";
 
 // The policy shape lives in the zero-import aiPolicyModel so the merge rule below it can be asserted
@@ -45,11 +46,11 @@ export interface AiPolicyWire {
   reason: string | null;
 }
 
-// globalState key holding the last authoritative (engine) policy, so a previously-seen central
-// "off" / ai:assist deny is not overridable simply by taking the engine offline (SEC-022). It is
-// stamped with when the engine answered, so a cached answer that ENABLES assistance expires
-// (BACKLOG #1154; see cachedPolicyOffline).
-const LAST_POLICY_KEY = "messagefoundry.lastAiPolicy";
+// The last authoritative (engine) policy is kept in globalState, so a previously-seen central "off" /
+// ai:assist deny is not overridable simply by taking the engine offline (SEC-022). It is stamped with
+// when the engine answered, so a cached answer that ENABLES assistance expires (BACKLOG #1154; see
+// cachedPolicyOffline), and it is keyed by the engine that answered (aiPolicyCacheKey, BACKLOG #5564),
+// so one engine's answer never stands in for another's.
 
 /**
  * Wire → resolved policy. `AiPolicyWire` is a claim about a response, not a guarantee: `JSON.parse`
@@ -107,15 +108,28 @@ export interface AiPolicyIo {
 }
 
 /**
+ * The engine the AI policy is read from, and the one an engine-brokered chat request goes to: the
+ * engine the status bar and the live view target (BACKLOG #5564). With named `environments`
+ * configured, that is the first environment, not `engineUrl`. Reading the policy from `engineUrl`
+ * there asked a different engine than the one the IDE works against, so the target's central "off"
+ * or `ai:assist` deny was never seen.
+ */
+export function aiPolicyEngineUrl(): string {
+  return resolveEngineStatusTarget(engineUrl(), environments()).url;
+}
+
+/**
  * Production wiring.
  *
  * `readToken` is {@link peekToken} and must NEVER become `ensureToken`: a chat turn resolves the policy
  * before every request, and `ensureToken` would pop an interactive sign-in modal out of it. The two
  * functions are structurally identical, so the type system cannot tell them apart — the control is the
  * test that asserts this field IS `peekToken` by identity, not this comment.
+ *
+ * `url` is {@link aiPolicyEngineUrl}.
  */
 export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
-  url: engineUrl,
+  url: aiPolicyEngineUrl,
   readToken: peekToken,
   getPolicy: (url, route, token) => getJson<AiPolicyWire>(url, route, token),
   getCliPolicy: () => runJson<AiPolicyWire>(["ai-policy"], workspaceDir()),
@@ -138,8 +152,12 @@ export async function resolveAiPolicy(
   io: AiPolicyIo = DEFAULT_AI_POLICY_IO,
 ): Promise<AiPolicy> {
   const now = io.now ?? Date.now;
+  // The cache key names the engine asked (BACKLOG #5564). Undefined only if reading the target
+  // threw, and then no engine's cache may answer for it.
+  let cacheKey: string | undefined;
   try {
     const url = io.url();
+    cacheKey = aiPolicyCacheKey(url);
     const plan = ASSIST_GATE_PLAN[0];
     // SEC-005 (ADR 0035 / engineTarget.ts): never send a bearer in clear to a non-loopback http://
     // target. Same shape as the liveStatus poll's guard. peekToken, never ensureToken — see
@@ -153,17 +171,18 @@ export async function resolveAiPolicy(
     // deny — a degraded read UPGRADING assistance a central policy had switched off. The merge keeps
     // the deny and nothing else; see mergeAuthoritativePolicy for why it is one-way.
     const merged = mergeAuthoritativePolicy(
-      ctx.globalState.get<CachedAiPolicy>(LAST_POLICY_KEY) ?? null,
+      ctx.globalState.get<CachedAiPolicy>(cacheKey) ?? null,
       fresh,
     );
     // Remember the authoritative answer, stamped with when it was given (BACKLOG #1154).
     const stamped: CachedAiPolicy = { ...merged, cachedAt: now() };
-    await ctx.globalState.update(LAST_POLICY_KEY, stamped);
+    await ctx.globalState.update(cacheKey, stamped);
     return merged;
   } catch {
     // Engine unreachable or errored — fall back to the cached authoritative / CLI / fail-closed view.
   }
-  const cached = ctx.globalState.get<CachedAiPolicy>(LAST_POLICY_KEY) ?? null;
+  const cached =
+    cacheKey === undefined ? null : (ctx.globalState.get<CachedAiPolicy>(cacheKey) ?? null);
   let cli: AiPolicy | null = null;
   // pickOfflinePolicy never reads the CLI's answer while a cache exists, so do not spawn it.
   if (cached === null) {

@@ -5,9 +5,9 @@
 // or ship keys. PHI boundary: we only ever attach code + the config graph (names) — never message
 // bodies / patient data — regardless of the chosen model.
 import * as vscode from "vscode";
-import { assistantState, resolveAiPolicy } from "./aiPolicy";
+import { aiPolicyEngineUrl, assistantState, resolveAiPolicy } from "./aiPolicy";
 import { withAuth } from "./auth";
-import { aiContextCharLimit, engineUrl } from "./cli";
+import { aiContextCharLimit } from "./cli";
 import { postJson } from "./engineClient";
 import { GraphProvider } from "./graphTree";
 
@@ -153,7 +153,8 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
     // code) — never message bodies / PHI — regardless of mode; the server re-resolves the policy and is
     // the sole enforcement point. MVP is non-streaming: render the whole reply at once.
     if (policy.mode === "managed_endpoint") {
-      const url = engineUrl();
+      // The engine whose policy said managed_endpoint (BACKLOG #5564), not a different one.
+      const url = aiPolicyEngineUrl();
       try {
         const res = await withAuth(context, url, (token) =>
           postJson<AiChatReply>(

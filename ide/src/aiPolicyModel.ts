@@ -185,3 +185,33 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
   // BYO with assistPermitted true OR null (RBAC not evaluable offline) — allowed.
   return { enabled: true };
 }
+
+/**
+ * The globalState key prefix for a cached authoritative policy. The key is per ENGINE (BACKLOG
+ * #5564): with one unscoped key, the answer one engine gave stood in for another, so a permit cached
+ * from engine A enabled assistance while engine B was unreachable, and a deny cached from B was
+ * replaced by A's answer. A key written before this change is not read; with no cache for an
+ * engine, the offline order falls to the CLI and then fails closed.
+ */
+export const AI_POLICY_CACHE_PREFIX = "messagefoundry.lastAiPolicy@";
+
+/**
+ * The globalState key for the policy cached from the engine at `url`. The URL is canonicalized so
+ * one engine spelled two ways shares one entry: the origin, which lowercases the scheme and host and
+ * drops a default port, plus the path with trailing slashes removed. The path stays in because the
+ * engine client appends each route to it, so two engines behind one origin at different paths are
+ * two engines. A URL that does not parse, or has no origin, is keyed by its trimmed text.
+ */
+export function aiPolicyCacheKey(url: string): string {
+  const text = url.trim();
+  let base = text.replace(/\/+$/, "");
+  try {
+    const u = new URL(text);
+    if (u.origin !== "null") {
+      base = u.origin + u.pathname.replace(/\/+$/, "");
+    }
+  } catch {
+    // Not a URL: keep the trimmed text, which still separates one setting value from another.
+  }
+  return AI_POLICY_CACHE_PREFIX + base;
+}

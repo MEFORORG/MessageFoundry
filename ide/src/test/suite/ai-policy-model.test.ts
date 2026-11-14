@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
 
 import {
+  AI_POLICY_CACHE_PREFIX,
   CACHED_PERMIT_MAX_AGE_MS,
+  aiPolicyCacheKey,
   assistantState,
   cachedPolicyOffline,
   mergeAuthoritativePolicy,
@@ -184,5 +188,86 @@ suite("cachedPolicyOffline (BACKLOG #1154 — a cached permit expires, a cached 
       const off = cachedPolicyOffline({ ...policy({ mode: "off" }), cachedAt }, NOW);
       assert.strictEqual(off.mode, "off");
     }
+  });
+});
+
+// BACKLOG #5564: the cached policy is keyed by the engine that answered, so one engine's permit
+// never enables assistance against another, and one engine's deny is never replaced by another's.
+suite("aiPolicyCacheKey (BACKLOG #5564)", () => {
+  test("K1: two engines get two keys, so neither answers for the other offline", () => {
+    const a = aiPolicyCacheKey("https://127.0.0.1:8765");
+    const b = aiPolicyCacheKey("https://engine-b.example.test:8765");
+    assert.notStrictEqual(a, b);
+    assert.ok(a.startsWith(AI_POLICY_CACHE_PREFIX) && b.startsWith(AI_POLICY_CACHE_PREFIX));
+  });
+
+  test("K2: one engine spelled two ways shares one key (case, default port, trailing slash)", () => {
+    const key = aiPolicyCacheKey("https://engine.example.test");
+    for (const spelling of [
+      "HTTPS://Engine.Example.Test/",
+      "https://engine.example.test:443",
+      "  https://engine.example.test//  ",
+    ]) {
+      assert.strictEqual(aiPolicyCacheKey(spelling), key, spelling);
+    }
+  });
+
+  test("K3: the scheme, the port and the path each name a different engine", () => {
+    const base = aiPolicyCacheKey("https://engine.example.test:8765");
+    assert.notStrictEqual(aiPolicyCacheKey("http://engine.example.test:8765"), base);
+    assert.notStrictEqual(aiPolicyCacheKey("https://engine.example.test:8766"), base);
+    // The engine client appends each route to the URL's path, so a path prefix is part of the target.
+    assert.notStrictEqual(
+      aiPolicyCacheKey("https://proxy.example.test/engine-a"),
+      aiPolicyCacheKey("https://proxy.example.test/engine-b"),
+    );
+  });
+
+  test("K4: text that is not a URL is still keyed, by its own text", () => {
+    assert.strictEqual(aiPolicyCacheKey("not a url/"), AI_POLICY_CACHE_PREFIX + "not a url");
+    assert.notStrictEqual(aiPolicyCacheKey("not a url"), aiPolicyCacheKey("also not a url"));
+  });
+});
+
+// aiPolicy.ts imports vscode, so its behavioural tests run only in the Extension Host leg
+// (ai-policy.test.ts). These read its source so the two halves of BACKLOG #5564 are pinned on every
+// leg: the policy is read from the status bar's target, and every cache read and write is keyed.
+suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG #5564)", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "aiPolicy.ts"), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
+
+  const urlResolvesTarget = (line: string): boolean => /^\s*url:\s*aiPolicyEngineUrl,?\s*$/.test(line);
+  const keyedAccess = (call: string): boolean => /^globalState\.(get<\w+>|update)\(cacheKey[,)]/.test(call);
+
+  test("T1: DEFAULT_AI_POLICY_IO.url resolves through resolveEngineStatusTarget, not engineUrl alone", () => {
+    const block = /DEFAULT_AI_POLICY_IO: AiPolicyIo = \{([\s\S]*?)\n\};/.exec(code);
+    assert.ok(block, "DEFAULT_AI_POLICY_IO moved — re-point this scan before trusting it");
+    const urlLines = block[1].split(/\r?\n/).filter((l) => /^\s*url:/.test(l));
+    assert.strictEqual(urlLines.length, 1, "expected one url entry in DEFAULT_AI_POLICY_IO");
+    assert.ok(urlResolvesTarget(urlLines[0]), `the policy is read from the wrong engine: ${urlLines[0].trim()}`);
+    // The control: the line the file carried before the fix must fail the predicate.
+    assert.ok(!urlResolvesTarget("  url: engineUrl,"), "the predicate accepts the defect line");
+    assert.ok(
+      /function aiPolicyEngineUrl\(\): string \{\s*return resolveEngineStatusTarget\(engineUrl\(\),\s*environments\(\)\)\.url;/.test(
+        code,
+      ),
+      "aiPolicyEngineUrl must resolve the status bar's target",
+    );
+  });
+
+  test("T3: an engine-brokered chat request goes to the engine the policy was read from", () => {
+    const chat = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "chat.ts"), "utf8");
+    assert.ok(/const url = aiPolicyEngineUrl\(\);/.test(chat), "chat.ts brokers to a different engine");
+    assert.ok(!/\bengineUrl\(\)/.test(chat), "chat.ts reads engineUrl directly");
+  });
+
+  test("T2: every globalState read and write of the policy goes through the per-engine key", () => {
+    const calls = code.match(/globalState\.(?:get<\w+>|update)\([^,)]*[,)]/g) ?? [];
+    assert.ok(calls.length >= 3, `expected the merge read, the write and the offline read; found ${calls.length}`);
+    for (const call of calls) {
+      assert.ok(keyedAccess(call), `an unkeyed policy cache access: ${call}`);
+    }
+    assert.ok(!keyedAccess("globalState.get<CachedAiPolicy>(LAST_POLICY_KEY)"), "the predicate accepts the defect");
+    assert.ok(/cacheKey = aiPolicyCacheKey\(url\);/.test(code), "the key must be derived from the url asked");
   });
 });
