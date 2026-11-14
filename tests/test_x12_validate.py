@@ -417,7 +417,7 @@ def test_sender_separators_cannot_forge_the_acks_st_segment(
 ) -> None:
     # With "|" and newline as the sender's separators, a GS03 of "X~ST" and a GS02 of "999" are
     # echoed into the 997's GS line, ahead of its real ST*997. pyx12 4.0.1 copied them as-is, a whole
-    # "~ST*999" segment boundary; 4.1.0 writes "?" for the "~", leaving the text "?ST*999".
+    # "~ST*999" segment boundary; 4.1.0, the floor, writes "?" for the "~", leaving the text "?ST*999".
     msg = _conformant_270(dob="19431399").replace("GS*HS*SENDERAPP*RECVAPP*", "GS*HS*999*X#ST*")
     msg = msg.replace("*", "|").replace("~", chr(10)).replace("#", "~")
     real = load_x12_code_resolver()
@@ -429,10 +429,11 @@ def test_sender_separators_cannot_forge_the_acks_st_segment(
 
     monkeypatch.setattr(_X12_VALIDATE, "load_x12_code_resolver", lambda: recording)
     result = validate(msg)
-    # Positive control: either form puts the text "ST*999" in the ack ahead of the real "ST*997", so
-    # an ack type read from the ack's text would come out as 999.
+    # pyx12 escapes the echoed "~", so no segment boundary is forged; a pyx12 that stopped escaping
+    # fails here. Positive control: the text "ST*999" still sits in the ack ahead of the real "ST*997",
+    # so an ack type read from the ack's text would come out as 999.
     assert result.ack is not None and "ST*997" in result.ack
-    assert "~ST*999" in result.ack or "?ST*999" in result.ack
+    assert "GS*FA*X?ST*999*" in result.ack and "~ST*999" not in result.ack
     assert result.ack.index("ST*999") < result.ack.index("ST*997")
     assert result.ack_transaction == "997"
     assert seen and not any(seen)
@@ -470,8 +471,8 @@ def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment(
 ) -> None:
     # With "|" and newline as the sender's separators, a GS06 of "1~IEA*1*000000001" is echoed into
     # the fragment's AK1, so the fragment's text ends in "IEA*1*000000001~", which pyx12 never wrote
-    # as an IEA. pyx12 4.0.1 copied the "~" as-is, a whole IEA segment; 4.1.0 writes "?" for it, and
-    # its 997 writer still splits the "*"s into elements, so the text ends the same way.
+    # as an IEA. pyx12 4.0.1 copied the "~" as-is, a whole IEA segment; 4.1.0, the floor, writes "?"
+    # for it, and its 997 writer still splits the "*"s into elements, so the text ends the same way.
     pipes = _conformant_270().replace("ST*270*0001~", "ST*270~").replace("*", "|")
     pipes = pipes.replace("|1200|1|X|", "|1200|1#IEA*1*000000001|X|")
     pipes = pipes.replace("GE|1|1~", "GE|1|1#IEA*1*000000001~")
@@ -485,10 +486,11 @@ def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment(
 
     monkeypatch.setattr(_X12_VALIDATE, "_AckBuffer", keep)
     result = validate(msg)
-    # Positive control: the fragment's text really does end in the forged IEA text, in either form,
-    # so a check that the text ends in an IEA's text would take the fragment for a finished ack.
+    # pyx12 escapes the echoed "~", so the forged text is no whole IEA segment; a pyx12 that stopped
+    # escaping fails here. Positive control: the fragment's text still ends in the forged IEA text, so
+    # a check that the text ends in an IEA's text would take the fragment for a finished ack.
     tail = buffers[0].getvalue().rstrip()
-    assert tail.endswith(("AK1*HS*1~IEA*1*000000001~", "AK1*HS*1?IEA*1*000000001~"))
+    assert tail.endswith("AK1*HS*1?IEA*1*000000001~")
     assert result.ack is None
     assert result.ack_transaction is None
 
@@ -522,7 +524,7 @@ def test_a_value_holding_the_ack_writers_delimiters_is_a_validation_result() -> 
     ]
     assert result.ack is not None and result.ack_transaction == "999"
     assert "IK4*4*373*8*20?6?5?1?2~" in result.ack
-    assert _DELIMITED_VALUE not in result.ack and _DELIMITED_VALUE not in _rendered(result)
+    assert _DELIMITED_VALUE not in _rendered(result)
 
 
 def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
@@ -555,6 +557,25 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
     assert result.ack is None and result.ack_transaction is None
     assert "before the closing IEA" in caplog.text
     assert "20*6" not in caplog.text and "20*6" not in _rendered(result)
+
+    # Positive control: with the engine's mute taken away and the pyx12 logger tree let through, the
+    # same pass does log the value, in the exception pyx12 logs for its failed ack writer. So the
+    # absence above is the mute's doing, not a pass that logs nothing. Re-mute afterwards.
+    real_mute = _X12_VALIDATE._mute_pyx12_logger
+    monkeypatch.setattr(_X12_VALIDATE, "_mute_pyx12_logger", lambda: None)
+    pyx12_logger = logging.getLogger("pyx12")
+    monkeypatch.setattr(pyx12_logger, "propagate", True)
+    pyx12_logger.setLevel(logging.NOTSET)
+    raised.clear()
+    caplog.clear()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            validate(_DELIMITED_837)
+        unmuted_log = caplog.text
+    finally:
+        real_mute()
+    assert raised
+    assert "20*6" in unmuted_log
 
 
 def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error() -> None:
