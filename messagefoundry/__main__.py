@@ -6882,7 +6882,9 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     """
     import getpass
 
+    from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
     from messagefoundry.auth.audit_visibility import ADMIN_UNLOCKED_ACTION
+    from messagefoundry.auth.usernames import BLANK_USERNAME_REFUSAL
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.redaction import codec_safe_str
@@ -6890,8 +6892,8 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
+        store_call_errors,
         store_connect_errors,
-        store_driver_errors,
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
     from messagefoundry.store.row_seal import (
@@ -6909,7 +6911,8 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     # created the account also finds it; every later use reads this value.
     wanted = args.username.strip()
     if not wanted:
-        return _emit_error("the username is empty; nothing was written", as_json=args.json)
+        # The shared text, so commands answer a blank name alike (BACKLOG #3391).
+        return _emit_error(f"{BLANK_USERNAME_REFUSAL}; nothing was written", as_json=args.json)
     try:
         # Before the store opens: a shell whose OS user cannot be named writes nothing.
         actor = f"cli:{getpass.getuser()}"
@@ -6928,19 +6931,16 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         _StoreOpenRefused,  # the OPEN only: a refused hop (#2532), a key, a short schema (#1720)
         *_key_unresolved(),
     )
-    # The drivers' errors, and what a store raises when it cannot reach its database (vault
-    # BACKLOG #3054, item 10): pyodbc's `Error` root, a pool borrow that timed out, an OSError.
-    reach_errors: tuple[type[Exception], ...] = (*store_driver_errors(), *store_connect_errors())
+    # A refused store call on every backend (BACKLOG #1983, store_call_errors), and what a store
+    # raises when it cannot reach its database (vault BACKLOG #3054, item 10).
+    reach_errors: tuple[type[Exception], ...] = (*store_call_errors(), *store_connect_errors())
     # Raised by the OPEN: a keyed store opened without its key, or a row the open cannot decrypt.
     # Could not start, exit 2, as admin-set-notify-email exits on them (BACKLOG #2124).
     open_errors: tuple[type[Exception], ...] = (StoreKeylessError, CipherError, *reach_errors)
-    # Raised by the read or the write, after the open: a refused write on every backend (BACKLOG
-    # #1983), as admin-set-notify-email names them, plus a cipher or a Transit row seal that failed
-    # mid-write. Each rolls the clear and its row back together. Exit 1: not "could not start".
-    write_errors: tuple[type[Exception], ...] = (
-        RuntimeError,
-        OSError,
-        StoreKeylessError,
+    # Raised by the read or the write, after the open: the refusals above, plus a cipher or a
+    # Transit row seal that failed. Exit 1: not "could not start". A defect is re-raised first
+    # (AUDIT_WRITE_DEFECTS), so a bug reaches the dispatch floor rather than reading as a refusal.
+    call_errors: tuple[type[Exception], ...] = (
         CipherError,
         RowSealUnverifiableError,
         TransitSealUnavailableError,
@@ -6949,8 +6949,8 @@ def _admin_unlock(args: argparse.Namespace) -> int:
 
     async def run() -> tuple[str, Any]:
         """``(outcome, extra)``: ``extra`` is the report for ``unlocked``, the error for
-        ``open-failed`` and ``refused``, else ``None``. Each catch is scoped to its own step, so
-        an error is classed by where it was raised, and anything else reaches the dispatch floor."""
+        ``open-failed``, ``read-refused`` and ``refused``, else ``None``. Each catch is scoped to
+        its own step, so an error is classed by where it was raised."""
         # A key that does not resolve is "could not start", exit 2, as audit-verify exits on it
         # (vault BACKLOG #3054, item 11). Only the open is wrapped; see the helper.
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
@@ -6964,13 +6964,17 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                     ),
                 )
             )
+        except (*AUDIT_WRITE_DEFECTS, *could_not_start):
+            raise  # a defect, or a refusal that prints its own text, exit 2, below
         except open_errors as exc:
             return ("open-failed", exc)
         try:
             try:
                 user = await store.get_user_by_username(wanted)
-            except write_errors as exc:
-                return ("refused", exc)
+            except AUDIT_WRITE_DEFECTS:
+                raise
+            except call_errors as exc:
+                return ("read-refused", exc)
             if user is None:
                 return ("no-such-user", None)
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
@@ -6994,12 +6998,16 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 cleared = await store.clear_lockout(
                     user.id, audit=audit, reset_cycles=bool(args.reset_cycles)
                 )
-            except write_errors as exc:
+            except AUDIT_WRITE_DEFECTS:
+                raise
+            except call_errors as exc:
                 return ("refused", exc)
             # False: the row was removed, or changed under the clear's compare-and-set.
             return ("unlocked", report) if cleared else ("changed", None)
         finally:
-            await store.close()
+            # A close that fails warns and never replaces the result: after a commit it would
+            # report a landed unlock as a failure (vault BACKLOG #3054).
+            await _close_store_quietly(store)
 
     try:
         outcome, extra = run_guarded(run())
@@ -7024,17 +7032,25 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             return 2
         # #1670: a path that is not a database, or a server the driver could not reach.
         return _emit_store_open_error(extra, _store_label(settings.store), as_json=args.json)
-    if outcome == "refused":
+    if outcome in ("read-refused", "refused"):
         # Logged, so the cause can be found: WARNING names the class only, since a driver's
         # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
         # store is not "could not start", so it keeps exit 1 (ADR 0171 Amendment C).
         log = logging.getLogger(__name__)
         log.warning(
-            "admin-unlock: the store refused the unlock for %r (%s)",
+            "admin-unlock: the store refused the %s for %r (%s)",
+            "account read" if outcome == "read-refused" else "unlock",
             wanted,
             type(extra).__name__,
         )
-        log.debug("admin-unlock: the refused unlock's traceback", exc_info=extra)
+        log.debug("admin-unlock: the refusal's traceback", exc_info=extra)
+    if outcome == "read-refused":
+        return _emit_error(
+            f"the store refused to read the account {wanted!r} ({type(extra).__name__}); "
+            "nothing was written. Check the store key and the database, then re-run",
+            as_json=args.json,
+        )
+    if outcome == "refused":
         return _emit_error(
             f"the store refused the unlock for {wanted!r} ({type(extra).__name__}). The clear and "
             "its audit row are one transaction, so neither was written, unless a server "

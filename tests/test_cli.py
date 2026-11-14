@@ -3884,7 +3884,51 @@ def test_admin_unlock_refuses_an_empty_username(
     db = tmp_path / "unlock-empty.db"
     _seed_locked(db, locked_until=None)
     assert main(["admin-unlock", "--username", "   ", "--db", str(db), "--json"]) == 1
-    assert "username is empty" in json.loads(capsys.readouterr().out)["error"]
+    assert "must not be blank" in json.loads(capsys.readouterr().out)["error"]
+    assert _unlock_audit_details(db) == []
+
+
+def test_admin_unlock_exits_2_when_the_open_refuses_for_a_missing_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633: a keyed store opened without its key could not start, exit 2, one JSON
+    object, as admin-set-notify-email exits on it (ADR 0171 Amendment C)."""
+    import messagefoundry.store.base as store_base
+    from messagefoundry.store.crypto import StoreKeylessError
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-keyless.db"
+    _seed_locked(db, locked_until=None)
+
+    async def keyless(*_a: object, **_k: object) -> object:
+        raise StoreKeylessError("the store is keyed and this shell holds no key")
+
+    monkeypatch.setattr(store_base, "open_store", keyless)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "holds no key" in error and "Nothing was written" in error
+
+
+def test_admin_unlock_reports_a_defect_rather_than_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633: a bug in the write is not dressed as a store refusal that a re-run fixes."""
+    import time
+
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-defect.db"
+    _seed_locked(db, locked_until=time.time() + 86_400)
+
+    async def bug(*_a: object, **_k: object) -> bool:
+        raise NotImplementedError("a defect")
+
+    monkeypatch.setattr(MessageStore, "clear_lockout", bug)
+    main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"])
+    assert "refused the unlock" not in capsys.readouterr().out
 
 
 def test_admin_unlock_names_the_os_user_before_any_write(
