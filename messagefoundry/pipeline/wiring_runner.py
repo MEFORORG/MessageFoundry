@@ -11834,18 +11834,10 @@ class RegistryRunner:
                         # leave the lane down with its inbound deployed, so re-pend the tail as the
                         # except arm below does: retried while this worker holds the lane, so no
                         # claim passes those rows. Only LANDED frees them; any other end returns.
-                        # Unlike the except arm's hold, the #122 halt ends this one (the abandon
-                        # below), so the worker returns with the tail still in flight and the lane
-                        # down; _inbound_log_halted says what respawns it.
                         # Not under a lease other than the claim's: this is a second write, and a
                         # successor may hold the rows (RependFence).
                         held = await self._repend_claimed_on_fault(
-                            "transform",
-                            name,
-                            claimed,
-                            faults=faults,
-                            fence=fence,
-                            abandon=functools.partial(self._inbound_log_halted, name),
+                            "transform", name, claimed, faults=faults, fence=fence
                         )
                         released = held is HoldResult.LANDED
                     if released and self._take_voided_transform_stop(name):

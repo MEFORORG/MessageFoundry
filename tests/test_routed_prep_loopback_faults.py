@@ -850,6 +850,118 @@ async def test_a_per_lane_release_fault_in_the_restore_window_does_not_take_the_
         await runner.stop()
 
 
+async def test_the_log_halt_holds_a_voided_stop_repend_until_it_lands_and_keeps_fifo(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The per-lane worker is holding the lane on the re-pend of a voided STOP's tail, as in the
+    # test above, when the #122 log-write halt latches (BACKLOG #5704). The halt is a claim gate
+    # and must not end that hold: a worker that returned with the tail in flight would be
+    # respawned by the start that lifts the halt, and the new worker would claim the rows behind
+    # that tail first, a per-inbound FIFO break. So the hold goes on until the re-pend lands, the
+    # worker then waits at its gate and processes nothing, and once the halt lifts every row drains
+    # in claim order.
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.01)
+    monkeypatch.setattr(wiring_runner, "_capped_backoff", lambda base, exp, cap: 0.02)
+    calls: list[str] = []
+    full = _registry(calls)
+    message_ids = await _routed_rows(store, 4)
+    runner = RegistryRunner(
+        full,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        fifo_claim_batch=3,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    race = _Race(monkeypatch, store, runner, full, restore="release_tail")
+    reschedules = [0]
+    state = {"fail": True, "landed": False}
+
+    async def release_claimed(ids: Any) -> None:
+        raise RuntimeError("store fault")
+
+    monkeypatch.setattr(store, "release_claimed", release_claimed)
+    real_reschedule = store.reschedule_claimed
+
+    async def reschedule_claimed(ids: Any, when: float) -> None:
+        reschedules[0] += 1
+        if state["fail"]:
+            raise RuntimeError("store fault")
+        await real_reschedule(ids, when)
+        # No await follows in the worker before its loop-top gate, so once this test sees the
+        # flag the worker has already read the gate.
+        state["landed"] = True
+
+    monkeypatch.setattr(store, "reschedule_claimed", reschedule_claimed)
+    processed: list[str] = []
+    real_process = runner._process_routed_item
+
+    async def process(name: str, item: OutboxItem, **kwargs: Any) -> Any:
+        processed.append(item.message_id)
+        return await real_process(name, item, **kwargs)
+
+    monkeypatch.setattr(runner, "_process_routed_item", process)
+    transform_ev = (
+        runner._lane_event(Stage.ROUTED, LOOP) if runner._per_lane_wake else runner._routed_work
+    )
+    gate_waits = [0]
+    real_wait = runner._wait_for_work
+
+    async def wait_for_work(event: asyncio.Event) -> bool:
+        if event is transform_ev:
+            gate_waits[0] += 1
+        return await real_wait(event)
+
+    monkeypatch.setattr(runner, "_wait_for_work", wait_for_work)
+
+    async def statuses() -> list[str | None]:
+        return [await _routed_status(store, m) for m in message_ids]
+
+    await runner.start()
+    try:
+
+        async def holding() -> bool:
+            return reschedules[0] >= 3
+
+        assert await _until(holding), "the worker never held the lane on the tail's re-pend"
+        assert race.restored, "the restoring reload never ran in its window"
+        assert calls == []
+        worker = runner._transform_workers[LOOP]
+        await runner._stop_all_for_log_failure(sink="file", reason="disk full")
+        halted_at = len(processed)
+        state["fail"] = False  # the store heals while the log is still halted
+
+        async def settled() -> bool:
+            return state["landed"] or worker.done()
+
+        assert await _until(settled), "the held re-pend neither landed nor ended"
+        # Positive control that the gate holds: woken, the worker reads the gate again and waits.
+        waits = gate_waits[0]
+        runner._wake_lane(Stage.ROUTED, LOOP)
+
+        async def gated_again() -> bool:
+            return gate_waits[0] > waits or worker.done()
+
+        assert await _until(gated_again), "the worker neither waited at its gate nor returned"
+        assert processed[halted_at:] == [], "a row was processed while the log was halted"
+        assert calls == []
+
+        await runner.restart_inbound(LOOP)  # the log works again, so this lifts the halt
+
+        async def drained() -> bool:
+            return calls == ["ran"] * 4 and await statuses() == [None] * 4
+
+        assert await _until(drained), (
+            f"the backlog did not drain after the halt lifted: statuses {await statuses()}, "
+            f"processed after the halt {processed[halted_at:]}"
+        )
+        assert processed[halted_at:] == message_ids, "the rows were not processed in claim order"
+        assert runner._transform_workers[LOOP] is worker, "the halt ended the worker's hold"
+        assert not _lane_down(runner), "the transform lane is down with its inbound deployed"
+    finally:
+        await runner.stop()
+
+
 @pytest.mark.parametrize("end", ["landed", "exhausted", "superseded"])
 async def test_a_pooled_stop_whose_tail_release_did_not_land_stays_stopped(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, end: str
