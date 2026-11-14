@@ -9900,11 +9900,7 @@ class RegistryRunner:
         * ``abandon``, read at the base interval through each backoff, returns ``ABANDONED``. The
           delivery worker and the pooled batch guard pass the negation of :meth:`_lane_may_deliver`,
           so a stop or pause of the outbound and the #122 halt are not held until the store heals
-          (that method says how a schedule window or a DR park reaches it). The router, transform
-          and response workers pass none: their #122 gate WAITS rather than returning (BACKLOG
-          #5704), so a hold the halt ended would leave its rows INFLIGHT under a live worker that
-          claims past them once the gate lifts. The hold writes to the store only, never processes
-          a row, so it runs on under the halt until it lands or the runner stops.
+          (that method says how a schedule window or a DR park reaches it).
         * ``give_up_after`` failures return ``EXHAUSTED``. Only the pooled batch guard passes it,
           under ``infra_fault_policy = stop``, since that hold is the pooled dispatcher's. The
           per-lane workers never read the policy and have no STOP path, so they pass none.
@@ -10046,8 +10042,7 @@ class RegistryRunner:
         refuses is PARKED with no timer until the gate lifts. A lane can still STOP while the halt
         is in force, at least under its own fault policy (the T17 infra-fault bound, for example
         when a hand-back's reschedule keeps failing on a full store) and through a leadership-loss
-        hand-back (:meth:`_refuse_log_halted`). Such a STOP records its hold as any other does, and
-        lifting the gate does not re-arm it."""
+        hand-back (:meth:`_refuse_log_halted`). Lifting the gate does not re-arm such a STOP."""
         # A mark gates only an inbound still in the graph: a removed inbound's worker must reach
         # its claim, see the inbound gone and return, rather than wait on a mark nothing lifts. A
         # re-add finds the mark again.
