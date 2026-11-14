@@ -462,6 +462,104 @@ def test_a_link_the_walk_cannot_stat_refuses(
         _file_and_folder([values])
 
 
+def _linked_value_file(tmp_path: Path) -> tuple[Path, Path]:
+    """``environments/dev.toml``, a link to ``elsewhere/dev.toml``, which is created."""
+    values = tmp_path / "environments" / "dev.toml"
+    values.parent.mkdir()
+    real = tmp_path / "elsewhere" / "dev.toml"
+    real.parent.mkdir()
+    real.write_text("", encoding="utf-8")
+    _link(values, real)
+    return values, real
+
+
+def test_a_dangling_value_file_link_vets_the_folder_it_leads_to(tmp_path: Path) -> None:
+    """Whoever can write the folder a dangling link leads to can create the file before a read.
+    The removed reload walk vetted that folder; a start check skipping the absent file must too."""
+    values, real = _linked_value_file(tmp_path)
+    real.unlink()
+    vetted = _same_paths(_file_and_folder([values]))
+    assert {_norm(real.parent), _norm(values.parent)} <= vetted
+    # The control: an absent file no link leads to adds nothing, its folder included.
+    assert _file_and_folder([tmp_path / "environments" / "absent.toml"]) == []
+
+
+def test_a_link_past_the_hop_limit_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import messagefoundry.auth.anchor_path as anchor_path
+
+    values, real = _linked_value_file(tmp_path)
+    middle = tmp_path / "elsewhere" / "middle.toml"
+    _link(middle, real)
+    values.unlink()
+    _link(values, middle)
+    assert _norm(real.parent) in _same_paths(_file_and_folder([values]))  # control: two hops pass
+    monkeypatch.setattr(anchor_path, "MAX_LINK_HOPS", 1)
+    with pytest.raises(WiringError, match="more than 1 links"):
+        _file_and_folder([values])
+
+
+def test_a_reparse_point_the_walk_cannot_follow_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name surrogate other than a symbolic link or a junction stands for another path the walk
+    cannot read, so the folders around that path would go unvetted."""
+    import stat as stat_module
+    from types import SimpleNamespace
+
+    values, _real = _linked_value_file(tmp_path)
+    real_lstat = os.lstat
+
+    def _lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if _norm(Path(path)) == _norm(values.parent):
+            # A WSL symbolic link's tag: a name surrogate (bit 0x20000000).
+            return SimpleNamespace(st_mode=stat_module.S_IFDIR, st_reparse_tag=0xA000001D)
+        return real_lstat(path, *args, **kwargs)
+
+    _file_and_folder([values])  # control: the real walk passes
+    monkeypatch.setattr(os, "lstat", _lstat)
+    with pytest.raises(WiringError, match="reparse point"):
+        _file_and_folder([values])
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a junction is a Windows link")
+def test_a_junction_in_the_path_vets_the_folder_holding_it(tmp_path: Path) -> None:
+    """``mklink /J`` needs no privilege, so a junction is the commonest Windows folder link; it
+    takes the reparse-tag arm, not the symbolic-link one."""
+    import _winapi
+
+    winapi: Any = _winapi  # typeshed declares CreateJunction for win32 only
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    store = tmp_path / "store" / "envs"
+    store.mkdir(parents=True)
+    (store / "dev.toml").write_text("", encoding="utf-8")
+    junction = cfg / "environments"
+    winapi.CreateJunction(str(store), str(junction))
+    vetted = _same_paths(_file_and_folder([junction / "dev.toml"]))
+    assert {_norm(cfg), _norm(junction), _norm(store), _norm(store / "dev.toml")} <= vetted
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the fast path is Windows only")
+def test_a_path_through_no_link_needs_no_stat_of_the_folders_above_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An account granted only traverse on a folder above the file can open it but not lstat that
+    folder, so a walk would refuse a start no link is involved in. The folder is named by its long
+    path: a short (8.3) name differs from the real path, so it is walked."""
+    tmp_path = Path(os.path.realpath(tmp_path))
+    _settings, values = _two_files(tmp_path)
+    real_lstat = os.lstat
+
+    def _lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if _norm(Path(path)) == _norm(tmp_path):
+            raise PermissionError(errno.EACCES, "access denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _lstat)
+    assert _file_and_folder([values]) == [values, values.parent]
+
+
 @pytest.mark.parametrize(
     ("target", "plain"),
     [

@@ -765,17 +765,20 @@ def test_every_folder_along_a_link_chain_is_vetted_before_the_read(
         value_file.symlink_to(middle)
     except OSError:
         pytest.skip("this account cannot create a file link")
-    vetted = _record_vets(monkeypatch)
+    events = _record_vets(monkeypatch, final)
     snapshot = Engine._reload_snapshot_blocking(cfg, value_file)
     assert snapshot is not None and snapshot.environment_file(value_file) == _APPROVED.encode()
+    read = ("read", os.path.normcase(os.path.realpath(final)))
+    assert read in events, "control: the snapshot read the file the chain ends at"
     for folder in (value_file.parent, middle.parent, final.parent):
-        assert ("vet", os.path.normcase(os.path.realpath(folder))) in vetted
+        assert ("vet", os.path.normcase(os.path.realpath(folder))) in events[: events.index(read)]
 
 
 def _record_vets(monkeypatch: pytest.MonkeyPatch, value_file: Path | None = None) -> list[Any]:
     """Record, in order, each path the config-source policy is handed, as ``("vet", path)``, and
-    each read of ``value_file``, as ``("read", path)``; each path normalized and resolved. The
-    policy itself passes everything."""
+    each read of ``value_file``, as ``("read", path)``. A vetted path is normalized but not
+    resolved, so a vetted link is not mistaken for the folder it leads to; a read is resolved, so
+    a read through a link names the file it reached. The policy itself passes everything."""
     from messagefoundry.config import snapshot as snapshot_module
     from messagefoundry.config import wiring
 
@@ -785,7 +788,7 @@ def _record_vets(monkeypatch: pytest.MonkeyPatch, value_file: Path | None = None
         return os.path.normcase(os.path.realpath(path))
 
     def _check(paths: Any, **_kwargs: Any) -> None:
-        events.extend(("vet", _norm(p)) for p in paths)
+        events.extend(("vet", os.path.normcase(os.path.abspath(p))) for p in paths)
 
     real_read = snapshot_module._read
 
