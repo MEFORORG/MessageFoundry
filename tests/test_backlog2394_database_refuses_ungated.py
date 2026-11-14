@@ -19,6 +19,7 @@ no database.
 from __future__ import annotations
 
 import ast
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -37,6 +38,7 @@ from tests._odbc_cancel_fakes import (
     cancel_once_started,
     cancelled_at_once,
     wait_for_entry,
+    wait_until,
 )
 from tests.test_backlog2394_store_refuses_ungated import (
     _closed_once_and_never_used,
@@ -126,17 +128,17 @@ async def test_a_send_on_a_refused_connection_fails_as_a_transient_connect_failu
     await _closed_once_and_never_used(rig)
 
 
-async def test_a_cancel_during_a_refused_connections_close_does_not_wait(rig: _Rig) -> None:
-    """A cancellation while the refused connection's close runs propagates at once. The close
-    goes on, once, and the pool still gets the connection back closed."""
+async def test_a_refusal_does_not_wait_for_the_close_it_starts(rig: _Rig) -> None:
+    """The refused connection's handle is dropped at once and closed on a worker thread, and the
+    borrow fails without waiting for that close, so a slow disconnect or a busy executor does not
+    hold it past its ``acquire_timeout``. The close still runs, once."""
     conn = rig.ungated(block_conn_close=True)
     pool = _WakingPool(conn)
-    task = await cancel_once_started(rig.started, database._acquire(pool, 1.0))
-    await cancelled_at_once(task)
-    assert "conn.close:start" in rig.log, "the arm is vacuous: the cancel missed the close"
-    assert "conn.close" not in rig.log, rig.log
+    with pytest.raises(UngatedConnectionError):
+        await asyncio.wait_for(database._acquire(pool, 1.0), 1.0)
+    assert await asyncio.to_thread(rig.started.wait, 1.0), "the arm is vacuous: no close started"
+    assert "conn.close" not in rig.log, "the arm is vacuous: the close was not held"
     assert conn.closed and pool.free == [], "the refused connection is lendable again"
-    del task
     await _closed_once_and_never_used(rig)
 
 
@@ -150,20 +152,23 @@ async def test_a_refused_renamed_handle_is_closed_through_its_own_close(rig: _Ri
     assert raw.closed and not raw.cursors, rig.log
 
 
-async def test_a_refused_renamed_handle_relent_mid_close_is_not_closed_twice(rig: _Rig) -> None:
-    """A cancellation during that close gives the pool the connection back still open. The next
-    borrow refuses it again, and must not start a second close beside the first."""
+async def test_a_cancelled_renamed_handle_close_keeps_it_out_of_the_pool_until_it_returns(
+    rig: _Rig,
+) -> None:
+    """A cancellation during that close propagates at once, and the connection, which still reads
+    open, goes back only once its close has returned, so neither a later borrow nor the pool's
+    own close can close it a second time beside the first."""
     raw = rig.raw(block_conn_close=True)
     conn = _RenamedHandleConn(raw, rig.executor)
     pool = _WakingPool(conn)
     task = await cancel_once_started(rig.started, database._acquire(pool, 1.0))
     await cancelled_at_once(task)
-    assert pool.free == [conn], "the arm is vacuous: the pool did not get the connection back"
-    with pytest.raises(UngatedConnectionError):
-        await database._acquire(pool, 1.0)
-    assert "conn.close" not in rig.log, "the second refusal closed it beside the first close"
+    assert "conn.close:start" in rig.log, "the arm is vacuous: the cancel missed the close"
+    assert not conn.closed and not pool.returned, "it went back while its close ran"
     rig.release.set()
     await wait_for_entry(rig.log, "conn.close")
+    assert await wait_until(lambda: pool.returned), "it never went back"
+    assert conn.closed and pool.free == [], rig.log
     assert rig.log.count("conn.close:start") == 1 and rig.log.count("conn.close") == 1, rig.log
 
 

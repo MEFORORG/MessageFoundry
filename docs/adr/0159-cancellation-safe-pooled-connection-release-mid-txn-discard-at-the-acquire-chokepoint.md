@@ -680,8 +680,10 @@ the next reader does not re-derive the wrong precedent from the same comment.
   **NOTE 2026-11-14 (BACKLOG #2394 step 1): the DATABASE connector's ungated residual is closed by
   refusal too.** Its two borrow sites, `_acquire` and the autocommit pool's `_acquire_confirmed`,
   run `require_call_gate` before the connector makes its first pyodbc call on the connection. A
-  real aioodbc connection the gate cannot wrap is closed there while nothing runs on it, and given
-  back to its pool closed, and the borrow fails. So the cancelled DATABASE borrow on a connection
+  real aioodbc connection the gate cannot wrap is closed there while nothing runs on it, and the
+  borrow fails. Its handle is dropped first, so the pool gets it back closed and never lends it
+  again; on an aioodbc that also renamed `_conn` there is no handle to drop, so it goes back only
+  once its own close has returned, and open if that close failed. So the cancelled DATABASE borrow on a connection
   with no gate, which the 2026-11-05 note says drops its handle and closes nothing, is now reached
   only by a stand-in, not by a real connection that entered through those two sites. That holds
   only while they are the connector's only ways in; the source pin in

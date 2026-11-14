@@ -3371,27 +3371,42 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
     Call it before the first pyodbc call on ``conn``, with no await between the borrow and it. A
     real aioodbc connection the call gate cannot wrap
     (:func:`~messagefoundry.odbc_call_gate.require_call_gate`) has no safe cancellation exit, so
-    it is closed here, while no call runs on it, and given back to ``pool`` closed, so the pool
-    never lends it again. :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` then
-    propagates, and each caller classifies it as it does any other failure to borrow. A stand-in
-    the gate cannot wrap is not refused, as ``require_call_gate`` leaves it alone.
+    it is closed here, while no call runs on it.
+    :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` then propagates, and each caller
+    classifies it as it does any other failure to borrow. A stand-in the gate cannot wrap is not
+    refused, as ``require_call_gate`` leaves it alone.
 
-    The close is :func:`~messagefoundry.odbc_call_gate.close_one_shot`, which drops the handle
-    before its first await and goes on if a cancellation lands meanwhile. A connection with no
-    ``_conn`` (an aioodbc that renamed it, as it renamed ``_execute``) is closed through its own
-    ``close()``; a cancellation there can leave it open, and the pool may lend it again, so it is
-    marked, and a later refusal of it does not start a second close beside the first."""
+    **Its handle is dropped before any await**, so the pool never lends it again, and given back
+    closed at once. The close of that handle runs on a worker thread, and the refusal does not wait
+    for it, as the store's refusal does not: nothing runs on the connection, so the close can race
+    nothing, and a borrow is not held behind a busy executor or a slow disconnect.
+
+    **A connection with no ``_conn``** (an aioodbc that renamed it, as it renamed ``_execute``) has
+    no handle to drop, so it is closed through its own ``close()``
+    (:func:`~messagefoundry.odbc_call_gate.close_one_shot`), and goes back to ``pool`` only once
+    that close has returned, through :func:`_return_when_settled` when a cancellation lands
+    meanwhile. So the pool can neither lend it nor close it again while that close runs. A close
+    that failed leaves it open: it goes back open, and the next borrow refuses and closes it
+    again."""
     try:
         require_call_gate(conn)
     except UngatedConnectionError:
-        try:
-            # A first refusal always closes: close_one_shot drops a handle before it awaits, so
-            # only a connection with no ``_conn`` can be lent and refused again mid-close.
-            if not getattr(conn, "_mefor_refused", False):
-                conn._mefor_refused = True  # await-free, before the close starts
-                await close_one_shot(conn, None)
-        finally:
-            await _return_to_pool(pool, conn)
+        raw = drop_handle(conn)  # first, and await-free: the pool never lends it again
+        if raw is not None:
+            try:
+                _thread_settled(partial(_close_dropped, raw))  # never raises; not awaited
+            except (
+                RuntimeError
+            ) as exc:  # the executor is shut down: pyodbc closes it when collected
+                logger.debug("DATABASE: refused connection not closed, executor shut down: %s", exc)
+        else:
+            closing = asyncio.ensure_future(close_one_shot(conn, None))
+            try:
+                await asyncio.shield(closing)
+            except BaseException:
+                _return_when_settled(pool, conn, closing, "a refused connection's close")
+                raise
+        await _return_to_pool(pool, conn)
         raise
 
 
