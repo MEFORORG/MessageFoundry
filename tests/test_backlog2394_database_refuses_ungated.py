@@ -170,6 +170,8 @@ async def test_a_cancelled_renamed_handle_close_keeps_it_out_of_the_pool_until_i
     assert await wait_until(lambda: pool.returned), "it never went back"
     assert conn.closed and pool.free == [], rig.log
     assert rig.log.count("conn.close:start") == 1 and rig.log.count("conn.close") == 1, rig.log
+    # Held back while its close ran, so a pool close stopped at its bound; no longer once back.
+    assert await wait_until(lambda: not database._holds_back(pool)), "still counted held back"
 
 
 def test_every_database_borrow_requires_the_gate() -> None:
@@ -191,10 +193,11 @@ def test_every_database_borrow_requires_the_gate() -> None:
     borrows = sorted(name for name, calls in defs if "acquire" in calls)
     # The control: the pin sees the two borrow sites, so it is not vacuous.
     assert borrows == ["_acquire", "_acquire_confirmed"]
-    for name in [*borrows, "_make_pool"]:
+    for name in [*borrows, "_make_pool", "_require_gate_or_discard"]:
         assert names.count(name) == 1, f"{name} is defined twice, so the pin reads only one"
     for name in borrows:
         assert "_require_gate_or_discard" in funcs[name], name
+    assert "require_call_gate" in funcs["_require_gate_or_discard"]
     assert not [n for n, calls in defs if "install_call_gate" in calls]
     assert sorted(n for n, calls in defs if "aioodbc.create_pool" in calls) == ["_make_pool"]
     assert not [n for n, calls in defs if "aioodbc.connect" in calls]

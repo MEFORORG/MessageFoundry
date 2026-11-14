@@ -3379,28 +3379,32 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
     **Its handle is dropped before any await**, so the pool never lends it again, and given back
     closed at once. The close of that handle runs on a worker thread, and the refusal does not wait
     for it, as the store's refusal does not: nothing runs on the connection, so the close can race
-    nothing, and a borrow is not held behind a busy executor or a slow disconnect.
+    nothing, and the borrow is not held behind a busy executor or a slow disconnect. Where the
+    executor is already shut down, at loop teardown, no thread can take the close, and the handle
+    is freed as this refusal unwinds, on the event loop thread.
 
     **A connection with no ``_conn``** (an aioodbc that renamed it, as it renamed ``_execute``) has
     no handle to drop, so it is closed through its own ``close()``
     (:func:`~messagefoundry.odbc_call_gate.close_one_shot`), and goes back to ``pool`` only once
     that close has returned, through :func:`_return_when_settled` when a cancellation lands
-    meanwhile. So the pool can neither lend it nor close it again while that close runs. A close
-    that failed leaves it open: it goes back open, and the next borrow refuses and closes it
-    again."""
+    meanwhile. So the pool can neither lend it nor close it again while that close runs. On this
+    path the borrow does wait for the close, and nothing bounds that wait. A close that failed
+    leaves it open: it goes back open, and the next borrow refuses and closes it again."""
     try:
         require_call_gate(conn)
     except UngatedConnectionError:
         raw = drop_handle(conn)  # first, and await-free: the pool never lends it again
         if raw is not None:
             try:
-                _thread_settled(partial(_close_dropped, raw))  # never raises; not awaited
-            except (
-                RuntimeError
-            ) as exc:  # the executor is shut down: pyodbc closes it when collected
+                asyncio.get_running_loop().run_in_executor(None, _close_refused, raw)
+            except RuntimeError as exc:  # the executor is shut down; see the docstring
                 logger.debug("DATABASE: refused connection not closed, executor shut down: %s", exc)
         else:
             closing = asyncio.ensure_future(close_one_shot(conn, None))
+            # The loop holds a task only weakly; keep this one alive until it ends, since on a
+            # cancellation only _return_when_settled's callback is left waiting on it.
+            _DETACHED_SETTLES.add(closing)
+            closing.add_done_callback(_DETACHED_SETTLES.discard)
             try:
                 await asyncio.shield(closing)
             except BaseException:
@@ -3408,6 +3412,15 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
                 raise
         await _return_to_pool(pool, conn)
         raise
+
+
+def _close_refused(raw: Any) -> None:
+    """On a worker thread: close the driver connection of a borrow the call gate refused. No call
+    ever ran on it, so no transaction can be open. Never raises."""
+    try:
+        raw.close()
+    except Exception as exc:  # noqa: BLE001 - every driver fault; nobody is left to raise to
+        logger.warning("DATABASE: closing a refused connection failed: %s", _safe_db_error(exc))
 
 
 async def _close_cursor(cur: Any) -> None:
@@ -3466,9 +3479,11 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     gate closes the cursor it made as it returns. A cancellation that lands after a call was handed
     to the connection's executor but before that call entered the gate leaves a call that never
     runs (:class:`~messagefoundry.odbc_call_gate.CallGate`), so no close races it. A real aioodbc
-    connection the gate cannot wrap never reaches here: the borrow refused and discarded it before
-    its first call (:func:`_require_gate_or_discard`). A connection with no gate is therefore a
-    stand-in, a test double. It has nothing to hand a close to, so a cancellation drops its handle
+    connection the gate cannot wrap does not reach here through this module's borrows, which refuse
+    and discard it before its first call (:func:`_require_gate_or_discard`); a connection taken
+    from a plain aioodbc pool some other way, such as ``acquire_pooled`` on a pool that is not an
+    :class:`_AutocommitPool`, is not checked. A connection with no gate, a test double or one that
+    came that other way, has nothing to hand a close to, so a cancellation drops its handle
     and closes nothing: the pool gets it back closed, and its unclosed handles are freed where
     their last reference drops, rather than under the call.
 
