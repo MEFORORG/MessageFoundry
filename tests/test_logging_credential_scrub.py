@@ -209,9 +209,9 @@ OTHER_QUOTED_VALUES: tuple[tuple[QuotedValue, str], ...] = (
         QuotedValue(
             "digest_parameter_list",
             'upstream sent Authorization: Digest username="wt-Dg_Usr-93", realm="api", '
-            'nonce="wt-Dg_Non-94", uri="/a", response="wt-Dg_Rsp-95" rejected',
+            'nonce="wt-Dg_Non-94", uri="/a", response="wt-Dg_Rsp-95"',
             ("wt-Dg_Usr-93", "wt-Dg_Non-94", "wt-Dg_Rsp-95"),
-            ("upstream sent", "rejected"),
+            ("upstream sent", "Authorization"),
         ),
         "_BEARER",
     ),

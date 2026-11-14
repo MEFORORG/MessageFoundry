@@ -3152,7 +3152,9 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     # non-empty user and a password ending at the first "@", narrower than ``_DSN_PASSWORD``'s.
     url_arm = r"://[^\s:/@]+:[^\s/@]+@"
     assert url_arm in pattern
-    assert secretscrub._DSN_PASSWORD.pattern.endswith(r"://[^\s:/@]*+):[^\s/@]++(?:@[^\s/@;]*+)*@")
+    assert secretscrub._DSN_PASSWORD.pattern.endswith(
+        r"://[^\s:/@]*+):[^\s/@]++(?:@[^\s/@;?#|=]*+)*@"
+    )
 
 
 def _start_labels_at_a_word_boundary_alone(patched: pytest.MonkeyPatch) -> None:

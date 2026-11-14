@@ -121,8 +121,8 @@ _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 _ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
 _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 _GUARDED_QUOTED_VALUE = (
-    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))++(?='(?!\\s*+[:=]))(?<![:=](?-i:b))(?<![:=]\\s(?-i:b))"
-    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))++(?="(?!\\s*+[:=]))(?<![:=](?-i:b))(?<![:=]\\s(?-i:b))'
+    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))++(?='(?!\\s*+[:=]))"
+    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))++(?="(?!\\s*+[:=]))'
 )
 _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
 _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
@@ -351,21 +351,10 @@ _QUOTED_SCHEME_VALUE = (
     r'))[A-Za-z0-9+/._~-]++=++(?="(?!\s*+[:=]))'
 )
 # A DIGEST CREDENTIAL'S WHOLE PARAMETER LIST is tried next (BACKLOG #5548): the single value stopped
-# at ``username=``'s quote, so the username, nonce and response printed. Why each quoted parameter
-# stops at a later label, and why it stays linear, are stated once, on the same fragments in
-# ``messagefoundry/secretscrub.py``; this copy builds them on its own ``_RUN_ON_LABEL``.
-_DIGEST_PARAM_QUOTED = (
-    r"\"(?:[^\"\\\r\nA-Za-z0-9\x80-\U0010ffff]|\\[^\r\n\x80-\U0010ffff]"
-    r"|(?!" + _RUN_ON_LABEL + r"(?-i:b)?[\"'])(?-i:[A-Za-z0-9])++)*+\"(?!\s*+[:=])"
-)
-_DIGEST_PARAM = r"[A-Za-z0-9_-]++=(?:" + _DIGEST_PARAM_QUOTED + r"|[A-Za-z0-9._~+/-]++)"
-_DIGEST_PARAMS = (
-    r"(?i:digest)[^\S\r\n]++"
-    + _DIGEST_PARAM
-    + r"(?:[^\S\r\n]*+,[^\S\r\n]*+"
-    + _DIGEST_PARAM
-    + r")*+"
-)
+# at ``username=``'s quote, so the username, nonce and response printed. After ``digest`` and a first
+# ``name=``, the rest of the line is taken; why, and why it stays linear, are stated once, on the
+# same pattern in ``messagefoundry/secretscrub.py``.
+_DIGEST_PARAMS = r"(?i:digest)[^\S\r\n]++(?=[A-Za-z0-9_-]++\*?[^\S\r\n]*+=)[^\r\n]*+"
 _BEARER = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
     r"(?:['\"]\s*:|\s*[:=])\s*(?:"
@@ -575,10 +564,10 @@ _KEY_MATERIAL = re.compile(
 # the shared PHI pass beside it is linear on that same input (0.12 ms at 2 KB, 0.99 ms at 16 KB), so
 # the quadratic was this module's own rather than inherited.
 # The user may be empty and the password runs to the LAST "@" before the next "/" or white space,
-# over segments after the first that hold no ";" (BACKLOG #5549), so ``pg://:pw@h`` and a password holding an unencoded "@" no longer print; why
+# over segments after the first that hold no ";", "?", "#", "|" or "=" (BACKLOG #5549), so ``pg://:pw@h`` and a password holding an unencoded "@" no longer print; why
 # that takes every span the old tail took, and stays linear, is on the same pattern there too.
 _DSN_PASSWORD = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[^\s/@]++(?:@[^\s/@;]*+)*@"
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[^\s/@]++(?:@[^\s/@;?#|=]*+)*@"
 )
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.

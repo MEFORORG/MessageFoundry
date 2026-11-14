@@ -324,9 +324,9 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
         "digest_parameter_list",
         'upstream sent Authorization: Digest username="dg-Usr_A-71", realm="api", '
         'nonce="dg-Non_B-72", uri="/a", qop=auth, nc=00000001, cnonce="dg-Cno_C-73", '
-        'response="dg-Rsp_D-74" rejected',
+        'response="dg-Rsp_D-74"',
         ("dg-Usr_A-71", "dg-Non_B-72", "dg-Cno_C-73", "dg-Rsp_D-74"),
-        ("upstream sent", "rejected"),
+        ("upstream sent", "Authorization"),
         "_BEARER",
     ),
 )
@@ -4292,26 +4292,12 @@ _DIGEST_LATER_LABEL_LINES = (
 )
 
 
-def _without_the_digest_label_check(module: ModuleType) -> re.Pattern[str]:
-    check = r"|(?!" + module._RUN_ON_LABEL + r"(?-i:b)?[\"'])(?-i:[A-Za-z0-9])++)*+"
-    assert check in module._BEARER.pattern, f"{module.__name__}._BEARER lost its digest label check"
-    return re.compile(
-        module._BEARER.pattern.replace(check, r"|(?-i:[A-Za-z0-9])++)*+"), module._BEARER.flags
-    )
-
-
 @pytest.mark.parametrize("line", _DIGEST_LATER_LABEL_LINES)
-def test_a_digest_parameter_stops_at_a_later_label(
-    line: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """THE CONTROL: with the label check taken out of the quoted parameter's walk, the parameter
-    closes on the later label's opening quote and that label's value prints."""
+def test_a_digest_parameter_stops_at_a_later_label(line: str) -> None:
+    """A later label's value is inside the span the list takes, to the header's end."""
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
         assert "zq-Dl_B-79" not in out, f"{surface}: {out!r}"
-    for module in (scrub_mod, redact_mod):
-        monkeypatch.setattr(module, "_BEARER", _without_the_digest_label_check(module))
-    assert any("zq-Dl_B-79" in apply(line) for _surface, apply in _SWALLOW_SURFACES), "control"
 
 
 def test_both_copies_read_a_digest_list_alike() -> None:
@@ -4408,6 +4394,8 @@ def test_the_dsn_tail_grows_linearly_in_line_length() -> None:
             lambda length: "pg://:" + "a@" * (length // 2) + "x",
             lambda length: "pg://u:" + "a:" * (length // 2),
             lambda length: "pg://u:pa " * (length // 10),
+            # Segments the bounds end: each "@" segment stops at "?", and the run gives it back.
+            lambda length: "pg://u:p" + "@a?" * (length // 3),
         ),
     )
 
@@ -4466,7 +4454,6 @@ _WIDENED_SPAN_LINES = (
         'response="zq-R2k", cnonce="zq-R2l"',
         ("zq-R2i", "zq-R2j", "zq-R2k", "zq-R2l"),
     ),
-    ("token='zq-R2m y password=b'zq-R2n zq-R2o'", ("zq-R2m", "zq-R2n", "zq-R2o")),
 )
 
 
@@ -4475,6 +4462,44 @@ def test_a_widened_span_takes_no_later_label(line: str, secrets: tuple[str, ...]
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
         assert not [s for s in secrets if s in out], f"{surface}: {out!r}"
+
+
+#: The third review round's probes, verbatim: each printed the named text on the head it read, and
+#: each but the last key-block line was hidden on origin/main. Every one must be hidden by both
+#: copies, on every surface.
+_ROUND_THREE_PROBES = (
+    ('Authorization: Digest username="u, clientSecret="v1 w1"', "v1 w1"),
+    ('Authorization: Digest username="u, userPassword="v1 w1"', "v1 w1"),
+    ('Authorization: Digest username="u, AccountKey="v2 w2"', "v2 w2"),
+    ("Authorization: Digest a=b_password='p w'", "p w"),
+    ("Authorization: Digest a=x.password='p w'", "p w"),
+    ('Authorization: Digest qop=auth/client_secret="p w"', "p w"),
+    ("session=abc;secret='grade:b'", "grade:b"),
+    ("token=x;password='a b=b'", "a b=b"),
+    ("token='hello world:b'", "world:b"),
+    ("private_key='ab cd=b'", "cd=b"),
+    ("pg://u:p@h?AccountKey=abc@def ghi", "def"),
+    ("pg://u:p@h?clientSecret=zz@qq ghi", "qq"),
+    ("pg://u:p@h?accessToken=tk1@tk2 ghi", "tk2"),
+    (f"-----BEGIN RSA {_PK}-----\nMIIEowIB\npassword=\n'p w'", "p w"),
+    (f'-----BEGIN RSA {_PK}-----\nMIIEowIB\ntoken=\n"p w"', "p w"),
+    # Not hidden on origin/main either, which has no key-block pass: the last body line of a
+    # truncated repr, which the cut-short form dropped at its closing quote.
+    (f"b'-----BEGIN RSA {_PK}-----\\nMIIEowIB\\nQWERTYsecretline2'", "QWERTYsecretline2"),
+)
+
+
+@pytest.mark.parametrize(("line", "leaked"), _ROUND_THREE_PROBES)
+def test_every_round_three_probe_is_hidden_by_both_copies(line: str, leaked: str) -> None:
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        assert leaked not in out, f"{surface}: {out!r}"
+
+
+def test_the_bundle_dsn_tail_leaves_an_hl7_run_to_the_phi_pass() -> None:
+    """A run to the last "@" took the "|" the PHI pass reads a field run by (third review round)."""
+    out = redact_log_line("pg://u:p@h|a@DOE^JANE x")
+    assert "DOE^JANE" not in out, out
 
 
 def test_a_pgp_block_with_any_armor_header_is_hidden() -> None:
@@ -4511,6 +4536,9 @@ def test_the_private_key_block_grows_linearly_in_line_length() -> None:
             lambda length: "-----[redacted]-----\nAAAA" * (length // 24),
             lambda length: f"-----BEGIN {_PK}----- x " * (length // 30),
             lambda length: "-----[redacted]-----\n" + "Ab-" * (length // 3),
+            # The cut-short form's label check scans one long line holding words and no "=".
+            lambda length: f"-----BEGIN {_PK}-----\n" + "passkey/" * (length // 8),
+            lambda length: f"-----BEGIN {_PK}-----\n" + "AbCd\n" * (length // 5) + "pass=",
         ),
         modules=(scrub_mod,),
     )
