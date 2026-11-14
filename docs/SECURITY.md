@@ -5861,6 +5861,31 @@ residual. If the first reconciler's pass ended before it alerted, the second's q
 means that account pages nobody. A quiet revocation whose own row is refused alerts instead, with no
 notice.
 
+A directory sign-in's role sync is a compare-and-set on the roles it read too (vault BACKLOG
+#3085), on the Kerberos and the OIDC leg alike. When another writer, at least a reconciler,
+another sign-in or a custom role's deletion, wrote the roles in between, the sign-in reads them
+again. If they are already at the directory's set, the sign-in writes no role and no
+`auth.ad_roles_resynced` row, but still ends the account's other sessions, sends its notice and
+runs the Administrator checks from the roles it first read, as on `main`, so a failed revoke by
+the other writer cannot leave stale sessions live. Otherwise it writes once more against what it
+read, and its `auth.ad_roles_resynced` row, its revoke, its notice and any Administrator alert are
+computed from the roles it replaced. If the roles read after that write are at another set still,
+the sign-in is refused with an `auth.login_failed` row whose reason is `role_sync_contended`. A
+record gone or failing its seal when read again after a lost write is refused with
+`account_refused`, and one now disabled or locked with the reason its eligibility gate gives. On
+these refusals the sign-in writes no role: the other writer's
+roles and sessions stand until the next sign-in or reconcile pass. Its other writes, such as a
+profile refresh, have already committed. The compare is on the set, so it cannot tell a newer
+directory read from an older one.
+
+A write that raises is applied again without its row, and a retry that finds the roles moved reads
+them back, as the reconciler's does. Roles found at the sign-in's set count the change as written,
+with its row, revoke and notice, even when another writer put them there. Roles that cannot be read
+back, through a store refusal or a record failing its seal, count it as written too, and the
+sign-in then fails with an error rather than mint a session. A first write
+that committed with its reply lost, followed by another writer's move before the read-back, reads
+as not written, so that first change gets no revoke, notice or alert of its own.
+
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors
 the reconciler treats as a refusal. Any other error still ends the pass. The reconciler logs
