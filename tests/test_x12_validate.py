@@ -524,10 +524,15 @@ def test_a_value_holding_the_ack_writers_delimiters_is_a_validation_result() -> 
     ]
     assert result.ack is not None and result.ack_transaction == "999"
     assert "IK4*4*373*8*20?6?5?1?2~" in result.ack
-    # No echoed delimiter opened a segment: every segment of the 999 starts with an ack segment ID.
+    # Every segment of the 999 starts with an ack segment ID. That catches an echoed "~" only where
+    # the text after it is not an ack segment ID, so a raw "1~IK5" would pass it.
     ack_ids = {"ISA", "GS", "ST", "AK1", "AK2", "IK3", "IK4", "IK5", "AK9", "SE", "GE", "IEA"}
-    seg_ids = {seg.strip().split("*", 1)[0] for seg in result.ack.split("~") if seg.strip()}
-    assert seg_ids <= ack_ids
+    segments = [seg.strip() for seg in result.ack.split("~") if seg.strip()]
+    assert {seg.split("*", 1)[0] for seg in segments} <= ack_ids
+    # So also check that each IK4 has exactly four elements, the last the whole replaced value: an
+    # echoed "~" or "*" anywhere in the value would cut it or add an element.
+    ik4s = [seg for seg in segments if seg.startswith("IK4*")]
+    assert ik4s and all(seg.split("*")[4:] == ["20?6?5?1?2"] for seg in ik4s)
     assert _DELIMITED_VALUE not in _rendered(result)
 
 
@@ -566,6 +571,7 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
     failures = [r for r in caplog.records if r.getMessage() == "Failed to create 999 response"]
     assert len(failures) == 1 and failures[0].exc_info is not None
     assert "20*6" in str(failures[0].exc_info[1])
+    assert "20*6" in caplog.text  # the instrument the negative below reads
     assert raised
 
     monkeypatch.setattr(_X12_VALIDATE, "_mute_pyx12_logger", real_mute)
@@ -582,10 +588,10 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
 
 
 def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error() -> None:
-    # pyx12 4.1.0 raises X12Error when no segment terminator comes within 1,048,576 characters;
-    # 4.0.1 had already stopped reading at a segment longer than about 16K characters. The pass
-    # raises X12ValidationError, and neither its message nor the pyx12 error it chains holds any of
-    # the input.
+    # pyx12 4.1.0 can raise X12Error on a segment of about a megabyte or longer, as it does on this
+    # unterminated one; 4.0.1 could stop reading at a much shorter segment. The pass raises
+    # X12ValidationError, and neither its message nor the pyx12 error it chains holds any of the
+    # input.
     import pyx12.errors
 
     body = "Q" * (1024 * 1024 + 100)
