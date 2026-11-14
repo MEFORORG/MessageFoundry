@@ -2057,12 +2057,17 @@ async def cleanup_failed_open(
         except TimeoutError:
             continue  # the next pass finds the deadline passed, or the cleanup done
         except asyncio.CancelledError:
+            # Ours unless only the cleanup task was cancelled: a cancel of this task landing in
+            # the same turn counts too, so it is never dropped (BACKLOG #5720).
+            if not task.cancelled() or (
+                current is not None and current.cancelling() > cancels_before
+            ):
+                cancelled = True
+                if deadline is None:
+                    trigger = "a cancel"
+                    deadline = loop.time() + FAILED_OPEN_CANCEL_BOUND_S
             if task.cancelled():
                 break
-            cancelled = True
-            if deadline is None:
-                trigger = "a cancel"
-                deadline = loop.time() + FAILED_OPEN_CANCEL_BOUND_S
     if cancelled and isinstance(exc, Exception):
         raise asyncio.CancelledError from exc
 
