@@ -150,13 +150,22 @@ worker strands its claimed row INFLIGHT, and `reset_stale_inflight` is startup/D
 default pooled claim mode by `pause_lane` on each stage dispatcher, under `per_lane` by a loop-top
 gate that returns out of the worker before its next claim. A lane already mid-episode finishes **at
 most its one in-flight head** — bounded, and strictly better than stranding the row.
+*(Note, BACKLOG #5704: superseded in mechanism. The internal stages are now held by a claim gate,
+`_inbound_log_halted`, which reads the latch and the per-inbound marks: per_lane workers WAIT at
+their loop top rather than returning, and a pooled lane parks before its claim, touching no
+row, until the gate lifts. A per_lane router or transform worker still finishes a batch it had
+already claimed, so for those lanes the one-head bound above holds under per_lane only at
+`fifo_claim_batch = 1`; the response worker claims one row at a time. The halt pauses no internal lane, and STOPs one only through its hand-back of a prefix claimed before the gate shut (on leadership loss, or at T17); a lane can still STOP for other causes, at least under its own fault policy. ADR 0189's note says the rest.)*
 
 **Recovery, measured rather than assumed — the two tiers recover differently and an operator needs
 both halves.** The inbound re-arm rides `_start_inbound_unsafe`, so **anything that starts an inbound
 re-arms it**: `restart_inbound` for one connection, and a `/config/reload` for every inbound it
 re-binds (reload quiesces every source and re-binds from the new graph). The inbounds a reload
 declines to bind — `deployed=False`, `auto_start=False` and not previously listening, DR-filtered —
-stay halted, as do the connections a per-connection restart does not name. The outbound **pause is
+stay halted, as do the connections a per-connection restart does not name. *(Note, BACKLOG #5704:
+under the pooled claim mode a router, transform or response lane that is STOPPED at a
+per-connection restart of its inbound stays STOPPED after it.)*
+The outbound **pause is
 operator-owned in both cases** (#115/#233: a reload never resumes a lane an operator has not looked
 at), so delivery needs an explicit `start_outbound` or a service restart either way. Stated the other
 way round: *a reload alone will not drain the backlog*, and a test pins exactly that — after a reload

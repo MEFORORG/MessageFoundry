@@ -228,8 +228,8 @@ async def test_file_stuck_files_do_not_charge_the_ceiling(
     directory, so if it charged the budget it would spend the whole ceiling on the same two files every
     scan and the healthy ones behind them would never be ingested.
 
-    Red mutation: add ``disposed += 1`` to the transient-read arm of ``_scan_once`` — the ceiling of two
-    is spent on the locked files and ``handler.bodies`` is empty."""
+    Red mutation: make the transient-read arm of ``FileSource._examine`` return ``_Step.CHARGED`` —
+    the ceiling of two is spent on the locked files and ``handler.bodies`` is empty."""
     from messagefoundry.transports import file as file_mod
 
     monkeypatch.setattr(file_mod, "DEFAULT_MAX_ITEMS_PER_POLL", 2)
@@ -266,8 +266,9 @@ async def test_file_leave_mode_files_already_taken_do_not_charge_the_ceiling(
     before the leave-mode dedup ran, so files already taken used up the budget and new ones behind
     them were never reached.
 
-    Red mutation: add ``disposed += 1`` before the leave-mode ``continue`` in ``_scan_once``. The third
-    scan then spends its budget of two on m000 and m001 again, and m002 and m003 never arrive."""
+    Red mutation: make the leave-mode already-ingested arm of ``FileSource._examine`` return
+    ``_Step.CHARGED``. The third scan then spends its budget of two on m000 and m001 again, and m002
+    and m003 never arrive."""
     inbox = tmp_path / "in"
     inbox.mkdir()
     _drop(inbox, 3)

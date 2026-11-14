@@ -84,7 +84,8 @@ hand a wrong body to the caller as the peer's answer, with no truncation for the
 see.
 :func:`reply_framing_fault` refuses them before any body byte is read, under RFC 9112 section 6.
 See its docstring for the shapes and for why each one is refused. It also refuses a header block
-the HTTP reader did not parse cleanly, because a framing header after a malformed line is lost.
+the HTTP reader did not parse cleanly, because a framing header after a malformed line is lost,
+and a body in a content coding other than ``identity``, which nothing here decodes (BACKLOG #5910).
 
 **A chunked body is decoded here, not by** ``http.client`` (BACKLOG #1979). ``http.client`` parses
 each chunk-size line with ``int(line, 16)``, so ``-5``, ``1_0``, ``+5``, ``0x5`` and `` 5 `` all
@@ -151,7 +152,6 @@ __all__ = [
     "MalformedReplyHeadError",
     "NoRedirectHandler",
     "ProxyCredentialsRefusedError",
-    "ProxyTunnelRefusedError",
     "ResponseTooLargeError",
     "StrictHTTPHandler",
     "StrictHTTPResponse",
@@ -266,6 +266,10 @@ class AmbiguousFramingError(EgressReplyError):
     calls them an error: ``Transfer-Encoding`` beside ``Content-Length``, a ``+5`` or ``5, 5``
     length, and ``Transfer-Encoding`` on HTTP/1.0. There, a correct read depends on which field
     ``http.client`` happens to consult first. The shapes are listed on :func:`reply_framing_fault`.
+
+    Also raised for a body in a content coding other than ``identity`` (BACKLOG #5910). That body
+    is framed legally and read whole, but the engine does not decode it, so the caller would take
+    compressed bytes as the reply's text. Its reason names the coding fault, not a length.
 
     Also raised part-way through a chunked body, at the first chunk-size line, chunk terminator or
     trailer line that breaks the RFC 9112 section 7.1 grammar. By then some bytes have been read,
@@ -475,13 +479,28 @@ def reply_framing_fault(reader: object) -> str | None:
       first; section 6.3 calls this an unrecoverable error. Identical repeats are allowed.
     * A ``Content-Length`` that is all digits but that ``http.client`` could not parse, so it left
       the length unset and would read to close. Past 4300 digits :func:`int` refuses the string.
+    * A ``Content-Encoding`` naming any coding but ``identity``, across every field (BACKLOG
+      #5910). The stdlib sends ``Accept-Encoding: identity`` and ``http.client`` decodes no content
+      coding, so a ``gzip`` body from a peer, a proxy or an operator-set request header would be
+      decoded as text with ``errors="replace"``. A SOAP Fault or a STOW-RS ``FailedSOPSequence``
+      inside a 2xx would then go unseen and the message read as delivered. ``strict_requests``
+      refuses the same codings on the Vault hop with its own check, which runs on every status.
+      This one skips a reply to ``HEAD``, a ``204``, a ``304`` and any ``1xx``, as described
+      below, and a ``Content-Length: 0`` reply, which has no coded bytes to misread. An empty
+      chunked or close-framed body that names a coding is still refused, because its emptiness is
+      known only after the read. Checked after the
+      ``Transfer-Encoding`` and ``Content-Length`` rules above, so a framing fault is the reason
+      given when both apply. An operator-supplied ``Accept-Encoding`` request header is not
+      overridden: a reply it brings back coded is refused here instead. Raised through
+      :class:`AmbiguousFramingError`, so on a 2xx it is the ``reply-misframed`` refusal.
 
     A reply to ``HEAD`` is not checked: ``http.client`` returns no body for it whatever the headers
     say. A ``204``, a ``304`` and any ``1xx`` have no body either, and ``http.client`` sets
     ``length = 0`` for them, so a ``Content-Length`` there frames nothing; a ``304`` routinely
     carries its representation's length. But ``http.client`` tests ``chunked`` before ``length``,
     so ``Transfer-Encoding`` on one of those statuses would still make it read a chunked body that
-    section 6.3 says does not exist. That one header is refused there, and nothing else is checked.
+    section 6.3 says does not exist. That one header is refused there, and nothing else is checked:
+    a ``304`` routinely carries its representation's ``Content-Encoding`` too.
 
     A reader with no parsed headers, such as a binary file handle, has no framing to refuse and
     returns ``None``.
@@ -505,13 +524,36 @@ def reply_framing_fault(reader: object) -> str | None:
     status = getattr(reader, "status", None)
     if isinstance(status, int) and _status_has_no_body(status):
         return "Transfer-Encoding on a response that has no body" if te_fields else None
+    framing_fault = _length_framing_fault(reader, te_fields, cl_fields)
+    if framing_fault is not None:
+        # Checked first, so a smuggling-shaped framing is named as such even on a coded reply.
+        return framing_fault
+    if getattr(reader, "length", None) == 0:
+        return None  # an empty body has no coded bytes to misread
+    # BACKLOG #5910. The same token parse strict_requests._read_body applies on the Vault hop.
+    if set(_codings(get_all("Content-Encoding") or [])) - {"identity"}:
+        return _CONTENT_CODED_REASON
+    return None
+
+
+#: The fixed reason :func:`reply_framing_fault` gives a content-coded body (BACKLOG #5910).
+_CONTENT_CODED_REASON = "a content coding other than identity, which the engine does not decode"
+
+
+def _codings(fields: Collection[object]) -> list[str]:
+    """The non-empty codings named across ``fields``, each stripped of OWS and lower-cased."""
+    codings = (c.strip(" \t").lower() for field in fields for c in str(field).split(","))
+    return [c for c in codings if c]
+
+
+def _length_framing_fault(reader: object, te_fields: list[str], cl_fields: list[str]) -> str | None:
+    """The ``Transfer-Encoding`` and ``Content-Length`` half of :func:`reply_framing_fault`."""
     if te_fields:
         if getattr(reader, "version", None) == 10:
             return "Transfer-Encoding on an HTTP/1.0 response"
         if cl_fields:
             return "Transfer-Encoding and Content-Length together"
-        codings = [c.strip(" \t").lower() for field in te_fields for c in field.split(",")]
-        codings = [c for c in codings if c]
+        codings = _codings(te_fields)
         if not codings or codings[-1] != "chunked":
             return "Transfer-Encoding whose final coding is not chunked"
         if "chunked" in codings[:-1]:
@@ -666,11 +708,9 @@ class StrictHTTPResponse(http.client.HTTPResponse):
     the response's stream, and never calls ``begin``. A guard that ``begin`` put on would miss that
     head. Built here, it covers both reads with no copy of ``_tunnel``.
 
-    **Of the framing checks, only the bare-CR check reaches a** ``CONNECT`` **reply.** ``_tunnel``
-    keeps the raw header lines and parses none, so :func:`reply_framing_fault` never sees that
-    head. At least a header line with no colon, and a control character in a value, still open the
-    tunnel. The ``CONNECT`` reply's status is also recorded, as :attr:`status_read`, which
-    ``_StrictHTTPSConnection._tunnel`` reads to type a refused tunnel (BACKLOG #2989).
+    **Only the bare-CR check reaches a** ``CONNECT`` **reply.** ``_tunnel`` keeps the raw header
+    lines and parses none, so :func:`reply_framing_fault` never sees that head. At least a header
+    line with no colon, and a control character in a value, still open the tunnel.
     """
 
     def __init__(
@@ -682,16 +722,6 @@ class StrictHTTPResponse(http.client.HTTPResponse):
     ) -> None:
         super().__init__(sock, debuglevel=debuglevel, method=method, url=url)
         self.fp = cast("Any", _BareCRGuard(self.fp))
-        #: The status code this response read off its status line, or ``None`` before one is read.
-        #: :class:`_StrictHTTPSConnection` reads it for a ``CONNECT`` reply, which never sets
-        #: ``status`` because ``begin`` never runs on it.
-        self.status_read: int | None = None
-
-    def _read_status(self) -> tuple[str, int, str]:
-        # http.client's own name for the status-line read; typeshed does not declare it.
-        version, status, reason = super()._read_status()  # type: ignore[misc]
-        self.status_read = status
-        return version, status, reason
 
     def begin(self) -> None:
         try:
@@ -708,55 +738,8 @@ class _StrictHTTPConnection(http.client.HTTPConnection):
     response_class = StrictHTTPResponse
 
 
-class ProxyTunnelRefusedError(OSError):
-    """A web proxy answered the ``CONNECT`` for an ``https`` target with a status other than 200.
-
-    ``http.client`` raises that as a bare ``OSError`` that carries the status only in its text.
-    :class:`_StrictHTTPSConnection` raises this subclass in its place, with the text unchanged and
-    the status code the reply's own status line gave, so a caller reads ``status`` rather than the
-    text (BACKLOG #2989). It is still an ``OSError``, so ``urllib`` wraps it in a ``URLError`` and
-    a caller that catches ``OSError`` catches it; a check for the exact type does not."""
-
-    def __init__(self, message: str, *, status: int) -> None:
-        super().__init__(message)
-        self.status = status
-
-    def __reduce__(self) -> tuple[object, ...]:
-        # As AmbiguousFramingError: the keyword-only status travels with the constructor.
-        return (functools.partial(type(self), status=self.status), self.args, self.__dict__)
-
-
 class _StrictHTTPSConnection(http.client.HTTPSConnection):
     response_class = StrictHTTPResponse
-
-    def _tunnel(self) -> None:
-        # The reply to CONNECT is built from response_class inside _tunnel and never returned, so
-        # the one built here is kept to read its status after _tunnel refuses the tunnel.
-        replies: list[StrictHTTPResponse] = []
-        own = vars(self)
-        prior = own.get("response_class")
-        response_class = prior if prior is not None else type(self).response_class
-
-        def reply(sock: socket.socket, *args: Any, **kwargs: Any) -> StrictHTTPResponse:
-            built = response_class(sock, *args, **kwargs)
-            replies.append(built)
-            return built
-
-        own["response_class"] = reply
-        try:
-            super()._tunnel()  # type: ignore[misc]
-        except OSError as exc:
-            status = getattr(replies[-1], "status_read", None) if replies else None
-            # _tunnel's own refusal of a status is a bare OSError with no errno. A socket error
-            # while reading the head carries an errno or is a subclass, and keeps its own type.
-            if status is None or status == 200 or type(exc) is not OSError or exc.errno is not None:
-                raise
-            raise ProxyTunnelRefusedError(str(exc), status=status) from exc
-        finally:
-            if prior is None:
-                own.pop("response_class", None)
-            else:
-                own["response_class"] = prior
 
 
 class StrictHTTPHandler(urllib.request.HTTPHandler):
@@ -1904,7 +1887,8 @@ def read_bounded_text(
 REPLY_TOO_LARGE_CODE = "reply-too-large"
 #: The ``code`` it raises for a body that stopped short of the length the peer declared.
 REPLY_TRUNCATED_CODE = "reply-truncated"
-#: The ``code`` it raises for a body framed in a way RFC 9112 does not allow.
+#: The ``code`` it raises for a body framed in a way RFC 9112 does not allow, or in a content
+#: coding the engine does not decode (BACKLOG #5910).
 REPLY_MISFRAMED_CODE = "reply-misframed"
 
 
@@ -1962,7 +1946,8 @@ def read_2xx_reply_text(
     The partner answered 2xx, so a body the engine cannot read must not cause a re-send. Three
     kinds are handled, and each has its own code: a body over the bound (:data:`REPLY_TOO_LARGE_CODE`,
     vault BACKLOG #2180), a body cut short of its declared length (:data:`REPLY_TRUNCATED_CODE`),
-    and a misframed body (:data:`REPLY_MISFRAMED_CODE`), the last two since BACKLOG #2989. What
+    and a misframed body (:data:`REPLY_MISFRAMED_CODE`), the last two since BACKLOG #2989. A body
+    in a content coding counts as misframed since BACKLOG #5910. What
     each causes depends on ``body_is_needed``, which says who reads the body. This is the one
     place in code that states the rule:
 
@@ -1978,7 +1963,8 @@ def read_2xx_reply_text(
       recorded as delivered.
 
     Who decided the rule for each kind, and on what authority, is recorded once, in ADR 0095
-    Amendment B.1.
+    Amendment B.1. That amendment does not cover the content-coded body, which BACKLOG #5910
+    added under the misframed code.
 
     Which FHIR writes need the body is stated at the call in ``transports/fhir.py``.
 

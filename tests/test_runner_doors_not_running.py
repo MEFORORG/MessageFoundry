@@ -5,10 +5,14 @@
 The ADR 0157 demoted follower stops its runner and keeps its API serving, so a control can still
 reach the runner. Before the fix the start doors bound a listener or spawned a delivery worker on
 it, outside the engine lifecycle, and ``stop_outbound`` recorded a pause the next start inherited.
+
+A node that lost its lease before ``_stop_graph`` ran still has a running graph, so its start and
+restart doors also ask the coordinator for leadership (BACKLOG #5906, #8214 item 16).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,8 +25,10 @@ from messagefoundry.api import create_app
 from messagefoundry.api.app import _alert_control_action, _outbound_down_detail
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
+    RunnerLeaseLostError,
     RunnerNotRunningError,
     TeardownReason,
 )
@@ -164,6 +170,206 @@ async def test_the_control_route_answers_503_on_a_downed_graph(tmp_path: Path) -
         )
     finally:
         await engine.stop()
+
+
+class _LeaseCoordinator(NullCoordinator):
+    """A cluster node whose lease the test takes away while its graph still runs."""
+
+    def __init__(self) -> None:
+        super().__init__("node-under-test")
+        self.leader = True
+
+    def is_leader(self) -> bool:
+        return self.leader
+
+    def is_clustered(self) -> bool:
+        return True  # as a real cluster coordinator is, so the clustered branches run
+
+
+async def _lease_lost_runner(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> tuple[RegistryRunner, _LeaseCoordinator]:
+    """A runner whose node lost its lease after its graph came up and before ``_stop_graph`` ran
+    (#8214 item 16): ``_running`` is still True."""
+    coordinator = _LeaseCoordinator()
+    runner = RegistryRunner(
+        _unsharded_registry(tmp_path),
+        store,
+        claim_mode=claim_mode,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+        coordinator=coordinator,
+    )
+    await runner.start()
+    try:
+        assert runner.running and _IN in runner._sources  # the control: the graph really runs
+        coordinator.leader = False
+        assert runner.running  # the window: the lease is gone and the graph is not yet stopped
+    except BaseException:
+        await runner.stop()
+        raise
+    return runner, coordinator
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_node_that_lost_its_lease_refuses_the_start_and_restart_doors(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    """BACKLOG #5906, #8214 item 16. The refusal is a RunnerNotRunningError, so the API's 503
+    mapping takes it, and it does not claim the graph is down: here it still runs."""
+    runner, _ = await _lease_lost_runner(store, tmp_path, claim_mode)
+    try:
+        # The stops take work down, which a node losing its lease should do, so they still pass.
+        await runner.stop_inbound(_IN)
+        await runner.stop_outbound(_OUT)
+        assert _IN not in runner._sources and _OUT in runner._outbound_paused
+        for door, call in _doors(runner):
+            if door == "stop_outbound":
+                continue
+            with pytest.raises(RunnerLeaseLostError) as ei:
+                await call()
+            assert isinstance(ei.value, RunnerNotRunningError), door
+            assert ei.value.name in (_IN, _OUT), door
+            assert "lease" in str(ei.value) and "graph is not running" not in str(ei.value)
+        # Nothing was bound or resumed behind the refusals.
+        assert _IN not in runner._sources
+        assert _OUT in runner._outbound_paused
+        assert ("inbound", _IN) not in runner._failed  # a refusal is not a failed start
+    finally:
+        await runner.stop()
+
+
+async def test_the_scheduler_starts_nothing_on_a_node_that_lost_its_lease(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A window open is the engine, not an operator, and the lease-lost door would refuse it; the
+    tick must not record that refusal as a failed start that pages."""
+    runner, _ = await _lease_lost_runner(store, tmp_path, "pooled")
+    always: Any = SimpleNamespace(is_active=lambda _now: True)
+    try:
+        await runner.stop_inbound(_IN)
+        await runner.stop_outbound(_OUT)
+        await runner._reconcile_schedule(_IN, "inbound", always)
+        await runner._reconcile_schedule(_OUT, "outbound", always)
+        assert _IN not in runner._sources and _OUT in runner._outbound_paused
+        assert ("inbound", _IN) not in runner._failed
+    finally:
+        await runner.stop()
+
+
+async def test_a_lease_lost_while_a_window_open_waits_on_the_lock_is_not_a_failed_start(
+    store: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The scheduler's own lease read is a fast path taken before the reload lock. A lease lost
+    while the tick waits on that lock reaches the door's refusal, which is still not recorded as a
+    failed start and does not escape the tick."""
+    runner, coordinator = await _lease_lost_runner(store, tmp_path, "pooled")
+    always: Any = SimpleNamespace(is_active=lambda _now: True)
+    try:
+        await runner.stop_inbound(_IN)
+        await runner.stop_outbound(_OUT)
+        coordinator.leader = True  # the lease is held when each tick reads it
+        async with runner._reload_lock:
+            ticks = [
+                asyncio.ensure_future(runner._reconcile_schedule(_IN, "inbound", always)),
+                asyncio.ensure_future(runner._reconcile_schedule(_OUT, "outbound", always)),
+            ]
+            for _ in range(5):
+                await asyncio.sleep(0)  # both ticks pass their lease read and wait on the lock
+            assert not any(t.done() for t in ticks)
+            coordinator.leader = False
+        caplog.set_level("INFO")
+        await asyncio.gather(*ticks)  # neither raises
+        assert _IN not in runner._sources and _OUT in runner._outbound_paused
+        assert ("inbound", _IN) not in runner._failed
+        # The premise: both ticks got past their own lease read and met the door's refusal, rather
+        # than first running after the flip and taking the fast path.
+        assert sum("not started" in r.getMessage() for r in caplog.records) == 2
+    finally:
+        await runner.stop()
+
+
+async def test_a_lease_lost_restart_is_refused_before_its_stop_half(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A live listener and a delivering lane keep their state: the refusal comes before the stop
+    half of either restart, so nothing is unbound or turned into an operator pause."""
+    runner, _ = await _lease_lost_runner(store, tmp_path, "pooled")
+    try:
+        assert _IN in runner._sources and _OUT not in runner._outbound_paused  # the premise
+        with pytest.raises(RunnerLeaseLostError):
+            await runner.restart_inbound(_IN, operator=True)
+        with pytest.raises(RunnerLeaseLostError):
+            await runner.restart_outbound(_OUT)
+        assert _IN in runner._sources and _OUT not in runner._outbound_paused
+    finally:
+        await runner.stop()
+
+
+async def test_the_control_route_answers_503_on_a_node_that_lost_its_lease(
+    tmp_path: Path,
+) -> None:
+    """The API's existing RunnerNotRunningError arms take the subclass: a 503 naming the lease,
+    and a refused-control audit row, while the stops still answer 200."""
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_unsharded_registry(tmp_path))
+    await engine.start()
+    try:
+        rr = engine.registry_runner
+        assert rr is not None and rr.running
+        coordinator = _LeaseCoordinator()
+        coordinator.leader = False
+        rr._coordinator = coordinator  # the lease is gone; _stop_graph has not run yet
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            assert (await c.post(f"/connections/{_IN}/stop")).status_code == 200
+            assert (await c.post(f"/connections/{_OUT}/stop")).status_code == 200
+            for name, action in (
+                (_IN, "start"),
+                (_IN, "restart"),
+                (_OUT, "start"),
+                (_OUT, "restart"),
+            ):
+                r = await c.post(f"/connections/{name}/{action}")
+                assert r.status_code == 503, (name, action, r.text)
+                assert "lease" in r.text and "graph is not running" not in r.text
+        assert _IN not in rr._sources and _OUT in rr._outbound_paused
+        details = [
+            json.loads(row["detail"] or "{}")
+            for row in await engine.store.list_audit(action="connection_control")
+        ]
+        refused = sorted((d["connection"], d["action"]) for d in details if d.get("refused"))
+        assert refused == sorted(
+            [(_IN, "start"), (_IN, "restart"), (_OUT, "start"), (_OUT, "restart")]
+        )
+    finally:
+        await engine.stop()
+
+
+async def test_a_leader_takes_the_start_doors_as_before(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The negative control: with the lease held, the same doors act."""
+    runner, coordinator = await _lease_lost_runner(store, tmp_path, "pooled")
+    coordinator.leader = True
+    try:
+        await runner.stop_inbound(_IN)
+        await runner.stop_outbound(_OUT)
+        await runner.start_inbound(_IN, operator=True)
+        await runner.start_outbound(_OUT)
+        assert _IN in runner._sources and _OUT not in runner._outbound_paused
+        # The scheduler's positive control: the same window-open calls the lease-lost test makes
+        # do start an engine-stopped inbound here.
+        await runner.stop_inbound(_IN)
+        always: Any = SimpleNamespace(is_active=lambda _now: True)
+        await runner._reconcile_schedule(_IN, "inbound", always)
+        assert _IN in runner._sources
+    finally:
+        await runner.stop()
 
 
 async def test_an_outbound_stop_still_pauses_a_lane_a_failed_teardown_left(

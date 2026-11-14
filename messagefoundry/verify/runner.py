@@ -88,15 +88,20 @@ def _load_settings(service_config: str | None) -> tuple[ServiceSettings | None, 
     """
     from pydantic import ValidationError
 
+    from messagefoundry.config.anchor import anchor_settings_store_path
     from messagefoundry.config.settings import load_settings, settings_error_detail
 
     try:
-        return load_settings(config_path=service_config), None
+        settings = load_settings(config_path=service_config)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
         # OSError covers a --service-config that names a DIRECTORY; the mechanism is stated once,
         # at messagefoundry.__main__._load_service_settings. It costs more here than there: the
         # report IS this command's output, so a traceback leaves an operator with no report at all.
         return None, settings_error_detail(exc)
+    # Every store check below then tests the store serve opens, not one beside the working
+    # directory (BACKLOG #5926).
+    anchor_settings_store_path(settings, cwd=Path.cwd())
+    return settings, None
 
 
 def _writable_dir(settings: ServiceSettings | None) -> Path:

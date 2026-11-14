@@ -239,6 +239,15 @@ this line.**
 
 ### Fixed
 
+- **Edit and resubmit keeps the original's line endings.** A browser submits a textarea's line
+  breaks as CRLF, so a direct send of a CR-terminated HL7 body, or a resend of an LF-only payload,
+  changed its terminators. The editor now carries the original's style in a hidden `eol` field
+  (`cr`, `lf` or `crlf`; the style most breaks use, CR first on a tie, and CR for a one-line HL7
+  body), and the route rewrites the submitted breaks to it before resubmitting. An `eol` outside
+  that set, an empty one included, is refused with the generic "invalid input". A body that starts
+  with a line break keeps it. The seam digest moved because the route's form parser changed, and
+  it now hashes the helper that rewrites the breaks. (BACKLOG #5930)
+
 - **TOTP enrolment no longer drops the first code.** Under the default
   `[auth].require_action_step_up`, the enroll page showed a code form whose submit the confirm
   gate refused for want of its own single-use proof, sending the operator to re-auth and losing the

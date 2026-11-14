@@ -2191,9 +2191,9 @@ jobs:
     # for its own 66/55. Sizing a cap close to the observed run buys no detection and costs red builds
     # on green suites, and a gate that cries wolf gets deleted. The engine Windows legs carry 66/55 for
     # a bigger suite; 40/30 was proportionate here and well clear at -n 4. It went to 45/35, then to
-    # 60/48 on both legs. Since 2026-10-23 the caps are PER LEG: windows-2025 is 80/67, every other leg
-    # stays 60/48. The paragraphs below are why -- that sentence about sizing a cap close to the
-    # observed run is the rule that moved it, applied to its own tier.
+    # 60/48 on both legs. Since 2026-10-23 the caps are PER LEG: windows-2025 was 80/67 and is 115/100
+    # since 2026-11-14, every other leg stays 60/48. The paragraphs below are why -- that sentence
+    # about sizing a cap close to the observed run is the rule that moved it, applied to its own tier.
     #
     # RE-DERIVED FOR THE WINDOWS LEG'S -n 3 EXPERIMENT (BACKLOG #1109, against #1304), because the
     # trigger at the bottom of this note fires on its own change. The paragraphs above are the caps'
@@ -2395,6 +2395,9 @@ jobs:
     # days. This note makes NO runway claim from that: a daily median on a bimodal leg does not
     # support one.
     #
+    # SUPERSEDED FOR windows-2025 ON 2026-11-14 (see "RE-DERIVED A FOURTH TIME" below); the 80/67
+    # sizing and the nesting row in the next paragraph are its record, not the caps in force.
+    #
     # THE STEP CAP IS 67 = ceil_minute(1.35x 49:06). The kills were cut short, so their true durations
     # are longer than 48:08. The progress figure is tests done over tests collected, so the [98%] kill,
     # job 120484240748, gives its full length as about 48:07 / 0.98 = 49:06. That is an ESTIMATE:
@@ -2402,7 +2405,7 @@ jobs:
     # longest of the four. The JOB cap is 80. Setup is the larger of the two pools' windows maxima,
     # 4:33 (run 39664551193, job 119446204553), above the old pool's 3:13:
     #
-    #   windows-2025    setup 4:33, pad 4:30, step cap 67:00: 76:03 of 80:00, slack 3:57
+    #   windows-2025    setup 4:33, pad 4:30, step cap 67:00: 76:03 of 80:00, slack 3:57  <- SUPERSEDED 2026-11-14
     #
     # The largest job-minus-step time on windows-2025 in this pool is 4:40, which is setup plus the
     # `if: always()` steps, and it fits in setup plus slack. EVERY OTHER LEG KEEPS 48/60, through the
@@ -2417,17 +2420,79 @@ jobs:
     # above. Whether to keep -n 3 stays BACKLOG #1109's call. THE CAP IS NOT THE FIX for the slow
     # population: finding what makes some windows-2025 runs take half as long again is unfiled work.
     #
+    # RE-DERIVED A FOURTH TIME, 2026-11-14, FOR windows-2025 ONLY, TO 115/100, under an owner ruling
+    # of 2026-11-14 in the Lander's session: asked "How should the slow windows harness leg be
+    # fixed?", with raising the step timeout or splitting the tier as the options, the owner answered
+    # "Raise the timeout". The 51:32 trigger below had fired and nothing read it, as the "NOTHING
+    # READS THE TRIGGER BELOW FOR YOU" paragraph after this block says will happen. The 67-minute
+    # cap then killed the step at least five times on 2026-11-14, on four heads, each with no F or
+    # E in the progress line and no FAILED in the job log, and each turned the required `CI gate`
+    # red:
+    #
+    #   run 43565011443  job 132356944784  PR 2939 403f31dee1, attempt 1  killed 67:08  last [97%]
+    #   run 43588751540  job 132428879971  PR 2947 bb1d9b6cfe, attempt 1  killed 67:07  last [99%]
+    #   run 43602637847  job 132470698933  PR 2947 0be8cfa25a, attempt 1  killed 67:08  last [99%]
+    #   run 43602637847  job 132489474794  PR 2947 0be8cfa25a, attempt 2  killed 67:08  last [98%]
+    #   run 43612946074  job 132501859343  push `main` 6bae356760         killed 67:08  last [100%]
+    #
+    # The `main` kill printed its [100%] progress line 36 ms before the kill: a suite that had run
+    # every test was killed in its last second. Pool: every ci.yml run CREATED from
+    # 2026-11-14T00:00:00Z to 2026-11-14T19:06:30Z UTC, 102 runs, read by the 2026-10-07 method
+    # (rows from push, pull_request and workflow_dispatch; jobs with ?filter=all; a row is this STEP
+    # keyed on its own conclusion, duration = its completed_at minus started_at; identical-stamp
+    # re-run copies dropped). windows-2025 has 49 green steps, from 40:16 to 66:54. The largest,
+    # 66:54, is run 43581274972 (job 132406419622, push `main` deaf82ea90), and run 43534005584 (job
+    # 132258607452) also took 66:54. Twelve greens took 65:26 or longer, within 1:42 of the kill.
+    # One more step failed at 66:16, under the cap, and is not a kill.
+    #
+    # One day is NOT a week's pool, so this gives a LOWER BOUND on the worst green and no trend. The
+    # kills are runs that wanted longer than the cap, so the largest green, 66:54, is right-censored
+    # again for the reason recorded above; the gap to the cap is not the evidence for that, the kills
+    # are.
+    #
+    # THE STEP CAP IS 100. The 2026-10-23 method gives 94: the [97%] kill, the lowest progress of the
+    # five, puts its full length at about 67:08 / 0.97 = 69:13, an ESTIMATE for the reason given
+    # there, and ceil_minute(1.35x 69:13) = ceil(93.43) = 94. The [100%] kill bounds its own run
+    # near 67:08, inside that estimate. The 6 minutes above 94 are a CHOICE, not a derivation. The
+    # leg is growing: the 2026-10-23 pool's largest green was 47:58 and this day's is 66:54, 22 days
+    # later. Both are censored maxima, of a week's pool and of one day's, so the 19 minutes between
+    # them is an order of magnitude, not a rate. Each cap this note sized at the rule's minimum on
+    # this leg has been outgrown. 100 is ceil_minute(1.35x 74:04), so it holds the 1.35 rule for a
+    # run about 4:50 longer than the 69:13 estimate. The JOB cap is 115. Setup keeps the 2026-10-23
+    # pool's maximum, 4:33, far above this day's windows-2025 setup, 0:43 to 1:15 from job start to
+    # the step's start over every job that was not cancelled:
+    #
+    #   windows-2025    setup 4:33, pad 4:30, step cap 100:00: 109:03 of 115:00, slack 5:57
+    #
+    # The job rule the engine note states gives less: the 2026-10-23 pool's largest job-minus-step
+    # time, 4:40, is the worst overhead, and 100 + ceil_minute(1.5x 4:40) = 100 + 7 = 107. 115 is
+    # taken over 107 so that the nesting row above holds with the pad, as each earlier row in this
+    # note does. Both are far under GitHub's 360-minute job limit. EVERY OTHER LEG KEEPS 60/48. On
+    # ubuntu, in the same pool, setup on the 58 green jobs took 0:30 to 0:55 by the same reading,
+    # inside its 2026-10-07 nesting row's 5:06, and the GREEN steps took 17:29 to 28:58. The largest
+    # is run 43588751540 (job 132428879883), and ceil_minute(1.35x 28:58) = 40 is inside its 48.
+    #
+    # THE CAP IS STILL NOT THE FIX, and this change names no cause. What is growing the leg is not
+    # measured here; the slow-population question and the worker lever above are untouched, and
+    # splitting the tier was the option the owner did not take.
+    #
     # NOTHING READS THE TRIGGER BELOW FOR YOU, and pairing this step with scripts/ci/step_margin.py the
     # way the engine and web console steps are paired is not a few lines: it needs a `--mark` step and
     # a margin step, a margin-cap knob in the `tooling_matrix` the `changes` job builds, a row per leg
     # in scripts/ci/step_margin_baseline.toml with its pool file, and an entry in the per-job tables
     # tests/test_ci_step_margin.py checks. That is its own change, and it is unfiled.
     #
+    # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 76:55 -- the 100-minute
+    # cap divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates -- or if
+    # any run is killed at the 100-minute step cap, or if TOOLING_WORKERS changes, and re-measure in
+    # any case after a week, because the leg was still growing when this was written. THE PARAGRAPH
+    # BELOW IS THE TRIGGER THIS REPLACES, kept as its record:
+    #
     # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 51:32 -- the 67-minute cap
     # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates -- or if any
     # run is killed at the 67-minute step cap, or if TOOLING_WORKERS changes, and re-measure in any
     # case after a week, because the slow population's median was still rising when this was written.
-    # THE PARAGRAPH BELOW IS THE TRIGGER THIS REPLACES, kept as its record:
+    # THE PARAGRAPH BELOW IS THE TRIGGER BEFORE THAT, kept as its record:
     #
     # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 36:55 -- the 48-minute cap
     # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates, which do not
@@ -2445,8 +2510,8 @@ jobs:
     # or it stops meaning anything.
     # `pytest_workers` is NOT this tier's knob and never was -- see the TOOLING_WORKERS note on the
     # step below.
-    # Per leg, see "RE-DERIVED A THIRD TIME" above: windows-2025 80, every other leg 60.
-    timeout-minutes: ${{ matrix.os == 'windows-2025' && 80 || 60 }}
+    # Per leg, see "RE-DERIVED A FOURTH TIME" above: windows-2025 115, every other leg 60.
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 115 || 60 }}
     defaults:
       run:
         shell: bash
@@ -2558,9 +2623,9 @@ jobs:
       # carry. It was deliberately not ported blind: it is a behaviour change whose zero cost was
       # measured on the engine tier's history and on no sample from this one. See BACKLOG #1304.
       - name: Harness tests (pytest)
-        # Per leg, windows-2025 67 and every other leg 48; see the job cap above for the derivation.
+        # Per leg, windows-2025 100 and every other leg 48; see the job cap above for the derivation.
         # Each must stay under its own leg's job cap with setup.
-        timeout-minutes: ${{ matrix.os == 'windows-2025' && 67 || 48 }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 100 || 48 }}
         env:
           # Same reason as the apt step above: collection imports the Qt modules whether or not this
           # job executes them, and the shipped ones construct QApplication at import on some paths.
@@ -3263,7 +3328,7 @@ jobs:
           # tests/_lockout_store_contract.py is the lockout body both server store suites run.
           # ci/python-version is the interpreter every one of these legs runs, so a patch bump
           # must meet them on its own PR rather than first on the nightly after the merge.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/_lockout_store_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|retention|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota|embedded_document_pruning)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/_lockout_store_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -3776,6 +3841,7 @@ jobs:
           tests/test_sqlserver_lookup_login_role_probe.py
           tests/test_sqlserver_autocommit_pools_live.py
           tests/test_sqlserver_cipher_audit.py
+          tests/test_embedded_document_pruning.py
 
       - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
         env:
@@ -4216,6 +4282,7 @@ jobs:
           tests/test_pooled_rider.py
           tests/test_uploads_shard_quota_interleave.py
           tests/test_postgres_cipher_audit.py
+          tests/test_embedded_document_pruning.py
 
       - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
         env:
@@ -4442,6 +4509,7 @@ jobs:
           tests/test_pooled_rider.py
           tests/test_uploads_shard_quota_interleave.py
           tests/test_postgres_cipher_audit.py
+          tests/test_embedded_document_pruning.py
 
       - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
         env:

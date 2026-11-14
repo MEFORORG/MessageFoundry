@@ -96,7 +96,6 @@ from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     LoopbackDirectProxyHandler,
     NoRedirectHandler,
-    ProxyTunnelRefusedError,
     build_strict_opener,
     drain_bounded,
     hop_identity,
@@ -353,16 +352,8 @@ AUTH_CHALLENGE_REFUSED = (
     "met a non-SHA-256 or unanswerable authentication challenge; the engine will not answer it"
 )
 
-#: The FIXED text for the one case no Digest handler sees: the token hop's web proxy, set up for
-#: Digest, answered the ``CONNECT`` for an ``https`` token endpoint with 407. Nothing was screened,
-#: so :data:`AUTH_CHALLENGE_REFUSED`'s hash and challenge words would be false here. It states the
-#: fault only; ADR 0095 Amendment B.1 gives the remedy.
-AUTH_CHALLENGE_REFUSED_ON_CONNECT = (
-    "met a 407 from its web proxy on the CONNECT, which Digest cannot answer (ADR 0095 B.1)"
-)
 
-
-def auth_challenge_refused(label: str, *, on_connect: bool = False) -> NegativeAckError:
+def auth_challenge_refused(label: str) -> NegativeAckError:
     """The delivery failure for a wire-time :class:`HttpAuthError` on ``label``'s hop (BACKLOG #2323).
 
     ``HttpAuthError`` is a ``ValueError``, so each send's ``(ValueError, InvalidURL)`` arm caught it
@@ -370,30 +361,13 @@ def auth_challenge_refused(label: str, *, on_connect: bool = False) -> NegativeA
     and would send an operator looking for a bad header or URL. The fault is the connection's, so
     this is a configuration fault: under the default ``credential_fault_policy`` the delivery
     worker stops the lane and keeps the queue. ADR 0095 Amendment B is the source of record for
-    why a stop was chosen over a retry, and for where that reasoning is weak. The text after the
-    label is always one of the two fixed ones; ``on_connect`` picks
-    :data:`AUTH_CHALLENGE_REFUSED_ON_CONNECT`, for the case :func:`is_refused_proxy_digest_tunnel`
-    names (BACKLOG #2989)."""
-    reason = AUTH_CHALLENGE_REFUSED_ON_CONNECT if on_connect else AUTH_CHALLENGE_REFUSED
+    why a stop was chosen over a retry, and for where that reasoning is weak."""
     return NegativeAckError(
-        f"{label} {reason}",
+        f"{label} {AUTH_CHALLENGE_REFUSED}",
         code=AUTH_CHALLENGE_REFUSED_CODE,
         permanent=True,
         config_fault=True,
     )
-
-
-def is_refused_proxy_digest_tunnel(exc: urllib.error.URLError, *, digest_proxy: bool) -> bool:
-    """Whether ``exc`` is a web proxy's 407 to the ``CONNECT`` for an ``https`` target, on a hop
-    whose proxy is set up for Digest (BACKLOG #2989, ADR 0095 Amendment B.1 states the case).
-
-    ``digest_proxy`` is decided when the hop is built, from its proxy configuration, so the answer
-    never rests on what an opener exposes. The status is the one the proxy's status line gave, read
-    from :class:`~messagefoundry.transports.bounded_read.ProxyTunnelRefusedError`, which the strict
-    https connection ``StrictHTTPSHandler`` dials raises for a refused ``CONNECT``; the error's text
-    is not read. ``tests/test_digest_refusal_classification.py`` pins the match on a real socket."""
-    reason = exc.reason
-    return digest_proxy and isinstance(reason, ProxyTunnelRefusedError) and reason.status == 407
 
 
 class _NoRedirectHandler(NoRedirectHandler):
@@ -2247,7 +2221,8 @@ class _HostProxy:
     @property
     def answers_digest(self) -> bool:
         """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener. The
-        token hop reads it as its ``digest_proxy`` flag, so the two decide from one rule."""
+        token hop's build refusal of a Digest proxy for an https token endpoint reads it, so the two
+        decide from one rule (BACKLOG #2989)."""
         return self.credentialed and self.config.digest is not None
 
     def auth_headers(self) -> dict[str, str]:
@@ -2511,7 +2486,8 @@ def proxy_config_from_settings(
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
     (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
-    target's scheme (for the digest-over-https refusal).
+    target's scheme (for the digest-over-https refusal; a token hop's https endpoint is refused
+    for Digest in ``smart._TokenEndpointProvider._open_token_hop``).
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
     (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.

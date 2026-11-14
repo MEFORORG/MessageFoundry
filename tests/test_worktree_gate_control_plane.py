@@ -2173,6 +2173,11 @@ def test_the_tokens_rule_3_excludes_really_cannot_move_a_governed_tree(
 #: measure that a deny STARTED firing rather than assert it (the BACKLOG #1229 discipline).
 VERB_SPLIT_GUARD = "if (-not $headRoot) {"
 
+#: The same split in rule 3's ADDED per-invocation reading (BACKLOG #5642, #5655), which reads the
+#: repository token off each invocation's own window. Both are switched off, or the control would be
+#: refused by the added reading and stop measuring the split.
+ADDED_VERB_SPLIT_GUARD = "if ($movesHead -and ($ownRepo -or $carried)) {"
+
 
 @pytest.fixture
 def pre_split_gate(tmp_path: Path) -> Path:
@@ -2182,12 +2187,14 @@ def pre_split_gate(tmp_path: Path) -> Path:
     the gate under test, and the pair would then agree for the wrong reason.
     """
     src = GATE.read_text(encoding="utf-8")
-    assert src.count(VERB_SPLIT_GUARD) == 1, (
-        "the verb-split guard moved or was reformatted, so this control no longer rebuilds the "
-        "pre-#1869 gate. Fix VERB_SPLIT_GUARD rather than deleting the control."
-    )
+    for guard in (VERB_SPLIT_GUARD, ADDED_VERB_SPLIT_GUARD):
+        assert src.count(guard) == 1, (
+            f"the verb-split guard {guard!r} moved or was reformatted, so this control no longer "
+            "rebuilds the pre-#1869 gate. Fix the guard constant rather than deleting the control."
+        )
+        src = src.replace(guard, "if ($false) {")
     dst = tmp_path / "worktree_gate_pre_split.ps1"
-    dst.write_text(src.replace(VERB_SPLIT_GUARD, "if ($false) {"), encoding="utf-8")
+    dst.write_text(src, encoding="utf-8")
     return dst
 
 

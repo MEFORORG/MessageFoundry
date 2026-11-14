@@ -270,6 +270,12 @@ async def _assert_session_binding_guard_contract(store: Any) -> None:
     #    so the refusals above came from the guard and not from anything else about the row.
     assert await _guarded_session(store, "g-unguarded", None) is True
 
+    # 6. BACKLOG #2733. With no guard either, an account that is gone is refused, not handed to the
+    #    INSERT's foreign-key error: a sign-in that lost a race with the account's delete.
+    assert (
+        await _guarded_session(store, "g-unguarded-nobody", None, user="fed-guard-nobody") is False
+    )
+
 
 #: A second account for the bind's sweep, so "every session of THAT account" has a control.
 GUARD_BYSTANDER = "fed-guard-bystander"

@@ -630,9 +630,10 @@ async def test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_windo
 ) -> None:
     # PR 1811 review, on BACKLOG #2072. The T17 bound can STOP a pooled RESPONSE lane (a loopback's
     # re-ingress), and _HOLD_DIRECTION had no entry for RESPONSE, so that STOP was not held. A window
-    # open can re-arm it: a #122 log halt pauses the loopback's internal lanes, which turns STOPPED
-    # into PAUSED, and once another connection's restart clears the halt latch, the window open's
-    # start_inbound resumes every PAUSED lane of that loopback. The fault was then retried.
+    # open could re-arm it: a #122 log halt paused the loopback's internal lanes, which turned
+    # STOPPED into PAUSED, and once another connection's restart cleared the halt latch, the window
+    # open's start_inbound resumed every PAUSED lane of that loopback. The fault was then retried.
+    # The halt is a claim gate now (BACKLOG #5704) and leaves the STOP as it is; this pins both.
     schedule = _weekday_window()
     clock = _Clock(_IN_WINDOW)
     reg = Registry()
@@ -676,7 +677,8 @@ async def test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_windo
         await runner._respond_to_log_sink_event(
             LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
         )
-        assert response.paused("IB_LOOP")  # the halt overwrote STOPPED
+        # The halt is a claim gate and touches no lane phase, so the STOP stands (BACKLOG #5704).
+        assert response.stopped("IB_LOOP")
         guard.writable = True
         await runner.restart_inbound("IB_TWO")  # clears the process-wide latch
         assert not runner._delivery_halted
@@ -687,9 +689,12 @@ async def test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_windo
         assert attempts == 1  # the lane was not re-armed, so the fault was not retried
         assert not runner.inbound_running("IB_LOOP")
 
-        # Control: the operator restarts the loopback, a real re-arm. It lifts the hold and the head
-        # is claimed again. Without this arm, "one attempt" could mean a lane that never re-claims.
-        await runner.restart_inbound("IB_LOOP")
+        # Control: a real re-arm (the pooled broadcast a reload or replay sends) lifts the hold and
+        # the head is claimed again. Without this arm, "one attempt" could mean a lane that never
+        # re-claims. Not an inbound restart: since the halt became a claim gate that never touches a
+        # lane's phase (BACKLOG #5704), a restart re-arms no pooled STOPPED lane, halt or no halt.
+        await runner.restart_inbound("IB_LOOP")  # lifts the loopback's halt mark
+        runner.notify_work()
         assert ("inbound", "IB_LOOP") not in runner._stop_held
         await _wait_until(lambda: attempts == 2)
     finally:

@@ -24,19 +24,23 @@ literal default so the anonymizer's structural IP check still functions without 
 Returns **reasons only** (never the matched text), and the token denylist is the fail-closed
 *backstop*, not the primary control: it catches known *tokens*, not structural PHI (ADR 0030 §5). The
 structural PHI-shape detectors + unmapped-field coverage report below (BACKLOG #331) close that gap —
-they are held byte-for-byte identical with the toolkit copy so the two agree on every input. The
-dashed SSN and punctuated phone detectors also refuse such a shape that the message's own field
+they are held byte-for-byte identical with the toolkit copy so the two agree on every input. They
+look for a dashed SSN, a punctuated phone, an ``MR``/``MRN`` id type and a routable IPv6 address
+(BACKLOG #5654) in the fields no rule rewrote; the IPv6 detector alone also reads the MSH header,
+MSH-2 past its encoding characters and the fields from MSH-3 on that no rule rewrites. The dashed SSN and punctuated phone detectors also refuse such a shape that the message's own field
 separator cut across fields, when at least one of them is unmapped (BACKLOG #3465), and scan what
 a retarget of a default field left past its first component (:func:`retarget_residue_hits`,
 BACKLOG #3493), and the components an ``id``, ``mrn``, ``ssn`` or ``dln`` rule keeps as captured
 past its first (:func:`kept_component_hits`, BACKLOG #5533, #5534). The shape detectors that read one field, and the token scan, read a value
 decoded from its HL7 escape sequences as well as as written (BACKLOG #5532); docs/PHI.md section
-9 names the checks that do not decode.
+9, *An escaped value is read decoded too*, lists at least the escaped forms each check still
+passes.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter
@@ -48,9 +52,13 @@ from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind, retarge
 from .surrogates import (
     COMPONENT_KEEPING_KINDS,
     Seps,
+    decoded_readings,
+    dropped,
     message_has_site_code,
     read_message_seps,
+    trim,
     unescape,
+    unescaped_fields,
     unescaped_message,
 )
 
@@ -118,6 +126,12 @@ _ALLOWED_IP = (
 )
 
 
+def _ipv4_allow_list() -> re.Pattern[str] | None:
+    """The IPv4 allow list the structural IPv6 check uses to judge an IPv4-mapped address
+    (BACKLOG #5654): the guard's own, or the literal default above when no guard is reachable."""
+    return _ALLOWED_IP
+
+
 def scan_text(text: str, *, include_estate: bool = False) -> list[str]:
     """Forbidden-token **reasons** in ``text`` (no matched text) — vendored twin of
     ``scan_forbidden.scan_text``. The site code is checked field-anchored by :func:`leak_check`, not
@@ -166,6 +180,130 @@ def _can_cut_a_shape(field_sep: str) -> bool:
     digit, whitespace, ``-``, ``(`` or ``)``. Under any other, ``|`` among them, no line can hold
     a cut shape, so the walk skips the line scan."""
     return field_sep.isdigit() or field_sep.isspace() or field_sep in "-()"
+
+
+#: A maximal run of hex digits, colons and dots: the text an IPv6 address can be written in. A run
+#: with fewer than two colons is skipped, and ``ipaddress`` decides whether the rest hold one. The
+#: run is matched whole, never with a colon pinned inside it, so the scan stays linear.
+_IPV6_RUN: re.Pattern[str] = re.compile(r"[0-9A-Fa-f.:]+")
+#: The IPv6 networks the check allows, as the publish guard allows the private and reserved IPv4
+#: ranges: the unspecified and loopback addresses, link-local, unique-local, multicast and the two
+#: documentation ranges. They are not routable on the internet, but a unique-local address's
+#: Global ID, and a link-local address built from a MAC, can still name a site's network or a
+#: device; docs/PHI.md section 9 says so. An IPv4-mapped or IPv4-compatible address is judged by
+#: its IPv4 part instead (:func:`_has_routable_ipv6`).
+_ALLOWED_IPV6: tuple[ipaddress.IPv6Network, ...] = tuple(
+    ipaddress.IPv6Network(net)
+    for net in (
+        "::/128",
+        "::1/128",
+        "fe80::/10",
+        "fc00::/7",
+        "ff00::/8",
+        "2001:db8::/32",
+        "3fff::/20",
+    )
+)
+#: The deprecated IPv4-compatible block, whose low 32 bits are an IPv4 address.
+_IPV4_COMPATIBLE = ipaddress.IPv6Network("::/96")
+#: The loopback address, the highest one in :data:`_IPV4_COMPATIBLE` that embeds no IPv4 address.
+_IPV6_LOOPBACK = ipaddress.IPv6Address(1)
+#: The multicast flag that says the address embeds a unicast prefix (RFC 3306 and the embedded-RP
+#: form of RFC 3956), set in bits 116 to 119 of the address.
+_MULTICAST_PREFIX_FLAG = 0x2
+
+
+def _ipv6_candidates(run: str) -> Iterator[str]:
+    """The texts in ``run`` an IPv6 address may be written as: the run, without the dots that end
+    a sentence, without a trailing ``.port`` or ``.word``, and without both; each of those with one
+    colon taken off either end or both, as a label or a list joins one; and each with every colon
+    and dot taken off both ends. So ``Addr:::ffff:808:808``, ``IP:2a01:4f8::``,
+    ``2a01:4f8::5.443``, ``2a01:4f8::5.443.`` and ``2a01:4f8:::`` still hold their address. A
+    text may come more than once. :func:`_label_dropped_runs` gives the texts to try when none of
+    these parse."""
+    stripped = run.strip(".")
+    for base in (run, stripped, run.rsplit(".", 1)[0], stripped.rsplit(".", 1)[0]):
+        front = base[1:] if base.startswith(":") else base
+        yield from (base, front)
+        if base.endswith(":"):
+            yield from (base[:-1], front[:-1])
+        yield base.strip(":.")
+
+
+def _label_dropped_runs(run: str) -> tuple[str, ...]:
+    """``run`` without a leading label that ends in hex letters or digits and a colon or dot, as
+    in ``Device:`` or ``data.``, without a trailing ``:port``, and without both, as in
+    ``IPv6:<address>:443``. Tried only when no text :func:`_ipv6_candidates` gives parses, so a
+    well-formed address, such as a unique-local ``fd00:1::5``, is never read as the shorter
+    address its tail would make."""
+    labels = (
+        run.split(":", 1)[1] if ":" in run else run,
+        run.split(".", 1)[1] if "." in run else run,
+    )
+    return (*labels, run.rsplit(":", 1)[0], *(label.rsplit(":", 1)[0] for label in labels))
+
+
+def _is_allowed_ipv6(address: ipaddress.IPv6Address) -> bool:
+    """True if ``address`` is in :data:`_ALLOWED_IPV6` and, when it is multicast, does not embed a
+    unicast prefix, which can name the site's own network."""
+    if address.is_multicast and (int(address) >> 116) & _MULTICAST_PREFIX_FLAG:
+        return False
+    return any(address in net for net in _ALLOWED_IPV6)
+
+
+#: The reason a routable IPv6 address gets (BACKLOG #5654).
+IPV6_REASON = "routable IPv6 address"
+
+
+def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bool:
+    """True if ``text`` holds an IPv6 address outside :data:`_ALLOWED_IPV6` (BACKLOG #5654). An
+    IPv4-mapped or IPv4-compatible address counts when ``ipv4_is_routable`` says its dotted IPv4
+    part is routable, so the IPv4 allow list stays the publish guard's own. Every text
+    :func:`_ipv6_candidates` gives is tried, and any one that parses to a routable address is a
+    hit, so a fail-closed check refuses on any reading. When none parses, the texts of
+    :func:`_label_dropped_runs` are tried the same way. What it misses, and what it refuses
+    though it holds no address, is listed in docs/PHI.md section 9."""
+    for match in _IPV6_RUN.finditer(text):
+        run = match.group()
+        if run.count(":") < 2:
+            continue
+        verdict = _judge_ipv6_texts(_ipv6_candidates(run), ipv4_is_routable)
+        if verdict is None:
+            dropped = (c for r in _label_dropped_runs(run) for c in _ipv6_candidates(r))
+            verdict = _judge_ipv6_texts(dropped, ipv4_is_routable)
+        if verdict:
+            return True
+    return False
+
+
+def _judge_ipv6_texts(texts: Iterable[str], ipv4_is_routable: Callable[[str], bool]) -> bool | None:
+    """True if any of ``texts`` parses to a routable IPv6 address, False if some parse and none is
+    routable, and None if none parses. A failed parse means the text is no address, so it is
+    skipped, not logged."""
+    parsed = False
+    for candidate in dict.fromkeys(texts):
+        try:
+            address = ipaddress.IPv6Address(candidate)
+        except ValueError:
+            continue  # not an address: the next text is tried
+        parsed = True
+        embedded = address.ipv4_mapped
+        if embedded is None and address in _IPV4_COMPATIBLE and address > _IPV6_LOOPBACK:
+            embedded = ipaddress.IPv4Address(int(address))
+        if embedded is not None:
+            if ipv4_is_routable(str(embedded)):
+                return True
+        elif not _is_allowed_ipv6(address):
+            return True
+    return False if parsed else None
+
+
+def _ipv4_is_routable(ip: str) -> bool:
+    """True if the dotted IPv4 ``ip`` is outside the publish guard's own IPv4 allow list
+    (:func:`_ipv4_allow_list`), so an IPv4-mapped IPv6 address is judged as the guard judges its
+    IPv4 part. With no allow list reachable, every address counts, failing closed."""
+    allowed = _ipv4_allow_list()
+    return allowed is None or allowed.match(ip) is None
 
 
 #: HL7 CX id-type codes that mark a component as a medical-record number.
@@ -451,7 +589,9 @@ def unmapped_field_values(
     would be refused on the way out (BACKLOG #3004).
 
     The MSH control header is skipped whole: it carries routing/site data the field-anchored
-    site-code pass already covers, not patient PHI. The header is the ONE line
+    site-code pass already covers, not patient PHI. It can still carry a network address, so
+    :func:`structural_phi_hits` reads it for a routable IPv6 address apart from this walk
+    (:func:`_header_ipv6_hits`, BACKLOG #5654). The header is the ONE line
     ``read_message_seps`` takes the separators from, and no other. A header with fewer than
     :data:`_HEADER_MIN_FIELDS` split fields, such as a lone ``MSH|^~\\&``, is not skipped: it is
     refused, like every short header line (BACKLOG #3001). An ``MSH`` line
@@ -539,7 +679,7 @@ def _walk(
         # not skipped, and the check below refuses it, as it did before the header was found
         # by line. Nor is a header below _HEADER_MIN_FIELDS (a lone ``MSH|^~\&``): the check
         # below refuses it, as it refuses every short header line (BACKLOG #3001).
-        if n == header_at and is_msh and len(fields) >= _HEADER_MIN_FIELDS:
+        if n == header_at and _is_skipped_header(fields):
             continue
         # One address per split index; None for a field the check does not judge.
         addresses: list[str | None]
@@ -571,14 +711,37 @@ def _walk(
             if a is not None and (v or a == _MALFORMED_LINE)
         )
         if split:
-            split_hits.extend(_split_shape_hits(seg, field_sep, addresses))
+            split_hits.extend(_split_shape_hits(fields, seps, field_sep, addresses))
     return out, split_hits
 
 
-def _split_shape_hits(line: str, field_sep: str, addresses: Sequence[str | None]) -> list[str]:
+def _line_readings(fields: list[str], seps: Seps, field_sep: str) -> list[list[str]]:
+    """The fields of one line as written, then with each field decoded a subcomponent at a time
+    and a component at a time, the readings :func:`unescaped_message` gives the token scan. The
+    segment id and encoding characters of a header line are left as written. A reading the same
+    as one before it is left out."""
+    readings = [fields]
+    if not seps.escape or not any(seps.escape in field for field in fields):
+        return readings
+    for by_component in (False, True):
+        decoded = unescaped_fields(fields, seps, field_sep, by_component=by_component)
+        if decoded not in readings:
+            readings.append(decoded)
+    return readings
+
+
+def _split_shape_hits(
+    fields: list[str], seps: Seps, field_sep: str, addresses: Sequence[str | None]
+) -> list[str]:
     """Hits for a punctuated shape (:data:`_SPLITTABLE_SHAPES`) that the field separator cuts
-    across fields of ``line``: a match on the line as written that holds the separator, so no one
-    field held it whole (BACKLOG #3465). Under ``|`` no such match exists.
+    across the ``fields`` of one line: a match on the line that runs across a separator between
+    two fields, so no one field held it whole (BACKLOG #3465). Under ``|`` no such match exists.
+
+    The line is read as written and with its fields decoded (:func:`_line_readings`), so a shape
+    whose own characters are escaped, such as ``123-45\\X2D\\6789`` under a field separator of
+    ``-``, is found too (#5533 item 8). A separator is only where the fields meet, so a field
+    separator a ``\\F\\`` decodes to inside a field never counts as a cut; the shape detectors
+    that read one field judge that one.
 
     ``addresses`` names each split index of the line, ``None`` for a field the check does not
     judge. A match is a hit when at least one field it reaches has an address, and the hit names
@@ -586,21 +749,31 @@ def _split_shape_hits(line: str, field_sep: str, addresses: Sequence[str | None]
     runs on into a field no rule rewrites: the shape reached the output whole. What still passes
     is listed once, in docs/PHI.md section 9."""
     hits: list[str] = []
-    cuts = [i for i, c in enumerate(line) if c == field_sep]
-    for pattern, reason in _SPLITTABLE_SHAPES:
-        for match in pattern.finditer(line):
-            if field_sep not in match.group():
-                continue
-            # The fields that hold a character of the match: the separators at or before its first
-            # character, and those before its last. A separator at its first character belongs
-            # to no field, so counting it starts at the next field. Positions are found once per
-            # line, so a long line costs a search per match, not a rescan.
-            first = bisect_right(cuts, match.start())
-            last = bisect_left(cuts, match.end() - 1)
-            named = [a for a in addresses[first : last + 1] if a is not None]
-            if named:
-                span = named[0] if len(named) == 1 else f"{named[0]} to {named[-1]}"
-                hits.append(f"{reason} across {span}, cut by the field separator")
+    for reading in _line_readings(fields, seps, field_sep):
+        line = field_sep.join(reading)
+        # Where each separator between two fields sits in ``line``, found once per reading, so a
+        # long line costs a search per match, not a rescan.
+        cuts: list[int] = []
+        at = -1
+        for field in reading[:-1]:
+            at += len(field) + 1
+            cuts.append(at)
+        for pattern, reason in _SPLITTABLE_SHAPES:
+            for match in pattern.finditer(line):
+                if bisect_left(cuts, match.start()) == bisect_left(cuts, match.end()):
+                    continue  # no separator inside the match: one field held it whole
+                # The fields that hold a character of the match: the separators at or before its
+                # first character, and those before its last. A separator at its first character
+                # belongs to no field, so counting it starts at the next field.
+                first = bisect_right(cuts, match.start())
+                last = bisect_left(cuts, match.end() - 1)
+                named = [a for a in addresses[first : last + 1] if a is not None]
+                if named:
+                    span = named[0] if len(named) == 1 else f"{named[0]} to {named[-1]}"
+                    hit = f"{reason} across {span}, cut by the field separator"
+                    # A decoded reading adds only what the reading as written did not find.
+                    if reading is fields or hit not in hits:
+                        hits.append(hit)
     return hits
 
 
@@ -640,26 +813,54 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
 
 
 def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
-    """True if any repetition of ``value`` is a CX with a non-empty id (component 1) and a whole
-    ``MR``/``MRN`` id-type component — an unmapped medical-record number by HL7 structure, far more
-    precise than a bare digit-run heuristic. A fail-closed detector refuses on any reading, so an
-    id type counts in each of :func:`_is_mrn_type`'s readings, and one written ``M\\X52\\`` counts
-    (BACKLOG #5532). The id counts when it is non-empty as written, so one that decodes to
+    """True if any repetition of ``value`` has a non-empty component 1 and an ``MR``/``MRN`` id
+    type — an unmapped medical-record number by HL7 structure, far more precise than a bare
+    digit-run heuristic. Two readings count (BACKLOG #5654):
+
+    * any component, component 1 included, that is ``MR`` or ``MRN`` whole or as its first
+      subcomponent, as written or decoded and trimmed, so ``12345^MR``, ``MRN^12345``,
+      ``12345^MR&L`` and an XCN ``1234^DOE^JOHN^^^MR`` count, as they did before; and
+    * CX.5, the identifier type code, in any of its subcomponents too, as written or decoded and
+      trimmed, so ``ID^^^AUTH^MR&local`` counts.
+
+    ``M\\X52\\`` (BACKLOG #5532) and ``MR\\X20\\`` count in either. A decoded part is never split
+    again, so ``PET&MR`` outside CX.5, and a word ``MR`` that an escaped delimiter or whitespace
+    sets apart, as in ``PET\\T\\MR`` or ``X\\S\\MR``, do not count. :func:`.surrogates.trim`
+    says what is trimmed. The id counts when it is non-empty as written, so one that decodes to
     nothing, such as ``\\Z98765\\``, counts."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
-        if comps[0] and any(_is_mrn_type(comp, seps, field_sep) for comp in comps):
+        if not comps[0]:
+            continue
+        if any(_is_mrn_type(comp, seps, field_sep, subcomponents=False) for comp in comps):
+            return True
+        if len(comps) >= 5 and _is_mrn_type(comps[4], seps, field_sep, subcomponents=True):
             return True
     return False
 
 
-def _is_mrn_type(comp: str, seps: Seps, field_sep: str) -> bool:
-    """True if ``comp`` is ``MR`` or ``MRN`` as written, decoded whole as a ``Message`` component
-    read decodes it, or as its first subcomponent decoded, which is what ``Peek`` reads for a
-    component that has subcomponents."""
-    first = comp.split(seps.subcomponent, 1)[0]
-    forms = (comp, unescape(comp, seps, field_sep), unescape(first, seps, field_sep))
-    return any(form.upper() in _MRN_TYPES for form in forms)
+def _is_mrn_type(comp: str, seps: Seps, field_sep: str, *, subcomponents: bool) -> bool:
+    """True if ``comp`` is ``MR`` or ``MRN`` as written or decoded whole, as a ``Message`` component
+    read decodes it, or as its first subcomponent, as ``Peek`` reads a component that has them,
+    each reading also with its invisible characters dropped (:func:`.surrogates.dropped`), each
+    trimmed (:func:`.surrogates.trim`), and never split again. With ``subcomponents``, any one of
+    its subcomponents counts the same way, since a ``Message`` subcomponent read can read any of
+    them (BACKLOG #5654)."""
+    leaves = comp.split(seps.subcomponent)
+    if len(leaves) == 1:
+        parts: tuple[str, ...] = (comp,)
+    else:
+        parts = (comp, *leaves) if subcomponents else (comp, leaves[0])
+    forms = [
+        form
+        for part in parts
+        for form in (
+            part,
+            dropped(part),
+            *decoded_readings(part, seps, field_sep, resplit=False),
+        )
+    ]
+    return any(trim(form).upper() in _MRN_TYPES for form in forms)
 
 
 def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
@@ -667,7 +868,10 @@ def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
 
     Each shape is looked for in the value as written and in each of its parts decoded
     (:func:`_decoded_parts`), so a shape written with HL7 escape sequences, such as
-    ``123\\X2D\\45\\X2D\\6789``, is found too (BACKLOG #5532)."""
+    ``123\\X2D\\45\\X2D\\6789``, is found too (BACKLOG #5532). A routable IPv6 address is looked
+    for the same way (:func:`_has_routable_ipv6`). It is read here, in a field no rule rewrote, and
+    not over the whole message, so a surrogate the anonymizer wrote, such as an id whose letters
+    came out as hex beside a ``::``, is never refused as one (BACKLOG #5654)."""
     reasons: list[str] = []
     forms = [value, *_decoded_parts(value, seps, field_sep)]
     for pattern, reason in _SPLITTABLE_SHAPES:
@@ -675,7 +879,46 @@ def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
             reasons.append(reason)
     if _has_mrn_typed_identifier(value, seps, field_sep):
         reasons.append("unmapped MRN-typed identifier")
+    if any(_has_routable_ipv6(form, _ipv4_is_routable) for form in forms):
+        reasons.append(f"unmapped {IPV6_REASON}")
     return reasons
+
+
+def _is_skipped_header(fields: list[str]) -> bool:
+    """True if ``fields``, the header line split, is a header :func:`_walk` skips and
+    :func:`_header_ipv6_hits` reads instead: its id reads ``MSH`` and it has at least
+    :data:`_HEADER_MIN_FIELDS` fields. Any other header is walked and judged like any line."""
+    return fields[0].upper() == "MSH" and len(fields) >= _HEADER_MIN_FIELDS
+
+
+def _header_ipv6_hits(text: str, mapped_paths: set[str]) -> list[str]:
+    """Routable-IPv6 hits in the header, the one line :func:`_walk` skips: MSH-2 past its four
+    encoding characters, and each field from MSH-3 on, that no rule rewrites, read as written and
+    decoded as :func:`_structural_reasons` reads a value. The whole-message IPv4 check reads the
+    header, so an IPv6 address there, such as one in MSH-24, is judged too (BACKLOG #5654). Only
+    the IPv6 shape is read here. MSH-1 and the encoding characters are never read. A header the
+    walk does not skip, such as a short one, is walked and judged there, so it is not read again."""
+    found = _split_at_header(text)
+    if found is None:
+        return []
+    seps, field_sep, lines, header_at = found
+    fields = lines[header_at].split(field_sep)
+    if not _is_skipped_header(fields):
+        return []
+    hits: list[str] = []
+    # The anonymizer and the engine's parser take the first four characters of MSH-2 as the
+    # encoding characters and no more, and no rule may rewrite MSH-2, so text a sender put after
+    # them reaches the output.
+    # After MSH-2, fields[i] is MSH-(i + 1).
+    values = [(_MSH2, fields[1][4:])]
+    values += [(f"MSH-{i + 1}", value) for i, value in enumerate(fields[2:], start=2)]
+    for address, value in values:
+        if not value or address in mapped_paths:
+            continue
+        forms = [value, *_decoded_parts(value, seps, field_sep)]
+        if any(_has_routable_ipv6(form, _ipv4_is_routable) for form in forms):
+            hits.append(f"unmapped {IPV6_REASON} in {address}")
+    return hits
 
 
 def structural_phi_hits(
@@ -692,7 +935,10 @@ def structural_phi_hits(
     name or note is exactly what such a line tends to carry.
 
     A dashed SSN or punctuated phone that the message's own field separator cuts across fields
-    is a hit too, named by the fields it spans (:func:`_split_shape_hits`, BACKLOG #3465)."""
+    is a hit too, named by the fields it spans (:func:`_split_shape_hits`, BACKLOG #3465).
+
+    The header, which the walk skips, is read for a routable IPv6 address alone
+    (:func:`_header_ipv6_hits`, BACKLOG #5654)."""
     parsed = read_message_seps(text)
     if parsed is None:
         return []
@@ -705,7 +951,7 @@ def structural_phi_hits(
         hits.extend(
             f"{reason} in {address}" for reason in _structural_reasons(value, seps, field_sep)
         )
-    return hits + split_hits
+    return _header_ipv6_hits(text, mapped_paths) + hits + split_hits
 
 
 #: What a hit in the part of a field a retarget left reads as, after its shape label.
@@ -721,8 +967,9 @@ def past_first_component_hits(
     leave as captured. Reasons name the shape and the field address only, never a value.
 
     A rule maps its field, so :func:`structural_phi_hits` never scans it. Two kinds of field
-    are scanned here, each repetition with its component 1 left out, for the dashed SSN and the
-    punctuated phone, as written and decoded as :func:`_structural_reasons` reads a value:
+    are scanned here, each repetition with its component 1 left out, for the dashed SSN, the
+    punctuated phone and a routable IPv6 address (BACKLOG #5654), as written and decoded as
+    :func:`_structural_reasons` reads a value:
 
     * a default field a retarget points at a different kind (:func:`.rules.retargeted_defaults`,
       BACKLOG #3493). Its hits read :data:`RETARGET_RESIDUE`, unless its default kind is one
@@ -734,8 +981,10 @@ def past_first_component_hits(
     The MRN-typed shape needs a component 1, so it never fires here, which is right: the id
     there is the surrogate. The other kinds add no hit on a retargeted field: ``name``,
     ``address`` and ``provider`` write values from fixed pools, and
-    ``tests/test_anon_overlay_retarget_warning.py`` pins that no pool value has one of these
-    shapes; ``phone`` and ``dob`` write one component; ``date`` writes component 1 and keeps after
+    ``tests/test_anon_overlay_retarget_warning.py`` pins that no pool value has the SSN or phone
+    shape. Nothing pins that no pool value reads as an IPv6 address, so a pool value written as
+    a hex word beside ``::`` would make a retarget refuse its own output. ``phone`` and ``dob``
+    write one component; ``date`` writes component 1 and keeps after
     it only a known TS.2 precision code.
 
     The walk names a segment by every rule's path, so a segment only these rules name keeps its
@@ -999,6 +1248,15 @@ def has_other_cause(report: LeakReport) -> bool:
     return any(not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE) for hit in report.hits)
 
 
+#: The address a header hit after the encoding characters names.
+_MSH2 = "MSH-2"
+#: The step for such a hit, which no rule can scrub.
+_MSH2_ADVICE = (
+    "No rule can rewrite MSH-2: repair a header that carries text after its four encoding "
+    "characters."
+)
+
+
 def refusal_advice(
     report: LeakReport, *, denylist_refused: bool = False, coverage_refused: bool = False
 ) -> str:
@@ -1013,6 +1271,10 @@ def refusal_advice(
     )
     if token_hit or shape_hit:
         steps.append("Extend the rule map so the field that carries it is scrubbed.")
+    if any(hit.endswith(f" in {_MSH2}") for hit in report.structural_hits):
+        # No rule may rewrite MSH-2, so the step above cannot reach the text after its
+        # encoding characters (BACKLOG #5654).
+        steps.append(_MSH2_ADVICE)
     steps.extend(mapped_field_advice(report))
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")
@@ -1030,8 +1292,9 @@ def refusal_advice(
 #: What the structural detectors look for in an unmapped field, and what they let through. Stated once
 #: here so the run summary cannot drift from the detectors above (docs/PHI.md section 9 is the long form).
 UNMAPPED_SCOPE_NOTE = (
-    "Beyond the partner-token and IP scan of the whole message, the leak-check looks in these "
-    "fields only for a dashed SSN, a punctuated phone number and an MR/MRN-typed identifier. A "
+    "Beyond the partner-token and IPv4 scan of the whole message, the leak-check looks in these "
+    "fields only for a dashed SSN, a punctuated phone number, an MR/MRN-typed identifier and a "
+    "routable IPv6 address, and in the MSH header for a routable IPv6 address alone. A "
     "name, an undashed number or a date in one of them passes, so review this list before you "
     "share the dataset."
 )

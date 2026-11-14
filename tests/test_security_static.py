@@ -60,7 +60,9 @@ invariants can't silently regress.
   ``parsing/xml/_deps.py``'s lazy loaders — is covered by its own clause
   (:data:`_XML_DEPS_CONSUMERS`) rather than left to the module-name matcher. Separately,
   ``transports/soap.py`` triages SOAP faults with regexes and ``str.find`` over the XML response
-  body. Its fault-code patterns, ``_FAULTCODE_RE``/``_CODEVALUE_RE``, each match a ``<``, optional
+  body. Its fault-code patterns include at least ``_FAULTCODE_RE``/``_CODEVALUE_RE`` and, for the
+  SOAP 1.2 ``Code``, ``_CODE_RE``/``_CODE_END_RE``, which soap.py describes; only a faultcode or
+  Value match reaches ``_code_text``. ``_FAULTCODE_RE``/``_CODEVALUE_RE`` each match a ``<``, optional
   whitespace, an optional prefix of word characters, dots and hyphens ending in ``:``, and the name
   ``faultcode`` or ``Value`` in any case with no word character after it. So they also match a
   longer name that goes on with at least ``.``, ``-`` or ``:``, such as ``<faultcode.detail>`` or
@@ -703,8 +705,17 @@ _UNSCANNABLE_RE_PATTERNS = {
     # necessarily makes the expression unresolvable to this static scanner. The shape is bounded and
     # non-catastrophic by inspection: an alternation of digit literals followed by a fixed ``\d{4}`` —
     # no nested quantifier, no overlapping alternation.
-    "messagefoundry_toolkit/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
-    "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
+    #
+    # BACKLOG #5632, #5654 -- the decoded-reading re-split in ``decoded_readings``. Unresolvable BY
+    # CONSTRUCTION: its class is the delimiter set the message declares in MSH-1/MSH-2, read at
+    # runtime and passed through ``re.escape``, plus ``\s``, which every invisible character is
+    # mapped to before the split. It is a
+    # single character class used only by ``re.split``, with no quantifier at all, so it is linear.
+    "messagefoundry_toolkit/anon/surrogates.py": (
+        "f'(?:{alt})\\\\d{{4}}'",
+        "f'[{breaks}{_TRIM_CLASS}]'",
+    ),
+    "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'", "f'[{breaks}{_TRIM_CLASS}]'"),
     # BACKLOG #1678 -- the orphan sweep's temp-file shape. Unresolvable BY CONSTRUCTION, and that is
     # the point: the matcher is spliced from the SAME constants the atomic write MINTS the name from
     # (_BLOB_SUFFIX, _META_SUFFIX, _TMP_TOKEN_BYTES), which is what stops a DELETING pattern from

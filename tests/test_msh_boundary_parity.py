@@ -15,6 +15,11 @@ its copy in the same commit, and says so; never edit one only to make a failure 
 split's copy calls the live ``normalize`` and ``_LEADING_WS_STR``, so it pins the boundary, not
 those. That the delivery reading agrees with the ingress one is AC-7's test, in
 ``tests/test_one_frame_one_message.py``, not this file's. Synthetic data only.
+
+BACKLOG #5918 widened three readings on purpose, and edited their copies here to match: the
+split, the ingress guard and the byte scan now take a later ``MSH`` line that byte order marks
+lead as a boundary, as the delivery reading already did, and the split cuts past those marks.
+Each edited line says what it read at a0a5e4f5a4.
 """
 
 from __future__ import annotations
@@ -33,13 +38,19 @@ from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
 BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 
-# --- the readings as they stood at engine origin/main a0a5e4f5a4, verbatim but for names --------
+# --- the readings as they stood at engine origin/main a0a5e4f5a4, verbatim but for names and ---
+# --- the lines marked BACKLOG #5918, which widen the boundary ------------------------------------
 
-_OLD_MSH_BOUNDARY = re.compile(r"(?=\rMSH)")
+# BACKLOG #5918: was r"(?=\rMSH)"; byte order marks may now sit between the CR and the MSH.
+_OLD_MSH_BOUNDARY = re.compile(r"(?=\r" + BOM + r"*MSH)")
 _OLD_FIRST_KEPT = re.compile(r"\S")
 _OLD_LEADS_WITH_MSH_PAST_BOM = re.compile(r"[\s" + BOM + r"]*MSH")
 _OLD_LATER_MSH_PAST_BOM = re.compile(r"[\r\n]" + BOM + r"+MSH")
 _OLD_LEADING_BOM = re.compile(rb"\s*\xef\xbb\xbf")
+#: BACKLOG #5918: the later MSH lines the ingress guard and the byte scan now read, marks and all.
+_OLD_LATER_MSH_CR = re.compile(r"\r" + BOM + r"*MSH")
+#: The byte scan reads any run of the mark's three bytes, a superset that only costs a decode.
+_OLD_LATER_MSH_BYTES_PAST_BOM = re.compile(rb"[\r\n][\xef\xbb\xbf]+MSH")
 
 
 def _old_holds_more_than_one_message(text: str) -> bool:
@@ -47,7 +58,7 @@ def _old_holds_more_than_one_message(text: str) -> bool:
     if first is None:
         return False
     start = first.start()
-    later = text.count("\rMSH", start)
+    later = len(_OLD_LATER_MSH_CR.findall(text, start))  # BACKLOG #5918: was text.count("\rMSH")
     return later > 1 or (later == 1 and text.startswith("MSH", start))
 
 
@@ -70,13 +81,16 @@ def _old_needs_a_decode(raw: bytes, encoding: str) -> bool:
         return True
     if name == "utf-8" and _OLD_LEADING_BOM.match(raw):
         return True
-    return b"\rMSH" in raw or b"\nMSH" in raw
+    if b"\rMSH" in raw or b"\nMSH" in raw:
+        return True
+    # BACKLOG #5918: a later MSH that UTF-8 byte order marks lead now needs a decode too.
+    return _OLD_LATER_MSH_BYTES_PAST_BOM.search(raw) is not None
 
 
 def _old_split_batch(raw: str | bytes) -> list[str]:
     text = normalize(raw)
     first, *rest = _OLD_MSH_BOUNDARY.split(text)
-    messages = [chunk[1:] for chunk in rest]
+    messages = [chunk[1:].lstrip(BOM) for chunk in rest]  # BACKLOG #5918: was chunk[1:]
     head = first.lstrip(_LEADING_WS_STR)
     while head.startswith(("FHS", "BHS")):
         head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
@@ -128,7 +142,7 @@ def test_the_corpus_reaches_every_answer() -> None:
     assert {len(_old_split_batch(text)) for text in CORPUS} >= {1, 2, 3}
 
 
-def test_the_ingress_reading_is_unchanged() -> None:
+def test_the_ingress_reading_matches_its_copy() -> None:
     # check_decoded hands it normalized text; the raw strings are read too, so a change that only
     # shows on an LF the guard is never given would still fail here.
     normalized = [normalize(text) for text in CORPUS]
@@ -141,7 +155,7 @@ def test_the_ingress_reading_is_unchanged() -> None:
         )
 
 
-def test_the_delivery_reading_is_unchanged() -> None:
+def test_the_delivery_reading_matches_its_copy() -> None:
     assert (
         _disagreements(split._sends_more_than_one_message, _old_sends_more_than_one_message, CORPUS)
         == []
@@ -149,7 +163,7 @@ def test_the_delivery_reading_is_unchanged() -> None:
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "latin-1", "cp1252", "ascii", "utf-16", "nope"])
-def test_the_whole_file_byte_scan_is_unchanged(encoding: str) -> None:
+def test_the_whole_file_byte_scan_matches_its_copy(encoding: str) -> None:
     assert [
         body
         for body in BODIES
@@ -157,14 +171,15 @@ def test_the_whole_file_byte_scan_is_unchanged(encoding: str) -> None:
     ] == []
 
 
-def test_the_batch_split_is_unchanged() -> None:
+def test_the_batch_split_matches_its_copy() -> None:
     assert [text for text in CORPUS if split.split_batch(text) != _old_split_batch(text)] == []
     assert [body for body in BODIES if split.split_batch(body) != _old_split_batch(body)] == []
 
 
-#: The earliest boundary each multi-spelling ``_Boundary`` names, written as one plain regex.
+#: The earliest boundary each ``_Boundary`` names, written out again here as a plain regex.
 _EARLIEST_OUTBOUND = re.compile(r"[\r\n]" + BOM + r"*MSH")
-_EARLIEST_RAW_BYTES = re.compile(rb"[\r\n]MSH")
+_EARLIEST_NORMALIZED = re.compile(r"\r" + BOM + r"*MSH")
+_EARLIEST_RAW_BYTES = re.compile(rb"[\r\n][\xef\xbb\xbf]*MSH")
 
 
 def _earliest(pattern: re.Pattern[Any], text: Any, start: int) -> int:
@@ -174,14 +189,20 @@ def _earliest(pattern: re.Pattern[Any], text: Any, start: int) -> int:
 
 @pytest.mark.parametrize("start", [0, 1, 3])
 def test_the_predicate_returns_the_earliest_boundary(start: int) -> None:
-    # The boolean readings throw the index away, and the split takes the one-spelling path, so the
-    # parity tests above would not see a multi-spelling search return a later boundary (BACKLOG
-    # #4972). Each answer is held to a plain regex for the same boundary.
+    # The boolean readings throw the index away, so the parity tests above would not see a search
+    # return a later boundary (BACKLOG #4972). Each answer is held to a plain regex for the same
+    # boundary, for each kind of text.
     assert [
         text
         for text in CORPUS
         if split._next_boundary(text, start, split._OUTBOUND)
         != _earliest(_EARLIEST_OUTBOUND, text, start)
+    ] == []
+    assert [
+        text
+        for text in CORPUS
+        if split._next_boundary(text, start, split._NORMALIZED)
+        != _earliest(_EARLIEST_NORMALIZED, text, start)
     ] == []
     assert [
         body
@@ -191,17 +212,11 @@ def test_the_predicate_returns_the_earliest_boundary(start: int) -> None:
     ] == []
 
 
-def test_a_boundary_spelling_longer_than_one_break_is_refused() -> None:
-    # _next_boundary begins its searches one before the first MSH, so it would miss a CRLF spelling.
-    with pytest.raises(ValueError, match="one line-break character"):
-        split._Boundary("MSH", ("\r\nMSH",))
-
-
 def test_a_clean_outbound_payload_pays_one_scan() -> None:
     # Item 3.2. A str subclass counts the substring scans the delivery reading makes through find,
     # count and `in`; a payload with no MSH after its lead must stop at the first, and one holding
     # a second message still answers. A regex search is not counted: the lead match reads only the
-    # lead, and the marked-boundary search runs only past this scan.
+    # lead, and the boundary pattern is searched only once this scan has found an MSH.
     class Counted(str):
         scans = 0
 
@@ -234,3 +249,38 @@ def test_a_clean_outbound_payload_pays_one_scan() -> None:
     assert split._sends_more_than_one_message(clean) is False
     assert Counted.scans == 1
     assert split._sends_more_than_one_message(Counted("MSH|a\rPID|1\nMSH|b\r")) is True
+
+
+@pytest.mark.parametrize("lead", ["", BOM, BOM * 3])
+def test_walking_a_batch_reads_the_text_a_bounded_number_of_times(lead: str) -> None:
+    # BACKLOG #5918 review: with only marked boundaries, a search that scanned on for a plain
+    # boundary read to the end of the text on every call, so a split was quadratic. Walking every
+    # boundary of an N-message batch, as split_batch does, must read the text a bounded number of
+    # times in all. A str subclass totals the characters each find reads, which is the MSH
+    # prescan; the boundary pattern opens with a line break no mark holds, so its own search is
+    # linear, and the regex is not counted here.
+    class Counted(str):
+        read = 0
+
+        def find(
+            self,
+            sub: str,
+            start: SupportsIndex | None = None,
+            end: SupportsIndex | None = None,
+            /,
+        ) -> int:
+            first = 0 if start is None else int(start)
+            last = len(self) if end is None else int(end)
+            hit = super().find(sub, start, end)
+            type(self).read += (last if hit < 0 else hit + len(sub)) - first
+            return hit
+
+    count = 200
+    text = Counted(("MSH|a\rOBX|1|MSH x\r" + lead) * count)
+    found = []
+    at = split._next_boundary(text, 0, split._NORMALIZED)
+    while at >= 0:
+        found.append(at)
+        at = split._next_boundary(text, at + 1, split._NORMALIZED)
+    assert len(found) == count - 1
+    assert Counted.read <= 3 * len(text)

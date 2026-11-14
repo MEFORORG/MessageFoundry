@@ -261,6 +261,236 @@ def test_replace_literal() -> None:
     assert m["PID-5.1"] == "MS SMITH"
 
 
+# --- decoded values: escapes survive, structure is kept (BACKLOG #5928) -------
+#
+# Each helper below used to transform the field's raw wire text, so an escape sequence was cased,
+# sliced, counted or matched as if it were data. Every case reads the raw text back with a
+# whole-field read, which returns the wire form, so the assertion sees the escapes themselves.
+
+
+_MSH = "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260101120000||ADT^A01|MSG1|P|2.5.1\r"
+
+
+def _with_pid(pid5: str, pid4: str = "") -> Message:
+    return Message.parse(f"{_MSH}PID|1||100^^^HOSP^MR|{pid4}|{pid5}\r")
+
+
+def test_convert_case_keeps_a_rich_text_escape_on_a_whole_field() -> None:
+    m = _with_pid("line\\.br\\two^x")
+    convert_case(m, "PID-5", "upper")
+    # Upper-casing the raw text made ``\.br\`` into ``\.BR\``, which no decoder maps.
+    assert m["PID-5"] == "LINE\\.br\\TWO^X"
+
+
+def test_convert_case_on_a_leaf_with_a_line_break_escape_does_not_raise() -> None:
+    m = _with_pid("line\\.br\\two")
+    # The decoded value holds a CR, which a write refuses, so the old helper raised.
+    convert_case(m, "PID-5.1", "upper")
+    assert m["PID-5"] == "LINE\\.br\\TWO"
+
+
+def test_convert_case_keeps_a_highlight_escape() -> None:
+    m = _with_pid("mc\\H\\donald")
+    convert_case(m, "PID-5.1", "upper")
+    # ``\H\`` decodes to "_"; writing the decoded value back lost the escape.
+    assert m["PID-5"] == "MC\\H\\DONALD"
+
+
+def test_convert_case_keeps_subcomponents_of_a_component_path() -> None:
+    m = _with_pid("doe&van^jane")
+    convert_case(m, "PID-5.1", "upper")
+    # The decoded component read is "doe&van"; writing it back as data escaped the "&".
+    assert m["PID-5"] == "DOE&VAN^jane"
+    assert m["PID-5.1.2"] == "VAN"
+
+
+def test_convert_case_title_reads_case_across_an_escape() -> None:
+    m = _with_pid("o\\S\\brien \\X41\\bc")
+    convert_case(m, "PID-5.1", "title")
+    assert m["PID-5.1"] == "O^Brien Abc"
+    assert m["PID-5"] == "O\\S\\Brien \\X41\\bc"
+
+
+def test_substring_field_indexes_the_decoded_whole_field() -> None:
+    m = _with_pid("doe", pid4="A\\S\\BC")
+    substring_field(m, "PID-4", 2)
+    # The raw slice "S\BC" cut the escape in half.
+    assert m["PID-4"] == "BC"
+
+
+def test_substring_field_keeps_an_escape_inside_the_slice() -> None:
+    m = _with_pid("AB\\.br\\CD")
+    substring_field(m, "PID-5.1", 1)
+    assert m["PID-5"] == "B\\.br\\CD"
+    substring_field(m, "PID-5.1", 0, 2)
+    assert m["PID-5"] == "B\\.br\\"
+
+
+def test_substring_field_cutting_inside_a_multi_character_escape_keeps_the_data() -> None:
+    m = _with_pid("\\X4142\\C")
+    substring_field(m, "PID-5.1", 1)
+    assert m["PID-5.1"] == "BC"
+
+
+def test_substring_field_refuses_a_field_with_structure() -> None:
+    m = _with_pid("doe^jane")
+    with pytest.raises(ValueError, match="separator"):
+        substring_field(m, "PID-5", 0, 2)
+    assert m["PID-5"] == "doe^jane"
+
+
+def test_substring_field_refuses_a_component_with_subcomponents() -> None:
+    m = _with_pid("doe&van^jane")
+    with pytest.raises(ValueError, match="separator"):
+        substring_field(m, "PID-5.1", 0, 2)
+
+
+def test_pad_field_counts_the_decoded_length() -> None:
+    m = _with_pid("doe", pid4="4\\S\\2")
+    pad_field(m, "PID-4", 5)
+    # The raw text is five characters long, so the old helper padded nothing.
+    assert m["PID-4"] == "004\\S\\2"
+
+
+def test_pad_field_writes_a_separator_fill_as_data() -> None:
+    m = _with_pid("doe", pid4="4")
+    pad_field(m, "PID-4", 3, fill="^")
+    assert m["PID-4"] == "\\S\\\\S\\4"
+    assert m["PID-4.1"] == "^^4"
+
+
+def test_pad_field_refuses_a_field_with_structure() -> None:
+    m = _with_pid("doe^jane")
+    with pytest.raises(ValueError, match="separator"):
+        pad_field(m, "PID-5", 12)
+
+
+def test_replace_literal_does_not_match_inside_an_escape() -> None:
+    m = _with_pid("a\\.br\\b")
+    replace_literal(m, "PID-5.1", "br", "X")
+    # The raw replace turned ``\.br\`` into ``\.X\``.
+    assert m["PID-5"] == "a\\.br\\b"
+
+
+def test_replace_literal_writes_new_as_data() -> None:
+    m = _with_pid("doe^jane")
+    replace_literal(m, "PID-5", "doe", "o^b")
+    assert m["PID-5"] == "o\\S\\b^jane"
+    assert m["PID-5.1"] == "o^b"
+    assert m["PID-5.2"] == "jane"
+
+
+def test_replace_literal_old_with_a_separator_does_not_match_across_leaves() -> None:
+    m = _with_pid("doe^jane")
+    replace_literal(m, "PID-5", "e^j", "X")
+    assert m["PID-5"] == "doe^jane"
+
+
+def test_replace_literal_matches_an_escaped_separator_within_a_leaf() -> None:
+    m = _with_pid("A\\S\\B^C")
+    replace_literal(m, "PID-5", "^", "-")
+    assert m["PID-5"] == "A-B^C"
+
+
+def test_replace_literal_refuses_a_line_break_in_new() -> None:
+    m = _with_pid("doe")
+    with pytest.raises(ValueError, match="CR/LF"):
+        replace_literal(m, "PID-5.1", "doe", "a\rb")
+
+
+def test_transforms_refuse_the_delimiter_fields() -> None:
+    m = _with_pid("doe")
+    with pytest.raises(ValueError, match="MSH-2"):
+        replace_literal(m, "MSH-2", "^", "#")
+    assert m["MSH-9.1"] == "ADT"
+
+
+def test_convert_case_keeps_a_hex_escaped_cr_escaped_and_never_raw() -> None:
+    m = _with_pid("doe\\X0D\\evn^jane")
+    convert_case(m, "PID-5.1", "upper")
+    # The escape is kept as sent, so no raw CR reaches the wire and no new segment opens.
+    assert m["PID-5"] == "DOE\\X0D\\EVN^jane"
+    assert m.encode().count("\r") == 2
+    assert m.count_segments("EVN") == 0
+
+
+def test_replace_literal_keeps_a_zero_width_escape_at_a_match() -> None:
+    m = _with_pid("a\\.fi\\bc")
+    replace_literal(m, "PID-5.1", "bc", "X")
+    assert m["PID-5"] == "a\\.fi\\X"
+
+
+def test_substring_field_keeps_a_zero_width_escape_outside_the_slice() -> None:
+    m = _with_pid("\\C2842\\abc\\.fi\\")
+    substring_field(m, "PID-5.1", 1, 2)
+    assert m["PID-5"] == "\\C2842\\b\\.fi\\"
+
+
+def test_an_edit_that_removes_all_text_leaves_the_field_empty() -> None:
+    m = _with_pid("doe", pid4="\\.fi\\abc")
+    replace_literal(m, "PID-4", "abc", "")
+    assert m["PID-4"] is None
+    m = _with_pid("doe", pid4="\\.fi\\abc")
+    substring_field(m, "PID-4", 0, 0)
+    assert m["PID-4"] is None
+
+
+def test_replace_literal_crlf_in_new_raises_only_on_a_match() -> None:
+    m = _with_pid("doe")
+    replace_literal(m, "PID-5.1", "zzz", "a\rb")  # nothing matches: a no-op, as before
+    replace_literal(m, "ZZZ-1", "x", "a\rb")  # absent segment: a no-op, as before
+    assert m["PID-5"] == "doe"
+
+
+def test_replace_literal_replaces_a_decoded_line_break() -> None:
+    m = _with_pid("line one\\.br\\line two")
+    replace_literal(m, "PID-5.1", "\r", " ")
+    assert m["PID-5"] == "line one line two"
+
+
+def test_substring_field_refuses_a_cut_that_leaves_a_bare_cr() -> None:
+    m = _with_pid("\\.sp2\\z")
+    with pytest.raises(ValueError, match="CR/LF"):
+        substring_field(m, "PID-5.1", 1)
+    assert m["PID-5"] == "\\.sp2\\z"
+
+
+def test_transforms_refuse_a_batch_header_delimiter_field() -> None:
+    m = Message.parse("BHS|^~\\&|SENDAPP\r" + _MSH + "PID|1||X\r")
+    with pytest.raises(ValueError, match="delimiters"):
+        replace_literal(m, "BHS-2", "", "x")
+
+
+def test_convert_case_unhashable_mode_raises_value_error() -> None:
+    m = _msg()
+    with pytest.raises(ValueError, match="convert_case mode"):
+        convert_case(m, "PID-5.1", ["upper"])  # type: ignore[arg-type]  # outside the declared set: the refusal is the subject
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["plain", "a\\.br\\b", "\\X4142\\C", "x\\\\y", "SMITH\\", "JO\\E", "\\H\\hi\\N\\", "\\.in3\\z"],
+)
+def test_leaf_units_decode_exactly_as_unescape(raw: str) -> None:
+    # The tokenizer the transforms use must decode a leaf as the read side does, or every length
+    # and match they compute drifts from what Message.field returns.
+    from messagefoundry.parsing import _builtin_hl7
+
+    seps = ("|", "^", "~", "&", "\\")
+    units = actions_mod._leaf_units(raw, seps)
+    assert "".join(raw_part for raw_part, _decoded, _kind in units) == raw
+    assert actions_mod._decoded(units) == _builtin_hl7.unescape(raw, seps)
+
+
+def test_copy_segment_skips_a_fieldless_bare_line() -> None:
+    m = Message.parse(f"{_MSH}PID\rPID|1||X\r")
+    assert m.count_segments("PID") == 1
+    copy_segment(m, "PID")
+    # The bare line is no occurrence, so occurrence 1 is the populated PID, as Peek and Message agree.
+    assert m.count_segments("PID") == 2
+    assert m.field("PID-3", occurrence=2) == "X"
+
+
 def test_arith_field_multiply_rounds() -> None:
     m = _msg()
     set_field(m, "PID-4.1", "70")  # kg

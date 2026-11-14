@@ -1815,7 +1815,11 @@ class QueueStore(StoreLifecycle, Protocol):
         :meth:`purge_message_bodies` (per-connection-or-global cutoff AND not in-flight); ``min_bytes``
         skips a sub-threshold embed; ``content_types`` (channel_id -> declared content_type) labels a
         bare-mfb64 tombstone. Idempotent (an already-tombstoned body is skipped). Returns a
-        :class:`StripResult` (counts + bytes reclaimed; no message content)."""
+        :class:`StripResult` (counts + bytes reclaimed; no message content).
+
+        Every backend runs it through :func:`~messagefoundry.store.document_strip.run_strip_pass`
+        (BACKLOG #5651); its module docstring states the batching and the write-back guard, and
+        what the guard does and does not cover on each backend."""
         ...
 
     async def purge_dead_letters(
@@ -3291,9 +3295,7 @@ class AuthStore(Protocol):
 
         ``require_federated_subject`` makes the insert CONDITIONAL on the account still carrying
         that verified ``(issuer, sub)``, checked in the same transaction (BACKLOG #1474): the row is
-        written only if the binding is still there, and the call returns ``False`` otherwise. A user
-        id that resolves to no row is a mismatch like any other, so it too returns ``False`` rather
-        than inserting a session against an account that is not there.
+        written only if the binding is still there, and the call returns ``False`` otherwise.
 
         **It closes a race a caller cannot close for itself.** A federated login and an admin unbind
         can overlap, and the unbind revokes the sessions that EXIST when it runs. Without this guard
@@ -3301,13 +3303,18 @@ class AuthStore(Protocol):
         the withdrawn identity keeps a live session. Checking the binding before calling would only
         narrow the window, because the check and the insert would still be two transactions.
 
+        **A ``user_id`` that resolves to no row returns ``False`` on every call**, guarded or not,
+        and writes nothing (BACKLOG #2733): an account deleted after the caller read it is refused
+        here rather than by the INSERT's foreign-key error.
+
         **``(None, None)`` requires an UNBOUND row** (vault BACKLOG #2609). It is the same guard
         read the other way, for the Windows SSO mint: a bound account is refused that sign-in,
         and a bind sweeps the sessions that exist when it runs. So a Windows SSO insert that
         landed after a bind's sweep would leave a session the bind could not see. A row holding
         either half of a pair is not unbound, and the insert is refused.
 
-        Every other caller passes nothing and is byte-identical: no extra read, no extra statement.
+        A caller that passes no guard still has its account read, for the session epoch, and still
+        takes the missing-row refusal above; only the binding comparison is skipped.
         """
         ...
 

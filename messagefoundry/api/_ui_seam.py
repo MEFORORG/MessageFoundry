@@ -888,12 +888,20 @@ from typing import Any
 #: recorded gate chain grew. Re-derived with ``--write``, from ``4b5769ef2c675677`` to
 #: ``6737556a16ce6d15``.
 #:
+#: BACKLOG #5930: the console's edit-resend form parser ``_resubmit_form`` now restores the
+#: original's line endings through ``restore_eol`` and reads the body through ``_form_pairs``. Both
+#: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. It
+#: does not hash the ``EDIT_EOL_TERMINATORS`` mapping, which is module data, or the route's refusal
+#: of an unknown ``eol``, which sits in the endpoint body. No engine surface changed.
+#: Re-derived with ``--write``, on the branch from ``4b5769ef2c675677`` to ``8386df80553a4313``,
+#: and over the merge with #5931 from ``6737556a16ce6d15`` to ``c537067c6952d93c``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "6737556a16ce6d15"
+ENGINE_UI_SEAM: str = "c537067c6952d93c"
 
 
 @dataclass(frozen=True, slots=True)

@@ -111,10 +111,11 @@ MAX_FILE_BYTES: Final = 64 * 1024
 
 #: The remedy every access refusal ends with.
 _REMEDY: Final = (
-    "Restrict it to SYSTEM, Administrators and the account the engine runs as (POSIX: the "
-    "engine's own account, mode 0700 for the directory and 0600 for a file, as real files and "
-    "directories rather than links, in a folder that account or root owns and only it may "
-    "write, or that has the sticky bit)"
+    "Restrict it to SYSTEM, Administrators and the account the engine runs as, as real files and "
+    "directories rather than links, with no junction or link above them that another account can change (Windows: "
+    "in a folder no broad group may delete a file in or change the access list of; POSIX: the "
+    "engine's own account, mode 0700 for the directory and 0600 for a file, in a folder that "
+    "account or root owns and only it may write, or that has the sticky bit)"
 )
 
 
@@ -153,10 +154,12 @@ _CUSTODY_KEYS: Final = frozenset(_name_key(name) for name in CUSTODY_FILE_NAMES)
 def _check(path: Path, what: str, *, directory: bool = False) -> None:
     """Refuse ``path`` when a known broad group can reach it: the rule key files get. For the
     directory, a broad right to delete a file inside it is refused too, since deleting a file sends
-    its setting back to the environment."""
+    its setting back to the environment. The directory's own check walks the folders above it; a
+    file's does not walk them again, because the directory that holds it is the one just judged
+    (on POSIX that directory's owner and mode are still read for each file)."""
     from messagefoundry.restricted_file import broad_access_problem
 
-    problem = broad_access_problem(path, directory=directory)
+    problem = broad_access_problem(path, directory=directory, holder_judged=not directory)
     if problem is not None:
         raise SecretsDirectoryError(f"{what} is not restricted: {problem}. {_REMEDY}")
 

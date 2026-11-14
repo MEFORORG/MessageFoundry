@@ -39,8 +39,9 @@ one exception is the first pass that finds the forwarder absent, which fires wha
 throttle says. The default sink's alert is a log line, and a log line is one more record for a
 forwarder that is already losing them.
 
-**Over UDP only queue and spool losses can fire.** No failed send is counted over UDP, so a collector
-that is down looks the same as one that is up (:attr:`ForwarderStatus.delivery_confirmed`).
+**Over UDP a collector that is down looks the same as one that is up.** A datagram to it raises
+nothing (:attr:`ForwarderStatus.delivery_confirmed`). What can fire there is at least queue and
+spool losses and a send that raises an error on this host (BACKLOG #5923).
 
 The alert carries counts, fixed words and this process's own label only: never a record, the
 collector's host name or an error text. An unpinned cluster node's label holds this engine's own
