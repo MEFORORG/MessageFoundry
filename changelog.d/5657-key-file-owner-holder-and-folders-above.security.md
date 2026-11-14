@@ -13,8 +13,8 @@
   access list being read at the file's lexical path without following a link there. It does not
   judge everything around the file;
   [ADR 0214's amendment](../docs/adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments)
-  lists at least what it leaves out. Restrict the secrets directory, any link target and the
-  folders above them yourself. Before, the Windows check read the key file's own access list
+  lists at least what it leaves out. Restrict the folder that holds each key file, the secrets
+  directory, any link target and the folders above them yourself. Before, the Windows check read the key file's own access list
   alone, and the POSIX check followed a linked folder above the file whoever could re-point it. The check applies at
   least to the generated and the operator's API TLS key, the store key file and each connection's
   key file, and to the secrets directory, whose files are not walked again. This supersedes the 5636 entry's sentence about

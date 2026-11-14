@@ -448,8 +448,8 @@ than a path is not checked
   share, such as at a folder it cannot read, is refused, and so is a holder whose access list the
   engine's account may not read: give that account read access to the folder's permissions.
   It does not judge everything around the file; [ADR 0214's amendment](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments)
-  lists at least what it leaves out. Restrict the secrets directory, any link target and the
-  folders above them yourself.
+  lists at least what it leaves out. Restrict the folder that holds each key file, the secrets
+  directory, any link target and the folders above them yourself.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
   in the group, and one held in a directory that another account owns or that a group or other may

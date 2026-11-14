@@ -2734,7 +2734,8 @@ secret. Each file in that directory holds one setting and is named exactly as it
   change, and on
   Windows one held in a folder a broad group may delete a file in or change the access list of, or
   that such a group owns; [PHI.md](PHI.md) section 2, *The folders above a key file*, states that
-  rule and what it does not read. It also
+  rule, and [ADR 0214's amendment](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments) lists at least what it
+  does not judge. It also
   refuses a relative path, a file that is not a regular file, a file named for no setting above
   (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
   whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
@@ -2747,7 +2748,8 @@ secret. Each file in that directory holds one setting and is named exactly as it
   named for no setting is cited by its position, never spelled, since its name may be a value.
 - **On Windows the access check is a list of known broad groups.** It does not refuse one named
   account that can write the directory, the way the config-directory checks do. It reads the
-  access of the folder that holds the directory, as the rule above says. It reads the folders
+  access of the folder that holds the directory, as the rule above says, except for a directory
+  at a drive root, such as a `subst` root, whose surroundings it does not read. It reads the folders
   above that only where a junction or link is on the path, to judge who can change the link;
   where none is, an account that can write one of those folders could replace the directory
   unrefused. Restrict the directory, and the folders above it, as below rather than relying on
