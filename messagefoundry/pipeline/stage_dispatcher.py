@@ -1738,7 +1738,10 @@ class StageDispatcher:
 
         **A pause ends the hold** (``ABANDONED``). It is read at the base interval through the
         backoff, so a pause, a stop of the outbound, the purge that waits on it and the #122 halt
-        are not held until the store heals. :meth:`_hold_abandoned` says what pauses a lane.
+        of the DELIVERY tier are not held until the store heals. :meth:`_hold_abandoned` says what
+        pauses a lane. The #122 halt of an INGRESS, ROUTED or RESPONSE lane pauses nothing, so it
+        does not end that hold: the hold runs on until its write lands or the policy below ends it,
+        and the lane's next claim then meets the runner's claim gate (BACKLOG #5704).
 
         **At ``infra_fault_stop_after`` consecutive failures the policy decides.** Under ``stop``
         the hold ends (``EXHAUSTED``) and :meth:`_run_lane` raises the lane's ``infra_error_streak``

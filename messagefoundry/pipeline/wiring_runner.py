@@ -10025,8 +10025,12 @@ class RegistryRunner:
 
     def _inbound_log_halted(self, name: str) -> bool:
         """Whether the #122 halt (ADR 0162) holds inbound ``name``'s internal stages: THE CLAIM GATE
-        the per_lane router, transform and response workers read at their loop top, and the pooled
-        INGRESS, ROUTED and RESPONSE adapters read on each claimed row (:meth:`_refuse_log_halted`).
+        the per_lane router, transform and response workers read at their loop top. Under pooled the
+        INGRESS, ROUTED and RESPONSE dispatchers read it before each claim
+        (:meth:`_may_claim_internal`), and their adapters read it again on each claimed row
+        (:meth:`_refuse_log_halted`) for a prefix claimed before the latch. Other readers include
+        at least :meth:`_ensure_inbound_workers` and the rebind gate in
+        :meth:`_resume_inbound_processing`.
 
         True while the LATCH is set, for every inbound, and afterwards for each inbound still marked
         until its own re-arm (BACKLOG #5704). Reading the latch is what makes the halt hold from the
