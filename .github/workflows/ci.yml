@@ -2425,12 +2425,12 @@ jobs:
     # fixed?", with raising the step timeout or splitting the tier as the options, the owner answered
     # "Raise the timeout". The 51:32 trigger below had fired and nothing read it, as the "NOTHING
     # READS THE TRIGGER BELOW FOR YOU" paragraph after this block says will happen. The 67-minute
-    # cap then killed the step on PR 2947 with no F or E in the progress line, which turned the
-    # required `CI gate` red. Two of those kills were read here; a third was reported with the brief
-    # for this change and was not re-read:
+    # cap then killed the step on PR 2947 three times, on two heads, with no F or E in the progress
+    # line and no FAILED in the job log, which turned the required `CI gate` red:
     #
-    #   run 43602637847  job 132470698933  PR 2947, attempt 1  killed 67:08  last progress [99%]
-    #   run 43602637847  job 132489474794  PR 2947, attempt 2  killed 67:08  last progress [98%]
+    #   run 43588751540  job 132428879971  PR 2947 bb1d9b6cfe, attempt 1  killed 67:07  last [99%]
+    #   run 43602637847  job 132470698933  PR 2947 0be8cfa25a, attempt 1  killed 67:08  last [99%]
+    #   run 43602637847  job 132489474794  PR 2947 0be8cfa25a, attempt 2  killed 67:08  last [98%]
     #
     # Green steps on other heads the same day, each this STEP's own completed_at minus started_at,
     # with the job's wall clock beside it:
@@ -2439,33 +2439,33 @@ jobs:
     #   run 43591079818  job 132435837957  PR 2946                 step 59:18  job 60:26
     #   run 43604145244  job 132475236591  PR 2942                 step 61:10  job 62:14
     #
-    # That is five jobs read one at a time, NOT a pool by the 2026-10-07 method, so it gives a worst
-    # case and no distribution. The kills are runs that wanted longer than the cap, so the largest
-    # green, 61:10, is right-censored again for the reason recorded above; the gap to the cap is not
-    # the evidence for that, the kills are.
+    # That is six jobs read one at a time, NOT a pool by the 2026-10-07 method, so it gives a LOWER
+    # BOUND on the worst green and no distribution. The kills are runs that wanted longer than the
+    # cap, so the largest green, 61:10, is right-censored again for the reason recorded above; the
+    # gap to the cap is not the evidence for that, the kills are.
     #
-    # THE STEP CAP IS 100. The 2026-10-23 method gives 93: the [98%] kill puts its full length at
-    # about 67:08 / 0.98 = 68:30, an ESTIMATE for the reason given there, and ceil_minute(1.35x
-    # 68:30) = ceil(92.48) = 93. That is the method on two of the three kills: the third kill's
-    # progress was not read, and 100 still covers it unless that kill stopped under about 91 percent.
-    # The 7 minutes above 93 are a CHOICE, not a derivation. The leg is growing: the 2026-10-23
+    # THE STEP CAP IS 100. The 2026-10-23 method gives 93: the [98%] kill, the longest of the three,
+    # puts its full length at about 67:08 / 0.98 = 68:30, an ESTIMATE for the reason given there, and
+    # ceil_minute(1.35x 68:30) = ceil(92.48) = 93. The 7 minutes above 93 are a CHOICE, not a
+    # derivation. The leg is growing: the 2026-10-23
     # pool's largest green was 47:58 and the largest of the three read here is 61:10, 22 days later.
     # Those are different instruments, a censored pool maximum and a three-run maximum, so the 13
     # minutes between them is an order of magnitude, not a rate. Each cap this note sized at the
     # rule's minimum on this leg has been outgrown. 100 is ceil_minute(1.35x 74:04), so it holds the
     # 1.35 rule for a run about 5:30 longer than the 68:30 estimate. The JOB cap is 115. Setup keeps
-    # the 2026-10-23 pool's maximum, 4:33, far above the setup in each of the five jobs read here,
-    # about a minute:
+    # the 2026-10-23 pool's maximum, 4:33, far above the setup in the six jobs read here, 0:50 to
+    # 1:02 from job start to the step's start:
     #
     #   windows-2025    setup 4:33, pad 4:30, step cap 100:00: 109:03 of 115:00, slack 5:57
     #
     # The job rule the engine note states gives less: the 2026-10-23 pool's largest job-minus-step
     # time, 4:40, is the worst overhead, and 100 + ceil_minute(1.5x 4:40) = 100 + 7 = 107. 115 is
     # taken over 107 so that the nesting row above holds with the pad, as each earlier row in this
-    # note does. Both are far under GitHub's 360-minute job limit. EVERY OTHER LEG KEEPS 60/48, and
-    # ubuntu's 2026-10-07 nesting row still holds: its GREEN steps in the same runs took 23:20 to
-    # 26:38. The main run's first ubuntu attempt failed at 20:03 and is left out; the 23:24 green is
-    # its re-run.
+    # note does. Both are far under GitHub's 360-minute job limit. EVERY OTHER LEG KEEPS 60/48. On
+    # ubuntu, in runs 43602637847, 43598638958, 43591079818 and 43604145244, setup took 0:31 to 0:41
+    # by the same reading, inside its 2026-10-07 nesting row's 5:06, and the GREEN steps took 23:20
+    # to 26:38, so ceil_minute(1.35x 26:38) = 36 is inside its 48. The main run's first ubuntu
+    # attempt failed at 20:03 and is left out; the 23:24 green is its re-run.
     #
     # THE CAP IS STILL NOT THE FIX, and this change names no cause. What is growing the leg is not
     # measured here; the slow-population question and the worker lever above are untouched, and
