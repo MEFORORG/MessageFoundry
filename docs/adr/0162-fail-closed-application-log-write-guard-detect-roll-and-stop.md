@@ -155,7 +155,7 @@ most its one in-flight head** — bounded, and strictly better than stranding th
 their loop top rather than returning, and a pooled lane parks before its claim, touching no
 row, until the gate lifts. A per_lane router or transform worker still finishes a batch it had
 already claimed, so for those lanes the one-head bound above holds under per_lane only at
-`fifo_claim_batch = 1`; the response worker claims one row at a time. The halt pauses no internal lane, and STOPs one only through its hand-back of a prefix claimed before the latch (on leadership loss, or at T17); a lane can still STOP for other causes, at least under its own fault policy. ADR 0189's note says the rest.)*
+`fifo_claim_batch = 1`; the response worker claims one row at a time. The halt pauses no internal lane, and STOPs one only through its hand-back of a prefix claimed before the gate shut (on leadership loss, or at T17); a lane can still STOP for other causes, at least under its own fault policy. ADR 0189's note says the rest.)*
 
 **Recovery, measured rather than assumed — the two tiers recover differently and an operator needs
 both halves.** The inbound re-arm rides `_start_inbound_unsafe`, so **anything that starts an inbound
