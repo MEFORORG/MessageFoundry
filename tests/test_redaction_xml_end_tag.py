@@ -58,10 +58,19 @@ def _main_end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
 
 @contextmanager
 def _main() -> Iterator[None]:
-    """The redactor as it stood before #5925: every end-tag rest copied as it stood."""
+    """The redactor as it stood before #5925: every end-tag rest copied as it stood, and a round
+    ending only where the structured passes changed nothing. With no mask, that is
+    :func:`redaction._masked_only` always False, so a fault in that gate cannot move this baseline
+    with the redactor it is compared against (code review round 2)."""
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(redaction, "_end_tag_rest", _main_end_tag_rest)
+        patch.setattr(redaction, "_masked_only", _never_masked_only)
         yield
+
+
+def _never_masked_only(text: str, flat: str, *, widened: bool) -> bool:
+    """Main's round gate: no change is a mask alone, so only ``text == flat`` ends a round."""
+    return False
 
 
 @pytest.mark.parametrize(
@@ -484,7 +493,7 @@ def test_a_masked_rest_runs_no_round_main_did_not(a: str, raw: str) -> None:
     # THE POSITIVE CONTROL: with a mask counted as a change again, as at 552c25b49e, this pair
     # prints the joined value where main hid it, so the green above is the round gate's work.
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(redaction, "_masked_only", lambda text, flat, *, widened: False)
+        patch.setattr(redaction, "_masked_only", _never_masked_only)
         assert "Qzhqpjzj" in redact(redact(a) + raw)
 
 
@@ -501,6 +510,46 @@ def test_a_scrub_that_keeps_length_and_class_still_runs_another_round() -> None:
     masked_alone = redaction._redact_structured(flat, widened=False)
     assert masked_alone == '{"name": "[abcdefgh]"} </family Xxx>'
     assert redaction._masked_only(masked_alone, flat, widened=False)
+    with _main():
+        main = redact(flat)
+    assert main == '{"name": "[redacted]"} </family Zqx>'
+    assert _is_main_masked(redact(flat), main)
+
+
+#: Shapes main's one call does not leave at a fixed point of its own passes, for the generated arm
+#: below: a name pair glued to a segment id, and a JSON value whose scrub joins field-run halves.
+_ROUND_PIECES = (
+    "&Smith, Jones=PID|x", "&Doe, Webb=PID|", '{"family":"a b"}|q', "&Kim, Li=OBX|y",
+    '{"given":"c d"}|',
+)  # fmt: skip
+
+
+def test_the_round_gate_holds_over_generated_joins() -> None:
+    """The generated arm for the round gate (code review round 2): the gate above cannot see a
+    round main did not run, since its corpus holds no text main's one call leaves short of a fixed
+    point. Here each ``a`` ends on such a shape. Every route is main's with some letters and digits
+    masked, and the control, the gate forced off as at 552c25b49e, leaks.
+
+    Measured by hand at 1,500 trials on each of five seeds, this one among them: 0 leaks and 0
+    unmasked routes, against 100 to 481 leaks on the control. A measurement of this corpus, not a
+    proof."""
+    rand = random.Random(59252)
+    shipped, forced = _Tally(), _Tally()
+    for _ in range(1_000):
+        a = _fragment(rand, element=True) + rand.choice(("", " ", "  ", "\n", " x "))
+        a += rand.choice(_ROUND_PIECES)
+        raw = rand.choice((" ", "\n", "")) + _fragment(rand, element=rand.random() < 0.3)
+        where = f"{a!r} + {raw!r}"
+        with _main():
+            before = _composed(a, raw)
+        shipped.add(_composed(a, raw), before, where)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(redaction, "_masked_only", _never_masked_only)
+            forced.add(_composed(a, raw), before, where)
+    assert forced.leaks, "the forced-off gate leaked nothing, so this corpus cannot see the defect"
+    assert shipped.gains, "the mask hid nothing main printed, so the mask is not exercised"
+    assert not shipped.leaks, shipped.leaks[:5]
+    assert not shipped.unmasked, shipped.unmasked[:5]
 
 
 def test_the_mask_is_a_fixed_point() -> None:

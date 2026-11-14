@@ -1656,9 +1656,11 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     what main's hid. The mask keeps every character's class.
 
     **That is not a proof that every reader sees main's answer.** A mask alone sends no text round
-    again (:func:`_masked_only`), but in a round that also scrubbed something the next round reads
-    the masked text, and a pass that is not a fixed point can read it differently there. The
-    credential backstop is the known one, so a text holding its opener
+    again (:func:`_masked_only`), but masked text still reaches passes main ran on the unmasked
+    text, at least these: the next round after one that masks and also scrubs, the widened stage
+    and the encoded run's re-run after a round that masks, and a caller's later call. A pass that
+    is not a fixed point can read it differently there. The credential backstop is the known one,
+    so a text holding its opener
     (:data:`_USERINFO_OPENER`) keeps every rest, as :func:`_scrub_field_runs` does: ``mask`` is
     False there. The caller tests that once per text, not once per end tag, which was quadratic.
     The differential
@@ -1822,9 +1824,9 @@ def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
     if not out:
         if not masks or "</" not in text or _XML_PHI_END_OPEN.search(text) is None:
             return text
-        mask = masks and _USERINFO_OPENER not in text
-        if not mask:
+        if _USERINFO_OPENER in text:
             return text
+        mask = True
     out.append(_mask_stray_end_tags(text, pos, len(text), mask))
     return "".join(out)
 
