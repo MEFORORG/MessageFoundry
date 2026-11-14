@@ -411,8 +411,9 @@ than a path is not checked
   --grant-account` refuses the same list. A name it is given must resolve to a user account, a
   well-known account or a computer account; a group, an alias or a domain is refused, and the
   refusal names the kind the name resolved to. A well-known account here includes SYSTEM, a
-  virtual service account, and at least some well-known groups Windows reports the same way; only
-  the broad groups on the list above are refused among those. A computer account is admitted
+  virtual service account, and well-known groups Windows reports the same way. Among those, at
+  least the broad groups on the list above and an application package are refused, and other
+  well-known groups are admitted. A computer account is admitted
   because a group managed service account may resolve as one, so **a plain computer account
   (`DOMAIN\HOST$`) is admitted too**. Do not grant a host's own machine account to reach its local
   services: nothing here shows that a local SYSTEM or NETWORK SERVICE token carries the machine

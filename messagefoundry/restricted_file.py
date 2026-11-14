@@ -203,6 +203,8 @@ _GRANT_NAME_KINDS = frozenset({1, 5, 9})
 #: The SID_NAME_USE an owner NAME may resolve to: a user or a well-known account. Any other kind of
 #: owner is named by its SID.
 _OWNER_NAME_KINDS = frozenset({1, 5})
+#: SidTypeDeletedAccount, SidTypeInvalid and SidTypeUnknown: a name that resolves to no live account.
+_NOT_A_LIVE_ACCOUNT_KINDS = frozenset({6, 7, 8})
 _SID_TYPE_NAMES: Mapping[int, str] = MappingProxyType(
     {
         1: "a user account",
@@ -233,6 +235,9 @@ def _name_kind_problem(principal: str, kind: int, *, as_owner: bool) -> str | No
     if kind in (_OWNER_NAME_KINDS if as_owner else _GRANT_NAME_KINDS):
         return None
     what = _sid_kind_text(kind)
+    if kind in _NOT_A_LIVE_ACCOUNT_KINDS:
+        # Its SID literal would be taken as given, so do not point the operator at one.
+        return f"Windows resolves {principal!r} to {what}, not a live account; name one that exists"
     if as_owner:
         return (
             f"Windows resolves {principal!r} to {what}, not a user or well-known account; name an "
@@ -240,8 +245,8 @@ def _name_kind_problem(principal: str, kind: int, *, as_owner: bool) -> str | No
         )
     return (
         f"Windows resolves {principal!r} to {what}, and a key file is granted by name only to a "
-        "user, a well-known or a computer account. Name the one account the engine runs as, such "
-        "as a virtual service account or a group managed service account"
+        "user, a well-known account or group, or a computer account. Name the one account the "
+        "engine runs as, such as a virtual service account or a group managed service account"
     )
 
 

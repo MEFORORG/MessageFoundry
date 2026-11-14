@@ -1104,7 +1104,7 @@ def test_windows_refuses_a_name_that_is_not_one_account(tmp_path: Path, name: st
     # A bare domain resolves to a SID no token carries, so the grant would reach nobody and the
     # service would fail at its first start. A group is not one account either. The control is the
     # account name in the test above, which is granted.
-    with pytest.raises(RestrictedFileError, match="granted by name only to"):
+    with pytest.raises(RestrictedFileError, match="to a domain, and a key file is granted"):
         write_restricted_file(tmp_path / "store.key", b"k", read_grants=[name])
     assert list(tmp_path.iterdir()) == []
 
@@ -1121,6 +1121,7 @@ def test_windows_refuses_a_name_that_is_not_one_account(tmp_path: Path, name: st
         (3, False, False, "a domain"),
         (4, False, False, "an alias"),
         (6, False, False, "a deleted account"),
+        (8, False, False, "an unknown account"),
         (12, False, False, "an account of kind 12"),
     ],
 )
@@ -1134,6 +1135,8 @@ def test_a_grant_name_may_resolve_to_a_computer_account(
         else:
             # The refusal names the kind the name resolved to.
             assert problem is not None and f"to {named}," in problem
+            # A name that resolves to no live account is not sent on to its SID literal.
+            assert ("by its SID" in problem) == (as_owner and kind not in (6, 8))
 
 
 @windows_only
@@ -1141,14 +1144,12 @@ def test_windows_a_computer_account_grant_name_is_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The whole create, for a name Windows resolves as a computer account: the grant is written
-    # and reads back. Any real SID stands in for the gMSA; the kind is what is under test.
-    from messagefoundry.config.wiring import _win32_config_source_probes
-
-    me = _win32_config_source_probes().self_sid
-    assert me is not None
-    monkeypatch.setattr(restricted_file, "_lookup_account_name", lambda _name: (me, 9))
+    # and reads back. NETWORK SERVICE's SID stands in for the gMSA, an account apart from the
+    # creator so its read entry is its own; the kind is what is under test.
+    monkeypatch.setattr(restricted_file, "_lookup_account_name", lambda _name: ("S-1-5-20", 9))
     path = tmp_path / "store.key"
     write_restricted_file(path, b"k", read_grants=["CORP\\gmsa-mefor$"])
+    assert (_ALLOW, _READ, "S-1-5-20") in _windows_access(path)[1]
     assert path.read_bytes() == b"k"
     # The control: the same name as an owner is refused, and leaves no file.
     refused = tmp_path / "owned.key"
