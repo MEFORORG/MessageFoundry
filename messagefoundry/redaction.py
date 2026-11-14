@@ -1649,12 +1649,10 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     place where masking them is not expected to change another pass's reading (BACKLOG #5925).
 
     Well-formed XML allows only whitespace there, so a word is a value a malformed tag carried: inside
-    the tag (``</family Zqxdoe>``) or after one that never got its ``>`` (``</family Zqxdoe``). It was
-    copied as it stood, and printed. It is MASKED, not replaced, for the reason the section on
-    :data:`_SHAPE` gives: a placeholder changed the answer's length and dropped words a name run
-    would have joined, so a redacted answer joined to a caller's raw text and redacted again printed
-    what main's hid. The mask keeps a letter's case and a digit a digit, not every class
-    (:data:`_SHAPE`'s section says which it does not).
+    the tag (``</family Zqxdoe>``) or after one that never got its ``>`` (``</family Zqxdoe``). It is
+    MASKED, not replaced, for the reason the section on :data:`_SHAPE` gives. The mask keeps a
+    letter's case and a digit a digit, not every class (:data:`_SHAPE`'s section says which it does
+    not).
 
     **That is not a proof that every reader sees main's answer.** A mask alone sends no text round
     again (:func:`_masked_only`), but masked text still reaches passes main ran on the unmasked
@@ -1664,23 +1662,18 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     ``tests/test_redaction_xml_end_tag.py`` measures this; it is not a proof either.
 
     **A text that holds the credential backstop's opener (:data:`_USERINFO_OPENER`) when the XML
-    pass reads it keeps every rest**: ``mask`` is False there. The exclusion was added when a mask
-    alone forced a round main did not run, and the backstop read further in that round than on
-    main; the round gate (:func:`_masked_only`) now covers that case. It is kept as a conservative
-    choice: the backstop can read further in a later round than in an earlier one, and the passes
-    above still read masked text. :func:`_redact_xml_elements` tests it once per text, not once per
-    end tag, which was quadratic.
+    pass reads it keeps every rest**: ``mask`` is False there, a conservative choice.
+    :func:`_redact_xml_elements` tests it once per text.
 
     **Which words may be masked depends on what follows them** (:func:`_rest_words` holds the rules
     both share). Where the line ends the text, a caller can glue text onto the last word, so
-    :func:`_maskable_rest` decides with its rules for an answer's end, and the last word may not
-    begin a credential label's head either (:func:`_ends_in_camel_head`). Where the tag's ``>``, a
-    ``<`` or a line break follows, a caller's appended text cannot reach the last word, so only a
-    whole boundary-free word at its end refuses it, and a surname such as ``Johnson`` or ``Li`` is
-    masked there.
+    :func:`_maskable_rest` decides with its rules for an answer's end, and a last word ending on a
+    credential label word's head is refused too (:func:`_ends_in_camel_head`). Where the tag's
+    ``>``, a ``<`` or a line break follows, a last word ending in a whole boundary-free word is
+    refused too, and a surname such as ``Johnson`` or ``Li`` is masked there.
 
     Where the rules refuse, the rest stays as it stood, and that is the residual, at least these: a
-    rest holding punctuation, a tab or a non-ASCII letter (``</family Zq, Doe>``); one holding a word
+    rest holding punctuation, a tab or a non-ASCII letter; one holding a word
     some pass reads literally, a credential word inside a longer word, or a date (``</family
     Bearer x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any word after a
     line break inside the tag; every rest in a text that holds the backstop's opener when the XML
@@ -1809,8 +1802,8 @@ def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
 
     Words after an end tag's name, inside a malformed tag or after one with no ``>``, are masked in
     place where the rules expect that to change no other pass's reading, and kept as they stood
-    elsewhere (:func:`_end_tag_rest`), in a
-    walked element and outside one (:func:`_mask_stray_end_tags`). ``masks`` False keeps every one
+    elsewhere (:func:`_end_tag_rest`), in a walked element, and outside one only after a vocabulary
+    end tag (:func:`_mask_stray_end_tags`). ``masks`` False keeps every one
     as it stood, which is this pass as it was before BACKLOG #5925 (:func:`_masked_only`)."""
     if "<" not in text:
         return text
@@ -2294,7 +2287,7 @@ def _glued_phi_value_end(text: str, token: str, end: int) -> int | None:
 def _maskable_rest(
     text: str, end: int, stop: int, field_run: re.Pattern[str], *, credential: bool
 ) -> str | None:
-    """``text[end:stop]`` when masking it leaves every pass reading what it read before."""
+    """``text[end:stop]`` when the rules below allow masking it, else ``None``."""
     rest = text[end:stop]
     words = _rest_words(rest, camel=False)
     if words is None:

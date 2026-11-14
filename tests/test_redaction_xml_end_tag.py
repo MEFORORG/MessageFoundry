@@ -91,7 +91,7 @@ def test_main_printed_each_value(text: str, value: str, end_tag: str) -> None:
         ("<family>Smith</family Zqx 4455>", "<family>[redacted]</family Xxx 0000>"),
         ("<family>Smith</family >", "<family>[redacted]</family >"),
         # Names ending in a letter a boundary-free word starts with, and short ones, are masked
-        # inside a tag: nothing can join the last word before its ``>``.
+        # inside a tag.
         ("<family>Smith</family Johnson>", "<family>[redacted]</family Xxxxxxx>"),
         ("<given>Smith</given Li>", "<given>[redacted]</given Xx>"),
         # A vocabulary end tag outside a walked element: after the element closed, or with its start
@@ -109,8 +109,7 @@ def test_main_printed_each_value(text: str, value: str, end_tag: str) -> None:
     ],
 )
 def test_the_rest_is_masked_in_place(text: str, want: str) -> None:
-    """Masked character for character, as :data:`redaction._SHAPE` masks a glued value: the same
-    length, whitespace and class, so a cut, a later pass or a caller's text reads it as main's."""
+    """Masked character for character, as :data:`redaction._SHAPE` masks a glued value."""
     assert redact(text) == want
 
 
@@ -222,9 +221,7 @@ def test_the_backstop_opener_is_tested_once_per_text(unit: str) -> None:
 
 
 def test_a_text_holding_the_backstop_opener_keeps_every_rest() -> None:
-    """Found by code review round 2: masking forced a round main did not run, the backstop reached
-    further on the line a field run had shortened, and took the ``"name":`` key the widened stage
-    needed, so the name value printed. The opener keeps every rest, as the glued-value mask does."""
+    """The backstop's opener keeps every rest, as the glued-value mask does."""
     text = "nonnumeric port: 'pw " + "x|y|" * 70 + ' {"name": "Zq@host Kplm7"} </family Zqxdoe>'
     assert "Kplm7" not in redact(text)
     assert "Zqxdoe" in redact(text)
@@ -243,8 +240,7 @@ def test_a_text_holding_the_backstop_opener_keeps_every_rest() -> None:
 # ``a`` and ``raw``, every route over ``redact(a) + raw`` (and ``a + raw``, and the log chain's
 # output plus ``raw``) is compared with main's same route, value by value.
 
-#: Planted values: synthetic tokens, and surnames that end on a boundary-free word's head or are two
-#: letters long, which the end-of-text rules refuse and the in-tag rules mask.
+#: Planted values: synthetic tokens, and surnames.
 _VALUES = (
     "Zqxdoe", "Vandtjane", "Plantone", "Kplm7", "Qwerty12", "s3cr3tvalue99", "4455667", "Johnson",
     "Webb", "Kim", "Li",
@@ -380,8 +376,7 @@ def _is_main_masked(out: str, main: str) -> bool:
 
 
 def _replace_rest(text: str, start: int, stop: int, mask: bool) -> str:
-    """The CONTROL: a rest REPLACED by the placeholder wherever it holds a word, the design the
-    previous attempt took. It is not class-preserving, so the fuzz must find it leaking. It ignores
+    """The CONTROL: a rest REPLACED by the placeholder, the design the previous attempt took. It is not class-preserving, so the fuzz must find it leaking. It ignores
     ``mask``, so it also replaces walked rests in texts holding the backstop's opener, and inside
     :func:`redaction._masked_only`'s check with every rest kept."""
     rest = text[start:stop]
@@ -394,14 +389,8 @@ def test_the_end_tag_mask_redacts_at_least_what_main_did_through_composed_joins(
     """THE GATE for #5925: over generated vocabulary elements with malformed end tags, joined to raw
     text and redacted again by every route, every output is main's with some letters and digits
     masked, so no value main hid prints. The gain count shows the mask is exercised; the replacing
-    control shows the arm can find a leak.
-
-    Measured at 1,500 trials: 0 leaks, 0 unmasked routes and 9,398 values hidden that main printed.
-    The corpus holds the shapes code review found (camelCase credential labels and their
-    heads, a segment id glued to a tag's ``>``, surnames the end-of-text rules refuse, the
-    backstop's opener over a tail a field run shortens). With the head check narrowed to capitals
-    the same 1,500 trials found no leak, so that shape rests on the pins above, not on this arm.
-    These are measurements of this corpus, not a proof for every input."""
+    control shows the arm can find a leak. It is a measurement of this corpus, not a proof for every
+    input."""
     shipped, control = _differential(1_500, 5925, _replace_rest)
     assert control.leaks, "the replacing control leaked nothing, so the corpus cannot find the leak"
     assert shipped.gains, "the mask hid nothing main printed, so #5925 is not exercised"
@@ -472,9 +461,8 @@ _ROUND_JOINS = (
 @pytest.mark.parametrize("a", _ROUND_STARTS)
 def test_a_masked_rest_runs_no_round_main_did_not(a: str, raw: str) -> None:
     """A mask alone is not a change that sends the text round again: every route over ``a`` and
-    ``a`` joined to ``raw`` is main's with some letters and digits masked, so the joined value is
-    hidden wherever main hid it, ``redact(redact(a) + raw)`` and ``safe_text(safe_text(a) + raw)``
-    first among them."""
+    ``a`` joined to ``raw`` is main's with some letters and digits masked, and so is
+    ``safe_text(safe_text(a) + raw)``."""
     with _main():
         before = _composed(a, raw)
         main_twice = safe_text(safe_text(a) + raw)
@@ -513,8 +501,8 @@ def test_a_scrub_that_keeps_length_and_class_still_runs_another_round() -> None:
     assert _is_main_masked(redact(flat), main)
 
 
-#: Shapes main's one call does not leave at a fixed point of its own passes, for the generated arm
-#: below: a name pair glued to a segment id, and a JSON value whose scrub joins field-run halves.
+#: The pieces the generated arm below ends each ``a`` on: name pairs glued to a segment id, and
+#: JSON values.
 _ROUND_PIECES = (
     "&Smith, Jones=PID|x", "&Doe, Webb=PID|", '{"family":"a b"}|q', "&Kim, Li=OBX|y",
     '{"given":"c d"}|',
@@ -522,12 +510,9 @@ _ROUND_PIECES = (
 
 
 def test_the_round_gate_holds_over_generated_joins() -> None:
-    """The generated arm for the round gate (code review round 2): the gate above cannot see a
-    round main did not run, since its corpus holds no text main's one call leaves short of a fixed
-    point. Here each ``a`` ends on such a shape. Every route is main's with some letters and digits
-    masked, and the control, the gate forced off as at 552c25b49e, leaks.
-
-    It runs 1,000 trials on one seed: a measurement of this corpus, not a proof."""
+    """The generated arm for the round gate: each ``a`` ends on one of :data:`_ROUND_PIECES`. Every
+    route is main's with some letters and digits masked, and the control, the gate forced off,
+    leaks. It is a measurement of this corpus, not a proof."""
     rand = random.Random(59252)
     shipped, forced = _Tally(), _Tally()
     for _ in range(1_000):
