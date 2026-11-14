@@ -528,8 +528,10 @@ class StageDispatcher:
         self._is_leader: Callable[[], bool] = is_leader or (lambda: True)
         self._current_epoch: Callable[[], int | None] = current_epoch or (lambda: None)
         # The pre-claim gate (BACKLOG #5704). A lane it refuses parks at chunk assembly with NO claim
-        # and NO row write, so a gate held for hours costs no store I/O and cannot reach the T17
-        # infra-fault STOP. The runner lifts it with release_gated. None: every lane may claim.
+        # and NO row write, so a gate held for hours makes no claim or reschedule for that lane and
+        # cannot reach the T17 infra-fault STOP while it is parked. Not no store I/O: the sweep
+        # still reads the stage's lane heads every pass (list_fifo_lanes), the gated lane's
+        # included. The runner lifts it with release_gated. None: every lane may claim.
         self._may_claim: Callable[[str], bool] = may_claim or (lambda _lane: True)
 
         self._states: dict[str, _LaneState] = {}
