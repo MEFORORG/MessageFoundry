@@ -19,6 +19,7 @@ Synthetic accounts only.
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
@@ -28,10 +29,13 @@ import pytest
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import (
+    ACCOUNT_REFUSED,
     NO_ENABLED_ADMINISTRATOR_ACTION,
     ROLE_SYNC_CONTENDED,
     AuthService,
     LoginOutcome,
+    _SignInRolesUnread,
+    _UserLookup,
 )
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
@@ -215,3 +219,107 @@ async def test_two_lost_compare_and_sets_refuse_the_sign_in_closed(
     assert len(refusals) == 1 and {k: refusals[0].get(k) for k in expected} == expected
     assert await service.identity_for_token(first) is not None, "a refused sign-in ended a session"
     assert len(await store.list_sessions(user_id)) == 1, "a refused sign-in minted a session"
+
+
+@pytest.mark.parametrize("leg", LEGS)
+async def test_a_record_that_fails_its_seal_when_read_again_refuses_the_sign_in(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, leg: str
+) -> None:
+    """After a lost compare-and-set the record is read again, twice since a refused read may be a
+    re-key, and both reads fail the seal. The sign-in is refused as ``account_refused``, not as
+    contention, and nothing is written."""
+    service, user_id, first = await _signed_in(store, leg)
+    await store.set_ad_group_role_map([(_GROUP, VIEWER)])
+    seen = _interleave(monkeypatch, store, [[ADMIN]])
+    real_lookup = service._lookup_user
+    reads: list[str] = []
+
+    async def lookup(uid: str) -> Any:
+        if seen:
+            reads.append(uid)
+            return _UserLookup(None, True)
+        return await real_lookup(uid)
+
+    monkeypatch.setattr(service, "_lookup_user", lookup)
+    out = await _sign_in(service, leg)
+    monkeypatch.undo()
+    assert not out.ok and out.reason == ACCOUNT_REFUSED
+    assert len(seen) == 1 and len(reads) == 2
+    assert await store.get_user_role_ids(user_id) == [ADMIN]
+    assert len(await store.list_sessions(user_id)) == 1, "a refused sign-in minted a session"
+    assert await service.identity_for_token(first) is not None
+
+
+async def test_an_error_held_from_a_lost_write_is_raised_after_the_refusal(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first write with its row raises a defect after another writer moved the roles; the
+    retry without the row finds them moved and reads them back at another set. The second
+    compare-and-set loses too, so the sign-in is refused, its row written, and the held defect is
+    raised rather than dropped."""
+    service, user_id, _first = await _signed_in(store, "kerberos")
+    await store.set_ad_group_role_map([(_GROUP, VIEWER)])
+    real_cas = store.set_user_roles_if_held
+    real_plain = store.set_user_roles
+    calls: list[int] = []
+
+    async def racing(uid: str, role_ids: Sequence[str], **kw: Any) -> bool:
+        calls.append(1)
+        if len(calls) == 1:
+            await real_plain(uid, [ADMIN], audits=())
+            raise TypeError("synthetic defect")
+        if len(calls) == 3:
+            await real_plain(uid, [OPERATOR], audits=())
+        return await real_cas(uid, role_ids, **kw)
+
+    monkeypatch.setattr(store, "set_user_roles_if_held", racing)
+    with pytest.raises(TypeError):
+        await _sign_in(service, "kerberos")
+    monkeypatch.undo()
+    assert len(calls) == 3
+    assert await store.get_user_role_ids(user_id) == [OPERATOR]
+    refusals = [
+        r for r in await _rows(store, "auth.login_failed") if r.get("reason") == ROLE_SYNC_CONTENDED
+    ]
+    assert len(refusals) == 1
+
+
+async def test_a_retry_whose_roles_cannot_be_read_back_ends_the_sessions_then_fails(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first write is refused with its row after another writer moved the roles; the retry
+    finds them moved and the read-back is refused. The change counts as written, so its row is
+    written with ``read_back: refused`` and the other sessions end, and then the sign-in fails
+    rather than mint a session on roles nobody read."""
+    service, user_id, first = await _signed_in(store, "kerberos")
+    await store.set_ad_group_role_map([(_GROUP, VIEWER)])
+    real_cas = store.set_user_roles_if_held
+    real_plain = store.set_user_roles
+    real_lookup = service._lookup_user
+    calls: list[int] = []
+
+    async def racing(uid: str, role_ids: Sequence[str], **kw: Any) -> bool:
+        calls.append(1)
+        if len(calls) == 1:
+            await real_plain(uid, [ADMIN], audits=())
+            raise sqlite3.OperationalError("synthetic: disk I/O error")
+        return await real_cas(uid, role_ids, **kw)
+
+    async def lookup(uid: str) -> Any:
+        if len(calls) >= 2:
+            raise sqlite3.OperationalError("synthetic: disk I/O error")
+        return await real_lookup(uid)
+
+    monkeypatch.setattr(store, "set_user_roles_if_held", racing)
+    monkeypatch.setattr(service, "_lookup_user", lookup)
+    with pytest.raises(_SignInRolesUnread):
+        await _sign_in(service, "kerberos")
+    monkeypatch.undo()
+    assert len(calls) == 2
+    assert (await _rows(store, "auth.ad_roles_resynced"))[0] == {
+        "from": [OPERATOR],
+        "to": [VIEWER],
+        "read_back": "refused",
+    }
+    assert await service.identity_for_token(first) is None, "an unread change kept a session"
+    assert len(await store.list_sessions(user_id)) == 0, "an unread change minted a session"

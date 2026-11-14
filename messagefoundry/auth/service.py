@@ -306,7 +306,18 @@ class _SignInRoleSync:
 
     previous: frozenset[str]  #: the roles the write replaced, or found already at the target
     held: Exception | None  #: raise once the sign-in's own steps have run
-    lost: bool = False  #: two compare-and-sets found the roles moved; nothing was written
+    #: Why the sign-in is refused, with nothing written: :data:`ROLE_SYNC_CONTENDED`, or
+    #: :data:`ACCOUNT_REFUSED` for a record gone or failing its seal when read again.
+    refusal: str | None = None
+
+
+class _SignInRolesUnread(RuntimeError):
+    """A directory sign-in's retried role write found the roles moved and could not read them
+    back, so it counted the change as written (vault BACKLOG #3085). Held, and raised once the
+    revoke, the notice and the alerts have run: no session is minted on roles nobody read."""
+
+    def __init__(self) -> None:
+        super().__init__("the directory sign-in's roles could not be read back after its write")
 
 
 #: How far, in seconds, a verified repeat-revocation row's ``ts`` may fall before this engine's
@@ -7801,8 +7812,8 @@ class AuthService:
         A write that finds the roles moved reads them again. Already at ``role_ids``, as a
         reconciler or another sign-in left them, is success with nothing changed by this sign-in.
         Otherwise the write is tried once more against the set just read. A second loss writes
-        nothing and is reported ``lost``, for the caller to refuse the sign-in, as is an account
-        gone or failing its seal at that read.
+        nothing and is reported as a ``refusal``, for the caller to refuse the sign-in, as is an
+        account gone or failing its seal at that read.
 
         BACKLOG #2221: a change's ``auth.ad_roles_resynced`` row commits in the role write's
         transaction, not after the revoke, because the roles are what it records. A sync that
@@ -7822,9 +7833,34 @@ class AuthService:
                 held = _hold(held, more)
             if written:
                 return _SignInRoleSync(expected, held)
-            stored = await self._lookup_user(user.id)
+            try:
+                stored = await self._lookup_user(user.id)
+                if stored.refused:
+                    # As in :meth:`_roles_read_back`: a refused read is also a row re-keyed between
+                    # its row and role reads, so it is read once more and that read decides.
+                    stored = await self._lookup_user(user.id)
+            except Exception as exc:
+                if held is None:
+                    raise
+                # Nothing was written, so the error held from the write is the one raised, with
+                # this one named on it rather than dropped.
+                _log.error(
+                    "auth: the directory sign-in's roles for %s could not be read again after its "
+                    "role write found them moved (%s)",
+                    scrub_log_argument(user.username),
+                    type(exc).__name__,
+                    exc_info=exc,
+                )
+                _hold(held, exc)
+                raise held from exc
             if stored.user is None:
-                break
+                _log.error(
+                    "auth: the record of %s is gone or fails its seal, read after the sign-in's "
+                    "role write found its roles moved; nothing was written and the sign-in is "
+                    "refused",
+                    scrub_log_argument(user.username),
+                )
+                return _SignInRoleSync(expected, held, refusal=ACCOUNT_REFUSED)
             expected = frozenset(stored.user.role_ids)
             if expected == target:
                 return _SignInRoleSync(expected, held)
@@ -7833,7 +7869,7 @@ class AuthService:
             "writer twice; nothing was written and the sign-in is refused",
             scrub_log_argument(user.username),
         )
-        return _SignInRoleSync(expected, held, lost=True)
+        return _SignInRoleSync(expected, held, refusal=ROLE_SYNC_CONTENDED)
 
     async def _write_sign_in_change(
         self,
@@ -7850,9 +7886,11 @@ class AuthService:
         and the row is written on its own before the revoke can raise. A held error, a row refused
         twice, which pages, and an error from the retry fail the sign-in only once the revoke has
         been tried, the user is told and an Administrator grant has paged: the change may have
-        committed, so it counts as written and this fails closed."""
+        committed, so it counts as written and this fails closed. So does a retry whose roles
+        could not be read back: counted as written, so the revoke, the notice and the alerts run,
+        and then the sign-in fails rather than mint a session on roles nobody read."""
         try:
-            synced = await self._write_roles_if_held(
+            synced, unread = await self._write_roles_if_held(
                 user.id,
                 user.username,
                 role_ids,
@@ -7872,7 +7910,10 @@ class AuthService:
                 exc_info=exc,
             )
             return True, exc
-        return synced.result, _hold(synced.held, synced.refused)
+        held = _hold(synced.held, synced.refused)
+        if unread:
+            held = _hold(held, _SignInRolesUnread())
+        return synced.result, held
 
     async def _roles_read_back(
         self, user_id: str, username: str, role_ids: Iterable[str], *, where: str
@@ -8153,25 +8194,26 @@ class AuthService:
         # set. Every step below reads what the write did, never the roles first read: the revoke,
         # the notice, the Administrator alerts and the audit row.
         sync = await self._sync_sign_in_roles(user, role_ids, client=client)
-        if sync.lost:
-            # The SIGN-IN is refused here, not the role write: what the other writer left stands,
-            # and owner ruling 2026-10-13 (#3229) still applies a directory role write that takes
-            # Administrator from its last holder. A session minted on roles this sign-in could not
+        if sync.refusal is not None:
+            # The SIGN-IN is refused, and this sign-in wrote nothing: what the other writer left
+            # stands, sessions included, until the next sign-in or reconcile pass. No role write
+            # is refused for taking Administrator from its last holder (owner ruling 2026-10-13,
+            # #3229); this one did not happen. A session minted on roles this sign-in could not
             # establish would be the open direction.
             if federated:
                 await self._directory_reject_audit(
                     principal.username,
                     "oidc",
-                    ROLE_SYNC_CONTENDED,
+                    sync.refusal,
                     client=client,
                     extra=outcome_extra,
                 )
                 refused = LoginOutcome(
-                    ok=False, error="federated sign-in failed", reason=ROLE_SYNC_CONTENDED
+                    ok=False, error="federated sign-in failed", reason=sync.refusal
                 )
             else:
                 refused = await self._refuse_directory_row(
-                    principal.username, ROLE_SYNC_CONTENDED, client=client, extra=outcome_extra
+                    principal.username, sync.refusal, client=client, extra=outcome_extra
                 )
             if sync.held is not None:
                 raise sync.held
@@ -8292,8 +8334,8 @@ class AuthService:
                 # A bind landed between the refusal check and the insert, so no session was
                 # minted. The caller gets the answer the check gives. NOT THE SAME AS THAT
                 # CHECK IN ONE WAY: the role, scope and profile sync above already ran, so a
-                # directory role change in this window is applied and audited, and it ends
-                # the account's other sessions as that sync always does. The reason is
+                # directory role change this sign-in wrote in this window is applied and
+                # audited, and it ends the account's other sessions. The reason is
                 # also written for a row deleted in the same window, which the guard
                 # refuses too; that row has no binding to look for.
                 refused = await self._refuse_directory_row(
@@ -8555,11 +8597,12 @@ class AuthService:
                 # check added there belongs here too.
                 #
                 # NOT CLOSED HERE: both sign-ins then run the caller's role resync on one new row.
-                # When the groups map to a role, each can read no prior roles and revoke the
-                # account's sessions, which can end the other's new session. On the server backends
-                # the two `set_user_roles` transactions can also meet the `user_roles` key, by
-                # reading (not measured), and the second would raise. Two concurrent sign-ins of an
-                # existing account meet both races too, so they belong to the resync.
+                # Its write is a compare-and-set on the roles each read (vault BACKLOG #3085), so
+                # only the first writes and revokes; the second finds the roles at its own set
+                # and changes nothing, or writes once more against what it read. The first's
+                # revoke can still end a session the second minted between that write and that
+                # revoke. Two concurrent sign-ins of an existing account meet the same race, so it
+                # belongs to the resync.
                 if winner.auth_provider != AuthProvider.AD.value:
                     raise _DirectoryAccountConflict("local_account_conflict") from exc
                 if winner.directory_object_id != principal.directory_object_id:
@@ -11384,7 +11427,7 @@ class AuthService:
         **Not closed:** a first write that committed, then another writer's move to a third set
         before the read, reads as not written, and this write goes unreported. A row lost twice is
         noted for the pass's ``audit_write_failed`` page."""
-        return await self._write_roles_if_held(
+        written, _unread = await self._write_roles_if_held(
             revocation.user_id,
             revocation.username,
             role_ids,
@@ -11395,6 +11438,7 @@ class AuthService:
             where="directory reconcile",
             on_refused=self._note_refused_reconciler_row,
         )
+        return written
 
     async def _write_roles_if_held(
         self,
@@ -11408,11 +11452,11 @@ class AuthService:
         client: str | None,
         where: str,
         on_refused: Callable[[str], None],
-    ) -> _RowWrite[bool]:
+    ) -> tuple[_RowWrite[bool], bool]:
         """The compare-and-set role write with its ``auth.ad_roles_resynced`` row that the
         directory sign-in and the reconciler share (vault BACKLOG #3085), through
-        :meth:`_write_with_row`. ``result`` says whether the roles now stand as this write left
-        them.
+        :meth:`_write_with_row`. Its ``result`` says whether the roles now stand as this write
+        left them; the second value, whether that was counted without reading them.
 
         The row is appended only when the write lands. A retry without the row that finds the
         roles moved reads them back through :meth:`_roles_read_back`, and counts the change
@@ -11458,7 +11502,7 @@ class AuthService:
             read_back_refused = landed is None
             return landed is not False
 
-        return await self._write_with_row(
+        synced = await self._write_with_row(
             write,
             write_row,
             action=resynced.action,
@@ -11467,6 +11511,7 @@ class AuthService:
             on_refused=on_refused,
             landed=bool,
         )
+        return synced, read_back_refused
 
     async def _apply_reconcile_revocation(
         self,
