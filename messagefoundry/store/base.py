@@ -4533,6 +4533,14 @@ def store_call_errors() -> tuple[type[Exception], ...]:
     return (RuntimeError, OSError, ValueError, *store_driver_errors())
 
 
+def sealed_read_errors() -> tuple[type[Exception], ...]:
+    """What a refused read of a sealed record can raise (BACKLOG #5559): :func:`store_call_errors`
+    and ``CipherError``, from a record that cannot be decrypted. The same caveat holds: a caller
+    that must not read a bug as a refusal re-raises
+    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first."""
+    return (*store_call_errors(), CipherError)
+
+
 @cache
 def audit_write_errors() -> tuple[type[Exception], ...]:
     """What a refused audit write raises, at least on the store backends and key modes named here
