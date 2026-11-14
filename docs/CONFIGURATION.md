@@ -483,7 +483,7 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `dir` | str | `environments` | directory holding `<env>.toml` flat key→value tables for non-secret values, **versioned** in the repo. A table anywhere inside an array value stops the load, naming the key and index, even for a key nothing references (vault BACKLOG #1820). Arrays of scalars, nested ones included, load. Resolved against `base_dir` (below). |
-| `base_dir` | str | `""` (= the working dir) | **Anchor** `dir` resolves against. Empty keeps the original behavior (relative to the process working directory). Set it to the **config-repo root** so env-value resolution no longer depends on where `serve` was launched. A relative value is taken against the working dir; an absolute value is used as-is — **on Windows it must be drive-qualified** (`C:/repo`); a leading-slash `/repo` is drive-relative and still inherits the launch drive (logged as a warning). Overridable per run with `serve --project-root`. **It also anchors the store path** (BACKLOG #5926): `serve` and at least the offline store commands `provision-admin`, `admin-unlock`, `audit-verify`, `rotate-key` and `backup` take a relative `[store].path`, or a relative `--db`, under this root. An absolute path and SQLite's `:memory:` stay put, and with no root the path still resolves against the working directory. On Windows a leading-slash `/data/mf.db` is not absolute, so it is anchored under the root too, with a warning. An offline command sees only the `base_dir` its own settings load gives it: a root `serve` got from `--project-root` does not reach it. Where the two could differ, give the command the absolute store path `serve` uses, as `--db`. |
+| `base_dir` | str | `""` (= the working dir) | **Anchor** `dir` resolves against. Empty keeps the original behavior (relative to the process working directory). Set it to the **config-repo root** so env-value resolution no longer depends on where `serve` was launched. A relative value is taken against the working dir; an absolute value is used as-is — **on Windows it must be drive-qualified** (`C:/repo`); a leading-slash `/repo` is drive-relative and still inherits the launch drive (logged as a warning). Overridable per run with `serve --project-root`. **It also anchors the store path** (BACKLOG #5926, #5927): `serve` and at least the offline store commands `provision-admin`, `admin-unlock`, `audit-verify`, `rotate-key` and `backup` take a relative `[store].path`, or a relative `--db`, under this root. An absolute path and SQLite's `:memory:` stay put, and with no root the path is used as written. On Windows a leading-slash `/data/mf.db` is not absolute, so it is anchored under the root too, with a warning. An offline command sees only the `base_dir` its own settings load gives it: a root `serve` got from `--project-root` does not reach it. Where the two could differ, give the command the absolute store path `serve` uses, as `--db`. |
 
 - A graph value that differs by environment is authored as `env("acme_adt_host")`; the running
   instance resolves it from `<base_dir>/<dir>/<active-env>.toml` overlaid by **`MEFOR_VALUE_<KEY>`**
@@ -1675,7 +1675,7 @@ literal compares as an address, so `[0:0:0:0:0:0:0:1]` names `::1`; a name compa
 to case. Nothing looser matches: an IPv4-mapped IPv6 address does not name its IPv4 address, and
 `127.1` is a name, not `127.0.0.1`. An entry matches nothing at least when it holds more than one
 colon outside brackets (write `::1` as `[::1]`), when its brackets hold anything but an IPv6
-literal, when a colon has no port after it, or when it carries a `%` zone id. The `[egress]` lists
+literal, when a colon has no port after it, or when it carries a `%` zone id. The lists named here
 load such an entry without error, so check each entry against the forms above. The host being
 checked must name an IPv6 literal bare, as `::1`, at least in a connection's `host` setting and in
 `[logging].forward_host`: a bracketed `[::1]` there matches no entry. A URL brackets its IPv6 host,
@@ -1683,11 +1683,11 @@ and that is read correctly.
 
 **How a pinned port is matched.** Write a pinned port in plain digits, and give a connection's own
 `port` as a number: a port that reaches the check as text, such as an uncast `env()` value, is
-compared as written, so `06661` matches neither `host:6661` nor `[::1]:6661`. Where a connection
-names no port, at least a URL with no port and a RemoteFile connection with no `port` setting match
-only an entry that names no port, although the connector then dials a default; an `Email()` or
-`Direct()` connection with no `port` is checked as port 587. `allowed_db` reads its entries this way
-but matches them differently; its row says how.
+compared as written, so `06661` matches neither `host:6661` nor `[::1]:6661`. A URL that names no
+port matches only an entry that names no port, although the connector then dials a default such as
+443. `Sftp()` and `Ftp()` write their default port, 22 or 21, into the settings, and an `Email()` or
+`Direct()` connection with no `port` is checked as port 587, so those compare like a pinned port.
+`allowed_db` reads its entries this way but matches them differently; its row says how.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -1695,7 +1695,7 @@ but matches them differently; its row says how.
 | `allowed_tcp` | list | `[]` | allowed raw-TCP destinations; each entry names a host, and optionally a port, as the paragraphs above this table state. **Covers three connectors, not one:** `Tcp(...)`, `X12(...)` and the **DICOM C-STORE SCU** (`DICOM()` outbound) all resolve to this list — they are all raw sockets ([`transports/egress.py`](../messagefoundry/transports/egress.py), `_allowlist_for`). Populate it for every one of them, or under the deny default your X12/PACS destinations are refused at load. An inbound `Tcp(...)`/`X12(...)`/`DICOM()` is a local listener and is not connect-gated. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_TCP` |
 | `allowed_file_dirs` | list | `[]` | allowed File output directories; a destination's directory must resolve at/under one of these |
 | `allowed_http` | list | `[]` | allowed HTTP destination hosts; each entry names a host, and optionally a port, as the paragraphs above this table state (ADR 0003). **Covers the whole HTTP family, not just REST/SOAP:** `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` (STOW-RS), the read-only `fhir_lookup` / `FhirLookup(...)` (ADR 0043), **and** the SMART / OAuth2 **token endpoints** — a token endpoint is a second egress host and is checked against this same list, so list it too. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_HTTP` |
-| `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry names a host, and optionally a port, as the paragraphs above this table state (ADR 0003). **A `server` that holds a colon is refused as unlisted**, whatever the entries say, so an IPv6 literal can never be listed here: name such a server by host name. A port an entry pins is compared as a number, so `db:05432` names port 5432, and such an entry does not admit a connection whose port the engine cannot read. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
+| `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry names a host, and optionally a port, as the paragraphs above this table state (ADR 0003). While this list is set, a `server` that holds a colon, an IPv6 literal included, is refused as unlisted whatever the entries say, so name such a server by host name. How the check reads a connection's server and port, and how a pinned port is compared, is in [CONNECTIONS.md](CONNECTIONS.md#the-port-an-allowed_db-entry-binds). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
 | `allowed_remote` | list | `[]` | allowed RemoteFile (SFTP/FTP/FTPS) hosts — gates the connector in **both** directions (source poll + destination upload); each entry names a host, and optionally a port, as the paragraphs above this table state. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_REMOTE` |
 | `allowed_smtp` | list | `[]` | allowed **email (SMTP)** destination hosts for the `Email(...)` outbound ([ADR 0029](adr/0029-email-smtp-destination.md)); each entry names a host, and optionally a port, as the paragraphs above this table state. Distinct from `[alerts].smtp_allowed_hosts`, which gates the **alert notifier's** own SMTP dial. **Whether it counts toward the open-egress startup gate depends on `[security].block_unlisted_outbound`**; see "Which lists the startup gate counts" above the key table. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SMTP` |
 | `allowed_direct` | list | `[]` | allowed **Direct** (S/MIME-over-SMTP HISP relay) destination hosts ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)); each entry names a host, and optionally a port, as the paragraphs above this table state. Kept deliberately **separate from `allowed_smtp`** so an operator can permit a Direct HISP relay without opening generic email egress — a distinct trust relationship carrying encrypted PHI. **Counts toward the open-egress startup gate on the same terms as `allowed_smtp`**. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DIRECT` |
@@ -1801,8 +1801,9 @@ but matches them differently; its row says how.
      [CONNECTIONS.md](CONNECTIONS.md#rest--rest) says which, under *A 2xx reply body in a content
      coding*.
 
-**An `Accept-Encoding` request header you set is not overridden, proxy or no proxy,** whether on
-the connection or per message from a Handler through an `http.header.` metadata key. With none
+**An `Accept-Encoding` request header you set is not overridden, proxy or no proxy,** whether in
+the connection's headers or, on a REST or FHIR connection that sets `dynamic_headers = true`, per
+message from a Handler through an `http.header.` metadata key. With none
 set, a delivery request asks for `identity`. A partner that honours yours and codes its reply gets
 the treatment item 4 describes, so leave `Accept-Encoding` unset.
 
