@@ -82,7 +82,6 @@ import os
 import re
 import subprocess
 import sys
-import unicodedata
 from pathlib import Path
 from typing import NamedTuple
 
@@ -596,18 +595,31 @@ _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
 #: The characters _PR_MARKUP matches plus every space character (a tab and a no-break space included),
 #: as str.strip takes them, to trim only a cell's ends.
 _PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`_\"'"
-#: The format characters (Unicode category Cf: zero-width space and joiners, direction marks, the
-#: byte-order mark, the tag characters) in the planes that hold any. They render as nothing, so
-#: _pr_units deletes them from each line before any pattern reads it, inside a word or a cell as
-#: well as around one.
+#: Unicode's Default_Ignorable_Code_Point ranges: the zero-width space and joiners, direction marks
+#: and controls, the byte-order mark, variation selectors, the Hangul fillers and the tag characters.
+#: They render as nothing, so _pr_units deletes them from each line before any pattern reads it,
+#: inside a word or a cell as well as around one. A fixed table, so an import pays nothing for it.
+_PR_DEFAULT_IGNORABLE = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
 _PR_INVISIBLE = re.compile(
-    "["
-    + "".join(
-        re.escape(c)
-        for c in map(chr, [*range(0x20000), *range(0xE0000, 0xE1000)])
-        if unicodedata.category(c) == "Cf"
-    )
-    + "]"
+    "[" + "".join(f"{chr(low)}-{chr(high)}" for low, high in _PR_DEFAULT_IGNORABLE) + "]"
 )
 #: No "\s*" around a separator: on a long run of spaces it backtracks quadratically, so whitespace is a
 #: separator of its own and the empty parts are dropped.
@@ -691,8 +703,11 @@ _PR_ID_LIST_GAP = re.compile(r"(?:[\s,;/&+*`_\"']|(?i:and|or)(?![A-Za-z0-9]))+")
 #: A table header cell that names its column ASVS, however it spells the rest ("ASVS", "ASVS ID",
 #: "ASVS v5.0", "ASVS:", "Requirement (ASVS)", "OWASP ASVS", "ASVS_ID"), so a row under it has every
 #: identifier in that column marked as a requirement, though the row never says so itself. Searched
-#: with the cell's markup read as a space, so "ASVS_ID" and "**ASVS**" both name it.
-_PR_TABLE_ASVS_HEAD = re.compile(rf"(?i){_PR_NB}asvs{_PR_NA}")
+#: with the cell's markup read as a space, so "ASVS_ID" and "**ASVS**" both name it. A cell that
+#: disclaims it ("Version (not ASVS)", "Non-ASVS ref") does not.
+_PR_TABLE_ASVS_HEAD = re.compile(
+    rf"(?i)(?<!\bnot )(?<!\bnon )(?<!\bnon-)(?<!\bno ){_PR_NB}asvs{_PR_NA}"
+)
 #: The characters of a markdown table's second line, which makes the line above it a header row. A set
 #: and not a pattern: a class holding "-" twice backtracks quadratically on a long run of dashes.
 _PR_TABLE_DELIMITER_CHARS = frozenset("|:- \t")
@@ -858,11 +873,12 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
     a lead or a verdict reads beside its neighbour ("ASVS `<id>`", "unchanged, `partial`.")."""
     if not ids:
         return False
-    # Split at every pipe, escaped or not, unlike the column lookup (_PR_CELL_PIPE): a cell split
-    # further only adds readings, so this reads at least what a markdown renderer shows.
+    # Split at every pipe, escaped or not, unlike the column lookup (_PR_CELL_PIPE), as engine PR 2893
+    # read cells. Splitting an escaped pipe here only adds cells to read; the backslash it leaves
+    # behind is not unescaped, so an id and a verdict joined by "\|" are not read as a pair.
     raw = row.strip().strip("|").split("|")
     cells = [c.strip(_PR_CELL_EDGE) for c in raw] + [
-        _PR_CELL_MARKUP.sub("", c).strip(_PR_CELL_EDGE) for c in raw
+        _PR_CELL_MARKUP.sub("", c).strip() for c in raw
     ]
     keys = {_PR_CELL_ID_LEAD.sub("", i) for i in ids}
 
@@ -910,16 +926,30 @@ def _pr_starts_table(units: _PrUnits, index: int) -> bool:
     return not above_is_row or above_marks[0][1] != marks[0][1] - 1
 
 
-def _pr_header_columns(units: _PrUnits, index: int) -> set[int]:
-    """The ASVS columns a table's first row names, or none: it is a header only with a delimiter row
-    on the very next line. A dash-only row further down, or a rule after the table, is no delimiter."""
-    # The delimiter must be a row continuing this table: a "---" rule is a unit of its own, not a row.
+def _pr_is_header(units: _PrUnits, index: int) -> bool:
+    """Whether a row is a header: a delimiter row sits on the very next line, in the same run of rows.
+    A "---" rule after a table is a unit of its own, not a row, so it makes no header."""
     if index + 1 >= len(units) or not units[index + 1][2] or _pr_starts_table(units, index + 1):
-        return set()
-    header, delimiter = units[index][1], units[index + 1][1]
-    if _pr_is_delimiter(header) or not _pr_is_delimiter(delimiter):
-        return set()
-    return _pr_asvs_columns(header)
+        return False
+    return not _pr_is_delimiter(units[index][1]) and _pr_is_delimiter(units[index + 1][1])
+
+
+def _pr_table_columns(units: _PrUnits) -> list[set[int]]:
+    """For each unit, the ASVS columns its table's header names, or none.
+
+    A run of rows on adjacent lines holds at most one table, and it starts at the first header in the
+    run: pipe lines above it render as a paragraph, and a dash-only row below it is data, not a second
+    delimiter. A non-row unit or a blank line ends the run."""
+    columns: list[set[int]] = []
+    current: set[int] = set()
+    in_table = False
+    for index, (_, text, is_row) in enumerate(units):
+        if not is_row or _pr_starts_table(units, index):
+            current, in_table = set(), False
+        if is_row and not in_table and _pr_is_header(units, index):
+            current, in_table = _pr_asvs_columns(text), True
+        columns.append(current)
+    return columns
 
 
 def _pr_in_list(text: str, end: int, m: re.Match[str]) -> bool:
@@ -930,7 +960,11 @@ def _pr_in_list(text: str, end: int, m: re.Match[str]) -> bool:
 
 def _pr_asvs_columns(header: str) -> set[int]:
     """The columns of a table header row whose cell names the column ASVS."""
-    cells = _PR_CELL_PIPE.split(header.strip().strip("|"))
+    # One edge pipe off each end, not every one: "|| ASVS |" has an empty first cell.
+    header = header.strip().removeprefix("|")
+    if header.endswith("|") and not header.endswith("\\|"):
+        header = header[:-1]
+    cells = _PR_CELL_PIPE.split(header)
     return {
         i for i, c in enumerate(cells) if _PR_TABLE_ASVS_HEAD.search(_PR_CELL_MARKUP.sub(" ", c))
     }
@@ -955,12 +989,7 @@ def scan_pr_body(body: str) -> list[str]:
     """
     hits: list[str] = []
     units = _pr_units(body)
-    asvs_columns: set[int] = set()
-    for index, (marks, unit, is_row) in enumerate(units):
-        if not is_row:
-            asvs_columns = set()
-        elif _pr_starts_table(units, index):
-            asvs_columns = _pr_header_columns(units, index)
+    for (marks, unit, is_row), asvs_columns in zip(units, _pr_table_columns(units), strict=True):
         for start, sentence in _pr_sentences(unit, is_row):
             found: dict[str, int] = {}
             # The tree scan's tight pair, before the version filter can set its identifier aside: what

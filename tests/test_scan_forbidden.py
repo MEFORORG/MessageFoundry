@@ -1109,6 +1109,20 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("11", "verdict", f"| ASVS{chr(0x200B)}{_REQ} | the limb | {_PASS.title()} (12 messages) |"),
     ("11", "verdict", f"| AS{chr(0x200B)}VS | Note | Result |\n|---|---|---|\n{_ROW}"),
     ("11", "gap", f"AS{chr(0x200D)}VS {_REQ} lacks a row-completeness pin."),
+    # Default-ignorable characters outside the format category: a combining grapheme joiner and
+    # variation selectors, inside a word.
+    ("11", "gap", f"AS{chr(0x034F)}VS {_REQ} lacks a row-completeness pin."),
+    ("11", "verdict", f"| ASVS {_REQ} | the limb | stays par{chr(0xFE0F)}tial |"),
+    ("11", "verdict", f"| ASVS {_REQ} | the limb | stays par{chr(0xE0100)}tial |"),
+    # Steps 5 and 9: a pipe line above the header renders as a paragraph, and the table starts at the
+    # header; a header whose first cell is empty keeps its columns where they render.
+    ("5", "verdict", f"| Summary |\n{_HEAD}{_ROW}"),
+    ("8", "verdict", f"|| ASVS | Note | Result |\n|---|---|---|---|\n| x {_ROW}"),
+    # Step 10's boundary: an unmarked verdict-state cell after "never", and "row" before a verdict
+    # state, still bind; only the CI verbs are exempt.
+    ("10", "verdict", f"| {_REQ} | the parser | never {_MET} |"),
+    ("10", "verdict", f"The row stays {_PARTIAL} for {_REQ}."),
+    ("10", "verdict", f"The row is not {_PARTIAL} for {_REQ}."),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
@@ -1134,8 +1148,10 @@ _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     ("10", "| 2.5.1 | parser | has never been failing |"),
     # Step 11: "ASVS" followed by a version and then a clause boundary marks nothing after it.
     ("11", f"ASVS 5; {_REQ_B} lacks wheels for this platform."),
-    # Step 11: a header naming a requirement but not ASVS marks no column.
+    # Step 11: a header naming a requirement but not ASVS, or disclaiming ASVS, marks no column.
     ("11", f"| Requirement | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Version (not ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Non-ASVS ref | Note | Result |\n|---|---|---|\n{_ROW}"),
     # Step 11: a snake_case join is not emphasis, so these words stay inside their names.
     ("11", "The `retry_gap` setting is read for 2.5.1 batches."),
     ("11", "The example_row_is_failing flag is set for 2.5.1 batches."),
