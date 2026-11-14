@@ -278,10 +278,12 @@ dicom = ["pynetdicom==3.0.4", "pydicom>=3.0.2,<3.1"]
 # bundled TRUSTED map XML — not attacker input. The engine itself no longer depends on that package: it
 # parses through its own vendored copy (messagefoundry/_vendor/defusedxml/), so this extra is now the
 # only thing that installs upstream defusedxml. The floor is 4.1.0, upstream's security release: its
-# 997/999 acks write "?" for the segment terminator in the sender values they echo, so a hostile value
-# can no longer forge an ack segment, and its log records no longer carry the offending data value
-# unless log_data_values is set (the engine never sets it). The engine keeps its own guards against
-# both (parsing/x12/validate.py). The earlier floor reason still holds under it:
+# 997/999 acks write "?" for the ack separators in most sender values they echo, and its log records
+# carry no data value unless log_data_values is on (off by default; the engine does not set it, but a
+# pyx12 config file can). It does not close the forgery class: at least a sender's ISA11 is still
+# copied as-is into a 997, and some echoed values are still split on "*". The engine's own guards are
+# narrower: it reads the ack type from pyx12's report, returns no fragment, and mutes the pyx12 logger
+# tree (parsing/x12/validate.py). The earlier floor reason still holds under it:
 # parsing/x12/validate.py resolves error codes with pyx12.error_codes.x12_code_for, which 4.0.1 added
 # when its JSON err_cde became a pyx12 error name at segment, element and interchange level.
 x12 = ["pyx12>=4.1.0"]
