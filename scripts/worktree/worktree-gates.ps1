@@ -22,7 +22,7 @@
     them too), Get-FlaggedFiles,
     $CACHE_DATA_NAME_PATTERN, Get-NestedHazard,
     Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
-    Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Test-PlainFile, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
+    Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Test-PlainFile, Test-PlainFileItem, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
     $GIT_CONFIG_CARRIER_PATTERN, Get-GitConfigCarriers, $SEAT_LOCAL_REL, $SCAN_TOKENS_REL and
     Test-SameAsPrimaryCopy.
 #>
@@ -627,7 +627,7 @@ function Get-UnsafeIgnoredEntries([string]$Path, [string]$Primary) {
         if ($line -ceq "!! $SCAN_TOKENS_REL") {
             # A read error is kept, so one fault on the primary's copy is told from many copies that
             # differ. It names a path, never the contents: the file is a list of forbidden tokens.
-            $why = 'not a plain file byte-identical to the primary checkout''s plain copy'
+            $why = if ($Primary) { 'not a plain file byte-identical to the primary checkout''s plain copy' } else { 'no primary checkout was named to compare it with' }
             try { $same = Test-SameAsPrimaryCopy $Path $Primary $SCAN_TOKENS_REL }
             catch { $same = $false; $why = "could not be compared: $($_.Exception.Message)" }
             if (-not $same) { $unsafe += "$line ($why)" }
@@ -643,19 +643,32 @@ function Get-UnsafeIgnoredEntries([string]$Path, [string]$Primary) {
 # plain file at the same $Rel: $false for anything else, and a throw when a read fails, which the caller
 # refuses on. Every folder between each root and its copy must be a plain directory too: a link on
 # either side could make the two paths one file, and the removal would then delete the only copy.
-# Full contents are compared byte for byte, never a size or a timestamp alone.
+# Full contents are compared byte for byte, never a size or a timestamp alone. Both files are read by the
+# full path Get-Item resolved, and their plainness is read again after the bytes, so a swap for a link
+# while they are read refuses. A swap there and back between the two plainness reads is not seen.
 function Test-SameAsPrimaryCopy([string]$Path, [string]$Primary, [string]$Rel) {
     if (-not $Primary) { return $false }
     $dir = ''
     foreach ($part in @($Rel.Split('/') | Select-Object -SkipLast 1)) {
         $dir = if ($dir) { "$dir/$part" } else { $part }
-        if (-not ((Test-PlainDirectory $Path $dir) -and (Test-PlainDirectory $Primary $dir))) { return $false }
+        foreach ($root in $Path, $Primary) {
+            # Get-ItemOrThrow, not Test-PlainDirectory: a folder that cannot be read throws to the
+            # caller, which reports it as a read error rather than as a copy that differs.
+            $item = Get-ItemOrThrow (Join-Path $root $dir) "the folder $dir above a copy"
+            if (-not $item -or -not (Test-PlainDirectoryItem $item)) { return $false }
+        }
     }
-    $mine = Join-Path $Path $Rel
-    $theirs = Join-Path $Primary $Rel
-    if (-not ((Test-PlainFile $mine 'the tree''s copy') -and (Test-PlainFile $theirs 'the primary checkout''s copy'))) { return $false }
-    [byte[]]$a = [System.IO.File]::ReadAllBytes($mine)
-    [byte[]]$b = [System.IO.File]::ReadAllBytes($theirs)
+    $copies = @(
+        (Get-ItemOrThrow (Join-Path $Path $Rel) 'the tree''s copy'),
+        (Get-ItemOrThrow (Join-Path $Primary $Rel) 'the primary checkout''s copy')
+    )
+    if (@($copies | Where-Object { -not (Test-PlainFileItem $_) }).Count -gt 0) { return $false }
+    if ($copies[0].Length -ne $copies[1].Length) { return $false }
+    [byte[]]$a = [System.IO.File]::ReadAllBytes($copies[0].FullName)
+    [byte[]]$b = [System.IO.File]::ReadAllBytes($copies[1].FullName)
+    foreach ($c in $copies) {
+        if (-not (Test-PlainFileItem (Get-ItemOrThrow $c.FullName 'a copy, read again'))) { return $false }
+    }
     return [System.Linq.Enumerable]::SequenceEqual($a, $b)
 }
 
@@ -674,6 +687,9 @@ function Test-PlainDirectoryItem([object]$Item) {
 # A file that is not a link: $false for a folder, a link or nothing there, and a throw (Get-ItemOrThrow)
 # when it cannot be read, so cannot-tell is told apart from not-plain.
 function Test-PlainFile([string]$LiteralPath, [string]$What) {
-    $item = Get-ItemOrThrow $LiteralPath $What
-    return ($item -is [System.IO.FileInfo]) -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    return Test-PlainFileItem (Get-ItemOrThrow $LiteralPath $What)
+}
+
+function Test-PlainFileItem([object]$Item) {
+    return ($Item -is [System.IO.FileInfo]) -and -not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }

@@ -1381,6 +1381,61 @@ def test_a_scan_tokens_copy_is_tolerated_only_when_identical_to_the_primarys(
         assert "scan-tokens.local.txt" in row["Reason"], row
 
 
+@pytest.mark.parametrize(
+    ("case", "same"),
+    [("identical", True), ("tree-folder-linked", False), ("primary-folder-linked", False)],
+)
+def test_the_copy_comparison_refuses_a_linked_folder_on_either_side(
+    tmp_path: Path, case: str, same: bool
+) -> None:
+    """Test-SameAsPrimaryCopy on its own, since through the removal a linked folder in the tree is
+    refused first by git status or the walk. A junction on either side makes the two paths one file,
+    so it must read as not the same copy; "identical", two separate plain files, is the control."""
+    tree, primary = tmp_path / "tree", tmp_path / "primary"
+    linked, real = (tree, primary) if case == "tree-folder-linked" else (primary, tree)
+    (real / _TOKENS_REL).parent.mkdir(parents=True)
+    (real / _TOKENS_REL).write_bytes(_SYNTHETIC_TOKENS)
+    if case == "identical":
+        (linked / _TOKENS_REL).parent.mkdir(parents=True)
+        (linked / _TOKENS_REL).write_bytes(_SYNTHETIC_TOKENS)
+    else:
+        (linked / _TOKENS_REL).parent.parent.mkdir(parents=True)
+        _junction((linked / _TOKENS_REL).parent, (real / _TOKENS_REL).parent)
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{HELPER}'; Test-SameAsPrimaryCopy $env:T_TREE $env:T_PRIMARY '{_TOKENS_REL.as_posix()}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "T_TREE": str(tree), "T_PRIMARY": str(primary)},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(same), proc.stdout
+
+
+def test_a_copy_that_cannot_be_compared_refuses_with_the_read_error(fx: Fx) -> None:
+    """A read error is reported as one, not as a copy that differs, so one fault on the primary is told
+    from many differing copies. The stub's marker reaching the row is also the positive control for
+    the no-token-text assertions above: exception text is the one route a reason takes from a read."""
+    tree = fx.tree("clean")
+    _ignore_like_the_engine(fx, tree)
+    for root in (tree, fx.primary):
+        (root / _TOKENS_REL).parent.mkdir(parents=True)
+        (root / _TOKENS_REL).write_bytes(_SYNTHETIC_TOKENS)
+    _age(fx.primary, tree, 200)
+    prelude = "function Test-SameAsPrimaryCopy { throw 'MARKER-read-failed' }"
+    rows = remove(fx, [tree], apply=False, prelude=prelude)
+    row = rows["clean"]
+    assert row["Outcome"] == "REFUSED", row
+    assert "could not be compared: MARKER-read-failed" in row["Reason"], row
+
+
 def test_a_primary_copy_changed_after_the_first_pass_refuses_in_the_late_pass(fx: Fx) -> None:
     """The late pass compares the token list again: here the primary's copy is rewritten while the
     first pass reads the fence, after its own comparison passed, so only the late one can see it."""
