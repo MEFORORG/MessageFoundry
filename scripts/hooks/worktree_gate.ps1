@@ -783,6 +783,57 @@ function Get-ScanRawIndexMap($Seg) {
     , $map.ToArray()
 }
 
+# ===================================================================================================
+# THE ADDED READINGS OF RULES 3, 3b AND 3c: ONE INVOCATION AT A TIME, OFF THE SCAN (BACKLOG #5642, #5655)
+#
+# TWO MEASURED FAIL-OPENS, ONE CAUSE: the shared readers read the RAW line.
+#   #5642  Their patterns strip DOUBLE quotes only, so `git -C '<primary>' reset --hard`, the same with
+#          --work-tree, GIT_WORK_TREE, --git-dir or GIT_DIR, and `cd '<worktree>' && git checkout <b>`
+#          resolved to a path with quote characters in it, which names nothing, and were ALLOWED.
+#   #5655  Rule 3 took the line's FIRST `-C` as every invocation's target, so an earlier command's
+#          `-C`, or a `-C` inside a quoted argument, suppressed the inferred cwd target of a later
+#          `git reset --hard`; and rule 3b judged only the first verb-bearing invocation.
+#
+# THE READER IS THE SCAN, which is the gate's existing tokenizer: Remove-QuotedSpans unquotes a quoted
+# span holding one bare word, single or double and under either host's escape, joins quoted pieces the
+# way the shell does (`'a'/'b'` reads `a/b`), and blanks a span with whitespace in it, so a quoted
+# commit message or echo cannot supply a token. Each invocation is read from its OWN window -- from the
+# separator before its owning git token up to its verb -- through the resolver's -OwnWindow branch,
+# which folds that invocation's own `-C` tokens over a chdir it can follow and answers NOTHING where it
+# cannot. The window is also handed in as the resolver's $Line, so --work-tree, GIT_WORK_TREE,
+# --git-dir and GIT_DIR are read off the same unquoted window.
+#
+# ADDED, NEVER SUBSTITUTED, AND THAT IS WHAT MAKES THE CHANGE STRICTLY TIGHTER. Every reading the gate
+# made before still runs first and unchanged. These readings run only where it found nothing, and each
+# can only add a DENY. A previous attempt replaced the raw readers with quote-stripping ones and moved
+# verdicts toward ALLOW: a correctly unquoted `-C` then suppressed the inferred cwd target exactly as
+# #5655 describes. The cost of adding is that every false deny the old readings make is kept.
+#
+# NO COMMAND-POSITION TEST, DELIBERATELY. Rule 3's verb hunt never had one (`echo git reset --hard`
+# from the primary denies), and a reading that skipped wrapper words such as `time git` or `command
+# git` would leave exactly the #5655 shape open behind them. A git word in prose costs a false deny in
+# the direction the old reading already errs.
+#
+# WHAT IT DOES NOT READ, AT LEAST: a quoted path with whitespace in it (blanked by the scan, so the
+# window answers nothing and the old reading decides); a `-C` value the shell would still expand
+# (Test-ShellLiteralPath); a chdir the resolver cannot follow (popd, a subshell, two chdirs); and git
+# options after the verb.
+function Get-InvocationReading([string]$Scan, [int]$At) {
+    $inv = Get-OwnInvocationWindow $Scan $At -SeparatorInToken
+    $pfxEnd = $(if ($inv.Own) { $inv.Own.Index } else { $inv.Start })
+    [pscustomobject]@{
+        ScanPrefix = $Scan.Substring(0, $pfxEnd)
+        Window     = $inv.CmdWin
+    }
+}
+
+# The candidate list of one invocation under the added reading: the resolver's own-window answer, read
+# from that invocation's scan window alone. Empty where the window cannot be read.
+function Get-InvocationCandidates($Reading, [string]$CwdRaw, [switch]$ExplicitFirst, [string]$CarriedGitDir = "") {
+    @(Get-GitTargetCandidatesRaw $Reading.Window $Reading.ScanPrefix $CwdRaw -OwnWindow `
+          -DashCText $Reading.Window -ExplicitFirst:$ExplicitFirst -CarriedGitDir $CarriedGitDir)
+}
+
 function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw,
                                    [switch]$AllTargets, [switch]$BaseFallback,
                                    [switch]$ExplicitFirst, [string]$CarriedGitDir = "",
@@ -2724,6 +2775,47 @@ function Get-RootCommonDirCmp($Root) {
     return $value
 }
 
+# THE GOVERNED ROOT A REPOSITORY'S COMMON DIR BELONGS TO, or $null. Extracted from rule 3c's candidate
+# chain, which calls it byte-identically, because rule 3c's ADDED READING (BACKLOG #5642, #5655) asks the
+# same question of a second candidate list and a second copy is how two spellings of one fact drift.
+#
+# GOVERNANCE IS REPOSITORY IDENTITY, NOT A PATH PREFIX (BACKLOG #1067). This used to compare the TARGET's
+# common dir against the root's WORKING TREE path, so any repository living anywhere UNDER a governed
+# root inherited its governance -- including an independent clone vendored there, which shares nothing
+# with it but its path. The refusal then went on to assert a shared .git directory that such a clone
+# does not have, and a refusal which misdescribes what it blocked is exactly what teaches people to
+# route around the gate; rule 3's own comment in this file records that having happened.
+#
+# Comparing against the ROOT'S OWN common dir keeps every case that must keep denying: the primary and
+# each of its worktrees -- sibling, or nested under .claude/worktrees -- all answer the SAME common dir,
+# so path shape stops being what decides it.
+#
+# EQUALITY-OR-UNDER, not equality alone, and that is the load-bearing half: a SUBMODULE's git dir is
+# <root>/.git/modules/<name>, so the identity-only predicate the item warned about would have flipped
+# submodules from DENY to ALLOW as a silent side effect of fixing the vendored case. Under-the-common-dir
+# leaves them exactly where they were. Whether a submodule SHOULD be governed is its own decision,
+# pinned by a test so that answering it has to be one.
+#
+# BOTH `-eq` BELOW STAY CULTURE. A match governs the config and so denies; an ordinal-only equality
+# would stop matching a common dir that differs by an ignorable character, and allow a write this rule
+# denies today. The prefix halves are ordinal already.
+function Get-GovernedRootForCommon([string]$CommonCmp) {
+    foreach ($r in $roots) {
+        $rootCommon = Get-RootCommonDirCmp $r
+        if (-not $rootCommon) {
+            # The root is not a repository's top level, so there is no identity to compare and the path
+            # test remains the only answer available. Unchanged deliberately: a root that merely contains
+            # checkouts must not start failing OPEN on a shape it used to catch.
+            if ($CommonCmp -eq $r.Compare -or
+                $CommonCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { return $r }
+            continue
+        }
+        if ($CommonCmp -eq $rootCommon -or
+            $CommonCmp.StartsWith("$rootCommon/", [System.StringComparison]::Ordinal)) { return $r }
+    }
+    $null
+}
+
 # ---------------------------------------------------------------------------------------------------
 # WHICH MECHANISM MADE THIS WORKTREE, AND WHICH ONE A REMEDY NAMES (BACKLOG #1038). This is the
 # canonical statement. scripts/coord/occupancy.ps1, scripts/worktree/prune-merged.ps1 and the rule 3d
@@ -3822,43 +3914,10 @@ What to do instead:
             $common = "$(& git -C $candRaw rev-parse --git-common-dir 2>$null)".Trim()
             if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
             $commonCmp = Get-ComparablePath $common $candRaw
-            # GOVERNANCE IS REPOSITORY IDENTITY, NOT A PATH PREFIX (BACKLOG #1067). This compared the
-        # TARGET's common dir against the root's WORKING TREE path, so any repository living anywhere
-        # UNDER a governed root inherited its governance -- including an independent clone vendored
-        # there, which shares nothing with it but its path. The refusal then went on to assert a shared
-        # .git directory that such a clone does not have, and a refusal which misdescribes what it
-        # blocked is exactly what teaches people to route around the gate; rule 3's own comment in this
-        # file records that having happened.
-        #
-        # Comparing against the ROOT'S OWN common dir keeps every case that must keep denying: the
-        # primary and each of its worktrees -- sibling, or nested under .claude/worktrees -- all answer
-        # the SAME common dir, so path shape stops being what decides it.
-        #
-        # EQUALITY-OR-UNDER, not equality alone, and that is the load-bearing half: a SUBMODULE's git
-        # dir is <root>/.git/modules/<name>, so the identity-only predicate the item warned about would
-        # have flipped submodules from DENY to ALLOW as a silent side effect of fixing the vendored
-        # case. Under-the-common-dir leaves them exactly where they were. Whether a submodule SHOULD be
-        # governed is its own decision, pinned by a test so that answering it has to be one.
-        #
-        # $govCfg IS NOT RE-INITIALISED HERE. It is set once above the candidate loop, because clearing
-        # it per candidate would make the chain's answer depend on the LAST candidate walked instead of
-        # the first that answered -- the opposite of what the chain is for.
-        # BOTH `-eq` BELOW STAY CULTURE. A match governs the config and so denies; an ordinal-only
-        # equality would stop matching a common dir that differs by an ignorable character, and allow
-        # a write this rule denies today. The prefix halves are ordinal already.
-        foreach ($r in $roots) {
-            $rootCommon = Get-RootCommonDirCmp $r
-            if (-not $rootCommon) {
-                # The root is not a repository's top level, so there is no identity to compare and the
-                # path test remains the only answer available. Unchanged deliberately: a root that
-                # merely contains checkouts must not start failing OPEN on a shape it used to catch.
-                if ($commonCmp -eq $r.Compare -or
-                    $commonCmp.StartsWith("$($r.Compare)/", [System.StringComparison]::Ordinal)) { $govCfg = $r; break }
-                continue
-            }
-            if ($commonCmp -eq $rootCommon -or
-                $commonCmp.StartsWith("$rootCommon/", [System.StringComparison]::Ordinal)) { $govCfg = $r; break }
-            }
+            # Repository identity, not a path prefix: Get-GovernedRootForCommon says why. $govCfg is null
+            # whenever this line is reached, because the loop breaks as soon as it is set, so assigning
+            # the function's answer is the inline walk it replaced.
+            $govCfg = Get-GovernedRootForCommon $commonCmp
             # THE FIRST CANDIDATE GIT ANSWERS ON DECIDES, GOVERNED OR NOT -- so this break is
             # UNCONDITIONAL, and that is the load-bearing half. Reaching this line means `rev-parse`
             # succeeded on $cand, so $cand IS a repository and the roots walk above has just given the
@@ -3873,6 +3932,22 @@ What to do instead:
             # instead of ending the rule, and that is the only behaviour this change adds.
             if ($govCfg -or -not $denyFold -or $candIndex -ge $where.Count) { break }
             $answered = $true
+        }
+        # THE ADDED READING (BACKLOG #5642, #5655), only where the chain above found nothing governed:
+        # the disarming invocation's own window, read off the scan, so a single-quoted `-C`, --git-dir
+        # or GIT_DIR names its path. The first candidate git answers on decides, as above, and only a
+        # governed answer is used, so this can add a deny and never remove one. See THE ADDED READINGS.
+        if (-not $govCfg) {
+            $addedCands = Get-InvocationCandidates (Get-InvocationReading $seg.Scan $dis.Index) $cwdRaw `
+                              -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir
+            foreach ($cand in $addedCands) {
+                $candRaw = Get-FullPathRaw $cand $cwdRaw
+                if (-not $candRaw) { continue }
+                $common = "$(& git -C $candRaw rev-parse --git-common-dir 2>$null)".Trim()
+                if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
+                $govCfg = Get-GovernedRootForCommon (Get-ComparablePath $common $candRaw)
+                break
+            }
         }
         if (-not $govCfg) { continue }
 
@@ -4754,7 +4829,48 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
         # one I am standing in", and reading a script-scope variable inside the function would hide that
         # dependency from the reader of the call site.
         Test-WorktreeHijack $verb $verbLine $targetRaw $cwdRaw
-        exit 0
+
+        # THE ADDED READINGS (BACKLOG #5642, #5655), reached only where everything above allowed: EVERY
+        # verb-bearing invocation on EVERY segment, each read from its own window off the scan (see THE
+        # ADDED READINGS). Rule 3 first, over all of them, then rule 3b, so a line touching both the
+        # primary and a linked worktree is refused with the primary's text as before.
+        $addedReads = @(foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
+            if ($seg.Scan -cnotmatch $verbHunt) { continue }
+            foreach ($vm in @([regex]::Matches($seg.Scan, $verbHunt))) {
+                $vGroup = $vm.Groups['verb']
+                [pscustomobject]@{
+                    Verb  = $vGroup.Value
+                    # Rule 3b reads a branch switch's destination after the FIRST occurrence of its verb,
+                    # so it is handed the text from this invocation's verb on, never an earlier command.
+                    Text  = $seg.Scan.Substring($vGroup.Index)
+                    Cands = @(Get-InvocationCandidates (Get-InvocationReading $seg.Scan $vGroup.Index) $cwdRaw)
+                }
+            }
+        })
+        foreach ($addedRead in $addedReads) {
+            foreach ($addedCand in $addedRead.Cands) {
+                $hit = Test-Governed (Get-ComparablePath $addedCand $cwdRaw)
+                if ($hit) { $root = $hit ; $verb = $addedRead.Verb ; break }
+            }
+            if ($root) { break }
+        }
+        if (-not $root) {
+            # Rule 3b judges the tree the reading names first, as the first reading hands it $cands[0].
+            # An identical judgement is not asked of git twice. Only a branch switch reads its text (for
+            # the destination), so a HEAD move is keyed on verb and tree alone, and the first reading's
+            # own HEAD-move judgement is not repeated.
+            $judgeKeyOf = { param($v, $t, $w)
+                "$v`n$(if ($hijackSwitchVerbs -contains $v) { $t })`n$w" }
+            $judged = @(& $judgeKeyOf $verb $verbLine $targetRaw)
+            foreach ($addedRead in $addedReads) {
+                if ($addedRead.Cands.Count -eq 0) { continue }
+                $judgeKey = & $judgeKeyOf $addedRead.Verb $addedRead.Text $addedRead.Cands[0]
+                if ($judged -ccontains $judgeKey) { continue }
+                $judged += $judgeKey
+                Test-WorktreeHijack $addedRead.Verb $addedRead.Text $addedRead.Cands[0] $cwdRaw
+            }
+            exit 0
+        }
     }
 
     $displayQ = Get-SafeForCommand $root.Display
