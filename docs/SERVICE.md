@@ -734,12 +734,15 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   account (read+execute) — no companion flag needed, since the run-as account defaults to the
   virtual account. It also removes at least the well-known broad entries (Everyone, Users,
   Authenticated Users and others) from the dir, makes Administrators the owner of each file and
-  folder below it, resets each one's DACL to inherit only those grants, discarding its own
+  folder below it that it does not skip (see below), resets each one's DACL to inherit only those
+  grants, discarding its own
   entries, and reads each owner and DACL back. What the read-back finds is named in a warning
   instead of the "locked" line: at least an entry for another account, an owner it could not set,
   a missing read for the run-as account, a deny entry on the dir, a link, a junction or any other
-  folder reparse point, which it does not enter, and a hard-linked file, whose own entries it
-  keeps because its other names share them. A write grant the run-as account held below the dir becomes read, and
+  folder reparse point, which it does not enter, and a file it reads as hard-linked, whose own
+  entries it keeps because its other names share them; the entries it inherits still change with
+  the dir, for every name of it. A hard-linked file whose link count it cannot read is reset like
+  any other file, and is not named. A write grant the run-as account held below the dir becomes read, and
   is named in a warning too. It is **opt-in** because the config dir often lives inside a developer's repo
   where stripping inheritance is surprising — for production, point `-Config` at a dedicated
   admin-owned directory and pass `-LockConfigDir`.
