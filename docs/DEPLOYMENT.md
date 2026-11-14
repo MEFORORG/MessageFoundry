@@ -610,8 +610,9 @@ Two other shapes were weighed and not built:
    [matrix](#channel--tls-posture-matrix)). Per-connection, the only
    honest way across is `cleartext_accepted = true` + `cleartext_reason` (ADR 0153: warn + audit at every
    construction, listed by `messagefoundry check` and `GET /security/posture`). Do **not** set
-   `MEFOR_ALLOW_INSECURE_TLS` in production — it no longer influences a cleartext hop at all, and where it
-   still applies it only weakens verification (see [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
+   `MEFOR_ALLOW_INSECURE_TLS` in production. The cleartext-hop authority no longer reads it, but at
+   least cleartext SMTP on an Email or Direct destination (`use_tls = false`) still does, and elsewhere
+   it weakens verification (see [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
    **At least two hops can still cross outside that refusal** and need a deliberate decision from you: a
    `dialect='generic'` DATABASE hop, outbound or a `DatabasePoll` inbound (driver-owned TLS: once a mode outside the no-TLS deny-list is set, the engine neither enforces nor verifies it) and a Direct destination
    with `use_tls=false` — see the exceptions under the [matrix](#channel--tls-posture-matrix).
