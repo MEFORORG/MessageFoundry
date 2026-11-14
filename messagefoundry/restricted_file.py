@@ -573,8 +573,9 @@ def _windows_link_problem(
     ``None`` (vault BACKLOG #5657). A link is judged by who can change it: its own owner and access
     list, and every folder above it up to the volume root, any of which could delete, rename or
     re-point what lies below, each by the trust-anchor rule
-    (:func:`~messagefoundry.auth.anchor_path.evaluate_windows_object`). So a junction only SYSTEM,
-    Administrators, TrustedInstaller or the engine's own account can change passes, such as
+    (:func:`~messagefoundry.auth.anchor_path.evaluate_windows_object`, whose ``WinTrust`` trusts at
+    least SYSTEM, Administrators, TrustedInstaller, the local Administrators group's direct members
+    and the engine's own account). So a junction only those can change passes, such as
     ``C:\\Users\\All Users`` or a folder an administrator mounted a volume on. A finding that could
     not be settled is refused too. A volume root cannot be renamed, so ``DELETE`` on one is not
     counted. Kept free of ctypes so the decision is testable everywhere."""
@@ -778,18 +779,27 @@ def _posix_host_link_problem(path: Path) -> str | None:
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("a POSIX path is walked on POSIX only")
 
+    # Each error is raised outside its handler, so it carries no __context__ holding the original,
+    # whose filename names the path.
     def lstat_fn(part: str) -> PosixStat:
+        failed: tuple[int, str] | None = None
         try:
             status = os.lstat(part)
         except OSError as exc:
-            raise OSError(exc.errno, exc.strerror) from None
+            failed = (exc.errno or 0, exc.strerror or type(exc).__name__)
+        if failed is not None:
+            raise OSError(*failed)
         return PosixStat(status.st_uid, status.st_mode)
 
     def readlink_fn(part: str) -> str:
+        failed: tuple[int, str] | None = None
         try:
-            return os.readlink(part)
+            target = os.readlink(part)
         except OSError as exc:
-            raise OSError(exc.errno, exc.strerror) from None
+            failed = (exc.errno or 0, exc.strerror or type(exc).__name__)
+        if failed is not None:
+            raise OSError(*failed)
+        return target
 
     try:
         return _posix_link_problem(

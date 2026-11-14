@@ -418,15 +418,21 @@ than a path is not checked
   the folders on the key file's path, from the root down, and judges each junction or link among
   them by who can change it, since the file is wherever that link leads. The folders above a link
   are read only where a link is, and the rule is the trust-anchor check's. On Windows a link is
-  refused when an account other than the engine's own, SYSTEM, Administrators and TrustedInstaller
-  owns it, or may change it, or may delete, rename or re-point anything in any folder from the
+  refused when an account outside the trust-anchor check's trusted set owns it, or may change it,
+  or may delete, rename or re-point anything in any folder from the
   one that holds it up to the volume root (`DELETE` on a volume root is not counted, since a root
-  cannot be renamed). On POSIX a link's own owner and mode change nothing, since a symbolic link
+  cannot be renamed). That trusted set is at least the engine's own account (never LOCAL SERVICE
+  or NETWORK SERVICE), SYSTEM, Administrators, TrustedInstaller and each direct member of the local
+  Administrators group, and as an owner also a well-known administrator account or group of any
+  domain (`WinTrust` in `auth/anchor_path.py`). On POSIX a link's own owner and mode change nothing, since a symbolic link
   cannot be re-pointed in place: it passes unless the folder that holds it, or one above, is owned
   by an account other than the engine's own or root, or may be written by a group or other without
   the sticky bit, or the link is owned by another account in a sticky folder others may write. So
-  macOS `/tmp`, an ostree host's `/home`, `C:\Users\All Users` and a folder an administrator
-  mounted a volume on pass, and a link under a folder others may write, at any depth, is refused.
+  macOS `/tmp`, an ostree host's `/home` and `C:\Users\All Users` pass. A folder a volume is
+  mounted on passes only when its own access list, and those of the folders above it, give no
+  account outside that set a right to change it: one made under `C:\` with the default
+  inheritance gives Authenticated Users Modify and is refused. A link under a folder others may
+  write, at any depth, is refused.
   So is a link whose access, or a folder whose access, could not be read. A key file that is itself
   a link is refused whoever can change it. A POSIX mount point is not a link. The TLS pair the
   engine mints is one only it writes, so on Windows its key's owner must also be the engine's own
@@ -455,8 +461,9 @@ than a path is not checked
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
   in the group, and one held in a directory that another account owns or that a group or other may
-  write without the sticky bit (vault BACKLOG #5636). A link in a folder above it is refused as the
-  item above says. Only the directory that holds the file has its owner and mode read, not the
+  write without the sticky bit (vault BACKLOG #5636). A link in a folder above it is judged as the
+  item above says, which reads the owner and mode of the folders at and above that link. Where no
+  link is on the path, only the directory that holds the file has its owner and mode read, not the
   ones above it. A directory a group or other account may write is accepted when it has the sticky
   bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
   mints its own TLS key beside the store. **When it mints its own pair and the store directory does

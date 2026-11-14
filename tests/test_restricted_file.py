@@ -1885,6 +1885,8 @@ def test_the_generated_key_remedy_names_the_store_dir_with_commands_on_posix_onl
     monkeypatch.setattr(sys, "platform", platform)
     remedy = cli._generated_tls_key_remedy(Path("/srv/mefor data"))
     assert "[store].path" not in remedy
+    # An owner refusal (vault BACKLOG #5657) is fixed by a new pair, not by a narrower access list.
+    assert "names who owns it, delete it and its certificate" in remedy
     if platform == "win32":
         assert "chmod" not in remedy and "chown" not in remedy
         # The Windows check judges the store directory too (vault BACKLOG #5657).

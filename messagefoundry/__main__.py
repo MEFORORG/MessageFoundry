@@ -7988,7 +7988,9 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
     import shlex
 
     remedy = (
-        "Restrict it to the account the engine runs as, or delete it and its certificate so "
+        "Where the refusal names who owns it, delete it and its certificate so the next start "
+        "mints a pair the engine owns: restricting it does not change its owner. Otherwise "
+        "restrict it to the account the engine runs as, or delete it and its certificate so "
         "the next start mints a new pair. "
     )
     if sys.platform != "win32":

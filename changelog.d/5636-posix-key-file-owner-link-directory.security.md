@@ -5,9 +5,10 @@
   directory others could replace it in, would have passed. The check applies at least to the
   generated and the operator's API TLS key and each connection's key file, which `serve` and
   `supervise` judge, and to the secrets directory and its files. A dangling link to a key is now
-  refused rather than passed as a missing file. Only the directory that holds the file has its
-  owner and mode read, not the ones above it; how a link above the file is judged is in the
-  `5657-key-file-owner-holder-and-folders-above` entry.
+  refused rather than passed as a missing file. Where no link is on the path, only the directory
+  that holds the file has its owner and mode read, not the ones above it. A link above the file is
+  judged by the owner and mode of the folders at and above it, as the
+  `5657-key-file-owner-holder-and-folders-above` entry says.
   When the engine mints its own TLS pair and the store directory does not exist yet, it creates
   that directory on POSIX with no group or other write bit (`0755` at most), and only then; with
   an operator certificate or an upstream terminator it creates none. The `cert self-signed` and

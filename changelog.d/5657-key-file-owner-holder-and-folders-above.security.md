@@ -1,8 +1,9 @@
 - **The key-file access check now reads the folders above a key file, and on Windows its owner
   and the directory that holds it.** On every platform a junction or a link in the folders on a
   key file's path is judged by who can change it, with the trust-anchor rules: one only the
-  engine's own account and the host's administrators (root; SYSTEM, Administrators and
-  TrustedInstaller) can change passes, such as macOS `/tmp` or `C:\Users\All Users`, and one
+  engine's own account and the host's administrators can change passes (POSIX: root; Windows: at
+  least SYSTEM, Administrators, TrustedInstaller and the local Administrators group's direct
+  members, as [PHI.md](../docs/PHI.md) lists), such as macOS `/tmp` or `C:\Users\All Users`, and one
   another account can change, or that sits at any depth under a folder another account may
   rename or re-point it in, is refused. On Windows the TLS pair the engine mints must be owned by
   the engine's own account, SYSTEM or Administrators, so a pair another account planted in the
