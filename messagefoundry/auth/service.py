@@ -3419,8 +3419,33 @@ class _RevokeRetry(NamedTuple):
 #: minutes of store refusals rather than the request budget's seconds. The request constants above
 #: stay as they are: a request caller must stay inside the API's request deadline.
 _PROVISION_REVOKE_RETRY: Final = _RevokeRetry(
-    attempts=30, backoff_seconds=0.5, budget_seconds=300.0, max_pause_seconds=15.0
+    attempts=30, backoff_seconds=1.0, budget_seconds=300.0, max_pause_seconds=15.0
 )
+
+
+def _provision_revoke_missed_text(username: str, *, enrolled: bool) -> str:
+    """``provision-admin``'s refusal once the revoke after its grant was given up on (vault BACKLOG
+    #3023 residual (4)). A re-run refuses an account that holds the role, so it names the host
+    command that ends the session instead."""
+    codes = (
+        " This run's recovery codes were not shown: replace its authenticator seed and get "
+        "recovery codes with 'messagefoundry admin-reset-totp', naming that account and giving "
+        "the same --db and --service-config."
+        if enrolled
+        else ""
+    )
+    return (
+        f"the account named {username!r} now holds the Administrator role, but the store refused "
+        "to end its earlier sessions on every attempt, re-running for up to "
+        f"{_PROVISION_REVOKE_RETRY.budget_seconds / 60:g} minutes, so a session its earlier holder "
+        "kept may still act as an Administrator. Running provision-admin again does not help: it "
+        "refuses an account that holds the role. Once the store answers again, run "
+        "'messagefoundry admin-revoke-sessions' on this host, with the --service-config or --db "
+        f"this command used: it ends every account's sessions, that one's included.{codes} The "
+        f"{SESSIONS_REVOKE_FAILED_ACTION} audit row records the miss, where the store accepted it"
+    )
+
+
 #: What a session id can look like: a token hash, lower-case hex, cut to at most its full length.
 _SESSION_ID_SHAPE: Final = re.compile(r"[0-9a-f]{1,64}")
 
@@ -4984,9 +5009,16 @@ class AuthService:
             await self._store.delete_all_webauthn_credentials(user_id)
             # The command's longer budget here too (vault BACKLOG #3023 residual (4)): no request
             # deadline bounds this run, and a miss here is cheaper to wait out than to re-run.
-            await self._revoke_for_provision(
-                user_id, username=username, actor=actor, granted=False, enrolled=False
-            )
+            missed = await self._revoke_for_provision(user_id, actor=actor, granted=False)
+            if missed is not None:
+                raise FirstAdministratorRefused(
+                    f"the store refused to end the sessions of the account named {username!r} on "
+                    "every attempt, re-running for up to "
+                    f"{_PROVISION_REVOKE_RETRY.budget_seconds / 60:g} minutes, so this run set no "
+                    "password and granted no role; remove any authenticator entry it showed. Once "
+                    "the store answers again, run the command "
+                    "again: it reads that account and completes it"
+                ) from missed
         else:
             user_id = uuid4().hex
             try:
@@ -5189,15 +5221,6 @@ class AuthService:
                 scrub_log_argument(repr(username)),
                 grant.name if isinstance(grant, AdminGrant) else type(grant).__name__,
             )
-            if repaired:
-                # The repair branch's second revoke, as on success below, and ahead of the read
-                # below so a read that raises cannot skip it. Harmless if no role was written.
-                await self._revoke_after_commit(
-                    user_id,
-                    change="first_administrator_repair",
-                    actor=actor,
-                    retry=_PROVISION_REVOKE_RETRY,
-                )
             # Vault BACKLOG #3849 B2: the address clear runs once the role is written, as on success
             # below, so the row is read again first. Only a read of this very row without the role
             # shows the store wrote none and took nothing over, and leaves the record, as
@@ -5207,6 +5230,16 @@ class AuthService:
             row: VerifiedUser | None = None
             may_hold_role = True
             try:
+                if repaired:
+                    # The repair branch's second revoke, as on success below, ahead of the read so
+                    # a read that raises cannot skip it, and inside this try so a revoke given up
+                    # on still clears the record. Harmless if no role was written.
+                    await self._revoke_after_commit(
+                        user_id,
+                        change="first_administrator_repair",
+                        actor=actor,
+                        retry=_PROVISION_REVOKE_RETRY,
+                    )
                 row = (await self._lookup_by_username(username)).user
                 may_hold_role = not (
                     row is not None
@@ -5226,16 +5259,10 @@ class AuthService:
             # still worked until ``set_password`` above, so a sign-in in that window minted a session
             # the first revoke never saw, and roles are re-read on every request. Revoking once more
             # here ends it before it can act as an Administrator, on the command's longer budget
-            # (vault BACKLOG #3023 residual (4)); one given up on still exits non-zero, naming the
-            # host command that ends the session.
+            # (vault BACKLOG #3023 residual (4)). One given up on still records the run below,
+            # then exits non-zero, naming the host command that ends the session.
             try:
-                await self._revoke_for_provision(
-                    user_id,
-                    username=username,
-                    actor=actor,
-                    granted=True,
-                    enrolled=totp_secret is not None,
-                )
+                missed = await self._revoke_for_provision(user_id, actor=actor, granted=True)
             finally:
                 # Vault BACKLOG #3849 B2: the addresses the earlier holder signed in from are
                 # theirs, not the new Administrator's, so they go too, as after an administrator's
@@ -5247,37 +5274,53 @@ class AuthService:
                 # password, the TOTP and the notification address, but it wrote no role, so the
                 # addresses are left as they were. Best effort, as at a reset.
                 await self._clear_login_addresses(user_id, username=username)
-        await self._audit(
-            "auth.first_administrator_provisioned",
-            actor=actor,
-            detail=_json(
-                {
-                    "username": username,
-                    "repaired": repaired,
-                    # UNCHANGED MEANING: an address was supplied with --email, which every run now
-                    # does (BACKLOG #1138, #3391), so it is always true. It says nothing about the
-                    # notice to an earlier holder, which is `holder_notice`.
-                    "notified": True,
-                    "holder_notice": holder_notice,
-                    # The earlier address itself is not recorded here; the notice went to it.
-                    "notify_email_moved": moved,
-                    "totp_enrolled": totp_secret is not None,
-                    # Vault BACKLOG #2711 step 1: every enabled Administrator when this run checked.
-                    # None of them could sign in with a local password; most are directory
-                    # accounts. Empty on a first install; non-empty means this one was added beside
-                    # them.
-                    "administrators_at_check": list(standing_admins),
-                }
+        else:
+            missed = None
+        provisioned: dict[str, object] = {
+            "username": username,
+            "repaired": repaired,
+            # UNCHANGED MEANING: an address was supplied with --email, which every run now
+            # does (BACKLOG #1138, #3391), so it is always true. It says nothing about the
+            # notice to an earlier holder, which is `holder_notice`.
+            "notified": True,
+            "holder_notice": holder_notice,
+            # The earlier address itself is not recorded here; the notice went to it.
+            "notify_email_moved": moved,
+            "totp_enrolled": totp_secret is not None,
+            # Vault BACKLOG #2711 step 1: every enabled Administrator when this run checked.
+            # None of them could sign in with a local password; most are directory
+            # accounts. Empty on a first install; non-empty means this one was added beside
+            # them.
+            "administrators_at_check": list(standing_admins),
+        }
+        if missed is None:
+            await self._audit(
+                "auth.first_administrator_provisioned", actor=actor, detail=_json(provisioned)
+            )
+            return ProvisionedAdministrator(
+                user_id=user_id,
+                username=username,
+                repaired=repaired,
+                holder_notice=holder_notice,
+                recovery_codes=plain_codes,
+                administrators_at_check=standing_admins,
+            )
+        # Vault BACKLOG #3023 residual (4): the role is granted, so the run is still recorded, but
+        # softly, on a store that is refusing writes, so a refused row cannot hide the refusal.
+        provisioned["earlier_sessions_revoked"] = False
+        await write_audit_soft(
+            lambda: self._audit(
+                "auth.first_administrator_provisioned", actor=actor, detail=_json(provisioned)
             ),
+            log=_log,
+            message="the %s row for a granted run could not be written",
+            args=("auth.first_administrator_provisioned",),
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
         )
-        return ProvisionedAdministrator(
-            user_id=user_id,
-            username=username,
-            repaired=repaired,
-            holder_notice=holder_notice,
-            recovery_codes=plain_codes,
-            administrators_at_check=standing_admins,
-        )
+        raise FirstAdministratorRefused(
+            _provision_revoke_missed_text(username, enrolled=totp_secret is not None)
+        ) from missed
 
     async def _unexpected_grant_refusal(
         self, username: str, user_id: str, row: VerifiedUser | None, *, enrolled: bool
@@ -12097,7 +12140,7 @@ class AuthService:
 
         ``first_attempt_at`` is for a caller that made the first attempt itself, with its audit row
         (:meth:`_revoke_with_row`): the event loop's clock when that attempt began. It counts
-        toward :data:`_POST_COMMIT_REVOKE_ATTEMPTS`, and the budget runs from it. This call's own
+        toward the attempt cap, and the budget runs from it. This call's own
         attempt always runs, as a first attempt does. ``reconciled`` is that caller's too: what its
         revocation committed before the revoke, for the miss record (:meth:`_record_revoke_miss`).
 
@@ -12114,6 +12157,9 @@ class AuthService:
         #3802). ``retry`` replaces the request budget for a caller with no request deadline,
         ``provision-admin`` alone (:data:`_PROVISION_REVOKE_RETRY`); ``None`` is the request
         budget, read when called."""
+        # A caller's own budget runs for minutes, so each re-run is logged: an operator watching
+        # a terminal sees a wait, not a hang.
+        progress = retry is not None
         if retry is None:
             retry = _RevokeRetry(
                 attempts=_POST_COMMIT_REVOKE_ATTEMPTS,
@@ -12137,6 +12183,14 @@ class AuthService:
                     if _is_revoke_defect(exc):
                         raise
                     if attempt < retry.attempts and loop.time() < give_up_at:
+                        if progress:
+                            _log.warning(
+                                "auth: the store refused attempt %d of the session revoke of"
+                                " account %s (%s); running it again",
+                                attempt,
+                                user_id,
+                                type(exc).__name__,
+                            )
                         await asyncio.sleep(
                             min(retry.backoff_seconds * attempt, retry.max_pause_seconds)
                         )
@@ -12154,44 +12208,26 @@ class AuthService:
                     raise
 
     async def _revoke_for_provision(
-        self, user_id: str, *, username: str, actor: str, granted: bool, enrolled: bool
-    ) -> None:
+        self, user_id: str, *, actor: str, granted: bool
+    ) -> Exception | None:
         """``provision-admin``'s repair-branch revoke, on :data:`_PROVISION_REVOKE_RETRY` (vault
-        BACKLOG #3023 residual (4)). One given up on is recorded as any is, then raised as
-        :class:`FirstAdministratorRefused`, so the command exits non-zero with text that says what
-        to do. Once ``granted``, a re-run is refused, because the account holds the role, so the
-        text names the host command that ends the sessions instead. Revoking the role on a give-up
-        is not done: it would leave the install with no Administrator."""
+        BACKLOG #3023 residual (4)); the refusal it gave up on, or None once it landed. The give-up
+        is recorded as any is, under the change ``first_administrator_granted`` after the grant and
+        ``first_administrator_repair`` before it, so the row says whether the account held the
+        role. The caller refuses the run with text that says what to do. Revoking the role on a
+        give-up is not done: it would leave the install with no Administrator."""
         try:
             await self._revoke_after_commit(
                 user_id,
-                change="first_administrator_repair",
+                change="first_administrator_granted" if granted else "first_administrator_repair",
                 actor=actor,
                 retry=_PROVISION_REVOKE_RETRY,
             )
         except _session_write_errors() as exc:
             if _is_revoke_defect(exc):
                 raise
-            minutes = round(_PROVISION_REVOKE_RETRY.budget_seconds / 60)
-            if not granted:
-                raise FirstAdministratorRefused(
-                    f"the store refused to end the sessions of the account named {username!r} on "
-                    f"every attempt, over up to {minutes} minutes, so this run set no password and "
-                    "granted no role; remove any authenticator entry it showed. Once the store "
-                    "answers again, run the command again: it reads that account and completes it"
-                ) from exc
-            codes = " This run's recovery codes were not shown." if enrolled else ""
-            raise FirstAdministratorRefused(
-                f"the account named {username!r} now holds the Administrator role, but the store "
-                f"refused to end its earlier sessions on every attempt, over up to {minutes} "
-                "minutes, so a session its earlier holder kept may still act as an Administrator. "
-                "Running provision-admin again does not help: it refuses an account that holds the "
-                "role. Once the store answers again, run 'messagefoundry admin-revoke-sessions' "
-                "on this host, with the --service-config or --db this command used: it ends every "
-                f"account's sessions, that one's included.{codes} The "
-                f"{SESSIONS_REVOKE_FAILED_ACTION} audit row records the miss, where the store "
-                "accepted it"
-            ) from exc
+            return exc
+        return None
 
     async def _refused_after_password(
         self, user_id: str, refusal: str, *, actor: str
@@ -12199,18 +12235,24 @@ class AuthService:
         """``refusal`` for a ``provision-admin`` run refused after it set the account's password,
         once the account's sessions are revoked: a sign-in with that password in the window
         could have minted one (vault BACKLOG #3023 residual (4), hardening). The request budget
-        is enough here, since no role was written; a give-up is recorded as any is and noted in
-        the text rather than raised over the refusal."""
+        is enough here, since no role was written. A revoke that fails, a defect included, is
+        logged (and a give-up recorded as any is) and noted in the text rather than raised over
+        the refusal, whose text is what the operator needs."""
         try:
             await self._revoke_after_commit(
                 user_id, change="first_administrator_refused", actor=actor
             )
         except _session_write_errors() as exc:
             if _is_revoke_defect(exc):
-                raise
+                _log.error(
+                    "auth: the session revoke of refused provision-admin account %s raised %s",
+                    user_id,
+                    type(exc).__name__,
+                    exc_info=exc,
+                )
             refusal += (
-                ". The store also refused to end that account's sessions; once it answers again, "
-                "run 'messagefoundry admin-revoke-sessions' on this host"
+                ". The store also refused to end that account's sessions; the account holds no "
+                "role, and a re-run of this command ends them before it grants one"
             )
         return FirstAdministratorRefused(refusal)
 

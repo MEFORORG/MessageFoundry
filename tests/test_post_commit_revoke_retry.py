@@ -279,6 +279,11 @@ async def _actions(store: MessageStore) -> list[Any]:
 @pytest.fixture(autouse=True)
 def _no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(
+        service_module,
+        "_PROVISION_REVOKE_RETRY",
+        service_module._PROVISION_REVOKE_RETRY._replace(backoff_seconds=0.0),
+    )
 
 
 @pytest.mark.parametrize(("caller", "change", "audited", "account"), CALLERS)
@@ -622,18 +627,21 @@ async def test_provision_admin_waits_out_a_refusal_past_the_request_budget(
 
 async def test_a_request_caller_keeps_the_request_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """The control for the case above: the same refusal, after a role change on a request, is
-    given up on at the request budget, though the command's budget allows a thousand attempts.
-    The shipped request budget is pinned too: a request caller must stay inside the API's 120 s
-    request deadline."""
+    given up on at the request budget's time limit: both attempt caps are lifted, so only the time
+    limit can stop it. The shipped request budget is pinned too: a request caller must stay inside
+    the API's 120 s request deadline."""
     assert service_module._POST_COMMIT_REVOKE_ATTEMPTS == 3
     assert service_module._POST_COMMIT_REVOKE_BUDGET_SECONDS == 15.0
     _scaled(monkeypatch, attempts=1000)
+    monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_ATTEMPTS", 1000)
     store = await MessageStore.open(":memory:")
     try:
         service, _, hashes = await _account(store)
-        _refusing_over_time(store, _REFUSED_FOR, first_lands=False)
+        calls = _refusing_over_time(store, _REFUSED_FOR, first_lands=False)
         with pytest.raises(StoreAcquireTimeout):
             await service.set_roles("u1", ["operator"], actor="admin")
+        # Stopped by the 0.1 s time limit, well short of the 0.3 s refusal at 0.02 s an attempt.
+        assert 3 < calls[0] < _REFUSED_FOR / _ATTEMPT_TAKES
         assert await _live(store, hashes) == hashes
         [missed] = [
             r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
@@ -668,10 +676,17 @@ async def test_provision_admin_given_up_after_the_grant_names_the_recovery(
         ]
         assert json.loads(missed["detail"]) == {
             "user_id": "u1",
-            "change": "first_administrator_repair",
+            "change": "first_administrator_granted",
             "attempts": 4,
             "error": "StoreAcquireTimeout",
         }
+        # The granted run is still recorded, saying the revoke did not land.
+        [provisioned] = [
+            r
+            for r in await _actions(store)
+            if r["action"] == "auth.first_administrator_provisioned"
+        ]
+        assert json.loads(provisioned["detail"])["earlier_sessions_revoked"] is False
         # A re-run is refused, which is why the text points elsewhere.
         assert await service.provision_refusal("bob", notify_email="ops@example.org") is not None
     finally:
@@ -687,12 +702,20 @@ async def test_provision_admin_given_up_before_the_grant_grants_nothing(
     store = await MessageStore.open(":memory:")
     try:
         service, _, hashes = await _roleless_account(store)
+        before = await store.get_user("u1")
         calls = _refusing(store, None)
-        with pytest.raises(FirstAdministratorRefused, match="granted no role"):
+        with pytest.raises(FirstAdministratorRefused, match="set no password and granted no role"):
             await _provision_admin(service, store, None)
         assert calls[0] == 4
         assert await store.get_user_role_ids("u1") == []
+        after = await store.get_user("u1")
+        assert before is not None and after is not None
+        assert after.password_hash == before.password_hash
         assert await _live(store, hashes) == hashes
+        [missed] = [
+            r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
+        ]
+        assert json.loads(missed["detail"])["change"] == "first_administrator_repair"
     finally:
         await store.close()
 
@@ -730,6 +753,7 @@ async def test_a_provision_refused_at_the_grant_revokes_the_accounts_sessions(
         async def set_password(user_id: str, **kwargs: Any) -> Any:
             result = await real_set_password(user_id, **kwargs)
             await store.create_session(token_hash=_LATE_SESSION, user_id=user_id, expires_at=9e9)
+            assert await _live(store, [_LATE_SESSION]) == [_LATE_SESSION]
             minted.append(user_id)
             return result
 
@@ -738,10 +762,37 @@ async def test_a_provision_refused_at_the_grant_revokes_the_accounts_sessions(
 
         monkeypatch.setattr(store, "set_password", set_password)
         monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", grant)
-        with pytest.raises(FirstAdministratorRefused, match="no role"):
+        with pytest.raises(FirstAdministratorRefused, match="no role") as refused:
             await _provision_admin(service, store, None)
         assert minted, "the window session was not minted"
         assert await _live(store, [_LATE_SESSION]) == []
         assert await store.get_user_role_ids(minted[0]) == []
+        assert "also refused" not in str(refused.value)
+    finally:
+        await store.close()
+
+
+async def test_a_provision_refused_at_the_grant_keeps_its_text_when_the_revoke_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hardening revoke given up on does not replace the refusal: its text gains a note, and
+    the miss is recorded."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await service.initialize()
+
+        async def grant(*_a: Any, **_k: Any) -> AdminGrant:
+            return AdminGrant.ADMIN_EXISTS
+
+        monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", grant)
+        _refusing(store, None)
+        with pytest.raises(FirstAdministratorRefused, match="another enabled Administrator") as r:
+            await _provision_admin(service, store, None)
+        assert "The store also refused to end that account's sessions" in str(r.value)
+        [missed] = [
+            row for row in await _actions(store) if row["action"] == SESSIONS_REVOKE_FAILED_ACTION
+        ]
+        assert json.loads(missed["detail"])["change"] == "first_administrator_refused"
     finally:
         await store.close()
