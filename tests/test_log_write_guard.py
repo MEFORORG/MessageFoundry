@@ -2667,14 +2667,22 @@ async def test_an_unheld_stopped_pooled_lane_runs_after_a_halt_reload_and_the_re
         logging.getLogger("t").warning("a record this engine cannot write anywhere")
         assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
         assert await _until(lambda: not runner._log_guard_tasks), "the halt never finished"
+        # The forced STOP must still stand here, or the assertions below pass vacuously.
+        assert routed.stopped(INBOUND), "the forced STOP did not hold through the halt"
 
         await runner.reload(_e2e_registry(outdir))
         assert runner._log_write_stopped  # the log is still dead
+        # The reload re-armed the unheld lane while the log was dead; the claim gate holds it.
+        assert not routed.stopped(INBOUND), "the reload kept an unheld STOP during the halt"
 
         _revive_every_sink(logdir, monkeypatch)
         await runner.restart_inbound(INBOUND)
+        await runner.start_outbound(OUTBOUND)
         assert not runner._log_write_stopped and INBOUND not in runner._log_halted
         assert not routed.stopped(INBOUND), "the recovery restart left the unheld STOP in place"
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        assert await _until(lambda: any(outdir.iterdir())), "the re-armed lane never drained"
+        assert await _until_processed(store, message_id), "delivered but never finalized"
     finally:
         await runner.stop()
 
@@ -2686,7 +2694,9 @@ async def test_a_stopped_pooled_lane_stays_stopped_after_the_recovery_restart_un
     # BACKLOG #5704: what the recovery records say about a pooled internal lane that STOPped while
     # the log was down. The restart lifts the gate and re-arms no STOP, held (a T17 bound) or not
     # (a leadership-loss hand-back); a reload after that restart re-arms it and releases any hold.
-    # Measured here so the records can say so.
+    # Measured here so the records can say so. This pins a known gap against main, where the halt
+    # paused the lane and the restart resumed it; a fix that makes the restart re-arm the lane
+    # should flip the first assertion after the restart, and the records with it.
     outdir, logdir = tmp_path / "out", tmp_path / "logs"
     outdir.mkdir()
     logdir.mkdir()
@@ -2701,6 +2711,7 @@ async def test_a_stopped_pooled_lane_stays_stopped_after_the_recovery_restart_un
         # The lane STOPs while the halt is in force, as a T17 bound (held) or a leadership-loss
         # hand-back (unheld) would.
         routed._to_stopped(INBOUND, routed._states[INBOUND], "stopped under the halt")
+        assert routed.stopped(INBOUND)
         if held:
             runner._hold_for_operator(INBOUND, "inbound")
 
