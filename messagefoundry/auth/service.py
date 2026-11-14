@@ -15335,8 +15335,9 @@ class AuthService:
         carrying ``cap_reached`` for the first address past that, because this runs on every
         sensitive request (BACKLOG #2159). The step-up
         dependencies treat ``True`` as "force a fresh step-up"; a successful re-verify (``POST
-        /me/reauth`` **or** ``/auth/mfa-verify``) re-anchors the session to the new address (see
-        :meth:`reauth` / :meth:`verify_mfa`), so the signal clears and the caller proceeds. An
+        /me/reauth``, ``/auth/mfa-verify`` or a passkey assertion) re-anchors the session to the new
+        address (see :meth:`reauth` / :meth:`verify_mfa` / :meth:`finish_webauthn_assertion`), so
+        the signal clears and the caller proceeds. An
         ``oidc`` session, which :meth:`reauth` refuses, can re-anchor through the IdP step-up
         (:meth:`complete_oidc_step_up`). It is
         **step-up-forcing only** — it never changes an RBAC allow or deny, and a ``True`` is cleared

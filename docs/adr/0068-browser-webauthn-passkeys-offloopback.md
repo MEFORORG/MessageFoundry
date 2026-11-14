@@ -260,9 +260,9 @@ amendment of that date.*
   after the password-only re-proof (a stolen pre-MFA cookie can never bind a passkey).
   → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_enroll_requires_password_reproof`
 - **AC-2** — WHEN a passkey assertion verifies at `POST /ui/reauth/webauthn`, THE SYSTEM SHALL stamp
-  `mfa_verified_at` ONLY (no `reauth_at`, no client re-anchor); the subsequent password leg SHALL
-  stamp `reauth_at` and re-anchor the client IP.
-  → `tests/test_webauthn.py::test_assertion_stamps_mfa_only_never_reauth`
+  `mfa_verified_at`, and on any session but an `oidc` one `reauth_at` and the client re-anchor
+  (Amendment 2026-11-14; this criterion first said `mfa_verified_at` ONLY).
+  → `tests/test_webauthn.py::test_assertion_stamps_the_factor_and_re_anchors`
 - **AC-3** — WHILE a user's only enrolled factor is WebAuthn, WHEN they hit a `step_up=True` action,
   THE SYSTEM SHALL render the reauth page with the passkey prompt (never divert to
   `enroll_first`, never demand a TOTP code), and the generalized anti-loop check SHALL run before
@@ -763,6 +763,12 @@ session's anchor and the account's known-address record agree after a passkey, a
 opens the step-up window, as a code does. An action-bound grant (ADR 0077) still comes only from the
 password, directory or IdP leg. Enrolment, TOTP confirm and passkey registration alike, still does
 not re-anchor: ADR 0197 Amendment A lets a holder of the password alone enrol.
+
+**A premise this leaves open.** Decision 1 justified `user_verification=PREFERRED` with "the
+knowledge factor is the password that accompanies every step-up", and *Options considered* item 1
+said a passkey-alone step-up forces the UV-policy question. A window-gated route (not an
+action-bound one) now passes after a passkey alone, so that premise no longer holds there. A TOTP
+code already had the same reach. Whether to require user verification is not decided here.
 
 **Who decided.** The owner, 2026-11-14, answering "#2964 item 14 ... Which do you want?" with
 "Assertion only".

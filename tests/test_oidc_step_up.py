@@ -1245,6 +1245,72 @@ async def test_a_code_completes_a_pending_oidc_factor_but_opens_no_window(
         await store.close()
 
 
+async def test_a_passkey_completes_a_pending_oidc_factor_but_opens_no_window(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``finish_webauthn_assertion`` stamps ``reauth_at`` or re-anchors an OIDC session.
+
+    Vault BACKLOG #2964 item 14 made the passkey re-anchor as a code does, and kept BACKLOG #2142's
+    exclusion: on an OIDC session the window and the anchor move only at the IdP."""
+    pytest.importorskip("webauthn")
+    from webauthn.helpers import base64url_to_bytes
+
+    from tests._soft_webauthn import SoftAuthenticator
+
+    rp = "ops.example"
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(
+            store,
+            rsa_key,
+            ldap=_ProbingLdap(),
+            oidc_require_mfa_claim=False,
+            mfa_verify_min_elapsed_seconds=0,
+            admin_new_ip_step_up=True,
+        )
+        first = await _oidc_session(service, monkeypatch, rsa_key, client="10.0.0.1")
+        identity = await service.identity_for_token(first, activity=False)
+        assert identity is not None
+        auth = SoftAuthenticator(rp_id=rp, origin=ORIGIN)
+        staged = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=first, rp_id=rp, rp_name="MessageFoundry"
+            )
+        )
+        registered = await service.finish_webauthn_registration(
+            identity,
+            auth.create_response(base64url_to_bytes(staged["challenge"])),
+            label="k",
+            token=first,
+            rp_id=rp,
+            origin=ORIGIN,
+            enrolment_code=await enrolment_code_for(service, identity.user_id),
+        )
+        assert registered.ok, registered
+        pending = await _oidc_session(service, monkeypatch, rsa_key, client="10.0.0.1")
+        assert not await service.mfa_satisfied(pending)
+        options = await service.begin_webauthn_assertion(pending, rp_id=rp)
+        assert options is not None
+
+        verified = await service.finish_webauthn_assertion(
+            pending,
+            auth.get_response(base64url_to_bytes(json.loads(options)["challenge"])),
+            client="10.0.0.9",
+            rp_id=rp,
+            origin=ORIGIN,
+        )
+
+        assert verified.ok and verified.token is not None, verified
+        assert await service.mfa_satisfied(verified.token)
+        session = await store.get_session(hash_token(verified.token))
+        assert session is not None and session.auth_mechanism == SessionMechanism.OIDC.value
+        assert session.reauth_at is None, "a passkey opened an OIDC session's step-up window"
+        assert session.client == "10.0.0.1", "a passkey re-anchored an OIDC session"
+        assert await service.flag_new_client_ip(verified.token, "10.0.0.9", path=NEXT)
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("kind", ["totp", "recovery"])
 async def test_a_code_on_a_satisfied_oidc_session_is_refused_unread(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, kind: str

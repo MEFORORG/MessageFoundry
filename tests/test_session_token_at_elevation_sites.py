@@ -330,9 +330,8 @@ async def test_the_passkey_assertion_elevates_the_pre_mfa_token_in_place() -> No
 
     INVERTED when the wiring landed. Same shape as the TOTP arm — a token captured before the second
     factor is no longer elevated by the legitimate user's assertion; it stops working and a new one
-    carries the elevation. Only the MFA leg is asserted here, and that is the site's whole contract:
-    ADR 0068 decision 1 keeps ``reauth_at`` off the assertion path deliberately, so this arm must NOT
-    grow a ``has_recent_step_up`` assertion on the way past.
+    carries the elevation. Only the MFA leg is asserted here, and that is the site's whole contract;
+    the window the assertion stamps (vault BACKLOG #2964 item 14) is pinned in tests/test_webauthn.py.
     """
     store, service = await _service()
     try:

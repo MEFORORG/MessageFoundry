@@ -1319,13 +1319,22 @@ async def _session_after(service: AuthService, token: str) -> tuple[str | None, 
     return row.client, row.reauth_at is not None
 
 
+async def _reaudited(service: AuthService, token: str, address: str) -> bool:
+    """Whether flagging ``address`` writes a new audit row, which a dedupe kept across the proof
+    would suppress as a repeat."""
+    action = "auth.new_address_reverify_required"
+    before = len(await service._store.list_audit(action=action))
+    assert await service.flag_new_client_ip(token, address, path="/ui/x")
+    return len(await service._store.list_audit(action=action)) == before + 1
+
+
 async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #2964 item 14 (owner ruling 2026-11-14): a passkey proved at the MFA gate from a
     roamed address leaves the session anchored there with a stamped window, exactly as a TOTP code
-    proved by ``verify_mfa`` does. Each also restarts the new-address dedupe, so an address flagged
-    before the proof is judged afresh after it."""
+    proved by ``verify_mfa`` does. Each also restarts the new-address dedupe, so a third address
+    flagged before the proof is audited afresh after it."""
     from messagefoundry.auth import totp
     from tests._totp_clock import pin_totp_clock
 
@@ -1340,6 +1349,7 @@ async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
         assert out.ok and out.mfa_required and out.token is not None
         assert await _session_after(service, out.token) == ("10.7.7.1", False)
         assert await service.flag_new_client_ip(out.token, "10.7.7.2", path="/ui/x")
+        assert await service.flag_new_client_ip(out.token, "10.7.7.3", path="/ui/x")
         options = await service.begin_webauthn_assertion(out.token, rp_id=RP)
         assert options is not None
         challenge = base64url_to_bytes(json.loads(options)["challenge"])
@@ -1349,6 +1359,7 @@ async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
         assert passkey.ok and passkey.token is not None
         results["passkey"] = await _session_after(service, passkey.token)
         assert not await service.flag_new_client_ip(passkey.token, "10.7.7.2", path="/ui/x")
+        assert await _reaudited(service, passkey.token, "10.7.7.3")
     finally:
         await store.close()
 
@@ -1367,6 +1378,7 @@ async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
         assert out.ok and out.mfa_required and out.token is not None
         assert await _session_after(service, out.token) == ("10.7.7.1", False)
         assert await service.flag_new_client_ip(out.token, "10.7.7.2", path="/ui/x")
+        assert await service.flag_new_client_ip(out.token, "10.7.7.3", path="/ui/x")
         t1 = t0 + totp.DEFAULT_PERIOD
         pin_totp_clock(monkeypatch, t1)
         code = await service.verify_mfa(
@@ -1375,6 +1387,7 @@ async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
         assert code.ok and code.token is not None
         results["code"] = await _session_after(service, code.token)
         assert not await service.flag_new_client_ip(code.token, "10.7.7.2", path="/ui/x")
+        assert await _reaudited(service, code.token, "10.7.7.3")
     finally:
         await store.close()
 

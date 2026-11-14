@@ -168,8 +168,8 @@ async def test_audit_cookie_not_accepted_on_json_routes(engine: Engine) -> None:
 #
 # Browser-level ceremony tests use the in-repo soft authenticator and are gated FUNCTION-LOCALLY on
 # the [webauthn] extra (a module-level importorskip here would skip the whole webui suite on an
-# extra-less install). The passkey assertion satisfies ONLY the MFA leg; the mandatory password leg
-# of POST /ui/reauth stamps step-up freshness + the new-IP re-anchor (decision 1). Options ride
+# extra-less install). The passkey assertion meets the factor and stamps the window; an action-bound
+# route's grant still comes only from the password leg of POST /ui/reauth (ADR 0077). Options ride
 # HTML-escaped data-* attributes (CSP: no inline script); only the verify legs are JSON POSTs — the
 # sanctioned first cookie-authed JSON under /ui.
 
@@ -250,14 +250,14 @@ async def test_webauthn_browser_enroll_and_stepup_e2e(engine: Engine) -> None:
         assert "Invalid code." not in r.text
         options = _data_attr(r.text, "data-mf-webauthn-get")
 
-        # The passkey leg: assert -> MFA satisfied (ONLY the MFA leg — the delete is still stale).
+        # The passkey leg: assert -> MFA satisfied; the delete is action-bound, so it still owes a grant.
         resp = json.loads(
             auth_a.get_response(base64url_to_bytes(options["challenge"]), sign_count=0)
         )
         r = await c.post("/ui/reauth/webauthn", json={"response": resp}, headers=_SFS)
         assert r.status_code == 200 and r.json() == {"ok": True}
         r = await c.post(delete_path, headers=_SFS)
-        assert r.status_code == 303  # still 303s: reauth_at is NOT stamped by the assertion
+        assert r.status_code == 303  # still 303s: only the password leg mints the delete's grant
 
         # The password leg completes the pair -> continuation auto-retries the delete.
         r = await c.post("/ui/reauth", data={"next": delete_path, "password": PW}, headers=_SFS)

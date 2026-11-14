@@ -570,8 +570,8 @@
   });
 
   // Step-up assertion: run the get() ceremony against the staged options and POST the assertion
-  // to the reauth passkey leg. On success the MFA leg is satisfied — the operator still enters
-  // the password below (the mandatory leg that stamps step-up freshness + re-anchors, ADR 0068).
+  // to the reauth passkey leg. On success the factor is met and the window stamped — the operator
+  // still enters the password below, the leg that mints an action-bound grant (ADR 0077).
   feature("[data-mf-webauthn-get]", function (button) {
     var status = statusNode(button);
     if (!window.PublicKeyCredential) {

@@ -1122,15 +1122,16 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     # for every other session), and the paragraph says both.
     # Vault BACKLOG #2964 item 14: the passkey assertion stamps under the same branch.
     for name, leg in (("verify_mfa", verify), ("finish_webauthn_assertion", assertion)):
+        # The stamp sits in the body of an `auth_mechanism != ...` test, never under its else.
         guarded = [
             n
             for n in ast.walk(leg)
             if isinstance(n, ast.If)
-            and any(
-                isinstance(a, ast.Attribute) and a.attr == "auth_mechanism"
-                for a in ast.walk(n.test)
-            )
-            and any(_called(stmt, "mark_session_reauthed") for stmt in ast.walk(n))
+            and isinstance(n.test, ast.Compare)
+            and isinstance(n.test.left, ast.Attribute)
+            and n.test.left.attr == "auth_mechanism"
+            and all(isinstance(op, ast.NotEq) for op in n.test.ops)
+            and any(_called(stmt, "mark_session_reauthed") for stmt in n.body)
         ]
         unguarded = [
             stmt
