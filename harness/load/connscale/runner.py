@@ -530,6 +530,7 @@ async def _run_one_step(
             sandbox_mode=sandbox_mode,
             mode=mode,
             count=count,
+            trial=trial,
             aggregate_rate=aggregate_rate,
             sink_host=sink_host,
             base_env=base_env,
@@ -556,6 +557,7 @@ async def _run_started_step(
     sandbox_mode: str,
     mode: str,
     count: int,
+    trial: int,
     aggregate_rate: float,
     sink_host: str,
     base_env: Mapping[str, str],
@@ -852,6 +854,7 @@ async def _run_started_step(
             reload_account=reload_account,
             per_lane_wake=_effective_per_lane_wake(node_env),
             sandbox=sandbox,
+            trial=trial,
         )
     finally:
         for task in sampler_tasks:
@@ -1756,6 +1759,7 @@ def _build_record(
     fd_probe_root_pid: int | None = None,
     per_lane_wake: bool | None = None,
     sandbox: SandboxReading | None = None,
+    trial: int = 0,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -1821,6 +1825,9 @@ def _build_record(
     return ConnScaleRecord(
         sweep_mode=mode,
         count=count,
+        # The repeat of this cell, so the monotonicity pairing keeps each trial in its own lane
+        # (BACKLOG #5570).
+        trial=trial,
         offered_aggregate_rate=aggregate_rate,
         sent=c.sent,
         acked=c.acked,
@@ -2859,8 +2866,8 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
     The run-level bound that some group actually had a pair to compare lives in
     ``tests/test_connscale_smoke.py`` (WALL #4 NEVER COMPARED), because only a real run knows whether
     the metric was measurable. Any new caller needs its own such bound or it inherits the hole."""
-    # The pairing itself — including the group-by-(sweep_mode, claim_mode) rule BACKLOG #1101 records
-    # as load-bearing — lives in `monotonic_pairs`. The emitter that records EVERY reading reads the
+    # The pairing itself — including the lane key, `monotonic_lane`, which BACKLOG #1101 and #5570
+    # record as load-bearing — lives in `monotonic_pairs`. The emitter that records EVERY reading reads the
     # same function, so a passing run and a failing run cannot describe the sequence differently.
     pairs = monotonic_pairs(records, key, tolerance=tolerance)
     breaches = [p for p in pairs if not p.ok]
