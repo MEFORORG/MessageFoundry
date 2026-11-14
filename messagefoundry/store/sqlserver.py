@@ -4312,9 +4312,8 @@ class SqlServerStore:
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except BaseException as exc:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
-            # (BACKLOG #5720). The block the open reserved is forfeited, not settled, as before: a
-            # forfeit only over-counts, the conservative direction for the AES-GCM bound. The
-            # executor is released in a finally, same as close() above: wait_closed() cannot
+            # (BACKLOG #5720). The reserved block is forfeited, not settled: see the same except in
+            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is released in a finally, same as close() above: wait_closed() cannot
             # complete while the pool is wedged, so releasing the executor only on the success path
             # would leak its threads in exactly the case this except exists for.
             async def _release() -> None:

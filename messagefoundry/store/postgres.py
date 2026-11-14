@@ -2255,9 +2255,9 @@ class PostgresStore:
                 )  # populate the reference-snapshot read cache (ADR 0006)
         except BaseException as exc:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
-            # (BACKLOG #5720). The block the open reserved is forfeited, not settled, as before: a
-            # forfeit only over-counts, the conservative direction for the AES-GCM bound. A cleanup
-            # that fails is logged by class, so it never replaces the open's own error (vault
+            # (BACKLOG #5720). The cleanup settles nothing, as before: a failed open forfeits the
+            # AES-GCM invocation block it reserved, and each forfeited block counts toward the
+            # key's fail-closed invocation ceiling. A cleanup that fails is logged by class, so it never replaces the open's own error (vault
             # BACKLOG #3054).
             async def _release() -> None:
                 try:
