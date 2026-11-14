@@ -5,7 +5,7 @@
 // loaded without `vscode`. connectionEditor.ts builds the page and embeds this; the unit suite
 // evaluates the SAME source in a jsdom page (webview-receivers.test.ts), so what the tests exercise
 // is what ships.
-import { FIELD_CONTROLS, PARAM_TYPES } from "./connectionForm";
+import { ENVREF_KEY_NAMES, FIELD_CONTROLS, PARAM_TYPES } from "./connectionForm";
 import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
 
 /** What the connection editor's script is seeded with, each embedded as JSON. */
@@ -58,10 +58,29 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
 
     function isInbound() { return $('direction').value === 'inbound'; }
 
+    // The {env = "KEY"} inline table, and nothing else: a non-empty string env key, and no key outside
+    // the list envRefOf in connectionForm.ts uses, embedded from there. So a table-valued setting
+    // that happens to carry an "env" key is a table here too, not a reference (BACKLOG #5565).
+    const ENVREF_KEY_NAMES = ${embedJson(ENVREF_KEY_NAMES)};
+    function isEnvRefValue(val) {
+      if (!val || typeof val !== 'object' || Array.isArray(val)) return false;
+      if (typeof val.env !== 'string' || val.env === '') return false;
+      return Object.keys(val).every((k) => ENVREF_KEY_NAMES.includes(k));
+    }
+
+    // A value as a text input shows it: a table or array as JSON, never String(value), which shows
+    // and saves '[object Object]' (BACKLOG #5565).
+    function displayValue(value) {
+      return value == null ? '' : (typeof value === 'object' ? JSON.stringify(value) : String(value));
+    }
+
     function settingRow(key, value, isEnv, cast) {
       const wrap = document.createElement('div'); wrap.className = 'setting';
       const k = document.createElement('input'); k.type = 'text'; k.className = 'k'; k.placeholder = 'key'; k.value = key || '';
-      const v = document.createElement('input'); v.type = 'text'; v.placeholder = 'value'; v.value = value == null ? '' : String(value);
+      const v = document.createElement('input'); v.type = 'text'; v.placeholder = 'value';
+      v.value = displayValue(value);
+      // Marked, so the save parses the JSON back into the table.
+      if (value !== null && typeof value === 'object') v.dataset.table = '1';
       const castSel = document.createElement('select');
       for (const c of ['', 'int', 'float', 'bool', 'str']) { const o = document.createElement('option'); o.value = c; o.textContent = c || 'cast'; castSel.appendChild(o); }
       castSel.value = cast || '';
@@ -81,6 +100,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // to the legacy free-text key/value rows when the engine could not describe itself, so an older
     // engine still edits connections. A field whose value the record carries but whose key the schema
     // does not describe arrives in its own group and is rendered here like any other -- never dropped.
+    // What a schema control must carry back on save but never show, per control element: an inline
+    // credential the record holds (preserveValue) and an env reference's default (envDefault).
+    // Kept here rather than in a data- attribute or an input, so no control displays the credential.
+    // It is not kept out of the page: INITIAL and FIELD_GROUPS above already carry the record.
+    const HELD = new WeakMap();
     function renderField(f, into) {
       const wrap = document.createElement('div'); wrap.className = 'field';
       const lab = document.createElement('label');
@@ -102,14 +126,18 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       } else {
         control = document.createElement('input');
         control.type = f.control === 'number' && !useEnv ? 'number' : 'text';
-        control.placeholder = useEnv ? 'environment key' : (f.placeholder || '');
-        const shown = useEnv ? (f.envKey || '') : f.value;
-        control.value = shown == null ? '' : (typeof shown === 'object' ? JSON.stringify(shown) : String(shown));
+        control.placeholder = useEnv
+          ? (f.preserveValue !== undefined ? 'environment key (the current inline value is kept, not shown)' : 'environment key')
+          : (f.placeholder || '');
+        control.value = displayValue(useEnv ? (f.envKey || '') : f.value);
       }
       control.dataset.key = f.key;
       control.dataset.kind = f.control;
       if (useEnv) { control.dataset.env = '1'; }
       if (f.cast) { control.dataset.cast = f.cast; }
+      if (f.preserveValue !== undefined || f.envDefault !== undefined) {
+        HELD.set(control, { preserveValue: f.preserveValue, envDefault: f.envDefault });
+      }
       const hint = document.createElement('div'); hint.className = 'sub'; hint.textContent = f.help || '';
       wrap.append(lab, control, hint);
       into.appendChild(wrap);
@@ -163,12 +191,17 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       $('strict').checked = !!INITIAL.strict;
       $('ordering').value = INITIAL.ordering || '';
       if (INITIAL.retry && INITIAL.retry.max_attempts != null) $('maxAttempts').value = String(INITIAL.retry.max_attempts);
+      // The settings: the schema-driven controls whenever the engine described itself (BACKLOG
+      // #5565). The host built FIELD_GROUPS from this very record, so they already carry its values,
+      // with a secret held back rather than shown and a table as JSON. The free-text rows below are
+      // only the fallback for an engine that could not describe itself.
+      if (FIELD_GROUPS) { renderGroups(FIELD_GROUPS); return; }
       const s = INITIAL.settings || {};
       const keys = Object.keys(s);
       if (keys.length) {
         for (const key of keys) {
           const val = s[key];
-          if (val && typeof val === 'object' && 'env' in val) settingRow(key, val.env, true, val.cast || '');
+          if (isEnvRefValue(val)) settingRow(key, val.env, true, val.cast || '');
           else settingRow(key, val, false, '');
         }
       } else settingRow('', '', false, '');
@@ -204,6 +237,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       return text;
     }
 
+    // A table or array typed as JSON parses back to its value; text that does not parse is returned
+    // verbatim, so the engine's validator refuses what the user typed rather than this page guessing
+    // (the rule coerce in connectionForm.ts states for a table).
+    function parseTable(text) {
+      try { return JSON.parse(text); } catch (e) { return text; }
+    }
+
     /**
      * The settings table the form currently expresses. Two shapes feed it: the schema-driven
      * controls (one per declared setting, keyed by data-key) and, when the engine could not describe
@@ -215,11 +255,19 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       for (const el of document.querySelectorAll('#settings [data-key]')) {
         const key = el.dataset.key;
         if (!key) continue;
+        const held = HELD.get(el);
         if (el.dataset.env === '1') {
           const envKey = el.value.trim();
-          if (!envKey) continue;              // a secret with no key set writes nothing
+          if (!envKey) {
+            // No key typed. An inline credential the record already holds is written back as it
+            // was, unseen; deleting a working credential because the form will not show it would
+            // be its own outage. With nothing held, nothing is written.
+            if (held && held.preserveValue !== undefined) settings[key] = held.preserveValue;
+            continue;
+          }
           const ref = { env: envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
+          if (held && held.envDefault !== undefined) ref.default = held.envDefault;
           settings[key] = ref;
           continue;
         }
@@ -230,7 +278,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         }
         const raw = el.value.trim();
         if (raw === '') continue;             // untouched -> omit the key entirely
-        settings[key] = el.dataset.kind === 'table' ? coerce(raw) : coerce(raw);
+        settings[key] = el.dataset.kind === 'table' ? parseTable(raw) : coerce(raw);
       }
       for (const row of document.querySelectorAll('#settings .setting')) {
         const inputs = row.querySelectorAll('input[type=text]');
@@ -244,7 +292,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           if (castSel.value) ref.cast = castSel.value;
           settings[key] = ref;
         } else {
-          settings[key] = coerce(raw);
+          settings[key] = inputs[1].dataset.table === '1' ? parseTable(raw) : coerce(raw);
         }
       }
       return settings;
@@ -299,7 +347,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // unknown-typed values (value, defaultValue, envDefault, preserveValue) are not typed there
     // either, and their presence is not checked: all four are optional there, and FieldDescriptor
     // says why value and defaultValue can be absent, so a presence check would discard ordinary
-    // "fields" messages. This page does not read envDefault or preserveValue at all. choices is
+    // "fields" messages. This page reads envDefault and preserveValue only to write them back on
+    // save (HELD), and never shows either. choices is
     // required and may be null; envKey, cast and a group's description may be absent and are never
     // null.
     // control and type are closed sets: the lists FieldControl and ParamType are derived from.
