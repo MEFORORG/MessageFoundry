@@ -24,7 +24,16 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 
 import { peekToken, signIn, signOut } from "./auth";
-import { configDir, engineUrl, environments, pythonPath, serviceConfig, workspaceDir } from "./cli";
+import {
+  configDir,
+  engineUrl,
+  environments,
+  pythonPath,
+  serviceConfig,
+  serviceConfigIsSet,
+  workspaceDir,
+} from "./cli";
+import { connectionServiceConfig } from "./connectionWizardModel";
 import {
   buildAdminProbeInvocation,
   buildBootstrapPlan,
@@ -485,10 +494,13 @@ export class EngineStatusBar implements vscode.Disposable {
     // in a trusted workspace (otherwise we must not exec a possibly repo-supplied .venv — SEC-004), and only
     // when there is a workspace for `serve` to run in.
     const canControl = ws !== undefined && vscode.workspace.isTrusted && isLocalEngine(url);
+    // The service TOML judged here is the one serve, the probe and provision-admin are handed
+    // (startServiceConfig, BACKLOG #5566), resolved the way they resolve it from the workspace. Only
+    // a regular file counts, so a blank setting, which resolves to the workspace itself, is no TOML.
     const hasStore =
       canControl && ws !== undefined
         ? runDirHasEngine({
-            serviceTomlExists: fs.existsSync(path.join(ws, serviceConfig())),
+            serviceTomlExists: isFile(path.resolve(ws, startServiceConfig() ?? serviceConfig())),
             dbFiles: dbFilesIn(ws),
           })
         : false;
@@ -626,7 +638,7 @@ export class EngineStatusBar implements vscode.Disposable {
    *  terminal (execFile pipes stdin), so it answers that question and otherwise refuses for want of a
    *  terminal, before any password prompt and without creating a store. */
   private probeAdmin(python: string, ws: string): Promise<AdminProbeResult> {
-    const { command, args } = buildAdminProbeInvocation({ python });
+    const { command, args } = buildAdminProbeInvocation({ python, serviceConfig: startServiceConfig() });
     return new Promise((resolve) => {
       execFile(command, args, { cwd: ws, timeout: 60_000 }, (err, stdout, stderr) => {
         if (err?.killed) {
@@ -660,7 +672,7 @@ export class EngineStatusBar implements vscode.Disposable {
     ws: string,
     admin: AdminDetails,
   ): Promise<number | undefined> {
-    const { command, args } = buildHeldInvocation(buildProvisionInvocation({ python, ...admin }));
+    const { command, args } = buildHeldInvocation(buildProvisionInvocation({ python, serviceConfig: startServiceConfig(), ...admin }));
     const term = vscode.window.createTerminal({
       name: "MessageFoundry: Provision Administrator",
       shellPath: command,
@@ -688,7 +700,11 @@ export class EngineStatusBar implements vscode.Disposable {
 
   /** Start `serve` in its own terminal. Reached only through the Start plan's `serve` effect. */
   private serveEngine(python: string, ws: string): void {
-    const { command, args } = buildServeInvocation({ python, configDir: configDir() });
+    const { command, args } = buildServeInvocation({
+      python,
+      configDir: configDir(),
+      serviceConfig: startServiceConfig(),
+    });
     const term = vscode.window.createTerminal({
       name: "MessageFoundry Engine",
       shellPath: command,
@@ -897,6 +913,25 @@ async function chooseAfterRefusal(detail: string): Promise<"provision" | "startA
   return pick === provision ? "provision" : pick === anyway ? "startAnyway" : undefined;
 }
 
+/**
+ * The `--service-config` that serve, the admin probe and provision-admin are started with, and the
+ * file the Start fork guard judges (BACKLOG #5566): the same rule connection edits pass the setting
+ * by, so undefined when `messagefoundry.serviceConfig` is left at its default, where serve reads the
+ * same default file on its own.
+ */
+function startServiceConfig(): string | undefined {
+  return connectionServiceConfig(serviceConfig(), serviceConfigIsSet());
+}
+
+/** Whether `p` names a regular file. A missing path, or a directory, is not one. */
+function isFile(p: string): boolean {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** The `*.db` files directly under `dir` — a cheap "is there already an engine store here?" signal.
  *  A missing/unreadable directory is simply "no store" (never throws into the caller). */
 function dbFilesIn(dir: string): string[] {
@@ -1028,7 +1063,7 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
       // BRAND-NEW empty database with no account in it, forking the user's engine. Handing them
       // the command lets them run it where they mean to. No --db/--env overrides: the service TOML is
       // the authority on which store and which environment this engine is.
-      const cmd = serveCommandLine(configDir());
+      const cmd = serveCommandLine(configDir(), startServiceConfig());
       await vscode.env.clipboard.writeText(cmd);
       logAction("copy start command", cmd);
       void vscode.window.showInformationMessage(
@@ -1042,6 +1077,11 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
         e.affectsConfiguration("messagefoundry.environments")
       ) {
         bar.refreshTarget();
+      }
+      // The Start fork guard reads the service TOML this setting names (BACKLOG #5566), so the
+      // hover's actions are re-planned when it changes.
+      if (e.affectsConfiguration("messagefoundry.serviceConfig")) {
+        bar.repaint();
       }
     }),
   );

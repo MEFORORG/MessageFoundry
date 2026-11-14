@@ -28,6 +28,12 @@ export function preflightArgs(): string[] {
   return [...INTERPRETER_OPTIONS, "-c", `import ${PREFLIGHT_IMPORT}`];
 }
 
+/** The `--service-config` element serve, the probe and provision-admin share, or none when undefined.
+ *  Bound with `=`, so a path that starts with a dash stays a value and never becomes a flag. */
+function serviceConfigFlag(serviceConfig: string | undefined): string[] {
+  return serviceConfig === undefined ? [] : [`--service-config=${serviceConfig}`];
+}
+
 /**
  * The command the pill's Start action runs. Deliberately identical to the command ADR 0110 shipped for the
  * clipboard — `python -P -X disable-remote-debug -m messagefoundry serve --config <configDir>`, the options
@@ -39,24 +45,40 @@ export function preflightArgs(): string[] {
  *
  * `configDir` is passed as a single argv element, so a path with spaces needs no quoting (the shell never
  * re-parses it — it is `shellArgs` to a `createTerminal`, i.e. argv, not a command line).
+ *
+ * `serviceConfig` names the service TOML: the value `connectionServiceConfig` gives for the
+ * `messagefoundry.serviceConfig` setting, undefined when the setting is left at its default (BACKLOG
+ * #5566). It is the file the Start fork guard looked at, so `serve` must open the same one. Left off,
+ * `serve` reads `./messagefoundry.toml`, so with a non-default setting the guard judged one file and
+ * `serve` opened none and created a new default store. Undefined leaves the flag off, where `serve`
+ * falls back to the same default file the setting names.
  */
 export function buildServeInvocation(opts: {
   python: string;
   configDir: string;
+  serviceConfig?: string;
 }): { command: string; args: string[] } {
   return {
     command: opts.python,
     // Vault BACKLOG #2700: under the default enforce, serve refuses to start with the
     // interpreter's remote debugging on. The argv is the launch that refusal names.
-    args: [...INTERPRETER_OPTIONS, "-m", "messagefoundry", "serve", "--config", opts.configDir],
+    args: [
+      ...INTERPRETER_OPTIONS,
+      "-m",
+      "messagefoundry",
+      "serve",
+      "--config",
+      opts.configDir,
+      ...serviceConfigFlag(opts.serviceConfig),
+    ],
   };
 }
 
 /** The pill's Start command as one line, for the clipboard and for hints: the argv of
  *  {@link buildServeInvocation}, with `python` for the interpreter, and an element holding
  *  whitespace double-quoted so a pasted path with a space stays one argument. */
-export function serveCommandLine(configDir: string): string {
-  const args = buildServeInvocation({ python: "python", configDir }).args;
+export function serveCommandLine(configDir: string, serviceConfig?: string): string {
+  const args = buildServeInvocation({ python: "python", configDir, serviceConfig }).args;
   return ["python", ...args.map((a) => (/\s/.test(a) ? `"${a}"` : a))].join(" ");
 }
 
@@ -156,9 +178,10 @@ export function buildBootstrapPlan(opts: {
 // answer. The modal in `statusBar.ts` words both cases: no Administrator at all, or only ones that need
 // an outside service (vault BACKLOG #3849 B3).
 //
-// The probe and the provisioning terminal run in the workspace, as `serve` does, with no `--db` or
-// `--service-config`. In the default layout that is the store `serve` opens. It is NOT when the service
-// TOML sets `[environments].base_dir`: `serve` anchors a relative `[store].path` under it, and
+// The probe and the provisioning terminal run in the workspace, as `serve` does, with no `--db`, and
+// with the same `--service-config` `serve` gets (BACKLOG #5566), so all three read one service TOML.
+// In the default layout that is the store `serve` opens. It is NOT when the service TOML sets
+// `[environments].base_dir`: `serve` anchors a relative `[store].path` under it, and
 // `provision-admin` does not (yet). The probe is advice, never the control: `serve` applies its own gates.
 
 /** The username the probe passes. `provision-admin` requires one, and the probe never reaches the step
@@ -186,22 +209,37 @@ export interface AdminDetails {
 /**
  * The `provision-admin` argv. Each value is bound with `=`, so a value that starts with a dash stays a value
  * and never becomes a flag. The address always rides, trimmed: `provision-admin` refuses a blank one.
+ * `serviceConfig` is {@link buildServeInvocation}'s, so the Administrator lands in the store `serve`
+ * opens; undefined leaves the flag off.
  */
-export function buildProvisionInvocation(opts: { python: string } & AdminDetails): {
+export function buildProvisionInvocation(opts: { python: string; serviceConfig?: string } & AdminDetails): {
   command: string;
   args: string[];
 } {
-  const args = [...INTERPRETER_OPTIONS, "-m", "messagefoundry", "provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`];
+  const args = [
+    ...INTERPRETER_OPTIONS,
+    "-m",
+    "messagefoundry",
+    "provision-admin",
+    `--username=${opts.username}`,
+    `--email=${opts.email.trim()}`,
+    ...serviceConfigFlag(opts.serviceConfig),
+  ];
   return { command: opts.python, args };
 }
 
 /** The probe's argv: {@link buildProvisionInvocation} for {@link PROBE_USERNAME} and {@link PROBE_EMAIL},
- *  answering in JSON. */
-export function buildAdminProbeInvocation(opts: { python: string }): {
+ *  answering in JSON, against the same service TOML. */
+export function buildAdminProbeInvocation(opts: { python: string; serviceConfig?: string }): {
   command: string;
   args: string[];
 } {
-  const inv = buildProvisionInvocation({ python: opts.python, username: PROBE_USERNAME, email: PROBE_EMAIL });
+  const inv = buildProvisionInvocation({
+    python: opts.python,
+    serviceConfig: opts.serviceConfig,
+    username: PROBE_USERNAME,
+    email: PROBE_EMAIL,
+  });
   return { command: inv.command, args: [...inv.args, "--json"] };
 }
 

@@ -602,3 +602,73 @@ suite("engine control — statusBar.ts serves only through the Start plan (Wave 
     assert.ok(!/--password/.test(code), "statusBar.ts must not pass a password flag");
   });
 });
+
+// BACKLOG #5566. The Start fork guard judged a store present from the configured service TOML, but
+// serve, the admin probe and provision-admin ran without --service-config. So with a non-default
+// `messagefoundry.serviceConfig`, the guard passed and serve opened no service TOML and created a
+// new default store. All four now carry the one value the guard judges.
+suite("engine control — Start runs against the service TOML the fork guard judged (BACKLOG #5566)", () => {
+  const SC = "deploy/prod/messagefoundry.toml";
+
+  test("serve, the probe, provision-admin and the copied command all carry --service-config", () => {
+    const flag = `--service-config=${SC}`;
+    assert.ok(buildServeInvocation({ python: "p", configDir: "c", serviceConfig: SC }).args.includes(flag));
+    assert.ok(buildAdminProbeInvocation({ python: "p", serviceConfig: SC }).args.includes(flag));
+    assert.ok(
+      buildProvisionInvocation({ python: "p", serviceConfig: SC, username: "a", email: "a@b.test" }).args.includes(
+        flag,
+      ),
+    );
+    assert.ok(serveCommandLine("c", SC).endsWith(` ${flag}`));
+  });
+
+  test("a path that starts with a dash stays a value, and one with a space stays one argument", () => {
+    const serve = buildServeInvocation({ python: "p", configDir: "c", serviceConfig: "-odd.toml" }).args;
+    assert.ok(serve.includes("--service-config=-odd.toml"));
+    assert.ok(serveCommandLine("c", "my dir/x.toml").endsWith('"--service-config=my dir/x.toml"'));
+  });
+
+  test("left at its default, no flag is added: serve reads the same default file itself", () => {
+    for (const args of [
+      buildServeInvocation({ python: "p", configDir: "c" }).args,
+      buildAdminProbeInvocation({ python: "p" }).args,
+      buildProvisionInvocation({ python: "p", username: "a", email: "a@b.test" }).args,
+    ]) {
+      assert.ok(!args.some((a) => a.startsWith("--service-config")), args.join(" "));
+    }
+  });
+
+  const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "statusBar.ts"), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
+
+  test("statusBar.ts hands every invocation the value the guard judges", () => {
+    const calls = [
+      /buildServeInvocation\(\{[^}]*serviceConfig:\s*startServiceConfig\(\)/,
+      /buildAdminProbeInvocation\(\{[^}]*serviceConfig:\s*startServiceConfig\(\)/,
+      /buildProvisionInvocation\(\{[^}]*serviceConfig:\s*startServiceConfig\(\)/,
+      /serveCommandLine\(configDir\(\),\s*startServiceConfig\(\)\)/,
+    ];
+    for (const call of calls) {
+      assert.ok(call.test(code), `not handed the service config: ${call}`);
+    }
+    // The control: the call the file carried before the fix must fail its predicate.
+    assert.ok(!calls[0].test("buildServeInvocation({ python, configDir: configDir() })"));
+    assert.ok(
+      /path\.resolve\(ws,\s*startServiceConfig\(\)\s*\?\?\s*serviceConfig\(\)\)/.test(code),
+      "the fork guard must judge the file the invocations name",
+    );
+    assert.ok(
+      /function startServiceConfig\(\)[^{]*\{\s*return connectionServiceConfig\(serviceConfig\(\),\s*serviceConfigIsSet\(\)\);/.test(
+        code,
+      ),
+      "the value must follow the rule connection edits use",
+    );
+  });
+
+  test("a change to messagefoundry.serviceConfig re-plans the hover's actions", () => {
+    assert.ok(
+      /affectsConfiguration\("messagefoundry\.serviceConfig"\)\)\s*\{\s*bar\.repaint\(\);/.test(code),
+      "the status bar must react to a service config change",
+    );
+  });
+});
