@@ -241,18 +241,24 @@ async def test_assertion_stamps_the_factor_and_re_anchors() -> None:
         identity, token, password = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
 
-        out = await service.login(ADMIN_USERNAME, password)
+        out = await service.login(ADMIN_USERNAME, password, client="10.4.4.1")
         fresh = out.token
         assert fresh is not None
         before = await store.get_session(hash_token(fresh))
         assert before is not None and before.reauth_at is None  # MFA-pending: no seeded step-up
-        ok, fresh = await _assert_once(service, fresh, auth)
-        assert ok is True
+        options = await service.begin_webauthn_assertion(fresh, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        elevation = await service.finish_webauthn_assertion(
+            fresh, auth.get_response(challenge), client="10.4.4.2", rp_id=RP, origin=ORIGIN
+        )
+        assert elevation.ok and elevation.token is not None
         # Read back under the ROTATED token: the assertion re-keyed the row.
-        after = await store.get_session(hash_token(fresh))
+        after = await store.get_session(hash_token(elevation.token))
         assert after is not None
         assert after.mfa_verified_at is not None
         assert after.reauth_at is not None
+        assert after.client == "10.4.4.2"
     finally:
         await store.close()
 

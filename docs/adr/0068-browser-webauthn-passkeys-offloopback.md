@@ -54,8 +54,9 @@ minted `mfa_verified=True`; engine MFA never applies to directory identities —
 **Second factor at the existing WP-14b step-up boundary, browser-only ceremony**; no login-time
 ceremony (the deferred-MFA posture stands — MFA is satisfied lazily at the first step-up).
 
-The browser step-up stays **two-credential**: a passkey assertion replaces the TOTP-code leg and
-stamps **`mfa_verified_at` only**; the operator then submits the existing `POST /ui/reauth`
+*Amended 2026-11-14: the assertion now also stamps `reauth_at` and re-anchors, as a TOTP code does;
+see the amendment of that date.* The browser step-up stays **two-credential**: a passkey assertion
+replaces the TOTP-code leg and stamps **`mfa_verified_at` only**; the operator then submits the existing `POST /ui/reauth`
 password leg, which stamps `reauth_at` **and performs the `mark_session_reauthed(client)` new-IP
 re-anchor**. The completed pair produces both stamps exactly as `verify_mfa` + reauth do today — so
 the WP-L3-13 new-client-IP forced step-up clears and no redirect-loop class exists.
@@ -769,6 +770,8 @@ knowledge factor is the password that accompanies every step-up", and *Options c
 said a passkey-alone step-up forces the UV-policy question. A window-gated route (not an
 action-bound one) now passes after a passkey alone, so that premise no longer holds there. A TOTP
 code already had the same reach. Whether to require user verification is not decided here.
+Where `[auth].require_action_step_up` is off, every action-bound route falls back to the window, so
+there a passkey alone also passes factor binding and removal, which before this needed the password.
 
 **Who decided.** The owner, 2026-11-14, answering "#2964 item 14 ... Which do you want?" with
 "Assertion only".

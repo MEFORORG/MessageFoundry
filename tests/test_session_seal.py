@@ -672,6 +672,76 @@ async def test_verify_mfa_succeeds_when_no_stamp_is_refused(
     assert await service.mfa_satisfied(run.out.token) is True
 
 
+@pytest.mark.parametrize("tamper", ["mark_session_reauthed", None])
+async def test_a_passkey_ends_the_session_when_the_reauth_stamp_is_refused(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch, tamper: str | None
+) -> None:
+    """Vault BACKLOG #2964 item 14 gave the passkey leg verify_mfa's reauth stamp, and its refusal:
+    a session whose seal fails at that stamp is ended, with no success recorded (BACKLOG #2592).
+    ``None`` is the control: the same flow and spies, no row changed, and the leg succeeds."""
+    pytest.importorskip("webauthn")
+    from webauthn.helpers import base64url_to_bytes
+
+    from tests._soft_webauthn import SoftAuthenticator
+
+    store, path = keyed
+    alerts: list[str] = []
+    service = AuthService(
+        store,
+        AuthSettings(require_mfa=False, mfa_verify_min_elapsed_seconds=0),
+        integrity_alert=alerts.append,
+    )
+    identity, token, password = await login_admin(service)
+    auth = SoftAuthenticator(rp_id="t", origin="http://t")
+    staged = json.loads(
+        await service.begin_webauthn_registration(identity, token=token, rp_id="t", rp_name="MF")
+    )
+    registered = await service.finish_webauthn_registration(
+        identity,
+        auth.create_response(base64url_to_bytes(staged["challenge"])),
+        label="k",
+        token=token,
+        rp_id="t",
+        origin="http://t",
+    )
+    assert registered.ok
+    out = await service.login(ADMIN_USERNAME, password)
+    assert out.ok and out.mfa_required and out.token is not None
+    pending = out.token
+    options = await service.begin_webauthn_assertion(pending, rp_id="t")
+    assert options is not None
+    response = auth.get_response(base64url_to_bytes(json.loads(options)["challenge"]))
+
+    async def tamper_row() -> None:
+        await _raw_for(path)(
+            "UPDATE sessions SET client=? WHERE token_hash=?", ("192.0.2.77", hash_token(pending))
+        )
+
+    calls: list[str] = []
+    for name in _WATCHED:
+        before = tamper_row if name == tamper else None
+        monkeypatch.setattr(store, name, _spy(calls, name, getattr(store, name), before))
+    counted = ("auth.webauthn_verified", AUTHORITY_SEAL_FAILED_ACTION)
+    counts = {a: len(await store.list_audit(action=a)) for a in counted}
+
+    elevation = await service.finish_webauthn_assertion(
+        pending, response, client="192.0.2.9", rp_id="t", origin="http://t"
+    )
+
+    added = {a: len(await store.list_audit(action=a)) - counts[a] for a in counted}
+    if tamper is None:
+        assert elevation.ok and elevation.token is not None
+        assert calls == list(_WATCHED)
+        assert added == {"auth.webauthn_verified": 1, AUTHORITY_SEAL_FAILED_ACTION: 0}
+        return
+    assert elevation.session_lost and not elevation.ok and elevation.token is None
+    row = await store.get_session(hash_token(pending))
+    assert row is not None and row.revoked_at is not None
+    assert calls == ["mark_session_mfa_verified", "mark_session_reauthed"]
+    assert added == {"auth.webauthn_verified": 0, AUTHORITY_SEAL_FAILED_ACTION: 1}
+    assert len(alerts) == 1
+
+
 # --- static guards --------------------------------------------------------------------------
 
 

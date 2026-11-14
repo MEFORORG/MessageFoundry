@@ -982,7 +982,8 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
        POST leg itself: limiter, flow and all.
     2. A browser SSO or OIDC session's first sensitive action does not always force a step-up.
        ``verify_mfa`` stamps ``reauth_at``, and neither code route asks whether the session already
-       met its factor, so a TOTP or recovery code opens a fresh window at any time. A passkey does not.
+       met its factor, so a TOTP or recovery code opens a fresh window at any time. Since vault
+       BACKLOG #2964 item 14 a passkey assertion stamps one too.
     3. Console routes charge the per-actor ceremony budget, ``POST /ui/mfa`` among them. There were
        four when this pass ran; BACKLOG #296 added ``POST /ui/reauth/oidc`` for five, and the doc's
        count is now derived from the route list below rather than written into this test.
@@ -1131,6 +1132,13 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
             and isinstance(n.test.left, ast.Attribute)
             and n.test.left.attr == "auth_mechanism"
             and all(isinstance(op, ast.NotEq) for op in n.test.ops)
+            and all(
+                isinstance(c, ast.Attribute)
+                and c.attr == "value"
+                and isinstance(c.value, ast.Attribute)
+                and c.value.attr == "OIDC"
+                for c in n.test.comparators
+            )
             and any(_called(stmt, "mark_session_reauthed") for stmt in n.body)
         ]
         unguarded = [

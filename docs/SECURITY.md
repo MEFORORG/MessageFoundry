@@ -3479,8 +3479,7 @@ item 14 (owner ruling 2026-11-14). So a Windows SSO session whose holder answers
 code or a passkey passes the window check for `step_up_max_age_seconds` with no further challenge. **An `oidc` session's code opens no
 window** (BACKLOG #2142, ADR 0142 Amendment F; a seat decision under owner delegation 2026-10-08, not
 an owner ruling). The code still meets a pending factor and re-keys the session, but the window opens
-only at the IdP. A passkey stamps the window only where the console stages an assertion, which it
-does only for a session that has not met its factor. An action-bound route still asks while
+only at the IdP. An action-bound route still asks while
 `[auth].require_action_step_up` is on (the default), because its single-use grant comes only from the
 step-up itself (see the Action-bound step-up grant row). A Windows SSO session's first
 window-gated action does force a step-up when it met the gate by owing no factor. That holds
@@ -3584,7 +3583,7 @@ outcome. `POST /auth/mfa-verify` answers **403** saying the directory could not 
 and `/ui/mfa` and `/ui/reauth` say the same. A local account is never looked up.
 
 **The passkey leg asks the same question before it marks the factor (BACKLOG #2239).** A passkey
-opens no window, but it does mark the factor met. So without the check, an account disabled in the
+marks the factor met. So without the check, an account disabled in the
 directory would clear the MFA gate with its passkey until the reconciliation pass revoked it.
 `finish_webauthn_assertion` uses the same lookup and refuses the same answers, through the one
 helper both legs call (`_directory_vouches_for_factor`, BACKLOG #3068). That includes a row with
