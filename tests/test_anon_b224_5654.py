@@ -142,6 +142,41 @@ def test_an_mr_type_in_a_cx_5_subcomponent_is_still_a_hit(leak: ModuleType) -> N
     assert any("MRN" in hit and "ZPD-4" in hit for hit in hits), hits
 
 
+#: A coded OBR-4 value, not a CX, whose fifth component holds an ``MR`` subcomponent.
+#: ``docs/PHI.md`` and the changelog name it as refused.
+_CODED_MR_IN_COMPONENT_5 = "OBR|1|ORD1||70553^MRI^C4^^PET&MR"
+
+
+@_LEAKS
+def test_component_5_of_any_field_is_read_as_cx_5(leak: ModuleType) -> None:
+    """The check does not know a field's type, so component 5 of the coded field OBR-4 is read
+    as CX.5, and an ``MR`` subcomponent there is an MRN-typed hit (BACKLOG #5654)."""
+    hits = leak.structural_phi_hits(f"{_HEAD}\r{_CODED_MR_IN_COMPONENT_5}", {"PID-3", "PID-5"})
+    assert hits == ["unmapped MRN-typed identifier in OBR-4"], hits
+
+
+@_LEAKS
+@pytest.mark.parametrize(
+    "segment",
+    ["OBR|1|ORD1||70553^MRI^C4^PET&MR", "OBR|1|ORD1||70553^MRI^C4^^^PET&MR"],
+    ids=["component-4", "component-6"],
+)
+def test_the_same_mr_subcomponent_beside_component_5_is_no_hit(
+    leak: ModuleType, segment: str
+) -> None:
+    """Only component 5 is read subcomponent by subcomponent, so the neighbours pass."""
+    assert leak.structural_phi_hits(f"{_HEAD}\r{segment}", {"PID-3", "PID-5"}) == []
+
+
+@_NO_SCANNER
+@_SIDES
+def test_anonymize_checked_refuses_an_mr_subcomponent_in_component_5(anon: ModuleType) -> None:
+    with pytest.raises(anon.LeakError, match=r"MRN-typed identifier in OBR-4(?!\d)"):
+        anon.anonymize_checked(
+            f"{_HEAD}\r{_CODED_MR_IN_COMPONENT_5}", salt="b224-5654-salt-0123456789abcdef"
+        )
+
+
 @_LEAKS
 @pytest.mark.parametrize("value", ["M1^^^H^X&MRX", "M1^^^H^X&M R", "^^^H^X&MR"])
 def test_a_near_miss_or_an_mrn_type_with_no_id_is_no_hit(leak: ModuleType, value: str) -> None:
