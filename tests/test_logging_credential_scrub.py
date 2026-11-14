@@ -182,6 +182,13 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
         ("wt-Qsc_A-88", "wt-Qsc_B-89"),
         ("connect failed", "retrying"),
     ),
+    QuotedValue(
+        # BACKLOG #5547: a Python bytes literal after the label.
+        "bytes_literal_password",
+        "connect failed password=b'wt-Byt_A-91 wt-Byt_B-92' retrying",
+        ("wt-Byt_A-91", "wt-Byt_B-92"),
+        ("connect failed", "retrying"),
+    ),
 )
 
 #: Quoted rows a pattern other than ``_CREDENTIAL_KV`` must do the work for, with that pattern.

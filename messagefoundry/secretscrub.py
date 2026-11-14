@@ -734,8 +734,22 @@ _LABEL_HEAD = (
     r")"
 )
 _MEFOR_LABEL_HEAD = r"\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+"
-_QUOTED_LABEL = _LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
-_MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
+
+# A PYTHON BYTES LITERAL'S PREFIX in front of a quoted value: ``password=b'...'``, the way a bytes
+# value prints in an exception or a debug line (BACKLOG #5547). Every quoted form here needs its quote
+# right after the separator, so the plain class took the "b", stopped at the quote, and the secret
+# inside the quotes printed, under all four label patterns. Each pattern now takes an optional "b"
+# in front of each QUOTED form it has, and nowhere else, so where the quoted form refuses the value the
+# plain class starts where it always did and takes what it always took. The stop before a later quoted
+# label (:data:`_QUOTED_LABEL`) and ``_CREDENTIAL_KV``'s run-on past a later label's quote
+# (:data:`_KV_QUOTED_VALUE`) read the same prefix, so a value in front of such a label still ends there.
+#
+# LOWER CASE ONLY, inside the ``(?i)`` patterns too, which is how Python prints one, and so the bundle
+# copy, whose patterns fold case only on their keywords, reads exactly the same text. A raw or
+# formatted prefix (``rb``, ``f``) is not a repr, and is not read.
+_BYTES_PREFIX = r"(?-i:b)?"
+_QUOTED_LABEL = _LABEL_HEAD + _BYTES_PREFIX + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
+_MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + _BYTES_PREFIX + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 
 # A LATER ``_CREDENTIAL_KV`` LABEL WHOSE VALUE IS BRACED AND HOLDS WHITE SPACE (BACKLOG #2966). The
 # plain class ran on over such a label and stopped at the space inside its braces, so the tail of the
@@ -876,8 +890,12 @@ _RUN_ON_LABEL = (
     r"|\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
 )
 #: The outer walk: up to the next quote of one kind, or to a label whose value opens with one.
-_SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')" + _RUN_UNIT + r")*+"
-_DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")" + _RUN_UNIT + r")*+"
+_SQ_RUN_ON_WALK = (
+    r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + _BYTES_PREFIX + r"')" + _RUN_UNIT + r")*+"
+)
+_DQ_RUN_ON_WALK = (
+    r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + _BYTES_PREFIX + r"\")" + _RUN_UNIT + r")*+"
+)
 #: The inner walk, over the later label's value. It stops at anything a later pass could read past
 #: the closer: either quote, a "{", a "://", any label at all, and any character outside ASCII, so
 #: a keyword spelled with a fold character stops it in both copies alike.
@@ -920,20 +938,27 @@ _RUN_ON_INNER = (
 # LINEAR. Each walk is a run or one other character at a time, with the label check in front of each
 # run only. The outer walk ends at the first quote after the opening one; the inner walk ends at the
 # next quote after that. So walks from two labels cannot share more than the span of three quotes.
+#
+# A BYTES PREFIX IN FRONT OF THE LATER LABEL'S QUOTE (BACKLOG #5547) counts as part of its head: the
+# walks stop before ``private_key=b'``, the run-on takes the "b" with the label, and the fast path
+# refuses a closer right after a "b" that follows ":", "=" or a space, where a later label's prefixed
+# quote would sit. A value merely ending in " b" then takes the walk, which gives the plain span.
 _KV_QUOTED_VALUE = (
-    r"'[^'\r\n]*+(?<![:=\s])'"
+    r"'[^'\r\n]*+(?<![:=\s])(?<![:=\s](?-i:b))'"
     + r"|'"
     + _SQ_RUN_ON_WALK
     + r"(?:"
     + _RUN_ON_LABEL
+    + _BYTES_PREFIX
     + r"(?=')(?:'"
     + _RUN_ON_INNER
     + r"(?='(?!\s*+[:=])))?+)?+'"
-    + r"|\"[^\"\r\n]*+(?<![:=\s])\""
+    + r"|\"[^\"\r\n]*+(?<![:=\s])(?<![:=\s](?-i:b))\""
     + r"|\""
     + _DQ_RUN_ON_WALK
     + r"(?:"
     + _RUN_ON_LABEL
+    + _BYTES_PREFIX
     + r"(?=\")(?:\""
     + _RUN_ON_INNER
     + r"(?=\"(?!\s*+[:=])))?+)?+\""
@@ -1103,7 +1128,7 @@ _QUOTED_SCHEME_VALUE = "|".join(
 _BEARER = re.compile(
     r"(?i)(" + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
     r"(?:['\"]\s*:|\s*[:=])\s*(?:" + _QUOTED_SCHEME_VALUE + r"|(?:(?:bearer|basic|digest)\s+)?"
-    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _CAMEL_PLAIN_VALUE + r"))"
+    r"(?:" + _BYTES_PREFIX + r"(?:" + _GUARDED_QUOTED_VALUE + r")|" + _CAMEL_PLAIN_VALUE + r"))"
 )
 
 # A bare auth scheme carrying its credential with no preceding header label -- "Bearer <tok>" as it
@@ -1156,11 +1181,13 @@ _MEFOR_SECRET = re.compile(
     # branch above, it takes exactly the span the old plain class and its trailing quote took, so later
     # passes see the same text they always did, wherever the old pattern matched this label at all.
     # An empty value is refused, as the old class refused it.
-    + r"|(?="
+    + r"|"
+    + _BYTES_PREFIX
+    + r"(?:(?="
     + _GUARDED_QUOTED_VALUE
     + r")['\"][^\s'\"]++['\"]|"
     + _GUARDED_QUOTED_VALUE
-    + r"|"
+    + r")|"
     + _PLAIN_VALUE
     + r"['\"]?)"
 )
@@ -1223,8 +1250,10 @@ _CREDENTIAL_KV = re.compile(
     r"(?:"
     + _ODBC_BRACED
     + r"|"
+    + _BYTES_PREFIX
+    + r"(?:"
     + _KV_QUOTED_VALUE
-    + r"|"
+    + r")|"
     + _ODBC_BRACED_OVERRUN
     + r"|"
     + _PLAIN_KV_VALUE
@@ -1265,8 +1294,10 @@ _KEY_MATERIAL = re.compile(
     r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_KEY_TERMINATORS}])|"
+    + _BYTES_PREFIX
+    + r"(?:"
     + _GUARDED_QUOTED_VALUE
-    + r"|"
+    + r")|"
     + _CAMEL_PLAIN_KEY_VALUE
     + r")"
 )

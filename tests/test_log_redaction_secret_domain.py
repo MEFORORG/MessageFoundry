@@ -285,6 +285,35 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
         ("upstream headers", "} rejected"),
         "_BEARER",
     ),
+    # BACKLOG #5547: a Python bytes literal after the label. The quoted forms needed the quote right
+    # after the separator, so the plain class took the "b" and stopped at the quote.
+    QuotedValue(
+        "bytes_literal_password",
+        "connect failed password=b'pw-By_A-63 pw-By_B-64' retrying",
+        ("pw-By_A-63", "pw-By_B-64"),
+        ("connect failed", "retrying"),
+    ),
+    QuotedValue(
+        "bytes_literal_token",
+        'rest connector token=b"tk-By_A-65 tk-By_B-66" configured',
+        ("tk-By_A-65", "tk-By_B-66"),
+        ("rest connector", "configured"),
+        "_BEARER",
+    ),
+    QuotedValue(
+        "bytes_literal_key_material",
+        "signing setup private_key=b'pk-By_A-67 pk-By_B-68' for IB_ACME_ADT",
+        ("pk-By_A-67", "pk-By_B-68"),
+        ("signing setup", "for IB_ACME_ADT"),
+        "_KEY_MATERIAL",
+    ),
+    QuotedValue(
+        "bytes_literal_mefor",
+        "startup MEFOR_VALUE_PW=b'pw-By_A-69 pw-By_B-70' loaded",
+        ("pw-By_A-69", "pw-By_B-70"),
+        ("startup", "loaded"),
+        "_MEFOR_SECRET",
+    ),
 )
 
 
@@ -4165,6 +4194,56 @@ def test_a_padded_token_ending_in_a_label_is_left_to_that_label(
     for module in (scrub_mod, redact_mod):
         monkeypatch.setattr(module, "_BEARER", _without_the_token68_keyword_guard(module))
     assert any("zq-Lt_B-73" in apply(line) for _surface, apply in _SWALLOW_SURFACES), "control"
+
+
+#: A bytes literal under a LATER label: the stop before a quoted label and the run-on past a later
+#: label's quote must read the "b" as part of the head (BACKLOG #5547). Each line pairs with the
+#: value that printed before.
+_BYTES_LATER_LABEL_LINES = (
+    "token=zq-x;password=b'zq-Bl_A-76 zq-Bl_B-77'",
+    "password='zq-x, private_key=b'zq-Bl_A-76 zq-Bl_B-77'",
+    'MEFOR_X=zq-x;secret=b"zq-Bl_A-76 zq-Bl_B-77"',
+)
+
+
+@pytest.mark.parametrize("line", _BYTES_LATER_LABEL_LINES)
+def test_a_bytes_literal_under_a_later_label_is_hidden(
+    line: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE CONTROL: with the prefix taken out of every stopped pattern in both copies, the later
+    label's value prints on at least one surface, as it did before."""
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        assert "zq-Bl_B-77" not in out, f"{surface}: {out!r}"
+    for module in (scrub_mod, redact_mod):
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            monkeypatch.setattr(
+                module, name, re.compile(pattern.pattern.replace("(?-i:b)?", ""), pattern.flags)
+            )
+    assert any("zq-Bl_B-77" in apply(line) for _surface, apply in _SWALLOW_SURFACES), "control"
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "password=bob x",
+        "token=b x",
+        "password='a b' tail",
+        "private_key=b' unclosed",
+        "secret=b{x}",
+    ),
+)
+def test_a_b_that_opens_no_quoted_value_is_read_as_before(line: str) -> None:
+    """The prefix is taken only in front of a quoted form that matches, so a value that merely
+    starts with "b", or a "b" before an unclosed quote, gets the plain class it always had."""
+    for module in (scrub_mod, redact_mod):
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            before = re.compile(pattern.pattern.replace("(?-i:b)?", ""), pattern.flags)
+            assert [m.span() for m in pattern.finditer(line)] == [
+                m.span() for m in before.finditer(line)
+            ], (module.__name__, name, line)
 
 
 def test_the_quoted_scheme_token_grows_linearly_in_line_length() -> None:

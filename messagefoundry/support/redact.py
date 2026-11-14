@@ -147,8 +147,12 @@ _LABEL_HEAD = (
     r")"
 )
 _MEFOR_LABEL_HEAD = r"\b(?-i:MEFOR_[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+"
-_QUOTED_LABEL = _LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
-_MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
+# A Python bytes literal's "b" in front of a quoted value, ``password=b'...'`` (BACKLOG #5547): each
+# quoted form, the stop and the run-on take it, and nothing else does. Why, and why lower case only,
+# are stated once, on the same constant in ``messagefoundry/secretscrub.py``.
+_BYTES_PREFIX = r"(?-i:b)?"
+_QUOTED_LABEL = _LABEL_HEAD + _BYTES_PREFIX + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
+_MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + _BYTES_PREFIX + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 # The stop fires before a ``_CREDENTIAL_KV`` label whose braced value holds a space followed only by
 # lower case letters and spaces, and the value then takes that label up to the braced value's closer
 # (BACKLOG #2966), so ``MEFOR_X=a;PWD={pp ww}`` no longer prints " ww}". Why the closer stays, why
@@ -203,26 +207,32 @@ _RUN_ON_LABEL = (
     r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
     r"|\b(?-i:MEFOR_[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
 )
-_SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')[A-Za-z0-9]++)*+"
-_DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9]++)*+"
+_SQ_RUN_ON_WALK = (
+    r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + _BYTES_PREFIX + r"')[A-Za-z0-9]++)*+"
+)
+_DQ_RUN_ON_WALK = (
+    r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + _BYTES_PREFIX + r"\")[A-Za-z0-9]++)*+"
+)
 _RUN_ON_INNER = (
     r"(?:[^'\"{:\r\nA-Za-z0-9\x80-\U0010ffff]|:(?!//)"
     r"|(?!" + _RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+"
 )
 _KV_QUOTED_VALUE = (
-    r"'[^'\r\n]*+(?<![:=\s])'"
+    r"'[^'\r\n]*+(?<![:=\s])(?<![:=\s](?-i:b))'"
     + r"|'"
     + _SQ_RUN_ON_WALK
     + r"(?:"
     + _RUN_ON_LABEL
+    + _BYTES_PREFIX
     + r"(?=')(?:'"
     + _RUN_ON_INNER
     + r"(?='(?!\s*+[:=])))?+)?+'"
-    + r"|\"[^\"\r\n]*+(?<![:=\s])\""
+    + r"|\"[^\"\r\n]*+(?<![:=\s])(?<![:=\s](?-i:b))\""
     + r"|\""
     + _DQ_RUN_ON_WALK
     + r"(?:"
     + _RUN_ON_LABEL
+    + _BYTES_PREFIX
     + r"(?=\")(?:\""
     + _RUN_ON_INNER
     + r"(?=\"(?!\s*+[:=])))?+)?+\""
@@ -342,7 +352,7 @@ _QUOTED_SCHEME_VALUE = (
 _BEARER = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
     r"(?:['\"]\s*:|\s*[:=])\s*(?:" + _QUOTED_SCHEME_VALUE + r"|(?:(?i:bearer|basic|digest)\s+)?"
-    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r"))"
+    r"(?:" + _BYTES_PREFIX + r"(?:" + _GUARDED_QUOTED_VALUE + r")|" + _PLAIN_VALUE + r"))"
 )
 
 # A bare auth scheme carrying its credential with no preceding header label — "Bearer <tok>" as it
@@ -381,11 +391,13 @@ _MEFOR_SECRET = re.compile(
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
     # A non-empty quoted value with no space in it, closer and all: the span the old plain class took.
-    + r"|(?="
+    + r"|"
+    + _BYTES_PREFIX
+    + r"(?:(?="
     + _GUARDED_QUOTED_VALUE
     + r")['\"][^\s'\"]++['\"]|"
     + _GUARDED_QUOTED_VALUE
-    + r"|"
+    + r")|"
     + _PLAIN_VALUE
     + r"['\"]?)"
 )
@@ -435,8 +447,10 @@ _CREDENTIAL_KV = re.compile(
     r"(?:"
     + _ODBC_BRACED
     + r"|"
+    + _BYTES_PREFIX
+    + r"(?:"
     + _KV_QUOTED_VALUE
-    + r"|"
+    + r")|"
     + _ODBC_BRACED_OVERRUN
     + r"|"
     + _PLAIN_KV_VALUE
@@ -516,8 +530,10 @@ _KEY_MATERIAL = re.compile(
     r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_KEY_TERMINATORS}])|"
+    + _BYTES_PREFIX
+    + r"(?:"
     + _GUARDED_QUOTED_VALUE
-    + r"|"
+    + r")|"
     + _PLAIN_KEY_VALUE
     + r")"
 )
