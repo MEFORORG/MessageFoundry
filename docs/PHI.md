@@ -411,17 +411,18 @@ than a path is not checked
   --grant-account` refuses the same list, and refuses a name that is a group or a domain.
 - On Windows it refuses a key file whose owner is one of those groups or an application package,
   or whose owner cannot be read, since an owner may rewrite the access list (vault BACKLOG #5657).
-  A grant to any account that is not such a group or an application package, one you made
-  yourself included, is not vetted. The list counts at least one account, IUSR, as such a group.
-  The owner screen names owners it refuses, never owners it allows, so your own TLS key may be
-  owned by the administrator who copied it in. At least two kinds of key file are held to a
-  stricter owner rule. One is the key at the path where the engine mints its TLS key, while the
-  engine uses that pair (below); when it does not, as with an operator certificate, that rule does
-  not apply to that path. The other is the key custody host and handoff files, which a separate
-  check, `key_file_handle_problem` ([restricted_file.py](../messagefoundry/restricted_file.py)),
-  holds to a fixed set of owners and an exact access list.
-  LOCAL SERVICE and NETWORK SERVICE are accounts that many services share, and the check does not
-  report them.
+  This check does not vet an ordinary allow entry for an account that is neither, one you made
+  yourself included. The list counts at least one account, IUSR, as such a group. The owner screen names
+  owners it refuses, never owners it allows, so your own TLS key may be owned by the administrator
+  who copied it in. LOCAL SERVICE and NETWORK SERVICE are accounts that many services share, and
+  the check does not count them as such groups. At least two kinds of key file are held to a
+  stricter owner rule. One is the key at the path where the engine mints its TLS key, when
+  `serve` or `supervise` starts with that pair (below). When the engine does not use that pair, as
+  with an operator certificate, the file at that path is not checked at all unless a key setting
+  names it. The other is the key custody host and handoff files. A separate check,
+  `key_file_handle_problem` ([restricted_file.py](../messagefoundry/restricted_file.py)), refuses
+  them at least when an account other than SYSTEM, Administrators or the engine's own owns them,
+  or when their access list is not exactly the one the engine writes.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
   the owner and access list of the folder just above the key file in its path, as written, and
   refuses the key file when one of the groups above or an application package may delete a file in that folder, change its access list or take it over, or when that
