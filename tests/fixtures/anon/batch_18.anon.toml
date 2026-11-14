@@ -8,8 +8,9 @@
 # rules only after it ran (BACKLOG #5557). So the corpus was scrubbed again, by DEFAULT_RULES plus
 # THIS file, over every message. This file is now the record of that final pass. It holds the
 # fields this corpus scrubs that are NOT defaults, says why each is not one, and lists under [hl7]
-# keep every other field the corpus carries, each decided as safe to leave. So no field of the
-# corpus is undecided, and tests/test_anon_hapi_samples.py holds it to that.
+# keep every other field the leak-check walks, each decided as safe to leave. So no field it walks
+# is undecided, and tests/test_anon_hapi_samples.py holds the corpus to that. The leak-check does
+# not walk the MSH header, so no MSH field is scrubbed or listed here.
 #
 # The salt of either pass was not recorded, so nothing here reproduces the committed surrogates.
 #

@@ -5,9 +5,11 @@ test fixtures, for exercising MessageFoundry parsing/routing (e.g. feeding throu
 [`samples/send_mllp.py`](../../send_mllp.py)).
 
 `send_mllp.py` sends a whole file as ONE frame, and a listener refuses a frame holding more than
-one MSH. So only the one-message files below can be sent with it. `batch_18_messages.txt` and
-`oml_o21.hl7` hold several messages each: drop them in a `File(...)` inbox instead, which splits a
-file into one message each.
+one MSH. So only the one-message files below can be sent with it. `oml_o21.hl7` holds 13
+messages: drop it in a `File(...)` inbox instead, which splits a file into one message each.
+`batch_18_messages.txt` also carries `//` and `/* */` comment lines, which that splitter keeps:
+the leading comment block becomes an `ERROR` record of its own, and a comment line after a
+message rides along at its end. Strip the comment lines first.
 
 ## Provenance
 
@@ -26,8 +28,9 @@ Both modified files were scrubbed with the project's own de-identification frame
 deterministic, salt-keyed surrogate machinery the tee relay and test harness use, over
 `DEFAULT_RULES` plus a committed rule overlay for each file. **No ad-hoc redaction logic was
 written** (§9: centralize the rules, don't reimplement beside the framework). Each overlay scrubs
-the fields this corpus needs that are not defaults, and lists every other field the corpus carries
-as reviewed and kept, so no field is undecided.
+the fields this corpus needs that are not defaults, and lists every other field the leak-check
+walks as reviewed and kept, so no field it walks is undecided. The leak-check does not walk the
+MSH header, so the MSH fields are neither scrubbed nor listed.
 [`tests/test_anon_hapi_samples.py`](../../../tests/test_anon_hapi_samples.py) holds each file to its
 overlay. The salt is not recorded: these surrogates are final, not reversible, and the files are
 not intended to be re-derived. Line endings, segment order and every line's field count are
@@ -56,8 +59,9 @@ shipping it unchanged is incompatible with this project's synthetic-data-only ru
 
 **How.** It was scrubbed twice. The first pass used `DEFAULT_RULES` plus a hand-written overlay
 that was never committed. It left identifiers behind: `PID-2`, the order and accession numbers,
-the operator ids in `ORC-10/11`, the query subject and qualifier in `QRD-8/11`, the insurance group
-fields `IN1-8/9`, and the locations and dates the default map gained only later (BACKLOG #5557).
+the operator ids in `ORC-10/11`, the query id, subject and qualifier in `QRD-4/8/11`, the insurance
+group fields `IN1-8/9/10`, and the locations and dates the default map gained only later
+(BACKLOG #5557).
 So the whole file was scrubbed again, over every message, by `DEFAULT_RULES` plus
 [`tests/fixtures/anon/batch_18.anon.toml`](../../../tests/fixtures/anon/batch_18.anon.toml), which
 says why each of its fields is not a default.
@@ -70,11 +74,20 @@ encoding sequences survive intact, including the 3-character `MSH|^~}|` that no 
 accepts. It is a tolerant-parsing test case, and the anonymizer (correctly) refuses such a
 message, so MSH-2 was repaired for the scrub and the malformation restored afterward.
 
-**What the scrub changed beyond identifier values.** A scrubbed date keeps only its year. An empty
-placeholder such as `^^` in a field a rule scrubs now holds a surrogate: a fabricated id in an
-identifier field such as `PID-2`, or `[REDACTED]` in a location field. An identifier's check digit, and a namespace written in its
-second component, are blanked. Routing fields (MSH, message type, trigger, version) are untouched,
-so routing behaves exactly as before.
+**What the scrub changed beyond identifier values**, at least:
+
+- A scrubbed date keeps only its year. A date of birth is drawn at random, so some now fall after
+  the message that carries them.
+- An empty placeholder such as `^^` in a field a rule scrubs now holds a surrogate: a fabricated id
+  in an identifier field, or `[REDACTED]` in a location field. A surrogate is keyed on the value,
+  so every patient whose `PID-2` was `^^` now shares one fabricated id, and two placer numbers
+  that were empty share one too.
+- The `""` null in `PID-12` became `[REDACTED]`.
+- An identifier's check digit, and a namespace written in its second component, are blanked.
+- Clinicians are drawn from a small pool, so two upstream clinicians can share one surrogate.
+
+Routing fields (MSH, message type, trigger, version) are untouched, so routing behaves exactly as
+before. Do not use this corpus to test patient matching, ages or clinician identity.
 
 ### `oml_o21.hl7` is MODIFIED — de-identified, not verbatim
 
@@ -91,11 +104,14 @@ not all of them plainly are, so it was scrubbed, by `DEFAULT_RULES` plus
 **What was deliberately preserved:** the 13 messages, the bare-CR segment endings and the empty
 lines between messages, the OML/OUL/ORL/ORU mix, the numeric results, and the order, group and
 specimen numbers, which upstream invented as placeholder runs and which tie each ORC to its OBR
-and SPM. The department names and the patients' assigning authorities are kept too.
+and SPM. The department names and the patients' assigning authorities are kept too. The same
+limits as above apply. In addition, the default `OBR-32` rule writes a clinician's id, family and
+given name over the interpreter field, so in two messages its start time is gone and its second
+component holds a surname.
 
 The parser parity record, `tests/golden/python_hl7_oracle.json`, still holds this file's upstream
-bytes as its own frozen input. Nothing can regenerate that record (ADR 0054), so this scrub does
-not reach it.
+bytes as its own frozen input, the upstream names included. Nothing can regenerate that record
+(ADR 0054), so this scrub does not reach it, and those names are still in the repository there.
 
 ## Manifest
 
@@ -110,7 +126,7 @@ not reach it.
 | `batch_18_messages.txt` | mixed (see below) | 2.1 to 2.4 | 18 | `hapi-test/.../ca/uhn/hl7v2/util/messages.txt` |
 
 `batch_18_messages.txt` is **18 concatenated messages** (no FHS/BHS batch wrapper): 1 ORU^R01,
-10 BAR^P01, 1 ACK, 3 ORM^O01, 2 QRY^Q01 — a useful mix of versions (2.1/2.2/2.4) for testing a
+11 BAR^P01, 1 ACK, 3 ORM^O01, 2 QRY^Q01 — a useful mix of versions (2.1/2.2/2.4) for testing a
 splitter and tolerant parsing.
 
 `oml_o21.hl7` is **13 concatenated messages**, separated by empty lines (no FHS/BHS batch

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import functools
 import re
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -31,6 +32,7 @@ import pytest
 
 from messagefoundry.parsing.message import Message
 from messagefoundry_toolkit.anon import (
+    DEFAULT_RULES,
     FieldRule,
     SurrogateKind,
     _pools,
@@ -76,6 +78,9 @@ def _messages(name: str) -> tuple[str, ...]:
             messages.append([line])
         elif messages and _SEGMENT.match(line):
             messages[-1].append(line)
+        else:
+            # Only a blank or comment line may be left out, or its text would be checked by nothing.
+            assert not line.strip() or line.lstrip().startswith(("//", "/*", "*")), name
     return tuple("\r".join(lines) for lines in messages)
 
 
@@ -166,6 +171,23 @@ def test_no_field_of_the_corpus_is_undecided(name: str, index: int) -> None:
     report = leak_report(_messages(name)[index], rules=_rules(name))
     assert report.undecided_fields == ()
     assert report.hits == []
+
+
+def test_the_coverage_check_names_a_field_whose_keep_is_removed() -> None:
+    """The control for the test above: without one keep, its field is reported undecided."""
+    message = next(m for m in _messages("batch_18_messages.txt") if "\rORC|" in m)
+    rules = tuple(r for r in _rules("batch_18_messages.txt") if r.path != "OBR-24")
+    assert "OBR-24" in leak_report(message, rules=rules).undecided_fields
+
+
+@pytest.mark.parametrize("name", sorted(_CORPORA))
+def test_the_overlay_scrubs_only_fields_no_default_maps(name: str) -> None:
+    """Each overlay says why its scrubbed fields are not defaults. If one becomes a default, that
+    reason is stale, and this is the prompt to rewrite it."""
+    with _CORPORA[name].open("rb") as handle:
+        overlay_fields = set(tomllib.load(handle)["hl7"]["fields"])
+    assert len(overlay_fields) >= 7
+    assert overlay_fields.isdisjoint(rule.path for rule in DEFAULT_RULES)
 
 
 @pytest.mark.parametrize("name", sorted(_CORPORA))

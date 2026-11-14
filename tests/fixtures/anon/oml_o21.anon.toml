@@ -4,8 +4,9 @@
 # who ordered and collected, the doctor who interpreted, and the insurer. It was then scrubbed by
 # DEFAULT_RULES plus THIS file, over each of its 13 messages. This file is the record of that pass.
 # It holds the fields this corpus scrubs that are NOT defaults, says why each is not one, and lists
-# under [hl7] keep every other field the corpus carries, each decided as safe to leave. So no
-# field of the corpus is undecided, and tests/test_anon_hapi_samples.py holds it to that.
+# under [hl7] keep every other field the leak-check walks, each decided as safe to leave. So no
+# field it walks is undecided, and tests/test_anon_hapi_samples.py holds the corpus to that. The
+# leak-check does not walk the MSH header, so no MSH field is scrubbed or listed here.
 #
 # The salt was not recorded, so nothing here reproduces the committed surrogates.
 #
@@ -35,8 +36,8 @@
 # the leak-check still scans it for PHI shapes. A keep rewrites nothing.
 keep = [
     # Codes, flags, units and ranges: the table-coded values a router or validator reads.
-    "MSA-1", "ORC-1", "ORC-5", "TQ1-9", "PV1-18",
-    "OBR-5", "OBR-11", "OBR-17", "OBR-24", "OBR-25",
+    "MSA-1", "ORC-1", "ORC-5", "TQ1-9",
+    "OBR-5", "OBR-11", "OBR-24", "OBR-25",
     "OBX-2", "OBX-6", "OBX-7", "OBX-8", "OBX-10", "OBX-11",
     "SPM-4", "SPM-11", "SPM-20", "SPM-21", "SPM-26",
     "IN1-2", "IN1-3",
@@ -44,8 +45,10 @@ keep = [
     "OBR-4", "OBX-3",
     # The order, group and specimen numbers. Upstream invented them as placeholder runs (12345678,
     # 555, 666, 123456781 onward), and they are what ties each ORC to its OBR and SPM, which is what
-    # the example shows. MSA-2 is the acknowledged control id.
-    "ORC-2", "ORC-3", "ORC-4", "OBR-2", "OBR-3", "SPM-2", "MSA-2",
+    # the example shows. MSA-2 is the acknowledged control id. PV1-18 (12345) and OBR-17, the
+    # order callback phone (821), hold placeholder values of the same kind; they are kept because
+    # these values are placeholders, not because the fields are codes.
+    "ORC-2", "ORC-3", "ORC-4", "OBR-2", "OBR-3", "SPM-2", "MSA-2", "PV1-18", "OBR-17",
     # The ordering facility: a department, not a person. In most messages it repeats the sending
     # facility in MSH-4, which ADR 0030 keeps for routing.
     "ORC-21",
