@@ -193,8 +193,15 @@ def custody_account_problem(sid: str | None) -> str | None:
 #: SID_NAME_USE SidTypeUser and SidTypeComputer: one account each (a group managed service
 #: account, at least, may answer either).
 _ONE_ACCOUNT_KINDS = frozenset({1, 9})
+#: The SID_NAME_USE an account NAME may resolve to in a key-file read grant: one account, or a
+#: well-known one (5), which is how SYSTEM and a virtual service account resolve.
+_GRANT_NAME_KINDS = _ONE_ACCOUNT_KINDS | {5}
+#: The SID_NAME_USE an owner NAME may resolve to: a user or a well-known account. Any other kind of
+#: owner is named by its SID.
+_OWNER_NAME_KINDS = frozenset({1, 5})
 _SID_TYPE_NAMES: Mapping[int, str] = MappingProxyType(
     {
+        1: "a user account",
         2: "a group",
         3: "a domain",
         4: "an alias",
@@ -202,6 +209,7 @@ _SID_TYPE_NAMES: Mapping[int, str] = MappingProxyType(
         6: "a deleted account",
         7: "an invalid account",
         8: "an unknown account",
+        9: "a computer account",
         10: "a label",
         11: "a logon session",
     }
@@ -2077,8 +2085,10 @@ def _create_restricted_windows(
 def _resolve_sid(principal: str, *, as_owner: bool = False) -> str:
     """The string SID of ``principal``: an account name, or a SID with or without a leading ``*``.
 
-    A NAME must resolve to one account: a group, an alias or a domain is refused. A SID literal is
-    taken as given.
+    A NAME must resolve to one account: a group, an alias or a domain is refused. A grant name may
+    be a user, a well-known account or a computer account (at least a group managed service account
+    may answer as one); an owner name a user or a well-known account. A SID literal is taken as
+    given.
 
     Every answer comes back from ``ConvertSidToStringSidW``, so what reaches the access list is a
     SID Windows itself rendered and never the caller's text. A name that does not resolve raises
@@ -2105,15 +2115,20 @@ def _resolve_sid(principal: str, *, as_owner: bool = False) -> str:
             raise refusal
         rendered, use = found
         # SID_NAME_USE: 1 is a user account and 5 a well-known account, which is how SYSTEM and a
-        # service's virtual account resolve. A group, an alias or a bare domain name is not ONE
-        # account, and a bare domain SID is one no token carries, so the grant would reach nobody.
-        if use not in (1, 5):
+        # service's virtual account resolve. A grantee may also be a computer account (9), which is
+        # at least how a group managed service account may answer, and so a plain computer account
+        # is admitted too. A group, an alias or a bare domain name is not ONE account, and a bare
+        # domain SID is one no token carries, so the grant would reach nobody. An owner stays
+        # {1, 5}: one of any other kind is named by its SID.
+        if use not in (_OWNER_NAME_KINDS if as_owner else _GRANT_NAME_KINDS):
+            what = _SID_TYPE_NAMES.get(use, f"an account of kind {use}")
             raise RestrictedFileError(
-                f"{principal!r} names a group or a domain, not one account, so a key file cannot "
-                "be granted to it. Name the one account the engine runs as"
+                f"{principal!r} names {what}, not one account, so a key file cannot be granted "
+                "to it. Name the one account the engine runs as: a user, a well-known or virtual "
+                "service account, or a computer account such as a group managed service account"
                 if not as_owner
-                else f"{principal!r} is not a user or well-known account by name; name an owner "
-                "that is a group, a computer or any other kind by its SID"
+                else f"{principal!r} names {what}, not a user or well-known account; name an "
+                "owner that is a group, a computer or any other kind by its SID"
             )
     if rendered is None:
         raise refusal

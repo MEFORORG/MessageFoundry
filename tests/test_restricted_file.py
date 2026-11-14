@@ -1110,6 +1110,40 @@ def test_windows_refuses_a_name_that_is_not_one_account(tmp_path: Path, name: st
 
 
 @windows_only
+@pytest.mark.parametrize(
+    ("kind", "admitted_as_grant", "admitted_as_owner", "named"),
+    [
+        (1, True, True, None),
+        (5, True, True, None),
+        # A group managed service account may resolve as a computer account, so the grant takes
+        # one, and a plain computer account with it. An owner of that kind is named by its SID.
+        (9, True, False, "a computer account"),
+        (2, False, False, "a group"),
+        (3, False, False, "a domain"),
+        (4, False, False, "an alias"),
+        (12, False, False, "an account of kind 12"),
+    ],
+)
+def test_windows_a_grant_name_may_resolve_to_a_computer_account(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: int,
+    admitted_as_grant: bool,
+    admitted_as_owner: bool,
+    named: str | None,
+) -> None:
+    sid = "S-1-5-21-1111111111-2222222222-3333333333-4105"
+    monkeypatch.setattr(restricted_file, "_lookup_account_name", lambda _name: (sid, kind))
+    for as_owner, admitted in ((False, admitted_as_grant), (True, admitted_as_owner)):
+        if admitted:
+            assert restricted_file._resolve_sid("CORP\\svc-mefor$", as_owner=as_owner) == sid
+        else:
+            with pytest.raises(RestrictedFileError) as refused:
+                restricted_file._resolve_sid("CORP\\svc-mefor$", as_owner=as_owner)
+            # The refusal names the kind the name resolved to.
+            assert named is not None and f"names {named}," in str(refused.value)
+
+
+@windows_only
 @pytest.mark.parametrize("grant", [f"*{_USERS}", "*S-1-1-0", "*S-1-5-11", "*S-1-5-15"])
 def test_windows_refuses_a_read_grant_to_a_broad_group(tmp_path: Path, grant: str) -> None:
     # A grant that would make the key file broadly readable is not a restricted create. The control
