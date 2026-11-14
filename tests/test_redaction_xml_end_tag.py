@@ -50,7 +50,7 @@ def _through_the_chain(text: str) -> str:
     return record.getMessage()
 
 
-def _main_end_tag_rest(text: str, start: int, stop: int) -> str:
+def _main_end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     """The end-tag rest as main copied it, vendored: main appended ``text[tag.start():pos]``, which
     is the tag itself (still appended) followed by exactly this."""
     return text[start:stop]
@@ -137,10 +137,11 @@ def test_a_rest_a_pass_could_read_differently_stays_as_main_left_it(text: str) -
 def test_a_field_run_that_takes_the_end_tag_prints_the_rest_as_main_did() -> None:
     """A STATED RESIDUAL (code review round 3): the flat passes run before the XML pass, so a field
     run that takes the end tag's name leaves a rest no end tag owns, and it prints, as on main."""
-    text = "a|b|<family>Smith</family Zqxdoe>"
-    assert redact(text) == "[redacted] Zqxdoe>"
-    with _main():
-        assert redact(text) == "[redacted] Zqxdoe>"
+    for text in ("a|b|<family>Smith</family Zqxdoe>", "<given>A^B^C</given Zqxdoe>"):
+        with _main():
+            main = redact(text)
+        assert redact(text) == main
+        assert "Zqxdoe" in main  # the residual, named so a fix to it is seen here
 
 
 @pytest.mark.parametrize(
@@ -186,6 +187,29 @@ def test_every_head_of_a_camel_label_word_is_refused_at_the_end() -> None:
                 continue
             assert redaction._ends_in_camel_head(f" {head}"), head
             assert redaction._ends_in_camel_head(f" zq{head[0].upper()}{head[1:]}"), head
+
+
+class _CountingText(str):
+    """A text that counts how often it is searched for the backstop's opener."""
+
+    searches = 0
+
+    def __contains__(self, item: object) -> bool:
+        if item == redaction._USERINFO_OPENER:
+            type(self).searches += 1
+        return super().__contains__(item)  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    "unit", ["<name><a>b" + "</b Zq> x" * 500, "</name Zq> x" * 500], ids=["walked", "stray"]
+)
+def test_the_backstop_opener_is_tested_once_per_text(unit: str) -> None:
+    """THE COST PIN (code review round 3): a scan of the whole text once per end tag was quadratic
+    on a 64 KiB window. Counted, not timed, so it cannot pass on a fast runner."""
+    _CountingText.searches = 0
+    out = redaction._redact_xml_elements(_CountingText(unit))
+    assert "Zq" not in out  # the end tags were reached, and masked
+    assert _CountingText.searches <= 1, _CountingText.searches
 
 
 def test_a_text_holding_the_backstop_opener_keeps_every_rest() -> None:
@@ -317,7 +341,7 @@ class _Tally:
 
 
 def _differential(
-    trials: int, seed: int, control: Callable[[str, int, int], str]
+    trials: int, seed: int, control: Callable[[str, int, int, bool], str]
 ) -> tuple[_Tally, _Tally]:
     """The shipped redactor's tally and ``control``'s, which replaces
     :func:`redaction._end_tag_rest`, over ``trials`` composed texts, each compared with main's
@@ -346,9 +370,10 @@ def _is_main_masked(out: str, main: str) -> bool:
     )
 
 
-def _replace_rest(text: str, start: int, stop: int) -> str:
+def _replace_rest(text: str, start: int, stop: int, mask: bool) -> str:
     """The CONTROL: a rest REPLACED by the placeholder wherever it holds a word, the design the
-    previous attempt took. It is not class-preserving, so the fuzz must find it leaking."""
+    previous attempt took. It is not class-preserving, so the fuzz must find it leaking. It ignores
+    ``mask``, so it reaches texts holding the backstop's opener too."""
     rest = text[start:stop]
     return (
         f" {redaction._REDACTED}{'>' if rest.endswith('>') else ''}" if rest.strip(" >") else rest
@@ -362,13 +387,15 @@ def test_the_end_tag_mask_redacts_at_least_what_main_did_through_composed_joins(
     control shows the corpus can produce the composed-join leak.
 
     Measured at 1,500 trials: 0 leaks, 0 unmasked routes and 9,398 values hidden that main printed,
-    against 1,535 leaks on the control. 16,000 more trials over four other seeds, run by hand, also
-    found 0 leaks and 0 unmasked routes. The corpus holds the shapes code review found (camelCase
-    credential labels and their heads, a segment id glued to a tag's ``>``, surnames the
-    end-of-text rules refuse, the backstop's opener over a tail a field run shortens). With the
-    opener guard switched off by hand, the same 1,500 trials found 203 leaks; with the head check
-    narrowed to capitals they found none, so that shape rests on the pins above, not on this arm.
-    These are measurements of this corpus, not a    proof for every input."""
+    against 1,526 leaks on the control, which ignores ``mask`` and so reaches texts holding the
+    backstop's opener. 16,000 more trials over four other seeds, run by hand, also found 0 leaks and
+    0 unmasked routes. The corpus holds the shapes code review found (camelCase credential labels
+    and their heads, a segment id glued to a tag's ``>``, surnames the end-of-text rules refuse,
+    the backstop's opener over a tail a field run shortens). With ``_end_tag_rest`` patched to
+    ignore ``mask``, the same 1,500 trials found 203 leaks; with the head check narrowed to
+    capitals they found none, so that shape rests on the pins above, not on this arm. These are
+    measurements of this corpus, not a
+    proof for every input."""
     shipped, control = _differential(1_500, 5925, _replace_rest)
     assert control.leaks, "the replacing control leaked nothing, so the corpus cannot find the leak"
     assert shipped.gains, "the mask hid nothing main printed, so #5925 is not exercised"

@@ -1644,7 +1644,7 @@ def _xml_text(chunk: str, policy: int) -> str:
     return f"{chunk[:lead]}{_REDACTED}{chunk[len(chunk.rstrip()) :]}"
 
 
-def _end_tag_rest(text: str, start: int, stop: int) -> str:
+def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     """The rest of an end tag, ``text[start:stop]``, with the words on the tag's own line masked in
     place where masking them is not expected to change another pass's reading (BACKLOG #5925).
 
@@ -1658,8 +1658,9 @@ def _end_tag_rest(text: str, start: int, stop: int) -> str:
     **That is not a proof that every reader sees main's answer.** A mask is a change, so it can make
     :func:`_redact_rounds` run a round main did not, and a pass that is not a fixed point reads
     differently there. The credential backstop is the known one, so a text holding its opener
-    (:data:`_USERINFO_OPENER`) keeps every rest, as :func:`_scrub_field_runs` does; its callers test
-    that once per text, not once per end tag, which was quadratic. The differential
+    (:data:`_USERINFO_OPENER`) keeps every rest, as :func:`_scrub_field_runs` does: ``mask`` is
+    False there. The caller tests that once per text, not once per end tag, which was quadratic.
+    The differential
     fuzz in ``tests/test_redaction_xml_end_tag.py`` measures the rest; it is not a proof either.
 
     **Which words may be masked depends on what follows them** (:func:`_rest_words` holds the rules
@@ -1674,11 +1675,12 @@ def _end_tag_rest(text: str, start: int, stop: int) -> str:
     some pass reads literally, a credential word inside a longer word, or a date (``</family
     password: x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any word after a
     line break inside the tag; every rest in a text holding the backstop's opener; every rest whose
-    end tag an HL7 field run took before this pass ran (``a|b|<family>Smith</family Zqxdoe>`` prints
-    ``[redacted] Zqxdoe>``); and, where the
+    end tag an HL7 field run took before this pass ran, whether the run starts before the element
+    (``a|b|<family>Smith</family Zqxdoe>``) or in its own content (``<given>A^B^C</given Zqxdoe>``);
+    and, where the
     rest ends the text, every refusal :func:`_maskable_rest` makes there, a last word with a digit or
     ending in ``m``, ``b``, ``f`` or ``n`` among them."""
-    if not text.startswith(" ", start):
+    if not mask or not text.startswith(" ", start):
         return text[start:stop]
     line = _END_TAG_LINE.match(text, start, stop)
     assert line is not None  # the pattern matches the empty string
@@ -1759,7 +1761,7 @@ def _scrub_xml_element(
             rest = _XML_END_TAG_REST.match(text, tag.end())
             pos = rest.end() if rest is not None else tag.end()
             out.append(tag.group())
-            out.append(_end_tag_rest(text, tag.end(), pos) if mask else text[tag.end() : pos])
+            out.append(_end_tag_rest(text, tag.end(), pos, mask))
             if open_names.get(qname):
                 while stack:
                     name, _ = stack.pop()
@@ -1804,17 +1806,23 @@ def _redact_xml_elements(text: str) -> str:
     #: Where the LAST end tag of each vocabulary name starts, built on the first match: whether an
     #: element closes anywhere later is then one lookup, not a search to the end of the text.
     last_close: dict[str, int] | None = None
-    #: The backstop's opener keeps every end-tag rest (:func:`_end_tag_rest`), tested once here.
-    mask = _USERINFO_OPENER not in text
+    #: Whether end-tag rests may be masked: not beside the backstop's opener (:func:`_end_tag_rest`).
+    #: Tested once per text, and only once a tag needs it.
+    mask = False
     while (match := _XML_PHI_ELEMENT.search(text, pos)) is not None:
         if last_close is None:
             last_close = {close.group(1): close.start() for close in _XML_PHI_END.finditer(text)}
+            mask = _USERINFO_OPENER not in text
         replacement, end = _scrub_xml_element(text, match, last_close, mask)
         out.append(_mask_stray_end_tags(text, pos, match.start(), mask))
         out.append(replacement)
         pos = end
-    if not out and (not mask or "</" not in text or _XML_PHI_END_OPEN.search(text) is None):
-        return text
+    if not out:
+        if "</" not in text or _XML_PHI_END_OPEN.search(text) is None:
+            return text
+        mask = _USERINFO_OPENER not in text
+        if not mask:
+            return text
     out.append(_mask_stray_end_tags(text, pos, len(text), mask))
     return "".join(out)
 
@@ -1827,8 +1835,8 @@ def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool) -> str:
     **Only a vocabulary end tag, where the walk masks after any end tag.** Inside a walked element
     every tag is that element's markup; outside one, ``</b Zqxdoe>`` is read as prose and kept. The
     cost is over-masking prose that names a vocabulary tag: ``missing </name element`` prints as
-    ``missing </name xxxxxxx``. ``mask`` False keeps every rest, as in the walk."""
-    if not mask or text.find("</", lo, hi) == -1:
+    ``missing </name xxxxxxx``. ``mask`` is :func:`_end_tag_rest`'s."""
+    if text.find("</", lo, hi) == -1:
         return text[lo:hi]
     out: list[str] = []
     pos = lo
@@ -1836,7 +1844,7 @@ def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool) -> str:
         rest = _XML_END_TAG_REST.match(text, tag.end(), hi)
         stop = rest.end() if rest is not None else tag.end()
         out.append(text[pos : tag.end()])
-        out.append(_end_tag_rest(text, tag.end(), stop))
+        out.append(_end_tag_rest(text, tag.end(), stop, mask))
         pos = stop
     out.append(text[pos:hi])
     return "".join(out)
