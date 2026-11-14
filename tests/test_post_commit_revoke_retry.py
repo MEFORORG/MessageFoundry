@@ -20,21 +20,30 @@ accounts only.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.passwords import hash_password
-from messagefoundry.auth.service import SESSIONS_REVOKE_FAILED_ACTION, AuthService
+from messagefoundry.auth.service import (
+    SESSIONS_REVOKE_FAILED_ACTION,
+    AuthService,
+    FirstAdministratorGrantedSessionsLive,
+    FirstAdministratorRefused,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import StoreAcquireTimeout
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import AdminGrant, MessageStore
 from tests.test_ad_session_reconcile import _ad_settings, _principal
+from tests.test_b1720_cli_schema_refusal_exit import _PASSWORD as _B1720_PASSWORD
+from tests.test_b1720_cli_schema_refusal_exit import shell as shell  # noqa: F401
 
 _PASSWORD = "Str0ng-Synthetic-Pass!!"
 _NEW_PASSWORD = "An0ther-Synthetic-Pass!!"
@@ -274,6 +283,11 @@ async def _actions(store: MessageStore) -> list[Any]:
 @pytest.fixture(autouse=True)
 def _no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(
+        service_module,
+        "_PROVISION_REVOKE_RETRY",
+        service_module._PROVISION_REVOKE_RETRY._replace(backoff_seconds=0.0),
+    )
 
 
 @pytest.mark.parametrize(("caller", "change", "audited", "account"), CALLERS)
@@ -295,7 +309,12 @@ async def test_a_refused_revoke_after_the_change_is_retried(
         await store.close()
 
 
-@pytest.mark.parametrize(("caller", "change", "audited", "account"), CALLERS)
+#: The callers that run inside a request. ``provision-admin`` runs offline on a longer budget and
+#: turns a give-up into its own refusal; its cases are at the end of this file.
+REQUEST_CALLERS = [p for p in CALLERS if p.id != "provision_admin"]
+
+
+@pytest.mark.parametrize(("caller", "change", "audited", "account"), REQUEST_CALLERS)
 async def test_a_revoke_refused_on_every_attempt_is_audited_and_raised(
     caller: Caller, change: str, audited: str, account: Account
 ) -> None:
@@ -529,3 +548,343 @@ async def test_a_custom_role_delete_revokes_before_it_deletes_and_records_no_mis
         assert not any(r["action"] == SESSIONS_REVOKE_FAILED_ACTION for r in await _actions(store))
     finally:
         await store.close()
+
+
+# Vault BACKLOG #3023 residual (4): `provision-admin` is an offline command with no request
+# deadline, so its repair-branch revokes run on `_PROVISION_REVOKE_RETRY`, a budget of minutes,
+# and one given up on after the grant says which host command ends the earlier holder's session.
+# The budgets are scaled down here so the cases run in well under a second; the request budget
+# is scaled down with them, so "longer than the request budget" keeps its meaning.
+
+#: The scaled request budget, and how long the store refuses: past the first, inside the
+#: command's (scaled to 5 s).
+_REQUEST_BUDGET = 0.1
+_REFUSED_FOR = 0.3
+#: How long each refused attempt takes, so a refusal spans real time rather than a call count.
+_ATTEMPT_TAKES = 0.02
+
+#: A session the earlier holder minted after the first revoke, before `set_password`: the one the
+#: revoke after the grant exists to end.
+_LATE_SESSION = "1a7e" * 16
+
+
+def _scaled(monkeypatch: pytest.MonkeyPatch, **changes: Any) -> None:
+    """The request budget at :data:`_REQUEST_BUDGET`, and the command's budget at 5 s with no
+    pause and ``changes`` applied; its attempts stay as shipped unless ``changes`` names them."""
+    monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_BUDGET_SECONDS", _REQUEST_BUDGET)
+    retry = service_module._PROVISION_REVOKE_RETRY._replace(
+        backoff_seconds=0.0, budget_seconds=5.0, **changes
+    )
+    monkeypatch.setattr(service_module, "_PROVISION_REVOKE_RETRY", retry)
+
+
+def _refusing_over_time(
+    store: MessageStore, refused_for: float | None, *, first_lands: bool
+) -> list[int]:
+    """Make ``revoke_user_sessions`` refuse for ``refused_for`` seconds from its first refusal
+    (``None``: always), each refusal taking :data:`_ATTEMPT_TAKES`. With ``first_lands`` the
+    first call (the repair's, before the grant) lands instead, and a late session is then minted
+    for the account, as a sign-in by its earlier holder before ``set_password`` would be. Returns
+    the call counter."""
+    real = store.revoke_user_sessions
+    calls = [0]
+    first_refused_at: list[float] = []
+
+    async def revoke(user_id: str, **kwargs: Any) -> Any:
+        calls[0] += 1
+        if first_lands and calls[0] == 1:
+            result = await real(user_id, **kwargs)
+            await store.create_session(token_hash=_LATE_SESSION, user_id=user_id, expires_at=9e9)
+            return result
+        now = asyncio.get_running_loop().time()
+        if not first_refused_at:
+            first_refused_at.append(now)
+        if refused_for is None or now - first_refused_at[0] < refused_for:
+            await asyncio.sleep(_ATTEMPT_TAKES)
+            raise StoreAcquireTimeout("synthetic pool shortage")
+        return await real(user_id, **kwargs)
+
+    store.revoke_user_sessions = revoke  # type: ignore[method-assign]
+    return calls
+
+
+async def test_provision_admin_waits_out_a_refusal_past_the_request_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The revoke after the grant is refused for longer than the request budget but less than
+    the command's: it lands, and no session of the earlier holder survives on the Administrator."""
+    _scaled(monkeypatch)
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, hashes = await _roleless_account(store)
+        calls = _refusing_over_time(store, _REFUSED_FOR, first_lands=True)
+        await _provision_admin(service, store, None)
+        assert calls[0] > 1 + service_module._POST_COMMIT_REVOKE_ATTEMPTS
+        assert await _live(store, [*hashes, _LATE_SESSION]) == []
+        assert "administrator" in await store.get_user_role_ids("u1")
+        rows = await _actions(store)
+        assert any(r["action"] == "auth.first_administrator_provisioned" for r in rows)
+        assert not any(r["action"] == SESSIONS_REVOKE_FAILED_ACTION for r in rows)
+    finally:
+        await store.close()
+
+
+async def test_a_request_caller_keeps_the_request_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control for the case above: the same refusal, after a role change on a request, is
+    given up on at the request budget's time limit: both attempt caps are lifted, so only the time
+    limit can stop it. The shipped request budget is pinned too: a request caller must stay inside
+    the API's 120 s request deadline."""
+    assert service_module._POST_COMMIT_REVOKE_ATTEMPTS == 3
+    assert service_module._POST_COMMIT_REVOKE_BUDGET_SECONDS == 15.0
+    _scaled(monkeypatch, attempts=1000)
+    monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_ATTEMPTS", 1000)
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, hashes = await _account(store)
+        calls = _refusing_over_time(store, _REFUSED_FOR, first_lands=False)
+        with pytest.raises(StoreAcquireTimeout):
+            await service.set_roles("u1", ["operator"], actor="admin")
+        # Stopped by the 0.1 s time limit, well short of the 0.3 s refusal at 0.02 s an attempt.
+        assert calls[0] < _REFUSED_FOR / _ATTEMPT_TAKES
+        assert await _live(store, hashes) == hashes
+        [missed] = [
+            r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
+        ]
+        assert json.loads(missed["detail"])["change"] == "roles_changed"
+    finally:
+        await store.close()
+
+
+async def test_provision_admin_given_up_after_the_grant_names_the_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every revoke after the grant refused: the command is refused, so it exits non-zero, the
+    role stands, the miss is audited, and the text names the host command that ends the session,
+    since a re-run refuses an account that holds the role."""
+    _scaled(monkeypatch, attempts=4)
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, _ = await _roleless_account(store)
+        calls = _refusing_over_time(store, None, first_lands=True)
+        with pytest.raises(FirstAdministratorGrantedSessionsLive) as refused:
+            await _provision_admin(service, store, None)
+        assert refused.value.username == "bob"
+        text = str(refused.value)
+        assert "now holds the Administrator role" in text
+        assert "messagefoundry admin-revoke-sessions" in text
+        assert isinstance(refused.value.__cause__, StoreAcquireTimeout)
+        assert calls[0] == 1 + 4
+        assert await _live(store, [_LATE_SESSION]) == [_LATE_SESSION]  # what the row records
+        assert "administrator" in await store.get_user_role_ids("u1")
+        [missed] = [
+            r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
+        ]
+        assert json.loads(missed["detail"]) == {
+            "user_id": "u1",
+            "change": "first_administrator_granted",
+            "attempts": 4,
+            "error": "StoreAcquireTimeout",
+        }
+        # The granted run is still recorded, saying the revoke did not land.
+        [provisioned] = [
+            r
+            for r in await _actions(store)
+            if r["action"] == "auth.first_administrator_provisioned"
+        ]
+        assert json.loads(provisioned["detail"])["earlier_sessions_revoked"] is False
+        # A re-run is refused, which is why the text points elsewhere.
+        assert await service.provision_refusal("bob", notify_email="ops@example.org") is not None
+    finally:
+        await store.close()
+
+
+async def test_provision_admin_given_up_before_the_grant_grants_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repair's first revoke runs on the command's budget too. Given up on, the run is refused
+    before the password or the role, so a re-run completes the account."""
+    _scaled(monkeypatch, attempts=4)
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, hashes = await _roleless_account(store)
+        before = await store.get_user("u1")
+        calls = _refusing(store, None)
+        with pytest.raises(FirstAdministratorRefused, match="set no password and granted no role"):
+            await _provision_admin(service, store, None)
+        assert calls[0] == 4
+        assert await store.get_user_role_ids("u1") == []
+        after = await store.get_user("u1")
+        assert before is not None and after is not None
+        assert after.password_hash == before.password_hash
+        assert await _live(store, hashes) == hashes
+        [missed] = [
+            r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
+        ]
+        assert json.loads(missed["detail"])["change"] == "first_administrator_repair"
+    finally:
+        await store.close()
+
+
+async def test_provision_admin_waits_out_a_refusal_before_the_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first revoke, refused past the request budget, lands on the command's budget."""
+    _scaled(monkeypatch)
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, hashes = await _roleless_account(store)
+        calls = _refusing_over_time(store, _REFUSED_FOR, first_lands=False)
+        await _provision_admin(service, store, None)
+        assert calls[0] > service_module._POST_COMMIT_REVOKE_ATTEMPTS
+        assert await _live(store, hashes) == []
+        assert "administrator" in await store.get_user_role_ids("u1")
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("outcome", [AdminGrant.ADMIN_EXISTS, AdminGrant.ACCOUNT_CHANGED])
+async def test_a_provision_refused_at_the_grant_revokes_the_accounts_sessions(
+    monkeypatch: pytest.MonkeyPatch, outcome: AdminGrant
+) -> None:
+    """A run the grant refuses has already set the password, so a session minted with it in the
+    window is ended before the refusal is raised. No role is written either way."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        real_set_password = store.set_password
+        minted: list[str] = []
+
+        async def set_password(user_id: str, **kwargs: Any) -> Any:
+            result = await real_set_password(user_id, **kwargs)
+            await store.create_session(token_hash=_LATE_SESSION, user_id=user_id, expires_at=9e9)
+            assert await _live(store, [_LATE_SESSION]) == [_LATE_SESSION]
+            minted.append(user_id)
+            return result
+
+        async def grant(*_a: Any, **_k: Any) -> AdminGrant:
+            return outcome
+
+        monkeypatch.setattr(store, "set_password", set_password)
+        monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", grant)
+        with pytest.raises(FirstAdministratorRefused, match="no role") as refused:
+            await _provision_admin(service, store, None)
+        assert minted, "the window session was not minted"
+        assert await _live(store, [_LATE_SESSION]) == []
+        assert await store.get_user_role_ids(minted[0]) == []
+        assert "also refused" not in str(refused.value)
+    finally:
+        await store.close()
+
+
+async def test_a_provision_refused_at_the_grant_keeps_its_text_when_the_revoke_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hardening revoke given up on does not replace the refusal: its text gains a note, and
+    the miss is recorded."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await service.initialize()
+
+        async def grant(*_a: Any, **_k: Any) -> AdminGrant:
+            return AdminGrant.ADMIN_EXISTS
+
+        monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", grant)
+        _refusing(store, None)
+        with pytest.raises(FirstAdministratorRefused, match="another enabled Administrator") as r:
+            await _provision_admin(service, store, None)
+        assert "The store also refused to end that account's sessions" in str(r.value)
+        [missed] = [
+            row for row in await _actions(store) if row["action"] == SESSIONS_REVOKE_FAILED_ACTION
+        ]
+        assert json.loads(missed["detail"])["change"] == "first_administrator_refused"
+    finally:
+        await store.close()
+
+
+async def test_an_unexpected_grant_outcome_maps_a_given_up_revoke_to_its_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fail-closed branch's revoke given up on is folded into its refusal text, not raised as
+    the raw store error, and recorded as after a grant, since the role may have landed."""
+    _scaled(monkeypatch, attempts=4)
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, _ = await _roleless_account(store)
+
+        async def grant(*_a: Any, **_k: Any) -> object:
+            return object()  # out of contract
+
+        monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", grant)
+        _refusing_over_time(store, None, first_lands=True)
+        with pytest.raises(FirstAdministratorRefused) as refused:
+            await _provision_admin(service, store, None)
+        assert not isinstance(refused.value, FirstAdministratorGrantedSessionsLive)
+        assert isinstance(refused.value.__cause__, StoreAcquireTimeout)
+        assert "The store also refused to end the account's earlier sessions" in str(refused.value)
+        [missed] = [
+            r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
+        ]
+        assert json.loads(missed["detail"])["change"] == "first_administrator_granted"
+    finally:
+        await store.close()
+
+
+def test_the_given_up_text_names_how_to_get_recovery_codes() -> None:
+    """With TOTP enrolled the codes are not shown on this path, so the text names the two ways that
+    work: ``admin-reset-totp`` for the sole enabled Administrator (it refuses one with an enabled
+    peer), and a peer's MFA reset from the web console otherwise."""
+    text = service_module._provision_revoke_missed_text("bob", enrolled=True)
+    assert "messagefoundry admin-reset-totp --username bob" in text
+    assert "only enabled Administrator" in text
+    assert "reset its MFA from the web console" in text
+    assert "admin-reset-totp" not in service_module._provision_revoke_missed_text(
+        "bob", enrolled=False
+    )
+
+
+def test_the_cli_pages_a_granted_run_whose_revoke_was_given_up_on(
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The role is granted, so ``administrator_granted`` is raised (vault BACKLOG #3849 B5) before
+    the command exits non-zero with the service's text."""
+    import sys
+    import types
+
+    from messagefoundry import __main__ as cli
+
+    async def granted_then_missed(*_a: object, **_k: object) -> object:
+        raise FirstAdministratorGrantedSessionsLive(
+            "synthetic sessions live", username="site-admin"
+        )
+
+    paged: list[tuple[str, str]] = []
+
+    async def page(*_a: object, username: str, granted_by: str) -> bool:
+        paged.append((username, granted_by))
+        return True
+
+    monkeypatch.setattr(AuthService, "provision_first_administrator", granted_then_missed)
+    monkeypatch.setattr(cli, "_raise_offline_administrator_granted", page)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _B1720_PASSWORD)
+    code = cli.main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(shell / "provision.db"),
+            "--json",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert [u for u, _ in paged] == ["site-admin"]
+    assert "synthetic sessions live" in out
+    assert "administrator_granted_sessions_live" in out

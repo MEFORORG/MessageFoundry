@@ -9205,6 +9205,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         HOLDER_NOTICE_DISPATCHED,
         HOLDER_NOTICE_NO_CHANNEL,
         HOLDER_NOTICE_NO_PRIOR_ADDRESS,
+        FirstAdministratorGrantedSessionsLive,
         FirstAdministratorRefused,
         ProvisionedAdministrator,
         _is_integrity_refusal,
@@ -9845,8 +9846,38 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
 
     # No TrustAnchorError arm: the anchors are checked at the build, before the prompt (#2081).
+    def page_granted(granted: str) -> bool:
+        """Vault BACKLOG #3849 B5: a grant that is written pages, as every console grant does;
+        bounded, with an interrupt taken. Whether an [alerts] transport confirmed delivery."""
+
+        async def reopen() -> Store:
+            # The store opened again, as `serve` opens it, only so the alert's open instance lands
+            # in it. Called only when a notifier was built.
+            return await open_store(
+                settings.store,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+
+        async def alert() -> bool:
+            return await _raise_offline_administrator_granted(
+                settings, posture, reopen, username=granted, granted_by=actor
+            )
+
+        alerted = _run_offline_alert_step(alert)
+        if not alerted:
+            # Here, not in the step, so the line is written once, whether or not the step answered.
+            _log_administrator_granted(granted, actor)
+        return alerted
+
     try:
         outcome, store_path = run_guarded(run())
+    except FirstAdministratorGrantedSessionsLive as exc:
+        # Vault BACKLOG #3023 residual (4): the role is granted, so it pages as any grant does,
+        # then the command exits non-zero with the text naming the host command that ends the
+        # earlier holder's session.
+        page_granted(exc.username)
+        return _emit_error(str(exc), as_json=args.json, code="administrator_granted_sessions_live")
     except FirstAdministratorRefused as exc:
         # The service's own text says what to do with the entry it showed, where that is known: a
         # refusal can follow a grant that may have landed (#5067 leaves these as they are).
@@ -9919,30 +9950,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         "`admin-reset-totp`, so create a second Administrator soon.",
     )
 
-    async def reopen() -> Store:
-        # The store opened again, as `serve` opens it, only so the alert's open instance lands in
-        # it. Called only when a notifier was built.
-        return await open_store(
-            settings.store,
-            posture=posture,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-        )
-
     # The name alone: the step's thread can outlive this function, and `outcome` holds the codes.
-    granted = outcome.username
-
-    async def alert() -> bool:
-        # Vault BACKLOG #3849 B5: the grant is written and audited, so it pages, as every console
-        # grant does. AFTER the codes are shown, and bounded with an interrupt taken, so a slow
-        # relay or a Ctrl-C here costs neither the codes nor the result printed below.
-        return await _raise_offline_administrator_granted(
-            settings, posture, reopen, username=granted, granted_by=actor
-        )
-
-    alerted = _run_offline_alert_step(alert)
-    if not alerted:
-        # Here, not in the step, so the line is written once, whether or not the step answered.
-        _log_administrator_granted(granted, actor)
+    # AFTER the codes are shown, so a slow relay or a Ctrl-C in the step costs neither the codes
+    # nor the result printed below.
+    alerted = page_granted(outcome.username)
     if args.json:
         _print_json(
             {

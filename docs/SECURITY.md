@@ -1017,7 +1017,17 @@ a statement timeout or a lost connection, is run again, up to three attempts. A 
 only while less than 15 seconds have passed since the first attempt began, give or take its
 half-second pause, and nothing bounds how long one attempt runs. At the default `acquire_timeout`
 a SQL Server pool wait uses up that budget on its own, so it is recorded at once rather than run
-into the request deadline. The directory reconciler's revoke counts its attempts the same way, but
+into the request deadline. `provision-admin` has no request deadline, so its repair revokes run on
+a longer budget: a re-run starts only while less than five minutes have passed since the first
+attempt, give or take its pause of up to 15 seconds, and nothing bounds how long one attempt runs.
+One it gives up on before its grant is recorded with the change `first_administrator_repair` and
+refuses the run with no password or role written. One it gives up on after its grant, or after a
+grant whose outcome was unexpected, is recorded with the change `first_administrator_granted`; the
+granted run still raises its `administrator_granted` alert, and the command exits non-zero with
+text naming `messagefoundry admin-revoke-sessions`, since a re-run refuses an account that holds the
+role. A run the grant refuses after it set the password ends the account's sessions on the request
+budget, and one it gives up on there is recorded with the change `first_administrator_refused`
+(vault BACKLOG #3023). The directory reconciler's revoke counts its attempts the same way, but
 its first attempt carries its `auth.ad_session_revoked` row and its second, without the row,
 always runs, since the first one's error may be the row's; so there a SQL Server pool wait is
 recorded after the second wait. One it gives up on ends the pass, and its miss row counts the

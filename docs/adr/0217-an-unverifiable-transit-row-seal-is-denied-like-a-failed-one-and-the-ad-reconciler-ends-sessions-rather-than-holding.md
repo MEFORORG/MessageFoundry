@@ -768,6 +768,13 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   attempt with the row counted as the first, so a refusal that only its failed attempts met can
   be reported up to `_POST_COMMIT_REVOKE_ATTEMPTS` (3) times from it. The 2026-11-11 note above
   is kept as it was.
+- **Note, recorded 2026-11-14: `provision-admin` retries more than three times.** Its repair
+  revokes run `_revoke_after_commit` on `_PROVISION_REVOKE_RETRY` (vault BACKLOG #3023): re-runs
+  start while less than 300 s have passed, in one `deferred_revoke_reports` scope that stays open
+  that long or longer. So a refusal that only its failed attempts met can be reported once per
+  attempt that fits in the 300 s budget, when the scope ends; at the shipped pauses that is fewer
+  than the 30-attempt cap, which does not bind. The bound of three above holds for the request
+  callers.
 - **The AD-map piece of slice 3 is built (owner ruling 2026-11-10, in session: *"Hold, build AD-map
   piece"*).** Before it, an Unverifiable or Outage answer on an AD map raised out of
   `reconcile_directory_sessions`; the reconcile loop in `api/app.py` logged "pass failed" and the
