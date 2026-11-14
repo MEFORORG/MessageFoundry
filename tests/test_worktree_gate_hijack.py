@@ -601,35 +601,22 @@ def test_the_shadow_probe_is_discriminating(repo: SimpleNamespace) -> None:
     assert run_gate(shell('cp -r "/c/backups/Git" switch', cwd=repo.wt), repo.repos) is None
 
 
-def test_a_SAME_LINE_semicolon_compound_still_shadows_and_is_NOT_fixed_here(
-    repo: SimpleNamespace,
-) -> None:
-    """A KNOWN OPEN RESIDUAL, asserted as ALLOW, and NOT an endorsement -- read before acting on it.
+def test_a_SAME_LINE_semicolon_compound_no_longer_shadows(repo: SimpleNamespace) -> None:
+    """Rule 3b judges every verb-bearing invocation now (BACKLOG #5655), so the shadow is gone.
 
-    ``Get-ScannableSegments`` splits on NEWLINES only, so a ``;`` compound is ONE segment, and
-    ``Test-WorktreeHijack`` strips a segment up to its FIRST gated verb. So the shadow survives on one
-    line, with or without any quoted path::
+    This row used to assert ALLOW as a KNOWN OPEN RESIDUAL: ``Test-WorktreeHijack`` was handed only the
+    first verb-bearing invocation, so both of these were allowed on origin/main::
 
-        cp -r "/c/backups/Git" switch ; git switch <free branch>     ALLOW
-        git -C <ungoverned> clean -fd  NEWLINE  git switch <branch>  ALLOW  (no quoting at all)
+        cp -r "/c/backups/Git" switch ; git switch <free branch>
+        git -C <ungoverned> clean -fd  NEWLINE  git switch <branch>
 
-    Both ALLOW on origin/main as well, so neither is introduced by anything in the emit and neither is
-    closed by it. This row exists because a shadow test written on ONE LINE would pass vacuously --
-    it would be measuring the segment splitter, not the emit -- and the next person to write one needs
-    to see that stated rather than rediscover it.
-
-    WHEN THIS TEST REDS, somebody fixed rule 3b's first-verb capture. Delete the row; do not restore
-    the ALLOW.
+    Its docstring said to delete the ALLOW once rule 3b's first-verb capture was fixed. The added
+    per-invocation reading judges the second command with its own text, so both deny.
     """
     same_line = f'cp -r "/c/backups/Git" switch ; git switch {repo.other}'
-    assert run_gate(shell(same_line, cwd=repo.wt), repo.repos) is None, (
-        "the same-line shadow now DENIES. If you fixed rule 3b's first-verb capture deliberately, "
-        "that is the intended outcome -- delete this test. Do NOT restore the ALLOW."
-    )
-    # The quoting-free twin, which proves the residual is the SEGMENT SPLIT and the first-verb capture
-    # rather than anything Remove-QuotedSpans does.
+    assert "LINKED WORKTREE" in assert_denied(run_gate(shell(same_line, cwd=repo.wt), repo.repos))
     unquoted = f"git -C {repo.primary.parent} clean -fd\ngit switch {repo.other}"
-    assert run_gate(shell(unquoted, cwd=repo.wt), repo.repos) is None
+    assert "LINKED WORKTREE" in assert_denied(run_gate(shell(unquoted, cwd=repo.wt), repo.repos))
 
 
 # ------------------------------------ the remedy names the mechanism that made the READER'S worktree
