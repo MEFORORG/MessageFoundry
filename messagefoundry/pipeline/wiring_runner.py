@@ -6278,9 +6278,7 @@ class RegistryRunner:
 
         The recovery path the ADR promises — fix the disk, restart the connection, the backlog drains
         — except that under pooled an internal lane that is STOPPED when the restart runs (for
-        example one T17 stopped while the log was down) stays STOPPED after it, held or not. A
-        reload after that restart re-arms it and releases any hold (measured in
-        ``tests/test_log_write_guard.py``). Per-inbound, so
+        example one T17 stopped while the log was down) stays STOPPED after it, held or not. Per-inbound, so
         restarting A leaves B halted until B is restarted too. A no-op when the inbound is not
         gated (:meth:`_inbound_log_halted`).
 

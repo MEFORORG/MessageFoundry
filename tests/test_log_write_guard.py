@@ -2693,8 +2693,8 @@ async def test_a_stopped_pooled_lane_stays_stopped_after_the_recovery_restart_un
 ) -> None:
     # BACKLOG #5704: what the recovery records say about a pooled internal lane that STOPped while
     # the log was down. The restart lifts the gate and re-arms no STOP, held (a T17 bound) or not
-    # (a leadership-loss hand-back); a reload after that restart re-arms it and releases any hold.
-    # Measured here so the records can say so. This pins a known gap against main, where the halt
+    # (a leadership-loss hand-back). It also measures that a reload after that restart re-arms the
+    # lane and releases any hold: a measurement, not a remedy, so no record names it. This pins a known gap against main, where the halt
     # paused the lane and the restart resumed it; a fix that makes the restart re-arm the lane
     # should flip the first assertion after the restart, and the records with it.
     outdir, logdir = tmp_path / "out", tmp_path / "logs"
