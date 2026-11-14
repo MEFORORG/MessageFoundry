@@ -1710,7 +1710,7 @@ def test_a_short_last_window_is_judged_with_the_text_before_it() -> None:
 async def test_save_refuses_a_nul_past_the_sample_and_writes_nothing(tmp_path: Path) -> None:
     store = UploadStore(tmp_path / "uploads", make_cipher(generate_key()), max_bytes=1 << 16)
     data = _ADT.encode() + _PAST_THE_SAMPLE + b"\x00"
-    with pytest.raises(UploadContentError):
+    with pytest.raises(UploadNotTextError):  # the subclass the route answers 415, not 400
         await store.save(data=data, filename="a.hl7", uploader="op", uploader_id="u-op")
     assert await store.list_files() == []
 

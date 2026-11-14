@@ -940,12 +940,13 @@ class UploadStore:
         **itself**, directly under the canonical uploads root. Raises :class:`UploadPathError` on any
         mismatch — without touching the filesystem for a bad id.
 
-        **A link to another file is refused, wherever that file is (BACKLOG #5552),** because such
-        a link does not resolve to itself. A link to ANOTHER upload's file inside the root would
-        otherwise let a delete, prune or discard under one id act on the other upload. A link that
-        loops back to itself does resolve to itself and passes; it reaches no other file, and its
-        own read fails. A refused pair is left to an operator, and the prune logs each one it
-        leaves."""
+        **What it refuses (BACKLOG #5552): a path that does not resolve to itself,** such as a
+        symbolic link or a junction to another file, wherever that file is. Such a link to ANOTHER
+        upload's file inside the root would otherwise let a delete, prune or discard under one id
+        act on the other upload. **A hard link is not refused:** it is a second name for the same
+        file and resolves to itself. Nor is a symbolic link that loops back to itself, which
+        resolves to itself too; it reaches no other file, and its own read fails. A refused pair
+        is left to an operator, and the prune logs each one it leaves."""
         blob, meta = self._paths_unfollowed(file_id)
         if blob.resolve() != blob or meta.resolve() != meta:
             raise UploadPathError(

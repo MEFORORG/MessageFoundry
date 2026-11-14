@@ -9157,7 +9157,7 @@ def create_app(
 
         **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
         ``.txt`` / ``.xml``). A body that begins with a metadata-bearing binary container's signature
-        (JPEG/PNG/PDF/ZIP incl. DOCX), or holds a NUL byte or a control-dense 8 KiB window anywhere,
+        (JPEG/PNG/PDF/ZIP incl. DOCX/GIF/TIFF), or holds a NUL byte or a control-dense 8 KiB window anywhere,
         is refused with **HTTP 415** before anything is written. Metadata held as text is admitted
         as text, such as an XMP packet in an ``.xml`` file or a PDF whose every stream is text after
         a text head.
