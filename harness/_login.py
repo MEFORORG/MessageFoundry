@@ -118,9 +118,9 @@ class LoginDialog(QDialog):
             self.must_change_password = result.must_change_password
             self.credential_expires_at = result.credential_expires_at
             self.entered_password = password
-        # The engine accepted the credential but wants a second factor; _authenticate prompts for the
-        # TOTP code before opening the window. This used to be documented as always False for a
-        # directory login; that delegation is retired (BACKLOG #1144), and a directory session now
-        # reports the debt like any other.
+        # The engine accepted the credential but wants a second factor; the monitor's _ensure_auth
+        # prompts for it before connecting (BACKLOG #5568). This used to be documented as always
+        # False for a directory login; that delegation is retired (BACKLOG #1144), and a directory
+        # session now reports the debt like any other.
         self.mfa_required = result.mfa_required
         self.accept()

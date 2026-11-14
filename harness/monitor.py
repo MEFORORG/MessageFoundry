@@ -340,7 +340,35 @@ class MonitorPanel(QWidget):
                 error=True,
             )
             return False
+        if dialog.mfa_required and not self._verify_second_factor(client):
+            return False
         return client.token is not None
+
+    def _verify_second_factor(self, client: EngineClient) -> bool:
+        """Verify the second factor an accepted sign-in still owes (BACKLOG #5568).
+
+        A user with MFA enrolled who leaves the dialog's code blank gets an MFA-pending session, on
+        which the engine refuses every poll and action. Ask for a TOTP or recovery code until one
+        is verified. Return False on a cancel, a blank answer or any refusal other than a wrong
+        code; the caller then ends the pending session. ``verify_mfa`` rotates the session, and the
+        polling client is built from the rotated token after this returns."""
+        label = "Enter the code from your authenticator app, or a recovery code:"
+        while True:
+            code, ok = QInputDialog.getText(self, "Second factor required", label)
+            code = code.strip()
+            if not ok or not code:
+                self._set_status("sign-in cancelled: no second factor was entered")
+                return False
+            try:
+                client.verify_mfa(code)
+                return True
+            except ApiError as exc:
+                if exc.status != 401:
+                    self._set_status(str(exc), error=True)
+                    return False
+                label = (
+                    "That code was not accepted. Enter an authenticator code or a recovery code:"
+                )
 
     def _step_up(self) -> bool:
         """Answer a step-up refusal (403 + ``X-Step-Up-Required``): ask for the password, masked,

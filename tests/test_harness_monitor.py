@@ -738,3 +738,131 @@ def test_server_fixture_stops_its_thread_when_startup_times_out(
     # join(timeout=10) has already run inside the fixture's finally, so a thread still alive here
     # was never asked to stop.
     assert leaked == [], f"the fixture leaked {len(leaked)} live thread(s): {leaked}"
+
+
+# --- the second factor a sign-in still owes (BACKLOG #5568) -----------------
+
+
+def _mfa_pending_dialog(client: object, parent: object = None) -> Any:
+    """A sign-in the engine accepted with ``mfa_required``: the session is pending a second factor."""
+
+    class _Dialog:
+        must_change_password = False
+        mfa_required = True
+
+        def exec(self) -> bool:
+            return True
+
+    return _Dialog()
+
+
+class _MfaPendingClient(_RefusedClient):
+    """Holds the MFA-pending session the sign-in left, and verifies a second factor: ``GOOD`` is the
+    one code it accepts; any other code is a 401, as the engine answers a wrong code. ``refusal``,
+    when set, is what every verify raises instead."""
+
+    GOOD = "123456"
+
+    def __init__(self, refusal: ApiError | None = None) -> None:
+        super().__init__("tok-pending", logout_fails=False)
+        self.codes: list[str] = []
+        self._refusal = refusal
+
+    def verify_mfa(self, code: str) -> None:
+        self.calls.append("verify_mfa")
+        self.codes.append(code)
+        if self._refusal is not None:
+            raise self._refusal
+        if code != self.GOOD:
+            raise ApiError("invalid code", status=401)
+        self.token = "tok-verified"
+
+    def for_polling(self) -> None:
+        # Stops _connect right after a sign-in it accepted, so the test reads what came before.
+        self.calls.append("for_polling")
+        raise ApiError("stop here")
+
+
+def _answers(monkeypatch: pytest.MonkeyPatch, *answers: tuple[str, bool]) -> list[str]:
+    """Feed ``answers`` to the code prompt in order, and return the prompt texts it was shown."""
+    queue = list(answers)
+    prompts: list[str] = []
+
+    def get_text(parent: object, title: str, label: str, *args: object, **kwargs: object) -> Any:
+        prompts.append(label)
+        return queue.pop(0)
+
+    monkeypatch.setattr(QInputDialog, "getText", get_text)
+    return prompts
+
+
+def test_an_mfa_pending_sign_in_verifies_the_code_before_connecting(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``_ensure_auth`` ignores the dialog's ``mfa_required`` and connects on the pending
+    session, whose every poll and action the engine refuses until a second factor is verified."""
+    monkeypatch.setattr(monitor, "LoginDialog", _mfa_pending_dialog)
+    _answers(monkeypatch, (" 123456 ", True))
+    client = _MfaPendingClient()
+    panel = MonitorPanel()
+    try:
+        assert panel._ensure_auth(client) is True  # type: ignore[arg-type]
+        assert client.codes == ["123456"]
+        assert client.token == "tok-verified"
+    finally:
+        panel.shutdown()
+
+
+def test_a_wrong_second_factor_is_asked_for_again(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(monitor, "LoginDialog", _mfa_pending_dialog)
+    prompts = _answers(monkeypatch, ("000000", True), ("123456", True))
+    client = _MfaPendingClient()
+    panel = MonitorPanel()
+    try:
+        assert panel._ensure_auth(client) is True  # type: ignore[arg-type]
+        assert client.codes == ["000000", "123456"]
+        assert "not accepted" in prompts[1] and "not accepted" not in prompts[0]
+    finally:
+        panel.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("answers", "refusal", "codes", "status"),
+    [
+        ([("", False)], None, [], "no second factor"),
+        ([("   ", True)], None, [], "no second factor"),
+        ([("000000", True), ("", False)], None, ["000000"], "no second factor"),
+        (
+            [("123456", True)],
+            ApiError("the directory could not confirm this account", status=403),
+            ["123456"],
+            "the directory could not confirm this account",
+        ),
+    ],
+    ids=["cancelled", "blank", "wrong-then-cancelled", "refused"],
+)
+def test_an_unverified_second_factor_ends_the_pending_session(
+    qapp: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    answers: list[tuple[str, bool]],
+    refusal: ApiError | None,
+    codes: list[str],
+    status: str,
+) -> None:
+    """RED when: a sign-in whose second factor was never verified still connects, or leaves the
+    pending session live when the panel drops the client (BACKLOG #2091's rule, for this case)."""
+    client = _MfaPendingClient(refusal=refusal)
+    monkeypatch.setattr(monitor, "EngineClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(monitor, "LoginDialog", _mfa_pending_dialog)
+    _answers(monkeypatch, *answers)
+    panel = MonitorPanel()
+    try:
+        panel._connect()
+        assert client.codes == codes
+        assert [c for c in client.calls if c != "verify_mfa"] == ["health", "me", "logout", "close"]
+        assert panel._client is None
+        assert status in panel._status.text()
+    finally:
+        panel.shutdown()
