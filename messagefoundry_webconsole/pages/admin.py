@@ -258,6 +258,18 @@ def _lock_card(user: UserSummary) -> Markup:
     )
 
 
+def _delete_user_form(user_id: str) -> Markup:
+    """The one-button form that deletes an account, on its detail page and, for an account whose
+    record fails its seal, on the users list (BACKLOG #5559)."""
+    return el(
+        "form",
+        el("button", "Delete user", type="submit"),
+        method="post",
+        action=f"/ui/users/{_seg(user_id)}/delete",
+        class_="ctl",
+    )
+
+
 def users_page(users: Sequence[UserListEntry]) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms.
 
@@ -271,7 +283,8 @@ def users_page(users: Sequence[UserListEntry]) -> Markup:
 
     An account whose record fails its integrity seal arrives as an :class:`IntegrityFailedUser`, its
     id alone (BACKLOG #5520). Its row names the id and says the check failed, and every other cell
-    is blank: the engine sent nothing else of it, so nothing here may read as its name or roles."""
+    is blank: the engine sent nothing else of it, so nothing here may read as its name or roles. Its
+    Status cell offers the delete, the one action the console takes on it (BACKLOG #5559)."""
     summaries = [u for u in users if isinstance(u, UserSummary)]
     show_lock = any(u.lock_state is not None for u in summaries)
     show_scope = any(not u.channel_scope_withheld for u in summaries)
@@ -284,10 +297,13 @@ def users_page(users: Sequence[UserListEntry]) -> Markup:
     rows: list[list[object]] = []
     for u in users:
         if isinstance(u, IntegrityFailedUser):
-            # Not linked: the detail page still reads the row unchecked (BACKLOG #5559).
+            # Not linked: the detail page answers 423 for this record (BACKLOG #5559). The delete
+            # is offered here instead, as the engine keeps the account listed so it can be removed.
             failed: list[object] = [""] * len(headers)
             failed[0] = u.id
-            failed[headers.index("Status")] = "integrity check failed"
+            failed[headers.index("Status")] = el(
+                "span", "integrity check failed ", _delete_user_form(u.id)
+            )
             rows.append(failed)
             continue
         row: list[object] = [
@@ -628,15 +644,7 @@ def user_detail_page(
             class_="ctl",
         )
     danger.append(sign_out)
-    danger.append(
-        el(
-            "form",
-            el("button", "Delete user", type="submit"),
-            method="post",
-            action=f"/ui/users/{user.id}/delete",
-            class_="ctl",
-        )
-    )
+    danger.append(_delete_user_form(user.id))
     return page(
         f"User {user.username}",
         el("h1", f"User: {user.username}"),

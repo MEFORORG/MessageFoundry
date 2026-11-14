@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -246,6 +247,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         p.value for p in Permission if p not in CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
     )
 
+    async def _checked(user_id: str, service: AuthService) -> Any:
+        """The account ``user_id`` names, its record checked against its integrity seal, or the
+        engine's refusal: 404 no row, 423 a record that fails its check, 503 a Vault transit Outage
+        (BACKLOG #5559). The JSON handler's own read, so a failure is reported as the JSON plane
+        reports it. Never a store row nobody checked: a page would show its forged grants."""
+        return await admin.checked_user(service=service, user_id=user_id)
+
+    async def _shown_name(user_id: str, service: AuthService) -> str:
+        """The username a page shows after an action already landed, checked as :func:`_checked`
+        checks it, or the id when the check refuses. The action's one-time output must still be
+        rendered, so a refusal here never replaces the page (BACKLOG #5559)."""
+        try:
+            user = await _checked(user_id, service)
+        except HTTPException:
+            return user_id
+        return str(user.username)
+
     async def _user_detail(
         user_id: str,
         service: AuthService,
@@ -255,17 +273,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         status_code: int = 200,
         scope_draft: list[str] | None = None,
     ) -> HTMLResponse:
-        user = await service.store.get_user(user_id)
-        if user is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        role_ids = await service.store.get_user_role_ids(user.id)
+        # BACKLOG #5559: the checked record carries the role rows its seal covered.
+        user = await _checked(user_id, service)
         all_roles = await admin.list_roles(service=service, _=identity)
         return HTMLResponse(
             pages.user_detail_page(
                 # BACKLOG #1141: a must-change account's page states when its credential dies.
                 admin.user_summary_scoped(
                     user,
-                    role_ids,
+                    list(user.role_ids),
                     credential_expires_at=pending_credential_deadline(service, user),
                     # BACKLOG #1131 (ASVS 6.1.1): this page is users:manage, so it shows the locks.
                     lock_state_at=time.time(),
@@ -476,9 +492,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        # BACKLOG #3393: before any form check; the guard's docstring says why. The row read here
-        # is the guard's target, and the directory-scope check below reuses it.
-        user = await service.store.get_user(user_id)
+        # BACKLOG #3393: before any form check; the guard's docstring says why. The record read
+        # here is the guard's target, and the directory-scope check below reuses it. Checked
+        # (BACKLOG #5559): a missing account is the 404 every path here answered, and a record
+        # that fails its seal is refused before anything is decided from it.
+        user = await _checked(user_id, service)
         try:
             # By keyword: the seam digest records the field's name, not its parameters.
             await admin.refuse_own_channel_scope(
@@ -557,11 +575,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # 409 caught below rather than an overwrite.
         #
         # Read through the summary, not the record: the console never reads a UserRecord attribute
-        # itself, so the seam snapshot covers the field. The role list is not read. A missing user
-        # falls through to the handler's own 404. The record is the one read before the guard.
-        summary = None if user is None else admin.user_summary_scoped(user, [], show_scope=True)
+        # itself, so the seam snapshot covers the field. The role list is not read. The record is
+        # the one read before the guard.
+        summary = admin.user_summary_scoped(user, [], show_scope=True)
         ticked = form.get(CONFIRM_MANUAL_SCOPE_FIELD) == CONFIRM_MANUAL_SCOPE_VALUE
-        if not ticked and summary is not None and needs_manual_scope_confirm(summary):
+        if not ticked and needs_manual_scope_confirm(summary):
             return await _user_detail(
                 user_id,
                 service,
@@ -577,11 +595,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         try:
             body = ChannelScope(
                 channels=channels,
-                expected_source=(
-                    ticked_scope_expected_source(summary)
-                    if ticked and summary is not None
-                    else None
-                ),
+                expected_source=ticked_scope_expected_source(summary) if ticked else None,
             )
             await admin.set_channel_scope(
                 user_id, body=body, request=request, service=service, identity=identity
@@ -631,8 +645,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return await _user_detail(
                 user_id, service, identity, error=str(exc.detail), status_code=_refusal_status(exc)
             )
-        user = await service.store.get_user(user_id)
-        username = user.username if user is not None else user_id
+        username = await _shown_name(user_id, service)
         # The one-time credential is rendered ONCE for out-of-band delivery — never logged/stored.
         # BACKLOG #1141 (ASVS 6.4.5): its deadline rides along on the same page, read off the same
         # response, so the administrator who conveys the credential can convey when it dies.
@@ -665,10 +678,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if reset.enrolment_code is not None and reset.enrolment_code_expires_at is not None:
             # ADR 0207 section 5: an enabled directory account's reset issued an enrolment code
             # for its next first factor. Rendered ONCE, like the generated credential below.
-            target = await service.store.get_user(user_id)
             return HTMLResponse(
                 pages.enrolment_code_page(
-                    target.username if target is not None else user_id,
+                    await _shown_name(user_id, service),
                     reset.enrolment_code,
                     reset.enrolment_code_expires_at,
                     heading="Authenticator reset",
@@ -678,10 +690,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
         # ADR 0197 Amendment A, AC-A4: a local account's factor reset also issued a generated
         # credential. Rendered ONCE, like the password reset's.
-        user = await service.store.get_user(user_id)
         return HTMLResponse(
             pages.temp_password_page(
-                user.username if user is not None else user_id,
+                await _shown_name(user_id, service),
                 reset.temp_password,
                 reset.expires_at,
                 heading="Authenticator reset",
@@ -715,11 +726,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return await _user_detail(
                 user_id, service, identity, error=str(exc.detail), status_code=_refusal_status(exc)
             )
-        user = await service.store.get_user(user_id)
         # Rendered ONCE for the handover; the engine keeps only the digest.
         return HTMLResponse(
             pages.enrolment_code_page(
-                user.username if user is not None else user_id,
+                await _shown_name(user_id, service),
                 issued.code,
                 issued.expires_at,
                 replaced=issued.replaced,
@@ -763,9 +773,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # same, and the page says so beside the form.
 
     async def _federated_view(user_id: str, service: AuthService) -> FederatedIdentityView:
-        user = await service.store.get_user(user_id)
-        if user is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        user = await _checked(user_id, service)
         view: FederatedIdentityView = admin.federated_identity_view(user, service)
         return view
 

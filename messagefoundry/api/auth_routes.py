@@ -2632,6 +2632,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     return AdminHandlers(
         list_roles=list_roles,
         list_users=list_users,
+        checked_user=_checked_user,
         list_custom_roles=list_custom_roles,
         create_user=create_user,
         update_user=update_user,
