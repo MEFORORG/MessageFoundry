@@ -366,9 +366,9 @@ def _subcommands() -> dict[str, argparse.ArgumentParser]:
 
 
 def _rendered_help(command: str, monkeypatch: pytest.MonkeyPatch) -> str:
-    """The subcommand's --help as argparse renders it, unwrapped, so a phrase is never split."""
-    monkeypatch.setenv("COLUMNS", "10000")
-    return " ".join(_subcommands()[command].format_help().split())
+    """The subcommand's --help as argparse renders it in an 80-column terminal."""
+    monkeypatch.setenv("COLUMNS", "80")
+    return _subcommands()[command].format_help()
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
@@ -378,12 +378,15 @@ def test_offline_env_help_says_the_flag_loads_no_values(
     # validate, graph and dryrun read --env only for the value-file check under --project-root.
     # Their help said it selected the file's values, which a site could take as an environment
     # check; it must name what it does and point at check --env, which reads the values.
-    text = _rendered_help(command, monkeypatch)
+    rendered = _rendered_help(command, monkeypatch)
+    # argparse breaks help on hyphens; a reader copying the flag must not get "--project-".
+    assert "--project-\n" not in rendered
+    text = " ".join(rendered.split())
     assert "selects environments/<env>.toml values" not in text
-    assert "loads no env() values" in text and "check --env does" in text
-    assert "without --project-root it has no effect" in text
+    assert "It selects no values: at least" in text and "left to check --env" in text
+    assert "without --project-root it does nothing" in text
     # Control: check's own help still says it reads the name as serve does.
-    assert "read as serve --env reads it" in _rendered_help("check", monkeypatch)
+    assert "read as serve --env reads it" in " ".join(_rendered_help("check", monkeypatch).split())
 
 
 def test_validate_env_resolves_no_value_where_check_env_does(

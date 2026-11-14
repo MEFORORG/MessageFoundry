@@ -1397,10 +1397,10 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
         "--env",
         default=None,
         help=env_help
-        or "active environment NAME, used only for ADR 0050's value-file check under --project-root, "
-        "which can fail the command when that environment's value file is missing; without "
-        "--project-root it has no effect. This command loads no env() values, resolves no env() "
-        "reference and runs no posture check; check --env does.",
+        or "active environment NAME. Here it feeds ADR 0050's value-file check under --project-root, "
+        "which can fail the command when that environment's value file is missing, and without "
+        "--project-root it does nothing. It selects no values: at least loading env() values, "
+        "resolving env() references and the posture check are left to check --env.",
     )
     p.add_argument(
         "--service-config",
