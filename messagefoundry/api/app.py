@@ -9157,8 +9157,8 @@ def create_app(
 
         **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
         ``.txt`` / ``.xml``). A body that begins with a metadata-bearing binary container's signature
-        (JPEG/PNG/PDF/ZIP incl. DOCX/GIF/TIFF), or holds a NUL byte or a control-dense 8 KiB window
-        anywhere, is refused with **HTTP 415** before anything is written. What this lets through is
+        (JPEG/PNG/PDF/ZIP incl. DOCX/GIF/TIFF), or holds a NUL byte or a control-dense 8 KiB window,
+        is refused with **HTTP 415** before anything is written. What this lets through is
         stated in docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types".
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
@@ -9197,11 +9197,9 @@ def create_app(
             raise HTTPException(413, str(exc)) from None
         except UploadNotTextError as exc:
             # ASVS 14.2.8: the feature's text-only format contract, checked by save() before anything
-            # is written (BACKLOG #5551 moved it there from this route). A binary container
-            # (JPEG/PNG/PDF/ZIP incl. DOCX) or a non-text body (NUL / control-dense) is refused with
-            # 415 + a metadata-only upload.reject audit, which is what "no metadata stripping" rests
-            # on; docs/CONNECTIONS.md ("Permitted types") states what it lets through. The answer
-            # and the audit carry the reason only, never the file name or content.
+            # is written (BACKLOG #5551 moved it there from this route). docs/CONNECTIONS.md
+            # ("Permitted types") states what it refuses and what it lets through. The answer and the
+            # audit carry the reason only, never the file name or content.
             await engine.store.record_audit(
                 "upload.reject",
                 actor=identity.username,

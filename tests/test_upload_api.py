@@ -366,8 +366,7 @@ async def test_upload_accepts_txt_and_xml(engine: Engine, tmp_path: Path) -> Non
 
 async def test_upload_rejects_binary_container_415(engine: Engine, tmp_path: Path) -> None:
     # ASVS 14.2.8: a metadata-bearing binary container (JPEG/PDF/ZIP incl. DOCX) is refused with HTTP 415
-    # BEFORE anything is written, even under a permitted text extension — so no embedded metadata
-    # (EXIF/XMP/docProps) can be stored (closes "no metadata stripping" without a stripper). The magic
+    # BEFORE anything is written, even under a permitted text extension. The magic
     # bytes are sent as BYTES so they survive multipart encoding; the audit records the shape, never a body.
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
