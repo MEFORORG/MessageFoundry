@@ -155,8 +155,10 @@ in the reply, else the first Value, the Header included, and an empty `<faultcod
 *(Amended 2026-11-13, BACKLOG #5912: those two are not the only fault-code patterns now. At least
 `_CODE_RE` matches the SOAP 1.2 `Code` start tag the same way, except that the name must be followed by
 whitespace, `/` or `>`, so `<Code.x>` does not match, and `_CODE_END_RE` is its close tag. Each of the
-three start-tag patterns is tried at most once, anchored: `faultcode` and `Code` at the Fault's first
-child element, `Value` at the Code's first child. Only a `faultcode` or `Value` match reaches
+three start-tag patterns is tried at most once, anchored, by the first read: `faultcode` and `Code` at
+the Fault's first child element, `Value` at the Code's first child. Where that read yields no code,
+the fallback searches forward once each for the first `faultcode` and a `Value` ahead of it, as the
+code did before #5912. Only a `faultcode` or `Value` match reaches
 `_code_text`; the `_fault_code` docstring says how. The Fault start-tag search and the Fault and Code close-tag searches step over a comment, a CDATA section or a processing instruction whole, with `str.find`, as the first-child search does; `_search_outside_markup` says how. This decision is unchanged.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
 `messagefoundry/`. *(Corrected 2026-11-04: that sentence, the "regex-only" premise and the heading's
 "no XML parser" are no longer true of the codebase. The engine imports XML parsers, and

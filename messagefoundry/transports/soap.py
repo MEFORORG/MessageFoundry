@@ -156,7 +156,8 @@ _WSSE_FAULT_RE = re.compile(
 # only inside the Fault _FAULT_RE matched, up to that Fault's close tag (_FAULT_END_RE) or the reply's
 # end. BACKLOG #5912: the code element is the Fault's first child, a faultcode or a Code (_CODE_RE),
 # and for a Code the Value that is its own first child, up to its close tag (_CODE_END_RE);
-# _fault_code says why. The Fault and Code close tags are searched for outside markup, with
+# _fault_code says why, and when it falls back to the earlier search (_searched_code). The Fault
+# and Code close tags are searched for outside markup, with
 # _FAULT_END_OUTSIDE_MARKUP_RE and _CODE_END_OUTSIDE_MARKUP_RE, which hold these two patterns.
 _FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
 _CODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])", re.IGNORECASE)
@@ -330,13 +331,19 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     SOAP 1.1's ``faultcode`` or SOAP 1.2's ``Code``, which both schemas put first. For ``Code`` the
     code is the ``Value`` that is the Code's own first child, read only up to the Code's close tag.
     A ``Value`` anywhere else in the Fault, in a Subcode, Reason, Node, Role or Detail, never
-    decides permanent versus retryable. Where the first child is neither, or the code element
-    cannot hold a code, the code is ``""``, and :func:`_classify_soap` reads that as a permanent
-    fault, never as delivered: a later element is not tried, so a Detail cannot stand in for a
-    missing or misplaced code, and a SOAP 1.1 Fault whose faultcode is not its first child reads as
-    permanent. Each step is one scan forward from the Fault, so the read stays linear in the reply.
-    A Fault or Code close tag inside a comment, a CDATA section or a processing instruction does not
-    end either element (:func:`_search_outside_markup`)."""
+    decides permanent versus retryable when the first child yields a code. A Fault or Code close tag
+    inside a comment, a CDATA section or a processing instruction does not end either element
+    (:func:`_search_outside_markup`).
+
+    Where the first-child read yields no code, because the first child is neither element, it
+    cannot hold a code, or a ``<!`` the read does not step over (a DOCTYPE, a lowercase
+    ``<![cdata[``, an unterminated comment) stops it, the code falls back to the earlier search
+    (:func:`_searched_code`): the first ``faultcode``, or a ``Value`` before it, in the Fault. So a
+    shape the first-child read cannot place, such as a SOAP 1.1 ``faultstring`` before the
+    ``faultcode`` or a SOAP 1.2 ``Reason`` before the ``Code``, reads as it did before #5912, and a
+    Receiver fault there is retried rather than dead-lettered. Only where both reads find nothing is
+    the code ``""``, which :func:`_classify_soap` reads as a permanent fault, never as delivered.
+    Each read is one scan forward from the Fault, so the whole stays linear in the reply."""
     if fault is None:
         fault, _ = _find_fault(body)
         if fault is None:
@@ -347,6 +354,12 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
         return ""
     fault_end = _search_outside_markup(_FAULT_END_OUTSIDE_MARKUP_RE, body, gt + 1, len(body))
     end = len(body) if fault_end is None else fault_end.start()
+    return _first_child_code(body, gt, end) or _searched_code(body, gt + 1, end)
+
+
+def _first_child_code(body: str, gt: int, end: int) -> str:
+    """The code the Fault's first child element holds, or ``""``: the read :func:`_fault_code`
+    tries first. ``gt`` is the Fault start tag's ``>`` and ``end`` where the Fault ends."""
     child = _first_child(body, gt + 1, end)
     if child < 0:
         return ""
@@ -362,6 +375,21 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     child = _first_child(body, code_gt + 1, stop)
     value = None if child < 0 else _CODEVALUE_RE.match(body, child, stop)
     return "" if value is None else _code_text(value, _CODEVALUE_END_RE, body, stop)
+
+
+def _searched_code(body: str, start: int, end: int) -> str:
+    """The code the earlier search finds in ``body[start:end]``, or ``""``: :func:`_fault_code`'s
+    fallback, kept as it was before BACKLOG #5912. The first ``faultcode`` or ``Value`` start tag
+    there is the code element, a ``Value`` taken only before the first ``faultcode``, and only that
+    first tag is read: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may
+    carry an element of the other name. Markup is not stepped over, as it was not before."""
+    faultcode = _FAULTCODE_RE.search(body, start, end)
+    value = _CODEVALUE_RE.search(body, start, end if faultcode is None else faultcode.start())
+    if value is not None:
+        return _code_text(value, _CODEVALUE_END_RE, body, end)
+    if faultcode is not None:
+        return _code_text(faultcode, _FAULTCODE_END_RE, body, end)
+    return ""
 
 
 def _classify_soap(status: int, body: str) -> DeliveryError | None:

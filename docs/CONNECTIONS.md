@@ -2947,16 +2947,19 @@ follow-on and is **not** built.
 **Fault & delivery semantics.** The response is inspected for a SOAP `Fault` (which can arrive as an HTTP
 500 **or** an HTTP 200 body). A **Sender/Client** fault → `NegativeAckError` → **dead-letter** (the
 request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. The
-Sender/Receiver class is read only from the Fault's first child element: SOAP 1.2's `Code`, then the
+Sender/Receiver class is read first from the Fault's first child element: SOAP 1.2's `Code`, then the
 `Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or
 processing instruction before either child is stepped over, with at least these exceptions, each of
-which leaves no code: such markup that has no terminator; a `<!` that opens anything else, such as a
-DOCTYPE; and a `</` inside such markup within the `faultcode` or `Value` itself, which still ends the
-code text. A Fault start tag, a `</Fault>` or a `</Code>` inside such markup is stepped over, so the
+which leaves that read with no code: such markup that has no terminator; a `<!` that opens anything
+else, such as a DOCTYPE or a lowercase `<![cdata[`; and a `</` inside such markup within the
+`faultcode` or `Value` itself, which still ends the code text. Where that read yields no code, for
+those shapes, for a first child that is neither element (a SOAP 1.1 `faultstring` before the
+`faultcode`, a SOAP 1.2 `Reason` before the `Code`), or for a code element that holds no code, the
+code falls back to the earlier search: the Fault's first `faultcode`, or a `Value` ahead of it,
+markup not stepped over. A Fault start tag, a `</Fault>` or a `</Code>` inside such markup is stepped over, so the
 real Fault and its code are read; only where every Fault start tag after the first Body start tag,
 or with none there every one, is inside such markup is the first of them taken as the Fault, so such
-a reply never reads as delivered. A Fault whose first child is neither, including a SOAP 1.1 Fault whose
-`faultcode` is not its first child, or whose code element holds no code, reads as a permanent fault.
+a reply never reads as delivered. A Fault where neither read finds a code reads as a permanent fault.
 The WS-Security check is separate: a WS-Security code anywhere from where the Fault search starts (after
 the first Body start tag when a Fault follows it, else the whole reply), inside the Fault or not, still
 dead-letters the reply. An

@@ -131,6 +131,31 @@ def _ref_fault_code(body: str) -> str:
         return ""
     fault_inner = _REF_FAULT_INNER_RE.match(body, fault_tag.end())
     inner = "" if fault_inner is None else fault_inner.group(1)
+    return _ref_first_child_code(inner) or _ref_searched_code(inner)
+
+
+#: The fallback's start-tag names, written out independently of _FAULTCODE_RE and _CODEVALUE_RE.
+_REF_FAULTCODE_NAME_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
+_REF_VALUE_NAME_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
+
+
+def _ref_searched_code(inner: str) -> str:
+    """The fallback: the old patterns' search over the Fault, a Value only ahead of the first
+    faultcode, markup not stepped over (BACKLOG #5912)."""
+    faultcode = _REF_FAULTCODE_NAME_RE.search(inner)
+    head = inner if faultcode is None else inner[: faultcode.start()]
+    value = _REF_VALUE_NAME_RE.search(head)
+    # Only each name is searched for; its capture, the old pattern's, may run past the faultcode.
+    if value is not None:
+        old_value = _OLD_CODEVALUE_RE.match(inner, value.start())
+        return _ref_code_text(old_value, inner, soap._CODEVALUE_END_RE)
+    if faultcode is None:
+        return ""
+    old_faultcode = _OLD_FAULTCODE_RE.match(inner, faultcode.start())
+    return _ref_code_text(old_faultcode, inner, soap._FAULTCODE_END_RE)
+
+
+def _ref_first_child_code(inner: str) -> str:
     lead = _REF_BEFORE_THE_CHILD_RE.match(inner)
     child = inner[lead.end() :] if lead is not None else ""
     faultcode = _OLD_FAULTCODE_RE.match(child)
@@ -179,11 +204,11 @@ _NAMED_SHAPES = {
         "<!-- c -->soap:Server",
     ),
     "multiline": ("<Fault><faultcode>\n  soap:Client\n</faultcode></Fault>", "\n  soap:Client\n"),
-    # BACKLOG #5912: a Value outside a Code element is not a code, and the Fault's first child is
-    # the only candidate.
-    "bare-value-then-faultcode": ("<Fault><Value>x:Sender</Value><faultcode>y", ""),
-    "name-only-prefix-match": ("<Fault><faultcodeX>a</faultcodeX><Value>v</Value></Fault>", ""),
-    "code-name-prefix-match": ("<Fault><CodeX><Value>v</Value></CodeX></Fault>", ""),
+    # BACKLOG #5912: the Fault's first child is read first. Where it yields no code, the earlier
+    # search is the fallback (PR 2936 hold of 2026-11-14): the first faultcode, or a Value before it.
+    "bare-value-then-faultcode": ("<Fault><Value>x:Sender</Value><faultcode>y", "x:Sender"),
+    "name-only-prefix-match": ("<Fault><faultcodeX>a</faultcodeX><Value>v</Value></Fault>", "v"),
+    "code-name-prefix-match": ("<Fault><CodeX><Value>v</Value></CodeX></Fault>", "v"),
     "code-then-faultcode": (
         "<Fault><Code><Value>env:Sender</Value></Code><faultcode>soap:Server</faultcode></Fault>",
         "env:Sender",
@@ -196,8 +221,11 @@ _NAMED_SHAPES = {
         "<env:Fault><!-- c --><env:Code><env:Value>env:Sender</env:Value></env:Code></env:Fault>",
         "env:Sender",
     ),
-    "code-without-value": ("<Fault><Code><Subcode/></Code><Detail><Value>v</Value></Detail>", ""),
-    "self-closing-code": ("<Fault><Code/><Detail><Value>Receiver</Value></Detail></Fault>", ""),
+    "code-without-value": ("<Fault><Code><Subcode/></Code><Detail><Value>v</Value></Detail>", "v"),
+    "self-closing-code": (
+        "<Fault><Code/><Detail><Value>Receiver</Value></Detail></Fault>",
+        "Receiver",
+    ),
     "unclosed-code": ("<Fault><Code><Value>env:Sender</Value>", "env:Sender"),
     # Markup that is not an element is stepped over whole, so a tag inside it is not the child.
     "comment-holding-a-faultcode": (
@@ -217,25 +245,39 @@ _NAMED_SHAPES = {
         "<Fault><Code><!-- <Value>Receiver</Value> --><Value>Sender</Value></Code></Fault>",
         "Sender",
     ),
-    "unterminated-comment": ("<Fault><!-- <faultcode>Server</faultcode></Fault>", ""),
-    "doctype-before-the-code": ("<Fault><!DOCTYPE x><faultcode>Server</faultcode></Fault>", ""),
-    # The Code's own first child must be its Value; a Subcode's Value is not the code.
+    # Where the first-child read stops, the fallback reads the code as the earlier search did.
+    "unterminated-comment": ("<Fault><!-- <faultcode>Server</faultcode></Fault>", "Server"),
+    "doctype-before-the-code": (
+        "<Fault><!DOCTYPE x><faultcode>Server</faultcode></Fault>",
+        "Server",
+    ),
+    "bang-before-the-code": ("<Fault><!foo><faultcode>Server</faultcode></Fault>", "Server"),
+    "lowercase-cdata-before-the-code": (
+        "<Fault><![cdata[x]]><faultcode>soap:Server</faultcode></Fault>",
+        "soap:Server",
+    ),
+    # The Code's own first child must be its Value for the first read; a Subcode first leaves the
+    # fallback, which takes the Fault's first Value.
     "subcode-first": (
         "<Fault><Code><Subcode><Value>Receiver</Value></Subcode><Value>Sender</Value></Code></Fault>",
-        "",
+        "Receiver",
     ),
     "unclosed-code-then-detail": (
         "<Fault><Code><Reason><Text>t</Text></Reason><Detail><Value>Receiver</Value></Detail></Fault>",
-        "",
+        "Receiver",
     ),
-    # A Value start tag that runs past the Code's close tag is read only up to it.
-    "value-tag-past-the-code": ("<Fault><Code><Value</Code>Receiver</Value></Fault>", ""),
+    "value-tag-past-the-code": ("<Fault><Code><Value</Code>Receiver</Value></Fault>", "Receiver"),
     # The faultcode name ends at a non-word character.
     "faultcode-name-boundary": ("<Fault><faultcodeX>Server</faultcode></Fault>", ""),
-    # SOAP 1.1's schema puts faultcode first; a faultcode after a faultstring is not read.
+    # SOAP 1.1's schema puts faultcode first; after a faultstring only the fallback reads it.
     "faultstring-before-faultcode": (
         "<soap:Fault><faultstring>busy</faultstring><faultcode>soap:Server</faultcode></soap:Fault>",
-        "",
+        "soap:Server",
+    ),
+    "reason-before-the-code": (
+        "<env:Fault><env:Reason><env:Text>busy</env:Text></env:Reason><env:Code>"
+        "<env:Value>env:Receiver</env:Value></env:Code></env:Fault>",
+        "env:Receiver",
     ),
     # The first code element decides: an empty one is not passed over for the Value after it.
     "empty": ("<Fault><faultcode></faultcode><Value>x:Sender</Value></Fault>", ""),
@@ -340,11 +382,11 @@ def test_an_empty_code_element_yields_no_code(body: str) -> None:
     assert failure.code == "soap-fault"
 
 
-# BACKLOG #5912: a Value outside the Fault's Code element decided the class. The PR 2790 reading
-# took the Fault's first Value before any faultcode, so a Value in a Reason, Node, Role or Detail,
-# or one ahead of a SOAP 1.1 faultcode (#6664 item 5), could make a fault read as a Receiver one
-# and retry. Each shape reads ``env:Receiver``-like text outside a Code.
-_VALUE_OUTSIDE_THE_CODE = {
+# BACKLOG #5912: the PR 2790 reading took the Fault's first Value before any faultcode. Each shape
+# here has no code the Fault's first child yields, so the fallback reads it that way: the first five
+# by a Value in a Reason, Node, Role or Detail, or ahead of a SOAP 1.1 faultcode (#6664 item 5), the
+# rest the shapes of the PR 2936 hold of 2026-11-14, which head 933e347fe8 dead-lettered.
+_NO_FIRST_CHILD_CODE = {
     "soap12-detail-value-no-code": (
         "<env:Body><env:Fault><env:Reason><env:Text>bad</env:Text></env:Reason><env:Detail>"
         "<app:Value>Receiver</app:Value></env:Detail></env:Fault></env:Body>"
@@ -362,6 +404,33 @@ _VALUE_OUTSIDE_THE_CODE = {
     ),
     "soap11-bare-value-before-faultcode": (
         "<soap:Fault><Value>Server</Value><faultcode>soap:Client</faultcode></soap:Fault>"
+    ),
+    # Hold shape C: a `<!` the first-child read does not step over, ahead of the faultcode.
+    "doctype-before-the-faultcode": (
+        "<soap:Envelope><soap:Body><soap:Fault><!DOCTYPE x><faultcode>soap:Server</faultcode>"
+        "</soap:Fault></soap:Body></soap:Envelope>"
+    ),
+    "bang-before-the-faultcode": (
+        "<soap:Envelope><soap:Body><soap:Fault><!foo><faultcode>soap:Server</faultcode>"
+        "</soap:Fault></soap:Body></soap:Envelope>"
+    ),
+    # Hold shape D: SOAP 1.1's faultstring ahead of its faultcode.
+    "faultstring-before-the-faultcode": (
+        "<soap:Envelope><soap:Body><soap:Fault><faultstring>busy</faultstring>"
+        "<faultcode>soap:Server</faultcode></soap:Fault></soap:Body></soap:Envelope>"
+    ),
+    "reason-before-the-code": (
+        "<env:Envelope><env:Body><env:Fault><env:Reason><env:Text xml:lang='en'>busy</env:Text>"
+        "</env:Reason><env:Code><env:Value>env:Receiver</env:Value></env:Code></env:Fault>"
+        "</env:Body></env:Envelope>"
+    ),
+    "unterminated-comment-in-the-fault": (
+        "<soap:Envelope><soap:Body><soap:Fault><!-- note <faultcode>soap:Server</faultcode>"
+        "</soap:Fault></soap:Body></soap:Envelope>"
+    ),
+    "lowercase-cdata-before-the-faultcode": (
+        "<soap:Envelope><soap:Body><soap:Fault><![cdata[note]]><faultcode>soap:Server</faultcode>"
+        "</soap:Fault></soap:Body></soap:Envelope>"
     ),
 }
 
@@ -386,15 +455,53 @@ def _pr2790_fault_code(body: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "body", list(_VALUE_OUTSIDE_THE_CODE.values()), ids=list(_VALUE_OUTSIDE_THE_CODE)
+    "body", list(_NO_FIRST_CHILD_CODE.values()), ids=list(_NO_FIRST_CHILD_CODE)
 )
-def test_a_value_outside_the_code_does_not_decide_the_fault(body: str) -> None:
-    """Red on the PR 2790 reading, which retried each of these as a Receiver fault. Now no code is
-    read, and the fault is permanent: an ambiguous code never reads as retryable or delivered."""
+def test_with_no_first_child_code_the_fallback_reads_as_before(body: str) -> None:
+    """The PR 2936 hold of 2026-11-14: where the Fault's first child yields no code, the fallback
+    reads each shape as the PR 2790 reading did, so a fault main retries is never newly
+    dead-lettered. That keeps the PR 2790 trade for these shapes: a Value outside the Code decides
+    them, as it did before #5912. Control: with the fallback patched out, each reads as no code, a
+    permanent fault, as PR 2936 head 933e347fe8 read it."""
+    reading = _pr2790_fault_code(body)
+    assert soap._RECEIVER_RE.search(reading), "the shape must hold a retryable reading"
+    assert _fault_code(body) == reading
+    assert _outcome(_classify_soap(200, body)) == "transient"
+    assert _outcome(_classify_soap(500, body)) == "transient"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(soap, "_searched_code", lambda body, start, end: "")
+        assert _fault_code(body) == ""
+        assert _outcome(_classify_soap(200, body)) == "soap-fault"
+
+
+#: BACKLOG #5912: where the first child holds the code, a Value outside the Code, here inside markup
+#: ahead of it, does not decide the fault, though the PR 2790 reading took it.
+_VALUE_IN_MARKUP_BEFORE_THE_CODE = {
+    "soap11-commented-value-before-faultcode": (
+        "<soap:Fault><!-- <Value>Server</Value> --><faultcode>soap:Client</faultcode></soap:Fault>",
+        "soap:Client",
+    ),
+    "soap12-commented-value-in-the-code": (
+        "<env:Fault><env:Code><!-- <x:Value>Receiver</x:Value> --><env:Value>env:Sender"
+        "</env:Value></env:Code></env:Fault>",
+        "env:Sender",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("body", "code"),
+    list(_VALUE_IN_MARKUP_BEFORE_THE_CODE.values()),
+    ids=list(_VALUE_IN_MARKUP_BEFORE_THE_CODE),
+)
+def test_a_value_outside_the_first_child_code_does_not_decide_the_fault(
+    body: str, code: str
+) -> None:
+    """Red on the PR 2790 reading, which retried each of these as a Receiver fault."""
     assert soap._RECEIVER_RE.search(_pr2790_fault_code(body)), "the shape must exercise the defect"
-    assert _fault_code(body) == ""
-    assert _outcome(_classify_soap(200, body)) == "soap-fault"
-    assert _outcome(_classify_soap(500, body)) == "soap-fault"
+    assert _fault_code(body) == code
+    assert _outcome(_classify_soap(200, body)) == "soap-sender"
+    assert _outcome(_classify_soap(500, body)) == "soap-sender"
 
 
 _STILL_RECEIVER = {
@@ -617,6 +724,8 @@ def test_a_fault_tag_inside_markup_does_not_decide_the_fault(
     monkeypatch.setattr(soap, "_FAULT_OUTSIDE_MARKUP_RE", soap._FAULT_RE)
     monkeypatch.setattr(soap, "_FAULT_END_OUTSIDE_MARKUP_RE", soap._FAULT_END_RE)
     monkeypatch.setattr(soap, "_CODE_END_OUTSIDE_MARKUP_RE", soap._CODE_END_RE)
+    # Head adfdcd5d31 had no fallback to the earlier search, which may read such a shape too.
+    monkeypatch.setattr(soap, "_searched_code", lambda body, start, end: "")
     assert _outcome(_classify_soap(200, body)) == unmarked
 
 
@@ -737,7 +846,9 @@ def test_random_replies_yield_the_reference_reading() -> None:
     child, now yield none, the head fragments gained two Faults that hold a code, and markup the
     first-child search steps over may precede the code element; and 25.3%, 16.9% and 3.5% after
     the PR 2936 repair, the same day, which added markup holding Fault start tags to the head
-    fragments and to one envelope's Body)."""
+    fragments and to one envelope's Body; and 56.2%, 15.8% and 3.5% after the 2026-11-14 hold
+    repair, whose fallback to the earlier search reads a code from most of the replies the
+    first-child read yields none for)."""
     rng = random.Random(2827)
     total, with_a_code, anchored, fallback = 5_000, 0, 0, 0
     for _ in range(total):
