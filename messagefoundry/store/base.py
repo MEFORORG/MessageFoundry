@@ -3309,7 +3309,8 @@ class AuthStore(Protocol):
         landed after a bind's sweep would leave a session the bind could not see. A row holding
         either half of a pair is not unbound, and the insert is refused.
 
-        Every other caller passes nothing and is byte-identical: no extra read, no extra statement.
+        A caller that passes no guard still has its account read, for the session epoch, and still
+        takes the missing-row refusal above; only the binding comparison is skipped.
         """
         ...
 

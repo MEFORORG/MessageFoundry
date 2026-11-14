@@ -43,21 +43,28 @@ def _delete_before_insert(monkeypatch: pytest.MonkeyPatch, store: MessageStore) 
     return issued
 
 
-def _pad_slots(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Record each failure-pad deadline, and skip the pad's sleep."""
-    slots: list[float] = []
+#: Widened as test_mfa.py's AC6 arm widens it, so a loaded host cannot push the work or the
+#: deferred row past a slot boundary and add a second deadline.
+_BUDGET = 5.0
+
+
+def _pad_slots(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record the slot of each failure-pad deadline, and skip the pad's waits."""
+    slots: list[int] = []
     real_deadline = service_module._failure_deadline
 
     def spy(started: float, now: float, budget: float | None = None) -> float:
         deadline = real_deadline(started, now, budget)
-        slots.append(deadline)
+        slots.append(round((deadline - started) / _BUDGET))
         return deadline
 
     async def no_sleep(_deadline: float) -> None:
         return None
 
+    monkeypatch.setattr(service_module, "_FAILURE_BUDGET_SECONDS", _BUDGET)
     monkeypatch.setattr(service_module, "_failure_deadline", spy)
     monkeypatch.setattr(service_module, "_sleep_until", no_sleep)
+    monkeypatch.setattr(service_module, "_sleep_until_write_point", no_sleep)
     return slots
 
 
@@ -75,7 +82,7 @@ async def test_a_sign_in_whose_account_is_deleted_mid_login_is_refused_and_padde
         assert issued == [False], "the store did not refuse the insert for a missing account"
         assert not outcome.ok and outcome.error == "invalid credentials"
         assert outcome.token is None
-        assert len(slots) == 1, "the refusal did not go through the failure pad"
+        assert slots == [1], "the refusal did not answer in the failure pad's first slot"
         rows = await store.list_audit(action="auth.login_failed")
         assert [json.loads(r["detail"])["reason"] for r in rows] == ["unknown_or_disabled"]
         assert await store.list_audit(action="auth.login_success") == []

@@ -1894,7 +1894,8 @@ class _BindingChangedMidLogin(Exception):
     refuses inside the same transaction that re-reads the binding, so there is no point at which the
     caller could have asked "is it still bound?" and acted on the answer — a second call would be a
     second transaction. The exception carries the refusal out of a method whose whole contract is
-    "returns the token", without giving every other caller a ``None`` to handle.
+    "returns the token". The store's one ``False`` does not say which cause it was, so a directory
+    leg reports a deleted account as a binding change.
     """
 
 
