@@ -5861,6 +5861,16 @@ residual. If the first reconciler's pass ended before it alerted, the second's q
 means that account pages nobody. A quiet revocation whose own row is refused alerts instead, with no
 notice.
 
+A directory sign-in's role sync is a compare-and-set on the roles it read too (vault BACKLOG
+#3085), on the Kerberos and the OIDC leg alike. When a reconciler or another sign-in wrote the
+roles in between, the sign-in reads them again. Roles already at the directory's set count as
+synced, and the sign-in records no change and ends no session. Otherwise it writes once more
+against what it read, and its `auth.ad_roles_resynced` row, its revoke, its notice and any
+Administrator alert are computed from the roles it replaced. If that write also finds the roles
+moved, the sign-in is refused with an `auth.login_failed` row whose reason is
+`role_sync_contended`, and the other writer's roles stand. The sign-in is refused, not the role
+write: a directory write that takes Administrator from its last holder is still applied.
+
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors
 the reconciler treats as a refusal. Any other error still ends the pass. The reconciler logs

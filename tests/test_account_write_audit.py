@@ -438,7 +438,7 @@ async def test_a_sign_in_logs_its_first_role_error_before_the_retry_can_raise(
             raise NotImplementedError("synthetic first")
         raise sqlite3.OperationalError("synthetic retry")
 
-    monkeypatch.setattr(store, "set_user_roles", failing)
+    monkeypatch.setattr(store, "set_user_roles_if_held", failing)
     with (
         caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"),
         pytest.raises(NotImplementedError) as raised,
@@ -524,7 +524,7 @@ async def test_a_sign_in_whose_role_retry_raises_still_ends_the_sessions_and_tel
             raise sqlite3.OperationalError("synthetic first")
         raise retry_error
 
-    monkeypatch.setattr(store, "set_user_roles", failing)
+    monkeypatch.setattr(store, "set_user_roles_if_held", failing)
     with pytest.raises(type(retry_error)):
         await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
     assert len(calls) == 2
@@ -568,7 +568,7 @@ async def test_a_sign_in_role_retry_refused_before_it_wrote_still_fails_closed(
         revokes.append(user_id)
         return await real_revoke(user_id, **kwargs)
 
-    monkeypatch.setattr(store, "set_user_roles", failing)
+    monkeypatch.setattr(store, "set_user_roles_if_held", failing)
     monkeypatch.setattr(service, "_revoke_after_commit", revoke)
     with pytest.raises(type(retry_error)):
         await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
@@ -594,7 +594,7 @@ async def test_a_sign_in_demotion_whose_role_write_raises_before_it_writes_ends_
     async def refused(*_args: object, **_kwargs: object) -> None:
         raise UnknownRoleError([VIEWER])
 
-    monkeypatch.setattr(store, "set_user_roles", refused)
+    monkeypatch.setattr(store, "set_user_roles_if_held", refused)
     with pytest.raises(UnknownRoleError):
         await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
     monkeypatch.undo()
