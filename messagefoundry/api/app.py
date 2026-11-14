@@ -446,7 +446,7 @@ from messagefoundry.logging_setup import (
     level_refused_on_production,
     set_runtime_level,
 )
-from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
+from messagefoundry.parsing.sniff import attachment_mime_agrees
 from messagefoundry.pipeline import (
     ApprovedConfig,
     ConfigDigestMismatch,
@@ -573,6 +573,7 @@ from messagefoundry.uploads import (
     UploadedFileMeta,
     UploadError,
     UploadNotFoundError,
+    UploadNotTextError,
     UploadPathError,
     UploadQuotaError,
     UploadRetentionRunner,
@@ -9155,9 +9156,11 @@ def create_app(
         under the store DEK when a key is set); step-up-gated + audited (metadata only).
 
         **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
-        ``.txt`` / ``.xml``). A metadata-bearing binary container (JPEG/PNG/PDF/ZIP incl. DOCX) or any
-        non-text body is refused with **HTTP 415** before anything is written — so no embedded metadata
-        (EXIF/XMP/docProps) can ever be stored.
+        ``.txt`` / ``.xml``). A body that begins with a metadata-bearing binary container's signature
+        (JPEG/PNG/PDF/ZIP incl. DOCX), or holds a NUL byte or a control-dense 8 KiB window anywhere,
+        is refused with **HTTP 415** before anything is written. Metadata held as text is admitted
+        as text, such as an XMP packet in an ``.xml`` file or a PDF whose every stream is text after
+        a text head.
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
         to you and to authorized operators holding ``files:access_any`` (administrators). Your username
@@ -9181,20 +9184,6 @@ def create_app(
             raise HTTPException(413, str(exc)) from None
         except MultipartError as exc:
             raise HTTPException(400, str(exc)) from None
-        # ASVS 14.2.8: enforce the feature's text-only format contract at the route, BEFORE save. A binary
-        # container (JPEG/PNG/PDF/ZIP incl. DOCX) or a non-text body (NUL / control-dense) is refused with
-        # 415 + a metadata-only upload.reject audit — nothing is written, so no embedded-metadata container
-        # can reach the store (closes "no metadata stripping" without a stripping engine). Covers both
-        # POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
-        nontext = nontext_upload_reason(part.data)
-        if nontext is not None:
-            await engine.store.record_audit(
-                "upload.reject",
-                actor=identity.username,
-                detail=json.dumps({"reason": nontext}),
-                client=client_ip(request),
-            )
-            raise HTTPException(415, nontext) from None
         outage: str | None = None
         try:
             # uploader_id (the immutable account id) is the ownership + quota key; uploader (the
@@ -9207,6 +9196,20 @@ def create_app(
             )
         except UploadTooLargeError as exc:
             raise HTTPException(413, str(exc)) from None
+        except UploadNotTextError as exc:
+            # ASVS 14.2.8: the feature's text-only format contract, checked by save() before anything
+            # is written (BACKLOG #5551 moved it there from this route). A binary container
+            # (JPEG/PNG/PDF/ZIP incl. DOCX) or a non-text body (NUL / control-dense) is refused with
+            # 415 + a metadata-only upload.reject audit, which is what "no metadata stripping" rests
+            # on; parsing/sniff.py's nontext_upload_reason names what it does not catch. The answer
+            # and the audit carry the reason only, never the file name or content.
+            await engine.store.record_audit(
+                "upload.reject",
+                actor=identity.username,
+                detail=json.dumps({"reason": exc.reason}),
+                client=client_ip(request),
+            )
+            raise HTTPException(415, exc.reason) from None
         except UploadContentError as exc:
             # ASVS 5.2.2: disallowed extension or content/extension mismatch. Refuse with 400 and a
             # metadata-only audit: the reason without the file name (#2619), NEVER any content. Covers

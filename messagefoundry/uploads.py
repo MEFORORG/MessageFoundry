@@ -52,7 +52,7 @@ from typing import Any, Literal, NamedTuple, Protocol
 from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
-from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
+from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.store.content_search import SearchSpec, row_matches
@@ -62,7 +62,9 @@ from messagefoundry.store.crypto import (
     Cipher,
     CipherError,
     CipherUnavailableError,
+    UnauthenticatedCipherError,
     cell_aad,
+    gave_no_verdict,
 )
 
 _log = logging.getLogger(__name__)
@@ -219,6 +221,56 @@ def _is_inflight(name: str) -> bool:
         return name in _inflight_names
 
 
+#: How long one upload's sidecar tag failure is reported once (BACKLOG #5553). Every listing,
+#: quota check and prune meets the same sidecar, so without this each would raise the alert again.
+_TAG_REPORT_INTERVAL_S = 3600.0
+#: The most upload ids remembered; the oldest is forgotten first.
+_TAG_REPORTED_MAX = 4096
+#: How much of an upload id a tag-failure alert names, as ``store/cell_tag.py`` names a row.
+_TAG_REF_LEN = 12
+_tag_reported: dict[str, float] = {}
+# Scans run on worker threads, so the read-modify-write holds this lock.
+_tag_reported_lock = threading.Lock()
+
+
+def _first_tag_report(fid: str) -> bool:
+    """Whether upload ``fid``'s tag failure has not been reported within the interval; records it."""
+    now = time.monotonic()
+    with _tag_reported_lock:
+        last = _tag_reported.get(fid)
+        if last is not None and now - last < _TAG_REPORT_INTERVAL_S:
+            return False
+        _tag_reported.pop(fid, None)
+        _tag_reported[fid] = now
+        while len(_tag_reported) > _TAG_REPORTED_MAX:
+            _tag_reported.pop(next(iter(_tag_reported)))
+    return True
+
+
+def _not_a_plain_file(path: Path) -> str | None:
+    """Why ``path`` must not be read, from its ``lstat``: it is a symbolic link or a Windows
+    name-surrogate reparse point such as a junction (BACKLOG #5552), or it is not a regular file,
+    such as a FIFO, whose open would block the reader for good. ``None`` when it is a regular file,
+    or when it cannot be checked; the caller's own read then meets and names that fault."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if _names_a_link(info):
+        return "it is a link and was not followed"
+    if not S_ISREG(info.st_mode):
+        return "it is not a regular file"
+    return None
+
+
+def _names_a_link(info: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a symbolic link or a name-surrogate reparse point."""
+    reparse = getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+    return S_ISLNK(info.st_mode) or bool(
+        reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
+    )
+
+
 class UploadError(Exception):
     """Base class for uploaded-logs storage failures."""
 
@@ -235,9 +287,10 @@ class UploadContentError(UploadError):
     """An upload's extension is not permitted, or its content contradicts its extension (ASVS 5.2.2).
 
     The uploaded-logs feature accepts only text diagnostic logs; a disallowed extension or a
-    content/extension mismatch (PNG bytes in a ``.hl7``, a non-``<`` body in a ``.xml``, a NUL-bearing
-    ``.txt``) is refused at the chokepoint before anything is written. The API maps it to HTTP 400 and a
-    metadata-only ``upload.reject`` audit.
+    content/extension mismatch (a ``.hl7`` with no HL7 header, a non-``<`` body in a ``.xml``) is
+    refused at the chokepoint before anything is written. The API maps it to HTTP 400 and a
+    metadata-only ``upload.reject`` audit, and its subclass :class:`UploadNotTextError`, a body that
+    is not plain text, to HTTP 415.
 
     ``str(exc)`` names the file, for the uploader's own 400 response. ``reason`` is the same text
     without the name, and is what the audit row records: the audit log is plaintext and kept, and an
@@ -252,6 +305,14 @@ class UploadContentError(UploadError):
         # The default rebuilds from ``self.args``, the one formatted message, which this signature
         # does not take; copy and pickle would raise TypeError.
         return (type(self), (self.display, self.reason))
+
+
+class UploadNotTextError(UploadContentError):
+    """An upload's body is not plain text (ASVS 14.2.8): it begins with a binary container's
+    signature, holds a NUL byte, or has a control-dense 8 KiB window, as
+    ``parsing.sniff.nontext_upload_reason`` judges it. ``reason`` is that function's
+    text. The API answers it 415, where any other :class:`UploadContentError` is 400 (BACKLOG
+    #5551)."""
 
 
 class UploadQuotaError(UploadError):
@@ -519,33 +580,40 @@ _ALLOWED_UPLOAD_EXTENSIONS = (".hl7", ".hl7v2", ".txt", ".xml")
 
 
 def validate_upload_content(display: str, data: bytes) -> None:
-    """Extension-allowlist + content-vs-extension sniff for an uploaded file (ASVS 5.2.2). Raises
-    :class:`UploadContentError` when the sanitized display filename's extension is not permitted, or when
-    the content's leading bytes contradict the extension:
+    """Text-only check, extension allowlist and content-vs-extension sniff for an uploaded file.
 
-    * ``.hl7``/``.hl7v2`` → an MSH/FHS/BHS HL7 header sniff (rejects e.g. PNG bytes in a ``.hl7``);
+    First, the whole body must be plain text (ASVS 14.2.8, ``parsing.sniff.nontext_upload_reason``):
+    no binary container signature, no NUL byte anywhere, and no control-dense window. A failure
+    raises :class:`UploadNotTextError`, which the route answers 415. It is checked here, at the
+    chokepoint, and nowhere else, so every caller of :meth:`UploadStore.save` meets it (BACKLOG
+    #5551).
+
+    Then (ASVS 5.2.2) it raises :class:`UploadContentError` when the sanitized display filename's
+    extension is not permitted, or when the content's leading bytes contradict the extension:
+
+    * ``.hl7``/``.hl7v2`` → an MSH/FHS/BHS HL7 header sniff;
     * ``.xml`` → a leading ``<`` after any BOM/whitespace;
-    * ``.txt`` → NUL-free (``.txt`` has no magic signature, so content validation is necessarily weak —
-      the same residual the plain-text connectors carry).
+    * ``.txt`` → nothing more (``.txt`` has no magic signature, so content validation is necessarily
+      weak — the same residual the plain-text connectors carry).
 
-    Pure + off-loop friendly (no I/O). Reuses the shared ``parsing.sniff`` magic-byte helpers, so the
-    upload chokepoint and the File connectors enforce the same sniff."""
+    Pure (no I/O), but linear in the body, so :meth:`UploadStore.save` runs it off the event loop.
+    Reuses the shared ``parsing.sniff`` magic-byte helpers, so the upload chokepoint and the File
+    connectors enforce the same sniff."""
+    nontext = nontext_upload_reason(data)
+    if nontext is not None:
+        raise UploadNotTextError(display, nontext)
     if not display.lower().endswith(_ALLOWED_UPLOAD_EXTENSIONS):
         raise UploadContentError(
             display,
             f"has a disallowed extension; permitted: {', '.join(_ALLOWED_UPLOAD_EXTENSIONS)}",
         )
     ctype = content_type_for(display)
-    if ctype == "hl7v2":
-        if not _looks_like_hl7(data):
-            raise UploadContentError(
-                display, "is not HL7 (no MSH/FHS/BHS header) despite its extension"
-            )
-    elif ctype == "xml":
-        if not _lstrip_bom_ws(data).startswith(b"<"):
-            raise UploadContentError(display, "is not XML (no leading '<') despite its extension")
-    elif b"\x00" in data:  # text (.txt) — no magic; NUL-free is the only structural check
-        raise UploadContentError(display, "declares .txt but contains NUL bytes (not plain text)")
+    if ctype == "hl7v2" and not _looks_like_hl7(data):
+        raise UploadContentError(
+            display, "is not HL7 (no MSH/FHS/BHS header) despite its extension"
+        )
+    if ctype == "xml" and not _lstrip_bom_ws(data).startswith(b"<"):
+        raise UploadContentError(display, "is not XML (no leading '<') despite its extension")
 
 
 def _decode_text(data: bytes) -> str:
@@ -868,16 +936,21 @@ class UploadStore:
 
     def _paths(self, file_id: str) -> tuple[Path, Path]:
         """Resolve the (blob, meta) paths for ``file_id`` with the ADR 0134 path-traversal guard:
-        reject any id that is not the exact 32-hex shape, then resolve and assert both paths sit
-        **directly under** the canonical uploads root. Raises :class:`UploadPathError` on any mismatch —
-        without touching the filesystem for a bad id."""
+        reject any id that is not the exact 32-hex shape, then resolve and assert each path is
+        **itself**, directly under the canonical uploads root. Raises :class:`UploadPathError` on any
+        mismatch — without touching the filesystem for a bad id.
+
+        **A link to another file is refused, wherever that file is (BACKLOG #5552),** because such
+        a link does not resolve to itself. A link to ANOTHER upload's file inside the root would
+        otherwise let a delete, prune or discard under one id act on the other upload. A link that
+        loops back to itself does resolve to itself and passes; it reaches no other file, and its
+        own read fails. A refused pair is left to an operator, and the prune logs each one it
+        leaves."""
         blob, meta = self._paths_unfollowed(file_id)
-        root = blob.parent
-        blob, meta = blob.resolve(), meta.resolve()
-        # Belt-and-suspenders: a validated 32-hex id cannot contain a separator, but verify the resolved
-        # parent IS the root so no symlink/normalization trick lands the write elsewhere.
-        if blob.parent != root or meta.parent != root:
-            raise UploadPathError(f"upload id {file_id!r} resolves outside the uploads root")
+        if blob.resolve() != blob or meta.resolve() != meta:
+            raise UploadPathError(
+                f"upload id {file_id!r} names a link or resolves elsewhere; it is not followed"
+            )
         return blob, meta
 
     def _paths_unfollowed(self, file_id: str) -> tuple[Path, Path]:
@@ -1025,18 +1098,36 @@ class UploadStore:
         by the id in a sidecar's JSON.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
-        marker versions and algorithm names, never a decrypted value. The malformed-shape branch
+        marker versions and algorithm names, never a decrypted value. Each of those is cut from the
+        stored text, so the cipher bounds what it echoes of one (BACKLOG #5553). The malformed-shape branch
         logs only the exception TYPE, because a ``ValueError`` from coercing a metadata field can
-        echo that field's value back into the message."""
+        echo that field's value back into the message.
+
+        **A sidecar whose tag fails under a key the cipher holds is reported (BACKLOG #5553),**
+        through the cipher's tag-failure hook, once per upload per hour
+        (:meth:`_report_tag_failure`). That is a value sealed under this store's key for some other
+        place, such as another upload's sidecar moved under this id. A value under a key that is
+        not configured is a key fault, not that, and is only logged.
+
+        **A sidecar that is a link, or is not a regular file, is not read (BACKLOG #5552).** It is
+        logged and skipped: a followed link read a file outside the root, or another upload's
+        sidecar, and a FIFO would block the scan, and the ``_quota_lock`` a save holds over it, for
+        good. One planted between that check and the read is still opened."""
         out: list[UploadedFileMeta] = []
         sink = held if self._refuses_plaintext else None
         bodies: set[str] = set()
         for fid, entry in self._iter_sidecars():
             if sink is not None:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
+            refused = _not_a_plain_file(entry)
+            if refused is not None:
+                _log.warning("uploaded-file sidecar %s: %s, so it was not read", fid, refused)
+                continue
             classify = False
+            stored = ""
             try:
-                out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
+                stored = entry.read_text(encoding="utf-8")
+                out.append(self._decrypt_meta(stored, fid))
             except CipherError as exc:
                 if isinstance(exc, CipherUnavailableError):
                     # Its own line, so an outage never reads as the refusal logged below. Logged
@@ -1050,6 +1141,7 @@ class UploadStore:
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
                 # sidecar. Named on its own so these can be told apart from a damaged file.
                 _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
+                self._report_tag_failure(fid, stored, exc)
                 classify = True
             except (OSError, UnicodeDecodeError) as exc:
                 # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
@@ -1075,6 +1167,30 @@ class UploadStore:
             for name in self._body_checks.copy().keys() - bodies:
                 self._body_checks.pop(name, None)
         return out
+
+    def _report_tag_failure(self, fid: str, stored: str, exc: CipherError) -> None:
+        """Raise the cipher's tag-failure alert for sidecar ``fid`` when ``exc`` is its AEAD tag
+        failing under a key the cipher holds, once per upload per :data:`_TAG_REPORT_INTERVAL_S`
+        (BACKLOG #5553). The tests are ``store/cell_tag.py``'s ``_tag_failure_kind``, inlined
+        because that module imports beyond this leaf's set: a verdict was given, a cipher that names
+        its keys holds the one the marker names, and one that cannot (Vault Transit) declares that
+        its refusal is the value's own tag. The reason names a prefix of the upload id, as
+        ``cell_tag`` names a row: the id is random and carries no PHI, and the WARNING the scan logs
+        beside it names the whole id."""
+        if not isinstance(exc, UnauthenticatedCipherError) or gave_no_verdict(exc):
+            return
+        cipher = self._cipher
+        if not cipher.is_encrypted(stored):
+            return
+        holds = getattr(cipher, "holds_key_for", None)
+        held = holds(stored) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
+        report = getattr(cipher, "report_tag_failure", None)
+        if not (held and callable(report) and _first_tag_report(fid)):
+            return
+        report(
+            "uploaded_file",
+            f"an uploaded-file sidecar failed its integrity tag (upload {fid[:_TAG_REF_LEN]})",
+        )
 
     def _unsealable_sync(self, fid: str, sidecar: Path) -> _UnsealableUpload | None:
         """``fid`` as an upload ``rotate-key`` cannot seal, or ``None`` when it is not one.
@@ -1167,17 +1283,18 @@ class UploadStore:
         filename: str,
         uploader: str,
         uploader_id: str,
-        content_type: str | None = None,
     ) -> UploadedFileMeta:
-        """Persist an uploaded file (encrypted at rest) and return its metadata.
+        """Persist an uploaded file (encrypted at rest) and return its metadata. Its format tag is
+        derived from its extension; a caller cannot set one (BACKLOG #5551).
 
         ``uploader_id`` is the owning account's immutable ``Identity.user_id``; ``uploader`` is its
         username, kept for display and the audit rows only. Both are required — a file written with
         no ``uploader_id`` would be readable by nobody but a ``files:access_any`` holder while still
         billing to nobody's quota, so an empty one is a programming error and is refused here.
 
-        Raises :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadContentError`
-        on a disallowed extension / content mismatch (ASVS 5.2.2), :class:`UploadQuotaError` when
+        Raises :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadNotTextError`
+        on a body that is not plain text (ASVS 14.2.8), :class:`UploadContentError` on a disallowed
+        extension / content mismatch (ASVS 5.2.2), :class:`UploadQuotaError` when
         the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4), or
         :class:`UploadUnavailableError` when the cipher's key service gave no verdict, before anything
         is written (BACKLOG #3734).
@@ -1202,11 +1319,14 @@ class UploadStore:
                 f"upload is {len(data)} bytes; the limit is {self._max_bytes}"
             )
         display = sanitize_filename(filename)
-        # Extension allowlist + content-vs-extension sniff at the chokepoint (ASVS 5.2.2). Both upload
-        # surfaces (POST /uploads and POST /ui/uploaded-logs/upload) reach save(), so a disallowed
-        # extension or a content/extension mismatch is refused here before any PHI is written.
-        validate_upload_content(display, data)
-        ctype = content_type or content_type_for(display)
+        # Text-only check, extension allowlist + content-vs-extension sniff at the chokepoint (ASVS
+        # 14.2.8, 5.2.2). Both upload surfaces (POST /uploads and POST /ui/uploaded-logs/upload) reach
+        # save(), so a non-text body, a disallowed extension or a content/extension mismatch is
+        # refused here before any PHI is written. It reads the whole body (BACKLOG #5551), so it runs
+        # off the loop like the rest.
+        await asyncio.to_thread(validate_upload_content, display, data)
+        # Always derived from the extension the check above judged, never a caller's label (#5551).
+        ctype = content_type_for(display)
         file_id = secrets.token_hex(16)
         # Set by the write thread once the sidecar lands; read only after that thread has finished.
         landed = False
@@ -2649,10 +2769,17 @@ class UploadStore:
         Never raises: a raise would drop the pass's list, and with it the audit rows for every
         pair already deleted. ``_paths`` resolves the path, which can touch the filesystem, so an
         ``OSError`` there leaves the pair for the next pass like a refused unlink does."""
-        # A sidecar whose id somehow fails the path guard is left alone (never blindly unlinked).
+        # A sidecar whose id fails the path guard, or whose pair holds a link, is left alone (never
+        # blindly unlinked) and named, so an operator can remove it (BACKLOG #5552). The id is cut
+        # short: an unsealed sidecar's JSON chooses it.
         try:
             blob_path, meta_path = self._paths(meta.file_id)
         except UploadPathError:
+            _log.warning(
+                "uploaded-logs prune left %r for an operator: its id fails the path guard or its "
+                "pair holds a link",
+                meta.file_id[:40],
+            )
             return False
         except OSError as exc:
             _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
@@ -3552,10 +3679,7 @@ def _refuse_a_planted_link(lock: Path) -> None:
         return  # edit_lock creates it, or fails and _pair_lock classifies and logs why
     # Any other lstat error propagates, so _pair_lock classifies and logs it as it would the open's,
     # and no open follows a path this could not check.
-    reparse = getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
-    if S_ISLNK(info.st_mode) or (
-        reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
-    ):
+    if _names_a_link(info):
         loop = OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(lock))
         raise _PairLockBusy(
             f"{lock} is a link; the uploads pair lock is not taken through it -- remove it"

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 import os
 import threading
@@ -26,6 +27,7 @@ from messagefoundry.uploads import (
     UploadContentError,
     UploadedFileMeta,
     UploadNotFoundError,
+    UploadNotTextError,
     UploadPathError,
     UploadQuotaError,
     UploadRetentionRunner,
@@ -52,7 +54,6 @@ async def test_save_encrypts_and_lists(tmp_path: Path) -> None:
         filename="acme.hl7",
         uploader="op",
         uploader_id="u-op",
-        content_type=None,
     )
     assert isinstance(meta, UploadedFileMeta)
     assert meta.filename == "acme.hl7"
@@ -1660,3 +1661,194 @@ def test_upload_content_error_keeps_the_name_out_of_its_reason_and_survives_pick
     assert "MRN_SYNTH_0001" not in exc.reason
     for clone in (copy.copy(exc), pickle.loads(pickle.dumps(exc))):
         assert (str(clone), clone.reason) == (str(exc), exc.reason)
+
+
+# --- BACKLOG #5551: the text-only check reads the whole body, and save() runs it ----------------
+
+#: Past the 8 KiB the route's check used to sample, so a defect there shows only past it.
+_PAST_THE_SAMPLE = b"x" * 9000
+
+
+@pytest.mark.parametrize(
+    ("name", "head"),
+    [("a.hl7", b"MSH|^~\\&|A|B\r"), ("a.xml", b"<root>"), ("a.txt", b"a log line\n")],
+)
+@pytest.mark.parametrize(
+    "tail",
+    [b"\x00binary tail", b"PK\x03\x04\x14\x00\x00\x00", bytes(range(1, 9)) * 2048],
+    # The ZIP member is caught by its NUL bytes: a signature past the head is not matched.
+    ids=["nul", "zip-member-with-nul", "control-dense"],
+)
+@pytest.mark.parametrize("after", [b"", b"y" * 20_000], ids=["at-the-end", "in-the-middle"])
+def test_validate_upload_content_reads_past_the_first_8_kib(
+    name: str, head: bytes, tail: bytes, after: bytes
+) -> None:
+    """BACKLOG #5551: a body whose head passes the header sniff but which is binary past the
+    sample, in the last window or a middle one, is refused at save()'s chokepoint, for every
+    permitted extension."""
+    from messagefoundry.parsing.sniff import nontext_upload_reason
+
+    data = head + _PAST_THE_SAMPLE + tail + after
+    reason = nontext_upload_reason(data)
+    assert reason is not None
+    with pytest.raises(UploadNotTextError) as caught:  # the route answers this one 415
+        validate_upload_content(name, data)
+    assert caught.value.reason == reason
+
+
+def test_a_short_last_window_is_judged_with_the_text_before_it() -> None:
+    """BACKLOG #5551: the density check runs over full 8 KiB windows, so one trailing control byte
+    (a DOS end-of-file mark, say) past the sample is not a window of its own and is admitted."""
+    from messagefoundry.parsing.sniff import nontext_upload_reason
+
+    data = b"MSH|^~\\&|A|B\r" + b"x" * (8192 - 13) + b"\x1a"
+    assert len(data) == 8193
+    assert nontext_upload_reason(data) is None
+    validate_upload_content("a.hl7", data)
+
+
+async def test_save_refuses_a_nul_past_the_sample_and_writes_nothing(tmp_path: Path) -> None:
+    store = UploadStore(tmp_path / "uploads", make_cipher(generate_key()), max_bytes=1 << 16)
+    data = _ADT.encode() + _PAST_THE_SAMPLE + b"\x00"
+    with pytest.raises(UploadContentError):
+        await store.save(data=data, filename="a.hl7", uploader="op", uploader_id="u-op")
+    assert await store.list_files() == []
+
+
+# --- BACKLOG #5552: a link in the uploads root is never followed --------------------------------
+
+
+def _link(link: Path, target: Path) -> None:
+    link.unlink(missing_ok=True)
+    try:
+        link.symlink_to(target)
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"cannot make a symlink here: {exc}")
+
+
+async def test_a_delete_never_follows_a_link_to_another_upload(tmp_path: Path) -> None:
+    """BACKLOG #5552: a body that is a link to ANOTHER upload's body resolved inside the root, so
+    the parent check passed and a delete under one id unlinked the other upload's file."""
+    store = _store(tmp_path, key=True, aad=True)
+    mine = await store.save(data=_ADT.encode(), filename="a.hl7", uploader="op", uploader_id="u-op")
+    other = await store.save(
+        data=_BATCH.encode(), filename="b.hl7", uploader="op", uploader_id="u-op"
+    )
+    root = tmp_path / "uploads"
+    victim = root / f"{other.file_id}.blob"
+    _link(root / f"{mine.file_id}.blob", victim)
+    with pytest.raises(UploadPathError):
+        await store.delete(mine.file_id)
+    assert victim.is_file()
+    assert await store.read_bytes(other.file_id) == _BATCH.encode()
+
+
+async def test_the_sidecar_scan_never_follows_a_link(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5552: the listing scan read a sidecar that is a link to a file outside the root."""
+    store = _store(tmp_path, key=False)  # identity cipher, so a followed plaintext JSON would list
+    kept = await store.save(data=b"kept\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    fid = "ab" * 16
+    outside = tmp_path / "outside.json"
+    outside.write_text(
+        json.dumps({"file_id": fid, "filename": "planted.txt", "uploader_id": "u-op"}),
+        encoding="utf-8",
+    )
+    _link(tmp_path / "uploads" / f"{fid}.meta", outside)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        listed = await store.list_files()
+    assert [m.file_id for m in listed] == [kept.file_id]
+    assert any(fid in r.getMessage() and "link" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_sidecar_scan_never_opens_a_file_that_is_not_regular(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A FIFO sidecar would block the scan's open for good; a directory stands in for any
+    non-regular file, since a FIFO cannot be made everywhere."""
+    store = _store(tmp_path, key=False)
+    kept = await store.save(data=b"kept\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    fid = "ef" * 16
+    (tmp_path / "uploads" / f"{fid}.meta").mkdir()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        listed = await store.list_files()
+    assert [m.file_id for m in listed] == [kept.file_id]
+    assert any(
+        fid in r.getMessage() and "not a regular file" in r.getMessage() for r in caplog.records
+    )
+
+
+# --- BACKLOG #5553: a sidecar refusal logs a bounded reason and reports a tag failure ------------
+
+
+async def test_a_planted_marker_version_is_not_echoed_unbounded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5553: the cipher echoed the whole marker version of a planted sidecar, and the
+    scan logged it verbatim at WARNING on every listing."""
+    store = _store(tmp_path, key=True, aad=True)
+    planted = "Q" * 100_000
+    (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "uploads" / f"{'cd' * 16}.meta").write_text(f"mfenc:{planted}", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert await store.list_files() == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("cd" * 16 in m for m in messages)
+    assert all(len(m) < 1024 for m in messages), max(len(m) for m in messages)
+
+
+def test_the_cipher_bounds_every_marker_field_it_echoes() -> None:
+    """BACKLOG #5553: a marker version, algorithm or key id is cut from the stored text, so each
+    is bounded in the cipher's own error, wherever that error is logged or answered."""
+    import base64
+
+    cipher = make_cipher(generate_key(), write_v2=True)
+    long = "Z" * 50_000
+    unopened = base64.b64encode(bytes(40)).decode("ascii")  # long enough, but no key opens it
+    for stored in (
+        f"mfenc:{long}",  # unknown version
+        f"mfenc:v4:{long}:x",  # unknown algorithm
+        f"mfenc:v1:{long}",  # too short
+        f"mfenc:v1:{long}:a",  # bad base64
+        f"mfenc:v1:{long}:{unopened}",  # no configured key decrypts it
+    ):
+        with pytest.raises(CipherError) as caught:
+            cipher.decrypt(stored, aad=b"x")
+        assert len(str(caught.value)) < 512, stored[:12]
+
+
+async def test_a_tag_failure_under_a_held_key_is_reported_once(tmp_path: Path) -> None:
+    """BACKLOG #5553: a sidecar sealed under a key this store holds but failing its tag (here,
+    another upload's sidecar moved under this id) was logged and never reported."""
+    store = _store(tmp_path, key=True, aad=True)
+    reports: list[tuple[str, str]] = []
+    store._cipher.set_tag_failure_hook(lambda table, reason: reports.append((table, reason)))  # type: ignore[attr-defined]
+    a = await store.save(data=b"a\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    b = await store.save(data=b"b\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    root = tmp_path / "uploads"
+    (root / f"{b.file_id}.meta").write_text(
+        (root / f"{a.file_id}.meta").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    assert [m.file_id for m in await store.list_files()] == [a.file_id]
+    assert [m.file_id for m in await store.list_files()] == [a.file_id]
+    assert len(reports) == 1
+    table, reason = reports[0]
+    assert table == "uploaded_file"
+    assert b.file_id[:12] in reason and b.file_id not in reason
+
+
+async def test_a_sidecar_under_a_key_not_held_is_not_reported(tmp_path: Path) -> None:
+    """BACKLOG #5553: a value under a key that is not configured is a key fault, not a tag
+    failure, so it is logged and not reported."""
+    store = _store(tmp_path, key=True, aad=True)
+    reports: list[tuple[str, str]] = []
+    store._cipher.set_tag_failure_hook(lambda table, reason: reports.append((table, reason)))  # type: ignore[attr-defined]
+    elsewhere = await _store(tmp_path / "other", key=True, aad=True).save(
+        data=b"x\n", filename="x.txt", uploader="op", uploader_id="u-op"
+    )
+    (tmp_path / "uploads").mkdir(parents=True, exist_ok=True)
+    meta = (tmp_path / "other" / "uploads" / f"{elsewhere.file_id}.meta").read_text("utf-8")
+    (tmp_path / "uploads" / f"{elsewhere.file_id}.meta").write_text(meta, encoding="utf-8")
+    assert await store.list_files() == []
+    assert reports == []
