@@ -163,8 +163,8 @@ re-arms it**: `restart_inbound` for one connection, and a `/config/reload` for e
 re-binds (reload quiesces every source and re-binds from the new graph). The inbounds a reload
 declines to bind — `deployed=False`, `auto_start=False` and not previously listening, DR-filtered —
 stay halted, as do the connections a per-connection restart does not name. *(Note, BACKLOG #5704:
-under the pooled claim mode a router, transform or response lane that is STOPPED when the inbound
-restarts stays STOPPED after it.)*
+under the pooled claim mode a router, transform or response lane that is STOPPED at a
+per-connection restart of its inbound stays STOPPED after it.)*
 The outbound **pause is
 operator-owned in both cases** (#115/#233: a reload never resumes a lane an operator has not looked
 at), so delivery needs an explicit `start_outbound` or a service restart either way. Stated the other
