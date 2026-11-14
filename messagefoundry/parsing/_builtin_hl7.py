@@ -250,8 +250,15 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     A non-MSH segment is split on the field separator the first time a field path touches it; the
     field entries start as bare ``str`` (component split is deferred again, per field, to first
     componentized access). MSH segments are never lazy.
+
+    The fields are stored **before** the raw line leaves ``_lazy``. A :meth:`Message.copy` clone shares
+    this tree until one side writes, so under free-threaded Python another reader can look at the
+    segment mid-split; every reader checks ``_lazy`` first and falls back to ``fields``, so at each
+    instant it sees either the raw line or the full field list, never an empty segment (BACKLOG #5801).
+    The ``pop`` keeps its default because a racing split of the same segment may have removed it.
     """
-    raw = msg["_lazy"].pop(seg_index, None)
+    lazy = msg["_lazy"]
+    raw = lazy.get(seg_index)
     if raw is None:
         return
     field_sep = msg["seps"][0]
@@ -259,6 +266,7 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     # parts[0] is the segment id; fields are 1-based after it (matching python-hl7's Segment indexing
     # where index 0 is the id and field N is at list index N).
     msg["segments"][seg_index]["fields"] = list(parts)
+    lazy.pop(seg_index, None)
 
 
 def segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:

@@ -513,3 +513,45 @@ def test_clear_then_rebuild_repeating_block() -> None:
     assert m.count_segments("OBX") == 2
     assert [m.field("OBX-3.1", occurrence=i) for i in (1, 2)] == ["GLU", "NA"]
     assert m.field("OBX-5") == "OK"
+
+
+class _ReadOnRemoveLazy(dict[int, str]):
+    """A ``_lazy`` map that runs a reader right after an entry leaves it, the instant a reader on
+    another free-threaded thread sharing a :meth:`Message.copy` tree could land in (BACKLOG #5801)."""
+
+    def __init__(self, msg: _builtin_hl7.ParsedMessage, seen: list[str]) -> None:
+        super().__init__(msg["_lazy"])
+        self._msg = msg
+        self._seen = seen
+
+    def _read(self, key: int) -> None:
+        self._seen.append(_builtin_hl7._encode_segment(self._msg, key, self._msg["seps"]))
+
+    def pop(self, key: int, *default: object) -> object:  # type: ignore[override]
+        present = key in self
+        value = super().pop(key, *default)
+        if present:
+            self._read(key)
+        return value
+
+    def __delitem__(self, key: int) -> None:
+        super().__delitem__(key)
+        self._read(key)
+
+
+def test_lazy_split_stores_fields_before_dropping_the_raw_line() -> None:
+    # The lazy split must never leave a moment where the raw line is gone and the fields are not yet
+    # stored: a reader of a shared copy there would encode PID as its bare id, its fields dropped.
+    m = Message.parse(ADT)
+    clone = m.copy()  # shares the backing tree until a write
+    tree = clone._m
+    seen: list[str] = []
+    tree["_lazy"] = _ReadOnRemoveLazy(tree, seen)
+    pid = _builtin_hl7.segment_index(tree, "PID", 1)
+    assert pid is not None
+
+    assert m["PID-5.1"] == "DOE"  # the first touch splits PID in the shared tree
+
+    assert seen == ["PID|1||100^^^HOSP^MR||DOE^JANE^Q||19800101|F"]
+    assert pid not in tree["_lazy"]
+    assert clone.encode() == ADT
