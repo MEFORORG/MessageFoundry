@@ -5864,13 +5864,16 @@ notice.
 A directory sign-in's role sync is a compare-and-set on the roles it read too (vault BACKLOG
 #3085), on the Kerberos and the OIDC leg alike. When another writer, at least a reconciler,
 another sign-in or a custom role's deletion, wrote the roles in between, the sign-in reads them
-again. If they are already at the directory's set, the sign-in goes on, records no change and
-ends no session, even if that writer's own revoke failed. Otherwise it writes once more against
-what it read, and its `auth.ad_roles_resynced` row, its revoke, its notice and any Administrator
-alert are computed from the roles it replaced. If the roles read after that write are at another
-set still, the sign-in is refused with an `auth.login_failed` row whose reason is
-`role_sync_contended`. A record gone or failing its seal when read again after a lost write is
-refused with `account_refused`. On both refusals the sign-in writes no role: the other writer's
+again. If they are already at the directory's set, the sign-in writes no role and no
+`auth.ad_roles_resynced` row, but still ends the account's other sessions, sends its notice and
+runs the Administrator checks from the roles it first read, as on `main`, so a failed revoke by
+the other writer cannot leave stale sessions live. Otherwise it writes once more against what it
+read, and its `auth.ad_roles_resynced` row, its revoke, its notice and any Administrator alert are
+computed from the roles it replaced. If the roles read after that write are at another set still,
+the sign-in is refused with an `auth.login_failed` row whose reason is `role_sync_contended`. A
+record gone or failing its seal when read again after a lost write is refused with
+`account_refused`, and one now disabled or locked with the reason its eligibility gate gives. On
+these refusals the sign-in writes no role: the other writer's
 roles and sessions stand until the next sign-in or reconcile pass. Its other writes, such as a
 profile refresh, have already committed. The compare is on the set, so it cannot tell a newer
 directory read from an older one.

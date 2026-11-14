@@ -304,7 +304,8 @@ class _SignInRoleSync:
     """What :meth:`AuthService._sync_sign_in_roles` wrote (vault BACKLOG #3085). Everything after
     the write is computed from this, never from the roles the sign-in first read."""
 
-    previous: frozenset[str]  #: the roles the write replaced, or found already at the target
+    #: The roles the write replaced; or, found already at the target, the roles first read.
+    previous: frozenset[str]
     held: Exception | None  #: raise once the sign-in's own steps have run
     #: Why the sign-in is refused, with nothing written: :data:`ROLE_SYNC_CONTENDED`, or
     #: :data:`ACCOUNT_REFUSED` for a record gone or failing its seal when read again.
@@ -7802,23 +7803,26 @@ class AuthService:
         await self._audit("auth.login_failed", actor=actor, detail=_json(detail), client=client)
 
     async def _sync_sign_in_roles(
-        self, user: VerifiedUser, role_ids: list[str], *, client: str | None
+        self, user: VerifiedUser, role_ids: list[str], *, federated: bool, client: str | None
     ) -> _SignInRoleSync:
         """Write a directory sign-in's roles as a compare-and-set on the roles it read (vault
         BACKLOG #3085), and say what was written.
 
-        A write that finds the roles moved reads them again. Already at ``role_ids``, as a
-        reconciler or another sign-in left them, is success with nothing changed by this sign-in.
+        A write that finds the roles moved reads the record again, and a record gone, failing its
+        seal, or now ineligible to sign in (:func:`_directory_login_refusal`) is reported as a
+        ``refusal``, with nothing written. Roles already at ``role_ids``, as another writer left
+        them, are success, and ``previous`` is then the set this sign-in first read: the caller
+        revokes, notifies and checks the Administrator role as it would had it written them
+        itself, so a failed revoke by the other writer cannot leave stale sessions live.
         Otherwise the write is tried once more against the set just read, and a second loss reads
-        them again too: at ``role_ids`` is success, anything else writes nothing and is reported
-        as a ``refusal``, for the caller to refuse the sign-in. So is an account gone or failing
-        its seal at either read.
+        again the same way: anything but ``role_ids`` writes nothing and is reported as a
+        ``refusal``, for the caller to refuse the sign-in.
 
         BACKLOG #2221: a change's ``auth.ad_roles_resynced`` row commits in the role write's
         transaction, not after the revoke, because the roles are what it records. A sync that
         changes nothing writes the same roles and no row, and a raise there raises out of here."""
         target = frozenset(role_ids)
-        expected = frozenset(user.role_ids)
+        first_read = expected = frozenset(user.role_ids)
         held: Exception | None = None
         for _attempt in range(2):
             if expected == target:
@@ -7832,6 +7836,7 @@ class AuthService:
                 held = _hold(held, more)
             if written:
                 return _SignInRoleSync(expected, held)
+            read_error: Exception | None = None
             try:
                 stored = await self._lookup_user_settled(user.id)
             except Exception as exc:
@@ -7846,8 +7851,11 @@ class AuthService:
                     type(exc).__name__,
                     exc_info=exc,
                 )
-                _hold(held, exc)
-                raise held from exc
+                read_error = exc
+            if read_error is not None and held is not None:
+                # Raised outside the handler, so the held error keeps its own cause and context.
+                _hold(held, read_error)
+                raise held
             if stored.user is None:
                 _log.error(
                     "auth: the record of %s is gone or fails its seal, read after the sign-in's "
@@ -7856,9 +7864,14 @@ class AuthService:
                     scrub_log_argument(user.username),
                 )
                 return _SignInRoleSync(expected, held, refusal=ACCOUNT_REFUSED)
+            # The record read now decides eligibility too: it may have been disabled or locked
+            # since the read the sign-in's own gate ran on.
+            ineligible = _directory_login_refusal(stored.user, time.time(), federated=federated)
+            if ineligible is not None:
+                return _SignInRoleSync(expected, held, refusal=ineligible)
             expected = frozenset(stored.user.role_ids)
             if expected == target:
-                return _SignInRoleSync(expected, held)
+                return _SignInRoleSync(first_read, held)
         _log.error(
             "auth: the directory sign-in's role write for %s found the roles moved by another "
             "writer twice; nothing was written and the sign-in is refused",
@@ -8198,30 +8211,46 @@ class AuthService:
         # reconciler or another sign-in that wrote in between is never overwritten with a stale
         # set. Every step below reads what the write did, never the roles first read: the revoke,
         # the notice, the Administrator alerts and the audit row.
-        sync = await self._sync_sign_in_roles(user, role_ids, client=client)
+        sync = await self._sync_sign_in_roles(user, role_ids, federated=federated, client=client)
         if sync.refusal is not None:
-            # The SIGN-IN is refused, and this sign-in wrote nothing: what the other writer left
+            # The SIGN-IN is refused, and this sign-in wrote no role: what the other writer left
             # stands, sessions included, until the next sign-in or reconcile pass. No role write
             # is refused for taking Administrator from its last holder (owner ruling 2026-10-13,
             # #3229); this one did not happen. A session minted on roles this sign-in could not
             # establish would be the open direction.
             # ``account_refused`` keeps the shape it has elsewhere in this method on both legs.
-            if federated and sync.refusal == ROLE_SYNC_CONTENDED:
-                await self._directory_reject_audit(
-                    principal.username,
-                    "oidc",
-                    sync.refusal,
-                    client=client,
-                    extra=outcome_extra,
+            row_error: Exception | None = None
+            try:
+                if federated and sync.refusal == ROLE_SYNC_CONTENDED:
+                    await self._directory_reject_audit(
+                        principal.username,
+                        "oidc",
+                        sync.refusal,
+                        client=client,
+                        extra=outcome_extra,
+                    )
+                    refused = LoginOutcome(
+                        ok=False, error="federated sign-in failed", reason=sync.refusal
+                    )
+                else:
+                    refused = await self._refuse_directory_row(
+                        principal.username, sync.refusal, client=client, extra=outcome_extra
+                    )
+            except Exception as exc:
+                if sync.held is None:
+                    raise
+                # The held error is the one raised, with the row's named on it, not dropped.
+                _log.error(
+                    "auth: the refusal row for %s's directory sign-in raised %s; the error held "
+                    "from its role write is raised",
+                    scrub_log_argument(user.username),
+                    type(exc).__name__,
+                    exc_info=exc,
                 )
-                refused = LoginOutcome(
-                    ok=False, error="federated sign-in failed", reason=sync.refusal
-                )
-            else:
-                refused = await self._refuse_directory_row(
-                    principal.username, sync.refusal, client=client, extra=outcome_extra
-                )
+                row_error = exc
             if sync.held is not None:
+                # Raised outside the handler, so the held error keeps its own cause and context.
+                _hold(sync.held, row_error)
                 raise sync.held
             return refused
         previous, held = set(sync.previous), sync.held

@@ -8,8 +8,8 @@ both legs that share ``_complete_ad_login``: the Kerberos mint and the OIDC (fed
 
 - a write in between is what the sign-in replaces: the audit row, the revoke and the
   Administrator-loss report are computed from it, not from the stale read;
-- a write in between that already holds the sign-in's directory roles is success, and the
-  sign-in changes nothing more;
+- a write in between that already holds the sign-in's directory roles is success: the sign-in
+  writes nothing more, but still ends the other sessions, as main did;
 - two lost compare-and-sets refuse the sign-in closed, with a ``role_sync_contended`` row, and
   leave what the other writer wrote.
 
@@ -170,11 +170,12 @@ async def test_a_write_in_between_that_holds_the_directory_roles_is_success(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, leg: str
 ) -> None:
     """The other writer already wrote the directory's ``viewer``. The sign-in's compare-and-set on
-    ``operator`` loses, reads ``viewer`` back, and stops: it writes nothing more, records no
-    change and ends no session, since the writer that made the change owns those.
+    ``operator`` loses, reads ``viewer`` back, and writes nothing more and no row. It still ends
+    the other sessions, as main did, computed from the ``operator`` it first read, so a revoke
+    the other writer failed cannot leave stale sessions live (Manager ruling on #3085).
 
-    RED on main: the sign-in wrote ``viewer`` again, recorded ``operator`` to ``viewer`` and ended
-    the other sessions for a change it did not make."""
+    RED on main: the sign-in wrote ``viewer`` again and recorded ``operator`` to ``viewer`` for a
+    change it did not make."""
     service, user_id, first = await _signed_in(store, leg)
     await store.set_ad_group_role_map([(_GROUP, VIEWER)])
     before = await _rows(store, "auth.ad_roles_resynced")
@@ -182,11 +183,10 @@ async def test_a_write_in_between_that_holds_the_directory_roles_is_success(
     out = await _sign_in(service, leg)
     monkeypatch.undo()
     assert out.ok and out.token is not None
-    assert out.roles_gained is None
     assert len(seen) == 1, "the sign-in wrote again after finding its roles in place"
     assert await store.get_user_role_ids(user_id) == [VIEWER]
     assert await _rows(store, "auth.ad_roles_resynced") == before
-    assert await service.identity_for_token(first) is not None, "it ended a session for no change"
+    assert await service.identity_for_token(first) is None, "a found-at-target sync kept a session"
 
 
 @pytest.mark.parametrize("leg", LEGS)
@@ -248,6 +248,73 @@ async def test_a_record_that_fails_its_seal_when_read_again_refuses_the_sign_in(
     assert await store.get_user_role_ids(user_id) == [ADMIN]
     assert len(await store.list_sessions(user_id)) == 1, "a refused sign-in minted a session"
     assert await service.identity_for_token(first) is not None
+
+
+@pytest.mark.parametrize("leg", LEGS)
+@pytest.mark.parametrize("moved_to", [VIEWER, ADMIN], ids=["at-target", "elsewhere"])
+async def test_an_account_disabled_by_the_time_of_the_re_read_is_refused(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, leg: str, moved_to: str
+) -> None:
+    """The other writer moves the roles and the account is disabled before the sign-in's
+    compare-and-set. The re-read sees the disabled record, so the sign-in is refused as
+    ``disabled``, whether the roles were moved to its target or elsewhere, and no session is
+    minted."""
+    service, user_id, _first = await _signed_in(store, leg)
+    await store.set_ad_group_role_map([(_GROUP, VIEWER)])
+    real_cas = store.set_user_roles_if_held
+    real_plain = store.set_user_roles
+    calls: list[int] = []
+
+    async def racing(uid: str, role_ids: Sequence[str], **kw: Any) -> bool:
+        calls.append(1)
+        if len(calls) == 1:
+            await real_plain(uid, [moved_to], audits=())
+            await store.set_user_disabled(uid, disabled=True)
+        return await real_cas(uid, role_ids, **kw)
+
+    monkeypatch.setattr(store, "set_user_roles_if_held", racing)
+    out = await _sign_in(service, leg)
+    monkeypatch.undo()
+    assert not out.ok and out.reason == "disabled"
+    assert len(calls) == 1
+    assert await store.get_user_role_ids(user_id) == [moved_to]
+    assert len(await store.list_sessions(user_id)) == 1, "a refused sign-in minted a session"
+
+
+async def test_a_refusal_row_that_raises_keeps_the_held_error(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held defect from the first write, then a refusal whose own ``auth.login_failed`` row
+    raises: the held defect is raised with the row's error named on it, not dropped, and its
+    cause is left as it was."""
+    service, _user_id, _first = await _signed_in(store, "kerberos")
+    await store.set_ad_group_role_map([(_GROUP, VIEWER)])
+    real_cas = store.set_user_roles_if_held
+    real_plain = store.set_user_roles
+    real_audit = service._audit
+    calls: list[int] = []
+
+    async def racing(uid: str, role_ids: Sequence[str], **kw: Any) -> bool:
+        calls.append(1)
+        if len(calls) == 1:
+            await real_plain(uid, [ADMIN], audits=())
+            raise TypeError("synthetic defect")
+        if len(calls) == 3:
+            await real_plain(uid, [OPERATOR], audits=())
+        return await real_cas(uid, role_ids, **kw)
+
+    async def audit(action: str, **kw: Any) -> Any:
+        if action == "auth.login_failed":
+            raise sqlite3.OperationalError("synthetic: disk I/O error")
+        return await real_audit(action, **kw)
+
+    monkeypatch.setattr(store, "set_user_roles_if_held", racing)
+    monkeypatch.setattr(service, "_audit", audit)
+    with pytest.raises(TypeError) as raised:
+        await _sign_in(service, "kerberos")
+    monkeypatch.undo()
+    assert any("OperationalError" in note for note in raised.value.__notes__)
+    assert raised.value.__cause__ is None, "the held error's cause was overwritten"
 
 
 async def test_an_error_held_from_a_lost_write_is_raised_after_the_refusal(
