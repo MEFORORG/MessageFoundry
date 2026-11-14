@@ -48,9 +48,9 @@
 # No other platform under either index was inspected.
 #
 # Any digest on the FROM line that no INSPECTED paragraph above names is uninspected, whatever the
-# paragraphs below say: they record past pins, and the FROM line can move past them. Nothing checks
-# this: tests/test_container_build_pins.py refuses only the known-bad digests, so check this block
-# against the FROM line when it moves.
+# paragraphs below say: they are dated records of the pin each PR set, and the FROM line can move
+# past the newest of them. Nothing checks this: tests/test_container_build_pins.py refuses only the
+# known-bad digests, so check this block against the FROM line when it moves.
 #
 # NOT INSPECTED, THE PIN ENGINE PR 2778 SET: the index
 # sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527, set by that PR
