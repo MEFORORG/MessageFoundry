@@ -8033,7 +8033,7 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
         what=f"the generated TLS private key {plan.key_file}",
         remedy=_generated_tls_key_remedy(state_dir),
         enforcing=enforcing,
-        engine_owned=True,  # only the engine mints this pair, so a planted one is refused
+        engine_owned=True,  # only the engine mints this key, so its owner is vetted
     )
 
 

@@ -414,27 +414,21 @@ than a path is not checked
   It does not vet an owner that is one account, or an account you granted yourself: any one
   account may own the file, as the administrator who copied in your own TLS key may. LOCAL SERVICE
   and NETWORK SERVICE are accounts that many services share, and the check does not report them.
-- **The folders above a key file** (vault BACKLOG #5656, #5657). On every platform the check
-  judges each junction or link its walk of the key file's path finds by who can change it, on POSIX by the owner and mode the file system reports, which a network file system
-  such as CIFS or NFS may not enforce, as
-  `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py` define. A key file that is itself a link is refused whoever can change it. The TLS pair
-  the engine mints is one only it writes, so on Windows its key's owner must also be the engine's
-  own account, SYSTEM or Administrators (on POSIX every key file's owner must already be the
-  engine's own account or root).
-  On Windows the check also reads the owner and access list of the directory that holds the key
-  file, and refuses the file when one of the groups above or an application package may delete a
-  file in that directory, change its access list or take it over (`FILE_DELETE_CHILD`,
-  `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when its owner is such a group or cannot be
-  read. This holds when that directory is an ordinary folder, not a junction, a symbolic link, or a
-  folder a volume is mounted on. A holder whose access list the engine's
-  account may not read is refused: give that account read access to the folder's permissions.
-  Treat anything else about that directory or the folders around it as not judged, and restrict the folder that holds each
-  key file, the secrets directory and the folders above them yourself.
+- **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
+  the owner and access list of the folder just above the key file in its path, as written, and
+  refuses the key file when one of the groups above or an application package may delete a file in that folder, change its access list or take it over, or when that
+  folder's owner is such a group or cannot be read
+  (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`). A folder whose access list
+  the engine's account may not read is refused: give that account read access to the folder's
+  permissions. On Windows the TLS key the engine mints must also be owned by the engine's own
+  account, SYSTEM or Administrators. It is not a complete check of the file's surroundings; see
+  [ADR 0214](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments). Do not rely on this check alone. Restrict the
+  secrets directory and every folder above it yourself, and the folder that holds each key file
+  and every folder above it.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
   in the group, and one held in a directory that another account owns or that a group or other may
-  write without the sticky bit (vault BACKLOG #5636). A link on its path is judged as the item
-  above says. A directory a group or other account may write is accepted when it has the sticky
+  write without the sticky bit (vault BACKLOG #5636). A directory a group or other account may write is accepted when it has the sticky
   bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
   mints its own TLS key beside the store. **When it mints its own pair and the store directory does
   not exist yet, the engine creates it on POSIX with no group or other write bit (`0755` at most,

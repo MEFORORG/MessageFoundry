@@ -100,9 +100,9 @@ def key_file_problem(
     """Why the engine may not use the key file at ``path``, or ``None`` when it may.
 
     A known broad group or an application package must not be able to read or change the file
-    (:func:`~messagefoundry.restricted_file.broad_access_problem`). That check also reads the
-    folders above the file: a junction or a link among them that another account can change is refused, and so is a directory
-    holding it that lets a broad group replace it (vault BACKLOG #5656, #5657). On POSIX it also
+    (:func:`~messagefoundry.restricted_file.broad_access_problem`). On Windows that check also
+    reads the folder just above the file in its path, and it judges some junctions and links on
+    the path (vault BACKLOG #5656, #5657). On POSIX it also
     refuses a link, a file another account owns, and a directory holding it that another account
     owns or that a group or other may write with no sticky bit. ``what`` names the file for
     the operator and ``remedy`` says what to do about it; the reason never carries the file's
