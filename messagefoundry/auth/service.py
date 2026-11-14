@@ -3244,16 +3244,16 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
 
 
-def _lock_notice_details(rows: Iterable[Any], lock: str) -> Iterator[dict[str, Any]]:
-    """The JSON detail of each audit row that names this ``lock`` kind, in row order. A row whose
-    detail does not parse as a JSON object is skipped."""
+def _lock_notice_details(rows: Iterable[Any], lock: str) -> Iterator[tuple[float, dict[str, Any]]]:
+    """The timestamp and JSON detail of each audit row that names this ``lock`` kind, in row
+    order. A row whose detail does not parse as a JSON object is skipped."""
     for row in rows:
         try:
             detail = json.loads(row["detail"] or "{}")
         except (TypeError, ValueError):
             continue
         if isinstance(detail, dict) and detail.get("lock") == lock:
-            yield detail
+            yield float(row["ts"]), detail
 
 
 def _is_idp_transport_failure(exc: BaseException) -> bool:
@@ -3314,6 +3314,14 @@ _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
 #: How many rows of each action one throttle read takes, newest first, both kinds together. A
 #: failed send re-arms the throttle (BACKLOG #1138), so a window can hold more than one row per kind.
 _LOCK_NOTICE_READ_LIMIT: Final = 200
+#: BACKLOG #1138: after a lock notice of a kind failed to send, the next one waits this long after
+#: it, doubling with each consecutive failure in the window, up to the window itself. A relay that
+#: keeps failing is then tried a few times a day per account and kind, not on every lock.
+_LOCK_NOTICE_RETRY_BASE_SECONDS: Final = 15 * 60.0
+#: How far before the oldest mailed row the failure read starts. A failure row is written after its
+#: notice's hand-off, and the notice's own row is stamped right after that hand-off, but nothing
+#: orders the two writes, so a fast failure can be stamped a moment before its notice's row.
+_LOCK_NOTICE_FAILURE_SLACK_SECONDS: Final = 300.0
 #: BACKLOG #2216: how long :meth:`AuthService.close_background` lets the
 #: service's background tasks finish at shutdown before it cancels the rest, and how long it then
 #: waits for the cancelled ones to unwind. A task still running at the first bound is queued behind
@@ -20323,9 +20331,12 @@ class AuthService:
         With a notifier wired, the caller records a due notice AFTER the mail, through
         :meth:`_record_lock_notice` (BACKLOG #2216). With none, this writes the row itself.
 
-        ADR 0197 Decision item 7 (BACKLOG #1131): at most one mail per lock kind per account per
-        :data:`_LOCK_NOTICE_WINDOW_SECONDS`, and always a mail for the first lock after a quiet window.
-        Throttled by TIME, not by cycle: the cycle count survives ``admin-unlock`` and never decays, so
+        ADR 0197 Decision item 7 (BACKLOG #1131): one mail per lock kind per account per
+        :data:`_LOCK_NOTICE_WINDOW_SECONDS` while sends succeed, and always a mail for the first lock
+        after a quiet window. A send recorded as failed is retried on a backoff
+        (:meth:`_lock_notice_held_back`, BACKLOG #1138), so a send that fails after the relay
+        accepted the mail can deliver more than one a window. Throttled by TIME, not by cycle:
+        the cycle count survives ``admin-unlock`` and never decays, so
         a cycle throttle would go quiet for a new campaign starting at a high count.
 
         **It cannot key on the ``auth.account_locked`` row**, which ``_record_suspicious_login`` writes
@@ -20365,14 +20376,17 @@ class AuthService:
     async def _lock_notice_held_back(self, user: UserRecord, lock: str) -> bool:
         """The throttle's READ: whether a notice of this ``lock`` kind already went out in the window.
 
-        **A failed send cancels its own notice's hold (BACKLOG #1138).** A ``mailed: true`` row is
-        cancelled by an ``auth.lock_notice_undelivered`` row of the kind carrying the same notice
-        id (``LOCK_NOTICE_ID_FIELD``): that mail never left. The notice is held back while any
-        ``mailed: true`` row of the kind in the window is not cancelled, so once every mail of the
-        kind in the window failed, the next lock retries the relay. Matched by id, not by order:
-        the relay drains one queue and can record an earlier notice's failure after a later
-        notice's row. A row without an id cancels nothing, nor does a failure whose record write
-        failed or has not landed yet; the hold then stands for the window as before.
+        **A failed send cancels its own notice's hold, on a backoff (BACKLOG #1138).** A
+        ``mailed: true`` row is cancelled by an ``auth.lock_notice_undelivered`` row of the kind
+        carrying the same notice id (``LOCK_NOTICE_ID_FIELD``): that mail never left. The notice is
+        held back while any ``mailed: true`` row of the kind in the window is not cancelled. Once
+        all N of them failed, the next lock retries the relay only from
+        :data:`_LOCK_NOTICE_RETRY_BASE_SECONDS` times 2**(N-1) after the newest, capped at the
+        window, so a failing relay is not tried on every lock and its queue, which every account's
+        notices share, does not fill. Matched by id, not by order: the relay drains one queue and
+        can record an earlier notice's failure after a later notice's row. A row without an id
+        cancels nothing, nor does a failure whose record write failed or has not landed yet; the
+        hold then stands for the window as before.
 
         Kept apart from the row write, so the background task can send the mail between this read
         and :meth:`_record_lock_notice` (BACKLOG #2216). An audit index serves both actions' reads
@@ -20388,7 +20402,8 @@ class AuthService:
         and ``GET /logs/tail`` serves the log to ``logs:view``. A traceback would carry the
         driver's message, which can quote the bound username."""
         mailable = bool(user.notify_email)
-        since = max(time.time() - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
+        now = time.time()
+        since = max(now - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
         try:
             async with self._lock_notice_read_slots:
                 rows = await self._store.list_audit(
@@ -20397,8 +20412,8 @@ class AuthService:
                     since=since,
                     limit=_LOCK_NOTICE_READ_LIMIT,
                 )
-                mailed_ids: set[str] = set()
-                for detail in _lock_notice_details(rows, lock):
+                mailed: dict[str, float] = {}  # notice id -> its row's timestamp
+                for ts, detail in _lock_notice_details(rows, lock):
                     if detail.get("mailed", True) is False:
                         # A row that mailed nothing holds back only another addressless notice.
                         if not mailable:
@@ -20407,18 +20422,24 @@ class AuthService:
                     notice_id = detail.get(LOCK_NOTICE_ID_FIELD)
                     if not isinstance(notice_id, str):
                         return True  # no failure can be matched to it
-                    mailed_ids.add(notice_id)
-                if not mailed_ids:
+                    mailed[notice_id] = ts
+                if not mailed:
                     return False
+                # Held until then whatever the failures say: by an uncancelled mail, or by the
+                # backoff once every mail failed. Only past it does the failure read decide.
+                backoff = _LOCK_NOTICE_RETRY_BASE_SECONDS * 2.0 ** (len(mailed) - 1)
+                if now < max(mailed.values()) + min(backoff, _LOCK_NOTICE_WINDOW_SECONDS):
+                    return True
+                # The same notices the first read saw, and no older failures to crowd them out.
                 failed = await self._store.list_audit(
                     actor=user.username,
                     action=LOCK_NOTICE_UNDELIVERED_ACTION,
-                    since=since,
+                    since=max(since, min(mailed.values()) - _LOCK_NOTICE_FAILURE_SLACK_SECONDS),
                     limit=_LOCK_NOTICE_READ_LIMIT,
                 )
-                return not mailed_ids <= {
+                return not mailed.keys() <= {
                     detail.get(LOCK_NOTICE_ID_FIELD)
-                    for detail in _lock_notice_details(failed, lock)
+                    for _ts, detail in _lock_notice_details(failed, lock)
                 }
         except Exception as exc:  # noqa: BLE001 - fails open by design, and is logged
             _log.error(

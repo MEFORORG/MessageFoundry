@@ -330,8 +330,10 @@ discriminator the attacker lacks: the owner's TOTP secret.
 6. **Cycle counts.** Each counter gets a cycle count, raised by the attempt that sets its lock. A
    full authentication zeroes both counters and both cycle counts, as `record_login_success` does
    for the columns it clears today.
-7. **Notices.** `ACCOUNT_LOCKED` is throttled by time, not by cycle: at most one mail per lock kind
-   per account per 24 hours, and always a mail for the first lock after 24 hours with none. The
+7. **Notices.** `ACCOUNT_LOCKED` is throttled by time, not by cycle: one mail per lock kind per
+   account per 24 hours while sends succeed, and always a mail for the first lock after 24 hours
+   with none. A send recorded as failed is retried on a backoff (BACKLOG #1138;
+   `AuthService._lock_notice_held_back` states it). The
    throttle cannot key on the `auth.account_locked` row: `_record_suspicious_login` writes that row
    for every lock, before any mail, so the newest one is always the current lock and a 15-minute
    campaign would look mailed forever. Instead the notifier writes its own audit row for each mail it
@@ -491,7 +493,8 @@ timing parity across its outcomes has to be measured, not assumed.
 - **AC-9** — WHEN `admin-unlock` runs, THE SYSTEM SHALL clear both locks and both failure counts, and
   SHALL report both old expiries and both cycle counts. Test: to build with the chosen shape.
 - **AC-10** — WHEN a lock is set, THE SYSTEM SHALL write an `auth.account_locked` audit row, and
-  SHALL mail `ACCOUNT_LOCKED` unless it mailed that lock kind for that account in the last 24 hours.
+  SHALL mail `ACCOUNT_LOCKED` unless it mailed that lock kind for that account in the last 24 hours
+  and that send was not recorded as failed (a failed one is retried on the BACKLOG #1138 backoff).
   Test: to build with the chosen shape, including an arm that runs `admin-unlock` and then a new
   lock at a high cycle count and asserts a mail, and an arm that locks every 15 minutes for 25
   hours and asserts exactly two mails.

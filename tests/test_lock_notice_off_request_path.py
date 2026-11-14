@@ -14,6 +14,7 @@ Each test that asserts an absence carries a control showing the instrument can s
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import threading
@@ -1200,6 +1201,13 @@ async def test_the_sign_in_lock_notice_reads_the_totp_verdict_its_escalation_use
 # --- a send that fails after the hand-off (BACKLOG #1138) -------------------------------------
 
 
+@pytest.fixture
+def _no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No retry backoff after a failed lock notice, so a test can lock again at once and see the
+    failure cancel the hold. The backoff has its own tests below."""
+    monkeypatch.setattr(service_module, "_LOCK_NOTICE_RETRY_BASE_SECONDS", 0.0)
+
+
 class _Relay:
     """The shipped notifier, started, with ``send_plain_email`` replaced by a recorder that fails
     while ``fail`` is set."""
@@ -1261,6 +1269,7 @@ async def _relay_harness(
             await store.close()
 
 
+@pytest.mark.usefixtures("_no_backoff")
 async def test_a_send_that_fails_after_the_hand_off_does_not_hold_the_next_notice_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1297,6 +1306,7 @@ async def test_a_delivered_notice_still_holds_the_next_one_back(
         assert await _undelivered_rows(store, user.username) == []
 
 
+@pytest.mark.usefixtures("_no_backoff")
 async def test_an_older_failure_does_not_cancel_a_later_delivered_notice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1316,6 +1326,7 @@ def _held(lock: str, notice_id: str, *, mailed: bool = True) -> str:
     return json.dumps({"lock": lock, "mailed": mailed, "notice_id": notice_id})
 
 
+@pytest.mark.usefixtures("_no_backoff")
 async def test_only_the_same_notices_failure_cancels_the_hold() -> None:
     """Rows written straight to the store. The newest holding row is notice ``b``. A failure of
     the earlier notice ``a``, recorded AFTER ``b``'s row (a relay that drained a backed-up queue
@@ -1345,6 +1356,7 @@ async def test_only_the_same_notices_failure_cancels_the_hold() -> None:
         await _close(store, service)
 
 
+@pytest.mark.usefixtures("_no_backoff")
 async def test_a_failed_second_read_fails_open() -> None:
     """The undelivered read fails while the first read found a delivered notice: the throttle
     sends rather than hold, as on a failed first read. The control is the same state with the
@@ -1368,6 +1380,7 @@ async def test_a_failed_second_read_fails_open() -> None:
         await _close(store, service)
 
 
+@pytest.mark.usefixtures("_no_backoff")
 async def test_a_delivered_mail_in_the_window_holds_even_behind_a_newer_failure() -> None:
     """Two notices of one kind went out in the window, for example from two engine shards: ``a``
     was delivered and the newer ``b`` failed. ``a`` reached the owner, so the next lock is still
@@ -1391,3 +1404,55 @@ async def test_a_delivered_mail_in_the_window_holds_even_behind_a_newer_failure(
         assert await service._lock_notice_held_back(user, "sign_in") is False
     finally:
         await _close(store, service)
+
+
+async def _failed_notices(store: MessageStore, actor: str, ages: list[float]) -> None:
+    """One mailed ``sign_in`` notice per age in seconds, oldest first, each with a failure row."""
+    now = time.time()
+    for n, age in enumerate(ages):
+        notice_id = f"n{n:010d}"
+        await store.record_audit(
+            _LOCK_NOTICE, actor=actor, detail=_held("sign_in", notice_id), now=now - age
+        )
+        await store.record_audit(
+            _LOCK_NOTICE_UNDELIVERED,
+            actor=actor,
+            detail=json.dumps({"lock": "sign_in", "notice_id": notice_id}),
+            now=now - age + 1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("ages", "held"),
+    [
+        ([60.0], True),  # one failure a minute ago: wait 15 minutes
+        ([16 * 60.0], False),  # the control: 15 minutes have passed
+        ([3600.0, 20 * 60.0], True),  # two failures: wait 30 minutes after the newer
+        ([3600.0, 31 * 60.0], False),
+        ([20 * 3600.0, 10 * 3600.0, 5 * 3600.0, 4 * 3600.0, 3 * 3600.0, 2 * 3600.0, 3000.0], True),
+    ],
+)
+async def test_a_failing_relay_is_retried_on_a_backoff(ages: list[float], held: bool) -> None:
+    """BACKLOG #1138: once every mailed notice of the kind in the window failed, the next is due
+    only 15 minutes times 2**(N-1) after the newest, capped at the window. So a relay that keeps
+    failing is not tried on every lock, and its shared queue does not fill. The ``False`` rows are
+    the controls: past the backoff the notice goes."""
+    store, service, _fake, user = await _harness()
+    try:
+        await _failed_notices(store, user.username, ages)
+        # Born before the rows, which the throttle would otherwise ignore as older than the account.
+        old = dataclasses.replace(user, created_at=0.0)
+        assert await service._lock_notice_held_back(old, "sign_in") is held
+    finally:
+        await _close(store, service)
+
+
+async def test_a_lock_inside_the_backoff_is_not_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End to end: a send fails, and an immediate second lock of the kind is held by the backoff,
+    so the relay is tried once. The control is the same two locks with no backoff, which try it
+    twice (``test_a_send_that_fails_after_the_hand_off_does_not_hold_the_next_notice_back``)."""
+    async with _relay_harness(monkeypatch) as (store, service, relay, user):
+        relay.fail = True
+        await _lock_and_settle(service, store, relay, user, 1)
+        await _lock_and_settle(service, store, relay, user, 2)
+        assert relay.sends == 1, "a lock inside the backoff tried the failing relay again"

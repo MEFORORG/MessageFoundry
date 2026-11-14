@@ -7025,8 +7025,10 @@ conditions the security-event notification section above states (an alert sink c
 notification setting on, and an address on the account), and recorded on `GET /me/security-events`,
 which is a self-scoped feed the holder can read only while they still hold a live, fully-authenticated
 session. Each refusal is also audited, so a campaign is visible in the audit log while it runs. Every lock
-writes `auth.account_locked`, but the mail is **throttled by time** (ADR 0197): at most one per lock
-kind per account per 24 hours, and always one for the first lock after a quiet day. Each mail names
+writes `auth.account_locked`, but the mail is **throttled by time** (ADR 0197): one per lock kind
+per account per 24 hours while sends succeed, and always one for the first lock after a quiet day.
+A send recorded as failed is retried on a backoff that `AuthService._lock_notice_held_back` states
+(BACKLOG #1138). Each mail names
 the lock and its cycle count, and writes its own `auth.lock_notice` row, which is what the throttle
 reads, with the relay's `auth.lock_notice_undelivered` rows (below). With a relay wired, that read and the mail run in a background task (BACKLOG #2216). The
 refusal writes `auth.account_locked` first and does not wait for the task. So a large audit log would
@@ -7662,9 +7664,9 @@ again for the row, and only when a send failed. **Still open, at least:**
   example while the send waits out the relay's timeout, is held back. A write that fails or is cut
   off keeps the hold for the rest of its 24 hours.
 - A send that raises after the relay accepted the mail, for example on a refused `QUIT`, is
-  recorded as `send_failed` too, so the next lock of the kind mails again.
-- Each failed send re-arms the throttle, so while the relay fails every lock of a kind retries it,
-  and each try holds the relay's one worker until the send fails.
+  recorded as `send_failed` too, so a later lock of the kind mails again once the backoff allows.
+- While the relay fails, each account and lock kind still retries it a few times a day, and each
+  try holds the relay's one worker until the send fails.
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
 engine waits at most two seconds for pending notices, then cancels any still pending, each with one
