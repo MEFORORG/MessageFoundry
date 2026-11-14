@@ -16,6 +16,7 @@ import dataclasses
 import importlib
 import inspect
 import textwrap
+import typing
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from messagefoundry.config.models import bool_setting
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     _COMPOSER_BOOL_SETTINGS,
+    MLLP,
     Database,
     EnvRef,
     Ftp,
@@ -964,3 +966,177 @@ def test_the_bool_scan_reads_every_connections_toml_transport() -> None:
     from messagefoundry.config.connections_file import _TRANSPORTS
 
     assert {factory.__name__ for factory in _TRANSPORTS.values()} <= _bool_settings().factories
+
+
+# --- the flags inbound() and outbound() take themselves (#3234 step 1, engine PR 2929 deferred) -----
+#
+# The engine reads these with plain truthiness and never resolves an env() on them, so a quoted
+# "false", a number or an env() reference read True: simulate="false" suppressed every send.
+
+
+def _declaration_flags(factory: Any) -> dict[str, bool]:
+    """Every parameter ``factory`` types ``bool``, mapped to whether it also takes ``None``. Read
+    from the signature, so a flag added later is covered without editing this list."""
+    hints = typing.get_type_hints(factory)
+    return {
+        name: hints[name] is not bool
+        for name in inspect.signature(factory).parameters
+        if hints.get(name) in (bool, bool | None)
+    }
+
+
+_DECLARATION_FLAGS = [
+    *(("inbound", key, none_ok) for key, none_ok in _declaration_flags(wiring.inbound).items()),
+    *(("outbound", key, none_ok) for key, none_ok in _declaration_flags(wiring.outbound).items()),
+]
+
+
+def _declare(direction: str, **flags: Any) -> Any:
+    if direction == "inbound":
+        return build_inbound_connection("IB_X", MLLP(port=2575), router="r", **flags)
+    return build_outbound_connection("OB_X", Rest(url="https://partner.example.org/in"), **flags)
+
+
+def test_the_flag_census_finds_the_flags_the_review_named() -> None:
+    # The control for the census: the flags engine PR 2929's review named, and the hop-policy flags.
+    inbound_flags = _declaration_flags(wiring.inbound)
+    outbound_flags = _declaration_flags(wiring.outbound)
+    named = {"strict", "inline", "auto_start", "deployed", "capture_ack"}
+    assert named | {"capture_connection_errors", "tls_hop_attested"} <= set(inbound_flags)
+    assert {"simulate", "auto_start", "deployed", "cleartext_accepted"} <= set(outbound_flags)
+    assert inbound_flags["capture_ack"] is True and inbound_flags["deployed"] is False
+    # connections.toml goes through the build_* factories, so they must take the same flags.
+    assert _declaration_flags(build_inbound_connection) == inbound_flags
+    assert _declaration_flags(build_outbound_connection) == outbound_flags
+
+
+@pytest.mark.parametrize(
+    "bad", ["false", "true", 0, 1, env("x"), None], ids=["false", "true", "0", "1", "env", "None"]
+)
+@pytest.mark.parametrize(("direction", "key", "none_ok"), _DECLARATION_FLAGS)
+def test_a_declaration_flag_that_is_not_a_bool_is_refused(
+    direction: str, key: str, none_ok: bool, bad: Any
+) -> None:
+    if bad is None and none_ok:
+        pytest.skip("None means inherit on this flag")
+    with pytest.raises(WiringError) as ei:
+        _declare(direction, **{key: bad})
+    msg = str(ei.value)
+    assert f"{direction} connection '{direction[0].upper()}B_X'" in msg
+    assert f"{key} must be true or false, not {type(bad).__name__}" in msg
+
+
+@pytest.mark.parametrize(("direction", "key", "none_ok"), _DECLARATION_FLAGS)
+def test_a_declaration_flag_still_takes_a_real_bool_and_none_where_it_inherits(
+    direction: str, key: str, none_ok: bool
+) -> None:
+    # The control. False is what every flag carries off; True on a hop-policy flag needs a reason
+    # and on some flags a transport, so only False and None are built here.
+    def read(conn: Any) -> Any:
+        return conn.validation.strict if key == "strict" else getattr(conn, key)
+
+    assert read(_declare(direction, **{key: False})) is False
+    if none_ok:
+        assert read(_declare(direction, **{key: None})) is None
+
+
+def test_the_refusal_says_a_quoted_false_reads_true_and_env_is_not_read() -> None:
+    with pytest.raises(WiringError) as ei:
+        _declare("outbound", simulate="false")
+    assert _QUOTED_FALSE_HINT in str(ei.value)
+    with pytest.raises(WiringError) as ei:
+        _declare("outbound", deployed=env("deployed", cast=bool))
+    msg = str(ei.value)
+    assert "an env() reference is not read here" in msg
+    assert _QUOTED_FALSE_HINT not in msg
+
+
+def test_a_strict_quoted_false_is_refused_before_the_content_type_check() -> None:
+    # The content_type check read strict by truthiness, so "false" was refused as if strict were on.
+    with pytest.raises(WiringError) as ei:
+        build_inbound_connection(
+            "IB_X",
+            MLLP(port=2575),
+            router="r",
+            content_type="json",
+            strict="false",  # type: ignore[arg-type]
+        )
+    assert "strict must be true or false, not str" in str(ei.value)
+
+
+def test_a_code_first_simulate_false_string_stops_the_load(tmp_path: Path) -> None:
+    # End to end: simulate="false" read True, so the outbound suppressed every send and finalized
+    # the message PROCESSED. The load now refuses it, so check, dryrun and serve all see it.
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_X', Rest(url='https://partner.example.org/in'), simulate='false')\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match=r"'OB_X'.*simulate must be true or false, not str"):
+        load_config(tmp_path, allow_empty=True)
+    diagnostics = wiring.validate_config(tmp_path, allow_empty=True)
+    assert any("simulate must be true or false" in d.message for d in diagnostics)
+
+
+_TOML_FLAG = """
+[[{direction}]]
+name = "{name}"
+transport = "{transport}"
+{extra}{key} = {value}
+  [{direction}.settings]
+  {settings}
+"""
+
+#: The declaration flags a connections.toml table carries (``inline`` is code-first only).
+_TOML_FLAGS = [
+    ("inbound", "strict"),
+    ("inbound", "capture_ack"),
+    ("inbound", "capture_connection_errors"),
+    ("inbound", "auto_start"),
+    ("inbound", "deployed"),
+    ("outbound", "simulate"),
+    ("outbound", "auto_start"),
+    ("outbound", "deployed"),
+]
+
+
+def _toml_flag(direction: str, key: str, value: str) -> str:
+    inbound = direction == "inbound"
+    return _TOML_FLAG.format(
+        direction=direction,
+        name="IB_X" if inbound else "OB_X",
+        transport="mllp" if inbound else "rest",
+        extra='router = "r"\n' if inbound else "",
+        key=key,
+        value=value,
+        settings="port = 2575" if inbound else 'url = "https://partner.example.org/in"',
+    )
+
+
+@pytest.mark.parametrize(("direction", "key"), _TOML_FLAGS)
+def test_connections_toml_refuses_a_quoted_declaration_flag(
+    tmp_path: Path, direction: str, key: str
+) -> None:
+    # The other authoring route refused a quoted value before build_* saw it, and still does.
+    (tmp_path / "connections.toml").write_text(
+        _toml_flag(direction, key, '"false"'), encoding="utf-8"
+    )
+    with pytest.raises(WiringError, match=rf"connection '.B_X': '{key}' must be true or false"):
+        load_config(tmp_path, allow_empty=True)
+
+
+@pytest.mark.parametrize(("direction", "key"), _TOML_FLAGS)
+def test_connections_toml_still_reads_a_real_false_declaration_flag(
+    tmp_path: Path, direction: str, key: str
+) -> None:
+    (tmp_path / "connections.toml").write_text(
+        _toml_flag(direction, key, "false"), encoding="utf-8"
+    )
+    (tmp_path / "routes.py").write_text(
+        "from messagefoundry import router\n@router('r')\ndef route(msg):\n    return []\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    conn = reg.inbound["IB_X"] if direction == "inbound" else reg.outbound["OB_X"]
+    got = reg.inbound["IB_X"].validation.strict if key == "strict" else getattr(conn, key)
+    assert got is False

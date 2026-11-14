@@ -48,7 +48,7 @@ import threading
 import tokenize
 import traceback
 import urllib.parse
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -1658,13 +1658,16 @@ def _bool_literal_problem(key: str, value: Any) -> str | None:
     return None
 
 
-def _bool_remedy(value: object) -> str:
+def _bool_remedy(value: object, *, env_read: bool = True) -> str:
     """The remedy every refusal of a non-bool literal ends with. A false spelling in quotes, which
     every lax read takes as true, gets a hint that says so; it says the value is a false spelling,
-    never which."""
+    never which. ``env_read`` is false where nothing resolves an ``env()`` on the flag, so the
+    remedy does not offer one."""
     hint = ""
     if isinstance(value, str) and _BOOL_SPELLINGS.get(value.strip().lower()) is False:
         hint = " (a false spelling in quotes reads as true)"
+    if not env_read:
+        return f"{hint}; write True or False (an env() reference is not read here)"
     return f"{hint}; write True, False or an env() reference"
 
 
@@ -1676,6 +1679,23 @@ def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
     for key, value in settings.items():
         if (bad := _bool_literal_problem(key, value)) is not None:
             raise WiringError(f"{where}: {bad}")
+
+
+def _refuse_non_bool_flags(
+    where: str, flags: Mapping[str, object], *, none_inherits: Collection[str] = ()
+) -> None:
+    """Refuse a flag ``inbound()`` or ``outbound()`` takes itself that is not a real ``bool``
+    (vault BACKLOG #3234). The engine reads these by truthiness and resolves no ``env()`` on them,
+    so ``simulate="false"``, a number or a reference would read True. ``None`` passes only on a
+    flag in ``none_inherits``, where it means inherit the service default. The hop-policy flags
+    are not passed here: their own checks refuse a non-bool with a hop-specific remedy."""
+    for key, value in flags.items():
+        if isinstance(value, bool) or (value is None and key in none_inherits):
+            continue
+        raise WiringError(
+            f"{where}: {key} must be true or false, not {type(value).__name__}"
+            f"{_bool_remedy(value, env_read=False)}"
+        )
 
 
 def resolve_env_settings(
@@ -8300,6 +8320,19 @@ def build_inbound_connection(
     member **or** its bare string value (``"x12"``, ``"json"``, …); it is coerced to the enum here so a
     raw string can't reach the pipeline and crash later."""
     _refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
+    # Before any check below reads one: the content_type check read strict="false" as strict on.
+    _refuse_non_bool_flags(
+        f"inbound connection {name!r}",
+        {
+            "strict": strict,
+            "inline": inline,
+            "auto_start": auto_start,
+            "deployed": deployed,
+            "capture_ack": capture_ack,
+            "capture_connection_errors": capture_connection_errors,
+        },
+        none_inherits=("capture_ack", "capture_connection_errors"),
+    )
     content_type = _coerce_content_type(name, content_type)
     if (
         spec.type
@@ -8694,6 +8727,10 @@ def build_outbound_connection(
     The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
     _refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
+    _refuse_non_bool_flags(
+        f"outbound connection {name!r}",
+        {"simulate": simulate, "auto_start": auto_start, "deployed": deployed},
+    )
     # ADR 0153 decision 2: the cleartext-acceptance pair is coherence-checked HERE, the one choke point
     # both authoring surfaces pass through, so a flag with no reason (or a reason with no flag) fails at
     # `messagefoundry check` / dry-run rather than at connector construction. Re-raised as a WiringError
