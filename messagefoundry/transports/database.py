@@ -110,11 +110,13 @@ from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
 from messagefoundry.odbc_call_gate import (
     CallGate,
+    UngatedConnectionError,
     call_gate,
+    close_one_shot,
     drop_handle,
-    install_call_gate,
     raw_cursor,
     report_once,
+    require_call_gate,
 )
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
@@ -3227,8 +3229,9 @@ class _AutocommitPool:
     async def _acquire_confirmed(self) -> Any:
         conn = await self._pool.acquire()
         # BACKLOG #2394: here, not only in _acquire, because a DatabaseRef sync borrows through
-        # acquire_pooled, and because the set below goes through the gate.
-        install_call_gate(conn)
+        # acquire_pooled, and because the set below goes through the gate. One the gate cannot
+        # wrap is refused before that set, its first call.
+        await _require_gate_or_discard(self._pool, conn)
         if conn in self._confirmed:  # False, not an error, for an object with no weak reference
             return conn
         try:
@@ -3349,15 +3352,47 @@ async def _acquire(pool: Any, timeout: float) -> Any:
     hung/exhausted pool surfaces as a retryable failure instead of an unbounded await.
 
     The connection comes back with the call gate installed (BACKLOG #2394), so a cancelled call
-    cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded."""
+    cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded. A
+    real aioodbc connection the gate cannot wrap is refused and discarded instead, before any call
+    runs on it (:func:`_require_gate_or_discard`)."""
     try:
         conn = await asyncio.wait_for(pool.acquire(), timeout)
     except TimeoutError as exc:
         raise DeliveryError(
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
-    install_call_gate(conn)
+    await _require_gate_or_discard(pool, conn)
     return conn
+
+
+async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
+    """Gate a connection just borrowed from ``pool``, or refuse it (BACKLOG #2394).
+
+    Call it before the first pyodbc call on ``conn``, with no await between the borrow and it. A
+    real aioodbc connection the call gate cannot wrap
+    (:func:`~messagefoundry.odbc_call_gate.require_call_gate`) has no safe cancellation exit, so
+    it is closed here, while no call runs on it, and given back to ``pool`` closed, so the pool
+    never lends it again. :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` then
+    propagates, and each caller classifies it as it does any other failure to borrow. A stand-in
+    the gate cannot wrap is not refused, as ``require_call_gate`` leaves it alone.
+
+    The close is :func:`~messagefoundry.odbc_call_gate.close_one_shot`, which drops the handle
+    before its first await and goes on if a cancellation lands meanwhile. A connection with no
+    ``_conn`` (an aioodbc that renamed it, as it renamed ``_execute``) is closed through its own
+    ``close()``; a cancellation there can leave it open, and the pool may lend it again, so it is
+    marked, and a later refusal of it does not start a second close beside the first."""
+    try:
+        require_call_gate(conn)
+    except UngatedConnectionError:
+        try:
+            # A first refusal always closes: close_one_shot drops a handle before it awaits, so
+            # only a connection with no ``_conn`` can be lent and refused again mid-close.
+            if not getattr(conn, "_mefor_refused", False):
+                conn._mefor_refused = True  # await-free, before the close starts
+                await close_one_shot(conn, None)
+        finally:
+            await _return_to_pool(pool, conn)
+        raise
 
 
 async def _close_cursor(cur: Any) -> None:
@@ -3415,20 +3450,19 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     alone is handed to that call, so the connection goes back only once it has returned, and the
     gate closes the cursor it made as it returns. A cancellation that lands after a call was handed
     to the connection's executor but before that call entered the gate leaves a call that never
-    runs (:class:`~messagefoundry.odbc_call_gate.CallGate`), so no close races it. A connection
-    with no gate (one :func:`~messagefoundry.odbc_call_gate.install_call_gate` could not wrap,
-    which it logs at ERROR, or a test double) has nothing to hand a close to, so a cancellation
-    drops its handle and closes nothing: the pool gets it back closed, and pyodbc frees the cursor
-    and then the connection once nothing uses them, since its cursor holds the connection.
+    runs (:class:`~messagefoundry.odbc_call_gate.CallGate`), so no close races it. A real aioodbc
+    connection the gate cannot wrap never reaches here: the borrow refused and discarded it before
+    its first call (:func:`_require_gate_or_discard`). A connection with no gate is therefore a
+    stand-in, a test double. It has nothing to hand a close to, so a cancellation drops its handle
+    and closes nothing: the pool gets it back closed, and its unclosed handles are freed where
+    their last reference drops, rather than under the call.
 
     **What this does not cover, at least.** A cursor with no raw pyodbc cursor (a test double, or
     an aioodbc that renamed ``_impl``, which :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs
     once) is closed through its own ``close()`` as a task, and a teardown cancel of that task keeps
-    the connection out of the pool (:func:`_return_when_settled`). An ungated connection's
-    unclosed handles are freed where their last reference drops, which can be the event loop, for
-    one through the cancelled call's own result: that free rolls back and disconnects there, the
-    trade for not freeing them under the call. Its session ends only then. A cancellation that lands after a ``cursor()`` call returned on its
-    thread, but before the loop delivered the result, leaves that cursor for the collector.
+    the connection out of the pool (:func:`_return_when_settled`). A cancellation that lands after
+    a ``cursor()`` call returned on its thread, but before the loop delivered the result, leaves
+    that cursor for the collector.
 
     **``discard`` closes the connection instead of returning it open (BACKLOG #5010).** A caller
     whose own rollback failed passes it, since the transaction may still be open on a live session
