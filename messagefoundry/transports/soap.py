@@ -32,7 +32,9 @@ retry). A **Sender/Client** fault → permanent dead-letter; a **Receiver/Server
 Code, and where that yields none, from the Fault's first faultcode or a Value ahead of it
 (``_fault_code`` says how). An unrecognized fault is treated as permanent. With no fault, the HTTP
 status decides: 2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter; a connection/timeout
-error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the SOAP
+error retries. One exception comes before all of these: with OAuth2 client credentials configured, an
+HTTP 401 drops the cached bearer and retries, whatever the body holds, as the REST and FHIR
+connectors do (BACKLOG #5798). Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the SOAP
 fault role + HTTP status are.
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** (minting a fresh ``<wsa:MessageID>``
@@ -1310,6 +1312,16 @@ class SoapDestination(DestinationConnector):
                 body = ""
             except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
                 body = ""
+            if self._token_provider is not None and exc.code == 401:
+                # BACKLOG #5798, as in the REST and FHIR twins: the cached OAuth2 bearer may have been
+                # revoked or expired between mint and use. Drop it and retry with a fresh one
+                # (transient); classifying the 401 permanent dead-lettered the message and left the
+                # bad token cached for every later send. A 403 stays permanent below, as there.
+                # Secret-safe: the redacted URL only, never the body.
+                self._token_provider.invalidate()
+                raise DeliveryError(
+                    f"SOAP {_redact_url(self.url)} returned HTTP 401; refreshing OAuth2 token"
+                ) from exc
             # A non-2xx status: _classify_soap always returns a failure here (it returns None only on
             # 2xx). This is a transport-level fault — raised for BOTH capturing and non-capturing.
             raise (

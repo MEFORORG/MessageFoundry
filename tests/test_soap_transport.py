@@ -23,6 +23,7 @@ from messagefoundry.config.wiring import Soap, WiringError
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
+from messagefoundry.transports.http_auth import with_oauth2_client_credentials
 from messagefoundry.transports.soap import SoapDestination, _classify_soap, _fault_code
 from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
@@ -344,3 +345,64 @@ def test_egress_shares_allowed_http() -> None:
         check_egress_allowed(bad, EgressSettings(allowed_http=["api.example.com"]))
     good = Destination(name="x", type=ConnectorType.SOAP, settings=Soap(url=URL).settings)
     check_egress_allowed(good, EgressSettings(allowed_http=["api.example.com"]))  # no raise
+
+
+# --- BACKLOG #5798: an OAuth2 401 drops the cached bearer and retries ----------------------------
+
+
+class _CountingProvider:
+    def __init__(self) -> None:
+        self.invalidations = 0
+
+    def access_token(self) -> str:
+        return "AT-synthetic"
+
+    def invalidate(self) -> None:
+        self.invalidations += 1
+
+
+def _oauth2_dest() -> tuple[SoapDestination, _CountingProvider]:
+    spec = with_oauth2_client_credentials(
+        Soap(url=URL),
+        token_url="https://auth.example.com/token",
+        client_id="cid",
+        client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+    )
+    d = build_destination(
+        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=spec.settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(d, SoapDestination)
+    provider = _CountingProvider()
+    d._token_provider = provider
+    return d, provider
+
+
+@pytest.mark.parametrize("body", [b"", _SENDER_11.encode()], ids=["no-fault", "sender-fault"])
+async def test_an_oauth2_401_invalidates_the_token_and_retries(body: bytes) -> None:
+    """Mutation: delete the 401 arm in `_post`. Red: the 401 classifies as a permanent
+    NegativeAckError, so the message dead-letters and the provider is never invalidated."""
+    dest, provider = _oauth2_dest()
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("<env/>")
+    assert not isinstance(ei.value, NegativeAckError)  # transient: it retries with a fresh bearer
+    assert provider.invalidations == 1
+    assert str(ei.value) == f"SOAP {URL} returned HTTP 401; refreshing OAuth2 token"
+
+
+async def test_control_an_oauth2_403_stays_permanent_and_keeps_the_token() -> None:
+    dest, provider = _oauth2_dest()
+    dest._opener = _Opener(exc=_http_error(403, b""))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<env/>")
+    assert ei.value.permanent is True
+    assert provider.invalidations == 0
+
+
+async def test_control_a_401_without_a_token_provider_stays_permanent() -> None:
+    dest = _dest(basic_user="svc", basic_password="pw-synthetic")  # noqa: S106 -- synthetic
+    dest._opener = _Opener(exc=_http_error(401, b""))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<env/>")
+    assert ei.value.permanent is True
