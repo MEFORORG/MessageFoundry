@@ -1,6 +1,7 @@
-- **On POSIX the key-file access check now refuses a key file reached through a link, one owned by
-  an account other than the engine's own or root, and one held in a directory that such an account
-  owns or that a group or other account may write without the sticky bit.** Before, it judged the
+- **On POSIX the key-file access check now refuses a key file whose own name is a link or whose
+  path runs through a link another account can change, one owned by an account other than the
+  engine's own or root, and one held in a directory that such an account owns or that a group or
+  other account may write without the sticky bit.** Before, it judged the
   mode bits of the file a link named, so a mode `0600` key another account owned, or one in a
   directory others could replace it in, would have passed. The check applies at least to the
   generated and the operator's API TLS key and each connection's key file, which `serve` and

@@ -418,11 +418,13 @@ than a path is not checked
   the check does not count them as such groups. At least two kinds of key file are held to a
   stricter owner rule. One is the key at the path where the engine mints its TLS key, when
   `serve` or `supervise` starts with that pair (below). When the engine does not use that pair, as
-  with an operator certificate, the file at that path is not checked at all unless a key setting
+  with an operator certificate, the file at that path is not checked at all unless a setting
   names it. The other is the key custody host and handoff files. A separate check,
   `key_file_handle_problem` ([restricted_file.py](../messagefoundry/restricted_file.py)), refuses
   them at least when an account other than SYSTEM, Administrators or the engine's own owns them,
-  or when their access list is not exactly the one the engine writes.
+  or when their access list is not exactly SYSTEM and Administrators with full control and the
+  engine's own account with full control for the host file, or with read and delete for the
+  handoff file.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
   the owner and access list of the folder just above the key file in its path, as written, and
   refuses the key file when one of the groups above or an application package may delete a file in that folder, change its access list or take it over, or when that
