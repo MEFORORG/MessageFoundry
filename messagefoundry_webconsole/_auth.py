@@ -90,6 +90,7 @@ __all__ = [
     "set_oidc_flow_cookie",
     "set_session_cookie",
     "spend_ui_action_step_up",
+    "ui_action_proof_held",
     "ActionSpend",
     "RepeatRefused",
     "proof_spent_for",
@@ -1520,6 +1521,21 @@ def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPExce
     _issue_continuation(request, target)
     nxt = quote(target, safe="/")
     return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": f"/ui/reauth?next={nxt}"})
+
+
+async def ui_action_proof_held(request: Request, action: str) -> bool:
+    """Whether a submit to a gate bound to ``action`` would pass that gate's proof check now,
+    WITHOUT spending anything: the session holds the live grant, or the org opted out and the
+    window is fresh. ``True`` with no auth service, as the gates are no-ops then.
+
+    For a page that would render a form for a body-carrying POST, so it can offer the re-auth
+    before the operator types rather than drop what they typed (BACKLOG #5931). Decides only what
+    renders: the gate still spends the proof. Its new-client-IP refusal is not run here, because it
+    records the address, so a submit from a new address can still be sent to re-auth."""
+    auth = get_auth(request)
+    return auth is None or await _ui_action_step_up_ok(
+        auth, session_token(request), action, spend=False
+    )
 
 
 async def _refuse_from_new_address(

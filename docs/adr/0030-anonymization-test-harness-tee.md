@@ -432,7 +432,10 @@ a refusal or via the `on_report` hook. The broad-shape tier stays scoped out (be
 ### 6. Integration points
 
 - **Tee — anonymize on export.** A **new** subcommand `tee anonymize-captures` (NOT folded into the body-
-  free `tee export`, whose PHI-safe-by-construction contract is load-bearing): reads
+  free `tee export`, whose PHI-safe-by-construction contract is load-bearing *(amended
+  2026-11-13, #5637: export is body-free but not PHI-safe, because a log row's `detail` can carry
+  partner ACK text that names a patient; the corrected statement is
+  [TEE-RELAY.md, Export for review](../TEE-RELAY.md#export-for-review-incl-ai-analysis))*): reads
   `RelayStore.captures(direction="corepoint_copy")`, pipes each `CaptureRow.raw` through `tee.anon.anonymize`,
   runs `leak_check`, and on a clean pass writes de-identified bodies (`--out`). **Precondition:** captures
   are written **only when the relay ran with `--capture-bodies`** (the body table is empty otherwise), so the

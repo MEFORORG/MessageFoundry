@@ -15,6 +15,7 @@ finally reaches, and it does not see a native driver that dials on its own.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import urllib.parse
 from collections.abc import Mapping
@@ -204,7 +205,7 @@ def _check_credential_token_url_egress(
             use="the connection's client credential settings",
             error=WiringError,
         )
-        if not _http_egress_allowed(token_url, allowed_http):
+        if not http_egress_allowed(token_url, allowed_http):
             host = url_host_label(token_url)
             log.warning(
                 "egress denied: %s %s host %r not in [egress].allowed_http",
@@ -454,7 +455,7 @@ def check_fhir_lookup_allowed(
     if egress.allowed_http:
         url = str(settings.get("url", ""))
         refuse_url_credentials(url, f"FhirLookup {name!r} 'url'", error=WiringError)
-        if not _http_egress_allowed(
+        if not http_egress_allowed(
             url, egress.allowed_http
         ):  # same host[:port] matching as the FHIR outbound
             host = url_host_label(url)
@@ -685,7 +686,7 @@ def check_egress_allowed(
         # (the same key Rest()/FHIR() use), so the host gate reads it unchanged (ADR 0025 §6.4).
         url = str(dest.settings.get("url", ""))
         refuse_url_credentials(url, f"outbound {dest.name!r} 'url'", error=WiringError)
-        if not _http_egress_allowed(url, egress.allowed_http):
+        if not http_egress_allowed(url, egress.allowed_http):
             host = url_host_label(url)
             log.warning(
                 "egress denied: outbound %r %s host %r not in [egress].allowed_http",
@@ -862,22 +863,80 @@ def syslog_forward_refusal(host: str, port: int, egress: EgressSettings) -> str 
 
 
 def host_port_allowed(host: str, port: object, allowed: list[str]) -> bool:
+    """True if an entry in ``allowed`` names ``host`` and either names no port or names ``port``.
+    A ``port`` of ``None`` matches only an entry that names no port, never one spelled ``None``."""
     return any(
-        not allow_port or str(port) == allow_port.strip()
+        not allow_port or (port is not None and str(port) == allow_port)
         for allow_port in _allowed_ports_for(host, allowed)
     )
 
 
+#: A host as the allowlist compares it: an IP literal as an address, a name lowercased.
+_CanonicalHost = ipaddress.IPv4Address | ipaddress.IPv6Address | str
+
+
+def _canonical_host(text: str) -> _CanonicalHost | None:
+    """``text``, a host as a connection names it, in the form the allowlist compares, or ``None``
+    when no entry may match it (BACKLOG #5915).
+
+    An IP literal compares as its address, so ``0:0:0:0:0:0:0:1`` is ``::1``. Anything else
+    holding a ``:``, a bracketed ``[::1]`` included, matches no entry: no entry's host is such a
+    name, and reading it as an address would be a guess about how its connector dials it. A name
+    compares lowercased. Canonical equivalence only,
+    never looser: an IPv4-mapped IPv6 address is not the IPv4 address, a trailing-dot name is not
+    the dotless one, and shorthand IPv4 such as ``127.1`` is a name, since :mod:`ipaddress` reads
+    only the dotted quad. A ``%`` zone id gets ``None``. :mod:`ipaddress` compares the zone, but a
+    URL's zone is compared as written and dialled decoded: ``urlsplit`` reads ``[::1%31]`` as the
+    host ``::1%31``, which an entry ``[::1%31]`` names, and ``urllib.request`` decodes it to
+    ``::11`` before it dials, so the entry would admit a host it does not name."""
+    if not text or "%" in text:
+        return None
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None if ":" in text else text.lower()
+
+
+def _parse_allow_entry(entry: str) -> tuple[_CanonicalHost, str] | None:
+    """``entry`` read as ``(host, port text)``, the port text ``""`` where it names none, or
+    ``None`` for an entry that matches nothing (BACKLOG #5915).
+
+    ``host``, ``host:port``, ``[v6]`` and ``[v6]:port`` are read. Brackets hold an IPv6 literal and
+    nothing else. An unbracketed entry holding more than one ``:``, such as ``::1`` or
+    ``fe80::1:443``, is ambiguous, so it matches nothing: the last group is never read as a port,
+    and the entry is not read as a host with no port. A ``:`` with no port after it, such as
+    ``[::1]:`` or ``db:`` (an ``env()`` that expanded to nothing), matches nothing too, rather
+    than any port. The host is read by :func:`_canonical_host`."""
+    text = entry.strip()
+    if text.startswith("["):
+        close = text.find("]")
+        if close == -1:
+            return None
+        inner, rest = text[1:close], text[close + 1 :]
+        if (rest and not rest.startswith(":")) or ":" not in inner:
+            return None
+        host, sep, port = inner, rest[:1], rest[1:]
+    elif text.count(":") > 1:
+        return None
+    else:
+        host, sep, port = text.partition(":")
+    port = port.strip()
+    canonical = _canonical_host(host.strip())
+    if canonical is None or (sep and not port):
+        return None
+    return canonical, port
+
+
 def _allowed_ports_for(host: str, allowed: list[str]) -> list[str]:
-    """The port text of each ``host`` / ``host:port`` entry whose host is ``host``, in any case:
-    ``""`` for an entry that names no port. The parse :func:`host_port_allowed` and the DATABASE
-    check share; at least ``transports.ai_broker.endpoint_host_allowed`` keeps its own copy."""
-    host = host.lower()
-    return [
-        allow_port
-        for allow_host, _, allow_port in (entry.partition(":") for entry in allowed)
-        if allow_host.strip().lower() == host
-    ]
+    """The port text of each entry in ``allowed`` whose host is ``host``, ``""`` for an entry that
+    names no port. Hosts compare in :func:`_canonical_host`'s form and entries are read by
+    :func:`_parse_allow_entry`. The one parse :func:`host_port_allowed`, the DATABASE check and
+    ``transports.ai_broker.endpoint_host_allowed`` share."""
+    canonical = _canonical_host(host)
+    if canonical is None:
+        return []
+    parsed = (_parse_allow_entry(entry) for entry in allowed)
+    return [entry[1] for entry in parsed if entry is not None and entry[0] == canonical]
 
 
 def _database_refusal(
@@ -891,8 +950,9 @@ def _database_refusal(
     ``dialect`` setting. The host and port are read by
     :func:`~messagefoundry.transports.db_endpoint.database_dial_endpoint`, which says what each
     dialect's connection string sends. A host no entry names is refused as unlisted, before its
-    port is read. Once the host is listed, a port the reading cannot settle is refused, whatever
-    the entries for that host say, and so is a driver or ``server`` the SQL Server preset refuses
+    port is read, and so is a host holding a ``:``, an IPv6 literal included. Once the host is
+    listed, a port the reading cannot settle is refused, whatever the entries for that host say,
+    and so is a driver or ``server`` the SQL Server preset refuses
     (BACKLOG #4873); both arrive as the reading's ``conflict``. An entry that pins a port admits
     only that port, compared as a number on both sides. A connection whose port the engine cannot
     read matches an entry that names no port, and never one that pins one."""
@@ -900,7 +960,8 @@ def _database_refusal(
         dialect = str(settings.get("dialect", "sqlserver"))
     endpoint = database_dial_endpoint(settings, dialect=dialect)
     host, port = endpoint.host, endpoint.port
-    pins = _allowed_ports_for(host, allowed)
+    # Unverified driver reads fail closed; docs/CONNECTIONS.md says why (BACKLOG #5915).
+    pins = [] if ":" in host else _allowed_ports_for(host, allowed)
     if not pins:
         return f"server {host!r} is not in the [egress].allowed_db allowlist"
     if endpoint.conflict is not None:
@@ -936,7 +997,7 @@ def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
     return False
 
 
-def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
+def http_egress_allowed(url: str, allowed: list[str]) -> bool:
     """True if ``url``'s host (and port, when an allow entry pins one) is on the allowlist — the same
     ``host`` / ``host:port`` matching as MLLP.
 

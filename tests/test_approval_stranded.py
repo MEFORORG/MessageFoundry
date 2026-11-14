@@ -10,6 +10,7 @@
 - The restart keeps the claim time in ``decided_at`` (residual 6) and reads other owners' rows
   apart from its own (residual 7). It claims no outcome from the audit trail: residual 3 was
   dropped by Manager decision d20261109T215156567-4334fc, since ``list_audit`` checks no row MAC.
+  A second app over the same engine leaves the first app's live releases alone (residual 5).
 - The interrupt refuses the original requester and reads ``attest_owner_stopped`` strictly (the
   same decision).
 """
@@ -28,6 +29,7 @@ from typing import Any
 import httpx
 import pytest
 
+from messagefoundry.api import approvals as approvals_module
 from messagefoundry.api import create_app
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
@@ -265,6 +267,102 @@ async def test_a_restart_never_reads_the_audit_trail(engine: Engine) -> None:
     assert reads == []
 
 
+async def test_a_second_app_leaves_the_first_apps_live_release_executing(engine: Engine) -> None:
+    """Residual 5: a second create_app lifespan over the same engine reconciles under the same
+    owner, so it used to take the first app's running release for a leftover and move it to
+    'interrupted'. A release any gate in this process is running is left alone, and the second
+    app's interrupt route refuses it. Control: a row left over from before still moves."""
+    first = create_app(engine, approvals=ON)
+    async with first.router.lifespan_context(first):
+        gate: ApprovalGate = first.state.approval_gate
+        # The gate's account reads, answered without provisioning users, as the contract does.
+        gate._store = _StandingStore(engine.store)
+        gate._resolve_identity = _resolve
+        live, release, leave = await _running_release(gate)
+        leftover = await _stranded(engine, "engine")
+        try:
+            second = create_app(engine, approvals=ON)
+            async with second.router.lifespan_context(second):
+                assert str((await _row(engine, live))["status"]) == "executing"
+                assert str((await _row(engine, leftover))["status"]) == "interrupted"
+                # Nor does the second app's interrupt route take the live release.
+                with pytest.raises(ApprovalError) as refused:
+                    await second.state.approval_gate.interrupt_stranded(
+                        live,
+                        actor="operator",
+                        actor_user_id="operator-id",
+                        attest_owner_stopped=True,
+                    )
+                assert refused.value.status == 409
+                assert "is running this release now" in refused.value.detail
+                assert str((await _row(engine, live))["status"]) == "executing"
+        finally:
+            leave.set()
+        await asyncio.wait_for(release, 10.0)
+    assert str((await _row(engine, live))["status"]) == "approved"
+
+
+class _SettlesFail(_StandingStore):
+    """Both of _settle's writes fail, so the release ends with its row still 'executing'."""
+
+    async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+        if kw["status"] == "approved":
+            raise OSError("PROBE: store unreachable")
+        return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+
+async def _claim_left_unsettled(gate: ApprovalGate) -> str:
+    """A release ``gate`` claims and runs, whose outcome it never records."""
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert approval_id not in gate._releasing, "the release has ended"
+    return approval_id
+
+
+async def _runs(_p: Mapping[str, Any]) -> dict[str, Any]:
+    return {"ran": True}
+
+
+async def test_a_second_app_recovers_an_unsettled_claim_no_gate_runs(engine: Engine) -> None:
+    """As on main: a claim of this life that no gate runs any more (both settle writes failed) is
+    moved to 'interrupted' by a second app's start, with reason engine_restart. Only a release a
+    gate in this process is running is left alone."""
+    first = create_app(engine, approvals=ON)
+    async with first.router.lifespan_context(first):
+        gate1: ApprovalGate = first.state.approval_gate
+        gate1._store = _SettlesFail(engine.store)
+        gate1._resolve_identity = _resolve
+        unsettled = await _claim_left_unsettled(gate1)
+        assert str((await _row(engine, unsettled))["status"]) == "executing"
+        second = create_app(engine, approvals=ON)
+        async with second.router.lifespan_context(second):
+            assert str((await _row(engine, unsettled))["status"]) == "interrupted"
+    [row] = await _audit(engine, "approval.interrupted", unsettled)
+    assert json.loads(str(row["detail"]))["reason"] == "engine_restart"
+
+
+async def test_a_release_running_over_another_store_object_is_not_reconciled(
+    engine: Engine,
+) -> None:
+    """Residual 5: a release a gate in this process is running is left alone even when that gate
+    was built over a different store object for the same database, as the interrupt route leaves
+    it. Control: a row no gate in this process runs still moves."""
+    wrapped = _gate(engine)  # built over a _StandingStore, a store object of its own
+    live, release, leave = await _running_release(wrapped)
+    leftover = await _stranded(engine, "engine")
+    try:
+        found = await ApprovalGate(engine.store, ON).reconcile_after_restart()
+        assert found.interrupted == (leftover,)
+        assert str((await _row(engine, live))["status"]) == "executing"
+    finally:
+        leave.set()
+        await asyncio.wait_for(release, 10.0)
+
+
 # --- GET /approvals/executing and the three tiers (residuals 1 and 4) ------------------------------
 
 
@@ -500,7 +598,10 @@ async def test_an_interrupt_in_flight_does_not_read_as_a_release(engine: Engine)
 
 @pytest.mark.parametrize("combined_raises", [False, True])
 async def test_an_outcome_whose_row_was_interrupted_elsewhere(
-    engine: Engine, caplog: pytest.LogCaptureFixture, combined_raises: bool
+    engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    combined_raises: bool,
 ) -> None:
     """An operator interrupt from another process moves the row while this process still runs
     the release. The combined outcome write then finds the row moved, and the outcome row is
@@ -531,7 +632,8 @@ async def test_an_outcome_whose_row_was_interrupted_elsewhere(
         gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     )
     await entered.wait()
-    # Another process's operator interrupts it.
+    # Another process's operator interrupts it. That process sees none of this one's releases.
+    monkeypatch.setattr(approvals_module, "_releasing_in_process", lambda _id: False)
     elsewhere = _gate(engine, owner="shard:other")
     await elsewhere.interrupt_stranded(
         approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
