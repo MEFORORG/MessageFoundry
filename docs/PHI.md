@@ -411,9 +411,9 @@ than a path is not checked
   --grant-account` refuses the same list, and refuses a name that is a group or a domain.
 - On Windows it refuses a key file whose owner is one of those groups or an application package,
   or whose owner cannot be read, since an owner may rewrite the access list (vault BACKLOG #5657).
-  It does not vet an owner that is one account, or an account you granted yourself, except on the
-  key at the path where the engine mints its own TLS key (below): any one account may own a key
-  file you name in the configuration, as the administrator who copied in your own TLS key may.
+  It does not vet an account you granted yourself, or an owner that is one account, except that
+  the TLS key the engine mints has its owner vetted (below). Any other key file may be owned by
+  any one account, as your own TLS key may be by the administrator who copied it in.
   LOCAL SERVICE and NETWORK SERVICE are accounts that many services share, and the check does not
   report them.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
