@@ -573,7 +573,7 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
     failures = [r for r in caplog.records if r.getMessage() == "Failed to create 999 response"]
     assert len(failures) == 1 and failures[0].exc_info is not None
     assert "20*6" in str(failures[0].exc_info[1])
-    assert "20*6" in caplog.text  # the instrument the negative below reads
+    assert "20*6" in caplog.text  # the instrument the log negative below reads
     assert raised
 
     monkeypatch.setattr(_X12_VALIDATE, "_mute_pyx12_logger", real_mute)
@@ -590,10 +590,10 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
 
 
 def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error() -> None:
-    # pyx12 4.1.0 can raise X12Error on a segment of about a million characters or longer, as it
+    # pyx12 4.1.0 can raise X12Error on a segment longer than about 1,040,000 characters, as it
     # does on this unterminated one; 4.0.1 could stop reading at a much shorter segment. The pass
-    # raises X12ValidationError, and neither its message nor the pyx12 error it chains holds the
-    # segment's text.
+    # raises X12ValidationError, and neither its message nor the message of the pyx12 error it
+    # chains shows the segment's text.
     import pyx12.errors
 
     body = "Q" * (1024 * 1024 + 100)
