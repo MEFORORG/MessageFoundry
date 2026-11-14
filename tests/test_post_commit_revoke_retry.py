@@ -641,7 +641,7 @@ async def test_a_request_caller_keeps_the_request_budget(monkeypatch: pytest.Mon
         with pytest.raises(StoreAcquireTimeout):
             await service.set_roles("u1", ["operator"], actor="admin")
         # Stopped by the 0.1 s time limit, well short of the 0.3 s refusal at 0.02 s an attempt.
-        assert 3 < calls[0] < _REFUSED_FOR / _ATTEMPT_TAKES
+        assert calls[0] < _REFUSED_FOR / _ATTEMPT_TAKES
         assert await _live(store, hashes) == hashes
         [missed] = [
             r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION

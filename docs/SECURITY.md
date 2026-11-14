@@ -1018,8 +1018,9 @@ only while less than 15 seconds have passed since the first attempt began, give 
 half-second pause, and nothing bounds how long one attempt runs. At the default `acquire_timeout`
 a SQL Server pool wait uses up that budget on its own, so it is recorded at once rather than run
 into the request deadline. `provision-admin` has no request deadline, so its repair revokes run on
-a longer budget, up to 30 attempts and no re-run started past five minutes, with each pause capped
-at 15 seconds. One it gives up on after its grant is recorded with the change
+a longer budget, up to 30 attempts, with each pause capped at 15 seconds; a re-run starts only
+while less than five minutes have passed, give or take its pause, and nothing bounds how long one
+attempt runs. One it gives up on after its grant is recorded with the change
 `first_administrator_granted`, and the command is refused with text naming
 `messagefoundry admin-revoke-sessions`, since a re-run refuses an account that holds the role (vault
 BACKLOG #3023). The directory reconciler's revoke counts its attempts the same way, but

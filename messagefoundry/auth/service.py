@@ -3428,9 +3428,7 @@ def _provision_revoke_missed_text(username: str, *, enrolled: bool) -> str:
     #3023 residual (4)). A re-run refuses an account that holds the role, so it names the host
     command that ends the session instead."""
     codes = (
-        " This run's recovery codes were not shown: replace its authenticator seed and get "
-        "recovery codes with 'messagefoundry admin-reset-totp', naming that account and giving "
-        "the same --db and --service-config."
+        " This run's recovery codes were not shown; the authenticator entry it showed is live."
         if enrolled
         else ""
     )
@@ -5316,7 +5314,8 @@ class AuthService:
             message="the %s row for a granted run could not be written",
             args=("auth.first_administrator_provisioned",),
             errors=audit_write_errors(),
-            defects=AUDIT_WRITE_DEFECTS,
+            # A raise would replace the refusal below, which the operator needs.
+            defects=(),
         )
         raise FirstAdministratorRefused(
             _provision_revoke_missed_text(username, enrolled=totp_secret is not None)
@@ -12235,24 +12234,18 @@ class AuthService:
         """``refusal`` for a ``provision-admin`` run refused after it set the account's password,
         once the account's sessions are revoked: a sign-in with that password in the window
         could have minted one (vault BACKLOG #3023 residual (4), hardening). The request budget
-        is enough here, since no role was written. A revoke that fails, a defect included, is
-        logged (and a give-up recorded as any is) and noted in the text rather than raised over
-        the refusal, whose text is what the operator needs."""
+        is enough here, since this run wrote no role. A give-up is recorded as any is and noted
+        in the text rather than raised over the refusal; a defect is raised, as everywhere."""
         try:
             await self._revoke_after_commit(
                 user_id, change="first_administrator_refused", actor=actor
             )
         except _session_write_errors() as exc:
             if _is_revoke_defect(exc):
-                _log.error(
-                    "auth: the session revoke of refused provision-admin account %s raised %s",
-                    user_id,
-                    type(exc).__name__,
-                    exc_info=exc,
-                )
+                raise
             refusal += (
-                ". The store also refused to end that account's sessions; the account holds no "
-                "role, and a re-run of this command ends them before it grants one"
+                ". The store also refused to end that account's sessions; the "
+                f"{SESSIONS_REVOKE_FAILED_ACTION} audit row records it, where the store accepted it"
             )
         return FirstAdministratorRefused(refusal)
 
