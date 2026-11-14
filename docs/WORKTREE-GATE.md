@@ -134,6 +134,17 @@ with its victim resolved against the line's first `-C` and, where the gate can r
 invocation's own `-C` tokens. At least some invocations are still not judged, and in some only the
 first `-C` is used; the residual list beside rule 3d in the hook names them and is the source of record.
 
+**Rules 3, 3b and 3c read a single-quoted path, and rules 3 and 3b judge every git invocation on a
+line.** Until BACKLOG #5642 the shared path readers stripped double quotes only, so a single-quoted
+`-C`, `--work-tree`, `GIT_WORK_TREE`, `--git-dir`, `GIT_DIR` or `cd` target named a path with quote
+characters in it and the command was allowed. Until BACKLOG #5655 rule 3 took the line's first `-C` as
+every invocation's target, so an earlier command's `-C`, or one inside a quoted argument, hid a later
+`git reset --hard` in the primary, and rule 3b judged only the first invocation. Each invocation is now
+also read from its own tokens, unquoted the way the shell does. That reading is added after the old one
+and can only add a refusal, so nothing the gate refused before is allowed now. At least a quoted path
+with a space in it is still not read this way; the ADDED READINGS note in the hook is the source of
+record.
+
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
 
