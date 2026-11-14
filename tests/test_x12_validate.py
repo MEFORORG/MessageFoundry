@@ -524,11 +524,17 @@ def test_a_value_holding_the_ack_writers_delimiters_is_a_validation_result() -> 
     ]
     assert result.ack is not None and result.ack_transaction == "999"
     assert "IK4*4*373*8*20?6?5?1?2~" in result.ack
+    # No echoed delimiter opened a segment: every segment of the 999 starts with an ack segment ID.
+    ack_ids = {"ISA", "GS", "ST", "AK1", "AK2", "IK3", "IK4", "IK5", "AK9", "SE", "GE", "IEA"}
+    seg_ids = {seg.strip().split("*", 1)[0] for seg in result.ack.split("~") if seg.strip()}
+    assert seg_ids <= ack_ids
     assert _DELIMITED_VALUE not in _rendered(result)
 
 
 def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    unmuted_pyx12_logger: logging.Logger,
 ) -> None:
     # Take the "?" replacement away, so the raw value reaches X12Writer.Write. The writer raises,
     # pyx12 catches it inside x12n_document and leaves a fragment, and the pass still returns a
@@ -549,6 +555,22 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
 
     monkeypatch.setattr(pyx12.x12file.X12Writer, "_check_delimiters", spy)
     monkeypatch.setattr(pyx12.error_visitor, "sanitize_ack_segment", lambda seg_data: None)
+
+    # Positive control first: with the engine's mute taken away and the pyx12 tree at logging's
+    # defaults, the same pass logs the value, in the exception pyx12 logs for its failed 999 writer.
+    # So the absence below is the mute's doing, not a pass that logs nothing.
+    real_mute = _X12_VALIDATE._mute_pyx12_logger
+    monkeypatch.setattr(_X12_VALIDATE, "_mute_pyx12_logger", lambda: None)
+    with caplog.at_level(logging.DEBUG):
+        validate(_DELIMITED_837)
+    failures = [r for r in caplog.records if r.getMessage() == "Failed to create 999 response"]
+    assert len(failures) == 1 and failures[0].exc_info is not None
+    assert "20*6" in str(failures[0].exc_info[1])
+    assert raised
+
+    monkeypatch.setattr(_X12_VALIDATE, "_mute_pyx12_logger", real_mute)
+    raised.clear()
+    caplog.clear()
     with caplog.at_level(logging.DEBUG):
         result = validate(_DELIMITED_837)
     # Positive control: the writer really did raise on the value.
@@ -558,30 +580,12 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
     assert "before the closing IEA" in caplog.text
     assert "20*6" not in caplog.text and "20*6" not in _rendered(result)
 
-    # Positive control: with the engine's mute taken away and the pyx12 logger tree let through, the
-    # same pass does log the value, in the exception pyx12 logs for its failed ack writer. So the
-    # absence above is the mute's doing, not a pass that logs nothing. Re-mute afterwards.
-    real_mute = _X12_VALIDATE._mute_pyx12_logger
-    monkeypatch.setattr(_X12_VALIDATE, "_mute_pyx12_logger", lambda: None)
-    pyx12_logger = logging.getLogger("pyx12")
-    monkeypatch.setattr(pyx12_logger, "propagate", True)
-    pyx12_logger.setLevel(logging.NOTSET)
-    raised.clear()
-    caplog.clear()
-    try:
-        with caplog.at_level(logging.DEBUG):
-            validate(_DELIMITED_837)
-        unmuted_log = caplog.text
-    finally:
-        real_mute()
-    assert raised
-    assert "20*6" in unmuted_log
-
 
 def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error() -> None:
-    # pyx12 4.1.0 raises X12Error when no segment terminator comes within 1 MiB; 4.0.1 had already
-    # stopped reading after about 8 KB. The pass raises X12ValidationError, and neither its message
-    # nor the pyx12 error it chains holds any of the input.
+    # pyx12 4.1.0 raises X12Error when no segment terminator comes within 1,048,576 characters;
+    # 4.0.1 had already stopped reading at a segment longer than about 16K characters. The pass
+    # raises X12ValidationError, and neither its message nor the pyx12 error it chains holds any of
+    # the input.
     import pyx12.errors
 
     body = "Q" * (1024 * 1024 + 100)
