@@ -223,6 +223,36 @@ def test_person_name_components_splits_pn() -> None:
     assert hl7_map.person_name_components(None) == ()
 
 
+@pytest.mark.parametrize(
+    ("pn", "xpn"),
+    [
+        # DICOM Family^Given^Middle^Prefix^Suffix; XPN Family^Given^Middle^Suffix^Prefix.
+        pytest.param("Doe^Jane^Q^Dr^Jr", ("Doe", "Jane", "Q", "Jr", "Dr"), id="prefix-and-suffix"),
+        pytest.param("Doe^Jane^^Dr", ("Doe", "Jane", "", "", "Dr"), id="prefix-only"),
+        pytest.param("Doe^Jane^^^Jr", ("Doe", "Jane", "", "Jr"), id="suffix-only"),
+        # An empty alphabetic group falls through to the first populated group.
+        pytest.param("=Yamada^Taro", ("Yamada", "Taro"), id="ideographic-only"),
+        pytest.param("^^=^=Yamada", ("Yamada",), id="phonetic-only"),
+        pytest.param("^^^^", (), id="all-empty"),
+        pytest.param("==", (), id="empty-groups"),
+    ],
+)
+def test_person_name_components_maps_pn_onto_xpn(pn: str, xpn: tuple[str, ...]) -> None:
+    # BACKLOG #5804: the prefix and suffix landed in each other's XPN slot, and an empty
+    # alphabetic group returned ("",) and dropped the ideographic name.
+    assert hl7_map.person_name_components(pn) == xpn
+
+
+def test_pid_from_dataset_writes_an_ideographic_only_name() -> None:
+    raw = make_sr_part10(patient_name="=Yamada^Taro")
+    ds = DicomDataset.parse(RawMessage.from_bytes(raw, "dicom"))
+    assert ds.patient_name == "=Yamada^Taro"
+    msg = Message.parse("MSH|^~\\&|MEFOR|FAC|PSCRIBE|DEST|20260620101500||ORU^R01|ID1|P|2.5.1")
+    msg.add_segment(hl7_map.pid_from_dataset(ds))
+    assert msg.field("PID-5.1") == "Yamada"
+    assert msg.field("PID-5.2") == "Taro"
+
+
 def test_obx_builder_strips_crlf_injection() -> None:
     from messagefoundry.parsing.dicom.dataset import SrMeasurement
 

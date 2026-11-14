@@ -86,12 +86,26 @@ def encode_segment(
 
 def person_name_components(patient_name: str | None) -> tuple[str, ...]:
     """Split a DICOM ``PatientName`` (a ``^``-delimited PN — ``Family^Given^Middle^Prefix^Suffix``,
-    with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components. Uses the
-    alphabetic group; ``()`` for an absent name."""
+    with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components.
+
+    Uses the first group with a populated component, so an ideographic-only name is not lost, and
+    ``()`` for an absent or all-empty name. ``XPN`` puts the suffix before the prefix
+    (``Family^Given^Middle^Suffix^Prefix``), so the DICOM prefix and suffix swap places; trailing
+    empty components are dropped (BACKLOG #5804)."""
     if not patient_name:
         return ()
-    alphabetic = patient_name.split("=", 1)[0]
-    return tuple(alphabetic.split("^"))
+    for group in patient_name.split("="):
+        parts = group.split("^")
+        if any(parts):
+            break
+    else:
+        return ()
+    if len(parts) >= 4:
+        parts += [""] * (5 - len(parts))
+        parts[3], parts[4] = parts[4], parts[3]
+    while not parts[-1]:
+        parts.pop()
+    return tuple(parts)
 
 
 def obx_from_measurement(
