@@ -1490,6 +1490,7 @@ def _config_lockdown(tmp_path: Path, prepare: str = "") -> dict:
     (cfg / "mod.py").write_text("X = 1\n", encoding="utf-8")
     (cfg / "sub" / "inner.py").write_text("Y = 2\n", encoding="utf-8")
     (outside / "target.py").write_text("Z = 3\n", encoding="utf-8")
+    (outside / "shared.py").write_text("W = 4\n", encoding="utf-8")
     body = rf"""
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
   $parent = {_psq(str(parent))}
@@ -1498,6 +1499,7 @@ def _config_lockdown(tmp_path: Path, prepare: str = "") -> dict:
   $paths = [ordered]@{{
     cfg = $cfg; mod = (Join-Path $cfg 'mod.py'); sub = (Join-Path $cfg 'sub')
     inner = (Join-Path $cfg 'sub\inner.py'); target = (Join-Path $outside 'target.py')
+    shared = (Join-Path $outside 'shared.py')
   }}
   function Read-Sids([string]$p) {{
     @((Get-Acl -LiteralPath $p).Access | ForEach-Object {{
@@ -1509,6 +1511,8 @@ def _config_lockdown(tmp_path: Path, prepare: str = "") -> dict:
     foreach ($k in $paths.Keys) {{ $o[$k] = @(Read-Sids $paths[$k]) }}
     $o['modProtected'] = (Get-Acl -LiteralPath $paths.mod).AreAccessRulesProtected
     $o['cfgProtected'] = (Get-Acl -LiteralPath $cfg).AreAccessRulesProtected
+    $o['targetOwner'] = (Get-Acl -LiteralPath $paths.target).GetOwner(
+      [Security.Principal.SecurityIdentifier]).Value
     $o
   }}
   try {{
@@ -1525,6 +1529,8 @@ def _config_lockdown(tmp_path: Path, prepare: str = "") -> dict:
     [pscustomobject]@{{
       before = $before; after = $after; problems = @($problems); warnings = @($warnings)
       listing = (& icacls $cfg /T | Out-String); meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+      elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
     }} | ConvertTo-Json -Depth 5 -Compress
   }} finally {{
     # Put the tree back in reach so pytest can delete it, however the block above ended. The
@@ -1543,9 +1549,12 @@ def _config_lockdown(tmp_path: Path, prepare: str = "") -> dict:
     out: dict = json.loads(
         _ok(_extract(_SCRIPT, _CONFIG_ACL_FNS, body), tmp_path).strip().splitlines()[-1]
     )
-    out["problems"] = [p for p in (out.get("problems") or []) if p]
-    # The owner step needs elevation; unelevated, it warns, and that warning is not under test.
-    out["warnings"] = [w for w in (out.get("warnings") or []) if w and "owner" not in w.lower()]
+    problems = [p for p in (out.get("problems") or []) if p]
+    # Only an elevated token may make Administrators the owner, so an unelevated run reads back an
+    # owner problem for every item. Those are kept apart, and the owner arm below judges them.
+    out["ownerProblems"] = [p for p in problems if "is owned by" in p]
+    out["problems"] = [p for p in problems if "is owned by" not in p]
+    out["warnings"] = [w for w in (out.get("warnings") or []) if w]
     return out
 
 
@@ -1615,19 +1624,61 @@ def test_config_residue_outside_the_removal_set_is_returned(tmp_path: Path) -> N
 def test_a_junction_in_the_config_dir_is_not_followed_and_is_named(tmp_path: Path) -> None:
     """icacls /T walks through a junction (measured: ``icacls <dir>\\* /reset /T`` reset a file in
     the junction's target, with /L or without), so the reset walks the tree itself and stops at a
-    link. A link it did not reset is named, because the lockdown did not reach what it points at."""
+    link. A link it did not reset is named, because the lockdown did not reach what it points at.
+
+    The owner step walks the same way: ``/setowner /T`` follows a junction too. Unelevated, no
+    owner can be set either way, so only an elevated run (CI) witnesses the owner arm.
+
+    A HARD LINK shares one DACL among all its names, so resetting ``config\\shared.py`` would
+    rewrite ``outside\\shared.py`` too. It is named and left alone."""
     prepare = r"""
     & icacls $paths.target /grant '*S-1-5-32-547:R' | Out-Null
+    & icacls $paths.shared /grant '*S-1-5-32-547:R' | Out-Null
     cmd /c mklink /J (Join-Path $cfg 'linked') $outside | Out-Null
+    cmd /c mklink /H (Join-Path $cfg 'shared.py') $paths.shared | Out-Null
 """
     got = _config_lockdown(tmp_path, prepare)
     assert "S-1-5-32-547" in got["before"]["target"], "CONTROL FAILED: the target has no grant"
+    assert "S-1-5-32-547" in got["before"]["shared"], "CONTROL FAILED: the shared file has no grant"
     assert "S-1-5-32-547" in got["after"]["target"], (
         "the reset followed the junction and rewrote a file OUTSIDE the config dir"
+    )
+    assert got["after"]["targetOwner"] == got["before"]["targetOwner"], (
+        "the owner step followed the junction and re-owned a file OUTSIDE the config dir"
+    )
+    assert "S-1-5-32-547" in got["after"]["shared"], (
+        "the reset went through a hard link and rewrote the DACL of a file OUTSIDE the config dir"
     )
     assert any("linked" in p for p in got["problems"]), (
         f"the junction must be named as not reset: {got['problems']}"
     )
+    assert any("shared.py" in p and "hard link" in p for p in got["problems"]), (
+        f"the hard link must be named as not reset: {got['problems']}"
+    )
+
+
+@_windows_only
+def test_every_owner_in_the_config_tree_is_read_back(tmp_path: Path) -> None:
+    """The guard refuses a dir or *.py whose owner it cannot trust, so an owner the lockdown could
+    not set is returned, not left under the lockdown line. Unelevated, nothing can be made
+    Administrators-owned, so every item must come back; elevated, none."""
+    got = _config_lockdown(tmp_path)
+    named = " ".join(got["ownerProblems"])
+    if got["elevated"]:
+        assert got["ownerProblems"] == [], got["ownerProblems"]
+    else:
+        for part in ("config'", "mod.py", "sub'", "inner.py"):
+            assert part in named, f"an owner left unset was not returned for {part}: {named}"
+
+
+@_windows_only
+def test_a_write_grant_for_the_run_as_account_below_the_config_is_named(tmp_path: Path) -> None:
+    """The reset drops the run-as account's own explicit Modify on a child folder to the read it
+    inherits. The read-back allows that account, so without a warning a File connection writing
+    there would fail at run time with nothing said at install."""
+    got = _config_lockdown(tmp_path, '    & icacls $paths.sub /grant "${me}:(OI)(CI)M" | Out-Null')
+    assert any("write away" in w and "sub'" in w for w in got["warnings"]), got["warnings"]
+    assert got["problems"] == [], got["problems"]
 
 
 @_windows_only
@@ -2883,15 +2934,28 @@ def test_the_secedit_folder_defaults_to_the_windows_temp_not_the_users(tmp_path:
     got = json.loads(_ok(_extract(_UNINSTALL, [], body), tmp_path).strip().splitlines()[-1])
     remove = got[_SECEDIT_FN]
     helper = got[_WORKDIR_FN]
-    code = "\n".join(line for line in remove.splitlines() if not line.lstrip().startswith("#"))
+    code = "\n".join(
+        line
+        for line in re.sub(r"<#.*?#>", "", remove, flags=re.S).splitlines()
+        if not line.lstrip().startswith("#")
+    )
     assert "$env:TEMP" not in code and "GetTempPath" not in code, (
         "Remove-ServiceLogonRight still builds a path in the user's TEMP"
     )
     assert re.search(rf"\b{_WORKDIR_FN}\b", code), (
         "Remove-ServiceLogonRight does not call the helper"
     )
-    assert re.search(r'Join-Path \$env:SystemRoot "Temp"', helper), (
-        "the helper's default parent must be %SystemRoot%\\Temp"
+    assert re.search(r'Join-Path \(\[Environment\]::GetFolderPath\("Windows"\)\) "Temp"', helper), (
+        "the helper's default parent must be the Windows folder's Temp, asked of the system"
+    )
+    helper_code = "\n".join(
+        line
+        for line in re.sub(r"<#.*?#>", "", helper, flags=re.S).splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "$env:SystemRoot" not in helper_code and "$env:windir" not in helper_code.lower(), (
+        "the user can set SystemRoot and windir for their own processes, so neither may name the "
+        "trusted parent"
     )
 
 

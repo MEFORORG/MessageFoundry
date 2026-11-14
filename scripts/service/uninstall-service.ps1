@@ -410,8 +410,9 @@ function New-SeceditWorkDirectory {
     <#
       Make a new folder for Remove-ServiceLogonRight's secedit files and return its path. It is made
       in one step with its final security: owner $OwnerSid, inheritance off, and full control for
-      SYSTEM, Administrators and the owner only. Throws, having made nothing it keeps, when that
-      cannot be shown.
+      SYSTEM, Administrators and the owner only. Throws when that cannot be shown. A folder found at
+      the path afterwards is left where it is, because a failed read-back cannot tell this run's
+      folder from one someone made first.
 
       NOT IN THE USER'S TEMP (BACKLOG #5563). The uninstaller runs elevated, but the user's TEMP
       belongs to the user, and a process of that user at medium integrity holds FILE_DELETE_CHILD
@@ -419,12 +420,13 @@ function New-SeceditWorkDirectory {
       and put its own folder in its place with a policy file of its choosing. So the default parent is
       %SystemRoot%\Temp, where users may add a folder but not delete or rename one an administrator
       made. The parent is checked for that before anything is made, so a host whose Windows Temp
-      differs is refused rather than trusted.
+      differs is refused rather than trusted. The Windows folder is asked of the system, not read
+      from $env:SystemRoot: the user can set that variable for their own processes.
 
       $Parent and $OwnerSid are parameters so the unelevated tests can make a folder they own.
     #>
     param([string]$Parent, [string]$OwnerSid = "S-1-5-32-544")
-    if (-not $Parent) { $Parent = Join-Path $env:SystemRoot "Temp" }
+    if (-not $Parent) { $Parent = Join-Path ([Environment]::GetFolderPath("Windows")) "Temp" }
     # CREATOR OWNER (S-1-3-0) matches no one outside an inherited entry, so it is listed here.
     $trusted = @(
         "S-1-5-18", "S-1-5-32-544",
