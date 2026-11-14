@@ -483,7 +483,7 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `dir` | str | `environments` | directory holding `<env>.toml` flat key→value tables for non-secret values, **versioned** in the repo. A table anywhere inside an array value stops the load, naming the key and index, even for a key nothing references (vault BACKLOG #1820). Arrays of scalars, nested ones included, load. Resolved against `base_dir` (below). |
-| `base_dir` | str | `""` (= the working dir) | **Anchor** `dir` resolves against. Empty keeps the original behavior (relative to the process working directory). Set it to the **config-repo root** so env-value resolution no longer depends on where `serve` was launched. A relative value is taken against the working dir; an absolute value is used as-is — **on Windows it must be drive-qualified** (`C:/repo`); a leading-slash `/repo` is drive-relative and still inherits the launch drive (logged as a warning). Overridable per run with `serve --project-root`. **It also anchors the store path** (BACKLOG #5926, #5927): `serve` and at least the offline store commands `provision-admin`, `admin-unlock`, `audit-verify`, `rotate-key` and `backup` take a relative `[store].path`, or a relative `--db`, under this root. An absolute path and SQLite's `:memory:` stay put, and with no root the path is used as written. On Windows a leading-slash `/data/mf.db` is not absolute, so it is anchored under the root too, with a warning. An offline store command sees only the `base_dir` its own settings load gives it: a root `serve` got from `--project-root` does not reach it. Where the two could differ, give the command the absolute store path `serve` uses, as `--db`. |
+| `base_dir` | str | `""` (= the working dir) | **Anchor** `dir` resolves against. Empty keeps the original behavior (relative to the process working directory). Set it to the **config-repo root** so env-value resolution no longer depends on where `serve` was launched. A relative value is taken against the working dir; an absolute value is used as-is — **on Windows it must be drive-qualified** (`C:/repo`); a leading-slash `/repo` is drive-relative and still inherits the launch drive (logged as a warning). Overridable per run with `serve --project-root`. **It also anchors the store path:** `serve` ([ADR 0050](adr/0050-single-project-root-config-anchoring.md)) and at least the offline store commands `provision-admin`, `admin-unlock`, `audit-verify`, `rotate-key` and `backup` (BACKLOG #5926, #5927) take a relative path such as `data/mf.db`, from `[store].path` or `--db`, under this root, which is itself resolved against the process's working directory when relative. An absolute path and SQLite's `:memory:` stay put, and with no root the path is used as written. On Windows a leading-slash `/data/mf.db` is not absolute, so it is anchored under the root too, with a warning. An offline store command sees only the `base_dir` its own settings load gives it: a root `serve` got from `--project-root` does not reach it. Where the two could differ, give the command the absolute store path `serve` uses, as `--db`. |
 
 - A graph value that differs by environment is authored as `env("acme_adt_host")`; the running
   instance resolves it from `<base_dir>/<dir>/<active-env>.toml` overlaid by **`MEFOR_VALUE_<KEY>`**
@@ -1673,8 +1673,8 @@ transport's list is set, an outbound of that transport not on it is **refused at
 `host:port`, `[v6]` (an IPv6 literal, any port) or `[v6]:port`, such as `[2001:db8::10]:6661`. An IP
 literal compares as an address, so `[0:0:0:0:0:0:0:1]` names `::1`; a name compares without regard
 to case. Nothing looser matches: an IPv4-mapped IPv6 address does not name its IPv4 address, and
-`127.1` is a name, not `127.0.0.1`. An entry matches nothing at least when it holds more than one
-colon outside brackets (write `::1` as `[::1]`), when its brackets hold anything but an IPv6
+`127.1` is a name, not `127.0.0.1`. An entry matches nothing at least when it is unbracketed and holds
+more than one colon (write `::1` as `[::1]`), when its brackets hold anything but an IPv6
 literal, when a colon has no port after it, or when it carries a `%` zone id. The lists named here
 load such an entry without error, so check each entry against the forms above. The host being
 checked must name an IPv6 literal bare, as `::1`, at least in a connection's `host` setting and in
@@ -1803,7 +1803,8 @@ port matches only an entry that names no port, although the connector then dials
 
 **An `Accept-Encoding` request header you set is not overridden, proxy or no proxy,** whether in
 the connection's headers or, on a REST or FHIR connection that sets `dynamic_headers = true`, per
-message from a Handler through an `http.header.` metadata key. With none
+message from a Handler through an `http.header.` metadata key. A `verify_tls = false` hop refuses
+a header that is off its allowlist, `Accept-Encoding` included. With none
 set, a delivery request asks for `identity`. A partner that honours yours and codes its reply gets
 the treatment item 4 describes, so leave `Accept-Encoding` unset.
 
