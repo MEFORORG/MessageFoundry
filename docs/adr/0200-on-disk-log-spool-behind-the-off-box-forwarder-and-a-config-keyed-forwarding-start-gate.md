@@ -9,6 +9,9 @@
   ASVS 16.4.3 is the re-score's question, and G15's *"a gate whose predicate is a config key rather
   than the verb is not rule 4"* is the objection it must answer. **Amendment A is accepted**
   (owner ruling 2026-10-08, recorded on engine PR 2183); it changes decision 2's wording.
+  **Amendment B** (2026-11-13) records a code change (BACKLOG #5923) that leaves three Decision 1
+  statements out of date: UDP detection, where a send error is undeliverable, and start deferral.
+  Decision 1's text is left as written, and the amendment holds where they disagree.
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1966 (this build) and #1199 (the 16.4.3 research that named the spool as the
   missing durability half) · [ADR 0080](0080-offbox-forwarding-tls-defaults.md) (native TLS-syslog) ·
@@ -231,3 +234,47 @@ that is this host through.
 **The Consequences line on start-time cost moved too.** It called the gate "a settings read". For
 an IP-literal collector it is now also one local socket call, measured at well under a
 millisecond on a Windows host. For a name it is one `gethostname` call.
+
+## Amendment B (2026-11-13) -- UDP now counts a send that raises an error on this host (BACKLOG #5923)
+
+This amendment records a code change. Decision 1's text is left as written, so at least these of
+its statements no longer match the code; where they disagree, this amendment holds:
+
+- **"UDP detects nothing" is now too strong.** The UDP arm uses the same failure-tracking handler
+  as TCP and TLS, so a `sendto` that raises a network error on this host, such as `ENETUNREACH`,
+  is now counted as a failed send: spooled with a spool, counted as unsent without one, as on TCP
+  and TLS. A datagram too large to send (`EMSGSIZE`) is not one of these; the next bullet covers
+  it. Unlike a stream socket, the UDP socket is kept, not reset. Not every loss on this host is detected:
+  a datagram the kernel drops after `sendto` reported success is not. On Linux that can include a
+  full local transmit queue or a neighbour address that never resolves (reasoned from the kernel,
+  not measured). Nor is a datagram that leaves this host and never reaches the collector, which
+  includes every datagram to a collector that is down. Delivery over UDP stays unconfirmed.
+- **A send error that is not a network error is now undeliverable on UDP too**, not only on TCP
+  and TLS. So is a datagram too large to send (`EMSGSIZE`): a retry resends the same record as
+  the same datagram, so kept at the spool head it would hold every later entry behind it while
+  the size limit stands. Neither is ever counted as sent: each is counted in `undeliverable`, is
+  not kept for a retry, and never sets `send_failing`. A copy already in the spool for another
+  reason, such as backoff or the drain deadline, is dropped the same way when replay reaches it.
+  `EMSGSIZE` is the only send errno read this way. Every other one, `EACCES`, `EADDRNOTAVAIL`,
+  `EAFNOSUPPORT` and `EINVAL` included, is a failed send: with a spool the record is kept for a
+  retry, and without one it is counted in `unsent`. Such an error is read as belonging to the
+  destination or the route, so every record to that collector fails alike and nothing good waits
+  behind the head. Some causes can clear, at least a Linux `prohibit` or `blackhole` route and an
+  IPv6 source address still in duplicate address detection; a firewall or endpoint-security
+  block on Windows is expected to surface as `WSAEACCES`, errno 13 (reasoned, not measured).
+  Some cannot, at least a broadcast `forward_host`, since the forwarder never sets
+  `SO_BROADCAST`: every send then fails, `send_failing` stays set, and the spool fills to its cap,
+  after which the newest records are dropped and counted. Dropping each record as undeliverable
+  instead would turn spool retention into a loss of log evidence for every cause that clears.
+  A filter that refuses one record by its content or length with one of these errnos would hold
+  the spool head; that case is not handled (reasoned, not measured).
+- **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
+  deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process
+  running with no forwarder. A name that does not exist is still permanent.
+
+On every arm the standard library's traceback to stderr on a failed send is gone. A throttled
+ERROR line with no record content reports network send errors instead, and an undeliverable
+record gets its own. Both are logged during the shutdown drain too, unless the throttle holds
+one back, when they reach only the local sinks. A line the throttle holds during the drain is never
+written, because no later report follows and `close()` counts nothing a failed send cost. The counts each case moves are stated for
+operators in [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]`.

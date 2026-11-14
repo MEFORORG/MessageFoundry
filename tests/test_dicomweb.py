@@ -40,7 +40,7 @@ PAYLOAD = RawMessage.from_bytes(
 STORED_OK = json.dumps(
     {
         "00081190": {"vr": "UR", "Value": [f"{BASE}/studies/1.2.3"]},
-        "00081199": {"vr": "SQ", "Value": [{}]},
+        "00081199": {"vr": "SQ", "Value": [{"00081155": {"vr": "UI", "Value": ["1.2.3.4.5"]}}]},
     }
 )
 # A dicom+json body carrying a non-empty FailedSOPSequence (00081198) → an instance was rejected.
@@ -447,6 +447,327 @@ async def test_dicomweb_capture_empty_response_is_no_reply() -> None:
     assert resp.outcome == "no_reply"
     assert resp.body == ""
     assert resp.detail == "HTTP 200"
+
+
+# --- BACKLOG #5914: a 2xx reply that does not confirm the store is not a delivery ---------------
+
+# Nested arrays past json's recursion limit: json.loads raises RecursionError, not ValueError.
+_TOO_DEEP = "[" * 100_000 + "]" * 100_000
+# Stands in for PHI in a reply body; it must never reach the refusal text.
+_REPLY_CANARY = "Secretpatient^Replycanary"
+_REPEATED_KEY = '{"00081198": {"vr": "SQ", "Value": [{}]}, "00081198": {"vr": "SQ", "Value": []}}'
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<NativeDicomModel/>",  # an XML reply, the server having ignored Accept
+        "not json",
+        '{"00081199": ',  # truncated
+        _REPEATED_KEY,  # json.loads keeps the last (empty) FailedSOPSequence
+        # The ruling refuses a repeated key at any depth, inside a sequence item too.
+        '{"00081199": {"vr": "SQ", "Value": [{"00081155": 1, "00081155": 2}]}}',
+        _TOO_DEEP,
+    ],
+    ids=["xml", "text", "truncated", "repeated-key", "nested-repeated-key", "too-deep"],
+)
+@pytest.mark.parametrize("status", [200, 202])
+async def test_dicomweb_unparseable_2xx_reply_is_a_permanent_refusal(
+    body: str, status: int, capture: bool
+) -> None:
+    dest = _dest(capture_response=capture)
+    dest._opener = _FakeOpener(body=body.encode(), status=status)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.permanent is True
+    assert exc.value.code == "unparseable-reply"
+    # Raised outside any handler: no decode error, which holds the whole body, rides the chain.
+    assert exc.value.__context__ is None and exc.value.__cause__ is None
+
+
+def _uid_body(uid: object) -> str:
+    return json.dumps({"00081199": {"vr": "SQ", "Value": [{"00081155": uid}]}})
+
+
+# ReferencedSOPSequence bodies that name no stored instance, so confirm no 202 store (BACKLOG #5914):
+# first by a malformed ReferencedSOPInstanceUID element, then by a malformed sequence element.
+_UNCONFIRMING_BODIES = [
+    pytest.param(_uid_body(uid), id=f"uid-{name}")
+    for name, uid in [
+        ("no-value", {"vr": "UI"}),
+        ("empty-value", {"vr": "UI", "Value": []}),
+        ("null-value", {"vr": "UI", "Value": None}),
+        ("null-entry", {"vr": "UI", "Value": [None]}),
+        ("empty-string", {"vr": "UI", "Value": [""]}),
+        ("blank-string", {"vr": "UI", "Value": ["  "]}),
+        ("zero-width-space", {"vr": "UI", "Value": ["\N{ZERO WIDTH SPACE}"]}),
+        ("bom", {"vr": "UI", "Value": ["\N{ZERO WIDTH NO-BREAK SPACE}"]}),
+        ("not-a-uid", {"vr": "UI", "Value": ["N/A"]}),
+        ("empty-component", {"vr": "UI", "Value": ["1..2"]}),
+        ("over-64", {"vr": "UI", "Value": ["1." * 32 + "1"]}),
+        ("two-values", {"vr": "UI", "Value": ["1.2", "3.4"]}),
+        ("one-blank-of-two", {"vr": "UI", "Value": ["1.2.3", ""]}),
+        ("non-string", {"vr": "UI", "Value": [42]}),
+        ("value-not-array", {"vr": "UI", "Value": "1.2.3.4.5"}),
+        ("element-not-object", "1.2.3.4.5"),
+        ("bulk-uri", {"vr": "UI", "Value": ["1.2"], "BulkDataURI": "x"}),
+        ("misspelt-value", {"vr": "UI", "value": ["1.2"]}),
+        ("wrong-vr", {"vr": "SQ", "Value": ["1.2"]}),
+        ("no-vr", {"Value": ["1.2"]}),
+    ]
+] + [
+    pytest.param(json.dumps({"00081199": seq}), id=f"seq-{name}")
+    for name, seq in [
+        ("bulk-uri", {"vr": "SQ", "BulkDataURI": "https://pacs.example.test/bulk/1"}),
+        ("inline-binary", {"vr": "SQ", "InlineBinary": "AAAA"}),
+    ]
+]
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("\r\n", id="whitespace"),
+        pytest.param("{}", id="empty-object"),
+        pytest.param(
+            json.dumps({"00081190": {"vr": "UR", "Value": [f"{BASE}/studies/1.2.3"]}}),
+            id="no-sequence",
+        ),
+        pytest.param(json.dumps({"00081199": {"vr": "SQ", "Value": []}}), id="empty-sequence"),
+        pytest.param(json.dumps({"00081199": {"vr": "SQ"}}), id="no-value"),
+        pytest.param(json.dumps({"00081199": {"vr": "SQ", "Value": "x"}}), id="bad-value"),
+        pytest.param(
+            json.dumps({"00081199": {"vr": "SQ", "Value": [None, "x"]}}), id="non-dataset-items"
+        ),
+        pytest.param(
+            json.dumps([{"00081199": {"vr": "SQ", "Value": []}}]), id="list-empty-sequence"
+        ),
+        pytest.param(
+            json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}), id="item-without-instance-uid"
+        ),
+        *_UNCONFIRMING_BODIES,
+    ],
+)
+async def test_dicomweb_202_without_a_referenced_sop_is_a_permanent_refusal(
+    body: str, capture: bool
+) -> None:
+    dest = _dest(capture_response=capture)
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.permanent is True
+    assert exc.value.code == "unconfirmed-202"
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("body", _UNCONFIRMING_BODIES)
+async def test_dicomweb_200_is_not_held_to_the_202_confirmation_rule(
+    body: str, capture: bool
+) -> None:
+    # The ruling: a 200 whose ReferencedSOPSequence confirms nothing is still a delivery.
+    dest = _dest(capture_response=capture)
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    resp = await dest.send(PAYLOAD)
+    if capture:
+        assert isinstance(resp, DeliveryResponse)
+        assert resp.outcome == "accepted"
+    else:
+        assert resp is None
+
+
+@pytest.mark.parametrize(
+    "uid",
+    [
+        pytest.param("1." * 31 + "12", id="exactly-64"),
+        pytest.param("1.2.3\0", id="nul-pad"),
+        pytest.param("1.2.3 ", id="space-pad"),
+        pytest.param("1.02.3", id="leading-zero"),
+    ],
+)
+async def test_dicomweb_202_confirms_by_a_uid_at_the_grammar_boundary(uid: str) -> None:
+    body = _uid_body({"vr": "UI", "Value": [uid]})
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
+async def test_dicomweb_202_confirms_when_one_item_of_several_names_an_instance() -> None:
+    body = json.dumps(
+        {
+            "00081199": {
+                "vr": "SQ",
+                "Value": [{}, {"00081155": {"vr": "UI", "Value": ["1.2.3.4.5"]}}],
+            }
+        }
+    )
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
+async def test_dicomweb_202_with_a_referenced_sop_delivers() -> None:
+    # A 202 that names the stored instance (warnings only) is a delivery, in both capture modes.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+    dest = _dest(capture_response=True)
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    resp = await dest.send(PAYLOAD)
+    assert isinstance(resp, DeliveryResponse)
+    assert resp.outcome == "accepted"
+    assert resp.detail == "HTTP 202"
+
+
+@pytest.mark.parametrize("status", [200, 202])
+async def test_dicomweb_a_leading_bom_is_not_a_refusal(status: int) -> None:
+    dest = _dest()
+    dest._opener = _FakeOpener(body=("\ufeff" + STORED_OK).encode(), status=status)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
+@pytest.mark.parametrize("body", ["\r\n", "\ufeff", "\ufeff \t\r\n"], ids=["ws", "bom", "bom-ws"])
+async def test_dicomweb_a_whitespace_200_is_not_a_refusal(body: str) -> None:
+    # As an empty 200 is not: neither can carry a FailedSOPSequence. Captured, it is no_reply.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+    dest = _dest(capture_response=True)
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    resp = await dest.send(PAYLOAD)
+    assert isinstance(resp, DeliveryResponse)
+    assert resp.outcome == "no_reply"
+
+
+async def test_dicomweb_unicode_space_is_not_json_whitespace() -> None:
+    # A no-break space is not JSON whitespace, so the body is unparseable, not empty.
+    dest = _dest()
+    dest._opener = _FakeOpener(body="\N{NO-BREAK SPACE}".encode(), status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "unparseable-reply"
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["null", "true", '"x"', "42", "[]", "NaN", "[[" + STORED_FAILED + "]]", '[{}, "x"]'],
+)
+async def test_dicomweb_a_2xx_that_is_not_a_dataset_is_unparseable(body: str) -> None:
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "unparseable-reply"
+
+
+@pytest.mark.parametrize(
+    "element",
+    [
+        '"garbage"',
+        '{"vr": "SQ", "Value": {"a": 1}}',
+        '{"vr": "SQ", "Value": null}',
+        '{"vr": "SQ", "BulkDataURI": "https://pacs.example.test/bulk/1"}',
+        '{"vr": "SQ", "InlineBinary": "AAAA"}',
+        '{"vr": "SQ", "Value": [], "InlineBinary": "AAAA"}',
+        '{"vr": "SQ", "value": [{"00081197": {"vr": "US", "Value": [272]}}]}',
+    ],
+    ids=[
+        "not-object",
+        "value-object",
+        "value-null",
+        "bulk-uri",
+        "inline-binary",
+        "value-and-bulk",
+        "misspelt-value",
+    ],
+)
+@pytest.mark.parametrize("status", [200, 202])
+async def test_dicomweb_a_malformed_failed_sop_sequence_fails_closed(
+    element: str, status: int
+) -> None:
+    # A FailedSOPSequence with bulk data in place of a Value is not an empty one (BACKLOG #5914).
+    body = json.dumps({**json.loads(STORED_OK), "00081198": json.loads(element)})
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=status)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "failed-sop"
+
+
+async def test_dicomweb_an_empty_failed_sop_sequence_is_not_a_refusal() -> None:
+    # PS3.18 F.2.5: an element with no Value, or an empty one, is an empty sequence.
+    for element in ('{"vr": "SQ"}', '{"vr": "SQ", "Value": []}'):
+        dest = _dest()
+        dest._opener = _FakeOpener(body=f'{{"00081198": {element}}}'.encode(), status=200)  # type: ignore[assignment]
+        assert await dest.send(PAYLOAD) is None
+
+
+async def test_only_the_reply_refusals_that_prove_nothing_carry_the_replay_advice() -> None:
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_FAILED.encode(), status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert "before a replay" not in str(exc.value)
+    # A malformed FailedSOPSequence proves no rejection, so it carries the advice too.
+    dest._opener = _FakeOpener(body=b'{"00081198": {"vr": "SQ", "value": []}}', status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "failed-sop"
+    assert "before a replay" in str(exc.value)
+    dest._opener = _FakeOpener(body=b"", status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert "before a replay" in str(exc.value)
+
+
+async def test_dicomweb_refusal_text_leads_with_its_code() -> None:
+    # A stored error is cut at about 200 characters; a long base URL must not cut the code off.
+    dest = _dest()
+    dest.base_url = BASE + "/" + "x" * 300  # only the refusal text reads it after construction
+    dest._opener = _FakeOpener(body=b"not json", status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert str(exc.value).startswith("DICOMweb unparseable-reply: HTTP 200")
+
+
+async def test_dicomweb_202_failed_sop_wins_over_a_referenced_sop() -> None:
+    body = json.dumps({**json.loads(STORED_OK), **json.loads(STORED_FAILED)})
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "failed-sop"
+
+
+async def test_dicomweb_200_does_not_require_a_referenced_sop() -> None:
+    # The ruling: a 200 is not held to the 202 rule; a parseable dataset without one delivers.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=b"{}", status=200)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "code"),
+    [
+        (f"<Patient>{_REPLY_CANARY}</Patient>", 200, "unparseable-reply"),
+        (
+            json.dumps({"00100010": {"vr": "PN", "Value": [{"Alphabetic": _REPLY_CANARY}]}}),
+            202,
+            "unconfirmed-202",
+        ),
+        (f'{{"a": "{_REPLY_CANARY}", "a": 1}}', 200, "unparseable-reply"),
+    ],
+    ids=["xml", "unconfirmed-202", "repeated-key"],
+)
+async def test_dicomweb_reply_refusals_are_content_free(body: str, status: int, code: str) -> None:
+    dest = _dest(capture_response=True)
+    dest._opener = _FakeOpener(body=body.encode(), status=status)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == code  # control: the canary body reached the classifier
+    assert "Secretpatient" not in str(exc.value)
 
 
 # --- test_connection / reachability probe ------------------------------------

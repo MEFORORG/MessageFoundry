@@ -170,8 +170,18 @@ class Message:
         return [self._extract(rep, comp, sub) for rep in text.split(rep_sep)]
 
     def count_segments(self, segment_id: str) -> int:
-        """How many segments of ``segment_id`` the message has (0 if none)."""
-        return sum(1 for sid in _builtin_hl7.segment_ids(self._m) if sid == segment_id)
+        """How many segments of ``segment_id`` the message has (0 if none).
+
+        A fieldless bare line such as ``PID`` (no field separator) is not counted, as no read or
+        write numbers it as an occurrence (BACKLOG #5917), so ``range(1, count + 1)`` visits every
+        segment a write can reach. :meth:`segments` still lists it."""
+        return _builtin_hl7.count_segments(self._m, segment_id)
+
+    def _addressable_segment_ids(self) -> list[str | None]:
+        """:meth:`segments` with each fieldless bare line as ``None``: positional like
+        :meth:`segments`, but an entry matches an id only where a by-occurrence read or write counts
+        that line. Group views number their member occurrences from it (BACKLOG #5917)."""
+        return _builtin_hl7.addressable_segment_ids(self._m)
 
     @property
     def message_code(self) -> str | None:
@@ -190,7 +200,12 @@ class Message:
         return self.field("MSH-10")
 
     def segments(self) -> list[str]:
-        """Ordered segment ids, e.g. ``["MSH", "EVN", "PID"]``."""
+        """Ordered segment ids, e.g. ``["MSH", "EVN", "PID"]``.
+
+        Positional, one entry per line, so it lists a fieldless bare line too, as ``Peek.segments``
+        does; a position here is the one :meth:`add_segment`'s ``index`` uses. It is not an
+        occurrence count: :meth:`count_segments` and every by-occurrence read and write skip a
+        fieldless line (BACKLOG #5917)."""
         return _builtin_hl7.segment_ids(self._m)
 
     # --- derived HL7 timestamp values ---------------------------------------
@@ -286,7 +301,9 @@ class Message:
         write emits a raw MLLP frame byte (ADR 0205 rules 2 and 3).
 
         ``occurrence`` (1-based) selects which segment of that id to write — ``occurrence=2`` edits
-        the **second** ``OBX``. ``repetition`` (1-based) scopes the write to one field repetition: a
+        the **second** ``OBX``. It counts as :meth:`field` and :meth:`count_segments` do, and
+        occurrence 1 is the segment ``Peek.field`` reads (see ``_builtin_hl7.segment_index`` for a
+        fieldless bare line). ``repetition`` (1-based) scopes the write to one field repetition: a
         component write edits that repetition (padding earlier reps if needed) and preserves the
         others (default — and ``repetition=1`` — edit the first, preserve the rest; review H-9); a
         whole-field write with ``repetition`` replaces just that repetition's text (and the value may
@@ -446,10 +463,10 @@ class Message:
             raise ValueError(f"segment must begin with a 3-char segment id, got {segment_id!r}")
         if segment_id == "MSH":
             raise ValueError("refusing to add a second MSH segment")
-        # A bare segment id (no field separator -> a single token) grafts a segment with no data
-        # field: the backend counts it, but the write path can't address it, so a later set()/field
-        # write raises "cannot set absent segment" even though count_segments() sees it. Normalize a
-        # bare id to a settable empty segment (id + one empty field) — identical to add_segment("TXA|").
+        # A bare segment id (no field separator -> a single token) would graft a fieldless segment,
+        # which no read, count or write numbers as an occurrence (BACKLOG #5917), so a later set()
+        # would raise "cannot set absent segment". Normalize a bare id to a settable empty segment
+        # (id + one empty field), identical to add_segment("TXA|").
         if len(tokens) == 1:
             tokens.append("")
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
@@ -463,7 +480,8 @@ class Message:
 
         Deleting ``MSH`` is refused — the message must keep its header. Common for clearing a
         repeating block (e.g. ``delete_segments("ODS")``) before rebuilding it with
-        :meth:`add_segment`."""
+        :meth:`add_segment`. A fieldless bare line of that id is removed and counted too, though
+        :meth:`count_segments` skips it, so a delete leaves no stray bare line behind."""
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
@@ -565,13 +583,9 @@ class Message:
     def _segment_present(self, segment_id: str, occurrence: int = 1) -> bool:
         """Whether the ``occurrence``-th (1-based) segment with ``segment_id`` exists — the presence
         check used by the write/repetition guards."""
-        seen = 0
-        for sid in _builtin_hl7.segment_ids(self._m):
-            if sid == segment_id:
-                seen += 1
-                if seen == occurrence:
-                    return True
-        return False
+        # The scan the write resolves through, so the guard and the write cannot disagree on which
+        # segment is the ``occurrence``-th (BACKLOG #5917).
+        return _builtin_hl7.segment_index(self._m, segment_id, occurrence) is not None
 
     def _assign_field(self, seg: str, fld: int, occurrence: int, raw_value: str) -> None:
         """Write the whole raw field text at ``seg``/``fld`` for the given segment ``occurrence``.

@@ -236,6 +236,584 @@ def test_split_tolerates_cosmetic_newlines_after_terminator() -> None:
     assert len(parts) == 1 and parts[0].lstrip().startswith("ISA") and "IEA" in parts[0]
 
 
+# --- non-ISA noise and false ISA trigrams (BACKLOG #5921) --------------------
+# split used to stop at the first run of non-ISA data and drop it and everything after it. The frame
+# reader took any "ISA" trigram in noise as an interchange start, so a real interchange behind it was
+# swallowed into a false frame. Both now check the ISA's fixed element-separator positions, and both
+# surface what fails the check rather than drop it.
+
+
+@pytest.mark.parametrize(
+    ("raw_parts", "expected"),
+    [
+        pytest.param(["A", "\r\nGARBAGE line\r\n", "B"], ["A", "GARBAGE line", "B"], id="between"),
+        pytest.param(["A", "trailing junk\r\n"], ["A", "trailing junk"], id="trailing"),
+        pytest.param(["leading junk ", "A"], ["leading junk", "A"], id="leading"),
+        pytest.param(
+            ["A", "noise ISAAC here ", "B"], ["A", "noise ISAAC here", "B"], id="false-isa"
+        ),
+        pytest.param(["A", "\r\n"], ["A"], id="trailing-crlf-is-skipped"),
+    ],
+)
+def test_split_surfaces_non_isa_junk_as_its_own_element(
+    raw_parts: list[str], expected: list[str]
+) -> None:
+    a, b = interchange(), interchange(control="000000002")
+    parts = {"A": a, "B": b}
+    out = split("".join(parts.get(p, p) for p in raw_parts))
+    assert out == [parts.get(p, p) for p in expected]
+
+
+def test_split_of_a_buffer_with_no_isa() -> None:
+    assert split("not x12 at all\r\n") == ["not x12 at all"]
+    assert split("\ufeff \r\n") == [] and split("") == []
+
+
+def _corrupt(raw: str) -> str:
+    return raw[:6] + "X" + raw[7:]  # clobber a fixed element-separator position
+
+
+@pytest.mark.parametrize(
+    ("raw_parts", "expected"),
+    [
+        pytest.param(["A", "\r\nPaid by VISA\r\n"], ["A", "Paid by VISA"], id="trailing-visa"),
+        pytest.param(["A", "\r\nISAAC\r\n"], ["A", "ISAAC"], id="short-trailing-isa"),
+        pytest.param(
+            ["A", "\r\nISA segment missing\r\n", "B"],
+            ["A", "ISA segment missing", "B"],
+            id="junk-opening-with-isa",
+        ),
+        pytest.param(["BAD", "BAD", "B"], ["BAD", "BAD", "B"], id="two-corrupted-then-good"),
+        pytest.param(
+            ["BAD", "\r\nGARBAGE\r\n", "B"], ["BAD", "GARBAGE", "B"], id="corrupted-noise"
+        ),
+    ],
+)
+def test_split_bounds_a_malformed_isa_and_never_raises_on_one(
+    raw_parts: list[str], expected: list[str]
+) -> None:
+    a, b = interchange(), interchange(control="000000002")
+    parts = {"A": a, "B": b, "BAD": _corrupt(interchange(control="000000003"))}
+    out = split("".join(parts.get(p, p) for p in raw_parts))
+    assert out == [parts.get(p, p) for p in expected]
+
+
+def _frames_of(data: bytes, chunk: int) -> list[bytes]:
+    reader = X12FrameReader()
+    frames: list[bytes] = []
+    for i in range(0, len(data), chunk):
+        frames.extend(reader.feed(data[i : i + chunk]))
+    assert not reader.in_frame
+    return frames
+
+
+@pytest.mark.parametrize(
+    "noise",
+    [
+        pytest.param(b"xxISA junk ", id="short"),
+        pytest.param(b"ISA long noise line " * 12, id="longer-than-an-isa"),
+        pytest.param(b"ISAISAISA ", id="repeated"),
+    ],
+)
+@pytest.mark.parametrize("chunk", [4096, 1])
+def test_frame_reader_frames_a_false_isa_in_noise_apart_from_the_real_one(
+    noise: bytes, chunk: int
+) -> None:
+    real = interchange().encode("utf-8")
+    frames = _frames_of(noise + real, chunk)
+    # The false ISA's run is framed on its own, so the parse refuses it, and the real one is whole.
+    assert frames == [noise[noise.index(b"ISA") :], real]
+    with pytest.raises(X12PeekError):
+        X12Message.parse(frames[0])
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        pytest.param(["BAD"], id="alone"),
+        pytest.param(["BAD", "GOOD"], id="before-good"),
+        pytest.param(["BAD", "\r\n", "GOOD"], id="crlf-between"),
+        pytest.param(["BAD", "\r\nGARBAGE\r\n", "GOOD"], id="noise-between"),
+        pytest.param(["BAD", "BAD", "BAD", "GOOD"], id="three-corrupted"),
+        pytest.param(["GOOD", "BAD", "GOOD"], id="between-goods"),
+    ],
+)
+@pytest.mark.parametrize("chunk", [4096, 7, 1])
+def test_frame_reader_frames_each_corrupted_isa_through_its_own_iea(
+    parts: list[str], chunk: int
+) -> None:
+    # A real interchange whose header fails the structural check is not noise to discard, and its
+    # frame does not depend on how the stream was split into reads.
+    good = interchange(control="000000002").encode("utf-8")
+    bad = _corrupt(interchange()).encode("utf-8")
+    pieces = {"BAD": bad, "GOOD": good}
+    data = b"".join(pieces.get(p, p.encode()) for p in parts)
+    assert _frames_of(data, chunk) == [pieces[p] for p in parts if p in pieces]
+
+
+def test_frame_reader_does_not_cut_a_suspect_inside_the_next_isa_in_small_reads() -> None:
+    # A suspect whose +105 terminator is "S" could close an IEA segment on the "S" of the next real
+    # ISA while only "IS" of it had arrived, losing that interchange in small reads only.
+    head = bytearray(b"ISA" + b"x" * 102 + b"S")
+    head[6:7] = b"y"  # fails the structural check
+    suspect = bytes(head) + b"IEA*1*000000001~"
+    real = interchange().encode("utf-8")
+    for chunk in (4096, 1):
+        assert _frames_of(suspect + real, chunk) == [suspect, real]
+
+
+def test_split_keeps_a_malformed_interchanges_whitespace_terminator() -> None:
+    bad = _corrupt(interchange(term="\n"))
+    assert split(bad + interchange(control="000000002")) == [bad, interchange(control="000000002")]
+
+
+def test_split_and_reader_stay_linear_over_many_malformed_interchanges() -> None:
+    # Each malformed interchange used to restart the search for the next passing ISA, so k of them
+    # in one buffer cost about k * k structural checks. Count the checks rather than time the run.
+    from messagefoundry.parsing.x12 import delimiters
+
+    bad = _corrupt(interchange())
+    calls = 0
+    original = delimiters.isa_separators_line_up
+
+    def counting(buf: Any, isa_at: int) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(buf, isa_at)
+
+    import messagefoundry.parsing.x12.interchange as interchange_mod
+
+    # The reader's bound search checks a candidate through _whole_isa_passes, so count it too.
+    original_whole = interchange_mod._whole_isa_passes
+
+    def counting_whole(buf: Any, isa_at: int, gate: int) -> tuple[bool | None, int]:
+        nonlocal calls
+        calls += 1
+        return original_whole(buf, isa_at, gate)
+
+    for k in (50, 200):
+        calls = 0
+        mp = pytest.MonkeyPatch()
+        mp.setattr(interchange_mod, "isa_separators_line_up", counting)
+        mp.setattr(interchange_mod, "_whole_isa_passes", counting_whole)
+        try:
+            assert len(split(bad * k)) == k
+            assert len(list(X12FrameReader().feed((bad * k).encode()))) == k
+        finally:
+            mp.undo()
+        assert calls < 10 * k, (k, calls)
+
+
+def test_frame_reader_clear_resets_the_trailer_allowance() -> None:
+    reader = X12FrameReader()
+    assert list(reader.feed(interchange().encode("utf-8"))) != []
+    assert reader._tail_left == 2
+    reader._clear()
+    assert reader._tail_left == 0
+    list(reader.feed(b"\r\n"))
+    assert not reader.trailer_only
+
+
+# A run of one character after "ISA" lines up at every separator position, so the separator check
+# alone passed padded text ("Paid by VISA" then spaces, a row of "=" or "0"). The reader then walked it
+# without bound and split refused the whole buffer. The check also requires distinct delimiters now.
+_PADDED_NOISE = [
+    pytest.param("\r\nPaid by VISA" + " " * 110 + "\r\n", id="spaces"),
+    pytest.param("\r\nVISA" + "0" * 110 + "\r\n", id="zeros"),
+    pytest.param("\r\n====VISA" + "=" * 120 + "\r\n", id="banner"),
+]
+
+
+@pytest.mark.parametrize("fill", [" ", "0", "="])
+def test_isa_followed_by_one_repeated_character_fails_the_check(fill: str) -> None:
+    from messagefoundry.parsing.x12.delimiters import isa_separators_line_up
+
+    run = "ISA" + fill * 103
+    assert not isa_separators_line_up(run, 0)
+    assert not isa_separators_line_up(run.encode(), 0)
+    assert not isa_separators_line_up(bytearray(run.encode()), 0)
+    # Positive controls: a real header passes, and so does one too short to tell yet.
+    assert isa_separators_line_up(isa(), 0) and isa_separators_line_up(isa().encode()[:40], 0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"comp": "*"}, id="component-is-element"),
+        pytest.param({"term": "*"}, id="terminator-is-element"),
+        pytest.param({"comp": "~"}, id="component-is-terminator"),
+        pytest.param({"rep": ":"}, id="repetition-is-component"),
+    ],
+)
+def test_the_check_refuses_delimiters_that_are_not_distinct(kwargs: dict[str, Any]) -> None:
+    from messagefoundry.parsing.x12.delimiters import isa_separators_line_up
+
+    assert not isa_separators_line_up(isa(**kwargs), 0)
+    # Before 00501 ISA11 is data, so a value equal to a delimiter is not a repetition clash.
+    assert isa_separators_line_up(isa(version="00401", rep=":"), 0)
+
+
+@pytest.mark.parametrize("noise", _PADDED_NOISE)
+def test_split_surfaces_padded_isa_noise_and_keeps_both_interchanges(noise: str) -> None:
+    a, b = interchange(), interchange(control="000000002")
+    assert split(a + noise + b) == [a, noise.strip(), b]
+
+
+@pytest.mark.parametrize("noise", _PADDED_NOISE)
+@pytest.mark.parametrize("chunk", [4096, 1])
+def test_frame_reader_bounds_padded_isa_noise_at_the_next_interchange(
+    noise: str, chunk: int
+) -> None:
+    a = interchange().encode()
+    b = interchange(control="000000002").encode()
+    run = noise.encode()
+    frames = _frames_of(a + run + b, chunk)
+    assert frames == [a, run[run.index(b"ISA") :], b]
+
+
+@pytest.mark.parametrize("sender", ["SEND~X", "SEND*X"])
+def test_split_returns_an_isa_the_parse_refuses_as_its_own_element(sender: str) -> None:
+    # The ISA passes the structural check, but a delimiter in ISA06 makes the parse refuse it. split
+    # used to raise for the whole buffer, losing both good interchanges; the reader framed all three.
+    a, b = interchange(), interchange(control="000000002")
+    c = interchange(control="000000003", sender=sender)
+    assert split(a + c + b) == [a, c, b]
+    assert _frames_of((a + c + b).encode(), 4096) == [a.encode(), c.encode(), b.encode()]
+    # The forged delimiter still cannot make it parse as valid (BACKLOG #5536).
+    with pytest.raises(X12PeekError, match="ISA-06 holds a delimiter character"):
+        X12Message.parse(c)
+
+
+def _without_iea(raw: str) -> str:
+    return raw[: raw.index("IEA*")]
+
+
+_BIG_CUT = _without_iea(interchange(groups=[("HS", "005010X279A1", ["270", "270", "270"])]))
+
+
+@pytest.mark.parametrize(
+    ("first", "cap"),
+    [
+        # A suspect's frame ends at the next ISA that passes.
+        pytest.param(b"ISA long noise line " * 9, 220, id="suspect"),
+        # A passing interchange with no IEA ends at the next one too.
+        pytest.param(_without_iea(interchange()).encode(), 232, id="passing-no-iea"),
+        # At the cap exactly, and one over: the next ISA's first bytes are not charged.
+        pytest.param(_BIG_CUT.encode(), len(_BIG_CUT), id="passing-at-cap"),
+        pytest.param(_BIG_CUT.encode(), len(_BIG_CUT) + 1, id="passing-cap-plus-one"),
+    ],
+)
+def test_frame_reader_cap_does_not_depend_on_read_size(first: bytes, cap: int) -> None:
+    # Bytes of the next ISA already received belong to it, not to the open frame, so they must not
+    # count against the open frame's cap: they did, and 1- or 64-byte reads raised frame_oversize
+    # where one read framed both.
+    good = interchange(control="000000002").encode()
+    assert len(first) <= cap and len(good) <= cap < len(first) + len(good)
+    data = first + good
+    for chunk in (len(data), 4096, 150, 64, 7, 1):
+        reader = X12FrameReader(max_interchange_bytes=cap)
+        frames: list[bytes] = []
+        for i in range(0, len(data), chunk):
+            frames.extend(reader.feed(data[i : i + chunk]))
+        assert frames == [first, good], chunk
+        assert not reader.in_frame
+
+
+def _feed_all(reader: X12FrameReader, data: bytes, chunk: int) -> list[bytes]:
+    frames: list[bytes] = []
+    for i in range(0, len(data), chunk):
+        frames.extend(reader.feed(data[i : i + chunk]))
+    return frames
+
+
+@pytest.mark.parametrize("chunk", [4096, 7, 1])
+def test_frame_reader_cap_holds_over_whitespace_after_a_segment(chunk: int) -> None:
+    # Whitespace after a terminator may open the next ISA, which would cut the frame before it, so
+    # the reader waits to see what follows. It is still charged, or a peer could grow the buffer
+    # with it without bound: refused one byte past the cap, and not at the cap.
+    open_frame = _without_iea(interchange()).encode()
+    data = open_frame + b" " * 400
+    with pytest.raises(X12FrameError):
+        _feed_all(X12FrameReader(max_interchange_bytes=len(data) - 1), data, chunk)
+    reader = X12FrameReader(max_interchange_bytes=len(data))
+    assert _feed_all(reader, data, chunk) == [] and reader.in_frame
+
+
+@pytest.mark.parametrize("chunk", [4096, 150, 7, 1])
+def test_frame_reader_cap_over_whitespace_before_a_cut_does_not_depend_on_read_size(
+    chunk: int,
+) -> None:
+    # The whitespace before an ISA that cuts a frame with no IEA is charged whether the reader saw
+    # it while waiting or all at once, though the frame it takes leaves that whitespace out.
+    first = _without_iea(interchange()).encode()
+    ws = b" " * 120
+    good = interchange(control="000000002").encode()
+    data = first + ws + good
+    charged = len(first) + len(ws)
+    with pytest.raises(X12FrameError):
+        _feed_all(X12FrameReader(max_interchange_bytes=charged - 1), data, chunk)
+    reader = X12FrameReader(max_interchange_bytes=charged)
+    assert _feed_all(reader, data, chunk) == [first, good]
+    assert not reader.in_frame
+
+
+@pytest.mark.parametrize("between", ["", "\r\n"])
+@pytest.mark.parametrize("next_term", ["~", "\n"])
+def test_an_interchange_with_no_iea_ends_at_the_next_interchange(
+    between: str, next_term: str
+) -> None:
+    # A passing ISA with no IEA was walked to the end of the buffer, swallowing the interchange
+    # after it. Its walk now ends at the next ISA that opens a segment, whatever that interchange's
+    # own terminator. Both surfaces keep the frame verbatim through its last terminator; the
+    # whitespace before the next ISA is between interchanges, so neither frame holds it.
+    a = _without_iea(interchange())
+    b = interchange(control="000000002", term=next_term)
+    assert split(a + between + b) == [a, b]
+    for chunk in (4096, 7, 1):
+        assert _frames_of((a + between + b).encode(), chunk) == [a.encode(), b.encode()]
+    # The cut frame still parses, so check_integrity is what reports it.
+    assert check_integrity(a) == ["no IEA segment"]
+
+
+def test_check_integrity_reports_every_trailer_left_open() -> None:
+    raw = interchange()
+    cut = raw[: raw.index("SE*")]
+    assert check_integrity(cut) == [
+        "ST02 '0001' has no SE",
+        "GS06 '1' has no GE",
+        "no IEA segment",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dropped", "groups", "expected"),
+    [
+        pytest.param(
+            "GE*1*1~",
+            [("HS", "005010X279A1", ["270"]), ("HB", "005010X279A1", ["271"])],
+            ["GS06 '1' has no GE"],
+            id="group-opened-over",
+        ),
+        pytest.param(
+            "SE*2*0001~",
+            [("HS", "005010X279A1", ["270", "270"])],
+            ["ST02 '0001' has no SE"],
+            id="set-opened-over",
+        ),
+    ],
+)
+def test_check_integrity_reports_a_trailer_a_new_header_opens_over(
+    dropped: str, groups: list[tuple[str, str, list[str]]], expected: list[str]
+) -> None:
+    raw = interchange(groups=groups).replace(dropped, "", 1)
+    assert check_integrity(raw) == expected
+
+
+class _CountingStr(str):
+    """A ``str`` that totals how far its ``find`` calls scan, and how much its slices read."""
+
+    scanned = 0
+    read = 0
+
+    def find(self, sub: Any, start: Any = 0, end: Any = None) -> int:
+        stop = len(self) if end is None else end
+        idx = super().find(sub, start, stop)
+        type(self).scanned += max(0, (stop if idx == -1 else idx + len(sub)) - start)
+        return idx
+
+    def __getitem__(self, key: Any) -> str:
+        # Every slice or index read, such as the ISA check's, is tallied in ``read``.
+        got = super().__getitem__(key)
+        type(self).read += len(got)
+        return got
+
+
+def test_split_walks_a_chain_of_interchanges_with_no_iea_linearly() -> None:
+    # Each walk used to run to the end of the buffer before looking for the next ISA, so a run of
+    # interchanges with no IEA cost about N * N.
+    cut = _without_iea(interchange())
+    for k in (50, 400):
+        _CountingStr.scanned = 0
+        raw = _CountingStr(cut * k)
+        assert len(split(raw)) == k
+        assert _CountingStr.scanned < 4 * len(raw), (k, _CountingStr.scanned)
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        pytest.param("\ufeff", id="bom"),
+        pytest.param("junk", id="junk"),
+        pytest.param("\x1c\r\x0b", id="mllp-envelope"),
+    ],
+)
+def test_split_and_reader_stay_linear_when_noise_precedes_each_isa(between: str) -> None:
+    # A passing walk used to search ahead for a later ISA that opens a segment before walking. With
+    # anything but terminator and whitespace before each next ISA, none opens one, so each of k
+    # interchanges searched to the end of the buffer: about k * k. Count what find scans.
+    one = interchange() + between
+    for k in (50, 400):
+        _CountingStr.scanned = 0
+        raw = _CountingStr(one * k)
+        assert len([p for p in split(raw) if p.startswith("ISA")]) == k
+        assert _CountingStr.scanned < 4 * len(raw), (k, _CountingStr.scanned)
+        data = (one * k).encode()
+        frames, scanned = _drip(data, len(data))
+        assert len(frames) == k
+        assert scanned < 4 * len(data), (k, scanned)
+
+
+def test_a_passing_isa_that_opens_a_segment_ends_a_passing_walk() -> None:
+    # Only an ISA that passes ends the walk, so an interchange with no IEA does not swallow a good one
+    # after it. A corrupted ISA there fails, so it is data in the walk before it: the two are framed
+    # together, through the corrupted one's IEA. That is the price of never cutting a complete
+    # interchange at a body segment that only starts with "ISA".
+    a = _without_iea(interchange())
+    bad = _corrupt(interchange(control="000000002"))
+    good = interchange(control="000000003")
+    for between in ("", "\r\n"):
+        raw = a + between + good
+        assert split(raw) == [a, good]
+        swallowed = a + between + bad
+        assert split(swallowed + good) == [swallowed, good]
+        for chunk in (4096, 7, 1):
+            assert _frames_of(raw.encode(), chunk) == [a.encode(), good.encode()]
+            frames = _frames_of((swallowed + good).encode(), chunk)
+            assert frames == [swallowed.encode(), good.encode()]
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        pytest.param("\r\nISA segment missing\r\n", id="junk-opening-with-isa"),
+        pytest.param(interchange(control="000000002")[:11], id="cut-off-header"),
+        pytest.param(_corrupt(interchange(control="000000002", term="'")), id="other-terminator"),
+    ],
+)
+def test_a_failing_isa_after_an_interchange_with_no_iea_does_not_let_it_swallow_the_next(
+    between: str,
+) -> None:
+    # A failing ISA that opens a segment is data in the walk, but from it on the walk is bounded by
+    # the next ISA that passes, as a suspect's is. Without that bound, a run with no terminator
+    # in it hid the good interchange's ISA from every segment start, and the walk took it whole.
+    a = _without_iea(interchange())
+    good = interchange(control="000000003")
+    assert split(a + between + good) == [a + between, good]
+    data = (a + between + good).encode()
+    for chunk in (4096, 107, 7, 1):
+        assert _frames_of(data, chunk) == [(a + between).encode(), good.encode()], chunk
+
+
+def test_split_takes_a_lowercase_isa_as_data_as_the_reader_does() -> None:
+    # The separator check never reads the literal. split took a lowercase "isa" header as an
+    # interchange and walked it past a passing ISA in its element data; the reader only starts a
+    # frame at a literal "ISA", so the two framed the same bytes differently.
+    body_isa = isa(control="000000009")
+    raw = interchange().replace("GS*HS*", "GS*HS" + body_isa + "*", 1)
+    lower = "isa" + raw[3:]
+    cut = lower.index(body_isa)
+    assert split(lower) == [lower[:cut], lower[cut:]]
+    # The reader discards the lowercase run as noise and starts its frame at the same ISA.
+    assert _frames_of(lower.encode(), 4096) == [lower[cut:].encode()]
+    assert split(raw) == [raw]  # the control: with a literal ISA it is one interchange
+
+
+def test_split_checks_a_chain_of_interchanges_with_no_iea_once_each() -> None:
+    import messagefoundry.parsing.x12.interchange as interchange_mod
+    from messagefoundry.parsing.x12 import delimiters
+
+    calls = 0
+    original = delimiters.isa_separators_line_up
+
+    def counting(buf: Any, isa_at: int) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(buf, isa_at)
+
+    cut = _without_iea(interchange())
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(interchange_mod, "isa_separators_line_up", counting)
+        assert split(cut * 50) == [cut] * 50
+    assert calls <= 50, calls
+
+
+# Body segments that open with a literal "ISA" but fail the check: a short segment, a note, and a
+# terminator then "ISA" inside BIN binary data, which the walk reads as a segment start.
+_ISA_LIKE_SEGMENTS = [
+    pytest.param("ISA~", id="isa-alone"),
+    pytest.param("ISAX*1~", id="isax"),
+    pytest.param("ISA*NOTE*~", id="isa-note"),
+    # Holds the separator at +3, +6 and +17, and fails at +20, so a read can end mid-check.
+    pytest.param("ISA*00*          *00X~", id="fails-at-a-later-gate"),
+    pytest.param("BIN*9*ab~ISAcd~", id="bin-holding-terminator-isa"),
+]
+
+
+@pytest.mark.parametrize("term", ["~", "\n"])
+@pytest.mark.parametrize("segment", _ISA_LIKE_SEGMENTS)
+def test_a_segment_opening_with_a_failing_isa_does_not_cut_an_interchange(
+    segment: str, term: str
+) -> None:
+    # A segment that only starts with "ISA" used to end the walk, cutting a complete interchange in
+    # two: the reader yielded the head and held the tail, with the real IEA, as a suspect that could
+    # be lost at the frame deadline. Only an ISA that passes ends the walk now (BACKLOG #5921), so
+    # the interchange frames whole on both surfaces, however the reads split it. An LF terminator
+    # used to lose the tail's own IEA terminator in split too, where the tail was cut off.
+    raw = interchange(term=term).replace("GE*", segment.replace("~", term) + "GE*", 1)
+    assert split(raw) == [raw]
+    data = raw.encode()
+    for chunk in range(1, len(data) + 1):
+        assert _frames_of(data, chunk) == [data], chunk
+    # With a good interchange after it, both are framed, at every read size.
+    nxt = interchange(control="000000002", term=term).encode()
+    assert split(raw + nxt.decode()) == [raw, nxt.decode()]
+    for chunk in range(1, len(data) + len(nxt) + 1):
+        assert _frames_of(data + nxt, chunk) == [data, nxt], chunk
+
+
+def test_a_passing_walk_holds_at_an_isa_until_its_header_has_arrived() -> None:
+    # An ISA that opens a segment is not decided until the bytes that decide it arrive: the reader
+    # holds the open frame rather than cut it or walk past it, and cuts once the header passes.
+    a = _without_iea(interchange()).encode()
+    b = interchange(control="000000002").encode()
+    reader = X12FrameReader()
+    assert list(reader.feed(a + b[:60])) == [] and reader.in_frame
+    assert list(reader.feed(b[60:105])) == []
+    assert list(reader.feed(b[105:])) == [a, b]
+    assert not reader.in_frame
+
+
+@pytest.mark.parametrize("chunk", [4096, 1])
+def test_an_isa_in_element_data_does_not_end_an_interchange(chunk: int) -> None:
+    # Only an ISA that opens a segment ends the walk: one inside element data is data, even one
+    # whose own header passes the check.
+    body_isa = isa(control="000000009", term="!")
+    raw = interchange().replace("GS*HS*", "GS*HS" + body_isa + "*", 1)
+    from messagefoundry.parsing.x12.delimiters import isa_separators_line_up
+
+    assert isa_separators_line_up(raw, raw.index(body_isa))
+    assert split(raw) == [raw]
+    assert _frames_of(raw.encode(), chunk) == [raw.encode()]
+
+
+def test_split_checks_each_passing_interchange_once() -> None:
+    import messagefoundry.parsing.x12.interchange as interchange_mod
+    from messagefoundry.parsing.x12 import delimiters
+
+    calls = 0
+    original = delimiters.isa_separators_line_up
+
+    def counting(buf: Any, isa_at: int) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(buf, isa_at)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(interchange_mod, "isa_separators_line_up", counting)
+        assert len(split(interchange() * 100)) == 100
+    assert calls <= 100, calls
+
+
 # --- streaming byte frame reader ---------------------------------------------
 
 
@@ -255,10 +833,16 @@ def test_iea_segment_whitespace_matches_the_shared_set() -> None:
     literal equal to _SEGMENT_WHITESPACE, byte for byte, so the two cannot drift apart.
     """
     from messagefoundry.parsing.x12.delimiters import _SEGMENT_WHITESPACE
-    from messagefoundry.parsing.x12.interchange import _IEA_SEGMENT
+    from messagefoundry.parsing.x12.interchange import (
+        _IEA_SEGMENT,
+        _SEGMENT_WS_RUN,
+        _SEGMENT_WS_RUN_STR,
+    )
 
     skipped = {chr(b) for b in range(256) if _IEA_SEGMENT.fullmatch(bytes([b, b, *b"IEA"]))}
     assert skipped == set(_SEGMENT_WHITESPACE)
+    assert {chr(b) for b in range(256) if _SEGMENT_WS_RUN.fullmatch(bytes([b]))} == skipped
+    assert {chr(c) for c in range(0x10000) if _SEGMENT_WS_RUN_STR.fullmatch(chr(c))} == skipped
 
 
 def test_frame_reader_two_in_one_feed() -> None:
@@ -284,15 +868,26 @@ def test_frame_reader_iea_in_data_does_not_truncate() -> None:
 # --- a delimiter inside ISA element data (BACKLOG #5536) ---------------------
 # The ISA is fixed-width, but every tokenizer used to split it on the delimiters, so a terminator in
 # ISA06 could forge an ST, GS or IEA ahead of the real body and an element separator could shift every
-# ISA element after it. The str surfaces now refuse such an ISA; the frame reader frames it whole, so
-# the real body is not dropped, and the parse after it refuses.
+# ISA element after it. The str surfaces now refuse such an ISA. split and the frame reader frame it
+# whole, so the real body is not dropped, and the parse after them refuses (BACKLOG #5921).
+
+
+def _split_then_parse(raw: str) -> None:
+    """split frames the interchange whole, never at a forged segment, and the parse of that frame
+    refuses it where the delimiters are spoofed."""
+    try:
+        parts = split(raw)
+    except X12PeekError as exc:  # split must frame it, not refuse it for the whole buffer
+        pytest.fail(f"split raised: {exc}")
+    assert parts == [raw]
+    X12Message.parse(parts[0])
 
 
 _REFUSE_STR_SURFACES = [
     pytest.param(discover_delimiters, id="discover_delimiters"),
     pytest.param(X12Peek.parse, id="X12Peek"),
     pytest.param(X12Message.parse, id="X12Message"),
-    pytest.param(split, id="split"),
+    pytest.param(_split_then_parse, id="split"),
     pytest.param(check_integrity, id="check_integrity"),
 ]
 
@@ -440,21 +1035,33 @@ def _assert_open_interchange_refused_at_cap(chunk: bytes) -> None:
 
 
 class _CountingBuffer(bytearray):
-    """A bytearray that tallies how many bytes each ``find`` call examines."""
+    """A bytearray that tallies how many bytes each ``find`` call examines, and its slices read."""
 
     scanned = 0
+    read = 0
 
     def find(self, sub: object, start: object = 0, end: object = None) -> int:
-        assert isinstance(sub, bytes) and isinstance(start, int) and end is None
-        idx = super().find(sub, start)
-        self.scanned += (len(self) if idx == -1 else idx + len(sub)) - start
+        assert isinstance(sub, bytes) and isinstance(start, int)
+        assert end is None or isinstance(end, int)
+        stop = len(self) if end is None else end
+        idx = super().find(sub, start, stop)
+        self.scanned += max(0, (stop if idx == -1 else idx + len(sub)) - start)
         return idx
 
+    def __getitem__(self, key: Any) -> Any:
+        # Every slice or index read, such as the ISA check's, is tallied in ``read``.
+        got = super().__getitem__(key)
+        self.read += len(got) if isinstance(got, bytearray) else 1
+        return got
 
-def _drip(data: bytes, chunk: int) -> tuple[list[bytes], int]:
-    """Feed ``data`` ``chunk`` bytes at a time; return the frames and the bytes ``find`` examined."""
+
+def _drip(
+    data: bytes, chunk: int, counter: _CountingBuffer | None = None
+) -> tuple[list[bytes], int]:
+    """Feed ``data`` ``chunk`` bytes at a time; return the frames and the bytes ``find`` examined.
+    Pass ``counter`` to read its other tallies afterwards."""
     reader = X12FrameReader()
-    counter = _CountingBuffer()
+    counter = _CountingBuffer() if counter is None else counter
     reader._buf = counter  # the seam: every scan the reader does goes through this buffer
     frames: list[bytes] = []
     for i in range(0, len(data), chunk):
@@ -496,6 +1103,43 @@ def test_frame_reader_scan_work_grows_linearly_with_input() -> None:
     _, small_work = _drip(small, 16)
     _, large_work = _drip(large, 16)
     assert large_work <= 2.5 * small_work, (small_work, large_work)
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        # Fails at +6, the first gate read.
+        pytest.param("ISA~", id="fails-early"),
+        # A whole header whose every gate holds the separator, refused only by the distinctness
+        # rule: the most a body segment can make the check read.
+        pytest.param(isa(comp="*"), id="fails-last"),
+    ],
+)
+@pytest.mark.parametrize("chunk", [4096, 7, 1])
+def test_the_isa_check_at_each_segment_start_stays_linear(segment: str, chunk: int) -> None:
+    # A passing walk checks a literal ISA at each segment start, and a reader holds while the header
+    # arrives. Re-reading it from the start on each feed, or searching past it, would make a body of
+    # many such segments quadratic, or 100 times the input in one-byte reads. Count every byte the
+    # slices read, the separator check's included, and every byte find scans.
+    raw = interchange().replace("GE*", segment * 400 + "GE*", 1)
+    data = raw.encode()
+    counter = _CountingBuffer()
+    frames, _ = _drip(data, chunk, counter)
+    assert frames == [data]
+    # One-byte reads cost about four bytes read per input byte, and about eight scanned once the
+    # first failing ISA bounds the walk (the bound's search and the terminator's, each feed), the
+    # same per byte at 200, 400 or 800 such segments. Re-reading each held header from its first
+    # gate on every feed reads about ten; a search ahead to the buffer end grows with the count.
+    assert counter.read < 6 * len(data) and counter.scanned < 10 * len(data), (
+        counter.read,
+        counter.scanned,
+    )
+    _CountingStr.scanned = _CountingStr.read = 0
+    assert split(_CountingStr(raw)) == [raw]
+    assert _CountingStr.read + _CountingStr.scanned < 6 * len(raw), (
+        _CountingStr.read,
+        _CountingStr.scanned,
+    )
 
 
 # --- integrity ---------------------------------------------------------------
@@ -570,6 +1214,127 @@ def test_message_set_rejects_delimiter_injection() -> None:
         msg.set("NM1-03", "BAD*VALUE")  # element separator would inject a field
     with pytest.raises(ValueError, match="delimiter"):
         msg.set("NM1-03", "BAD~VALUE")  # segment terminator would inject a segment
+
+
+# --- a component path in a repeating element (BACKLOG #5922) -----------------
+# ZZ1 is a made-up segment: these tests are about the codec's separators, not any guide's layout.
+
+
+def _repeating(
+    *,
+    el: str = "*",
+    comp: str = ":",
+    term: str = "~",
+    rep: str = "^",
+    between: str | None = None,
+    **kw: str,
+) -> str:
+    """An interchange with one ``ZZ1`` whose element 1 is ``A:B`` and ``C:D`` joined by ``between``
+    (the repetition separator ``rep`` unless given)."""
+    body = el.join(
+        [
+            "ZZ1",
+            comp.join(["A", "B"]) + (rep if between is None else between) + comp.join(["C", "D"]),
+        ]
+    )
+    return (
+        isa(el=el, comp=comp, term=term, rep=rep, **kw)
+        + el.join(["GS", "HS", "A", "B", "20240101", "1200", "1", "X", "005010X279A1"])
+        + term
+        + el.join(["ST", "270", "0001"])
+        + term
+        + body
+        + term
+        + el.join(["SE", "3", "0001"])
+        + term
+        + el.join(["GE", "1", "1"])
+        + term
+        + el.join(["IEA", "1", "000000001"])
+        + term
+    )
+
+
+_REPEATING_DELIMS = [
+    pytest.param({}, id="default-delimiters"),
+    pytest.param({"el": "|", "comp": "^", "term": "'", "rep": "~"}, id="custom-delimiters"),
+]
+
+
+@pytest.mark.parametrize("delims", _REPEATING_DELIMS)
+def test_a_component_read_addresses_the_first_repetition(delims: dict[str, str]) -> None:
+    msg = X12Message.parse(_repeating(**delims))
+    rep, comp = msg.delimiters.repetition, msg.delimiters.component
+    assert rep is not None
+    assert msg["ZZ1-01"] == f"A{comp}B{rep}C{comp}D"  # a whole element is still the raw element
+    assert msg["ZZ1-01.1"] == "A"
+    assert msg["ZZ1-01.2"] == "B"  # not "B" fused with the next repetition's "C"
+    assert msg["ZZ1-01.3"] is None  # the first repetition has two components
+
+
+@pytest.mark.parametrize("delims", _REPEATING_DELIMS)
+def test_a_component_write_keeps_the_later_repetitions(delims: dict[str, str]) -> None:
+    msg = X12Message.parse(_repeating(**delims))
+    rep, comp = msg.delimiters.repetition, msg.delimiters.component
+    msg["ZZ1-01.2"] = "X"
+    assert msg["ZZ1-01"] == f"A{comp}X{rep}C{comp}D"
+    msg["ZZ1-01.3"] = "E"  # extending the first repetition leaves the second alone
+    assert msg["ZZ1-01"] == f"A{comp}X{comp}E{rep}C{comp}D"
+    reparsed = X12Message.parse(msg.encode())
+    assert reparsed["ZZ1-01.2"] == "X"
+    assert reparsed["ZZ1-01"] == f"A{comp}X{comp}E{rep}C{comp}D"
+
+
+@pytest.mark.parametrize("delims", _REPEATING_DELIMS)
+def test_a_component_write_holding_the_repetition_separator_is_refused(
+    delims: dict[str, str],
+) -> None:
+    # The later repetitions are kept as they are, so a separator in the value would put a new
+    # repetition in front of them.
+    msg = X12Message.parse(_repeating(**delims))
+    before = msg.encode()
+    rep = msg.delimiters.repetition
+    assert rep is not None
+    with pytest.raises(ValueError, match="delimiter"):
+        msg.set("ZZ1-01.1", f"X{rep}Y")
+    with pytest.raises(ValueError, match="delimiter"):
+        msg.set_data("ZZ1-01.2", f"X{rep}Y")
+    assert msg.encode() == before
+
+
+def test_a_component_write_into_an_empty_first_repetition() -> None:
+    msg = X12Message.parse(_repeating().replace("ZZ1*A:B^", "ZZ1*^"))
+    assert msg["ZZ1-01"] == "^C:D"
+    assert msg["ZZ1-01.1"] is None
+    msg["ZZ1-01.2"] = "Y"
+    assert msg["ZZ1-01"] == ":Y^C:D"
+
+
+def test_before_00501_the_caret_is_data_so_a_component_spans_it() -> None:
+    # Before 00501 ISA-11 is the standards identifier, so "^" is an ordinary character.
+    msg = X12Message.parse(_repeating(rep="U", version="00401", between="^"))
+    assert msg.delimiters.repetition is None
+    assert msg["ZZ1-01.2"] == "B^C"
+    msg["ZZ1-01.2"] = "X^Y"
+    assert msg["ZZ1-01"] == "A:X^Y:D"
+
+
+def test_a_legacy_isa11_u_on_00501_is_not_split_in_component_paths() -> None:
+    # The parse tolerates a 00501 header still carrying ISA-11 "U" (see 00501-legacy-ISA11-U), so
+    # a "U" in data is an ordinary character there and a component path keeps today's behaviour.
+    raw = _repeating(rep="U", between="^").replace("ZZ1*A:B^C:D", "ZZ1*ABK:U071")
+    msg = X12Message.parse(raw)
+    assert msg.delimiters.repetition == "U"
+    assert msg["ZZ1-01.2"] == "U071"
+    msg["ZZ1-01.1"] = "ABF"
+    assert msg["ZZ1-01"] == "ABF:U071"
+
+
+def test_an_isa_component_read_is_unchanged_by_the_repetition_split() -> None:
+    # ISA-11 holds the repetition separator itself from 00501; a component read there still
+    # returns it rather than splitting it away.
+    msg = X12Message.parse(_repeating())
+    assert msg["ISA-11"] == "^"
+    assert msg["ISA-11.1"] == "^"
 
 
 def test_an_isa_write_keeps_the_fixed_width_and_re_peeks() -> None:

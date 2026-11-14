@@ -1704,6 +1704,8 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 - **One message per body on a listener.** An MLLP, TCP or HTTP inbound, and any other source that does
   not split, refuses an HL7 v2 body holding more than one `MSH` segment: it records `ERROR`, and a
   listener with an ACK channel answers `AR` with MSA-3 `more than one MSH in body` (ADR 0206 rule 5). A
+  later line whose `MSH` follows byte order marks counts too, where the inbound's charset decodes them
+  as marks. At least latin-1 and cp1252 do not, so under them that line is read as part of one message. A
   sender with a batch sends one message per frame or request, or drops the file where a `File(...)` or
   remote-file source splits it. That includes the shipped helper: `samples/send_mllp.py` sends a whole
   file as one frame, so `samples/send_mllp.py samples/messages/adt_batch.hl7` (five messages, no
@@ -1816,6 +1818,17 @@ before the declared length counts as cut short, so where the body is needed that
 dead-letters once. The owner's ruling covers the over-size body only; who decided these two, and
 on what authority, is recorded in ADR 0095 Amendment B.1. At least a read that times out, or one
 that a connection reset cuts off, is a separate case, and the lane still retries it.
+
+**A 2xx reply body in a content coding (BACKLOG #5910).** The engine decodes no content coding, so
+a 2xx body whose `Content-Encoding` names anything but `identity`, such as `gzip`, counts as
+misframed and follows the same table: dropped with a `reply_dropped` event where the table says
+delivered, refused with `reply-misframed` where it says permanent refusal. The replies the
+coding check skips are listed on `reply_framing_fault` in
+[`bounded_read.py`](../messagefoundry/transports/bounded_read.py); among 2xx
+replies they include at least a `204` and a `Content-Length: 0` reply, neither of which has coded
+bytes to misread. An empty chunked or close-framed body labelled with a coding still counts as
+misframed, because its emptiness is known only after the read.
+ADR 0095 Amendment B.1 does not record this case; BACKLOG #5910 added it.
 
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
@@ -2933,7 +2946,28 @@ follow-on and is **not** built.
 
 **Fault & delivery semantics.** The response is inspected for a SOAP `Fault` (which can arrive as an HTTP
 500 **or** an HTTP 200 body). A **Sender/Client** fault → `NegativeAckError` → **dead-letter** (the
-request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. An
+request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. The
+Sender/Receiver class is read first from the Fault's first child element: SOAP 1.2's `Code`, then the
+`Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or
+processing instruction before either child is stepped over, with at least these exceptions, the first two of
+which leave that read with no code: such markup that has no terminator; a `<!` that opens anything
+else, such as a DOCTYPE or a lowercase `<![cdata[`; and a `</` inside such markup within the
+`faultcode` or `Value` itself, which still ends the code text. Where that read yields no code, for
+those shapes, for a first child that is neither element (a SOAP 1.1 `faultstring` before the
+`faultcode`, a SOAP 1.2 `Reason` before the `Code`), or for a code element that holds no code, the
+code falls back to the earlier search's rule, from the Fault start tag to the first `</Fault>`
+after it, or the reply's end: the first `Value` ahead of the Fault's first `faultcode`, else that `faultcode`. Like the earlier
+search, the fallback steps over no markup: a `faultcode` or `Value` inside a comment counts, and a
+`</Fault>` inside one ends its range. For example,
+`<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>`
+reads no code and dead-letters, as the earlier search read it. A Fault start tag inside terminated markup is stepped over when
+the Fault is chosen, and a `</Fault>` or `</Code>` inside terminated markup does not end the
+first-child read, except where the Fault was itself taken from inside markup; only where every Fault start tag after the first Body start tag,
+or with none there every one, is inside such markup is the first of them taken as the Fault, so such
+a reply never reads as delivered. A Fault where neither read finds a code reads as a permanent fault.
+The WS-Security check is separate: a WS-Security code anywhere from where the Fault search starts (after
+the first Body start tag when a Fault follows it, else the whole reply), inside the Fault or not, still
+dead-letters the reply. An
 unrecognized fault is treated as permanent (so a rejected request can't loop the lane). With no fault, the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role
@@ -3869,7 +3903,20 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 (`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
 a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. A 2xx whose body is
 over the byte bound cannot be checked for a FailedSOPSequence, so it is a permanent refusal and is not sent
-again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). **PHI:** the response can
+again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). Each of these 2xx replies is
+also a permanent refusal, in both capture modes (BACKLOG #5914): a non-empty 2xx body that is not
+parseable JSON, repeats a key at any depth, is nested too deep, or is not a dataset object or a
+non-empty array of them (code `unparseable-reply`); a FailedSOPSequence that is not an object, has a
+`Value` that is not an array, or carries any key but `vr` and `Value` (code `failed-sop`); and a
+202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID (`00081155`)
+element has `vr` `UI`, carries no key but `vr` and `Value`, and has a `Value` of exactly one string
+in the UID grammar once trailing NUL or space padding is dropped (dot-separated ASCII digits, at
+most 64 characters), an empty 202 included (code
+`unconfirmed-202`). A ReferencedSOPSequence that is malformed in the ways a FailedSOPSequence can
+be names no instance. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
+required to carry a ReferencedSOPSequence, so a 200 dataset that confirms nothing and is not
+refused above, `{}` included, is delivered; and an empty 2xx other than a 202 (empty, or JSON
+whitespace after a leading BOM) is delivered, `no_reply` when capturing. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python
@@ -4963,9 +5010,9 @@ reading this page already applies to a file the scan never opened.
 | Vault Transit — store DEK unwrap (`MEFOR_STORE_VAULT_ADDR`, `[store].key_provider = vault`, ADR 0019) | one HTTPS request per DEK unwrap (startup / rotation), not per message | a failure is fail-closed — the store does not open | operator fixes Vault and restarts |
 | Vault Transit — bulk at-rest cipher (`MEFOR_STORE_TRANSIT_KEY`, `[store].cipher_provider = vault_transit`, ADR 0138) | **one synchronous HTTPS round trip per encrypted cell** on store writes and reads, except where the store batches: the cipher-cell walk (`restore-verify --full`, `cipher-audit`) and the SQLite store's at-open `_seal_surface` sweep send up to `BATCH_MAX_ITEMS` cells per request (`store/crypto.py`, vault BACKLOG #6706). `_enc`/`_dec` are sync. At least the SQLite, Postgres and SQL Server message writes (`_enc`), and SQLite message reads such as `get_message` (`open_message_cell`, which calls `cipher.decrypt`), call the cipher **on the event loop**. On each of the three stores, at least content search, attachment chunk sealing and the TOTP secret reads run their cell calls off it through `asyncio.to_thread`. On the audit chain (stated here once; other documents link here), at least: one `generate_hmac` per audit row appended; one `verify_signed_data` per audit row a chain walk checks, and one of the genesis row at every store open; one `verify_signed_data` per one-row check, such as the Transit-bound attestation's audit row each time that attestation is read and the newest keyed audit row an AD session revocation check reads, both run off the event loop through `to_thread`; per failed `verify_signed_data`, one more `generate_hmac` (the version probe) when hvac raises the failure as `InvalidRequest`, then, unless that probe read it as a refused version or `is_vault_unavailable` reads it as an outage, one `generate_hmac` and one `verify_signed_data` over fixed input and, when those succeed, one more `verify_signed_data` of the row, and when that fails too, the fixed-input pair once more, and when both failures are an HTTP 408 or 504 the chain walk then ends with a `CipherError` while every other check reads the row as not verifying (`TransitCipher._recheck_refused_row`, `_audit_row_mac`, BACKLOG #8222); one `generate_hmac`, in place of the `verify_signed_data`, per row whose stored MAC is malformed; and one `generate_hmac` per range row whose outgoing key is held, for its handover tag, on every walk, and at every open once the genesis row authenticated, in order, stopping at the first range row that fails a check (`settle_audit_ranges`). The append's `generate_hmac`, the chain walk, and at open the genesis-row verify and the handover-tag calls also run **on the event loop**. The row seals (ADR 0217) make Transit `generate_hmac` and `verify_signed_data` calls of their own, on a pool of `TRANSIT_SEAL_WORKERS` (8) threads (`store/row_seal.py`). The cell calls have no concurrency cap of their own: a call on the event loop blocks the loop while it runs, and each `to_thread` call holds a thread of asyncio's default executor | Vault's own rate limit or a slow Transit **stalls the event loop across the whole engine**. The `to_thread` calls can fill asyncio's default executor, which other off-loop work in the engine shares, and a row-seal call past the pool's 8 waits for a free thread with no deadline. A failed cell call raises `CipherError` (a batch decrypt returns it for that cell instead), and a row-seal failure raises the row sealer's own errors (`TransitSealUnavailableError`, `TransitSealUnverifiableError`). An audit-chain call's failure raises `CipherError` too, except where `TransitCipher.verify_audit_hmac` logs it and reads the row as a break: at least the cost-only `generate_hmac` beside a malformed stored MAC, and a row `_recheck_refused_row` reads as refused; and except where a handover-tag `generate_hmac` answered with a non-empty string that is no well-formed MAC (`AuditMacMalformedError`) is logged and read as a tag that does not match in the walk (`_handover_tag_ok`), a break at that range row; the open still refuses on it (unruled, on the owner's queue; listed below), and where the open's check reaches such a row no walk runs to read it. On a stage's cell call the stage errors/dead-letters that row; at least a TOTP judgement reads it as unknown, and a content search or a TOTP secret read raises it to its caller. At open, at least these refuse the open: a `CipherError` from a cell decrypt the open makes, such as the SQLite store's state and reference cache loads; one from the genesis append's `generate_hmac` on a fresh store; one from a range row's handover-tag `generate_hmac`, `AuditMacMalformedError` included; and one the genesis row's check raises other than `AuditKeyVersionRefusedError`; for a both-asks 408 or 504 on the genesis check, that is when the fixed-input verify after the second ask also fails, and when it verifies the open logs a genesis break and opens instead (as before this change, engine PR 2903 at `686c5f7443`; unruled). A refused version, a genesis row `verify_audit_hmac` reads as a break with no raise, and a genesis verify that timed out on both asks (`AuditVerifyTimedOutError`, which `_audit_row_mac` reads there as not verifying), are logged by `settle_audit_ranges` as a break, and the store opens | the store stays open and the row is retried by the normal stage re-claim; after a refused open, the operator fixes Vault and restarts |
 | Vault KV v2 (`MEFOR_SECRETS_VAULT_ADDR`) | one HTTPS request per secret resolution at config load / connector construction | fail-closed — the connection refuses to build | operator fixes Vault and reloads |
-| Alerts — SMTP sink (`[alerts].email_smtp_host`) | one connection per send, serialized on **its own** background drain task behind **its own** bounded 1000-item queue | over-cap events are **dropped with a warning** rather than growing the queue | a send failure is swallowed + logged; the alert is not retried |
+| Alerts — SMTP sink (`[alerts].email_smtp_host`) | one connection per send, from the notifier's **single** background drain task and bounded 1000-item queue, which the webhook sink shares; the webhook row says how the two sends of one event run | over-cap events are **dropped with a warning** rather than growing the queue | a send failure is swallowed + logged; the alert is not retried |
 | Alerts — per-user security-event email (`[auth].notify_security_events`) | one connection per notification, serialized on a **second, independent** drain task with its **own** bounded 1000-item queue — so the SMTP relay sees up to **two** concurrent sessions from this engine, not one | at cap the event is **dropped with a warning**; the audited `GET /me/security-events` feed still records it when it is the user's own event, but not an administrator's change to their account (`auth/notifications.py` states the rule) | the send failure is swallowed + logged, never propagated onto the login or admin path; recovery is the pull feed, for the events it carries |
-| Alerts — webhook sink (`[alerts].webhook_url`) | one POST per event on the same single drain task and the same bounded 1000-item queue | as the SMTP sink — over-cap events are dropped with a warning | best-effort; a failure is swallowed + logged, never retried |
+| Alerts — webhook sink (`[alerts].webhook_url`) | one POST per event, from the same bounded 1000-item queue and drain task as the SMTP sink; each event's POST and SMTP send run at once, in two worker threads, and the next event waits for both (BACKLOG #5907) | as the SMTP sink — over-cap events are dropped with a warning | best-effort; a failure is swallowed + logged, never retried |
 | Syslog forwarder (`[logging].forward_host`) | a **single** socket, synchronous send, one record at a time | a stalled collector costs at most the socket timeout per record and the record is then **dropped** | an unreachable collector at startup is skipped with a warning and the service still starts |
 | SNTP clock-sync probe (`[logging].ntp_peer`) | exactly **one** datagram per process start; never on the message path | a silent peer raises `socket.timeout` | skew beyond `time_sync_max_skew_seconds` warns loudly, or refuses to start under `time_sync_fail_closed` |
 | Forward / egress web proxy (`[egress].proxy_url`) | no separate bound — the proxied request occupies the destination connector's own lane | the proxy's own limit surfaces as an HTTP error on the destination request | handled by the destination's retry policy |
@@ -4989,7 +5036,7 @@ reading this page already applies to a file the scan never opened.
 | REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed. A Digest challenge the engine will not answer, on the delivery or the token hop (`auth-challenge-refused`, ADR 0095 Amendment B; on an `https://` token endpoint, a Digest proxy's 407 to the `CONNECT`), and a send-time hop refusal (`insecure-hop-refused`) are configuration faults: under the default `credential_fault_policy` the lane stops and the queue stays. A 2xx reply body that is over the bound, cut short or misframed is never sent again; the *A 2xx reply over the byte bound* table under REST says whether it is delivered or refused | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
 | SOAP destination | `timeout_seconds` 30 s | as REST | as REST | as REST |
 | FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | the destination as REST, configuration faults and the 2xx reply rule included; a lookup failure, a refused Digest challenge among them, raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
-| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST, on the delivery hop only (a web proxy's Digest challenge only, since DICOMweb has no origin Digest and no token hop) | `RetryPolicy` |
+| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST, on the delivery hop only (a web proxy's Digest challenge only, since DICOMweb has no origin Digest and no token hop), and some 2xx replies that do not confirm the store are a permanent refusal; which ones is *Status classification* under DICOMweb | `RetryPolicy` |
 | DICOM C-STORE SCP (inbound) | `timeout_seconds` 30 s applied to **all three** pynetdicom timers (ACSE, DIMSE, network) and to the off-loop commit future, and as a fixed deadline on the association request, on each later read, and on each whole send ([DICOM.md](DICOM.md) section 3) | on the timers, the association is released by pynetdicom; a read deadline ends the association by closing the connection, not by a release; the AE is shut down cooperatively on stop | an over-cap object fails the DIMSE operation before the durable commit | n/a — the modality re-sends |
 | DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent; the third end with no response in a row of one object over 32 MiB → permanent (`unanswered-over-ceiling`, vault BACKLOG #4908) | `RetryPolicy`, except that permanent class, which dead-letters whatever the policy says |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |

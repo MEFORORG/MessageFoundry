@@ -14,6 +14,7 @@ import pytest
 from messagefoundry.config.settings import AlertRule, AlertsSettings, load_settings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alert_sinks import (
+    _DRAIN_CANCEL_GRACE_SECONDS,
     EmailTransport,
     NotifierAlertSink,
     WebhookTransport,
@@ -69,7 +70,7 @@ async def test_one_failing_transport_does_not_starve_the_others() -> None:
 
 async def test_the_delivery_observer_hears_only_sends_that_returned() -> None:
     """Vault BACKLOG #3849, repair 3: the observer is told of a send that returned, and not of one
-    that raised; an observer that raises is logged and the drain goes on to the next transport."""
+    that raised; an observer that raises is logged and the other transports still get the event."""
     good, bad, last = (
         _RecordingTransport("good"),
         _RecordingTransport("bad", fail=True),
@@ -86,9 +87,290 @@ async def test_the_delivery_observer_hears_only_sends_that_returned() -> None:
     sink.connection_stopped("OB_X", detail="boom")
     sink.connection_stopped("OB_Y", detail="boom")
     await _drain(sink)
-    # The observer raised after `good`, and `last` still got each event.
-    assert heard == ["good", "last", "good", "last"]
+    # The observer raised for `good`, and `last` still got each event. The sends run at once, so
+    # the order across transports is not promised (BACKLOG #5907).
+    assert sorted(heard) == ["good", "good", "last", "last"]
     assert len(last.events) == 2
+
+
+class _HungTransport:
+    """A transport whose send never returns until cancelled, recording the cancel."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.entered = asyncio.Event()
+        self.cancelled = False
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+async def test_a_hung_transport_does_not_hold_the_alert_from_a_healthy_one() -> None:
+    """BACKLOG #5907: each alert went to its transports in turn, so a hung first transport held the
+    alert from every one after it. The alert being handled now reaches the healthy transport, and
+    the observer hears that send, while the hung one is still waiting."""
+    hung, good = _HungTransport("webhook"), _RecordingTransport("email")
+    heard: list[str] = []
+    delivered = asyncio.Event()
+
+    def observe(name: str, _event: dict[str, Any]) -> None:
+        heard.append(name)
+        delivered.set()
+
+    sink = NotifierAlertSink([hung, good])
+    sink.set_delivery_observer(observe)
+    sink.start()
+    try:
+        sink.connection_stopped("OB_X", detail="boom")
+        await asyncio.wait_for(delivered.wait(), 5.0)
+        assert hung.entered.is_set() and not hung.cancelled  # the control: still hung
+        assert len(good.events) == 1
+        assert heard == ["email"]  # only the send that returned
+        # A close cut at its bound cancels the drain, and that cancel reaches the hung send.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(sink.aclose(), 0.2)
+        assert hung.cancelled
+        assert sink._task is None
+    finally:
+        if sink._task is not None:
+            sink._task.cancel()
+            await asyncio.gather(sink._task, return_exceptions=True)
+
+
+async def test_a_failing_transport_does_not_stop_a_slower_sibling() -> None:
+    """A send that raises while a sibling's send is still running leaves that sibling to finish.
+    The first send finishes only once the second has raised, so in-turn sends would never end."""
+    raised = asyncio.Event()
+
+    class _Slow(_RecordingTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            await raised.wait()
+            await super().send(event, **kw)
+
+    class _Bad(_RecordingTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            raised.set()
+            raise RuntimeError("transport down")
+
+    slow, bad = _Slow("slow"), _Bad("bad")
+    heard: list[str] = []
+    sink = NotifierAlertSink([slow, bad])
+    sink.set_delivery_observer(lambda name, _event: heard.append(name))
+    sink.connection_stopped("OB_X", detail="boom")
+    await asyncio.wait_for(_drain(sink), 5.0)
+    assert len(slow.events) == 1
+    assert heard == ["slow"]
+
+
+@pytest.mark.parametrize("how", ["raises", "cancels_own_task", "cancels_own_task_and_returns"])
+async def test_a_send_cancelled_on_its_own_does_not_end_the_drain(
+    caplog: pytest.LogCaptureFixture, how: str
+) -> None:
+    """A send that ends cancelled without the drain being cancelled leaves its sibling to finish,
+    and the drain goes on to the next alert. The lost send is logged, not dropped in silence.
+    A transport that cancels its own task with current_task().cancel() leaves the cancel count on
+    that task, not on the drain; it was read as the drain's cancel, which ended the drain with
+    nothing logged. ``cancels_own_task_and_returns`` returns before the cancel lands, so the send
+    went out: the observer hears it, no loss is logged, and its task's late cancel is logged and
+    ends nothing."""
+    heard: list[str] = []
+    returns = how == "cancels_own_task_and_returns"
+
+    class _SelfCancelled(_RecordingTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            if how == "raises":
+                raise asyncio.CancelledError
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            if how == "cancels_own_task":
+                await asyncio.sleep(0)
+
+    odd, good = _SelfCancelled("odd"), _RecordingTransport("good")
+    sink = NotifierAlertSink([odd, good])
+    sink.set_delivery_observer(lambda name, _event: heard.append(name))
+    sink.connection_stopped("OB_X", detail="boom")
+    sink.connection_stopped("OB_Y", detail="boom")
+    await asyncio.wait_for(_drain(sink), 5.0)
+    assert [e["connection"] for e in good.events] == ["OB_X", "OB_Y"]
+    lost = [r for r in caplog.records if "alert transport odd was cancelled" in r.getMessage()]
+    assert len(lost) == (0 if returns else 2), caplog.text
+    late = [r for r in caplog.records if "transport odd ended cancelled" in r.getMessage()]
+    assert len(late) == (2 if returns else 0), caplog.text
+    assert sorted(heard) == (["good", "good", "odd", "odd"] if returns else ["good", "good"])
+
+
+async def test_a_lost_send_is_logged_while_a_sibling_still_hangs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A send that cancels its own task is logged as it ends, not once its siblings end: a hung
+    sibling, or a drain cut while it hangs, does not hold back or drop the line."""
+
+    class _CancelsItself(_RecordingTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+
+    hung = _HungTransport("webhook")
+    sink = NotifierAlertSink([_CancelsItself("email"), hung])
+    sink.start()
+    try:
+        sink.connection_stopped("OB_X", detail="boom")
+        await asyncio.wait_for(hung.entered.wait(), 5.0)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert "alert transport email was cancelled" in caplog.text
+        assert not hung.cancelled  # the control: the sibling is still hung
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(sink.aclose(), 0.2)
+        assert hung.cancelled
+        assert caplog.text.count("alert transport email was cancelled") == 1
+    finally:
+        if sink._task is not None:
+            sink._task.cancel()
+            await asyncio.gather(sink._task, return_exceptions=True)
+
+
+async def test_a_cut_drain_waits_for_every_send_to_finish_its_cancel_cleanup() -> None:
+    """A drain cancelled while two sends wait ends only once both sends' tasks have ended, where
+    each ends inside the grace. One send's cancel ends at once and the other's async cleanup
+    awaits; the drain used to end with the first, leaving the second's cleanup running after
+    aclose() returned."""
+    cleanup_done = asyncio.Event()
+    quick_ended_first: list[bool] = []
+
+    class _SlowCleanup(_HungTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            try:
+                await super().send(event, **kw)
+            except asyncio.CancelledError:
+                for _ in range(3):  # an async cleanup that ends well inside the grace
+                    await asyncio.sleep(0)
+                quick_ended_first.append(quick.cancelled)
+                cleanup_done.set()
+                raise
+
+    slow, quick = _SlowCleanup("email"), _HungTransport("webhook")
+    sink = NotifierAlertSink([slow, quick])
+    sink.start()
+    try:
+        sink.connection_stopped("OB_X", detail="boom")
+        await asyncio.wait_for(slow.entered.wait(), 5.0)
+        await asyncio.wait_for(quick.entered.wait(), 5.0)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(sink.aclose(), 0.2)
+        # The control: the quick send's cancel had ended before the slow cleanup finished.
+        assert quick_ended_first == [True]
+        assert cleanup_done.is_set()
+        assert sink._task is None
+    finally:
+        if sink._task is not None:
+            sink._task.cancel()
+            await asyncio.gather(sink._task, return_exceptions=True)
+
+
+async def test_a_send_that_swallows_the_cancel_does_not_hold_a_cut_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A drain cancelled while a send swallows every cancel and goes on waiting ends within the
+    grace, not when that send ends: the send held aclose() past its caller's bound, so a probe
+    returned after 1.22 s against a 0.2 s bound. The send left past the grace is logged as a count,
+    with no alert content."""
+    release = asyncio.Event()
+    swallowed: list[bool] = []
+
+    class _Swallows(_HungTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            self.entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    swallowed.append(True)
+
+    stubborn = _Swallows("webhook")
+    sink = NotifierAlertSink([stubborn])
+    sink.start()
+    try:
+        sink.connection_stopped("OB_SECRETNAME", detail="boom")
+        await asyncio.wait_for(stubborn.entered.wait(), 5.0)
+        bound = 0.2
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(sink.aclose(), bound)
+        elapsed = time.monotonic() - started
+        assert swallowed  # the control: the send did swallow the cancel
+        assert sink._left_sends and not any(t.done() for t in sink._left_sends)  # and still runs
+        # The bound and one grace, with slack for a loaded runner, under the 1.22 s measured.
+        assert elapsed < bound + _DRAIN_CANCEL_GRACE_SECONDS + 0.5, elapsed
+        assert sink._task is None
+        left = [r for r in caplog.records if "alert send task(s) still running" in r.getMessage()]
+        assert left and left[0].levelname == "WARNING", caplog.text
+        assert "1 alert send task(s)" in left[0].getMessage()
+        assert all("OB_SECRETNAME" not in r.getMessage() for r in left)
+    finally:
+        release.set()
+        await asyncio.sleep(0.05)
+        if sink._task is not None:
+            sink._task.cancel()
+            await asyncio.gather(sink._task, return_exceptions=True)
+
+
+async def test_a_repeat_drain_cancel_reaches_a_send_in_its_cancel_cleanup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A second cancel of the drain, during the grace, reaches a send whose cleanup of the first
+    cancel is still waiting, so that cleanup is cut rather than left running past the grace."""
+    seen: list[int] = []
+
+    class _LongCleanup(_HungTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            try:
+                await super().send(event, **kw)
+            except asyncio.CancelledError:
+                seen.append(1)
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    seen.append(2)
+                    raise
+
+    slow = _LongCleanup("email")
+    sink = NotifierAlertSink([slow])
+    sink.start()
+    drain = sink._task
+    assert drain is not None
+    sink.connection_stopped("OB_X", detail="boom")
+    await asyncio.wait_for(slow.entered.wait(), 5.0)
+    try:
+        drain.cancel()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert seen == [1]  # the control: the first cancel reached the send, and it is cleaning up
+        drain.cancel()
+        await asyncio.wait_for(asyncio.gather(drain, return_exceptions=True), 5.0)
+        assert drain.cancelled()
+        assert seen == [1, 2]
+        assert "alert send task(s) still running" not in caplog.text
+        assert not sink._left_sends
+    finally:
+        drain.cancel()
+        await asyncio.gather(drain, *sink._left_sends, return_exceptions=True)
+
+
+def test_the_drain_grace_nests_inside_the_teardown_cut_grace() -> None:
+    """A close the API teardown cuts gets _CUT_GRACE_SECONDS to end, so the drain's own grace for
+    its sends must be shorter, or the teardown leaves the close running and its line is lost."""
+    from messagefoundry.api import app
+
+    assert _DRAIN_CANCEL_GRACE_SECONDS < app._CUT_GRACE_SECONDS
 
 
 async def test_realert_throttle_suppresses_repeats() -> None:
