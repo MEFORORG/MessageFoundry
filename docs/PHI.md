@@ -417,10 +417,12 @@ than a path is not checked
   who copied it in. LOCAL SERVICE and NETWORK SERVICE are accounts that many services share, and
   the check does not count them as such groups. At least two kinds of key file are held to a
   stricter owner rule. One is the key at the path where the engine mints its TLS key, when
-  `serve` or `supervise` starts with that pair (below). When the engine does not use that pair, as
-  with an operator certificate, the file at that path is checked only where a setting that a check
-  reads names it, and a setting such as `[api].tls_key_file` holds it to the owner rule for a key
-  you supply, not this one. The other is the key custody host and handoff files. A separate check,
+  `serve` or `supervise` starts with no `[api].tls_cert_file` and no
+  `[api].tls_terminated_upstream`, and so mints or reuses that pair (below). Otherwise this rule
+  does not apply to that path. With an operator certificate, the file `[api].tls_key_file` names,
+  or `[api].tls_cert_file` when no key file is set, is judged as a key file you supply, by the
+  owner screen above rather than this rule, even where it names the mint path. Another is the key
+  custody host and handoff files. A separate check,
   `key_file_handle_problem` ([restricted_file.py](../messagefoundry/restricted_file.py)), refuses
   them at least when an account other than SYSTEM, Administrators or the engine's own owns them,
   or when their access list is not exactly SYSTEM and Administrators with full control and the
