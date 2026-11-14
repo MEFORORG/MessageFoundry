@@ -738,11 +738,13 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   grants, discarding its own
   entries, and reads each owner and DACL back. What the read-back finds is named in a warning
   instead of the "locked" line: at least an entry for another account, an owner it could not set,
-  a missing read for the run-as account, a deny entry on the dir, a link, a junction or any other
-  folder reparse point, which it does not enter, and a file it reads as hard-linked, whose own
-  entries it keeps because its other names share them; the entries it inherits still change with
-  the dir, for every name of it. A hard-linked file whose link count it cannot read is reset like
-  any other file, and is not named. A write grant the run-as account held below the dir becomes read, and
+  a missing read for the run-as account, and a deny entry on the dir. It skips at least a link, a
+  junction, any other folder reparse point and a file it reads as hard-linked, when it can read
+  the item's link type, and names each in a warning; a skipped hard-linked file keeps its own
+  entries, not the ones it inherits. An item whose link type it cannot read is re-owned and reset
+  like an ordinary file, and is not named: for a file link that changes its target, which may lie
+  outside the directory, and for a hard link it changes every name of the file. A write grant the
+  run-as account held below the dir becomes read, and
   is named in a warning too. It is **opt-in** because the config dir often lives inside a developer's repo
   where stripping inheritance is surprising — for production, point `-Config` at a dedicated
   admin-owned directory and pass `-LockConfigDir`.

@@ -929,12 +929,13 @@ Other switches on `install-service.ps1` change more than the service:
   SYSTEM, Administrators and the service account. It also makes Administrators the owner of the
   directory and of each file and folder in it that it does not skip, and resets each one's
   permissions to inherit from the directory, discarding the entries it carried itself; nothing
-  records them. It skips at least a link, a junction, any other folder reparse point and a file
-  it reads as hard-linked, and names each in a warning; a skipped hard-linked file keeps its own
-  entries, not the ones it inherits. A hard-linked file whose link count it cannot read is reset
-  like any other file, and is not named. It does the same
-  to the value file's folder, and to the
-  settings file's folder when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
+  records them. It skips at least a link, a junction, any other folder reparse point and a file it
+  reads as hard-linked, when it can read the item's link type, and names each in a warning; a
+  skipped hard-linked file keeps its own entries, not the ones it inherits. An item whose link
+  type it cannot read is re-owned and reset like an ordinary file, and is not named: for a file
+  link that changes its target, which may lie outside the directory, and for a hard link it
+  changes every name of the file. It does the same to the value file's folder, and to the settings
+  file's folder when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
   Without the switch, the script only adds a read grant.
 - `-SuppressCrashDumps` writes machine-wide Windows Error Reporting keys under `HKLM`. They are
   keyed by program name. So they affect every process with that name on the machine, not only the
