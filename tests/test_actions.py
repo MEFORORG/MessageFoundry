@@ -551,6 +551,87 @@ def test_date_diff_field_unparseable_raises() -> None:
         date_diff_field(m, "PID-4.1", "MSH-7", "PID-13.1", unit="days")
 
 
+def _two_stamps(start: str, end: str) -> Message:
+    # Synthetic: the two stamps ride in ZTS-1 and ZTS-2, with ZTS-3 the destination.
+    return Message.parse(ADT + f"ZTS|{start}|{end}\r")
+
+
+def test_date_diff_field_applies_both_offsets() -> None:
+    # BACKLOG #5822. 08:00 at -0500 is 13:00Z; 14:00 at +0000 is 14:00Z, one hour later. NEGATIVE
+    # CONTROL: the unfixed code discarded both offsets and wrote the wall-clock gap, 6.
+    m = _two_stamps("202603010800-0500", "202603011400+0000")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="hours")
+    assert m["ZTS-3"] == "1"
+
+
+def test_date_diff_field_offsets_move_the_day_count() -> None:
+    # 23:00 at -0500 on the 1st is 04:00Z on the 2nd, so 03:00Z on the 3rd is 23 hours on: 0 days.
+    # NEGATIVE CONTROL: the wall-clock reading, 1st 23:00 to 3rd 03:00, is 28 hours and wrote 1.
+    m = _two_stamps("202603012300-0500", "202603030300+0000")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] == "0"
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="minutes")
+    assert m["ZTS-3"] == str(23 * 60)
+
+
+def test_date_diff_field_years_with_offsets_reads_one_calendar() -> None:
+    # The end is re-expressed at the start's offset: 2026-06-15 02:00Z is 2026-06-14 21:00 at -0500,
+    # the day before the anniversary, so 45 years, not 46.
+    m = _two_stamps("198006150000-0500", "202606150200+0000")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="years")
+    assert m["ZTS-3"] == "45"
+
+
+def test_date_diff_field_one_offset_reads_both_as_wall_clocks() -> None:
+    # Only one stamp has an offset, so there is no instant to pin the other to; both are read as the
+    # wall clocks they state, as before.
+    m = _two_stamps("202603010800", "202603011400+0000")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="hours")
+    assert m["ZTS-3"] == "6"
+
+
+def test_date_diff_field_out_of_range_offset_raises() -> None:
+    m = _two_stamps("202603010800-0500", "202603011400+0060")
+    with pytest.raises(ValueError):
+        date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="hours")
+
+
+def test_date_diff_field_reads_a_composite_ts_by_its_first_component() -> None:
+    # BACKLOG #5822. A v2.3 TS carries its degree of precision as component 2. NEGATIVE CONTROL: the
+    # unfixed code parsed the whole field, "20260101^D", and raised ValueError.
+    m = _two_stamps("20260101^D", "20260104120000^S")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] == "3"
+    # A component path is read as addressed.
+    date_diff_field(m, "ZTS-1.1", "ZTS-2.1", "ZTS-3", unit="hours")
+    assert m["ZTS-3"] == "84"
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "unit", "forward"),
+    [
+        ("20250616", "20260615", "years", "0"),  # a day short of a year
+        ("20250614", "20260615", "years", "1"),
+        ("19800101", "20260101", "years", "46"),
+        ("202603010000", "202603011200", "days", "0"),
+        ("202603010000", "202603031200", "days", "2"),
+        ("202603010000", "202603010030", "hours", "0"),
+        ("20260301000000", "20260301000030", "minutes", "0"),
+    ],
+)
+def test_date_diff_field_is_symmetric(
+    start: str, end: str, unit: Literal["days", "years", "hours", "minutes"], forward: str
+) -> None:
+    # BACKLOG #5822. Swapping the fields negates the interval exactly, in every unit. NEGATIVE
+    # CONTROL: the unfixed code floored, so the reversed "a day short of a year" was -1 years and
+    # the reversed 12 hours was -1 days.
+    m = _two_stamps(start, end)
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit=unit)
+    assert m["ZTS-3"] == forward
+    date_diff_field(m, "ZTS-2", "ZTS-1", "ZTS-3", unit=unit)
+    assert m["ZTS-3"] == ("0" if forward == "0" else f"-{forward}")
+
+
 def test_date_diff_field_unknown_unit_raises() -> None:
     m = _msg()
     with pytest.raises(ValueError):
