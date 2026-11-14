@@ -193,9 +193,13 @@ def custody_account_problem(sid: str | None) -> str | None:
 #: SID_NAME_USE SidTypeUser and SidTypeComputer: one account each (a group managed service
 #: account, at least, may answer either).
 _ONE_ACCOUNT_KINDS = frozenset({1, 9})
-#: The SID_NAME_USE an account NAME may resolve to in a key-file read grant: one account, or a
-#: well-known one (5), which is how SYSTEM and a virtual service account resolve.
-_GRANT_NAME_KINDS = _ONE_ACCOUNT_KINDS | {5}
+#: The SID_NAME_USE an account NAME may resolve to in a key-file read grant: a user (1), a
+#: well-known account (5), which is how SYSTEM and a virtual service account resolve, or a computer
+#: account (9), which is at least how a group managed service account may answer, so a plain
+#: computer account passes too. A group, an alias or a bare domain is refused: a bare domain SID is
+#: one no token carries, so the grant would reach nobody. Kept apart from the handoff's
+#: ``_ONE_ACCOUNT_KINDS``: the two gates have different callers and may change apart.
+_GRANT_NAME_KINDS = frozenset({1, 5, 9})
 #: The SID_NAME_USE an owner NAME may resolve to: a user or a well-known account. Any other kind of
 #: owner is named by its SID.
 _OWNER_NAME_KINDS = frozenset({1, 5})
@@ -214,6 +218,31 @@ _SID_TYPE_NAMES: Mapping[int, str] = MappingProxyType(
         11: "a logon session",
     }
 )
+
+
+def _sid_kind_text(kind: int) -> str:
+    """What a SID_NAME_USE ``kind`` is, in words, for a refusal."""
+    return _SID_TYPE_NAMES.get(kind, f"an account of kind {kind}")
+
+
+def _name_kind_problem(principal: str, kind: int, *, as_owner: bool) -> str | None:
+    """Why the account NAME ``principal``, which Windows resolved to SID_NAME_USE ``kind``, may not
+    be a key file's read grant (or, with ``as_owner``, its owner), or ``None`` when it may. The
+    admitted kinds are :data:`_GRANT_NAME_KINDS` and :data:`_OWNER_NAME_KINDS`. Kept free of ctypes
+    so the decision is testable on every platform."""
+    if kind in (_OWNER_NAME_KINDS if as_owner else _GRANT_NAME_KINDS):
+        return None
+    what = _sid_kind_text(kind)
+    if as_owner:
+        return (
+            f"Windows resolves {principal!r} to {what}, not a user or well-known account; name an "
+            "owner that is a group, a computer or any other kind by its SID"
+        )
+    return (
+        f"Windows resolves {principal!r} to {what}, and a key file is granted by name only to a "
+        "user, a well-known or a computer account. Name the one account the engine runs as, such "
+        "as a virtual service account or a group managed service account"
+    )
 
 
 def handoff_grantee_problem(sid: str, kind_of: Callable[[str], int | None]) -> str | None:
@@ -241,7 +270,7 @@ def handoff_grantee_problem(sid: str, kind_of: Callable[[str], int | None]) -> s
     kind = kind_of(sid)
     if kind in _ONE_ACCOUNT_KINDS:
         return None
-    what = "no account" if kind is None else _SID_TYPE_NAMES.get(kind, f"an account of kind {kind}")
+    what = "no account" if kind is None else _sid_kind_text(kind)
     return (
         f"Windows maps {describe_sid(sid)} to {what}, not to one account, and a handoff is granted "
         "to the one account the service runs as, such as a user account or a virtual service "
@@ -1733,12 +1762,15 @@ def write_restricted_file(
     """Create ``path`` restricted, confirm its access, then write ``data`` to it.
 
     ``read_grants`` (Windows only) names further accounts to grant read: an account name such as
-    ``NT SERVICE\\MessageFoundry``, or a SID, with or without a leading ``*``.
+    ``NT SERVICE\\MessageFoundry``, or a SID, with or without a leading ``*``. A name must resolve
+    to a user, a well-known or a computer account (:data:`_GRANT_NAME_KINDS`); a group, an alias or
+    a domain is refused.
 
     ``owner`` (Windows only) is the account the file is created owned by, in the call that creates
     it, and read back through the creating handle before a byte is written. It is a SID, with or
-    without a leading ``*``, or a name: a name Windows reports as a group, an alias or a domain is
-    refused, as for a read grant, so a group such as Administrators is named by its SID. A name it
+    without a leading ``*``, or a name: a name Windows reports as a group, an alias, a domain or a
+    computer account is refused (a read grant admits a computer account; an owner does not), so a
+    group such as Administrators is named by its SID. A name it
     reports as a well-known group (SID_NAME_USE 5, as SYSTEM, a service's virtual account and
     Everyone all report) passes that gate, and a SID is taken as given. Then an
     application package, and at least the broad groups :func:`_is_broad_group` knows, are refused
@@ -2085,9 +2117,7 @@ def _create_restricted_windows(
 def _resolve_sid(principal: str, *, as_owner: bool = False) -> str:
     """The string SID of ``principal``: an account name, or a SID with or without a leading ``*``.
 
-    A NAME must resolve to one account: a group, an alias or a domain is refused. A grant name may
-    be a user, a well-known account or a computer account (at least a group managed service account
-    may answer as one); an owner name a user or a well-known account. A SID literal is taken as
+    A NAME must resolve to a kind :func:`_name_kind_problem` admits. A SID literal is taken as
     given.
 
     Every answer comes back from ``ConvertSidToStringSidW``, so what reaches the access list is a
@@ -2114,22 +2144,9 @@ def _resolve_sid(principal: str, *, as_owner: bool = False) -> str:
         if found is None:
             raise refusal
         rendered, use = found
-        # SID_NAME_USE: 1 is a user account and 5 a well-known account, which is how SYSTEM and a
-        # service's virtual account resolve. A grantee may also be a computer account (9), which is
-        # at least how a group managed service account may answer, and so a plain computer account
-        # is admitted too. A group, an alias or a bare domain name is not ONE account, and a bare
-        # domain SID is one no token carries, so the grant would reach nobody. An owner stays
-        # {1, 5}: one of any other kind is named by its SID.
-        if use not in (_OWNER_NAME_KINDS if as_owner else _GRANT_NAME_KINDS):
-            what = _SID_TYPE_NAMES.get(use, f"an account of kind {use}")
-            raise RestrictedFileError(
-                f"{principal!r} names {what}, not one account, so a key file cannot be granted "
-                "to it. Name the one account the engine runs as: a user, a well-known or virtual "
-                "service account, or a computer account such as a group managed service account"
-                if not as_owner
-                else f"{principal!r} names {what}, not a user or well-known account; name an "
-                "owner that is a group, a computer or any other kind by its SID"
-            )
+        problem = _name_kind_problem(principal, use, as_owner=as_owner)
+        if problem is not None:
+            raise RestrictedFileError(problem)
     if rendered is None:
         raise refusal
     return rendered

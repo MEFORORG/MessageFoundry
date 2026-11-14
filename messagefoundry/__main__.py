@@ -614,8 +614,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "'NT SERVICE\\MessageFoundry' or a SID. SYSTEM is always granted read (so a LocalSystem "
         "service starts); pass this for a virtual / gMSA service account. A name must resolve to "
         "one account: a user, a well-known account, or a computer account. A gMSA may resolve as "
-        "a computer account, so a plain computer account (DOMAIN\\HOST$) is admitted too. A group "
-        "or a domain is refused.",
+        "a computer account, so a plain computer account (DOMAIN\\HOST$) is admitted too. A group, "
+        "an alias or a domain is refused, but a well-known group other than the broad ones is "
+        "not. See docs/PHI.md, 'Key files'.",
     )
 
     cert = sub.add_parser(

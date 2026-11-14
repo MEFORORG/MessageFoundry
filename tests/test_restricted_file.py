@@ -1104,12 +1104,11 @@ def test_windows_refuses_a_name_that_is_not_one_account(tmp_path: Path, name: st
     # A bare domain resolves to a SID no token carries, so the grant would reach nobody and the
     # service would fail at its first start. A group is not one account either. The control is the
     # account name in the test above, which is granted.
-    with pytest.raises(RestrictedFileError, match="not one account"):
+    with pytest.raises(RestrictedFileError, match="granted by name only to"):
         write_restricted_file(tmp_path / "store.key", b"k", read_grants=[name])
     assert list(tmp_path.iterdir()) == []
 
 
-@windows_only
 @pytest.mark.parametrize(
     ("kind", "admitted_as_grant", "admitted_as_owner", "named"),
     [
@@ -1121,26 +1120,41 @@ def test_windows_refuses_a_name_that_is_not_one_account(tmp_path: Path, name: st
         (2, False, False, "a group"),
         (3, False, False, "a domain"),
         (4, False, False, "an alias"),
+        (6, False, False, "a deleted account"),
         (12, False, False, "an account of kind 12"),
     ],
 )
-def test_windows_a_grant_name_may_resolve_to_a_computer_account(
-    monkeypatch: pytest.MonkeyPatch,
-    kind: int,
-    admitted_as_grant: bool,
-    admitted_as_owner: bool,
-    named: str | None,
+def test_a_grant_name_may_resolve_to_a_computer_account(
+    kind: int, admitted_as_grant: bool, admitted_as_owner: bool, named: str | None
 ) -> None:
-    sid = "S-1-5-21-1111111111-2222222222-3333333333-4105"
-    monkeypatch.setattr(restricted_file, "_lookup_account_name", lambda _name: (sid, kind))
     for as_owner, admitted in ((False, admitted_as_grant), (True, admitted_as_owner)):
+        problem = restricted_file._name_kind_problem("CORP\\svc-mefor$", kind, as_owner=as_owner)
         if admitted:
-            assert restricted_file._resolve_sid("CORP\\svc-mefor$", as_owner=as_owner) == sid
+            assert problem is None
         else:
-            with pytest.raises(RestrictedFileError) as refused:
-                restricted_file._resolve_sid("CORP\\svc-mefor$", as_owner=as_owner)
             # The refusal names the kind the name resolved to.
-            assert named is not None and f"names {named}," in str(refused.value)
+            assert problem is not None and f"to {named}," in problem
+
+
+@windows_only
+def test_windows_a_computer_account_grant_name_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The whole create, for a name Windows resolves as a computer account: the grant is written
+    # and reads back. Any real SID stands in for the gMSA; the kind is what is under test.
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    me = _win32_config_source_probes().self_sid
+    assert me is not None
+    monkeypatch.setattr(restricted_file, "_lookup_account_name", lambda _name: (me, 9))
+    path = tmp_path / "store.key"
+    write_restricted_file(path, b"k", read_grants=["CORP\\gmsa-mefor$"])
+    assert path.read_bytes() == b"k"
+    # The control: the same name as an owner is refused, and leaves no file.
+    refused = tmp_path / "owned.key"
+    with pytest.raises(RestrictedFileError, match="to a computer account, not a user"):
+        write_restricted_file(refused, b"k", owner="CORP\\gmsa-mefor$")
+    assert not refused.exists()
 
 
 @windows_only
