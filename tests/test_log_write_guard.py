@@ -2756,8 +2756,8 @@ async def test_a_reload_during_the_halt_re_arms_a_stopped_lane_whose_sibling_sta
 async def test_an_unheld_stopped_pooled_lane_runs_after_a_halt_reload_and_the_recovery_restart(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # BACKLOG #5704 review: the reload broadcast keeps STOPPED only a lane the gate holds AND a STOP
-    # holds. A STOP with no hold (the T16 "inbound not in registry" STOP records none) is re-armed
+    # BACKLOG #5704 review: the reload broadcast keeps STOPPED only a lane the gate holds AND whose
+    # own stage recorded a held STOP. A STOP with no hold (the T16 "inbound not in registry" STOP records none) is re-armed
     # by the reload as it is with no halt, and gate-parked, so the recovery restart releases it.
     # The end state after the restart matches main, where the halt paused the lane and the restart
     # resumed it. MEASURED 2026-11-14: with keep_stopped True for every gated lane, it read STOPPED

@@ -5593,7 +5593,8 @@ class RegistryRunner:
         fail part way, as a reload that rolls back does): a fresh per_lane worker
         (:meth:`_spawn_worker`, :meth:`_ensure_inbound_workers`), a pooled broadcast that re-arms a
         lane it found STOPPED (:meth:`_broadcast_to`, sent by more than an operator: see
-        :meth:`outbound_stop_held`), a pooled resume of a PAUSED or STOPPED lane
+        :meth:`outbound_stop_held`; during a log halt it keeps an inbound record a sibling stage
+        still needs), a pooled resume of a PAUSED or STOPPED lane
         (:meth:`_resume_pooled_lane`), and a full teardown. An operator start that re-arms nothing,
         such as ``start_outbound`` on a pooled lane still finishing the episode its STOP ends,
         leaves the hold in place."""
