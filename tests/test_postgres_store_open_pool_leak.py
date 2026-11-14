@@ -41,6 +41,9 @@ class _FakePool:
         if self._close_fails:
             raise ConnectionResetError("pool close wedged")
 
+    def terminate(self) -> None:
+        """asyncpg's synchronous release, the forced fallback a cancel reaches (BACKLOG #5720)."""
+
 
 def _install_fake_asyncpg(monkeypatch: pytest.MonkeyPatch, pool: _FakePool) -> None:
     async def _create_pool(**kwargs: Any) -> _FakePool:
@@ -308,3 +311,40 @@ async def test_a_settle_failure_after_a_failed_open_is_logged_by_class_only(
     assert pool.closed == 1
     assert "after a failed store open (ConnectionResetError)" in caplog.text
     assert "db01" not in caplog.text
+
+
+async def test_a_cancelled_open_with_a_wedged_pool_close_ends_and_terminates(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5720, decision d20261114T002244771-017417: a cancelled open whose pool close
+    never returns ends within the bound, and ``terminate()`` drops the connections. Red at
+    faa7869c8e: the shielded cleanup absorbs the cancel and the open never returns."""
+    monkeypatch.setattr("messagefoundry.store.store.FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    unwedge = asyncio.Event()
+    pool = _FakePool()
+    terminated: list[str] = []
+
+    async def wedged_close() -> None:
+        pool.closed += 1
+        await unwedge.wait()
+
+    pool.close = wedged_close  # type: ignore[method-assign]
+    pool.terminate = lambda: terminated.append("terminated")  # type: ignore[method-assign]
+    _install_fake_asyncpg(monkeypatch, pool)
+
+    async def _cancelled(self: PostgresStore, **_kwargs: object) -> bool:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(PostgresStore, "_ensure_schema", _cancelled)
+
+    task = asyncio.create_task(PostgresStore.open(_settings()))
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=3)
+        assert task in done, "a cancelled open still waited on a wedged pool close"
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    with pytest.raises(asyncio.CancelledError):
+        task.result()
+    assert pool.closed == 1
+    assert terminated == ["terminated"]

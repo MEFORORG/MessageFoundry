@@ -1586,13 +1586,15 @@ async def test_cleanup_failed_open_releases_when_the_settle_is_cancelled() -> No
     async def release() -> None:
         released.append("released")
 
-    await cleanup_failed_open(RuntimeError("open boom"), release, checkpoint=cancelled_settle)
+    await cleanup_failed_open(
+        RuntimeError("open boom"), release, lambda: None, checkpoint=cancelled_settle
+    )
     assert released == ["released"]
 
 
-async def test_cleanup_failed_open_runs_nothing_on_generator_exit() -> None:
-    """BACKLOG #5720: a coroutine being closed cannot await, so the cleanup returns at once and
-    the caller re-raises the ``GeneratorExit`` unchanged."""
+async def test_cleanup_failed_open_runs_only_the_forced_release_on_generator_exit() -> None:
+    """BACKLOG #5720: a coroutine being closed cannot await, so the cleanup runs only the
+    synchronous forced release, and the caller re-raises the ``GeneratorExit`` unchanged."""
     from messagefoundry.store.store import cleanup_failed_open
 
     released: list[str] = []
@@ -1600,5 +1602,80 @@ async def test_cleanup_failed_open_runs_nothing_on_generator_exit() -> None:
     async def release() -> None:
         released.append("released")
 
-    await cleanup_failed_open(GeneratorExit(), release)
-    assert released == []
+    await cleanup_failed_open(GeneratorExit(), release, lambda: released.append("forced"))
+    assert released == ["forced"]
+
+
+async def _wedged_cleanup_ends_within_the_bound(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, exc: BaseException
+) -> BaseException | None:
+    """Run ``cleanup_failed_open`` over a release that never finishes, cancel it, and return what
+    it raised, if anything; the test fails rather than hangs when nothing bounds the wait."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    forced: list[str] = []
+    unwedge = asyncio.Event()
+    started = asyncio.Event()
+
+    async def wedged_release() -> None:
+        started.set()
+        await unwedge.wait()
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(exc, wedged_release, lambda: forced.append("forced"))
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=3)
+        assert task in done, "a cancelled failed-open cleanup still waited on a wedged release"
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    assert forced == ["forced"]
+    assert "did not finish within" in caplog.text
+    try:
+        task.result()
+    except BaseException as raised:  # noqa: BLE001 -- what the cleanup raised, a cancel included
+        return raised
+    return None
+
+
+async def test_a_cancel_bounds_a_wedged_failed_open_cleanup(monkeypatch, caplog) -> None:
+    """BACKLOG #5720, decision d20261114T002244771-017417: once a cancel lands, a wedged cleanup
+    gets one bound, then the forced release runs and the cancel ends the open, chained to the
+    open's own failure."""
+    failure = RuntimeError("open boom")
+    raised = await _wedged_cleanup_ends_within_the_bound(monkeypatch, caplog, failure)
+    assert isinstance(raised, asyncio.CancelledError)
+    assert raised.__cause__ is failure
+
+
+async def test_a_cancelled_opens_wedged_cleanup_is_bounded_from_the_start(
+    monkeypatch, caplog
+) -> None:
+    """BACKLOG #5720: an open that was itself cancelled has had its cancel already, so its
+    cleanup is bounded from the start, and it raises nothing: the caller re-raises the open's
+    own cancel."""
+    raised = await _wedged_cleanup_ends_within_the_bound(
+        monkeypatch, caplog, asyncio.CancelledError()
+    )
+    assert raised is None
+
+
+async def test_run_to_completion_names_its_caller(caplog) -> None:
+    """BACKLOG #5720: a caller other than the revoke names itself, so a failed-open cleanup is
+    never logged as a revoke's seal report; the default keeps the revoke's text."""
+    from messagefoundry.store.store import _run_to_completion
+
+    async def boom() -> None:
+        raise RuntimeError("boom")
+
+    await _run_to_completion(boom, what="a failed store open's cleanup", lost="nothing")
+    await _run_to_completion(boom)
+    assert "a failed store open's cleanup failed (RuntimeError); nothing" in caplog.text
+    assert (
+        "a revoke's seal report failed (RuntimeError); its remaining audit rows and pages were"
+        " not sent" in caplog.text
+    )
