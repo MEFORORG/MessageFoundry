@@ -1586,11 +1586,14 @@ async def route_decision(request: Request) -> AsyncIterator[None]:
     ``messages:view_summary`` read it refused.
 
     The first block a request enters takes the decision; a later one, or one on a route whose gate
-    deferred nothing, records nothing. Any other exception from the block leaves the decision
-    deferred, and :class:`AuthenticatedBeforeBodyRoute` settles it after the endpoint, as it does
-    when no block runs. That keeps the row a refusal raised with no reason of its own had before.
-    A cancellation, such as the request deadline's, leaves it deferred the same way. This block
-    writes the grant row before the route acts, which the settling cannot."""
+    deferred nothing, records nothing. Any other exception from the block, a store fault in the
+    check or a plain refusal raised inside it, writes no decision row, as
+    :func:`_recorded_decision` writes none for it: the request never passed the check, so it gets
+    no grant row. A cancellation, such as the request deadline's, instead leaves the decision
+    deferred, and :class:`AuthenticatedBeforeBodyRoute` writes it after the endpoint. A
+    cancellation that lands while this block's own row is being written can lose that row, because
+    the decision has already been taken. This block writes the grant row before the route acts,
+    which the settling cannot."""
     deferred = _take_deferred_decision(request)
     if deferred is None:
         yield
@@ -1600,7 +1603,7 @@ async def route_decision(request: Request) -> AsyncIterator[None]:
     except _GateRefusal as refusal:
         await _write_deferred(request, deferred, refusal)
         raise
-    except (Exception, asyncio.CancelledError):
+    except asyncio.CancelledError:
         setattr(request.state, _DEFERRED_DECISION_STATE, deferred)
         raise
     await _write_deferred(request, deferred, None)
@@ -1639,7 +1642,8 @@ def _settle_deferred_grant_after(
     A cancelled request is settled too, since the gate wrote its row before the body before it
     deferred: the request deadline cancels the handler and still answers 503. That write runs
     through the app's :class:`~messagefoundry.api.outlive.OutlivingOperations`, so a second
-    cancellation, such as the client going away, does not stop it either, and shutdown drains it."""
+    cancellation, such as the client going away, does not stop it either, and shutdown drains it.
+    A cancellation that lands while the row is being written on the uncancelled path can lose it."""
 
     async def settle(request: Request, refusal: BaseException | None) -> None:
         deferred = _take_deferred_decision(request)

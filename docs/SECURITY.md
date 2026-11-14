@@ -5098,9 +5098,12 @@ flowchart TB
   row writes no refusal row either. A refused second factor writes `auth.mfa_denied`, as the base
   gate's does. The step-up proof a `proof_in_route` route spends itself, the group-wide saves'
   window check and a `reveal`'s new-address and PHI-budget refusals are decided the same way: the
-  route's gate leaves its row to that check, so a refused request writes only `auth.gate_refused`.
-  On such a route, a request the check never decides, or that the body refuses for another reason,
-  gets the grant row after the endpoint, so it can follow that refusal's own row. A reveal refused
+  route's gate leaves its row to that check, so a refused request writes `auth.gate_refused` as
+  its decision row and no grant row. Other rows can sit beside it: a new-address refusal also
+  writes `auth.new_address_reverify_required`. A store fault or other error inside the check
+  writes no decision row, as on a gate that does not defer. On such a route, a request the check
+  never decides, a refusal raised before it and a request cancelled by the request deadline get
+  the grant row after the endpoint, so it can follow that refusal's own row. A reveal refused
   for want of `messages:view_summary` writes only that permission's denial row. A refusal the
   body makes after that check has decided, or on any other route after its gate has passed, at
   least the PHI-read budget a route body charges itself, still follows a grant row.

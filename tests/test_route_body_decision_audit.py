@@ -17,20 +17,23 @@ import ast
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.routing import APIRoute
 
 from messagefoundry.api import create_app
+from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
     _defers_decision,
     _GateRefusal,
+    _grant_or_defer,
+    _settle_deferred_grant_after,
     refuse_unless_step_up_window_live,
     require_step_up_action,
     route_decision,
@@ -116,13 +119,6 @@ async def _app(engine: Engine) -> FastAPI:
         if mode == "unblocked":
             # A gate's refusal raised in the body outside any decision block.
             raise _GateRefusal(429, "too many requests; please slow down", reason="throttled")
-        if mode == "hang":
-            # Outlasts the request deadline before anything decides.
-            await asyncio.sleep(30)
-        if mode == "hang_in_block":
-            # The same, inside the decision block, as a spend stuck on the store would be.
-            async with route_decision(request):
-                await asyncio.sleep(30)
         await spend_step_up_action(request, _ACTION)
         return {"ok": "1"}
 
@@ -196,28 +192,28 @@ async def test_a_refused_spend_leaves_one_refusal_row(engine: Engine) -> None:
 
 
 @pytest.mark.parametrize(
-    ("mode", "status", "row"),
+    ("mode", "status", "rows"),
     [
-        ("skip", 404, _granted(_MANAGE, _SPEND)),
-        ("plain", 403, _granted(_MANAGE, _SPEND)),
-        ("unblocked", 429, _refused(_MANAGE, _SPEND, "throttled")),
+        ("skip", 404, [_granted(_MANAGE, _SPEND)]),
+        ("plain", 403, []),
+        ("unblocked", 429, [_refused(_MANAGE, _SPEND, "throttled")]),
     ],
 )
 async def test_a_request_the_body_does_not_decide_is_settled_after_the_endpoint(
-    engine: Engine, mode: str, status: int, row: tuple[str, dict[str, Any]]
+    engine: Engine, mode: str, status: int, rows: list[tuple[str, dict[str, Any]]]
 ) -> None:
-    """The gate's deferred decision is written after the endpoint when no decision block takes it.
-    A refusal that is not the gate's before the spend (as a dual-control rejoin or a 404 is), or
-    one raised inside a block with no reason of its own (as a reveal's hop refusal is), keeps its
-    grant row. A gate's refusal raised outside a block writes the refusal row. RED when: the
-    settling step is lost, so such a request leaves no decision row at all, or the block drops the
-    decision on a plain refusal."""
+    """The gate's deferred decision is written after the endpoint when no decision block takes it:
+    a refusal that is not the gate's before the spend (as a dual-control rejoin or a 404 is) keeps
+    its grant row, and a gate's refusal raised outside a block writes the refusal row. A plain
+    refusal raised inside a block (as a reveal's hop refusal is) writes no decision row, as on a
+    gate that does not defer. RED when: the settling step is lost, so the first and last requests
+    leave no decision row, or the block settles a request that never passed its check as a grant."""
     app = await _app(engine)
     async with _client(app, _HOME) as c:
         token = await _login(c)
         r = await c.post(_SPEND, params={"mode": mode}, headers=_auth(token))
         assert r.status_code == status, r.text
-    assert await _decisions(engine, _SPEND) == [row]
+    assert await _decisions(engine, _SPEND) == rows
 
 
 #: The route-body checks that decide a deferred decision. A route whose body reaches one, directly
@@ -366,23 +362,98 @@ async def test_a_reveal_without_view_summary_leaves_only_its_denial_row(engine: 
     ]
 
 
-@pytest.mark.parametrize("mode", ["hang", "hang_in_block"])
-async def test_a_request_cancelled_by_its_deadline_still_records_the_grant(
-    engine: Engine, mode: str
+class _Recorder:
+    """Stands in for :class:`AuthService`: records which decision row was asked for."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def audit_permission_granted(self, *_: object, **__: object) -> None:
+        self.calls.append(_GRANTED)
+
+    async def audit_gate_refused(self, *_: object, **__: object) -> None:
+        self.calls.append(_REFUSED)
+
+
+async def _deferred_request(recorder: _Recorder) -> Request:
+    """A POST whose gate admitted it under ``users:manage`` and left the decision to the body."""
+    app = FastAPI()
+    app.state.audit_all_authz = True
+    app.state.outliving_operations = OutlivingOperations()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": _SPEND,
+            "headers": [],
+            "query_string": b"",
+            "client": (_HOME, 1),
+            "app": app,
+        }
+    )
+    identity: Any = object()  # the recorder never reads it
+    auth: Any = recorder
+    await _grant_or_defer(request, auth, identity, (Permission.USERS_MANAGE,), defer=True)
+    return request
+
+
+async def _cancelled_before_a_block(request: Request) -> Response:
+    raise asyncio.CancelledError
+
+
+async def _cancelled_inside_a_block(request: Request) -> Response:
+    async with route_decision(request):
+        raise asyncio.CancelledError
+
+
+async def _answered(request: Request) -> Response:
+    return Response()
+
+
+@pytest.mark.parametrize("body", [_cancelled_before_a_block, _cancelled_inside_a_block])
+async def test_a_cancelled_request_still_records_the_grant(
+    body: Callable[[Request], Coroutine[Any, Any, Response]],
 ) -> None:
     """The request deadline cancels the handler and answers 503. The gate admitted the request, so
     its deferred grant row is still written, as the gate wrote it before the body when it did not
-    defer. RED when: the settling step skips a cancelled request, or the decision block drops the
-    decision on a cancellation, and the request leaves no decision row. The control is the same
-    request with a deadline it does not outlast, which also writes one grant row."""
-    from messagefoundry.api.request_timeout import TIMEOUT_STATE_ATTR
+    defer. The cancellation is raised by the stub body itself, so no deadline can land in the
+    gate's own work first. RED when: the settling step skips a cancelled request, or the decision
+    block drops the decision on a cancellation, and the request leaves no decision row. The
+    control is a body that answers, which leaves the one grant row too."""
+    recorder = _Recorder()
+    request = await _deferred_request(recorder)
+    with pytest.raises(asyncio.CancelledError):
+        await _settle_deferred_grant_after(body)(request)
+    assert recorder.calls == [_GRANTED]
 
-    app = await _app(engine)
-    async with _client(app, _HOME) as c:
-        token = await _login(c)
-        r = await c.post(_SPEND, params={"mode": "skip"}, headers=_auth(token))
-        assert r.status_code == 404, r.text
-        setattr(app.state, TIMEOUT_STATE_ATTR, 0.5)
-        r = await c.post(_SPEND, params={"mode": mode}, headers=_auth(token))
-        assert r.status_code == 503, r.text
-    assert await _decisions(engine, _SPEND) == [_granted(_MANAGE, _SPEND)] * 2
+    control = _Recorder()
+    request = await _deferred_request(control)
+    await _settle_deferred_grant_after(_answered)(request)
+    assert control.calls == [_GRANTED]
+
+
+async def test_a_fault_inside_the_check_records_no_grant() -> None:
+    """A store fault inside the check means the request never passed it, so it writes no decision
+    row, as a gate that does not defer writes none for it. RED when: the block puts the decision
+    back and the settling step writes a grant for it. The control is the same block exiting
+    cleanly, which writes the grant row."""
+
+    async def faulted(request: Request) -> Response:
+        async with route_decision(request):
+            raise OSError("the store is down")
+
+    async def passed(request: Request) -> Response:
+        async with route_decision(request):
+            pass
+        return Response()
+
+    recorder = _Recorder()
+    request = await _deferred_request(recorder)
+    with pytest.raises(OSError):
+        await _settle_deferred_grant_after(faulted)(request)
+    assert recorder.calls == []
+
+    control = _Recorder()
+    request = await _deferred_request(control)
+    await _settle_deferred_grant_after(passed)(request)
+    assert control.calls == [_GRANTED]

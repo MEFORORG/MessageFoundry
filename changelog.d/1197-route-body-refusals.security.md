@@ -8,8 +8,10 @@
   wrote no row before this change and writes none after it. The route's gate now
   leaves its row to that check, so a refused request writes one `auth.gate_refused` row naming the
   gate's permission and a `reason` of `step_up` or `throttled`, and an admitted one writes the grant
-  row. A request the check never decides, or that the body refuses for another reason, still gets
-  its grant row, after the endpoint. A reveal refused for want of `messages:view_summary` writes
+  row. A store fault or plain refusal inside the check writes no decision row, as a gate that
+  does not defer writes none for it. A request the check never decides, including one cancelled
+  by the request deadline, still gets its grant row, after the endpoint; a cancellation that lands
+  while a decision row is being written can lose that row. A reveal refused for want of `messages:view_summary` writes
   only its `auth.permission_denied` row, without the monitoring grant row it also had. No request
   is allowed or refused differently. [SECURITY.md](../docs/SECURITY.md) says which refusals still
   follow a grant row. (`BACKLOG #1197`)
