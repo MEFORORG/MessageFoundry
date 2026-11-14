@@ -6,11 +6,12 @@ The script used to build one ``X509Certificate2`` from the path and then hand th
 ``Import-Certificate``. An unsigned ``.p7b`` chain, the shape the help advertises, made the
 constructor throw ``Cannot find the original signer``; a PEM bundle showed the operator only its
 first certificate. Now the bytes are read once into a collection, every certificate in it is shown
-and checked, and the whole file is refused when any one is not a CA or carries a private key.
+and checked, and the whole file is refused when any one is not a CA or carries a private key. A
+root goes into the machine Root store and any other CA into the intermediate store.
 
 NOTHING HERE WRITES A CERTIFICATE STORE. The fixtures are generated in a pytest temporary
-directory. The function-level tests lift ``Read-CaBundle`` and ``Get-CaRefusal`` (and the console
-helpers they call) out of the script's AST and call them, as
+directory. The function-level tests lift ``Read-CaBundle``, ``Get-CaRefusal`` and
+``Get-CaStoreName`` (and the console helpers they call) out of the script's AST and call them, as
 ``tests/test_import_db_ca_console_text.py`` does. The whole-script tests run it with ``-WhatIf``
 only, where ``ShouldProcess`` declines every import, so the store is never opened; they are also
 skipped in an elevated session, so even a regression that ignored ``-WhatIf`` would meet the
@@ -58,9 +59,14 @@ _Key = ec.EllipticCurvePrivateKey
 
 
 def _cert(
-    cn: str, ca: bool | None, issuer: tuple[x509.Certificate, _Key] | None = None
+    cn: str,
+    ca: bool | None,
+    issuer: tuple[x509.Certificate, _Key] | None = None,
+    *,
+    cert_sign: bool | None = None,
 ) -> tuple[x509.Certificate, _Key]:
-    """A synthetic certificate. ``ca`` None leaves the basic constraints extension out."""
+    """A synthetic certificate. ``ca`` None leaves the basic constraints extension out, and
+    ``cert_sign`` None leaves the key usage extension out."""
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     now = datetime.datetime.now(datetime.UTC)
@@ -75,6 +81,22 @@ def _cert(
     )
     if ca is not None:
         builder = builder.add_extension(x509.BasicConstraints(ca=ca, path_length=None), True)
+    if cert_sign is not None:
+        usage = dict.fromkeys(
+            (
+                "content_commitment",
+                "key_encipherment",
+                "data_encipherment",
+                "key_agreement",
+                "crl_sign",
+                "encipher_only",
+                "decipher_only",
+            ),
+            False,
+        )
+        builder = builder.add_extension(
+            x509.KeyUsage(digital_signature=True, key_cert_sign=cert_sign, **usage), True
+        )
     return builder.sign(issuer[1] if issuer else key, hashes.SHA256()), key
 
 
@@ -94,6 +116,8 @@ def chain() -> dict[str, tuple[x509.Certificate, _Key]]:
         "intermediate": _cert("Synthetic Test Issuing CA", True, root),
         "leaf": _cert("db.test.invalid", False, root),
         "unconstrained": _cert("Synthetic No Constraints", None),
+        "no_cert_sign": _cert("Synthetic CA Without CertSign", True, cert_sign=False),
+        "cert_sign": _cert("Synthetic CA With CertSign", True, cert_sign=True),
     }
 
 
@@ -125,6 +149,19 @@ def files(
             serialization.NoEncryption(),
         ),
         "pem_unterminated": _pem(root) + b"-----BEGIN CERTIFICATE-----\nMIIB\n",
+        # A text file whose first byte is '0' (0x30, an ASN.1 SEQUENCE) is still PEM.
+        "pem_zero_first": b"0 s:/CN=x\n" + _pem(root, inter),
+        "pem_zero_first_with_key": b"0\n"
+        + _pem(root)
+        + root_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ),
+        "pem_utf16": b"\xff\xfe" + _pem(root, inter).decode("ascii").encode("utf-16-le"),
+        "pem_x509_label": _pem(root).replace(b" CERTIFICATE-----", b" X509 CERTIFICATE-----"),
+        "pem_duplicate": _pem(root, root),
+        "pem_key_usage": _pem(chain["no_cert_sign"][0], chain["cert_sign"][0]),
         "empty": b"",
         "garbage": b"not a certificate at all\n",
     }
@@ -141,13 +178,14 @@ def _psq(value: str) -> str:
 
 
 def _read_all(tmp_path: Path, paths: dict[str, Path]) -> dict[str, dict[str, object]]:
-    """Each file through ``Read-CaBundle`` then ``Get-CaRefusal``, as the script does."""
+    """Each file through ``Read-CaBundle``, then ``Get-CaRefusal`` and ``Get-CaStoreName``, as the
+    script does."""
     script = f"""
 $ErrorActionPreference = 'Stop'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     {_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
 foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-CaBundle',
-                    'Get-CaRefusal')) {{
+                    'Get-CaRefusal', 'Get-CaStoreName')) {{
   $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
       $args[0].Name -eq $name }}, $true)
   if (-not $def) {{ throw "missing function $name" }}
@@ -159,7 +197,8 @@ foreach ($k in $paths.Keys) {{
   try {{
     $bundle = Read-CaBundle -Bytes ([System.IO.File]::ReadAllBytes($paths[$k]))
     $out[$k] = @{{ certs = @(foreach ($c in $bundle) {{
-      @{{ thumb = $c.Thumbprint; refusal = (Get-CaRefusal -Certificate $c) }} }}) }}
+      @{{ thumb = $c.Thumbprint; refusal = (Get-CaRefusal -Certificate $c);
+          store = (Get-CaStoreName -Certificate $c) }} }}) }}
   }} catch {{
     $out[$k] = @{{ error = $_.Exception.Message }}
   }}
@@ -187,19 +226,27 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     root = _thumb(chain["root"][0])
     inter = _thumb(chain["intermediate"][0])
 
-    def certs(name: str) -> list[tuple[str, str | None]]:
+    def full(name: str) -> list[tuple[str, str | None, str]]:
         entry = got[name]
         assert "error" not in entry, f"{name}: {entry}"
         listed = entry["certs"]
         assert isinstance(listed, list)
-        return [(c["thumb"], c["refusal"]) for c in listed]
+        return [(c["thumb"], c["refusal"], c["store"]) for c in listed]
+
+    def certs(name: str) -> list[tuple[str, str | None]]:
+        return [(thumb, refusal) for thumb, refusal, _store in full(name)]
 
     # Accepted: the unsigned .p7b chain the help advertises, in both encodings, and a PEM bundle,
-    # each read in full -- not its first certificate only.
+    # each read in full -- not its first certificate only. The root is bound for Root, and the
+    # issuing CA for the intermediate store, never for Root.
     assert certs("der") == [(root, None)]
     assert certs("pem_one") == [(root, None)]
-    for name in ("p7b_der", "p7b_pem", "pem_bundle"):
-        assert sorted(certs(name)) == sorted([(root, None), (inter, None)]), name
+    for name in ("p7b_der", "p7b_pem", "pem_bundle", "pem_zero_first", "pem_utf16"):
+        assert sorted(full(name)) == sorted(
+            [(root, None, "Root"), (inter, None, "CertificateAuthority")]
+        ), name
+    assert certs("pem_x509_label") == [(root, None)]
+    assert certs("pem_duplicate") == [(root, None)]
 
     # Read in full, so the non-CA among them is seen and refused.
     leaf = _thumb(chain["leaf"][0])
@@ -211,6 +258,11 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert unconstrained[_thumb(chain["unconstrained"][0])] == (
         "it has no basic constraints extension, so it is not marked as a CA"
     )
+    usage = dict(certs("pem_key_usage"))
+    assert usage[_thumb(chain["no_cert_sign"][0])] == (
+        "its key usage does not allow it to sign certificates"
+    )
+    assert usage[_thumb(chain["cert_sign"][0])] is None
 
     # Refused before anything is parsed: a private key, in either container, and what is not a
     # certificate file at all.
@@ -221,6 +273,7 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
 
     assert "'Pfx' content" in error("pfx")
     assert "labelled 'PRIVATE KEY'" in error("pem_with_key")
+    assert "labelled 'EC PRIVATE KEY'" in error("pem_zero_first_with_key")
     assert "not well formed" in error("pem_unterminated")
     assert "empty" in error("empty")
     assert "no certificate" in error("garbage")
@@ -254,10 +307,16 @@ def test_whatif_shows_and_offers_every_certificate_of_an_unsigned_p7b(
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
     assert "About to trust 2 CA certificate(s)" in out
-    for key in ("root", "intermediate"):
+    # No elevation was needed, and each certificate is offered for its own store.
+    assert "requires an elevated" not in out
+    for key, store in (
+        ("root", "Cert:\\LocalMachine\\Root"),
+        ("intermediate", "Cert:\\LocalMachine\\CA"),
+    ):
         thumb = _thumb(chain[key][0])
         assert f"Thumbprint : {thumb}" in out
-        assert any("What if" in ln and thumb in ln for ln in out.splitlines()), thumb
+        offered = [ln for ln in out.splitlines() if "What if" in ln and thumb in ln]
+        assert len(offered) == 1 and f'"{store}"' in offered[0], (thumb, offered)
     assert "Imported" not in out
 
 
@@ -284,6 +343,8 @@ def test_the_script_adds_through_the_store_and_never_by_path() -> None:
     assert body.count("ReadAllBytes(") == 1
     assert "Import-Certificate" not in body
     assert "X509Certificate2]::new($CaPath)" not in body
-    # Every certificate is checked before a single import is offered.
+    # Elevation is checked before the file is read, and every certificate is checked before a
+    # single import is offered.
+    assert body.index("IsInRole(") < body.index("ReadAllBytes(")
     assert body.index("Get-CaRefusal -Certificate") < body.index("ShouldProcess(")
-    assert body.index("ShouldProcess(") < body.index("$store.Add(")
+    assert body.index("ShouldProcess(") < body.index(".Store.Add(")

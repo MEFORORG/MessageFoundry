@@ -552,7 +552,10 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 .\scripts\service\import-db-ca.ps1 -CaPath C:\certs\internal-root-ca.crt
 ```
 
-or run the equivalent built-in directly:
+The helper shows every certificate in the file, refuses the whole file if any one is not a CA or
+carries a private key, and puts a root in `LocalMachine\Root` and any issuing CA from a `.p7b`
+chain in the intermediate store `LocalMachine\CA`. The built-ins below check none of that, so use
+them only for a file holding one root CA you have checked yourself:
 
 ```powershell
 # PowerShell:
