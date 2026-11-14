@@ -82,6 +82,16 @@ export function serveCommandLine(configDir: string, serviceConfig?: string): str
   return ["python", ...args.map((a) => (/\s/.test(a) ? `"${a}"` : a))].join(" ");
 }
 
+/** The Start command as a hint, for text that cannot read the settings (an error message): the
+ *  command Start runs, with the `--service-config` it adds when `messagefoundry.serviceConfig` is
+ *  set named too, so the hint never omits a flag Start passes (BACKLOG #5566). */
+export function serveCommandHint(): string {
+  return (
+    `\`${serveCommandLine("<configDir>")}\`, adding \`--service-config=<file>\` when ` +
+    "messagefoundry.serviceConfig is set"
+  );
+}
+
 /** The outcome of the interpreter preflight, each with a DIFFERENT remedy. */
 export type PreflightVerdict = "ok" | "missingDeps" | "missingInterpreter" | "error";
 

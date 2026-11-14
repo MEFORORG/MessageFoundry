@@ -580,11 +580,9 @@ export class EngineStatusBar implements vscode.Disposable {
     const serviceConfigArg = startServiceConfig();
     // A set service config that names no file: serve and provision-admin refuse it, so say so now
     // rather than prompt for a new store that the refusal would never create.
-    if (serviceConfigArg !== undefined && !isFile(path.resolve(ws, serviceConfigArg))) {
-      notify(
-        `messagefoundry.serviceConfig names "${serviceConfigArg}", which is not a file in this workspace — ` +
-          "serve would refuse it. Correct the setting, or clear it to use the default.",
-      );
+    const refusal = serviceConfigRefusal(ws, serviceConfigArg);
+    if (refusal !== undefined) {
+      notify(refusal);
       return;
     }
     // Fork guard (ADR 0110 §5): with no engine store here, starting would create a NEW database. That is
@@ -760,6 +758,14 @@ export class EngineStatusBar implements vscode.Disposable {
 
   /** Restart: stop the engine we own (waiting for the process to actually exit so the port frees), then start. */
   async restartEngine(): Promise<void> {
+    // The Start below would refuse a service config that names no file, so refuse BEFORE stopping
+    // the running engine; otherwise a refused Restart acts as Stop (BACKLOG #5566).
+    const ws = workspaceDir();
+    const refusal = ws === undefined ? undefined : serviceConfigRefusal(ws, startServiceConfig());
+    if (refusal !== undefined) {
+      notify(refusal);
+      return;
+    }
     if (this.engineAlive()) {
       const term = this.engineTerminal;
       this.engineTerminal = undefined;
@@ -940,6 +946,18 @@ async function chooseAfterRefusal(detail: string): Promise<"provision" | "startA
  */
 function startServiceConfig(): string | undefined {
   return connectionServiceConfig(serviceConfig(), serviceConfigIsSet());
+}
+
+/** Why Start must not run with this `--service-config`, or undefined when it may: a set value that
+ *  names no file in the workspace, which serve and provision-admin would refuse (BACKLOG #5566). */
+function serviceConfigRefusal(ws: string, serviceConfigArg: string | undefined): string | undefined {
+  if (serviceConfigArg === undefined || isFile(path.resolve(ws, serviceConfigArg))) {
+    return undefined;
+  }
+  return (
+    `messagefoundry.serviceConfig names "${serviceConfigArg}", which is not a file in this workspace — ` +
+    "serve would refuse it. Correct the setting, or clear it to use the default."
+  );
 }
 
 /** Whether `p` names a regular file. A missing path, or a directory, is not one. */

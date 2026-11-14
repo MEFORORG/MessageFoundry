@@ -19,6 +19,7 @@ import {
   preflightArgs,
   runDirHasEngine,
   runStartPlan,
+  serveCommandHint,
   serveCommandLine,
   validateProvisionEmail,
   type AdminDetails,
@@ -671,11 +672,37 @@ suite("engine control — Start runs against the service TOML the fork guard jud
     );
     // A set value naming no file is refused before the guard, since serve would refuse it anyway.
     assert.ok(
-      /if \(serviceConfigArg !== undefined && !isFile\(path\.resolve\(ws, serviceConfigArg\)\)\) \{[\s\S]*?return;/.test(
+      /const refusal = serviceConfigRefusal\(ws, serviceConfigArg\);\s*if \(refusal !== undefined\) \{[\s\S]*?return;/.test(
         launch[0],
       ),
       "a set service config that names no file must stop Start",
     );
+    assert.ok(
+      /function serviceConfigRefusal\([^)]*\)[^{]*\{\s*if \(serviceConfigArg === undefined \|\| isFile\(path\.resolve\(ws, serviceConfigArg\)\)\) \{\s*return undefined;/.test(
+        code,
+      ),
+      "the refusal must be exactly: set, and not a file",
+    );
+  });
+
+  test("Restart refuses a service config that names no file BEFORE it stops the engine", () => {
+    const restart = /async restartEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    assert.ok(restart, "restartEngine moved — re-point this scan before trusting it");
+    const body = restart[0];
+    const refused = body.search(/if \(refusal !== undefined\) \{\s*notify\(refusal\);\s*return;/);
+    const stops = body.search(/term\.dispose\(\)/);
+    assert.ok(refused >= 0, "restartEngine must check the service config");
+    assert.ok(stops > refused, "the check must come before the running engine is stopped");
+    assert.ok(/serviceConfigRefusal\(ws, startServiceConfig\(\)\)/.test(body));
+  });
+
+  test("the unreachable-engine hint names the --service-config Start adds", () => {
+    const hint = serveCommandHint();
+    assert.ok(hint.includes(serveCommandLine("<configDir>")));
+    assert.ok(hint.includes("--service-config=<file>"), hint);
+    const client = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "engineClient.ts"), "utf8");
+    assert.ok(/serveCommandHint\(\)/.test(client), "engineClient's hint must use serveCommandHint");
+    assert.ok(!/serveCommandLine\(/.test(client), "engineClient must not name the bare command");
     assert.ok(
       /function startServiceConfig\(\)[^{]*\{\s*return connectionServiceConfig\(serviceConfig\(\),\s*serviceConfigIsSet\(\)\);/.test(
         code,
