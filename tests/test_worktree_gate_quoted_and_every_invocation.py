@@ -377,3 +377,40 @@ def test_bracket_controls_stay_allowed(rig: SimpleNamespace, template: str, tool
     """ALLOW on origin/main from the primary: each command acts on the ungoverned repository."""
     cmd = _fmt(rig, template.replace("{s}", _SUBST))
     assert _allowed(rig, cmd, rig.primary, tool)
+
+
+# ------------------------------------------------------------------ review round 73e9b81f0a
+#
+# DENY on ff2d69b286, ALLOW on 8e1c8eb5e4: the owning-word search missed a path-qualified git and
+# answered an earlier command's git across `;`.
+
+
+@pytest.mark.parametrize(
+    ("template", "tool"),
+    [
+        ("git -C {o} status ; /usr/bin/git reset --hard", "Bash"),
+        (r"git -C {o} status ; \git reset --hard", "Bash"),
+        ("git -C {o} status ; C:/Tools/Git/cmd/git.exe reset --hard", "Bash"),
+        ("git -C {o} status ; git.cmd reset --hard", "Bash"),
+        (r"git -C {o} status; C:\Tools\Git\cmd\git.exe reset --hard", "PowerShell"),
+    ],
+)
+def test_a_path_qualified_git_after_an_earlier_command_is_rule_3s(
+    rig: SimpleNamespace, template: str, tool: str
+) -> None:
+    reason = _reason(rig, _fmt(rig, template), rig.primary, tool)
+    assert "SHARED PRIMARY" in reason, reason
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "git config alias.lg log ; /usr/bin/git -C '{p}' config {k}",
+        r"git config alias.lg log ; git -C '{p}' -c a=\) config {k}",
+    ],
+)
+def test_a_later_disarm_owned_by_a_path_git_or_after_a_closer_is_rule_3cs(
+    rig: SimpleNamespace, template: str
+) -> None:
+    reason = _reason(rig, _fmt(rig, template), rig.outside)
+    assert "SHARED git" in reason, reason

@@ -888,6 +888,19 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
 # `git -C '<p>' -c user.name=$(git config user.name) reset --hard` the inner git sits in a `$( )`
 # that closes before `reset`, and taking it as owner dropped the quoted `-C`. A word with more
 # closers than openers between it and $At is skipped, and the search goes on leftwards.
+#
+# RULE 3c USES Get-AnyGitWordBefore BELOW INSTEAD (review round 73e9b81f0a). Switching its later-disarm
+# filter and its window to this narrower word dropped a later disarm owned by `/usr/bin/git`, or one
+# after a stray `)`, which the earlier head judged.
+function Get-AnyGitWordBefore([string]$Scan, [int]$At) {
+    # The last `git` or `git.exe` substring before $At, in any case on Windows: the reading rule 3c's
+    # added reading had before the owning-word search, kept for it.
+    $opts = $(if ($IsWindows) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
+            [System.Text.RegularExpressions.RegexOptions]::None })
+    $words = [regex]::Matches($Scan.Substring(0, $At), '\bgit(\.exe)?\b', $opts)
+    $(if ($words.Count -gt 0) { $words[$words.Count - 1].Index } else { -1 })
+}
+
 function Get-GitWordBefore([string]$Scan, [int]$At) {
     $opts = $(if ($IsWindows) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
             [System.Text.RegularExpressions.RegexOptions]::None })
@@ -3659,7 +3672,7 @@ if ($tool -in @("Bash", "PowerShell")) {
             # (review round b62475f26d): `git config core.hooksPath ; grep -c alias.x f` is a read and a
             # grep. The first match is kept as it always was.
             if (-not $first) {
-                $gw = Get-GitWordBefore $seg.Scan $m.Index
+                $gw = Get-AnyGitWordBefore $seg.Scan $m.Index
                 if ($gw -lt 0 -or (Test-TrueSeparatorIn $seg.Scan.Substring($gw, $m.Index - $gw))) { continue }
             }
             $first = $false
@@ -4083,7 +4096,7 @@ What to do instead:
                     '^\S*(?:\s+(?:-[Cc]\s+\S+|--(?:git-dir|work-tree|namespace)(?:=\S+|\s+\S+)|--?[A-Za-z][\w-]*(?:=\S+)?))*')
                 $readTo = $keyAt + $globals.Length
             }
-            $gitWord = Get-GitWordBefore $seg.Scan $dis.Index
+            $gitWord = Get-AnyGitWordBefore $seg.Scan $dis.Index
             foreach ($reading in @(Get-InvocationReading $seg.Scan $readTo -GitAt $gitWord -Prior $seg.Prior)) {
                 $govCfg = Find-FirstAnsweringRoot (Get-InvocationCandidates $reading $cwdRaw `
                               -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir) $cwdRaw
@@ -4962,9 +4975,17 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
                 # THE OWNING GIT WORD, not the verb hunt's match start (review round f99d8271af): the hunt
                 # crosses `( ) { }`, so in `if (git -C <o> diff) { git reset --hard }` it starts at the
                 # first git and the reset read that command's `-C`.
+                #
+                # FLOORED AT THE VERB HUNT'S OWN START, AND BOTH ARE READ (review round 73e9b81f0a). The
+                # owning-word pattern misses `/usr/bin/git`, `\git` and `git.cmd`, and then answered an
+                # earlier command's git across `;`. The hunt's start never crosses `|;&`, so it is always
+                # read; the owning word is read as well only where it lies after that start. Reading both
+                # can only add a deny, so no shape the earlier head refused is allowed.
+                $gitAts = @($vm.Index)
                 $ownGit = Get-GitWordBefore $seg.Scan $vIdx
-                if ($ownGit -lt 0) { $ownGit = $vm.Index }
-                foreach ($reading in @(Get-InvocationReading $seg.Scan $vIdx -GitAt $ownGit -Prior $seg.Prior)) {
+                if ($ownGit -gt $vm.Index) { $gitAts += $ownGit }
+                $readings = @(foreach ($gitAt in $gitAts) { Get-InvocationReading $seg.Scan $vIdx -GitAt $gitAt -Prior $seg.Prior })
+                foreach ($reading in $readings) {
                     $ownRepo = ($reading.Window -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
                     [pscustomobject]@{
                         Verb  = $vGroup.Value
