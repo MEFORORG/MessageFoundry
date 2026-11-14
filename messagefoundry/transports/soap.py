@@ -28,8 +28,9 @@ per-connection opener (server verification stays on); incompatible with ``verify
 HTTP 200 body). A WS-Security fault (FailedAuthentication / InvalidSecurityToken / MessageExpired) →
 :class:`NegativeAckError` (``permanent=True``) → dead-letter (a credential/expiry reject won't fix on a
 retry). A **Sender/Client** fault → permanent dead-letter; a **Receiver/Server** fault →
-:class:`DeliveryError` (retry). The code is read only from the Fault's first child, its faultcode or
-Code (``_fault_code`` says how). An unrecognized fault is treated as permanent. With no fault, the HTTP
+:class:`DeliveryError` (retry). The code is read first from the Fault's first child, its faultcode or
+Code, and where that yields none, from the Fault's first faultcode or a Value ahead of it
+(``_fault_code`` says how). An unrecognized fault is treated as permanent. With no fault, the HTTP
 status decides: 2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter; a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the SOAP
 fault role + HTTP status are.
@@ -230,8 +231,8 @@ def _first_child(body: str, pos: int, end: int) -> int:
 
     BACKLOG #5912: a comment, a CDATA section or a processing instruction is stepped over whole, so
     markup inside one is never taken for the child. Where one has no terminator before ``end``, or
-    a ``<!`` opens anything else, such as a DOCTYPE, there is no child: the code then reads as none,
-    a permanent fault. Each step resumes after the markup it passed, so the search is linear."""
+    a ``<!`` opens anything else, such as a DOCTYPE, there is no child: the first-child read then
+    yields no code, and :func:`_fault_code` falls back to :func:`_searched_code`. Each step resumes after the markup it passed, so the search is linear."""
     while True:
         lt = body.find("<", pos, end)
         if lt < 0:
@@ -331,7 +332,8 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     SOAP 1.1's ``faultcode`` or SOAP 1.2's ``Code``, which both schemas put first. For ``Code`` the
     code is the ``Value`` that is the Code's own first child, read only up to the Code's close tag.
     A ``Value`` anywhere else in the Fault, in a Subcode, Reason, Node, Role or Detail, never
-    decides permanent versus retryable when the first child yields a code. A Fault or Code close tag
+    decides permanent versus retryable when the first child yields a code, other than one inside
+    markup, which the fallback below may still read. A Fault or Code close tag
     inside a comment, a CDATA section or a processing instruction does not end either element
     (:func:`_search_outside_markup`).
 
@@ -354,13 +356,14 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
         return ""
     fault_end = _search_outside_markup(_FAULT_END_OUTSIDE_MARKUP_RE, body, gt + 1, len(body))
     end = len(body) if fault_end is None else fault_end.start()
-    return _first_child_code(body, gt, end) or _searched_code(body, gt + 1, end)
+    return _first_child_code(body, gt + 1, end) or _searched_code(body, gt + 1, end)
 
 
-def _first_child_code(body: str, gt: int, end: int) -> str:
-    """The code the Fault's first child element holds, or ``""``: the read :func:`_fault_code`
-    tries first. ``gt`` is the Fault start tag's ``>`` and ``end`` where the Fault ends."""
-    child = _first_child(body, gt + 1, end)
+def _first_child_code(body: str, start: int, end: int) -> str:
+    """The code the first child element in ``body[start:end]`` holds, or ``""``: the read
+    :func:`_fault_code` tries first, ``start`` just after the Fault start tag's ``>`` and ``end``
+    where the Fault ends."""
+    child = _first_child(body, start, end)
     if child < 0:
         return ""
     faultcode = _FAULTCODE_RE.match(body, child, end)
@@ -379,7 +382,10 @@ def _first_child_code(body: str, gt: int, end: int) -> str:
 
 def _searched_code(body: str, start: int, end: int) -> str:
     """The code the earlier search finds in ``body[start:end]``, or ``""``: :func:`_fault_code`'s
-    fallback, kept as it was before BACKLOG #5912. The first ``faultcode`` or ``Value`` start tag
+    fallback, the search the code ran before BACKLOG #5912. Its range is not that search's: it
+    starts after the Fault start tag's ``>`` and ends at the first Fault close tag outside markup,
+    where that search ended at the first Fault close tag anywhere, so a ``</Fault>`` in a comment
+    no longer cuts it short. The first ``faultcode`` or ``Value`` start tag
     there is the code element, a ``Value`` taken only before the first ``faultcode``, and only that
     first tag is read: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may
     carry an element of the other name. Markup is not stepped over, as it was not before."""
@@ -1184,10 +1190,11 @@ class SoapDestination(DestinationConnector):
         a reply of ``<Fault>`` followed by one long run of ``<``. On a bare run of ``<``,
         ``_FAULT_RE`` finds nothing and the name scans never run. Those are that machine's readings,
         not a bound on another. Later #2827 changes added scans, at least ``_find_fault``'s and the
-        code-element checks in ``_code_text``, and BACKLOG #5912 replaced the name scans with up to
-        three anchored matches, ``faultcode`` then ``Code`` at the Fault's first child and ``Value``
+        code-element checks in ``_code_text``, and BACKLOG #5912 put up to three anchored matches
+        ahead of the name scans, ``faultcode`` then ``Code`` at the Fault's first child and ``Value``
         at the Code's, each child found by :func:`_first_child`'s Python-level loop, and added the
-        Code close-tag search; the PR 2936 repair moved the Fault start-tag search and the Fault
+        Code close-tag search. The name scans still run, in :func:`_searched_code`, wherever that
+        first-child read yields no code, as it does on a ``<Fault>`` followed by a run of ``<``; the PR 2936 repair moved the Fault start-tag search and the Fault
         and Code close-tag searches into :func:`_search_outside_markup`'s Python-level loop, which
         a reply of many markup runs makes several times slower. So they are not a reading of this
         code."""

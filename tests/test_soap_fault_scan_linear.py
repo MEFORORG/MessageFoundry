@@ -17,9 +17,11 @@ in the reply, else the first Value, the Header included, and an empty ``<faultco
 code. Both could make a permanent fault read as a Receiver one and retry until the attempt limit;
 the named tests below pin each, with a control. The Fault is searched for from the SOAP Body start
 tag, ``_find_fault`` says how, and the Body tests pin that, each with a control. BACKLOG #5912
-narrows the code read to the Fault's first child, a faultcode or a Code and the Value that is that
-Code's first child, so a Value anywhere else in the Fault decides nothing; its tests pin that against the PR 2790
-reading, which took the Fault's first Value.
+reads the code first from the Fault's first child, a faultcode or a Code and the Value that is that
+Code's first child, so where that read yields a code a Value anywhere else in the Fault, inside
+markup say, does not decide it; its tests pin that against the PR 2790 reading, which took the
+Fault's first Value. Where that read yields no code, the fallback reads the code as the PR 2790
+reading did (the PR 2936 hold of 2026-11-14), and its tests pin that too.
 
 The third is about which thread runs the scan, not about the loop staying responsive.
 ``SoapDestination._post_and_classify`` says why the two differ, and what bounds the difference.
@@ -459,10 +461,11 @@ def _pr2790_fault_code(body: str) -> str:
 )
 def test_with_no_first_child_code_the_fallback_reads_as_before(body: str) -> None:
     """The PR 2936 hold of 2026-11-14: where the Fault's first child yields no code, the fallback
-    reads each shape as the PR 2790 reading did, so a fault main retries is never newly
+    reads each shape as the PR 2790 reading did, so none of these Receiver or Server faults is newly
     dead-lettered. That keeps the PR 2790 trade for these shapes: a Value outside the Code decides
-    them, as it did before #5912. Control: with the fallback patched out, each reads as no code, a
-    permanent fault, as PR 2936 head 933e347fe8 read it."""
+    them, as it did before #5912. ``_pr2790_fault_code`` shares this module's patterns and Fault
+    search, so it pins the reading's order, not the patterns. Control: with the fallback patched
+    out, each reads as no code, a permanent fault, as PR 2936 head 933e347fe8 read it."""
     reading = _pr2790_fault_code(body)
     assert soap._RECEIVER_RE.search(reading), "the shape must hold a retryable reading"
     assert _fault_code(body) == reading
@@ -497,7 +500,8 @@ _VALUE_IN_MARKUP_BEFORE_THE_CODE = {
 def test_a_value_outside_the_first_child_code_does_not_decide_the_fault(
     body: str, code: str
 ) -> None:
-    """Red on the PR 2790 reading, which retried each of these as a Receiver fault."""
+    """Red on the PR 2790 reading, which retried each of these as a Receiver fault: the one place a
+    main-retried reply is now dead-lettered, a Sender code read past a Value inside markup."""
     assert soap._RECEIVER_RE.search(_pr2790_fault_code(body)), "the shape must exercise the defect"
     assert _fault_code(body) == code
     assert _outcome(_classify_soap(200, body)) == "soap-sender"
@@ -656,6 +660,15 @@ _FAULT_TAG_IN_MARKUP = {
     "comment-code-close-before-the-value": (
         "<env:Body><env:Fault><env:Code><!-- </env:Code> --><env:Value>env:Receiver</env:Value>"
         "</env:Code></env:Fault></env:Body>",
+        "transient",
+        "soap-fault",
+    ),
+    # Cut short at the commented close tag, the Code yields no code, and the fallback would read
+    # the commented Value ahead of it, so this one pins the Code close-tag step-over even with the
+    # fallback in place.
+    "comment-code-close-after-a-commented-value": (
+        "<env:Body><env:Fault><!-- <x:Value>Sender</x:Value> --><env:Code><!-- </env:Code> -->"
+        "<env:Value>env:Receiver</env:Value></env:Code></env:Fault></env:Body>",
         "transient",
         "soap-fault",
     ),
@@ -876,10 +889,10 @@ _MAX_LINEAR_RATIO = 8.0
 #: the three ``long-code-*`` shapes reach a code element's checks: ``long-code-close-prefix`` and
 #: ``long-code-text`` the faultcode's, in ``_code_text``, and ``long-code-close-prefixes`` the Code's
 #: close-tag search, ``_CODE_END_RE``. Since BACKLOG
-#: #5912 the name regexes are tried at most once each, anchored, ``faultcode`` and ``Code`` at the
-#: Fault's first child and ``Value`` at the Code's, so ``long-prefixes``, ``value-start-tags`` and
-#: ``unterminated-value-tags`` time the matches at the Fault's first child and the Fault close-tag
-#: scan rather than a name scan; ``unterminated-value-tags-in-a-code`` reaches the Value path. ``long-prefixes`` is here for the
+#: #5912 the name regexes are tried first anchored, ``faultcode`` and ``Code`` at the Fault's first
+#: child and ``Value`` at the Code's; where that read yields no code, as on ``long-prefixes``,
+#: ``value-start-tags`` and ``unterminated-value-tags``, the fallback's ``faultcode`` and ``Value``
+#: name scans run over the Fault too, so those shapes time them as well; ``unterminated-value-tags-in-a-code`` reaches the Value path. ``long-prefixes`` is here for the
 #: name regexes' ``[\w.\-]+:`` prefix class, which backtracks over each run that has no colon, and
 #: ``long-close-prefixes`` for the same class in the Fault close-tag scan, ``_FAULT_END_RE``.
 #: ``lt-run`` is the shape measured in ``SoapDestination._post_and_classify``'s docstring.
