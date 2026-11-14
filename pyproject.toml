@@ -277,23 +277,14 @@ dicom = ["pynetdicom==3.0.4", "pydicom>=3.0.2,<3.1"]
 # by-product. Its SOLE runtime dependency is the upstream defusedxml package, used to parse pyx12's
 # bundled TRUSTED map XML — not attacker input. The engine itself no longer depends on that package: it
 # parses through its own vendored copy (messagefoundry/_vendor/defusedxml/), so this extra is now the
-# only thing that installs upstream defusedxml. At least 4.0.1 because parsing/x12/validate.py resolves
-# error codes with pyx12.error_codes.x12_code_for, which 4.0.1 added when its JSON err_cde became a
-# pyx12 error name at segment, element and interchange level.
-# Pinned exactly: 4.0.1 is the release measured. Under 4.1.0, three tests in
-# tests/test_x12_validate.py fail on the ubuntu, windows-2022 and windows-2025 test legs (PR 2946):
-# test_sender_separators_cannot_forge_the_acks_st_segment,
-# test_sender_text_cannot_forge_the_closing_iea_of_a_fragment and
-# test_pyx12_itself_logs_the_value_when_unmuted. In each, the assertion that fails is a positive
-# control that a 4.0.1 defect is present: sender values echoed unescaped into the ack, and the raw
-# value logged. pytest stops at that assertion, so the engine's own assertions after it have not run
-# on 4.1.0. 4.1.0 is upstream's security release for those defects (its release notes: ack values
-# escaped, no data values in pyx12's log records, the HTML report escaped), with breaking changes of
-# its own. So this pin holds back an upstream security fix, and lifting it is security work: re-derive
-# at least those three tests' controls, run the engine's assertions, read 4.1.0's breaking changes
-# against parsing/x12/, and move the pyx12 entry in .github/dependabot.yml's uv ignore list in the
-# same PR.
-x12 = ["pyx12==4.0.1"]
+# only thing that installs upstream defusedxml. The floor is 4.1.0, upstream's security release: its
+# 997/999 acks write "?" for the segment terminator in the sender values they echo, so a hostile value
+# can no longer forge an ack segment, and its log records no longer carry the offending data value
+# unless log_data_values is set (the engine never sets it). The engine keeps its own guards against
+# both (parsing/x12/validate.py). The earlier floor reason still holds under it:
+# parsing/x12/validate.py resolves error codes with pyx12.error_codes.x12_code_for, which 4.0.1 added
+# when its JSON err_cde became a pyx12 error name at segment, element and interchange level.
+x12 = ["pyx12>=4.1.0"]
 # Optional XML/SOAP message accessor + schema validation + signature for parsing/xml/ (BACKLOG #31).
 # Lazy-imported, so installs that never touch XML skip it. lxml is the hardened XPath/serialize engine
 # (parser locked down directly — defusedxml does NOT cover lxml and defusedxml.lxml is deprecated);

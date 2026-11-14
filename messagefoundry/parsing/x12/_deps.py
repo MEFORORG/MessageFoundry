@@ -58,7 +58,7 @@ def load_x12_code_resolver() -> Callable[..., str | None]:
         import pyx12.error_codes
     except ImportError as exc:  # pragma: no cover - exercised only without the [x12] extra
         raise RuntimeError(
-            "strict X12 validation requires pyx12>=4.0.1 from the optional 'x12' extra: "
+            "strict X12 validation requires pyx12>=4.1.0 from the optional 'x12' extra: "
             "pip install 'messagefoundry[x12]'"
         ) from exc
     table = pyx12.error_codes.ERROR_CODES
