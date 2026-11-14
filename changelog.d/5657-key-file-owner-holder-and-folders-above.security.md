@@ -9,7 +9,10 @@
   the engine's own account, SYSTEM or Administrators, so a pair another account planted in the
   store directory is refused. On Windows a key file, or the directory that holds it, whose owner is a broad group or
   an application package, or cannot be read, is refused, and so is a key file in a directory that
-  lets a broad group delete a file in it or change its access list. Before, the Windows check read
+  lets a broad group delete a file in it or change its access list. When the directory that holds
+  the file is itself a junction or symbolic link, its target's access list is not read, so a
+  junction only the engine's account and the host's administrators can change, pointing to a
+  folder that lets a broad group delete a file in it, passes. Before, the Windows check read
   the key file's own access list alone, and the POSIX check followed a linked folder above the
   file whoever could re-point it. A right to list a directory or add a file to it is not refused,
   so a store directory the engine makes under `C:\ProgramData` still passes. The check applies at

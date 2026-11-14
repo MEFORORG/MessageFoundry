@@ -157,7 +157,10 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   above that says *"Nor are the folders above the directory checked"* is now partly closed. The
   check walks the folders on the directory's path and refuses a junction or link among them that
   another account can change, and on Windows it reads the folder that holds the directory and
-  refuses one a broad group may delete a file in, change the access list of, or owns. It still
+  refuses one a broad group may delete a file in, change the access list of, or owns. When that
+  folder is itself a junction or symbolic link, its target's access list is not read, so a
+  junction only the engine's account and the host's administrators can change, pointing to a
+  folder a broad group may delete a file in, passes. It still
   does not read whether a broad group may rename that folder or one above it, which `DELETE`
   allows, nor the access lists of the folders above the one that holds the directory, so the
   risk's replacement of the directory by such a group stands for those. A file in the directory
