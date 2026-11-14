@@ -284,6 +284,43 @@ async def test_an_error_held_from_a_lost_write_is_raised_after_the_refusal(
     assert len(refusals) == 1
 
 
+async def test_a_read_error_after_a_lost_write_names_itself_on_the_held_error(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first write raises a held defect and nothing lands; the read after it raises too. The
+    held defect is the one raised, with the read's error named on it rather than dropped."""
+    service, user_id, _first = await _signed_in(store, "kerberos")
+    await store.set_ad_group_role_map([(_GROUP, VIEWER)])
+    real_cas = store.set_user_roles_if_held
+    real_plain = store.set_user_roles
+    real_read_back = service._roles_read_back
+    calls: list[int] = []
+
+    async def racing(uid: str, role_ids: Sequence[str], **kw: Any) -> bool:
+        calls.append(1)
+        if len(calls) == 1:
+            await real_plain(uid, [ADMIN], audits=())
+            raise TypeError("synthetic defect")
+        return await real_cas(uid, role_ids, **kw)
+
+    async def lookup(_uid: str) -> Any:
+        raise sqlite3.OperationalError("synthetic: disk I/O error")
+
+    async def read_back(*args: Any, **kw: Any) -> bool | None:
+        landed = await real_read_back(*args, **kw)
+        monkeypatch.setattr(service, "_lookup_user_settled", lookup)
+        return landed
+
+    monkeypatch.setattr(store, "set_user_roles_if_held", racing)
+    monkeypatch.setattr(service, "_roles_read_back", read_back)
+    with pytest.raises(TypeError) as raised:
+        await _sign_in(service, "kerberos")
+    monkeypatch.undo()
+    assert any("OperationalError" in note for note in raised.value.__notes__)
+    assert len(calls) == 2
+    assert await store.get_user_role_ids(user_id) == [ADMIN]
+
+
 async def test_a_retry_whose_roles_cannot_be_read_back_ends_the_sessions_then_fails(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

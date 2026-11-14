@@ -316,9 +316,6 @@ class _SignInRolesUnread(RuntimeError):
     back, so it counted the change as written (vault BACKLOG #3085). Held, and raised once the
     revoke, the notice and the alerts have run: no session is minted on roles nobody read."""
 
-    def __init__(self) -> None:
-        super().__init__("the directory sign-in's roles could not be read back after its write")
-
 
 #: How far, in seconds, a verified repeat-revocation row's ``ts`` may fall before this engine's
 #: clock at the account's watermark and still count (``AuthService._already_revoked_elsewhere``).
@@ -1171,7 +1168,8 @@ ACCOUNT_REFUSED = "account_refused"
 DIRECTORY_LOCKED = "locked"
 
 #: The closed-set reason a directory sign-in is refused with when its role sync's compare-and-set
-#: finds the account's roles moved twice, by a reconciler or another sign-in, to a set that is not
+#: finds the account's roles moved twice by another writer (at least a reconciler, another sign-in
+#: or a custom role's deletion), the second time to a set that is not
 #: this sign-in's directory-derived one (vault BACKLOG #3085). The sign-in is refused, not the role
 #: write: whatever the other writer left stands, and nothing is written over it.
 ROLE_SYNC_CONTENDED = "role_sync_contended"
@@ -7811,9 +7809,10 @@ class AuthService:
 
         A write that finds the roles moved reads them again. Already at ``role_ids``, as a
         reconciler or another sign-in left them, is success with nothing changed by this sign-in.
-        Otherwise the write is tried once more against the set just read. A second loss writes
-        nothing and is reported as a ``refusal``, for the caller to refuse the sign-in, as is an
-        account gone or failing its seal at that read.
+        Otherwise the write is tried once more against the set just read, and a second loss reads
+        them again too: at ``role_ids`` is success, anything else writes nothing and is reported
+        as a ``refusal``, for the caller to refuse the sign-in. So is an account gone or failing
+        its seal at either read.
 
         BACKLOG #2221: a change's ``auth.ad_roles_resynced`` row commits in the role write's
         transaction, not after the revoke, because the roles are what it records. A sync that
@@ -7834,11 +7833,7 @@ class AuthService:
             if written:
                 return _SignInRoleSync(expected, held)
             try:
-                stored = await self._lookup_user(user.id)
-                if stored.refused:
-                    # As in :meth:`_roles_read_back`: a refused read is also a row re-keyed between
-                    # its row and role reads, so it is read once more and that read decides.
-                    stored = await self._lookup_user(user.id)
+                stored = await self._lookup_user_settled(user.id)
             except Exception as exc:
                 if held is None:
                     raise
@@ -7912,8 +7907,22 @@ class AuthService:
             return True, exc
         held = _hold(synced.held, synced.refused)
         if unread:
-            held = _hold(held, _SignInRolesUnread())
+            held = _hold(
+                held,
+                _SignInRolesUnread(
+                    "the directory sign-in's roles could not be read back after its write"
+                ),
+            )
         return synced.result, held
+
+    async def _lookup_user_settled(self, user_id: str) -> _UserLookup:
+        """:meth:`_lookup_user`, read once more when the first read is refused: ``_lookup_user``
+        also reads a row deleted or re-keyed between its row and role reads as refused, so the
+        second read decides."""
+        stored = await self._lookup_user(user_id)
+        if stored.refused:
+            stored = await self._lookup_user(user_id)
+        return stored
 
     async def _roles_read_back(
         self, user_id: str, username: str, role_ids: Iterable[str], *, where: str
@@ -7925,11 +7934,7 @@ class AuthService:
         landed is reported rather than missed. Read through the seal, so the roles compared are
         ones the seal vouches for. Any other read error raises, and an account gone is ``False``."""
         try:
-            stored = await self._lookup_user(user_id)
-            if stored.refused:
-                # ``_lookup_user`` also reads a row deleted or re-keyed after its row read as
-                # refused, so a refused read is read once more and that read decides.
-                stored = await self._lookup_user(user_id)
+            stored = await self._lookup_user_settled(user_id)
         except audit_write_errors() as exc:
             if _is_held_write_error(exc):
                 raise
@@ -8200,7 +8205,8 @@ class AuthService:
             # is refused for taking Administrator from its last holder (owner ruling 2026-10-13,
             # #3229); this one did not happen. A session minted on roles this sign-in could not
             # establish would be the open direction.
-            if federated:
+            # ``account_refused`` keeps the shape it has elsewhere in this method on both legs.
+            if federated and sync.refusal == ROLE_SYNC_CONTENDED:
                 await self._directory_reject_audit(
                     principal.username,
                     "oidc",
