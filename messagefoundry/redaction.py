@@ -1552,6 +1552,8 @@ _XML_PHI_ELEMENT = re.compile(
 _XML_TAG = re.compile(r"<(/?)((?:[A-Za-z_][\w.-]*+:)?([A-Za-z_][\w.-]*+))")
 #: The rest of an end tag, up to its ``>``.
 _XML_END_TAG_REST = re.compile(r"[^<>]*+>?")
+#: The part of that rest on the tag's own line, before its ``>``: what :func:`_end_tag_rest` masks.
+_END_TAG_LINE = re.compile(r"[^<>\r\n]*+")
 #: One part of a start tag after its name: whitespace, the tag's end, an attribute and the opening of
 #: its quoted value (the value itself is read by :data:`_XML_ATTR_VALUE`), or anything else.
 #:
@@ -1636,6 +1638,32 @@ def _xml_text(chunk: str, policy: int) -> str:
     return f"{chunk[:lead]}{_REDACTED}{chunk[len(chunk.rstrip()) :]}"
 
 
+def _end_tag_rest(text: str, start: int, stop: int) -> str:
+    """The rest of an end tag, ``text[start:stop]``, with the words on the tag's own line masked in
+    place when :func:`_maskable_rest` says masking them changes no pass's reading (BACKLOG #5925).
+
+    Well-formed XML allows only whitespace there, so a word is a value a malformed tag carried: inside
+    the tag (``</family Zqxdoe>``) or after one that never got its ``>`` (``</family Zqxdoe``). It was
+    copied as it stood, and printed. It is MASKED, not replaced, for the reason the section on
+    :data:`_SHAPE` gives: a placeholder changed the answer's length and dropped words a name run
+    would have joined, so a redacted answer joined to a caller's raw text and redacted again printed
+    what main's hid. The mask keeps every character's class, so every later pass, a second call and
+    a limit read the answer as they read main's.
+
+    Where :func:`_maskable_rest` refuses -- punctuation, a word some pass reads literally, a date,
+    more than :data:`_GLUED_VALUE_MAX` characters -- the rest stays as it stood, and that is the
+    residual, at least these: ``</family Zq, Doe>``, ``</family password: x>``, a rest opening with
+    a tab, and any word after a line break inside the tag."""
+    line = _END_TAG_LINE.match(text, start, stop)
+    end = line.end() if line is not None else start
+    if end - start > _GLUED_VALUE_MAX:
+        return text[start:stop]
+    rest = _maskable_rest(text, start, end, _HL7_FIELD_RUN, credential=False)
+    if rest is None:
+        return text[start:stop]
+    return rest.translate(_SHAPE) + text[end:stop]
+
+
 def _scrub_xml_element(
     text: str, match: re.Match[str], last_close: dict[str, int]
 ) -> tuple[str, int]:
@@ -1666,7 +1694,8 @@ def _scrub_xml_element(
         if tag.group(1):  # an end tag: close back to the element it names, if it is open at all
             rest = _XML_END_TAG_REST.match(text, tag.end())
             pos = rest.end() if rest is not None else tag.end()
-            out.append(text[tag.start() : pos])
+            out.append(tag.group())
+            out.append(_end_tag_rest(text, tag.end(), pos))
             if open_names.get(qname):
                 while stack:
                     name, _ = stack.pop()
@@ -1699,7 +1728,10 @@ def _redact_xml_elements(text: str) -> str:
     carries an attribute, or its content opens with a child tag or a word character. That is where the
     fail-closed rule has exceptions, at least these: a cut that strands ``<family> Van`` (text opening
     with whitespace) or ``<family>(Van`` (opening with punctuation) reads as prose, and the fragment
-    before the cut survives. A closed element is always scrubbed, whatever its text opens with."""
+    before the cut survives. A closed element is always scrubbed, whatever its text opens with.
+
+    Words after an end tag's name, inside a malformed tag or after one with no ``>``, are masked in
+    place where that is safe, and kept as they stood where it is not (:func:`_end_tag_rest`)."""
     if "<" not in text:
         return text
     out: list[str] = []
