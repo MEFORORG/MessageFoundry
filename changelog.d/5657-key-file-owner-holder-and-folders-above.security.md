@@ -1,15 +1,14 @@
 - **The key-file access check now judges a junction or link on a key file's path, and on Windows
   the key file's owner and the directory that holds it.** On every platform a junction or a link
-  on a key file's path is judged by who can change it, as `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py`
-  define. On Windows the TLS pair the engine mints must be owned by the engine's own account,
-  SYSTEM or Administrators, so a pair another account planted in the store directory is refused,
+  the walk of a key file's path finds is judged by who can change it, as `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py`
+  define. On Windows the TLS key the engine mints must be owned by the engine's own account,
+  SYSTEM or Administrators, so a key another account planted in the store directory is refused,
   and a key file whose owner is a broad group or an application package, or cannot be read, is
   refused. On Windows the check also reads the owner and access list of the directory that holds
   the key file, and refuses the file when a broad group or an application package may delete a
   file in that directory, change its access list or take it over, or when its owner is such a
-  group or cannot be read. This holds when that directory is an ordinary folder, not a junction, a symbolic link, a
-  folder a volume is mounted on or a drive root. It judges nothing else about that directory or the folders around it: treat any other path
-  shape, and any other right or account, as not judged, and restrict the folder that holds each
+  group or cannot be read. This holds when that directory is an ordinary folder, not a junction, a symbolic link, or a
+  folder a volume is mounted on. Treat anything else about that directory or the folders around it as not judged, and restrict the folder that holds each
   key file, the secrets directory and the folders above them yourself. Before, the Windows check read
   the key file's own access list alone, and the POSIX check followed a linked folder above the
   file whoever could re-point it. The check applies at least to the generated and the operator's

@@ -415,7 +415,7 @@ than a path is not checked
   account may own the file, as the administrator who copied in your own TLS key may. LOCAL SERVICE
   and NETWORK SERVICE are accounts that many services share, and the check does not report them.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On every platform the check
-  judges each junction or link on the key file's path by who can change it, as `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py`
+  judges each junction or link its walk of the key file's path finds by who can change it, as `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py`
   define. A key file that is itself a link is refused whoever can change it. The TLS pair
   the engine mints is one only it writes, so on Windows its key's owner must also be the engine's
   own account, SYSTEM or Administrators: a pair another account planted in the store directory
@@ -424,11 +424,10 @@ than a path is not checked
   file, and refuses the file when one of the groups above or an application package may delete a
   file in that directory, change its access list or take it over (`FILE_DELETE_CHILD`,
   `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when its owner is such a group or cannot be
-  read. This holds when that directory is an ordinary folder, not a junction, a symbolic link, a
-  folder a volume is mounted on or a drive root. A holder whose access list the engine's
+  read. This holds when that directory is an ordinary folder, not a junction, a symbolic link, or a
+  folder a volume is mounted on. A holder whose access list the engine's
   account may not read is refused: give that account read access to the folder's permissions.
-  It judges nothing else about that directory or the folders around it: treat any other path
-  shape, and any other right or account, as not judged, and restrict the folder that holds each
+  Treat anything else about that directory or the folders around it as not judged, and restrict the folder that holds each
   key file, the secrets directory and the folders above them yourself.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
