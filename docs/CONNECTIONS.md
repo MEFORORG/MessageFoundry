@@ -2955,9 +2955,13 @@ else, such as a DOCTYPE or a lowercase `<![cdata[`; and a `</` inside such marku
 `faultcode` or `Value` itself, which still ends the code text. Where that read yields no code, for
 those shapes, for a first child that is neither element (a SOAP 1.1 `faultstring` before the
 `faultcode`, a SOAP 1.2 `Reason` before the `Code`), or for a code element that holds no code, the
-code falls back to the earlier search: the Fault's first `faultcode`, or a `Value` ahead of it,
-markup not stepped over. A Fault start tag, a `</Fault>` or a `</Code>` inside such markup is stepped over, so the
-real Fault and its code are read; only where every Fault start tag after the first Body start tag,
+code falls back to the earlier search: the Fault's first `faultcode`, or a `Value` ahead of it, up
+to the first `</Fault>`. That fallback steps over no markup, as the earlier search did not: a
+`faultcode` or `Value` inside a comment counts, and a `</Fault>` inside one ends its range, so a
+`</soap:Fault>` inside a comment ahead of the `faultcode` (`<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>`)
+still leaves no code and dead-letters, as before. A Fault start tag inside such markup is stepped
+over, so the real Fault is read, and a `</Fault>` or `</Code>` inside it does not end the
+first-child read; only where every Fault start tag after the first Body start tag,
 or with none there every one, is inside such markup is the first of them taken as the Fault, so such
 a reply never reads as delivered. A Fault where neither read finds a code reads as a permanent fault.
 The WS-Security check is separate: a WS-Security code anywhere from where the Fault search starts (after

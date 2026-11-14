@@ -157,9 +157,10 @@ _WSSE_FAULT_RE = re.compile(
 # only inside the Fault _FAULT_RE matched, up to that Fault's close tag (_FAULT_END_RE) or the reply's
 # end. BACKLOG #5912: the code element is the Fault's first child, a faultcode or a Code (_CODE_RE),
 # and for a Code the Value that is its own first child, up to its close tag (_CODE_END_RE);
-# _fault_code says why, and when it falls back to the earlier search (_searched_code). The Fault
-# and Code close tags are searched for outside markup, with
-# _FAULT_END_OUTSIDE_MARKUP_RE and _CODE_END_OUTSIDE_MARKUP_RE, which hold these two patterns.
+# _fault_code says why, and when it falls back to the earlier search (_searched_code). For the
+# first-child read the Fault and Code close tags are searched for outside markup, with
+# _FAULT_END_OUTSIDE_MARKUP_RE and _CODE_END_OUTSIDE_MARKUP_RE, which hold these two patterns; the
+# fallback's range ends at the first plain _FAULT_END_RE match, markup not stepped over.
 _FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
 _CODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])", re.IGNORECASE)
 _CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
