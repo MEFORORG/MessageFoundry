@@ -193,3 +193,87 @@ def test_every_invocation_controls_stay_allowed(
 ) -> None:
     """An invocation that names an ungoverned tree, or the session's own worktree, is still allowed."""
     assert _allowed(rig, _fmt(rig, template), _cwd(rig, where))
+
+
+# ------------------------------------------------------------------ review round 3411eb8641
+#
+# Each row was measured ALLOW on the first build of this branch (and on origin/main) by the reviewer.
+
+
+@pytest.mark.parametrize(
+    ("template", "where", "text", "tool"),
+    [
+        # A chdir on an EARLIER line, then a decoy -C that switched the old text fallback off.
+        ("cd {p}\ngit -C {o} status ; git reset --hard", "outside", "SHARED PRIMARY", "Bash"),
+        (
+            "Set-Location {p}\ngit -C {o} status; git reset --hard",
+            "outside",
+            "SHARED PRIMARY",
+            "PowerShell",
+        ),
+        ("cd {wt}\ngit -C {o} status ; git checkout {b}", "outside", "LINKED WORKTREE", "Bash"),
+        # A harmless disarm-key write earlier on the line hid a later one from rule 3c.
+        ("git config alias.lg log ; git -C '{p}' config {k}", "outside", "SHARED git", "Bash"),
+        ("git -C {o} config alias.lg log ; git -C {p} config {k}", "outside", "SHARED git", "Bash"),
+        # A relative --git-dir or GIT_DIR was rooted on the line's first -C, not on the cwd.
+        (
+            "git -C {o}/sub status ; git --git-dir=../Primary/.git checkout {b}",
+            "outside",
+            "through --git-dir or GIT_DIR",
+            "Bash",
+        ),
+        (
+            "git -C {o}/sub status ; GIT_DIR=../Primary/.git git checkout {b}",
+            "outside",
+            "through --git-dir or GIT_DIR",
+            "Bash",
+        ),
+        (
+            "git -C {o}/sub status ; git --git-dir='../Primary/.git' checkout {b}",
+            "outside",
+            "through --git-dir or GIT_DIR",
+            "Bash",
+        ),
+        # A relative tree handed to rule 3b was asked of git from the hook's own directory.
+        (
+            "git -C {o} status ; git -C ../Primary-wt checkout {b}",
+            "outside",
+            "LINKED WORKTREE",
+            "Bash",
+        ),
+        (
+            "git -C {o} status ; cd ../Primary-wt && git checkout {b}",
+            "outside",
+            "LINKED WORKTREE",
+            "Bash",
+        ),
+        (
+            "git -C {o} status ; git -C ../Primary-wt reset --hard",
+            "outside",
+            "LINKED WORKTREE",
+            "Bash",
+        ),
+        # A git word the owning-token pattern misses read an earlier command's -C.
+        ("git -C {o} stash list ; git.EXE reset --hard", "primary", "SHARED PRIMARY", "Bash"),
+    ],
+)
+def test_review_round_one_shapes_are_denied(
+    rig: SimpleNamespace, template: str, where: str, text: str, tool: str
+) -> None:
+    reason = _reason(rig, _fmt(rig, template), _cwd(rig, where), tool)
+    assert text in reason, reason
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["git -C '{wt}' checkout 'feat(x)'", "git -C {o} status ; git -C {wt} checkout 'feat(x)'"],
+)
+def test_a_quoted_destination_the_scan_blanks_is_still_read(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """A branch name that needs quoting is read from the raw line, as the first reading reads it."""
+    subprocess.run(
+        ["git", "-C", str(rig.primary), "branch", "feat(x)"], check=True, capture_output=True
+    )
+    reason = _reason(rig, _fmt(rig, template), rig.outside)
+    assert "LINKED WORKTREE" in reason, reason
