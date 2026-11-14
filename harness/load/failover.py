@@ -779,10 +779,11 @@ async def _monitor_failover(
     whatever the survivor delivered in the gap, and a drain that finished there would time out. A
     failed read never stands in as zero, which would read the next read as instant recovery: it
     keeps the last good baseline. With no good read before promotion, the first good read after it
-    becomes the baseline, which can miss a recovery (a timeout, a FAIL) but not invent one. One
-    residue stays: a commit the dying primary had already sent can land after an early baseline read,
-    and if every later standby read fails it reads as the survivor's progress. ``kill()`` does not
-    wait for the process to exit, so a later standby read is the only thing that narrows it.
+    becomes the baseline, which can miss a recovery (a timeout, a FAIL) but not invent one. At least
+    one residue stays: a commit the dying primary had already sent can land after an early baseline
+    read, and if every later standby read fails it reads as the survivor's progress. ``kill()`` does
+    not wait for the process to exit; a later standby read narrows the window, and so would awaiting
+    that exit before the monitor starts, which this rig does not do.
 
     The CONTINUOUS single-leader SLO (H6): every poll observes BOTH nodes' roles and folds the count of
     simultaneous primaries into a :class:`LeadershipTracker`, so a split-brain that flickers *between*
@@ -817,7 +818,8 @@ async def _monitor_failover(
                     baseline = cur.done
                     notes.append(
                         "no stats read was usable as a baseline before promotion (none succeeded on a "
-                        "standby poll); the recovery baseline is the first read after it, so a recovery "
+                        "poll the survivor answered as standby, or the first poll already saw it "
+                        "primary); the recovery baseline is the first read after it, so a recovery "
                         "that finished before that read is not measured"
                     )
                 elif cur.done > baseline:

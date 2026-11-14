@@ -552,8 +552,9 @@ def _monitor(
         world.next_poll()
         await real_sleep(0)
 
-    # The module reads asyncio.sleep at call time, so patching the module attribute reaches it.
-    monkeypatch.setattr(asyncio, "sleep", end_poll)
+    # Only the failover module sees this sleep: its own asyncio name, not the process-wide module,
+    # is swapped, so no other event loop in the process can end a scripted poll.
+    monkeypatch.setattr(failover, "asyncio", SimpleNamespace(sleep=end_poll))
     notes: list[str] = []
     outcome = asyncio.run(
         failover._monitor_failover(

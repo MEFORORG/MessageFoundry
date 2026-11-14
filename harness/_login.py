@@ -45,7 +45,9 @@ class LoginDialog(QDialog):
         # BACKLOG #2009 (ASVS 6.4.5): when must_change_password is set, the instant the engine stops
         # accepting the temporary password (LoginResponse.credential_expires_at), or None.
         self.credential_expires_at: float | None = None
-        self.mfa_required = False  # engine wants a second factor before sensitive ops (WP-14)
+        # The engine refuses every authorized route on this session until a second factor is
+        # verified (WP-14); the monitor's _ensure_auth asks for it.
+        self.mfa_required = False
         self.entered_password = ""  # nosec B105 (empty seam init, not a credential)
 
         self._username = QLineEdit()

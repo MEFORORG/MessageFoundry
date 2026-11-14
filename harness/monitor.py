@@ -352,10 +352,12 @@ class MonitorPanel(QWidget):
         A user who leaves the dialog's code blank, or whose engine requires MFA, gets an
         MFA-pending session, on which the engine refuses every poll and action. When the account
         has an authenticator enrolled, ask once for a TOTP or recovery code and verify it. Return
-        False when it has none (enrolment, or a passkey, is the web console's), on a cancel or a
-        blank answer, and on any refusal, naming the engine's reason; the caller then ends the
-        pending session. ``verify_mfa`` rotates the session, and the polling client is built from
-        the rotated token after this returns."""
+        False when it has none (a passkey cannot answer here, and enrolment is the web console's),
+        on a cancel or a blank answer, and on any refusal, naming the engine's reason; the caller
+        then ends the pending session. ``verify_mfa`` rotates the session, and the polling client is
+        built from the rotated token after this returns. A verify whose reply is lost is the one
+        case that can strand a session: the engine may have rotated it, and the caller's logout
+        then ends only the old token, so the status says the outcome is unknown."""
         try:
             totp_enrolled = client.mfa_status().enabled
         except ApiError as exc:
@@ -363,8 +365,8 @@ class MonitorPanel(QWidget):
             return False
         if not totp_enrolled:
             self._set_status(
-                "Account needs a second factor this panel cannot take: enrol an authenticator, or "
-                "sign in with a passkey, in the web console first.",
+                "Account needs a second factor, and this panel takes only an authenticator app "
+                "code: enrol an authenticator in the web console first.",
                 error=True,
             )
             return False
@@ -381,7 +383,11 @@ class MonitorPanel(QWidget):
         try:
             client.verify_mfa(code)
         except ApiError as exc:
-            self._set_status(f"second factor refused: {exc}", error=True)
+            if exc.status is None:
+                # No answer: the engine may have verified and rotated the session anyway.
+                self._set_status(f"second factor outcome unknown: {exc}", error=True)
+            else:
+                self._set_status(f"second factor refused: {exc}", error=True)
             return False
         return True
 

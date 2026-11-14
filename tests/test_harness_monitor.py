@@ -764,15 +764,24 @@ class _MfaPendingClient(_RefusedClient):
 
     GOOD = "123456"
 
-    def __init__(self, *, totp: bool = True, refusal: ApiError | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        totp: bool = True,
+        refusal: ApiError | None = None,
+        status_error: ApiError | None = None,
+    ) -> None:
         super().__init__("tok-pending", logout_fails=False)
         self.codes: list[str] = []
         self.polling_token: str | None = None
         self._totp = totp
         self._refusal = refusal
+        self._status_error = status_error
 
     def mfa_status(self) -> Any:
         self.calls.append("mfa_status")
+        if self._status_error is not None:
+            raise self._status_error
         return SimpleNamespace(enabled=self._totp)
 
     def verify_mfa(self, code: str) -> None:
@@ -844,9 +853,30 @@ def test_an_mfa_pending_sign_in_verifies_the_code_before_connecting(
             ["123456"],
             "the directory could not confirm it",
         ),
+        (
+            {"refusal": ApiError("could not reach engine: timed out")},
+            ("123456", True),
+            ["123456"],
+            "second factor outcome unknown: could not reach engine",
+        ),
         ({"totp": False}, None, [], "enrol an authenticator"),
+        (
+            {"status_error": ApiError("engine unavailable", status=503)},
+            None,
+            [],
+            "engine unavailable",
+        ),
     ],
-    ids=["cancelled", "blank", "wrong-code", "session-ended", "refused", "no-authenticator"],
+    ids=[
+        "cancelled",
+        "blank",
+        "wrong-code",
+        "session-ended",
+        "refused",
+        "reply-lost",
+        "no-authenticator",
+        "status-unreadable",
+    ],
 )
 def test_an_unverified_second_factor_ends_the_pending_session(
     qapp: Any,
