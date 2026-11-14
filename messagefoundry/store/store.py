@@ -4921,15 +4921,32 @@ def report_refused_role_holder() -> None:
     )
 
 
-#: The sealed columns ``rotate-key``'s re-seal passes move to the active key, as ``(table, column)``,
-#: read back after the passes by each backend's ``_unrotated_seals`` (vault BACKLOG #5635). The two
-#: directory maps' seals are read through ``get_ad_map``. Constants, never input, so each backend
-#: may format them into its SQL.
+#: The sealed columns ``rotate-key``'s re-seal passes move to the active key, as ``(table, column,
+#: filter)``, read back after the passes (vault BACKLOG #5635). Approvals are the open ones alone,
+#: as ``count_unsealed_approvals`` counts them: a decided request releases nothing, so a seal on
+#: one must not hold a rotation open. Constants, never input, so :func:`unrotated_seal_queries`
+#: formats them into SQL.
 RESEALED_SEAL_COLUMNS: Final = (
-    ("users", "authz_seal"),
-    ("roles", "seal"),
-    ("pending_approvals", "seal"),
+    ("users", "authz_seal", ""),
+    ("roles", "seal", ""),
+    ("pending_approvals", "seal", " AND status IN ('pending', 'executing', 'interrupted')"),
+    ("authority_set_seal", "seal", ""),
 )
+
+
+def unrotated_seal_queries(placeholder: str, *, collate: str = "") -> tuple[tuple[str, str], ...]:
+    """``(table, SELECT)`` for each of :data:`RESEALED_SEAL_COLUMNS`: its seals that are not blank
+    and do not name the active key, whose ``LIKE`` pattern the one ``placeholder`` takes. Each
+    backend runs these after its re-seal passes and hands the rows to ``classify_unrotated``.
+    ``collate`` is SQL Server's binary collation, so the filter matches as its passes match."""
+    return tuple(
+        (
+            table,
+            f"SELECT {column} AS seal FROM {table} WHERE {column} <> ''"
+            f" AND {column}{collate} NOT LIKE {placeholder}{where}",
+        )
+        for table, column, where in RESEALED_SEAL_COLUMNS
+    )
 
 
 def report_user_reseal(resealed: int, refused: int) -> None:
@@ -12257,6 +12274,7 @@ class MessageStore:
         supplied via ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED``) — it never silently drops PHI. Returns the
         number of values rewritten."""
         cipher = self._cipher
+        self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
             # and the comment named only the harmless one. IdentityCipher means NO key is
@@ -19172,23 +19190,18 @@ class MessageStore:
         one (vault BACKLOG #5635); empty before one has run."""
         return self._reseal_outcome
 
-    async def _unrotated_seals(self) -> list[object]:
-        """Every stored seal in :data:`RESEALED_SEAL_COLUMNS`, and each directory map's, that does
-        not name the active key, read after the re-seal passes (vault BACKLOG #5635)."""
+    async def _unrotated_seals(self) -> list[tuple[str, object]]:
+        """``(table, seal)`` for every seal :func:`unrotated_seal_queries` selects, read after the
+        re-seal passes (vault BACKLOG #5635)."""
         sealer = self._row_sealer
         if sealer is None:
             return []
         active = f"{SEAL_PREFIX}{sealer.key_id}:%"
-        seals: list[object] = []
+        seals: list[tuple[str, object]] = []
         async with self._read() as db:
-            for table, column in RESEALED_SEAL_COLUMNS:
-                cur = await db.execute(
-                    f"SELECT {column} FROM {table} WHERE {column} <> '' AND {column} NOT LIKE ?",
-                    (active,),
-                )
-                seals.extend(r[0] for r in await cur.fetchall())
-        for name in AD_MAPS:
-            seals.append((await self.get_ad_map(name)).seal)
+            for table, sql in unrotated_seal_queries("?"):
+                cur = await db.execute(sql, (active,))
+                seals.extend((table, r[0]) for r in await cur.fetchall())
         return seals
 
     async def reseal_user_records(self) -> tuple[int, int]:

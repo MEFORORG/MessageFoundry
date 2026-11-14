@@ -53,6 +53,7 @@ from typing import Final, Protocol
 
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.store.crypto import (
+    _KEY_ID_LEN,
     NO_STORE_ID,
     Cipher,
     CipherError,
@@ -358,9 +359,15 @@ class RowSealer:
         be genuine and sealed under a retired key the run was not given, so the run is PARTIAL
         until a run that holds that key re-seals it. A row whose seal fails under a key this
         sealer holds, or that is malformed, answers ``False``: no key re-seals it, so it must not
-        hold the rotation open."""
+        hold the rotation open. A key id that is not one :func:`row_seal_key_id` could return is
+        malformed."""
         parsed = self._parse(stored)
-        return parsed is not None and parsed[0] != self.key_id and parsed[0] not in self._retired
+        if parsed is None or parsed[0] == self.key_id or parsed[0] in self._retired:
+            return False
+        # Only an id a key could have: row_seal_key_id's lower-case hex digest prefix. Any other
+        # text no writer made, so it is a malformed seal and must not hold a rotation open.
+        key_id = parsed[0]
+        return len(key_id) == _KEY_ID_LEN and all(c in "0123456789abcdef" for c in key_id)
 
     # The awaited forms (ADR 0217 slice 1, the async seal seam), so one call site can serve this
     # sealer and :class:`TransitRowSealer`. No I/O: each answers in the calling coroutine.
@@ -890,30 +897,46 @@ class ResealOutcome:
     ``reseal_outcome`` returns, so the command can tell a finished rotation from one that left a
     row sealed under a key it was not given.
 
-    ``unheld`` counts the user, role, approval and directory-map seals that name a retired key the
-    run did not hold. Dropping that key strands them, so the run is PARTIAL. ``refused`` counts the
-    rest it left: a seal that fails under a key the run holds, or is malformed. No key re-seals
+    ``unheld`` counts the user, role, open approval and directory-map seals that name a key the run
+    did not hold, which may be a retired key it was not given: dropping that key would strand
+    them, so the run is PARTIAL. ``unheld_tables`` and ``unheld_key_ids`` say where they are and
+    which seal key ids they name, both non-secret, so an operator can find them. ``refused`` counts
+    the rest it left: a seal that fails under a key the run holds, or is malformed. No key re-seals
     those, so they never hold a rotation open; failing on them would fail every later run too."""
 
     unheld: int = 0
     refused: int = 0
+    unheld_tables: tuple[str, ...] = ()
+    unheld_key_ids: tuple[str, ...] = ()
 
 
-def classify_unrotated(sealer: AnyRowSealer | None, seals: Iterable[object]) -> ResealOutcome:
-    """The :class:`ResealOutcome` for ``seals``, each a stored seal a re-seal pass read after it
-    ran. A blank seal or one under the active key is not counted. Under a Transit sealer, or no
-    sealer, nothing is: ``rotate-key`` refuses vault_transit before it opens the store."""
+def classify_unrotated(
+    sealer: AnyRowSealer | None, seals: Iterable[tuple[str, object]]
+) -> ResealOutcome:
+    """The :class:`ResealOutcome` for ``seals``, each ``(table, stored seal)`` a re-seal pass's
+    table held after it ran. A blank seal or one under the active key is not counted. Under a
+    Transit sealer, or no sealer, nothing is: ``rotate-key`` refuses vault_transit before it opens
+    the store."""
     if not isinstance(sealer, RowSealer):
         return ResealOutcome()
     unheld = refused = 0
-    for stored in seals:
+    tables: set[str] = set()
+    key_ids: set[str] = set()
+    for table, stored in seals:
         if not stored or sealer.is_active(stored if isinstance(stored, str) else None):
             continue
         if sealer.names_unheld_key(stored):
             unheld += 1
+            tables.add(table)
+            key_ids.add(str(stored)[len(SEAL_PREFIX) :].partition(":")[0])
         else:
             refused += 1
-    return ResealOutcome(unheld=unheld, refused=refused)
+    return ResealOutcome(
+        unheld=unheld,
+        refused=refused,
+        unheld_tables=tuple(sorted(tables)),
+        unheld_key_ids=tuple(sorted(key_ids)),
+    )
 
 
 async def require_seal_for_write(

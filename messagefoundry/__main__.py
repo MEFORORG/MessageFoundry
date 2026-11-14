@@ -11524,7 +11524,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    async def run() -> tuple[int, ResealResult, tuple[bool, str], bool, ResealOutcome]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str], bool, ResealOutcome, bool]:
         import datetime
 
         from messagefoundry.pipeline.secret_rotation import (
@@ -11592,12 +11592,13 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # audit step the newest range is; a stamp would tell the watcher the rotation finished.
             # The run that completes still sees the old fingerprint here and stamps then, because the
             # open rotation record keeps every engine start from stamping it first (BACKLOG #3737).
-            if (
-                isinstance(store, SecretRotationMetaStore)
-                and rolled[0]
-                and not uploads.incomplete
-                and not seals.unheld
-            ):
+            # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading
+            # stdout must not see OK and drop the retired key while the audit roll failed (BACKLOG
+            # #1904), while an uploaded file may still be under that key (BACKLOG #3181), or while
+            # a sealed record is still under a key this run was not given (vault BACKLOG #5635).
+            # Decided once, here, so the stamp and the OK line cannot disagree.
+            done_all = rolled[0] and not uploads.incomplete and not seals.unheld
+            if isinstance(store, SecretRotationMetaStore) and done_all:
                 if key_id:
                     meta = await store.get_secret_rotation_meta()
                     prior = meta.get("MEFOR_STORE_ENCRYPTION_KEY")
@@ -11637,7 +11638,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # way out only then: a run with the key already stamped opens no record, and a
             # refusal a re-run or a restored key clears has its own remedy in the roll's error.
             way_out = record_named and not rolled[0] and audit_roll_refused_for_good(rolled[1])
-            return count, uploads, rolled, way_out, seals
+            return count, uploads, rolled, way_out, seals, done_all
         finally:
             await store.close()
 
@@ -11651,7 +11652,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         *_key_unresolved(),
     )
     try:
-        count, uploads, (rolled_ok, rolled_msg), name_way_out, seals = run_guarded(run())
+        count, uploads, (rolled_ok, rolled_msg), name_way_out, seals, complete = run_guarded(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -11695,11 +11696,6 @@ def _rotate_key(args: argparse.Namespace) -> int:
         f"re-encrypted {count} value(s) under the active key"
         f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
     )
-    # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
-    # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904), or while an
-    # uploaded file may still be under that key (BACKLOG #3181), or while a user, role, approval or
-    # directory-map row is still sealed under a key this run was not given (vault BACKLOG #5635).
-    complete = rolled_ok and not uploads.incomplete and not seals.unheld
     print(f"OK: {done}" if complete else f"PARTIAL: {done}")
     if uploads.sealed_plaintext:
         # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
@@ -11766,22 +11762,26 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # row changed outside the store. No key re-seals it, so it must not fail the run, or every
         # later run would fail on it too (the BACKLOG #3181 precedent). Said here, not only logged.
         print(
-            f"note: {seals.refused} user, role, approval or directory-map record(s) failed their "
-            "integrity seal and were left as they are. Each is refused on every read, and no key "
-            "re-seals it, so it does not hold this rotation open. The log names each kind. "
-            "Recreate or remove them."
+            f"note: {seals.refused} user, role, open approval or directory-map record(s) failed "
+            "their integrity seal under a key this run holds, or carry a malformed seal, and were "
+            "left as they are. Each is refused on every read, and no key re-seals it, so it does "
+            "not hold this rotation open. Recreate or remove them. The log's refused counts "
+            "include any record still sealed under a key this run was not given."
         )
     if seals.unheld:
         # Vault BACKLOG #5635: these name a retired key this run was not given, so they are still
         # sealed under it, and dropping it locks them out for good. The stamp and the rotation
         # record's close were withheld in run(), as for a skipped upload.
         print(
-            f"error: {seals.unheld} user, role, approval or directory-map record(s) are still "
-            "sealed under a retired key this run was not given, so they were NOT re-sealed. "
-            "Supply that key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run rotate-key BEFORE "
-            "retiring any prior key. A record whose seal names a key no one ever held was changed "
-            "outside the store: recreate or remove it, then re-run. This run did not stamp the "
-            "key's rotation date, and the rotation stays open.",
+            f"error: {seals.unheld} user, role, open approval or directory-map record(s) "
+            f"in {', '.join(seals.unheld_tables)} name a seal key this run does not hold "
+            f"(seal key id(s) {', '.join(seals.unheld_key_ids)}; each seal starts "
+            "mfseal:v1:<id>:), so they were NOT re-sealed. The causes include at least a prior "
+            "key that was not supplied, a key that is lost, and a seal written outside the store. "
+            "Supply the prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run rotate-key "
+            "BEFORE retiring any prior key. Where no key you hold opens it, recreate or remove "
+            "the record, then re-run. This run did not stamp the key's rotation date, and the "
+            "rotation stays open.",
             file=sys.stderr,
         )
     if not rolled_ok:

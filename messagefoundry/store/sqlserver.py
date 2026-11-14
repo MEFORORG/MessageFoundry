@@ -237,7 +237,6 @@ from messagefoundry.store.store import (
     REINGRESS_ARTIFACT_MISSING,
     REINGRESS_PEEK_FAILED,
     REINGRESS_TARGET_PREFIX,
-    RESEALED_SEAL_COLUMNS,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -419,6 +418,7 @@ from messagefoundry.store.store import (
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    unrotated_seal_queries,
     user_disabled_change,
     user_insert_params,
     user_reseal_params,
@@ -9787,6 +9787,7 @@ class SqlServerStore:
         Each batch's re-encrypt list is built UP FRONT so an undecryptable value raises BEFORE any
         UPDATE (all-or-nothing; PHI never dropped). Skips rows already under the active key and
         blank/purged values."""
+        self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
@@ -15057,22 +15058,16 @@ class SqlServerStore:
         """store.py's ``MessageStore.reseal_outcome`` states the contract (vault BACKLOG #5635)."""
         return self._reseal_outcome
 
-    async def _unrotated_seals(self) -> list[object]:
+    async def _unrotated_seals(self) -> list[tuple[str, object]]:
         """store.py's ``MessageStore._unrotated_seals`` states the contract (vault BACKLOG #5635)."""
         sealer = self._row_sealer
         if sealer is None:
             return []
         active = f"{SEAL_PREFIX}{sealer.key_id}:%"
-        seals: list[object] = []
-        for table, column in RESEALED_SEAL_COLUMNS:
-            rows = await self._fetchall(
-                f"SELECT {column} AS seal FROM {table}"
-                f" WHERE {column} <> '' AND {column} NOT LIKE ?",
-                (active,),
-            )
-            seals.extend(r["seal"] for r in rows)
-        for name in AD_MAPS:
-            seals.append((await self.get_ad_map(name)).seal)
+        seals: list[tuple[str, object]] = []
+        for table, sql in unrotated_seal_queries("?", collate=" COLLATE Latin1_General_100_BIN2"):
+            rows = await self._fetchall(sql, (active,))
+            seals.extend((table, r["seal"]) for r in rows)
         return seals
 
     async def reseal_user_records(self) -> tuple[int, int]:
