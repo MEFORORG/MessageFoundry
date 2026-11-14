@@ -185,6 +185,10 @@ updates:
       # `pyside6`, so pip-audit would not red on a Qt fix this range withholds.
       - dependency-name: "pyside6"
         versions: [">=6.12.0"]
+      # Why: the comment above the [x12] extra in pyproject.toml. A 4.0.x patch release still gets
+      # a PR, and tests/test_x12_validate.py reds it if it moves the behaviour that comment names.
+      - dependency-name: "pyx12"
+        versions: [">=4.1.0"]
     groups:
       # Version-update grouping (applies-to defaults to version-updates), SPLIT BY UPDATE TYPE (owner
       # decision 2026-09-30) so one bad major cannot hold the routine minors and patches hostage.

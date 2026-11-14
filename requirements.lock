@@ -912,9 +912,9 @@ python-dateutil==2.9.0.post0 ; (python_full_version < '3.15' and platform_python
     --hash=sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3 \
     --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
     # via fhirpathpy
-pyx12==4.1.0 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
-    --hash=sha256:5c3c6979c6f98d4a9a36d1551f14fa79c86d749aab3fdd3d3341ad790d1fff3c \
-    --hash=sha256:be06aa9acaca605786581165e12ee3fc13025ef5f070b841b916fe7388bb9ca6
+pyx12==4.0.1 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
+    --hash=sha256:30241f4427f0db03675df55edba5b02cc38998114b34c03bf9bbe1bd92ec3314 \
+    --hash=sha256:d7fbe4e367be6405c724f7109306bf46f319557406035ea2cac2c403cc4f6296
     # via messagefoundry
 pyyaml==6.0.3 ; (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version < '3.15' and platform_python_implementation == 'CPython' and sys_platform == 'win32') \
     --hash=sha256:00c4bdeba853cc34e7dd471f16b4114f4162dc03e6b7afcc2128711f0eca823c \
