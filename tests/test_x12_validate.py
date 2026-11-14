@@ -13,7 +13,8 @@ import importlib
 import io
 import logging
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import Any
 
 import pytest
 
@@ -192,24 +193,46 @@ def unmuted_pyx12_logger() -> Iterator[logging.Logger]:
             parent.addHandler(handler)
 
 
-def test_pyx12_itself_logs_the_value_when_unmuted(
-    unmuted_pyx12_logger: logging.Logger, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Control for the next test: pyx12 really does put the value in the log. Without this, the
-    next test's "not in the log" would also pass if pyx12 simply stopped logging it."""
+def _leaky_validator() -> tuple[Any, Callable[[], Any]]:
+    """pyx12's validator with value logging turned back on.
+
+    pyx12 4.1.0 leaves the error message and the offending value out of its log records unless
+    ``log_data_values`` is set; 4.0.1 always logged them and ignores the parameter. The engine never
+    sets it, so with it off the mute tests below would pass even if the engine muted nothing."""
     from messagefoundry.parsing.x12._deps import load_x12_validator
 
     x12n_document, make_params = load_x12_validator()
+
+    def leaky_params() -> Any:
+        params = make_params()
+        params.set("log_data_values", True)
+        return params
+
+    return x12n_document, leaky_params
+
+
+def test_pyx12_itself_logs_the_value_when_unmuted(
+    unmuted_pyx12_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Control for the next test: pyx12, run as the next test runs it, really does put the value
+    in the log. Without this, the next test's "not in the log" would also pass if pyx12 simply
+    stopped logging it."""
+    x12n_document, make_params = _leaky_validator()
     with caplog.at_level(logging.DEBUG):
         x12n_document(make_params(), io.StringIO(_LEAKY_837), io.StringIO(), None, None, None)
     assert _LEAKY in caplog.text
 
 
 def test_validation_silences_the_value_bearing_pyx12_logger(
-    unmuted_pyx12_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+    unmuted_pyx12_logger: logging.Logger,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """pyx12 logs raw, value-bearing error strings at ERROR; the pass must suppress them so the
     secret never reaches the general log, and must leave the tree muted afterwards."""
+    # The pass runs with value logging on, as the control above does, so the secret is in what
+    # pyx12 logs and only the engine's mute keeps it out.
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", _leaky_validator)
     # Capture at the root (where pyx12's records would propagate); do NOT force the pyx12 logger level
     # -- the validator's own suppression must win on its own.
     with caplog.at_level(logging.DEBUG):
@@ -388,8 +411,9 @@ def test_a_4010_pass_with_no_ack_reports_the_4010_codes(monkeypatch: pytest.Monk
 def test_sender_separators_cannot_forge_the_acks_st_segment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # With "|" and newline as the sender's separators, a GS03 of "X~ST" and a GS02 of "999" put a
-    # whole "~ST*999" segment boundary into the 997's GS line, ahead of its real ST*997.
+    # With "|" and newline as the sender's separators, a GS03 of "X~ST" and a GS02 of "999" are
+    # echoed into the 997's GS line, ahead of its real ST*997. pyx12 4.0.1 copied them as-is, a whole
+    # "~ST*999" segment boundary; 4.1.0 writes "?" for the "~", leaving the text "?ST*999".
     msg = _conformant_270(dob="19431399").replace("GS*HS*SENDERAPP*RECVAPP*", "GS*HS*999*X#ST*")
     msg = msg.replace("*", "|").replace("~", chr(10)).replace("#", "~")
     real = load_x12_code_resolver()
@@ -401,7 +425,11 @@ def test_sender_separators_cannot_forge_the_acks_st_segment(
 
     monkeypatch.setattr(_X12_VALIDATE, "load_x12_code_resolver", lambda: recording)
     result = validate(msg)
-    assert result.ack is not None and "~ST*999" in result.ack and "ST*997" in result.ack
+    # Positive control: either form puts the text "ST*999" in the ack ahead of the real "ST*997", so
+    # an ack type read from the ack's text would come out as 999.
+    assert result.ack is not None and "ST*997" in result.ack
+    assert "~ST*999" in result.ack or "?ST*999" in result.ack
+    assert result.ack.index("ST*999") < result.ack.index("ST*997")
     assert result.ack_transaction == "997"
     assert seen and not any(seen)
 
@@ -437,7 +465,9 @@ def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # With "|" and newline as the sender's separators, a GS06 of "1~IEA*1*000000001" is echoed into
-    # the fragment's AK102, so the fragment's text ends in an IEA segment pyx12 never wrote.
+    # the fragment's AK1, so the fragment's text ends in "IEA*1*000000001~", which pyx12 never wrote
+    # as an IEA. pyx12 4.0.1 copied the "~" as-is, a whole IEA segment; 4.1.0 writes "?" for it, and
+    # its 997 writer still splits the "*"s into elements, so the text ends the same way.
     pipes = _conformant_270().replace("ST*270*0001~", "ST*270~").replace("*", "|")
     pipes = pipes.replace("|1200|1|X|", "|1200|1#IEA*1*000000001|X|")
     pipes = pipes.replace("GE|1|1~", "GE|1|1#IEA*1*000000001~")
@@ -451,7 +481,89 @@ def test_sender_text_cannot_forge_the_closing_iea_of_a_fragment(
 
     monkeypatch.setattr(_X12_VALIDATE, "_AckBuffer", keep)
     result = validate(msg)
-    # Positive control: the fragment's text really does end in the forged IEA.
-    assert buffers[0].getvalue().rstrip().endswith("AK1*HS*1~IEA*1*000000001~")
+    # Positive control: the fragment's text really does end in the forged IEA text, in either form,
+    # so a check that the text ends in an IEA's text would take the fragment for a finished ack.
+    tail = buffers[0].getvalue().rstrip()
+    assert tail.endswith(("AK1*HS*1~IEA*1*000000001~", "AK1*HS*1?IEA*1*000000001~"))
     assert result.ack is None
     assert result.ack_transaction is None
+
+
+# A bad BHT04 that holds all four of the ack writer's own delimiters ("~ * : ^"). The sender uses
+# "|", newline, ">" and "{" as its separators, so to the sender these are data, and pyx12 echoes the
+# bad value into the 999's IK404.
+_DELIMITED_VALUE = "20*6:5^1~2"
+_DELIMITED_837 = (
+    _interchange(
+        "ST*837*0001*005010X222A1~",
+        "BHT*0019*00*0123*#VALUE#*1200*CH~",
+        "SE*4*0001~",
+    )
+    .replace("*^*00501*", "*{*00501*")
+    .replace("*:~", "*>~")
+    .replace("*", "|")
+    .replace("~", chr(10))
+    .replace("#VALUE#", _DELIMITED_VALUE)
+)
+
+
+def _rendered(result: X12ValidationResult) -> str:
+    return "\n".join(
+        f"{e.code}|{e.message}|{e.segment_id}|{e.element_position}|{e.element_name}|{e.loop}"
+        for e in result.errors
+    )
+
+
+def test_a_value_holding_the_ack_writers_delimiters_is_a_validation_result() -> None:
+    # pyx12 4.1.0's X12Writer.Write raises EngineError on a value holding one of its delimiters. Its
+    # 999 writer replaces those characters in an echoed value with "?" first, so the 999 completes.
+    result = validate(_DELIMITED_837)
+    assert result.valid is False
+    assert [(e.segment_id, e.element_position) for e in result.errors if e.element_position] == [
+        ("BHT", 4),
+        ("BHT", 4),
+    ]
+    assert result.ack is not None and result.ack_transaction == "999"
+    assert "IK4*4*373*8*20?6?5?1?2~" in result.ack
+    assert _DELIMITED_VALUE not in result.ack and _DELIMITED_VALUE not in _rendered(result)
+
+
+def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Take the "?" replacement away, so the raw value reaches X12Writer.Write. The writer raises,
+    # pyx12 catches it inside x12n_document and leaves a fragment, and the pass still returns a
+    # result: no ack, the errors, and nothing of the value in them or in the log.
+    import pyx12.error_visitor
+    import pyx12.errors
+    import pyx12.x12file
+
+    raised: list[Exception] = []
+    real_check = pyx12.x12file.X12Writer._check_delimiters
+
+    def spy(self: Any, seg_data: Any) -> None:
+        try:
+            real_check(self, seg_data)
+        except pyx12.errors.EngineError as exc:
+            raised.append(exc)
+            raise
+
+    monkeypatch.setattr(pyx12.x12file.X12Writer, "_check_delimiters", spy)
+    monkeypatch.setattr(pyx12.error_visitor, "sanitize_ack_segment", lambda seg_data: None)
+    with caplog.at_level(logging.DEBUG):
+        result = validate(_DELIMITED_837)
+    # Positive control: the writer really did raise on the value.
+    assert raised and all(isinstance(exc, pyx12.errors.EngineError) for exc in raised)
+    assert result.valid is False and result.errors
+    assert result.ack is None and result.ack_transaction is None
+    assert "before the closing IEA" in caplog.text
+    assert "20*6" not in caplog.text and "20*6" not in _rendered(result)
+
+
+def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error() -> None:
+    # pyx12 4.1.0 raises X12Error when no segment terminator comes within 1 MiB, where 4.0.1 stopped
+    # reading there. The pass raises X12ValidationError, whose message holds none of the input.
+    body = "Q" * (1024 * 1024 + 100)
+    with pytest.raises(X12ValidationError) as caught:
+        validate(_ISA + _GS + "ST*837*0001*005010X222A1~BHT*0019*00*" + body)
+    assert "QQQQ" not in str(caught.value)
