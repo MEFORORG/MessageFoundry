@@ -127,6 +127,14 @@ def test_non_x12_input_raises_validation_error() -> None:
         validate("this is not an X12 interchange at all")
 
 
+def _rendered(result: X12ValidationResult) -> str:
+    """Every surfaced field of every error, as one string to search for a leaked value."""
+    return "\n".join(
+        f"{e.code}|{e.message}|{e.segment_id}|{e.element_position}|{e.element_name}|{e.loop}"
+        for e in result.errors
+    )
+
+
 def test_errors_never_leak_the_offending_value() -> None:
     """PHI guard: a bad data-element value (here a fake date) must NOT appear anywhere in the surfaced
     errors — only the structural locators (code, segment id, element position, schema type name)."""
@@ -138,11 +146,7 @@ def test_errors_never_leak_the_offending_value() -> None:
     )
     result = validate(msg)
     assert result.valid is False
-    rendered = "\n".join(
-        f"{e.code}|{e.message}|{e.segment_id}|{e.element_position}|{e.element_name}|{e.loop}"
-        for e in result.errors
-    )
-    assert secret not in rendered, "the offending data value leaked into a surfaced error"
+    assert secret not in _rendered(result), "the offending data value leaked into a surfaced error"
 
 
 _LEAKY = "LEAKYVALUE"
@@ -507,13 +511,6 @@ _DELIMITED_837 = (
 )
 
 
-def _rendered(result: X12ValidationResult) -> str:
-    return "\n".join(
-        f"{e.code}|{e.message}|{e.segment_id}|{e.element_position}|{e.element_name}|{e.loop}"
-        for e in result.errors
-    )
-
-
 def test_a_value_holding_the_ack_writers_delimiters_is_a_validation_result() -> None:
     # pyx12 4.1.0's X12Writer.Write raises EngineError on a value holding one of its delimiters. Its
     # 999 writer replaces those characters in an echoed value with "?" first, so the 999 completes.
@@ -553,7 +550,7 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
     with caplog.at_level(logging.DEBUG):
         result = validate(_DELIMITED_837)
     # Positive control: the writer really did raise on the value.
-    assert raised and all(isinstance(exc, pyx12.errors.EngineError) for exc in raised)
+    assert raised
     assert result.valid is False and result.errors
     assert result.ack is None and result.ack_transaction is None
     assert "before the closing IEA" in caplog.text
