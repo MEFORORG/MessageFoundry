@@ -209,7 +209,7 @@ def test_the_backstop_opener_is_tested_once_per_text(unit: str) -> None:
     _CountingText.searches = 0
     out = redaction._redact_xml_elements(_CountingText(unit))
     assert "Zq" not in out  # the end tags were reached, and masked
-    assert _CountingText.searches <= 1, _CountingText.searches
+    assert _CountingText.searches == 1, _CountingText.searches
 
 
 def test_a_text_holding_the_backstop_opener_keeps_every_rest() -> None:

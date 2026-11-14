@@ -1675,10 +1675,10 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     some pass reads literally, a credential word inside a longer word, or a date (``</family
     password: x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any word after a
     line break inside the tag; every rest in a text holding the backstop's opener; every rest whose
-    end tag an HL7 field run took before this pass ran, whether the run starts before the element
-    (``a|b|<family>Smith</family Zqxdoe>``) or in its own content (``<given>A^B^C</given Zqxdoe>``);
-    and, where the
-    rest ends the text, every refusal :func:`_maskable_rest` makes there, a last word with a digit or
+    end tag an HL7 field run took before this pass ran, in at least these shapes: a run before the
+    element (``a|b|<family>Smith</family Zqxdoe>``), one in its own content (``<given>A^B^C</given
+    Zqxdoe>``), and one before a stray end tag (``a|b|</family Zqxdoe>``); and, where the rest ends
+    the text, every refusal :func:`_maskable_rest` makes there, a last word with a digit or
     ending in ``m``, ``b``, ``f`` or ``n`` among them."""
     if not mask or not text.startswith(" ", start):
         return text[start:stop]
