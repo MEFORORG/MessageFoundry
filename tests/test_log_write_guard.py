@@ -202,6 +202,63 @@ def test_a_sink_that_keeps_needing_a_roll_is_declared_unwritable(tmp_path: Path)
     assert guard.status()[0].state == "unwritable"
 
 
+def test_a_flapping_sink_past_the_bound_pages_once_not_once_per_roll(tmp_path: Path) -> None:
+    # BACKLOG #5812. Writing ``rolled`` before escalating made record_unwritable read its latch from
+    # the state record_rollover had just overwritten, so every roll past the bound paged and asked
+    # for a stop again. Driven by real rolls: a sink that heals on every roll and breaks on every
+    # record, well past the bound. NEGATIVE CONTROL: on the unfixed code this collects one
+    # ``unwritable`` event per roll past the bound (four here), not one.
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = _file_handler(tmp_path / "app.log", guard)
+
+    for _ in range(_MAX_ROLLS_PER_WINDOW + 4):
+        _break_the_open_handle(handler)
+        handler.emit(_record("break"))
+
+    assert [e.stage for e in events] == ["rolled"] * _MAX_ROLLS_PER_WINDOW + ["unwritable"]
+    assert sum(e.stop_requested for e in events) == 1
+    status = guard.status()[0]
+    assert status.state == "unwritable"
+    # The rolls the latch swallowed are still counted, and the newest rolled-aside path is kept.
+    assert status.rollovers == _MAX_ROLLS_PER_WINDOW + 4
+    aside = sorted(p for p in tmp_path.iterdir() if ".broken-" in p.name)
+    assert status.rolled_aside is not None and Path(status.rolled_aside) in aside
+
+
+def test_a_roll_does_not_clear_unwritable_only_a_revalidate_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5812, the second half. A successful roll proves one write landed, which a flapping sink
+    # also does, so it must not move a sink out of ``unwritable`` once the flap window lapses. Only
+    # revalidate's probe may. NEGATIVE CONTROL: on the unfixed code the roll after the window resets
+    # the streak, writes ``rolled``, fires a ``rolled`` event, and can_log() reads True with no probe.
+    clock = [1000.0]
+    monkeypatch.setattr(logging_guard.time, "monotonic", lambda: clock[0])
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.set_escalation(events.append)
+    handler = _file_handler(tmp_path / "app.log", guard)
+    for _ in range(_MAX_ROLLS_PER_WINDOW + 1):
+        _break_the_open_handle(handler)
+        handler.emit(_record("break"))
+    assert guard.status()[0].state == "unwritable"
+    paged = len(events)
+
+    clock[0] += logging_guard._ROLL_FLAP_WINDOW_SECONDS + 1
+    _break_the_open_handle(handler)
+    handler.emit(_record("after the window"))
+
+    assert guard.status()[0].state == "unwritable"
+    assert guard.can_log() is False
+    assert len(events) == paged  # latched: no rolled event, no second page
+
+    # The operator path still recovers it, by writing a real record.
+    assert guard.revalidate() is True
+    assert guard.status()[0].state == "healthy"
+
+
 def test_the_flap_bound_does_not_fire_on_an_ordinary_transient(tmp_path: Path) -> None:
     # …and the bound is loose enough that a genuine one-off never trips it (the negative control for
     # the test above — otherwise a bound of 1 would pass it and be an outage generator).

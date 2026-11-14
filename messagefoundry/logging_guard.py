@@ -77,7 +77,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, TextIO
 
 # Bound at MODULE scope, not inlined: that is what lets a test force the scrubber itself to raise
@@ -153,8 +153,10 @@ class LogWriteGuard:
     Thread-safe: log records are emitted from the event loop, from handler worker threads and from
     connector threads alike, so every mutation is under one lock. Escalation is **latched per sink** —
     a sink that is already ``unwritable`` does not re-fire on every subsequent record (that would turn
-    one broken disk into an unbounded alert storm), and a later successful Stage-1 roll clears the
-    latch so a genuine re-break pages again."""
+    one broken disk into an unbounded alert storm). A later successful Stage-1 roll does NOT clear the
+    latch, because a flapping sink rolls successfully too (BACKLOG #5812): only :meth:`revalidate`,
+    whose probe writes a real record, clears it (through :meth:`record_healthy`), so a genuine
+    re-break after that pages again."""
 
     def __init__(self, *, stop_on_unwritable: bool = True) -> None:
         self._lock = threading.RLock()
@@ -222,6 +224,10 @@ class LogWriteGuard:
         declared unwritable instead: a log you must replace every few seconds is not a working log,
         and stage 2 is the honest verdict on it.
 
+        **A sink already ``unwritable`` stays so.** Its roll is counted and its rolled-aside path
+        recorded, but it fires no ``rolled`` event and pages nothing: the latch in
+        :meth:`record_unwritable` holds, and only :meth:`revalidate` clears the state.
+
         **PRECONDITION: ``reason`` and ``rolled_aside`` arrive ALREADY SCRUBBED** (BACKLOG #1591).
         Build them with :func:`_safe_reason` and :func:`_escape_only`, as
         :meth:`_GuardedSinkMixin.handleError` does. This method cannot enforce it by re-scrubbing:
@@ -236,21 +242,43 @@ class LogWriteGuard:
                 first_at, streak = now, 0
             streak += 1
             self._roll_flap[sink] = (first_at, streak)
-            self._sinks[sink] = LogSinkStatus(
-                sink=sink,
-                state="rolled",
-                rollovers=(previous.rollovers if previous else 0) + 1,
-                last_event=reason,
-                last_event_at=_utc_now(),
-                rolled_aside=rolled_aside,
-            )
-        if streak > _MAX_ROLLS_PER_WINDOW:
+            rollovers = (previous.rollovers if previous else 0) + 1
+            already_down = previous is not None and previous.state == "unwritable"
+            if already_down or streak > _MAX_ROLLS_PER_WINDOW:
+                # THE PRIOR STATE AND THE STREAK ARE READ BEFORE ANYTHING IS WRITTEN (BACKLOG #5812).
+                # Writing ``rolled`` first and escalating after made :meth:`record_unwritable` read
+                # its ``already_down`` latch from the state this method had just overwritten, so a
+                # flapping sink paged and asked for a stop on EVERY roll past the bound, and a roll
+                # after the window lapsed cleared ``unwritable`` with no operator revalidate. A
+                # successful roll proves only that one write landed, which a flapping sink also
+                # does; only :meth:`record_healthy`, reached through :meth:`revalidate`'s probe,
+                # moves a sink out of ``unwritable``. The roll is still counted and its path kept,
+                # and :meth:`record_unwritable` below carries both onto the state it writes.
+                base = previous or LogSinkStatus(sink=sink, state="healthy", rollovers=0)
+                self._sinks[sink] = replace(
+                    base, rollovers=rollovers, rolled_aside=rolled_aside or base.rolled_aside
+                )
+            else:
+                self._sinks[sink] = LogSinkStatus(
+                    sink=sink,
+                    state="rolled",
+                    rollovers=rollovers,
+                    last_event=reason,
+                    last_event_at=_utc_now(),
+                    rolled_aside=rolled_aside,
+                )
+        if already_down or streak > _MAX_ROLLS_PER_WINDOW:
             # The precondition holds through this join: ``reason`` arrived scrubbed and everything
             # appended is a literal plus two formatted numbers, so nothing new needs escaping.
+            # An ``already_down`` sink reaches the latch in :meth:`record_unwritable` and pages
+            # nothing; a sink crossing the bound for the first time pages exactly once.
             self.record_unwritable(
                 sink,
                 reason=(
-                    f"{reason}; the sink needed rolling {streak} times in "
+                    f"{reason}; the sink was rolled but stays unwritable until an operator "
+                    "recovery re-tests it"
+                    if already_down
+                    else f"{reason}; the sink needed rolling {streak} times in "
                     f"{_ROLL_FLAP_WINDOW_SECONDS:.0f}s, which is a failing log rather than a transient"
                 ),
             )
