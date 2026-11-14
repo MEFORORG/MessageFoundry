@@ -1197,7 +1197,7 @@ class StageDispatcher:
             st = self._states.get(lane)
             if st is None or st.phase is not _LanePhase.READY:
                 continue  # stale: the lane already left READY (e.g. teardown, or a double entry)
-            if not self._may_claim(lane):  # BACKLOG #5704: gated, so park with no claim and no slot
+            if not self._lane_may_claim(lane):  # BACKLOG #5704: gated, so park, no claim, no slot
                 self._park_gated(lane, st)
                 continue
             st.phase = _LanePhase.CLAIMING  # T8
@@ -2037,6 +2037,20 @@ class StageDispatcher:
         st.gated = False  # a backoff park: its timer and the sweep unpark it
         if until is not None:
             self._arm_timer(lane, until)
+
+    def _lane_may_claim(self, lane: str) -> bool:
+        """Ask the pre-claim gate. A raise is logged and read as a refusal, so the lane parks
+        gated rather than killing the claimer with the lane popped and still READY."""
+        try:
+            return self._may_claim(lane)
+        except Exception as exc:  # noqa: BLE001 — a gate fault must not kill the claimer
+            log.error(
+                "StageDispatcher %s may_claim raised %s for lane %s; parking it gated",
+                self._stage.value,
+                type(exc).__name__,
+                lane,
+            )
+            return False
 
     def _park_gated(self, lane: str, st: _LaneState) -> None:
         """Park a lane the pre-claim gate refused (BACKLOG #5704), with no timer: nothing is due to

@@ -2566,8 +2566,8 @@ class RegistryRunner:
                     ev.set()
 
     def _broadcast_to(self, d: StageDispatcher, stage: Stage) -> None:
-        """``d.notify_work()``, which re-arms every STOPPED lane, and so lifts the operator holds on
-        exactly those. The STOPPED set is read BEFORE the broadcast: a hold whose lane has not reached
+        """``d.notify_work()``, which re-arms STOPPED lanes, and lifts the operator holds on the lanes
+        it re-arms. The STOPPED set is read BEFORE the broadcast: a hold whose lane has not reached
         STOPPED yet (the STOP site records it first) is not re-armed by it, and must survive."""
         kind = _HOLD_DIRECTION.get(stage)
         # BACKLOG #5704: under the #122 claim gate an internal lane's STOP and its hold are left
@@ -6023,8 +6023,7 @@ class RegistryRunner:
         claim gate. Sync and await-free. Only the mark is lifted: the halt itself does not pause
         or STOP a lane, so it left no lane to resume. A lane
         that STOPped under its own fault policy meanwhile stays STOPPED here, as any STOP does
-        (:meth:`_inbound_log_halted`; BACKLOG #5704). Only this inbound's lanes are woken, so a reload re-arming N inbounds wakes each
-        once. A pooled lane the pre-claim gate parked is released with
+        (:meth:`_inbound_log_halted`; BACKLOG #5704). A pooled lane the pre-claim gate parked is released with
         :meth:`StageDispatcher.release_gated`, which unparks nothing else."""
         self._log_halted.discard(name)
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
@@ -7589,10 +7588,7 @@ class RegistryRunner:
         # While the #122 log halt gates this inbound, a worker a content STOP ended (its hold is
         # recorded) is not respawned: the new worker would wait at the claim gate and then retry the
         # STOP's message the moment the gate lifts, with the hold still recorded (BACKLOG #5704).
-        # The next ungated door re-arms it. Any other
-        # finished worker (one that exited on a removed inbound) and a missing one are spawned, so
-        # the backlog drains once the gate lifts. A worker that RAISED is respawned by its
-        # done-callback.
+        # The next ungated door re-arms it. A worker that RAISED is respawned by its done-callback.
         gated = self._inbound_log_halted(name)
         held = gated and ("inbound", name) in self._stop_held
         rearmed = False

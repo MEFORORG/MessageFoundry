@@ -2734,6 +2734,38 @@ async def test_a_gated_pooled_lane_claims_nothing_and_is_never_stopped_while_the
         await runner.stop()
 
 
+def test_a_raising_claim_gate_parks_the_lane_and_spares_the_claimer(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # BACKLOG #5704 review: a may_claim that raises must not kill the claimer with the lane popped
+    # and still READY, where nothing re-enqueues it. The lane parks gated, as on a refusal, and the
+    # rest of the chunk assembles. Control: the lane the gate answers for claims.
+    def gate(lane: str) -> bool:
+        if lane == "bad":
+            raise KeyError(lane)
+        return True
+
+    dispatcher = stage_dispatcher.StageDispatcher(
+        Stage.ROUTED,
+        store,
+        process_item=None,  # type: ignore[arg-type]  # assembly runs no body
+        lane_provider=set,
+        per_lane_limit=1,
+        may_claim=gate,
+    )
+    dispatcher.mark_ready("bad")
+    dispatcher.mark_ready("ok")
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.stage_dispatcher"):
+        chunk = dispatcher._assemble_chunk(dispatcher._claimers[0])
+
+    assert chunk == ["ok"]
+    st = dispatcher._states["bad"]
+    assert (st.phase, st.gated) == (stage_dispatcher._LanePhase.PARKED, True)
+    assert any("KeyError" in r.getMessage() for r in caplog.records)
+    dispatcher.release_gated(["bad"])  # lifting the gate re-arms it
+    assert dispatcher.phase("bad") is stage_dispatcher._LanePhase.READY
+
+
 def test_lifting_the_gate_releases_only_gate_parked_lanes(store: MessageStore) -> None:
     # BACKLOG #5704: lifting the gate unparks a lane the gate parked, and nothing else. A lane a
     # backing-off head parked keeps its park, and a STOPPED lane keeps its STOP: release_gated is
