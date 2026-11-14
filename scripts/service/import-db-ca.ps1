@@ -2,9 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 <#
 .SYNOPSIS
-    Import a private / internal-CA certificate into the Windows LocalMachine\Root trust store so
-    the MessageFoundry engine can validate a PostgreSQL or SQL Server TLS server certificate
-    without disabling certificate validation.
+    Import a private / internal CA into the Windows machine certificate stores (a root into the
+    LocalMachine\Root trust store, an issuing CA into LocalMachine\CA) so the MessageFoundry engine
+    can validate a PostgreSQL or SQL Server TLS server certificate without disabling certificate
+    validation.
 
 .DESCRIPTION
     ODBC Driver 18 (the SQL Server backend) has no connection-string CA-file keyword: it validates
@@ -13,9 +14,12 @@
     build -- and operators are then tempted to set TrustServerCertificate=true, which disables
     validation and re-opens a man-in-the-middle path to PHI (NIST SP 800-52r2; CWE-295).
 
-    This script imports the CA into the *machine* store (Cert:\LocalMachine\Root) -- not the
-    per-user store (Cert:\CurrentUser\Root) -- so the service principal (LocalSystem / a gMSA /
-    a dedicated service account) sees it. It is the supported full-chain-trust path:
+    This script imports the CA into the *machine* stores (Cert:\LocalMachine\Root, and
+    Cert:\LocalMachine\CA for an issuing CA) -- not the per-user stores (Cert:\CurrentUser\...)
+    -- so the service principal (LocalSystem / a gMSA / a dedicated service account) sees it.
+    The file must hold the root: an issuing CA alone goes into LocalMachine\CA, which is not a
+    trust anchor, and the script warns that the chain will not validate unless the root is
+    already in LocalMachine\Root. It is the supported full-chain-trust path:
     trust_server_certificate stays false and the engine validates the full chain.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
@@ -34,8 +38,8 @@
     nothing. Idempotent: re-importing the same CA is a no-op (each store keys on thumbprint).
 
 .PARAMETER CaPath
-    Path to the CA certificate(s) to trust: a DER or PEM certificate (.cer/.crt/.pem, one
-    certificate or a PEM bundle of several), or a .p7b chain (PKCS#7, signed or not).
+    Path to the CA certificate(s) to trust: a DER, base64 or PEM certificate (.cer/.crt/.pem, one
+    certificate or a PEM bundle of several), or a .p7b chain (PKCS#7, signed or not, DER or base64).
 
 .PARAMETER WhatIf
     Show what would be imported without changing the store. Needs no elevation.
@@ -150,10 +154,10 @@ function ConvertTo-PrintableText {
 }
 
 # Every certificate the file holds, parsed from bytes the caller read once, so the collection
-# returned is the one shown, checked and added. Only two shapes are accepted. One is DER, a single
-# certificate or a PKCS#7 bundle (.p7b), signed or not. The other is PEM text whose blocks are all
-# CERTIFICATE (or its legacy spelling X509 CERTIFICATE) or PKCS7, in ASCII, UTF-8 or UTF-16 with a
-# byte-order mark. The PEM is parsed here because Windows PowerShell 5.1's .NET Framework has no
+# returned is the one shown, checked and added. A certificate or a PKCS#7 bundle (.p7b), signed or
+# not, is accepted as DER, as bare base64 of DER, or as PEM text whose blocks are all CERTIFICATE
+# (or its legacy spelling X509 CERTIFICATE) or PKCS7, in ASCII, UTF-8 or UTF-16 with a byte-order
+# mark. The PEM is parsed here because Windows PowerShell 5.1's .NET Framework has no
 # ImportFromPem, which would in any case skip a private-key block silently. A PKCS#12 (.pfx) and a
 # PEM private-key block are refused before any of it is parsed, so no private key is ever loaded:
 # a key has no place in a trust-store import, and such a file is usually a server certificate
@@ -169,10 +173,43 @@ function Read-CaBundle {
         $encoding = [System.Text.Encoding]::BigEndianUnicode
     }
     $text = $encoding.GetString($Bytes)
-    if ($text.Contains('-----BEGIN ')) {
-        # Any armour at all makes the file PEM, whatever its first byte, so a text file that
-        # happens to start with '0' (0x30) is never handed to the DER reader, which would take its
-        # first certificate only and never see a private-key block after it.
+    # Every piece of DER, the whole file or one PEM block, must be a certificate or a PKCS#7 chain,
+    # so a .pfx is refused wherever it sits, before it is parsed.
+    $importDer = {
+        param([byte[]]$Der)
+        try {
+            $type = [System.Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($Der)
+        } catch [System.Management.Automation.MethodInvocationException] {
+            # .NET on Windows throws for content it cannot classify rather than answering Unknown.
+            $type = 'Unknown'
+        }
+        if ($type -ne 'Cert' -and $type -ne 'Pkcs7') {
+            throw ("The file holds '$type' content. Only a certificate or a .p7b chain is " +
+                "accepted (a .pfx is refused: it carries a private key, which never belongs in " +
+                "the trust store).")
+        }
+        $bundle.Import($Der)
+    }
+    # One DER value that spans the whole file (0x30 opens an ASN.1 SEQUENCE, then its length), so a
+    # DER file whose bytes happen to spell '-----BEGIN ' is still read as DER, and a text file that
+    # happens to start with '0' (also 0x30) is not.
+    $wholeDer = $false
+    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0x30) {
+        $first = [int]$Bytes[1]
+        if ($first -lt 0x80) {
+            $wholeDer = (2 + $first) -eq $Bytes.Length
+        } elseif ($first -ge 0x81 -and $first -le 0x84 -and $Bytes.Length -ge 2 + ($first - 0x80)) {
+            $n = $first - 0x80
+            $length = [long]0
+            for ($k = 0; $k -lt $n; $k++) { $length = $length * 256 + $Bytes[2 + $k] }
+            $wholeDer = (2 + $n + $length) -eq $Bytes.Length
+        }
+    }
+    if ($wholeDer) {
+        & $importDer $Bytes
+    } elseif ($text.Contains('-----BEGIN ')) {
+        # Any armour makes a file that is not one DER value PEM, so the DER reader, which would
+        # take its first certificate only, never sees a private-key block after it.
         $labels = [regex]::Matches($text, '-----BEGIN ([^\r\n]*?)-----')
         foreach ($label in $labels) {
             if ($label.Groups[1].Value -cnotin @('CERTIFICATE', 'X509 CERTIFICATE', 'PKCS7')) {
@@ -187,26 +224,26 @@ function Read-CaBundle {
             throw "The file has a PEM block that is not well formed."
         }
         foreach ($block in $blocks) {
-            $der = [Convert]::FromBase64String(($block.Groups[2].Value -replace '\s', ''))
-            # The block's content must be what its label says, so a PKCS#7 under a CERTIFICATE
-            # label, or a .pfx under either, is refused rather than read as whatever it holds.
-            $want = if ($block.Groups[1].Value -ceq 'PKCS7') { 'Pkcs7' } else { 'Cert' }
-            if ([System.Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($der) -ne $want) {
-                throw "A PEM $($block.Groups[1].Value) block does not hold what its label says."
-            }
-            $bundle.Import($der)
+            # Either label may hold a PKCS#7 chain: AD CS web enrollment and certutil -encode
+            # write a base64 .p7b under a CERTIFICATE header.
+            & $importDer ([Convert]::FromBase64String(($block.Groups[2].Value -replace '\s', '')))
         }
     } elseif ($Bytes[0] -eq 0x30) {
-        # 0x30 opens an ASN.1 SEQUENCE: DER, which may be a certificate, a PKCS#7 or a PKCS#12.
-        $type = [System.Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($Bytes)
-        if ($type -ne 'Cert' -and $type -ne 'Pkcs7') {
-            throw ("The file holds '$type' content. Only a certificate or a .p7b chain is " +
-                "accepted; a .pfx carries a private key, which never belongs in the trust store.")
+        # DER that does not span the file, such as BER with an indefinite length.
+        & $importDer $Bytes
+    } elseif ($text -match '^[A-Za-z0-9+/=\s]+$') {
+        # Base64 of a DER value with no armour, which the X509Certificate2 constructor this script
+        # used before also read.
+        $der = $null
+        try {
+            $der = [Convert]::FromBase64String(($text -replace '\s', ''))
+        } catch [System.FormatException] {
+            throw "The file looks like base64 but does not decode."
         }
-        $bundle.Import($Bytes)
+        & $importDer $der
     }
     if ($bundle.Count -eq 0) {
-        throw ("The file holds no certificate. Expected DER, PEM armour such as " +
+        throw ("The file holds no certificate. Expected DER, base64, PEM armour such as " +
             "'-----BEGIN CERTIFICATE-----', or a .p7b chain.")
     }
     $unique = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
@@ -231,9 +268,11 @@ function Get-CaStoreName {
 }
 
 # Why the certificate must not be trusted as a CA, or $null when it may be. A certificate whose basic
-# constraints do not mark it as a CA cannot sign another, so it has no business in Root; a missing
-# extension counts as not a CA (RFC 5280, the Basic Constraints section), and so does a key usage
-# extension that leaves out certificate signing (RFC 5280, the Key Usage section).
+# constraints do not mark it as a CA cannot sign another, so it has no business in Root. A missing
+# extension counts as not a CA here. RFC 5280 (the Basic Constraints section) requires the extension
+# of a version 3 CA certificate; a version 1 root, which cannot carry it, is refused too, by this
+# script's choice rather than the RFC's. A key usage extension that leaves out certificate signing
+# also counts as not a CA (RFC 5280, the Key Usage section).
 function Get-CaRefusal {
     param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
     # Read-CaBundle already refuses every container that can carry a key; this holds if it ever stops.
@@ -271,33 +310,40 @@ try {
     throw "Could not read '$CaPath' as X.509 CA certificates: $($_.Exception.Message)"
 }
 
-Write-Host "About to trust $($bundle.Count) CA certificate(s):"
+Write-Host "The file holds $($bundle.Count) certificate(s):"
 $now = [datetime]::Now
 $refusals = @()
-foreach ($cert in $bundle) {
+# The store each certificate is shown with is the one it is offered for and written to.
+$entries = @(foreach ($cert in $bundle) {
+    $target = $stores[(Get-CaStoreName -Certificate $cert)]
     Write-Host ""
     Write-Host "  Subject    : $(ConvertTo-PrintableText $cert.Subject)"
     Write-Host "  Issuer     : $(ConvertTo-PrintableText $cert.Issuer)"
     Write-Host "  Thumbprint : $($cert.Thumbprint)"
     Write-Host "  Not after  : $($cert.NotAfter.ToString('u'))"
-    Write-Host "  Store      : $($stores[(Get-CaStoreName -Certificate $cert)].Label)"
+    Write-Host "  Store      : $($target.Label)"
     if ($cert.NotAfter -lt $now -or $cert.NotBefore -gt $now) {
         Write-Warning "$($cert.Thumbprint) is outside its validity period; a chain through it will not validate."
     }
     $why = Get-CaRefusal -Certificate $cert
     if ($why) { $refusals += "  $($cert.Thumbprint): $why" }
-}
+    @{ Certificate = $cert; Target = $target }
+})
 if ($refusals.Count -gt 0) {
     throw ("Nothing was imported. Every certificate in the file must be a CA without a private " +
         "key, and these are not:`n" + ($refusals -join "`n"))
 }
+if (-not ($entries | Where-Object { $_.Target -eq $stores['Root'] })) {
+    Write-Warning ("The file holds no self-issued root, so nothing here becomes a trust anchor. A chain " +
+        "through these CAs validates only if its root is already in $StoreLocation; import the root too.")
+}
 
 # --- import ------------------------------------------------------------------
 
-$approved = @(foreach ($cert in $bundle) {
-    $target = $stores[(Get-CaStoreName -Certificate $cert)]
-    if ($PSCmdlet.ShouldProcess($target.Label, "Import CA '$(ConvertTo-PrintableText $cert.Subject)' ($($cert.Thumbprint))")) {
-        @{ Certificate = $cert; Target = $target }
+$approved = @(foreach ($entry in $entries) {
+    $cert = $entry.Certificate
+    if ($PSCmdlet.ShouldProcess($entry.Target.Label, "Import CA '$(ConvertTo-PrintableText $cert.Subject)' ($($cert.Thumbprint))")) {
+        $entry
     }
 })
 
@@ -319,8 +365,14 @@ if ($approved.Count -gt 0) {
             "failed: $($_.Exception.Message)")
     }
     Write-Host ""
-    Write-Host "Imported $added CA certificate(s). The DB server cert chaining to them now validates with" -ForegroundColor Green
-    Write-Host "trust_server_certificate = false (no TrustServerCertificate=true needed)." -ForegroundColor Green
+    Write-Host "Imported $added CA certificate(s)."
+    if ($approved | Where-Object { $_.Target -eq $stores['Root'] }) {
+        Write-Host "A DB server cert chaining to the imported root now validates with" -ForegroundColor Green
+        Write-Host "trust_server_certificate = false (no TrustServerCertificate=true needed)." -ForegroundColor Green
+    } else {
+        Write-Warning ("No root was imported, so a DB server cert validates only if its root is already " +
+            "in $StoreLocation.")
+    }
     Write-Host ""
     Write-Host "Rotation: when the CA is replaced, import the NEW CA first (this leaves both trusted),"
     Write-Host "roll the server cert, then remove the OLD CA -- see docs/DEPLOY-SERVER-DB.md."

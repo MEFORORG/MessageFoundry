@@ -553,8 +553,10 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 ```
 
 The helper shows every certificate in the file, refuses the whole file if any one is not a CA or
-carries a private key, and puts a root in `LocalMachine\Root` and any issuing CA from a `.p7b`
-chain in the intermediate store `LocalMachine\CA`. The built-ins below check none of that, so use
+carries a private key, and puts a self-issued root in `LocalMachine\Root` and any other CA in the
+intermediate store `LocalMachine\CA`, which is not a trust anchor. So give it the root, alone or in
+a `.p7b` chain: an issuing CA on its own validates nothing until its root is in `LocalMachine\Root`,
+and the helper warns when a file holds no root. The built-ins below check none of that, so use
 them only for a file holding one root CA you have checked yourself:
 
 ```powershell
@@ -577,16 +579,18 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 **Rotating the CA (root/intermediate):**
 
 1. **Add** the new CA alongside the old one — both trusted at once (the overlap window):
-   - **SQL Server:** import the new CA into `LocalMachine\Root` (§5.2) on every connecting host; the
-     old CA stays imported. Both chains now validate.
+   - **SQL Server:** import the new CA (§5.2) on every connecting host: a new root goes into
+     `LocalMachine\Root`, a new issuing CA into `LocalMachine\CA`. The old CA stays imported. Both
+     chains now validate.
    - **PostgreSQL (file pin):** point `[store].ssl_root_cert` at a **multi-root PEM bundle** containing
      **both** the old and new CA certs (concatenate them in one PEM file), then reload. `libpq`
      accepts a server cert that chains to **either** root.
 2. **Roll the DB server certificate** to one issued by the new CA (a DB-administrator action). Because
    both CAs are trusted, connections keep validating across the swap.
 3. **Remove the old CA** once every host trusts the new one and the server cert has rolled:
-   - **SQL Server:** delete the old CA from `LocalMachine\Root` (e.g.
-     `Get-ChildItem Cert:\LocalMachine\Root | Where-Object Thumbprint -eq <old> | Remove-Item`).
+   - **SQL Server:** delete the old CA from whichever machine store holds it, `LocalMachine\Root` for
+     a root or `LocalMachine\CA` for an issuing CA (e.g.
+     `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA | Where-Object Thumbprint -eq <old> | Remove-Item`).
    - **PostgreSQL:** drop the old CA from the PEM bundle and reload.
 
 **Rotating only the server leaf cert** (same CA): no trust-store change is needed — the new leaf still

@@ -21,6 +21,7 @@ skip where there is none.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import os
@@ -118,6 +119,8 @@ def chain() -> dict[str, tuple[x509.Certificate, _Key]]:
         "unconstrained": _cert("Synthetic No Constraints", None),
         "no_cert_sign": _cert("Synthetic CA Without CertSign", True, cert_sign=False),
         "cert_sign": _cert("Synthetic CA With CertSign", True, cert_sign=True),
+        # A DER CA whose bytes spell PEM armour inside its subject.
+        "armour_in_subject": _cert("-----BEGIN NOTE-----", True),
     }
 
 
@@ -162,8 +165,16 @@ def files(
         "pem_x509_label": _pem(root).replace(b" CERTIFICATE-----", b" X509 CERTIFICATE-----"),
         "pem_duplicate": _pem(root, root),
         "pem_key_usage": _pem(chain["no_cert_sign"][0], chain["cert_sign"][0]),
+        # Bare base64 with no armour, and the AD CS shape: a base64 .p7b under a CERTIFICATE header.
+        "b64_der": base64.encodebytes(root.public_bytes(der)),
+        "adcs_p7b": b"-----BEGIN CERTIFICATE-----\n"
+        + base64.encodebytes(pkcs7.serialize_certificates([root, inter], der))
+        + b"-----END CERTIFICATE-----\n",
+        "der_armour_in_subject": chain["armour_in_subject"][0].public_bytes(der),
+        "inter_only": _pem(inter),
         "empty": b"",
-        "garbage": b"not a certificate at all\n",
+        "base64_junk": b"not a certificate at all\n",
+        "garbage": b"not a certificate!\n",
     }
     paths = {}
     for name, data in contents.items():
@@ -241,7 +252,10 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     # issuing CA for the intermediate store, never for Root.
     assert certs("der") == [(root, None)]
     assert certs("pem_one") == [(root, None)]
-    for name in ("p7b_der", "p7b_pem", "pem_bundle", "pem_zero_first", "pem_utf16"):
+    assert certs("b64_der") == [(root, None)]
+    assert certs("der_armour_in_subject") == [(_thumb(chain["armour_in_subject"][0]), None)]
+    assert full("inter_only") == [(inter, None, "CertificateAuthority")]
+    for name in ("p7b_der", "p7b_pem", "pem_bundle", "pem_zero_first", "pem_utf16", "adcs_p7b"):
         assert sorted(full(name)) == sorted(
             [(root, None, "Root"), (inter, None, "CertificateAuthority")]
         ), name
@@ -277,6 +291,7 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert "not well formed" in error("pem_unterminated")
     assert "empty" in error("empty")
     assert "no certificate" in error("garbage")
+    assert "'Unknown' content" in error("base64_junk")
 
 
 def _run_whatif(ca_path: Path) -> subprocess.CompletedProcess[str]:
@@ -306,7 +321,8 @@ def test_whatif_shows_and_offers_every_certificate_of_an_unsigned_p7b(
     proc = _run_whatif(files["p7b_der"])
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
-    assert "About to trust 2 CA certificate(s)" in out
+    assert "The file holds 2 certificate(s)" in out
+    assert "holds no self-issued root" not in out
     # No elevation was needed, and each certificate is offered for its own store.
     assert "requires an elevated" not in out
     for key, store in (
@@ -318,6 +334,17 @@ def test_whatif_shows_and_offers_every_certificate_of_an_unsigned_p7b(
         offered = [ln for ln in out.splitlines() if "What if" in ln and thumb in ln]
         assert len(offered) == 1 and f'"{store}"' in offered[0], (thumb, offered)
     assert "Imported" not in out
+
+
+def test_an_issuing_ca_alone_is_offered_for_the_intermediate_store_with_a_warning(
+    chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
+) -> None:
+    proc = _run_whatif(files["inter_only"])
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "holds no self-issued root" in out
+    offered = [ln for ln in out.splitlines() if "What if" in ln]
+    assert len(offered) == 1 and '"Cert:\\LocalMachine\\CA"' in offered[0], offered
 
 
 def test_a_bundle_holding_a_non_ca_imports_nothing(
