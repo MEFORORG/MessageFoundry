@@ -68,11 +68,12 @@
         directory, so a .env, a *.db store or a build output beside them refuses the tree. Two files
         are tolerated too. By the owner's ruling of 2026-11-06: `.claude/seat.local.txt` at the
         tree's root, as a plain file, not a folder or a link. By the owner's ruling of 2026-11-14,
-        which extends it: `scripts/security/scan-tokens.local.txt`, which new.ps1 copies into every
-        new worktree, only when it is a plain file whose bytes (compared in full) equal those of
-        -Primary's own copy at that path, itself a plain file reached through plain folders. A copy
-        that differs, a primary copy that is missing or a link, a folder or link in the tree, and any
-        read that fails all still refuse, and no refusal prints the file's contents;
+        which extends it: `scripts/security/scan-tokens.local.txt`, which Claude Code copies into the
+        worktrees it makes (.worktreeinclude) and new.ps1 into its own, only when it is a plain file
+        whose bytes (compared in full) equal those of -Primary's own copy at that path, both plain
+        files reached through plain folders. A copy that differs, a primary copy that is missing, a
+        folder or a link, a folder or link in the tree, and any read that fails all still refuse,
+        and no refusal prints the file's contents;
       * a walk of the whole working tree, ignored directories included, finds no nested git checkout (an
         entry named .git), no link of any kind, and inside a cache directory no file named like data
         ($CACHE_DATA_NAME_PATTERN); a folder it cannot list refuses;
@@ -97,7 +98,9 @@
         content check and the removal. A refusal here reads "re-checked just before the removal". THE
         RESIDUAL, at least: a write into the tree while the late fence is being read, and a claim, an
         allocation or a per-worktree ref written while the late content check or fence is being read,
-        are not seen. The content check is the slow read (a whole-tree walk), so that is the longer
+        are not seen; nor is the primary checkout's copy of scan-tokens.local.txt changed, removed or
+        reached through a new link in that window, so the tree's copy can go after the primary's
+        stopped matching it. The content check is the slow read (a whole-tree walk), so that is the longer
         window; it was put after the ownership reads so that the tree's own contents, the commonest
         late write, get the shorter one. A root, a folder above it or its .git swapped for a link
         between the last root check and the removal itself is not seen either.
@@ -188,7 +191,7 @@ function Get-TreeRootRefusal([string]$Path, [switch]$Late) {
 # before only the fence, so a write in the window refuses the tree. -Primary is the checkout whose copy
 # of the leak-gate token list the tree's copy is compared with. Returns '' or the refusal.
 function Get-ContentRefusal {
-    param([string]$Primary, [string]$Path, [double]$IdleHours)
+    param([string]$Path, [double]$IdleHours, [string]$Primary)
     $flagged = Get-FlaggedFileCount $Path
     if ($flagged -ne 0) { return $(if ($flagged -lt 0) { 'its flagged files could not be read' } else { "$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see" }) }
     $clean = Test-WorktreeClean -Path $Path -AllUntracked

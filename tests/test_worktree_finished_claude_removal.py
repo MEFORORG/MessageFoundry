@@ -1308,29 +1308,37 @@ _SYNTHETIC_TOKENS = b"# synthetic\nACME-SYNTHETIC-TOKEN-0001\n"
         "tree-folder",
         "tree-link",
         "tree-junction",
+        "tree-folder-linked",
     ],
 )
 def test_a_scan_tokens_copy_is_tolerated_only_when_identical_to_the_primarys(
     fx: Fx, case: str
 ) -> None:
     """The owner's ruling of 2026-11-14, asked "Should the prune accept a scan-tokens copy identical
-    to the primary checkout's?" and answering "Yes, brief a fix": new.ps1 copies the ignored leak-gate
-    token list into every new worktree, so a finished tree whose copy is a plain file byte-identical to
-    the primary checkout's own plain copy loses nothing when it goes. Red on 8274fc4ad7 for
-    "identical", which refused. Every other case is a control that still refuses: a copy that
-    differs, a primary copy that is missing, a folder or a link, a primary copy reached through a
-    linked folder (here, into the tree itself, so the removal would delete the only copy), and a
-    tree copy that is a folder, a file symlink or a junction. The token text never reaches a row."""
+    to the primary checkout's?" and answering "Yes, brief a fix": Claude Code (.worktreeinclude) and
+    new.ps1 copy the ignored leak-gate token list into the worktrees they make, so a finished tree
+    whose copy is a plain file byte-identical to the primary checkout's own plain copy loses nothing
+    when it goes. Red on 8274fc4ad7 for "identical", which refused. Every other case is a control
+    that still refuses: a copy that differs, a primary copy that is missing, a folder or a link, a
+    copy reached through a linked folder on either side (so both paths are one file, and the removal
+    would delete the only copy), and a tree copy that is a folder, a file symlink or a junction. The
+    token text never reaches a row."""
     tree = fx.tree("clean")
     _ignore_like_the_engine(fx, tree)
     mine = tree / _TOKENS_REL
     theirs = fx.primary / _TOKENS_REL
-    mine.parent.mkdir(parents=True)
     if case == "primary-folder-linked":
         # The primary's scripts/security is a junction into the tree's, so its copy IS the tree's.
+        mine.parent.mkdir(parents=True)
         theirs.parent.parent.mkdir()
         _junction(theirs.parent, mine.parent)
+    elif case == "tree-folder-linked":
+        # The tree's scripts/security is a junction into the primary's: the same one file again.
+        theirs.parent.mkdir(parents=True)
+        mine.parent.parent.mkdir()
+        _junction(mine.parent, theirs.parent)
     else:
+        mine.parent.mkdir(parents=True)
         theirs.parent.mkdir(parents=True)
     # The tree's copy.
     if case == "tree-folder":
@@ -1345,7 +1353,7 @@ def test_a_scan_tokens_copy_is_tolerated_only_when_identical_to_the_primarys(
     else:
         mine.write_bytes(_SYNTHETIC_TOKENS)
     # The primary checkout's copy.
-    if case in ("identical", "tree-folder", "tree-link", "tree-junction"):
+    if case in ("identical", "tree-folder", "tree-link", "tree-junction", "tree-folder-linked"):
         theirs.write_bytes(_SYNTHETIC_TOKENS)
     elif case == "differing":
         # Same length, one byte apart, so only a content comparison tells them apart.
@@ -1366,9 +1374,35 @@ def test_a_scan_tokens_copy_is_tolerated_only_when_identical_to_the_primarys(
         assert theirs.read_bytes() == _SYNTHETIC_TOKENS
         return
     assert row["Outcome"] == "REFUSED", row
-    assert "ignored entr(ies) that are not a regenerable cache" in row["Reason"], row
-    assert "scan-tokens.local.txt" in row["Reason"], row
     assert tree.is_dir()
+    if case != "tree-folder-linked":
+        # git may list a linked folder in the tree as an untracked link, refused before this gate.
+        assert "ignored entr(ies) that are not a regenerable cache" in row["Reason"], row
+        assert "scan-tokens.local.txt" in row["Reason"], row
+
+
+def test_a_primary_copy_changed_after_the_first_pass_refuses_in_the_late_pass(fx: Fx) -> None:
+    """The late pass compares the token list again: here the primary's copy is rewritten while the
+    first pass reads the fence, after its own comparison passed, so only the late one can see it."""
+    tree = fx.tree("clean")
+    _ignore_like_the_engine(fx, tree)
+    for root in (tree, fx.primary):
+        (root / _TOKENS_REL).parent.mkdir(parents=True)
+        (root / _TOKENS_REL).write_bytes(_SYNTHETIC_TOKENS)
+    _age(fx.primary, tree, 200)
+    rows = remove(
+        fx,
+        [tree],
+        apply=True,
+        prelude=_LATE_WRITE.format(write="[IO.File]::WriteAllText($env:T_THEIRS, 'changed')"),
+        env_extra={"T_THEIRS": str(fx.primary / _TOKENS_REL)},
+    )
+    row = rows["clean"]
+    assert row["Outcome"] == "REFUSED", row
+    assert "re-checked just before the removal" in row["Reason"], row
+    assert "scan-tokens.local.txt" in row["Reason"], row
+    assert "ACME-SYNTHETIC-TOKEN" not in json.dumps(row)
+    assert (tree / _TOKENS_REL).read_bytes() == _SYNTHETIC_TOKENS
 
 
 def test_a_removed_tree_under_a_plain_parent_still_reads_removed(fx: Fx) -> None:
