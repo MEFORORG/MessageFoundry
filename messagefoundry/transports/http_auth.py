@@ -192,6 +192,25 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
             )
         if auth_style not in ("basic", "post"):
             raise HttpAuthError(f"oauth2_auth_style must be 'basic' or 'post', got {auth_style!r}")
+        # BACKLOG #5800: each grant field is encoded strictly as UTF-8 at every mint, so a value
+        # holding a lone surrogate raised UnicodeEncodeError out of send or test_connection, and that
+        # exception's `object` is the whole value, the client_secret included. Refused here instead,
+        # by setting name only, and raised outside the handler so nothing chains the value.
+        unencodable = next(
+            (
+                name
+                for name, value in (
+                    ("oauth2_client_id", client_id),
+                    ("oauth2_client_secret", client_secret),
+                    ("oauth2_scope", scope),
+                    ("oauth2_audience", audience),
+                )
+                if value and not _utf8_encodable(value)
+            ),
+            None,
+        )
+        if unencodable is not None:
+            raise HttpAuthError(f"{unencodable} holds a character UTF-8 cannot encode")
         self.client_id = client_id
         self._client_secret = client_secret
         self.scope = scope or None
@@ -210,11 +229,22 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
             trust_anchor=trust_anchor,
             connection=connection,
         )
+        # ASVS 4.2.5: the token URL and the Basic client-credential header are operator-supplied via
+        # env(), so an env value that resolved to an unexpected blob is refused here as a clear config
+        # error. BACKLOG #5800: this ran at each mint, where its ValueError escaped send and
+        # test_connection unclassified. Every value it measures is fixed by now, the proxy's
+        # Proxy-Authorization from _open_token_hop included, so a mint cannot fail it later. The
+        # message names a header and a length, never a value. The grant is built outside the try, so
+        # this arm can only ever chain the length refusal.
+        _, headers = self._grant()
+        try:
+            enforce_outbound_length_limits(self.token_url, headers)
+        except ValueError as exc:
+            raise HttpAuthError(f"OAuth2 token request: {exc}") from exc
 
-    def _fetch_token(self) -> tuple[str, float]:
-        """POST the ``client_credentials`` grant and return ``(access_token, ttl)``. PHI/secret-safe: a
-        failure names only the redacted token host + HTTP status — never the secret or the response body
-        (which carries the bearer)."""
+    def _grant(self) -> tuple[bytes, dict[str, str]]:
+        """The ``client_credentials`` grant's form body and headers, built from the configured
+        values alone."""
         form: dict[str, str] = {"grant_type": "client_credentials"}
         if self.scope:
             form["scope"] = self.scope
@@ -231,12 +261,23 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         else:  # client_secret_post
             form["client_id"] = self.client_id
             form["client_secret"] = self._client_secret
-        data = urllib.parse.urlencode(form).encode("ascii")
-        # ASVS 4.2.5: the token URL and the Basic client-credential header are operator-supplied via
-        # env(), so an env value that resolved to an unexpected blob would otherwise surface as an
-        # opaque IdP-side failure on the first mint rather than as a clear config error.
-        enforce_outbound_length_limits(self.token_url, dict(headers))
+        return urllib.parse.urlencode(form).encode("ascii"), headers
+
+    def _fetch_token(self) -> tuple[str, float]:
+        """POST the ``client_credentials`` grant and return ``(access_token, ttl)``. PHI/secret-safe: a
+        failure names only the redacted token host + HTTP status — never the secret or the response body
+        (which carries the bearer). The grant's encode and length were checked at construction."""
+        data, headers = self._grant()
         return self._post_token(data, headers)
+
+
+def _utf8_encodable(value: str) -> bool:
+    """Whether ``value`` encodes as strict UTF-8, which the grant's form and Basic header need."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def oauth2_cc_provider_from_settings(

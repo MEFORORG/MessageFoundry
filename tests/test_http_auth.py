@@ -130,6 +130,75 @@ def test_oauth2_cc_cleartext_token_endpoint_refused(monkeypatch: pytest.MonkeyPa
     assert "cleartext" in str(ei.value)
 
 
+# --- BACKLOG #5800: a grant the provider cannot send is refused at construction -----------------
+
+_SURROGATE_SECRET = "s3cr3t-\ud800-synthetic"  # noqa: S105 -- a synthetic test credential
+
+
+@pytest.mark.parametrize("auth_style", ["basic", "post"])
+@pytest.mark.parametrize(
+    ("setting", "over"),
+    [
+        ("oauth2_client_secret", {"client_secret": _SURROGATE_SECRET}),
+        ("oauth2_client_id", {"client_id": "cid-\udfff"}),
+        ("oauth2_scope", {"scope": "claims.\ud800"}),
+        ("oauth2_audience", {"audience": "aud-\ud800"}),
+    ],
+    ids=["secret", "client-id", "scope", "audience"],
+)
+def test_oauth2_cc_refuses_an_unencodable_grant_value_at_construction(
+    setting: str, over: dict[str, str], auth_style: str
+) -> None:
+    """Mutation: drop the encodability check in ``__init__``. Red: the provider builds, and the
+    first mint raises a UnicodeEncodeError whose ``object`` is the whole value, the secret
+    included, out of send or test_connection."""
+    with pytest.raises(
+        HttpAuthError, match=f"{setting} holds a character UTF-8 cannot encode"
+    ) as ei:
+        _oauth_provider(auth_style=auth_style, **over)
+    assert "s3cr3t" not in str(ei.value)
+    # Raised outside any handler, so no exception holding the value rides the chain.
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{"client_secret": "x" * 20_000}, {"token_url": TOKEN_URL + "?" + "q" * 20_000}],
+    ids=["basic-header", "token-url"],
+)
+def test_oauth2_cc_refuses_an_over_length_grant_at_construction(over: dict[str, str]) -> None:
+    """Mutation: move the length check back into ``_fetch_token``. Red: the provider builds, and
+    the first mint raises a bare ValueError out of send or test_connection."""
+    with pytest.raises(HttpAuthError, match="OAuth2 token request: .*over the") as ei:
+        _oauth_provider(**over)
+    assert "x" * 64 not in str(ei.value) and "q" * 64 not in str(ei.value)
+
+
+def test_control_a_post_style_long_secret_rides_the_body_and_builds() -> None:
+    """The length gate measures the URL and the headers. A post-style secret is in the form body,
+    which it does not bound, so the same long secret builds and mints there."""
+    p = _oauth_provider(auth_style="post", client_secret="x" * 20_000)
+    p._opener = _RecordingOpener(b'{"access_token":"AT","expires_in":3600}')  # type: ignore[assignment]
+    assert p.access_token() == "AT"
+
+
+def test_an_unencodable_secret_refuses_the_destination_build() -> None:
+    """The refusal reaches the connector's construction, so it fails at check, dry-run or start,
+    never at send time."""
+    spec = with_oauth2_client_credentials(
+        Rest(url=URL),
+        token_url=TOKEN_URL,
+        client_id="cid",
+        client_secret=_SURROGATE_SECRET,
+    )
+    with pytest.raises(ValueError, match="oauth2_client_secret holds a character") as ei:
+        build_destination(
+            Destination(name="OB_REST", type=ConnectorType.REST, settings=spec.settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
+    assert "s3cr3t" not in str(ei.value)
+
+
 def test_oauth2_cc_unparseable_token_response_raises_delivery_error() -> None:
     p = _oauth_provider()
     p._opener = _RecordingOpener(b"not-json")  # type: ignore[assignment]
