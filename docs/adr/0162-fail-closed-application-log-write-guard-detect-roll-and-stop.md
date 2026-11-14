@@ -162,7 +162,10 @@ both halves.** The inbound re-arm rides `_start_inbound_unsafe`, so **anything t
 re-arms it**: `restart_inbound` for one connection, and a `/config/reload` for every inbound it
 re-binds (reload quiesces every source and re-binds from the new graph). The inbounds a reload
 declines to bind — `deployed=False`, `auto_start=False` and not previously listening, DR-filtered —
-stay halted, as do the connections a per-connection restart does not name. The outbound **pause is
+stay halted, as do the connections a per-connection restart does not name. *(Note, BACKLOG #5704:
+under the pooled claim mode a router, transform or response lane that is STOPPED when the inbound
+restarts stays STOPPED after it; `docs/CONFIGURATION.md`, `on_write_failure`, says what re-arms it.)*
+The outbound **pause is
 operator-owned in both cases** (#115/#233: a reload never resumes a lane an operator has not looked
 at), so delivery needs an explicit `start_outbound` or a service restart either way. Stated the other
 way round: *a reload alone will not drain the backlog*, and a test pins exactly that — after a reload

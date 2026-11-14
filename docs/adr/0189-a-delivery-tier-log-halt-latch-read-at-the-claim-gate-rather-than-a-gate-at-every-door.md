@@ -277,8 +277,8 @@ its re-arm genuinely is per-connection.
 workers' loop top and, under pooled, in a pre-claim predicate on the INGRESS, ROUTED and
 RESPONSE dispatchers: a gated pooled lane parks with no claim and no row write until the gate lifts. The halt pauses
 no internal lane, and STOPs one only through its hand-back of a prefix claimed before the latch
-(on leadership loss, or at T17, when that pooled hand-back keeps failing its reschedule on a full
-store). A lane can still STOP while the halt is in force for other causes, at least under its own
+(on leadership loss, or at T17, when that pooled hand-back's reschedule raises and the
+dispatcher's re-pend of the head then keeps failing, for example on a full store). A lane can still STOP while the halt is in force for other causes, at least under its own
 fault policy; lifting the gate does not itself re-arm a STOP. `_inbound_log_halted` states this once
 in the code. It marks every inbound as it latches, before it waits
 for the reload lock, so a reload holding that lock cannot rebind a listener over gated stages. A
