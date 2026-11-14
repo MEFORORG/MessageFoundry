@@ -321,10 +321,28 @@ _PLAIN_SCHEME_VALUE = (
 # never (the reason is at ``_CREDENTIAL_KV``); otherwise the plain class stops at the first quote. A
 # QUOTED KEY is a label when a colon follows the quote, here and in ``_LABEL_HEAD`` (BACKLOG #3038);
 # why the colon only is on the same pattern in ``messagefoundry/secretscrub.py``.
+#
+# A QUOTED SCHEME WITH A PADDED TOKEN, ``{"Authorization": "Basic dXNlcjpwYXNz=="}``, is tried first
+# (BACKLOG #5546): the guarded form refuses a closer after "=", so the token printed. Why it takes only
+# a token68 holding no label word, and why it stays linear, are stated once, on the same fragment in
+# ``messagefoundry/secretscrub.py``, and so is why its guard names the compound key words this copy
+# does not read as labels; a test holds the two spellings equal.
+_QUOTED_SCHEME_VALUE = (
+    r"'(?i:bearer|basic)[^\S\r\n]++(?![A-Za-z0-9+/._~-]*?(?i:"
+    r"subscriptionkey|encryption_key|authorization|encryptionkey|secondarykey|private_key"
+    r"|accountkey|credential|privatekey|accesskey|masterkey|api\-key|api_key|authkey|session"
+    r"|apikey|bearer|mefor_|secret|token|pass|pwd"
+    r"))[A-Za-z0-9+/._~-]++=++(?='(?!\s*+[:=]))"
+    r'|"(?i:bearer|basic)[^\S\r\n]++(?![A-Za-z0-9+/._~-]*?(?i:'
+    r"subscriptionkey|encryption_key|authorization|encryptionkey|secondarykey|private_key"
+    r"|accountkey|credential|privatekey|accesskey|masterkey|api\-key|api_key|authkey|session"
+    r"|apikey|bearer|mefor_|secret|token|pass|pwd"
+    r'))[A-Za-z0-9+/._~-]++=++(?="(?!\s*+[:=]))'
+)
 _BEARER = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
-    r"(?:['\"]\s*:|\s*[:=])\s*(?:(?i:bearer|basic|digest)\s+)?"
-    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
+    r"(?:['\"]\s*:|\s*[:=])\s*(?:" + _QUOTED_SCHEME_VALUE + r"|(?:(?i:bearer|basic|digest)\s+)?"
+    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r"))"
 )
 
 # A bare auth scheme carrying its credential with no preceding header label — "Bearer <tok>" as it

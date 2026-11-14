@@ -1026,6 +1026,58 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
     _PLAIN_KEY_VALUE, _KEY_TERMINATORS, "compound", ","
 )
 
+# A QUOTED SCHEME AND PADDED TOKEN, the way a JSON or dict header map holds an Authorization value:
+# ``{"Authorization": "Basic dXNlcjpwYXNz=="}`` (BACKLOG #5546). The scheme word sits INSIDE the quote,
+# so ``_BEARER``'s scheme group never sees it, and :data:`_GUARDED_QUOTED_VALUE` refuses a closer right
+# after "=", which is exactly where base64 padding puts one. So the plain class took the opening quote
+# and the scheme word, stopped at the space, and the token printed. A padded Basic value is a base64
+# user and password.
+#
+# WHY THE GUARD THAT REFUSED IT IS NOT SIMPLY DROPPED. That guard exists because a closer right after
+# "=" is usually a LATER label's opening quote, as in ``token='Bearer password='p w'``, and taking it
+# would print "p w", which the plain class hid. So this branch takes only an RFC 7235 token68, a run of
+# letters, digits and ``+/._~-`` then at least one "=", which holds no space, quote, "{" or ":", the
+# other four things the guard refuses. And it refuses a token holding any label word of any family,
+# or the ``MEFOR_`` prefix, ignoring case: a closer after "=" can belong to a later label only when the
+# run before the "=" ends in one. A token it refuses falls back to the forms below, so it prints as
+# before. The closer must be the opening quote's twin, it is left in the text as the guarded form
+# leaves it, and it may not be followed by ":" or "=", the quote of a ``'label'=`` echo.
+#
+# UNPADDED, the guarded form already takes the same value, so this branch asks for the padding.
+#
+# LINEAR. It is tried only right after a label's separator, and the keyword walk runs over the one
+# token68 run that follows the scheme word, which ends at the closer; two labels' runs cannot share a
+# character, because a quote ends each.
+#
+# WRITTEN WITH ITS OWN ``(?i:...)`` GROUPS so ``support/redact.py``, whose patterns fold case only where
+# they say so, carries the same text; a test holds the two equal. The guard names every family's words,
+# :data:`_COMPOUND_KEY_WORDS` among them, in BOTH copies and both readings. The bundle copy and the
+# reading before the camelCase one read no compound key word as a label, but this module does, and in
+# the bundle it runs second: a copy that took ``'Bearer x.AccountKey='`` would hand the compound label's
+# quoted value to the second layer with no label in front of it. Refusing more falls back to what
+# printed before.
+#
+# The words are REDUCED BY SUBSUMPTION, as :data:`_ANY_HINT` is: a word holding another is dropped,
+# since the guard is a substring test. That is also what keeps ``sharedaccesskey``, a marker of the
+# camelCase reading, out of the reading before; ``accesskey`` covers it.
+_TOKEN68_GUARD_SET = frozenset(word.casefold() for word in _CAMEL_WORDS + (_ENV_PREFIX,))
+_TOKEN68_GUARD_WORDS = _alternation(
+    tuple(
+        word
+        for word in sorted(_TOKEN68_GUARD_SET)
+        if not any(other != word and other in word for other in _TOKEN68_GUARD_SET)
+    )
+)
+_QUOTED_SCHEME_VALUE = "|".join(
+    quote
+    + r"(?i:bearer|basic)[^\S\r\n]++(?![A-Za-z0-9+/._~-]*?(?i:"
+    + _TOKEN68_GUARD_WORDS
+    + r"))[A-Za-z0-9+/._~-]++=++(?="
+    + quote
+    + r"(?!\s*+[:=]))"
+    for quote in ("'", '"')
+)
+
 # A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
 #
 # The ``(?:bearer|basic|digest)\s+`` group is load-bearing, not decoration: without it the value class
@@ -1046,10 +1098,12 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # token key still stops a plain value. The match is rewritten as ``label=<placeholder>``, as every
 # family's is, so the JSON shape is not kept. It takes no braced value: ``{"session": {"u": 1}}``
 # loses only its "{", exactly as ``session={"u": 1}`` does.
+#
+# A quoted scheme with a padded token is tried first, through :data:`_QUOTED_SCHEME_VALUE`.
 _BEARER = re.compile(
     r"(?i)(" + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
-    r"(?:['\"]\s*:|\s*[:=])\s*(?:(?:bearer|basic|digest)\s+)?"
-    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _CAMEL_PLAIN_VALUE + r")"
+    r"(?:['\"]\s*:|\s*[:=])\s*(?:" + _QUOTED_SCHEME_VALUE + r"|(?:(?:bearer|basic|digest)\s+)?"
+    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _CAMEL_PLAIN_VALUE + r"))"
 )
 
 # A bare auth scheme carrying its credential with no preceding header label -- "Bearer <tok>" as it

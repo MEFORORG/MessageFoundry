@@ -269,6 +269,22 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
         ("store opened", "active"),
         "_KEY_MATERIAL",
     ),
+    # BACKLOG #5546: the scheme word inside a quoted JSON or dict value, with a padded token. The
+    # guarded form refuses a closer after "=", so the plain class took the scheme word and stopped.
+    QuotedValue(
+        "json_basic_padded_token",
+        'upstream headers {"Authorization": "Basic zq-B4sic_Pad-61=="} rejected',
+        ("zq-B4sic_Pad-61",),
+        ("upstream headers", "} rejected"),
+        "_BEARER",
+    ),
+    QuotedValue(
+        "dict_basic_padded_token",
+        "upstream headers {'authorization': 'basic zq-B4sic_Pad-62='} rejected",
+        ("zq-B4sic_Pad-62",),
+        ("upstream headers", "} rejected"),
+        "_BEARER",
+    ),
 )
 
 
@@ -4085,3 +4101,89 @@ def test_a_token_quoted_key_takes_no_braced_value() -> None:
         line = key_shape + '{"u": "x"} tail'
         out = scrub_credentials(line)
         assert out.endswith(f'session={CREDENTIAL_PLACEHOLDER}"u": "x"}} tail'), out
+
+
+# --- BACKLOG #5546: a quoted scheme word with a padded token ---------------------------------------
+
+
+def test_the_quoted_scheme_token_is_one_text_in_both_copies() -> None:
+    """The bundle copy spells the fragment out literally, so the static regex scanner reads it; this
+    holds the spelling to ``secretscrub``'s, which is built from the vocabulary tuples, and holds it
+    unchanged in the reading before the camelCase one."""
+    assert redact_mod._QUOTED_SCHEME_VALUE == scrub_mod._QUOTED_SCHEME_VALUE
+    assert scrub_mod._QUOTED_SCHEME_VALUE in scrub_mod._pre_camel(scrub_mod._BEARER).pattern
+    for module in (scrub_mod, redact_mod):
+        assert module._QUOTED_SCHEME_VALUE in module._BEARER.pattern, module.__name__
+
+
+def test_a_padded_token_holding_a_compound_key_label_is_left_to_it() -> None:
+    """The guard names the compound key words in both copies. The bundle copy reads none of them as
+    a label, but the second layer does, so a copy that took ``'Bearer x.AccountKey='`` would hand
+    that label's quoted value to the second layer with no label in front of it."""
+    line = "token='Bearer x.AccountKey='zq-Ck_A-74 zq-Ck_B-75'"
+    for surface, apply in _SWALLOW_SURFACES:
+        assert "zq-Ck_B-75" not in apply(line), surface
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "{'Authorization': 'Bearer zq-Pad_Tok-71=='}",
+        '{"token": "basic zq-Pad_Tok-71="}',
+        "auth api_key='Bearer zq-Pad_Tok-71==' ok",
+    ),
+)
+def test_a_quoted_scheme_and_padded_token_is_taken_whole(line: str) -> None:
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        assert "zq-Pad_Tok-71" not in out, f"{surface}: {out!r}"
+
+
+def _without_the_token68_keyword_guard(module: ModuleType) -> re.Pattern[str]:
+    guard = r"(?![A-Za-z0-9+/._~-]*?(?i:" + scrub_mod._TOKEN68_GUARD_WORDS + r"))"
+    assert guard in module._BEARER.pattern, f"{module.__name__}._BEARER lost its keyword guard"
+    return re.compile(module._BEARER.pattern.replace(guard, ""), module._BEARER.flags)
+
+
+#: A padded token run that ends in a later label's head, so its closer is that label's opening quote.
+_LABEL_IN_TOKEN_LINES = (
+    "token='Bearer password='zq-Lt_A-72 zq-Lt_B-73'",
+    'authorization: "Basic x.client_secret="zq-Lt_A-72 zq-Lt_B-73"',
+)
+
+
+@pytest.mark.parametrize("line", _LABEL_IN_TOKEN_LINES)
+def test_a_padded_token_ending_in_a_label_is_left_to_that_label(
+    line: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guarded form refuses a closer after "=" because it is usually a later label's opening
+    quote. The padded-token branch takes one only when the token holds no label word. THE CONTROL:
+    without that guard the branch takes the later label's quote and its value prints."""
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        assert "zq-Lt_B-73" not in out, f"{surface}: {out!r}"
+    for module in (scrub_mod, redact_mod):
+        monkeypatch.setattr(module, "_BEARER", _without_the_token68_keyword_guard(module))
+    assert any("zq-Lt_B-73" in apply(line) for _surface, apply in _SWALLOW_SURFACES), "control"
+
+
+def test_the_quoted_scheme_token_grows_linearly_in_line_length() -> None:
+    """The keyword guard walks the token run once per label. Two shapes: one long run under one
+    label, and many labels each with a run that fails at its end."""
+    shapes: tuple[Callable[[int], str], ...] = (
+        lambda length: "token: 'Basic " + "aB0+" * (length // 4) + "x",
+        lambda length: "token: 'Basic aB0+aB0+aB0+aB0= " * (length // 30),
+    )
+    for module in (scrub_mod, redact_mod):
+        pattern: re.Pattern[str] = module._BEARER
+
+        def sub(text: str, pattern: re.Pattern[str] = pattern) -> str:
+            return pattern.sub("x", text)
+
+        for shape in shapes:
+            growth = _growth_between(
+                sub, shape(_GROWTH_LENGTHS[0]), shape(_GROWTH_LENGTHS[1]), rounds=5
+            )
+            assert growth <= _MAX_GROWTH, (
+                f"{module.__name__}._BEARER grew {growth:.1f}x for 8x the length on {shape(40)!r}"
+            )

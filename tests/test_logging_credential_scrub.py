@@ -184,6 +184,21 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
     ),
 )
 
+#: Quoted rows a pattern other than ``_CREDENTIAL_KV`` must do the work for, with that pattern.
+#: BACKLOG #5546: a JSON or dict header map holding the scheme word inside the quote and a padded
+#: token, which the guarded quoted form refuses because its closer follows "=".
+OTHER_QUOTED_VALUES: tuple[tuple[QuotedValue, str], ...] = (
+    (
+        QuotedValue(
+            "json_basic_padded_token",
+            'upstream headers {"Authorization": "Basic wt-B4sic_Pad-90=="} rejected',
+            ("wt-B4sic_Pad-90",),
+            ("upstream headers", "} rejected"),
+        ),
+        "_BEARER",
+    ),
+)
+
 
 #: The quoted rows as families, so they inherit the three parametrized assertions below: the production
 #: chain scrubs them, the DECLARED pattern is what did it, and the admission gate does not change the
@@ -206,6 +221,11 @@ QUOTED_FAMILIES: tuple[Family, ...] = tuple(
         ),
     )
     for case in QUOTED_VALUES
+) + tuple(
+    Family(
+        name=f"quoted_{case.name}", line=case.line, secret=case.fragments[-1], patterns=(pattern,)
+    )
+    for case, pattern in OTHER_QUOTED_VALUES
 )
 
 
@@ -395,7 +415,9 @@ def test_the_gate_folds_the_way_the_patterns_match_not_the_way_str_lower_does() 
     assert "wt-F0ld_Chk-72" not in run_chain(line).getMessage()
 
 
-@pytest.mark.parametrize("case", QUOTED_VALUES, ids=lambda c: c.name)
+@pytest.mark.parametrize(
+    "case", (*QUOTED_VALUES, *(case for case, _ in OTHER_QUOTED_VALUES)), ids=lambda c: c.name
+)
 def test_no_fragment_of_a_quoted_credential_value_survives_the_chain(case: QuotedValue) -> None:
     """EVERY piece of a quoted value must be gone, and the rest of the line must still be there.
 
