@@ -9157,10 +9157,9 @@ def create_app(
 
         **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
         ``.txt`` / ``.xml``). A body that begins with a metadata-bearing binary container's signature
-        (JPEG/PNG/PDF/ZIP incl. DOCX/GIF/TIFF), or holds a NUL byte or a control-dense 8 KiB window anywhere,
-        is refused with **HTTP 415** before anything is written. Metadata held as text is admitted
-        as text, such as an XMP packet in an ``.xml`` file or a PDF whose every stream is text after
-        a text head.
+        (JPEG/PNG/PDF/ZIP incl. DOCX/GIF/TIFF), or holds a NUL byte or a control-dense 8 KiB window
+        anywhere, is refused with **HTTP 415** before anything is written. What this lets through is
+        stated in docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types".
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
         to you and to authorized operators holding ``files:access_any`` (administrators). Your username
@@ -9201,7 +9200,7 @@ def create_app(
             # is written (BACKLOG #5551 moved it there from this route). A binary container
             # (JPEG/PNG/PDF/ZIP incl. DOCX) or a non-text body (NUL / control-dense) is refused with
             # 415 + a metadata-only upload.reject audit, which is what "no metadata stripping" rests
-            # on; parsing/sniff.py's nontext_upload_reason names what it does not catch. The answer
+            # on; docs/CONNECTIONS.md ("Permitted types") states what it lets through. The answer
             # and the audit carry the reason only, never the file name or content.
             await engine.store.record_audit(
                 "upload.reject",

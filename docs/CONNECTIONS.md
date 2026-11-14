@@ -1435,9 +1435,9 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
 - **Permitted types — text only.** The upload chokepoint (`UploadStore.save`) first refuses any
   **non-text or metadata-bearing container** body with **HTTP 415** (ASVS 14.2.8): a body that begins
   with JPEG/PNG/PDF/ZIP (incl. DOCX)/GIF/TIFF magic bytes, holds a NUL byte anywhere, or has a
-  control-character-dense 8 KiB window. A container that starts after a text head is caught only by
-  its NUL bytes or its control density, so one with neither, such as a PDF whose every stream is text,
-  is accepted as the text it then is. Then an extension allowlist (`.hl7`, `.hl7v2`, `.txt`, `.xml`) is
+  control-character-dense 8 KiB window. Past the leading signature, the check refuses only a NUL
+  anywhere and a control-dense window, so a NUL-free binary payload after a text head can pass.
+  Then an extension allowlist (`.hl7`, `.hl7v2`, `.txt`, `.xml`) is
   enforced on the sanitized display filename **and** the content is sniffed against it: `.hl7`/`.hl7v2`
   must begin with an HL7 header segment (`MSH`/`FHS`/`BHS`), `.xml` with a leading `<` (ASVS 5.2.2). A
   disallowed extension or a content/extension mismatch (e.g. HL7 text in a `.xml`) is refused with

@@ -276,7 +276,10 @@ class UploadError(Exception):
 
 
 class UploadPathError(UploadError):
-    """A file_id is malformed or resolves outside the uploads root (path-traversal guard, ADR 0134)."""
+    """A file_id is malformed or resolves outside the uploads root (path-traversal guard, ADR 0134).
+
+    ``UploadStore._paths`` also raises it for a path that does not resolve to itself, such as a
+    symbolic link inside the root (BACKLOG #5552)."""
 
 
 class UploadTooLargeError(UploadError):

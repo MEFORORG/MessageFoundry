@@ -178,16 +178,16 @@ def attachment_mime_agrees(content_type: str | None, head: bytes) -> bool:
 # incl. DOCX, GIF, TIFF: the SAME _MAGIC_PREFIXES families the 5.2.2 attachment sniff uses) — or (b) not
 # plausibly plain text (a NUL byte anywhere, or a high density of non-printable control bytes in one of
 # the body's 8 KiB windows). That is what "no metadata stripping" (ASVS 14.2.8) rests on, WITHOUT a
-# stripping engine. A container that starts after a text head and has neither a NUL byte nor a dense
-# window is admitted as text; nontext_upload_reason names that limit.
+# stripping engine. What it lets through is stated once, in docs/CONNECTIONS.md, under the
+# uploaded-logs upload policy, "Permitted types".
 
 # Control bytes that are legitimate inside a text diagnostic log: tab, LF, CR, vertical-tab/form-feed, and
 # the MLLP frame bytes (0x0b start-block, 0x1c/0x1d end-block/segment markers) an HL7 capture may carry.
 # Every other C0 control byte (and DEL, 0x7f) counts toward the non-text density.
 _TEXT_ALLOWED_CONTROLS = frozenset(b"\t\n\r\x0b\x0c\x1c\x1d")
 # >30% control bytes in one 8 KiB window => not plausibly text. Loose on purpose: real .hl7/.txt/.xml logs
-# sit far below it (segment/line terminators are the allowed set), while a header-less binary blob sits far
-# above it — the point is to catch binaries the magic table doesn't name, not to police odd-but-textual logs.
+# sit far below it (segment/line terminators are the allowed set), and it is not there to police
+# odd-but-textual logs.
 _CONTROL_DENSITY_LIMIT = 0.30
 #: The window the density is judged over: consecutive windows from the start, the last one ending at
 #: the body's end. A dense run that straddles two windows is judged as two halves.
@@ -203,15 +203,15 @@ def nontext_upload_reason(data: bytes) -> str | None:
     * a body that is not plausibly plain text — it contains a NUL byte anywhere, or one of its
       consecutive 8 KiB windows has a high density of non-printable control bytes.
 
-    **The whole body is read (BACKLOG #5551).** A container past the head is not matched by its
-    signature, only by its NUL bytes or its control density, so one with neither, such as a PDF whose
-    every stream is text, is admitted as the text it then is. The scan is ``bytes`` methods with no
-    per-byte Python loop, but it is linear in the body, so a caller runs it off the event loop.
+    **The whole body is read (BACKLOG #5551).** What it lets through is stated once, in
+    docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types". The scan is
+    ``bytes`` methods with no per-byte Python loop, but it is linear in the body, so a caller runs it
+    off the event loop.
 
     ``uploads.validate_upload_content`` runs this first, inside ``UploadStore.save`` and before the
     file is written, and POST /uploads answers a non-``None`` reason with HTTP 415, so a body that
-    begins with a container's signature never reaches the store. This is a stricter, binary-shaped gate than the 5.2.2 extension/content sniff
-    (which maps a text-but-mismatched body to 400); a container carrying a permitted text extension is
+    begins with a container's signature never reaches the store. This is a stricter, binary-shaped
+    gate than the 5.2.2 extension/content sniff (which maps a text-but-mismatched body to 400); a container carrying a permitted text extension is
     caught here first (415), so the 5.2.2 400 path handles the remaining text-vs-extension mismatches."""
     head = _lstrip_bom_ws(data)
     for mime, prefixes in _MAGIC_PREFIXES.items():
