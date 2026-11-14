@@ -203,6 +203,78 @@ def test_a_site_code_run_inside_a_longer_value_is_left(
     assert surrogates.scrub_message_site_codes(text, Keyer(_SALT), ()) == text
 
 
+@pytest.fixture
+def other_prefix(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Iterator[str]:
+    """``request.param`` loaded as the only site prefix in BOTH copies, as :func:`site_prefix`
+    loads its own."""
+    prefix: str = request.param
+    with contextlib.suppress(engine_leak.LeakCheckUnavailable):
+        engine_leak._scanner()
+    monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", f"[site_prefix]\n{prefix}\n")
+    engine_surrogates.reload_site_prefixes()
+    tee_surrogates.reload_site_prefixes()
+    yield prefix
+    monkeypatch.undo()
+    engine_surrogates.reload_site_prefixes()
+    tee_surrogates.reload_site_prefixes()
+
+
+@_SURROGATES
+@pytest.mark.parametrize(
+    ("other_prefix", "value"),
+    [
+        ("24", "\\M242844\\Yamada"),
+        ("41", "Name \\X414243\\"),
+        ("41", "\\X414243\\"),
+        ("28", "\\C282842\\Name"),
+        ("24", "Yamada^\\M242844\\Taro&\\M242844\\X"),
+    ],
+    ids=["multibyte-charset", "hex-data", "hex-data-whole", "single-byte-charset", "in-parts"],
+    indirect=["other_prefix"],
+)
+def test_a_hex_or_charset_escape_argument_is_no_site_code(
+    surrogates: ModuleType, other_prefix: str, value: str
+) -> None:
+    """The argument of ``\\M..\\``, ``\\X..\\`` or ``\\C..\\`` codes a character set or bytes. Read
+    as digits, it turned a name to a site-code surrogate (BACKLOG #5654)."""
+    text = _zpd(value)
+    assert not surrogates.message_has_site_code(text)
+    assert surrogates.scrub_message_site_codes(text, Keyer(_SALT), ()) == text
+
+
+@_SURROGATES
+@pytest.mark.parametrize(
+    ("other_prefix", "value"),
+    [
+        ("24", "\\M242844\\Yamada\\.br\\242844"),
+        ("24", "\\Z242844\\"),
+        ("24", "Call 242844 now\\M2842\\"),
+        ("41", "\\X414243"),
+        ("41", "\\X414243Z\\"),
+        ("41", "\\X3431343234\\3"),
+    ],
+    ids=[
+        "beside-a-break",
+        "local-escape",
+        "free-text-beside-a-charset-escape",
+        "unclosed-tail",
+        "not-hex",
+        "hex-digits-decoded",
+    ],
+    indirect=["other_prefix"],
+)
+def test_a_site_code_beside_or_inside_another_escape_is_still_found(
+    surrogates: ModuleType, other_prefix: str, value: str
+) -> None:
+    """Only a closed hex or character-set escape's own argument is left: a code beside one, in a
+    locally defined ``\\Z..\\`` escape, in an unclosed tail, in a body that is not hex, or that
+    the hex data decodes to, is still found and scrubbed."""
+    text = _zpd(value)
+    assert surrogates.message_has_site_code(text)
+    scrubbed = surrogates.scrub_message_site_codes(text, Keyer(_SALT), ())
+    assert not surrogates.message_has_site_code(scrubbed), scrubbed
+
+
 @_SURROGATES
 def test_the_field_separator_escape_decodes_to_the_message_s_own(
     surrogates: ModuleType, site_prefix: str
