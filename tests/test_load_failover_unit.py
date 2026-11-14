@@ -492,3 +492,101 @@ def test_a_status_answer_past_the_cap_is_no_answer_and_one_at_it_is_read(
     assert _status_read(b"x" * 65) == (None, None)
     # At the cap but not JSON: the status stands, the body does not.
     assert _status_read(b"x" * 64) == (200, None)
+
+
+# --- the recovery monitor's baseline (BACKLOG #5571) -------------------------
+
+
+class _ScriptedNode:
+    """Stands in for an :class:`EngineNode` in ``_monitor_failover``. Each poll reads the survivor's
+    role once, so a role read starts the next scripted tick; within a tick, every stats read takes
+    the next value from that tick's list and repeats the last. The last tick repeats too."""
+
+    def __init__(
+        self, node_id: str, ticks: list[tuple[str | None, list[int | None]]] | None = None
+    ) -> None:
+        self.node_id = node_id
+        self._ticks = ticks or [(None, [None])]
+        self._tick = -1
+        self._read = 0
+
+    def _current(self) -> tuple[str | None, list[int | None]]:
+        return self._ticks[min(max(self._tick, 0), len(self._ticks) - 1)]
+
+    async def role(self, client: object) -> str | None:
+        self._tick += 1
+        self._read = 0
+        return self._current()[0]
+
+    async def stats(self, client: object) -> NodeStats | None:
+        reads = self._current()[1]
+        done = reads[min(self._read, len(reads) - 1)]
+        self._read += 1
+        if done is None:
+            return None
+        return NodeStats(done=done, dead=0, pending=0, inflight=0, in_pipeline=0)
+
+
+def _monitor(
+    survivor_ticks: list[tuple[str | None, list[int | None]]],
+    monkeypatch: pytest.MonkeyPatch,
+    deadline_s: float = 0.05,
+) -> tuple[_KillOutcome, list[str]]:
+    real_sleep = asyncio.sleep
+
+    async def no_wait(_seconds: float) -> None:
+        await real_sleep(0)
+
+    # The module reads asyncio.sleep at call time, so patching the module attribute reaches it.
+    monkeypatch.setattr(asyncio, "sleep", no_wait)
+    notes: list[str] = []
+    outcome = asyncio.run(
+        failover._monitor_failover(
+            _ScriptedNode("fo-a"),  # type: ignore[arg-type]
+            _ScriptedNode("fo-b", survivor_ticks),  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            0,
+            deadline_s,
+            notes,
+        )
+    )
+    return outcome, notes
+
+
+def test_monitor_counts_a_recovery_that_drained_before_promotion_was_seen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the baseline is first read on the tick that sees the promotion. The survivor
+    promoted and delivered the rest in that gap, so the promotion read already holds the progress
+    and nothing later exceeds it: a recovery that completed would read as a timeout."""
+    outcome, notes = _monitor(
+        [("standby", [100]), ("standby", [100]), ("primary", [150])], monkeypatch
+    )
+    assert outcome.promotion_seconds is not None
+    assert outcome.recovery_seconds is not None
+    assert any("forward progress resumed" in n for n in notes)
+
+
+def test_monitor_never_reads_a_missing_stats_read_as_a_zero_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a stats read that fails on the promotion tick sets the baseline to zero, so the
+    next read, which shows no new delivery, reads as instant recovery and passes the SLO."""
+    outcome, notes = _monitor(
+        [("standby", [None]), ("primary", [None, 100]), ("primary", [100])], monkeypatch
+    )
+    assert outcome.promotion_seconds is not None
+    assert outcome.recovery_seconds is None
+    assert any("NOT observed" in n for n in notes)
+
+
+@pytest.mark.parametrize(("last_done", "recovered"), [(100, False), (101, True)])
+def test_monitor_keeps_the_last_good_baseline_across_a_failed_standby_read(
+    monkeypatch: pytest.MonkeyPatch, last_done: int, recovered: bool
+) -> None:
+    # A failed read before promotion keeps the last good baseline instead of replacing it.
+    outcome, _ = _monitor(
+        [("standby", [100]), ("standby", [None]), ("primary", [100]), ("primary", [last_done])],
+        monkeypatch,
+    )
+    assert (outcome.recovery_seconds is not None) is recovered

@@ -772,8 +772,14 @@ async def _monitor_failover(
     """Time the survivor's promotion + functional recovery after the kill. Runs in the BACKGROUND
     (concurrently with the rest of the measured phase + the post-load drain) so a slow-but-successful
     recovery is measured rather than timing out a fixed pre-drain window. ``done`` is DB-backed, so it
-    survives the dead primary; the recovery baseline is taken at PROMOTION (not at the kill) so a delivery
-    the dying primary committed just before SIGKILL can't be mistaken for the survivor's progress.
+    survives the dead primary. The recovery baseline is the LAST successful stats read taken while the
+    survivor was still standby (BACKLOG #5571): it is after the kill, so a delivery the dying primary
+    committed just before SIGKILL is already in it, and before promotion, so nothing the survivor
+    delivered is. Reading the baseline only on the tick that SAW promotion would fold in
+    whatever the survivor delivered in the gap, and a drain that finished there would time out. A
+    failed read never stands in as zero, which would read the next read as instant recovery: it
+    keeps the last good baseline. With no good read before promotion, the first good read after it
+    becomes the baseline, which can miss a recovery (a timeout, a FAIL) but never invent one.
 
     The CONTINUOUS single-leader SLO (H6): every poll observes BOTH nodes' roles and folds the count of
     simultaneous primaries into a :class:`LeadershipTracker`, so a split-brain that flickers *between*
@@ -782,9 +788,11 @@ async def _monitor_failover(
     leaders = LeadershipTracker()
     promotion_ns: int | None = None
     recovery_ns: int | None = None
-    done_at_promotion = 0
+    baseline: int | None = None
     start = time.perf_counter()
     while time.perf_counter() - start < deadline_s:
+        # Read BEFORE the role, so a standby answer below proves this read preceded promotion.
+        pre = await survivor.stats(client) if promotion_ns is None else None
         # H6 continuous single-leader invariant: sample BOTH nodes' roles every poll and record how many
         # are simultaneously primary right now. >= 2 at any sample is split-brain (a HARD SLO violation);
         # the killed node should stop reporting primary the instant it dies, so the count is normally 0
@@ -792,18 +800,27 @@ async def _monitor_failover(
         survivor_role = await survivor.role(client)
         killed_role = await killed.role(client)
         leaders.observe((survivor_role == "primary") + (killed_role == "primary"))
-        role = survivor_role
-        if promotion_ns is None and role == "primary":
-            promotion_ns = time.perf_counter_ns()
-            prom = await survivor.stats(client)
-            done_at_promotion = prom.done if prom else 0
-            notes.append(f"{survivor.node_id} promoted to primary")
-        if promotion_ns is not None and recovery_ns is None:
+        if promotion_ns is None:
+            if survivor_role == "primary":
+                promotion_ns = time.perf_counter_ns()
+                notes.append(f"{survivor.node_id} promoted to primary")
+            elif pre is not None:
+                baseline = pre.done
+        if promotion_ns is not None:
             cur = await survivor.stats(client)
-            if cur is not None and cur.done > done_at_promotion:
-                recovery_ns = time.perf_counter_ns()
-                notes.append("forward progress resumed (engine delivered new rows post-promotion)")
-                break
+            if cur is not None:
+                if baseline is None:
+                    baseline = cur.done
+                    notes.append(
+                        "no stats read succeeded before promotion; the recovery baseline is the first "
+                        "read after it, so a recovery that finished before that read is not measured"
+                    )
+                elif cur.done > baseline:
+                    recovery_ns = time.perf_counter_ns()
+                    notes.append(
+                        "forward progress resumed (engine delivered new rows post-promotion)"
+                    )
+                    break
         await asyncio.sleep(0.2)
 
     promotion_s = None if promotion_ns is None else (promotion_ns - kill_ns) / 1e9
