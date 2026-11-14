@@ -1650,9 +1650,8 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
 
     Well-formed XML allows only whitespace there, so a word is a value a malformed tag carried: inside
     the tag (``</family Zqxdoe>``) or after one that never got its ``>`` (``</family Zqxdoe``). It is
-    MASKED, not replaced, for the reason the section on :data:`_SHAPE` gives. The mask keeps a
-    letter's case and a digit a digit, not every class (:data:`_SHAPE`'s section says which it does
-    not).
+    MASKED, not replaced: a placeholder can remove a name run main would have formed with text a
+    caller joins after the answer. The mask keeps a letter's case and a digit a digit.
 
     **That is not a proof that every reader sees main's answer.** A mask alone sends no text round
     again (:func:`_masked_only`), but masked text still reaches passes main ran on the unmasked
@@ -1667,23 +1666,24 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
 
     **Which words may be masked depends on what follows them** (:func:`_rest_words` holds the rules
     both share). Where the line ends the text, a caller can glue text onto the last word, so
-    :func:`_maskable_rest` decides with its rules for an answer's end, and a last word ending on a
-    credential label word's head is refused too (:func:`_ends_in_camel_head`). Where the tag's
-    ``>``, a ``<`` or a line break follows, a last word ending in a whole boundary-free word is
-    refused too, and a surname such as ``Johnson`` or ``Li`` is masked there.
+    :func:`_maskable_rest` decides with its rules for an answer's end, and
+    :func:`_ends_in_camel_head` can refuse the last word too. Where the tag's ``>``, a ``<`` or a
+    line break follows, a last word ending in a whole boundary-free word is refused too, and a
+    surname such as ``Johnson`` is masked there.
 
     Where the rules refuse, the rest stays as it stood, and that is the residual, at least these: a
     rest holding punctuation, a tab or a non-ASCII letter; one holding a word
     some pass reads literally, a credential word inside a longer word, or a date (``</family
     Bearer x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any word after a
     line break inside the tag; every rest in a text that holds the backstop's opener when the XML
-    pass reads it; every rest whose
+    pass reads it; every rest of an end tag outside a walked element that names no vocabulary
+    element (``<family>Smith</family></b Zqxdoe>``, :func:`_mask_stray_end_tags`); every rest whose
     end tag an HL7 field run took before this pass ran, in at least these shapes: a run before the
     element (``a|b|<family>Smith</family Zqxdoe>``), one in its own content (``<given>A^B^C</given
     Zqxdoe>``), and one before a stray end tag (``a|b|</family Zqxdoe>``); and, where the rest ends
     the text, every refusal :func:`_maskable_rest` makes there, a last word with a digit or
-    ending in ``m``, ``b``, ``f`` or ``n`` among them, and a last word ending on a credential label
-    word's head (:func:`_ends_in_camel_head`, ``</family zqxP``)."""
+    ending in ``m``, ``b``, ``f`` or ``n`` among them, and every last word
+    :func:`_ends_in_camel_head` refuses (``</family zqxP``)."""
     if not mask or not text.startswith(" ", start):
         return text[start:stop]
     line = _END_TAG_LINE.match(text, start, stop)
@@ -2190,14 +2190,15 @@ _ANCHOR_PREFIXES = frozenset(
     for word in re.findall(r"[a-z]{2,}", source.lower())
     for end in range(1, len(word) + 1)
 )
-#: Every prefix of a word some pass reads with no word boundary before it, so a caller's text glued
-#: after a masked word could complete it: at least the segment ids :data:`_MSH_DELIMITERS` sniffs,
-#: the backstop's opener, and the support bundle's ``mfb64:`` marker (spelled here, as above).
+#: Words some pass reads with no word boundary before them, so a caller's text glued after a masked
+#: word could complete one: the segment ids :data:`_MSH_DELIMITERS` sniffs, the backstop's opener,
+#: and the support bundle's ``mfb64:`` marker (spelled here, as above).
 _UNBOUNDED_WORDS = (
     *_MSH_DELIMITERS.pattern[3:].split(")", 1)[0].lower().split("|"),
     _USERINFO_OPENER.split(" ", 1)[0],
     "mfb",
 )
+#: Every prefix of each of those words.
 _UNBOUNDED_HEADS = tuple(
     sorted({word[:end] for word in _UNBOUNDED_WORDS for end in range(1, len(word) + 1)})
 )

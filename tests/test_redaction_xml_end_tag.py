@@ -5,8 +5,9 @@
 The XML element walk copied an end tag's remainder -- everything after the tag's name up to the next
 ``<`` or ``>`` -- into the output as it stood. So a synthetic value inside an end tag
 (``</family Zqxdoe>``) or after one that never got its ``>`` (``</family Zqxdoe``) walked through
-:func:`redaction.redact`. Values here are single synthetic tokens on purpose: a two-name run is taken
-by the name pass whatever the XML pass does, and the arm would pass for the wrong reason."""
+:func:`redaction.redact`. The values in :data:`_MALFORMED` are single synthetic tokens on purpose:
+a two-name run is taken by the name pass whatever the XML pass does, and the arm would pass for the
+wrong reason."""
 
 from __future__ import annotations
 
@@ -90,8 +91,7 @@ def test_main_printed_each_value(text: str, value: str, end_tag: str) -> None:
         ("<family>Smith</family Zqxdoe", "<family>[redacted]</family Xxxxxx"),
         ("<family>Smith</family Zqx 4455>", "<family>[redacted]</family Xxx 0000>"),
         ("<family>Smith</family >", "<family>[redacted]</family >"),
-        # Names ending in a letter a boundary-free word starts with, and short ones, are masked
-        # inside a tag.
+        # Surnames, masked inside a tag.
         ("<family>Smith</family Johnson>", "<family>[redacted]</family Xxxxxxx>"),
         ("<given>Smith</given Li>", "<given>[redacted]</given Xx>"),
         # A vocabulary end tag outside a walked element: after the element closed, or with its start
@@ -221,7 +221,8 @@ def test_the_backstop_opener_is_tested_once_per_text(unit: str) -> None:
 
 
 def test_a_text_holding_the_backstop_opener_keeps_every_rest() -> None:
-    """The backstop's opener keeps every rest, as the glued-value mask does."""
+    """With the backstop's opener in the text, a stray end tag's rest is kept, as the glued-value
+    mask keeps its values."""
     text = "nonnumeric port: 'pw " + "x|y|" * 70 + ' {"name": "Zq@host Kplm7"} </family Zqxdoe>'
     assert "Kplm7" not in redact(text)
     assert "Zqxdoe" in redact(text)
@@ -267,7 +268,7 @@ _WORDS = ("Smith", "John", "retry", "after", "of", "Doe", "ms", "Zq", "for", "pe
 
 
 def _fragment(rand: random.Random, *, element: bool) -> str:
-    """Generated text: with ``element``, a vocabulary element and a malformed end tag first; then
+    """Generated text: with ``element``, it holds a vocabulary start tag and an end tag's name; then
     labels, words, values, separators and more end tags."""
     parts: list[str] = []
     if element:
@@ -309,8 +310,8 @@ def _routes(text: str) -> dict[str, str]:
 
 
 def _composed(a: str, raw: str) -> dict[str, str]:
-    """Every route over ``a`` alone and over ``a`` joined to ``raw`` three ways: raw, after one
-    :func:`redact`, and after the log chain."""
+    """Every route over ``a`` alone and over ``raw`` joined after ``a`` as it stands, or after
+    :func:`redact`, the log chain or :func:`safe_exc` read it."""
     routes: dict[str, str] = {}
     for name, text in (
         ("a", a),
@@ -376,9 +377,10 @@ def _is_main_masked(out: str, main: str) -> bool:
 
 
 def _replace_rest(text: str, start: int, stop: int, mask: bool) -> str:
-    """The CONTROL: a rest REPLACED by the placeholder, the design the previous attempt took. It is not class-preserving, so the fuzz must find it leaking. It ignores
-    ``mask``, so it also replaces walked rests in texts holding the backstop's opener, and inside
-    :func:`redaction._masked_only`'s check with every rest kept."""
+    """The CONTROL: a rest REPLACED by the placeholder unless it holds only spaces and ``>``, the
+    design the previous attempt took. It is not class-preserving, so the fuzz must find it leaking.
+    It ignores ``mask``, so it also replaces walked rests in texts holding the backstop's opener,
+    and inside :func:`redaction._masked_only`'s check with every rest kept."""
     rest = text[start:stop]
     return (
         f" {redaction._REDACTED}{'>' if rest.endswith('>') else ''}" if rest.strip(" >") else rest
@@ -390,7 +392,8 @@ def test_the_end_tag_mask_redacts_at_least_what_main_did_through_composed_joins(
     text and redacted again by every route, every output is main's with some letters and digits
     masked, so no value main hid prints. The gain count shows the mask is exercised; the replacing
     control shows the arm can find a leak. It is a measurement of this corpus, not a proof for every
-    input."""
+    input. This arm can stay green with :func:`redaction._ends_in_camel_head` switched off, so that
+    rule rests on the pins above."""
     shipped, control = _differential(1_500, 5925, _replace_rest)
     assert control.leaks, "the replacing control leaked nothing, so the corpus cannot find the leak"
     assert shipped.gains, "the mask hid nothing main printed, so #5925 is not exercised"
