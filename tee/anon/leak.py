@@ -26,8 +26,8 @@ Returns **reasons only** (never the matched text), and the token denylist is the
 structural PHI-shape detectors + unmapped-field coverage report below (BACKLOG #331) close that gap —
 they are held byte-for-byte identical with the toolkit copy so the two agree on every input. They
 look for a dashed SSN, a punctuated phone, an ``MR``/``MRN`` id type and a routable IPv6 address
-(BACKLOG #5654) in the fields no rule rewrote; the IPv6 detector alone also reads the MSH header's
-fields from MSH-3 on that no rule rewrites. The dashed SSN and punctuated phone detectors also refuse such a shape that the message's own field
+(BACKLOG #5654) in the fields no rule rewrote; the IPv6 detector alone also reads the MSH header,
+MSH-2 past its encoding characters and the fields from MSH-3 on that no rule rewrites. The dashed SSN and punctuated phone detectors also refuse such a shape that the message's own field
 separator cut across fields, when at least one of them is unmapped (BACKLOG #3465), and scan what
 a retarget of a default field left past its first component (:func:`retarget_residue_hits`,
 BACKLOG #3493), and the components an ``id``, ``mrn``, ``ssn`` or ``dln`` rule keeps as captured
@@ -677,7 +677,7 @@ def _walk(
         # not skipped, and the check below refuses it, as it did before the header was found
         # by line. Nor is a header below _HEADER_MIN_FIELDS (a lone ``MSH|^~\&``): the check
         # below refuses it, as it refuses every short header line (BACKLOG #3001).
-        if n == header_at and is_msh and len(fields) >= _HEADER_MIN_FIELDS:
+        if n == header_at and _is_skipped_header(fields):
             continue
         # One address per split index; None for a field the check does not judge.
         addresses: list[str | None]
@@ -882,24 +882,35 @@ def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
     return reasons
 
 
+def _is_skipped_header(fields: list[str]) -> bool:
+    """True if ``fields``, the header line split, is a header :func:`_walk` skips and
+    :func:`_header_ipv6_hits` reads instead: its id reads ``MSH`` and it has at least
+    :data:`_HEADER_MIN_FIELDS` fields. Any other header is walked and judged like any line."""
+    return fields[0].upper() == "MSH" and len(fields) >= _HEADER_MIN_FIELDS
+
+
 def _header_ipv6_hits(text: str, mapped_paths: set[str]) -> list[str]:
-    """Routable-IPv6 hits in the header, the one line :func:`_walk` skips: each field from MSH-3
-    on that no rule rewrites, read as written and decoded as :func:`_structural_reasons` reads a
-    value. The whole-message IPv4 check reads the header, so an IPv6 address there, such as one
-    in MSH-24, is judged too (BACKLOG #5654). Only the IPv6 shape is read here. MSH-1 and MSH-2
-    hold the delimiters and are never read. A header the walk does not skip, such as a short one,
-    is walked and judged there, so it is not read again."""
+    """Routable-IPv6 hits in the header, the one line :func:`_walk` skips: MSH-2 past its four
+    encoding characters, and each field from MSH-3 on, that no rule rewrites, read as written and
+    decoded as :func:`_structural_reasons` reads a value. The whole-message IPv4 check reads the
+    header, so an IPv6 address there, such as one in MSH-24, is judged too (BACKLOG #5654). Only
+    the IPv6 shape is read here. MSH-1 and the encoding characters are never read. A header the
+    walk does not skip, such as a short one, is walked and judged there, so it is not read again."""
     found = _split_at_header(text)
     if found is None:
         return []
     seps, field_sep, lines, header_at = found
     fields = lines[header_at].split(field_sep)
-    if fields[0].upper() != "MSH" or len(fields) < _HEADER_MIN_FIELDS:
+    if not _is_skipped_header(fields):
         return []
     hits: list[str] = []
-    # fields[1] is MSH-2, the encoding characters, so fields[i] is MSH-(i + 1).
-    for number, value in enumerate(fields[2:], start=3):
-        address = f"MSH-{number}"
+    # The anonymizer and the engine's parser take the first four characters of MSH-2 as the
+    # encoding characters and no more, and no rule may rewrite MSH-2, so text a sender put after
+    # them reaches the output.
+    # After MSH-2, fields[i] is MSH-(i + 1).
+    values = [("MSH-2", fields[1][4:])]
+    values += [(f"MSH-{i + 1}", value) for i, value in enumerate(fields[2:], start=2)]
+    for address, value in values:
         if not value or address in mapped_paths:
             continue
         forms = [value, *_decoded_parts(value, seps, field_sep)]
@@ -1268,7 +1279,7 @@ def refusal_advice(
 UNMAPPED_SCOPE_NOTE = (
     "Beyond the partner-token and IPv4 scan of the whole message, the leak-check looks in these "
     "fields only for a dashed SSN, a punctuated phone number, an MR/MRN-typed identifier and a "
-    "routable IPv6 address. A "
+    "routable IPv6 address, and in the MSH header for a routable IPv6 address alone. A "
     "name, an undashed number or a date in one of them passes, so review this list before you "
     "share the dataset."
 )

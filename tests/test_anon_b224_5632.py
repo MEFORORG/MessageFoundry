@@ -42,19 +42,28 @@ def _zpd(value: str, head: str = _HEAD) -> str:
     return f"{head}\rZPD|1|||{value}"
 
 
-@pytest.fixture
-def site_prefix(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    """A synthetic site prefix in BOTH copies. The engine's scanner loads first, so it never reads
-    the patched token source (as ``tests/test_anon_b193_2330.py`` does)."""
+@contextlib.contextmanager
+def _loaded_prefix(monkeypatch: pytest.MonkeyPatch, prefix: str) -> Iterator[str]:
+    """``prefix`` as the only synthetic site prefix in BOTH copies. The engine's scanner loads
+    first, so it never reads the patched token source (as ``tests/test_anon_b193_2330.py`` does)."""
     with contextlib.suppress(engine_leak.LeakCheckUnavailable):
         engine_leak._scanner()
-    monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", f"[site_prefix]\n{_PREFIX}\n")
+    monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", f"[site_prefix]\n{prefix}\n")
     engine_surrogates.reload_site_prefixes()
     tee_surrogates.reload_site_prefixes()
-    yield _PREFIX
-    monkeypatch.undo()  # restore the real source BEFORE recomputing, as tests/test_anon_core.py does
-    engine_surrogates.reload_site_prefixes()
-    tee_surrogates.reload_site_prefixes()
+    try:
+        yield prefix
+    finally:
+        monkeypatch.undo()  # restore the real source BEFORE recomputing, as test_anon_core does
+        engine_surrogates.reload_site_prefixes()
+        tee_surrogates.reload_site_prefixes()
+
+
+@pytest.fixture
+def site_prefix(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """The synthetic site prefix :data:`_PREFIX` in BOTH copies."""
+    with _loaded_prefix(monkeypatch, _PREFIX) as prefix:
+        yield prefix
 
 
 _ESCAPED_SITE_CODES = pytest.mark.parametrize(
@@ -205,18 +214,9 @@ def test_a_site_code_run_inside_a_longer_value_is_left(
 
 @pytest.fixture
 def other_prefix(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Iterator[str]:
-    """``request.param`` loaded as the only site prefix in BOTH copies, as :func:`site_prefix`
-    loads its own."""
-    prefix: str = request.param
-    with contextlib.suppress(engine_leak.LeakCheckUnavailable):
-        engine_leak._scanner()
-    monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", f"[site_prefix]\n{prefix}\n")
-    engine_surrogates.reload_site_prefixes()
-    tee_surrogates.reload_site_prefixes()
-    yield prefix
-    monkeypatch.undo()
-    engine_surrogates.reload_site_prefixes()
-    tee_surrogates.reload_site_prefixes()
+    """``request.param`` as the only synthetic site prefix in BOTH copies."""
+    with _loaded_prefix(monkeypatch, request.param) as prefix:
+        yield prefix
 
 
 @_SURROGATES
@@ -226,17 +226,16 @@ def other_prefix(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
         ("24", "\\M242844\\Yamada"),
         ("41", "Name \\X414243\\"),
         ("41", "\\X414243\\"),
-        ("28", "\\C282842\\Name"),
         ("24", "Yamada^\\M242844\\Taro&\\M242844\\X"),
     ],
-    ids=["multibyte-charset", "hex-data", "hex-data-whole", "single-byte-charset", "in-parts"],
+    ids=["multibyte-charset", "hex-data", "hex-data-whole", "in-parts"],
     indirect=["other_prefix"],
 )
 def test_a_hex_or_charset_escape_argument_is_no_site_code(
     surrogates: ModuleType, other_prefix: str, value: str
 ) -> None:
-    """The argument of ``\\M..\\``, ``\\X..\\`` or ``\\C..\\`` codes a character set or bytes. Read
-    as digits, it turned a name to a site-code surrogate (BACKLOG #5654)."""
+    """The argument of a well-formed ``\\M..\\`` or ``\\X..\\`` codes a character set or bytes.
+    Read as digits, it turned a name to a site-code surrogate (BACKLOG #5654)."""
     text = _zpd(value)
     assert not surrogates.message_has_site_code(text)
     assert surrogates.scrub_message_site_codes(text, Keyer(_SALT), ()) == text
@@ -252,6 +251,8 @@ def test_a_hex_or_charset_escape_argument_is_no_site_code(
         ("41", "\\X414243"),
         ("41", "\\X414243Z\\"),
         ("41", "\\X3431343234\\3"),
+        ("28", "\\C282842\\Name"),
+        ("41", "\\XA414243\\"),
     ],
     ids=[
         "beside-a-break",
@@ -260,6 +261,8 @@ def test_a_hex_or_charset_escape_argument_is_no_site_code(
         "unclosed-tail",
         "not-hex",
         "hex-digits-decoded",
+        "charset-c-too-long",
+        "hex-odd-count",
     ],
     indirect=["other_prefix"],
 )

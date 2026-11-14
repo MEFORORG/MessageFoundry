@@ -373,6 +373,26 @@ def test_a_header_field_is_numbered_the_header_way(leak: ModuleType) -> None:
     assert leak._header_ipv6_hits(text, set()) == [f"unmapped {leak.IPV6_REASON} in MSH-3"]
 
 
+@_NO_SCANNER
+@_SIDES
+def test_an_address_after_the_encoding_characters_is_refused(anon: ModuleType) -> None:
+    """The anonymizer and the engine's parser take four encoding characters from MSH-2, and no
+    rule may rewrite it, so
+    text after them reaches the output and is read for an address."""
+    raw = f"MSH|^~\\&{_GLOBAL}|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
+    with pytest.raises(anon.LeakError, match="IPv6 address in MSH-2"):
+        anon.anonymize_checked(raw, salt="b224-ipv6-header-0123456789abcdef")
+
+
+@_NO_SCANNER
+@_SIDES
+def test_a_truncation_character_after_the_encoding_characters_is_no_address(
+    anon: ModuleType,
+) -> None:
+    raw = "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|M1|P|2.7\rPID|1||1^^^H^MR||X^Y"
+    anon.anonymize_checked(raw, salt="b224-ipv6-header-0123456789abcdef")
+
+
 _FULL = ":".join(["4000", "a1", "0", "0", "0", "0", "0", "5"])
 
 

@@ -487,9 +487,9 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     as written, split at the escape character, each piece trimmed and read whole, and each
     escape body further split at every character that is not a digit: a raw viewer, or a
     receiver that defines the escape, shows that text, and a site code is digits only. The
-    argument of a closed hex or character-set escape (:data:`_HEX_ARGUMENT_ESCAPE`) is not split
-    that way, so ``\\M242844\\Yamada`` and ``Name \\X414243\\`` keep their text whatever the site
-    prefix. docs/PHI.md section 9, *Field-anchored site-code scrub*, states the rule and its
+    argument of a closed, well-formed hex or character-set escape (:data:`_HEX_ARGUMENT_ESCAPE`)
+    is not split that way, so ``\\M242844\\Yamada`` and ``Name \\X414243\\`` keep their text
+    whatever the site prefix, and a site code written as one passes. docs/PHI.md section 9, *Field-anchored site-code scrub*, states the rule and its
     consequences."""
     forms = [trim(part), trim(dropped(part)), *map(trim, _split_at_invisible(part))]
     forms += decoded_readings(part, seps, field_sep, resplit=True)
@@ -507,12 +507,17 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
 
 #: What splits an escape body read as written: any run of characters that are not ASCII digits.
 _NON_DIGITS: re.Pattern[str] = re.compile(r"[^0-9]+")
-#: The body of an escape whose argument is hex: ``\\Xhh..\\``, hex data, and ``\\Cxxyy\\`` and
-#: ``\\Mxxyyzz\\``, the single- and multi-byte character-set escapes. The argument codes bytes or a
-#: character set, not digits a consumer shows: the hex data is read decoded, and a character-set
-#: escape shows nothing. So its digits are never read as a site code (BACKLOG #5654). A body with
-#: anything past the letter that is not a hex digit is read as before.
-_HEX_ARGUMENT_ESCAPE: re.Pattern[str] = re.compile(r"[XCM][0-9A-Fa-f]+")
+#: The body of a well-formed escape whose argument is hex: ``\\Xhh..\\``, hex data in whole pairs,
+#: and ``\\Mxxyy\\`` or ``\\Mxxyyzz\\``, the multi-byte character-set escape. The argument codes
+#: bytes or a character set, not digits a consumer shows: the hex data is read decoded, and a
+#: character-set escape shows nothing. So its digits are not read as a site code (BACKLOG #5654).
+#: The cost: a site code written as such an argument, such as ``\\X971234\\``, passes, though a
+#: raw viewer shows its digits. ``\\Cxxyy\\`` is left out: four hex digits never hold a six-digit
+#: site code. A body of any other shape, an odd count of hex digits or a longer ``\\C..\\``
+#: among them, is read as before.
+_HEX_ARGUMENT_ESCAPE: re.Pattern[str] = re.compile(
+    r"X(?:[0-9A-Fa-f]{2})+|M[0-9A-Fa-f]{4}(?:[0-9A-Fa-f]{2})?"
+)
 
 
 def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|") -> str:
