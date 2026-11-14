@@ -4331,9 +4331,17 @@ class SqlServerStore:
                         type(cleanup).__name__,
                     )
 
+            def _force_release() -> None:
+                # Synchronous, so it cannot wait on a wedged pool: close() only marks it closing.
+                try:
+                    pool.close()
+                finally:
+                    executor.shutdown(wait=False)
+
             await cleanup_failed_open(
                 exc,
                 _release,
+                _force_release,
                 checkpoint=store.checkpoint_cipher_invocations if salt_bound else None,
             )
             raise

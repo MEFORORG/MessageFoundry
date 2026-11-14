@@ -2271,6 +2271,7 @@ class PostgresStore:
             await cleanup_failed_open(
                 exc,
                 _release,
+                pool.terminate,  # synchronous: drops every connection without waiting
                 checkpoint=store.checkpoint_cipher_invocations if salt_bound else None,
             )
             raise

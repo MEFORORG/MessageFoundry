@@ -1913,13 +1913,18 @@ async def deferred_revoke_reports() -> AsyncIterator[None]:
 
 async def _run_to_completion(
     body: Callable[[], Awaitable[None]],
+    *,
+    what: str = "a revoke's seal report",
+    lost: str = "its remaining audit rows and pages were not sent",
 ) -> tuple[bool, BaseException | None]:
     """Run ``body`` as a task awaited through :func:`asyncio.shield`, awaited again after each
     cancel, so a cancel cannot cut it short. Returns whether a cancel landed meanwhile, and the
     body's own failure, for the caller to re-raise or not. Never raises. A failure is logged at
     ERROR with its class, and its traceback at DEBUG only, since a defect's message may carry a
     row value (CLAUDE.md section 9). A body that ends cancelled is logged too, and returned as a
-    ``CancelledError`` (decision d20261110T063908944-857965, item 5)."""
+    ``CancelledError`` (decision d20261110T063908944-857965, item 5). ``what`` names the body and
+    ``lost`` what its unfinished end leaves undone in those lines; the defaults are the revoke's,
+    so its callers pass neither (BACKLOG #5720)."""
     task = asyncio.ensure_future(body())
     cancelled = False
     while not task.done():
@@ -1933,39 +1938,59 @@ async def _run_to_completion(
         except BaseException:  # noqa: BLE001 -- the body's own failure, read from the task below
             pass
     if task.cancelled():
-        log.error(
-            "a revoke's seal report was cancelled before it finished; its remaining audit rows"
-            " and pages were not sent"
-        )
+        log.error("%s was cancelled before it finished; %s", what, lost)
         return cancelled, asyncio.CancelledError()
     failure = task.exception()
     if failure is not None:
-        log.error(
-            "a revoke's seal report failed (%s); its remaining audit rows and pages were not sent",
+        log.error("%s failed (%s); %s", what, type(failure).__name__, lost)
+        log.debug("%s failure", what, exc_info=failure)
+    return cancelled, failure
+
+
+#: How long a failed store open's cleanup may still run once a cancel has landed, before
+#: :func:`cleanup_failed_open` forces the release and stops waiting (BACKLOG #5720, decision
+#: d20261114T002244771-017417). Nothing bounds the cleanup until a cancel lands.
+FAILED_OPEN_CANCEL_BOUND_S = 5.0
+
+# Cleanups a cancel stopped waiting for: held so the loop does not lose a pending task.
+_ABANDONED_OPEN_CLEANUPS: set[asyncio.Future[tuple[bool, BaseException | None]]] = set()
+
+
+def _force_failed_open_release(force_release: Callable[[], object]) -> None:
+    """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054)."""
+    try:
+        force_release()
+    except Exception as failure:  # noqa: BLE001 — never mask the open's error
+        log.warning(
+            "forcing the release after a failed store open also failed (%s)",
             type(failure).__name__,
         )
-        log.debug("a revoke's seal report failure", exc_info=failure)
-    return cancelled, failure
 
 
 async def cleanup_failed_open(
     exc: BaseException,
     release: Callable[[], Awaitable[None]],
+    force_release: Callable[[], object],
     *,
     checkpoint: Callable[..., Awaitable[object]] | None = None,
 ) -> None:
-    """Run a failed store open's cleanup to completion through :func:`_run_to_completion`, so a
-    cancel cannot cut it short and leak what the open built (BACKLOG #5720). ``checkpoint`` is
-    the store's ``checkpoint_cipher_invocations``, passed only once the open has bound the cipher
-    to this store's salt: it then squares the block the open reserved. ``release`` closes what the
-    open built, whatever the settle raised, and logs its own failures by class. A settle failure
-    that reaches here is logged by class too, so neither replaces the open's error (vault BACKLOG
+    """Run a failed store open's cleanup through :func:`_run_to_completion`, so a cancel cannot
+    cut it short and leak what the open built (BACKLOG #5720). ``checkpoint`` is the store's
+    ``checkpoint_cipher_invocations``, passed only once the open has bound the cipher to this
+    store's salt: it then squares the block the open reserved. ``release`` closes what the open
+    built, whatever the settle raised, and logs its own failures by class. A settle failure that
+    reaches here is logged by class too, so neither replaces the open's error (vault BACKLOG
     #3054). Raises a cancel that landed during the cleanup when ``exc`` is an ``Exception``; the
     caller re-raises ``exc`` otherwise.
 
-    A ``GeneratorExit`` runs nothing: a coroutine being closed cannot await, so the cleanup could
-    not run there and awaiting would replace the exit with a ``RuntimeError``."""
+    **A cancel still ends a failed open** (decision d20261114T002244771-017417). Nothing bounds the
+    cleanup until a cancel lands, the open's own included; from then it gets at most
+    :data:`FAILED_OPEN_CANCEL_BOUND_S`. Past that, ``force_release`` drops what the open built
+    without waiting, and this stops waiting for the cleanup. ``force_release`` is synchronous for
+    the same reason it is the only thing a ``GeneratorExit`` runs: a coroutine being closed cannot
+    await, and awaiting would replace the exit with a ``RuntimeError``."""
     if isinstance(exc, GeneratorExit):
+        _force_failed_open_release(force_release)
         return
 
     async def body() -> None:
@@ -1982,9 +2007,46 @@ async def cleanup_failed_open(
         finally:
             await release()
 
-    # body() catches Exception, so _run_to_completion's revoke wording can only be logged for a
-    # BaseException that is not one, or a cancel of the body's own task.
-    cancelled, _failure = await _run_to_completion(body)
+    task = asyncio.ensure_future(
+        _run_to_completion(
+            body,
+            what="a failed store open's cleanup",
+            lost="what the open built may not have been released",
+        )
+    )
+    loop = asyncio.get_running_loop()
+    # The open's own cancel has already landed, so its bound starts now.
+    deadline = (
+        loop.time() + FAILED_OPEN_CANCEL_BOUND_S
+        if isinstance(exc, asyncio.CancelledError)
+        else None
+    )
+    cancelled = False
+    while not task.done():
+        try:
+            if deadline is None:
+                await asyncio.shield(task)
+            else:
+                await asyncio.wait_for(asyncio.shield(task), max(0.0, deadline - loop.time()))
+        except TimeoutError:
+            if task.done():
+                break
+            _force_failed_open_release(force_release)
+            log.warning(
+                "a failed store open's cleanup did not finish within %.0f s of a cancel; what the"
+                " open built was released without waiting for it",
+                FAILED_OPEN_CANCEL_BOUND_S,
+            )
+            _ABANDONED_OPEN_CLEANUPS.add(task)
+            task.add_done_callback(_ABANDONED_OPEN_CLEANUPS.discard)
+            cancelled = True
+            break
+        except asyncio.CancelledError:
+            if task.cancelled():
+                break
+            cancelled = True
+            if deadline is None:
+                deadline = loop.time() + FAILED_OPEN_CANCEL_BOUND_S
     if cancelled and isinstance(exc, Exception):
         raise asyncio.CancelledError from exc
 
@@ -11333,14 +11395,7 @@ class MessageStore:
             # cleaning up must never replace the error the caller needs to see, so each is logged
             # by class (vault BACKLOG #3054). Run to completion, so a cancel cannot cut it short
             # and leave a non-daemon worker thread behind (BACKLOG #5720).
-            async def _release() -> None:
-                if store is not None:
-                    try:
-                        await store.close()
-                    except Exception as failure:  # noqa: BLE001 — never mask the real failure
-                        log.warning(
-                            "error closing a partially-opened store (%s)", type(failure).__name__
-                        )
+            async def _close_writer() -> None:
                 try:
                     await db.close()
                     # `close` returns before the worker thread it stops has left
@@ -11355,7 +11410,29 @@ class MessageStore:
                         type(failure).__name__,
                     )
 
-            await cleanup_failed_open(exc, _release)
+            async def _release() -> None:
+                try:
+                    if store is not None:
+                        try:
+                            await store.close()
+                        except Exception as failure:  # noqa: BLE001 — never mask the real failure
+                            log.warning(
+                                "error closing a partially-opened store (%s)",
+                                type(failure).__name__,
+                            )
+                finally:
+                    # Whatever store.close() raised, a cancel included (BACKLOG #5720).
+                    await _close_writer()
+
+            # Read now: close() empties the list, and a forced release must still reach each one.
+            conns = [*(store._read_conns if store is not None else ()), db]
+
+            def _force_release() -> None:
+                # stop() queues the close on each worker without awaiting it (BACKLOG #5720).
+                for conn in conns:
+                    _force_failed_open_release(conn.stop)
+
+            await cleanup_failed_open(exc, _release, _force_release)
             raise
 
     @classmethod
