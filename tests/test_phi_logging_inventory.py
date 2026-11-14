@@ -417,6 +417,112 @@ def test_connection_event_row_names_exactly_the_shipped_kinds() -> None:
     )
 
 
+def _quarantine_kinds(tree: ast.Module) -> tuple[set[str], list[int]]:
+    """The literal kinds ``tree``'s ``_quarantine`` calls pass, and the lines of any it cannot read.
+
+    The rule this enforces, and why, is stated once in :mod:`messagefoundry.connection_events`,
+    under KEEPING IT TRUE. The kind's slot is bound from the one ``def``: positional-only and ordinary
+    parameters with a leading ``self`` or ``cls`` dropped, or keyword-only. A renamed or duplicated
+    helper fails in ``named_func``. One that no longer passes its ``kind`` to ``_emit_event`` fails
+    here, because its call sites' literals would then not be what it emits.
+    """
+    func = named_func(tree, "_quarantine")
+    positional = [arg.arg for arg in (*func.args.posonlyargs, *func.args.args)]
+    if positional[:1] in (["self"], ["cls"]):
+        positional = positional[1:]
+    assert "kind" in positional or "kind" in {arg.arg for arg in func.args.kwonlyargs}, (
+        "_quarantine takes no `kind` parameter any more; re-aim _quarantine_kinds"
+    )
+    slot = positional.index("kind") if "kind" in positional else None
+
+    def _is_kind(node: ast.expr) -> bool:
+        return isinstance(node, ast.Name) and node.id == "kind"
+
+    assert any(
+        (call.args and _is_kind(call.args[0]))
+        or any(kw.arg == "kind" and _is_kind(kw.value) for kw in call.keywords)
+        for call in call_sites(func, "_emit_event")
+    ), "_quarantine no longer passes its `kind` to _emit_event; re-aim _quarantine_kinds"
+    calls = call_sites(tree, "_quarantine")
+    kinds: set[str] = set()
+    unread: list[int] = []
+    for call in calls:
+        kind = next((kw.value for kw in call.keywords if kw.arg == "kind"), None)
+        # A starred argument at or before the slot moves the kind to a position only run time knows.
+        if (
+            kind is None
+            and slot is not None
+            and len(call.args) > slot
+            and not any(isinstance(arg, ast.Starred) for arg in call.args[: slot + 1])
+        ):
+            kind = call.args[slot]
+        if isinstance(kind, ast.Constant) and isinstance(kind.value, str):
+            kinds.add(kind.value)
+        else:
+            unread.append(call.lineno)
+    # A reference that is not a direct call, such as an alias or a functools.partial, hides its
+    # arguments from the walk.
+    called = {id(call.func) for call in calls}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute | ast.Name) or id(node) in called:
+            continue
+        if (node.attr if isinstance(node, ast.Attribute) else node.id) == "_quarantine":
+            unread.append(node.lineno)
+    return kinds, sorted(unread)
+
+
+def test_quarantine_kind_walk_reads_literals_and_refuses_anything_else() -> None:
+    """Negative control for :func:`_quarantine_kinds`: the shipped file.py passes only literals, so
+    nothing there shows the refusal can fire."""
+    probe = ast.parse(
+        "class S:\n"
+        "    async def _quarantine(self, path, read_id, mark, kind, reason):\n"
+        "        await self._emit_event(kind, reason=reason)\n"
+        "    async def scan(self, k, head):\n"
+        "        await self._quarantine(p, i, m, 'by_position', 'r')\n"
+        "        await self._quarantine(p, i, m, kind='by_keyword', reason='r')\n"
+        "        await self._quarantine(p, i, m, k, 'r')\n"
+        "        await self._quarantine(p, i, m, reason='r', kind=k)\n"
+        "        await self._quarantine(*head, 'starred', 'r')\n"
+        "        q = self._quarantine\n"
+        "        functools.partial(self._quarantine, p, i, m, 'partial')\n"
+    )
+    assert _quarantine_kinds(probe) == ({"by_position", "by_keyword"}, [7, 8, 9, 10, 11])
+    reordered = ast.parse(
+        "class S:\n"
+        "    async def _quarantine(self, kind, /, path, reason):\n"
+        "        await self._emit_event(kind, reason=reason)\n"
+        "    async def scan(self):\n"
+        "        await self._quarantine('first', p, 'not a kind')\n"
+    )
+    assert _quarantine_kinds(reordered) == ({"first"}, [])
+    receiverless = ast.parse(
+        "class S:\n"
+        "    @staticmethod\n"
+        "    async def _quarantine(kind, path, reason):\n"
+        "        await emitter._emit_event(kind=kind, reason=reason)\n"
+        "    async def scan(self):\n"
+        "        await self._quarantine('first', p, 'not a kind')\n"
+    )
+    assert _quarantine_kinds(receiverless) == ({"first"}, [])
+    keyword_only = ast.parse(
+        "class S:\n"
+        "    async def _quarantine(self, path, *, kind, reason):\n"
+        "        await self._emit_event(kind, reason=reason)\n"
+        "    async def scan(self):\n"
+        "        await self._quarantine(p, kind='by_keyword', reason='r')\n"
+        "        await self._quarantine(p, 'no slot', reason='r')\n"
+    )
+    assert _quarantine_kinds(keyword_only) == ({"by_keyword"}, [6])
+    not_forwarding = ast.parse(
+        "class S:\n"
+        "    async def _quarantine(self, path, kind, reason):\n"
+        "        await self._emit_event('file_rejected', reason=kind)\n"
+    )
+    with pytest.raises(AssertionError, match="no longer passes its `kind`"):
+        _quarantine_kinds(not_forwarding)
+
+
 def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
     """Row 7 claims its vocabulary is "asserted against the emit sites"; make that TRUE.
 
@@ -436,8 +542,23 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
         *(_ROOT / "messagefoundry" / "transports").glob("*.py"),
         _ROOT / "messagefoundry" / "pipeline" / "wiring_runner.py",
     ]
+    read_file_source = False
     for path in sorted(roots):
         tree = _ast.parse(path.read_text(encoding="utf-8"))
+        if path.name == "file.py":
+            # The FILE source's reject path forwards its kind through `_quarantine` (BACKLOG #5717).
+            read_file_source = True
+            quarantined, unread = _quarantine_kinds(tree)
+            assert not unread, (
+                f"file.py _quarantine use(s) whose kind is not a string literal in a direct call, "
+                f"at lines {unread}. The walk cannot see what such a use emits, so call it directly "
+                "and pass the kind as a literal."
+            )
+            assert quarantined, (
+                "file.py's _quarantine has no call site the walk could read; the helper moved, "
+                "so re-aim _quarantine_kinds rather than let its kinds leave the walk."
+            )
+            emitted |= quarantined
         for node in _ast.walk(tree):
             if not isinstance(node, _ast.Call):
                 continue
@@ -458,6 +579,10 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
                     and isinstance(kw.value.value, str)
                 ):
                     emitted.add(kw.value.value)
+    assert read_file_source, (
+        "transports/file.py is no longer in the walk, so its _quarantine kinds are not read; "
+        "re-aim the file.py branch above."
+    )
     assert emitted, "no literal connection_event kind found — the emit-site walk broke, not the doc"
 
     section = _section_7()
