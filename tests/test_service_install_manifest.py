@@ -1692,6 +1692,24 @@ def test_a_root_that_could_not_be_locked_leaves_the_tree_alone(tmp_path: Path) -
 
 
 @_windows_only
+def test_a_root_still_granting_another_account_leaves_the_tree_alone(tmp_path: Path) -> None:
+    """The root grant succeeded, but an entry outside the removal set survived on it. Resetting a
+    child to inherit would then pass that entry to a child that was tighter than the root."""
+    prepare = r"""
+    & icacls $cfg /grant '*S-1-5-32-547:(OI)(CI)M' | Out-Null
+    & icacls $paths.mod /inheritance:r /grant:r "${me}:F" | Out-Null
+"""
+    got = _config_lockdown(tmp_path, prepare)
+    assert got["before"]["modProtected"] is True, "CONTROL FAILED: mod.py still inherits"
+    assert any("S-1-5-32-547" in p or "Power Users" in p for p in got["problems"]), got["problems"]
+    assert any("nothing below" in p for p in got["problems"]), got["problems"]
+    assert got["after"]["modProtected"] is True, (
+        f"the walk reset mod.py under a root that still grants Power Users:\n{got['listing']}"
+    )
+    assert "S-1-5-32-547" not in got["after"]["mod"], got["listing"]
+
+
+@_windows_only
 def test_a_dot_backslash_account_locks_like_its_full_name(tmp_path: Path) -> None:
     """icacls does not take '.\\name', which Set-ServiceAccount accepts, so the account is spelled
     with this host's name first; otherwise -LockConfigDir could never finish for it."""
@@ -2996,6 +3014,123 @@ def test_the_secedit_folder_defaults_to_the_windows_temp_not_the_users(tmp_path:
         "the user can set SystemRoot and windir for their own processes, so neither may name the "
         "trusted parent"
     )
+
+
+def test_both_scripts_carry_the_same_secedit_folder_helper(tmp_path: Path) -> None:
+    """The installer and the uninstaller share no file, so each carries New-SeceditWorkDirectory.
+    A fix to one copy that never reaches the other would reopen #5563 on one side, silently."""
+    assert _SCRIPT is not None and _UNINSTALL is not None
+    body = f"""
+  $out = @()
+  foreach ($src in @({_psq(str(_SCRIPT))}, {_psq(str(_UNINSTALL))})) {{
+    $tree = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
+    $fns = @($tree.FindAll({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $args[0].Name -eq '{_WORKDIR_FN}' }}, $true))
+    $out += ,@($fns | ForEach-Object {{ $_.Extent.Text }})
+  }}
+  ConvertTo-Json -InputObject $out -Depth 3 -Compress
+"""
+    got = json.loads(_ok(_extract(_SCRIPT, [], body), tmp_path).strip().splitlines()[-1])
+    install, uninstall = got
+    assert len(install) == 1 and len(uninstall) == 1, (
+        f"each script must define {_WORKDIR_FN} once: {len(install)}, {len(uninstall)}"
+    )
+
+    def norm(text: str) -> str:
+        return text.replace("\r\n", "\n")
+
+    assert norm(install[0]) == norm(uninstall[0]), (
+        f"the two copies of {_WORKDIR_FN} differ; change both, byte for byte"
+    )
+
+
+_GRANT_FN = "Set-ServiceLogonRight"
+
+
+def _grant_arms(tmp_path: Path, *, workdir: str | None = None) -> dict:
+    """Run install-service.ps1's Set-ServiceLogonRight against a stubbed secedit, the account
+    being this test's own, and read the folder the policy file sits in at the configure call."""
+    assert _SCRIPT is not None
+    parent = tmp_path / "secedit-parent"
+    parent.mkdir(exist_ok=True)
+    inf = ["[Unicode]", "Unicode=yes", "[Privilege Rights]", "SeServiceLogonRight = *S-1-5-32-544"]
+    inf_ps = "@(" + ", ".join(_psq(line) for line in inf) + ")"
+    body = rf"""
+  $env:TEMP = {_psq(str(tmp_path))}
+{_workdir_seam(parent) if workdir is None else workdir}
+  $script:Calls = 0
+  $script:Cfg = ''
+  $script:Configured = ''
+  $script:Folder = $null
+  function secedit {{
+    $a = @($args)
+    $script:Calls++
+    $script:Cfg = $a[[array]::IndexOf($a, '/cfg') + 1]
+    if ($a -contains '/export') {{
+      Set-Content -LiteralPath $script:Cfg -Value {inf_ps} -Encoding Unicode
+    }} else {{
+      $script:Configured = ((Get-Content -LiteralPath $script:Cfg) -join ' | ')
+      $dir = Split-Path -Parent $script:Cfg
+      $acl = Get-Acl -LiteralPath $dir
+      $script:Folder = [ordered]@{{
+        path = $dir
+        owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        protected = $acl.AreAccessRulesProtected
+        sids = @($acl.Access | Where-Object {{ $_.AccessControlType -eq 'Allow' }} |
+          ForEach-Object {{ $_.IdentityReference.Translate(
+            [Security.Principal.SecurityIdentifier]).Value }})
+      }}
+    }}
+    $global:LASTEXITCODE = 0
+  }}
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $warnings = @()
+  $emitted = & {{ {_GRANT_FN} -Account $me.Name }} 3>&1 6>$null
+  foreach ($o in @($emitted)) {{
+    if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
+  }}
+  [pscustomobject]@{{
+    calls = $script:Calls; cfg = $script:Cfg; configured = $script:Configured
+    folder = $script:Folder; warnings = @($warnings); me = $me.User.Value
+    left = @(Get-ChildItem -LiteralPath {_psq(str(parent))} -Force | ForEach-Object {{ $_.Name }})
+  }} | ConvertTo-Json -Depth 4 -Compress
+"""
+    parsed: dict = json.loads(
+        _ok(_extract(_SCRIPT, [_GRANT_FN, _WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
+    )
+    parsed["warnings"] = [w for w in (parsed.get("warnings") or []) if w]
+    return parsed
+
+
+@_windows_only
+def test_the_installer_grants_the_logon_right_from_a_private_folder(tmp_path: Path) -> None:
+    """The grant direction of #5563, and the larger one: `secedit /configure` applies every user
+    right in the file, so a rewritten .inf could hand any right to any account."""
+    got = _grant_arms(tmp_path)
+    assert got["calls"] == 2, got["warnings"]
+    assert f"*{got['me']}" in got["configured"], "the account's SID was not added to the policy"
+    folder = got["folder"]
+    assert Path(folder["path"]).parent == tmp_path / "secedit-parent", (
+        f"the policy file is not in a folder of its own under the trusted parent: {got['cfg']}"
+    )
+    assert re.search(r"[0-9a-f]{32}", Path(folder["path"]).name), folder["path"]
+    assert folder["protected"] is True, "the work folder inherits entries from the folder above"
+    assert folder["owner"] == got["me"], f"the work folder has another owner: {folder['owner']}"
+    extra = set(folder["sids"]) - {"S-1-5-18", "S-1-5-32-544", got["me"]}
+    assert not extra, f"the work folder grants access to {sorted(extra)}"
+    assert got["left"] == [], f"the work folder was not removed afterwards: {got['left']}"
+
+
+@_windows_only
+def test_the_installer_runs_no_secedit_without_a_private_folder(tmp_path: Path) -> None:
+    seam = f"""
+  function {_WORKDIR_FN} {{ throw 'planted refusal' }}
+"""
+    got = _grant_arms(tmp_path, workdir=seam)
+    assert got["calls"] == 0, "secedit ran although the private folder could not be made"
+    assert any("planted refusal" in w and "NOT granted" in w for w in got["warnings"]), got[
+        "warnings"
+    ]
 
 
 def test_the_ace_switch_issues_the_reverse_icacls_call(tmp_path: Path) -> None:

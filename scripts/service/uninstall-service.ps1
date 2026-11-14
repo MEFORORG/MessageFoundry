@@ -408,13 +408,17 @@ function Get-UninstallResidueNotice {
 
 function New-SeceditWorkDirectory {
     <#
-      Make a new folder for Remove-ServiceLogonRight's secedit files and return its path. It is made
-      in one step with its final security: owner $OwnerSid, inheritance off, and full control for
-      SYSTEM, Administrators and the owner only. Throws when that cannot be shown. A folder found at
-      the path afterwards is left where it is, because a failed read-back cannot tell this run's
-      folder from one someone made first.
+      Make a new folder for the secedit files of Set-ServiceLogonRight (install-service.ps1) or
+      Remove-ServiceLogonRight (uninstall-service.ps1), and return its path. It is made in one step
+      with its final security: owner $OwnerSid, inheritance off, and full control for SYSTEM,
+      Administrators and the owner only. Throws when that cannot be shown. A folder found at the path
+      afterwards is left where it is, because a failed read-back cannot tell this run's folder from
+      one someone made first.
 
-      NOT IN THE USER'S TEMP (BACKLOG #5563). The uninstaller runs elevated, but the user's TEMP
+      THE TWO SCRIPTS SHARE NO FILE, so each carries this function, byte for byte, and
+      tests/test_service_install_manifest.py fails when the two copies differ.
+
+      NOT IN THE USER'S TEMP (BACKLOG #5563). Both scripts run elevated, but the user's TEMP
       belongs to the user, and a process of that user at medium integrity holds FILE_DELETE_CHILD
       there. With it, the process can rename any folder in it, whatever that folder's own DACL says,
       and put its own folder in its place with a policy file of its choosing. So the default parent is

@@ -1305,6 +1305,15 @@ function Reset-ConfigTreeAcl {
         if ($residue) { "'$Item' still grants access to: $($residue -join ', ')" }
     }
     $problems = @(& $readBack $Path)
+    # Stop before the walk when the root itself is not locked: each child is reset to inherit from
+    # it, so a root that still grants another account access, or still inherits, would pass that
+    # access down to children that were tighter than it.
+    $rootAcl = $null
+    try { $rootAcl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch { }
+    if ((-not $rootAcl) -or (-not $rootAcl.AreAccessRulesProtected) -or
+            @(Get-BroadAclResidue -Path $Path -Account $Account -Acl $rootAcl).Count -gt 0) {
+        return @($problems) + "nothing below '$Path' was changed, because '$Path' itself is not locked"
+    }
     $narrowed = @()
     $pending = New-Object System.Collections.Generic.Queue[string]
     $pending.Enqueue($Path)
@@ -1527,6 +1536,94 @@ function Test-GmsaInstalled {
     }
 }
 
+function New-SeceditWorkDirectory {
+    <#
+      Make a new folder for the secedit files of Set-ServiceLogonRight (install-service.ps1) or
+      Remove-ServiceLogonRight (uninstall-service.ps1), and return its path. It is made in one step
+      with its final security: owner $OwnerSid, inheritance off, and full control for SYSTEM,
+      Administrators and the owner only. Throws when that cannot be shown. A folder found at the path
+      afterwards is left where it is, because a failed read-back cannot tell this run's folder from
+      one someone made first.
+
+      THE TWO SCRIPTS SHARE NO FILE, so each carries this function, byte for byte, and
+      tests/test_service_install_manifest.py fails when the two copies differ.
+
+      NOT IN THE USER'S TEMP (BACKLOG #5563). Both scripts run elevated, but the user's TEMP
+      belongs to the user, and a process of that user at medium integrity holds FILE_DELETE_CHILD
+      there. With it, the process can rename any folder in it, whatever that folder's own DACL says,
+      and put its own folder in its place with a policy file of its choosing. So the default parent is
+      %SystemRoot%\Temp, where users may add a folder but not delete or rename one an administrator
+      made. The parent is checked for that before anything is made, so a host whose Windows Temp
+      differs is refused rather than trusted. The Windows folder is asked of the system, not read
+      from $env:SystemRoot: the user can set that variable for their own processes.
+
+      $Parent and $OwnerSid are parameters so the unelevated tests can make a folder they own.
+    #>
+    param([string]$Parent, [string]$OwnerSid = "S-1-5-32-544")
+    if (-not $Parent) { $Parent = Join-Path ([Environment]::GetFolderPath("Windows")) "Temp" }
+    # CREATOR OWNER (S-1-3-0) matches no one outside an inherited entry, so it is listed here.
+    $trusted = @(
+        "S-1-5-18", "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",   # TrustedInstaller
+        "S-1-3-0", $OwnerSid)
+    $item = Get-Item -LiteralPath $Parent -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "'$Parent' is not a plain folder"
+    }
+    # Who could rename a folder made here: its owner (WRITE_DAC grants the rest), and anyone the
+    # folder itself gives delete-child, a DACL change, ownership or GENERIC_ALL. Inherit-only entries
+    # apply to what is made inside, which this folder's own DACL replaces. OWNER RIGHTS (S-1-3-4)
+    # names the parent's owner, so the owner arm judges it.
+    $acl = Get-Acl -LiteralPath $Parent -ErrorAction Stop
+    $rights = [System.Security.AccessControl.FileSystemRights]
+    $renameMask = [int]($rights::DeleteSubdirectoriesAndFiles -bor $rights::ChangePermissions -bor
+        $rights::TakeOwnership) -bor 0x10000000
+    $open = @()
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($trusted -notcontains $owner) { $open += "$owner (owner)" } else { $trusted += @("S-1-3-4") }
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        if (([int]$rule.FileSystemRights -band $renameMask) -eq 0) { continue }
+        $sid = "$($rule.IdentityReference)"
+        try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { }
+        if ($trusted -notcontains $sid) { $open += "$sid ($($rule.FileSystemRights))" }
+    }
+    if ($open) {
+        throw ("'$Parent' lets another account rename a folder made in it: " +
+            (($open | Select-Object -Unique) -join ', '))
+    }
+    $path = Join-Path $Parent ("mefor-secedit-" + [guid]::NewGuid().ToString("N"))
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetOwner([Security.Principal.SecurityIdentifier]$OwnerSid)
+    $sec.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @("S-1-5-18", "S-1-5-32-544", $OwnerSid) | Select-Object -Unique) {
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.SecurityIdentifier]$sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    # .NET Framework (Windows PowerShell 5.1) has the overload; .NET (PowerShell 7) moved it to an
+    # extension method. As in install-service.ps1's New-RestrictedDirectory.
+    $overload = [System.IO.Directory].GetMethod('CreateDirectory',
+        [type[]]@([string], [System.Security.AccessControl.DirectorySecurity]))
+    if ($overload) { [void][System.IO.Directory]::CreateDirectory($path, $sec) }
+    else { [System.IO.FileSystemAclExtensions]::Create((New-Object System.IO.DirectoryInfo($path)), $sec) }
+    # CreateDirectory succeeds on a folder already there, so what is there is read back. A folder
+    # someone else made first is left alone, never deleted: it is not this run's.
+    $made = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    $back = Get-Acl -LiteralPath $path -ErrorAction Stop
+    if (($made.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+            $back.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $OwnerSid -or
+            -not $back.AreAccessRulesProtected) {
+        throw "'$path' was there before this run made it, so it is not the private folder asked for"
+    }
+    return $path
+}
+
 function Set-ServiceLogonRight {
     <#
       Grant the SeServiceLogonRight ("Log on as a service") user right to $Account via the LOCAL security
@@ -1535,6 +1632,11 @@ function Set-ServiceLogonRight {
       built-in secedit (no extra module): export USER_RIGHTS, append the account SID to
       SeServiceLogonRight if missing, re-import. Best-effort: resolves the SID, warns and returns on any
       failure, never aborts the install (an operator can grant it via secpol.msc / Group Policy instead).
+
+      THE TWO SECEDIT FILES LIVE IN A FOLDER ONLY ADMINISTRATORS CAN CHANGE (BACKLOG #5563). They sat
+      at fixed names in the user's TEMP, where a process of the same user at medium integrity could
+      rewrite the policy between the export and the import, and the import applies every user right
+      in it, not only this one. New-SeceditWorkDirectory says where the folder goes and why.
     #>
     param([Parameter(Mandatory)][string]$Account)
     try {
@@ -1546,15 +1648,22 @@ function Set-ServiceLogonRight {
             "Policies -> User Rights Assignment) or the service will fail to start with error 1069.")
         return
     }
-    $inf = Join-Path $env:TEMP "mefor-secedit-$PID.inf"
-    $sdb = Join-Path $env:TEMP "mefor-secedit-$PID.sdb"
+    try { $work = New-SeceditWorkDirectory } catch {
+        Write-Warning ("A private folder for the secedit files could not be made ($($_.Exception.Message)), " +
+            "so 'Log on as a service' was NOT granted to '$Account'. Grant SeServiceLogonRight manually " +
+            "(secpol.msc -> Local Policies -> User Rights Assignment) or the service will fail to start " +
+            "with error 1069.")
+        return
+    }
+    $inf = Join-Path $work "grant.inf"
+    $sdb = Join-Path $work "grant.sdb"
     try {
         & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $inf)) {
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $inf)) {
             Write-Warning "secedit export failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."
             return
         }
-        $lines = Get-Content $inf
+        $lines = Get-Content -LiteralPath $inf
         $row = $lines | Where-Object { $_ -match '^\s*SeServiceLogonRight\s*=' }
         if ($row) {
             # Compare against exact SID tokens, not a raw substring: a SID that is a string prefix of an
@@ -1576,7 +1685,7 @@ function Set-ServiceLogonRight {
             # No existing row: inject one under [Privilege Rights].
             $new = $lines -replace '(\[Privilege Rights\])', "`$1`r`nSeServiceLogonRight = *$sid"
         }
-        Set-Content -Path $inf -Value $new -Encoding Unicode
+        Set-Content -LiteralPath $inf -Value $new -Encoding Unicode
         & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-Warning "secedit configure failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."
@@ -1584,7 +1693,7 @@ function Set-ServiceLogonRight {
         }
         Write-Host "  Right  : granted SeServiceLogonRight (Log on as a service) to '$Account'." -ForegroundColor Green
     } finally {
-        Remove-Item $inf, $sdb -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
