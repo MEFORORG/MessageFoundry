@@ -2301,9 +2301,9 @@ class RegistryRunner:
         # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
         # Read at the CLAIM GATE (:meth:`_inbound_log_halted`) together with the latch, never applied
         # as a pause or a STOP. The halt itself
-        # does not pause or STOP a lane, save that it ends the per_lane voided-STOP re-pend hold, so
-        # the STOP a reload voided stands and that lane goes down; _inbound_log_halted says what
-        # else can still STOP one (BACKLOG #5704).
+        # does not pause or STOP an internal lane, save by ending the per_lane voided-STOP re-pend
+        # hold, so the STOP a reload voided stands and that lane goes down; _inbound_log_halted
+        # says what else can still STOP one (BACKLOG #5704).
         self._log_halted: set[str] = set()
         # The DELIVERY tier's counterpart is :attr:`_delivery_halted`, a derived read below rather
         # than a field here — see that property for why the tier links to the process latch instead
@@ -5947,7 +5947,7 @@ class RegistryRunner:
         async with self._reload_lock:
             # Again, for an inbound a reload holding the lock added while this waited: the latch
             # gates it now, and its mark keeps it gated after a later restart clears the latch. So
-            # while the latch is set, every inbound is marked, bound or not.
+            # if the latch is still set here, every registry inbound is marked, bound or not.
             # If a probe cleared the latch meanwhile, a listener a reload bound since passed that
             # probe. This halt still stops it, and marks it, when its inbound is one it read before
             # the wait (`inbounds`, stopped below); any other such listener it leaves bound, so
@@ -6028,8 +6028,9 @@ class RegistryRunner:
 
     def _lift_log_halt(self, name: str) -> None:
         """Lift the #122 halt's mark on inbound ``name`` and wake its per_lane workers waiting at the
-        claim gate. Sync and await-free. Only the mark is lifted, and no lane is resumed: the halt
-        itself does not pause or STOP a lane, save that it ends the per_lane voided-STOP re-pend
+        claim gate. Sync and await-free. Only the mark is lifted, and no internal lane is resumed:
+        the halt itself
+        does not pause or STOP an internal lane, save that it ends the per_lane voided-STOP re-pend
         hold, so the STOP a reload voided stands and that lane goes down. A lane that STOPped
         meanwhile, that way or under its own fault policy, stays STOPPED here, as any STOP does
         (:meth:`_inbound_log_halted`; BACKLOG #5704). A pooled lane the pre-claim gate parked is released with
@@ -6284,7 +6285,8 @@ class RegistryRunner:
 
         Lifting the gate unparks only lanes the gate parked, because the halt itself set no other
         phase: a STOP, whatever caused it (:meth:`_inbound_log_halted`), an operator pause and their
-        holds stand as they were."""
+        holds stand as they were, here. Under per_lane the start that called this then respawns
+        the finished workers (:meth:`_ensure_inbound_workers`)."""
         if not self._inbound_log_halted(name):
             return True
         if not self._log_recovery_ok():
@@ -9917,7 +9919,8 @@ class RegistryRunner:
           too, the voided STOP stands, and that lane goes down.
         * ``give_up_after`` failures return ``EXHAUSTED``. Only the pooled batch guard passes it,
           under ``infra_fault_policy = stop``, since that hold is the pooled dispatcher's. The
-          per-lane workers never read the policy and have no STOP path, so they pass none.
+          per-lane workers never read the policy and have no ``infra_fault_policy`` STOP path, so
+          they pass none.
 
         Dates the rows into the future by the same backoff the caller is about to sleep, exactly as
         T17 does and for the same reason: a plain release leaves them past-due, so the sweep re-readies
@@ -10058,9 +10061,11 @@ class RegistryRunner:
         per_lane :meth:`_transform_worker`, retrying the re-pend of the tail of a STOP a reload
         voided (BACKLOG #5708), passes this method as the hold's ``abandon``. So the halt ends the
         hold, the voided STOP stands, and the worker returns with the tail in flight, where without
-        the halt it would retry until the re-pend lands and then drain on. That lane is down until
-        something respawns the worker: at least a reload, even while the halt holds, and a start
-        of the inbound that passes the rebind gate. A lane can still STOP while the halt is in
+        the halt it would go on retrying and, once the re-pend landed, could drain on. That lane is
+        down until something respawns the worker, such as a reload (even while the halt holds,
+        unless a STOP hold is recorded for the inbound) or a start of the inbound that passes the
+        rebind gate and rebinds its listener; a start of a listener still bound respawns nothing.
+        A lane can still STOP while the halt is in
         force, at least under its own fault policy (the T17 infra-fault bound, for example when a
         hand-back's reschedule keeps failing on a full store) and through a leadership-loss
         hand-back (:meth:`_refuse_log_halted`).
@@ -11271,7 +11276,9 @@ class RegistryRunner:
             # fail-closed. Checked BEFORE the claim so no row is left INFLIGHT. The worker WAITS here
             # rather than returning (BACKLOG #5704), so the gate stays apart from the worker's life:
             # a lifted gate needs no respawn, and a respawn cannot resurrect a worker a content STOP
-            # ended. :meth:`_wake_log_gated` wakes it when the gate lifts.
+            # ended. :meth:`_wake_log_gated` wakes it when the gate lifts. Not so the transform
+            # worker the halt ends at its voided-STOP re-pend: that one returned, so it needs a
+            # respawn (:meth:`_inbound_log_halted`).
             if self._inbound_log_halted(name):
                 woken = await self._wait_for_work(wait_ev)
                 continue
