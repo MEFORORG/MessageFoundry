@@ -277,9 +277,10 @@ class MonitorPanel(QWidget):
             self._set_status(str(exc), error=True)
             return
         if not self._ensure_auth(client):
-            # A must-change sign-in leaves the client holding a session it will never use. End it
-            # before dropping the client, or it stays live until it expires (BACKLOG #2091). The
-            # engine lets a must-change session reach /auth/logout.
+            # A must-change sign-in, or one whose second factor was never verified, leaves the client
+            # holding a session it will never use. End it before dropping the client, or it stays
+            # live until it expires (BACKLOG #2091, #5568). The engine lets a must-change or an
+            # MFA-pending session reach /auth/logout.
             if client.token is not None:
                 with contextlib.suppress(ApiError):
                     client.logout()
@@ -319,7 +320,8 @@ class MonitorPanel(QWidget):
 
     def _ensure_auth(self, client: EngineClient) -> bool:
         """Return True if usable: a no-auth engine answers ``/auth/me`` directly; an authed one
-        401/403s, so prompt sign-in via the :class:`LoginDialog`."""
+        401/403s, so prompt sign-in via the :class:`LoginDialog`, then for the second factor the
+        sign-in still owes, if any."""
         try:
             client.me()
             return True
@@ -347,28 +349,41 @@ class MonitorPanel(QWidget):
     def _verify_second_factor(self, client: EngineClient) -> bool:
         """Verify the second factor an accepted sign-in still owes (BACKLOG #5568).
 
-        A user with MFA enrolled who leaves the dialog's code blank gets an MFA-pending session, on
-        which the engine refuses every poll and action. Ask for a TOTP or recovery code until one
-        is verified. Return False on a cancel, a blank answer or any refusal other than a wrong
-        code; the caller then ends the pending session. ``verify_mfa`` rotates the session, and the
-        polling client is built from the rotated token after this returns."""
-        label = "Enter the code from your authenticator app, or a recovery code:"
-        while True:
-            code, ok = QInputDialog.getText(self, "Second factor required", label)
-            code = code.strip()
-            if not ok or not code:
-                self._set_status("sign-in cancelled: no second factor was entered")
-                return False
-            try:
-                client.verify_mfa(code)
-                return True
-            except ApiError as exc:
-                if exc.status != 401:
-                    self._set_status(str(exc), error=True)
-                    return False
-                label = (
-                    "That code was not accepted. Enter an authenticator code or a recovery code:"
-                )
+        A user who leaves the dialog's code blank, or whose engine requires MFA, gets an
+        MFA-pending session, on which the engine refuses every poll and action. When the account
+        has an authenticator enrolled, ask once for a TOTP or recovery code and verify it. Return
+        False when it has none (enrolment, or a passkey, is the web console's), on a cancel or a
+        blank answer, and on any refusal, naming the engine's reason; the caller then ends the
+        pending session. ``verify_mfa`` rotates the session, and the polling client is built from
+        the rotated token after this returns."""
+        try:
+            totp_enrolled = client.mfa_status().enabled
+        except ApiError as exc:
+            self._set_status(str(exc), error=True)
+            return False
+        if not totp_enrolled:
+            self._set_status(
+                "Account needs a second factor this panel cannot take: enrol an authenticator, or "
+                "sign in with a passkey, in the web console first.",
+                error=True,
+            )
+            return False
+        code, ok = QInputDialog.getText(
+            self,
+            "Second factor required",
+            "Enter the code from your authenticator app, or a recovery code:",
+            QLineEdit.EchoMode.Password,
+        )
+        code = code.strip()
+        if not ok or not code:
+            self._set_status("sign-in cancelled: no second factor was entered")
+            return False
+        try:
+            client.verify_mfa(code)
+        except ApiError as exc:
+            self._set_status(f"second factor refused: {exc}", error=True)
+            return False
+        return True
 
     def _step_up(self) -> bool:
         """Answer a step-up refusal (403 + ``X-Step-Up-Required``): ask for the password, masked,

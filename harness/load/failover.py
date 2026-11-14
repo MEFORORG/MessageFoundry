@@ -779,7 +779,10 @@ async def _monitor_failover(
     whatever the survivor delivered in the gap, and a drain that finished there would time out. A
     failed read never stands in as zero, which would read the next read as instant recovery: it
     keeps the last good baseline. With no good read before promotion, the first good read after it
-    becomes the baseline, which can miss a recovery (a timeout, a FAIL) but never invent one.
+    becomes the baseline, which can miss a recovery (a timeout, a FAIL) but not invent one. One
+    residue stays: a commit the dying primary had already sent can land after an early baseline read,
+    and if every later standby read fails it reads as the survivor's progress. ``kill()`` does not
+    wait for the process to exit, so a later standby read is the only thing that narrows it.
 
     The CONTINUOUS single-leader SLO (H6): every poll observes BOTH nodes' roles and folds the count of
     simultaneous primaries into a :class:`LeadershipTracker`, so a split-brain that flickers *between*
@@ -791,7 +794,8 @@ async def _monitor_failover(
     baseline: int | None = None
     start = time.perf_counter()
     while time.perf_counter() - start < deadline_s:
-        # Read BEFORE the role, so a standby answer below proves this read preceded promotion.
+        # Read BEFORE the role, so a "standby" answer below proves this read preceded promotion. Any
+        # other answer, including none, proves nothing, so only "standby" moves the baseline.
         pre = await survivor.stats(client) if promotion_ns is None else None
         # H6 continuous single-leader invariant: sample BOTH nodes' roles every poll and record how many
         # are simultaneously primary right now. >= 2 at any sample is split-brain (a HARD SLO violation);
@@ -804,7 +808,7 @@ async def _monitor_failover(
             if survivor_role == "primary":
                 promotion_ns = time.perf_counter_ns()
                 notes.append(f"{survivor.node_id} promoted to primary")
-            elif pre is not None:
+            elif survivor_role == "standby" and pre is not None:
                 baseline = pre.done
         if promotion_ns is not None:
             cur = await survivor.stats(client)
@@ -812,8 +816,9 @@ async def _monitor_failover(
                 if baseline is None:
                     baseline = cur.done
                     notes.append(
-                        "no stats read succeeded before promotion; the recovery baseline is the first "
-                        "read after it, so a recovery that finished before that read is not measured"
+                        "no stats read was usable as a baseline before promotion (none succeeded on a "
+                        "standby poll); the recovery baseline is the first read after it, so a recovery "
+                        "that finished before that read is not measured"
                     )
                 elif cur.done > baseline:
                     recovery_ns = time.perf_counter_ns()

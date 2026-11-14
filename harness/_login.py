@@ -40,7 +40,7 @@ class LoginDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Sign in — MessageFoundry")
         self._client = client
-        # Seams read by _authenticate() after the dialog is accepted.
+        # Seams read by MonitorPanel._ensure_auth() after the dialog is accepted.
         self.must_change_password = False
         # BACKLOG #2009 (ASVS 6.4.5): when must_change_password is set, the instant the engine stops
         # accepting the temporary password (LoginResponse.credential_expires_at), or None.
@@ -114,7 +114,7 @@ class LoginDialog(QDialog):
                 "Directory (or ask an administrator) before your access is restricted.",
             )
         else:
-            # Hand the must-change flag and the just-entered plaintext back to _authenticate.
+            # Hand the must-change flag and the just-entered plaintext back to the caller.
             self.must_change_password = result.must_change_password
             self.credential_expires_at = result.credential_expires_at
             self.entered_password = password
