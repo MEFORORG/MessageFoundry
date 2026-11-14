@@ -2412,11 +2412,14 @@ Properties of the anonymizer:
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. Each component and subcomponent is read as written, decoded from its
   escape sequences, and with its invisible characters (Unicode categories Cc and Cf) removed.
-  Each is also split at every invisible character that is not whitespace, such as NUL or a
-  zero-width space; a tab and the unit separator U+001F count as whitespace. A part that holds an
-  escape character is also split at the escape character, at escaped delimiters and at
-  whitespace. A part with none is not split at whitespace, so `Call 971234 today` passes. A
-  reading that is a site code whole counts. The test tables in `tests/test_anon_b224_5632.py` are the specification of
+  The part as written is also split at every invisible character that `str.isspace` does not
+  count as whitespace, such as NUL or a zero-width space. A part that holds an escape character
+  is also split as written at the escape character, each escape body split again at every
+  character that is not a digit, and its decoded reading is split at the message's delimiters,
+  at whitespace and at every invisible character. A part with none is not split at whitespace,
+  so `Call 971234 today` in a component of its own is neither found nor scrubbed. A reading that
+  is a site code whole counts; `_reads_as_site_code` in `messagefoundry_toolkit/anon/surrogates.py`
+  says which reading is split where. The test tables in `tests/test_anon_b224_5632.py` are the specification of
   which forms are found and which are left; this paragraph does not restate them (BACKLOG
   #5632). A part that reads as a site code is replaced, escapes and all, by digits of the same
   width, and a component with subcomponents that reads as one whole is replaced whole, its
