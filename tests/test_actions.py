@@ -574,25 +574,46 @@ def test_date_diff_field_offsets_move_the_day_count() -> None:
     assert m["ZTS-3"] == str(23 * 60)
 
 
-def test_date_diff_field_years_with_offsets_reads_one_calendar() -> None:
-    # The end is re-expressed at the start's offset: 2026-06-15 02:00Z is 2026-06-14 21:00 at -0500,
-    # the day before the anniversary, so 45 years, not 46.
-    m = _two_stamps("198006150000-0500", "202606150200+0000")
+def test_date_diff_field_years_with_offsets_reads_the_utc_calendar() -> None:
+    # 1980-06-15 01:00 at +0200 is 1980-06-14 23:00Z, so the 2026-06-14 23:30Z end is the UTC
+    # anniversary: 46 years either way round. NEGATIVE CONTROL: the unfixed code read the wall dates,
+    # June 15 then June 14, and wrote 45.
+    m = _two_stamps("198006150100+0200", "202606142330+0000")
     date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="years")
-    assert m["ZTS-3"] == "45"
+    assert m["ZTS-3"] == "46"
+    date_diff_field(m, "ZTS-2", "ZTS-1", "ZTS-3", unit="years")
+    assert m["ZTS-3"] == "-46"
 
 
-def test_date_diff_field_one_offset_reads_both_as_wall_clocks() -> None:
-    # Only one stamp has an offset, so there is no instant to pin the other to; both are read as the
-    # wall clocks they state, as before.
+def test_date_diff_field_one_offset_beside_a_time_of_day_raises() -> None:
+    # Only one stamp has an offset and the other has a time of day: there is no instant to compare it
+    # with, so the wall-clock gap (6) would be a guess. Either way round.
     m = _two_stamps("202603010800", "202603011400+0000")
-    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="hours")
-    assert m["ZTS-3"] == "6"
+    with pytest.raises(ValueError, match="cannot be compared as instants"):
+        date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="hours")
+    with pytest.raises(ValueError, match="cannot be compared as instants"):
+        date_diff_field(m, "ZTS-2", "ZTS-1", "ZTS-3", unit="hours")
+    assert m["ZTS-3"] is None
 
 
-def test_date_diff_field_out_of_range_offset_raises() -> None:
-    m = _two_stamps("202603010800-0500", "202603011400+0060")
-    with pytest.raises(ValueError):
+def test_date_diff_field_a_date_only_stamp_beside_an_offset_reads_as_its_date() -> None:
+    # Age at an event: a date-only date of birth beside an event time that carries an offset.
+    m = _two_stamps("19800615", "202606150200-0500")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="years")
+    assert m["ZTS-3"] == "46"
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ("202603010800-0500", "202603011400+0060"),  # minutes of 60
+        ("202603010800-0500", "202603011400+2500"),  # a day or more
+        ("202603010800", "20260302+0060"),  # beside a stamp with no offset
+    ],
+)
+def test_date_diff_field_out_of_range_offset_raises(start: str, end: str) -> None:
+    m = _two_stamps(start, end)
+    with pytest.raises(ValueError, match="offset"):
         date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="hours")
 
 
@@ -605,6 +626,15 @@ def test_date_diff_field_reads_a_composite_ts_by_its_first_component() -> None:
     # A component path is read as addressed.
     date_diff_field(m, "ZTS-1.1", "ZTS-2.1", "ZTS-3", unit="hours")
     assert m["ZTS-3"] == "84"
+
+
+@pytest.mark.parametrize("start", ["^D", "20260101~20270101"])
+def test_date_diff_field_refuses_a_ts_field_with_no_time_or_two(start: str) -> None:
+    # A precision with no time, and a repeating field, both raise rather than writing a number.
+    m = _two_stamps(start, "20260104")
+    with pytest.raises(ValueError):
+        date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] is None
 
 
 @pytest.mark.parametrize(
