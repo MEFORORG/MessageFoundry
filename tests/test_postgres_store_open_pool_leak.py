@@ -212,7 +212,7 @@ async def test_a_cancelled_open_closes_the_pool(monkeypatch: pytest.MonkeyPatch)
 async def test_a_failed_keyed_open_forfeits_the_block_it_reserved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5720, decision d20261114T005827: the open reserves a block of AES-GCM invocations
+    """BACKLOG #5720, decision d20261114T010249807-7b3140: the open reserves a block of AES-GCM invocations
     and then fails. Its cleanup closes the pool and settles nothing, so the block is forfeited, as
     on main: a forfeit only over-counts, the conservative direction for the bound."""
     pool = _FakePool()
@@ -324,7 +324,7 @@ async def test_a_cancel_during_the_cleanup_still_closes_the_pool(
 async def test_a_pool_without_terminate_keeps_the_opens_error(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5720, decision d20261114T005827: a pool with no ``terminate()`` must not replace
+    """BACKLOG #5720, decision d20261114T010249807-7b3140: a pool with no ``terminate()`` must not replace
     the open's error. The forced release looks it up only when it runs, inside the logged call."""
     monkeypatch.setattr("messagefoundry.store.store.FAILED_OPEN_CANCEL_BOUND_S", 0.05)
     unwedge = asyncio.Event()

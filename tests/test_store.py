@@ -1590,7 +1590,11 @@ async def test_cleanup_failed_open_runs_only_the_forced_release_on_generator_exi
 
 
 async def _wedged_cleanup_ends_within_the_bound(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, exc: BaseException
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc: BaseException,
+    *,
+    cancel: bool = True,
 ) -> BaseException | None:
     """Run ``cleanup_failed_open`` over a release that never finishes, cancel it, and return what
     it raised, if anything; the test fails rather than hangs when nothing bounds the wait."""
@@ -1612,7 +1616,8 @@ async def _wedged_cleanup_ends_within_the_bound(
     )
     try:
         await asyncio.wait_for(started.wait(), 5)
-        task.cancel()
+        if cancel:
+            task.cancel()
         done, _pending = await asyncio.wait({task}, timeout=3)
         assert task in done, "a cancelled failed-open cleanup still waited on a wedged release"
     finally:
@@ -1643,8 +1648,9 @@ async def test_a_cancelled_opens_wedged_cleanup_is_bounded_from_the_start(
     """BACKLOG #5720: an open that was itself cancelled has had its cancel already, so its
     cleanup is bounded from the start, and it raises nothing: the caller re-raises the open's
     own cancel."""
+    # No cancel from the test: only the open's own CancelledError can start the bound.
     raised = await _wedged_cleanup_ends_within_the_bound(
-        monkeypatch, caplog, asyncio.CancelledError()
+        monkeypatch, caplog, asyncio.CancelledError(), cancel=False
     )
     assert raised is None
 
@@ -1731,7 +1737,7 @@ async def test_a_cancel_on_every_pass_still_reaches_the_forced_release(monkeypat
 async def test_a_swallowed_earlier_cancel_does_not_turn_a_failed_open_into_a_cancel(
     tmp_path, monkeypatch
 ) -> None:
-    """BACKLOG #5720, decision d20261114T005827 (as BACKLOG #5004): a task that swallowed a cancel
+    """BACKLOG #5720, decision d20261114T010249807-7b3140 (as BACKLOG #5004): a task that swallowed a cancel
     before the open still counts it in ``cancelling()``. The open compares against the count it
     started with, so its own ordinary failure stays that failure, not a ``CancelledError``."""
 
@@ -1779,3 +1785,40 @@ async def test_an_exit_names_itself_in_the_forced_release_warning(monkeypatch, c
         unwedge.set()
         await asyncio.sleep(0)
     assert "did not finish within 0.05 s of KeyboardInterrupt" in caplog.text
+
+
+async def test_a_cleanup_that_ends_cancelled_still_forces_the_release() -> None:
+    """BACKLOG #5720: a release cancelled from outside, as ``asyncio.run``'s cancel-all does, can
+    stop before the read pool; the forced release then drops what it skipped."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    forced: list[str] = []
+
+    async def cancelled_release() -> None:
+        raise asyncio.CancelledError
+
+    await cleanup_failed_open(
+        RuntimeError("open boom"),
+        cancelled_release,
+        lambda: forced.append("forced"),
+        cancels_before=0,
+    )
+    assert forced == ["forced"]
+
+
+async def test_a_forced_stop_has_its_outcome_read(caplog) -> None:
+    """BACKLOG #5720: the SQLite forced release reads each ``stop()`` future's outcome when it
+    resolves, so a failed stop is logged by class rather than left unretrieved."""
+    from messagefoundry.store.store import _stop_unawaited
+
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    class _Conn:
+        def stop(self) -> asyncio.Future[None]:
+            return future
+
+    _stop_unawaited(_Conn())  # type: ignore[arg-type]
+    future.set_exception(OSError("worker gone at C:/secret/path"))
+    await asyncio.sleep(0)
+    assert "stopping a connection after a failed store open failed (OSError)" in caplog.text
+    assert "secret" not in caplog.text

@@ -277,7 +277,7 @@ async def test_a_cancelled_create_pool_releases_the_executor(
 async def test_a_failed_keyed_open_forfeits_the_block_it_reserved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #5720, decision d20261114T005827: the cleanup releases the pool and executor and
+    """BACKLOG #5720, decision d20261114T010249807-7b3140: the cleanup releases the pool and executor and
     settles nothing, so the reserved block is forfeited, as on main."""
     pool = _FakePool()
     _install_fake_aioodbc(monkeypatch, pool)
