@@ -500,7 +500,7 @@ messagefoundry-tray = "messagefoundry.tray.__main__:main"
 ci-scanners = [
     "bandit==1.9.4",
     "pip-audit==2.10.1",
-    "zizmor==1.31.1",
+    "zizmor==1.32.0",
 ]
 # The RELEASE SIGNING toolchain (BACKLOG #332). Exact `==`, and the version is the contract for the
 # same reason the scanners' are: this runs in the job holding `id-token: write`, and whatever executes
@@ -574,7 +574,7 @@ release-tools = [
 #                  supplied it. Same spec in both places ⇒ uv resolves ONE version and they cannot
 #                  disagree.
 ci-quality = [
-    "diff-cover==11.0.0",
+    "diff-cover==11.0.1",
     "mutmut==3.8.1",
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3.1",
