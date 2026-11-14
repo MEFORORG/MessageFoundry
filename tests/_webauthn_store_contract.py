@@ -329,14 +329,15 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
 
 
 async def assert_a_session_for_a_missing_account_is_refused(store: Any) -> None:
-    """BACKLOG #2733, pass F: the session's user foreign key, beside the passkey's above. SQL Server
-    lacked it, so a sign-in there committed a session for an account that does not exist, where
-    SQLite and Postgres refused it. Kept here, with the passkey case, so the three suites that run
-    this module run both."""
-    await _assert_integrity_refused(
-        store.create_session(token_hash="o" * 64, user_id="no-such-account", expires_at=9e9),
-        "a session for an account that does not exist",
+    """BACKLOG #2733: a session for an account that does not exist is refused on every backend,
+    beside the passkey case above, so the three suites that run this module run both. Pass F found
+    SQL Server committing one, for lack of the session's user foreign key. ``create_session`` now
+    refuses a missing account itself, returning ``False`` before its INSERT, so this no longer
+    reaches the key; ``test_sqlserver_store.py`` checks the key is in force."""
+    written = await store.create_session(
+        token_hash="o" * 64, user_id="no-such-account", expires_at=9e9
     )
+    assert written is False, "a session for an account that does not exist was accepted"
     assert await store.get_session("o" * 64) is None
 
 

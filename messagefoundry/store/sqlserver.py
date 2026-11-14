@@ -16500,11 +16500,15 @@ class SqlServerStore:
                 # fetchall drains the SELECT so the same-cursor INSERT below is clean; `_cursor`
                 # closes the cursor before the pooled connection is reused (EF-6).
                 rows = await cur.fetchall()
-                if require_federated_subject is not None:
-                    bound = None if not rows else (rows[0][0], rows[0][1])
-                    if bound != require_federated_subject:
-                        await conn.rollback()
-                        return False
+                # An account deleted under this sign-in is refused, guarded or not (BACKLOG #2733):
+                # the INSERT would otherwise fail fk_sessions_user with a raw 547. A row this read
+                # found stays locked to the commit, so a delete cannot land before the INSERT.
+                if not rows or (
+                    require_federated_subject is not None
+                    and (rows[0][0], rows[0][1]) != require_federated_subject
+                ):
+                    await conn.rollback()
+                    return False
                 record = new_session_record(
                     token_hash=token_hash,
                     user_id=user_id,
@@ -16514,7 +16518,7 @@ class SqlServerStore:
                     seed_reauth=seed_reauth,
                     auth_mechanism=auth_mechanism,
                     idp_auth_time=idp_auth_time,
-                    user_epoch=0 if not rows else int(rows[0][2]),
+                    user_epoch=int(rows[0][2]),
                     # BACKLOG #5091: its own statement, after the row lock, for the reason
                     # postgres.py's create_session gives; revoke_all_sessions says why it cannot
                     # close a cycle.

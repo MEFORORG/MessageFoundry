@@ -20629,11 +20629,14 @@ class MessageStore:
                 (user_id,),
             )
             row = await cur.fetchone()
-            if require_federated_subject is not None:
-                bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
-                if bound != require_federated_subject:
-                    await self._db.rollback()
-                    return False
+            # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+            # INSERT's foreign-key error.
+            if row is None or (
+                require_federated_subject is not None
+                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            ):
+                await self._db.rollback()
+                return False
             record = new_session_record(
                 token_hash=token_hash,
                 user_id=user_id,
@@ -20643,8 +20646,8 @@ class MessageStore:
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
-                user_epoch=0 if row is None else int(row["session_epoch"]),
-                global_epoch=0 if row is None else global_epoch_or_refuse(row["global_epoch"]),
+                user_epoch=int(row["session_epoch"]),
+                global_epoch=global_epoch_or_refuse(row["global_epoch"]),
             )
             record = await seal_session_async(self._row_sealer, record)
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
