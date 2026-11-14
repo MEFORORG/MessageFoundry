@@ -1748,8 +1748,10 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > **`data_class` is no longer read here** — a `synthetic` label used to allow every cleartext hop
 > silently, which made a typo in one file indistinguishable from a deliberate declaration, with every
 > transport hop in the product as its blast radius. `MEFOR_ALLOW_INSECURE_TLS` no longer influences this
-> decision either. It survives at least for cleartext SMTP on an Email or Direct outbound connection;
-> the [escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) lists hops it reaches.
+> decision either. It still reaches some checks outside this decision, and only on an instance at
+> `[security].enforcement = warn`: for one, the opt-in check an Email outbound connection with
+> `use_tls = false` runs before this decision is asked. The
+> [escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) lists hops it reaches.
 
 #### A forward proxy must not re-frame what it carries
 

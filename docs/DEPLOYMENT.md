@@ -610,10 +610,8 @@ Two other shapes were weighed and not built:
    [matrix](#channel--tls-posture-matrix)). Per-connection, the only
    honest way across is `cleartext_accepted = true` + `cleartext_reason` (ADR 0153: warn + audit at every
    construction, listed by `messagefoundry check` and `GET /security/posture`). Do **not** set
-   `MEFOR_ALLOW_INSECURE_TLS` in production. It is not only a verification switch: on an instance at
-   `warn` it still permits at least cleartext SMTP on an Email or Direct outbound connection
-   (`use_tls = false`) and a store or DATABASE hop with `encrypt = false`, beside the verify-off hops
-   (see [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
+   `MEFOR_ALLOW_INSECURE_TLS` in production: it is not only a verification switch, and
+   [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch) says what it permits and where.
    **At least one hop can still cross outside that refusal** and needs a deliberate decision from you: a
    `dialect='generic'` DATABASE hop, outbound or a `DatabasePoll` inbound (driver-owned TLS: once a mode outside the no-TLS deny-list is set, the engine neither enforces nor verifies it) — see the exceptions under the [matrix](#channel--tls-posture-matrix).
    A Direct outbound connection with `use_tls=false` is decided outside that refusal too, by its own
@@ -829,12 +827,14 @@ engine will not always refuse them for you:
 - **Direct (S/MIME) with `use_tls = false`** — the message body is S/MIME signed and encrypted, but the
   SMTP session (envelope metadata, recipients) is cleartext. This path is gated by the
   `MEFOR_ALLOW_INSECURE_TLS` escape only, read through the clamp, so it is refused at
-  `[security].enforcement = enforce` and no per-hop declaration lifts it. CORRECTED 2026-11-14: this
-  read *"`[security].enforcement` does not clamp it"*, stale since #323.
+  `[security].enforcement = enforce`, even to a loopback host, and no per-hop declaration lifts it.
+  CORRECTED 2026-11-14: this read *"`[security].enforcement` does not clamp it"*, stale since #323.
 
 **Deployment requirement:** run these on **loopback only**, or behind a **TLS-terminating proxy / on a
 trusted, isolated network segment**. If PHI flows over one of them off-host without that protection, it
-is exposed in cleartext. A non-loopback raw-TCP/X12 **bind** is refused at startup (`check_tcp_tls_exposure`,
+is exposed in cleartext. A Direct outbound connection with `use_tls = false` is the exception to the
+loopback route: a loopback host does not admit it, so under `enforce` keep `use_tls = true`, the
+default. It runs only on an instance at `warn` with the escape set, and the same advice holds there. A non-loopback raw-TCP/X12 **bind** is refused at startup (`check_tcp_tls_exposure`,
 PR #558) — but because these connectors have no TLS to enable, the gate's only passes are a loopback bind
 or OS-level firewall/segmentation (`serve --allow-insecure-bind` is clamped inert on the default
 enforcing-PHI posture); choosing one (and keeping PHI off the cleartext wire) is the **operator
@@ -849,16 +849,20 @@ decision 4; TLS support for them is BACKLOG #311).
 ## The `MEFOR_ALLOW_INSECURE_TLS` escape hatch
 
 Several connectors **fail closed** on a weakened-TLS or cleartext configuration unless the
-environment variable `MEFOR_ALLOW_INSECURE_TLS` is set. It exists for **dev / trusted-lab** use
-only.
+environment variable `MEFOR_ALLOW_INSECURE_TLS` is set on an instance at
+`[security].enforcement = warn`. It exists for **dev / trusted-lab** use only. At `enforce`, the
+default, it has no effect.
 
 The escape does not release a credential to a peer the engine has not verified, except on the hops
 that rule does not reach yet. The rule and those hops are stated once in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
-Each bullet below releases a hop with no credential, unless it says otherwise.
+Each entry in the first list below releases a hop with no credential, unless it says otherwise.
 
-With `MEFOR_ALLOW_INSECURE_TLS` set, at least these otherwise-refused settings become permitted (not every one
-logs a warning):
+With `MEFOR_ALLOW_INSECURE_TLS` set on an instance at `warn`, at least these otherwise-refused
+settings become permitted (not every one logs a warning). On the store hop, the command that opens the
+store decides: at least `serve`, `provision-admin` and `store provision-schema` pass the instance's own
+posture and honour the escape, while at least `admin-reset-totp`, `audit-verify`, `backup` and
+`rotate-key` pass none at `warn` and refuse a weakened store hop as they would at `enforce`.
 
 - REST/SOAP/FHIR/DICOMweb `verify_tls = false`. *(Clamped. A static header off the verify-off
   allowlist refuses the hop in every case, as a credential does.)*
@@ -868,29 +872,38 @@ logs a warning):
   database login, and the credential rule does not reach them yet.)*
 - RemoteFile SFTP: accepting an unknown host key on a login with no `password`. *(Clamped since
   #329.)*
-- Cleartext SMTP submission on a **Direct** (S/MIME) destination, and its `tls_verify = false`.
-  *(Clamped, read directly rather than through the authority. CORRECTED 2026-10-13: this read *Not
-  clamped*.)*
-- **Email** destination `use_tls = false` and `tls_verify = false`. *(Clamped. On `use_tls = false`
-  it is one of three ways past the cleartext pre-check, beside the connection's `tls_hop_attested`
-  and `cleartext_accepted`, and the cleartext-hop authority then decides the hop.)*
-- The non-connection cells, which have no per-hop `cleartext_accepted` declaration: the `[logging]`
-  syslog/SIEM forwarder (it does have `[logging].forward_hop_attested`, the claim that the hop is secure
-  by other means, which clears the hop decision but not the off-box forwarding gate of BACKLOG #1966:
-  under `enforce` `serve` still refuses a forwarder without verified TLS to a separate collector) and
-  the API PHI-read serve hop. The escape changes neither one's disposition: it applies only off
-  `enforce`, where both already WARN an unprotected hop, and under `enforce` it is inert.
-  *(Both clamped. LDAPS was on this list until vault BACKLOG #3230 made
-  `ad_tls_verify = false` a refusal with no escape. The AI-broker endpoint was on it until vault
-  BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`. The
-  webhook alert sink was on it until vault BACKLOG #3533 item 5 did the same for an `http`
-  `[alerts].webhook_url`, which can carry the hop's credential as a path token. The escape has no
-  effect on the webhook: an `http` URL refuses the start in every posture when `serve` builds the
-  alert notifier, and no setting turns off the `https` webhook's certificate chain or hostname
-  check.)*
+- Cleartext SMTP submission on a **Direct** (S/MIME) outbound connection, and its
+  `tls_verify = false`. *(Clamped, read directly rather than through the authority. CORRECTED
+  2026-10-13: this read *Not clamped*.)*
+- **Email** outbound connection `use_tls = false` and `tls_verify = false`. *(Clamped. On
+  `use_tls = false` it is one of at least three ways past the cleartext pre-check, beside the
+  connection's `tls_hop_attested` and `cleartext_accepted`, and the cleartext-hop authority then
+  decides the hop.)*
 
-An SMTP login on an Email or Direct outbound connection crosses none of these: it is refused before
-any of them, whatever is set.
+An Email or Direct outbound connection that logs in (`username` set) gets none of the SMTP entries
+above: its login over cleartext, over `tls_verify = false` or over `tls_check_hostname = false` is
+refused before any of them, whatever is set. A login over verified TLS, the default, is not refused.
+
+**What the escape does not open.** At least these:
+
+- The non-connection cells: the `[logging]` syslog/SIEM forwarder and the API PHI-read serve hop.
+  The escape changes neither one's disposition: under `enforce` it is inert, and at `warn` both
+  already WARN an unprotected hop without it. The forwarder's own way across is
+  `[logging].forward_hop_attested`, the claim that the hop is secure by other means; it clears the
+  hop decision but not the off-box forwarding gate of BACKLOG #1966, so under `enforce` `serve` still
+  refuses a forwarder without verified TLS to a separate collector.
+- LDAPS `ad_tls_verify = false`, a refusal with no escape since vault BACKLOG #3230.
+- The AI-broker `http` endpoint, refused with no escape since vault BACKLOG #3533, since every call
+  sends `[ai].api_key`.
+- The webhook alert sink: an `http` `[alerts].webhook_url`, which can carry the hop's credential as a
+  path token, refuses the start in every posture when `serve` builds the alert notifier (vault
+  BACKLOG #3533 item 5), and no setting turns off the `https` webhook's certificate chain or hostname
+  check.
+- A SMART or OAuth2 token URL over `http` to a host off this machine: the token request carries a
+  credential, so it is refused with no escape, and only a loopback host passes.
+
+LDAPS, the AI-broker endpoint and the webhook were each in the first list until the change named
+beside it; the non-connection cells were in it until 2026-11-14.
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
@@ -901,17 +914,20 @@ refused with no escape, whatever either declaration says (vault BACKLOG #3533 it
 forward-proxy login is the exception, under `cleartext_accepted` alone, and
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer) says which owner ruling governs it. (A per-connection `tls_hop_attested` + `tls_hop_attested_reason` makes
 the opposite claim, "secure by other means", and ALLOWs the hop. It is reported as a loosening; see
-[CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested).) *(b)* Where it does still apply it is mostly
+[CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested).) *(b)* Where it does still apply it is
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
-enforce`. That holds for the weakened-TLS / cleartext-escape cells that route through
-`weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
-the SFTP host key of a key-only login. That clamp once also required the
+enforce`. The engine reads the variable only through the clamp, `hop_insecure_escape_downgrades`
+and `weakened_tls_escape_permitted` built on it, and the cells in the first list call one of the two. A
+cell that knows no posture gets no escape either. That clamp once also required the
 instance to be PHI; by design every instance is now treated as carrying patient data (BACKLOG
-#1279), so that conjunct is gone. Either way, on the shipped posture those cells are inert;
-no bullet above is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
+#1279), so that conjunct is gone. Either way, on the shipped posture the escape is inert in every
+cell of the first list, and no entry there is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
+CORRECTED 2026-11-14: this read *"mostly clamped"*.
 
-**Never set `MEFOR_ALLOW_INSECURE_TLS` in production.** Its presence is the single **environment-variable**
-switch that turns the remaining fail-closed verification checks into best-effort.
+**Never set `MEFOR_ALLOW_INSECURE_TLS` in production.** It is inert at `enforce`, the default, but it
+is a latent switch: move the instance to `warn` and the settings in the first list become permitted
+with it. CORRECTED 2026-11-14: this read that it *"turns the remaining fail-closed verification checks
+into best-effort"*.
 
 **It is not the only way to weaken TLS, so do not audit for it alone.** Three further families of lever
 sit outside this variable entirely, and a config review that greps for `MEFOR_ALLOW_INSECURE_TLS` will

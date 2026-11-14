@@ -92,11 +92,10 @@ connection is TLS-verified out of the box. Give the managed Postgres a **CA-trus
 provider's default RDS/Cloud SQL/Azure CA chains to a public root, or pin a private CA by file via
 `[store].ssl_root_cert` — a Postgres CA-bundle, see [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5). **Do not
 set `MEFOR_ALLOW_INSECURE_TLS`** in a real deployment. It is a dev / trusted-lab escape with no effect at
-`[security].enforcement = enforce`, the default. On an instance at `warn` it permits a weakened hop that
-would otherwise be refused: `serve` then accepts `[store].trust_server_certificate = true` or
-`[store].encrypt = false` on this store hop. It does not reach every transport;
-[the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) lists hops it reaches, as an
-at-least list.
+`[security].enforcement = enforce`, the default; on an instance at `warn` it can let this store hop run
+with `[store].trust_server_certificate = true` or `[store].encrypt = false`.
+[The escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says which commands honour it
+there and which other hops it reaches.
 
 ### 2.2 Lease timings vs. failover speed
 
