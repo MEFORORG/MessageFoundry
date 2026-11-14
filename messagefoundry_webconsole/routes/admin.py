@@ -261,10 +261,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     async def _shown_name(user_id: str, service: AuthService) -> str:
         """The username a page shows after an action already landed, read as :func:`_checked`
-        reads it, or the id when that read is refused or fails. The action's one-time output was
-        already issued and must still be rendered, so a refusal or a store failure never replaces
-        the page with an error (BACKLOG #5559). Each fallback logs a WARNING naming the account; a
-        seal failure is also reported by the read itself. A defect still raises."""
+        reads it, or the id when that read raises ``HTTPException`` or one of
+        ``account_read_errors()`` other than ``AUDIT_WRITE_DEFECTS`` (BACKLOG #5559). The
+        action's one-time output was already issued and must still be rendered. Each fallback logs
+        a WARNING naming the account; a seal failure is also reported by the read itself. Any other
+        exception raises."""
         try:
             user = await _checked(user_id, service)
         except HTTPException as exc:

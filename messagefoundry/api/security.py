@@ -353,8 +353,7 @@ def account_read_errors() -> tuple[type[Exception], ...]:
     """The refusals the checked account read the console makes through ``AdminHandlers.checked_user``
     can raise past the 404, 423 and 503 its handler answers (BACKLOG #5559):
     :func:`~messagefoundry.store.base.sealed_read_errors`, a refused store call or a record that
-    cannot be decrypted. Its seal-failure audit row is written soft, so that row's own failures do
-    not reach the caller. As that function says, a caller that must not read a bug as a refusal
+    cannot be decrypted. As that function says, a caller that must not read a bug as a refusal
     re-raises :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first."""
     return sealed_read_errors()
 

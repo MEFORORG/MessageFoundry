@@ -1665,8 +1665,8 @@ failing account by its id alone, with its delete. `GET /ui/users/{user_id}`,
 `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
-account's name the same way; when that read is refused, or the store or Vault transit refuses it,
-they name the account by its id and still show what was issued, rather than answering 423. A failure is reported
+account's name the same way; when the record fails its seal, they name the account by its id and
+still show what was issued, rather than answering 423. A failure is reported
 per account and rate-limited, in each engine process: only the first refusal of an account in
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal

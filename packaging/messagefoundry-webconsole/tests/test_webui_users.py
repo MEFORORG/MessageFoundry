@@ -132,8 +132,7 @@ def test_users_page_hides_the_scope_columns_from_a_reader_who_is_not_shown_scope
 def test_users_page_lists_an_integrity_failed_account_by_id_alone() -> None:
     """BACKLOG #5520: an account whose record fails its seal arrives as its id alone. Its row names
     the id and says the check failed, keeps the table's column count, and has no link to the detail
-    page, which answers 423 for it; its one control is the delete form (BACKLOG #5559). The control
-    is an intact account beside it."""
+    page, which answers 423 for it (BACKLOG #5559). The control is an intact account beside it."""
     from messagefoundry.api.auth_models import IntegrityFailedUser, UserSummary
     from messagefoundry_webconsole.pages.admin import users_page
 
