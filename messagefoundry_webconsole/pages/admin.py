@@ -302,7 +302,7 @@ def users_page(users: Sequence[UserListEntry]) -> Markup:
             failed: list[object] = [""] * len(headers)
             failed[0] = u.id
             failed[headers.index("Status")] = el(
-                "span", "integrity check failed ", _delete_user_form(u.id)
+                "div", el("p", "integrity check failed"), _delete_user_form(u.id)
             )
             rows.append(failed)
             continue

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
@@ -69,6 +70,8 @@ from ..pages.admin import (
     ticked_scope_expected_source,
 )
 from ._common import _form_pairs
+
+_log = logging.getLogger(__name__)
 
 register_ui_action(
     r"^/ui/users/new$",
@@ -248,19 +251,27 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     )
 
     async def _checked(user_id: str, service: AuthService) -> Any:
-        """The account ``user_id`` names, its record checked against its integrity seal, or the
-        engine's refusal: 404 no row, 423 a record that fails its check, 503 a Vault transit Outage
-        (BACKLOG #5559). The JSON handler's own read, so a failure is reported as the JSON plane
-        reports it. Never a store row nobody checked: a page would show its forged grants."""
+        """The account ``user_id`` names, read by the JSON plane's own checked read
+        (``AdminHandlers.checked_user``; its docstring says what it refuses), never a store row
+        nobody checked, which a page would show with its forged grants (BACKLOG #5559)."""
         return await admin.checked_user(service=service, user_id=user_id)
 
     async def _shown_name(user_id: str, service: AuthService) -> str:
-        """The username a page shows after an action already landed, checked as :func:`_checked`
-        checks it, or the id when the check refuses. The action's one-time output must still be
-        rendered, so a refusal here never replaces the page (BACKLOG #5559)."""
+        """The username a page shows after an action already landed, read as :func:`_checked`
+        reads it, or the id when that read fails in any way. The action's one-time output was
+        already issued and must still be rendered, so nothing here may replace the page with an
+        error (BACKLOG #5559). A refusal is reported by the read itself; any other failure is
+        logged here."""
         try:
             user = await _checked(user_id, service)
         except HTTPException:
+            return user_id
+        except Exception as exc:  # noqa: BLE001 -- the issued credential must still be shown
+            _log.warning(
+                "the account name for a page after a landed action could not be read (%s); "
+                "the page names the account by id",
+                type(exc).__name__,
+            )
             return user_id
         return str(user.username)
 
@@ -273,7 +284,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         status_code: int = 200,
         scope_draft: list[str] | None = None,
     ) -> HTMLResponse:
-        # BACKLOG #5559: the checked record carries the role rows its seal covered.
         user = await _checked(user_id, service)
         all_roles = await admin.list_roles(service=service, _=identity)
         return HTMLResponse(
@@ -281,7 +291,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # BACKLOG #1141: a must-change account's page states when its credential dies.
                 admin.user_summary_scoped(
                     user,
-                    list(user.role_ids),
+                    # BACKLOG #5559: None takes the role rows the record's seal covered.
+                    None,
                     credential_expires_at=pending_credential_deadline(service, user),
                     # BACKLOG #1131 (ASVS 6.1.1): this page is users:manage, so it shows the locks.
                     lock_state_at=time.time(),
@@ -492,20 +503,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        # BACKLOG #3393: before any form check; the guard's docstring says why. The record read
-        # here is the guard's target, and the directory-scope check below reuses it. Checked
-        # (BACKLOG #5559): a missing account is the 404 every path here answered, and a record
-        # that fails its seal is refused before anything is decided from it.
-        user = await _checked(user_id, service)
+        # BACKLOG #3393: before anything else, the account read included; the guard's docstring
+        # says why. It reads the row only to compare ids, as its JSON twin does.
         try:
             # By keyword: the seam digest records the field's name, not its parameters.
             await admin.refuse_own_channel_scope(
-                request=request, service=service, identity=identity, user_id=user_id, target=user
+                request=request, service=service, identity=identity, user_id=user_id
             )
         except HTTPException as exc:
             return await _user_detail(
                 user_id, service, identity, error=str(exc.detail), status_code=exc.status_code
             )
+        # Checked (BACKLOG #5559): a missing account is the 404 every path here answered, and a
+        # record that fails its seal is refused before anything is decided from it. The
+        # directory-scope check below reuses it.
+        user = await _checked(user_id, service)
         form = dict(await _form_pairs(request))
         names = [ln.strip() for ln in form.get("channels", "").splitlines() if ln.strip()]
         # The tri-state scope_mode keeps deny-all distinguishable from all-channels — an empty
@@ -576,7 +588,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         #
         # Read through the summary, not the record: the console never reads a UserRecord attribute
         # itself, so the seam snapshot covers the field. The role list is not read. The record is
-        # the one read before the guard.
+        # the one read after the guard.
         summary = admin.user_summary_scoped(user, [], show_scope=True)
         ticked = form.get(CONFIRM_MANUAL_SCOPE_FIELD) == CONFIRM_MANUAL_SCOPE_VALUE
         if not ticked and needs_manual_scope_confirm(summary):
@@ -988,9 +1000,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
-            return await _user_detail(
-                user_id, service, identity, error=str(exc.detail), status_code=400
-            )
+            try:
+                return await _user_detail(
+                    user_id, service, identity, error=str(exc.detail), status_code=400
+                )
+            except HTTPException as page_exc:
+                # BACKLOG #5559: the users list offers the delete for a record that fails its
+                # seal, whose detail page answers 423. The delete's own refusal is the answer.
+                if page_exc.status_code != status.HTTP_423_LOCKED:
+                    raise
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc.detail)) from exc
         return RedirectResponse("/ui/users", status_code=303)
 
     # --- roles ------------------------------------------------------------

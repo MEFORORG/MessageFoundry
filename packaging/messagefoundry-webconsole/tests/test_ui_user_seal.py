@@ -31,6 +31,7 @@ from messagefoundry.auth.service import (
     AUTHORITY_SEAL_FAILED_ACTION,
     USER_SEAL_REFUSED,
     AuthService,
+    LastAdministratorRefused,
     UserSealRefused,
 )
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -172,13 +173,45 @@ async def test_a_failing_account_is_listed_with_its_delete_and_the_delete_remove
     assert await engine.store.get_user(intact) is not None
 
 
-async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checked_read(
+async def test_a_refused_delete_of_a_failing_account_answers_its_own_refusal(
     keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused delete re-renders the detail page, which answers 423 for a record that fails its
+    seal. For the delete the list offers on such a row, the delete's own refusal is the answer.
+    The refusal is stood in for at the service's delete; the control is the same refusal on an
+    intact account, shown on its detail page."""
+    engine, path = keyed
+    service, _alerts, intact, victim = await _setup(engine)
+    _tamper(path, victim)
+    refusal = "stand-in: this would leave no enabled administrator"
+
+    async def refused(user_id: str, *, actor: str) -> None:
+        raise LastAdministratorRefused(refusal)
+
+    monkeypatch.setattr(service, "delete_user", refused)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "root")
+        r = await c.post(f"/ui/users/{victim}/delete", headers=SAME_ORIGIN)
+        ok = await c.post(f"/ui/users/{intact}/delete", headers=SAME_ORIGIN)
+    assert r.status_code == 400 and refusal in r.text
+    assert _PLANTED not in r.text
+    assert ok.status_code == 400 and refusal in ok.text and "User: intact" in ok.text  # control
+    assert await engine.store.get_user(victim) is not None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [UserSealRefused(USER_SEAL_REFUSED), RuntimeError("stand-in: a store read failed")],
+    ids=["refused", "read-failed"],
+)
+async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checked_read(
+    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch, failure: Exception
 ) -> None:
     """The password reset lands through the engine's own checks, then the page that hands over the
     one-time credential names the account. That name is read through the checked read; when it
-    refuses, the page names the id and the credential is still shown, since it was issued. The
-    refusal is stood in for at the service's checked reader, after the reset's own read."""
+    refuses or fails in any other way, the page names the id and the credential is still shown,
+    since it was issued. The failure is stood in for at the service's checked reader, after the
+    reset's own read."""
     engine, _path = keyed
     service, _alerts, intact, victim = await _setup(engine)
     async with _client(engine, service) as c:
@@ -188,10 +221,10 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
         ok = await c.post(path, headers=SAME_ORIGIN)
         assert ok.status_code == 200 and "Convey this to intact " in ok.text  # control
 
-        async def refused(user_id: str) -> None:
-            raise UserSealRefused(USER_SEAL_REFUSED)
+        async def failing(user_id: str) -> None:
+            raise failure
 
-        monkeypatch.setattr(service, "checked_user", refused)
+        monkeypatch.setattr(service, "checked_user", failing)
         path = f"/ui/users/{victim}/reset-password"
         await mint_bound_proof(c, path)
         r = await c.post(path, headers=SAME_ORIGIN)

@@ -1032,8 +1032,8 @@ class AdminHandlers:
 
     list_roles: Callable[..., Awaitable[Any]]
     list_users: Callable[..., Awaitable[Any]]
-    # BACKLOG #5559: ``auth_routes._checked_user``, the one account read the console's user pages
-    # make, its record checked against its seal: 404 no row, 423 a failing record, 503 an Outage.
+    # BACKLOG #5559: ``auth_routes._checked_user``, the seal-checked account read the console's
+    # user pages make; its docstring says what it answers.
     checked_user: Callable[..., Awaitable[Any]]
     list_custom_roles: Callable[..., Awaitable[Any]]
     create_user: Callable[..., Awaitable[Any]]
