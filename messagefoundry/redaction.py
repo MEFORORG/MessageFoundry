@@ -1820,7 +1820,7 @@ def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
         out.append(replacement)
         pos = end
     if not out:
-        if "</" not in text or _XML_PHI_END_OPEN.search(text) is None:
+        if not masks or "</" not in text or _XML_PHI_END_OPEN.search(text) is None:
             return text
         mask = masks and _USERINFO_OPENER not in text
         if not mask:
@@ -1838,7 +1838,7 @@ def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool) -> str:
     every tag is that element's markup; outside one, ``</b Zqxdoe>`` is read as prose and kept. The
     cost is over-masking prose that names a vocabulary tag: ``missing </name element`` prints as
     ``missing </name xxxxxxx``. ``mask`` is :func:`_end_tag_rest`'s."""
-    if text.find("</", lo, hi) == -1:
+    if not mask or text.find("</", lo, hi) == -1:
         return text[lo:hi]
     out: list[str] = []
     pos = lo
@@ -1893,7 +1893,9 @@ def redact(text: str) -> str:
     two one-delimiter halves into a field run, and scrubbing a quoted label value can uncover a key.
     A fuzz over those fragments broke the fixed point above on its first run. So when the structured
     passes change the text, the whole redaction runs again on the result; text they leave alone takes
-    exactly one round, byte-identical and at the cost it had before them. If the rounds run out, the
+    exactly one round, byte-identical and at the cost it had before them. A change that only masks an
+    end tag's rest in place is not one: that round ends too, at the cost of one more structured pass
+    (:func:`_masked_only`, BACKLOG #5925). If the rounds run out, the
     flat passes run once more, so a run the last structured round joined is still caught.
 
     **Two stages, and the first is the redactor as BACKLOG #1711 shipped it (BACKLOG #2079).** The
@@ -2003,7 +2005,8 @@ def _needs_widened_stage(text: str) -> bool:
 
 
 def _redact_rounds(text: str, *, widened: bool) -> str:
-    """One stage of :func:`redact`: the flat and structured passes, repeated to a fixed point."""
+    """One stage of :func:`redact`: the flat and structured passes, repeated until a round changes
+    nothing but end-tag masks (:func:`_masked_only`)."""
     credentials = not widened
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:

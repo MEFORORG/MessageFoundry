@@ -476,9 +476,31 @@ def test_a_masked_rest_runs_no_round_main_did_not(a: str, raw: str) -> None:
     assert "Qzhqpjzj" not in before["redact(a) + raw by redact"]  # the gap main does not have
     assert "Qzhqpjzj" not in safe_text(safe_text(a) + raw)
     assert _is_main_masked(safe_text(safe_text(a) + raw), main_twice)
+    assert len(after) >= 45
+    assert after.keys() == before.keys()
     unmasked = [route for route, out in after.items() if not _is_main_masked(out, before[route])]
     assert not unmasked, [(route, after[route], before[route]) for route in unmasked[:3]]
     assert any(out != before[route] for route, out in after.items())  # the mask ran
+    # THE POSITIVE CONTROL: with a mask counted as a change again, as at 552c25b49e, this pair
+    # prints the joined value where main hid it, so the green above is the round gate's work.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(redaction, "_masked_only", lambda text, flat, *, widened: False)
+        assert "Qzhqpjzj" in redact(redact(a) + raw)
+
+
+def test_a_scrub_that_keeps_length_and_class_still_runs_another_round() -> None:
+    """THE EXACT CHECK (code review): ``[abcdefgh]`` and ``[redacted]`` have one length and one
+    class layout, so the class comparison alone would read this real scrub, beside a masked rest,
+    as masks only and end a round main ran again. The structured pass with every rest kept is what
+    tells them apart."""
+    flat = '{"name": "[abcdefgh]"} </family Zqx>'
+    out = redaction._redact_structured(flat, widened=True)
+    assert out == '{"name": "[redacted]"} </family Xxx>'
+    assert out.translate(redaction._SHAPE) == flat.translate(redaction._SHAPE)
+    assert not redaction._masked_only(out, flat, widened=True)
+    masked_alone = redaction._redact_structured(flat, widened=False)
+    assert masked_alone == '{"name": "[abcdefgh]"} </family Xxx>'
+    assert redaction._masked_only(masked_alone, flat, widened=False)
 
 
 def test_the_mask_is_a_fixed_point() -> None:
