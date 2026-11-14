@@ -7923,7 +7923,13 @@ def _refuse_an_unauditable_write(store: Store) -> None:
 
 
 def _key_file_access_gate(
-    path: str, *, what: str, remedy: str, enforcing: bool, absent_ok: bool = False
+    path: str,
+    *,
+    what: str,
+    remedy: str,
+    enforcing: bool,
+    absent_ok: bool = False,
+    engine_owned: bool = False,
 ) -> bool:
     """May ``serve`` use the key file at ``path``? ``False`` means refuse the start.
 
@@ -7932,10 +7938,12 @@ def _key_file_access_gate(
     ``[security].enforcement = enforce`` a problem is an error and the answer is ``False``; under
     ``warn`` it is a warning and the start goes on. ``what`` names the file for the operator and
     ``remedy`` says what to do about it. With ``absent_ok`` a missing file passes, for the loader
-    to fail on."""
+    to fail on. ``engine_owned`` is :func:`key_file_problem`'s, for a file only the engine writes."""
     from messagefoundry.config.key_file_access import key_file_problem
 
-    problem = key_file_problem(path, what=what, remedy=remedy, absent_ok=absent_ok)
+    problem = key_file_problem(
+        path, what=what, remedy=remedy, absent_ok=absent_ok, engine_owned=engine_owned
+    )
     if problem is None:
         return True
     if enforcing:
@@ -7965,7 +7973,8 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
         what="the store key file named by [store].encryption_key_file",
         remedy=(
             "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
-            "the key again with `messagefoundry protect-key` to a new path"
+            "the key again with `messagefoundry protect-key` to a new path in a folder no broad "
+            "group may delete a file in, with no junction or link on its path that another account can change"
         ),
         enforcing=enforcing,
     )
@@ -7986,13 +7995,16 @@ def _engine_account_name() -> str:
 
 
 def _generated_tls_key_remedy(state_dir: Path) -> str:
-    """What :func:`_generated_tls_key_gate` tells the operator to do. On POSIX it also covers the
-    store directory the key sits in, which the check judges there and nowhere else (vault BACKLOG
-    #5636), with the path shell-quoted so the command can be pasted as printed."""
+    """What :func:`_generated_tls_key_gate` tells the operator to do. It also covers the store
+    directory the key sits in, which the check judges on every platform (vault BACKLOG #5636,
+    #5657): on POSIX with the commands to fix its mode and owner, the path shell-quoted so they can
+    be pasted as printed, and on Windows in words, since a new pair would land in it again."""
     import shlex
 
     remedy = (
-        "Restrict it to the account the engine runs as, or delete it and its certificate so "
+        "Where the refusal names who owns it, delete it and its certificate so the next start "
+        "mints a pair the engine owns: restricting it does not change its owner. Otherwise "
+        "restrict it to the account the engine runs as, or delete it and its certificate so "
         "the next start mints a new pair. "
     )
     if sys.platform != "win32":
@@ -8002,6 +8014,16 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             f"Where it names the directory's mode, remove the write bits: chmod go-w {directory}. "
             "Where it names the directory's owner, give it to the account the engine runs as: "
             f"chown {shlex.quote(_engine_account_name())} {directory}. "
+            "Where it names a link on its path, keep the store where no link another account "
+            "can change is above it, since a new pair would be minted in the same place. "
+        )
+    else:
+        remedy += (
+            "Where the refusal names the directory that holds it, that is the store's directory: "
+            "remove a broad group's right to delete files in it or change its access list, and "
+            "give it an owner that is not such a group. Where it names a folder on its path, keep "
+            "the store where no junction or link another account can change is above it. A new pair would be minted in the "
+            "same place again. "
         )
     return remedy + (
         "If the volume itself widens the file on every mount, "
@@ -8025,6 +8047,7 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
         what=f"the generated TLS private key {plan.key_file}",
         remedy=_generated_tls_key_remedy(state_dir),
         enforcing=enforcing,
+        engine_owned=True,  # only the engine mints this key, so its owner is vetted
     )
 
 

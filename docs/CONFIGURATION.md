@@ -2761,7 +2761,9 @@ secret. Each file in that directory holds one setting and is named exactly as it
   group may delete a file (Windows `FILE_DELETE_CHILD`), and a link, on every platform. On POSIX
   it also refuses a directory or file owned by an account other than the engine's own or root,
   and one held in a directory that such an account owns or that a group or other may write
-  without the sticky bit, since any account that may write it may replace what it holds. It also
+  without the sticky bit, since any account that may write it may replace what it holds. On
+  Windows it also reads the folder just above the directory in its path, as [PHI.md](PHI.md)
+  section 2, *The folders above a key file*, states for a key file. It also
   refuses a relative path, a file that is not a regular file, a file named for no setting above
   (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
   whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
@@ -2773,11 +2775,9 @@ secret. Each file in that directory holds one setting and is named exactly as it
   not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
   named for no setting is cited by its position, never spelled, since its name may be a value.
 - **On Windows the access check is a list of known broad groups.** It does not refuse one named
-  account that can write the directory, the way the config-directory checks do, and it does not
-  read the folder that holds the directory. On POSIX it reads that one folder, as the rule above
-  says. On no platform does it read the folders above that: an account that can write one of
-  those could replace the directory. Restrict the directory, and the folders above it, as below
-  rather than relying on the check.
+  account that can write the directory, the way the config-directory checks do. Do not
+  rely on this check alone. Restrict the secrets directory and every folder above it yourself,
+  as below.
 - **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
   [`[store].encryption_key_file`](#store).

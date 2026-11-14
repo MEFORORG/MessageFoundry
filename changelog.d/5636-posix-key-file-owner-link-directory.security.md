@@ -1,12 +1,18 @@
-- **On POSIX the key-file access check now refuses a key file reached through a link, one owned by
-  an account other than the engine's own or root, and one held in a directory that such an account
-  owns or that a group or other account may write without the sticky bit.** Before, it judged the
+- **On POSIX the key-file access check now refuses at least a key file whose own name is a link,
+  whoever owns it, one owned by an account other than the engine's own or root, and one held in
+  a directory, or reached through a link held in or below a folder, that such an account owns or
+  that a group or other account may write without the sticky bit.** Before, it judged the
   mode bits of the file a link named, so a mode `0600` key another account owned, or one in a
   directory others could replace it in, would have passed. The check applies at least to the
   generated and the operator's API TLS key and each connection's key file, which `serve` and
   `supervise` judge, and to the secrets directory and its files. A dangling link to a key is now
-  refused rather than passed as a missing file. Only the last part of a path is read without
-  following a link, and only the directory that holds the file is read, not the ones above it.
+  refused rather than passed as a missing file. The directory that holds the file is judged by
+  its owner and mode. The folders above it are not, except those that hold a link on the path or
+  lie above one, which `_posix_link_problem` in `messagefoundry/restricted_file.py` judges, and,
+  since the secrets directory is checked as a path of its own, the folder that holds that
+  directory. A part of the path whose owner and mode cannot be read is refused, except when the
+  first read, of the root folder `/`, fails: the path is then not walked, so a link on it is not
+  judged either.
   When the engine mints its own TLS pair and the store directory does not exist yet, it creates
   that directory on POSIX with no group or other write bit (`0755` at most), and only then; with
   an operator certificate or an upstream terminator it creates none. The `cert self-signed` and

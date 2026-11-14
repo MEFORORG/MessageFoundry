@@ -62,10 +62,11 @@ _PEM_MARKER: Final = "-----BEGIN"
 
 #: The remedy for a key file an operator supplied.
 KEY_FILE_REMEDY: Final = (
-    "Restrict it to the account the engine runs as (POSIX: a file, not a link, that account owns, "
-    "in a directory that account or root owns and only it may write, or that has the sticky "
-    "bit; for a key "
-    "kept behind a link, such as a certbot live/ path, copy the file there on each renewal)"
+    "Restrict it to the account the engine runs as, as a file rather than a link, with no junction "
+    "or link above it that another account can change (Windows: in a directory no broad group "
+    "may delete a file in or change the access list of; POSIX: a file that account owns, in a directory that account "
+    "or root owns and only it may write, or that has the sticky bit; for a key kept behind a link, "
+    "such as a certbot live/ path, copy the file to a real folder on each renewal)"
 )
 
 
@@ -93,16 +94,22 @@ def _absent(path: str) -> bool:
     return False
 
 
-def key_file_problem(path: str, *, what: str, remedy: str, absent_ok: bool = False) -> str | None:
+def key_file_problem(
+    path: str, *, what: str, remedy: str, absent_ok: bool = False, engine_owned: bool = False
+) -> str | None:
     """Why the engine may not use the key file at ``path``, or ``None`` when it may.
 
     A known broad group or an application package must not be able to read or change the file
-    (:func:`~messagefoundry.restricted_file.broad_access_problem`). On POSIX that check also
+    (:func:`~messagefoundry.restricted_file.broad_access_problem`). That check also judges some
+    junctions and links on the path, and on Windows it reads the folder just above the file in its
+    path (vault BACKLOG #5656, #5657). On POSIX it also
     refuses a link, a file another account owns, and a directory holding it that another account
     owns or that a group or other may write with no sticky bit. ``what`` names the file for
     the operator and ``remedy`` says what to do about it; the reason never carries the file's
     contents. With ``absent_ok``, a missing file passes: the loader that opens it refuses it and
-    says why, which is the fault the operator needs to hear about. It prints and logs nothing:
+    says why, which is the fault the operator needs to hear about. With ``engine_owned``, the file is
+    one only the engine writes, and on Windows its owner must be the engine, SYSTEM or
+    Administrators (vault BACKLOG #5657). It prints and logs nothing:
     each caller refuses under ``enforce`` and warns under ``warn``."""
     from messagefoundry.restricted_file import broad_access_problem
 
@@ -112,7 +119,7 @@ def key_file_problem(path: str, *, what: str, remedy: str, absent_ok: bool = Fal
         return f"{what} is not restricted: its path could not be examined (a NUL in it). {remedy}"
     if absent_ok and _absent(path):
         return None
-    problem = broad_access_problem(Path(path))
+    problem = broad_access_problem(Path(path), engine_owned=engine_owned)
     if problem is None:
         return None
     return f"{what} is not restricted: {problem}. {remedy}"
