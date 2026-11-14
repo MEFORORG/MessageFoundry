@@ -705,8 +705,17 @@ _UNSCANNABLE_RE_PATTERNS = {
     # necessarily makes the expression unresolvable to this static scanner. The shape is bounded and
     # non-catastrophic by inspection: an alternation of digit literals followed by a fixed ``\d{4}`` —
     # no nested quantifier, no overlapping alternation.
-    "messagefoundry_toolkit/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
-    "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
+    #
+    # BACKLOG #5632, #5654 -- the decoded-reading re-split in ``decoded_readings``. Unresolvable BY
+    # CONSTRUCTION: its class is the delimiter set the message declares in MSH-1/MSH-2, read at
+    # runtime and passed through ``re.escape``, plus ``\s``, which every invisible character is
+    # mapped to before the split. It is a
+    # single character class used only by ``re.split``, with no quantifier at all, so it is linear.
+    "messagefoundry_toolkit/anon/surrogates.py": (
+        "f'(?:{alt})\\\\d{{4}}'",
+        "f'[{breaks}{_TRIM_CLASS}]'",
+    ),
+    "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'", "f'[{breaks}{_TRIM_CLASS}]'"),
     # BACKLOG #1678 -- the orphan sweep's temp-file shape. Unresolvable BY CONSTRUCTION, and that is
     # the point: the matcher is spliced from the SAME constants the atomic write MINTS the name from
     # (_BLOB_SUFFIX, _META_SUFFIX, _TMP_TOKEN_BYTES), which is what stops a DELETING pattern from

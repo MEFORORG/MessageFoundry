@@ -2459,13 +2459,26 @@ Properties of the anonymizer:
   the check-digit scheme, the identifier type and the issuer's names. It blanks CX.2, the check digit, the CX.7 and
   CX.8 dates, and anything past CX.10. `PID-20`, a driver's licence, takes the `dln` kind: the
   number is fabricated, the issuing state kept and the expiry blanked (BACKLOG #5534). The
-  leak-check still scans a kept component, as written and decoded. A dashed SSN or a punctuated
-  phone number there refuses, as it would in a field no rule maps. Any other text a sender puts
+  leak-check still scans a kept component, as written and decoded. A dashed SSN, a punctuated
+  phone number or a routable IPv6 address there refuses, as it would in a field no rule maps. Any other text a sender puts
   in one, such as a name, passes. The kept positions are
   CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
-  loose string search. With no site prefix loaded it matches nothing, and
-  `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
+  loose string search. Each component and subcomponent is read in several ways, among them as
+  written, decoded from its escape sequences, and with its invisible characters (Unicode
+  categories Cc and Cf) removed, and some of those readings are also split into pieces. A reading
+  or piece that is a site code whole counts. A part that holds no escape character is never split
+  at whitespace, so `Call 971234 today`, as a component with no escape character, is not found by
+  this check and is left by the scrub. A part that holds one is split at whitespace in its decoded
+  reading, so `Call 971234 today\.br\` is found. The test tables in `tests/test_anon_b224_5632.py` are the specification of
+  which forms are found and which are left; this paragraph does not restate them (BACKLOG
+  #5632). A part that reads as a site code is replaced, escapes and all, by digits of the same
+  width, and a component with subcomponents that reads as one whole is replaced whole, its
+  separators included, so free text in a part that holds an escape character can be lost to
+  digits, as `Call 971234 today\.br\` is. The surrogate is keyed on the part as written, so one
+  code written two ways gets two unrelated surrogates. With no site prefix loaded it matches
+  nothing, and `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG
+  #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
   reach. Plain `anonymize` and `anonymize_checked` both refuse it, in the toolkit and on the tee.
@@ -2485,11 +2498,12 @@ both are described below:
 | The leak-check refuses when | Where it looks |
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
-| A known partner, vendor or site token, or a routable IP address, survives | The whole message |
+| A known partner, vendor or site token, or a routable IPv4 address, survives | The whole message |
+| A routable IPv6 address appears. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast without the P flag, or in a documentation range (`2001:db8::/32`, `3fff::/20`). A multicast address with the P flag set is refused, whether or not it embeds a prefix: that includes the RFC 3306 and RFC 3956 forms and source-specific `ff3x::/32`. An IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. An allowed address is not routable on the internet, but it can still name a site or a device: a unique-local address carries its site's random Global ID, and a link-local one built from a MAC carries that MAC. The forms it cannot read are below (BACKLOG #5654) | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first, as for the SSN and phone rows. In the MSH header, MSH-2 past its four encoding characters and every field from MSH-3 on that no rule maps, as written and decoded. Not checked, at least: MSH-1, the encoding characters, the components a rule keeps past the first in a header field, and component 1 of a field a rule rewrites, which holds the surrogate |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
-| A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
+| A value with a non-empty first component and an `MR` or `MRN` id type: any component that is `MR` or `MRN` whole or as its first subcomponent, such as `12345^MR` or `12345^MR&L`, or CX.5, the identifier type code, in any of its subcomponents too, such as `ID^^^AUTH^MR&local`. Component 5 of any field the check reads is read as CX.5 whatever the field's type, so `70553^MRI^C4^^PET&MR` in `OBR-4`, a coded field and not a CX, is refused. An `MR` subcomponent past the first in any other component, such as the modality in `70553^PET&MR^C4`, does not count (BACKLOG #5654) | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
@@ -2510,9 +2524,14 @@ component read and one subcomponent on a subcomponent read, and `Peek` decodes a
 reading the first one where a component has several. An escape can pair across the subcomponent
 separator in the first reading and not in the second, so the check takes both. The shape
 detectors read each unmapped value as written, then each of its components decoded whole and each
-of its subcomponents decoded on its own. The MRN-typed check reads the id type as written,
-decoded whole, and as its first subcomponent decoded. The token scan reads the whole message as
-written, then decoded a subcomponent at a time, then decoded a component at a time. The escape
+of its subcomponents decoded on its own. The MRN-typed check reads every component, its first
+subcomponent and each subcomponent of CX.5, as written, decoded, and with invisible characters
+removed, each trimmed and never split; `tests/test_anon_b224_5654.py` is the specification
+of which forms count (BACKLOG #5654). The check for a shape cut
+across fields reads each line as written and with each field decoded a subcomponent and a
+component at a time, and counts a cut only where two fields meet (BACKLOG #5533 item 8). The
+token scan reads the whole message as written, then decoded a subcomponent at a time, then
+decoded a component at a time. The escape
 character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
 own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
 delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
@@ -2527,10 +2546,28 @@ still pass:
 - No part wider than a component is decoded, as neither engine reader decodes one, so a shape
   whose parts sit in different components is not joined, and an escape character with no closing
   one in a component never pairs with a sequence in the next.
-- The site-code check does not decode, so a site code written with an escape sequence passes it.
-- The check for a shape cut across fields by the field separator does not decode.
+- The site-code check and the scrub miss some forms. At least these pass:
+  `971234<U+001F>X`, a code an ASCII unit separator follows with no escape in the part, and
+  `97<U+00AD>1234\X2D\`, a code a soft hyphen interrupts beside a hex escape (BACKLOG #5632),
+  and a code written as the argument of a well-formed hex or multi-byte character-set escape,
+  such as `\X971234\` or `\M971234\`, which a raw viewer shows as digits. That argument is
+  not read as a site code, so a name such as `\M242844\Yamada` keeps its text (BACKLOG #5654).
+- The IPv6 check misses some routable addresses. At least these pass: one joined to an allowed
+  address, such as `fe80::1.4000:a1::5`, and one split by a highlighting or control escape, such
+  as `4000:a1:\H\:5` or `4000:a1\X00\::5` (BACKLOG #5654).
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
+
+The IPv6 check also refuses some text that holds no routable address. It reads runs of hex
+characters (0-9 and A-F), colons and dots, so a word that ends in hex characters can read as an
+address when a `::` or more colons follow it. At least these refuse: `Note::` and a
+colon-written EUI-64 device id such as `00:1A:2B:FF:FE:3C:4D:5E`. At least these pass:
+`Decade::`, whose hex run is too long to be an address group, and `Xfe80::`, which reads as an
+allowed link-local address.
+
+In a message whose field separator is `:`, every IPv6 address is cut into separate fields, none
+of which holds it, and there is no cut-across-fields check for IPv6 as there is for the SSN and
+phone shapes, so every IPv6 address there passes, and `1::1234` refuses nothing (BACKLOG #5654).
 
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
@@ -2547,7 +2584,8 @@ these still get through, on both anonymizers:
   such a rest too.
 - A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
   it. The detectors read that digit as part of a longer number.
-- A shape in the header line, which the check skips whole.
+- A cut shape in the header line, which this check skips whole. Of the shape checks, only the
+  IPv6 one reads the header.
 
 With `require_full_coverage` on, such a message is refused for as long as nobody decides the
 fields that carry the rest of the shape. A `keep` on each of them would let it through. That
@@ -2836,8 +2874,8 @@ field as captured.** The kinds do not rewrite the same parts of a field. `id`, `
 rewrite the first component and keep CX components 3 to 6, 9 and 10, so `PID-5` pointed at `id`
 leaves the middle name. `dln` keeps the second component, so it would leave the given name. `date` keeps
 the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check scans what such a
-field has left past its first component for a dashed SSN and a punctuated phone number, as the
-table above says, and refuses either. A name, a city or a year left there passes, and so does a
+field has left past its first component for a dashed SSN, a punctuated phone number and a
+routable IPv6 address, as the table above says, and refuses any of them. A name, a city or a year left there passes, and so does a
 year left in the first component, so a clean return does not clear it.
 
 **`load_rules` refuses such a retarget unless the overlay lists the field under
