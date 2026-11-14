@@ -20002,9 +20002,13 @@ class MessageStore:
     ) -> bool:
         """Clear both locks (:func:`lockout_clear`) and append ``audit`` in ONE transaction
         (BACKLOG #5633), the shape :meth:`replace_totp_enrolment` uses: a refused append rolls the
-        clear back, so an unlock never lands unrecorded. Returns whether a row was written."""
+        clear back, so an unlock never lands unrecorded. Returns whether a row was written.
+
+        ``immediate``: the clear reads the row and then decides, so the write lock is taken at the
+        ``BEGIN``. Deferred, an engine in another process committing between the read and the
+        write would fail the clear with ``SQLITE_BUSY_SNAPSHOT`` instead of waiting."""
         now = time.time() if now is None else now
-        async with _writer_txn(self._db, self._lock):
+        async with _writer_txn(self._db, self._lock, immediate=True):
             if (
                 await self._write_user(
                     user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)

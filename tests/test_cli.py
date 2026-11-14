@@ -3936,6 +3936,29 @@ def test_admin_unlock_reports_a_busy_store_as_a_refused_write(
     assert "cannot open the store" not in error
 
 
+def test_admin_unlock_reports_a_row_changed_under_the_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633: a clear that wrote nothing is not reported as an account that never existed:
+    the row may have changed under the compare-and-set while the account still exists."""
+    import time
+
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-changed.db"
+    _seed_locked(db, locked_until=time.time() + 86_400)
+
+    async def lost(*_a: object, **_k: object) -> bool:
+        return False
+
+    monkeypatch.setattr(MessageStore, "clear_lockout", lost)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "removed or changed" in error and "nothing was written" in error
+
+
 def test_audit_verify_exits_2_on_a_file_that_is_not_a_database(tmp_path: Path) -> None:
     """BACKLOG #1670: the measured symptom, and the assertion is that the PROCESS ENDS.
 

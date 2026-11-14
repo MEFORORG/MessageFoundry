@@ -2808,8 +2808,8 @@ class AuthStore(Protocol):
     # both failure counts, and keeps both cycle counts unless ``reset_cycles``. A named method, in
     # place of the ``record_login_failure`` reuse ADR 0171 shipped with. ``audit`` is appended in the
     # SAME transaction (BACKLOG #5633), so an unlock is never committed unrecorded: a refused append
-    # rolls the clear back. Returns whether a row was written; with no such account nothing is
-    # written or audited.
+    # rolls the clear back. Returns whether a row was written. False writes and audits nothing: no
+    # such account, or a row that changed under the write's compare-and-set.
     async def clear_lockout(
         self,
         user_id: str,

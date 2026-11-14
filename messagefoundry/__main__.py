@@ -6890,10 +6890,15 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
+        store_connect_errors,
         store_driver_errors,
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
-    from messagefoundry.store.row_seal import RowSealError
+    from messagefoundry.store.row_seal import (
+        RowSealError,
+        RowSealUnverifiableError,
+        TransitSealUnavailableError,
+    )
     from messagefoundry.store.store import AuditAppend
 
     settings = _host_gated_store_settings(args)
@@ -6915,37 +6920,59 @@ def _admin_unlock(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
     # Could not start, exit 2 (ADR 0171 Amendment C): each is raised before anything is written.
+    # `_UnauditableWrite` is raised by the pre-check, which runs outside the write's catch below.
     could_not_start: tuple[type[Exception], ...] = (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
         _StoreOpenRefused,  # the OPEN only: a refused hop (#2532), a key, a short schema (#1720)
-        StoreKeylessError,  # a keyed store opened without its key, as admin-set-notify-email exits
-        CipherError,  # a row the open cannot decrypt (BACKLOG #2124)
         *_key_unresolved(),
     )
-    # A refused write on every backend (BACKLOG #1983), as admin-set-notify-email names them.
-    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
-    #: Set once the store has opened, so a driver error is told apart: before it the store could
-    #: not be opened (exit 2, #1670), after it the store refused the write (exit 1).
-    opened: list[bool] = []
+    # The drivers' errors, and what a store raises when it cannot reach its database (vault
+    # BACKLOG #3054, item 10): pyodbc's `Error` root, a pool borrow that timed out, an OSError.
+    reach_errors: tuple[type[Exception], ...] = (*store_driver_errors(), *store_connect_errors())
+    # Raised by the OPEN: a keyed store opened without its key, or a row the open cannot decrypt.
+    # Could not start, exit 2, as admin-set-notify-email exits on them (BACKLOG #2124).
+    open_errors: tuple[type[Exception], ...] = (StoreKeylessError, CipherError, *reach_errors)
+    # Raised by the read or the write, after the open: a refused write on every backend (BACKLOG
+    # #1983), as admin-set-notify-email names them, plus a cipher or a Transit row seal that failed
+    # mid-write. Each rolls the clear and its row back together. Exit 1: not "could not start".
+    write_errors: tuple[type[Exception], ...] = (
+        RuntimeError,
+        OSError,
+        StoreKeylessError,
+        CipherError,
+        RowSealUnverifiableError,
+        TransitSealUnavailableError,
+        *reach_errors,
+    )
 
-    async def run() -> tuple[str, dict[str, Any]]:
+    async def run() -> tuple[str, Any]:
+        """``(outcome, extra)``: ``extra`` is the report for ``unlocked``, the error for
+        ``open-failed`` and ``refused``, else ``None``. Each catch is scoped to its own step, so
+        an error is classed by where it was raised, and anything else reaches the dispatch floor."""
         # A key that does not resolve is "could not start", exit 2, as audit-verify exits on it
         # (vault BACKLOG #3054, item 11). Only the open is wrapped; see the helper.
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
-        store = await _open_store_or_refuse(
-            open_store(
-                settings.store,
-                posture=posture,
-                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-            )
-        )
-        opened.append(True)
         try:
-            user = await store.get_user_by_username(wanted)
+            store = await _open_store_or_refuse(
+                open_store(
+                    settings.store,
+                    posture=posture,
+                    keyless_chain_refusal=keyless_opt_out_refusal(
+                        settings.store, settings.security
+                    ),
+                )
+            )
+        except open_errors as exc:
+            return ("open-failed", exc)
+        try:
+            try:
+                user = await store.get_user_by_username(wanted)
+            except write_errors as exc:
+                return ("refused", exc)
             if user is None:
-                return ("no-such-user", {})
+                return ("no-such-user", None)
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
             # ADR 0197: both old expiries and both cycle counts, read before the clear so they are
             # what the clear replaced. The engine is stopped for this command (ADR 0171).
@@ -6963,16 +6990,19 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 actor=actor,
                 detail=json.dumps({"username": user.username, **report}),
             )
-            if not await store.clear_lockout(
-                user.id, audit=audit, reset_cycles=bool(args.reset_cycles)
-            ):
-                return ("no-such-user", {})  # removed between the read and the write
-            return ("unlocked", report)
+            try:
+                cleared = await store.clear_lockout(
+                    user.id, audit=audit, reset_cycles=bool(args.reset_cycles)
+                )
+            except write_errors as exc:
+                return ("refused", exc)
+            # False: the row was removed, or changed under the clear's compare-and-set.
+            return ("unlocked", report) if cleared else ("changed", None)
         finally:
             await store.close()
 
     try:
-        outcome, report = run_guarded(run())
+        outcome, extra = run_guarded(run())
     # #1916; #1780: a server database with no store (auto mode); #3054: no key; #2532: a store hop
     # the posture refuses. Could not start. Through `codec_safe_str`: a key source's codec error
     # quotes a byte of what it decoded (BACKLOG #2532).
@@ -6986,21 +7016,41 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         return _emit_error(
             _seal_refusal(wanted, "unlock") + ". Nothing was written", as_json=args.json
         )
-    except store_errors as exc:
-        if not opened:
-            # #1670: a path that is not a database, or a server the driver could not reach.
-            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-        # The class only: a driver's message can quote a stored value (ASVS 16.5.4). A busy store
-        # is not "could not start", so it keeps exit 1 (ADR 0171 Amendment C).
+    if outcome == "open-failed":
+        if isinstance(extra, (StoreKeylessError, CipherError)):
+            _emit_error(
+                f"{_sentence(codec_safe_str(extra))} Nothing was written.", as_json=args.json
+            )
+            return 2
+        # #1670: a path that is not a database, or a server the driver could not reach.
+        return _emit_store_open_error(extra, _store_label(settings.store), as_json=args.json)
+    if outcome == "refused":
+        # Logged, so the cause can be found: WARNING names the class only, since a driver's
+        # message can quote a stored value (ASVS 16.5.4); the traceback goes to DEBUG. A busy
+        # store is not "could not start", so it keeps exit 1 (ADR 0171 Amendment C).
+        log = logging.getLogger(__name__)
+        log.warning(
+            "admin-unlock: the store refused the unlock for %r (%s)",
+            wanted,
+            type(extra).__name__,
+        )
+        log.debug("admin-unlock: the refused unlock's traceback", exc_info=extra)
         return _emit_error(
-            f"the store refused the unlock for {wanted!r} ({type(exc).__name__}). The clear and "
+            f"the store refused the unlock for {wanted!r} ({type(extra).__name__}). The clear and "
             "its audit row are one transaction, so neither was written, unless a server "
             "database reported the error after its commit. If the engine is running, stop it "
             "and re-run; a second unlock is harmless",
             as_json=args.json,
         )
+    if outcome == "changed":
+        return _emit_error(
+            f"the account {wanted!r} was removed or changed while this command ran; nothing was "
+            "written. Stop the engine and re-run",
+            as_json=args.json,
+        )
     if outcome == "no-such-user":
         return _emit_error(f"no local account named {wanted!r}", as_json=args.json)
+    report = cast("dict[str, Any]", extra)
     if args.json:
         print(json.dumps({"ok": True, "username": wanted, **report}))
     else:
@@ -7959,10 +8009,13 @@ def _refuse_an_unauditable_write(store: Store) -> None:
     """Raise :class:`_UnauditableWrite` when ``store`` would refuse this command's audit row.
 
     For a command that writes other rows BEFORE its audit row -- ``provision-admin`` writes the
-    account, ``admin-unlock`` clears the lockout. Without this, a refused audit append lands after
-    those writes, so the change is made and nothing records who made it. The case that reaches it: a
-    keyed chain opened from a shell with no key, under a stale audited opt-out that let the open
-    through.
+    account. Without this, a refused audit append lands after those writes, so the change is made
+    and nothing records who made it. The case that reaches it: a keyed chain opened from a shell
+    with no key, under a stale audited opt-out that let the open through.
+
+    ``admin-unlock`` and ``admin-reset-totp`` append their row in the write's own transaction, so a
+    refused append rolls the write back (BACKLOG #5633, #2226); they call this first so the ordinary
+    refusal exits 2, could not start, before any write is tried.
 
     ``admin-set-notify-email`` writes its audit row first, and calls this anyway: the refusal it
     raises exits 2, could not start, where the append's own refusal could not be told apart from a
@@ -10370,11 +10423,11 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     **It ends every session of the account** in the same transaction, because a session elevated
     with the old seed is what a seed leak buys.
 
-    **THE AUDIT ROW COMMITS WITH THE SWAP, NOT AFTER IT.** ``admin-unlock`` checks the audit refusal
-    before its write and appends its row after it, as a second write
-    (:func:`_refuse_an_unauditable_write`). A failure between the two leaves the change made and
-    unrecorded. For an unlock that is the narrowest change there is, and a re-run repeats it
-    harmlessly. Here the change is a live credential, and the first build of this command hit that
+    **THE AUDIT ROW COMMITS WITH THE SWAP, NOT AFTER IT.** A pre-check before the write and the row
+    appended after it as a second write (:func:`_refuse_an_unauditable_write`) leaves a window: a
+    failure between the two leaves the change made and unrecorded. ``admin-unlock`` shipped that
+    shape until BACKLOG #5633 moved its row into the clear's transaction too. Here the change is a
+    live credential, and the first build of this command hit that
     window: an append refused after the swap left the new seed in force with no audit row and no
     codes shown, reported as a store that could not be opened. So the row joins the swap's
     transaction, the shape ``create_user`` uses for BACKLOG #2100: both land, or neither does. The
