@@ -271,5 +271,19 @@ console derives its CSS class from the raw string, so the new state needed one r
 rather than a mapping.
 
 **Out of scope** -- the INBOUND tier is unchanged; `_log_halted` keeps its per-inbound shape because
-its re-arm genuinely is per-connection. Whether the door gates could now be simplified is left alone
+its re-arm genuinely is per-connection.
+*(Note, BACKLOG #5704: the INBOUND tier now takes this ADR's shape too. Its claim gate,
+`_inbound_log_halted`, reads the process latch as well as the per-inbound marks, in the per_lane
+workers' loop top and, under pooled, in a pre-claim predicate on the INGRESS, ROUTED and
+RESPONSE dispatchers: a gated pooled lane parks with no claim and no row write until the gate lifts. The halt pauses
+no internal lane, and STOPs one only through its hand-back of a prefix claimed before the gate shut
+(on leadership loss, or at T17, when that pooled hand-back's reschedule raises and the lane's
+infra-fault count reaches its bound, for example while the head's re-pend keeps failing on a full
+store). A lane can still STOP while the halt is in force for other causes, at least under its own
+fault policy; lifting the gate does not itself re-arm a STOP. `_inbound_log_halted` states this in full
+in the code. It marks every inbound as it latches, before it waits
+for the reload lock, so a reload holding that lock cannot rebind a listener over gated stages. A
+halt whose latch a probe cleared while it waited still completes, as before; decision
+d20261113T215259180-f5da2d, which had it stand down instead, was reversed. A per_lane internal worker now WAITS at the gate rather
+than returning. The marks keep their per-inbound shape and re-arm.)* Whether the door gates could now be simplified is left alone
 on purpose: removing working gates in the same change would make a regression unattributable.
