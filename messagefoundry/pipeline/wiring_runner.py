@@ -1580,8 +1580,9 @@ def _to_lane_result(outcome: tuple[_ItemOutcome, float | None]) -> LaneItemResul
     """Map a ``_process_*_item`` result (the per_lane control-flow carrier) onto the pooled
     dispatcher's :class:`LaneItemResult` (ADR 0066 §4.5): ``(PROCESSED, None)`` → ``RESOLVED``,
     ``(PROCESSED, next_attempt_at)`` → ``RETRY`` (park the lane until that deadline), ``(STOPPED, _)``
-    → ``STOP``. Only the delivery body ever surfaces a non-``None`` ``retry_until`` (ingress / routed /
-    response never re-pend-with-backoff, so they always resolve or stop). The per_lane worker loops
+    → ``STOP``. The delivery body surfaces a non-``None`` ``retry_until``, and so does the #122
+    claim gate's hand-back on ingress / routed / response (:meth:`RegistryRunner._refuse_log_halted`,
+    BACKLOG #5704); their bodies otherwise resolve or stop. The per_lane worker loops
     ignore this mapping — they read ``outcome[0]`` directly; it exists only for the pooled adapters."""
     item_outcome, retry_until = outcome
     if item_outcome is _ItemOutcome.STOPPED:
@@ -2256,6 +2257,13 @@ class RegistryRunner:
         # waited for the reload lock meanwhile alerts them, or rebinds them when it stands down
         # (BACKLOG #5704). Any stop of the listener drops the name: that stop is a newer intent.
         self._log_refused_rebinds: set[str] = set()
+        # How many halts are latched and not yet done with the reload lock. A refusal is recorded
+        # only while one waits, so no later, unrelated halt rebinds a listener an operator's own
+        # refused restart left down (BACKLOG #5704).
+        self._log_halts_pending = 0
+        # Outbounds `_pause_delivery_lanes` paused while a halt waited, which no alert has named
+        # yet; the waiting halt alerts them (BACKLOG #5704).
+        self._log_paused_unalerted: set[str] = set()
         # Delivery workers the ADR 0189 claim gate RETURNED (per_lane, and a pooled UNORDERED lane's
         # worker), which a halt that stands down respawns. A STOP-returned worker is never here, so
         # a stand-down cannot retry a STOP's row (BACKLOG #5704).
@@ -5744,7 +5752,8 @@ class RegistryRunner:
                     # After the stop, which drops the name, and in a finally: the stop pops the
                     # source before it awaits, so a raise still leaves the listener unbound, and a
                     # halt waiting for the lock must still alert it (BACKLOG #5704).
-                    self._log_refused_rebinds.add(name)
+                    if self._log_halts_pending:
+                        self._log_refused_rebinds.add(name)
                 return
             self._ensure_inbound_workers(name)
 
@@ -5870,8 +5879,10 @@ class RegistryRunner:
 
         **The internal stages are halted at the CLAIM GATE, as the latch is set, and no lane's phase
         is touched** (BACKLOG #5704). Setting the latch is what gates every inbound
-        (:meth:`_inbound_log_halted`), so from that line on no router, transform or response claim
-        runs, whatever happens below; nothing after it can fail open. The marks go on in the same
+        (:meth:`_inbound_log_halted`), so from that line on no router, transform or response row
+        claimed after it is processed, whatever happens below: a pooled lane still claims and hands
+        the row back once per backoff, and a per_lane worker finishes a batch it had already
+        claimed. The marks go on in the same
         await-free step, before this waits for the reload lock, which is the race fix: a reload
         holding that lock rebinds each listener through :meth:`_resume_inbound_processing`, which
         refuses while the latch is set and the log still cannot be written. A pause, a STOP and an
@@ -5888,55 +5899,75 @@ class RegistryRunner:
         if self._log_write_stopped:
             return  # latched: one halt per break
         self._log_write_stopped = True
-        # EVERY REGISTRY INBOUND, bound or not: an inbound whose listener never bound (isolated by
-        # ADR 0031, stopped by an operator, outside its active window) still has a backlog in its
-        # lanes. The marks are what keep each one halted after a later probe clears the latch,
-        # until its own re-arm. Only those this halt adds are its to lift in a stand-down.
-        marked = [name for name in self.registry.inbound if name not in self._log_halted]
-        self._log_halted.update(marked)
-        detail = f"application log sink {sink!r} is unwritable ({reason})"
-        # Alert BEFORE stopping, and through the NOTIFIER rather than a log line: the sink this is
-        # about is the one that just broke, so a log line may never land. If the stop itself wedges,
-        # the operator has already been told why the engine is going quiet. Guarded, so a raise
-        # cannot abort the halt with the latch set and the listeners still bound.
-        inbounds, outbounds = self._log_halt_lanes(sink)
+        self._log_halts_pending += 1
         try:
-            self._alert_sink.log_write_failed(
-                sink, stage="unwritable", reason=reason, stopped=len(inbounds) + len(outbounds)
-            )
-        except Exception:
-            log.exception("alert sink raised on log_write_failed for sink %r", sink)
-        async with self._reload_lock:
-            stopped = not self._running and not self.has_residual_state
-            if stopped or not self._log_write_stopped:
-                why = (
-                    "the runner stopped while it waited"
-                    if stopped
-                    else "a probe while it waited found the log writable"
-                )
-                await self._log_halt_stand_down(sink, reason, detail, marked, why=why)
-                return
-            # Read again now the lock is held: the list above only sized the page. A reload that
-            # held the lock may have removed a connection, added an inbound or engine-parked an
-            # outbound (`_gate_parked` / `_schedule_parked`), and pausing that lane again would turn
-            # its park into an operator pause no later reload lifts. A second halt of the same break
-            # reads both empty, so it stops nothing again. The marks are re-applied for the same
-            # graph: an inbound that reload added holds the latch alone, and needs its own mark to
-            # stay halted once a later restart of another inbound clears the latch.
-            self._log_halted.update(self.registry.inbound)
-            refused = self._log_refused_unbound()
+            # EVERY REGISTRY INBOUND, bound or not: an inbound whose listener never bound (isolated by
+            # ADR 0031, stopped by an operator, outside its active window) still has a backlog in its
+            # lanes. The marks are what keep each one halted after a later probe clears the latch,
+            # until its own re-arm. Only those this halt adds are its to lift in a stand-down.
+            marked = [name for name in self.registry.inbound if name not in self._log_halted]
+            self._log_halted.update(marked)
+            detail = f"application log sink {sink!r} is unwritable ({reason})"
+            # Alert BEFORE stopping, and through the NOTIFIER rather than a log line: the sink this is
+            # about is the one that just broke, so a log line may never land. If the stop itself wedges,
+            # the operator has already been told why the engine is going quiet. Guarded, so a raise
+            # cannot abort the halt with the latch set and the listeners still bound.
             inbounds, outbounds = self._log_halt_lanes(sink)
-            for name in inbounds:
-                try:
-                    await self._stop_inbound_unsafe(name)
-                except Exception:
-                    # One connection refusing to stop must not leave the others running: this is a
-                    # fail-closed halt, so a partial stop is strictly better than an abandoned one.
-                    log.exception("log-failure stop: inbound %r did not stop cleanly", name)
-            self._pause_delivery_lanes(outbounds)
-        # `refused`: listeners a reload's rebind gate refused and left unbound while this waited.
-        # The log stopped them, so they get the per-connection alert too.
-        self._log_halt_alert_stopped(refused + inbounds + outbounds, detail)
+            try:
+                self._alert_sink.log_write_failed(
+                    sink, stage="unwritable", reason=reason, stopped=len(inbounds) + len(outbounds)
+                )
+            except Exception:
+                log.exception("alert sink raised on log_write_failed for sink %r", sink)
+            async with self._reload_lock:
+                stopped = not self._running and not self.has_residual_state
+                if stopped or not self._log_write_stopped:
+                    why = (
+                        "the runner stopped while it waited"
+                        if stopped
+                        else "a probe while it waited found the log writable"
+                    )
+                    await self._log_halt_stand_down(sink, reason, marked, why=why)
+                    return
+                # Read again now the lock is held: the list above only sized the page. A reload that
+                # held the lock may have removed a connection, added an inbound or engine-parked an
+                # outbound (`_gate_parked` / `_schedule_parked`), and pausing that lane again would turn
+                # its park into an operator pause no later reload lifts. A second halt of the same break
+                # reads both empty, so it stops nothing again. The marks are re-applied for the same
+                # graph: an inbound that reload added holds the latch alone, and needs its own mark to
+                # stay halted once a later restart of another inbound clears the latch.
+                self._log_halted.update(self.registry.inbound)
+                refused = self._log_refused_unbound()
+                inbounds, outbounds = self._log_halt_lanes(sink)
+                # Outbounds a lock holder paused for the log while this waited (a reload's refused
+                # probe pauses through `_pause_delivery_lanes`, which sends no alert): the log
+                # stopped them, so they get their alert here, as origin/main's pre-lock list gave.
+                paused_meanwhile = sorted(
+                    name
+                    for name in self._log_paused_unalerted
+                    if name in self.registry.outbound
+                    and name in self._outbound_paused
+                    and name not in outbounds
+                )
+                self._log_paused_unalerted.clear()
+                for name in inbounds:
+                    try:
+                        await self._stop_inbound_unsafe(name)
+                    except Exception:
+                        # One connection refusing to stop must not leave the others running: this is a
+                        # fail-closed halt, so a partial stop is strictly better than an abandoned one.
+                        log.exception("log-failure stop: inbound %r did not stop cleanly", name)
+                self._pause_delivery_lanes(outbounds)
+                self._log_paused_unalerted.difference_update(outbounds)  # this halt alerts them
+            # `refused`: listeners a reload's rebind gate refused and left unbound while this waited.
+            # The log stopped them, so they get the per-connection alert too.
+            self._log_halt_alert_stopped(refused + inbounds + outbounds + paused_meanwhile, detail)
+        finally:
+            self._log_halts_pending -= 1
+            if not self._log_halts_pending:
+                # No halt waits any more, so no refusal or pause is any halt's to act on.
+                self._log_refused_rebinds.clear()
+                self._log_paused_unalerted.clear()
 
     def _log_refused_unbound(self) -> list[str]:
         """The inbounds a log gate refused and unbound, since a halt last took them, that are still
@@ -5990,7 +6021,7 @@ class RegistryRunner:
                 log.exception("alert sink raised on connection_stopped for %r", name)
 
     async def _log_halt_stand_down(
-        self, sink: str, reason: str, detail: str, marked: Sequence[str], *, why: str
+        self, sink: str, reason: str, marked: Sequence[str], *, why: str
     ) -> None:
         """A #122 halt that stops nothing once it holds the reload lock (BACKLOG #5704). Called with
         the lock held, from :meth:`_stop_all_for_log_failure`.
@@ -6002,9 +6033,10 @@ class RegistryRunner:
         that gate unbound only because the latch was set. No lane phase is touched, because the halt
         changed none, so a pause, a STOP and its hold stand as they were. The marks go first, with
         no await between the caller's latch read and them, so a new break cannot latch in between.
-        A rebind goes through the same gate as any other, so one that meets a new break is refused
-        again and gets its ``connection_stopped`` alert, and one whose start fails for another cause is recorded failed with that cause (ADR 0031). A listener whose
-        schedule window closed meanwhile is left to the scheduler.
+        A rebind goes through the same gate as any other: one that meets a new break is refused
+        again and left to that halt, which alerts it, and one whose start fails for another cause
+        is recorded failed with that cause (ADR 0031). A listener whose schedule window closed
+        meanwhile is left to the scheduler, and a passive DR standby binds none.
 
         If the runner stopped while it waited, nothing is undone: the next start probes the log
         and resets the marks itself.
@@ -6013,7 +6045,6 @@ class RegistryRunner:
         realert throttle, which keys on the type and the label, cannot drop it inside the cooldown
         the first page opened. ``stopped`` counts the listeners left down, None when none were."""
         failed: list[str] = []  # listeners left down, for the page's count
-        refused_again: list[str] = []  # of those, the ones a new break refused: alerted here
         if self._running:
             self._lift_log_halt(marked)
             # The delivery workers the ADR 0189 claim gate returned while the latch was set: no door
@@ -6033,20 +6064,19 @@ class RegistryRunner:
                 ic = self.registry.inbound[name]
                 if ic.schedule is not None and not ic.schedule.is_active(self._schedule_clock()):
                     continue  # its window closed while it was refused: the scheduler owns it now
+                if self._dr_refuses(name, operator=False):
+                    continue  # a passive DR standby binds no engine-started listener
                 try:
                     # The checked start, so a failure for another cause is recorded failed and
                     # alerted with that cause rather than the log's (ADR 0031).
                     await self._checked_inbound_start(name)
                 except Exception:
                     log.exception("log-failure stand-down: inbound %r did not rebind", name)
-                    failed.append(name)
-                    continue
                 if name not in self._sources:
-                    refused_again.append(name)  # a new break latched: its gate refused again
-            failed.extend(refused_again)
-        # A start that raised was recorded failed and alerted with its own cause by the checked
-        # start; only a listener a new break refused gets the log's.
-        self._log_halt_alert_stopped(refused_again, detail)
+                    # Left down. A start that raised was recorded failed and alerted with its own
+                    # cause by the checked start. One a new break refused is in the refusal set
+                    # again, and the new halt, which latched first, alerts it with its own cause.
+                    failed.append(name)
         try:
             self._alert_sink.log_write_failed(
                 f"{sink}:stood-down",
@@ -6076,13 +6106,17 @@ class RegistryRunner:
         Routes through :meth:`_stop_outbound_unsafe`, so a paused lane reads as an OPERATOR pause
         (``_gate_parked`` dropped) and no reload resumes it. Queued rows are RETAINED PENDING, never
         dead-lettered. Callers hold the reload lock."""
-        for name in names:
+        paused = list(names)
+        for name in paused:
             try:
                 self._stop_outbound_unsafe(name)
             except Exception:
                 # One lane refusing to pause must not leave the others delivering: a fail-closed halt
                 # is strictly better partial than abandoned.
                 log.exception("log-failure halt: outbound %r did not pause cleanly", name)
+        if self._log_halts_pending:
+            # A halt waiting for the lock alerts these; its own call takes its own back out.
+            self._log_paused_unalerted.update(paused)
 
     def _lift_log_halt(self, names: Iterable[str]) -> None:
         """Lift the #122 halt's marks on ``names`` and wake whatever waits at the claim gate. Sync
@@ -6684,8 +6718,9 @@ class RegistryRunner:
                 # Independent of claim_mode, so it runs for both pooled and per_lane.
                 self._activate_statement_batching()
                 # #122 (ADR 0162): this runner came up into an unwritable application log, so the
-                # listeners that bound above have to come back down. LAST, because the halt is only
-                # complete once the dispatchers exist to be paused (step 2.6).
+                # listeners that bound above have to come back down. LAST, once every listener this
+                # start binds has bound. The internal stages are held by the latch at their claim
+                # gate already (BACKLOG #5704), so nothing here needs the dispatchers.
                 if self._log_write_stopped:
                     await self._unbind_for_log_failure()
             except Exception:
@@ -10067,7 +10102,12 @@ class RegistryRunner:
         instant it fires, before it waits for the reload lock, and what covers an inbound a reload
         adds later, bound or not. It never reads or writes a lane's phase, so a pause, a STOP and a
         hold are not the halt's to change."""
-        return self._log_write_stopped or name in self._log_halted
+        # A mark gates only an inbound still in the graph: a removed inbound's worker must reach
+        # its claim, see the inbound gone and return, rather than wait on a mark nothing lifts. A
+        # re-add finds the mark again.
+        return self._log_write_stopped or (
+            name in self._log_halted and name in self.registry.inbound
+        )
 
     def _lane_may_deliver(self, name: str) -> bool:
         """The two conditions :meth:`_delivery_worker`'s loop-top gates refuse a claim on (the #122
@@ -10105,8 +10145,8 @@ class RegistryRunner:
             # process has fail-closed, so this lane must not deliver no matter which door started it.
             # Return BEFORE the claim so no row is left INFLIGHT. A door that finds the log working
             # clears the latch and respawns this worker, and so does a halt that stands down
-            # (:attr:`_log_gate_returned`). The internal-stage gates WAIT instead (BACKLOG #5704). Placed ABOVE the operator-pause
-            # gate because a halted lane that is ALSO paused must not sit in _wait_for_resume: a
+            # (:attr:`_log_gate_returned`). The internal-stage gates WAIT instead (BACKLOG #5704).
+            # Placed ABOVE the operator-pause gate because a halted lane that is ALSO paused must not sit in _wait_for_resume: a
             # resume would release it straight into a claim.
             #
             # SIGNAL QUIESCENCE ON THE WAY OUT, and that is not tidiness — it is the half of the halt

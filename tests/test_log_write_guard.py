@@ -2822,3 +2822,35 @@ async def test_a_second_halt_latching_keeps_a_refusal_an_earlier_halt_will_stand
     finally:
         runner._reload_lock.release()
     await asyncio.gather(first, second)
+
+
+async def test_an_outbound_a_reload_paused_for_the_log_while_a_halt_waited_is_alerted_once(
+    store: MessageStore,
+) -> None:
+    # A reload holding the lock refuses its memoised probe and pauses OUTBOUND through
+    # `_pause_delivery_lanes`, which sends no alert. The waiting halt then reads no running
+    # outbound, but the log stopped OUTBOUND, so the halt alerts it, once.
+    sink = _RecordingSink()
+    runner, _source = _graph(store, sink)
+    await runner._reload_lock.acquire()
+    try:
+        halt = await _halt_waiting_on_the_lock(runner)
+        runner._pause_delivery_lanes([OUTBOUND])  # the reload's refused door, under its lock
+    finally:
+        runner._reload_lock.release()
+    await halt
+
+    assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
+    assert runner._log_paused_unalerted == set()
+
+
+def test_a_removed_inbounds_mark_does_not_gate_its_worker(store: MessageStore) -> None:
+    # A reload removed a marked inbound: its worker must reach its claim, see the inbound gone and
+    # return, so the mark gates it only while the inbound is in the graph. The latch gates it too.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._log_halted.add(INBOUND)
+    assert runner._inbound_log_halted(INBOUND)
+    del runner.registry.inbound[INBOUND]
+    assert not runner._inbound_log_halted(INBOUND)
+    runner._log_write_stopped = True
+    assert runner._inbound_log_halted(INBOUND)
