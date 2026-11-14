@@ -331,10 +331,12 @@ from messagefoundry.store.store import (
     audit_seal_next,
     birth_notify_email,
     build_audit_mac_keys,
+    cancels_at_entry,
     check_caller_event_kind,
     check_executing_owner_filter,
     check_open_store_pin,
     check_password_generated,
+    cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
     delivery_key,
@@ -4227,6 +4229,7 @@ class SqlServerStore:
     ) -> SqlServerStore:
         """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
         (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
+        cancels_before = cancels_at_entry()  # BACKLOG #5720: only this open's cancels
         # Resolve the ambient posture ONCE, so every later connection of this store (claim connection,
         # sync-handoff pool) decides as the open did, wherever it is reached from (vault BACKLOG #2354).
         if posture is None:
@@ -4307,22 +4310,39 @@ class SqlServerStore:
                 # ADR 0005 read-through cache warm-up
                 await store._load_state_cache_noting(folded)
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
-        except Exception:
-            # Don't leak the pool if first-open initialization fails (M-6). The executor is released
-            # in a finally, same as close() above: wait_closed() cannot complete while the pool is
-            # wedged, so releasing the executor only on the success path would leak its threads in
-            # exactly the case this except exists for.
-            try:
+        except BaseException as exc:
+            # Don't leak the pool if first-open initialization fails (M-6), a cancel included
+            # (BACKLOG #5720). The reserved block is forfeited, not settled: see the same except in
+            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is released in a finally, same as close() above: wait_closed() cannot
+            # complete while the pool is wedged, so releasing the executor only on the success path
+            # would leak its threads in exactly the case this except exists for.
+            async def _release() -> None:
+                try:
+                    try:
+                        pool.close()
+                        await pool.wait_closed()
+                    finally:
+                        executor.shutdown(wait=False)
+                except Exception as cleanup:  # noqa: BLE001 — never mask the open's error
+                    # Logged by class, so it never replaces the open's own error (vault #3054).
+                    log.warning(
+                        "closing the pool after a failed open also failed (%s)",
+                        type(cleanup).__name__,
+                    )
+
+            def _force_release() -> None:
+                # Synchronous, so it cannot wait on a wedged pool: close() only marks it closing.
                 try:
                     pool.close()
-                    await pool.wait_closed()
                 finally:
                     executor.shutdown(wait=False)
-            except Exception as cleanup:
-                # Logged by class, so it never replaces the open's own error (vault BACKLOG #3054).
-                log.warning(
-                    "closing the pool after a failed open also failed (%s)", type(cleanup).__name__
-                )
+
+            await cleanup_failed_open(
+                exc,
+                _release,
+                _force_release,
+                cancels_before=cancels_before,
+            )
             raise
         return store
 
@@ -5565,9 +5585,10 @@ class SqlServerStore:
                 # LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT). The DSN cannot carry it (#1626).
                 timeout=settings.connect_timeout,
             )
-        except Exception:
+        except BaseException:
             # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
-            # never comes up (bad DSN, connect timeout, auth failure), so it has to be released here too.
+            # never comes up (bad DSN, connect timeout, auth failure, a cancel), so it has to be
+            # released here too (BACKLOG #5720).
             executor.shutdown(wait=False)
             raise
         return pool, executor

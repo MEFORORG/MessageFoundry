@@ -324,10 +324,12 @@ from messagefoundry.store.store import (
     audit_seal_next,
     birth_notify_email,
     build_audit_mac_keys,
+    cancels_at_entry,
     check_caller_event_kind,
     check_executing_owner_filter,
     check_open_store_pin,
     check_password_generated,
+    cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
     delivery_key,
@@ -2209,6 +2211,7 @@ class PostgresStore:
     ) -> PostgresStore:
         """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
         (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
+        cancels_before = cancels_at_entry()  # BACKLOG #5720: only this open's cancels
         pool = await cls._create_pool(settings, posture=posture, max_size=settings.pool_size)
         store = cls(
             pool,
@@ -2250,15 +2253,32 @@ class PostgresStore:
                 await (
                     store._load_reference_cache()
                 )  # populate the reference-snapshot read cache (ADR 0006)
-        except Exception:
-            # Don't leak the pool if first-open initialization fails (M-6). A cleanup that fails is
-            # logged by class, so it never replaces the open's own error (vault BACKLOG #3054).
-            try:
-                await pool.close()
-            except Exception as cleanup:
-                log.warning(
-                    "closing the pool after a failed open also failed (%s)", type(cleanup).__name__
-                )
+        except BaseException as exc:
+            # Don't leak the pool if first-open initialization fails (M-6), a cancel included
+            # (BACKLOG #5720). The cleanup settles nothing, as before: a failed open forfeits the
+            # AES-GCM invocation block it reserved, and each forfeited block counts toward the
+            # key's fail-closed invocation ceiling. A cleanup that fails is logged by class, so it never replaces the open's own error (vault
+            # BACKLOG #3054).
+            async def _release() -> None:
+                try:
+                    await pool.close()
+                except Exception as cleanup:  # noqa: BLE001 — never mask the open's error
+                    log.warning(
+                        "closing the pool after a failed open also failed (%s)",
+                        type(cleanup).__name__,
+                    )
+
+            def _force_release() -> None:
+                # Synchronous: asyncpg's terminate() drops every connection without waiting. Read
+                # here, not at the except, so a pool without it fails inside the logged release.
+                pool.terminate()
+
+            await cleanup_failed_open(
+                exc,
+                _release,
+                _force_release,
+                cancels_before=cancels_before,
+            )
             raise
         return store
 

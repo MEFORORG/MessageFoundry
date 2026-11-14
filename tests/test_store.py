@@ -1433,3 +1433,392 @@ async def test_a_failed_open_waits_for_its_connection_worker_thread(tmp_path, mo
     assert still_running == [], (
         f"a failed open returned with live aiosqlite worker(s): {', '.join(still_running)}"
     )
+
+
+async def _workers_left(watched: set[threading.Thread], *, within: float = 2.0) -> list[str]:
+    """The watched aiosqlite workers still alive after ``within`` seconds. A leaked connection's
+    worker never exits, so the deadline tells it apart from one already on its way out."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline and any(t.is_alive() for t in watched):
+        await asyncio.sleep(0.01)
+    return sorted(t.name for t in watched if t.is_alive())
+
+
+async def test_a_read_pool_pragma_failure_closes_that_connection(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720: ``_open_read_pool`` ran both PRAGMAs before it tracked the connection, so a
+    PRAGMA that raised left a connection ``close()`` never reached, and its non-daemon worker
+    outlived the failed open. Red before the fix: that one worker is still running."""
+    watched: set[threading.Thread] = set()
+    opened = _watch_aiosqlite_connects(monkeypatch, watched)
+    to_the_file: list[aiosqlite.Connection] = []
+    watched_connect = aiosqlite.connect
+
+    def failing_pool_connect(*args, **kwargs):
+        conn = watched_connect(*args, **kwargs)
+        # The schema check may open a ":memory:" scratch connection, cached across tests.
+        if args and str(args[0]) == ":memory:":
+            return conn
+        if to_the_file:  # the writer connects first; every later one to the file is the pool's
+            real_execute = conn.execute
+
+            def execute(sql, *a, **k):
+                if sql == "PRAGMA query_only=ON":
+                    raise sqlite3.OperationalError("query_only boom")
+                return real_execute(sql, *a, **k)
+
+            conn.execute = execute  # type: ignore[method-assign]
+        to_the_file.append(conn)
+        return conn
+
+    monkeypatch.setattr(aiosqlite, "connect", failing_pool_connect)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="query_only boom"):
+            await MessageStore.open(tmp_path / "pool.db")
+        left = await _workers_left(watched)
+    finally:
+        for conn in opened:  # so a red run does not hang interpreter exit on the leaked worker
+            await conn.close()
+    assert len(to_the_file) == 2, f"expected the writer and one pool connection: {to_the_file}"
+    assert left == [], f"a failed open left live aiosqlite worker(s): {', '.join(left)}"
+
+
+async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connection(
+    tmp_path, monkeypatch
+) -> None:
+    """BACKLOG #5720: the failed open's cleanup ran unshielded, so a cancel landing inside
+    ``store.close()`` skipped the rest of it, the writer's close included, and left non-daemon
+    workers behind. Red before the fix: workers are still running. The cancel is still raised,
+    chained to the open's own failure."""
+    watched: set[threading.Thread] = set()
+    opened = _watch_aiosqlite_connects(monkeypatch, watched)
+    closing = asyncio.Event()
+    real_close = MessageStore.close
+
+    async def slow_close(self: MessageStore) -> None:
+        closing.set()
+        await asyncio.sleep(0.2)
+        await real_close(self)
+
+    async def boom(self: MessageStore) -> None:
+        raise RuntimeError("reference cache boom")
+
+    monkeypatch.setattr(MessageStore, "close", slow_close)
+    monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
+    task = asyncio.create_task(MessageStore.open(tmp_path / "cancel.db"))
+    try:
+        await asyncio.wait_for(closing.wait(), 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        left = await _workers_left(watched)
+    finally:
+        for conn in opened:  # so a red run does not hang interpreter exit on a leaked worker
+            await conn.close()
+    assert left == [], f"a cancelled cleanup left live aiosqlite worker(s): {', '.join(left)}"
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+async def test_a_failed_opens_cleanup_logs_by_class_only(tmp_path, monkeypatch, caplog) -> None:
+    """BACKLOG #5720, vault BACKLOG #3054: a failure while the failed open cleans up is logged by
+    its class, never its text, which may carry a path or a driver's detail."""
+
+    async def boom(self: MessageStore) -> None:
+        raise RuntimeError("reference cache boom")
+
+    async def failing_close(self: MessageStore) -> None:
+        raise OSError("close failed on C:/secret/path")
+
+    monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
+    monkeypatch.setattr(MessageStore, "close", failing_close)
+    with pytest.raises(RuntimeError, match="reference cache boom"):
+        await MessageStore.open(tmp_path / "logged.db")
+    assert "error closing a partially-opened store (OSError)" in caplog.text
+    assert "secret" not in caplog.text
+
+
+async def test_a_pin_refused_open_settles_nothing(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720: a writable open that fails BEFORE its salt bind (here the pin check) must not
+    settle, because the cipher is not yet this store's. Red before the fix: the close the failed
+    open runs settles once."""
+    settles: list[bool] = []
+
+    async def record(self: MessageStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+
+    async def refused(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("pin refused")
+
+    monkeypatch.setattr(MessageStore, "checkpoint_cipher_invocations", record)
+    monkeypatch.setattr("messagefoundry.store.store.check_open_store_pin", refused)
+    with pytest.raises(RuntimeError, match="pin refused"):
+        await MessageStore.open(tmp_path / "refused.db")
+    assert settles == []
+
+
+async def test_a_failed_open_after_the_bind_still_settles(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720, the other side of the guard: once the bind holds, the failed open's close
+    settles the block the open reserved, as on main."""
+    settles: list[bool] = []
+
+    async def record(self: MessageStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+
+    async def boom(self: MessageStore) -> None:
+        raise RuntimeError("reference cache boom")
+
+    monkeypatch.setattr(MessageStore, "checkpoint_cipher_invocations", record)
+    monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
+    with pytest.raises(RuntimeError, match="reference cache boom"):
+        await MessageStore.open(tmp_path / "bound.db")
+    assert settles == [False, True]
+
+
+async def test_cleanup_failed_open_runs_only_the_forced_release_on_generator_exit() -> None:
+    """BACKLOG #5720: a coroutine being closed cannot await, so the cleanup runs only the
+    synchronous forced release, and the caller re-raises the ``GeneratorExit`` unchanged."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    released: list[str] = []
+
+    async def release() -> None:
+        released.append("released")
+
+    await cleanup_failed_open(
+        GeneratorExit(), release, lambda: released.append("forced"), cancels_before=0
+    )
+    assert released == ["forced"]
+
+
+async def _wedged_cleanup_ends_within_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc: BaseException,
+    *,
+    cancel: bool = True,
+) -> BaseException | None:
+    """Run ``cleanup_failed_open`` over a release that never finishes, cancel it, and return what
+    it raised, if anything; the test fails rather than hangs when nothing bounds the wait."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    forced: list[str] = []
+    unwedge = asyncio.Event()
+    started = asyncio.Event()
+
+    async def wedged_release() -> None:
+        started.set()
+        await unwedge.wait()
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            exc, wedged_release, lambda: forced.append("forced"), cancels_before=0
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        if cancel:
+            task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=3)
+        assert task in done, "a cancelled failed-open cleanup still waited on a wedged release"
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    assert forced == ["forced"]
+    assert "did not finish within 0.05 s of a cancel" in caplog.text
+    try:
+        task.result()
+    except BaseException as raised:  # noqa: BLE001 -- what the cleanup raised, a cancel included
+        return raised
+    return None
+
+
+async def test_a_cancel_bounds_a_wedged_failed_open_cleanup(monkeypatch, caplog) -> None:
+    """BACKLOG #5720, decision d20261114T002244771-017417: once a cancel lands, a wedged cleanup
+    gets one bound, then the forced release runs and the cancel ends the open, chained to the
+    open's own failure."""
+    failure = RuntimeError("open boom")
+    raised = await _wedged_cleanup_ends_within_the_bound(monkeypatch, caplog, failure)
+    assert isinstance(raised, asyncio.CancelledError)
+    assert raised.__cause__ is failure
+
+
+async def test_a_cancelled_opens_wedged_cleanup_is_bounded_from_the_start(
+    monkeypatch, caplog
+) -> None:
+    """BACKLOG #5720: an open that was itself cancelled has had its cancel already, so its
+    cleanup is bounded from the start, and it raises nothing: the caller re-raises the open's
+    own cancel."""
+    # No cancel from the test: only the open's own CancelledError can start the bound.
+    raised = await _wedged_cleanup_ends_within_the_bound(
+        monkeypatch, caplog, asyncio.CancelledError(), cancel=False
+    )
+    assert raised is None
+
+
+async def test_run_to_completion_names_its_caller(caplog) -> None:
+    """BACKLOG #5720: a caller other than the revoke names itself, so a failed-open cleanup is
+    never logged as a revoke's seal report; the default keeps the revoke's text."""
+    from messagefoundry.store.store import _run_to_completion
+
+    async def boom() -> None:
+        raise RuntimeError("boom")
+
+    await _run_to_completion(boom, what="a failed store open's cleanup", lost="nothing")
+    await _run_to_completion(boom)
+    assert "a failed store open's cleanup failed (RuntimeError); nothing" in caplog.text
+    assert (
+        "a revoke's seal report failed (RuntimeError); its remaining audit rows and pages were"
+        " not sent" in caplog.text
+    )
+
+
+async def test_an_exit_bounds_a_wedged_failed_open_cleanup_without_a_cancel(monkeypatch) -> None:
+    """BACKLOG #5720: an open that ends with ``SystemExit`` must not wait unbounded on a wedged
+    cleanup, so its bound starts at once, with no cancel needed."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    forced: list[str] = []
+    unwedge = asyncio.Event()
+
+    async def wedged_release() -> None:
+        await unwedge.wait()
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            SystemExit(1), wedged_release, lambda: forced.append("forced"), cancels_before=0
+        )
+    )
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=3)
+        assert task in done, "an exiting open still waited on a wedged release"
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    assert task.result() is None
+    assert forced == ["forced"]
+
+
+async def test_a_cancel_on_every_pass_still_reaches_the_forced_release(monkeypatch) -> None:
+    """BACKLOG #5720: a caller that cancels again on every pass, as a cancel scope does, must not
+    keep the wait from ever reaching the bound."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    forced: list[str] = []
+    unwedge = asyncio.Event()
+    started = asyncio.Event()
+
+    async def wedged_release() -> None:
+        started.set()
+        await unwedge.wait()
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            RuntimeError("open boom"),
+            wedged_release,
+            lambda: forced.append("forced"),
+            cancels_before=0,
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        deadline = asyncio.get_running_loop().time() + 3
+        while not task.done() and asyncio.get_running_loop().time() < deadline:
+            task.cancel()
+            await asyncio.sleep(0)
+        assert task.done(), "repeated cancels kept the cleanup from its bound"
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    assert forced == ["forced"]
+
+
+async def test_a_swallowed_earlier_cancel_does_not_turn_a_failed_open_into_a_cancel(
+    tmp_path, monkeypatch
+) -> None:
+    """BACKLOG #5720, decision d20261114T010249807-7b3140 (as BACKLOG #5004): a task that swallowed a cancel
+    before the open still counts it in ``cancelling()``. The open compares against the count it
+    started with, so its own ordinary failure stays that failure, not a ``CancelledError``."""
+
+    async def boom(self: MessageStore) -> None:
+        raise RuntimeError("reference cache boom")
+
+    monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
+
+    async def opener() -> BaseException | None:
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(1)  # the earlier cancel lands here and is swallowed
+        assert current.cancelling() == 1
+        try:
+            await MessageStore.open(tmp_path / "swallowed.db")
+        except BaseException as raised:  # noqa: BLE001 -- what the open raised
+            return raised
+        return None
+
+    raised = await asyncio.create_task(opener())
+    assert isinstance(raised, RuntimeError), raised
+
+
+async def test_an_exit_names_itself_in_the_forced_release_warning(monkeypatch, caplog) -> None:
+    """BACKLOG #5720: the forced-release WARNING names what started the bound, and the bound
+    itself, unrounded."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    unwedge = asyncio.Event()
+
+    async def wedged_release() -> None:
+        await unwedge.wait()
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            KeyboardInterrupt(), wedged_release, lambda: None, cancels_before=0
+        )
+    )
+    try:
+        await asyncio.wait({task}, timeout=3)
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    assert "did not finish within 0.05 s of KeyboardInterrupt" in caplog.text
+
+
+async def test_a_cleanup_that_ends_cancelled_still_forces_the_release() -> None:
+    """BACKLOG #5720: a release cancelled from outside, as ``asyncio.run``'s cancel-all does, can
+    stop before the read pool; the forced release then drops what it skipped."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    forced: list[str] = []
+
+    async def cancelled_release() -> None:
+        raise asyncio.CancelledError
+
+    await cleanup_failed_open(
+        RuntimeError("open boom"),
+        cancelled_release,
+        lambda: forced.append("forced"),
+        cancels_before=0,
+    )
+    assert forced == ["forced"]
+
+
+async def test_a_forced_stop_has_its_outcome_read(caplog) -> None:
+    """BACKLOG #5720: the SQLite forced release reads each ``stop()`` future's outcome when it
+    resolves, so a failed stop is logged by class rather than left unretrieved."""
+    from messagefoundry.store.store import _stop_unawaited
+
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    class _Conn:
+        def stop(self) -> asyncio.Future[None]:
+            return future
+
+    _stop_unawaited(_Conn())  # type: ignore[arg-type]
+    future.set_exception(OSError("worker gone at C:/secret/path"))
+    await asyncio.sleep(0)
+    assert "stopping a connection after a failed store open failed (OSError)" in caplog.text
+    assert "secret" not in caplog.text
