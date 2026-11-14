@@ -276,8 +276,12 @@ its re-arm genuinely is per-connection.
 `_inbound_log_halted`, reads the process latch as well as the per-inbound marks, in the per_lane
 workers' loop top and, under pooled, in a pre-claim predicate on the INGRESS, ROUTED and
 RESPONSE dispatchers: a gated lane parks with no claim and no row write until the gate lifts, and
-only a prefix claimed before the latch is handed back by `reschedule_claimed`. The halt never pauses or
-STOPs an internal lane or touches its hold. It marks every inbound as it latches, before it waits
+only a prefix claimed before the latch is handed back by `reschedule_claimed`. The halt itself
+never pauses or STOPs an internal lane or touches its hold. A lane can still STOP while it is in
+force, at least under its own fault policy (the T17 bound, for example when that hand-back's
+reschedule keeps failing on a full store) and through a leadership-loss hand-back; such a STOP
+keeps its hold, and lifting the gate does not re-arm it. `_inbound_log_halted` states this once
+in the code. It marks every inbound as it latches, before it waits
 for the reload lock, so a reload holding that lock cannot rebind a listener over gated stages. A
 halt whose latch a probe cleared while it waited still completes, as before; decision
 d20261113T215259180-f5da2d, which had it stand down instead, was reversed. A per_lane internal worker now WAITS at the gate rather
