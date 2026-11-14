@@ -153,9 +153,9 @@ _WSSE_FAULT_RE = re.compile(
 # SOAP 1.1 <faultcode>…</faultcode>; SOAP 1.2 <Code><Value>…</Value></Code>. Only the start tag's
 # NAME is a regex. BACKLOG #2827: the former `[^>]*>(.*?)</` tail rescanned to the end of the reply
 # from every start tag lacking a close, so a partner reply of repeated start tags cost the square of
-# its length. _code_text finds the `>` and `</` with str.find, once, from the one code element, and
-# only inside the Fault _FAULT_RE matched, up to that Fault's close tag (_FAULT_END_RE) or the reply's
-# end. BACKLOG #5912: the code element is the Fault's first child, a faultcode or a Code (_CODE_RE),
+# its length. _code_text finds the `>` and `</` with str.find, once per code element, at most two
+# (the first-child read's, then the fallback's), and only inside the Fault _find_fault took, up to
+# that Fault's close tag or the reply's end. BACKLOG #5912: the code element is the Fault's first child, a faultcode or a Code (_CODE_RE),
 # and for a Code the Value that is its own first child, up to its close tag (_CODE_END_RE);
 # _fault_code says why, and when it falls back to the earlier search (_searched_code). For the
 # first-child read the Fault and Code close tags are searched for outside markup, with
@@ -342,7 +342,8 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     cannot hold a code, or a ``<!`` the read does not step over (a DOCTYPE, a lowercase
     ``<![cdata[``, an unterminated comment) stops it, the code falls back to the earlier search
     (:func:`_searched_code`), over the range that search read: from the Fault start tag to the
-    first Fault close tag, markup not stepped over. So such a reply reads as it did before #5912. A
+    first Fault close tag, markup not stepped over. So, where :func:`_find_fault` takes the Fault
+    start tag the code before #5912 took, such a reply reads as it did then. A
     Receiver fault the first-child read cannot place, after a SOAP 1.1 ``faultstring`` or a SOAP 1.2
     ``Reason`` say, is retried rather than dead-lettered; and, as before #5912, a ``Value`` ahead of
     the code element, or after a code element that holds no code, decides the class there, so a

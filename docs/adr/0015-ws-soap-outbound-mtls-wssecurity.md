@@ -158,9 +158,10 @@ whitespace, `/` or `>`, so `<Code.x>` does not match, and `_CODE_END_RE` is its 
 three start-tag patterns is tried at most once, anchored, by the first read: `faultcode` and `Code` at
 the Fault's first child element, `Value` at the Code's first child. Where that read yields no code,
 the fallback searches forward once each for the first `faultcode` and a `Value` ahead of it, the
-search the code ran before #5912, over that search's range, up to the first plain `_FAULT_END_RE`
-match; it steps over no markup. Only a `faultcode` or `Value` match reaches
-`_code_text`; the `_fault_code` docstring says how. The Fault start-tag search, and the Fault and Code close-tag searches that bound the first read, step over a comment, a CDATA section or a processing instruction whole, with `str.find`, as the first-child search does; `_search_outside_markup` says how. The fallback's own Fault close-tag search does not. This decision is unchanged.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
+search the code ran before #5912, from the Fault start tag `_find_fault` chose to the first plain
+`_FAULT_END_RE` match, stepping over no markup; that Fault can differ from the one the earlier code
+chose. Only a `faultcode` or `Value` match reaches
+`_code_text`; the `_fault_code` docstring says how. The Fault start-tag search, where some Fault start tag on its side lies outside markup, and the Fault and Code close-tag searches that bound the first read, step over a terminated comment, CDATA section or processing instruction whole, with `str.find`, as the first-child search does; `_search_outside_markup` says how. The fallback's own Fault close-tag search does not. This decision is unchanged.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
 `messagefoundry/`. *(Corrected 2026-11-04: that sentence, the "regex-only" premise and the heading's
 "no XML parser" are no longer true of the codebase. The engine imports XML parsers, and
 `tests/test_security_static.py` keeps the allowlist of where. `transports/soap.py` is on it: it imports
