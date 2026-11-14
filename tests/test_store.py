@@ -1483,12 +1483,12 @@ async def test_a_read_pool_pragma_failure_closes_that_connection(tmp_path, monke
 
 
 async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connection(
-    tmp_path, monkeypatch, caplog
+    tmp_path, monkeypatch
 ) -> None:
     """BACKLOG #5720: the failed open's cleanup ran unshielded, so a cancel landing inside
     ``store.close()`` skipped the rest of it, the writer's close included, and left non-daemon
     workers behind. Red before the fix: workers are still running. The cancel is still raised,
-    and the open's own failure is not logged with its text (vault BACKLOG #3054)."""
+    chained to the open's own failure."""
     watched: set[threading.Thread] = set()
     opened = _watch_aiosqlite_connects(monkeypatch, watched)
     closing = asyncio.Event()
@@ -1500,7 +1500,7 @@ async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connect
         await real_close(self)
 
     async def boom(self: MessageStore) -> None:
-        raise RuntimeError("reference cache boom with driver text")
+        raise RuntimeError("reference cache boom")
 
     monkeypatch.setattr(MessageStore, "close", slow_close)
     monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
@@ -1516,7 +1516,6 @@ async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connect
             await conn.close()
     assert left == [], f"a cancelled cleanup left live aiosqlite worker(s): {', '.join(left)}"
     assert isinstance(raised.value.__cause__, RuntimeError)
-    assert "driver text" not in caplog.text
 
 
 async def test_a_failed_opens_cleanup_logs_by_class_only(tmp_path, monkeypatch, caplog) -> None:
