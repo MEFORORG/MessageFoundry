@@ -1294,7 +1294,10 @@ async def test_a_passkey_completes_a_pending_oidc_factor_but_opens_no_window(
 
         verified = await service.finish_webauthn_assertion(
             pending,
-            auth.get_response(base64url_to_bytes(json.loads(options)["challenge"])),
+            # UV set, so only the oidc branch can keep the window shut.
+            auth.get_response(
+                base64url_to_bytes(json.loads(options)["challenge"]), user_verified=True
+            ),
             client="10.0.0.9",
             rp_id=rp,
             origin=ORIGIN,

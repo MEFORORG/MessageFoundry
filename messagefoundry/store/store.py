@@ -2263,8 +2263,9 @@ def reauth_stamp(
 ) -> Callable[[SessionRecord], SessionRecord]:
     """The change ``mark_session_reauthed`` makes to a session row, for the session write helper.
 
-    ``reauth_at`` becomes ``now``, unless ``stamp_window`` is false, which keeps it. A ``client`` re-anchors the session's address; ``None`` keeps the
-    stored one (WP-L3-13). ``idp_auth_time`` only ever moves FORWARD (BACKLOG #2143), so two
+    ``reauth_at`` becomes ``now``, unless ``stamp_window`` is false, which clears it, so a window
+    opened at the old anchor never follows the session to a new one (vault BACKLOG #2964 item 14).
+    A ``client`` re-anchors the session's address; ``None`` keeps the stored one (WP-L3-13). ``idp_auth_time`` only ever moves FORWARD (BACKLOG #2143), so two
     step-ups landing out of order cannot leave the older value behind for a replay to pass."""
     when = float(now)
     idp = _opt_float(idp_auth_time)
@@ -2275,7 +2276,7 @@ def reauth_stamp(
             forward = idp
         return replace(
             s,
-            reauth_at=when if stamp_window else s.reauth_at,
+            reauth_at=when if stamp_window else None,
             client=s.client if client is None else client,
             idp_auth_time=forward,
         )

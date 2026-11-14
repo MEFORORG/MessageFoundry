@@ -18153,8 +18153,8 @@ class AuthService:
     ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
         factor satisfied, re-anchor it to the WP-L3-13 client as :meth:`verify_mfa` does, stamp
-        ``reauth_at`` only when the authenticator reported user verification (not on an ``oidc``
-        session either way; vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068
+        ``reauth_at`` only when the authenticator reported user verification and clear it otherwise
+        (not on an ``oidc`` session either way; vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068
         Amendments of that date) and re-key the session (ASVS 7.2.4). Returns a not-``ok``
         :class:`Elevation` (never raises) for any invalid input, always audited.
 
@@ -18330,8 +18330,9 @@ class AuthService:
             # Vault BACKLOG #2964 item 14 (owner rulings 2026-11-14, "Assertion only" and "Stamp
             # only if UV"): re-anchor the session to the address that proved the passkey, as
             # verify_mfa does after a good code, so the two address signals agree. The step-up
-            # window opens only when the signed authenticator data carried the UV flag. Not on an
-            # oidc session, whose anchor moves only at the IdP (BACKLOG #2142);
+            # window opens only when the signed authenticator data carried the UV flag; without it
+            # the same write shuts any open window, so none follows the anchor. Not on an oidc
+            # session, whose anchor moves only at the IdP (BACKLOG #2142);
             # tests/test_docs_security_pathways.py pins the branch.
             if session.auth_mechanism != SessionMechanism.OIDC.value:
                 async with self._sealed_stamp(hash_token(token)) as reauth_stamp:

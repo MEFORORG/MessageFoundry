@@ -793,3 +793,15 @@ and `reauth_at` only with UV, never on an `oidc` session. Its verifying test is 
 
 **Who decided.** The owner, 2026-11-14, answering "How should a passkey assertion stamp the
 window?" with "Stamp only if UV".
+
+## Amendment (2026-11-14, third) -- a non-UV assertion shuts the window (vault BACKLOG #2964 item 14)
+
+This corrects the amendment above, which said a non-UV assertion "leaves `reauth_at` as it was".
+That let a window opened at the old address follow the anchor to a new one. A verified assertion
+without the UV flag now clears `reauth_at` in the same sealed write that re-anchors
+(`mark_session_reauthed(stamp_window=False)`), so the window is shut after it whatever it was
+before. A user-verified assertion still stamps it.
+
+**Who decided.** The Manager, 2026-11-14, reading the owner's "Stamp only if UV" as "without UV,
+the window is shut", as the strictly safer option, under the owner's standing instruction of
+2026-10-22.

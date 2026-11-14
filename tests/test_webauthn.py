@@ -1410,6 +1410,41 @@ async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
     assert results["passkey"] == results["code"] == ("10.7.7.2", True)
 
 
+async def test_a_non_uv_assertion_shuts_an_open_window_as_it_re_anchors() -> None:
+    """Vault BACKLOG #2964 item 14 (Manager reading of the owner's "Stamp only if UV"): a window
+    opened by a user-verified passkey at one address must not follow the anchor when a presence-only
+    tap re-anchors the session elsewhere. The non-UV assertion clears ``reauth_at``."""
+    from messagefoundry.auth.tokens import hash_token
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        out = await service.login(ADMIN_USERNAME, password, client="10.3.3.1")
+        assert out.ok and out.token is not None
+        current = out.token
+        for uv, client in ((True, "10.3.3.1"), (False, "10.3.3.2")):
+            options = await service.begin_webauthn_assertion(current, rp_id=RP)
+            assert options is not None
+            challenge = base64url_to_bytes(json.loads(options)["challenge"])
+            elevation = await service.finish_webauthn_assertion(
+                current,
+                auth.get_response(challenge, user_verified=uv),
+                client=client,
+                rp_id=RP,
+                origin=ORIGIN,
+            )
+            assert elevation.ok and elevation.token is not None
+            current = elevation.token
+            row = await store.get_session(hash_token(current))
+            assert row is not None and row.client == client
+            assert (row.reauth_at is not None) is uv
+            assert await service.has_recent_step_up(current) is uv
+    finally:
+        await store.close()
+
+
 async def test_a_passkey_registration_does_not_re_anchor() -> None:
     """Control for vault BACKLOG #2964 item 14: enrolment keeps the anchor where it was. ADR 0197
     Amendment A lets a holder of the password alone enrol, so a registration proves nothing about

@@ -17,8 +17,9 @@ process is structural; ADR 0068 records the store-backed table as the multi-node
 Policy pins (ADR 0068 §1/§6): ``attestation=NONE`` (passkey norm — no attestation certificates are
 requested or stored, and this module configures no attestation trust anchor; the engine's
 operator-supplied anchors are :mod:`messagefoundry.auth.trust_anchors`),
-``user_verification=PREFERRED`` (the knowledge factor is the password that accompanies every
-step-up; ``REQUIRED`` would brick PIN-less U2F keys for no factor gain), the credential algorithm
+``user_verification=PREFERRED`` (``REQUIRED`` would brick PIN-less U2F keys; a passkey without the
+UV flag meets the factor but opens no step-up window, so the password leg still carries the
+knowledge factor there, vault BACKLOG #2964 item 14), the credential algorithm
 set (:data:`SUPPORTED_COSE_ALGS`), and the key type and curve each algorithm must arrive in
 (:data:`_COSE_KEY_SHAPE_FOR_ALG`), checked at registration and again at every sign-in.
 """
