@@ -519,10 +519,8 @@ _PR_MODAL = (
 #: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
 _PR_VERDICT_AFTER = re.compile(
     rf"(?i)^{_PR_FMT}(?:\s+(?:cell|row))?"
-    # A comma binds only before "which"/"that": "<id>, which stays partial". It starts a clause about
-    # whatever the sentence names, so it binds only a record verb or a marked identifier
-    # (_pr_verdict_bound): "the timeout in <section>, which is na" is a setting.
-    rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP}|(?P<comma>,)\s*(?=(?:which|that)\b))"
+    # A comma binds only before "which"/"that", emphasised or not: "<id>, which stays partial".
+    rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP}|,\s*(?={_PR_FMT}(?:which|that){_PR_NA}))"
     rf"(?:{_PR_FMT}(?:(?:which|that){_PR_SEP})?{_PR_AUX}"
     rf"(?:(?P<strong>{_PR_STRONG_VERB})|(?P<modal>{_PR_MODAL})|{_PR_STATE_VERB}|(?P<as>as)"
     rf"|(?P<to>to)){_PR_SEP}(?:at{_PR_SEP})?)?"
@@ -573,7 +571,7 @@ _PR_VERDICT_BEFORE = re.compile(
 )
 #: A table cell that is nothing but a verdict, optionally after a state verb ("Stay partial").
 _PR_CELL_VERDICT = re.compile(
-    rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?(?P<qualifier>{_PR_QUALIFIER})(?P<verdict>{_PR_VERDICT})"
+    rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}(?P<verdict>{_PR_VERDICT})"
 )
 #: "never fails" and "never passing" describe a component, not a verdict: the CI verbs after "never"
 #: bind only a marked row. "never met" and "never partial" are verdict states and still bind.
@@ -589,18 +587,27 @@ _PR_CELL_GOES_ON = (
 #: so with no "unchanged" or state verb before it, it binds only a row whose identifier is marked.
 _PR_CELL_VERDICT_LEAD = re.compile(
     rf"(?i)(?:(?P<prefix>unchanged(?:[,;:]|{_PR_CELL_DASH})?|{_PR_STATE_VERB}){_PR_SEP})?"
-    rf"(?P<qualifier>{_PR_QUALIFIER})(?P<verdict>{_PR_VERDICT}){_PR_FMT}"
+    rf"{_PR_QUALIFIER}(?P<verdict>{_PR_VERDICT}){_PR_FMT}"
     rf"(?:[.;,:](?:\s|$)|\s*\(|{_PR_CELL_DASH}(?:\s|$)"
     rf"|(?P<goes_on>\s+(?:{_PR_CELL_GOES_ON})\b)|$)"
 )
 #: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
 _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
-#: The characters _PR_MARKUP matches plus every space character (a tab and a no-break space included)
-#: and every invisible format character (zero-width space, joiner, direction mark, byte-order mark),
-#: which str.isspace does not count, as str.strip takes them, to trim only a cell's ends.
-_PR_CELL_EDGE = (
-    "".join(c for c in map(chr, range(0x10000)) if c.isspace() or unicodedata.category(c) == "Cf")
-    + "*`_\"'"
+#: The characters _PR_MARKUP matches plus every space character (a tab and a no-break space included),
+#: as str.strip takes them, to trim only a cell's ends.
+_PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`_\"'"
+#: The format characters (Unicode category Cf: zero-width space and joiners, direction marks, the
+#: byte-order mark, the tag characters) in the planes that hold any. They render as nothing, so
+#: _pr_units deletes them from each line before any pattern reads it, inside a word or a cell as
+#: well as around one.
+_PR_INVISIBLE = re.compile(
+    "["
+    + "".join(
+        re.escape(c)
+        for c in map(chr, [*range(0x20000), *range(0xE0000, 0xE1000)])
+        if unicodedata.category(c) == "Cf"
+    )
+    + "]"
 )
 #: No "\s*" around a separator: on a long run of spaces it backtracks quadratically, so whitespace is a
 #: separator of its own and the empty parts are dropped.
@@ -681,14 +688,11 @@ _PR_MARK_AFTER = re.compile(
 )
 #: Only a list separator, as the words between "ASVS <id>" and the next identifier of the same list.
 _PR_ID_LIST_GAP = re.compile(r"(?:[\s,;/&+*`_\"']|(?i:and|or)(?![A-Za-z0-9]))+")
-#: A table header cell that names its column ASVS ("ASVS", "ASVS ID", "ASVS v5.0", "ASVS:", "ASVS
-#: reference", "Requirement (ASVS)"), so a row under it has every identifier in that column marked as a
-#: requirement, though the row never says so itself.
-_PR_TABLE_ASVS_WORD = r"(?:v?\d[\d.]*|ids?|refs?|references?|reqs?|requirements?|numbers?)"
-_PR_TABLE_ASVS_HEAD = re.compile(
-    rf"(?i)asvs:?(?:\s+{_PR_TABLE_ASVS_WORD})*:?"
-    rf"|{_PR_TABLE_ASVS_WORD}?\s*\(\s*asvs(?:\s+v?\d[\d.]*)?\s*\):?"
-)
+#: A table header cell that names its column ASVS, however it spells the rest ("ASVS", "ASVS ID",
+#: "ASVS v5.0", "ASVS:", "Requirement (ASVS)", "OWASP ASVS", "ASVS_ID"), so a row under it has every
+#: identifier in that column marked as a requirement, though the row never says so itself. Searched
+#: with the cell's markup read as a space, so "ASVS_ID" and "**ASVS**" both name it.
+_PR_TABLE_ASVS_HEAD = re.compile(rf"(?i){_PR_NB}asvs{_PR_NA}")
 #: The characters of a markdown table's second line, which makes the line above it a header row. A set
 #: and not a pattern: a class holding "-" twice backtracks quadratically on a long run of dashes.
 _PR_TABLE_DELIMITER_CHARS = frozenset("|:- \t")
@@ -735,7 +739,8 @@ def _pr_units(body: str) -> _PrUnits:
             parts.clear()
 
     for lineno, raw in enumerate(body.splitlines(), 1):
-        line = _PR_MD_LINK.sub(r"\1", _PR_QUOTE.sub("", raw.strip(), count=1).strip())
+        line = _PR_INVISIBLE.sub("", raw).strip()
+        line = _PR_MD_LINK.sub(r"\1", _PR_QUOTE.sub("", line, count=1).strip())
         if not line:
             flush()
             continue
@@ -810,8 +815,6 @@ def _pr_verdict_bound(text: str, m: re.Match[str], version: bool, marked: bool) 
         return True
     if version:
         return False
-    if hit.group("comma") is not None:
-        return marked
     ends = _PR_VERDICT_END.match(after, hit.end()) is not None
     if modal is not None:
         return marked or ends
@@ -871,7 +874,8 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
         return (
             not marked
             and hit.group("verdict").lower() in _PR_CI_VERDICTS
-            and _PR_NEVER.search(hit.group("qualifier")) is not None
+            # Anywhere before the verdict: "never fails", and "has never been failing" too.
+            and _PR_NEVER.search(hit.string, hit.start(), hit.start("verdict")) is not None
         )
 
     def is_verdict(cell: str) -> bool:
@@ -928,9 +932,7 @@ def _pr_asvs_columns(header: str) -> set[int]:
     """The columns of a table header row whose cell names the column ASVS."""
     cells = _PR_CELL_PIPE.split(header.strip().strip("|"))
     return {
-        i
-        for i, c in enumerate(cells)
-        if _PR_TABLE_ASVS_HEAD.fullmatch(_PR_CELL_MARKUP.sub("", c).strip(_PR_CELL_EDGE))
+        i for i, c in enumerate(cells) if _PR_TABLE_ASVS_HEAD.search(_PR_CELL_MARKUP.sub(" ", c))
     }
 
 

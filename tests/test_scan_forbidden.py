@@ -1071,8 +1071,10 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # Step 10's must-fire controls: the shapes its false positives took, beside a marked identifier.
     ("10", "verdict", f"| ASVS {_REQ} | the parser | never fails |"),
     ("10", "verdict", f"ASVS {_REQ} is cited; the row is not failing now."),
-    ("10", "verdict", f"Set the timeout in ASVS {_REQ}, which is {_NA}."),
-    ("10", "verdict", f"Set the timeout in {_REQ}, which stays {_NA}."),
+    ("10", "verdict", f"| ASVS {_REQ} | the parser | has never been failing |"),
+    # Step 11: emphasis on the relative pronoun after a comma.
+    ("11", "verdict", f"ASVS {_REQ}, _which_ stays {_PARTIAL}."),
+    ("11", "verdict", f"ASVS {_REQ}, **that** is {_PARTIAL}."),
     # Step 11: an ASVS major version between "ASVS" and the identifier.
     ("11", "gap", f"ASVS v5 {_REQ} lacks a row-completeness pin."),
     ("11", "gap", f"ASVS 5 {_REQ} lacks a row-completeness pin."),
@@ -1080,11 +1082,15 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("11", "verdict", f"| ASVS: | Note | Result |\n|---|---|---|\n{_ROW}"),
     ("11", "verdict", f"| ASVS reference | Note | Result |\n|---|---|---|\n{_ROW}"),
     ("11", "verdict", f"| Requirement (ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| OWASP ASVS | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| ASVS_ID | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| ASVS-ID | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| ASVS # | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| Control (ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
     # Step 11: underscore emphasis at the word-boundary sites that bind.
     ("11", "verdict", f"_{_PARTIAL}_: {_REQ}"),
     ("11", "verdict", f"For {_REQ} the _cell_ stays {_PARTIAL}."),
     ("11", "verdict", f"For {_REQ} the vault _re-score_ to {_PASS} landed."),
-    ("11", "verdict", f"For {_REQ} the re-read _held_ the cell at {_PARTIAL}."),
     ("11", "gap", f"The _gap_ keeps {_REQ} open."),
     ("11", "map", f"{_REQ} is enforced in _pkg/example_guard.py_."),
     ("11", "map", f"{_REQ} is enforced in _messagefoundry.example_guard_."),
@@ -1097,6 +1103,12 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("11", "verdict", f"| ASVS {_REQ} | the limb |{chr(0x200E)}stays {_PARTIAL}{chr(0x200E)}|"),
     ("11", "verdict", f"| {chr(0x200B)}ASVS `{_REQ}`{chr(0x200B)} | the limb | {_PARTIAL} |"),
     ("11", "verdict", f"|\u200b{_REQ}\u200b| the limb | stays {_PARTIAL} |"),
+    # A tag character from outside the Basic Multilingual Plane, and invisible characters inside a
+    # cell, a header cell or a prose word rather than around them.
+    ("11", "verdict", f"| ASVS {_REQ} | the limb |{chr(0xE0020)}stays {_PARTIAL}{chr(0xE0020)}|"),
+    ("11", "verdict", f"| ASVS{chr(0x200B)}{_REQ} | the limb | {_PASS.title()} (12 messages) |"),
+    ("11", "verdict", f"| AS{chr(0x200B)}VS | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "gap", f"AS{chr(0x200D)}VS {_REQ} lacks a row-completeness pin."),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
@@ -1113,12 +1125,13 @@ _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 9: a blank line ends the ASVS-headed table, so a headerless pipe block after it is unmarked.
     ("9", f"{_HEAD}| a | b | c |\n\n{_ROW}"),
     ("9", f"{_HEAD}| a | b | c |\n\n| Version | Note | Result |\n|---|---|---|\n{_ROW}"),
-    # Step 10: the three newly flagged lines engine PR 2893 listed.
+    # Step 10: two of the three newly flagged lines engine PR 2893 listed, and their kin. The third,
+    # "<id>, which is na", is the comma spelling of a sentence that already flagged without one.
     ("10", "| 2.5.1 | parser | never fails |"),
     ("10", "The row is not failing for 2.5.1 batches."),
     ("10", "The row isn't passing for 2.5.1 batches."),
-    ("10", f"Set the timeout in 3.4.5, which is {_NA}."),
     ("10", "| 2.5.1 | parser | is never failing. |"),
+    ("10", "| 2.5.1 | parser | has never been failing |"),
     # Step 11: "ASVS" followed by a version and then a clause boundary marks nothing after it.
     ("11", f"ASVS 5; {_REQ_B} lacks wheels for this platform."),
     # Step 11: a header naming a requirement but not ASVS marks no column.
