@@ -19993,14 +19993,31 @@ class MessageStore:
             await self._commit()
 
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None:
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """Clear both locks (:func:`lockout_clear`) and append ``audit`` in ONE transaction
+        (BACKLOG #5633), the shape :meth:`replace_totp_enrolment` uses: a refused append rolls the
+        clear back, so an unlock never lands unrecorded. Returns whether a row was written."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
-            await self._write_user(
-                user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
-            )
+        async with _writer_txn(self._db, self._lock):
+            if (
+                await self._write_user(
+                    user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
+                )
+                is None
+            ):
+                # Nothing written, so nothing audited. The commit ends the empty transaction.
+                await self._commit()
+                return False
+            appended = await self._append_audits((audit,), now=now)
             await self._commit()
+        tee_audits((audit,), appended, ts=now)
+        return True
 
     async def record_login_failure(
         self,

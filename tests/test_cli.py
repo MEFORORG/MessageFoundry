@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import sqlite3
 import textwrap
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -3811,6 +3812,128 @@ def test_admin_unlock_writes_an_audit_row(
             await s.close()
 
     assert "auth.admin_unlocked" in asyncio.run(rows())
+
+
+def _unlock_audit_details(db: Path) -> list[dict[str, Any]]:
+    """The details of every ``auth.admin_unlocked`` row in ``db``."""
+    import asyncio
+
+    from messagefoundry.store.store import MessageStore
+
+    async def rows() -> list[dict[str, Any]]:
+        s = await MessageStore.open(db)
+        try:
+            found = await s.list_audit(limit=50, action="auth.admin_unlocked")
+            return [json.loads(r["detail"]) for r in found]
+        finally:
+            await s.close()
+
+    return asyncio.run(rows())
+
+
+def test_admin_unlock_leaves_the_lock_when_its_audit_row_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633: the clear and its audit row are one transaction, so an append the store
+    refuses after the pre-check leaves the lock standing rather than an unaudited unlock."""
+    import time
+
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-refused.db"
+    _seed_locked(db, locked_until=time.time() + 86_400)
+
+    async def refuse(*_a: object, **_k: object) -> object:
+        raise RuntimeError("the audit append was refused")
+
+    monkeypatch.setattr(MessageStore, "_append_audits", refuse)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "refused the unlock" in error and "RuntimeError" in error
+    assert "the audit append was refused" not in error  # the class only, never the text
+    monkeypatch.undo()
+    locked_until, _ = _read_lock(db)
+    assert locked_until is not None, "the unlock committed without its audit row"
+    assert _unlock_audit_details(db) == []
+
+
+def test_admin_unlock_strips_the_username_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633: the argv that created the account also finds it, and the audit row names the
+    stored username, not the padded argument."""
+    import time
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-strip.db"
+    _seed_locked(db, locked_until=time.time() + 86_400)
+    assert main(["admin-unlock", "--username", "  admin \t", "--db", str(db), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["username"] == "admin"
+    assert _read_lock(db)[0] is None
+    assert [d["username"] for d in _unlock_audit_details(db)] == ["admin"]
+
+
+def test_admin_unlock_refuses_an_empty_username(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-empty.db"
+    _seed_locked(db, locked_until=None)
+    assert main(["admin-unlock", "--username", "   ", "--db", str(db), "--json"]) == 1
+    assert "username is empty" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_admin_unlock_names_the_os_user_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633: ``getpass.getuser`` ran after the clear had committed, so a shell whose OS
+    user cannot be named left an unlock with no audit row. It now runs before the store opens."""
+    import getpass
+    import time
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-nouser.db"
+    _seed_locked(db, locked_until=time.time() + 86_400)
+
+    def no_user() -> str:
+        raise OSError("no username set in the environment")
+
+    monkeypatch.setattr(getpass, "getuser", no_user)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "cannot name the OS user" in error and "nothing was written" in error
+    monkeypatch.undo()
+    assert _read_lock(db)[0] is not None, "the lock was cleared with no audit row"
+    assert _unlock_audit_details(db) == []
+
+
+def test_admin_unlock_reports_a_busy_store_as_a_refused_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5633: a driver error from the write, after the store opened, is a refused write,
+    exit 1 (ADR 0171 Amendment C), not "cannot open the store", and stays one JSON object."""
+    import time
+
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-busy.db"
+    _seed_locked(db, locked_until=time.time() + 86_400)
+
+    async def busy(*_a: object, **_k: object) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(MessageStore, "clear_lockout", busy)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "refused the unlock" in error and "OperationalError" in error
+    assert "cannot open the store" not in error
 
 
 def test_audit_verify_exits_2_on_a_file_that_is_not_a_database(tmp_path: Path) -> None:

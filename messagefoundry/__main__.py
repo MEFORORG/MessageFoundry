@@ -6873,23 +6873,62 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     second-step lock. Both clear, through the named ``clear_lockout`` store method, and both old
     expiries and both cycle counts are reported and audited. The cycle counts are KEPT unless
     ``--reset-cycles``, so a campaign that resumes after an unlock resumes at the escalated length.
+
+    **THE AUDIT ROW COMMITS WITH THE CLEAR, NOT AFTER IT (BACKLOG #5633).** The clear and its row
+    were two writes, and the OS user was named between them, so a failure there left an unlock
+    made and unrecorded. Now the OS user is named before the store opens, and ``clear_lockout``
+    appends the row in the clear's own transaction, as ``admin-reset-totp`` does: both land, or
+    neither does. The pre-check still runs before the write, so the ordinary refusal exits 2.
     """
     import getpass
 
     from messagefoundry.auth.audit_visibility import ADMIN_UNLOCKED_ACTION
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
+        store_driver_errors,
     )
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
     from messagefoundry.store.row_seal import RowSealError
+    from messagefoundry.store.store import AuditAppend
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
         return settings
     posture = _command_hop_posture(settings)
+    # Stripped once, as `admin-reset-totp` and `admin-set-notify-email` strip it, so the argv that
+    # created the account also finds it; every later use reads this value.
+    wanted = args.username.strip()
+    if not wanted:
+        return _emit_error("the username is empty; nothing was written", as_json=args.json)
+    try:
+        # Before the store opens: a shell whose OS user cannot be named writes nothing.
+        actor = f"cli:{getpass.getuser()}"
+    except OSError as exc:
+        return _emit_error(
+            f"cannot name the OS user for the audit row ({codec_safe_str(exc)}); nothing was "
+            "written",
+            as_json=args.json,
+        )
+    # Could not start, exit 2 (ADR 0171 Amendment C): each is raised before anything is written.
+    could_not_start: tuple[type[Exception], ...] = (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        _StoreOpenRefused,  # the OPEN only: a refused hop (#2532), a key, a short schema (#1720)
+        StoreKeylessError,  # a keyed store opened without its key, as admin-set-notify-email exits
+        CipherError,  # a row the open cannot decrypt (BACKLOG #2124)
+        *_key_unresolved(),
+    )
+    # A refused write on every backend (BACKLOG #1983), as admin-set-notify-email names them.
+    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
+    #: Set once the store has opened, so a driver error is told apart: before it the store could
+    #: not be opened (exit 2, #1670), after it the store refused the write (exit 1).
+    opened: list[bool] = []
 
     async def run() -> tuple[str, dict[str, Any]]:
         # A key that does not resolve is "could not start", exit 2, as audit-verify exits on it
@@ -6902,8 +6941,9 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         )
+        opened.append(True)
         try:
-            user = await store.get_user_by_username(args.username)
+            user = await store.get_user_by_username(wanted)
             if user is None:
                 return ("no-such-user", {})
             _refuse_an_unauditable_write(store)  # before the lockout write, not after it
@@ -6916,14 +6956,17 @@ def _admin_unlock(args: argparse.Namespace) -> int:
                 "second_step_lock_cycles": user.second_step_lock_cycles,
                 "cycles_reset": bool(args.reset_cycles),
             }
-            await store.clear_lockout(user.id, reset_cycles=bool(args.reset_cycles))
             # Read only with users:manage (owner ruling 2026-09-28, BACKLOG #1131): its detail names
             # both locks, which would tell another reader which counter a campaign armed.
-            await store.record_audit(
+            audit = AuditAppend(
                 ADMIN_UNLOCKED_ACTION,
-                actor=f"cli:{getpass.getuser()}",
-                detail=json.dumps({"username": args.username, **report}),
+                actor=actor,
+                detail=json.dumps({"username": user.username, **report}),
             )
+            if not await store.clear_lockout(
+                user.id, audit=audit, reset_cycles=bool(args.reset_cycles)
+            ):
+                return ("no-such-user", {})  # removed between the read and the write
             return ("unlocked", report)
         finally:
             await store.close()
@@ -6931,26 +6974,35 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     try:
         outcome, report = run_guarded(run())
     # #1916; #1780: a server database with no store (auto mode); #3054: no key; #2532: a store hop
-    # the posture refuses. Could not start.
-    except (
-        KeylessAuditChainRefused,
-        StoreNotFoundError,
-        _UnauditableWrite,
-        _StoreOpenRefused,
-    ) as exc:
-        _emit_error(str(exc), as_json=args.json)
+    # the posture refuses. Could not start. Through `codec_safe_str`: a key source's codec error
+    # quotes a byte of what it decoded (BACKLOG #2532).
+    except could_not_start as exc:
+        # A short server schema says what the open may have changed before it (BACKLOG #5067).
+        left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+        _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.", as_json=args.json)
         return 2
     except RowSealError:
         # BACKLOG #3510: the store's write helper refused the clear, writing nothing.
         return _emit_error(
-            _seal_refusal(args.username, "unlock") + ". Nothing was written", as_json=args.json
+            _seal_refusal(wanted, "unlock") + ". Nothing was written", as_json=args.json
         )
-    except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
-        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    except store_errors as exc:
+        if not opened:
+            # #1670: a path that is not a database, or a server the driver could not reach.
+            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        # The class only: a driver's message can quote a stored value (ASVS 16.5.4). A busy store
+        # is not "could not start", so it keeps exit 1 (ADR 0171 Amendment C).
+        return _emit_error(
+            f"the store refused the unlock for {wanted!r} ({type(exc).__name__}). The clear and "
+            "its audit row are one transaction, so neither was written, unless a server "
+            "database reported the error after its commit. If the engine is running, stop it "
+            "and re-run; a second unlock is harmless",
+            as_json=args.json,
+        )
     if outcome == "no-such-user":
-        return _emit_error(f"no local account named {args.username!r}", as_json=args.json)
+        return _emit_error(f"no local account named {wanted!r}", as_json=args.json)
     if args.json:
-        print(json.dumps({"ok": True, "username": args.username, **report}))
+        print(json.dumps({"ok": True, "username": wanted, **report}))
     else:
 
         def _state(label: str, until: float | None) -> str:
@@ -6970,7 +7022,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         )
         kept = "reset to 0" if report["cycles_reset"] else "kept"
         print(
-            f"OK: cleared lockout for {args.username!r} ({states}; {cycles}, {kept}); "
+            f"OK: cleared lockout for {wanted!r} ({states}; {cycles}, {kept}); "
             "the password is UNCHANGED"
         )
     return 0
