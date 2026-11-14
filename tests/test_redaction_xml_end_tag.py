@@ -143,6 +143,11 @@ def test_a_rest_a_pass_could_read_differently_stays_as_main_left_it(text: str) -
         ("<family>Smith</family userPwd", "=s3cr3tvalue99"),
         ("<family>Smith</family clientSecret", "=s3cr3tvalue99"),
         ("<family>Smith</family zqxP", "assword: s3cr3tvalue99"),
+        # Found by code review round 2: a lower-case head of a compound key word, which the filter
+        # reads case-insensitively from a boundary.
+        ("<family>Smith</family shared", "accesskey=s3cr3tvalue99"),
+        ("<family>Smith</family zq master", "Key=s3cr3tvalue99"),
+        ("<family>Smith</family acco", "untkey=s3cr3tvalue99"),
     ],
 )
 def test_a_credential_label_in_the_rest_still_reaches_the_credential_filter(
@@ -160,6 +165,31 @@ def test_the_camel_label_words_cover_the_credential_filter() -> None:
     """THE DRIFT PIN: :mod:`redaction` cannot import :mod:`secretscrub`, so it spells the camelCase
     label words; a word added there and not here fails this."""
     assert {word.lower() for word in secretscrub._CAMEL_WORDS} <= set(redaction._CAMEL_LABEL_WORDS)
+
+
+def test_every_head_of_a_camel_label_word_is_refused_at_the_end() -> None:
+    """Every head of every label word, whole or after a camelCase capital, refuses a last word that
+    ends the text, since a caller's text could complete it into a label the filter reads."""
+    for word in redaction._CAMEL_LABEL_WORDS:
+        for end in range(1, len(word) + 1):
+            head = word[:end]
+            if not head.isalnum():  # a maskable rest holds letters and digits only
+                continue
+            assert redaction._ends_in_camel_head(f" {head}"), head
+            assert redaction._ends_in_camel_head(f" zq{head[0].upper()}{head[1:]}"), head
+
+
+def test_a_text_holding_the_backstop_opener_keeps_every_rest() -> None:
+    """Found by code review round 2: masking forced a round main did not run, the backstop reached
+    further on the line a field run had shortened, and took the ``"name":`` key the widened stage
+    needed, so the name value printed. The opener keeps every rest, as the glued-value mask does."""
+    text = "nonnumeric port: 'pw " + "x|y|" * 70 + ' {"name": "Zq@host Kplm7"} </family Zqxdoe>'
+    assert "Kplm7" not in redact(text)
+    assert "Zqxdoe" in redact(text)
+    cut = "nonnumeric port: 'pw Kplm7 " + "x|y|" * 70 + " tail@host' </family Zqxdoe> Qwerty12 rest"
+    with _main():
+        main = safe_text(cut, limit=60)
+    assert safe_text(cut, limit=60) == main
 
 
 # --- THE GATE: a differential fuzz against main, composed joins included ------------------------
@@ -188,7 +218,8 @@ _LABELS = (
     "mrn=", '"name": "', "'family': '", "(0010,0010) ", "PatientName=", "PatientID: ", "id=",
     "api_key=", "MEFOR_DB_PASSWORD=", "nonnumeric port: '", "MSH|^~\\&|", "MSH*$~\\#*", "user:",
     "OtherPatientIDs=", "Patient Name ", "secret ", "mfb64:v1:", "userPwd=", "clientSecret: ",
-    "zqxP", "assword: ", "ZqMSH", "^~\\&|", "accessToken=",
+    "zqxP", "assword: ", "ZqMSH", "^~\\&|", "accessToken=", "shared", "accesskey=", "master",
+    "Key=", "acco", "untkey=",
 )  # fmt: skip
 _SEPARATORS = (
     " ", " ", "", "\t", "\n", "\r\n", "<", "<b>", ">", "> ", "</family>", "<given>", '"', "'", ",",
@@ -202,6 +233,8 @@ def _fragment(rand: random.Random, *, element: bool) -> str:
     labels, words, values, separators and more end tags."""
     parts: list[str] = []
     if element:
+        if rand.random() < 0.05:  # the backstop's opener, with a tail a field run shortens
+            parts.append("nonnumeric port: 'pw " + "x|y|" * 70 + ' {"name": "Zq@host Kplm7"} ')
         if rand.random() < 0.3:
             parts.append(rand.choice(_LABELS) + rand.choice(('"', "'", "{", "", " ")))
         parts += [rand.choice(_STARTS), rand.choice(_CONTENT), rand.choice(_ENDS)]
@@ -228,6 +261,7 @@ def _routes(text: str) -> dict[str, str]:
         "redact": redact(text),
         "redact twice": redact(redact(text)),
         "chain": chained,
+        "safe_text": safe_text(text),
         "two handlers": _through_the_chain(chained),
         "credential filter": secretscrub.scrub_credentials(redact(text)),
         "bundle": redact_log_line(chained),
@@ -318,12 +352,14 @@ def test_the_end_tag_mask_redacts_at_least_what_main_did_through_composed_joins(
     masked, so no value main hid prints. The gain count shows the mask is exercised; the replacing
     control shows the corpus can produce the composed-join leak.
 
-    Measured at 1,500 trials: 0 leaks, 0 unmasked routes and 9,120 values hidden that main printed,
-    against 612 leaks on the control. 16,000 more trials over four other seeds, run by hand, also
-    found 0 leaks and 0 unmasked routes. The corpus holds the shapes code review found against the
-    first head (camelCase credential labels, a caller completing one, a segment id glued to a tag's
-    ``>``, surnames the end-of-text rules refuse). These are measurements of this corpus, not a
-    proof for every input."""
+    Measured at 1,500 trials: 0 leaks, 0 unmasked routes and 9,398 values hidden that main printed,
+    against 1,535 leaks on the control. 16,000 more trials over four other seeds, run by hand, also
+    found 0 leaks and 0 unmasked routes. The corpus holds the shapes code review found (camelCase
+    credential labels and their heads, a segment id glued to a tag's ``>``, surnames the
+    end-of-text rules refuse, the backstop's opener over a tail a field run shortens). With the
+    opener guard switched off by hand, the same 1,500 trials found 203 leaks; with the head check
+    narrowed to capitals they found none, so that shape rests on the pins above, not on this arm.
+    These are measurements of this corpus, not a    proof for every input."""
     shipped, control = _differential(1_500, 5925, _replace_rest)
     assert control.leaks, "the replacing control leaked nothing, so the corpus cannot find the leak"
     assert shipped.gains, "the mask hid nothing main printed, so #5925 is not exercised"
