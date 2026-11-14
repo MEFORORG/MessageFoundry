@@ -420,6 +420,7 @@ from messagefoundry.store.store import (
     user_insert_params,
     user_reseal_params,
     verify_audit_rows,
+    way_past_passkeys,
     webauthn_insert_params,
     without_role,
     write_kept_session,
@@ -15166,16 +15167,22 @@ class SqlServerStore:
         # the record's seal, so the write's compare loses.
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # The account row first, under UPDLOCK, so a concurrent removal waits.
+                # The account row first, under UPDLOCK, so a concurrent removal waits; the
+                # passkeys only where its TOTP does not already count (way_past_passkeys).
+                passkeys: list[WebAuthnCredential] = []
                 if conditional:
-                    await self._read_user_record(cur, user_id)
+                    passkeys = await way_past_passkeys(
+                        await self._read_user_record(cur, user_id),
+                        lambda: self._account_passkeys(cur, user_id),
+                        totp_counts=totp_counts,
+                    )
                 change = password_change(
                     password_hash=password_hash,
                     password_generated=password_generated,
                     must_change_password=must_change_password,
                     require_way_past=conditional,
                     now=now,
-                    passkeys=await self._account_passkeys(cur, user_id) if conditional else (),
+                    passkeys=passkeys,
                     sealed=self._row_sealer is not None,
                     totp_counts=totp_counts,
                     passkey_counts=passkey_counts,
@@ -15348,9 +15355,14 @@ class SqlServerStore:
             try:
                 passkeys: list[WebAuthnCredential] = []
                 if conditional:
-                    # The account row first, under UPDLOCK, so a concurrent removal waits.
-                    await self._read_user_record(cur, user_id)
-                    passkeys = await self._account_passkeys(cur, user_id)
+                    # The account row first, under UPDLOCK, so a concurrent removal waits. The
+                    # TOTP is what goes, so the set is read wherever that TOTP counts (way_past_passkeys).
+                    passkeys = await way_past_passkeys(
+                        await self._read_user_record(cur, user_id),
+                        lambda: self._account_passkeys(cur, user_id),
+                        totp_counts=totp_counts,
+                        drop_totp=True,
+                    )
                 change = totp_removal(
                     now,
                     require_way_past=conditional,
@@ -15495,7 +15507,11 @@ class SqlServerStore:
                 current = await self._read_user_record(cur, user_id)
                 if current is None or not removal_keeps_way_past(
                     current,
-                    await self._account_passkeys(cur, user_id),
+                    await way_past_passkeys(
+                        current,
+                        lambda: self._account_passkeys(cur, user_id),
+                        totp_counts=totp_counts,
+                    ),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,

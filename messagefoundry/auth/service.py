@@ -15518,9 +15518,8 @@ class AuthService:
         not parse is no exception and a set that fails its seal is reported. Such a set counts for
         nothing, and so does one with a cell the driver cannot decode while fetching
         (:func:`passkey_cell_undecodable`), as the census counts it. Any other read error raises,
-        before the hash. Where the TOTP counts, the store's write still reads the set under its
-        lock, after the hash, so a row that does not parse or a cell that cannot be decoded raises
-        there."""
+        before the hash. Where the TOTP counts, the store's write confirms it under its lock and
+        reads no passkey (:func:`~messagefoundry.store.store.way_past_passkeys`)."""
         judged = await judge_totp(self._store.open_totp_secret, _opened_totp_state, user)
         if judged.state != "refused":
             return

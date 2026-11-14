@@ -2678,3 +2678,89 @@ async def test_a_passkey_set_that_fails_its_seal_is_reported_by_the_rotation(
         assert reported == expected
     finally:
         await store.close()
+
+
+# --- a TOTP that counts under the lock spares the write's passkey read (BACKLOG #3948 step 7) ----
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["plain", "keyed"])
+@pytest.mark.parametrize(
+    "transports", ["not json", b"\xff", None], ids=["malformed", "undecodable", "control"]
+)
+async def test_a_usable_totp_rotates_beside_a_passkey_set_that_cannot_be_read(
+    transports: str | bytes | None, keyed: bool, tmp_path: Path
+) -> None:
+    """A covered account with a usable TOTP and a passkey row that does not parse, or a cell
+    sqlite3 cannot decode: ``change_password`` lands, with one argon2 hash. The TOTP counts on the
+    row the write locks, so the write reads no passkey; on a keyed store the user seal does not
+    cover the passkey rows, so the seal changes nothing. The control: the intact set rotates too.
+    RED when: the store's write reads the set before judging the TOTP, which raises after the
+    hash."""
+    from messagefoundry.store.crypto import generate_key, make_cipher
+
+    cipher = make_cipher(generate_key(), write_v2=True) if keyed else None
+    store = await MessageStore.open(tmp_path / "s.db", cipher=cipher)
+    try:
+        assert (store.row_sealer() is not None) is keyed
+        service, identity, hashes = await _passkey_owner_counting_hashes(store, totp=_USABLE_TOTP)
+        if transports is not None:
+            await _corrupt_passkey_rows(store, identity.user_id, transports)
+        before = await _password_hash(store, identity.user_id)
+        assert await service.change_password(identity, _NEW_PASSWORD) == []
+        assert hashes == [1]
+        assert await _password_hash(store, identity.user_id) != before
+    finally:
+        await store.close()
+
+
+async def test_the_way_past_read_falls_back_to_the_passkeys_when_the_totp_moved(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``way_past_passkeys`` on the locked record: a usable judgement of the cell the row holds
+    reads no passkey; one of a cell the row no longer holds counts for nothing, so the set is read,
+    and a set that does not parse is empty, warned with the account and the failure's class only.
+    ``drop_totp`` reads only where the TOTP counts, since only then do passkeys decide the
+    removal. Any other read error raises. RED when: a moved TOTP is trusted, a removal of a TOTP
+    that counts skips the read, or the catch widens past a decode failure."""
+    from messagefoundry.store.store import TotpJudgement, way_past_passkeys
+
+    store = await MessageStore.open(":memory:")
+    try:
+        _, identity, _ = await _passkey_owner_counting_hashes(store, totp=_USABLE_TOTP)
+        record = await store._read_user_record(identity.user_id)
+        assert record is not None and record.row.totp_enabled
+        held = TotpJudgement(cell=record.row.totp_secret, state="usable")
+        moved = TotpJudgement(cell="another cell", state="usable")
+        reads: list[str] = []
+
+        async def malformed() -> Any:
+            reads.append("read")
+            raise PasskeyRowMalformed("JSONDecodeError")
+
+        assert await way_past_passkeys(record, malformed, totp_counts=held) == []
+        assert reads == [], "a TOTP that counts still read the passkeys"
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+            assert await way_past_passkeys(record, malformed, totp_counts=moved) == []
+            assert (
+                await way_past_passkeys(record, malformed, totp_counts=held, drop_totp=True) == []
+            )
+        assert reads == ["read", "read"]
+        assert await way_past_passkeys(record, malformed, totp_counts=moved, drop_totp=True) == []
+        assert reads == ["read", "read"], "a removal of a TOTP that does not count read the set"
+        warned = [r.getMessage() for r in caplog.records if "could not be read" in r.getMessage()]
+        assert (
+            warned
+            == [
+                f"the passkeys of user {identity.user_id} could not be read (PasskeyRowMalformed); it"
+                " counts as no way past the sign-in lock"
+            ]
+            * 2
+        ), warned
+
+        async def locked() -> Any:
+            raise sqlite3.OperationalError("database is locked")
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            await way_past_passkeys(record, locked, totp_counts=moved)
+    finally:
+        await store.close()

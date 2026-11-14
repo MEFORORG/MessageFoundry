@@ -136,6 +136,7 @@ async def _assert_lockout_contract(store: Any, *, corrupt_passkeys: PasskeyCorru
     """The behaviour every backend owes ``increment_login_failure`` and the lockout writers.
     ``corrupt_passkeys`` drives the unreadable-passkey arm, which needs raw SQL on each backend."""
     await _assert_an_unreadable_passkey_set_counts_at_the_fixed_length(store, corrupt_passkeys)
+    await _assert_unreadable_passkeys_beside_a_totp(store, corrupt_passkeys)
     await _assert_single_counter_policy(store)
     await _assert_escalation(store)
     await _assert_passkey_escalates_the_sign_in_lock(store)
@@ -481,6 +482,75 @@ async def _assert_an_unreadable_passkey_set_counts_at_the_fixed_length(
         assert seen == expected_fixed, f"{case}: an unreadable passkey set escalated the lock"
         await store.delete_all_webauthn_credentials(user_id)
         await store.delete_user(user_id)
+
+
+async def _assert_unreadable_passkeys_beside_a_totp(
+    store: Any, corrupt_passkeys: PasskeyCorrupters
+) -> None:
+    """BACKLOG #3948 step 7, on every backend: the conditional writes read the passkey set only
+    where the TOTP on the locked row does not already count, and a set that cannot be read, at
+    fetch or at parse time, counts as no way past rather than raising.
+
+    Beside a usable TOTP, the rotation and the removal of the unreadable passkey land, with no
+    passkey read. ``disable_totp`` takes the TOTP away, so it reads the set, and with only an
+    unreadable passkey left it is refused. Beside a refused TOTP the rotation and the removal fall
+    back to the read, and are refused. RED when: a conditional write reads the set before judging
+    the TOTP (the usable arms raise), or a read failure escapes (the other arms raise)."""
+    from tests._webauthn_store_contract import _cred
+
+    def rotate(user_id: str) -> Awaitable[bool]:
+        return store.set_password(
+            user_id,
+            password_hash="h-chosen",
+            password_generated=False,
+            must_change_password=False,
+            require_way_past=_opened_totp_state,
+        )
+
+    for case, corrupt in corrupt_passkeys.items():
+        for secret in ("JBSWY3DPEHPK3PXP", _REFUSED_A):
+            usable = secret != _REFUSED_A
+            user_id = f"rot-bad-{case}-{'usable' if usable else 'refused'}"
+            pk = credential_id_hash(user_id.encode())
+            await store.create_user(
+                user_id=user_id,
+                username=user_id,
+                auth_provider="local",
+                password_hash="h-issued",
+                now=1.0,
+                password_generated=False,
+                audits=(),
+            )
+            staged = await store.set_totp_secret(user_id, secret=secret, now=2.0)
+            assert await store.enable_totp(
+                user_id, expected_secret_cell=staged, recovery_code_hashes=[], now=2.0
+            )
+            # Discoverable: read cleanly it would be a way past, so a corruption that did not land
+            # lets the disable through and fails the arm.
+            await store.add_webauthn_credential(
+                _cred(user_id, "resident", id_hash=pk, rp_id="t", discoverable=True)
+            )
+            await corrupt(user_id)
+
+            assert await rotate(user_id) is usable, f"{case}: the rotation beside {secret}"
+            user = await store.get_user(user_id)
+            assert user is not None
+            assert user.password_hash == ("h-chosen" if usable else "h-issued"), case
+            if usable:
+                assert not await store.disable_totp(
+                    user_id, now=3.0, require_way_past=_opened_totp_state
+                ), f"{case}: the TOTP went with only an unreadable passkey left"
+                user = await store.get_user(user_id)
+                assert user is not None and user.totp_enabled, case
+            # A keyed store's passkey write checks the set against its seal before it deletes, so
+            # there the usable arm never reaches the delete; the refused arm is declined before it.
+            if not usable or store.row_sealer() is None:
+                removed = await store.delete_webauthn_credential(
+                    user_id, pk, require_way_past=_opened_totp_state
+                )
+                assert removed is usable, f"{case}: the removal beside {secret}"
+            await store.delete_all_webauthn_credentials(user_id)
+            await store.delete_user(user_id)
 
 
 async def _assert_counters_stay_apart_and_clear(store: Any) -> None:
