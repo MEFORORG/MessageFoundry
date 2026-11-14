@@ -57,12 +57,12 @@ x-ha-engine-env: &ha-engine-env
   MEFOR_STORE_USERNAME: "mefor"
   MEFOR_STORE_POOL_SIZE: "40"         # default (ADR 0062); >= 2 required under [cluster]
   MEFOR_CLUSTER_ENABLED: "true"
-  # DEV-ONLY: the local Postgres has no CA-trusted cert, so verification can't succeed here. This
-  # escape has no effect at [security].enforcement = enforce, the default, and nothing in this file
-  # sets warn. At warn it permits a weakened hop that would otherwise be refused, the store's
-  # trust_server_certificate = true or encrypt = false among them (neither is set here). It does not
-  # reach every transport: docs/DEPLOYMENT.md, "The MEFOR_ALLOW_INSECURE_TLS escape hatch", lists the
-  # hops it reaches. It is a dev / trusted-lab switch and must NEVER be set in a real deployment.
+  # DEV-ONLY: the local Postgres below has no TLS set up, so a verified store hop can't succeed here.
+  # This escape has no effect at [security].enforcement = enforce, the default, and nothing in this
+  # file sets warn, so as shipped this line changes nothing. At warn, serve would accept the store's
+  # trust_server_certificate = true or encrypt = false (neither is set here). It does not reach every
+  # transport: docs/DEPLOYMENT.md, "The MEFOR_ALLOW_INSECURE_TLS escape hatch", lists hops it reaches,
+  # as an at-least list. It is a dev / trusted-lab switch and must NEVER be set in a real deployment.
   # Give a managed Postgres a CA-trusted cert and remove this line.
   MEFOR_ALLOW_INSECURE_TLS: "1"
   # DEV-ONLY: the local Postgres image makes POSTGRES_USER a SUPERUSER, and the engines log in as it.

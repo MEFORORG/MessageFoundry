@@ -610,9 +610,10 @@ Two other shapes were weighed and not built:
    [matrix](#channel--tls-posture-matrix)). Per-connection, the only
    honest way across is `cleartext_accepted = true` + `cleartext_reason` (ADR 0153: warn + audit at every
    construction, listed by `messagefoundry check` and `GET /security/posture`). Do **not** set
-   `MEFOR_ALLOW_INSECURE_TLS` in production. The cleartext-hop authority no longer reads it, but at
-   least cleartext SMTP on an Email or Direct destination (`use_tls = false`) still does, and elsewhere
-   it weakens verification (see [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
+   `MEFOR_ALLOW_INSECURE_TLS` in production. It is not only a verification switch: on an instance at
+   `warn` it still permits at least cleartext SMTP on an Email or Direct outbound connection
+   (`use_tls = false`) and a store or DATABASE hop with `encrypt = false`, beside the verify-off hops
+   (see [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
    **At least two hops can still cross outside that refusal** and need a deliberate decision from you: a
    `dialect='generic'` DATABASE hop, outbound or a `DatabasePoll` inbound (driver-owned TLS: once a mode outside the no-TLS deny-list is set, the engine neither enforces nor verifies it) and a Direct destination
    with `use_tls=false` — see the exceptions under the [matrix](#channel--tls-posture-matrix).
@@ -824,8 +825,10 @@ engine will not always refuse them for you:
   ODBC Driver for SQL Server), under the driver's registered name, and treat it as
   a deployment requirement rather than a default.
 - **Direct (S/MIME) with `use_tls = false`** — the message body is S/MIME signed and encrypted, but the
-  SMTP session (envelope metadata, recipients) is cleartext. This path is gated by the raw
-  `MEFOR_ALLOW_INSECURE_TLS` escape only; `[security].enforcement` does not clamp it.
+  SMTP session (envelope metadata, recipients) is cleartext. This path is gated by the
+  `MEFOR_ALLOW_INSECURE_TLS` escape only, read through the clamp, so it is refused at
+  `[security].enforcement = enforce` and no per-hop declaration lifts it. CORRECTED 2026-11-14: this
+  read *"`[security].enforcement` does not clamp it"*, stale since #323.
 
 **Deployment requirement:** run these on **loopback only**, or behind a **TLS-terminating proxy / on a
 trusted, isolated network segment**. If PHI flows over one of them off-host without that protection, it
@@ -852,7 +855,7 @@ that rule does not reach yet. The rule and those hops are stated once in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
 Each bullet below releases a hop with no credential, unless it says otherwise.
 
-With `MEFOR_ALLOW_INSECURE_TLS` set, these otherwise-refused settings become permitted (each logs a
+With `MEFOR_ALLOW_INSECURE_TLS` set, at least these otherwise-refused settings become permitted (each logs a
 loud warning):
 
 - REST/SOAP/FHIR/DICOMweb `verify_tls = false`. *(Clamped. A static header off the verify-off
@@ -863,11 +866,18 @@ loud warning):
   database login, and the credential rule does not reach them yet.)*
 - RemoteFile SFTP: accepting an unknown host key on a login with no `password`. *(Clamped since
   #329.)*
-- Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Clamped, read directly
-  rather than through the authority. CORRECTED 2026-10-13: this read *Not clamped*.)*
+- Cleartext SMTP submission on a **Direct** (S/MIME) destination, and its `tls_verify = false`.
+  *(Clamped, read directly rather than through the authority. CORRECTED 2026-10-13: this read *Not
+  clamped*.)*
+- **Email** destination `use_tls = false` and `tls_verify = false`. *(Clamped. On `use_tls = false`
+  it is one of three ways past the first check, beside the connection's `tls_hop_attested` and
+  `cleartext_accepted`, and the cleartext-hop authority then decides the hop.)*
+- An SMTP login on either crosses neither: it is refused first, whatever is set.
 - The non-connection cells, which have no per-hop `cleartext_accepted` declaration: the `[logging]`
   syslog/SIEM forwarder (it does have `[logging].forward_hop_attested`, the claim that the hop is secure
-  by other means) and the API PHI-read serve hop.
+  by other means, which clears the hop decision but not the off-box forwarding gate of BACKLOG #1966:
+  under `enforce` `serve` still refuses a forwarder without verified TLS to a separate collector) and
+  the API PHI-read serve hop.
   *(Both clamped. LDAPS was on this list until vault BACKLOG #3230 made
   `ad_tls_verify = false` a refusal with no escape. The AI-broker endpoint was on it until vault
   BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`. The

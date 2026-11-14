@@ -1748,7 +1748,9 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > **`data_class` is no longer read here** — a `synthetic` label used to allow every cleartext hop
 > silently, which made a typo in one file indistinguishable from a deliberate declaration, with every
 > transport hop in the product as its blast radius. `MEFOR_ALLOW_INSECURE_TLS` no longer influences this
-> decision either; it survives for the non-connection cells that have nowhere to carry a declaration.
+> decision either. It survives at least for the non-connection cells, which have no per-hop
+> `cleartext_accepted`, and for cleartext SMTP on an Email or Direct outbound connection; the
+> [escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) lists hops it reaches.
 
 #### A forward proxy must not re-frame what it carries
 
@@ -2112,7 +2114,7 @@ path, no git commit and no message content.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `webhook_url` | str | _unset_ | enable the **webhook** transport: HTTP `POST` the event as JSON here (fronts Slack/Teams/PagerDuty/custom inbound webhooks). **Must be `https`.** Any other scheme, `http` included, refuses the start when `serve` builds the alert notifier, at every posture and with no escape; an `http` URL is refused because a path token in it would cross in the clear (vault BACKLOG #3533 item 5). Settings load and `messagefoundry check` do not check the scheme yet. |
+| `webhook_url` | str | _unset_ | enable the **webhook** transport: HTTP `POST` the event as JSON here (fronts Slack/Teams/PagerDuty/custom inbound webhooks). **Must be `https`**: no other scheme builds, and [the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says when an `http` URL is refused. Settings load and `messagefoundry check` do not check the scheme yet. |
 | `webhook_timeout` | num | 10 | seconds per POST |
 | `webhook_allowed_hosts` | list | `[]` | egress allowlist for the webhook host (`[]` = any); SSRF defense (ASVS 15.3.2/1.3.6) |
 | `webhook_tls_revocation_attested` | bool | `false` | attests that revocation of the **webhook host's** certificate is covered outside the engine (BACKLOG #2193, owner ruling 2026-10-27, on the pattern of ADR 0173 section 12). The POST carries the webhook's path token over https the engine verifies, and its handshake checks no CRL and no OCSP. So under `[security].enforcement = enforce` an https `webhook_url` whose host is off the box is **refused** when `serve` builds the alert notifier unless this is `true`; under `warn` it builds with a WARNING. A host off a non-empty `webhook_allowed_hosts` is refused at the build, at every posture and before this guard. **It is the only way across:** the webhook dials through one shared opener, so `[tls].crl_file` cannot reach it, and the process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not cross an enforcing hop. Setting it adds no check on the wire, and it never lifts the cleartext `http` refusal. A loosening, named as `alerts.webhook_tls_revocation_attested`; an attested crossing on an enforcing posture, or with none known, logs a WARNING with the reason. Env: `MEFOR_ALERTS_WEBHOOK_TLS_REVOCATION_ATTESTED` |
