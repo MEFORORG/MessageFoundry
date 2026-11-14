@@ -725,7 +725,9 @@ def strip_markup(data: str) -> str:
 # Tag and attribute names are case-insensitive in HTML, so ``<SPAN CLASS='keyword'>`` is a span too.
 # Matched case-sensitively it fell out of the role layer into the flat reading, which applies neither
 # the handle gate nor the write gates (BACKLOG #5556). ASCII only, as HTML folds case: without
-# ``re.ASCII`` a long s or a Kelvin sign would fold into ``span`` or a class name.
+# ``re.ASCII`` a long s or a Kelvin sign would fold into ``span`` or a class name. It narrows ``\s``
+# to ASCII whitespace too, so a span spaced with a no-break space is unread markup: its send is
+# refused and its write is not mapped, which fails closed.
 _SPAN_OPEN = re.compile(r"<span\s+class=['\"]([A-Za-z-]+)['\"]\s*>", re.IGNORECASE | re.ASCII)
 _SPAN_CLOSE = re.compile(r"</span\s*>", re.IGNORECASE | re.ASCII)
 
@@ -776,8 +778,10 @@ def parse_roles(data: str) -> tuple[RoleToken, ...]:
     is tolerant by design: an unbalanced ``</span>`` simply pops to the enclosing role rather than
     raising, because the export is untrusted data.
 
-    Returns ``()`` when the value carries no recognizable span at all, which is the caller's signal to
-    fall back to the flat :func:`tokenize_statement` path (a synthetic or markup-free export)."""
+    Returns ``()`` when the value carries no recognizable span at all. In plain text that is the
+    caller's signal to fall back to the flat :func:`tokenize_statement` path (a synthetic export).
+    In rich text it is not: :func:`_unread_markup` decides, and such a statement never takes the
+    flat reading's write or send (BACKLOG #5556)."""
     tokens: list[RoleToken] = []
     stack: list[str] = []
     saw_span = False
@@ -968,7 +972,7 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
         tokens = parse_roles(data) if data else ()
         if _label_statement(elem):
             return frozenset(), frozenset()  # see the docstring: nothing is held
-        if data and _unread_markup(data, tokens) and _local(elem.tag).lower() == "line":
+        if _local(elem.tag).lower() == "line" and data and _unread_markup(data, tokens):
             # A send or a clone in markup the role layer does not read, which the render refuses
             # or leaves unmapped: which tree it sends or overwrites is not known (BACKLOG #5556).
             verb = _split_verb(strip_markup(data))[0]
@@ -978,7 +982,7 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
                 return frozenset(), frozenset()
             continue
         if not tokens:
-            continue  # markup-free: no handle roles to learn from
+            continue  # plain text, or unread markup off a Line: no handle roles to learn from
         inputs.update(t.text for t in tokens if t.source_class == "input-handle")
         # Every live element's handles count, an unmodelled tag included. Past the rule above, a
         # root copy or a send can only sit on a ``<Line>``.
@@ -1112,21 +1116,21 @@ _STATEMENT_VERBS = frozenset(
 )
 # What the marker says for such a statement (:func:`_label_marker`), ahead of the statement itself.
 # Kept short: the two share one 200-character comment. It says "role-marked" because the scan
-# reads handles from role markup alone: a markup-free write or send on a ``<Line>`` of such a list
+# reads handles from role markup alone: a plain-text write or send on a ``<Line>`` of such a list
 # names no handle the scan can read, and still renders as it does in any other list.
 _LABEL_STATEMENT_WHY = (
     "not on a Line, so it may never have run; nothing is mapped and no role-marked handle here "
     "is taken to be msg"
 )
+# The tail every refused ``MsgSend`` ends with, whichever cause it names.
+_REFUSES_MSG = "the import refuses to send msg in its place"
 # Why a ``MsgSend`` in a Block's or a Call's ``@Data`` is refused, whatever it names. It is the
 # one statement off a ``<Line>`` that is not marked with a comment alone. main renders it where it
 # sits: as a delivery, as a refusal that raises, or as a bare TODO when it names no destination and
 # is not refused. A comment in place of the refusal would leave a handler that returns nothing, so
 # the message would be FILTERED where main sent it to ERROR. The head must never be quieter than
 # main (ADR 0086 §2(b.4)), so it raises here wherever main renders the send at all.
-_LABEL_SEND_REFUSAL = (
-    f"MsgSend is {_LABEL_STATEMENT_WHY}; the import refuses to send msg in its place"
-)
+_LABEL_SEND_REFUSAL = f"MsgSend is {_LABEL_STATEMENT_WHY}; {_REFUSES_MSG}"
 # Why a statement on a ``<Line>`` in markup the role layer does not read (:func:`_unread_markup`) is
 # not mapped, and why such a ``MsgSend`` is refused: nothing in it says which handle it writes or
 # sends, so it is treated as :func:`_send_refusal` treats a role-parsed send of a handle it cannot
@@ -1136,7 +1140,6 @@ _UNREAD_MARKUP_WHY = (
     "marked up in a form this import does not read, so it names no message handle this import "
     "can identify as msg"
 )
-_REFUSES_MSG = "the import refuses to send msg in its place"
 _UNREAD_MARKUP_SEND_REFUSAL = f"MsgSend is {_UNREAD_MARKUP_WHY}; {_REFUSES_MSG}"
 
 # Kinds that continue an enclosing construct instead of standing alone, and what may adopt them.
@@ -1829,8 +1832,9 @@ def _parse_statement(
     data = _attr(elem, "Data")
     statement = strip_markup(data)
     note = strip_markup(_attr(elem, "Comment"))
-    # The role layer is the primary reading; the flat tokenizer stays the fallback for a markup-free
-    # export (the superseded synthetic model, and any exporter that writes plain @Data).
+    # The role layer is the primary reading; the flat tokenizer stays the fallback for a plain-text
+    # export (the superseded synthetic model, and any exporter that writes plain @Data). Rich text
+    # with no span it reads takes neither the flat write nor the flat send (:func:`_unread_markup`).
     roles = parse_roles(data)
     flat_verb, operands = _split_verb(statement)
     # Unspanned runs and ``detail`` spans are NOT inert decoration: measured against the export they
@@ -2593,7 +2597,7 @@ class _Binder:
             refusal = (
                 f"MsgSend delivers {handle}, which at this point holds no message this import can "
                 "identify (it is not the input handle, nor bound by a clone or a MsgCreate before "
-                "this send); the import refuses to send msg in its place"
+                f"this send); {_REFUSES_MSG}"
             )
             return Control("send", st.verb, st.text, args=args, refusal=refusal)
         self._sent.add(local)

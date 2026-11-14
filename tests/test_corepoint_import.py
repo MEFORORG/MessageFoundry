@@ -892,7 +892,7 @@ def test_parse_roles_is_linear_on_a_run_of_one_span_kind(unit: str) -> None:
     _assert_linear_with_control(_old_parse_roles, parse_roles, unit)
 
 
-def test_markup_stripped_statements_classify_in_the_fixture() -> None:
+def test_the_fixtures_flat_writes_reach_the_vocabulary() -> None:
     """Every flat field write in the fixture reaches the vocabulary. They are plain text: a write in
     markup the role layer does not read is never mapped (BACKLOG #5556), and the strip itself is
     pinned by :func:`test_strip_markup_recovers_the_verb`."""
@@ -2773,10 +2773,11 @@ def test_every_statement_is_accounted_for(tmp_path: Path) -> None:
     """Count-and-log: mapped + unmapped + disabled covers the fixture, nothing silently vanishes."""
     result = import_corepoint(FIXTURES / "acme_adt_package.xml", tmp_path)
     summary = result.to_json()
-    # 3 vocabulary calls from the flat list + 3 from the role list + 14 control constructs.
+    # 9 vocabulary calls + 8 control constructs (for, break, if, elif, else, try, except, call)
+    # from the flat list, + 3 vocabulary calls from the role list.
     assert summary["total_mapped"] == 20
-    # 3 from the flat list + its MsgSend, refused (BACKLOG #5556) + 5 role statements the guards
-    # correctly refuse to map.
+    # 3 unmapped verbs from the flat list + its MsgSend, refused (BACKLOG #5556) + 5 role statements
+    # the guards correctly refuse to map.
     assert summary["total_unmapped"] == 9
     assert summary["total_disabled"] == 1
     # The whole fixture is accounted for: every source element lands in exactly one bucket.

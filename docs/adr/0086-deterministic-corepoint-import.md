@@ -947,8 +947,9 @@ At least these limits remain:
 ### AC-6 (amendment, 2026-07-24 — the validated XML layer)
 
 - **AC-6a (markup)** — a markup-wrapped `@Data` SHALL yield its plain statement, and the fixture's
-  wrapped statements SHALL classify into vocabulary calls.
-  → `::test_strip_markup_recovers_the_verb`, `::test_markup_stripped_statements_classify_in_the_fixture`
+  flat writes SHALL classify into vocabulary calls. *Amended 2026-11-14 (BACKLOG #5556):* those
+  writes are plain text, since a write in markup the role layer reads no span in is never mapped.
+  → `::test_strip_markup_recovers_the_verb`, `::test_the_fixtures_flat_writes_reach_the_vocabulary`
 - **AC-6b (`<Block>`)** — a `<Block>` SHALL emit a comment with its body inline, never an action.
   → `::test_block_becomes_a_comment_never_an_action`
 - **AC-6c (`@Disabled`)** — a `@Disabled` subtree SHALL be preserved as a comment, never emitted as
