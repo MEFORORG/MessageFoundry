@@ -1,13 +1,18 @@
-# The anon.toml overlay for samples/messages/hapi-hl7v2/batch_18_messages.txt (BACKLOG #2645).
+# The anon.toml overlay for samples/messages/hapi-hl7v2/batch_18_messages.txt (BACKLOG #2645, #5557).
 #
-# That corpus was de-identified with DEFAULT_RULES plus a hand-written overlay. The overlay was
-# never committed, so the next person had to work it out again (BACKLOG #331, Proposed 4). Most of
-# its fields are now default rules in messagefoundry_toolkit/anon/rules.py. This file holds the ones that
-# are NOT defaults, and says why.
+# That corpus was first de-identified with DEFAULT_RULES plus a hand-written overlay. The overlay
+# was never committed, so the next person had to work it out again (BACKLOG #331, Proposed 4).
+# Most of its fields are now default rules in messagefoundry_toolkit/anon/rules.py.
 #
-# These kinds are RE-DERIVED, not recovered. They come from the field list in
-# samples/messages/hapi-hl7v2/README.md and from the shape of each surrogate in the committed
-# corpus. The corpus was scrubbed with a salt nobody recorded, so this file does not reproduce it.
+# The first pass left identifiers behind: fields no rule mapped, and fields that became default
+# rules only after it ran (BACKLOG #5557). So the corpus was scrubbed again, by DEFAULT_RULES plus
+# THIS file, over every message. This file is now the record of that final pass. It holds the
+# fields this corpus scrubs that are NOT defaults, says why each is not one, and lists under [hl7]
+# keep every other field the leak-check walks, each decided as safe to leave. So no field it walks
+# is undecided, and tests/test_anon_hapi_samples.py holds the corpus to that. The leak-check does
+# not walk the MSH header, so no MSH field is scrubbed or listed here.
+#
+# The salt of either pass was not recorded, so nothing here reproduces the committed surrogates.
 #
 # Use it with:  anonymize_checked(raw, salt=..., rules=load_rules(Path("tests/fixtures/anon/batch_18.anon.toml")))
 
@@ -26,3 +31,66 @@
 "DST-9" = "dob"
 "DST-27" = "id"
 "DST-35" = "address"
+
+# The order and accession numbers. ADR 0030 leaves ORC-2/3 and OBR-2/3 unmapped by default and names
+# that among the reasons a default run is not Safe Harbor, because a feed's correlation tests can
+# rely on them. This corpus has no such test, so it scrubs them. OBR-20, a filler field, holds an
+# accession-shaped number here. The same number in ORC-2 and OBR-2 keeps one surrogate, because a
+# surrogate is keyed on the value.
+"ORC-2" = "id"
+"ORC-3" = "id"
+"OBR-2" = "id"
+"OBR-3" = "id"
+"OBR-20" = "id"
+
+# Entered-by and verified-by. Here they hold operator logins. No default maps them yet: a default
+# is a decision for every feed, and this file is about one corpus.
+"ORC-10" = "provider"
+"ORC-11" = "provider"
+
+# The insured's group number, group name and group employer id. The defaults map the company's
+# contact, address and phone, not the group's own values.
+"IN1-8" = "id"
+"IN1-9" = "freetext"
+"IN1-10" = "id"
+
+# QRD is the HL7 2.1 query segment, rare in a live feed. Here QRD-4 is the query id, QRD-8 the
+# subject's name and QRD-11 an identifier-shaped qualifier.
+"QRD-4" = "id"
+"QRD-8" = "name"
+"QRD-11" = "id"
+
+[hl7]
+# Every other field this corpus carries, reviewed and left intact. A keep makes a field decided;
+# the leak-check still scans it for PHI shapes. A keep rewrites nothing.
+keep = [
+    # Codes, flags and amounts: the table-coded values a router or validator reads.
+    "EVN-1", "MSA-1", "NK1-3", "ORC-1", "ORC-6",
+    "PID-10", "PID-16", "PID-17",
+    "PV1-10", "PV1-14", "PV1-18", "PV1-20", "PV1-36", "PV1-39", "PV1-40", "PV1-41",
+    "GT1-9", "GT1-11", "GT1-20",
+    "IN1-2", "IN1-3", "IN1-15", "IN1-17",
+    "IN1-33", "IN1-34", "IN1-37", "IN1-38", "IN1-39", "IN1-40", "IN1-41", "IN1-42", "IN1-43",
+    "DST-6", "DST-8", "DST-24", "DST-25", "DST-28", "DST-29", "DST-30", "DST-31", "DST-32",
+    "DST-33", "DST-34",
+    "QRD-2", "QRD-3", "QRD-7", "QRD-9", "QRD-10", "QRD-12",
+    # The coded clinical order content, which ADR 0030 keeps: the service, its section, priority,
+    # transport mode and reason.
+    "OBR-4", "OBR-24", "OBR-25", "OBR-30", "OBR-31",
+    # Values that are only a placeholder here: MSA-2 is the literal msgCtrlId, IN1-14 and DST-5
+    # hold N/A or a run of zeros, DST-1 holds zeros, and GT1-4 and DST-10 hold only separators.
+    "MSA-2", "IN1-14", "DST-5", "DST-1", "GT1-4", "DST-10",
+    # Times. QRD-1 is the query time, a second from MSH-7, which ADR 0030 keeps for correlation.
+    # ORC-7's quantity and timing repeats the requested time, and no kind rewrites one component
+    # of it, so OBR-6 is kept with it. ADR 0030 names such unmapped dates among the reasons a run
+    # is not Safe Harbor.
+    "QRD-1", "ORC-7", "OBR-6",
+    # The first message's first OBR line carries five OBX segments run onto it with no segment
+    # break, a malformation the corpus keeps on purpose. These addresses are that text: each OBX's
+    # leading space and id, value type, code, set id and test narrative.
+    "OBR-36", "OBR-38", "OBR-39", "OBR-40", "OBR-41",
+    "OBR-42", "OBR-44", "OBR-45", "OBR-46", "OBR-47",
+    "OBR-48", "OBR-50", "OBR-51", "OBR-52", "OBR-53",
+    "OBR-54", "OBR-56", "OBR-57", "OBR-58", "OBR-59",
+    "OBR-60", "OBR-62", "OBR-63", "OBR-64", "OBR-65",
+]
