@@ -284,13 +284,15 @@ dicom = ["pynetdicom==3.0.4", "pydicom>=3.0.2,<3.1"]
 # tests/test_x12_validate.py fail on the ubuntu, windows-2022 and windows-2025 test legs (PR 2946):
 # test_sender_separators_cannot_forge_the_acks_st_segment,
 # test_sender_text_cannot_forge_the_closing_iea_of_a_fragment and
-# test_pyx12_itself_logs_the_value_when_unmuted. In each, the failing assertion is the positive
-# control that pyx12 4.0.1's own behaviour is present: it echoes sender separators unescaped into
-# the ack, and it logs the raw value. The CI log shows 4.1.0 escaping the separator and no longer
-# logging the value. The engine's own assertions in those tests did not fail. Move the pin only after
-# re-measuring at least those three against the new release, re-deriving their controls, and
-# re-reading what parsing/x12/validate.py assumes of pyx12. That is separate work. Move the pyx12
-# entry in .github/dependabot.yml's uv ignore list in the same PR.
+# test_pyx12_itself_logs_the_value_when_unmuted. In each, the assertion that fails is a positive
+# control that a 4.0.1 defect is present: sender values echoed unescaped into the ack, and the raw
+# value logged. pytest stops at that assertion, so the engine's own assertions after it have not run
+# on 4.1.0. 4.1.0 is upstream's security release for those defects (its release notes: ack values
+# escaped, no data values in pyx12's log records, the HTML report escaped), with breaking changes of
+# its own. So this pin holds back an upstream security fix, and lifting it is security work: re-derive
+# at least those three tests' controls, run the engine's assertions, read 4.1.0's breaking changes
+# against parsing/x12/, and move the pyx12 entry in .github/dependabot.yml's uv ignore list in the
+# same PR.
 x12 = ["pyx12==4.0.1"]
 # Optional XML/SOAP message accessor + schema validation + signature for parsing/xml/ (BACKLOG #31).
 # Lazy-imported, so installs that never touch XML skip it. lxml is the hardened XPath/serialize engine

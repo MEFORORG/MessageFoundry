@@ -187,8 +187,10 @@ updates:
         versions: [">=6.12.0"]
       # Why: the comment above the [x12] extra in pyproject.toml. A 4.0.x patch release still gets
       # a PR. tests/test_x12_validate.py reds it if it changes the pyx12 behaviour that comment
-      # names, including a patch that fixes that behaviour. This range also withholds the security
-      # track from 4.1.0 on, the release that changed it; pip-audit still sees an advisory.
+      # names, including a patch that backports 4.1.0's fix. This range also withholds the
+      # security track from 4.1.0 on, and 4.1.0 is itself a security release. The TRADE-OFF note's
+      # detection premise does NOT hold for this entry: OSV listed no advisory against pyx12 4.0.1
+      # on 2026-11-14, so pip-audit has nothing to red on.
       - dependency-name: "pyx12"
         versions: [">=4.1.0"]
     groups:
