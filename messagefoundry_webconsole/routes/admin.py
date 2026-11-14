@@ -265,19 +265,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         already issued and must still be rendered, so a refusal or a store failure never replaces
         the page with an error (BACKLOG #5559). Each fallback logs a WARNING naming the account; a
         seal failure is also reported by the read itself. A defect still raises."""
-        failures: tuple[type[Exception], ...] = (*account_read_errors(), AttributeError)
         try:
             user = await _checked(user_id, service)
-            # Inside the try: the seam digest records no record attribute, so a skewed engine's
-            # record falls back to the id here rather than losing the issued credential.
-            return str(user.username)
         except HTTPException as exc:
             # 404 gone since the action, 423 a record that fails its seal, 503 a Vault Outage.
             reason = f"answered {exc.status_code}"
-        except failures as exc:
+        except account_read_errors() as exc:
             if isinstance(exc, AUDIT_WRITE_DEFECTS):
                 raise
             reason = f"failed ({type(exc).__name__})"
+        else:
+            return str(user.username)
         _log.warning(
             "the name of account %s for a page after a landed action was not shown: its checked "
             "read %s; the page names the account by id",
