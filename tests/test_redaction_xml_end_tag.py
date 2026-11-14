@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5925: text inside a vocabulary element's malformed end tag no longer prints.
+"""BACKLOG #5925: text inside a vocabulary element's malformed end tag is masked where the XML pass sees it.
 
 The XML element walk copied an end tag's remainder -- everything after the tag's name up to the next
 ``<`` or ``>`` -- into the output as it stood. So a synthetic value inside an end tag
@@ -132,6 +132,15 @@ def test_a_rest_a_pass_could_read_differently_stays_as_main_left_it(text: str) -
     with _main():
         main = redaction._redact_xml_elements(text)
     assert redaction._redact_xml_elements(text) == main
+
+
+def test_a_field_run_that_takes_the_end_tag_prints_the_rest_as_main_did() -> None:
+    """A STATED RESIDUAL (code review round 3): the flat passes run before the XML pass, so a field
+    run that takes the end tag's name leaves a rest no end tag owns, and it prints, as on main."""
+    text = "a|b|<family>Smith</family Zqxdoe>"
+    assert redact(text) == "[redacted] Zqxdoe>"
+    with _main():
+        assert redact(text) == "[redacted] Zqxdoe>"
 
 
 @pytest.mark.parametrize(

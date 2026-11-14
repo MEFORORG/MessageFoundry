@@ -354,6 +354,10 @@ _HOSTILE = {
     "xml-attribute-run": ("<name ", "a"),
     "xml-unquoted-attribute-run": ("<name data=", "Q"),
     "xml-child-attribute-run": ("<name>\n<b ", "a"),
+    # End tags whose rest the #5925 mask reads: inside a walked element, and outside one. A draft
+    # scanned the whole text for the credential backstop's opener once per end tag (code review).
+    "xml-malformed-end-tags": ("<name><a>b", "</b x>"),
+    "xml-stray-end-tags": ("", "</family xq "),
 }
 
 
