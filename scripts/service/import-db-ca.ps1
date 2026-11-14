@@ -9,18 +9,28 @@
 
 .DESCRIPTION
     ODBC Driver 18 (the SQL Server backend) has no connection-string CA-file keyword: it validates
-    the DB server certificate against the *machine* trust store only. When the database is fronted
-    by a private or internal CA, that CA must be present in LocalMachine\Root or the chain won't
+    the DB server certificate against the *machine* stores only. When the database is fronted by a
+    private or internal CA, that CA's root must be present in LocalMachine\Root or the chain won't
     build -- and operators are then tempted to set TrustServerCertificate=true, which disables
     validation and re-opens a man-in-the-middle path to PHI (NIST SP 800-52r2; CWE-295).
 
-    This script imports the CA into the *machine* stores (Cert:\LocalMachine\Root, and
-    Cert:\LocalMachine\CA for an issuing CA) -- not the per-user stores (Cert:\CurrentUser\...)
-    -- so the service principal (LocalSystem / a gMSA / a dedicated service account) sees it.
-    The file must hold the root: an issuing CA alone goes into LocalMachine\CA, which is not a
-    trust anchor, and the script warns that the chain will not validate unless the root is
-    already in LocalMachine\Root. It is the supported full-chain-trust path:
-    trust_server_certificate stays false and the engine validates the full chain.
+    This script imports the CA into the *machine* stores -- not the per-user stores
+    (Cert:\CurrentUser\...) -- so the service principal (LocalSystem / a gMSA / a dedicated service
+    account) sees it. It is the supported full-chain-trust path: trust_server_certificate stays
+    false and the engine validates the full chain.
+
+    Where each CA goes. This is the one statement of it; docs/DEPLOY-SERVER-DB.md section 5.2
+    repeats it for operators, and every other document points there. A self-signed root, whose
+    signature verifies under its own key, goes into LocalMachine\Root. Any other CA in the file,
+    such as an issuing CA in a .p7b chain, or a self-issued certificate another key signed, goes
+    into the intermediate store LocalMachine\CA. That store is not a trust anchor for SChannel or
+    ODBC Driver 18 chain building, so the SQL Server hop still checks the chain up to the root. It
+    IS usable as a trust anchor by the engine's Python TLS on Windows: CPython's
+    ssl.create_default_context(), which the PostgreSQL system-trust path calls, loads the CA and
+    ROOT system stores, and Python 3.13 and later set partial-chain verification, so a chain that
+    reaches a certificate in LocalMachine\CA validates there without its root. A file with no
+    self-signed root is refused, so this script never adds an issuing CA without the root it
+    chains to.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
@@ -28,11 +38,11 @@
     The file is read once. Every certificate it holds is shown, checked, and only then added, so
     nothing reaches a store that the operator was not shown. The whole file is refused, and
     nothing is imported, when any certificate in it is not marked as a CA by its basic
-    constraints, has a key usage that cannot sign certificates, or carries a private key. A .pfx
-    and a PEM private-key block are refused outright. A self-issued root goes into
-    LocalMachine\Root; any other CA in the file, such as an issuing CA in a .p7b chain, goes into
-    the intermediate store LocalMachine\CA, so it helps build the chain without becoming a trust
-    anchor itself.
+    constraints, has a key usage that cannot sign certificates, or carries a private key, when it
+    holds no self-signed root, or when any of its bytes would be left unread. At least a .pfx, and
+    a well-formed PEM block with any label but CERTIFICATE, X509 CERTIFICATE or PKCS7 (such as a
+    PRIVATE KEY block), are refused before anything is parsed. Key material outside well-formed
+    PEM armour is not looked for; no private key is ever loaded either way.
 
     Run from an elevated (Administrator) PowerShell prompt; -WhatIf needs no elevation and changes
     nothing. Idempotent: re-importing the same CA is a no-op (each store keys on thumbprint).
@@ -48,7 +58,7 @@
     .\import-db-ca.ps1 -CaPath C:\certs\internal-root-ca.crt
 
 .EXAMPLE
-    # Equivalent one-liner without this script, only for a file holding ONE self-issued root CA
+    # Equivalent one-liner without this script, only for a file holding ONE self-signed root CA
     # you have checked yourself: neither command checks that what it imports is a CA.
     Import-Certificate -FilePath C:\certs\internal-root-ca.crt -CertStoreLocation Cert:\LocalMachine\Root
     # certutil equivalent (also writes LocalMachine\Root):
@@ -69,10 +79,8 @@ $ErrorActionPreference = "Stop"
 
 # The machine stores -- NOT the per-user ones. The engine runs as a service principal
 # (LocalSystem / gMSA / dedicated account), which only reads the machine stores, so a CurrentUser
-# import would be invisible to it. A self-issued CA (a root) goes into Root, the trust anchors. Any
-# other CA, such as the issuing CA a .p7b chain carries, goes into the machine's intermediate store
-# (CA), where chain building finds it without trusting it: in Root it would end the chain itself,
-# so its root's revocation and constraints would never be checked. Each store is built unopened
+# import would be invisible to it. Which CA goes into which store, and what each store is a trust
+# anchor for, is stated once, in the help's "Where each CA goes". Each store is built unopened
 # here, and the label every prompt names is read from it, so the store the operator approves and
 # the one written cannot drift apart.
 $stores = @{}
@@ -153,13 +161,37 @@ function ConvertTo-PrintableText {
     return $out.ToString()
 }
 
+# The header of the DER element at $Offset: its tag, where its content starts, its content length,
+# and where the element ends. $null when it is not a definite-length element that fits in $Bytes.
+# Only the single-byte tags this script reads (SEQUENCE, INTEGER, BIT STRING) are handled.
+function Read-DerHeader {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes, [int]$Offset = 0)
+    if ($Offset -lt 0 -or $Offset + 2 -gt $Bytes.Length) { return $null }
+    $first = [int]$Bytes[$Offset + 1]
+    $start = $Offset + 2
+    $length = [long]$first
+    if ($first -ge 0x80) {
+        $n = $first - 0x80
+        # 0x80 is BER's indefinite length, whose end cannot be found without parsing the content.
+        if ($n -lt 1 -or $n -gt 4 -or $start + $n -gt $Bytes.Length) { return $null }
+        $length = [long]0
+        for ($k = 0; $k -lt $n; $k++) { $length = $length * 256 + $Bytes[$start + $k] }
+        $start += $n
+    }
+    $end = $start + $length
+    if ($end -gt $Bytes.Length) { return $null }
+    return @{ Tag = [int]$Bytes[$Offset]; Start = $start; Length = [int]$length; End = [int]$end }
+}
+
 # Every certificate the file holds, parsed from bytes the caller read once, so the collection
 # returned is the one shown, checked and added. A certificate or a PKCS#7 bundle (.p7b), signed or
 # not, is accepted as DER, as bare base64 of DER, or as PEM text whose blocks are all CERTIFICATE
 # (or its legacy spelling X509 CERTIFICATE) or PKCS7, in ASCII, UTF-8 or UTF-16 with a byte-order
-# mark. The PEM is parsed here because Windows PowerShell 5.1's .NET Framework has no
-# ImportFromPem, which would in any case skip a private-key block silently. A PKCS#12 (.pfx) and a
-# PEM private-key block are refused before any of it is parsed, so no private key is ever loaded:
+# mark. Every DER value must end exactly where its bytes end, and nothing but text may sit outside
+# PEM blocks, so the file is refused rather than read in part. The PEM is parsed here because
+# Windows PowerShell 5.1's .NET Framework has no ImportFromPem, which would in any case skip a
+# private-key block silently. At least a PKCS#12 (.pfx) and a well-formed PEM block with another
+# label, such as PRIVATE KEY, are refused before any of it is parsed, so no private key is loaded:
 # a key has no place in a trust-store import, and such a file is usually a server certificate
 # handed over by mistake. A certificate the file holds twice is kept once.
 function Read-CaBundle {
@@ -177,11 +209,20 @@ function Read-CaBundle {
     # so a .pfx is refused wherever it sits, before it is parsed.
     $importDer = {
         param([byte[]]$Der)
-        try {
-            $type = [System.Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($Der)
-        } catch [System.Management.Automation.MethodInvocationException] {
-            # .NET on Windows throws for content it cannot classify rather than answering Unknown.
-            $type = 'Unknown'
+        # A certificate, a PKCS#7 and a PKCS#12 are each one ASN.1 SEQUENCE, which opens with 0x30.
+        $type = 'Unknown'
+        if ($Der.Length -gt 0 -and $Der[0] -eq 0x30) {
+            $header = Read-DerHeader -Bytes $Der
+            if (-not $header -or $header.End -ne $Der.Length) {
+                throw ("The file holds DER that does not end where its bytes end: trailing bytes, " +
+                    "several values run together, or an indefinite length. Nothing is read from " +
+                    "part of a file; split it into PEM blocks or one .p7b.")
+            }
+            try {
+                $type = [System.Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($Der)
+            } catch [System.Management.Automation.MethodInvocationException] {
+                # .NET on Windows throws for content it cannot classify rather than answering Unknown.
+            }
         }
         if ($type -ne 'Cert' -and $type -ne 'Pkcs7') {
             throw ("The file holds '$type' content. Only a certificate or a .p7b chain is " +
@@ -193,19 +234,8 @@ function Read-CaBundle {
     # One DER value that spans the whole file (0x30 opens an ASN.1 SEQUENCE, then its length), so a
     # DER file whose bytes happen to spell '-----BEGIN ' is still read as DER, and a text file that
     # happens to start with '0' (also 0x30) is not.
-    $wholeDer = $false
-    if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0x30) {
-        $first = [int]$Bytes[1]
-        if ($first -lt 0x80) {
-            $wholeDer = (2 + $first) -eq $Bytes.Length
-        } elseif ($first -ge 0x81 -and $first -le 0x84 -and $Bytes.Length -ge 2 + ($first - 0x80)) {
-            $n = $first - 0x80
-            $length = [long]0
-            for ($k = 0; $k -lt $n; $k++) { $length = $length * 256 + $Bytes[2 + $k] }
-            $wholeDer = (2 + $n + $length) -eq $Bytes.Length
-        }
-    }
-    if ($wholeDer) {
+    $top = if ($Bytes[0] -eq 0x30) { Read-DerHeader -Bytes $Bytes } else { $null }
+    if ($top -and $top.End -eq $Bytes.Length) {
         & $importDer $Bytes
     } elseif ($text.Contains('-----BEGIN ')) {
         # Any armour makes a file that is not one DER value PEM, so the DER reader, which would
@@ -218,10 +248,16 @@ function Read-CaBundle {
                     "others; a private key, for one, never belongs in the trust store.")
             }
         }
-        $blocks = [regex]::Matches($text,
-            '-----BEGIN (CERTIFICATE|X509 CERTIFICATE|PKCS7)-----([A-Za-z0-9+/=\s]*)-----END \1-----')
+        $blockPattern = '-----BEGIN (CERTIFICATE|X509 CERTIFICATE|PKCS7)-----([A-Za-z0-9+/=\s]*)-----END \1-----'
+        $blocks = [regex]::Matches($text, $blockPattern)
         if ($blocks.Count -ne $labels.Count) {
             throw "The file has a PEM block that is not well formed."
+        }
+        # Text outside the blocks, such as OpenSSL's 'subject=' lines, is ignored. Binary bytes
+        # there, such as DER in front of the PEM, would be left unread, so they refuse the file.
+        if ([regex]::Replace($text, $blockPattern, '') -match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]') {
+            throw ("The file holds binary data outside its PEM blocks, such as DER run together " +
+                "with PEM. Nothing is read from part of a file; give each certificate its own PEM block.")
         }
         foreach ($block in $blocks) {
             # Either label may hold a PKCS#7 chain: AD CS web enrollment and certutil -encode
@@ -229,7 +265,7 @@ function Read-CaBundle {
             & $importDer ([Convert]::FromBase64String(($block.Groups[2].Value -replace '\s', '')))
         }
     } elseif ($Bytes[0] -eq 0x30) {
-        # DER that does not span the file, such as BER with an indefinite length.
+        # DER that does not span the file: $importDer refuses it with the reason.
         & $importDer $Bytes
     } elseif ($text -match '^[A-Za-z0-9+/=\s]+$') {
         # Base64 of a DER value with no armour, which the X509Certificate2 constructor this script
@@ -257,13 +293,74 @@ function Read-CaBundle {
     return , $unique
 }
 
-# The store a checked CA belongs in: Root for a self-issued one, whose subject and issuer are the
-# same name, and CertificateAuthority (the intermediate store) for any other. See $stores above.
+# Whether the certificate is self-signed: its subject and issuer are the same name AND its signature
+# verifies under its own public key. A self-issued certificate another key signed, such as a CA
+# re-key link certificate, is not. RSA PKCS#1 v1.5 and ECDSA with SHA-1 or SHA-2 are checked; any
+# other signature algorithm (RSA-PSS, for one) reads as not self-signed, which fails closed.
+function Test-SelfSigned {
+    param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    if ([Convert]::ToBase64String($Certificate.SubjectName.RawData) -cne
+        [Convert]::ToBase64String($Certificate.IssuerName.RawData)) { return $false }
+    $hashes = @{
+        '1.2.840.113549.1.1.5' = 'SHA1'; '1.2.840.113549.1.1.11' = 'SHA256'
+        '1.2.840.113549.1.1.12' = 'SHA384'; '1.2.840.113549.1.1.13' = 'SHA512'
+        '1.2.840.10045.4.1' = 'SHA1'; '1.2.840.10045.4.3.2' = 'SHA256'
+        '1.2.840.10045.4.3.3' = 'SHA384'; '1.2.840.10045.4.3.4' = 'SHA512'
+    }
+    $oid = $Certificate.SignatureAlgorithm.Value
+    if (-not $hashes.ContainsKey($oid)) { return $false }
+    $hash = [System.Security.Cryptography.HashAlgorithmName]::new($hashes[$oid])
+    # Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue BIT STRING }.
+    $raw = $Certificate.RawData
+    $outer = Read-DerHeader -Bytes $raw
+    if (-not $outer) { return $false }
+    $tbs = Read-DerHeader -Bytes $raw -Offset $outer.Start
+    if (-not $tbs) { return $false }
+    $algorithm = Read-DerHeader -Bytes $raw -Offset $tbs.End
+    if (-not $algorithm) { return $false }
+    $bits = Read-DerHeader -Bytes $raw -Offset $algorithm.End
+    if (-not $bits -or $bits.Tag -ne 0x03 -or $bits.Length -lt 2 -or $raw[$bits.Start] -ne 0) { return $false }
+    $signed = New-Object byte[] ($tbs.End - $outer.Start)
+    [Array]::Copy($raw, $outer.Start, $signed, 0, $signed.Length)
+    $signature = New-Object byte[] ($bits.Length - 1)
+    [Array]::Copy($raw, $bits.Start + 1, $signature, 0, $signature.Length)
+    try {
+        if ($oid.StartsWith('1.2.840.113549.')) {
+            $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($Certificate)
+            if (-not $rsa) { return $false }
+            return [bool]$rsa.VerifyData($signed, $signature, $hash,
+                [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        }
+        $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($Certificate)
+        if (-not $ecdsa) { return $false }
+        # X.509 carries an ECDSA signature as a DER SEQUENCE of r and s; .NET Framework's VerifyData
+        # reads only r and s side by side, each padded to the key's width.
+        $sequence = Read-DerHeader -Bytes $signature
+        if (-not $sequence -or $sequence.End -ne $signature.Length) { return $false }
+        $r = Read-DerHeader -Bytes $signature -Offset $sequence.Start
+        if (-not $r) { return $false }
+        $s = Read-DerHeader -Bytes $signature -Offset $r.End
+        if (-not $s -or $s.End -ne $signature.Length) { return $false }
+        $width = [int][Math]::Ceiling($ecdsa.KeySize / 8)
+        $fixed = New-Object byte[] (2 * $width)
+        foreach ($part in @(@($r, 0), @($s, $width))) {
+            $from = $part[0].Start
+            $count = $part[0].Length
+            while ($count -gt 0 -and $signature[$from] -eq 0) { $from++; $count-- }
+            if ($count -gt $width) { return $false }
+            [Array]::Copy($signature, $from, $fixed, $part[1] + $width - $count, $count)
+        }
+        return [bool]$ecdsa.VerifyData($signed, $fixed, $hash)
+    } catch [System.Management.Automation.MethodInvocationException] {
+        return $false
+    }
+}
+
+# The store a checked CA belongs in: Root for a self-signed one, CertificateAuthority (the
+# intermediate store) for any other. The help's "Where each CA goes" says what each store means.
 function Get-CaStoreName {
     param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
-    $subject = [Convert]::ToBase64String($Certificate.SubjectName.RawData)
-    $issuer = [Convert]::ToBase64String($Certificate.IssuerName.RawData)
-    if ($subject -ceq $issuer) { return 'Root' }
+    if (Test-SelfSigned -Certificate $Certificate) { return 'Root' }
     return 'CertificateAuthority'
 }
 
@@ -334,8 +431,11 @@ if ($refusals.Count -gt 0) {
         "key, and these are not:`n" + ($refusals -join "`n"))
 }
 if (-not ($entries | Where-Object { $_.Target -eq $stores['Root'] })) {
-    Write-Warning ("The file holds no self-issued root, so nothing here becomes a trust anchor. A chain " +
-        "through these CAs validates only if its root is already in $StoreLocation; import the root too.")
+    # Without its root an issuing CA validates nothing over SChannel, and over the engine's Python TLS
+    # it would be trusted with no root's revocation or constraints over it (the help's "Where each
+    # CA goes"), so a rootless file is refused rather than imported.
+    throw ("Nothing was imported. The file holds no self-signed root. Give this script the root " +
+        "the CA chains to, alone or in the same .p7b chain.")
 }
 
 # --- import ------------------------------------------------------------------

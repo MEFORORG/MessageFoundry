@@ -479,7 +479,7 @@ is in the script's `param()` block or its body.
 | `uninstall-net-helper.ps1` | `-ServiceName` | The `-ServiceName` rule above |
 | `measure-store-access.ps1` | `-Order` | Required. One of `ProvisionFirst`, `StartFirst`, `StartFirstEndToEnd` |
 | | `-DataDir` | Required |
-| `import-db-ca.ps1` | `-CaPath` | Required. A DER or PEM certificate, a PEM bundle, or a .p7b chain, in which every certificate is a CA with no private key. A .pfx and any PEM block but a certificate or PKCS7 are refused |
+| `import-db-ca.ps1` | `-CaPath` | Required. A certificate file holding a self-signed root, in which every certificate is a CA with no private key. The script's help lists the shapes it reads and, with "at least", what it refuses |
 
 `install-service.ps1` also relates parameters to each other. `-EngineWheel` refuses `-AppExe` and
 `-PythonExe`. `-EngineWheelSha256`, `-RequirementsLock`, `-RequirementsLockSha256` and

@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives.serialization import pkcs7, pkcs12
 from cryptography.x509.oid import NameOID
 
@@ -125,8 +125,39 @@ def chain() -> dict[str, tuple[x509.Certificate, _Key]]:
 
 
 @pytest.fixture(scope="module")
+def extra(chain: dict[str, tuple[x509.Certificate, _Key]]) -> dict[str, x509.Certificate]:
+    """An RSA self-signed root, and a re-key certificate: self-issued (its subject and issuer are
+    the root's name) but signed by the root's old key, so it is not self-signed."""
+    root, root_key = chain["root"]
+    now = datetime.datetime.now(datetime.UTC)
+
+    def build(name: x509.Name, public: object, signer: object) -> x509.Certificate:
+        return (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(public)  # type: ignore[arg-type]
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=30))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(signer, hashes.SHA256())  # type: ignore[arg-type]
+        )
+
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic RSA Root CA")])
+    new_key = ec.generate_private_key(ec.SECP384R1())
+    return {
+        "rsa_root": build(rsa_name, rsa_key.public_key(), rsa_key),
+        "rekey": build(root.subject, new_key.public_key(), root_key),
+    }
+
+
+@pytest.fixture(scope="module")
 def files(
-    tmp_path_factory: pytest.TempPathFactory, chain: dict[str, tuple[x509.Certificate, _Key]]
+    tmp_path_factory: pytest.TempPathFactory,
+    chain: dict[str, tuple[x509.Certificate, _Key]],
+    extra: dict[str, x509.Certificate],
 ) -> dict[str, Path]:
     """Every fixture file, written once for the module."""
     tmp_path = tmp_path_factory.mktemp("dbca")
@@ -172,6 +203,14 @@ def files(
         + b"-----END CERTIFICATE-----\n",
         "der_armour_in_subject": chain["armour_in_subject"][0].public_bytes(der),
         "inter_only": _pem(inter),
+        "rsa_root": _pem(extra["rsa_root"]),
+        "rekey_only": _pem(extra["rekey"]),
+        "root_and_rekey": _pem(root, extra["rekey"]),
+        # Bytes that would be left unread: refused, never read in part.
+        "der_trailing": root.public_bytes(der) + b"\x00trailing",
+        "der_concat": root.public_bytes(der) + inter.public_bytes(der),
+        "der_then_pem": root.public_bytes(der) + _pem(inter),
+        "b64_trailing": base64.encodebytes(root.public_bytes(der) + b"\x00\x01"),
         "empty": b"",
         "base64_junk": b"not a certificate at all\n",
         "garbage": b"not a certificate!\n",
@@ -195,8 +234,8 @@ def _read_all(tmp_path: Path, paths: dict[str, Path]) -> dict[str, dict[str, obj
 $ErrorActionPreference = 'Stop'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     {_psq(str(_SCRIPT))}, [ref]$null, [ref]$null)
-foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-CaBundle',
-                    'Get-CaRefusal', 'Get-CaStoreName')) {{
+foreach ($name in @('Test-EscapedForConsole', 'ConvertTo-PrintableText', 'Read-DerHeader',
+                    'Read-CaBundle', 'Get-CaRefusal', 'Test-SelfSigned', 'Get-CaStoreName')) {{
   $def = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
       $args[0].Name -eq $name }}, $true)
   if (-not $def) {{ throw "missing function $name" }}
@@ -231,7 +270,10 @@ $out | ConvertTo-Json -Depth 5 -Compress -EscapeHandling EscapeNonAscii
 
 
 def test_every_shape_reads_every_certificate_and_only_cas_pass(
-    tmp_path: Path, chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
+    tmp_path: Path,
+    chain: dict[str, tuple[x509.Certificate, _Key]],
+    extra: dict[str, x509.Certificate],
+    files: dict[str, Path],
 ) -> None:
     got = _read_all(tmp_path, files)
     root = _thumb(chain["root"][0])
@@ -261,6 +303,15 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
         ), name
     assert certs("pem_x509_label") == [(root, None)]
     assert certs("pem_duplicate") == [(root, None)]
+
+    # Root means self-signed: an RSA root's signature verifies under its own key, and a
+    # self-issued re-key certificate another key signed goes to the intermediate store.
+    assert full("rsa_root") == [(_thumb(extra["rsa_root"]), None, "Root")]
+    rekey = _thumb(extra["rekey"])
+    assert full("rekey_only") == [(rekey, None, "CertificateAuthority")]
+    assert sorted(full("root_and_rekey")) == sorted(
+        [(root, None, "Root"), (rekey, None, "CertificateAuthority")]
+    )
 
     # Read in full, so the non-CA among them is seen and refused.
     leaf = _thumb(chain["leaf"][0])
@@ -292,6 +343,10 @@ def test_every_shape_reads_every_certificate_and_only_cas_pass(
     assert "empty" in error("empty")
     assert "no certificate" in error("garbage")
     assert "'Unknown' content" in error("base64_junk")
+    # Bytes that would be left unread refuse the file; nothing is read from part of it.
+    for name in ("der_trailing", "der_concat", "b64_trailing"):
+        assert "does not end where its bytes end" in error(name), name
+    assert "binary data outside its PEM blocks" in error("der_then_pem")
 
 
 def _run_whatif(ca_path: Path) -> subprocess.CompletedProcess[str]:
@@ -322,7 +377,6 @@ def test_whatif_shows_and_offers_every_certificate_of_an_unsigned_p7b(
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
     assert "The file holds 2 certificate(s)" in out
-    assert "holds no self-issued root" not in out
     # No elevation was needed, and each certificate is offered for its own store.
     assert "requires an elevated" not in out
     for key, store in (
@@ -336,15 +390,16 @@ def test_whatif_shows_and_offers_every_certificate_of_an_unsigned_p7b(
     assert "Imported" not in out
 
 
-def test_an_issuing_ca_alone_is_offered_for_the_intermediate_store_with_a_warning(
-    chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
+@pytest.mark.parametrize("name", ["inter_only", "rekey_only"])
+def test_a_file_without_a_self_signed_root_imports_nothing(
+    name: str, files: dict[str, Path]
 ) -> None:
-    proc = _run_whatif(files["inter_only"])
+    # An issuing CA alone, or a self-issued certificate another key signed: no root, so refused.
+    proc = _run_whatif(files[name])
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 0, out
-    assert "holds no self-issued root" in out
-    offered = [ln for ln in out.splitlines() if "What if" in ln]
-    assert len(offered) == 1 and '"Cert:\\LocalMachine\\CA"' in offered[0], offered
+    assert proc.returncode != 0, out
+    assert "Nothing was imported. The file holds no self-signed root." in out
+    assert "What if" not in out
 
 
 def test_a_bundle_holding_a_non_ca_imports_nothing(

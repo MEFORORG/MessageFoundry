@@ -2000,7 +2000,7 @@ env-var route to a weakened DB hop**: fix the trust instead (below). The outboun
 fail-closed `[egress].allowed_db` allowlist (WP-11c). A `:name` placeholder must not appear inside a
 quoted string literal in `statement` — bind dynamic strings as parameters. To validate a private /
 internal DB CA with `trust_server_certificate` left **false**, import that CA, root included, into
-the Windows **machine** stores (the root into the trust store `LocalMachine\Root`) via
+the Windows **machine** stores (which store each CA goes into is in `DEPLOY-SERVER-DB.md` §5.2) via
 [`scripts/service/import-db-ca.ps1`](../scripts/service/import-db-ca.ps1) — **never**
 `TrustServerCertificate=true`; ODBC 18 has no connection-string CA-file keyword. See the CA-import +
 make-before-break rotation runbooks in

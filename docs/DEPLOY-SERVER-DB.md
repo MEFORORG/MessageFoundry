@@ -536,14 +536,14 @@ validation to succeed, the database's certificate must chain to a CA the host al
 
 | Backend | How the DB CA is trusted | Disable validation? |
 |---|---|---|
-| **PostgreSQL** | **Either** pin the CA by file with `[store].ssl_root_cert = <ca.pem>` (no machine-wide install — see §1), **or** import it into the Windows machine trust store (§5.2). The file pin is the lighter-touch path. | Never. |
-| **SQL Server (ODBC Driver 18)** | **Machine trust store** (`LocalMachine\Root`, §5.2) is the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). **Never pin the self-signed certificate SQL Server generates when it has no trusted or valid one**: the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md) says why, and how to spot it. | Never. |
+| **PostgreSQL** | **Either** pin the CA by file with `[store].ssl_root_cert = <ca.pem>` (no machine-wide install — see §1), **or** import it into the Windows machine stores (§5.2). The file pin is the lighter-touch path. | Never. |
+| **SQL Server (ODBC Driver 18)** | **Machine stores** (the root in `LocalMachine\Root`, any issuing CA in `LocalMachine\CA`, §5.2) are the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). **Never pin the self-signed certificate SQL Server generates when it has no trusted or valid one**: the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md) says why, and how to spot it. | Never. |
 
-### 5.2 Import a private / internal CA into the machine store (`LocalMachine\Root`)
+### 5.2 Import a private / internal CA into the machine stores (`LocalMachine\Root`, `LocalMachine\CA`)
 
-The CA must go into the **machine** store (`Cert:\LocalMachine\Root`), **not** the per-user store
+The CA must go into the **machine** stores (`Cert:\LocalMachine\...`), **not** the per-user stores
 (`Cert:\CurrentUser\Root`): the engine runs as a **service principal** — LocalSystem, a gMSA, or a
-dedicated service account — which only reads the machine store. A per-user import is invisible to the
+dedicated service account — which only reads the machine stores. A per-user import is invisible to the
 service.
 
 From an **elevated (Administrator)** PowerShell, use the helper:
@@ -552,12 +552,24 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 .\scripts\service\import-db-ca.ps1 -CaPath C:\certs\internal-root-ca.crt
 ```
 
-The helper shows every certificate in the file, refuses the whole file if any one is not a CA or
-carries a private key, and puts a self-issued root in `LocalMachine\Root` and any other CA in the
-intermediate store `LocalMachine\CA`, which is not a trust anchor. So give it the root, alone or in
-a `.p7b` chain: an issuing CA on its own validates nothing until its root is in `LocalMachine\Root`,
-and the helper warns when a file holds no root. The built-ins below check none of that, so use
-them only for a file holding one root CA you have checked yourself:
+The helper shows every certificate in the file, and refuses the whole file if any one is not a CA
+or carries a private key, if the file holds no self-signed root, or if any of its bytes would be
+left unread.
+
+**Where each CA goes.** This paragraph and the helper's own help are the statement of it; other
+documents point here. A self-signed root, whose signature verifies under its own key, goes into
+`LocalMachine\Root`. Any other CA in the file, such as an issuing CA in a `.p7b` chain, or a
+self-issued certificate another key signed, goes into the intermediate store `LocalMachine\CA`.
+That store is **not** a trust anchor for SChannel or ODBC Driver 18 chain building, so the SQL
+Server hop still checks the chain up to the root. It **is** usable as a trust anchor by the
+engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which the PostgreSQL
+system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
+partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
+there without its root. That is why the helper refuses a file with no self-signed root: give it the
+root, alone or in the same `.p7b` chain.
+
+The built-ins below check none of that, so use them only for a file holding one self-signed root
+CA you have checked yourself:
 
 ```powershell
 # PowerShell:
@@ -579,9 +591,8 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 **Rotating the CA (root/intermediate):**
 
 1. **Add** the new CA alongside the old one — both trusted at once (the overlap window):
-   - **SQL Server:** import the new CA (§5.2) on every connecting host: a new root goes into
-     `LocalMachine\Root`, a new issuing CA into `LocalMachine\CA`. The old CA stays imported. Both
-     chains now validate.
+   - **SQL Server:** import the new CA with its root (§5.2) on every connecting host; §5.2 says which
+     store each goes into. The old CA stays imported. Both chains now validate.
    - **PostgreSQL (file pin):** point `[store].ssl_root_cert` at a **multi-root PEM bundle** containing
      **both** the old and new CA certs (concatenate them in one PEM file), then reload. `libpq`
      accepts a server cert that chains to **either** root.
