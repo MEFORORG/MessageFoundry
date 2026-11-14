@@ -1655,9 +1655,10 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     would have joined, so a redacted answer joined to a caller's raw text and redacted again printed
     what main's hid. The mask keeps every character's class.
 
-    **That is not a proof that every reader sees main's answer.** A mask is a change, so it can make
-    :func:`_redact_rounds` run a round main did not, and a pass that is not a fixed point reads
-    differently there. The credential backstop is the known one, so a text holding its opener
+    **That is not a proof that every reader sees main's answer.** A mask alone sends no text round
+    again (:func:`_masked_only`), but in a round that also scrubbed something the next round reads
+    the masked text, and a pass that is not a fixed point can read it differently there. The
+    credential backstop is the known one, so a text holding its opener
     (:data:`_USERINFO_OPENER`) keeps every rest, as :func:`_scrub_field_runs` does: ``mask`` is
     False there. The caller tests that once per text, not once per end tag, which was quadratic.
     The differential
@@ -1781,7 +1782,7 @@ def _scrub_xml_element(
     return "".join(out), pos
 
 
-def _redact_xml_elements(text: str) -> str:
+def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
     """Scrub the content and attribute values of every vocabulary element in an XML payload -- FHIR's
     ``<family value="..."/>``, a text-content ``<family>...</family>``, with or without a namespace
     prefix -- keeping every tag name, and inside ``<identifier>``/``<telecom>`` keeping everything but
@@ -1798,7 +1799,8 @@ def _redact_xml_elements(text: str) -> str:
 
     Words after an end tag's name, inside a malformed tag or after one with no ``>``, are masked in
     place where that is safe, and kept as they stood where it is not (:func:`_end_tag_rest`), in a
-    walked element and outside one (:func:`_mask_stray_end_tags`)."""
+    walked element and outside one (:func:`_mask_stray_end_tags`). ``masks`` False keeps every one
+    as it stood, which is this pass as it was before BACKLOG #5925 (:func:`_masked_only`)."""
     if "<" not in text:
         return text
     out: list[str] = []
@@ -1812,7 +1814,7 @@ def _redact_xml_elements(text: str) -> str:
     while (match := _XML_PHI_ELEMENT.search(text, pos)) is not None:
         if last_close is None:
             last_close = {close.group(1): close.start() for close in _XML_PHI_END.finditer(text)}
-            mask = _USERINFO_OPENER not in text
+            mask = masks and _USERINFO_OPENER not in text
         replacement, end = _scrub_xml_element(text, match, last_close, mask)
         out.append(_mask_stray_end_tags(text, pos, match.start(), mask))
         out.append(replacement)
@@ -1820,7 +1822,7 @@ def _redact_xml_elements(text: str) -> str:
     if not out:
         if "</" not in text or _XML_PHI_END_OPEN.search(text) is None:
             return text
-        mask = _USERINFO_OPENER not in text
+        mask = masks and _USERINFO_OPENER not in text
         if not mask:
             return text
     out.append(_mask_stray_end_tags(text, pos, len(text), mask))
@@ -1850,9 +1852,9 @@ def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool) -> str:
     return "".join(out)
 
 
-def _redact_structured(text: str, *, widened: bool) -> str:
+def _redact_structured(text: str, *, widened: bool, masks: bool = True) -> str:
     """The structured-shape passes, run on everything but this module's own trailing notes
-    (:data:`_TRAILING_NOTES`)."""
+    (:data:`_TRAILING_NOTES`); ``masks`` is :func:`_redact_xml_elements`'s."""
     body, tail = text, ""
     if text.endswith("unscanned]"):  # a cheap test before a search of the whole text
         note = _TRAILING_NOTES.search(text)
@@ -1861,7 +1863,7 @@ def _redact_structured(text: str, *, widened: bool) -> str:
     body = _redact_json_fields(body, widened=widened)
     body = _redact_dicom_tags(body, widened=widened)
     body = _redact_dicom_labels(body, widened=widened)
-    return _redact_xml_elements(body) + tail
+    return _redact_xml_elements(body, masks=masks) + tail
 
 
 def redact(text: str) -> str:
@@ -2008,9 +2010,27 @@ def _redact_rounds(text: str, *, widened: bool) -> str:
             return text
         flat = _redact_flat(text, widened=widened, credentials=credentials)
         text = _redact_structured(flat, widened=widened)
-        if text == flat:
+        if text == flat or _masked_only(text, flat, widened=widened):
             return text
     return _redact_flat(text, widened=widened, credentials=credentials)
+
+
+def _masked_only(text: str, flat: str, *, widened: bool) -> bool:
+    """Whether the structured passes turned ``flat`` into ``text`` only by masking end-tag rests in
+    place (:func:`_end_tag_rest`, BACKLOG #5925), so the round is the fixed point it was on main.
+
+    **A mask is not a change that sends the text round again.** It uncovers nothing for another
+    pass, and the passes are not all fixed points on their own output, so a round main did not run
+    reads differently: ``</given Doe>&Smith, Jones=PID|x`` left ``&[redacted]=PID|[redacted]`` on
+    main, and a second round turns that into ``[redacted]``, so the ``PID|`` that took a caller's
+    text joined after the answer was gone and the joined value printed. The exact test is the
+    structured passes with every rest kept, which change nothing; the class comparison before it
+    only skips that pass where some other change is certain."""
+    return (
+        len(text) == len(flat)
+        and text.translate(_SHAPE) == flat.translate(_SHAPE)
+        and _redact_structured(flat, widened=widened, masks=False) == flat
+    )
 
 
 #: The most rounds one stage of :func:`redact` takes. A call runs two stages, and runs both again when

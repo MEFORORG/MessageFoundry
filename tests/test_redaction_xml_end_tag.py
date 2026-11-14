@@ -433,6 +433,54 @@ def test_an_end_tag_after_an_element_read_as_prose_is_masked_on_a_second_call() 
         assert "Kplm7" in redact(redact(a) + raw)
 
 
+#: Found by the Lander's differential at 552c25b49e: a vocabulary end tag with a maskable rest, then
+#: a name pair glued to ``=PID|``. Main's first call leaves ``&[redacted]=PID|[redacted]``, and the
+#: ``PID|`` it keeps takes a caller's text joined after it; a second round turns it into
+#: ``[redacted]``. The mask counted as a change, so one call ran that second round and the joined
+#: value printed.
+_ROUND_STARTS = (
+    "</given Doe>&Smith, Jones=PID|x",
+    "</family Zqx>&Smith, Jones=PID|x",
+    "</given Doe> &Smith, Jones=PID|x",
+    "</family Zqx>  &Smith, Jones=PID|x",
+    "</given Doe>\n&Smith, Jones=PID|x",
+    "</family Zqx>\n&Smith, Jones=PID|x",
+)
+#: What a caller joins after it: prose, a date, a phone, quotes, markup and a comment.
+_ROUND_JOINS = (
+    " Qzhqpjzj",
+    " peer Qzhqpjzj",
+    " expected Qzhqpjzj got",
+    " 19800102 Qzhqpjzj",
+    " 1980-01-02 Qzhqpjzj",
+    " 555-201-3344 Qzhqpjzj",
+    " (555) 201-3344 Qzhqpjzj",
+    ' "Qzhqpjzj"',
+    " 'Qzhqpjzj'",
+    " <b>Qzhqpjzj</b>",
+    " <!-- Qzhqpjzj -->",
+)
+
+
+@pytest.mark.parametrize("raw", _ROUND_JOINS)
+@pytest.mark.parametrize("a", _ROUND_STARTS)
+def test_a_masked_rest_runs_no_round_main_did_not(a: str, raw: str) -> None:
+    """A mask alone is not a change that sends the text round again: every route over ``a`` and
+    ``a`` joined to ``raw`` is main's with some letters and digits masked, so the joined value is
+    hidden wherever main hid it, ``redact(redact(a) + raw)`` and ``safe_text(safe_text(a) + raw)``
+    first among them."""
+    with _main():
+        before = _composed(a, raw)
+        main_twice = safe_text(safe_text(a) + raw)
+    after = _composed(a, raw)
+    assert "Qzhqpjzj" not in before["redact(a) + raw by redact"]  # the gap main does not have
+    assert "Qzhqpjzj" not in safe_text(safe_text(a) + raw)
+    assert _is_main_masked(safe_text(safe_text(a) + raw), main_twice)
+    unmasked = [route for route, out in after.items() if not _is_main_masked(out, before[route])]
+    assert not unmasked, [(route, after[route], before[route]) for route in unmasked[:3]]
+    assert any(out != before[route] for route, out in after.items())  # the mask ran
+
+
 def test_the_mask_is_a_fixed_point() -> None:
     rand = random.Random(925)
     for _ in range(2_000):
