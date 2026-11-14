@@ -865,8 +865,9 @@ loud warning):
   #329.)*
 - Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Clamped, read directly
   rather than through the authority. CORRECTED 2026-10-13: this read *Not clamped*.)*
-- The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
-  forwarder and the API PHI-read serve hop.
+- The non-connection cells, which have no per-hop `cleartext_accepted` declaration: the `[logging]`
+  syslog/SIEM forwarder (it does have `[logging].forward_hop_attested`, the claim that the hop is secure
+  by other means) and the API PHI-read serve hop.
   *(Both clamped. LDAPS was on this list until vault BACKLOG #3230 made
   `ad_tls_verify = false` a refusal with no escape. The AI-broker endpoint was on it until vault
   BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`. The
