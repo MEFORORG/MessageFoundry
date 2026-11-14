@@ -614,9 +614,11 @@ Two other shapes were weighed and not built:
    `warn` it still permits at least cleartext SMTP on an Email or Direct outbound connection
    (`use_tls = false`) and a store or DATABASE hop with `encrypt = false`, beside the verify-off hops
    (see [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
-   **At least two hops can still cross outside that refusal** and need a deliberate decision from you: a
-   `dialect='generic'` DATABASE hop, outbound or a `DatabasePoll` inbound (driver-owned TLS: once a mode outside the no-TLS deny-list is set, the engine neither enforces nor verifies it) and a Direct destination
-   with `use_tls=false` — see the exceptions under the [matrix](#channel--tls-posture-matrix).
+   **At least one hop can still cross outside that refusal** and needs a deliberate decision from you: a
+   `dialect='generic'` DATABASE hop, outbound or a `DatabasePoll` inbound (driver-owned TLS: once a mode outside the no-TLS deny-list is set, the engine neither enforces nor verifies it) — see the exceptions under the [matrix](#channel--tls-posture-matrix).
+   A Direct outbound connection with `use_tls=false` is decided outside that refusal too, by its own
+   gate, which refuses it under `enforce`. CORRECTED 2026-11-14: this listed Direct as a second hop
+   that can still cross.
    Separately, **at least nine** verifying TLS outbounds have a revocation gate of their own — and the
    rest do **not**, including the SQL Server store hop: see
    [Revocation-guard behavior](#revocation-guard-behavior). And check every connection for
@@ -855,8 +857,8 @@ that rule does not reach yet. The rule and those hops are stated once in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer).
 Each bullet below releases a hop with no credential, unless it says otherwise.
 
-With `MEFOR_ALLOW_INSECURE_TLS` set, at least these otherwise-refused settings become permitted (each logs a
-loud warning):
+With `MEFOR_ALLOW_INSECURE_TLS` set, at least these otherwise-refused settings become permitted (not every one
+logs a warning):
 
 - REST/SOAP/FHIR/DICOMweb `verify_tls = false`. *(Clamped. A static header off the verify-off
   allowlist refuses the hop in every case, as a credential does.)*
@@ -870,14 +872,14 @@ loud warning):
   *(Clamped, read directly rather than through the authority. CORRECTED 2026-10-13: this read *Not
   clamped*.)*
 - **Email** destination `use_tls = false` and `tls_verify = false`. *(Clamped. On `use_tls = false`
-  it is one of three ways past the first check, beside the connection's `tls_hop_attested` and
-  `cleartext_accepted`, and the cleartext-hop authority then decides the hop.)*
-- An SMTP login on either crosses neither: it is refused first, whatever is set.
+  it is one of three ways past the cleartext pre-check, beside the connection's `tls_hop_attested`
+  and `cleartext_accepted`, and the cleartext-hop authority then decides the hop.)*
 - The non-connection cells, which have no per-hop `cleartext_accepted` declaration: the `[logging]`
   syslog/SIEM forwarder (it does have `[logging].forward_hop_attested`, the claim that the hop is secure
   by other means, which clears the hop decision but not the off-box forwarding gate of BACKLOG #1966:
   under `enforce` `serve` still refuses a forwarder without verified TLS to a separate collector) and
-  the API PHI-read serve hop.
+  the API PHI-read serve hop. The escape changes neither one's disposition: it applies only off
+  `enforce`, where both already WARN an unprotected hop, and under `enforce` it is inert.
   *(Both clamped. LDAPS was on this list until vault BACKLOG #3230 made
   `ad_tls_verify = false` a refusal with no escape. The AI-broker endpoint was on it until vault
   BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`. The
@@ -886,6 +888,9 @@ loud warning):
   effect on the webhook: an `http` URL refuses the start in every posture when `serve` builds the
   alert notifier, and no setting turns off the `https` webhook's certificate chain or hostname
   check.)*
+
+An SMTP login on an Email or Direct outbound connection crosses none of these: it is refused before
+any of them, whatever is set.
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
