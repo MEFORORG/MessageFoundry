@@ -48,7 +48,7 @@ import threading
 import tokenize
 import traceback
 import urllib.parse
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -1658,17 +1658,17 @@ def _bool_literal_problem(key: str, value: Any) -> str | None:
     return None
 
 
-def _bool_remedy(value: object, *, env_read: bool = True) -> str:
-    """The remedy every refusal of a non-bool literal ends with. A false spelling in quotes, which
-    every lax read takes as true, gets a hint that says so; it says the value is a false spelling,
-    never which. ``env_read`` is false where nothing resolves an ``env()`` on the flag, so the
-    remedy does not offer one."""
-    hint = ""
+def _quoted_false_hint(value: object) -> str:
+    """A hint for a false spelling in quotes, which every lax read takes as true. It says the value
+    is a false spelling, never which."""
     if isinstance(value, str) and _BOOL_SPELLINGS.get(value.strip().lower()) is False:
-        hint = " (a false spelling in quotes reads as true)"
-    if not env_read:
-        return f"{hint}; write True or False (an env() reference is not read here)"
-    return f"{hint}; write True, False or an env() reference"
+        return " (a false spelling in quotes reads as true)"
+    return ""
+
+
+def _bool_remedy(value: object) -> str:
+    """The remedy every refusal of a non-bool literal ends with, after :func:`_quoted_false_hint`."""
+    return f"{_quoted_false_hint(value)}; write True, False or an env() reference"
 
 
 def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
@@ -1682,20 +1682,28 @@ def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
 
 
 def _refuse_non_bool_flags(
-    where: str, flags: Mapping[str, object], *, none_inherits: Collection[str] = ()
+    where: str, flags: Mapping[str, object], *, none_inherits: tuple[str, ...] = ()
 ) -> None:
     """Refuse a flag ``inbound()`` or ``outbound()`` takes itself that is not a real ``bool``
-    (vault BACKLOG #3234). The engine reads these by truthiness and resolves no ``env()`` on them,
-    so ``simulate="false"``, a number or a reference would read True. ``None`` passes only on a
-    flag in ``none_inherits``, where it means inherit the service default. The hop-policy flags
-    are not passed here: their own checks refuse a non-bool with a hop-specific remedy."""
+    (vault BACKLOG #3234). The engine reads most of these by truthiness and resolves no ``env()``
+    on them, so ``simulate="false"``, a non-zero number or a reference would read True. ``0`` and
+    ``1`` are refused too, as :func:`~messagefoundry.config.models.require_flag` refuses them.
+    ``None`` passes only on a flag in ``none_inherits``, where it means inherit the service
+    default. The hop-policy flags are not passed here: their own checks refuse a non-bool first."""
     for key, value in flags.items():
-        if isinstance(value, bool) or (value is None and key in none_inherits):
+        inherits = key in none_inherits
+        if value is None and inherits:
             continue
-        raise WiringError(
-            f"{where}: {key} must be true or false, not {type(value).__name__}"
-            f"{_bool_remedy(value, env_read=False)}"
-        )
+        try:
+            require_flag(value, key)
+        except ValueError as exc:  # names the key and the type, never the value
+            problem = str(exc)
+        else:
+            continue
+        # Raised outside the handler, so the chain stays empty (tests/test_from_none_is_not_redaction.py).
+        env_hint = " (no env() is resolved on this flag)" if isinstance(value, EnvRef) else ""
+        tail = "; write True or False, or None to inherit" if inherits else "; write True or False"
+        raise WiringError(f"{where}: {problem}{_quoted_false_hint(value)}{env_hint}{tail}")
 
 
 def resolve_env_settings(

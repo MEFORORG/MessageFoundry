@@ -1040,15 +1040,40 @@ def test_a_declaration_flag_still_takes_a_real_bool_and_none_where_it_inherits(
         assert read(_declare(direction, **{key: None})) is None
 
 
-def test_the_refusal_says_a_quoted_false_reads_true_and_env_is_not_read() -> None:
+def test_the_flags_the_review_named_still_take_true() -> None:
+    # The other half of the control: a guard that let only False through would refuse these.
+    # The hop-policy flags need a reason with True, and their own tests cover it.
+    inbound = build_inbound_connection(
+        "IB_X",
+        MLLP(port=2575),
+        router="r",
+        strict=True,
+        inline=True,
+        auto_start=True,
+        deployed=True,
+        capture_ack=True,
+        capture_connection_errors=True,
+    )
+    assert inbound.validation.strict is True and inbound.inline is True
+    assert inbound.capture_ack is True and inbound.capture_connection_errors is True
+    outbound = _declare("outbound", simulate=True, auto_start=True, deployed=True)
+    assert outbound.simulate is True and outbound.auto_start is True and outbound.deployed is True
+
+
+def test_the_refusal_names_the_remedy_that_fits_the_value() -> None:
     with pytest.raises(WiringError) as ei:
         _declare("outbound", simulate="false")
-    assert _QUOTED_FALSE_HINT in str(ei.value)
+    msg = str(ei.value)
+    assert _QUOTED_FALSE_HINT in msg and "env()" not in msg
+    assert msg.endswith("; write True or False")
     with pytest.raises(WiringError) as ei:
         _declare("outbound", deployed=env("deployed", cast=bool))
     msg = str(ei.value)
-    assert "an env() reference is not read here" in msg
+    assert "(no env() is resolved on this flag)" in msg
     assert _QUOTED_FALSE_HINT not in msg
+    with pytest.raises(WiringError) as ei:
+        _declare("inbound", capture_ack="default")
+    assert str(ei.value).endswith("; write True or False, or None to inherit")
 
 
 def test_a_strict_quoted_false_is_refused_before_the_content_type_check() -> None:
