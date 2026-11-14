@@ -442,10 +442,12 @@ than a path is not checked
   Windows it also reads the access list of the directory that holds the file, and refuses it when
   one of the groups above or an application package may delete a file in it, change its access
   list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when
-  its owner is such a group or cannot be read. When the directory that holds the file is itself a
-  junction or symbolic link, its target's access list is not read, so a junction only the engine's
-  account and the host's administrators can change, pointing to a folder where a broad group may
-  delete a file, passes. A right to list or traverse the directory, or to add
+  its owner is such a group or cannot be read. When the directory that holds the file is itself
+  a junction, a symbolic link or a folder a volume is mounted on, at least, the owner and access
+  list of its target are not read, nor those of the folders above the target, so a junction only
+  the engine's account and the host's administrators can change, pointing to a folder where a
+  broad group may delete a file, passes: restrict the target and the folders above it yourself.
+  A right to list or traverse the directory, or to add
   a file to it, is not refused, so a store directory the engine makes under `C:\ProgramData`, which
   inherits that folder's grant to Users, passes. A path spelled as a network share
   (`\\host\share\...`) is walked no further than the share, so a junction behind it is not seen,
