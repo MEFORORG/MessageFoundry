@@ -274,11 +274,12 @@ rather than a mapping.
 its re-arm genuinely is per-connection.
 *(Note, BACKLOG #5704: the INBOUND tier now takes this ADR's shape too. Its claim gate,
 `_inbound_log_halted`, reads the process latch as well as the per-inbound marks, in the per_lane
-workers' loop top and in the pooled INGRESS, ROUTED and RESPONSE adapters, which hand a gated row
-back by `reschedule_claimed` and park, as `_dispatch_delivery` does. The halt never pauses or
+workers' loop top and, under pooled, in a pre-claim predicate on the INGRESS, ROUTED and
+RESPONSE dispatchers: a gated lane parks with no claim and no row write until the gate lifts, and
+only a prefix claimed before the latch is handed back by `reschedule_claimed`. The halt never pauses or
 STOPs an internal lane or touches its hold. It marks every inbound as it latches, before it waits
 for the reload lock, so a reload holding that lock cannot rebind a listener over gated stages. A
-halt whose latch a probe cleared while it waited still completes, as before; whether it should
-stand down instead (option 4) is left open. A per_lane internal worker now WAITS at the gate rather
+halt whose latch a probe cleared while it waited still completes, as before; decision
+d20261113T215259180-f5da2d, which had it stand down instead, was reversed. A per_lane internal worker now WAITS at the gate rather
 than returning. The marks keep their per-inbound shape and re-arm.)* Whether the door gates could now be simplified is left alone
 on purpose: removing working gates in the same change would make a regression unattributable.

@@ -5907,8 +5907,8 @@ class RegistryRunner:
 
     def _log_halt_lanes(self, sink: str) -> tuple[list[str], list[str]]:
         """The bound inbounds and the running owned outbounds a #122 halt stops, as ``(inbounds,
-        outbounds)``. Read once, before the halt waits for the reload lock, as origin/main read its
-        lists there.
+        outbounds)``. Read once, before the halt waits for the reload lock, so the halt stops and
+        alerts what was bound when it fired; a lane a racing reload rebinds meets the rebind gate.
 
         An ownership check that raises skips that outbound and logs it, rather than aborting the
         halt with the latch set and every listener still bound (BACKLOG #5704). The skipped lane is
@@ -5939,7 +5939,7 @@ class RegistryRunner:
         The one place that knows HOW the halt takes the DELIVERY tier down: two halts need exactly
         this loop and a third copy is how they drift. The callers choose the lanes rather than this
         method selecting them — :meth:`_stop_all_for_log_failure` reads its list with
-        :meth:`_log_halt_lanes` once it holds the reload lock, and
+        :meth:`_log_halt_lanes` before it waits for the reload lock, and
         :meth:`_park_delivery_for_log_failure` takes every owned lane.
 
         Routes through :meth:`_stop_outbound_unsafe`, so a paused lane reads as an OPERATOR pause
@@ -5958,37 +5958,42 @@ class RegistryRunner:
         claim gate. Sync and await-free. Only the mark is lifted: the halt never pauses or STOPs a
         lane or touches its hold, so there is no lane to resume and no hold to release (BACKLOG
         #5704). Only this inbound's lanes are woken, so a reload re-arming N inbounds wakes each
-        once. A pooled lane is parked by its adapter and claims again when the park ends."""
+        once. A pooled lane the pre-claim gate parked is released with
+        :meth:`StageDispatcher.release_gated`, which unparks nothing else."""
         self._log_halted.discard(name)
-        if self._claim_mode != "pooled":
-            for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
+        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
+            if self._claim_mode == "pooled":
+                dispatcher = self._dispatchers.get(stage)
+                if dispatcher is not None:
+                    dispatcher.release_gated([name])
+            else:
                 self._wake_lane(stage, name)
 
     def _wake_log_gated(self) -> None:
-        """Wake the per_lane router, transform and response workers waiting at the #122 claim gate,
-        so a lifted gate is read now rather than at the idle backstop. per_lane only: the pooled
-        broadcast re-arms STOPPED lanes and releases holds, which a gate lifting must not do. A
-        gated pooled lane is parked by its adapter for :data:`_WORKER_ERROR_BACKOFF_SECONDS` and
-        claims again when the park ends."""
+        """Wake every router, transform and response lane waiting at the #122 claim gate, so a
+        lifted gate is read now rather than at the idle backstop. per_lane wakes the workers; pooled
+        releases only the lanes the pre-claim gate parked. Not the pooled broadcast, which re-arms
+        STOPPED lanes and releases holds, which a gate lifting must not do."""
         if self._claim_mode != "pooled":
             self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE)
+            return
+        for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
+            dispatcher = self._dispatchers.get(stage)
+            if dispatcher is not None:
+                dispatcher.release_gated()
 
     async def _refuse_log_halted(self, item: OutboxItem) -> LaneItemResult:
-        """The pooled half of the #122 claim gate for the INTERNAL stages (BACKLOG #5704): hand a
-        claimed INGRESS, ROUTED or RESPONSE row of a gated inbound back unprocessed, and park its lane.
+        """The per-item backstop of the pooled #122 claim gate for the INTERNAL stages (BACKLOG
+        #5704): hand back unprocessed a row its lane claimed BEFORE the gate shut.
 
-        The runner does not own the pooled claim (the :class:`StageDispatcher` does, and it is
-        deliberately runner-agnostic), so this is the first runner-owned code the row reaches, as
-        :meth:`_dispatch_delivery` is for the delivery tier (ADR 0189). It RESCHEDULES rather than
-        failing the row, for the reasons that method gives: a log-write halt is a machinery fault,
-        not the message's, so no attempt is spent and ``seq`` is kept, and the head is dated past
-        the sweep, so the lane is claimed once per backoff rather than about four times a second.
-        The dispatcher releases the rest of a claimed prefix. A raise from the reschedule is the
-        dispatcher's T17 path, which re-pends the head itself; the row is not processed either way.
-
-        The lane parks, which its own timer ends; it is never paused or STOPped and no hold is
-        touched. The cost while halted is one claim and one reschedule per gated lane with a backlog
-        per backoff, the cost ADR 0189 states for the delivery tier.
+        The gate itself is the dispatcher's pre-claim predicate (:meth:`_may_claim_internal`), so a
+        gated lane makes no claim and writes no row. This reaches only a prefix already claimed
+        when the halt latched, once per halt per lane. It RESCHEDULES rather than failing the row,
+        for the reasons :meth:`_dispatch_delivery` gives: a log-write halt is a machinery fault,
+        not the message's, so no attempt is spent and ``seq`` is kept. The dispatcher releases the
+        rest of a claimed prefix. A raise from the reschedule is the dispatcher's T17 path, which
+        re-pends the head itself; the row is not processed either way. At the episode's end the
+        lane meets the predicate and parks with no timer.
 
         ON A NODE THAT HAS LOST LEADERSHIP it releases the row and STOPs the lane for the new
         leader instead, as :meth:`_refuse_claimed` does for the delivery tier: a reschedule would
@@ -7641,7 +7646,16 @@ class RegistryRunner:
             infra_fault_backoff_cap=self._infra_fault_backoff_cap,
             is_leader=self._coordinator.is_leader,
             current_epoch=self._coordinator.current_epoch,
+            # #122 claim gate, pooled half (BACKLOG #5704): a gated internal lane parks before it
+            # claims, so a halt costs no claim and no reschedule, and :meth:`_lift_log_halt` and
+            # :meth:`_wake_log_gated` release it. The delivery tier has its own gate (ADR 0189).
+            may_claim=(None if stage is Stage.OUTBOUND else self._may_claim_internal),
         )
+
+    def _may_claim_internal(self, lane: str) -> bool:
+        """The pooled pre-claim predicate for the INGRESS, ROUTED and RESPONSE dispatchers: the
+        #122 claim gate, read before the claim so a gated lane touches no row (BACKLOG #5704)."""
+        return not self._inbound_log_halted(lane)
 
     async def _start_pooled_dispatchers(self) -> None:
         """Build + start the pooled StageDispatchers (ADR 0066 §5) — called once from ``start()`` under

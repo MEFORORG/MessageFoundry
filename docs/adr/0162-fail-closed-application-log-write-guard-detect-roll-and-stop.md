@@ -152,8 +152,8 @@ gate that returns out of the worker before its next claim. A lane already mid-ep
 most its one in-flight head** — bounded, and strictly better than stranding the row.
 *(Note, BACKLOG #5704: superseded in mechanism. The internal stages are now held by a claim gate,
 `_inbound_log_halted`, which reads the latch and the per-inbound marks: per_lane workers WAIT at
-their loop top rather than returning, and the pooled adapters hand a gated row back by
-`reschedule_claimed` and park the lane. The halt never pauses or STOPs an internal lane or touches
+their loop top rather than returning, and a pooled lane parks before its claim, touching no
+row, until the gate lifts. The halt never pauses or STOPs an internal lane or touches
 its hold. ADR 0189's note says the rest.)*
 
 **Recovery, measured rather than assumed — the two tiers recover differently and an operator needs

@@ -47,7 +47,7 @@ import functools
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Protocol
@@ -243,6 +243,7 @@ class _LanePhase(Enum):
     CLAIMING = auto()  # in the current claim_fifo_heads batch (slot reserved)
     PROCESSING = auto()  # a live serializer is draining its claimed prefix (slot consumed)
     PARKED = auto()  # head backing off until park_until; unpark by timer / sweep-due / notify_work
+    # (or claim-gated, ``_LaneState.gated``: no timer, and only release_gated / notify_work unpark it)
     # Deliberately halted; re-armed by reload / notify_work or an operator resume_lane (#5700).
     STOPPED = auto()
     # Operator PAUSE (connection controls): delivery halted by an operator; queued rows RETAINED PENDING.
@@ -294,6 +295,10 @@ class _LaneState:
     # BACKLOG #2075: this lane holds one of the stage's processing slots. Paired by
     # _reserve_lane_slot / _release_lane_slot; why the phase cannot say this is at the release.
     slot_held: bool = False
+    # BACKLOG #5704: PARKED because ``may_claim`` refused the lane (the #122 log-write claim gate), not
+    # because a head is backing off. No timer is armed and no row was touched; the sweep and a stale
+    # timer leave it parked, and only release_gated or notify_work unparks it. Cleared by _unpark.
+    gated: bool = False
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
@@ -467,6 +472,7 @@ class StageDispatcher:
         infra_fault_backoff_cap: float = 60.0,
         is_leader: Callable[[], bool] | None = None,
         current_epoch: Callable[[], int | None] | None = None,
+        may_claim: Callable[[str], bool] | None = None,
     ) -> None:
         assert claimers_per_stage >= 1
         assert max_processing_lanes >= 1
@@ -512,6 +518,10 @@ class StageDispatcher:
         # with no epoch to fence on.
         self._is_leader: Callable[[], bool] = is_leader or (lambda: True)
         self._current_epoch: Callable[[], int | None] = current_epoch or (lambda: None)
+        # The pre-claim gate (BACKLOG #5704). A lane it refuses parks at chunk assembly with NO claim
+        # and NO row write, so a gate held for hours costs no store I/O and cannot reach the T17
+        # infra-fault STOP. The runner lifts it with release_gated. None: every lane may claim.
+        self._may_claim: Callable[[str], bool] = may_claim or (lambda _lane: True)
 
         self._states: dict[str, _LaneState] = {}
         self._claimers: list[_Claimer] = [
@@ -1171,6 +1181,9 @@ class StageDispatcher:
             st = self._states.get(lane)
             if st is None or st.phase is not _LanePhase.READY:
                 continue  # stale: the lane already left READY (e.g. teardown, or a double entry)
+            if not self._may_claim(lane):  # BACKLOG #5704: gated, so park with no claim and no slot
+                self._park_gated(lane, st)
+                continue
             st.phase = _LanePhase.CLAIMING  # T8
             st.dirty = False
             # The lane EPISODE opens exactly HERE — reserving the slot is the moment the lane stops being
@@ -1848,6 +1861,7 @@ class StageDispatcher:
         st.phase = _LanePhase.PAUSED
         st.pause_pending = False
         st.dirty = False
+        st.gated = False
         self._fire_paused(lane)
 
     def _to_stopped(self, lane: str, st: _LaneState, detail: str) -> None:
@@ -1971,8 +1985,30 @@ class StageDispatcher:
         st.phase = _LanePhase.PARKED
         st.dirty = False
         st.park_until = until
+        st.gated = False  # a backoff park: its timer and the sweep unpark it
         if until is not None:
             self._arm_timer(lane, until)
+
+    def _park_gated(self, lane: str, st: _LaneState) -> None:
+        """Park a lane the pre-claim gate refused (BACKLOG #5704), with no timer: nothing is due to
+        re-check, because the gate lifts only when the runner says so, through release_gated. A wake
+        meanwhile only sets dirty (T6)."""
+        self._cancel_timer(lane)
+        st.phase = _LanePhase.PARKED
+        st.dirty = False
+        st.park_until = None
+        st.gated = True
+
+    def release_gated(self, keys: Iterable[str] | None = None) -> None:
+        """Unpark lanes the pre-claim gate parked (BACKLOG #5704): ``keys``, or every gate-parked lane
+        when None. Sync and await-free. A lane parked for a backing-off head, STOPPED or PAUSED is left
+        exactly as it is, so lifting the gate releases no hold and re-arms nothing an operator or the
+        T17 bound halted. A lane the gate still refuses parks again at its next chunk assembly."""
+        lanes = list(self._states) if keys is None else list(keys)
+        for lane in lanes:
+            st = self._states.get(lane)
+            if st is not None and st.phase is _LanePhase.PARKED and st.gated:
+                self._unpark(lane, woken=True)
 
     def _unpark(self, lane: str, *, woken: bool) -> None:
         """PARKED/STOPPED -> READY (T18/T19): cancel the park timer, clear dirty, enqueue.
@@ -1997,6 +2033,7 @@ class StageDispatcher:
         st.phase = _LanePhase.READY
         st.dirty = False
         st.park_until = None
+        st.gated = False
         st.ready_woken = woken
         self._enqueue(lane)
 
@@ -2124,7 +2161,7 @@ class StageDispatcher:
         st = self._states.get(lane)
         if st is None:
             return
-        if st.phase is _LanePhase.PARKED:  # T18
+        if st.phase is _LanePhase.PARKED and not st.gated:  # T18; a gated park waits for release
             self._unpark(lane, woken=False)  # a due head is a sweep-class readiness, not a wake
         elif st.phase is _LanePhase.IDLE:  # a not-due head became due while the lane was idle
             self.mark_ready(lane, woken=False)
@@ -2203,6 +2240,8 @@ class StageDispatcher:
         phase = st.phase
         if phase in (_LanePhase.IDLE, _LanePhase.READY):
             self.mark_ready(lane, woken=False)  # T20
+        elif phase is _LanePhase.PARKED and st.gated:
+            st.dirty = True  # BACKLOG #5704: a gated park waits for release_gated, not a due head
         elif phase is _LanePhase.PARKED:
             self._unpark(lane, woken=False)  # T18 — backoff elapsed; the backstop
         elif phase in (_LanePhase.CLAIMING, _LanePhase.PROCESSING):

@@ -1442,15 +1442,16 @@ async def test_the_log_halt_leaves_a_held_internal_lane_to_land_and_then_gates_i
             await _until(reprocessed)
             return
         await _until(landed)
-        # Many backoffs: a gated lane claims and hands back, and never processes.
+        # Many backoffs: a gated lane never processes the row.
         await asyncio.sleep(0.5)
         assert calls[handoff] == handoffs, "a gated row was processed"
         if claim_mode == "per_lane":
             worker = runner._inbound_worker_dict(kind)["IB"]
             assert not worker.done(), "the worker left its lane instead of waiting at the gate"
         else:
-            phase = runner._dispatchers[stage]._states["IB"].phase
-            assert phase is not stage_dispatcher._LanePhase.PAUSED, "the halt paused the lane"
+            # Parked by the pre-claim gate: not PAUSED, not STOPPED, and no claim outstanding.
+            st = runner._dispatchers[stage]._states["IB"]
+            assert (st.phase, st.gated) == (stage_dispatcher._LanePhase.PARKED, True)
     finally:
         await runner.stop()
 
