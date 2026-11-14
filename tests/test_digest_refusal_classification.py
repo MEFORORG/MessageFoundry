@@ -25,7 +25,6 @@ the token hop, and a send-time hop refusal that wins over a Digest refusal.
 
 from __future__ import annotations
 
-import http.client
 import http.server
 import threading
 import urllib.error
@@ -50,7 +49,6 @@ from messagefoundry.transports.base import (
     DeliveryError,
     NegativeAckError,
 )
-from messagefoundry.transports.bounded_read import ProxyTunnelRefusedError
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_auth import (
     HttpAuthError,
@@ -61,11 +59,9 @@ from messagefoundry.transports.http_auth import (
 from messagefoundry.transports.rest import (
     AUTH_CHALLENGE_REFUSED,
     AUTH_CHALLENGE_REFUSED_CODE,
-    AUTH_CHALLENGE_REFUSED_ON_CONNECT,
     InsecureHopGuard,
     ProxyConfig,
     auth_challenge_refused,
-    is_refused_proxy_digest_tunnel,
     proxy_config_from_settings,
 )
 from tests._egress_policy import permitting
@@ -633,7 +629,6 @@ def test_the_token_hop_refusal_is_the_same_configuration_fault() -> None:
             timeout=1,
             endpoint="SMART token endpoint",
             connector="c",
-            digest_proxy=True,
         )
     err = ei.value
     assert err.code == AUTH_CHALLENGE_REFUSED_CODE
@@ -648,11 +643,15 @@ _HTTPS_TOKEN_URL = "https://auth.partner.invalid/token?tenant=SITE-QUERY"
 _HTTPS_TOKEN_LABEL = "OAuth2 token endpoint https://auth.partner.invalid/token"
 
 
-def _digest_proxy_config(proxy_url: str, *, auth: str | None) -> ProxyConfig:
-    """``proxy_url`` with no proxy credential, a pre-emptive Basic one, or a Digest one. Proxy
-    Digest is refused for an https destination, so the proxy is built for an http one, as it must
-    be."""
+def _digest_proxy_config(
+    proxy_url: str, *, auth: str | None, bypass: list[str] | None = None
+) -> ProxyConfig:
+    """``proxy_url`` with no proxy credential, a pre-emptive Basic one, or a Digest one, bypassing
+    the hosts in ``bypass``. Proxy Digest is refused for an https destination, so the proxy is
+    built for an http one, as it must be."""
     settings: dict[str, object] = {"proxy_url": proxy_url}
+    if bypass is not None:
+        settings["proxy_no_proxy"] = bypass
     if auth is not None:
         settings |= {"proxy_user": "pu", "proxy_password": "pw", "proxy_auth_type": auth}
     with active_hop_posture(_WARN_DIAL):
@@ -667,67 +666,121 @@ def _digest_proxy_config(proxy_url: str, *, auth: str | None) -> ProxyConfig:
     return proxy
 
 
-def _token_provider_via(proxy_url: str, *, auth: str | None) -> OAuth2ClientCredentialsProvider:
+def _token_provider_via(
+    proxy_url: str, *, auth: str | None, bypass: list[str] | None = None
+) -> OAuth2ClientCredentialsProvider:
     """An OAuth2 provider whose https token endpoint is behind ``proxy_url``. The token hop is the
     shared ``smart._TokenEndpointProvider``, so the SMART provider takes the same path."""
     return OAuth2ClientCredentialsProvider(
         token_url=_HTTPS_TOKEN_URL,
         client_id="cid",
         client_secret="s3cr3t",
-        proxy=_digest_proxy_config(proxy_url, auth=auth),
+        proxy=_digest_proxy_config(proxy_url, auth=auth, bypass=bypass),
     )
+
+
+#: What the build refusal says, after the provider's label (BACKLOG #2989 item 11).
+_DIGEST_PROXY_REFUSED = "token endpoint is https and its web proxy is set up for Digest"
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_an_https_token_endpoint_behind_a_digest_proxy_is_refused_at_build() -> None:
+    """BACKLOG #2989 item 11. An https token request meets its web proxy only as a CONNECT, and
+    urllib raises the proxy's 407 there before the Digest handler sees it, so no token could ever
+    be minted. The build refuses it as a configuration fault, and nothing reaches the proxy. Fails
+    on the code before that change, which built the provider and stopped the lane at send."""
+    with (
+        _Challenger(407, _SHA256, refuse_answered=True) as proxy,
+        pytest.raises(HttpAuthError) as ei,
+    ):
+        _token_provider_via(proxy.url, auth="digest")
+    message = str(ei.value)
+    assert message.startswith(f"OAuth2 {_DIGEST_PROXY_REFUSED} ")
+    assert "proxy_auth_type='basic'" in message
+    assert "(ADR 0095 B.1)" in message
+    # The token URL's query and the proxy's address stay out of the refusal.
+    assert "SITE-QUERY" not in message
+    assert "127.0.0.1" not in message
+    assert proxy.requests == 0
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_the_build_refusal_names_the_connection() -> None:
+    with pytest.raises(HttpAuthError, match=f"^connection 'OB'; OAuth2 {_DIGEST_PROXY_REFUSED} "):
+        OAuth2ClientCredentialsProvider(
+            token_url=_HTTPS_TOKEN_URL,
+            client_id="cid",
+            client_secret="s3cr3t",
+            proxy=_digest_proxy_config("http://127.0.0.1:3128", auth="digest"),
+            connection="OB",
+        )
+
+
+@pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize("auth", ["basic", None], ids=["basic", "no-credential"])
+def test_an_https_token_endpoint_behind_a_proxy_without_digest_still_builds(
+    auth: str | None,
+) -> None:
+    """THE CONTROLS for the build refusal: a proxy with a pre-emptive Basic credential, or none,
+    can let a token through the CONNECT, so it builds as before."""
+    provider = _token_provider_via("http://127.0.0.1:3128", auth=auth)
+    assert provider._opener is not None
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_token_host_the_digest_proxy_bypasses_still_builds() -> None:
+    """THE CONTROL that keys the refusal on the proxy resolved for the TOKEN host, not the one the
+    connection names: a token host on the proxy's bypass list goes direct, so the proxy's Digest
+    setup never meets it, and it builds with the shared opener and no proxy credential."""
+    from messagefoundry.transports.rest import _shared_no_redirect_opener
+
+    provider = _token_provider_via(
+        "http://127.0.0.1:3128", auth="digest", bypass=["auth.partner.invalid"]
+    )
+    assert provider._opener is _shared_no_redirect_opener()
+    assert provider._proxy_auth == {}
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_digest_proxy_with_an_ech_sidecar_is_not_refused_by_the_token_hop() -> None:
+    """With an ECH sidecar the token POST is re-addressed over loopback http, which is dialled
+    direct, so the proxy never meets it and the token hop has nothing to refuse. No built
+    connection pairs the two (``ech_egress`` and ``proxy_url`` are mutually exclusive), so this
+    pins the token hop alone."""
+    with active_hop_posture(_WARN_DIAL):
+        provider = OAuth2ClientCredentialsProvider(
+            token_url=_HTTPS_TOKEN_URL,
+            client_id="cid",
+            client_secret="s3cr3t",
+            proxy=_digest_proxy_config("http://127.0.0.1:3128", auth="digest"),
+            ech_sidecar="http://127.0.0.1:9",
+        )
+    assert provider._ech_sidecar == "http://127.0.0.1:9"
 
 
 @pytest.mark.usefixtures("no_bypass")
 @pytest.mark.parametrize(
-    "challenge", [_SHA256, 'Basic realm="proxy"'], ids=["sha256-digest", "basic"]
+    ("status", "auth"),
+    [(407, None), (407, "basic"), (403, "basic"), (502, None)],
+    ids=["407-no-credential", "407-basic-rejected", "403-basic", "502-no-credential"],
 )
-def test_an_https_token_endpoints_digest_proxy_407_is_the_same_configuration_fault(
-    challenge: str,
+def test_an_https_token_endpoints_tunnel_refusal_still_retries(
+    status: int, auth: str | None
 ) -> None:
-    """Finding 3, the half engine PR 2280 left open (vault BACKLOG #3532 item 1). ADR 0095 B.1
-    states the case. Before engine PR 2827 this was a plain ``DeliveryError``, retried. The text
-    names the proxy's ``CONNECT``, not a challenge the engine screened (BACKLOG #2989 item 14)."""
-    with _Challenger(407, challenge, refuse_answered=True) as proxy:
-        provider = _token_provider_via(proxy.url, auth="digest")
-        with pytest.raises(NegativeAckError) as ei:
+    """A CONNECT refusal on a token hop the build lets through reads as unreachable and retries:
+    a 407 is the plain 407 an http token endpoint also retries (ADR 0095 B.1 keeps a Basic
+    challenge a plain status), and any other CONNECT status is not a challenge."""
+    with _Challenger(status, 'Basic realm="proxy"', refuse_answered=True) as proxy:
+        provider = _token_provider_via(proxy.url, auth=auth)
+        with pytest.raises(DeliveryError) as ei:
             provider.access_token()
-    err = ei.value
-    assert err.code == AUTH_CHALLENGE_REFUSED_CODE
-    assert (err.permanent, err.config_fault) == (True, True)
-    assert str(err) == f"{_HTTPS_TOKEN_LABEL} {AUTH_CHALLENGE_REFUSED_ON_CONNECT}"
-    cause = err.__cause__
-    assert isinstance(cause, urllib.error.URLError)
-    # The status the proxy's status line gave, read off the strict connection, not its text.
-    assert isinstance(cause.reason, ProxyTunnelRefusedError)
-    assert cause.reason.status == 407
+    assert type(ei.value) is DeliveryError
+    assert str(ei.value).startswith(
+        f"{_HTTPS_TOKEN_LABEL} unreachable: Tunnel connection failed: {status} "
+    )
     assert proxy.requests == 1
-    assert proxy.answered == [], "Digest sends no pre-emptive credential"
-
-
-class _NoHandlers:
-    """An opener that passes every call to ``opener`` and has no ``handlers`` attribute."""
-
-    def __init__(self, opener: urllib.request.OpenerDirector) -> None:
-        self._opener = opener
-
-    def open(self, req: urllib.request.Request, timeout: float | None = None) -> Any:
-        return self._opener.open(req, timeout=timeout)
-
-
-@pytest.mark.usefixtures("no_bypass")
-def test_an_opener_without_handlers_still_meets_the_digest_connect_refusal() -> None:
-    """BACKLOG #2989 item 15. The match once read the Digest handler off ``opener.handlers`` with a
-    default of none, so an opener without that attribute silently read as "not this fault" and the
-    mint retried. The hop's Digest setup is now decided when it is built. Fails on the code before
-    that change: the same CONNECT 407 there is a retryable ``DeliveryError``."""
-    with _Challenger(407, _SHA256, refuse_answered=True) as proxy:
-        provider = _token_provider_via(proxy.url, auth="digest")
-        provider._opener = _NoHandlers(provider._opener)  # type: ignore[assignment]
-        with pytest.raises(NegativeAckError) as ei:
-            provider.access_token()
-    assert ei.value.code == AUTH_CHALLENGE_REFUSED_CODE
-    assert proxy.requests == 1
+    # The Basic case is real only if the credential went out on the CONNECT.
+    assert [a.split()[0] for a in proxy.answered] == (["Basic"] if auth == "basic" else [])
 
 
 @pytest.fixture(scope="module")
@@ -744,217 +797,39 @@ def ec_pem() -> str:
 
 
 @pytest.mark.usefixtures("no_bypass")
-def test_a_smart_providers_digest_proxy_connect_407_is_the_same_configuration_fault(
-    ec_pem: str,
-) -> None:
-    """BACKLOG #2989 item 17. The SMART provider shares the token hop with OAuth2, and this runs it
-    on the wire rather than through OAuth2."""
-    from messagefoundry.transports.smart import SmartBackendTokenProvider
+def test_a_smart_provider_behind_a_digest_proxy_is_refused_at_build(ec_pem: str) -> None:
+    """BACKLOG #2989 item 11, on the SMART provider, which shares the token hop with OAuth2 and
+    raises its own error type."""
+    from messagefoundry.transports.smart import SmartAuthError, SmartBackendTokenProvider
 
-    with _Challenger(407, _SHA256, refuse_answered=True) as proxy:
-        provider = SmartBackendTokenProvider(
+    with pytest.raises(SmartAuthError, match=f"^SMART {_DIGEST_PROXY_REFUSED} "):
+        SmartBackendTokenProvider(
             token_url=_HTTPS_TOKEN_URL,
             client_id="cid",
             private_key=ec_pem,
             algorithm=SignatureAlgorithm.ES256,
             scope="system/*.rs",
-            proxy=_digest_proxy_config(proxy.url, auth="digest"),
+            proxy=_digest_proxy_config("http://127.0.0.1:3128", auth="digest"),
         )
-        with pytest.raises(NegativeAckError) as ei:
-            provider.access_token()
-    err = ei.value
-    assert err.code == AUTH_CHALLENGE_REFUSED_CODE
-    assert (err.permanent, err.config_fault) == (True, True)
-    assert str(err) == (
-        f"SMART token endpoint https://auth.partner.invalid/token {AUTH_CHALLENGE_REFUSED_ON_CONNECT}"
-    )
-    assert proxy.requests == 1
-    assert proxy.answered == []
-
-
-def _bearer_rest_via(proxy_url: str) -> Any:
-    """A REST destination on a loopback ``http://`` URL, whose OAuth2 token endpoint is ``https://``
-    and behind a web proxy set up for Digest: the configuration this case needs (ADR 0095 B.1). The
-    destination's own hop is loopback, so it is dialled direct; only the token request meets the
-    proxy, and it fails before any delivery byte is sent."""
-    return _build(
-        ConnectorType.REST,
-        "http://127.0.0.1:9/x",
-        proxy=proxy_url,
-        proxy_user="pu",
-        proxy_password="pw",
-        proxy_auth_type="digest",
-        oauth2_token_url=_HTTPS_TOKEN_URL,
-    )
 
 
 @pytest.mark.usefixtures("no_bypass")
-async def test_the_digest_connect_refusal_stops_the_lane_and_keeps_the_row(tmp_path: Path) -> None:
-    """BACKLOG #2989 item 17: the delivery worker, not only the raised fault. A real REST
-    destination mints its bearer through the proxy, meets the CONNECT 407, and the lane stops
-    with the row kept, as for any refused challenge."""
-    with _Challenger(407, _SHA256, refuse_answered=True) as proxy:
-        dest = _bearer_rest_via(proxy.url)
-        outcome, status, sink = await _deliver_one(tmp_path, dest)
-    assert outcome is _ItemOutcome.STOPPED
-    assert status == OutboxStatus.PENDING.value, "the row was not kept for the operator"
-    assert [name for name, _ in sink.stopped] == [DEST]
-    assert "configuration fault (auth-challenge-refused)" in sink.stopped[0][1]
-    assert proxy.requests == 1
-
-
-@pytest.mark.usefixtures("no_bypass")
-def test_a_probe_that_mints_a_bearer_reports_the_digest_connect_refusal() -> None:
-    """BACKLOG #2989 item 17: the test-connection probe mints the bearer first, so it meets the
-    same refusal, with its marker and the text naming the proxy's CONNECT."""
-    with _Challenger(407, _SHA256, refuse_answered=True) as proxy:
-        dest = _bearer_rest_via(proxy.url)
-        with pytest.raises(DeliveryError) as ei:
-            dest._probe()
-    assert isinstance(ei.value, NegativeAckError)
-    assert ei.value.code == AUTH_CHALLENGE_REFUSED_CODE
-    assert str(ei.value) == f"{_HTTPS_TOKEN_LABEL} {AUTH_CHALLENGE_REFUSED_ON_CONNECT}"
-    assert proxy.requests == 1
-
-
-@pytest.mark.usefixtures("no_bypass")
-@pytest.mark.parametrize(
-    ("status", "auth"),
-    [(407, None), (407, "basic"), (403, "digest"), (502, "digest")],
-    ids=["407-no-credential", "407-basic-rejected", "403-digest", "502-digest"],
-)
-def test_an_https_token_endpoints_other_tunnel_refusal_still_retries(
-    status: int, auth: str | None
-) -> None:
-    """THE CONTROLS. With no Digest set up, a CONNECT 407 is the plain 407 an http token endpoint
-    also retries (ADR 0095 B.1 keeps a Basic challenge a plain status). Any other CONNECT status
-    is not a challenge."""
-    with _Challenger(status, 'Basic realm="proxy"', refuse_answered=True) as proxy:
-        provider = _token_provider_via(proxy.url, auth=auth)
-        with pytest.raises(DeliveryError) as ei:
-            provider.access_token()
-    assert type(ei.value) is DeliveryError
-    assert str(ei.value).startswith(
-        f"{_HTTPS_TOKEN_LABEL} unreachable: Tunnel connection failed: {status} "
-    )
-    assert proxy.requests == 1
-    # The Basic case is real only if the credential went out on the CONNECT.
-    assert [a.split()[0] for a in proxy.answered] == (["Basic"] if auth == "basic" else [])
-
-
-_TUNNEL_407 = "Tunnel connection failed: 407 x"
-
-
-@pytest.mark.parametrize(
-    ("reason", "digest_proxy"),
-    [
-        (ProxyTunnelRefusedError(_TUNNEL_407, status=407), False),
-        (ProxyTunnelRefusedError("Tunnel connection failed: 403 x", status=403), True),
-        (OSError(_TUNNEL_407), True),
-        (ConnectionResetError(_TUNNEL_407), True),
-        (_TUNNEL_407, True),
-    ],
-    ids=["no-digest-proxy", "status-403", "bare-oserror-text", "oserror-subclass", "string"],
-)
-def test_the_connect_407_match_reads_the_status_and_the_built_digest_setup(
-    reason: object, digest_proxy: bool
-) -> None:
-    """The match takes the status from ``ProxyTunnelRefusedError`` and the Digest setup from the
-    hop's build, and reads no text: a bare ``OSError`` carrying ``_tunnel``'s 407 text does not
-    match, because the strict https connection the token hop dials raises the typed error for a
-    refused CONNECT."""
-    match = ProxyTunnelRefusedError(_TUNNEL_407, status=407)
-    assert is_refused_proxy_digest_tunnel(urllib.error.URLError(match), digest_proxy=True)
-    refused = urllib.error.URLError(reason)  # type: ignore[arg-type]
-    assert not is_refused_proxy_digest_tunnel(refused, digest_proxy=digest_proxy)
-
-
-class _ConnectReply:
-    """A socket whose reader holds the proxy's status line and nothing after it."""
-
-    def __init__(self, status_line: bytes) -> None:
-        self._status_line = status_line
-
-    def makefile(self, mode: str) -> Any:
-        import io
-
-        return io.BytesIO(self._status_line)
-
-
-@pytest.mark.parametrize(
-    ("status_line", "raised", "typed"),
-    [
-        (b"HTTP/1.1 407 x\r\n", OSError("Tunnel connection failed: 407 x"), True),
-        (b"HTTP/1.1 407 x\r\n", ConnectionResetError(104, "reset while reading the head"), False),
-        (b"HTTP/1.1 407 x\r\n", OSError(113, "no route"), False),
-        (b"HTTP/1.1 407 x\r\n", TimeoutError("timed out"), False),
-        (b"HTTP/1.1 200 OK\r\n", OSError("closed after the tunnel opened"), False),
-    ],
-    ids=["tunnel-refusal", "reset-after-status", "errno-oserror", "timeout", "status-200"],
-)
-def test_the_strict_connection_types_only_its_own_tunnel_refusal(
-    monkeypatch: pytest.MonkeyPatch, status_line: bytes, raised: OSError, typed: bool
-) -> None:
-    """The pass-through arms of ``_StrictHTTPSConnection._tunnel``. A socket error after the
-    proxy's 407 status line was read keeps its own type, so it stays the transient it was rather
-    than becoming the refusal that stops the lane. The stand-in reads the status as ``_tunnel``
-    does, then raises."""
-    from messagefoundry.transports import bounded_read
-
-    def tunnel(self: http.client.HTTPConnection) -> None:
-        response = self.response_class(_ConnectReply(status_line))  # type: ignore[arg-type]
-        response._read_status()  # type: ignore[attr-defined]
-        raise raised
-
-    monkeypatch.setattr(http.client.HTTPConnection, "_tunnel", tunnel)
-    conn = bounded_read._StrictHTTPSConnection("proxy.invalid")
-    with pytest.raises(OSError) as ei:
-        conn._tunnel()
-    if typed:
-        assert isinstance(ei.value, ProxyTunnelRefusedError)
-        assert ei.value.status == 407
-        assert str(ei.value) == str(raised)
-    else:
-        assert ei.value is raised
-    assert "response_class" not in vars(conn), "the CONNECT reply hook outlived the tunnel"
-
-
-def test_the_strict_tunnel_restores_an_instance_response_class(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A response class set on the connection itself reads the CONNECT reply and is put back."""
-    from messagefoundry.transports import bounded_read
-
-    seen: list[type] = []
-
-    def tunnel(self: http.client.HTTPConnection) -> None:
-        response = self.response_class(_ConnectReply(b"HTTP/1.1 403 x\r\n"))  # type: ignore[arg-type]
-        seen.append(type(response))
-        response._read_status()  # type: ignore[attr-defined]
-        raise OSError("Tunnel connection failed: 403 x")
-
-    class _Own(bounded_read.StrictHTTPResponse):
-        pass
-
-    monkeypatch.setattr(http.client.HTTPConnection, "_tunnel", tunnel)
-    conn = bounded_read._StrictHTTPSConnection("proxy.invalid")
-    conn.response_class = _Own
-    with pytest.raises(ProxyTunnelRefusedError) as ei:
-        conn._tunnel()
-    assert ei.value.status == 403
-    assert seen == [_Own]
-    assert vars(conn)["response_class"] is _Own
-
-
-def test_the_typed_tunnel_refusal_survives_a_copy() -> None:
-    import copy
-    import pickle
-
-    err = ProxyTunnelRefusedError("Tunnel connection failed: 407 x", status=407)
-    err.add_note("kept")
-    for clone in (copy.copy(err), pickle.loads(pickle.dumps(err))):  # noqa: S301
-        assert isinstance(clone, ProxyTunnelRefusedError)
-        assert (clone.status, str(clone), clone.__notes__) == (407, str(err), ["kept"])
+def test_a_rest_destination_minting_through_a_digest_proxy_is_refused_at_build() -> None:
+    """The configuration that reached the token hop's CONNECT 407 before BACKLOG #2989 item 11: a
+    loopback ``http://`` REST destination, which goes direct, minting a bearer at an https token
+    endpoint behind a web proxy set up for Digest. The destination is now refused when it is
+    built rather than stopping its lane at the first send. The connection's name leads the text
+    only where the runner mirrors it into the settings, which a direct build does not."""
+    with pytest.raises(HttpAuthError, match=f"^OAuth2 {_DIGEST_PROXY_REFUSED} "):
+        _build(
+            ConnectorType.REST,
+            "http://127.0.0.1:9/x",
+            proxy="http://127.0.0.1:3128",
+            proxy_user="pu",
+            proxy_password="pw",
+            proxy_auth_type="digest",
+            oauth2_token_url=_HTTPS_TOKEN_URL,
+        )
 
 
 @pytest.mark.usefixtures("no_bypass")
@@ -982,16 +857,6 @@ def test_no_built_http_token_endpoint_reaches_the_web_proxy() -> None:
             provider.access_token()
     assert type(ei.value) is DeliveryError
     assert proxy.requests == 0
-
-
-@pytest.mark.usefixtures("no_bypass")
-@pytest.mark.parametrize(("auth", "expected"), [("digest", True), ("basic", False), (None, False)])
-def test_the_hop_decides_its_digest_setup_when_it_is_built(
-    auth: str | None, expected: bool
-) -> None:
-    # Bypass pinned off, so the Basic hop is credentialed and lacks Digest for that reason alone.
-    provider = _token_provider_via("http://127.0.0.1:3128", auth=auth)
-    assert provider._digest_proxy is expected
 
 
 class _CountingRefuser:

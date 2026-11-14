@@ -1,9 +1,8 @@
-- **A Digest web proxy's 407 to an `https://` token endpoint's `CONNECT` stops the lane instead
-  of retrying.** (`BACKLOG #2989`) The OAuth2 and SMART token hops now raise the
-  `auth-challenge-refused` configuration fault for it. urllib cannot answer a `CONNECT` challenge,
-  so each retry met the same 407. A `CONNECT` 407 on a proxy with no Digest set up, and any other
-  `CONNECT` refusal, still retry. Its text names the web proxy's 407 to the `CONNECT` and points at
-  ADR 0095 B.1 for the remedy, and the match reads the status of the proxy's reply and whether the token hop's proxy
-  was built for Digest, never `http.client`'s message text or what the opener exposes.
+- **An OAuth2 or SMART connection whose `https://` token endpoint sits behind a web proxy set up
+  for Digest is refused when it is built.** (`BACKLOG #2989`) urllib cannot answer a proxy's 407
+  to the `CONNECT`, so no token could ever be minted there; such a connection is now a
+  configuration error at load instead of a lane that stops at its first send. The refusal keys on
+  the proxy resolved for the token host, so a token host the proxy bypasses still builds. A
+  `CONNECT` 407 on a proxy with no Digest set up, and any other `CONNECT` refusal, still retry.
   [ADR 0095](../docs/adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)
   Amendment B.1 has the detail and the remedy.

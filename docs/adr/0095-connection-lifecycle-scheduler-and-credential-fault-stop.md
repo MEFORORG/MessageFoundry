@@ -312,9 +312,8 @@ The costs, at least these:
 - The `FhirLookup` read gets the new text and nothing else. A Handler that calls it behind a
   refusing web proxy would still fail each message in turn, as before.
 
-The fault is raised only where a Digest handler is on the opener and refuses, or, since
-2026-11-06, in the token hop's `CONNECT` case B.1 states. These unanswered challenges do not
-raise it, at least: a Basic challenge that reaches a handler (read as a plain 401 or 407, on
+The fault is raised only where a Digest handler is on the opener and refuses. These
+unanswered challenges do not raise it, at least: a Basic challenge that reaches a handler (read as a plain 401 or 407, on
 purpose; see B.1), a 407 on a request that went direct rather than through the proxy (read as a
 plain 407, since BACKLOG #2989), and any challenge on a connection with no Digest set up. A Digest challenge
 with no nonce, and one whose `qop` urllib does not support, did not raise it either until B.1. A
@@ -374,7 +373,12 @@ for Digest, `smart.request_token` now raises the same fault for the proxy's 407 
 token endpoint's `CONNECT`, which `rest.is_refused_proxy_digest_tunnel` recognises. Since
 2026-11-13 (BACKLOG #2989 items 14 and 15) its text names the proxy's `CONNECT`, and the match
 reads the status of the proxy's reply and a flag the hop sets when it is built, not
-`http.client`'s message.* The Digest
+`http.client`'s message.*
+*Overtaken by BACKLOG #2989 item 11: an OAuth2 or SMART token hop with an `https://` token
+endpoint, whose web proxy resolved for the token host is set up for Digest, is refused when it is
+built, so no built configuration meets this 407 and the send-time match is gone. A token host the
+proxy bypasses builds, and so does a token hop behind an ECH sidecar, whose request goes to the
+loopback sidecar direct.* The Digest
 handler never sees that 407, so no retry can answer it, whatever the proxy's challenge says. The
 error carries no challenge, so a Digest-set-up proxy that challenges the `CONNECT` with Basic is
 read the same way; the engine holds no Basic credential there to answer it with. The remedies
