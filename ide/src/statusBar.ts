@@ -33,8 +33,8 @@ import {
   serviceConfigIsSet,
   workspaceDir,
 } from "./cli";
-import { connectionServiceConfig } from "./connectionWizardModel";
 import {
+  SERVE_DEFAULT_SERVICE_CONFIG,
   buildAdminProbeInvocation,
   buildBootstrapPlan,
   buildHeldInvocation,
@@ -45,6 +45,7 @@ import {
   runDirHasEngine,
   runStartPlan,
   serveCommandLine,
+  startServiceConfigValue,
   storeLessStartPrompt,
   validateProvisionEmail,
   validateProvisionUsername,
@@ -501,12 +502,12 @@ export class EngineStatusBar implements vscode.Disposable {
     // when there is a workspace for `serve` to run in.
     const canControl = ws !== undefined && vscode.workspace.isTrusted && isLocalEngine(url);
     // The service TOML judged here is the one serve, the probe and provision-admin are handed,
-    // resolved the way they resolve it from the workspace. Only a regular file counts, so a blank
-    // setting, which resolves to the workspace itself, is no TOML.
+    // resolved the way they resolve it from the workspace: with no flag, the file serve reads by
+    // default, whatever the setting holds. Only a regular file counts.
     const hasStore =
       canControl && ws !== undefined
         ? runDirHasEngine({
-            serviceTomlExists: isFile(path.resolve(ws, serviceConfigArg ?? serviceConfig())),
+            serviceTomlExists: isFile(path.resolve(ws, serviceConfigArg ?? SERVE_DEFAULT_SERVICE_CONFIG)),
             dbFiles: dbFilesIn(ws),
           })
         : false;
@@ -940,12 +941,12 @@ async function chooseAfterRefusal(detail: string): Promise<"provision" | "startA
 
 /**
  * The `--service-config` that serve, the admin probe and provision-admin are started with, and the
- * file the Start fork guard judges (BACKLOG #5566): the same rule connection edits pass the setting
- * by, so undefined when `messagefoundry.serviceConfig` is left at its default, where serve reads the
- * same default file on its own.
+ * file the Start fork guard judges (BACKLOG #5566): undefined when `messagefoundry.serviceConfig` is
+ * left at its default or is blank, where serve reads the default file on its own
+ * (startServiceConfigValue).
  */
 function startServiceConfig(): string | undefined {
-  return connectionServiceConfig(serviceConfig(), serviceConfigIsSet());
+  return startServiceConfigValue(serviceConfig(), serviceConfigIsSet());
 }
 
 /** Why Start must not run with this `--service-config`, or undefined when it may: a set value that

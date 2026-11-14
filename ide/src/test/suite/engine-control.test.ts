@@ -19,8 +19,10 @@ import {
   preflightArgs,
   runDirHasEngine,
   runStartPlan,
+  SERVE_DEFAULT_SERVICE_CONFIG,
   serveCommandHint,
   serveCommandLine,
+  startServiceConfigValue,
   validateProvisionEmail,
   type AdminDetails,
   type AdminProbeResult,
@@ -667,7 +669,7 @@ suite("engine control — Start runs against the service TOML the fork guard jud
       assert.ok(use.test(launch[0]), `launchEngine does not pass the one value: ${use}`);
     }
     assert.ok(
-      /path\.resolve\(ws,\s*serviceConfigArg\s*\?\?\s*serviceConfig\(\)\)/.test(code),
+      /path\.resolve\(ws,\s*serviceConfigArg\s*\?\?\s*SERVE_DEFAULT_SERVICE_CONFIG\)/.test(code),
       "the fork guard must judge the file the invocations name",
     );
     // A set value naming no file is refused before the guard, since serve would refuse it anyway.
@@ -703,12 +705,33 @@ suite("engine control — Start runs against the service TOML the fork guard jud
     const client = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "engineClient.ts"), "utf8");
     assert.ok(/serveCommandHint\(\)/.test(client), "engineClient's hint must use serveCommandHint");
     assert.ok(!/serveCommandLine\(/.test(client), "engineClient must not name the bare command");
+  });
+
+  test("a blank messagefoundry.serviceConfig counts as unset: no flag, no refusal", () => {
+    // Clearing the Settings box stores "", which VS Code still reports as set.
+    for (const blank of ["", "   ", "\t"]) {
+      assert.strictEqual(startServiceConfigValue(blank, true), undefined, JSON.stringify(blank));
+    }
+    assert.strictEqual(startServiceConfigValue("messagefoundry.toml", false), undefined, "unset");
+    assert.strictEqual(startServiceConfigValue("deploy/prod.toml", true), "deploy/prod.toml");
+    // A hand-edited non-string is not a blank the user cleared; it is still refused as it was.
+    assert.strictEqual(startServiceConfigValue(42, true), "");
     assert.ok(
-      /function startServiceConfig\(\)[^{]*\{\s*return connectionServiceConfig\(serviceConfig\(\),\s*serviceConfigIsSet\(\)\);/.test(
+      /function startServiceConfig\(\)[^{]*\{\s*return startServiceConfigValue\(serviceConfig\(\),\s*serviceConfigIsSet\(\)\);/.test(
         code,
       ),
-      "the value must follow the rule connection edits use",
+      "Start must read the setting through startServiceConfigValue",
     );
+  });
+
+  test("with no flag, the fork guard judges the file serve reads by default, so Create new engine still runs", () => {
+    assert.strictEqual(SERVE_DEFAULT_SERVICE_CONFIG, "messagefoundry.toml");
+    assert.ok(
+      /path\.resolve\(ws,\s*serviceConfigArg\s*\?\?\s*SERVE_DEFAULT_SERVICE_CONFIG\)/.test(code),
+      "a blank setting must not make the guard judge the workspace directory",
+    );
+    // A blank setting, with no default TOML and no store, is no engine: the guard offers to create one.
+    assert.strictEqual(runDirHasEngine({ serviceTomlExists: false, dbFiles: [] }), false);
   });
 
   test("a change to messagefoundry.serviceConfig re-plans the hover's actions", () => {
