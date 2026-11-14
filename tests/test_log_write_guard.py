@@ -2615,6 +2615,36 @@ async def test_a_halt_overtaken_by_a_cleared_latch_still_completes(
         await runner.stop()
 
 
+async def test_a_reload_during_the_halt_leaves_a_content_stopped_pooled_lane_and_its_hold(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704 review: a reload while the log is still dead must not re-arm a pooled internal
+    # lane a content STOP halted, or release its hold. MEASURED 2026-11-14: before the claim gate
+    # the halt paused the lane and the reload kept the hold; with the gate and no keep_stopped on
+    # the broadcast, the reload re-armed the lane to READY and released the hold.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "pooled")
+    await runner.start()
+    try:
+        routed = runner._dispatchers[Stage.ROUTED]
+        routed._to_stopped(INBOUND, routed._states[INBOUND], "poison")
+        runner._hold_for_operator(INBOUND, "inbound")
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        assert await _until(lambda: not runner._log_guard_tasks), "the halt never finished"
+
+        await runner.reload(_e2e_registry(outdir))
+
+        assert runner._log_write_stopped  # the log is still dead: the reload re-armed nothing
+        assert routed.stopped(INBOUND), "the reload re-armed the content-STOPPED lane"
+        assert ("inbound", INBOUND) in runner._stop_held, "the reload released the STOP's hold"
+    finally:
+        await runner.stop()
+
+
 @pytest.mark.parametrize("claim_mode", CLAIM_MODES)
 async def test_a_listener_rebound_past_a_cleared_latch_is_not_gated_by_the_waiting_halt(
     store: MessageStore, tmp_path: Path, claim_mode: str

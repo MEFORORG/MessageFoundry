@@ -647,15 +647,22 @@ class StageDispatcher:
             st.dirty_woken = (st.dirty and st.dirty_woken) or woken
             st.dirty = True
 
-    def notify_work(self) -> None:
+    def notify_work(self, *, keep_stopped: Callable[[str], bool] | None = None) -> None:
         """Recovery broadcast (replay, DR failback, reload tail, post-recovery nudge): mark every known
         + registry lane READY, UNPARK every PARKED lane and re-arm every STOPPED lane (the broadcast
         overrides a park/stop), then request an immediate sweep. Snapshots the lane set before iterating
         so a concurrent producer can't raise 'set changed size during iteration' (mirrors ``_wake_all``,
-        wiring_runner:487)."""
+        wiring_runner:487). A STOPPED lane ``keep_stopped`` names is left STOPPED (BACKLOG #5704)."""
         lanes = set(self._states) | self._lane_provider()
         for lane in lanes:
             st = self._states.get(lane)
+            if (
+                st is not None
+                and st.phase is _LanePhase.STOPPED
+                and keep_stopped is not None
+                and keep_stopped(lane)
+            ):
+                continue
             if st is not None and st.phase is _LanePhase.PAUSED:
                 # Reload-survival (connection controls): a recovery broadcast must NEVER resurrect a
                 # deliberately operator-PAUSED lane (only resume_lane re-arms it). Skip it entirely —

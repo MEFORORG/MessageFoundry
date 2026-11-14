@@ -2300,7 +2300,7 @@ class RegistryRunner:
         # Per-inbound rather than one process-wide flag because the RE-ARM is per-connection: a
         # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
         # Read at the CLAIM GATE (:meth:`_inbound_log_halted`) together with the latch, never applied
-        # as a pause or a STOP: the halt itself pauses and STOPs no lane; _inbound_log_halted says
+        # as a pause or a STOP: the halt itself does not pause or STOP a lane; _inbound_log_halted says
         # what can still STOP one (BACKLOG #5704).
         self._log_halted: set[str] = set()
         # The DELIVERY tier's counterpart is :attr:`_delivery_halted`, a derived read below rather
@@ -2570,8 +2570,15 @@ class RegistryRunner:
         exactly those. The STOPPED set is read BEFORE the broadcast: a hold whose lane has not reached
         STOPPED yet (the STOP site records it first) is not re-armed by it, and must survive."""
         kind = _HOLD_DIRECTION.get(stage)
-        rearmed = [n for k, n in self._stop_held if k == kind and d.stopped(n)]
-        d.notify_work()
+        # BACKLOG #5704: under the #122 claim gate an internal lane's STOP and its hold are left
+        # alone, as the halt's pause left them before the gate replaced it.
+        keep = None if stage is Stage.OUTBOUND else self._inbound_log_halted
+        rearmed = [
+            n
+            for k, n in self._stop_held
+            if k == kind and d.stopped(n) and not (keep is not None and keep(n))
+        ]
+        d.notify_work(keep_stopped=keep)
         if kind is not None:
             for n in rearmed:
                 self._release_operator_hold(n, kind)
@@ -5906,8 +5913,8 @@ class RegistryRunner:
         Setting the latch is what gates every inbound (:meth:`_inbound_log_halted`), so no router,
         transform or response row claimed after that line is processed: a pooled lane parks before
         its claim (:meth:`_may_claim_internal`) and hands back a prefix it had already claimed, and a
-        per_lane worker finishes a batch it had already claimed. The halt itself pauses and STOPs
-        no internal lane and touches no hold; :meth:`_inbound_log_halted` states what can still STOP one. The
+        per_lane worker finishes a batch it had already claimed. The halt itself does not pause
+        or STOP an internal lane; :meth:`_inbound_log_halted` states what can still STOP one. The
         marks go on in the same await-free step, before this waits for the reload lock, which is the
         race fix: a reload holding that lock rebinds each listener through
         :meth:`_resume_inbound_processing`, which refuses while the latch is set and the log still
@@ -6013,8 +6020,8 @@ class RegistryRunner:
 
     def _lift_log_halt(self, name: str) -> None:
         """Lift the #122 halt's mark on inbound ``name`` and wake its per_lane workers waiting at the
-        claim gate. Sync and await-free. Only the mark is lifted: the halt itself pauses and STOPs
-        no lane and touches no hold, so it left no lane to resume and no hold to release. A lane
+        claim gate. Sync and await-free. Only the mark is lifted: the halt itself does not pause
+        or STOP a lane, so it left no lane to resume. A lane
         that STOPped under its own fault policy meanwhile stays STOPPED here, as any STOP does
         (:meth:`_inbound_log_halted`; BACKLOG #5704). Only this inbound's lanes are woken, so a reload re-arming N inbounds wakes each
         once. A pooled lane the pre-claim gate parked is released with
@@ -10037,8 +10044,8 @@ class RegistryRunner:
         instant it fires, before it waits for the reload lock, and what covers an inbound a reload
         adds later, bound or not.
 
-        **What the halt does to a lane, stated once here.** The halt itself never pauses or STOPs
-        an internal lane or touches its hold: it only gates the claim, and a pooled lane the gate
+        **What the halt does to a lane, stated once here.** The halt itself does not pause or STOP
+        an internal lane: it only gates the claim, and a pooled lane the gate
         refuses is PARKED with no timer until the gate lifts. A lane can still STOP while the halt
         is in force, at least under its own fault policy (the T17 infra-fault bound, for example
         when a hand-back's reschedule keeps failing on a full store) and through a leadership-loss
