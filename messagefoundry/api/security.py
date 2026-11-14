@@ -14,6 +14,7 @@ raising, so the caller can close the socket cleanly).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import Counter
@@ -39,6 +40,7 @@ from starlette.routing import BaseRoute
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry.api.auth_models import STEP_UP_VIA_HEADER, STEP_UP_VIA_IDP, CredentialReply
+from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
     peercert_from_ssl_object,
@@ -1577,14 +1579,18 @@ async def route_decision(request: Request) -> AsyncIterator[None]:
     the body's check runs inside this block, which writes what :func:`_recorded_decision` would
     have: the grant row on a clean exit, or one ``auth.gate_refused`` row naming the GATE's
     permission and the refusal's reason. So a refused request leaves exactly one decision row and
-    no grant row. The permission is the gate's because these checks have no permission of their
-    own: they refuse a request the gate admitted under that permission.
+    no grant row. The row names the GATE's permission because the step-up and window checks have
+    none of their own, and the reveal's new-address and PHI-budget checks refuse a request that
+    holds ``messages:view_summary``, which ``_admit_reveal`` checked first and records only on a
+    denial. So a reveal's refusal row names the route's monitoring permission, not the
+    ``messages:view_summary`` read it refused.
 
     The first block a request enters takes the decision; a later one, or one on a route whose gate
     deferred nothing, records nothing. Any other exception from the block leaves the decision
     deferred, and :class:`AuthenticatedBeforeBodyRoute` settles it after the endpoint, as it does
     when no block runs. That keeps the row a refusal raised with no reason of its own had before.
-    This block writes the grant row before the route acts, which the settling cannot."""
+    A cancellation, such as the request deadline's, leaves it deferred the same way. This block
+    writes the grant row before the route acts, which the settling cannot."""
     deferred = _take_deferred_decision(request)
     if deferred is None:
         yield
@@ -1594,7 +1600,7 @@ async def route_decision(request: Request) -> AsyncIterator[None]:
     except _GateRefusal as refusal:
         await _write_deferred(request, deferred, refusal)
         raise
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         setattr(request.state, _DEFERRED_DECISION_STATE, deferred)
         raise
     await _write_deferred(request, deferred, None)
@@ -1610,7 +1616,7 @@ def drop_route_decision(request: Request) -> None:
 
 
 async def _write_deferred(
-    request: Request, deferred: _DeferredDecision, refusal: Exception | None
+    request: Request, deferred: _DeferredDecision, refusal: BaseException | None
 ) -> None:
     """Write a deferred decision's row: ``auth.gate_refused`` for a :class:`_GateRefusal`, and
     the grant row for anything else."""
@@ -1628,18 +1634,30 @@ def _settle_deferred_grant_after(
 
     A :class:`_GateRefusal` the body raised outside a :func:`route_decision` block writes
     ``auth.gate_refused``. Anything else writes the grant row, a refusal that is not the gate's
-    included, as the gate wrote it before the body when it did not defer. Nothing is written after
-    a cancelled request, which answers nobody."""
+    included, as the gate wrote it before the body when it did not defer.
 
-    async def settle(request: Request, refusal: Exception | None) -> None:
+    A cancelled request is settled too, since the gate wrote its row before the body before it
+    deferred: the request deadline cancels the handler and still answers 503. That write runs
+    through the app's :class:`~messagefoundry.api.outlive.OutlivingOperations`, so a second
+    cancellation, such as the client going away, does not stop it either, and shutdown drains it."""
+
+    async def settle(request: Request, refusal: BaseException | None) -> None:
         deferred = _take_deferred_decision(request)
-        if deferred is not None:
-            await _write_deferred(request, deferred, refusal)
+        if deferred is None:
+            return
+        write = _write_deferred(request, deferred, refusal)
+        outliving = getattr(request.app.state, "outliving_operations", None)
+        if isinstance(refusal, asyncio.CancelledError) and isinstance(
+            outliving, OutlivingOperations
+        ):
+            await outliving.run(write, f"the deferred authorization row for {request.url.path}")
+        else:
+            await write
 
     async def settled(request: Request) -> Response:
         try:
             response = await handler(request)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             await settle(request, exc)
             raise
         await settle(request, None)

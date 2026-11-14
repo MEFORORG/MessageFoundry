@@ -6522,6 +6522,9 @@ def create_app(
         The route's gate leaves its decision row to this check (BACKLOG #1197), so a request it
         refuses records that refusal instead of a grant (:func:`route_decision`)."""
         if reveal is not None and not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
+            # Its denial row is this request's decision, so the gate's grant row does not follow,
+            # even when the denial write itself fails.
+            drop_route_decision(request)
             auth = get_auth(request)
             if auth is not None:
                 await auth.audit_permission_denied(
@@ -6530,8 +6533,6 @@ def create_app(
                     request.url.path,
                     client=client_ip(request),
                 )
-            # Its denial row is this request's decision, so the gate's grant row does not follow.
-            drop_route_decision(request)
             raise HTTPException(403, "a reveal needs messages:view_summary")
         async with route_decision(request):
             if reveal is None:

@@ -14,6 +14,7 @@ and that leaves exactly one grant row.
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterator
@@ -115,6 +116,13 @@ async def _app(engine: Engine) -> FastAPI:
         if mode == "unblocked":
             # A gate's refusal raised in the body outside any decision block.
             raise _GateRefusal(429, "too many requests; please slow down", reason="throttled")
+        if mode == "hang":
+            # Outlasts the request deadline before anything decides.
+            await asyncio.sleep(30)
+        if mode == "hang_in_block":
+            # The same, inside the decision block, as a spend stuck on the store would be.
+            async with route_decision(request):
+                await asyncio.sleep(30)
         await spend_step_up_action(request, _ACTION)
         return {"ok": "1"}
 
@@ -356,3 +364,25 @@ async def test_a_reveal_without_view_summary_leaves_only_its_denial_row(engine: 
         denied,
         _granted(Permission.MONITORING_READ.value, path),
     ]
+
+
+@pytest.mark.parametrize("mode", ["hang", "hang_in_block"])
+async def test_a_request_cancelled_by_its_deadline_still_records_the_grant(
+    engine: Engine, mode: str
+) -> None:
+    """The request deadline cancels the handler and answers 503. The gate admitted the request, so
+    its deferred grant row is still written, as the gate wrote it before the body when it did not
+    defer. RED when: the settling step skips a cancelled request, or the decision block drops the
+    decision on a cancellation, and the request leaves no decision row. The control is the same
+    request with a deadline it does not outlast, which also writes one grant row."""
+    from messagefoundry.api.request_timeout import TIMEOUT_STATE_ATTR
+
+    app = await _app(engine)
+    async with _client(app, _HOME) as c:
+        token = await _login(c)
+        r = await c.post(_SPEND, params={"mode": "skip"}, headers=_auth(token))
+        assert r.status_code == 404, r.text
+        setattr(app.state, TIMEOUT_STATE_ATTR, 0.5)
+        r = await c.post(_SPEND, params={"mode": mode}, headers=_auth(token))
+        assert r.status_code == 503, r.text
+    assert await _decisions(engine, _SPEND) == [_granted(_MANAGE, _SPEND)] * 2
