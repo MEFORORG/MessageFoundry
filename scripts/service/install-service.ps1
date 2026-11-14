@@ -689,7 +689,7 @@ function Save-PinnedNssm {
 
 function Get-WellKnownBroadSids {
     <#
-      The well-known broad principals the data-directory and secrets-directory lockdowns remove, as
+      The well-known broad principals the data, secrets and config directory lockdowns remove, as
       icacls '*SID' arguments. At least these, not all of them: Set-SecureDataDirAcl says why the
       read-back that follows each removal is what catches the rest.
     #>
@@ -808,7 +808,9 @@ function Get-BroadAclResidue {
       An unresolvable identity is reported rather than skipped: a SID nobody can translate is still
       a grant, and dropping it here would turn a residue into a clean result.
     #>
-    param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    param([Parameter(Mandatory)][string]$Path, [string]$Account,
+        # A list the caller has already read, so a tree walk reads each one once.
+        [System.Security.AccessControl.FileSystemSecurity]$Acl)
     $allowed = @("S-1-5-18", "S-1-5-32-544")
     if ($Account) {
         try {
@@ -820,9 +822,14 @@ function Get-BroadAclResidue {
         }
     }
     $found = @()
-    try { $acl = Get-Acl -Path $Path } catch {
-        Write-Warning "Could not read the ACL of '$Path' ($($_.Exception.Message))."
-        return @()
+    # -LiteralPath: with -Path a name holding '[' or ']' is a wildcard pattern, which can match
+    # nothing and return no list at all, and an empty result here reads as a clean one.
+    $acl = $Acl
+    if ($null -eq $acl) {
+        try { $acl = Get-Acl -LiteralPath $Path } catch {
+            Write-Warning "Could not read the ACL of '$Path' ($($_.Exception.Message))."
+            return @()
+        }
     }
     foreach ($rule in $acl.Access) {
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
@@ -932,6 +939,8 @@ function New-RestrictedDirectory {
       CreateDirectory succeeds on a folder that is already there, so someone who made the path first
       would hand this call their folder. The owner and the protection are read back to catch that.
       $OwnerSid is a parameter so the unelevated tests can make a folder they own.
+      uninstall-service.ps1's New-SeceditWorkDirectory copies this create step; the scripts share no
+      file, so a fix here belongs there too.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$OwnerSid = "S-1-5-32-544")
     $sec = New-Object System.Security.AccessControl.DirectorySecurity
@@ -1178,8 +1187,16 @@ function Set-SecureConfigAcl {
       rights arrive through a nested domain group is refused. Without this step the shipped installer
       could not produce a config dir that loads, and the only remaining cure would be
       MEFOR_ALLOW_INSECURE_CONFIG_SOURCE, which disables the whole control.
+
+      RETURNS WHAT THE READ-BACK FOUND, one string per problem, and nothing when the tree is locked
+      (BACKLOG #5562). `/inheritance:r /grant:r` is not a lockdown on its own, for the reason
+      Set-SecureDataDirAcl gives: an EXPLICIT ACE for a principal it does not name survives it, and so
+      does every child whose own DACL carries a grant or has inheritance turned off. The guard vets
+      the directory and each *.py, so the caller prints the lockdown line only when this returns
+      nothing.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    $problems = @()
     # *S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators. Full control, inherited (OI)(CI) by children.
     $grants = @("*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
     # Service account: read+execute only (it loads, never writes, config) - matches the runtime guard,
@@ -1190,6 +1207,13 @@ function Set-SecureConfigAcl {
         Write-Warning ("Could not lock down the config dir '$Path' (icacls exit $LASTEXITCODE); a " +
             "low-privileged principal with write would cause the engine to REFUSE to load it (SEC-003, " +
             "docs/SERVICE.md). Lock it manually or re-run elevated.")
+    }
+    # The explicit broad ACEs the grant above left standing, as Set-SecureDataDirAcl removes them.
+    # Whatever this set misses is named by the read-back below.
+    $broad = Get-WellKnownBroadSids
+    & icacls $Path /remove:g @broad | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $problems += "the broad entries on '$Path' could not be removed (icacls exit $LASTEXITCODE)"
     }
     # /T so the *.py files the guard also vets carry the same owner, not just the directory. /C so one
     # unsettable file (an open editor, an AV scan) does not abort the walk and leave the rest of the
@@ -1203,6 +1227,60 @@ function Set-SecureConfigAcl {
             "may have been skipped - check which, then run " +
             "'icacls ""$Path"" /setowner ""*S-1-5-32-544"" /T /C' elevated.")
     }
+    # After the owner step: a child whose DACL leaves Administrators out can be reset only by its
+    # owner, which that step just made Administrators.
+    $problems += @(Reset-ConfigTreeAcl -Path $Path -Account $Account)
+    return $problems
+}
+
+function Reset-ConfigTreeAcl {
+    <#
+      Reset the DACL of everything below $Path so it holds only what it inherits from $Path, then read
+      $Path and each item back. Returns one string per problem, nothing when the tree is locked: $Path
+      still inheriting, an entry for anyone but SYSTEM, Administrators and $Account anywhere, a DACL
+      that could not be reset or read, or a link.
+
+      THE WALK IS DONE HERE, NOT WITH `icacls /T`. Measured: `icacls <dir>\* /reset /T /C` reset a
+      file in a junction's target outside <dir>, with /L or without. So each item is reset on its own
+      and a junction, link or mounted folder is neither reset nor entered, and is named instead: what
+      it points at was not locked, and the guard may still load a module through it.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    $readBack = {
+        param([string]$Item)
+        $acl = $null
+        try { $acl = Get-Acl -LiteralPath $Item -ErrorAction Stop } catch { }
+        if ($null -eq $acl) { return "the DACL of '$Item' could not be read back" }
+        $residue = @(Get-BroadAclResidue -Path $Item -Account $Account -Acl $acl)
+        if ($residue) { "'$Item' still grants access to: $($residue -join ', ')" }
+    }
+    $problems = @(& $readBack $Path)
+    try {
+        if (-not (Get-Acl -LiteralPath $Path -ErrorAction Stop).AreAccessRulesProtected) {
+            $problems += "'$Path' still inherits entries from the folder above"
+        }
+    } catch { }
+    $pending = New-Object System.Collections.Generic.Queue[string]
+    $pending.Enqueue($Path)
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Dequeue()
+        try { $children = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop) } catch {
+            $problems += "the contents of '$dir' could not be listed ($($_.Exception.Message))"
+            continue
+        }
+        foreach ($child in $children) {
+            $item = $child.FullName
+            if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                $problems += "'$item' is a junction, a link or a mounted folder, so what it points at was not locked"
+                continue
+            }
+            & icacls $item /reset | Out-Null
+            if ($LASTEXITCODE -ne 0) { $problems += "the DACL of '$item' could not be reset (icacls exit $LASTEXITCODE)" }
+            $problems += @(& $readBack $item)
+            if ($child.PSIsContainer) { $pending.Enqueue($item) }
+        }
+    }
+    return $problems
 }
 
 function Get-CrashDumpImageName {
@@ -2883,16 +2961,29 @@ if ($LockConfigDir) {
         if ($problem) { $UnlockedFolders += "'$($folder.Path)' ($problem)" }
         else { $LockPaths += $folder.Path }
     }
-    foreach ($LockPath in $LockPaths) {
-        Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount
+    # Outermost first. The settings file's folder may hold -Config and the value folder, and its lock
+    # resets everything below it to inherit, so each folder inside it is locked after it, not before.
+    $ConfigLockProblems = @()
+    foreach ($LockPath in @($LockPaths | Sort-Object { $_.TrimEnd('\').Length })) {
+        $ConfigLockProblems += @(Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount)
     }
-    if ($LockPaths.Count -gt 1) {
-        Write-Host ("  Start  : " + (($LockPaths | Select-Object -Skip 1 | ForEach-Object { "'$_'" }) -join ", ") +
-            " locked the same way (vault BACKLOG #2626).")
+    if ($ConfigLockProblems) {
+        # Read back, not assumed (BACKLOG #5562): the lockdown line would otherwise sit over a tree the
+        # guard refuses to load.
+        Write-Warning ("-LockConfigDir did not finish locking the config: " +
+            ($ConfigLockProblems -join "; ") + ". The engine's source-trust guard (SEC-003) refuses " +
+            "to load a config dir or module that an account other than SYSTEM, an administrator or " +
+            "the run-as account can write, so the service may refuse to start. Remove those entries " +
+            "by hand and re-run; see docs/SERVICE.md 'Lock down the config directory (CONFIG-2)'.")
+    } else {
+        if ($LockPaths.Count -gt 1) {
+            Write-Host ("  Start  : " + (($LockPaths | Select-Object -Skip 1 | ForEach-Object { "'$_'" }) -join ", ") +
+                " locked the same way (vault BACKLOG #2626).")
+        }
+        $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
+                       else { "SYSTEM/Administrators (F)" }
+        Write-Host "  Config : locked to $cfgGrantees; inheritance disabled (SEC-003)."
     }
-    $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
-                   else { "SYSTEM/Administrators (F)" }
-    Write-Host "  Config : locked to $cfgGrantees; inheritance disabled (SEC-003)."
 } else {
     if ($ServiceAccount) { Set-ConfigReadAcl -Path $Config -Account $ServiceAccount }
     # Name BOTH refusal criteria. The owner arm (ADR 0036 Amendment A) is independent of the DACL, so

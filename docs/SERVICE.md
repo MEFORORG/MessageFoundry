@@ -728,7 +728,11 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   The supported one-step way to do this at install time is `install-service.ps1 -LockConfigDir`:
   it strips inherited ACEs and locks the dir to SYSTEM + Administrators (full) and the run-as
   account (read+execute) — no companion flag needed, since the run-as account defaults to the
-  virtual account. It is **opt-in** because the config dir often lives inside a developer's repo
+  virtual account. It removes the well-known broad entries (Everyone, Users, Authenticated Users and
+  others) from the dir and resets every file and folder below it to inherit only those grants,
+  then reads each DACL back. Anything still left, such as an entry for another account or a
+  junction inside the dir, which it does not follow, is named in a warning instead of the
+  "locked" line. It is **opt-in** because the config dir often lives inside a developer's repo
   where stripping inheritance is surprising — for production, point `-Config` at a dedicated
   admin-owned directory and pass `-LockConfigDir`.
 - **Fix an existing tree that inherits a broad write grant** without a full ACL reset. A config dir
