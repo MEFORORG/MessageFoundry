@@ -18,9 +18,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Final, Protocol, get_args
 
-from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
+from messagefoundry.auth.audit_visibility import (
+    LOCK_NOTICE_ID_FIELD,
+    LOCK_NOTICE_UNDELIVERED_ACTION,
+)
 from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
@@ -78,9 +82,10 @@ SECURITY_NOTICE_UNDELIVERED_ACTION: Final = "auth.security_notice_undelivered"
 #: How many queue-full records may be in flight at once. Past it a drop goes unrecorded, so the
 #: overload that filled the queue cannot also grow tasks and store writers without bound.
 _MAX_RECORDING: Final = 64
-#: The closed set of lock kinds a lock notice's undelivered row may name (BACKLOG #1138). Anything
-#: else in the event's detail is left off the row.
+#: The closed set of lock kinds a lock notice's undelivered row may name, and the shape of the
+#: notice id it may carry (BACKLOG #1138). Anything else in the event's detail is left off the row.
 _LOCK_KINDS: Final = frozenset(get_args(LockoutCounter))
+_NOTICE_ID: Final = re.compile(r"[A-Za-z0-9_-]{11}")
 
 
 class NoticeAuditSink(Protocol):
@@ -825,8 +830,8 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         say which account was never told. The actor is the notice's recipient, so the row also
         reaches that account's ``/me/security-events`` feed. The detail is the notice kind and
         ``why``, plus the holder's username on an issuer's reminder, which says whose credential it
-        was, and the closed-set lock kind on a lock notice, which the lock-notice throttle reads
-        (BACKLOG #1138). Never the rest of ``event.detail`` or the address: an EMAIL_CHANGED
+        was, and on a lock notice its closed-set lock kind and notice id, which the lock-notice
+        throttle reads (BACKLOG #1138). Never the rest of ``event.detail`` or the address: an EMAIL_CHANGED
         carries an address in its detail. A lock notice writes the hidden
         ``auth.lock_notice_undelivered`` action (BACKLOG #1131). A failed write is swallowed, like
         the send it reports on. It is logged by class, and not at all for a lock notice: that kind
@@ -839,9 +844,12 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         holder = event.detail.get("holder")
         if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER and isinstance(holder, str):
             detail["holder"] = holder
-        lock = event.detail.get("lock")
-        if event.event_type == ACCOUNT_LOCKED and isinstance(lock, str) and lock in _LOCK_KINDS:
-            detail["lock"] = lock
+        if event.event_type == ACCOUNT_LOCKED:
+            lock, notice_id = event.detail.get("lock"), event.detail.get(LOCK_NOTICE_ID_FIELD)
+            if isinstance(lock, str) and lock in _LOCK_KINDS:
+                detail["lock"] = lock
+            if isinstance(notice_id, str) and _NOTICE_ID.fullmatch(notice_id):
+                detail[LOCK_NOTICE_ID_FIELD] = notice_id
         try:
             await self._audit.record_audit(
                 action, actor=event.username, detail=json.dumps(detail, sort_keys=True)

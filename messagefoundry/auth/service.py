@@ -57,6 +57,7 @@ from messagefoundry.auth.audit_visibility import (
     CHANNEL_SCOPE_CHANGED_ACTION,
     DIRECTORY_LOGIN_LOCKED_ACTION,
     LOCK_NOTICE_ACTION,
+    LOCK_NOTICE_ID_FIELD,
     LOCK_NOTICE_UNDELIVERED_ACTION,
     LOCKED_REFUSAL_DETAIL,
     LOGIN_LOCKED_ACTION,
@@ -20286,6 +20287,7 @@ class AuthService:
                 wired = self._security_notifier is not None
                 if not await self._lock_notice_due(user, lock):
                     return
+                notice_id = secrets.token_urlsafe(8)
                 # The mail BEFORE its row, and the row says whether the notifier took it. A
                 # cut-off or failed row write, or a refused hand-off, then costs at most a
                 # duplicate mail at the next lock, the cheap failure. The other order could leave
@@ -20295,10 +20297,10 @@ class AuthService:
                     username=user.username,
                     email=user.notify_email,
                     client=client,
-                    detail=detail,
+                    detail={**detail, LOCK_NOTICE_ID_FIELD: notice_id},
                 )
                 if wired:
-                    await self._record_lock_notice(user, lock, handed=handed)
+                    await self._record_lock_notice(user, lock, handed=handed, notice_id=notice_id)
         except asyncio.CancelledError:
             _log.warning(
                 "a security notice was cancelled before it finished; it may be neither mailed "
@@ -20360,14 +20362,13 @@ class AuthService:
     async def _lock_notice_held_back(self, user: UserRecord, lock: str) -> bool:
         """The throttle's READ: whether a notice of this ``lock`` kind already went out in the window.
 
-        The newest ``auth.lock_notice`` row of the kind that holds a notice back is cancelled by an
-        ``auth.lock_notice_undelivered`` row of the kind stamped no earlier than it, which the
-        notifier writes when the send fails after the hand-off (BACKLOG #1138). So a failure before
-        a later mail cancels nothing, and a repeated lock retries a relay that failed last time.
-        Compared by timestamp, not row id: the store stamps the ``auth.lock_notice`` row as its
-        write starts, before anything yields to the loop after the hand-off, and the notifier's
-        send starts only once the loop runs its task. Its id is taken later, and on a server
-        backend a failed send's row can take a lower one.
+        **A failed send cancels its own notice's hold (BACKLOG #1138).** When the newest row of the
+        kind that holds a notice back says ``mailed: true``, an ``auth.lock_notice_undelivered``
+        row carrying the same notice id (``LOCK_NOTICE_ID_FIELD``) means that mail never left, so
+        the next lock retries the relay. Matched by id, not by order: the relay drains one queue
+        and can record an earlier notice's failure after a later notice's row, and an older failure
+        must not cancel a later mail. A row without an id, or a failure whose record write failed,
+        cancels nothing, and the hold then stands for the window as before.
 
         Kept apart from the row write, so the background task can send the mail between this read
         and :meth:`_record_lock_notice` (BACKLOG #2216). An audit index serves both actions' reads
@@ -20389,18 +20390,20 @@ class AuthService:
                 rows = await self._store.list_audit(
                     actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
                 )
-                for row, detail in _lock_notice_details(rows, lock):
+                for _row, detail in _lock_notice_details(rows, lock):
+                    mailed = detail.get("mailed", True) is not False
                     # A row that mailed nothing holds back only another addressless notice.
-                    if detail.get("mailed", True) is not False or not mailable:
-                        holding = float(row["ts"])
+                    if mailed or not mailable:
+                        notice_id = detail.get(LOCK_NOTICE_ID_FIELD)
                         break
                 else:
                     return False
-                # ``since`` is inclusive, so this reads the failures stamped no earlier.
+                if not mailed or not isinstance(notice_id, str):
+                    return True
                 failed = await self._store.list_audit(
                     actor=user.username,
                     action=LOCK_NOTICE_UNDELIVERED_ACTION,
-                    since=holding,
+                    since=since,
                     limit=50,
                 )
         except Exception as exc:  # noqa: BLE001 - fails open by design, and is logged
@@ -20410,9 +20413,14 @@ class AuthService:
                 type(exc).__name__,
             )
             return False
-        return next(_lock_notice_details(failed, lock), None) is None
+        return not any(
+            detail.get(LOCK_NOTICE_ID_FIELD) == notice_id
+            for _row, detail in _lock_notice_details(failed, lock)
+        )
 
-    async def _record_lock_notice(self, user: UserRecord, lock: str, *, handed: bool) -> None:
+    async def _record_lock_notice(
+        self, user: UserRecord, lock: str, *, handed: bool, notice_id: str
+    ) -> None:
         """Write the ``auth.lock_notice`` row the throttle reads, after the mail.
 
         ``mailed`` is true only when the account had an address AND the notifier took the event
@@ -20421,14 +20429,18 @@ class AuthService:
         ``mailed: false``, which holds back no later
         mailable notice, so the next lock mails again rather than staying quiet for a day.
 
-        A send that fails after the hand-off still leaves ``mailed: true``: it fails on the
-        notifier's own task, after this row is written. The notifier's newer
-        ``auth.lock_notice_undelivered`` row (BACKLOG #2383) then cancels this row's hold, in
-        :meth:`_lock_notice_held_back` (BACKLOG #1138)."""
+        A send that fails after the hand-off still leaves ``mailed: true``, since it fails on the
+        notifier's own task; ``notice_id`` lets :meth:`_lock_notice_held_back` find that failure."""
         await self._audit(
             _LOCK_NOTICE_ACTION,
             actor=user.username,
-            detail=_json({"lock": lock, "mailed": bool(user.notify_email) and handed}),
+            detail=_json(
+                {
+                    "lock": lock,
+                    "mailed": bool(user.notify_email) and handed,
+                    LOCK_NOTICE_ID_FIELD: notice_id,
+                }
+            ),
         )
 
     async def _notify_security(

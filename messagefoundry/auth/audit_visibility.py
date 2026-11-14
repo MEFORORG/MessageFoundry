@@ -118,6 +118,10 @@ LOCK_NOTICE_ACTION: Final = "auth.lock_notice"
 #: A lock notice that never left this engine (BACKLOG #2383). Its own name, not
 #: ``auth.security_notice_undelivered``, so the whole row can be hidden like the lock rows.
 LOCK_NOTICE_UNDELIVERED_ACTION: Final = "auth.lock_notice_undelivered"
+#: The detail field that ties a lock notice's ``auth.lock_notice`` row to the
+#: ``auth.lock_notice_undelivered`` row of the same notice (BACKLOG #1138). A random token the
+#: service mints per notice, carried on the event to the relay. It says nothing about the account.
+LOCK_NOTICE_ID_FIELD: Final = "notice_id"
 LOGIN_LOCKED_ACTION: Final = "auth.login_locked"
 ADMIN_UNLOCKED_ACTION: Final = "auth.admin_unlocked"
 #: A directory sign-in refused by a live lock (BACKLOG #3726). It used to share

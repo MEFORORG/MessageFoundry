@@ -176,6 +176,13 @@ def _write_overruns(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if "audit writes took" in r.getMessage()]
 
 
+def _without_id(row: Any) -> dict[str, Any]:
+    """A lock-notice row's detail without its per-notice random id (BACKLOG #1138)."""
+    detail: dict[str, Any] = json.loads(row["detail"])
+    detail.pop("notice_id", None)
+    return detail
+
+
 async def _lock_notice_rows(
     store: MessageStore, actor: str, action: str = _LOCK_NOTICE
 ) -> list[Any]:
@@ -226,7 +233,7 @@ async def test_the_lock_setting_refusal_stays_in_its_slot_with_a_large_audit_log
         assert reads.off_path == 1, reads.off_path
         assert len(notifier.locks()) == 1, "the notice never went out"
         rows = await _lock_notice_rows(store, user.username)
-        assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": True}]
+        assert [_without_id(r) for r in rows] == [{"lock": "sign_in", "mailed": True}]
     finally:
         await _close(store, service)
 
@@ -385,7 +392,7 @@ class _RaceSchedule:
                 self.probe.changed()
             return rows
 
-        async def write(user: UserRecord, lock: str, *, handed: bool) -> None:
+        async def write(user: UserRecord, lock: str, *, handed: bool, notice_id: str) -> None:
             await self.probe.until(
                 lambda: self.reads == 2 or self.probe.parked > 0,
                 "the peer to read the throttle or park in the queue",
@@ -397,7 +404,7 @@ class _RaceSchedule:
                     "arrived": self.probe.arrived,
                     "parked": self.probe.parked,
                 }
-            await real_write(user, lock, handed=handed)
+            await real_write(user, lock, handed=handed, notice_id=notice_id)
             if first:
                 self.parked_after_first_write = self.probe.parked
 
@@ -749,7 +756,7 @@ async def test_a_refused_hand_off_does_not_hold_the_next_notice_back() -> None:
         await service._record_lock(user, "sign_in", _lock(1), client=None)
         await service.drain_background()
         rows = await _lock_notice_rows(store, user.username)
-        assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": False}]
+        assert [_without_id(r) for r in rows] == [{"lock": "sign_in", "mailed": False}]
         attempts: list[SecurityEvent] = []
 
         async def took(event: SecurityEvent) -> bool:
@@ -804,7 +811,7 @@ async def test_a_notice_dropped_on_a_full_queue_does_not_hold_the_next_one_back(
         await service._record_lock(user, "sign_in", _lock(1), client=None)
         await service.drain_background()
         rows = await _lock_notice_rows(store, user.username)
-        assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": False}]
+        assert [_without_id(r) for r in rows] == [{"lock": "sign_in", "mailed": False}]
         # BACKLOG #2383: the relay records the drop on its own hidden row too.
         await asyncio.gather(*relay._recording)
         dropped = await store.list_audit(actor=user.username, action=_LOCK_NOTICE_UNDELIVERED)
@@ -981,7 +988,7 @@ async def test_a_lock_notice_raised_after_the_relay_closed_records_mailed_false(
         await service._record_lock(user, "sign_in", _lock(1), client=None)
         await service.drain_background()
         rows = await _lock_notice_rows(store, user.username)
-        assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": False}]
+        assert [_without_id(r) for r in rows] == [{"lock": "sign_in", "mailed": False}]
         assert relay._queue.qsize() == 0, "the late notice was queued where nothing reads it"
         await asyncio.gather(*relay._recording)
         dropped = await store.list_audit(actor=user.username, action=_LOCK_NOTICE_UNDELIVERED)
@@ -1199,6 +1206,7 @@ class _Relay:
 
     def __init__(self, store: MessageStore, monkeypatch: pytest.MonkeyPatch) -> None:
         self.sends = 0
+        self.failures = 0
         self.fail = False
         monkeypatch.setattr("messagefoundry.pipeline.security_notify.send_plain_email", self._send)
         self.notifier = SecurityEventNotifier(
@@ -1209,37 +1217,30 @@ class _Relay:
     def _send(self, **_: Any) -> None:
         self.sends += 1
         if self.fail:
+            self.failures += 1
             raise OSError("relay down")
 
 
-async def _until(cond: Callable[[], Any]) -> None:
-    deadline = time.monotonic() + _STALL_SECONDS
-    while not await cond():
-        assert time.monotonic() < deadline, "the relay never finished the notice"
-        await asyncio.sleep(0.01)
+async def _undelivered_rows(store: MessageStore, actor: str) -> list[Any]:
+    return await _lock_notice_rows(store, actor, _LOCK_NOTICE_UNDELIVERED)
 
 
 async def _lock_and_settle(
     service: AuthService, store: MessageStore, relay: _Relay, user: UserRecord, cycle: int
 ) -> None:
-    """Land a sign-in lock, then wait until the relay has sent the notice or recorded its failure,
-    so the next lock's throttle reads every row this one wrote."""
-    sends = relay.sends
-    failed = len(await _undelivered_rows(store, user.username))
+    """Land a sign-in lock, then wait until the relay has sent every notice it was handed and
+    recorded every failure, so the next lock's throttle reads every row this one wrote."""
     await service._record_lock(user, "sign_in", _lock(cycle), client=None)
     await service.drain_background()
-
-    async def settled() -> bool:
-        if relay.sends == sends:
-            # Held back by the throttle: the relay was never handed anything.
-            return not service._background_tasks
-        return not relay.fail or len(await _undelivered_rows(store, user.username)) > failed
-
-    await _until(settled)
-
-
-async def _undelivered_rows(store: MessageStore, actor: str) -> list[Any]:
-    return await _lock_notice_rows(store, actor, _LOCK_NOTICE_UNDELIVERED)
+    deadline = time.monotonic() + _STALL_SECONDS
+    while True:
+        rows = await _lock_notice_rows(store, user.username)
+        handed = sum(json.loads(r["detail"])["mailed"] is True for r in rows)
+        failed = len(await _undelivered_rows(store, user.username))
+        if relay.sends == handed and failed == relay.failures:
+            return
+        assert time.monotonic() < deadline, "the relay never finished the notice"
+        await asyncio.sleep(0.01)
 
 
 @asynccontextmanager
@@ -1252,30 +1253,36 @@ async def _relay_harness(
     try:
         yield store, service, relay, user
     finally:
-        await relay.notifier.aclose()
-        await _close(store, service)
+        # The lifespan's order: the service's notices, then the relay, then the store.
+        try:
+            await service.drain_background(timeout=_STALL_SECONDS)
+            await relay.notifier.aclose()
+        finally:
+            await store.close()
 
 
 async def test_a_send_that_fails_after_the_hand_off_does_not_hold_the_next_notice_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #1138. The relay took the first notice, so its row reads ``mailed: true``, and then
-    the send failed. The relay's undelivered row now carries the lock kind, and the throttle reads
-    it, so the next lock of the kind within the window mails again. Before, it was held back a
-    day behind a mail that never left."""
+    the send failed. The relay's undelivered row carries the lock kind and the notice's id, and the
+    throttle reads it, so the next lock of the kind within the window mails again. Before, it was
+    held back a day behind a mail that never left."""
     async with _relay_harness(monkeypatch) as (store, service, relay, user):
         relay.fail = True
         await _lock_and_settle(service, store, relay, user, 1)
-        rows = await _lock_notice_rows(store, user.username)
-        assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": True}]
-
         relay.fail = False
         await _lock_and_settle(service, store, relay, user, 2)
         assert relay.sends == 2, "the failed send held the next notice back"
-        failed = await _undelivered_rows(store, user.username)
-        assert [json.loads(r["detail"]) for r in failed] == [
-            {"lock": "sign_in", "notice": "account_locked", "reason": "send_failed"}
-        ]
+        [failed] = [json.loads(r["detail"]) for r in await _undelivered_rows(store, user.username)]
+        first = json.loads((await _lock_notice_rows(store, user.username))[-1]["detail"])
+        assert first["mailed"] is True
+        assert failed == {
+            "lock": "sign_in",
+            "notice": "account_locked",
+            "notice_id": first["notice_id"],
+            "reason": "send_failed",
+        }
 
 
 async def test_a_delivered_notice_still_holds_the_next_one_back(
@@ -1294,8 +1301,7 @@ async def test_an_older_failure_does_not_cancel_a_later_delivered_notice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed send, then a retry that went out: the third lock is held back by the retry's row.
-    The failure's undelivered row is older than the row of the mail that went out, so it cancels
-    nothing."""
+    The failure belongs to the first notice, so it cancels nothing."""
     async with _relay_harness(monkeypatch) as (store, service, relay, user):
         relay.fail = True
         await _lock_and_settle(service, store, relay, user, 1)
@@ -1306,22 +1312,57 @@ async def test_an_older_failure_does_not_cancel_a_later_delivered_notice(
         assert relay.sends == 2, "an older failure cancelled the hold of a later delivered mail"
 
 
-async def test_only_an_undelivered_row_of_the_same_kind_cancels_the_hold() -> None:
-    """A failed second-step notice does not release the sign-in kind's hold, and an undelivered
-    row naming no kind (one written before the row carried it) releases nothing. The control is
-    a sign-in failure, which does."""
+def _held(lock: str, notice_id: str, *, mailed: bool = True) -> str:
+    return json.dumps({"lock": lock, "mailed": mailed, "notice_id": notice_id})
+
+
+async def test_only_the_same_notices_failure_cancels_the_hold() -> None:
+    """Rows written straight to the store. The newest holding row is notice ``b``. A failure of
+    the earlier notice ``a``, recorded AFTER ``b``'s row (a relay that drained a backed-up queue
+    late), cancels nothing; nor does a failure of another kind, or one with no id. The control is
+    ``b``'s own failure, which does."""
+    store, service, _fake, user = await _harness()
+    try:
+        u, a, b = user.username, "a" * 11, "b" * 11
+        await store.record_audit(_LOCK_NOTICE, actor=u, detail=_held("sign_in", a))
+        await store.record_audit(_LOCK_NOTICE, actor=u, detail=_held("sign_in", b))
+        assert await service._lock_notice_held_back(user, "sign_in") is True
+        for other in (
+            json.dumps({"lock": "sign_in", "notice_id": a}),
+            json.dumps({"lock": "second_step", "notice_id": b}),
+            json.dumps({"lock": "sign_in"}),
+            "not json",
+        ):
+            await store.record_audit(_LOCK_NOTICE_UNDELIVERED, actor=u, detail=other)
+            assert await service._lock_notice_held_back(user, "sign_in") is True, other
+        await store.record_audit(
+            _LOCK_NOTICE_UNDELIVERED,
+            actor=u,
+            detail=json.dumps({"lock": "sign_in", "notice_id": b}),
+        )
+        assert await service._lock_notice_held_back(user, "sign_in") is False
+    finally:
+        await _close(store, service)
+
+
+async def test_a_failed_second_read_fails_open() -> None:
+    """The undelivered read fails while the first read found a delivered notice: the throttle
+    sends rather than hold, as on a failed first read. The control is the same state with the
+    read working, which holds."""
     store, service, _fake, user = await _harness()
     try:
         await store.record_audit(
-            _LOCK_NOTICE, actor=user.username, detail='{"lock": "sign_in", "mailed": true}'
+            _LOCK_NOTICE, actor=user.username, detail=_held("sign_in", "c" * 11)
         )
         assert await service._lock_notice_held_back(user, "sign_in") is True
-        for other in ('{"lock": "second_step"}', '{"notice": "account_locked"}', "not json"):
-            await store.record_audit(_LOCK_NOTICE_UNDELIVERED, actor=user.username, detail=other)
-            assert await service._lock_notice_held_back(user, "sign_in") is True, other
-        await store.record_audit(
-            _LOCK_NOTICE_UNDELIVERED, actor=user.username, detail='{"lock": "sign_in"}'
-        )
+        real = store.list_audit
+
+        async def refuse_second(**kwargs: Any) -> Any:
+            if kwargs.get("action") == _LOCK_NOTICE_UNDELIVERED:
+                raise OSError("store down")
+            return await real(**kwargs)
+
+        store.list_audit = refuse_second  # type: ignore[method-assign]
         assert await service._lock_notice_held_back(user, "sign_in") is False
     finally:
         await _close(store, service)

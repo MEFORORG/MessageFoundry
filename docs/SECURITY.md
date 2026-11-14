@@ -7028,7 +7028,7 @@ session. Each refusal is also audited, so a campaign is visible in the audit log
 writes `auth.account_locked`, but the mail is **throttled by time** (ADR 0197): at most one per lock
 kind per account per 24 hours, and always one for the first lock after a quiet day. Each mail names
 the lock and its cycle count, and writes its own `auth.lock_notice` row, which is what the throttle
-reads. With a relay wired, that read and the mail run in a background task (BACKLOG #2216). The
+reads, with the relay's `auth.lock_notice_undelivered` rows (below). With a relay wired, that read and the mail run in a background task (BACKLOG #2216). The
 refusal writes `auth.account_locked` first and does not wait for the task. So a large audit log would
 not push a refused sign-in past its padded slot. The task is queued per account and lock kind within
 one API process. Two locks of one kind landing together there would send one mail. **One throttle
@@ -7394,7 +7394,7 @@ still writes every lock row (ADR 0197 AC-10), and an Administrator reads them al
 |---|---|
 | `auth.account_locked` | a lock landed, which in a combined campaign under a live sign-in lock only a right candidate causes |
 | `auth.lock_notice` | the lock mail's throttle row, whose detail names the counter |
-| `auth.lock_notice_undelivered` | a lock mail the relay's queue dropped or the send lost, written only when a lock landed (BACKLOG #2383) |
+| `auth.lock_notice_undelivered` | a lock mail the relay's queue dropped or the send lost, written only when a lock landed (BACKLOG #2383); its detail names the counter (BACKLOG #1138) |
 | `auth.login_locked` | a sign-in refused by a live lock, where a wrong candidate is refused as a plain wrong password |
 | `auth.directory_login_locked` | a Kerberos or OIDC sign-in refused by a live lock, with any `callback_floor_exempt_amr` marker it carries (BACKLOG #3726) |
 | `auth.admin_unlocked` (the whole row) | its detail records both lock expiries and both cycle counts |
@@ -7616,10 +7616,12 @@ the actor. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
 notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
-holder, and a lock notice its lock kind. A lock notice whose send failed keeps its
-`auth.lock_notice` row reading `mailed: true`, but the throttle reads the undelivered row too: one
-of the kind stamped no earlier than the newest row holding the next notice back cancels that hold,
-so the next lock of the kind mails again (BACKLOG #1138). The row never carries the address, the rest of the notice's detail, or the error. The
+holder, and a lock notice its lock kind and the notice id its `auth.lock_notice` row also
+carries, a random token. A lock notice whose send failed keeps that row reading `mailed: true`, but
+the throttle reads the undelivered rows too, and one with the same notice id cancels that row's
+hold, so the next lock of the kind mails again (BACKLOG #1138). The rule is stated on
+`AuthService._lock_notice_held_back`. The row never carries the address, the rest of the
+notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
@@ -7656,6 +7658,9 @@ again for the row, and only when a send failed. **Still open, at least:**
   exit may wait for it, or it may be lost with no log line.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
+- A lock notice whose send failed but whose `auth.lock_notice_undelivered` write failed or was cut
+  off keeps its `auth.lock_notice` row's hold, so the throttle holds back the next lock notice of
+  the kind for the rest of its 24 hours.
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
 engine waits at most two seconds for pending notices, then cancels any still pending, each with one
