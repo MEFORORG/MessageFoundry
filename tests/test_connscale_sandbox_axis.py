@@ -98,18 +98,17 @@ def test_the_axis_parses_and_counts_toward_the_sweep() -> None:
             + "\n[connscale.slo]\nempty_claims_base_reading = true\n",
             "would mix the two sandbox arms",
         ),
+        (
+            # Its lanes split by arm since BACKLOG #5570, so the reason is now the missing per-arm
+            # "compared at least once" bound, not mixing.
+            _SANDBOX_AB + "\n[connscale.slo]\nfd_monotonic = true\n",
+            "no per-arm bound",
+        ),
     ],
 )
 def test_the_axis_refuses_a_profile_it_cannot_measure(text: str, match: str) -> None:
     with pytest.raises(ConnScaleProfileError, match=match):
         load_connscale_profile_text(text)
-
-
-def test_the_fd_slope_is_allowed_beside_a_sandbox_ab() -> None:
-    # Its pairing keeps each sandbox arm in its own lane, so the refusal's premise no longer holds
-    # for it (BACKLOG #5570).
-    p = load_connscale_profile_text(_SANDBOX_AB + "\n[connscale.slo]\nfd_monotonic = true\n")
-    assert p.slo.fd_monotonic and p.sandbox_modes == ("off", "subprocess")
 
 
 def test_a_fused_subprocess_arm_is_refused() -> None:

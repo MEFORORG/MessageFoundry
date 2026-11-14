@@ -97,9 +97,11 @@ class Difference:
     field_no: int | None  # None for whole-segment differences
     left: str | None
     right: str | None
-    # "field" | "left-only-segment" | "right-only-segment" | "field-count" | "segment-order". A
-    # "segment-order" row names one segment both sides hold in a different place; left/right are its
-    # content on each side, as for a whole-segment row.
+    # "field" | "left-only-segment" | "right-only-segment" | "field-count" | "segment-order" |
+    # "order-unchecked". A "segment-order" row names one segment both sides hold, whole, in a
+    # different place; left/right are its content, the same on both sides. An "order-unchecked" row
+    # says the messages were too large to align, so the order was not checked; it fails the
+    # comparison rather than pass it, and its left/right are None.
     kind: str
 
     def describe(self) -> str:
@@ -125,9 +127,11 @@ def _segments(message: str, sep: Separators) -> list[list[str]]:
 def normalize(message: str, rules: NormalizeRules | None = None) -> list[list[str]]:
     """Return the message as canonical ``[[field, ...], ...]`` segments with the rules applied.
 
-    Blanks non-deterministic fields, sorts non-semantic repetitions, drops ignored segments, and sorts
-    non-semantic segment occurrences — so two normalized messages compare equal iff they are
-    *semantically* equal under the rules. Pure; the input is never mutated.
+    Blanks non-deterministic fields, sorts non-semantic repetitions, drops ignored segments, moves
+    ``any_position_segments`` to the end (keeping their own order), and sorts non-semantic segment
+    occurrences — so two normalized messages compare equal iff they are *semantically* equal under
+    the rules. Moving the any-position segments first means one can no longer split a
+    ``sort_segments`` run on one side only. Pure; the input is never mutated.
     """
     rules = rules or NormalizeRules()
     sep = Separators.from_message(message)
@@ -135,7 +139,7 @@ def normalize(message: str, rules: NormalizeRules | None = None) -> list[list[st
 
     canon: list[list[str]] = []
     for fields in segs:
-        seg_id = fields[0] if fields else ""
+        seg_id = _seg_id(fields)
         if seg_id in rules.ignore_segments:
             continue
         row = list(fields)
@@ -152,6 +156,11 @@ def normalize(message: str, rules: NormalizeRules | None = None) -> list[list[st
                     row[idx] = sep.repetition.join(sorted(reps))
         canon.append(row)
 
+    if rules.any_position_segments:
+        anywhere = rules.any_position_segments
+        canon = [r for r in canon if _seg_id(r) not in anywhere] + [
+            r for r in canon if _seg_id(r) in anywhere
+        ]
     if rules.sort_segments:
         canon = _sort_segment_runs(canon, rules.sort_segments)
     return canon
@@ -163,10 +172,10 @@ def _sort_segment_runs(canon: list[list[str]], sort_ids: frozenset[str]) -> list
     i = 0
     n = len(canon)
     while i < n:
-        seg_id = canon[i][0] if canon[i] else ""
+        seg_id = _seg_id(canon[i])
         if seg_id in sort_ids:
             j = i
-            while j < n and (canon[j][0] if canon[j] else "") == seg_id:
+            while j < n and _seg_id(canon[j]) == seg_id:
                 j += 1
             out.extend(sorted(canon[i:j], key=lambda r: tuple(r)))
             i = j
@@ -185,9 +194,9 @@ def diff(left: str, right: str, rules: NormalizeRules | None = None) -> list[Dif
 
     That alignment alone cannot see WHERE a segment sits, so an ``NTE`` or ``OBX`` moved from one
     ``OBR`` group to another would compare equal although its clinical owner changed (BACKLOG
-    #5569). So the order of the segments is compared too: see :func:`_diff_order`. ``sort_segments``
-    has already sorted each contiguous run before this, so a run it was told to treat as unordered
-    stays clean, and ``any_position_segments`` leaves a segment's position out of it altogether.
+    #5569). So the order of the segments is compared too: see :func:`_diff_order`. :func:`normalize`
+    has already sorted each ``sort_segments`` run and moved each ``any_position_segments`` segment to
+    the end, so neither reads as a move.
     """
     rules = rules or NormalizeRules()
     lsegs = normalize(left, rules)
@@ -196,7 +205,7 @@ def diff(left: str, right: str, rules: NormalizeRules | None = None) -> list[Dif
     left_by_id = _group_by_id(lsegs)
     right_by_id = _group_by_id(rsegs)
 
-    out: list[Difference] = _diff_order(lsegs, rsegs, rules.any_position_segments)
+    out: list[Difference] = _diff_order(lsegs, rsegs)
     for seg_id in sorted(left_by_id.keys() | right_by_id.keys()):
         l_occ = left_by_id.get(seg_id, [])
         r_occ = right_by_id.get(seg_id, [])
@@ -219,11 +228,20 @@ def _seg_id(fields: list[str]) -> str:
     return fields[0] if fields else ""
 
 
-def _matched(left: list[str], right: list[str]) -> tuple[set[int], set[int]]:
-    """Indices of ``left`` and ``right`` on one longest common subsequence of the two id lists.
+#: The largest middle, in table cells, :func:`_matched` aligns. The table is quadratic in time and
+#: memory and its size is set by message content, so past this the order check reports
+#: ``order-unchecked`` rather than run it: about a second and some tens of MB in CPython.
+_LCS_MAX_CELLS = 1_000_000
+
+_Key = tuple[str, ...]
+
+
+def _matched(left: list[_Key], right: list[_Key]) -> tuple[set[int], set[int]] | None:
+    """Indices of ``left`` and ``right`` on one longest common subsequence of the two lists.
 
     The common prefix and suffix are always on some longest one, so only the middle runs the
     quadratic table; two messages that differ by one move or insertion keep that middle small.
+    ``None`` when the middle is past :data:`_LCS_MAX_CELLS`.
     """
     n, m = len(left), len(right)
     lo = 0
@@ -233,6 +251,8 @@ def _matched(left: list[str], right: list[str]) -> tuple[set[int], set[int]]:
     while hi < n - lo and hi < m - lo and left[n - 1 - hi] == right[m - 1 - hi]:
         hi += 1
     lm, rm = left[lo : n - hi], right[lo : m - hi]
+    if len(lm) * len(rm) > _LCS_MAX_CELLS:
+        return None
     # table[i][j] = LCS length of lm[i:] and rm[j:].
     table = [[0] * (len(rm) + 1) for _ in range(len(lm) + 1)]
     for i in range(len(lm) - 1, -1, -1):
@@ -256,50 +276,67 @@ def _matched(left: list[str], right: list[str]) -> tuple[set[int], set[int]]:
     return l_hit, r_hit
 
 
-def _diff_order(
-    lsegs: list[list[str]], rsegs: list[list[str]], any_position: frozenset[str]
-) -> list[Difference]:
-    """One ``segment-order`` row when a segment both sides hold sits in a different place, else none.
+def _first_shared(keys: list[_Key], other: Counter[_Key]) -> list[_Key]:
+    """``keys`` keeping, per key, only as many occurrences as ``other`` holds, the earliest first."""
+    seen: Counter[_Key] = Counter()
+    out: list[_Key] = []
+    for k in keys:
+        seen[k] += 1
+        if seen[k] <= other[k]:
+            out.append(k)
+    return out
 
-    Read on the segment ids, those in ``any_position`` left out. A segment only one side holds is
-    already a ``left-only``/``right-only`` row, and inserting or deleting one must not also read as
-    a move, wherever it sits. So the test is whether one longest common subsequence of the two id
-    lists keeps every occurrence both sides hold: if it does, the shared segments sit in the same
-    order and nothing moved. If it does not, some id has an occurrence on each side that no such
-    alignment can pair, and the first one on the left is the segment reported, with its content on
-    each side. The ``(id, ordinal)`` pairing still compares the content; this row says only that
-    position differs.
+
+def _diff_order(lsegs: list[list[str]], rsegs: list[list[str]]) -> list[Difference]:
+    """A ``segment-order`` row for each segment both sides hold, whole, in a different place.
+
+    Read on whole segments, so a moved segment is told apart from another of its id: an ``NTE``
+    re-parented beside a new ``NTE`` of the same id is still found. A segment only one side holds,
+    or whose content changed, is the ``(id, ordinal)`` pairing's to report, and inserting or deleting
+    one must not also read as a move, wherever it sits. So the test is whether one longest common
+    subsequence of the two lists keeps every segment both sides hold: if it does, nothing moved. If
+    it does not, each segment it cannot keep is reported, with its id and ordinal on the left and its
+    content, which is the same on both sides.
+
+    Past :data:`_LCS_MAX_CELLS` the alignment is not run. Then a cheap check that proves the order
+    unchanged is tried, and where it cannot, one ``order-unchecked`` row is returned: the gate fails
+    closed rather than pass a move it did not look for.
     """
-    l_idx = [k for k, s in enumerate(lsegs) if _seg_id(s) not in any_position]
-    r_idx = [k for k, s in enumerate(rsegs) if _seg_id(s) not in any_position]
-    l_ids = [_seg_id(lsegs[k]) for k in l_idx]
-    r_ids = [_seg_id(rsegs[k]) for k in r_idx]
-    if l_ids == r_ids:
+    l_keys = [tuple(s) for s in lsegs]
+    r_keys = [tuple(s) for s in rsegs]
+    if l_keys == r_keys:
         return []
-    l_hit, r_hit = _matched(l_ids, r_ids)
-    l_count, r_count = Counter(l_ids), Counter(r_ids)
-    shared = sum(min(c, r_count[seg]) for seg, c in l_count.items())
-    if len(l_hit) == shared:
+    l_count, r_count = Counter(l_keys), Counter(r_keys)
+    if _first_shared(l_keys, r_count) == _first_shared(r_keys, l_count):
+        # Every shared segment in one order on both sides: a common subsequence holding them all.
         return []
-    # Per id, the occurrences left unpaired beyond the surplus count are the moved ones; the count is
-    # the same on both sides, because the pairs are.
-    paired = Counter(l_ids[p] for p in l_hit)
-    moved = {seg for seg in l_count if paired[seg] < min(l_count[seg], r_count[seg])}
-    l_pos = next(p for p in range(len(l_ids)) if p not in l_hit and l_ids[p] in moved)
-    seg = l_ids[l_pos]
-    r_pos = next(p for p in range(len(r_ids)) if p not in r_hit and r_ids[p] == seg)
-    occ = l_ids[: l_pos + 1].count(seg)
-    left_fields, right_fields = lsegs[l_idx[l_pos]], rsegs[r_idx[r_pos]]
-    return [
-        Difference(seg, occ, None, sep_join(left_fields), sep_join(right_fields), "segment-order")
-    ]
+    matched = _matched(l_keys, r_keys)
+    if matched is None:
+        # The sides differ somewhere inside the shorter one, or the cheap check above returned.
+        first = next(i for i, (a, b) in enumerate(zip(l_keys, r_keys, strict=False)) if a != b)
+        seg = _seg_id(lsegs[first])
+        occ = sum(1 for s in lsegs[: first + 1] if _seg_id(s) == seg)
+        return [Difference(seg, occ, None, None, None, "order-unchecked")]
+    l_hit, r_hit = matched
+    paired = Counter(l_keys[p] for p in l_hit)
+    # Per segment, the occurrences no alignment keeps although both sides hold them.
+    excess = {k: min(c, r_count[k]) - paired[k] for k, c in l_count.items()}
+    out: list[Difference] = []
+    ordinal: Counter[str] = Counter()
+    for p, k in enumerate(l_keys):
+        seg = _seg_id(lsegs[p])
+        ordinal[seg] += 1
+        if p not in l_hit and excess.get(k, 0) > 0:
+            excess[k] -= 1
+            text = sep_join(lsegs[p])
+            out.append(Difference(seg, ordinal[seg], None, text, text, "segment-order"))
+    return out
 
 
 def _group_by_id(segs: list[list[str]]) -> dict[str, list[list[str]]]:
     grouped: dict[str, list[list[str]]] = {}
     for fields in segs:
-        seg_id = fields[0] if fields else ""
-        grouped.setdefault(seg_id, []).append(fields)
+        grouped.setdefault(_seg_id(fields), []).append(fields)
     return grouped
 
 

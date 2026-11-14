@@ -1433,6 +1433,29 @@ def test_a_non_finite_reading_mid_lane_fails_once() -> None:
     assert not [row for row in table if "OUTSIDE BAND" in row], table
 
 
+def test_the_payload_keeps_a_non_finite_first_reading_as_the_lanes_base_and_stays_json() -> None:
+    recs = [
+        _rec("fixed_per_conn", 12, per_msg=math.nan),
+        _rec("fixed_per_conn", 24, per_msg=48.0),
+        _rec("fixed_per_conn", 48, per_msg=10.0),
+    ]
+    report = _report(*recs)
+    payload = report.readings_payload(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    rows = payload["readings"]
+    assert isinstance(rows, list)
+    # The lane's base is N=12, the reading that came first, not the next finite one.
+    assert [(r["count"], r["first_in_lane"]) for r in rows] == [
+        (12, True),
+        (24, False),
+        (48, False),
+    ]
+    assert rows[0]["value"] is None and rows[0]["not_finite"] == "nan" and rows[0]["ok"] is False
+    json.dumps(payload, allow_nan=False)  # strict JSON: no NaN token anywhere
+    table = _rows(report.render_readings_markdown(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE))
+    assert ["first in lane" in t for t in table] == [False, False, False], table
+    assert "no finite prior" in table[1] and "NOT FINITE" in table[0], table
+
+
 def test_a_single_arm_off_its_default_keeps_the_plain_lane_label() -> None:
     # A sweep that ran only the sandbox arm varies no axis but N, so its lane reads as before -- the
     # same label the herd floor block gives it.

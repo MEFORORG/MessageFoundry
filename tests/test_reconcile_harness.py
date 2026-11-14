@@ -9,10 +9,17 @@ real content differences must.
 
 from __future__ import annotations
 
+import importlib
+from pathlib import Path
+
 import pytest
 
 from harness.reconcile import Difference, NormalizeRules, Separators, diff, normalize
+from harness.reconcile.__main__ import main as reconcile_main
 from harness.reconcile.normalize import ReconcileError
+
+# The package re-exports the `normalize` FUNCTION under the module's name, so name the module itself.
+normalize_module = importlib.import_module("harness.reconcile.normalize")
 
 # A small synthetic ADT^A01. \r segment separators (as MLLP delivers).
 BASE = (
@@ -212,6 +219,81 @@ def test_any_position_segments_waives_the_place_but_not_the_content() -> None:
     # The content is still compared.
     changed = BASE + "\rZPD|1|SITE-B"
     assert [d.kind for d in diff(left, changed, rules)] == ["field"]
+
+
+def test_the_cli_flag_reaches_the_rule(tmp_path: Path) -> None:
+    # The flag, upper-cased as its siblings are, is what an operator actually uses.
+    zpd = "\rZPD|1|SITE-A"
+    mefor = tmp_path / "mefor.hl7"
+    corepoint = tmp_path / "corepoint.hl7"
+    mefor.write_text(BASE.replace("\rPV1", zpd + "\rPV1") + "\r", encoding="latin-1")
+    corepoint.write_text(BASE + zpd + "\r", encoding="latin-1")
+    argv = ["compare", "--mefor", str(mefor), "--corepoint", str(corepoint)]
+    assert reconcile_main(argv) == 1
+    assert reconcile_main([*argv, "--any-position-segment", "zpd"]) == 0
+
+
+def test_a_move_beside_a_new_segment_of_the_same_id_is_found() -> None:
+    # The BMP's comment X moves to the CBC, and a new comment Y is added under the BMP. Aligned on
+    # ids alone, X would pair with Y and read as one comment appended.
+    left = (
+        "MSH|^~\\&|LAB|MMH|EPIC|MMH|20240101120000||ORU^R01|CTRL0003|P|2.5.1\r"
+        "PID|1||MRN123\rOBR|1|ORD1\rOBX|1|NM|WBC\rOBR|2|ORD2\rNTE|1||X"
+    )
+    right = (
+        "MSH|^~\\&|LAB|MMH|EPIC|MMH|20240101120000||ORU^R01|CTRL0003|P|2.5.1\r"
+        "PID|1||MRN123\rOBR|1|ORD1\rNTE|1||X\rOBX|1|NM|WBC\rOBR|2|ORD2\rNTE|1||Y"
+    )
+    orders = [d for d in diff(left, right) if d.kind == "segment-order"]
+    assert [(d.segment, d.left, d.right) for d in orders] == [("NTE", "NTE|1||X", "NTE|1||X")]
+
+
+def test_a_move_is_reported_with_its_own_content_never_a_deleted_neighbours() -> None:
+    # Comment A deleted, and the WBC result and comment B moved under the BMP. The alignment names
+    # the fewest segments that explain the reorder -- here OBR|2 moving ahead of them -- and each
+    # row carries that segment's own content, never A's beside B's.
+    left = (
+        "MSH|^~\\&|LAB|MMH|EPIC|MMH|20240101120000||ORU^R01|CTRL0004|P|2.5.1\r"
+        "PID|1||MRN123\rNTE|1||A\rOBR|1|ORD1\rOBX|1|NM|WBC\rNTE|1||B\rOBR|2|ORD2"
+    )
+    right = (
+        "MSH|^~\\&|LAB|MMH|EPIC|MMH|20240101120000||ORU^R01|CTRL0004|P|2.5.1\r"
+        "PID|1||MRN123\rOBR|1|ORD1\rOBR|2|ORD2\rOBX|1|NM|WBC\rNTE|1||B"
+    )
+    orders = [d for d in diff(left, right) if d.kind == "segment-order"]
+    assert [(d.segment, d.occurrence, d.left, d.right) for d in orders] == [
+        ("OBR", 2, "OBR|2|ORD2", "OBR|2|ORD2")
+    ], [d.describe() for d in orders]
+
+
+def test_two_independent_moves_are_both_reported() -> None:
+    # Two separate moves in one message: both rows appear at once, not the second only after the
+    # first is fixed.
+    wbc = "OBX|1|NM|WBC^WHITE CELLS||7.1|10*3/uL\r"
+    pid = "PID|1||MRN123^^^MMH^MR||DOE^JOHN^Q||19800101|M\r"
+    both = _nte_moved_to_bmp().replace(pid, "").replace(wbc, wbc + pid)
+    orders = [d for d in diff(ORU, both) if d.kind == "segment-order"]
+    assert {d.segment for d in orders} == {"PID", "NTE"}, [d.describe() for d in orders]
+
+
+def test_any_position_does_not_split_a_sorted_run() -> None:
+    rules = NormalizeRules(
+        sort_segments=frozenset({"NK1"}), any_position_segments=frozenset({"ZPD"})
+    )
+    left = BASE.replace("\rPV1", "\rNK1|2|A\rZPD|1\rNK1|1|B\rPV1")
+    right = BASE.replace("\rPV1", "\rNK1|2|A\rNK1|1|B\rPV1") + "\rZPD|1"
+    assert diff(left, right, rules) == []
+
+
+def test_a_message_too_large_to_align_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Past the alignment's size cap the order is not checked, and the comparison says so rather
+    # than pass a move it did not look for.
+    monkeypatch.setattr(normalize_module, "_LCS_MAX_CELLS", 1)
+    (d,) = diff(ORU, _nte_moved_to_bmp())
+    assert d.kind == "order-unchecked", d.describe()
+    # A pure insertion is still proved in order cheaply, so it is not flagged.
+    inserted = ORU.replace(_NTE, _NTE + "\rNTE|2||ADDED")
+    assert "order-unchecked" not in {d.kind for d in diff(ORU, inserted)}
 
 
 def test_with_blanks_keeps_every_other_rule() -> None:

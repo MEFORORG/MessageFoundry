@@ -55,5 +55,7 @@ corpus_count_per_trigger = 20
 
 [connscale.slo]
 # Correctness gate only. The walls are recorded per arm, not graded: their values are host-variable.
-# The vs-N slope checks are not armed, because they group records without the sandbox arm.
+# The vs-N checks are not armed, and the profile loader refuses them beside a sandbox A/B: the
+# empty-claims checks group records without the sandbox arm, and fd_monotonic has no per-arm bound
+# that it compared each arm at least once.
 zero_loss = true

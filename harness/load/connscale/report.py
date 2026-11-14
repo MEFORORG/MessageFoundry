@@ -27,7 +27,7 @@ import io
 import json
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from harness._spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from harness.load.connscale.intake_audit import (
@@ -535,8 +535,18 @@ def lane_label(sweep_mode: str, claim_mode: str) -> str:
     return sweep_mode if claim_mode == "per_lane" else f"{sweep_mode}/{claim_mode}"
 
 
-#: ``(sweep_mode, claim_mode, fuse_thread_hops, batch_handoff_statements, sandbox_mode, trial)``.
-MonotonicLane = tuple[str, str, bool, bool, str, int]
+#: The axes of :func:`monotonic_lane` past :func:`lane_label`'s two, each as its label prefix and how
+#: a record's value is read and spelled. The ONE list of them: the lane key and its label both read
+#: it, so an axis cannot be in one and missing from the other.
+_LANE_AXES: tuple[tuple[str, Callable[[ConnScaleRecord], str]], ...] = (
+    ("fuse", lambda r: "on" if r.fuse_thread_hops else "off"),
+    ("batch", lambda r: "on" if r.batch_handoff_statements else "off"),
+    ("sandbox", lambda r: r.sandbox_mode),
+    ("trial", lambda r: str(r.trial)),
+)
+
+#: ``(sweep_mode, claim_mode, *each _LANE_AXES value)``.
+MonotonicLane = tuple[str, ...]
 
 
 def monotonic_lane(r: ConnScaleRecord) -> MonotonicLane:
@@ -547,24 +557,7 @@ def monotonic_lane(r: ConnScaleRecord) -> MonotonicLane:
     a batching arm or a repeat trial onto its sibling at the same N, so the band compared two arms
     rather than two N, and two records at one N shared one pair (BACKLOG #5570, after #1101).
     """
-    return (
-        r.sweep_mode,
-        r.claim_mode,
-        r.fuse_thread_hops,
-        r.batch_handoff_statements,
-        r.sandbox_mode,
-        r.trial,
-    )
-
-
-#: The axes of :func:`monotonic_lane` past :func:`lane_label`'s two, each as its label prefix and how
-#: a record's value is read and spelled.
-_LANE_AXES: tuple[tuple[str, Callable[[ConnScaleRecord], str]], ...] = (
-    ("fuse", lambda r: "on" if r.fuse_thread_hops else "off"),
-    ("batch", lambda r: "on" if r.batch_handoff_statements else "off"),
-    ("sandbox", lambda r: r.sandbox_mode),
-    ("trial", lambda r: str(r.trial)),
-)
+    return (r.sweep_mode, r.claim_mode, *(read(r) for _, read in _LANE_AXES))
 
 
 def monotonic_lane_labeler(records: list[ConnScaleRecord]) -> Callable[[ConnScaleRecord], str]:
@@ -614,34 +607,44 @@ class MonotonicPair:
         return math.isfinite(self.value)
 
 
+class _Reading(NamedTuple):
+    label: str
+    record: ConnScaleRecord
+    value: float
+    pair: MonotonicPair | None  # None: no finite prior in the lane, and the reading is finite
+    first: bool  # the first reading in its lane, finite or not
+
+
 def _lane_readings(
     records: list[ConnScaleRecord],
     key: Callable[[ConnScaleRecord], float | int | None],
     *,
     tolerance: float,
-) -> list[tuple[str, ConnScaleRecord, float, MonotonicPair | None]]:
-    """Every reading, lane by lane then by N, as ``(label, record, value, pair)``.
+) -> list[_Reading]:
+    """Every reading, lane by lane then by N.
 
     THE ONE WALK. :func:`monotonic_pairs` and both emitters read it, so the SLO and the recorded
     rows cannot pair the readings differently, and each row carries its own record's pair rather
     than one looked up by label and N, which two records can share (BACKLOG #5570).
 
-    ``pair`` is ``None`` for the first finite reading in its lane. Readings of ``None`` are skipped
-    rather than failed, and a skipped reading does not become the ``prior`` for the next N. A
-    non-finite reading is not skipped: it gets a failing pair even where it is first in its lane
+    ``pair`` is ``None`` for a finite reading with no finite prior in its lane. Readings of ``None``
+    are skipped rather than failed, and a skipped reading does not become the ``prior`` for the next
+    N. A non-finite reading is not skipped: it gets a failing pair even where it is first in its lane
     (prior NaN then), because ``v < prior * floor`` is False for a NaN and would read as a pass. It
     does not become the prior either, so the next finite reading is judged against the last finite
-    one rather than failed for its predecessor (BACKLOG #5570).
+    one rather than failed for its predecessor (BACKLOG #5570). ``first`` is set on the lane's first
+    reading only, so a finite reading after a non-finite first is not mistaken for the lane's base.
     """
     label = monotonic_lane_labeler(records)
     floor = 1.0 - tolerance
-    out: list[tuple[str, ConnScaleRecord, float, MonotonicPair | None]] = []
+    out: list[_Reading] = []
     prev_lane: MonotonicLane | None = None
     prev_val: float | None = None
+    first = True
     for r in sorted(records, key=lambda r: (monotonic_lane(r), r.count)):
         lane = monotonic_lane(r)
         if lane != prev_lane:
-            prev_lane, prev_val = lane, None
+            prev_lane, prev_val, first = lane, None, True
         val = key(r)
         if val is None:
             continue
@@ -660,7 +663,8 @@ def _lane_readings(
             )
         if math.isfinite(v):
             prev_val = v
-        out.append((label(r), r, v, pair))
+        out.append(_Reading(label(r), r, v, pair, first))
+        first = False
     return out
 
 
@@ -678,9 +682,9 @@ def monotonic_pairs(
     missing and a non-finite reading are :func:`_lane_readings`'s.
     """
     return [
-        pair
-        for _, _, _, pair in _lane_readings(records, key, tolerance=tolerance)
-        if pair is not None
+        reading.pair
+        for reading in _lane_readings(records, key, tolerance=tolerance)
+        if reading.pair is not None
     ]
 
 
@@ -1055,23 +1059,21 @@ class ConnScaleReport:
         """
         rows: list[str] = []
         dropped = 0
-        for label, r, val, pair in _lane_readings(self.records, key, tolerance=tolerance):
+        for label, r, val, pair, first in _lane_readings(self.records, key, tolerance=tolerance):
             if len(rows) >= max_rows:
                 dropped += 1
                 continue
             if pair is None:
-                # First reading in its lane: a real sample, but nothing to compare it against.
-                rows.append(f"| {label} | {r.count} | {val:.4g} | | | | first in lane |")
+                # A real sample with nothing to compare it against: the lane's first reading, or the
+                # first finite one after a non-finite first.
+                note = "first in lane" if first else "no finite prior"
+                rows.append(f"| {label} | {r.count} | {val:.4g} | | | | {note} |")
+            elif not pair.finite:
+                # A non-finite reading did not drop below the band, and has no margin; say what it is.
+                rows.append(f"| {label} | {r.count} | {val} | | | | NOT FINITE |")
             else:
                 margin = pair.value - pair.threshold
-                # A non-finite reading did not drop below the band; say what it is.
-                verdict = (
-                    "NOT FINITE"
-                    if not pair.finite
-                    else "within band"
-                    if pair.ok
-                    else "OUTSIDE BAND"
-                )
+                verdict = "within band" if pair.ok else "OUTSIDE BAND"
                 rows.append(
                     f"| {label} | {r.count} | {pair.value:.4g} | {pair.prior:.4g} "
                     f"| {pair.threshold:.4g} | {margin:+.4g} | {verdict} |"
@@ -1194,16 +1196,32 @@ class ConnScaleReport:
         function's docstring states.
         """
         readings: list[dict[str, object]] = []
-        for label, r, val, pair in _lane_readings(self.records, key, tolerance=tolerance):
+        for label, r, val, pair, first in _lane_readings(self.records, key, tolerance=tolerance):
             if pair is None:
-                # First reading in its lane: a real sample with nothing to compare against. Recorded
-                # rather than skipped -- it is the PRIOR for the next N and a reader needs its value.
+                # A real sample with nothing to compare against. Recorded rather than skipped -- it
+                # is the PRIOR for the next N and a reader needs its value. `first_in_lane` is False
+                # where a non-finite reading came first, so a harvest never takes this, a larger N,
+                # as the lane's base.
                 readings.append(
                     {
                         "lane": label,
                         "count": r.count,
                         "value": val,
-                        "first_in_lane": True,
+                        "first_in_lane": first,
+                    }
+                )
+                continue
+            if not pair.finite:
+                # NaN and infinity are not JSON, and a strict reader refuses the whole artifact on
+                # one, so the value is null here and its spelling travels as text.
+                readings.append(
+                    {
+                        "lane": label,
+                        "count": r.count,
+                        "value": None,
+                        "not_finite": str(val),
+                        "ok": False,
+                        "first_in_lane": first,
                     }
                 )
                 continue
