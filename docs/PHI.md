@@ -411,9 +411,16 @@ than a path is not checked
   --grant-account` refuses the same list, and refuses a name that is a group or a domain.
 - On Windows it refuses a key file whose owner is one of those groups or an application package,
   or whose owner cannot be read, since an owner may rewrite the access list (vault BACKLOG #5657).
-  It does not vet an account you granted yourself, or an owner that is one account, except that
-  the TLS key the engine mints has its owner vetted (below). Any other key file may be owned by
-  any one account, as your own TLS key may be by the administrator who copied it in.
+  It does not vet an account you granted yourself. For the key files this check judges, the TLS
+  key the engine mints aside, that screen is the whole owner rule: an owner the check does not
+  count as such a group or as an application package passes it, as your own TLS key may be owned
+  by the administrator who copied it in. The list counts at least one single account, IUSR, as
+  such a group. The key at the path where the engine mints its TLS key must also be owned by the
+  engine's own account, SYSTEM or Administrators, when the engine uses that pair (below). When the
+  engine does not use it, as with an operator certificate, that path is not checked at all. The
+  key custody host and handoff files are held to a stricter rule: their reads, through
+  `key_file_handle_problem` ([restricted_file.py](../messagefoundry/restricted_file.py)), require
+  that same owner set and an exact access list.
   LOCAL SERVICE and NETWORK SERVICE are accounts that many services share, and the check does not
   report them.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
