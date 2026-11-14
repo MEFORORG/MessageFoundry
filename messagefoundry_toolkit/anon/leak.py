@@ -21,7 +21,8 @@ already-pseudonymized field is never re-flagged:
 * **high-precision structural PHI-shape detectors** over those unmapped values (dashed SSN,
   punctuated NANP phone, an ``MR``/``MRN`` id type in a whole component, its first subcomponent
   or any subcomponent of CX.5, a routable IPv6 address, and a line whose segment id is
-  malformed), plus a dashed SSN or punctuated phone that the message's own field separator cut
+  malformed; the IPv6 detector alone also reads the MSH header's fields from MSH-3 on that no
+  rule rewrites), plus a dashed SSN or punctuated phone that the message's own field separator cut
   across fields, when at least one of them is unmapped (BACKLOG #3465) — narrow by design to
   avoid the mass false-positives a broad digit-run search would produce on HL7 bodies (ADR 0030
   §5). A name, an undashed number or a date in an unmapped field
@@ -838,6 +839,32 @@ def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
     return reasons
 
 
+def _header_ipv6_hits(text: str, mapped_paths: set[str]) -> list[str]:
+    """Routable-IPv6 hits in the header, the one line :func:`_walk` skips: each field from MSH-3
+    on that no rule rewrites, read as written and decoded as :func:`_structural_reasons` reads a
+    value. The whole-message IPv4 check reads the header, so an IPv6 address there, such as one
+    in MSH-24, is judged too (BACKLOG #5654). Only the IPv6 shape is read here. MSH-1 and MSH-2
+    hold the delimiters and are never read. A header the walk does not skip, such as a short one,
+    is walked and judged there, so it is not read again."""
+    found = _split_at_header(text)
+    if found is None:
+        return []
+    seps, field_sep, lines, header_at = found
+    fields = lines[header_at].split(field_sep)
+    if fields[0].upper() != "MSH" or len(fields) < _HEADER_MIN_FIELDS:
+        return []
+    hits: list[str] = []
+    # fields[1] is MSH-2, the encoding characters, so fields[i] is MSH-(i + 1).
+    for number, value in enumerate(fields[2:], start=3):
+        address = f"MSH-{number}"
+        if not value or address in mapped_paths:
+            continue
+        forms = [value, *_decoded_parts(value, seps, field_sep)]
+        if any(_has_routable_ipv6(form, _ipv4_is_routable) for form in forms):
+            hits.append(f"unmapped {IPV6_REASON} in {address}")
+    return hits
+
+
 def structural_phi_hits(
     text: str, mapped_paths: set[str], *, version: str | None = None
 ) -> list[str]:
@@ -852,7 +879,10 @@ def structural_phi_hits(
     name or note is exactly what such a line tends to carry.
 
     A dashed SSN or punctuated phone that the message's own field separator cuts across fields
-    is a hit too, named by the fields it spans (:func:`_split_shape_hits`, BACKLOG #3465)."""
+    is a hit too, named by the fields it spans (:func:`_split_shape_hits`, BACKLOG #3465).
+
+    The header, which the walk skips, is read for a routable IPv6 address alone
+    (:func:`_header_ipv6_hits`, BACKLOG #5654)."""
     parsed = read_message_seps(text)
     if parsed is None:
         return []
@@ -865,7 +895,7 @@ def structural_phi_hits(
         hits.extend(
             f"{reason} in {address}" for reason in _structural_reasons(value, seps, field_sep)
         )
-    return hits + split_hits
+    return _header_ipv6_hits(text, mapped_paths) + hits + split_hits
 
 
 #: What a hit in the part of a field a retarget left reads as, after its shape label.

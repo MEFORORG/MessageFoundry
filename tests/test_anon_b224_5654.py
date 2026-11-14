@@ -26,6 +26,7 @@ from tests.test_anon_core import _NO_SCANNER
 
 _HEAD = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
 _LEAKS = pytest.mark.parametrize("leak", [engine_leak, tee_leak], ids=["engine", "tee"])
+_SIDES = pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
 
 
 def _zpd(value: str, head: str = _HEAD) -> str:
@@ -298,6 +299,78 @@ def test_a_surrogate_is_never_refused_as_an_ipv6_address(anon: ModuleType) -> No
 def test_an_ipv6_address_in_a_mapped_field_is_not_read(leak: ModuleType) -> None:
     text = f"{_HEAD.split(chr(13))[0]}\rPID|1||{_GLOBAL}^^^H^MR||X^Y"
     assert not any(leak.IPV6_REASON in hit for hit in leak.structural_phi_hits(text, {"PID-3"}))
+
+
+def _msh24(value: str) -> str:
+    """A message whose header holds ``value`` in MSH-24, its sending network address, after a full
+    MSH-7 timestamp with an offset."""
+    header = f"MSH|^~\\&|A|B|C|D|20260101120000-0500||ADT^A01|M1|P|2.5.1{'|' * 12}{value}"
+    return f"{header}\rPID|1||1^^^H^MR||X^Y"
+
+
+@_NO_SCANNER
+@_LEAKS
+@pytest.mark.parametrize(
+    "written",
+    [f"NET^{_GLOBAL}^DNS", _GLOBAL, _GLOBAL.replace(":", "\\X3A\\")],
+    ids=["hd", "bare", "escaped-colons"],
+)
+def test_a_routable_ipv6_address_in_the_header_is_a_hit(leak: ModuleType, written: str) -> None:
+    """The walk skips the header, so an address in MSH-24 passed while a routable IPv4 address
+    there was refused by the whole-message scan. The header's fields from MSH-3 on are read for
+    an IPv6 address too (BACKLOG #5654)."""
+    text = _msh24(written)
+    assert text.split("\r")[0].split("|")[23] == written  # MSH-24: field 1 is the separator
+    report = leak.leak_report(text, rules=DEFAULT_RULES)
+    assert f"unmapped {leak.IPV6_REASON} in MSH-24" in report.structural_hits, report.hits
+    assert not any(_GLOBAL in hit for hit in report.hits)
+
+
+@_NO_SCANNER
+@_SIDES
+def test_anonymize_checked_refuses_a_routable_ipv6_address_in_the_header(anon: ModuleType) -> None:
+    with pytest.raises(anon.LeakError, match="IPv6"):
+        anon.anonymize_checked(
+            _msh24(f"NET^{_GLOBAL}^DNS"), salt="b224-ipv6-header-0123456789abcdef"
+        )
+
+
+@_NO_SCANNER
+@_LEAKS
+@pytest.mark.parametrize(
+    "written",
+    ["NET^2001:db8::1^DNS", "NET^fe80::1^DNS", "NET^fd12:3456::1^DNS", "NET^host.example^DNS"],
+    ids=["documentation", "link-local", "unique-local", "a-name"],
+)
+def test_an_allowed_address_in_the_header_is_no_ipv6_hit(leak: ModuleType, written: str) -> None:
+    report = leak.leak_report(_msh24(written), rules=DEFAULT_RULES)
+    assert not any(leak.IPV6_REASON in hit for hit in report.hits), report.hits
+
+
+@_NO_SCANNER
+@_SIDES
+def test_an_ordinary_header_is_not_refused(anon: ModuleType) -> None:
+    """A header's timestamp, version and ids hold no IPv6 address, so reading it refuses nothing."""
+    raw = _msh24("")
+    out = anon.anonymize_checked(raw, salt="b224-ipv6-header-0123456789abcdef")
+    assert out.split("\r")[0] == raw.split("\r")[0]
+
+
+@_LEAKS
+def test_a_rule_on_a_header_field_takes_it_out_of_the_ipv6_read(leak: ModuleType) -> None:
+    """A field a rule rewrites holds the rule's output, so the header read skips it as the walk
+    skips every mapped field."""
+    text = _msh24(f"NET^{_GLOBAL}^DNS")
+    assert any(leak.IPV6_REASON in hit for hit in leak.structural_phi_hits(text, set()))
+    assert not any(leak.IPV6_REASON in hit for hit in leak.structural_phi_hits(text, {"MSH-24"}))
+
+
+@_LEAKS
+def test_a_header_field_is_numbered_the_header_way(leak: ModuleType) -> None:
+    """Field 1 of the header is the separator, so the read starts at MSH-3, after the encoding
+    characters, and names each field by its MSH number."""
+    text = f"MSH|^~\\&|{_GLOBAL}|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
+    assert leak._header_ipv6_hits(text, set()) == [f"unmapped {leak.IPV6_REASON} in MSH-3"]
 
 
 _FULL = ":".join(["4000", "a1", "0", "0", "0", "0", "0", "5"])
