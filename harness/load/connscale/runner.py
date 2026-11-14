@@ -1759,7 +1759,9 @@ def _build_record(
     fd_probe_root_pid: int | None = None,
     per_lane_wake: bool | None = None,
     sandbox: SandboxReading | None = None,
-    trial: int = 0,
+    # Required, like the other axes: a default would file a forgotten trial as trial 0 and chain the
+    # repeats into one lane again (BACKLOG #5570).
+    trial: int,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -2875,7 +2877,10 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
         "monotonic"
         if not breaches
         else "; ".join(
-            f"{p.label}@N={p.count}: {p.value:.3g} < prior {p.prior:.3g} * {p.tolerance_floor:.2f}"
+            # A non-finite reading is a broken instrument, not a drop: say so (BACKLOG #5570).
+            f"{p.label}@N={p.count}: reading {p.value} is not finite"
+            if not p.finite
+            else f"{p.label}@N={p.count}: {p.value:.3g} < prior {p.prior:.3g} * {p.tolerance_floor:.2f}"
             for p in breaches
         )
     )

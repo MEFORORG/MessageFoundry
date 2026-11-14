@@ -241,6 +241,7 @@ def _swept(
         batch_mode=batch,
         mode="fixed_aggregate",
         count=12,
+        trial=0,
         aggregate_rate=24.0,
         metrics_counters=Counters(),
         ack_hist=Histogram(),

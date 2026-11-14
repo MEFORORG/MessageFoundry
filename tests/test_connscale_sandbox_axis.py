@@ -92,7 +92,10 @@ def test_the_axis_parses_and_counts_toward_the_sweep() -> None:
             "cannot BOTH be multi-arm",
         ),
         (
-            _SANDBOX_AB + "\n[connscale.slo]\nfd_monotonic = true\n",
+            # per_lane, so the base-reading check's own per_lane requirement is met and the
+            # sandbox refusal is the one that fires.
+            _SANDBOX_AB.replace('claim_modes = ["pooled"]', 'claim_modes = ["per_lane"]')
+            + "\n[connscale.slo]\nempty_claims_base_reading = true\n",
             "would mix the two sandbox arms",
         ),
     ],
@@ -100,6 +103,13 @@ def test_the_axis_parses_and_counts_toward_the_sweep() -> None:
 def test_the_axis_refuses_a_profile_it_cannot_measure(text: str, match: str) -> None:
     with pytest.raises(ConnScaleProfileError, match=match):
         load_connscale_profile_text(text)
+
+
+def test_the_fd_slope_is_allowed_beside_a_sandbox_ab() -> None:
+    # Its pairing keeps each sandbox arm in its own lane, so the refusal's premise no longer holds
+    # for it (BACKLOG #5570).
+    p = load_connscale_profile_text(_SANDBOX_AB + "\n[connscale.slo]\nfd_monotonic = true\n")
+    assert p.slo.fd_monotonic and p.sandbox_modes == ("off", "subprocess")
 
 
 def test_a_fused_subprocess_arm_is_refused() -> None:
@@ -366,6 +376,7 @@ def _record(count: int, sandbox: SandboxReading) -> ConnScaleRecord:
         batch_mode=False,
         mode="fixed_aggregate",
         count=count,
+        trial=0,
         aggregate_rate=5.0,
         metrics_counters=Counters(sent=4, acked=4, sink_received=4),
         ack_hist=Histogram(),

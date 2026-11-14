@@ -557,22 +557,33 @@ def monotonic_lane(r: ConnScaleRecord) -> MonotonicLane:
     )
 
 
-def monotonic_lane_label(r: ConnScaleRecord) -> str:
-    """:func:`lane_label`, qualified by each axis of :func:`monotonic_lane` that is off its default.
+#: The axes of :func:`monotonic_lane` past :func:`lane_label`'s two, each as its label prefix and how
+#: a record's value is read and spelled.
+_LANE_AXES: tuple[tuple[str, Callable[[ConnScaleRecord], str]], ...] = (
+    ("fuse", lambda r: "on" if r.fuse_thread_hops else "off"),
+    ("batch", lambda r: "on" if r.batch_handoff_statements else "off"),
+    ("sandbox", lambda r: r.sandbox_mode),
+    ("trial", lambda r: str(r.trial)),
+)
 
-    A single-arm, single-trial run keeps the label it has always had, so harvested readings and SLO
-    detail strings keep their meaning; every other run's lanes read apart.
+
+def monotonic_lane_labeler(records: list[ConnScaleRecord]) -> Callable[[ConnScaleRecord], str]:
+    """Name a record's :func:`monotonic_lane` within ``records``.
+
+    :func:`lane_label`, qualified by each further axis that takes more than one value in
+    ``records``. So a run that varies no axis but N and the claim mode keeps the label it has always
+    had, whatever arm it ran -- the same label the herd floor and its harvest read -- while the lanes
+    of an A/B or a multi-trial run read apart (BACKLOG #5570).
     """
-    parts = [lane_label(r.sweep_mode, r.claim_mode)]
-    if r.fuse_thread_hops:
-        parts.append("fuse")
-    if r.batch_handoff_statements:
-        parts.append("batch")
-    if r.sandbox_mode != "off":
-        parts.append(f"sandbox={r.sandbox_mode}")
-    if r.trial:
-        parts.append(f"trial={r.trial}")
-    return "/".join(parts)
+    varying = [(name, read) for name, read in _LANE_AXES if len({read(r) for r in records}) > 1]
+
+    def label(r: ConnScaleRecord) -> str:
+        return "/".join(
+            [lane_label(r.sweep_mode, r.claim_mode)]
+            + [f"{name}={read(r)}" for name, read in varying]
+        )
+
+    return label
 
 
 @dataclass(frozen=True)
@@ -589,16 +600,68 @@ class MonotonicPair:
     reports and the numbers a failing run reports cannot drift apart.
     """
 
-    label: str  # :func:`monotonic_lane_label` of the lane
+    label: str  # the lane, named by :func:`monotonic_lane_labeler`
     count: int  # the LARGER N — the reading being judged
     value: float  # the metric at that N
-    prior: float  # the metric at the previous N in the same lane
+    prior: float  # the metric at the previous N in the same lane; NaN where there is none
     tolerance_floor: float  # the FRACTION, e.g. 0.75 — what the detail string prints after "*"
     threshold: float  # ``prior * tolerance_floor`` — the number ``value`` must actually beat
     ok: bool
-    # The record judged, so an emitter finds a record's own pair rather than looking it up by label
-    # and N, which two records can share.
-    record: ConnScaleRecord = field(repr=False, compare=False)
+
+    @property
+    def finite(self) -> bool:
+        """False for a NaN or infinite reading, which fails whatever its prior."""
+        return math.isfinite(self.value)
+
+
+def _lane_readings(
+    records: list[ConnScaleRecord],
+    key: Callable[[ConnScaleRecord], float | int | None],
+    *,
+    tolerance: float,
+) -> list[tuple[str, ConnScaleRecord, float, MonotonicPair | None]]:
+    """Every reading, lane by lane then by N, as ``(label, record, value, pair)``.
+
+    THE ONE WALK. :func:`monotonic_pairs` and both emitters read it, so the SLO and the recorded
+    rows cannot pair the readings differently, and each row carries its own record's pair rather
+    than one looked up by label and N, which two records can share (BACKLOG #5570).
+
+    ``pair`` is ``None`` for the first finite reading in its lane. Readings of ``None`` are skipped
+    rather than failed, and a skipped reading does not become the ``prior`` for the next N. A
+    non-finite reading is not skipped: it gets a failing pair even where it is first in its lane
+    (prior NaN then), because ``v < prior * floor`` is False for a NaN and would read as a pass. It
+    does not become the prior either, so the next finite reading is judged against the last finite
+    one rather than failed for its predecessor (BACKLOG #5570).
+    """
+    label = monotonic_lane_labeler(records)
+    floor = 1.0 - tolerance
+    out: list[tuple[str, ConnScaleRecord, float, MonotonicPair | None]] = []
+    prev_lane: MonotonicLane | None = None
+    prev_val: float | None = None
+    for r in sorted(records, key=lambda r: (monotonic_lane(r), r.count)):
+        lane = monotonic_lane(r)
+        if lane != prev_lane:
+            prev_lane, prev_val = lane, None
+        val = key(r)
+        if val is None:
+            continue
+        v = float(val)
+        pair: MonotonicPair | None = None
+        if prev_val is not None or not math.isfinite(v):
+            prior = math.nan if prev_val is None else prev_val
+            pair = MonotonicPair(
+                label=label(r),
+                count=r.count,
+                value=v,
+                prior=prior,
+                tolerance_floor=floor,
+                threshold=prior * floor,
+                ok=math.isfinite(v) and not (v < prior * floor),
+            )
+        if math.isfinite(v):
+            prev_val = v
+        out.append((label(r), r, v, pair))
+    return out
 
 
 def monotonic_pairs(
@@ -611,65 +674,14 @@ def monotonic_pairs(
 
     The SLO only ever needed the violations. An excursion-only record cannot establish the metric's
     variance, because the sample is selected on having already left the band (BACKLOG #1211) — so this
-    returns the whole sequence and lets the caller decide which half it wants.
-
-    Readings of ``None`` are skipped rather than failed, and a skipped reading does not become the
-    ``prior`` for the next N. A non-finite reading is not skipped: a pair with a NaN or infinite
-    value or prior fails, because ``v < prior * floor`` is False for a NaN and would read as a pass
-    (BACKLOG #5570).
+    returns the whole sequence and lets the caller decide which half it wants. The rules for a
+    missing and a non-finite reading are :func:`_lane_readings`'s.
     """
-    by_lane: dict[MonotonicLane, list[ConnScaleRecord]] = {}
-    for r in records:
-        by_lane.setdefault(monotonic_lane(r), []).append(r)
-
-    floor = 1.0 - tolerance
-    pairs: list[MonotonicPair] = []
-    for rs in by_lane.values():
-        prev_val: float | None = None
-        for r in sorted(rs, key=lambda r: r.count):
-            val = key(r)
-            if val is None:
-                continue
-            v = float(val)
-            if prev_val is not None:
-                pairs.append(
-                    MonotonicPair(
-                        label=monotonic_lane_label(r),
-                        count=r.count,
-                        value=v,
-                        prior=prev_val,
-                        tolerance_floor=floor,
-                        threshold=prev_val * floor,
-                        ok=math.isfinite(v)
-                        and math.isfinite(prev_val)
-                        and not (v < prev_val * floor),
-                        record=r,
-                    )
-                )
-            prev_val = v
-    return pairs
-
-
-def _lane_readings(
-    records: list[ConnScaleRecord],
-    key: Callable[[ConnScaleRecord], float | int | None],
-    *,
-    tolerance: float,
-) -> list[tuple[str, ConnScaleRecord, float, MonotonicPair | None]]:
-    """Every reading the emitters record, lane by lane then by N, as ``(label, record, value, pair)``.
-
-    ``pair`` is the record's own pair, or ``None`` for the first reading in its lane. It is found by
-    the record's identity: label and N are not a key, because two records can share both, and keying
-    on them gave both the one pair (BACKLOG #5570). Both emitters read this, so they cannot walk the
-    readings differently.
-    """
-    pair_by_record = {id(p.record): p for p in monotonic_pairs(records, key, tolerance=tolerance)}
-    out: list[tuple[str, ConnScaleRecord, float, MonotonicPair | None]] = []
-    for r in sorted(records, key=lambda r: (monotonic_lane(r), r.count)):
-        val = key(r)
-        if val is not None:
-            out.append((monotonic_lane_label(r), r, float(val), pair_by_record.get(id(r))))
-    return out
+    return [
+        pair
+        for _, _, _, pair in _lane_readings(records, key, tolerance=tolerance)
+        if pair is not None
+    ]
 
 
 #: Queue-draining workers the connscale graph runs PER CONNECTION, under ``claim_mode = per_lane``.
@@ -1052,7 +1064,14 @@ class ConnScaleReport:
                 rows.append(f"| {label} | {r.count} | {val:.4g} | | | | first in lane |")
             else:
                 margin = pair.value - pair.threshold
-                verdict = "within band" if pair.ok else "OUTSIDE BAND"
+                # A non-finite reading did not drop below the band; say what it is.
+                verdict = (
+                    "NOT FINITE"
+                    if not pair.finite
+                    else "within band"
+                    if pair.ok
+                    else "OUTSIDE BAND"
+                )
                 rows.append(
                     f"| {label} | {r.count} | {pair.value:.4g} | {pair.prior:.4g} "
                     f"| {pair.threshold:.4g} | {margin:+.4g} | {verdict} |"

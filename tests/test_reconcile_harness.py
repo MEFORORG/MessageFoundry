@@ -168,18 +168,58 @@ def test_an_obx_moved_to_another_order_is_a_difference() -> None:
     assert diff(ORU, moved) != []
 
 
-def test_the_order_difference_names_where_the_two_sides_first_part() -> None:
+def test_the_order_difference_names_the_moved_segment_with_its_content() -> None:
     (d,) = diff(ORU, _nte_moved_to_bmp())
-    # The fifth segment is the first place the segment-id sequences part: NTE on the left, the
-    # second OBR on the right.
+    # The moved segment is named, and left/right carry its content on each side, as a whole-segment
+    # row does.
     assert (d.segment, d.occurrence, d.field_no) == ("NTE", 1, None)
-    assert d.left == "NTE[1]" and d.right == "OBR[2]", d.describe()
+    assert d.left == _NTE and d.right == _NTE, d.describe()
 
 
 def test_a_surplus_segment_alone_is_not_also_an_order_difference() -> None:
     # An extra trailing NTE is right-only and nothing more: the shared segments still line up.
     extra = ORU + "\rNTE|2||ADDED"
     assert [d.kind for d in diff(ORU, extra)] == ["right-only-segment"]
+
+
+def test_a_segment_inserted_mid_message_is_not_a_move() -> None:
+    # A second NTE under the CBC: nothing moved, so whatever else the ordinal pairing reports, no row
+    # claims a reorder.
+    inserted = ORU.replace(_NTE, _NTE + "\rNTE|2||ADDED")
+    kinds = {d.kind for d in diff(ORU, inserted)}
+    assert "right-only-segment" in kinds and "segment-order" not in kinds, kinds
+    # The mirror image, a segment deleted mid-message, is not a move either.
+    assert "segment-order" not in {d.kind for d in diff(inserted, ORU)}
+
+
+def test_a_move_far_from_an_insertion_is_still_found() -> None:
+    # An NTE added under the CBC AND the WBC result moved to the BMP: the insertion must not hide
+    # the move.
+    wbc = "OBX|1|NM|WBC^WHITE CELLS||7.1|10*3/uL\r"
+    bmp = "OBR|2|ORD2||BMP^BASIC METABOLIC PANEL\r"
+    both = ORU.replace(_NTE, _NTE + "\rNTE|2||ADDED").replace(wbc, "").replace(bmp, bmp + wbc)
+    orders = [d for d in diff(ORU, both) if d.kind == "segment-order"]
+    assert len(orders) == 1, [d.describe() for d in diff(ORU, both)]
+
+
+def test_any_position_segments_waives_the_place_but_not_the_content() -> None:
+    zpd = "\rZPD|1|SITE-A"
+    left = BASE.replace("\rPV1", zpd + "\rPV1")  # before PV1
+    right = BASE + zpd  # after PV1
+    assert [d.kind for d in diff(left, right)] == ["segment-order"]
+    rules = NormalizeRules(any_position_segments=frozenset({"ZPD"}))
+    assert diff(left, right, rules) == []
+    # The content is still compared.
+    changed = BASE + "\rZPD|1|SITE-B"
+    assert [d.kind for d in diff(left, changed, rules)] == ["field"]
+
+
+def test_with_blanks_keeps_every_other_rule() -> None:
+    rules = NormalizeRules(
+        sort_segments=frozenset({"NK1"}), any_position_segments=frozenset({"ZPD"})
+    ).with_blanks(("PV1", 7))
+    assert rules.sort_segments == {"NK1"} and rules.any_position_segments == {"ZPD"}
+    assert ("PV1", 7) in rules.blank_fields and ("MSH", 7) in rules.blank_fields
 
 
 def test_a_move_beside_a_surplus_is_still_an_order_difference() -> None:

@@ -1409,10 +1409,45 @@ def test_a_non_finite_reading_fails_its_pair(bad: float) -> None:
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf])
-def test_a_non_finite_prior_fails_the_next_pair(bad: float) -> None:
+def test_a_non_finite_first_reading_fails_rather_than_becoming_the_prior(bad: float) -> None:
+    # First in its lane, it has no prior, and it still fails; the next finite reading is then the
+    # lane's first, not a pair blamed on a healthy N.
     recs = [_rec("fixed_per_conn", 12, per_msg=bad), _rec("fixed_per_conn", 24, per_msg=48.0)]
     (pair,) = monotonic_pairs(recs, _KEY, tolerance=_MONOTONIC_TOLERANCE)
-    assert not pair.ok, f"a reading compared against a {bad} prior passed the band"
+    assert pair.count == 12 and not pair.ok and not pair.finite, pair
+
+
+def test_a_non_finite_reading_mid_lane_fails_once() -> None:
+    recs = [
+        _rec("fixed_per_conn", 12, per_msg=48.0),
+        _rec("fixed_per_conn", 24, per_msg=math.nan),
+        _rec("fixed_per_conn", 48, per_msg=50.0),
+    ]
+    pairs = monotonic_pairs(recs, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    assert [(p.count, p.ok) for p in pairs] == [(24, False), (48, True)], pairs
+    assert pairs[1].prior == 48.0, "the reading after a NaN is judged against the last finite one"
+    detail = str(_monotonic_slo("m", recs, _KEY).observed)
+    assert detail == "fixed_per_conn@N=24: reading nan is not finite", detail
+    table = _rows(_render(_report(*recs)))
+    assert sum("NOT FINITE" in row for row in table) == 1, table
+    assert not [row for row in table if "OUTSIDE BAND" in row], table
+
+
+def test_a_single_arm_off_its_default_keeps_the_plain_lane_label() -> None:
+    # A sweep that ran only the sandbox arm varies no axis but N, so its lane reads as before -- the
+    # same label the herd floor block gives it.
+    arm = {
+        "sandbox": SandboxReading(
+            requested="subprocess", effective="subprocess", startup_seconds=1.0
+        )
+    }
+    recs = [
+        dataclasses.replace(_rec("fixed_per_conn", 12, per_msg=40.0), **arm),  # type: ignore[arg-type]
+        dataclasses.replace(_rec("fixed_per_conn", 24, per_msg=50.0), **arm),  # type: ignore[arg-type]
+    ]
+    (pair,) = monotonic_pairs(recs, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    assert pair.label == "fixed_per_conn"
+    assert [r.label for r in herd_floor_readings(recs, _KEY, base_count=12)] == [pair.label]
 
 
 def test_a_nan_fd_reading_fails_the_fd_monotonicity_slo() -> None:

@@ -507,10 +507,10 @@ def _validate_sandbox(profile: ConnScaleProfile, where: str) -> None:
             f"the engine disables fusion under the subprocess sandbox, so that arm would not be fused"
         )
     # These checks group records by (sweep_mode, claim_mode), so with two sandbox arms they would
-    # pair an off reading with a subprocess one and grade neither arm on its own.
+    # pair an off reading with a subprocess one and grade neither arm on its own. `fd_monotonic` is
+    # not among them: its pairing keeps each sandbox arm in its own lane (BACKLOG #5570).
     if len(profile.sandbox_modes) > 1:
         for key, armed in (
-            ("fd_monotonic", profile.slo.fd_monotonic),
             ("empty_claims_base_reading", profile.slo.empty_claims_base_reading),
             ("empty_claims_herd_floor_legs", bool(profile.slo.empty_claims_herd_floor_legs)),
         ):
