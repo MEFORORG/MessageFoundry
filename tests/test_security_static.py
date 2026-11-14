@@ -695,9 +695,12 @@ _UNSCANNABLE_RE_PATTERNS = {
     # the first character outside it, then that class and "=" possessively. It is tried only after a
     # label's separator, and ``support/redact.py`` spells it literally, so its twin is scanned there.
     # BACKLOG #5547 puts ``_BYTES_PREFIX``, an optional lower-case "b" with no repetition, in front of
-    # each quoted form, and a fixed-width lookbehind on the quoted fast path.
+    # each quoted form, and a fixed-width lookbehind on the quoted fast path. BACKLOG #5548 splices
+    # ``_DIGEST_PARAMS``: a list of parameters, every repetition possessive over branches that open
+    # on different characters, the quoted walk checking ``_RUN_ON_LABEL`` before each run as
+    # ``_RUN_ON_INNER`` does. The bundle copy builds it from literals and is scanned there.
     "messagefoundry/secretscrub.py": (
-        "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*(?:' + _QUOTED_SCHEME_VALUE + '|(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _BYTES_PREFIX + '(?:' + _GUARDED_QUOTED_VALUE + ')|' + _CAMEL_PLAIN_VALUE + '))'",
+        "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*(?:' + _QUOTED_SCHEME_VALUE + '|' + _DIGEST_PARAMS + '|(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _BYTES_PREFIX + '(?:' + _GUARDED_QUOTED_VALUE + ')|' + _CAMEL_PLAIN_VALUE + '))'",
         "'(?i)' + _LABEL_START + '(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|' + _BYTES_PREFIX + '(?:(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + ')|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _BYTES_PREFIX + '(?:' + _KV_QUOTED_VALUE + ')|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",

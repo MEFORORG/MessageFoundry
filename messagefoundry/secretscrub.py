@@ -1103,6 +1103,42 @@ _QUOTED_SCHEME_VALUE = "|".join(
     for quote in ("'", '"')
 )
 
+# A DIGEST CREDENTIAL'S WHOLE PARAMETER LIST (BACKLOG #5548). An RFC 7616 Authorization header is
+# ``Digest username="u", realm="r", nonce="n", uri="/a", response="h", ...``: a list of ``name=value``
+# parameters, most of them quoted. ``_BEARER`` took ``digest`` as a scheme word and then ONE value,
+# whose plain class stopped at the first quote, so ``username=`` was the whole match and the username,
+# nonce, client nonce and response printed. The response is a hash bound to the nonce that still
+# admits offline password guessing.
+#
+# So after ``digest`` the whole list is taken, one parameter at a time, each a name, "=", and a quoted
+# string or a token, joined by commas. A list it cannot read from its first parameter falls back to
+# the single value, so it prints what it printed before.
+#
+# A QUOTED PARAMETER STOPS AT A LATER LABEL, the way :data:`_RUN_ON_INNER` does, because its closer
+# may be that label's opening quote: in ``Digest username="u, password="p w"`` the username's quote
+# never closes, and a quoted string taken to the next quote would take the password's opening one and
+# leave "p w" to print. The walk checks :data:`_RUN_ON_LABEL` before each run and stops at any
+# character outside ASCII, so a keyword spelled with a fold character stops it as well; a stopped
+# parameter needs its closer next, fails, and the list ends before it, or falls back if it was the
+# first. A backslash escape is taken whole, as RFC 9110 quotes one. The closer may not be followed by
+# ":" or "=", the quote of a ``'label'=`` echo.
+#
+# LINEAR. It is tried only after ``digest`` behind a label's separator, and every repetition is
+# possessive over branches that open on different characters, so it reads each character once; a
+# quoted parameter ends at its closer, so two labels' lists cannot share one.
+_DIGEST_PARAM_QUOTED = (
+    r"\"(?:[^\"\\\r\nA-Za-z0-9\x80-\U0010ffff]|\\[^\r\n\x80-\U0010ffff]"
+    r"|(?!" + _RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+\"(?!\s*+[:=])"
+)
+_DIGEST_PARAM = r"[A-Za-z0-9_-]++=(?:" + _DIGEST_PARAM_QUOTED + r"|[A-Za-z0-9._~+/-]++)"
+_DIGEST_PARAMS = (
+    r"(?i:digest)[^\S\r\n]++"
+    + _DIGEST_PARAM
+    + r"(?:[^\S\r\n]*+,[^\S\r\n]*+"
+    + _DIGEST_PARAM
+    + r")*+"
+)
+
 # A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
 #
 # The ``(?:bearer|basic|digest)\s+`` group is load-bearing, not decoration: without it the value class
@@ -1124,10 +1160,15 @@ _QUOTED_SCHEME_VALUE = "|".join(
 # family's is, so the JSON shape is not kept. It takes no braced value: ``{"session": {"u": 1}}``
 # loses only its "{", exactly as ``session={"u": 1}`` does.
 #
-# A quoted scheme with a padded token is tried first, through :data:`_QUOTED_SCHEME_VALUE`.
+# A quoted scheme with a padded token is tried first, through :data:`_QUOTED_SCHEME_VALUE`, then a
+# Digest parameter list, through :data:`_DIGEST_PARAMS`.
 _BEARER = re.compile(
     r"(?i)(" + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
-    r"(?:['\"]\s*:|\s*[:=])\s*(?:" + _QUOTED_SCHEME_VALUE + r"|(?:(?:bearer|basic|digest)\s+)?"
+    r"(?:['\"]\s*:|\s*[:=])\s*(?:"
+    + _QUOTED_SCHEME_VALUE
+    + r"|"
+    + _DIGEST_PARAMS
+    + r"|(?:(?:bearer|basic|digest)\s+)?"
     r"(?:" + _BYTES_PREFIX + r"(?:" + _GUARDED_QUOTED_VALUE + r")|" + _CAMEL_PLAIN_VALUE + r"))"
 )
 

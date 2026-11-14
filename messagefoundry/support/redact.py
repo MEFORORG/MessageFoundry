@@ -349,9 +349,29 @@ _QUOTED_SCHEME_VALUE = (
     r"|apikey|bearer|mefor_|secret|token|pass|pwd"
     r'))[A-Za-z0-9+/._~-]++=++(?="(?!\s*+[:=]))'
 )
+# A DIGEST CREDENTIAL'S WHOLE PARAMETER LIST is tried next (BACKLOG #5548): the single value stopped
+# at ``username=``'s quote, so the username, nonce and response printed. Why each quoted parameter
+# stops at a later label, and why it stays linear, are stated once, on the same fragments in
+# ``messagefoundry/secretscrub.py``; this copy builds them on its own ``_RUN_ON_LABEL``.
+_DIGEST_PARAM_QUOTED = (
+    r"\"(?:[^\"\\\r\nA-Za-z0-9\x80-\U0010ffff]|\\[^\r\n\x80-\U0010ffff]"
+    r"|(?!" + _RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+\"(?!\s*+[:=])"
+)
+_DIGEST_PARAM = r"[A-Za-z0-9_-]++=(?:" + _DIGEST_PARAM_QUOTED + r"|[A-Za-z0-9._~+/-]++)"
+_DIGEST_PARAMS = (
+    r"(?i:digest)[^\S\r\n]++"
+    + _DIGEST_PARAM
+    + r"(?:[^\S\r\n]*+,[^\S\r\n]*+"
+    + _DIGEST_PARAM
+    + r")*+"
+)
 _BEARER = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
-    r"(?:['\"]\s*:|\s*[:=])\s*(?:" + _QUOTED_SCHEME_VALUE + r"|(?:(?i:bearer|basic|digest)\s+)?"
+    r"(?:['\"]\s*:|\s*[:=])\s*(?:"
+    + _QUOTED_SCHEME_VALUE
+    + r"|"
+    + _DIGEST_PARAMS
+    + r"|(?:(?i:bearer|basic|digest)\s+)?"
     r"(?:" + _BYTES_PREFIX + r"(?:" + _GUARDED_QUOTED_VALUE + r")|" + _PLAIN_VALUE + r"))"
 )
 

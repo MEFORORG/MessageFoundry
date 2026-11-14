@@ -204,6 +204,17 @@ OTHER_QUOTED_VALUES: tuple[tuple[QuotedValue, str], ...] = (
         ),
         "_BEARER",
     ),
+    (
+        # BACKLOG #5548: a Digest header's quoted parameters, after the first.
+        QuotedValue(
+            "digest_parameter_list",
+            'upstream sent Authorization: Digest username="wt-Dg_Usr-93", realm="api", '
+            'nonce="wt-Dg_Non-94", uri="/a", response="wt-Dg_Rsp-95" rejected',
+            ("wt-Dg_Usr-93", "wt-Dg_Non-94", "wt-Dg_Rsp-95"),
+            ("upstream sent", "rejected"),
+        ),
+        "_BEARER",
+    ),
 )
 
 

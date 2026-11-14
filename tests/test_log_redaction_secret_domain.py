@@ -314,6 +314,17 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
         ("startup", "loaded"),
         "_MEFOR_SECRET",
     ),
+    # BACKLOG #5548: an RFC 7616 Digest header. The single value stopped at the first quote, so the
+    # username, nonce, client nonce and response printed.
+    QuotedValue(
+        "digest_parameter_list",
+        'upstream sent Authorization: Digest username="dg-Usr_A-71", realm="api", '
+        'nonce="dg-Non_B-72", uri="/a", qop=auth, nc=00000001, cnonce="dg-Cno_C-73", '
+        'response="dg-Rsp_D-74" rejected',
+        ("dg-Usr_A-71", "dg-Non_B-72", "dg-Cno_C-73", "dg-Rsp_D-74"),
+        ("upstream sent", "rejected"),
+        "_BEARER",
+    ),
 )
 
 
@@ -4244,6 +4255,76 @@ def test_a_b_that_opens_no_quoted_value_is_read_as_before(line: str) -> None:
             assert [m.span() for m in pattern.finditer(line)] == [
                 m.span() for m in before.finditer(line)
             ], (module.__name__, name, line)
+
+
+#: Digest lines whose quoted parameter never closes, so its walk would otherwise end on a later
+#: label's opening quote (BACKLOG #5548).
+_DIGEST_LATER_LABEL_LINES = (
+    'Authorization: Digest username="zq-u, password="zq-Dl_A-78 zq-Dl_B-79"',
+    'authorization=Digest realm="r", nonce="zq-n, token: "zq-Dl_A-78 zq-Dl_B-79"',
+)
+
+
+def _without_the_digest_label_check(module: ModuleType) -> re.Pattern[str]:
+    check = r"|(?!" + module._RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+"
+    assert check in module._BEARER.pattern, f"{module.__name__}._BEARER lost its digest label check"
+    return re.compile(
+        module._BEARER.pattern.replace(check, r"|(?-i:[A-Za-z0-9])++)*+"), module._BEARER.flags
+    )
+
+
+@pytest.mark.parametrize("line", _DIGEST_LATER_LABEL_LINES)
+def test_a_digest_parameter_stops_at_a_later_label(
+    line: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE CONTROL: with the label check taken out of the quoted parameter's walk, the parameter
+    closes on the later label's opening quote and that label's value prints."""
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        assert "zq-Dl_B-79" not in out, f"{surface}: {out!r}"
+    for module in (scrub_mod, redact_mod):
+        monkeypatch.setattr(module, "_BEARER", _without_the_digest_label_check(module))
+    assert any("zq-Dl_B-79" in apply(line) for _surface, apply in _SWALLOW_SURFACES), "control"
+
+
+def test_both_copies_read_a_digest_list_alike() -> None:
+    """``test_both_copies_of_each_stopped_pattern_agree``'s corpus holds no Digest list, so these
+    lines compare the copy with ``secretscrub``'s reading before the camelCase one."""
+    corpus = [
+        *_DIGEST_LATER_LABEL_LINES,
+        'Authorization: Digest username="u", realm="r", response="h" x',
+        'token=Digest a=b,c="d\\"e" , f=g x="y"',
+        "session: digest x=",
+        'authorization: Digest username="u\'s", password="p"',
+    ]
+    ours, theirs = redact_mod._BEARER, scrub_mod._pre_camel(scrub_mod._BEARER)
+    for line in corpus:
+        assert [m.span() for m in ours.finditer(line)] == [
+            m.span() for m in theirs.finditer(line)
+        ], line
+
+
+def test_the_digest_list_grows_linearly_in_line_length() -> None:
+    """Three shapes: one long list, one quoted parameter that never closes, and one whose walk
+    checks for a label before every run."""
+    shapes: tuple[Callable[[int], str], ...] = (
+        lambda length: "authorization: Digest " + "ab=cd, " * (length // 7),
+        lambda length: 'authorization: Digest a="' + "x y " * (length // 4),
+        lambda length: 'authorization: Digest a="' + "pass " * (length // 5) + '"',
+    )
+    for module in (scrub_mod, redact_mod):
+        pattern: re.Pattern[str] = module._BEARER
+
+        def sub(text: str, pattern: re.Pattern[str] = pattern) -> str:
+            return pattern.sub("x", text)
+
+        for shape in shapes:
+            growth = _growth_between(
+                sub, shape(_GROWTH_LENGTHS[0]), shape(_GROWTH_LENGTHS[1]), rounds=5
+            )
+            assert growth <= _MAX_GROWTH, (
+                f"{module.__name__}._BEARER grew {growth:.1f}x for 8x the length on {shape(40)!r}"
+            )
 
 
 def test_the_quoted_scheme_token_grows_linearly_in_line_length() -> None:
