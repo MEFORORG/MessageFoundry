@@ -13,7 +13,7 @@ import {
   type AiPolicyIo,
   type AiPolicyWire,
 } from "../../aiPolicy";
-import { CACHED_PERMIT_MAX_AGE_MS, type CachedAiPolicy } from "../../aiPolicyModel";
+import { CACHED_PERMIT_MAX_AGE_MS, aiPolicyCacheKey, type CachedAiPolicy } from "../../aiPolicyModel";
 import { peekToken } from "../../auth";
 
 // SEC-022 regression. The offline AI-policy resolution must FAIL CLOSED: when the engine is
@@ -83,24 +83,33 @@ suite("pickOfflinePolicy (SEC-022)", () => {
 // Extension-Host leg); the pure merge rule they depend on is asserted node-side on every leg in
 // ai-policy-model.test.ts. That split is deliberate — see R4 in the plan.
 
-/** A fake globalState that records what was written, so a guard cannot pass by not writing. */
+/** The cache key fakeIo's default engine is cached under (BACKLOG #5564: the cache is per engine). */
+const LOOPBACK_KEY = aiPolicyCacheKey("http://127.0.0.1:8765");
+
+/** A fake globalState that records what was written, so a guard cannot pass by not writing. `seed`
+ *  is the policy cached for fakeIo's default engine; `stored` and `updates` read that engine's entry. */
 function fakeCtx(seed?: AiPolicy): {
   ctx: vscode.ExtensionContext;
   stored: () => AiPolicy | undefined;
   updates: () => number;
 } {
-  let value = seed;
+  const store = new Map<string, unknown>();
+  if (seed !== undefined) {
+    store.set(LOOPBACK_KEY, seed);
+  }
   let updates = 0;
   const ctx = {
     globalState: {
-      get: (_key: string): AiPolicy | undefined => value,
-      update: async (_key: string, v: AiPolicy): Promise<void> => {
-        value = v;
-        updates++;
+      get: (key: string): unknown => store.get(key),
+      update: async (key: string, v: unknown): Promise<void> => {
+        store.set(key, v);
+        if (key === LOOPBACK_KEY) {
+          updates++;
+        }
       },
     },
   } as unknown as vscode.ExtensionContext;
-  return { ctx, stored: () => value, updates: () => updates };
+  return { ctx, stored: () => store.get(LOOPBACK_KEY) as AiPolicy | undefined, updates: () => updates };
 }
 
 function wire(w: Partial<AiPolicyWire>): AiPolicyWire {
@@ -357,5 +366,21 @@ suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
     await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: false })));
     const offlineA = await resolveAiPolicy(ctx, engineIo(`${A}/`, undefined));
     assert.strictEqual(offlineA.assistPermitted, false, "the same engine, spelled with a slash, is one key");
+  });
+
+  test("T20: retargeting to an engine with no cache fails closed, not to the CLI's byo", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ mode: "off" })));
+    let cliAsked = false;
+    const offlineB: AiPolicyIo = {
+      ...engineIo(B, undefined),
+      getCliPolicy: async () => {
+        cliAsked = true;
+        return wire({ mode: "byo" });
+      },
+    };
+    const p = await resolveAiPolicy(ctx, offlineB);
+    assert.strictEqual(p.mode, "unverified", "a cached off must not be bypassed by changing the setting");
+    assert.strictEqual(cliAsked, false, "the CLI is not consulted once an engine has answered");
   });
 });

@@ -190,10 +190,51 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
  * The globalState key prefix for a cached authoritative policy. The key is per ENGINE (BACKLOG
  * #5564): with one unscoped key, the answer one engine gave stood in for another, so a permit cached
  * from engine A enabled assistance while engine B was unreachable, and a deny cached from B was
- * replaced by A's answer. A key written before this change is not read; with no cache for an
- * engine, the offline order falls to the CLI and then fails closed.
+ * replaced by A's answer. A key written before this change is not read as a policy; with no cache
+ * for an engine, {@link pickOfflinePolicy} fails closed once any engine has answered.
  */
 export const AI_POLICY_CACHE_PREFIX = "messagefoundry.lastAiPolicy@";
+
+/** The single unscoped key the policy was cached under before BACKLOG #5564. Never read as a policy,
+ *  since it does not say which engine answered; its presence still says that one did. */
+export const LEGACY_AI_POLICY_KEY = "messagefoundry.lastAiPolicy";
+
+/** The globalState flag set once any engine has answered the policy read; see
+ *  {@link pickOfflinePolicy}'s `heardFromAnEngine`. */
+export const AI_POLICY_HEARD_KEY = "messagefoundry.aiPolicyHeardFromEngine";
+
+/**
+ * Pick the policy when the authoritative engine is unreachable. Pure + testable. Order:
+ *   (a) the last cached authoritative policy from THIS engine, if any, as {@link cachedPolicyOffline}
+ *       lets it stand — so a previously-seen central "off" / ai:assist deny survives going offline,
+ *       and a cached answer that enables assistance stops doing so once it is too old (BACKLOG
+ *       #1154); else
+ *   (b) the local CLI's policy, if it positively returned one (it may itself carry mode "off"), but
+ *       only while no engine has ever answered; else
+ *   (c) the fail-closed UNVERIFIED policy (assistance disabled) — NEVER silently re-enable BYO.
+ *
+ * An expired cache does NOT fall through to (b). An IDE that holds a cache has heard from the
+ * engine, which is the authority; a local file must not outrank it once its answer expires.
+ *
+ * `heardFromAnEngine` extends that rule across engines (BACKLOG #5564). The cache is per engine, so
+ * retargeting to an unreachable engine, or to another spelling of one, finds no cache. Without this
+ * flag that fell to the CLI, so a deny cached from the engine the IDE had been using was bypassed by
+ * changing the setting. Once any engine has answered, a target with no cache of its own fails closed.
+ */
+export function pickOfflinePolicy(
+  cached: CachedAiPolicy | null,
+  cli: AiPolicy | null,
+  nowMs: number = Date.now(),
+  heardFromAnEngine: boolean = false,
+): AiPolicy {
+  if (cached) {
+    return cachedPolicyOffline(cached, nowMs);
+  }
+  if (cli && !heardFromAnEngine) {
+    return cli;
+  }
+  return UNVERIFIED_POLICY;
+}
 
 /**
  * The globalState key for the policy cached from the engine at `url`. The URL is canonicalized so

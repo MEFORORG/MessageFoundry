@@ -7,10 +7,12 @@ import * as path from "path";
 import {
   AI_POLICY_CACHE_PREFIX,
   CACHED_PERMIT_MAX_AGE_MS,
+  LEGACY_AI_POLICY_KEY,
   aiPolicyCacheKey,
   assistantState,
   cachedPolicyOffline,
   mergeAuthoritativePolicy,
+  pickOfflinePolicy,
   type AiPolicy,
 } from "../../aiPolicyModel";
 
@@ -227,6 +229,32 @@ suite("aiPolicyCacheKey (BACKLOG #5564)", () => {
     assert.strictEqual(aiPolicyCacheKey("not a url/"), AI_POLICY_CACHE_PREFIX + "not a url");
     assert.notStrictEqual(aiPolicyCacheKey("not a url"), aiPolicyCacheKey("also not a url"));
   });
+
+  test("K5: the legacy unscoped key is not a per-engine key", () => {
+    assert.ok(!LEGACY_AI_POLICY_KEY.startsWith(AI_POLICY_CACHE_PREFIX));
+  });
+});
+
+// BACKLOG #5564: per-engine keys mean a retarget finds no cache. Once any engine has answered, that
+// must fail closed, not fall to the local CLI, or changing the setting bypasses a cached deny.
+suite("pickOfflinePolicy — a retarget does not bypass a cached deny (BACKLOG #5564)", () => {
+  const byo = policy({ mode: "byo", assistPermitted: null });
+
+  test("P1: no cache, no engine ever answered: the CLI's policy is used", () => {
+    assert.strictEqual(pickOfflinePolicy(null, byo, 0, false), byo);
+  });
+
+  test("P2: no cache for this engine, but an engine has answered: fail closed, not the CLI", () => {
+    const p = pickOfflinePolicy(null, byo, 0, true);
+    assert.strictEqual(p.mode, "unverified");
+    assert.strictEqual(assistantState(p).enabled, false);
+  });
+
+  test("P3: this engine's own cache still answers whatever the flag says", () => {
+    const deny = { ...policy({ mode: "off" }), cachedAt: 0 };
+    assert.strictEqual(pickOfflinePolicy(deny, byo, 0, true).mode, "off");
+    assert.strictEqual(pickOfflinePolicy(deny, byo, 0, false).mode, "off");
+  });
 });
 
 // aiPolicy.ts imports vscode, so its behavioural tests run only in the Extension Host leg
@@ -262,12 +290,25 @@ suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG
   });
 
   test("T2: every globalState read and write of the policy goes through the per-engine key", () => {
-    const calls = code.match(/globalState\.(?:get<\w+>|update)\([^,)]*[,)]/g) ?? [];
-    assert.ok(calls.length >= 3, `expected the merge read, the write and the offline read; found ${calls.length}`);
-    for (const call of calls) {
+    // The policy reads are the CachedAiPolicy gets; the policy write is the one that stores `stamped`.
+    const reads = code.match(/globalState\.get<CachedAiPolicy>\([^)]*\)/g) ?? [];
+    const writes = code.match(/globalState\.update\([^,]*,\s*stamped\)/g) ?? [];
+    assert.strictEqual(reads.length, 2, `expected the merge read and the offline read: ${reads.join(" | ")}`);
+    assert.strictEqual(writes.length, 1, `expected one policy write: ${writes.join(" | ")}`);
+    for (const call of [...reads, ...writes]) {
       assert.ok(keyedAccess(call), `an unkeyed policy cache access: ${call}`);
     }
     assert.ok(!keyedAccess("globalState.get<CachedAiPolicy>(LAST_POLICY_KEY)"), "the predicate accepts the defect");
     assert.ok(/cacheKey = aiPolicyCacheKey\(url\);/.test(code), "the key must be derived from the url asked");
+    // Nothing reads the legacy unscoped key as a policy.
+    assert.ok(!/get<CachedAiPolicy>\(LEGACY_AI_POLICY_KEY\)/.test(code), "the unscoped key is read as a policy");
+  });
+
+  test("T4: the offline path passes whether any engine has answered", () => {
+    assert.ok(
+      /pickOfflinePolicy\(cached, cli, now\(\), heard\)/.test(code),
+      "resolveAiPolicy must tell pickOfflinePolicy whether an engine has answered",
+    );
+    assert.ok(/globalState\.update\(AI_POLICY_HEARD_KEY, true\)/.test(code), "a successful read must set the flag");
   });
 });

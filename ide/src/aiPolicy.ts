@@ -15,11 +15,12 @@ import { peekToken } from "./auth";
 import {
   type AiPolicy,
   type CachedAiPolicy,
-  UNVERIFIED_POLICY,
+  AI_POLICY_HEARD_KEY,
+  LEGACY_AI_POLICY_KEY,
   aiPolicyCacheKey,
-  cachedPolicyOffline,
   evaluatedPermission,
   mergeAuthoritativePolicy,
+  pickOfflinePolicy,
 } from "./aiPolicyModel";
 import { engineUrl, environments, runJson, workspaceDir } from "./cli";
 import { getJson } from "./engineClient";
@@ -68,30 +69,9 @@ function fromWire(w: AiPolicyWire): AiPolicy {
   };
 }
 
-/**
- * Pick the policy when the authoritative engine is unreachable. Pure + testable. Order:
- *   (a) the last cached authoritative (engine) policy, if any, as {@link cachedPolicyOffline} lets it
- *       stand — so a previously-seen central "off" / ai:assist deny survives going offline, and a
- *       cached answer that enables assistance stops doing so once it is too old (BACKLOG #1154); else
- *   (b) the local CLI's policy, if it positively returned one (it may itself carry mode "off"); else
- *   (c) the fail-closed UNVERIFIED policy (assistance disabled) — NEVER silently re-enable BYO.
- *
- * An expired cache does NOT fall through to (b). An IDE that holds a cache has heard from the
- * engine, which is the authority; a local file must not outrank it once its answer expires.
- */
-export function pickOfflinePolicy(
-  cached: CachedAiPolicy | null,
-  cli: AiPolicy | null,
-  nowMs: number = Date.now(),
-): AiPolicy {
-  if (cached) {
-    return cachedPolicyOffline(cached, nowMs);
-  }
-  if (cli) {
-    return cli;
-  }
-  return UNVERIFIED_POLICY;
-}
+// pickOfflinePolicy moved to the zero-import aiPolicyModel (BACKLOG #5564), so its fail-closed order
+// is asserted on the node-side leg; re-exported so existing importers are unchanged.
+export { pickOfflinePolicy } from "./aiPolicyModel";
 
 /**
  * The injectable IO seam for {@link resolveAiPolicy}. It exists so the fetch-and-cache path — where
@@ -177,22 +157,32 @@ export async function resolveAiPolicy(
     // Remember the authoritative answer, stamped with when it was given (BACKLOG #1154).
     const stamped: CachedAiPolicy = { ...merged, cachedAt: now() };
     await ctx.globalState.update(cacheKey, stamped);
+    // And that SOME engine has answered, so a retarget to an engine with no cache of its own fails
+    // closed rather than falling to the local CLI (BACKLOG #5564; see pickOfflinePolicy).
+    if (ctx.globalState.get<boolean>(AI_POLICY_HEARD_KEY) !== true) {
+      await ctx.globalState.update(AI_POLICY_HEARD_KEY, true);
+    }
     return merged;
   } catch {
     // Engine unreachable or errored — fall back to the cached authoritative / CLI / fail-closed view.
   }
   const cached =
     cacheKey === undefined ? null : (ctx.globalState.get<CachedAiPolicy>(cacheKey) ?? null);
+  // A cache written under the single unscoped key, before BACKLOG #5564, also says an engine answered.
+  const heard =
+    ctx.globalState.get<boolean>(AI_POLICY_HEARD_KEY) === true ||
+    ctx.globalState.get<unknown>(LEGACY_AI_POLICY_KEY) !== undefined;
   let cli: AiPolicy | null = null;
-  // pickOfflinePolicy never reads the CLI's answer while a cache exists, so do not spawn it.
-  if (cached === null) {
+  // pickOfflinePolicy never reads the CLI's answer while a cache exists, or once an engine has
+  // answered, so do not spawn it then.
+  if (cached === null && !heard) {
     try {
       cli = fromWire(await io.getCliPolicy());
     } catch {
       // CLI unavailable too (no Python / no workspace / untrusted) — leave cli null.
     }
   }
-  return pickOfflinePolicy(cached, cli, now());
+  return pickOfflinePolicy(cached, cli, now(), heard);
 }
 
 /** Fetch the current policy and surface it to the user (command: messagefoundry.showAiPolicy). */
