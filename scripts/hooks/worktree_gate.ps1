@@ -807,7 +807,10 @@ function Get-ScanRawIndexMap($Seg) {
 # made before still runs first and unchanged. These readings run only where it found nothing, and each
 # can only add a DENY. A previous attempt replaced the raw readers with quote-stripping ones and moved
 # verdicts toward ALLOW: a correctly unquoted `-C` then suppressed the inferred cwd target exactly as
-# #5655 describes. The cost of adding is that every false deny the old readings make is kept.
+# #5655 describes. The cost of adding is that every false deny the old readings make is kept, and
+# that a misreading here is a NEW false deny: review rounds measured three (a `-C` after a `-c`
+# disarm, a chdir on an earlier line, a grep's `-c` after a config read), each fixed with a control
+# row, and others are not ruled out.
 #
 # NO COMMAND-POSITION TEST, DELIBERATELY. Rule 3's verb hunt never had one (`echo git reset --hard`
 # from the primary denies), and a reading that skipped wrapper words such as `time git` or `command
@@ -816,8 +819,10 @@ function Get-ScanRawIndexMap($Seg) {
 #
 # WHAT IT DOES NOT READ, AT LEAST: a quoted path with whitespace in it (blanked by the scan, so the
 # window answers nothing and the old reading decides); a `-C` value the shell would still expand
-# (Test-ShellLiteralPath); a chdir the resolver cannot follow (popd, a subshell, two chdirs); and git
-# options after the verb.
+# (Test-ShellLiteralPath); a chdir the resolver cannot follow (popd, a subshell, two chdirs, a
+# relative chdir after an earlier line's); git options after the verb; and a line whose ONLY git word
+# is a spelling the token pattern misses (`git.EXE reset --hard`, or `GIT` on Windows), which rule 3's
+# first reading exits on before these readings run. That last one is origin/main's too.
 #
 # THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
@@ -830,22 +835,55 @@ function Get-ScanRawIndexMap($Seg) {
 # `-C` switches off rule 3's text fallback. Where the text that ran before ($Prior) holds a chdir at
 # command position, a second reading prefixes it, each line ending as a separator. Both are judged,
 # since each can only add a deny.
+#
+# REVISED IN REVIEW ROUND b62475f26d. It returns ONE reading or none, never both: standing in the
+# session cwd after an earlier line moved the shell refused a later command for a tree it never
+# touches. The earlier lines are read one at a time, because the chdir follower bails on any paren or
+# brace and on a second chdir anywhere in its text, so joining every earlier line switched the reading
+# off for an unrelated `echo $(date)`. Only the LAST earlier line with a chdir at command position is
+# used: an absolute target stands alone, and a relative one only where no earlier line moved the shell
+# before it. A chdir on this line's own prefix wins where it is absolute; a relative one after an
+# earlier line's chdir is unknown, so no reading is returned.
 function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [string]$Prior = "") {
     if ($GitAt -ge 0) {
         $seps = [regex]::Matches($Scan.Substring(0, $GitAt), '[;&|(){}]')
         $start = $(if ($seps.Count -gt 0) { $seps[$seps.Count - 1].Index + 1 } else { 0 })
-        $pfx = $Scan.Substring(0, $start)
-        $win = $Scan.Substring($start, $At - $start)
     } else {
-        $inv = Get-OwnInvocationWindow $Scan $At -SeparatorInToken
-        $pfx = $Scan.Substring(0, $(if ($inv.Own) { $inv.Own.Index } else { $inv.Start }))
-        $win = $inv.CmdWin
+        # Cut at the window START, not at the owning token: with -SeparatorInToken that token can begin
+        # on the separator itself, and `cd <p>&&git` then left a prefix ending `cd <p>&`, which the
+        # chdir follower cannot read.
+        $start = (Get-OwnInvocationWindow $Scan $At -SeparatorInToken).Start
     }
-    [pscustomobject]@{ ScanPrefix = $pfx; Window = $win }
-    $priorAsLine = ($Prior -replace '\r?\n', ' ; ')
-    if ($priorAsLine -match (Get-ChdirAtCommandPattern)) {
-        [pscustomobject]@{ ScanPrefix = $priorAsLine + $pfx; Window = $win }
+    $pfx = $Scan.Substring(0, $start)
+    $win = $Scan.Substring($start, $At - $start)
+    $chdirAt = Get-ChdirAtCommandPattern
+    $priorChdirs = @(($Prior -split '\r?\n') | Where-Object { $_ -match $chdirAt })
+    if ($priorChdirs.Count -eq 0) { return [pscustomobject]@{ ScanPrefix = $pfx; Window = $win } }
+    if ($pfx -match $chdirAt) {
+        $own = Get-ChdirTargetRaw $pfx
+        if ($own -and [System.IO.Path]::IsPathRooted($own)) { [pscustomobject]@{ ScanPrefix = $pfx; Window = $win } }
+        return
     }
+    $last = $priorChdirs[$priorChdirs.Count - 1]
+    $lastTarget = Get-ChdirTargetRaw $last
+    if (-not $lastTarget) { return }
+    if (-not [System.IO.Path]::IsPathRooted($lastTarget) -and $priorChdirs.Count -gt 1) { return }
+    [pscustomobject]@{ ScanPrefix = "$last ; $pfx"; Window = $win }
+}
+
+# The index of the git WORD that owns the text at $At, read the way rule 3's verb hunt reads it
+# (`git`, `git.exe`, and on Windows any case, since `GIT` and `git.EXE` run git.exe there), or -1.
+function Get-GitWordBefore([string]$Scan, [int]$At) {
+    $opts = $(if ($IsWindows) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
+            [System.Text.RegularExpressions.RegexOptions]::None })
+    $words = [regex]::Matches($Scan.Substring(0, $At), '\bgit(\.exe)?\b', $opts)
+    $(if ($words.Count -gt 0) { $words[$words.Count - 1].Index } else { -1 })
+}
+
+# A TRUE command separator: `;`, `|`, `||`, `&&` or a lone `&`, never the `&` of `2>&1` or `&>`. Rule
+# 3d's spelling of the same test, which it states the reason for.
+function Test-TrueSeparatorIn([string]$Text) {
+    $Text -match '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))'
 }
 
 # The candidate list of one reading: the resolver's own-window answer, read from that invocation's scan
@@ -865,6 +903,10 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     UPDATED BY BACKLOG #5643: rule 3d now ALSO calls this with -OwnWindow, on a second reading added
     after its unchanged three-argument call; see that switch below. The paragraph that
     follows describes the three-argument call, which this switch leaves byte-identical.
+    UPDATED BY BACKLOG #5642 AND #5655: the ADDED READINGS of rules 3 and 3c call it with -OwnWindow
+    too, with the invocation's own scan window as $Line, and rule 3 also with -RepositoryOnly. So the
+    "only rule 3c" and "rules 3 and 3d call this with three arguments" lines below describe the first
+    readings, not every call.
 
     THREE OPT-IN SWITCHES, ALL DEFAULT OFF. Rules 3 and 3d call this with three positional arguments
     and are therefore byte-identical to before; only rule 3c opts in. That is deliberate blast-radius
@@ -3589,8 +3631,17 @@ if ($tool -in @("Bash", "PowerShell")) {
     # harmless alias write was the only match this rule read.
     $disarms = foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
+        $first = $true
         foreach ($m in [regex]::Matches($seg.Scan, "(?<via>\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)",
                                          [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+            # A LATER match counts only where a git word owns it, with no true separator between them
+            # (review round b62475f26d): `git config core.hooksPath ; grep -c alias.x f` is a read and a
+            # grep. The first match is kept as it always was.
+            if (-not $first) {
+                $gw = Get-GitWordBefore $seg.Scan $m.Index
+                if ($gw -lt 0 -or (Test-TrueSeparatorIn $seg.Scan.Substring($gw, $m.Index - $gw))) { continue }
+            }
+            $first = $false
             [pscustomobject]@{ Seg = $seg; Dis = $m }
         }
     }
@@ -3998,8 +4049,21 @@ What to do instead:
         # the disarming invocation's own window, read off the scan, so a single-quoted `-C`, --git-dir
         # or GIT_DIR names its path. The first candidate git answers on decides, as above, and only a
         # governed answer is used, so this can add a deny and never remove one. See THE ADDED READINGS.
+        #
+        # Its window starts at the git WORD that owns the disarm, as rule 3's does (a `git.EXE` or `GIT`
+        # the token pattern misses must not reach back over `;`), and for a `-c <key>=<v>` disarm it runs
+        # on over the global options that follow, so `git -c <key>=<v> -C <ungoverned> commit` reads that
+        # `-C` (review round b62475f26d). A `config` disarm has every global option before it.
         if (-not $govCfg) {
-            foreach ($reading in @(Get-InvocationReading $seg.Scan $dis.Index -Prior $seg.Prior)) {
+            $readTo = $dis.Index
+            if (-not $viaConfig) {
+                $keyAt = $dis.Groups['key'].Index
+                $globals = [regex]::Match($seg.Scan.Substring($keyAt),
+                    '^\S*(?:\s+(?:-[Cc]\s+\S+|--(?:git-dir|work-tree|namespace)(?:=\S+|\s+\S+)|--?[A-Za-z][\w-]*(?:=\S+)?))*')
+                $readTo = $keyAt + $globals.Length
+            }
+            $gitWord = Get-GitWordBefore $seg.Scan $dis.Index
+            foreach ($reading in @(Get-InvocationReading $seg.Scan $readTo -GitAt $gitWord -Prior $seg.Prior)) {
                 $govCfg = Find-FirstAnsweringRoot (Get-InvocationCandidates $reading $cwdRaw `
                               -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir) $cwdRaw
                 if ($govCfg) { break }
@@ -4862,7 +4926,10 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     if (-not $root -and -not $headRoot) {
         $addedReads = @(foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
             if ($seg.Scan -cnotmatch $verbHunt) { continue }
-            $map = Get-ScanRawIndexMap $seg
+            # The raw map is built only where a branch switch needs its text (review round b62475f26d):
+            # it re-runs the span scanner over the line.
+            $map = $null
+            if ($seg.Scan -cmatch '\s(?:checkout|switch)(?=\s|$)') { $map = Get-ScanRawIndexMap $seg }
             foreach ($vm in @([regex]::Matches($seg.Scan, $verbHunt))) {
                 $vGroup = $vm.Groups['verb']
                 $vIdx = $vGroup.Index
@@ -4943,12 +5010,28 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
         # own text, from the raw line where the scan maps back to it, so a quoted destination the scan
         # blanked (`'feat(x)'`) is still read. An identical judgement is not asked of git twice; a HEAD
         # move reads no text, so it is keyed on verb and tree alone.
+        #
+        # THE KEY IS WHAT Test-WorktreeHijack READS: the verb, the tree, and for a branch switch the text
+        # after the verb's first occurrence, which is all its destination parse sees. The first reading's
+        # own judgement seeds the set where its tree is already absolute, so an ordinary command in a
+        # session's own worktree is not judged twice (review round b62475f26d).
+        $judgeKeyOf = {
+            param([string]$v, [string]$t, [string]$w)
+            $after = $(if ($hijackSwitchVerbs -contains $v) { $t -replace ('(?s)^.*?\b' + [regex]::Escape($v) + '\b'), '' })
+            "$v`n$after`n$w"
+        }
         $judged = @()
+        if ($targetRaw -and [System.IO.Path]::IsPathRooted($targetRaw)) {
+            $seedTree = Get-FullPathRaw $targetRaw $cwdRaw
+            if ($seedTree -and [string]::Equals($seedTree, $targetRaw, [System.StringComparison]::Ordinal)) {
+                $judged += (& $judgeKeyOf $verb $verbLine $targetRaw)
+            }
+        }
         foreach ($addedRead in $addedReads) {
             if ($addedRead.Cands.Count -eq 0) { continue }
             $tree = Get-FullPathRaw $addedRead.Cands[0] $cwdRaw
             if (-not $tree) { $tree = $addedRead.Cands[0] }
-            $judgeKey = "$($addedRead.Verb)`n$(if ($hijackSwitchVerbs -contains $addedRead.Verb) { $addedRead.Text })`n$tree"
+            $judgeKey = & $judgeKeyOf $addedRead.Verb $addedRead.Text $tree
             if ($judged -ccontains $judgeKey) { continue }
             $judged += $judgeKey
             Test-WorktreeHijack $addedRead.Verb $addedRead.Text $tree $cwdRaw

@@ -277,3 +277,44 @@ def test_a_quoted_destination_the_scan_blanks_is_still_read(
     )
     reason = _reason(rig, _fmt(rig, template), rig.outside)
     assert "LINKED WORKTREE" in reason, reason
+
+
+# ------------------------------------------------------------------ review round b62475f26d
+
+
+@pytest.mark.parametrize(
+    ("template", "where", "text"),
+    [
+        # Rule 3c's window starts at the git word that owns the disarm, not at an earlier command's.
+        ("git -C {o} status ; git.EXE config {k}", "primary", "SHARED git"),
+        # A chdir glued to `&&` is followed.
+        ("cd {p}&&git config {k}", "outside", "SHARED git"),
+        # An unrelated earlier line holding a paren does not switch the earlier-line chdir off.
+        ("cd {p}\necho $(date)\ngit -C {o} status ; git reset --hard", "outside", "SHARED PRIMARY"),
+    ],
+)
+def test_review_round_two_shapes_are_denied(
+    rig: SimpleNamespace, template: str, where: str, text: str
+) -> None:
+    reason = _reason(rig, _fmt(rig, template), _cwd(rig, where))
+    assert text in reason, reason
+
+
+@pytest.mark.parametrize(
+    ("template", "where"),
+    [
+        # A -C after a -c disarm decides where the command runs, as origin/main reads it.
+        ("git -c {kv} -C {o} commit -m x", "primary"),
+        ("git -c {kv} -C {o} commit -m x", "wt"),
+        # After an earlier line moved the shell, the session cwd is not where the checkout runs.
+        ("cd {o}\ngit -C {o} status ; git checkout {b}", "wt"),
+        # A grep's -c after an excused bare config read is not a git disarm.
+        ("git config core.hooksPath ; grep -c alias.x f", "primary"),
+    ],
+)
+def test_review_round_two_controls_stay_allowed(
+    rig: SimpleNamespace, template: str, where: str
+) -> None:
+    """ALLOW on origin/main; the first build of the added readings refused each one."""
+    cmd = _fmt(rig, template.replace("{kv}", "core." + "hooksPath=/nope"))
+    assert _allowed(rig, cmd, _cwd(rig, where))

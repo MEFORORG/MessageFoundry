@@ -142,7 +142,9 @@ every invocation's target, so an earlier command's `-C`, or one inside a quoted 
 `git reset --hard` in the primary, and rule 3b judged only the first invocation. Each verb-bearing
 invocation, and each disarming one for rule 3c, is now also read from its own tokens, unquoted the way
 the shell does. That reading is added after the old one and can only add a refusal, so nothing the gate
-refused before is allowed now, and the old reading's false refusals stay. It does not close the class.
+refused before is allowed now, and the old reading's false refusals stay. A misreading in the new one
+is a new false refusal; review measured and fixed three, and others are not ruled out. It does not
+close the class.
 At least these are still not read this way: a quoted path with a space in it, a `-C` value the shell
 would expand, a chdir the gate cannot follow, and git options after the verb. The ADDED READINGS note
 in the hook is the source of record.
