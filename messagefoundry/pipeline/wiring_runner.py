@@ -6278,9 +6278,9 @@ class RegistryRunner:
 
         The recovery path the ADR promises — fix the disk, restart the connection, the backlog drains
         — except that under pooled an internal lane that is STOPPED when the restart runs (for
-        example one T17 stopped while the log was down) stays STOPPED after it, held or not. Per-inbound, so
-        restarting A leaves B halted until B is restarted too. A no-op when the inbound is not
-        gated (:meth:`_inbound_log_halted`).
+        example one T17 stopped while the log was down) stays STOPPED after it, held or not.
+        Per-inbound, so restarting A leaves B halted until B is restarted too. A no-op when the
+        inbound is not gated (:meth:`_inbound_log_halted`).
 
         **REFUSES while the log is still unwritable** (:meth:`_log_recovery_ok`). Re-arming there
         would hand back exactly the state the halt exists to prevent — measured: a restart with the
