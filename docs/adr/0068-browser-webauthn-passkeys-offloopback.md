@@ -808,3 +808,19 @@ the window is shut", as the strictly safer option, under the owner's standing in
 
 AC-2's named test, `tests/test_webauthn.py::test_assertion_stamps_mfa_only_never_reauth`, was
 renamed to `tests/test_webauthn.py::test_assertion_stamps_the_factor_and_re_anchors`.
+
+## Amendment (2026-11-14, fourth) -- only an assertion that completes a pending factor re-anchors or stamps (vault BACKLOG #2964 item 14)
+
+This narrows the three amendments above. The console stages an assertion for a session that has
+already met its factor too: the `POST /ui/mfa` re-render after a refused code does. On such a
+session a passkey proves nothing the session lacked, so `finish_webauthn_assertion` now re-anchors
+and stamps (or, without UV, shuts) the window only when the session had not met its factor when the
+assertion began (`mfa_verified_at` unset on the session row it read). An assertion on a session that
+already met it still marks the factor, clears the failure counter and re-keys the session, but it
+moves no anchor and leaves `reauth_at` as it was. So "every verified assertion at the MFA gate"
+in the second amendment reads "every verified assertion that completes a pending factor".
+A TOTP code is unchanged: on any session but an `oidc` one, `verify_mfa` renews the window at any
+time.
+
+**Who decided.** The Manager, 2026-11-14, from the branch's review, within the owner's "Assertion
+only" and "Stamp only if UV".

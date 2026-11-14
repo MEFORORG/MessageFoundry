@@ -15341,9 +15341,14 @@ class AuthService:
         carrying ``cap_reached`` for the first address past that, because this runs on every
         sensitive request (BACKLOG #2159). The step-up
         dependencies treat ``True`` as "force a fresh step-up"; a successful re-verify (``POST
-        /me/reauth``, ``/auth/mfa-verify`` or a passkey assertion) re-anchors the session to the new
-        address (see :meth:`reauth` / :meth:`verify_mfa` / :meth:`finish_webauthn_assertion`), so
-        the signal clears and the caller proceeds. An
+        /me/reauth`` or ``/auth/mfa-verify``) on any session but an ``oidc`` one re-anchors the
+        session to the new address and stamps the step-up window (see :meth:`reauth` /
+        :meth:`verify_mfa`), so the signal clears and the caller proceeds. A passkey assertion that
+        completes a factor the session had not yet met (:meth:`finish_webauthn_assertion`), on any
+        session but an ``oidc`` one, re-anchors it too, so the signal clears, but it stamps
+        the window only when the authenticator reported user verification and otherwise shuts it,
+        so after an assertion without that flag a step-up gate still forces a step-up. An assertion
+        on a session that had already met its factor neither re-anchors nor stamps. An
         ``oidc`` session, which :meth:`reauth` refuses, can re-anchor through the IdP step-up
         (:meth:`complete_oidc_step_up`). It is
         **step-up-forcing only** — it never changes an RBAC allow or deny, and a ``True`` is cleared
@@ -18155,8 +18160,9 @@ class AuthService:
         """Verify an assertion for the caller's session; on success mark the session's second
         factor satisfied, re-anchor it to the WP-L3-13 client as :meth:`verify_mfa` does, stamp
         ``reauth_at`` only when the authenticator reported user verification and clear it otherwise
-        (not on an ``oidc`` session either way; vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068
-        Amendments of that date) and re-key the session (ASVS 7.2.4). Returns a not-``ok``
+        (not on an ``oidc`` session either way, and not on a session that had already met its
+        factor, which neither re-anchors nor stamps; vault BACKLOG #2964 item 14, owner rulings
+        2026-11-14, ADR 0068 Amendments of that date) and re-key the session (ASVS 7.2.4). Returns a not-``ok``
         :class:`Elevation` (never raises) for any invalid input, always audited.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
@@ -18335,14 +18341,22 @@ class AuthService:
             # the same write shuts any open window, so none follows the anchor. Not on an oidc
             # session, whose anchor moves only at the IdP (BACKLOG #2142);
             # tests/test_docs_security_pathways.py pins the branch.
-            if session.auth_mechanism != SessionMechanism.OIDC.value:
-                async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
-                    await self._store.mark_session_reauthed(
-                        hash_token(token), client=client, stamp_window=verified.user_verified
-                    )
-                if reauth_stamp.refused:  # BACKLOG #2592: as above, the session has been ended
-                    return Elevation(session_lost=True)
-                self._restart_new_ip_dedupe(hash_token(token))
+            # Only when this assertion completes a factor the session had not met. The console
+            # stages an assertion for a session that already met it too (the POST /ui/mfa
+            # re-render), and there a passkey proves nothing the session lacked, so it neither
+            # opens the window nor moves the anchor. Read from the session row loaded at entry:
+            # every leg that meets a factor on an existing session also re-keys it, so a factor
+            # met by another request since that read leaves this token naming no row. Kept as
+            # its own `if`: the docs pin wants the stamp under a bare auth_mechanism comparison.
+            if session.mfa_verified_at is None:  # noqa: SIM102
+                if session.auth_mechanism != SessionMechanism.OIDC.value:
+                    async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
+                        await self._store.mark_session_reauthed(
+                            hash_token(token), client=client, stamp_window=verified.user_verified
+                        )
+                    if reauth_stamp.refused:  # BACKLOG #2592: as above, the session has ended
+                        return Elevation(session_lost=True)
+                    self._restart_new_ip_dedupe(hash_token(token))
             # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
             # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
             # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,

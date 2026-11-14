@@ -1412,8 +1412,10 @@ async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
 
 async def test_a_non_uv_assertion_shuts_an_open_window_as_it_re_anchors() -> None:
     """Vault BACKLOG #2964 item 14 (Manager reading of the owner's "Stamp only if UV"): a window
-    opened by a user-verified passkey at one address must not follow the anchor when a presence-only
-    tap re-anchors the session elsewhere. The non-UV assertion clears ``reauth_at``."""
+    opened at one address must not follow the anchor when a presence-only tap re-anchors the
+    session elsewhere. The window here is opened by the password step-up, which stamps a session
+    that still owes its factor; the non-UV assertion that then completes the factor clears
+    ``reauth_at``."""
     from messagefoundry.auth.tokens import hash_token
 
     store = await MessageStore.open(":memory:")
@@ -1422,25 +1424,77 @@ async def test_a_non_uv_assertion_shuts_an_open_window_as_it_re_anchors() -> Non
         identity, token, password = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
         out = await service.login(ADMIN_USERNAME, password, client="10.3.3.1")
-        assert out.ok and out.token is not None
-        current = out.token
-        for uv, client in ((True, "10.3.3.1"), (False, "10.3.3.2")):
-            options = await service.begin_webauthn_assertion(current, rp_id=RP)
-            assert options is not None
-            challenge = base64url_to_bytes(json.loads(options)["challenge"])
-            elevation = await service.finish_webauthn_assertion(
-                current,
-                auth.get_response(challenge, user_verified=uv),
-                client=client,
-                rp_id=RP,
-                origin=ORIGIN,
-            )
-            assert elevation.ok and elevation.token is not None
-            current = elevation.token
-            row = await store.get_session(hash_token(current))
-            assert row is not None and row.client == client
-            assert (row.reauth_at is not None) is uv
-            assert await service.has_recent_step_up(current) is uv
+        assert out.ok and out.mfa_required and out.identity is not None and out.token is not None
+        stepped = await service.reauth(out.identity, password, token=out.token, client="10.3.3.1")
+        assert stepped.ok and stepped.token is not None
+        assert await service.has_recent_step_up(stepped.token) is True
+        assert await service.mfa_satisfied(stepped.token) is False  # the factor is still owed
+        options = await service.begin_webauthn_assertion(stepped.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        elevation = await service.finish_webauthn_assertion(
+            stepped.token,
+            auth.get_response(challenge, user_verified=False),
+            client="10.3.3.2",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert elevation.ok and elevation.token is not None
+        row = await store.get_session(hash_token(elevation.token))
+        assert row is not None and row.client == "10.3.3.2"
+        assert row.mfa_verified_at is not None and row.reauth_at is None
+        assert await service.has_recent_step_up(elevation.token) is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("uv", [True, False])
+async def test_an_assertion_on_a_session_that_met_its_factor_opens_nothing(uv: bool) -> None:
+    """Vault BACKLOG #2964 item 14: the ``POST /ui/mfa`` re-render stages an assertion for a session
+    that has already met its factor, since it passes ``satisfied=False`` to the passkey leg. A
+    passkey there proves nothing the session lacked, so it neither opens the step-up window, with
+    or without UV, nor moves the anchor. RED when: ``finish_webauthn_assertion``
+    re-anchors and stamps on every session, which opens the window from a third address."""
+    from messagefoundry.auth.tokens import hash_token
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        out = await service.login(ADMIN_USERNAME, password, client="10.6.6.1")
+        assert out.ok and out.mfa_required and out.token is not None
+        # A presence-only tap meets the factor from a second address: anchored there, no window.
+        options = await service.begin_webauthn_assertion(out.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        met = await service.finish_webauthn_assertion(
+            out.token,
+            auth.get_response(challenge, user_verified=False),
+            client="10.6.6.2",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert met.ok and met.token is not None
+        assert await service.mfa_satisfied(met.token) is True
+        assert await _session_after(service, met.token) == ("10.6.6.2", False)
+        # What the re-render stages for that satisfied session, answered from a third address.
+        options = await service.begin_webauthn_assertion(met.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        again = await service.finish_webauthn_assertion(
+            met.token,
+            auth.get_response(challenge, user_verified=uv),
+            client="10.6.6.3",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert again.ok and again.token is not None
+        row = await store.get_session(hash_token(again.token))
+        assert row is not None
+        assert (row.client, row.reauth_at) == ("10.6.6.2", None)
+        assert await service.has_recent_step_up(again.token) is False
+        assert await service.flag_new_client_ip(again.token, "10.6.6.3", path="/ui/x")
     finally:
         await store.close()
 

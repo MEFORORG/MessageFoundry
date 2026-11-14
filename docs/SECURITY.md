@@ -3475,7 +3475,9 @@ can pass a different answer.
 step-up stamps it, and so does a TOTP or recovery code proved at the MFA gate (`POST /ui/mfa` or
 `POST /auth/mfa-verify`), because `verify_mfa` calls `mark_session_reauthed` on every session but an
 `oidc` one. A passkey assertion (`POST /ui/reauth/webauthn`) does the same, but only when the authenticator reports user verification (the UV flag)
-(vault BACKLOG #2964 item 14, owner rulings 2026-11-14). So a Windows SSO session whose holder
+(vault BACKLOG #2964 item 14, owner rulings 2026-11-14), and only when it completes a factor the
+session had not yet met: unlike a code, an assertion on a session that already met its factor
+stamps no window. So a Windows SSO session whose holder
 answers the MFA gate with a code or a user-verified passkey passes the window check for `step_up_max_age_seconds` with no further challenge. **An `oidc` session's code opens no
 window** (BACKLOG #2142, ADR 0142 Amendment F; a seat decision under owner delegation 2026-10-08, not
 an owner ruling). The code still meets a pending factor and re-keys the session, but the window opens
@@ -4058,13 +4060,16 @@ Local and directory accounts (BACKLOG #1144) can also enroll **WebAuthn/FIDO2 pa
 **two console places a second factor is asked for**, the MFA access gate (`/ui/mfa`) and the step-up (`/ui/reauth`)
 — browser ceremonies on the `/ui` web console (requires the optional
 **`[webauthn]` extra**; a non-browser client has no `navigator.credentials`, so keep TOTP enrolled for
-step-up outside the browser). A passkey assertion marks the session's second factor and, as a TOTP
-or recovery code does, re-anchors the session's client IP (WP-L3-13), and it stamps step-up
+step-up outside the browser). A passkey assertion marks the session's second factor. When that
+completes a factor the session had not yet met, it also, as a TOTP or recovery code does,
+re-anchors the session's client IP (WP-L3-13), and it stamps step-up
 freshness only when the authenticator reports user verification (the UV flag, the authenticator's
 own claim in its signed data; see the strength table's passkey row), on any session but an `oidc`
 one; the combined password-and-passkey sign-in stamps it as before, because the password is present (vault
 BACKLOG #2964 item 14, owner rulings 2026-11-14; see
 [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). An
+assertion on a session that had already met its factor, which the `POST /ui/mfa` re-render can
+stage, neither re-anchors nor stamps. An
 action-bound grant still comes only from the credential leg: the password leg of `POST /ui/reauth`,
 or for an `oidc` session the IdP leg, which shows no password field. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **re-proof-only
 step-up**, with no MFA gate: the password or directory re-bind, or the IdP leg for an `oidc`
@@ -4380,13 +4385,15 @@ alone:
 5. **A genuine second authentication factor** at that step-up boundary — native TOTP MFA (WP-14) or a
    passkey, so an MFA-enrolled/required admin must have met a second factor, not only re-entered the
    same password. The step-up gate refuses a session that has not. A TOTP or recovery code, or a
-   user-verified passkey assertion, also stamps the window on its own, on any session but an `oidc` one (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)).
+   user-verified passkey assertion that completes a factor the session had not yet met, also stamps
+   the window on its own, on any session but an `oidc` one (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)).
 6. **A contextual-risk signal** — while `[auth].admin_new_ip_step_up` is on (the default), a sensitive admin action
    arriving from a **client IP the session has not verified from** emits an `auth.new_address_reverify_required`
    audit event + an out-of-band notice and **forces a fresh step-up**; a successful `POST /me/reauth`
    from that address re-anchors the session and clears the signal. At least these other legs
    re-anchor too: the password leg of the console's `POST /ui/reauth`, the IdP step-up, next, a
-   passkey assertion on any session but an `oidc` one (vault BACKLOG #2964 item 14), and a
+   passkey assertion that completes a factor the session had not yet met, on any session but an
+   `oidc` one (vault BACKLOG #2964 item 14), and a
    code at the MFA gate, under *A code at `POST /auth/mfa-verify` re-anchors too*, below, which
    says on which sessions and what budget it draws.
    `POST /me/reauth` refuses an `oidc` session, so the gate's refusal names the IdP leg instead
@@ -6859,7 +6866,7 @@ enrolment sentences against `AuthService.confirm_mfa_enrollment` and
 |---|---|---|---|
 | **Local password** | No outside provider. The engine checks the password itself, so it knows what it checked | Mints the session MFA-verified only when the sign-in owes no second factor, or when a combined sign-in proved a TOTP code or a passkey assertion in the same request. Otherwise the session is MFA-pending. At sign-in, the step-up window opens only in two cases. One is a sign-in that owes no factor and is not from a first-seen address. The other is a combined sign-in | `AuthService._login_local`: `mfa_verified=not mfa_required` and its `seed_reauth` expression |
 | **Engine TOTP or recovery code** | No outside provider. The engine checks the code itself | A good code marks the session's second factor and stamps the step-up window. Since BACKLOG #2142 it stamps no window on an `oidc` session, whose window opens only at the IdP. A directory account gets there only after the directory confirms the account (BACKLOG #2023). Confirming a TOTP enrolment also marks the factor, and for a directory account the engine asks the directory there too, before it checks the code (BACKLOG #3061) | `AuthService.verify_mfa`; `AuthService.confirm_mfa_enrollment` |
-| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on for the factor. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. The passkey-only assertion at the MFA gate marks the second factor and re-anchors the session, and it stamps the step-up window only when the signed authenticator data carries the UV flag; without the flag it shuts any open window; never on an `oidc` session (vault BACKLOG #2964 item 14). The combined password-and-passkey sign-in stamps the window as before, whatever the flag, because the password is present. The UV flag is what the authenticator reports in its signed authenticator data. Under `attestation=none` the engine does not verify which authenticator model made that report, so the flag is the authenticator's own claim, not a factor the engine checked. At least `AuthService.finish_webauthn_assertion` reads the flag. For a directory account, the engine asks the directory before it marks the factor (BACKLOG #2239); [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) states when and what it refuses. Registering a passkey also marks the factor, and for a directory account the engine asks the directory there too, before it takes the challenge (BACKLOG #3061); the step-up window also gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion`; `AuthService.finish_webauthn_registration` |
+| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on for the factor. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. The passkey-only assertion at the MFA gate marks the second factor. When that completes a factor the session had not yet met, it re-anchors the session, and it stamps the step-up window only when the signed authenticator data carries the UV flag; without the flag it shuts any open window; never on an `oidc` session (vault BACKLOG #2964 item 14). On a session that had already met its factor it neither re-anchors nor stamps. The combined password-and-passkey sign-in stamps the window as before, whatever the flag, because the password is present. The UV flag is what the authenticator reports in its signed authenticator data. Under `attestation=none` the engine does not verify which authenticator model made that report, so the flag is the authenticator's own claim, not a factor the engine checked. At least `AuthService.finish_webauthn_assertion` reads the flag. For a directory account, the engine asks the directory before it marks the factor (BACKLOG #2239); [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) states when and what it refuses. Registering a passkey also marks the factor, and for a directory account the engine asks the directory there too, before it takes the challenge (BACKLOG #3061); the step-up window also gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion`; `AuthService.finish_webauthn_registration` |
 | **Kerberos / SPNEGO** | A service ticket. It carries no factor-strength or sign-in-time value that `pyspnego` surfaces | One factor and no recent sign-in. The session is minted `mfa_verified=False`, with no step-up window. While `[security].require_mfa` is on (the default), such a directory session owes an engine factor whatever `require_mfa_scope` says | `AuthService._authenticate_kerberos`; `AuthService._complete_ad_login`, where `seed_reauth=False` is a constant; `AuthService._unverified_session_owes_factor` |
 | **AD bind, step-up only** | Whether the bind as the user succeeded. Nothing about the directory's own MFA | Not a sign-in since BACKLOG #1137. It re-proves the password behind a Kerberos session and stamps the step-up window. It grants no second factor: `reauth` stamps the window and never marks the factor. The directory's MFA is not delegated (BACKLOG #1144) | `AuthService.reauth` |
 | **OIDC sign-in, recency** | `auth_time` in the signed `id_token`. The engine asks for it by sending `max_age` on every authorization request | Refused, with no time assumed. A missing `auth_time` fails as `auth_time_missing`, and one older than `[auth].oidc_max_age_seconds` as `auth_time_stale`. An accepted session also ends at `auth_time + oidc_max_age_seconds` when that is sooner than its other caps | `_check_auth_time` in `auth/oidc/claims.py`; `AuthService._authenticate_oidc` |
