@@ -190,18 +190,27 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
  * The globalState key prefix for a cached authoritative policy. The key is per ENGINE (BACKLOG
  * #5564): with one unscoped key, the answer one engine gave stood in for another, so a permit cached
  * from engine A enabled assistance while engine B was unreachable, and a deny cached from B was
- * replaced by A's answer. A key written before this change is not read as a policy; with no cache
- * for an engine, {@link pickOfflinePolicy} fails closed once any engine has answered.
+ * replaced by A's answer. A key written before this change is not read. With no cache for an
+ * engine, {@link pickOfflinePolicy} fails closed once any engine has answered, and a deny carries
+ * ({@link AI_POLICY_DENY_KEY}).
  */
 export const AI_POLICY_CACHE_PREFIX = "messagefoundry.lastAiPolicy@";
 
-/** The single unscoped key the policy was cached under before BACKLOG #5564. Never read as a policy,
- *  since it does not say which engine answered; its presence still says that one did. */
-export const LEGACY_AI_POLICY_KEY = "messagefoundry.lastAiPolicy";
-
 /** The globalState flag set once any engine has answered the policy read; see
- *  {@link pickOfflinePolicy}'s `heardFromAnEngine`. */
+ *  {@link pickOfflinePolicy}'s `heardFromAnEngine`. It spans workspaces, as globalState does. */
 export const AI_POLICY_HEARD_KEY = "messagefoundry.aiPolicyHeardFromEngine";
+
+/**
+ * The globalState flag set while the last evaluable `ai:assist` answer from any engine was a deny.
+ * Only the permit is per engine (BACKLOG #5564); a deny still carries to an engine with no cache of
+ * its own, as it did under the single unscoped key, so another spelling of the same engine, read
+ * without the bearer and answered `null`, cannot shed it. An engine answering `true` clears it.
+ */
+export const AI_POLICY_DENY_KEY = "messagefoundry.aiPolicyDenySeen";
+
+/** What {@link mergeAuthoritativePolicy} is given as the cache when only a carried deny exists:
+ *  it reads nothing but `assistPermitted`. */
+export const CARRIED_DENY: AiPolicy = { ...UNVERIFIED_POLICY, assistPermitted: false };
 
 /**
  * Pick the policy when the authoritative engine is unreachable. Pure + testable. Order:

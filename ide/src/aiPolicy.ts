@@ -2,8 +2,9 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // AI-assistance policy resolution for the IDE. The policy is centrally governed by the engine; the
 // IDE reads it (never sets it) and gates the @messagefoundry chat assistant accordingly. Resolution
-// is authoritative-engine-first, falling back to the local CLI (which reads messagefoundry.toml) when
-// the engine is unreachable.
+// is authoritative-engine-first, falling back, when the engine is unreachable, to that engine's
+// cached answer, and to the local CLI (which reads messagefoundry.toml) only while no engine has
+// ever answered (pickOfflinePolicy).
 //
 // The policy has TWO halves and they are answered differently:
 //   - `mode` is identity-INDEPENDENT, so a central "off" is honored even by a tokenless client;
@@ -15,8 +16,9 @@ import { peekToken } from "./auth";
 import {
   type AiPolicy,
   type CachedAiPolicy,
+  AI_POLICY_DENY_KEY,
   AI_POLICY_HEARD_KEY,
-  LEGACY_AI_POLICY_KEY,
+  CARRIED_DENY,
   aiPolicyCacheKey,
   evaluatedPermission,
   mergeAuthoritativePolicy,
@@ -117,9 +119,10 @@ export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
 
 /**
  * Resolve the effective AI policy. Order: (a) the running engine [authoritative — includes the
- * identity-dependent `assist_permitted`; cached on success]; (b) when the engine is unreachable, the
- * last cached authoritative policy; (c) the local CLI [reads messagefoundry.toml]; (d) a fail-closed
- * "unverified" policy (assistance disabled) so a central "off" can't be bypassed by going offline.
+ * identity-dependent `assist_permitted`; cached on success, per engine]; (b) when the engine is
+ * unreachable, that engine's last cached authoritative policy; (c) the local CLI [reads
+ * messagefoundry.toml], only while no engine has ever answered; (d) a fail-closed "unverified" policy
+ * (assistance disabled) so a central "off" can't be bypassed by going offline or retargeting.
  *
  * The read is AUTHENTICATED (BACKLOG #330). `assist_permitted` is computed from the acting identity, so
  * a tokenless read can only ever answer `null` and the `ai:assist` deny branch could never fire — half
@@ -149,14 +152,22 @@ export async function resolveAiPolicy(
     // GUARDED write. An answer the engine could not attribute to an identity carries
     // `assist_permitted: null`, and writing that raw would overwrite a cached, authoritatively-observed
     // deny — a degraded read UPGRADING assistance a central policy had switched off. The merge keeps
-    // the deny and nothing else; see mergeAuthoritativePolicy for why it is one-way.
+    // the deny and nothing else; see mergeAuthoritativePolicy for why it is one-way. With no cache
+    // for this engine, a deny seen from any engine stands in (AI_POLICY_DENY_KEY, BACKLOG #5564).
+    const denySeen = ctx.globalState.get<boolean>(AI_POLICY_DENY_KEY) === true;
     const merged = mergeAuthoritativePolicy(
-      ctx.globalState.get<CachedAiPolicy>(cacheKey) ?? null,
+      ctx.globalState.get<CachedAiPolicy>(cacheKey) ?? (denySeen ? CARRIED_DENY : null),
       fresh,
     );
     // Remember the authoritative answer, stamped with when it was given (BACKLOG #1154).
     const stamped: CachedAiPolicy = { ...merged, cachedAt: now() };
     await ctx.globalState.update(cacheKey, stamped);
+    // A deny carries to every engine with no cache of its own; an engine's permit clears it.
+    if (merged.assistPermitted === false && !denySeen) {
+      await ctx.globalState.update(AI_POLICY_DENY_KEY, true);
+    } else if (merged.assistPermitted === true && denySeen) {
+      await ctx.globalState.update(AI_POLICY_DENY_KEY, undefined);
+    }
     // And that SOME engine has answered, so a retarget to an engine with no cache of its own fails
     // closed rather than falling to the local CLI (BACKLOG #5564; see pickOfflinePolicy).
     if (ctx.globalState.get<boolean>(AI_POLICY_HEARD_KEY) !== true) {
@@ -168,10 +179,7 @@ export async function resolveAiPolicy(
   }
   const cached =
     cacheKey === undefined ? null : (ctx.globalState.get<CachedAiPolicy>(cacheKey) ?? null);
-  // A cache written under the single unscoped key, before BACKLOG #5564, also says an engine answered.
-  const heard =
-    ctx.globalState.get<boolean>(AI_POLICY_HEARD_KEY) === true ||
-    ctx.globalState.get<unknown>(LEGACY_AI_POLICY_KEY) !== undefined;
+  const heard = ctx.globalState.get<boolean>(AI_POLICY_HEARD_KEY) === true;
   let cli: AiPolicy | null = null;
   // pickOfflinePolicy never reads the CLI's answer while a cache exists, or once an engine has
   // answered, so do not spawn it then.

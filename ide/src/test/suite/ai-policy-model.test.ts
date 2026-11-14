@@ -7,7 +7,7 @@ import * as path from "path";
 import {
   AI_POLICY_CACHE_PREFIX,
   CACHED_PERMIT_MAX_AGE_MS,
-  LEGACY_AI_POLICY_KEY,
+  CARRIED_DENY,
   aiPolicyCacheKey,
   assistantState,
   cachedPolicyOffline,
@@ -230,8 +230,11 @@ suite("aiPolicyCacheKey (BACKLOG #5564)", () => {
     assert.notStrictEqual(aiPolicyCacheKey("not a url"), aiPolicyCacheKey("also not a url"));
   });
 
-  test("K5: the legacy unscoped key is not a per-engine key", () => {
-    assert.ok(!LEGACY_AI_POLICY_KEY.startsWith(AI_POLICY_CACHE_PREFIX));
+  test("K5: a carried deny is a deny to the merge, and nothing else", () => {
+    const merged = mergeAuthoritativePolicy(CARRIED_DENY, policy({ mode: "byo", assistPermitted: null }));
+    assert.strictEqual(merged.assistPermitted, false);
+    assert.strictEqual(merged.mode, "byo", "the fresh mode still comes through");
+    assert.strictEqual(mergeAuthoritativePolicy(CARRIED_DENY, policy({ assistPermitted: true })).assistPermitted, true);
   });
 });
 
@@ -285,7 +288,11 @@ suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG
 
   test("T3: an engine-brokered chat request goes to the engine the policy was read from", () => {
     const chat = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "chat.ts"), "utf8");
-    assert.ok(/const url = aiPolicyEngineUrl\(\);/.test(chat), "chat.ts brokers to a different engine");
+    // One read of the target feeds both the policy read and the broker.
+    assert.strictEqual((chat.match(/aiPolicyEngineUrl\(\)/g) ?? []).length, 1, "read the target once");
+    assert.ok(/const engine = aiPolicyEngineUrl\(\);/.test(chat));
+    assert.ok(/resolveAiPolicy\(context, \{ \.\.\.DEFAULT_AI_POLICY_IO, url: \(\) => engine \}\)/.test(chat));
+    assert.ok(/const url = engine;/.test(chat), "chat.ts brokers to a different engine");
     assert.ok(!/\bengineUrl\(\)/.test(chat), "chat.ts reads engineUrl directly");
   });
 
@@ -300,8 +307,15 @@ suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG
     }
     assert.ok(!keyedAccess("globalState.get<CachedAiPolicy>(LAST_POLICY_KEY)"), "the predicate accepts the defect");
     assert.ok(/cacheKey = aiPolicyCacheKey\(url\);/.test(code), "the key must be derived from the url asked");
-    // Nothing reads the legacy unscoped key as a policy.
-    assert.ok(!/get<CachedAiPolicy>\(LEGACY_AI_POLICY_KEY\)/.test(code), "the unscoped key is read as a policy");
+  });
+
+  test("T5: with no cache for this engine, a deny seen from any engine stands in for the merge", () => {
+    assert.ok(
+      /get<CachedAiPolicy>\(cacheKey\) \?\? \(denySeen \? CARRIED_DENY : null\)/.test(code),
+      "a deny must carry to an engine with no cache of its own",
+    );
+    assert.ok(/update\(AI_POLICY_DENY_KEY, true\)/.test(code), "a deny must be recorded");
+    assert.ok(/update\(AI_POLICY_DENY_KEY, undefined\)/.test(code), "a permit must clear it");
   });
 
   test("T4: the offline path passes whether any engine has answered", () => {

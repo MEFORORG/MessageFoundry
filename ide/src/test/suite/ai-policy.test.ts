@@ -368,6 +368,17 @@ suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
     assert.strictEqual(offlineA.assistPermitted, false, "the same engine, spelled with a slash, is one key");
   });
 
+  test("T21: an ai:assist deny carries to an engine with no cache that answers null", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: false })));
+    // B could be the same engine spelled another way, read without the bearer.
+    const b = await resolveAiPolicy(ctx, engineIo(B, wire({ assist_permitted: null })));
+    assert.strictEqual(b.assistPermitted, false, "an unattributed answer must not shed a deny");
+    // An evaluable permit still wins outright, so signing in is the way out.
+    const granted = await resolveAiPolicy(ctx, engineIo(B, wire({ assist_permitted: true })));
+    assert.strictEqual(granted.assistPermitted, true);
+  });
+
   test("T20: retargeting to an engine with no cache fails closed, not to the CLI's byo", async () => {
     const ctx = keyedCtx();
     await resolveAiPolicy(ctx, engineIo(A, wire({ mode: "off" })));
