@@ -641,11 +641,11 @@ suite("engine control — Start runs against the service TOML the fork guard jud
   const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "statusBar.ts"), "utf8");
   const code = src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
 
-  test("statusBar.ts hands every invocation the value the guard judges", () => {
+  test("statusBar.ts hands every invocation the value the guard judges, read once per Start", () => {
     const calls = [
-      /buildServeInvocation\(\{[^}]*serviceConfig:\s*startServiceConfig\(\)/,
-      /buildAdminProbeInvocation\(\{[^}]*serviceConfig:\s*startServiceConfig\(\)/,
-      /buildProvisionInvocation\(\{[^}]*serviceConfig:\s*startServiceConfig\(\)/,
+      /buildServeInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
+      /buildAdminProbeInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
+      /buildProvisionInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
       /serveCommandLine\(configDir\(\),\s*startServiceConfig\(\)\)/,
     ];
     for (const call of calls) {
@@ -653,8 +653,20 @@ suite("engine control — Start runs against the service TOML the fork guard jud
     }
     // The control: the call the file carried before the fix must fail its predicate.
     assert.ok(!calls[0].test("buildServeInvocation({ python, configDir: configDir() })"));
+    // One read in launchEngine feeds the guard and all three effects of the Start plan.
+    const launch = /private async launchEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    assert.ok(launch, "launchEngine moved — re-point this scan before trusting it");
+    assert.strictEqual((launch[0].match(/startServiceConfig\(\)/g) ?? []).length, 1, "read it once");
+    for (const use of [
+      /this\.controlContextFor\(serviceConfigArg\)\.hasStore/,
+      /this\.probeAdmin\(python, ws, serviceConfigArg\)/,
+      /this\.provisionInTerminal\(python, ws, admin, serviceConfigArg\)/,
+      /this\.serveEngine\(python, ws, serviceConfigArg\)/,
+    ]) {
+      assert.ok(use.test(launch[0]), `launchEngine does not pass the one value: ${use}`);
+    }
     assert.ok(
-      /path\.resolve\(ws,\s*startServiceConfig\(\)\s*\?\?\s*serviceConfig\(\)\)/.test(code),
+      /path\.resolve\(ws,\s*serviceConfigArg\s*\?\?\s*serviceConfig\(\)\)/.test(code),
       "the fork guard must judge the file the invocations name",
     );
     assert.ok(

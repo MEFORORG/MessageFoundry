@@ -488,19 +488,25 @@ export class EngineStatusBar implements vscode.Disposable {
   /** The lifecycle capabilities for the current target — the pure {@link planActions} gate. All the vscode
    *  and filesystem I/O the model must not do lives here. */
   controlContext(): EngineControlContext {
+    return this.controlContextFor(startServiceConfig());
+  }
+
+  /** {@link controlContext} for a `--service-config` value read once by the caller, so the Start
+   *  flow judges the same file it then hands serve, the probe and provision-admin (BACKLOG #5566). */
+  private controlContextFor(serviceConfigArg: string | undefined): EngineControlContext {
     const url = this.link.target.url;
     const ws = workspaceDir();
     // canControl: only a loopback engine can be run by the IDE (a remote one reads its own filesystem), only
     // in a trusted workspace (otherwise we must not exec a possibly repo-supplied .venv — SEC-004), and only
     // when there is a workspace for `serve` to run in.
     const canControl = ws !== undefined && vscode.workspace.isTrusted && isLocalEngine(url);
-    // The service TOML judged here is the one serve, the probe and provision-admin are handed
-    // (startServiceConfig, BACKLOG #5566), resolved the way they resolve it from the workspace. Only
-    // a regular file counts, so a blank setting, which resolves to the workspace itself, is no TOML.
+    // The service TOML judged here is the one serve, the probe and provision-admin are handed,
+    // resolved the way they resolve it from the workspace. Only a regular file counts, so a blank
+    // setting, which resolves to the workspace itself, is no TOML.
     const hasStore =
       canControl && ws !== undefined
         ? runDirHasEngine({
-            serviceTomlExists: isFile(path.resolve(ws, startServiceConfig() ?? serviceConfig())),
+            serviceTomlExists: isFile(path.resolve(ws, serviceConfigArg ?? serviceConfig())),
             dbFiles: dbFilesIn(ws),
           })
         : false;
@@ -569,9 +575,12 @@ export class EngineStatusBar implements vscode.Disposable {
       notify("the engine is already running from here — use Restart to reload it.");
       return;
     }
+    // Read once (BACKLOG #5566): the guard below and every command this Start runs use this one
+    // value, so a settings change while a prompt or the provisioning terminal is open cannot split them.
+    const serviceConfigArg = startServiceConfig();
     // Fork guard (ADR 0110 §5): with no engine store here, starting would create a NEW database. That is
     // sometimes exactly what the user wants — but it must be a deliberate choice.
-    if (!this.controlContext().hasStore) {
+    if (!this.controlContextFor(serviceConfigArg).hasStore) {
       const go = await vscode.window.showWarningMessage(
         storeLessStartPrompt(ws),
         { modal: true },
@@ -624,12 +633,12 @@ export class EngineStatusBar implements vscode.Disposable {
     // ADR 0183 Wave 5: provision an Administrator if the store has none, and only then serve. The plan is
     // pure (engineControlModel); these effects are the only I/O it does.
     await runStartPlan({
-      probeAdmin: () => this.probeAdmin(python, ws),
+      probeAdmin: () => this.probeAdmin(python, ws, serviceConfigArg),
       chooseToProvision: () => chooseToProvision(),
       askAdmin: () => askAdminDetails(),
-      provisionInTerminal: (admin) => this.provisionInTerminal(python, ws, admin),
+      provisionInTerminal: (admin) => this.provisionInTerminal(python, ws, admin, serviceConfigArg),
       chooseAfterRefusal: (detail) => chooseAfterRefusal(detail),
-      serve: () => this.serveEngine(python, ws),
+      serve: () => this.serveEngine(python, ws, serviceConfigArg),
       report: (message) => notify(message),
     });
   }
@@ -637,8 +646,8 @@ export class EngineStatusBar implements vscode.Disposable {
   /** Ask `provision-admin` whether the store already has an enabled Administrator. It runs with NO
    *  terminal (execFile pipes stdin), so it answers that question and otherwise refuses for want of a
    *  terminal, before any password prompt and without creating a store. */
-  private probeAdmin(python: string, ws: string): Promise<AdminProbeResult> {
-    const { command, args } = buildAdminProbeInvocation({ python, serviceConfig: startServiceConfig() });
+  private probeAdmin(python: string, ws: string, serviceConfigArg: string | undefined): Promise<AdminProbeResult> {
+    const { command, args } = buildAdminProbeInvocation({ python, serviceConfig: serviceConfigArg });
     return new Promise((resolve) => {
       execFile(command, args, { cwd: ws, timeout: 60_000 }, (err, stdout, stderr) => {
         if (err?.killed) {
@@ -671,8 +680,9 @@ export class EngineStatusBar implements vscode.Disposable {
     python: string,
     ws: string,
     admin: AdminDetails,
+    serviceConfigArg: string | undefined,
   ): Promise<number | undefined> {
-    const { command, args } = buildHeldInvocation(buildProvisionInvocation({ python, serviceConfig: startServiceConfig(), ...admin }));
+    const { command, args } = buildHeldInvocation(buildProvisionInvocation({ python, serviceConfig: serviceConfigArg, ...admin }));
     const term = vscode.window.createTerminal({
       name: "MessageFoundry: Provision Administrator",
       shellPath: command,
@@ -699,11 +709,11 @@ export class EngineStatusBar implements vscode.Disposable {
   }
 
   /** Start `serve` in its own terminal. Reached only through the Start plan's `serve` effect. */
-  private serveEngine(python: string, ws: string): void {
+  private serveEngine(python: string, ws: string, serviceConfigArg: string | undefined): void {
     const { command, args } = buildServeInvocation({
       python,
       configDir: configDir(),
-      serviceConfig: startServiceConfig(),
+      serviceConfig: serviceConfigArg,
     });
     const term = vscode.window.createTerminal({
       name: "MessageFoundry Engine",
