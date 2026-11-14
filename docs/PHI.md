@@ -444,8 +444,12 @@ than a path is not checked
   list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when
   its owner is such a group or cannot be read. Where a junction, a symbolic link or a folder a
   volume is mounted on is on the path, at least these are not read: when it is the directory that
-  holds the file, its target's owner and access list; and the folders on its target's side above
-  the directory that holds the file. So a junction only the engine's account and the host's
+  holds the file, its target's owner and access list; the folders on its target's side above the
+  directory that holds the file; and, as where no link is on the path, whether a broad group may
+  rename the directory that holds the file, or its target when it is a link (`DELETE` on it), and
+  what one named account may do to that directory or target. A `subst` drive letter is not judged
+  as a link, so where no junction or link is also on the path, no folder above the folder it
+  stands for is read. So a junction only the engine's account and the host's
   administrators can change, pointing to a folder where a broad group may delete a file, passes:
   restrict the target and the folders above it yourself.
   A right to list or traverse the directory, or to add

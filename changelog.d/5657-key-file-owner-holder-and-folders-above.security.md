@@ -11,9 +11,13 @@
   an application package, or cannot be read, is refused, and so is a key file in a directory that
   lets a broad group delete a file in it or change its access list. Not read, at least: on
   Windows, when the directory that holds the file is itself a junction, a symbolic link or a
-  folder a volume is mounted on, its target's owner and access list; and on every platform,
-  where a link is on the path, the folders on its target's side above the directory that holds
-  the file. So a junction only the engine's account and the host's administrators can change,
+  folder a volume is mounted on, its target's owner and access list; on Windows, whether or not
+  a link is on the path, whether a broad group may rename the directory that holds the file, or
+  its target when it is a link (`DELETE` on it), and what one named account may do to that
+  directory or target; on Windows, where no junction or link is on the path, the folders above
+  the folder a `subst` drive letter stands for, since the letter is not judged as a link; and on
+  every platform, where a link is on the path, the folders on its target's side above the
+  directory that holds the file. So a junction only the engine's account and the host's administrators can change,
   pointing to a folder that lets a broad group delete a file in it, passes. Before, the Windows check read
   the key file's own access list alone, and the POSIX check followed a linked folder above the
   file whoever could re-point it. A right to list a directory or add a file to it is not refused,
