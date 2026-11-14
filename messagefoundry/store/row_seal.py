@@ -48,6 +48,7 @@ import logging
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Final, Protocol
 
 from messagefoundry.controlchars import scrub_control_chars
@@ -347,6 +348,19 @@ class RowSealer:
         """Whether ``stored`` names the active key. Says nothing about whether it verifies."""
         parsed = self._parse(stored)
         return parsed is not None and parsed[0] == self.key_id
+
+    def names_unheld_key(self, stored: object) -> bool:
+        """Whether ``stored`` is a well-formed seal naming a key that is neither the active key nor
+        a retired key this sealer holds (vault BACKLOG #5635). Says nothing about whether it
+        verifies, since no key here could check it.
+
+        ``rotate-key`` asks this of each row its re-seal passes left as they were: such a row may
+        be genuine and sealed under a retired key the run was not given, so the run is PARTIAL
+        until a run that holds that key re-seals it. A row whose seal fails under a key this
+        sealer holds, or that is malformed, answers ``False``: no key re-seals it, so it must not
+        hold the rotation open."""
+        parsed = self._parse(stored)
+        return parsed is not None and parsed[0] != self.key_id and parsed[0] not in self._retired
 
     # The awaited forms (ADR 0217 slice 1, the async seal seam), so one call site can serve this
     # sealer and :class:`TransitRowSealer`. No I/O: each answers in the calling coroutine.
@@ -867,6 +881,39 @@ class TransitRowSealer:
 
 #: Either sealer: one call site awaits the same four methods on both.
 AnyRowSealer = RowSealer | TransitRowSealer
+
+
+@dataclass(frozen=True, slots=True)
+class ResealOutcome:
+    """What ``rotate-key``'s re-seal passes left under a key other than the active one (vault
+    BACKLOG #5635): the side result a store's ``reencrypt_to_active`` records and its
+    ``reseal_outcome`` returns, so the command can tell a finished rotation from one that left a
+    row sealed under a key it was not given.
+
+    ``unheld`` counts the user, role, approval and directory-map seals that name a retired key the
+    run did not hold. Dropping that key strands them, so the run is PARTIAL. ``refused`` counts the
+    rest it left: a seal that fails under a key the run holds, or is malformed. No key re-seals
+    those, so they never hold a rotation open; failing on them would fail every later run too."""
+
+    unheld: int = 0
+    refused: int = 0
+
+
+def classify_unrotated(sealer: AnyRowSealer | None, seals: Iterable[object]) -> ResealOutcome:
+    """The :class:`ResealOutcome` for ``seals``, each a stored seal a re-seal pass read after it
+    ran. A blank seal or one under the active key is not counted. Under a Transit sealer, or no
+    sealer, nothing is: ``rotate-key`` refuses vault_transit before it opens the store."""
+    if not isinstance(sealer, RowSealer):
+        return ResealOutcome()
+    unheld = refused = 0
+    for stored in seals:
+        if not stored or sealer.is_active(stored if isinstance(stored, str) else None):
+            continue
+        if sealer.names_unheld_key(stored):
+            unheld += 1
+        else:
+            refused += 1
+    return ResealOutcome(unheld=unheld, refused=refused)
 
 
 async def require_seal_for_write(

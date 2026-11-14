@@ -197,11 +197,13 @@ from messagefoundry.store.row_seal import (
     SESSION_KIND,
     USER_KIND,
     AnyRowSealer,
+    ResealOutcome,
     RowSealer,
     RowSealError,
     RowSealKeyRetiredError,
     SealPager,
     TransitSealUnavailableError,
+    classify_unrotated,
     require_seal_for_write,
     revoke_seal_refusals,
     row_sealer_for_cipher,
@@ -4917,6 +4919,17 @@ def report_refused_role_holder() -> None:
         "a holder of a deleted custom role failed its integrity seal; its role row was removed"
         " and nothing was re-sealed (BACKLOG #2592)"
     )
+
+
+#: The sealed columns ``rotate-key``'s re-seal passes move to the active key, as ``(table, column)``,
+#: read back after the passes by each backend's ``_unrotated_seals`` (vault BACKLOG #5635). The two
+#: directory maps' seals are read through ``get_ad_map``. Constants, never input, so each backend
+#: may format them into its SQL.
+RESEALED_SEAL_COLUMNS: Final = (
+    ("users", "authz_seal"),
+    ("roles", "seal"),
+    ("pending_approvals", "seal"),
+)
 
 
 def report_user_reseal(resealed: int, refused: int) -> None:
@@ -11120,6 +11133,8 @@ class MessageStore:
     # check_reference_backend_supported).
     supports_reference_sets = True
     backend = StoreBackend.SQLITE
+    # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
+    _reseal_outcome: ResealOutcome = ResealOutcome()
 
     def __init__(
         self,
@@ -12276,6 +12291,8 @@ class MessageStore:
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
+        # Vault BACKLOG #5635: what the passes left under another key, for the command to read.
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
@@ -19149,6 +19166,30 @@ class MessageStore:
             digest = passkey_digest(await self._account_passkeys(user_id))
             await self._write_user(user_id, lambda r: r.changed(cred_digest=digest))
         return count
+
+    def reseal_outcome(self) -> ResealOutcome:
+        """What the last :meth:`reencrypt_to_active` left sealed under a key other than the active
+        one (vault BACKLOG #5635); empty before one has run."""
+        return self._reseal_outcome
+
+    async def _unrotated_seals(self) -> list[object]:
+        """Every stored seal in :data:`RESEALED_SEAL_COLUMNS`, and each directory map's, that does
+        not name the active key, read after the re-seal passes (vault BACKLOG #5635)."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return []
+        active = f"{SEAL_PREFIX}{sealer.key_id}:%"
+        seals: list[object] = []
+        async with self._read() as db:
+            for table, column in RESEALED_SEAL_COLUMNS:
+                cur = await db.execute(
+                    f"SELECT {column} FROM {table} WHERE {column} <> '' AND {column} NOT LIKE ?",
+                    (active,),
+                )
+                seals.extend(r[0] for r in await cur.fetchall())
+        for name in AD_MAPS:
+            seals.append((await self.get_ad_map(name)).seal)
+        return seals
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key (BACKLOG #2592), for ``rotate-key``.

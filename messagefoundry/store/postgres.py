@@ -196,8 +196,10 @@ from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     USER_KIND,
     AnyRowSealer,
+    ResealOutcome,
     RowSealError,
     SealPager,
+    classify_unrotated,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -233,6 +235,7 @@ from messagefoundry.store.store import (
     REINGRESS_ARTIFACT_MISSING,
     REINGRESS_PEEK_FAILED,
     REINGRESS_TARGET_PREFIX,
+    RESEALED_SEAL_COLUMNS,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -2083,6 +2086,8 @@ class PostgresStore:
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
     backend = StoreBackend.POSTGRES
+    # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
+    _reseal_outcome: ResealOutcome = ResealOutcome()
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
     #: columns (error/last_error/detail), and summary/metadata (MRN + patient name) added in EF-3.
@@ -3924,6 +3929,8 @@ class PostgresStore:
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
+        # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             if is_row_tagged(table, column):
@@ -10048,6 +10055,28 @@ class PostgresStore:
         order :meth:`revoke_all_sessions` relies on (decision d20261109T200352805-599b24, item
         2)."""
         await conn.fetchval("SELECT 1 FROM users WHERE id=$1 FOR UPDATE", user_id)
+
+    def reseal_outcome(self) -> ResealOutcome:
+        """store.py's ``MessageStore.reseal_outcome`` states the contract (vault BACKLOG #5635)."""
+        return self._reseal_outcome
+
+    async def _unrotated_seals(self) -> list[object]:
+        """store.py's ``MessageStore._unrotated_seals`` states the contract (vault BACKLOG #5635)."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return []
+        active = f"{SEAL_PREFIX}{sealer.key_id}:%"
+        seals: list[object] = []
+        for table, column in RESEALED_SEAL_COLUMNS:
+            rows = await self._fetchall(
+                f"SELECT {column} AS seal FROM {table}"
+                f" WHERE {column} <> '' AND {column} NOT LIKE $1",
+                active,
+            )
+            seals.extend(r["seal"] for r in rows)
+        for name in AD_MAPS:
+            seals.append((await self.get_ad_map(name)).seal)
+        return seals
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);

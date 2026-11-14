@@ -6576,6 +6576,30 @@ async def test_role_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_reseal_outcome_contract(store) -> None:
+    """Vault BACKLOG #5635: ``reencrypt_to_active`` records what its re-seal passes left under a
+    key it does not hold, for ``rotate-key`` to read, on a keyed handle. ``raw`` runs each
+    statement outside the store's helpers. The fixture clears the tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._reseal_outcome_contract import assert_reseal_outcome_contract
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        await assert_reseal_outcome_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
 async def test_approval_seal_contract(store) -> None:
     """BACKLOG #2592: sealed dual-control approval requests, the same contract the SQLite suite
     runs, on a keyed handle, with the table's columns pinned to the record the seal covers. ``raw``
