@@ -2645,6 +2645,78 @@ async def test_a_reload_during_the_halt_leaves_a_content_stopped_pooled_lane_and
         await runner.stop()
 
 
+async def test_a_reload_during_the_halt_re_arms_an_unheld_stopped_pooled_lane_as_main_does(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704 review: the reload broadcast keeps STOPPED only a lane the gate holds AND a STOP
+    # holds. A STOP with no hold (the T16 "inbound not in registry" STOP records none) is re-armed
+    # by the reload as it is with no halt, so the recovery restart finds it re-armed, as main did.
+    # MEASURED 2026-11-14: with keep_stopped True for every gated lane, it read STOPPED after the
+    # restart.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "pooled")
+    await runner.start()
+    try:
+        routed = runner._dispatchers[Stage.ROUTED]
+        routed._to_stopped(INBOUND, routed._states[INBOUND], "inbound not in registry")
+        assert ("inbound", INBOUND) not in runner._stop_held
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        assert await _until(lambda: not runner._log_guard_tasks), "the halt never finished"
+
+        await runner.reload(_e2e_registry(outdir))
+        assert runner._log_write_stopped  # the log is still dead
+
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.restart_inbound(INBOUND)
+        assert not runner._log_write_stopped and INBOUND not in runner._log_halted
+        assert not routed.stopped(INBOUND), "the recovery restart left the unheld STOP in place"
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("held", [True, False])
+async def test_a_stopped_pooled_lane_stays_stopped_after_the_recovery_restart_until_a_reload(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: bool
+) -> None:
+    # BACKLOG #5704: what the recovery records say about a pooled internal lane that STOPped while
+    # the log was down. The restart lifts the gate and re-arms no STOP, held (a T17 bound) or not
+    # (a leadership-loss hand-back); a reload after that restart re-arms it and releases any hold.
+    # Measured here so the records can say so.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "pooled")
+    await runner.start()
+    try:
+        routed = runner._dispatchers[Stage.ROUTED]
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        assert await _until(lambda: not runner._log_guard_tasks), "the halt never finished"
+        # The lane STOPs while the halt is in force, as a T17 bound (held) or a leadership-loss
+        # hand-back (unheld) would.
+        routed._to_stopped(INBOUND, routed._states[INBOUND], "stopped under the halt")
+        if held:
+            runner._hold_for_operator(INBOUND, "inbound")
+
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.restart_inbound(INBOUND)
+        await runner.start_outbound(OUTBOUND)
+        assert not runner._log_write_stopped and INBOUND not in runner._log_halted
+        assert routed.stopped(INBOUND), "the recovery restart re-armed the STOPPED lane"
+        assert (("inbound", INBOUND) in runner._stop_held) is held
+
+        await runner.reload(_e2e_registry(outdir))
+        assert not routed.stopped(INBOUND), "a reload after the recovery left the lane STOPPED"
+        assert ("inbound", INBOUND) not in runner._stop_held
+    finally:
+        await runner.stop()
+
+
 @pytest.mark.parametrize("claim_mode", CLAIM_MODES)
 async def test_a_listener_rebound_past_a_cleared_latch_is_not_gated_by_the_waiting_halt(
     store: MessageStore, tmp_path: Path, claim_mode: str

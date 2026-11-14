@@ -2571,9 +2571,7 @@ class RegistryRunner:
         it re-arms. The STOPPED set is read BEFORE the broadcast: a hold whose lane has not reached
         STOPPED yet (the STOP site records it first) is not re-armed by it, and must survive."""
         kind = _HOLD_DIRECTION.get(stage)
-        # BACKLOG #5704: under the #122 claim gate an internal lane's STOP and its hold are left
-        # alone, as the halt's pause left them before the gate replaced it.
-        keep = None if stage is Stage.OUTBOUND else self._inbound_log_halted
+        keep = None if stage is Stage.OUTBOUND else self._log_halt_keeps_stopped
         rearmed = [
             n
             for k, n in self._stop_held
@@ -2583,6 +2581,14 @@ class RegistryRunner:
         if kind is not None:
             for n in rearmed:
                 self._release_operator_hold(n, kind)
+
+    def _log_halt_keeps_stopped(self, name: str) -> bool:
+        """Whether a pooled broadcast leaves internal lane ``name`` STOPPED (BACKLOG #5704): only
+        while the #122 claim gate holds its inbound AND a STOP holds it, so a reload during the
+        halt neither re-arms a held STOP nor releases its hold. A STOP with no hold is
+        re-armed as it is with no halt, and the gate then refuses that lane's claims until it lifts.
+        An internal lane is keyed by its inbound's name, and its hold by ``("inbound", name)``."""
+        return self._inbound_log_halted(name) and ("inbound", name) in self._stop_held
 
     def _resume_pooled_lane(self, d: StageDispatcher, stage: Stage, name: str) -> None:
         """``d.resume_lane(name)``, lifting the operator hold only when it re-arms something.
