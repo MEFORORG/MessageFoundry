@@ -48,10 +48,10 @@ def _loaded_prefix(monkeypatch: pytest.MonkeyPatch, prefix: str) -> Iterator[str
     first, so it never reads the patched token source (as ``tests/test_anon_b193_2330.py`` does)."""
     with contextlib.suppress(engine_leak.LeakCheckUnavailable):
         engine_leak._scanner()
-    monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", f"[site_prefix]\n{prefix}\n")
-    engine_surrogates.reload_site_prefixes()
-    tee_surrogates.reload_site_prefixes()
     try:
+        monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", f"[site_prefix]\n{prefix}\n")
+        engine_surrogates.reload_site_prefixes()
+        tee_surrogates.reload_site_prefixes()
         yield prefix
     finally:
         monkeypatch.undo()  # restore the real source BEFORE recomputing, as test_anon_core does

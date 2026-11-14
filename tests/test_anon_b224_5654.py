@@ -130,7 +130,7 @@ def test_a_whole_component_mr_anywhere_is_a_hit(leak: ModuleType, value: str) ->
 
 
 @_NO_SCANNER
-@pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
+@_SIDES
 def test_anonymize_checked_passes_an_unescaped_modality(anon: ModuleType) -> None:
     text = f"{_HEAD}\rOBR|1|ORD1||70553^PET&MR^C4"
     assert anon.anonymize_checked(text, salt="b224-5654-salt-0123456789abcdef")
@@ -179,7 +179,7 @@ def test_the_word_mr_in_ordinary_escaped_text_is_no_mrn(leak: ModuleType, segmen
 
 
 @_NO_SCANNER
-@pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
+@_SIDES
 @_ORDINARY_MR_TEXT
 def test_anonymize_checked_passes_ordinary_mr_text(anon: ModuleType, segment: str) -> None:
     assert anon.anonymize_checked(f"{_HEAD}\r{segment}", salt="b224-5654-salt-0123456789abcdef")
@@ -285,7 +285,7 @@ def test_an_allowed_or_non_address_is_no_ipv6_hit(leak: ModuleType, written: str
 
 
 @_NO_SCANNER
-@pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
+@_SIDES
 def test_a_surrogate_is_never_refused_as_an_ipv6_address(anon: ModuleType) -> None:
     """``_fake_like`` writes a capital for each letter of an id, so a mapped PID-3 that holds
     ``::`` can come out as a hex word joined to ``::``. The IPv6 check reads only unmapped
@@ -365,6 +365,17 @@ def test_a_rule_on_a_header_field_takes_it_out_of_the_ipv6_read(leak: ModuleType
     assert not any(leak.IPV6_REASON in hit for hit in leak.structural_phi_hits(text, {"MSH-24"}))
 
 
+@_NO_SCANNER
+@_SIDES
+def test_a_keep_on_a_header_field_leaves_it_in_the_ipv6_read(anon: ModuleType) -> None:
+    """A keep rewrites nothing, so the field stays in scope, as a kept body field does."""
+    rules = (*anon.DEFAULT_RULES, anon.FieldRule("MSH-24", anon.SurrogateKind.KEEP))
+    with pytest.raises(anon.LeakError, match="IPv6 address in MSH-24"):
+        anon.anonymize_checked(
+            _msh24(f"NET^{_GLOBAL}^DNS"), salt="b224-ipv6-header-0123456789abcdef", rules=rules
+        )
+
+
 @_LEAKS
 def test_a_header_field_is_numbered_the_header_way(leak: ModuleType) -> None:
     """Field 1 of the header is the separator, so the read starts at MSH-3, after the encoding
@@ -380,8 +391,10 @@ def test_an_address_after_the_encoding_characters_is_refused(anon: ModuleType) -
     rule may rewrite it, so
     text after them reaches the output and is read for an address."""
     raw = f"MSH|^~\\&{_GLOBAL}|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
-    with pytest.raises(anon.LeakError, match="IPv6 address in MSH-2"):
+    with pytest.raises(anon.LeakError, match="IPv6 address in MSH-2") as refused:
         anon.anonymize_checked(raw, salt="b224-ipv6-header-0123456789abcdef")
+    # The refusal says to repair the header, since no rule may rewrite MSH-2.
+    assert "No rule can rewrite MSH-2" in str(refused.value)
 
 
 @_NO_SCANNER

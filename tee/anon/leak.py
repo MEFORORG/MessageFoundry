@@ -589,7 +589,9 @@ def unmapped_field_values(
     would be refused on the way out (BACKLOG #3004).
 
     The MSH control header is skipped whole: it carries routing/site data the field-anchored
-    site-code pass already covers, not patient PHI. The header is the ONE line
+    site-code pass already covers, not patient PHI. It can still carry a network address, so
+    :func:`structural_phi_hits` reads it for a routable IPv6 address apart from this walk
+    (:func:`_header_ipv6_hits`, BACKLOG #5654). The header is the ONE line
     ``read_message_seps`` takes the separators from, and no other. A header with fewer than
     :data:`_HEADER_MIN_FIELDS` split fields, such as a lone ``MSH|^~\\&``, is not skipped: it is
     refused, like every short header line (BACKLOG #3001). An ``MSH`` line
@@ -908,7 +910,7 @@ def _header_ipv6_hits(text: str, mapped_paths: set[str]) -> list[str]:
     # encoding characters and no more, and no rule may rewrite MSH-2, so text a sender put after
     # them reaches the output.
     # After MSH-2, fields[i] is MSH-(i + 1).
-    values = [("MSH-2", fields[1][4:])]
+    values = [(_MSH2, fields[1][4:])]
     values += [(f"MSH-{i + 1}", value) for i, value in enumerate(fields[2:], start=2)]
     for address, value in values:
         if not value or address in mapped_paths:
@@ -1246,6 +1248,15 @@ def has_other_cause(report: LeakReport) -> bool:
     return any(not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE) for hit in report.hits)
 
 
+#: The address a header hit after the encoding characters names.
+_MSH2 = "MSH-2"
+#: The step for such a hit, which no rule can scrub.
+_MSH2_ADVICE = (
+    "No rule can rewrite MSH-2: repair a header that carries text after its four encoding "
+    "characters."
+)
+
+
 def refusal_advice(
     report: LeakReport, *, denylist_refused: bool = False, coverage_refused: bool = False
 ) -> str:
@@ -1260,6 +1271,10 @@ def refusal_advice(
     )
     if token_hit or shape_hit:
         steps.append("Extend the rule map so the field that carries it is scrubbed.")
+    if any(hit.endswith(f" in {_MSH2}") for hit in report.structural_hits):
+        # No rule may rewrite MSH-2, so the step above cannot reach the text after its
+        # encoding characters (BACKLOG #5654).
+        steps.append(_MSH2_ADVICE)
     steps.extend(mapped_field_advice(report))
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")
