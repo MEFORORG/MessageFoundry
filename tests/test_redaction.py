@@ -3148,9 +3148,11 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
         *secretscrub._KEY_MATERIAL_WORDS,
     }
     assert "|".join(logging_setup._CREDENTIAL_QUERY_KEYS) in pattern
-    url_arm = r"://[^\s:/@]*+:[^\s/]+@"
+    # The second stated exception (BACKLOG #5549): the URL arm keeps the tail from before #5549, a
+    # non-empty user and a password ending at the first "@", narrower than ``_DSN_PASSWORD``'s.
+    url_arm = r"://[^\s:/@]+:[^\s/@]+@"
     assert url_arm in pattern
-    assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
+    assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(r"://[^\s:/@]*+:[^\s/]+@")
 
 
 def _start_labels_at_a_word_boundary_alone(patched: pytest.MonkeyPatch) -> None:

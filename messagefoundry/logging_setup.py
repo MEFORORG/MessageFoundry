@@ -361,7 +361,7 @@ _QUERY_STOP_WORDS = (
 _LABEL_WITH_ITS_VALUE_OUTSIDE = (
     r"\b(?:(?-i:MEFOR_[A-Z0-9_]+)|(?:[A-Za-z0-9]+[._-]){0,6}(?:"
     + "|".join(re.escape(word) for word in sorted(_QUERY_STOP_WORDS, key=len, reverse=True))
-    + r"))\b['\"]?\s*[:=]\s*['\"]"
+    + r"))\b['\"]?\s*[:=]\s*(?-i:b)?['\"]"
 )
 
 #: A query value: every character up to "&", whitespace or a quote, as before, except that it stops
@@ -387,7 +387,12 @@ _LABEL_WITH_ITS_VALUE_OUTSIDE = (
 #: LINEAR. The two branches take disjoint characters and are possessive. The lookahead runs only at a
 #: separator. It walks at most six label segments and the label's word, so it ends at the next
 #: separator. Past a quote or a space it walks one run of spaces, and then the value has ended.
+#:
+#: A bytes literal's "b" is no query value (BACKLOG #5547): taking it left the quoted value after it
+#: with no label in front, so ``token=b'v w'`` printed "v w". Refused, the literal is left to
+#: ``CredentialScrubFilter``, which reads it whole, as it reads ``token='v w'``.
 _QUERY_VALUE = (
+    r"(?!(?-i:b)['\"])"
     r"(?:[A-Za-z0-9._\-]++|[^A-Za-z0-9._\-&\s\"'](?!" + _LABEL_WITH_ITS_VALUE_OUTSIDE + r"))++"
 )
 

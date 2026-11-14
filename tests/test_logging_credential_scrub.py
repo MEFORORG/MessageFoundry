@@ -215,6 +215,26 @@ OTHER_QUOTED_VALUES: tuple[tuple[QuotedValue, str], ...] = (
         ),
         "_BEARER",
     ),
+    (
+        # BACKLOG #5547: a bytes literal under a query key, which the query filter runs on first.
+        QuotedValue(
+            "bytes_literal_query_key",
+            "upstream access_token=b'wt-Byt_C-84 wt-Byt_D-85' configured",
+            ("wt-Byt_C-84", "wt-Byt_D-85"),
+            ("upstream", "configured"),
+        ),
+        "_BEARER",
+    ),
+    (
+        # BACKLOG #5547: a query key's value running on into a later label's bytes literal.
+        QuotedValue(
+            "bytes_literal_after_query_value",
+            "upstream token=wt-q;password=b'wt-Byt_E-82 wt-Byt_F-83' configured",
+            ("wt-Byt_E-82", "wt-Byt_F-83"),
+            ("upstream", "configured"),
+        ),
+        "_CREDENTIAL_KV",
+    ),
 )
 
 
@@ -342,6 +362,17 @@ FAMILIES: tuple[Family, ...] = (
             f"wt-pem_pem-99==\n-----END RSA {_PK}-----\nretrying"
         ),
         secret="wt-pem_pem-99",
+        patterns=("_PEM_PRIVATE_KEY",),
+    ),
+    Family(
+        # BACKLOG #5550: a PGP block whose armor headers hold ".", "(", ")" and "@".
+        name="pgp_private_key_block",
+        line=(
+            f"key load failed:\n-----BEGIN PGP {_PK} BLOCK-----\n"
+            "Version: GnuPG v1.4.11 (GNU/Linux)\nComment: ops@example.invalid\n\n"
+            f"lQOYBF\nwt-pgp_pgp-81==\n-----END PGP {_PK} BLOCK-----\nretrying"
+        ),
+        secret="wt-pgp_pgp-81",
         patterns=("_PEM_PRIVATE_KEY",),
     ),
     Family(

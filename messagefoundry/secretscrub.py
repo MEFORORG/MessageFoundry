@@ -978,7 +978,8 @@ _KV_QUOTED_VALUE = (
 
 # THE FAST PATH, which is what keeps an ordinary credential line near its old cost. A stop needs label
 # syntax that runs from inside the value to a quote, so the value's natural run must end on that
-# syntax: on a quote, or on whitespace followed by ":", "=", a quote, or an auth scheme word.
+# syntax: on a quote, or on whitespace followed by ":", "=", a quote (a bytes literal's "b" in front
+# of it too, BACKLOG #5547), or an auth scheme word.
 # ``_NO_QUOTED_LABEL_AFTER`` rules all of those out, and when it holds the whole run is taken with no
 # check at all; only otherwise does the value walk token by token. The two paths give the same result,
 # because a stop is impossible whenever this lookahead passes. What it saves an ordinary credential
@@ -986,7 +987,7 @@ _KV_QUOTED_VALUE = (
 # it, because the stop before a braced label (BACKLOG #2966) needs a "{" right after a ":" or "=" in the
 # run; such a run walks, which the run-on walk tests time. That refuses more than the stop needs, so a
 # value such as a dict repr walks too; the cost is measured in the module docstring.
-_NO_QUOTED_LABEL_AFTER = r"(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
+_NO_QUOTED_LABEL_AFTER = r"(?!\s*+(?:[:=]|(?-i:b)?['\"])|\s++(?i:bearer|basic|digest)\s)"
 
 # The plain value classes. Each pattern keeps the terminator set it always had, stated once here and
 # spliced into all three places a class needs it: the fast path, the first run and every later run.
@@ -1073,8 +1074,8 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # WHY THE GUARD THAT REFUSED IT IS NOT SIMPLY DROPPED. That guard exists because a closer right after
 # "=" is usually a LATER label's opening quote, as in ``token='Bearer password='p w'``, and taking it
 # would print "p w", which the plain class hid. So this branch takes only an RFC 7235 token68, a run of
-# letters, digits and ``+/._~-`` then at least one "=", which holds no space, quote, "{" or ":", the
-# other four things the guard refuses. And it refuses a token holding any label word of any family,
+# letters, digits and ``+/._~-`` then at least one "=", which holds no space, quote, "{" or ":", at
+# least four other shapes the guard refuses. And it refuses a token holding any label word of any family,
 # or the ``MEFOR_`` prefix, ignoring case: a closer after "=" can belong to a later label only when the
 # run before the "=" ends in one. A token it refuses falls back to the forms below, so it prints as
 # before. The closer must be the opening quote's twin, it is left in the text as the guarded form
@@ -1446,9 +1447,10 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[
 #
 # THE BODY IS REPLACED AND BOTH MARKERS ARE KEPT, so a reader still sees that a key was there, and of
 # what kind. It runs from the begin marker up to the next ``-----``, over what a key body and its RFC
-# 1421 headers hold: base64, white space, ",", ":", "_", a single "-", a backslash escape such as the
-# ``\n`` a repr or a JSON string writes, and the PHI pass's ``[redacted]``. It must open, past white
-# space and escaped line breaks, on four base64 characters.
+# 1421 or PGP armor headers hold: base64, white space, ",", ":", "_", ".", "(", ")", "@", "<", ">", a
+# single "-", a backslash escape such as the ``\n`` a repr or a JSON string writes, and the PHI pass's
+# ``[redacted]``. It must open, past white space and escaped line breaks, a doubled escape included,
+# on four base64 characters. A header holding a character outside that set ends the body there.
 #
 # A BEGIN MARKER WITH NO END MARKER AFTER ITS BODY IS READ ONLY WHEN A LINE BREAK FOLLOWS IT, real or
 # escaped, as a key block's marker stands on its own line. That is a block a driver or a log line cut
@@ -1461,9 +1463,9 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[
 # ``logging_setup`` runs :func:`messagefoundry.redaction.redact` before this pass, and its name-run
 # rule reads ``BEGIN RSA PRIVATE KEY`` as a run of capitalised tokens, so every marker reaches this
 # pass as ``-----[redacted]-----``. That form names no key type, so it is read only with an end
-# marker of the same form after the body: a body between two such markers. That costs coverage in two
-# places, both stated: a block with no end marker prints its body on the installed chain, and a
-# CERTIFICATE or PUBLIC KEY block, which the PHI pass marks the same way, has its body redacted too.
+# marker of the same form after the body: a body between two such markers. That costs at least this:
+# a block with no end marker prints its body on the installed chain, and a CERTIFICATE or PUBLIC KEY
+# block, which the PHI pass marks the same way, has its body redacted too.
 # Text between two blocks is taken when it opens on four base64 characters, as a second block's body.
 #
 # LINEAR. A match starts only at five dashes, the label is a bounded walk, and the body is possessive
@@ -1471,9 +1473,9 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[
 # bodies never share a character.
 _PEM_PRIVATE_KEY = re.compile(
     r"(-----(?:BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?|(?P<phi>\[redacted\])[A-Z0-9 ]{0,40})-----)"
-    r"(?:(?P<line>)(?=[ \t]*+(?:\r?\n|\\[rn])))?"
-    r"(?=(?:\s|\\[rn])*+[A-Za-z0-9+/]{4})"
-    r"(?:[A-Za-z0-9+/=\s,:_]++|\\[^\r\n]|-(?!----)|\[redacted\])++"
+    r"(?:(?P<line>)(?=[ \t]*+(?:\r?\n|\\++[rn])))?"
+    r"(?=(?:\s|\\++[rn])*+[A-Za-z0-9+/]{4})"
+    r"(?:[A-Za-z0-9+/=\s,:_.()@<>]++|\\[^\r\n]|-(?!----)|\[redacted\])++"
     r"(?(phi)(?=-----\[redacted\][A-Z0-9 ]{0,40}-----)|(?(line)|(?=-----END )))"
 )
 

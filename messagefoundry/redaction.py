@@ -249,7 +249,7 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: lines, so no encoded run in one is scrubbed. Moving the credential filters ahead of this module
 #: in the log chain would lift it.
 #:
-#: **Each arm is a copy of its source, or wider, with ONE stated exception, and one source has no
+#: **Each arm is a copy of its source, or wider, except where stated below, and one source has no
 #: arm.** The label arm is
 #: ``secretscrub``'s own: the same bounded dotted prefix as ``_LABEL_PREFIX``, the same words, and
 #: the separator. Its start is ``\b`` alone. Since BACKLOG #2999 ``secretscrub`` also starts a label
@@ -260,8 +260,12 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: no value printed on any of nine log paths that the code before it hid. The price: where such a
 #: label sits in the run's own token and its value in the next one, as in
 #: ``a%7Cb%7Cc%2Cpassword: <value>``, the run takes the label and the value prints, as it did before
-#: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme,
-#: so since BACKLOG #5549 it too reads an empty user and a password up to the last "@".
+#: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` as it stood before
+#: BACKLOG #5549, so it is NARROWER than its source in two shapes #5549 added: an empty user, and an
+#: "@" inside the password. Taking them here would switch the encoded run off on every text holding
+#: such a URL, so a PHI run beside one would print where it is hidden now, the trade #2999 declined.
+#: Unmeasured: where such a URL sits inside the run's own token, the run takes it whole, and what a
+#: run that ends inside one leaves for ``secretscrub`` has not been counted.
 #: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:
 #: **A second exception: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
@@ -280,7 +284,7 @@ _CREDENTIAL_AHEAD = re.compile(
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
     r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
     r"""|token|pass|pwd)))\b['"]?\s*[:=]"""
-    r"""|(?i:\bbearer)\s|://[^\s:/@]*+:[^\s/]+@"""
+    r"""|(?i:\bbearer)\s|://[^\s:/@]+:[^\s/@]+@"""
     r"""|(?i:\b(?:code|state|id_token|access_token|token|session_state)=)"""
 )
 

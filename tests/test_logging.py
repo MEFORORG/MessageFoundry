@@ -3675,7 +3675,8 @@ def test_the_query_stop_keeps_the_scan_linear(monkeypatch: pytest.MonkeyPatch) -
     anywhere later in the value". Its lookahead scans to the end of the value from every separator,
     which is quadratic, and the same harness must catch it."""
     shipped = logging_setup._CREDENTIAL_QUERY_RE
-    unbounded = shipped.pattern.replace("(?!", "(?![^&\\s\"']*?", 1)
+    # The separator's lookahead, not the bytes-literal refusal that opens the value (BACKLOG #5547).
+    unbounded = shipped.pattern.replace("\\\"'](?!", "\\\"'](?![^&\\s\"']*?", 1)
     assert unbounded != shipped.pattern, "the control pattern did not change"
     quadratic = re.compile(unbounded, shipped.flags)
     with monkeypatch.context() as m:

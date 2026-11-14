@@ -245,7 +245,7 @@ _KV_QUOTED_VALUE = (
 # once and spliced into all three places. Why the two paths agree, why per run agrees with per
 # character, and this copy's one gap, are stated on the same constants in
 # ``messagefoundry/secretscrub.py``.
-_NO_QUOTED_LABEL_AFTER = r"(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
+_NO_QUOTED_LABEL_AFTER = r"(?!\s*+(?:[:=]|(?-i:b)?['\"])|\s++(?i:bearer|basic|digest)\s)"
 _PLAIN_TERMINATORS = r"\s'\""  # _MEFOR_SECRET, _BEARER
 _KV_TERMINATORS = r"\s'\";,&"  # _CREDENTIAL_KV
 _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL

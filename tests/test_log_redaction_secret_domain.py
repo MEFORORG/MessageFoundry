@@ -4243,6 +4243,8 @@ _BYTES_LATER_LABEL_LINES = (
     "token=zq-x;password=b'zq-Bl_A-76 zq-Bl_B-77'",
     "password='zq-x, private_key=b'zq-Bl_A-76 zq-Bl_B-77'",
     'MEFOR_X=zq-x;secret=b"zq-Bl_A-76 zq-Bl_B-77"',
+    # A space after the separator, which the plain fast path must hand to the walk.
+    "token=zq-x;password= b'zq-Bl_A-76 zq-Bl_B-77'",
 )
 
 
@@ -4426,6 +4428,15 @@ def test_the_dsn_tail_grows_linearly_in_line_length() -> None:
         (
             "-----[redacted]-----\nMIIEvQ\nzq-pem_pem-81\n-----[redacted]-----",
             "the PHI pass's markers",
+        ),
+        (
+            f"-----BEGIN PGP {_PK} BLOCK-----\nVersion: GnuPG v1.4.11 (GNU/Linux)\n"
+            f"Comment: ops@example.invalid\n\nlQOYBF\nzq-pem_pem-81\n-----END PGP {_PK} BLOCK-----",
+            "PGP armor headers",
+        ),
+        (
+            f"cfg=-----BEGIN RSA {_PK}-----\\\\nMIIEpA\\\\nzq-pem_pem-81\\\\n-----END RSA {_PK}-----",
+            "a doubled escape",
         ),
     ),
 )
