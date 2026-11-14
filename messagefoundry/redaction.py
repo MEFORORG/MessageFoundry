@@ -1650,30 +1650,30 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
 
     Well-formed XML allows only whitespace there, so a word is a value a malformed tag carried: inside
     the tag (``</family Zqxdoe>``) or after one that never got its ``>`` (``</family Zqxdoe``). It is
-    MASKED, not replaced: a placeholder can remove a name run main would have formed with text a
-    caller joins after the answer. The mask keeps a letter's case and a digit a digit.
+    MASKED, not replaced: a placeholder can remove a name run the earlier redactor would have formed
+    with text a caller joins after the answer. The mask keeps a letter's case and a digit a digit.
 
-    **That is not a proof that every reader sees main's answer.** A mask alone sends no text round
-    again (:func:`_masked_only`), but masked text still reaches passes main ran on the unmasked
-    text, at least these: the next round after one that masks and also scrubs, the widened stage
-    and the encoded run's re-run after a round that masks, and a caller's later call. A pass that
-    is not a fixed point could read it differently there. The differential fuzz in
-    ``tests/test_redaction_xml_end_tag.py`` measures this; it is not a proof either.
+    **That is not a proof that every reader sees the earlier redactor's answer.** A mask alone
+    sends no text round again (:func:`_masked_only`), but masked text still reaches passes the
+    earlier redactor ran on the unmasked text, at least these: the next round after one that masks
+    and also scrubs, the widened stage and the encoded run's re-run after a round that masks, and a
+    caller's later call. A pass that is not a fixed point could read it differently there. The
+    differential fuzz in ``tests/test_redaction_xml_end_tag.py`` measures this; it is not a proof
+    either.
 
     **A text that holds the credential backstop's opener (:data:`_USERINFO_OPENER`) when the XML
-    pass reads it keeps every rest**: ``mask`` is False there, a conservative choice.
-    :func:`_redact_xml_elements` tests it once per text.
+    pass reads it keeps every rest**: ``mask`` is False there. :func:`_redact_xml_elements` tests
+    it once per text.
 
     **Which words may be masked depends on what follows them** (:func:`_rest_words` holds the rules
-    both share). Where the line ends the text, a caller can glue text onto the last word, so
-    :func:`_maskable_rest` decides with its rules for an answer's end, and
-    :func:`_ends_in_camel_head` can refuse the last word too. Where the tag's ``>``, a ``<`` or a
-    line break follows, a last word ending in a whole boundary-free word is refused too, and a
-    surname such as ``Johnson`` is masked there.
+    both share). Where only whitespace follows the line, :func:`_maskable_rest` decides with its
+    rules for an answer's end, and :func:`_ends_in_camel_head` can refuse the last word too. Where
+    the tag's ``>``, a ``<`` or a line break follows, a last word ending in a whole boundary-free
+    word is refused too, and a surname such as ``Johnson`` is masked there.
 
     Where the rules refuse, the rest stays as it stood, and that is the residual, at least these: a
-    rest holding punctuation, a tab or a non-ASCII letter; one holding a word
-    some pass reads literally, a credential word inside a longer word, or a date (``</family
+    rest holding punctuation, a tab or a non-ASCII letter; one holding a word some pass reads
+    literally or the start of one, a credential word inside a longer word, or a date (``</family
     Bearer x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any word after a
     line break inside the tag; every rest in a text that holds the backstop's opener when the XML
     pass reads it; every rest of an end tag outside a walked element that names no vocabulary
@@ -1800,11 +1800,11 @@ def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
     with whitespace) or ``<family>(Van`` (opening with punctuation) reads as prose, and the fragment
     before the cut survives. A closed element is always scrubbed, whatever its text opens with.
 
-    Words after an end tag's name, inside a malformed tag or after one with no ``>``, are masked in
-    place where the rules expect that to change no other pass's reading, and kept as they stood
-    elsewhere (:func:`_end_tag_rest`), in a walked element, and outside one only after a vocabulary
-    end tag (:func:`_mask_stray_end_tags`). ``masks`` False keeps every one
-    as it stood, which is this pass as it was before BACKLOG #5925 (:func:`_masked_only`)."""
+    Words after an end tag's name, inside a malformed tag or after one with no ``>``, can be masked
+    in place in a walked element, and outside one only after a vocabulary end tag
+    (:func:`_mask_stray_end_tags`), where the rules expect that to change no other pass's reading
+    (:func:`_end_tag_rest`); other such words are kept as they stood. ``masks`` False keeps every
+    one as it stood, which is this pass as it was before BACKLOG #5925 (:func:`_masked_only`)."""
     if "<" not in text:
         return text
     out: list[str] = []
@@ -2030,11 +2030,10 @@ def _masked_only(text: str, flat: str, *, widened: bool) -> bool:
 
     **A mask is not a change that sends the text round again.** :func:`_end_tag_rest` masks only
     where that is not expected to change another pass's reading, which the differential fuzz
-    measures and does not prove. The passes
-    are not all fixed points on their own output, so a round main did not run
-    reads differently: ``</given Doe>&Smith, Jones=PID|x`` left ``&[redacted]=PID|[redacted]`` on
-    main, and a second round turns ``Doe>&[redacted]=PID|[redacted]`` into ``[redacted]``, so the
-    ``PID|`` that took a caller's
+    measures and does not prove. The passes are not all fixed points on their own output, so a
+    round the earlier redactor did not run reads differently: ``</given Doe>&Smith, Jones=PID|x``
+    left ``&[redacted]=PID|[redacted]`` on the earlier redactor, and a second round turns
+    ``Doe>&[redacted]=PID|[redacted]`` into ``[redacted]``, so the ``PID|`` that took a caller's
     text joined after the answer was gone and the joined value printed. The exact test is the
     structured passes with every rest kept, which change nothing; the class comparison before it
     only skips that pass where some other change is certain."""
@@ -2191,8 +2190,9 @@ _ANCHOR_PREFIXES = frozenset(
     for end in range(1, len(word) + 1)
 )
 #: Words some pass reads with no word boundary before them, so a caller's text glued after a masked
-#: word could complete one: the segment ids :data:`_MSH_DELIMITERS` sniffs, the backstop's opener,
-#: and the support bundle's ``mfb64:`` marker (spelled here, as above).
+#: word could complete one: at least the segment ids :data:`_MSH_DELIMITERS` sniffs, the first word
+#: of the backstop's opener, and the head of the support bundle's ``mfb64:`` marker (spelled here,
+#: as above).
 _UNBOUNDED_WORDS = (
     *_MSH_DELIMITERS.pattern[3:].split(")", 1)[0].lower().split("|"),
     _USERINFO_OPENER.split(" ", 1)[0],

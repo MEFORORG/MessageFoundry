@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5925: text inside a vocabulary element's malformed end tag is masked where the XML pass sees it.
+"""BACKLOG #5925: text inside a vocabulary element's malformed end tag can be masked.
 
 The XML element walk copied an end tag's remainder -- everything after the tag's name up to the next
 ``<`` or ``>`` -- into the output as it stood. So a synthetic value inside an end tag
@@ -113,10 +113,7 @@ def test_the_rest_is_masked_in_place(text: str, want: str) -> None:
     assert redact(text) == want
 
 
-#: Rests that stay as main left them, the stated residual, at least these: punctuation, a word a
-#: pass reads literally, a credential word inside a longer word, a date, a tab or a non-ASCII letter,
-#: a word on a later line inside the tag, and at the end of the text, a last word a caller's text
-#: could complete (a digit, a boundary-free word's head, a camelCase credential label's head).
+#: Rests the XML pass keeps as main left them; :func:`redaction._end_tag_rest` lists the residual.
 _KEPT = {
     "comma": "<family>Smith</family Zq, Zqxdoe>",
     "credential-label": "<family>Smith</family password: Zqxdoe>",
@@ -388,8 +385,8 @@ def _replace_rest(text: str, start: int, stop: int, mask: bool) -> str:
 
 
 def test_the_end_tag_mask_redacts_at_least_what_main_did_through_composed_joins() -> None:
-    """THE GATE for #5925: over generated vocabulary elements with malformed end tags, joined to raw
-    text and redacted again by every route, every output is main's with some letters and digits
+    """THE GATE for #5925: over generated text around vocabulary elements and end tags, joined to
+    raw text and redacted again by every route, every output is main's with some letters and digits
     masked, so no value main hid prints. The gain count shows the mask is exercised; the replacing
     control shows the arm can find a leak. It is a measurement of this corpus, not a proof for every
     input. This arm can stay green with :func:`redaction._ends_in_camel_head` switched off, so that
@@ -505,7 +502,7 @@ def test_a_scrub_that_keeps_length_and_class_still_runs_another_round() -> None:
 
 
 #: The pieces the generated arm below ends each ``a`` on: name pairs glued to a segment id, and
-#: JSON values.
+#: JSON objects before a field separator.
 _ROUND_PIECES = (
     "&Smith, Jones=PID|x", "&Doe, Webb=PID|", '{"family":"a b"}|q', "&Kim, Li=OBX|y",
     '{"given":"c d"}|',
