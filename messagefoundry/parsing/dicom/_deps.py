@@ -18,6 +18,7 @@ This module imports ``pydicom`` (third-party, not an engine package) and nothing
 from __future__ import annotations
 
 import struct
+import zlib
 from collections.abc import Callable
 from types import ModuleType
 from typing import Any
@@ -79,10 +80,15 @@ def parse_error_types() -> tuple[type[BaseException], ...]:
     wrapping it cannot re-trip the limit). An undefined-length ``SQ`` is read inside ``dcmread``; a
     defined-length one stays raw until first read, so it raises from the accessor that reads it.
     Enumerated at pydicom 3.0.2, and "at least": the list covers what was found, not everything a
-    later pydicom can raise. The stdlib members cover the truncation and garbage decode paths. The
-    accessors on a parsed :class:`~messagefoundry.parsing.dicom.dataset.DicomDataset` read values
-    after ``parse`` returns, outside this wrap; ``measurements()``, which walks the whole SR tree,
-    applies the same tuple itself.
+    later pydicom can raise. The stdlib members cover the truncation and garbage decode paths.
+    ``zlib.error`` is what ``dcmread``'s one-shot inflate raises on a corrupt Deflated Explicit VR
+    LE body, which the deflate guard leaves to ``dcmread`` on purpose (see
+    :func:`messagefoundry.parsing.dicom._inflate.bounded_inflate_or_error`). ``LookupError`` is
+    named rather than ``KeyError`` and ``IndexError`` alone, so its other subclasses are caught too,
+    and ``OverflowError`` covers a numeric conversion overflow (BACKLOG #5803). The accessors on a
+    parsed :class:`~messagefoundry.parsing.dicom.dataset.DicomDataset` read values after ``parse``
+    returns, outside this wrap; ``measurements()``, which walks the whole SR tree, applies the same
+    tuple itself.
 
     Never add bare ``RuntimeError`` or ``Exception``. :func:`load_dcmread` and
     :func:`load_header_readers` raise ``RuntimeError`` for a missing or broken ``[dicom]`` extra, a
@@ -101,7 +107,8 @@ def parse_error_types() -> tuple[type[BaseException], ...]:
         EOFError,
         OSError,
         struct.error,
+        zlib.error,
         AttributeError,
-        KeyError,
-        IndexError,
+        LookupError,
+        OverflowError,
     )
