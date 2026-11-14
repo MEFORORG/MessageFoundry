@@ -431,7 +431,19 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
     emitted: set[str] = set()
     # `Refusal` carries the refusal kinds the shared listener admission returns for a listener to
     # emit (transports/admission.py, vault BACKLOG #2606), so its `kind=` literals are emit sites too.
-    targets = {"_emit_event", "_enqueue_connection_event", "HttpRequestError", "Refusal"}
+    # `_quarantine(path, read_id, mark, kind, reason)` is the FILE source's reject path (BACKLOG
+    # #5717): it forwards `kind` to `_emit_event` as a variable, so its own call sites are where the
+    # literal lives. Unlike the other targets it must yield a literal at EVERY call site, or a kind
+    # routed through it would silently leave the walk (it once did, for `file_decompress_failed`).
+    targets = {
+        "_emit_event",
+        "_enqueue_connection_event",
+        "HttpRequestError",
+        "Refusal",
+        "_quarantine",
+    }
+    quarantine_kind_index = 3
+    unread_quarantine: list[str] = []
     roots = [
         *(_ROOT / "messagefoundry" / "transports").glob("*.py"),
         _ROOT / "messagefoundry" / "pipeline" / "wiring_runner.py",
@@ -451,6 +463,15 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
                 and isinstance(node.args[0].value, str)
             ):
                 emitted.add(node.args[0].value)
+            if name == "_quarantine":
+                kind_node = next((kw.value for kw in node.keywords if kw.arg == "kind"), None)
+                if kind_node is None and len(node.args) > quarantine_kind_index:
+                    kind_node = node.args[quarantine_kind_index]
+                if isinstance(kind_node, _ast.Constant) and isinstance(kind_node.value, str):
+                    emitted.add(kind_node.value)
+                else:
+                    unread_quarantine.append(f"{path.name}:{node.lineno}")
+                continue
             for kw in node.keywords:
                 if (
                     kw.arg == "kind"
@@ -458,6 +479,10 @@ def test_connection_event_vocabulary_is_derived_from_the_emit_sites() -> None:
                     and isinstance(kw.value.value, str)
                 ):
                     emitted.add(kw.value.value)
+    assert not unread_quarantine, (
+        f"_quarantine call(s) whose kind is not a string literal: {unread_quarantine}. The walk "
+        "cannot see what such a call emits, so pass the kind as a literal."
+    )
     assert emitted, "no literal connection_event kind found — the emit-site walk broke, not the doc"
 
     section = _section_7()
