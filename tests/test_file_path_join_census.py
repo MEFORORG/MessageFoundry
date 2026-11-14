@@ -610,6 +610,15 @@ SITES: dict[str, Site] = {
     "messagefoundry/config/wiring.py::_HelperImporter._load": Site(
         1, OPERATOR, "A helper module name from an import in the operator's own config code."
     ),
+    "messagefoundry/config/wiring.py::_link_chain": Site(
+        3,
+        REVIEWED,
+        "A name of the operator's settings or value file path joined to the real folder reached so "
+        "far, a link's own target joined to the real folder holding the link, and the rest of the "
+        "path joined to that target, to name what the start check vets. The walk lstats each "
+        "joined name and reads its link target; no file's contents are read or written through "
+        "any of the three (vault BACKLOG #2596, #6654).",
+    ),
     "messagefoundry/config/wiring.py::config_source_trust_paths": Site(
         3,
         REVIEWED,
@@ -816,15 +825,6 @@ SITES: dict[str, Site] = {
         "A directory name os.walk listed under the operator's config directory, joined to lstat "
         "it for a link or a junction and, when pruned, named in the caller's WARNING (BACKLOG "
         "#5221).",
-    ),
-    "messagefoundry/pipeline/engine.py::Engine._value_file_folders": Site(
-        2,
-        REVIEWED,
-        "A file link's own target, joined to the real folder holding the link, and that hop's "
-        "name re-joined to its own resolved folder, to name the folder the vet checks before "
-        "the value file is read. The walk lstats each joined hop and reads its link target "
-        "before that vet runs; no file's contents are read or written through either join "
-        "(vault BACKLOG #2596).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."

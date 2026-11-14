@@ -15,12 +15,15 @@ an ``icacls`` grant on Windows.
 
 from __future__ import annotations
 
+import errno
 import functools
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -291,3 +294,193 @@ def test_each_read_of_the_value_file_vets_it_again(tmp_path: Path) -> None:
     with pytest.raises(WiringError, match="refusing to read environment values from") as exc:
         read()
     assert str(values) in str(exc.value)
+
+
+# --- a stat fault, and the links a value file is reached through (vault BACKLOG #6654) -----------
+
+
+def _stat_fault(monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+    """Make every stat of ``target`` fail with access denied, as a folder this account cannot
+    traverse does: ``os.stat`` raises, and ``os.path.isdir`` and ``os.path.isfile``, which
+    ``Path.is_dir`` and ``Path.is_file`` call, answer ``False`` as they do for that fault."""
+
+    def _same(path: Any) -> bool:
+        return os.path.normcase(os.fspath(path)) == os.path.normcase(os.fspath(target))
+
+    real_stat = os.stat
+
+    def _stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if _same(path):
+            raise PermissionError(errno.EACCES, "access denied", os.fspath(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", _stat)
+    for name in ("isdir", "isfile"):
+        real = getattr(os.path, name)
+        monkeypatch.setattr(os.path, name, lambda p, _real=real: False if _same(p) else _real(p))
+
+
+@pytest.mark.usefixtures("no_escape")
+@pytest.mark.parametrize("kind", ["folder", "file"])
+def test_a_path_a_stat_cannot_reach_refuses_rather_than_vetting_nothing(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    """Items 2 and 17: ``Path.is_dir`` and ``Path.is_file`` answer ``False`` for a path they cannot
+    stat, so the start check vetted nothing there, though the read that followed could reach it."""
+    settings, values = _two_files(tmp_path)
+    seen = fake_windows_readers(lambda _path: False)
+    files, folders = ([settings], [values.parent]) if kind == "folder" else ([values], [])
+    faulted = values.parent if kind == "folder" else values
+    assert_trusted_start_paths(files, folders=folders)  # control: reachable, it is vetted
+    assert faulted in seen
+
+    _stat_fault(monkeypatch, faulted)
+    with pytest.raises(WiringError, match="could not vet it") as exc:
+        assert_trusted_start_paths(files, folders=folders)
+    assert str(faulted) in str(exc.value)
+
+
+def test_an_absent_file_or_folder_is_still_skipped(tmp_path: Path) -> None:
+    """The control for the refusal above: nothing there is no fault, because nothing is read."""
+    assert _file_and_folder([tmp_path / "absent.toml"], [tmp_path / "gone"]) == []
+
+
+def _link(link: Path, target: Path, *, folder: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=folder)
+    except OSError:
+        pytest.skip("this account cannot create a link")
+
+
+def _norm(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _same_paths(paths: list[Path]) -> set[str]:
+    return {_norm(p) for p in paths}
+
+
+@pytest.mark.usefixtures("no_escape")
+def test_a_value_file_link_vets_the_folder_and_file_it_leads_to(
+    tmp_path: Path, fake_windows_readers: FakeReaders
+) -> None:
+    """Item 5: a value file in ``environments/`` that is a link was vetted as the link and its
+    folder only, so the folder the bytes came from was never vetted."""
+    values = tmp_path / "cfg" / "environments" / "dev.toml"
+    values.parent.mkdir(parents=True)
+    real = tmp_path / "elsewhere" / "dev.toml"
+    real.parent.mkdir()
+    real.write_text("", encoding="utf-8")
+    _link(values, real)
+    seen = fake_windows_readers(lambda _path: False)
+    assert_trusted_start_paths([values], folders=[values.parent])
+    vetted = _same_paths(seen)
+    assert _norm(real.parent) in vetted
+    assert _norm(real) in vetted
+    assert {_norm(values), _norm(values.parent)} <= vetted
+
+    fake_windows_readers(lambda path: _norm(path) == _norm(real.parent))
+    with pytest.raises(WiringError, match="writable-by-others path"):
+        assert_trusted_start_paths([values], folders=[values.parent])
+
+
+@pytest.mark.usefixtures("no_escape")
+def test_a_folder_link_in_the_path_vets_the_folder_holding_it(
+    tmp_path: Path, fake_windows_readers: FakeReaders
+) -> None:
+    """Item 5: a folder link in the value file's path was resolved, not walked, so whoever could
+    write the folder holding it could re-point it unvetted; on Windows the link itself too."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    store = tmp_path / "store" / "envs"
+    store.mkdir(parents=True)
+    (store / "dev.toml").write_text("", encoding="utf-8")
+    linked = cfg / "environments"
+    _link(linked, store, folder=True)
+    values = linked / "dev.toml"
+    seen = fake_windows_readers(lambda _path: False)
+    assert_trusted_start_paths([values], folders=[values.parent])
+    vetted = _same_paths(seen)
+    assert {_norm(cfg), _norm(linked), _norm(store), _norm(store / "dev.toml")} <= vetted
+    assert _norm(tmp_path) not in vetted  # a folder above, holding no link, is not
+
+    fake_windows_readers(lambda path: _norm(path) == _norm(cfg))
+    with pytest.raises(WiringError, match="writable-by-others path"):
+        assert_trusted_start_paths([values])
+
+
+@pytest.mark.usefixtures("no_escape")
+def test_a_relative_link_reached_through_a_folder_link_names_the_real_folder(
+    tmp_path: Path,
+) -> None:
+    """A relative link target names a path from the real folder holding the link. Joined as text
+    to a folder reached through a folder link, its ``..`` collapses on Windows to a decoy folder
+    beside that folder link, so the real folder would go unvetted."""
+    from messagefoundry.config.wiring import _link_chain
+
+    real = tmp_path / "real" / "c"
+    real.mkdir(parents=True)
+    hop_dir = tmp_path / "real" / "x"
+    hop_dir.mkdir()
+    final = tmp_path / "final" / "values.toml"
+    final.parent.mkdir()
+    final.write_text("", encoding="utf-8")
+    decoy = tmp_path / "a" / "x"
+    decoy.mkdir(parents=True)
+    (decoy / "g.toml").write_text("", encoding="utf-8")
+    linked = tmp_path / "a" / "b"
+    _link(linked, real, folder=True)
+    _link(real / "f.toml", Path("..") / "x" / "g.toml")
+    _link(hop_dir / "g.toml", final)
+    chain, end = _link_chain(linked / "f.toml")
+    names = _same_paths(chain)
+    assert {_norm(linked.parent), _norm(real), _norm(hop_dir)} <= names
+    assert _norm(decoy) not in names
+    assert end is not None and _norm(end) == _norm(final)
+
+
+def test_a_link_the_walk_cannot_stat_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 5: ``os.path.islink`` answers ``False`` for a path it cannot stat, so a fault ended the
+    walk early and left the folders past it unvetted."""
+    values = tmp_path / "environments" / "dev.toml"
+    values.parent.mkdir()
+    real = tmp_path / "elsewhere" / "dev.toml"
+    real.parent.mkdir()
+    real.write_text("", encoding="utf-8")
+    _link(values, real)
+    real_lstat = os.lstat
+
+    def _lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if _norm(Path(path)) == _norm(values):
+            raise PermissionError(errno.EACCES, "access denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _lstat)
+    with pytest.raises(WiringError, match="could not vet it"):
+        _file_and_folder([values])
+
+
+@pytest.mark.parametrize(
+    ("target", "plain"),
+    [
+        ("\\\\?\\C:\\data\\dev.toml", "C:\\data\\dev.toml"),
+        ("..\\data\\dev.toml", "..\\data\\dev.toml"),
+        ("D:dev.toml", None),
+        ("\\RPC Control\\dev.toml", None),
+        ("\\\\.\\pipe\\dev", None),
+    ],
+)
+def test_a_windows_link_target_the_walk_cannot_follow_raises(
+    target: str, plain: str | None
+) -> None:
+    """A drive with no separator reads from that drive's own working directory, and a target rooted
+    with no drive may name the object namespace, so neither names a folder the walk can vet."""
+    from messagefoundry.config.wiring import _windows_link_target
+
+    if plain is None:
+        with pytest.raises(OSError):
+            _windows_link_target(target)
+    else:
+        assert _windows_link_target(target) == plain

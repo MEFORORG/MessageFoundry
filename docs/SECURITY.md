@@ -2821,13 +2821,18 @@ from disk instead. On a store that holds an in-process key, the approval covers 
 environment value file wherever `[environments].base_dir` puts it. A store with none binds a value
 file outside the config directory to nothing, as a later paragraph says. In the config directory's
 `environments/` folder the digest
-folds it. Elsewhere, the default layout, the release reads it into the snapshot after vetting the
-file, its folder, and the folder of each link along a chain of file links from it, and checks it
-against a keyed binding the hold took at request time, which the next paragraph describes. That
-vet misses at least these: a directory link
-in the path to the value file, or to any link along that chain, is resolved rather than walked,
-so the folder that holds it is not vetted, and on Windows the link objects themselves are not
-vetted (`Engine._value_file_folders` in [`pipeline/engine.py`](../messagefoundry/pipeline/engine.py)).
+folds it. Elsewhere, the default layout, the release reads it into the snapshot and checks it
+against a keyed binding the hold took at request time, which the next paragraph describes. In
+either place a reload with `serve`'s value provider vets the value file before it reads the config
+directory: the file, its
+folder, each link an open of it follows, a folder link anywhere in its path included, the real
+folder holding each link, and the real file and folder the links lead to (`_link_chain` in
+[`config/wiring.py`](../messagefoundry/config/wiring.py), vault BACKLOG #6654 item 5). A start
+vets the same paths when the engine is built, before its first load reads the directory. A folder
+holding a link is judged by the rule the file's own folder is, so a link that sits directly in
+`C:\` or `C:\ProgramData`, as Windows ships them, is refused. A path in that set that cannot be
+stat'ed, for any reason but nothing being there, is refused rather than skipped. That vet misses at
+least the folders above each of those folders, and the folders a `subst` drive letter stands for.
 Where that value file alone cannot be read, the
 reload is refused, released or not, rather than reading it again from disk. Where the config
 directory cannot be read whole, a value file in its `environments/` folder included, a released

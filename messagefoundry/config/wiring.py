@@ -41,8 +41,10 @@ import io
 import ipaddress
 import logging
 import math
+import ntpath
 import os
 import re
+import stat
 import sys
 import threading
 import tokenize
@@ -10695,21 +10697,115 @@ def _enforce_posix_paths(
 # answer to "who can write this path" for config and for start, on each platform.
 
 
-def _file_and_folder(files: Iterable[Path]) -> list[Path]:
-    """Each file in ``files`` that exists, then the folder it sits in, each path once.
+def _stat_is(path: Path, *, folder: bool) -> bool:
+    """Whether ``path`` is a folder, or with ``folder`` false a regular file, following links.
 
-    The folder counts because whoever can write it can replace the file. A file that does not exist
-    is left out with its folder, because nothing reads it. The value file is read again on every
-    reload, and each of those reads checks it again (``serve``'s ``env_values``), so one created
-    after the start is checked when it is first read."""
-    return list(
-        dict.fromkeys(
-            path
-            for file in files
-            if file.is_file()
-            for path in (file.absolute(), file.absolute().parent)
-        )
+    ``False`` where no object can be opened by that path (:func:`is_missing_directory`), or by a
+    name holding a NUL, so nothing there is read. Any other stat error raises: ``Path.is_dir`` and
+    ``Path.is_file`` answer ``False`` for it too, and the start check then vetted nothing there
+    (vault BACKLOG #6654 items 2 and 17)."""
+    try:
+        mode = path.stat().st_mode
+    except ValueError:
+        return False  # an embedded NUL, which no open accepts either
+    except OSError as exc:
+        if is_missing_directory(exc):
+            return False
+        raise
+    return stat.S_ISDIR(mode) if folder else stat.S_ISREG(mode)
+
+
+def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
+    """What an open of ``path`` passes through that its writer could re-point, and where it ends.
+
+    The first list holds each link the open follows, a folder link anywhere in the path included,
+    each with the real folder that holds it: whoever can write that folder, or on Windows the link
+    itself, can re-point the link between a vet and a read; and last the real object the open
+    reaches, which the second item names too, or ``None`` where nothing is there, so a caller vets
+    that object rather than only the link the path names (vault BACKLOG #2596, #6654 item 5). A
+    path may appear in the list more than once. Only folders holding a link are
+    named: the folders above a path's own folder are not vetted, as for a path with no link.
+
+    Walked the way the open resolves, one name at a time from the root, so a relative link target
+    names a path from the real folder holding the link: on POSIX ``..`` is the real parent of the
+    folder reached, and on Windows the text is normalized before each pass, as Win32 normalizes it.
+
+    Raises ``OSError`` where a name cannot be stat'ed for any reason but absence, a link cannot be
+    read, more than :data:`~messagefoundry.auth.anchor_path.MAX_LINK_HOPS` links are followed, or,
+    on Windows, a link leads to a device path, a drive with no separator after it or a path rooted
+    with no drive, or the name is a reparse point other than a symbolic link or a junction. Each of
+    those would leave a folder the open passes through unread."""
+    from messagefoundry.auth.anchor_path import (
+        _IO_REPARSE_TAG_MOUNT_POINT,
+        _NAME_SURROGATE_BIT,
+        MAX_LINK_HOPS,
     )
+
+    windows = os.name == "nt"
+    found: list[Path] = []
+    hops = 0
+    pending = os.fspath(path.absolute())
+    while True:
+        if windows:
+            # Win32 collapses ``.`` and ``..`` in the text before it follows any link.
+            pending = os.path.normpath(pending)
+        drive, rest = os.path.splitdrive(pending)
+        cur = drive + os.sep
+        parts = [part for part in rest.split(os.sep) if part]
+        for index, name in enumerate(parts):
+            if name == ".":
+                continue
+            if name == "..":
+                # POSIX only: the kernel takes the parent of the folder already reached, which
+                # holds no link.
+                cur = os.path.dirname(cur)
+                continue
+            child = os.path.join(cur, name)
+            try:
+                st = os.lstat(child)
+            except OSError as exc:
+                if is_missing_directory(exc):
+                    return found, None
+                raise
+            tag = getattr(st, "st_reparse_tag", 0)
+            if not (stat.S_ISLNK(st.st_mode) or tag == _IO_REPARSE_TAG_MOUNT_POINT):
+                if tag & _NAME_SURROGATE_BIT:
+                    raise OSError(
+                        errno.EINVAL, f"a reparse point (tag 0x{tag:08x}) this check cannot follow"
+                    )
+                cur = child
+                continue
+            hops += 1
+            if hops > MAX_LINK_HOPS:
+                raise OSError(errno.ELOOP, f"more than {MAX_LINK_HOPS} links were followed")
+            found += [Path(cur), Path(child)]
+            target = os.readlink(child)
+            if windows:
+                target = _windows_link_target(target)
+            if not os.path.isabs(target):
+                target = os.path.join(cur, target)
+            pending = os.path.join(target, *parts[index + 1 :])
+            break
+        else:
+            found.append(Path(cur))
+            return found, found[-1]
+
+
+def _windows_link_target(text: str) -> str:
+    """A Windows link's target, as :func:`_link_chain` joins it: its ``\\\\?\\`` prefix dropped.
+    Raises ``OSError`` for a target the walk could not follow to the folder the open reaches: a
+    device path, a drive with no separator after it (``D:x``), read from that drive's own working
+    directory, or a path rooted with no drive (``\\x``), which may name the object namespace."""
+    from messagefoundry.auth.anchor_path import _drive_relative, _strip_win_prefix
+
+    plain = _strip_win_prefix(text)
+    if plain is None:
+        raise OSError(errno.EINVAL, "a link leads to a device path")
+    if _drive_relative(plain):
+        raise OSError(errno.EINVAL, "a link leads to a drive with no separator after it")
+    if not ntpath.splitdrive(plain)[0] and plain[:1] in ("\\", "/"):
+        raise OSError(errno.EINVAL, "a link leads to a path rooted with no drive")
+    return plain
 
 
 def assert_trusted_start_paths(
@@ -10717,28 +10813,69 @@ def assert_trusted_start_paths(
 ) -> None:
     """Refuse a start that reads a settings file or value file another account could write.
 
-    ``files`` are the settings file and the value file this start reads. Each one that exists is
-    checked with the folder it sits in, by the config-source policy: on Windows the owner and DACL,
-    on POSIX the mode and the owning uid. A refusal raises :class:`WiringError` through
-    :func:`_refuse_unsafe_config_source`, so the clamped ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``
-    escape downgrades it exactly as it does a config refusal (vault BACKLOG #2599). Each message
-    starts with ``lead``, so a re-read of the value file on reload says what it refused.
+    ``files`` are the settings file and the value file this start reads. Each one that is a
+    regular file is checked with the folder it sits in, by the config-source policy: on Windows the
+    owner and DACL, on POSIX the mode and the owning uid. A refusal raises :class:`WiringError`
+    through :func:`_refuse_unsafe_config_source`, so the clamped
+    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape downgrades it exactly as it does a config refusal
+    (vault BACKLOG #2599). Each message starts with ``lead``, so a re-read of the value file on
+    reload says what it refused.
 
     Neither file is code, but each one steers code: the settings file sets the posture, the DR hook
     command, the reload roots and the egress lists, and the value file feeds every ``env()`` lookup
     in the graph. A writer of either would own the service at its next start (vault BACKLOG #2626
     step 3).
 
-    Each of ``folders`` that exists is checked too, whether or not a file in it does: a reload that
-    applies value bytes read earlier needs the folder vetted even when the file has gone since
+    Each of ``folders`` that is a folder is checked too, whether or not a file in it is: a reload
+    that applies value bytes read earlier needs the folder vetted even when the file has gone since
     (vault BACKLOG #2596).
 
-    **Not checked**, at least: the folders above each file's own folder, and a file named in the
-    settings that the start reads later, such as a key, certificate or CRL file. Those have their
-    own checks where they are read, or none."""
-    paths = _file_and_folder(files)
-    paths += [f.absolute() for f in folders if f.is_dir() and f.absolute() not in paths]
+    Where a file or folder is reached through links, each link, the real folder holding each one
+    and the real object the path ends at, with a file's real folder, are checked too
+    (:func:`_link_chain`). The same policy judges a folder holding a link as it judges the file's
+    own folder, so a link that sits directly in ``C:\\`` or ``C:\\ProgramData``, as Windows ships
+    them, is refused (vault BACKLOG #6654 item 5).
+
+    A path that cannot be stat'ed, for any reason but nothing being there, or whose link chain
+    cannot be walked, is refused with ``WiringError`` naming it, and the escape does not downgrade
+    that: nothing about it was vetted (vault BACKLOG #6654 item 2). A file or folder that is not
+    there is not checked, because nothing reads it.
+
+    **Not checked**, at least: the folders above each file's own folder and above each folder
+    holding a link, a ``subst`` drive's own folder, and a file named in the settings that the start
+    reads later, such as a key, certificate or CRL file. Those have their own checks where they are
+    read, or none."""
+    paths = _file_and_folder(files, folders, lead=lead)
     _check_trusted_paths(paths, lead=lead, refuse=_refuse_unsafe_config_source)
+
+
+def _file_and_folder(
+    files: Iterable[Path], folders: Iterable[Path] = (), *, lead: str = "refusing to start from"
+) -> list[Path]:
+    """What :func:`assert_trusted_start_paths` checks, each path once: each of ``files`` that is a
+    regular file, then the folder it sits in, then what :func:`_link_chain` names for it with the
+    real file and its real folder; then each of ``folders`` that is a folder, with what
+    :func:`_link_chain` names for it and the real folder. Raises ``WiringError``, its message
+    starting with ``lead``, for a path that cannot be stat'ed or walked."""
+    paths: list[Path] = []
+    for path, folder in [*((f, False) for f in files), *((f, True) for f in folders)]:
+        try:
+            if not _stat_is(path, folder=folder):
+                continue
+            chain, end = _link_chain(path)
+        except OSError as exc:
+            refusal = safe_exc(exc)
+        else:
+            given = path.absolute()
+            paths += [given, given.parent] if not folder else [given]
+            # The chain ends with the real object the path reaches, when there is one.
+            paths += chain
+            if end is not None and not folder:
+                paths.append(end.parent)
+            continue
+        # Outside the handler, so the refusal carries no __context__.
+        raise WiringError(f"{lead} {path}: could not vet it: {refusal}")
+    return list(dict.fromkeys(paths))
 
 
 def install_trust_paths() -> list[Path]:

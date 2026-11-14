@@ -708,11 +708,12 @@ async def test_an_ungated_reload_with_no_snapshot_refuses_a_value_file_on_a_lost
         assert cast(Any, engine)._env_values == approved_values
         runner = engine.registry_runner
 
-        # serve's provider vets the file's access list first. Stubbed, so the refusal pinned is
-        # the read's own whatever the vet decides of a lost share.
+        # serve's provider, and the reload's snapshot before it, vet the file's access list first.
+        # Stubbed, so the refusal pinned is the read's own whatever the vet decides of a lost share.
         monkeypatch.setattr(
             "messagefoundry.config.wiring.assert_trusted_start_paths", lambda *_a, **_k: None
         )
+        _vet_nothing(monkeypatch)
         # The share is lost: no stat reaches the file, and an existence test finds nothing there.
         value_file.unlink()
         real_stat = Path.stat
@@ -764,46 +765,64 @@ def test_every_folder_along_a_link_chain_is_vetted_before_the_read(
         value_file.symlink_to(middle)
     except OSError:
         pytest.skip("this account cannot create a file link")
-    vetted: list[str] = []
-
-    def _record(files: Any, *, lead: str = "", folders: Any = ()) -> None:
-        vetted.extend(os.path.normcase(os.path.realpath(f)) for f in folders)
-
-    monkeypatch.setattr("messagefoundry.pipeline.engine.assert_trusted_start_paths", _record)
+    vetted = _record_vets(monkeypatch)
     snapshot = Engine._reload_snapshot_blocking(cfg, value_file)
     assert snapshot is not None and snapshot.environment_file(value_file) == _APPROVED.encode()
     for folder in (value_file.parent, middle.parent, final.parent):
-        assert os.path.normcase(os.path.realpath(folder)) in vetted
+        assert ("vet", os.path.normcase(os.path.realpath(folder))) in vetted
 
 
-def test_a_relative_link_reached_through_a_directory_link_vets_the_real_folder(
-    tmp_path: Path,
+def _record_vets(monkeypatch: pytest.MonkeyPatch, value_file: Path | None = None) -> list[Any]:
+    """Record, in order, each path the config-source policy is handed, as ``("vet", path)``, and
+    each read of ``value_file``, as ``("read", path)``; each path normalized and resolved. The
+    policy itself passes everything."""
+    from messagefoundry.config import snapshot as snapshot_module
+    from messagefoundry.config import wiring
+
+    events: list[Any] = []
+
+    def _norm(path: Path) -> str:
+        return os.path.normcase(os.path.realpath(path))
+
+    def _check(paths: Any, **_kwargs: Any) -> None:
+        events.extend(("vet", _norm(p)) for p in paths)
+
+    real_read = snapshot_module._read
+
+    def _read(path: Path) -> bytes:
+        if value_file is not None and _norm(path) == _norm(value_file):
+            events.append(("read", _norm(path)))
+        return real_read(path)
+
+    monkeypatch.setattr(wiring, "_check_trusted_paths", _check)
+    monkeypatch.setattr(snapshot_module, "_read", _read)
+    return events
+
+
+def test_a_reload_vets_a_linked_environments_value_file_before_its_snapshot_reads_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A relative link target names a folder against the real folder holding the link. Joined as
-    text to a folder reached through a directory link, its ``..`` collapses on Windows to a decoy
-    folder beside that directory link, so the intermediate real folder would go unvetted."""
-    real = tmp_path / "real" / "c"
-    real.mkdir(parents=True)
-    hop_dir = tmp_path / "real" / "x"
-    hop_dir.mkdir()
-    final = tmp_path / "final" / "values.toml"
-    final.parent.mkdir()
-    final.write_bytes(_APPROVED.encode())
-    decoy = tmp_path / "a" / "x"
-    decoy.mkdir(parents=True)
-    (decoy / "g.toml").write_bytes(_APPROVED.encode())
-    linked = tmp_path / "a" / "b"
+    """Vault BACKLOG #6654 item 5. A value file in the config directory's ``environments/`` folder
+    that is a link was read by the reload's snapshot before any vet, and the folder its bytes came
+    from was never vetted, since the snapshot covered the file and no chain was walked."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    value_file = cfg / "environments" / "dev.toml"
+    value_file.parent.mkdir()
+    real = tmp_path / "elsewhere" / "dev.toml"
+    real.parent.mkdir()
+    real.write_bytes(_APPROVED.encode())
     try:
-        linked.symlink_to(real, target_is_directory=True)
-        (real / "f.toml").symlink_to(Path("..") / "x" / "g.toml")
-        (hop_dir / "g.toml").symlink_to(final)
+        value_file.symlink_to(real)
     except OSError:
-        pytest.skip("this account cannot create a link")
-    folders = {
-        os.path.normcase(os.path.realpath(f)) for f in Engine._value_file_folders(linked / "f.toml")
-    }
-    assert os.path.normcase(os.path.realpath(hop_dir)) in folders
-    assert os.path.normcase(os.path.realpath(decoy)) not in folders
+        pytest.skip("this account cannot create a file link")
+    events = _record_vets(monkeypatch, real)
+    snapshot = Engine._reload_snapshot_blocking(cfg, value_file)
+    assert snapshot is not None and snapshot.environment_file(value_file) == _APPROVED.encode()
+    where = os.path.normcase(os.path.realpath(real.parent))
+    read = ("read", os.path.normcase(os.path.realpath(real)))
+    assert read in events, "control: the snapshot read the linked file"
+    assert ("vet", where) in events[: events.index(read)]
 
 
 @pytest.mark.skipif(os.path.normcase("A") == "A", reason="Windows names files without case")
