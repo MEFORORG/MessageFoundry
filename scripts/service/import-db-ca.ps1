@@ -433,8 +433,13 @@ $entries = @(foreach ($cert in $bundle) {
     @{ Certificate = $cert; Target = $target }
 })
 if ($refusals.Count -gt 0) {
+    # Printed, not put in the error: PowerShell's error view joins a message's lines and rewraps
+    # them at the console width, which splits a thumbprint from its reason.
+    Write-Host ""
+    Write-Host "Refused:"
+    foreach ($refusal in $refusals) { Write-Host $refusal }
     throw ("Nothing was imported. Every certificate in the file must be a CA without a private " +
-        "key, and these are not:`n" + ($refusals -join "`n"))
+        "key, and the ones listed above are not.")
 }
 if (-not ($entries | Where-Object { $_.Target -eq $stores['Root'] })) {
     # Without its root an issuing CA validates nothing over SChannel, and over the engine's Python TLS

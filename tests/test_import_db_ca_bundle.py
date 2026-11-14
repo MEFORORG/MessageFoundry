@@ -410,7 +410,10 @@ def test_a_bundle_holding_a_non_ca_imports_nothing(
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
     assert "Nothing was imported" in out
-    assert f"{_thumb(chain['leaf'][0])}: its basic constraints say it is not a CA" in out
+    # A whole line: PowerShell's error view rewraps at the console width, and at the 80 columns of
+    # a Linux runner that split the thumbprint from its reason.
+    reason = f"  {_thumb(chain['leaf'][0])}: its basic constraints say it is not a CA"
+    assert reason in out.splitlines(), out
     # Refused before a single import is offered, even the CA beside it.
     assert "What if" not in out
 
