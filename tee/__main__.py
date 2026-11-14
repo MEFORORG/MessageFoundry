@@ -15,10 +15,11 @@ Examples::
     python -m tee run --listen-epic :6661 --corepoint corehost:5000 --mefor meforhost:2575 \
         --listen-corepoint-copy :6662 --capture-corepoint-copy --db ./tee.db
 
-    # Show the most recent NAKs / transport errors
+    # Show the most recent NAKs / transport errors (PHI: each detail can name a patient)
     python -m tee naks --db ./tee.db
 
-    # Export the log as JSON for review / AI analysis (metadata only — never message bodies)
+    # Export the log as JSON for review (never message bodies, but NOT PHI-safe: each row's
+    # detail can carry partner ACK text or an error string naming a patient; check before sharing)
     python -m tee export --db ./tee.db --naks-only --out ./tee-review.json
 
     # Purge the log DB (everything, or older than an age; --captures-only drops just the bodies)
@@ -33,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import io
 import json
 import logging
 import os
@@ -65,10 +67,11 @@ from tee.anon.rules import (
     retargeted_defaults,
 )
 from tee.anon.surrogates import site_prefixes_loaded
+from tee.controlchars import scrub_control_chars
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
-from tee.store import RelayStore
+from tee.store import PurgeIncompleteError, RelayStore
 
 # Shown prominently at every start. ASCII-only so it renders on legacy Windows consoles (cp1252).
 _STARTUP_WARNING = """\
@@ -229,12 +232,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--log-level", default="INFO")
 
-    naks = sub.add_parser("naks", help="show recently logged NAKs / transport errors")
+    naks = sub.add_parser(
+        "naks",
+        help="show recently logged NAKs / transport errors (PHI: a detail can name a patient)",
+    )
     naks.add_argument("--db", required=True, metavar="PATH", help="SQLite log database path")
     naks.add_argument("--limit", type=int, default=50)
 
     export = sub.add_parser(
-        "export", help="export the relay log as JSON (for review / AI analysis)"
+        "export",
+        help="export the relay log as JSON for review; NOT PHI-safe: a row's detail can carry"
+        " partner ACK text or an error string naming a patient, so check it before sharing",
     )
     export.add_argument("--db", required=True, metavar="PATH", help="SQLite log database path")
     export.add_argument(
@@ -270,7 +278,13 @@ def _build_parser() -> argparse.ArgumentParser:
     purge.add_argument(
         "--captures-only",
         action="store_true",
-        help="drop only the captured message bodies, keep the NAK/leg log",
+        help="drop only the captured message bodies; keep the NAK/leg log, whose detail can still"
+        " name a patient",
+    )
+    purge.add_argument(
+        "--scrub-only",
+        action="store_true",
+        help="delete nothing; only re-run the scrub a failed purge left unfinished",
     )
     purge.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
 
@@ -423,12 +437,20 @@ async def _naks(args: argparse.Namespace) -> int:
     if not rows:
         print("no NAKs or transport errors logged")
         return 0
+    # Escaping keeps printable non-ASCII text, which a narrow console encoding such as cp1252 may
+    # not hold, so write anything it cannot encode as a backslash escape rather than fail.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(errors="backslashreplace")
     for row in rows:
         when = datetime.fromtimestamp(row.at, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        code = row.ack_code or row.outcome
+        # Identifiers come from partner bytes, so escape them like the stored detail: a control
+        # character could otherwise drive the terminal.
+        code = scrub_control_chars(row.ack_code or row.outcome)
+        control_id = scrub_control_chars(row.control_id or "-")
+        message_type = scrub_control_chars(row.message_type or "-")
         print(
             f"{when}  {row.direction:<17}  {row.leg:<9}  {code:<6}  "
-            f"control_id={row.control_id or '-'}  type={row.message_type or '-'}  {row.detail or ''}"
+            f"control_id={control_id}  type={message_type}  {row.detail or ''}"
         )
     return 0
 
@@ -454,7 +476,32 @@ async def _export(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _scrub_only(args: argparse.Namespace) -> int:
+    if args.before is not None or args.captures_only:
+        print(
+            "error: --scrub-only deletes nothing; drop --before and --captures-only",
+            file=sys.stderr,
+        )
+        return 2
+    if not os.path.isfile(args.db):
+        # RelayStore.open would create it, and a scrub of a new empty file would read as success.
+        print(f"error: {args.db} does not exist; nothing to scrub", file=sys.stderr)
+        return 2
+    store = await RelayStore.open(args.db)
+    try:
+        await store.scrub()
+    except PurgeIncompleteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await store.close()
+    print(f"scrubbed {args.db}")
+    return 0
+
+
 async def _purge(args: argparse.Namespace) -> int:
+    if args.scrub_only:
+        return await _scrub_only(args)
     scope = "captured bodies only" if args.captures_only else "all logged rows + captured bodies"
     window = "older than the cutoff" if args.before is not None else "EVERYTHING"
     target = f"{scope} ({window}) in {args.db}"
@@ -474,6 +521,9 @@ async def _purge(args: argparse.Namespace) -> int:
     store = await RelayStore.open(args.db)
     try:
         log_n, cap_n = await store.purge(before=args.before, captures_only=args.captures_only)
+    except PurgeIncompleteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     finally:
         await store.close()
     print(f"purged {log_n} log row(s) and {cap_n} capture row(s)")

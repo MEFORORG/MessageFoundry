@@ -7,27 +7,36 @@ and the ACK code, so every NAK is durably captured and greppable (backlog #14's 
 is an **audit/log**, not a durable retry queue — the relay is fail-closed, not store-and-forward.
 
 PHI posture: the log stores message **identifiers** (MSH-10 control id, MSH-9 type) and **metadata**
-(size, outcome, ACK code) — never message bodies. The optional body capture (``--capture-bodies``)
-writes raw HL7 to a separate table and is **off by default**; when on, the DB holds PHI and must live
-on a protected volume (the file is ``chmod 0600`` best-effort on open).
+(size, outcome, ACK code) — never message bodies. Its ``detail`` column, though, can carry at least
+the partner's MSA-3 ACK text or a transport error string, and either can name a patient, so **every**
+tee DB holds PHI at rest, capture on or off, and must live on a protected volume (the file is
+``chmod 0600`` best-effort on open). The optional body capture (``--capture-bodies``) adds raw HL7
+in a separate table and is **off by default**.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import os
+import sqlite3
 import time
 from collections import Counter
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
 
-__all__ = ["RelayStore", "NakRow", "CaptureRow"]
+from tee.controlchars import scrub_control_chars
+
+__all__ = ["RelayStore", "NakRow", "CaptureRow", "PurgeIncompleteError"]
 
 # Bound the stored detail (an MSA-3 reason or an error string) so a hostile/huge field can't bloat the
-# log, and scrub control characters that could corrupt a terminal when an operator reads it back.
+# log, and escape its control characters so it cannot drive a terminal when an operator reads it
+# back. What is escaped is stated once, in docs/PHI.md, section 7, the tee relay paragraph.
 _MAX_DETAIL = 500
 
 _SCHEMA = """
@@ -54,10 +63,72 @@ CREATE TABLE IF NOT EXISTS relay_capture (
     raw        BLOB NOT NULL                 -- full message; ONLY written when --capture-bodies is on
 );
 CREATE INDEX IF NOT EXISTS ix_capture_at ON relay_capture(at);
+
+-- At most one row: the scrub-pending record. A scrub is owed while generation > scrubbed_through,
+-- or while the row is missing (a DB from before the record existed owes one scrub). Open never
+-- writes the row, so it needs no writer lock once the table exists.
+CREATE TABLE IF NOT EXISTS scrub_state (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    generation       INTEGER NOT NULL,
+    scrubbed_through INTEGER NOT NULL
+);
 """
 
 # An ACK code that means the partner rejected the message (vs AA/CA accepted). Used to flag NAK rows.
 _NAK_CODES = ("AE", "AR", "CE", "CR")
+
+_log = logging.getLogger(__name__)
+
+# The scrub_state row is the scrub-pending record. Each delete increments generation in its own
+# transaction, so the record is durable exactly when the delete is. A scrub notes the generation it
+# started from and, once its final checkpoint succeeds, raises scrubbed_through to that value, never
+# lowers it. generation only grows, so a purge that ran at the same time, having raised generation
+# past it, stays owed. Both writes are upserts, because open does not create the row.
+_BUMP_GENERATION = (
+    "INSERT INTO scrub_state (id, generation, scrubbed_through) VALUES (1, 1, 0)"
+    " ON CONFLICT(id) DO UPDATE SET generation = generation + 1"
+)
+_RECORD_SCRUBBED = (
+    "INSERT INTO scrub_state (id, generation, scrubbed_through) VALUES (1, ?, ?)"
+    " ON CONFLICT(id) DO UPDATE SET scrubbed_through = MAX(scrubbed_through, excluded.scrubbed_through)"
+)
+
+# A TRUNCATE checkpoint takes the writer lock, copies the WAL back and waits for readers while
+# holding it, so a long busy wait would stall the live relay's writes for as long. Purge instead
+# polls with no busy wait, which releases the lock between tries, for about the store's usual 5 s
+# busy_timeout in all, and runs a PASSIVE checkpoint first, which copies the bulk of the WAL
+# without blocking writers. VACUUM itself still holds the writer lock for its whole rebuild, as it
+# always has, so a purge that scrubs a large DB can still stall a live relay's writes past its 5 s.
+_BUSY_TIMEOUT_MS = 5000
+_CHECKPOINT_POLL_SECONDS = 0.1
+_CHECKPOINT_ATTEMPTS = 50
+
+
+class PurgeIncompleteError(RuntimeError):
+    """The scrub after a purge's delete (or a ``scrub()`` run alone) did not finish, so purged
+    bodies may still sit in the main DB file or its -wal file. ``reason`` names the step. Any
+    counts are rows the run already deleted and committed; a ``scrub()`` run deletes none."""
+
+    def __init__(self, log_rows: int, capture_rows: int, reason: str) -> None:
+        self.log_rows = log_rows
+        self.capture_rows = capture_rows
+        self.reason = reason
+        super().__init__(
+            f"deleted {log_rows} log row(s) and {capture_rows} capture row(s), but the scrub did"
+            f" not finish ({reason}), so purged bytes may remain in the DB file or its -wal file."
+            " Run `python -m tee purge --db <the same DB> --scrub-only` once the cause is gone;"
+            " docs/TEE-RELAY.md, Purge, says more."
+        )
+
+    def __reduce__(self) -> tuple[type[PurgeIncompleteError], tuple[int, int, str]]:
+        # BaseException would rebuild from the message alone, which this __init__ does not take.
+        return (type(self), (self.log_rows, self.capture_rows, self.reason))
+
+
+def _describe(exc: BaseException) -> str:
+    """An exception as ``Type: message``, or the bare type when it has no message (MemoryError)."""
+    text = str(exc)
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 @dataclass(frozen=True)
@@ -77,7 +148,7 @@ class NakRow:
 @dataclass(frozen=True)
 class CaptureRow:
     """One captured full message **body** (PHI), for the #14 parity-comparison reader. Returned only by
-    the explicit :meth:`RelayStore.captures` read — never by the PHI-safe :meth:`RelayStore.export`."""
+    the explicit :meth:`RelayStore.captures` read — never by the body-free :meth:`RelayStore.export`."""
 
     at: float
     direction: str
@@ -86,11 +157,23 @@ class CaptureRow:
 
 
 def _clean_detail(detail: str | None) -> str | None:
-    """Scrub control characters and bound the length of a logged detail string."""
+    """Escape a logged detail string's control characters with the vendored engine helper, and
+    keep at most ``_MAX_DETAIL`` characters, cut at a character boundary of the original so an
+    escape is never cut in half. Only the first ``_MAX_DETAIL`` characters are read: every escape
+    is at least one character, so nothing past them can reach the result, and the work stays
+    bounded however long the partner's text is. docs/PHI.md, section 7, the tee relay paragraph,
+    says what is escaped."""
     if detail is None:
         return None
-    cleaned = "".join(ch if ch >= " " or ch == "\t" else " " for ch in detail)
-    return cleaned[:_MAX_DETAIL]
+    pieces: list[str] = []
+    used = 0
+    for ch in detail[:_MAX_DETAIL]:
+        piece = scrub_control_chars(ch)
+        if used + len(piece) > _MAX_DETAIL:
+            break
+        pieces.append(piece)
+        used += len(piece)
+    return "".join(pieces)
 
 
 def _iso(at: float) -> str:
@@ -104,7 +187,9 @@ def _is_nak(row: aiosqlite.Row) -> bool:
 
 
 def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
-    """One relay_log row as a plain JSON-able dict (metadata only — never a message body)."""
+    """One relay_log row as a plain JSON-able dict. Never a message body, but ``detail`` can name a
+    patient (docs/PHI.md, section 7, the tee relay paragraph). Values are as stored; the JSON
+    writer's own escaping keeps control and non-ASCII characters out of the file."""
     return {
         "at": row["at"],
         "at_iso": _iso(row["at"]),
@@ -163,14 +248,23 @@ def _precreate_secure(path: str) -> None:
 
 
 def _secure_file(path: str) -> None:
-    """Best-effort owner-only permissions on the DB file **and its WAL/SHM siblings** (which WAL mode
-    creates and which can hold message data when body capture is on)."""
+    """Best-effort owner-only permissions on the DB file **and its WAL/SHM siblings**, which WAL mode
+    creates. The -wal can hold any recent page, so relay_log detail always and message bodies when
+    body capture is on.
+
+    On POSIX a sibling SQLite re-creates later, after this one-time chmod, takes the main file's
+    mode whatever the umask (the unix VFS copies it), so it is 0600 whenever the main file is,
+    which holds only when _precreate_secure's 0600 create or this best-effort chmod succeeds;
+    neither reports a failure. test_wal_siblings_recreated_after_open_inherit_owner_only_mode
+    pins the inheritance. On Windows chmod sets only
+    the read-only bit, so none of the three files is restricted to the owner here; that half is
+    open (BACKLOG #5637) and the protected-volume advice below is the only control there today."""
     for sibling in (path, path + "-wal", path + "-shm"):
         try:  # noqa: SIM105 - suppress() would drop the rationale recorded in the handler below
             os.chmod(sibling, 0o600)
         except OSError:
-            # Non-fatal: on some filesystems / Windows ACLs chmod is a partial no-op. Deployments that
-            # enable body capture should place the DB on a protected volume regardless.
+            # Non-fatal: on some filesystems / Windows ACLs chmod is a partial no-op. Every tee DB,
+            # capture on or off, should be on a protected volume regardless (module docstring).
             pass
 
 
@@ -193,7 +287,13 @@ class RelayStore:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
-        await db.execute("PRAGMA busy_timeout=5000")
+        await db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        # FAST zeroes deleted content inside a page where that costs no extra I/O, but leaves a
+        # freed page as it was. ON would write a zeroed WAL frame for every freed page before the
+        # delete commits, so a purge to free space on a full volume would fail and delete nothing.
+        # The scrub's VACUUM removes what FAST leaves. Per-connection, so set on the store's one.
+        async with db.execute("PRAGMA secure_delete=FAST"):
+            pass
         await db.executescript(_SCHEMA)
         await db.commit()
         if path != ":memory:":
@@ -313,36 +413,204 @@ class RelayStore:
             for row in rows
         ]
 
+    async def _checkpoint_truncate(self) -> bool:
+        """Copy every WAL frame into the main file and truncate the -wal to zero bytes.
+
+        The result row is ``(busy, log, checkpointed)``; only ``busy == 0`` means the WAL was fully
+        copied back and truncated. Polls with busy_timeout at 0 (see ``_CHECKPOINT_ATTEMPTS``)."""
+        await self._pragma("busy_timeout=0")
+        try:
+            await self._pragma("wal_checkpoint(PASSIVE)")  # the bulk copy, without the writer lock
+            for attempt in range(_CHECKPOINT_ATTEMPTS):
+                async with self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)") as cur:
+                    row = await cur.fetchone()
+                if row is not None and int(row[0]) == 0:
+                    return True
+                if attempt + 1 < _CHECKPOINT_ATTEMPTS:
+                    await asyncio.sleep(_CHECKPOINT_POLL_SECONDS)
+            return False
+        finally:
+            await self._pragma(f"busy_timeout={_BUSY_TIMEOUT_MS}")
+
+    async def _scrub(self, log_rows: int, capture_rows: int) -> None:
+        """TRUNCATE checkpoint, VACUUM, TRUNCATE checkpoint; raise if any of them does not finish.
+
+        The first checkpoint writes the pages secure_delete zeroed back into the main file and
+        empties the -wal. VACUUM is part of the scrub too: secure_delete=FAST leaves freed pages
+        as they were, and B-tree rebalancing can leave stale copies of a deleted cell in a page's
+        unused space; only VACUUM's rebuild removes them, and only
+        once the second checkpoint writes the rebuilt pages over the old ones. That checkpoint runs
+        even after a failed VACUUM, to truncate the frames the VACUUM spilled into the -wal.
+
+        At least these raise :class:`PurgeIncompleteError`, with ``log_rows`` and
+        ``capture_rows`` as the caller's deleted counts: a checkpoint that stays busy, and a
+        ``sqlite3.Error`` or ``MemoryError`` (CPython's SQLITE_NOMEM) from VACUUM, a checkpoint or a
+        PRAGMA. Anything else, such as a cancellation, propagates as raised.
+
+        This is a file-level scrub. A TRUNCATE frees the -wal's blocks and VACUUM's checkpoint
+        shrinks the DB file without overwriting either, so the bytes can stay in freed filesystem
+        blocks, and nothing here reaches a copy or backup taken before the purge."""
+        # temp_store=FILE for the VACUUM, so its rebuilt copy goes to a temp file in SQLite's temp
+        # directory, as docs/TEE-RELAY.md, Purge, says, even on a build whose default is memory: in
+        # memory a large capture DB would fail every purge. A build compiled with
+        # SQLITE_TEMP_STORE=3 keeps it in memory whatever this says.
+        try:
+            started_from = await self._generation()
+        except (sqlite3.Error, MemoryError) as exc:
+            raise PurgeIncompleteError(
+                log_rows, capture_rows, f"reading the scrub-pending record failed: {_describe(exc)}"
+            ) from exc
+        try:
+            scrubbed = await self._checkpoint_truncate()
+        except (sqlite3.Error, MemoryError) as exc:
+            raise PurgeIncompleteError(
+                log_rows, capture_rows, f"the WAL checkpoint failed: {_describe(exc)}"
+            ) from exc
+        if not scrubbed:
+            raise PurgeIncompleteError(log_rows, capture_rows, "the WAL checkpoint stayed busy")
+        failures: list[str] = []
+        cause: BaseException | None = None
+        try:
+            await self._pragma("temp_store=FILE")
+        except (sqlite3.Error, MemoryError) as exc:
+            failures.append(f"setting temp_store=FILE before VACUUM failed: {_describe(exc)}")
+            cause = exc
+        else:
+            try:
+                async with self._db.execute("VACUUM"):
+                    pass
+            except (sqlite3.Error, MemoryError) as exc:
+                failures.append(f"VACUUM failed: {_describe(exc)}")
+                cause = exc
+            try:
+                await self._pragma("temp_store=DEFAULT")
+            except (sqlite3.Error, MemoryError) as exc:  # not part of the scrub
+                _log.warning("tee store: restoring temp_store after VACUUM failed: %s", exc)
+        try:  # runs even after a failed VACUUM, to truncate the frames it spilled
+            if not await self._checkpoint_truncate():
+                failures.append("the WAL checkpoint after VACUUM stayed busy")
+        except (sqlite3.Error, MemoryError) as exc:
+            failures.append(f"the WAL checkpoint after VACUUM failed: {_describe(exc)}")
+            cause = cause or exc
+        if failures:
+            raise PurgeIncompleteError(log_rows, capture_rows, "; then ".join(failures)) from cause
+        # The scrub has finished. Recording that is not part of it: if the record fails, the next
+        # purge scrubs again, so the failure is logged, not reported as residue.
+        try:
+            async with (
+                self._immediate_txn(),
+                self._db.execute(_RECORD_SCRUBBED, (started_from, started_from)),
+            ):
+                pass
+        except (sqlite3.Error, MemoryError) as exc:
+            _log.warning("tee store: the scrub finished but recording it failed: %s", exc)
+
+    @contextlib.asynccontextmanager
+    async def _immediate_txn(self) -> AsyncIterator[None]:
+        """One write transaction: BEGIN IMMEDIATE, then commit, or roll back if the body or the
+        commit raises.
+
+        A transaction left open by an earlier failure is rolled back first, never committed, so a
+        half-done write cannot become durable through a later commit."""
+        if self._db.in_transaction:
+            await self._db.rollback()
+        async with self._db.execute("BEGIN IMMEDIATE"):
+            pass
+        try:
+            yield
+            await self._db.commit()
+        except BaseException:
+            try:
+                await self._db.rollback()
+            except sqlite3.Error as exc:
+                _log.warning("tee store: rollback after a failed write failed: %s", exc)
+            raise
+
+    async def _generation(self) -> int:
+        async with self._db.execute("SELECT generation FROM scrub_state WHERE id = 1") as cur:
+            row = await cur.fetchone()
+        return 0 if row is None else int(row[0])
+
+    async def _owed(self) -> bool:
+        """Whether a scrub is owed: generation is past scrubbed_through, or there is no record yet,
+        which a DB from before the record existed reads as one scrub owed."""
+        async with self._db.execute(
+            "SELECT generation > scrubbed_through FROM scrub_state WHERE id = 1"
+        ) as cur:
+            row = await cur.fetchone()
+        return row is None or bool(row[0])
+
+    async def scrub(self) -> None:
+        """Attempt the scrub alone, deleting nothing (``purge --scrub-only``). It writes no record
+        before it starts: an owed scrub's record already exists and stays until a scrub finishes,
+        and a scrub that was not owed creates no obligation by failing. Raises
+        :class:`PurgeIncompleteError` (with zero counts) as :meth:`_scrub` says."""
+        async with self._lock:
+            await self._scrub(0, 0)
+
+    async def _pragma(self, setting: str) -> None:
+        # Close the cursor: aiosqlite keeps an unclosed one's statement in progress, which makes a
+        # later VACUUM fail ("SQL statements in progress") or a journal-mode change silently refuse.
+        async with self._db.execute(f"PRAGMA {setting}"):
+            pass
+
     async def purge(
         self, *, before: float | None = None, captures_only: bool = False
     ) -> tuple[int, int]:
-        """Delete logged rows + captured bodies, then ``VACUUM`` to reclaim disk.
+        """Delete logged rows + captured bodies, then scrub deleted bodies from the DB and -wal files.
 
         ``before=None`` purges **everything**; ``before=<epoch>`` purges only rows older than it.
         ``captures_only`` leaves the relay_log (the NAK/leg audit) intact and drops only the captured
-        message bodies (the PHI-bearing table). Returns ``(relay_log rows, relay_capture rows)`` deleted.
+        message bodies (log rows can carry PHI too, see ``detail``). Returns ``(relay_log rows, relay_capture rows)`` deleted.
+
+        In WAL mode a delete writes new pages to the -wal file and leaves the old frames, body
+        bytes included, on disk until a checkpoint, so once the delete commits, a run that deleted
+        any row runs :meth:`_scrub`, which raises :class:`PurgeIncompleteError` with the deleted
+        counts if the scrub does not finish. Returning the counts then would read as a clean purge
+        that did not happen. relay_log rows count too: their ``detail`` can carry partner ACK text
+        that names a patient. When a run scrubs, and what finishes an unfinished scrub, is stated
+        once in docs/TEE-RELAY.md, Purge; the mechanism is the ``scrub_state`` row
+        (``_BUMP_GENERATION``).
         """
         async with self._lock:
-            # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
-            # rowcount inaccurate (0). `WHERE 1` deletes row-by-row so the returned count is real.
-            if before is None:
-                cap = await self._db.execute("DELETE FROM relay_capture WHERE 1")
-                log = (
-                    None
-                    if captures_only
-                    else await self._db.execute("DELETE FROM relay_log WHERE 1")
-                )
-            else:
-                cap = await self._db.execute("DELETE FROM relay_capture WHERE at < ?", (before,))
-                log = (
-                    None
-                    if captures_only
-                    else await self._db.execute("DELETE FROM relay_log WHERE at < ?", (before,))
-                )
-            cap_n = cap.rowcount
-            log_n = 0 if log is None else log.rowcount
-            await self._db.commit()
-            await self._db.execute("VACUUM")  # reclaim freed pages (esp. after dropping bodies)
+            # The delete and its scrub-pending record are one transaction: a failure in either rolls
+            # both back, so nothing is deleted without the record. That failure deletes nothing and
+            # propagates as raised.
+            async with self._immediate_txn():
+                # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which
+                # makes rowcount inaccurate (0). `WHERE 1` deletes row-by-row so the count is real.
+                if before is None:
+                    cap = await self._db.execute("DELETE FROM relay_capture WHERE 1")
+                    log = (
+                        None
+                        if captures_only
+                        else await self._db.execute("DELETE FROM relay_log WHERE 1")
+                    )
+                else:
+                    cap = await self._db.execute(
+                        "DELETE FROM relay_capture WHERE at < ?", (before,)
+                    )
+                    log = (
+                        None
+                        if captures_only
+                        else await self._db.execute("DELETE FROM relay_log WHERE at < ?", (before,))
+                    )
+                cap_n = cap.rowcount
+                log_n = 0 if log is None else log.rowcount
+                await cap.close()
+                if log is not None:
+                    await log.close()
+                if log_n or cap_n:
+                    async with self._db.execute(_BUMP_GENERATION):
+                        pass
+            try:
+                owed = bool(log_n or cap_n) or await self._owed()
+            except (sqlite3.Error, MemoryError) as exc:
+                raise PurgeIncompleteError(
+                    log_n, cap_n, f"reading the scrub-pending record failed: {_describe(exc)}"
+                ) from exc
+            if owed:
+                await self._scrub(log_n, cap_n)
         return (log_n, cap_n)
 
     async def export(
@@ -353,10 +621,12 @@ class RelayStore:
         naks_only: bool = False,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """A **PHI-safe, structured** snapshot of the relay LOG for review / AI analysis.
+        """A **body-free, structured** snapshot of the relay LOG for review / AI analysis.
 
         Returns ``{"summary": {...}, "rows": [...]}`` — never the captured message **bodies** (only the
-        leg metadata: outcomes, ACK codes, control ids, types, sizes, sanitized details). The summary
+        leg metadata: outcomes, ACK codes, control ids, types, sizes, details). It is **not**
+        PHI-safe: ``detail`` is stored as docs/PHI.md, section 7, the tee relay paragraph says, and can name a patient, so treat an
+        export as PHI. The summary
         aggregates the whole time window; ``rows`` is optionally narrowed to NAKs and the most-recent
         ``limit``. Filtering is done in Python (the log is small), so the SQL stays static."""
         async with self._lock:
