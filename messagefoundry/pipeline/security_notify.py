@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Final, Protocol
+from typing import Final, Protocol, get_args
 
 from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
 from messagefoundry.auth.notifications import (
@@ -66,6 +66,7 @@ from messagefoundry.pipeline.alert_sinks import (
     _refuse_off_allowlist_smtp_host,
     send_plain_email,
 )
+from messagefoundry.store.store import LockoutCounter
 from messagefoundry.transports.email import checked_sender
 
 log = logging.getLogger(__name__)
@@ -77,6 +78,9 @@ SECURITY_NOTICE_UNDELIVERED_ACTION: Final = "auth.security_notice_undelivered"
 #: How many queue-full records may be in flight at once. Past it a drop goes unrecorded, so the
 #: overload that filled the queue cannot also grow tasks and store writers without bound.
 _MAX_RECORDING: Final = 64
+#: The closed set of lock kinds a lock notice's undelivered row may name (BACKLOG #1138). Anything
+#: else in the event's detail is left off the row.
+_LOCK_KINDS: Final = frozenset(get_args(LockoutCounter))
 
 
 class NoticeAuditSink(Protocol):
@@ -821,11 +825,12 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         say which account was never told. The actor is the notice's recipient, so the row also
         reaches that account's ``/me/security-events`` feed. The detail is the notice kind and
         ``why``, plus the holder's username on an issuer's reminder, which says whose credential it
-        was. Never the rest of ``event.detail`` or the address: an EMAIL_CHANGED carries an address
-        in its detail. A lock notice writes the hidden ``auth.lock_notice_undelivered`` action (BACKLOG
-        #1131). A failed write is swallowed, like the send it reports on. It is logged by class, and
-        not at all for a lock notice: that kind writes no other line, so a lone line would say a
-        lock landed."""
+        was, and the closed-set lock kind on a lock notice, which the lock-notice throttle reads
+        (BACKLOG #1138). Never the rest of ``event.detail`` or the address: an EMAIL_CHANGED
+        carries an address in its detail. A lock notice writes the hidden
+        ``auth.lock_notice_undelivered`` action (BACKLOG #1131). A failed write is swallowed, like
+        the send it reports on. It is logged by class, and not at all for a lock notice: that kind
+        writes no other line, so a lone line would say a lock landed."""
         if self._audit is None:
             return
         silent = event.event_type in LOG_SILENT_EVENT_TYPES
@@ -834,6 +839,9 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         holder = event.detail.get("holder")
         if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER and isinstance(holder, str):
             detail["holder"] = holder
+        lock = event.detail.get("lock")
+        if event.event_type == ACCOUNT_LOCKED and isinstance(lock, str) and lock in _LOCK_KINDS:
+            detail["lock"] = lock
         try:
             await self._audit.record_audit(
                 action, actor=event.username, detail=json.dumps(detail, sort_keys=True)

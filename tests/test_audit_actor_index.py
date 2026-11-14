@@ -37,6 +37,7 @@ _SQLSERVER_ON = bool(os.getenv("MEFOR_TEST_SQLSERVER"))
 _POSTGRES_ON = bool(os.getenv("MEFOR_TEST_POSTGRES"))
 
 _LOCK_NOTICE = "auth.lock_notice"
+_LOCK_NOTICE_UNDELIVERED = "auth.lock_notice_undelivered"
 
 
 async def _open(backend: str, path: Path) -> Any:
@@ -189,11 +190,13 @@ async def _plan(
         return " | ".join(str(r[-1]) for r in await cur.fetchall())
 
 
+@pytest.mark.parametrize("action", [_LOCK_NOTICE, _LOCK_NOTICE_UNDELIVERED])
 async def test_the_throttle_read_seeks_the_actor_index_on_sqlite(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    action: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The plan of the statement ``list_audit`` runs for the throttle seeks ``ix_audit_actor`` on
-    both the actor and the action, not ``ix_audit_actor_id`` on the actor alone.
+    both the actor and the action, not ``ix_audit_actor_id`` on the actor alone. The throttle reads
+    two actions, its own rows and the relay's undelivered rows (BACKLOG #1138).
 
     The filters are the ones ``AuthService._lock_notice_held_back`` passes today, written out here.
     The control is an action-only read, whose plan names ``ix_audit_action``, so the instrument is
@@ -203,7 +206,7 @@ async def test_the_throttle_read_seeks_the_actor_index_on_sqlite(
         throttle = await _plan(
             store,
             monkeypatch,
-            lambda s: s.list_audit(actor="owner", action=_LOCK_NOTICE, since=0.0, limit=50),
+            lambda s: s.list_audit(actor="owner", action=action, since=0.0, limit=50),
         )
         control = await _plan(store, monkeypatch, lambda s: s.list_audit(action=_LOCK_NOTICE))
     finally:

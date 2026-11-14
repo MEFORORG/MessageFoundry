@@ -7034,7 +7034,8 @@ not push a refused sign-in past its padded slot. The task is queued per account 
 one API process. Two locks of one kind landing together there would send one mail. **One throttle
 read runs at a time in each API process, across every account**, so locks on many accounts at once
 cannot fill the store's read pool that sign-ins wait on; each mail then waits behind the reads
-queued before it. Every backend carries an `(actor, action, id)` index for that read, keyed on a
+queued before it. Every backend carries an `(actor, action, id)` index for that read, and for
+its second read of the `auth.lock_notice_undelivered` rows, keyed on a
 prefix of the actor on Postgres (vault BACKLOG #3120). A companion `(actor, id)` index, keyed the
 same way, serves the audit reads filtered by actor without an action equality (`GET
 /audit?actor=`, its export pages, `/me/security-events`); without it SQLite sought the actor on the
@@ -7615,7 +7616,10 @@ the actor. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
 notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
-holder. The row never carries the address, the rest of the notice's detail, or the error. The
+holder, and a lock notice its lock kind. A lock notice whose send failed keeps its
+`auth.lock_notice` row reading `mailed: true`, but the throttle reads the undelivered row too: one
+of the kind stamped no earlier than the newest row holding the next notice back cancels that hold,
+so the next lock of the kind mails again (BACKLOG #1138). The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
@@ -7652,12 +7656,6 @@ again for the row, and only when a send failed. **Still open, at least:**
   exit may wait for it, or it may be lost with no log line.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
-- A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
-  because the send fails on the relay's own task after that row is written. So the throttle holds
-  back the next lock notice of the kind for the rest of its 24 hours. The failure is on the
-  `auth.lock_notice_undelivered` row, which the throttle does not read. *Kept as a residual (vault
-  BACKLOG #3120): closing it would need that row to carry the lock kind and the throttle to read a
-  second action.*
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
 engine waits at most two seconds for pending notices, then cancels any still pending, each with one

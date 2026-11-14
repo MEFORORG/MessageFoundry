@@ -35,6 +35,7 @@ from collections.abc import (
     Callable,
     Coroutine,
     Iterable,
+    Iterator,
     Mapping,
     Sequence,
 )
@@ -56,6 +57,7 @@ from messagefoundry.auth.audit_visibility import (
     CHANNEL_SCOPE_CHANGED_ACTION,
     DIRECTORY_LOGIN_LOCKED_ACTION,
     LOCK_NOTICE_ACTION,
+    LOCK_NOTICE_UNDELIVERED_ACTION,
     LOCKED_REFUSAL_DETAIL,
     LOGIN_LOCKED_ACTION,
 )
@@ -3239,6 +3241,18 @@ async def lockable_account_census(
 
 def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
+
+
+def _lock_notice_details(rows: Iterable[Any], lock: str) -> Iterator[tuple[Any, dict[str, Any]]]:
+    """Each audit row whose JSON detail names this ``lock`` kind, with that detail, in row order.
+    A row whose detail does not parse as a JSON object is skipped."""
+    for row in rows:
+        try:
+            detail = json.loads(row["detail"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(detail, dict) and detail.get("lock") == lock:
+            yield row, detail
 
 
 def _is_idp_transport_failure(exc: BaseException) -> bool:
@@ -20346,11 +20360,21 @@ class AuthService:
     async def _lock_notice_held_back(self, user: UserRecord, lock: str) -> bool:
         """The throttle's READ: whether a notice of this ``lock`` kind already went out in the window.
 
+        The newest ``auth.lock_notice`` row of the kind that holds a notice back is cancelled by an
+        ``auth.lock_notice_undelivered`` row of the kind stamped no earlier than it, which the
+        notifier writes when the send fails after the hand-off (BACKLOG #1138). So a failure before
+        a later mail cancels nothing, and a repeated lock retries a relay that failed last time.
+        Compared by timestamp, not row id: the store stamps the ``auth.lock_notice`` row as its
+        write starts, before anything yields to the loop after the hand-off, and the notifier's
+        send starts only once the loop runs its task. Its id is taken later, and on a server
+        backend a failed send's row can take a lower one.
+
         Kept apart from the row write, so the background task can send the mail between this read
-        and :meth:`_record_lock_notice` (BACKLOG #2216). An audit index serves it (vault BACKLOG
-        #3120); ``docs/SECURITY.md`` names it and says on which backends its use is measured. One
-        such read still runs at a time per service (``_lock_notice_read_slots``), so locks on many
-        accounts at once cannot fill the store's read pool, which sign-ins wait on too. The cost is
+        and :meth:`_record_lock_notice` (BACKLOG #2216). An audit index serves both actions' reads
+        (vault BACKLOG #3120); ``docs/SECURITY.md`` names it and says on which backends its use is
+        measured. One throttle's reads still run at a time per service (``_lock_notice_read_slots``),
+        so locks on many accounts at once cannot fill the store's read pool, which sign-ins wait on
+        too. The cost is
         that each notice waits behind the reads queued before it, across every account in this
         process; ``docs/SECURITY.md`` states it.
 
@@ -20365,6 +20389,20 @@ class AuthService:
                 rows = await self._store.list_audit(
                     actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
                 )
+                for row, detail in _lock_notice_details(rows, lock):
+                    # A row that mailed nothing holds back only another addressless notice.
+                    if detail.get("mailed", True) is not False or not mailable:
+                        holding = float(row["ts"])
+                        break
+                else:
+                    return False
+                # ``since`` is inclusive, so this reads the failures stamped no earlier.
+                failed = await self._store.list_audit(
+                    actor=user.username,
+                    action=LOCK_NOTICE_UNDELIVERED_ACTION,
+                    since=holding,
+                    limit=50,
+                )
         except Exception as exc:  # noqa: BLE001 - fails open by design, and is logged
             _log.error(
                 "a security-notice throttle read failed (%s); the throttle did not hold the notice "
@@ -20372,16 +20410,7 @@ class AuthService:
                 type(exc).__name__,
             )
             return False
-        for row in rows:
-            try:
-                detail = json.loads(row["detail"] or "{}")
-                kind, mailed = detail.get("lock"), detail.get("mailed", True)
-            except (TypeError, ValueError, AttributeError):
-                continue
-            # A row that mailed nothing holds back only another addressless notice.
-            if kind == lock and (mailed is not False or not mailable):
-                return True
-        return False
+        return next(_lock_notice_details(failed, lock), None) is None
 
     async def _record_lock_notice(self, user: UserRecord, lock: str, *, handed: bool) -> None:
         """Write the ``auth.lock_notice`` row the throttle reads, after the mail.
@@ -20392,11 +20421,10 @@ class AuthService:
         ``mailed: false``, which holds back no later
         mailable notice, so the next lock mails again rather than staying quiet for a day.
 
-        **A send that fails after the hand-off still leaves ``mailed: true``.** It fails on the
-        notifier's own task, after this row is written, and is recorded only on the notifier's
-        ``auth.lock_notice_undelivered`` row (BACKLOG #2383), which the throttle does not read. So
-        the next lock of the kind is held back for the rest of the window. A residual
-        ``docs/SECURITY.md`` states."""
+        A send that fails after the hand-off still leaves ``mailed: true``: it fails on the
+        notifier's own task, after this row is written. The notifier's newer
+        ``auth.lock_notice_undelivered`` row (BACKLOG #2383) then cancels this row's hold, in
+        :meth:`_lock_notice_held_back` (BACKLOG #1138)."""
         await self._audit(
             _LOCK_NOTICE_ACTION,
             actor=user.username,
