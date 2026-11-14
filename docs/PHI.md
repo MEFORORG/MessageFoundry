@@ -442,11 +442,12 @@ than a path is not checked
   Windows it also reads the access list of the directory that holds the file, and refuses it when
   one of the groups above or an application package may delete a file in it, change its access
   list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when
-  its owner is such a group or cannot be read. When the directory that holds the file is itself
-  a junction, a symbolic link or a folder a volume is mounted on, at least, the owner and access
-  list of its target are not read, nor those of the folders above the target, so a junction only
-  the engine's account and the host's administrators can change, pointing to a folder where a
-  broad group may delete a file, passes: restrict the target and the folders above it yourself.
+  its owner is such a group or cannot be read. Where a junction, a symbolic link or a folder a
+  volume is mounted on is on the path, at least these are not read: when it is the directory that
+  holds the file, its target's owner and access list; and the folders on its target's side above
+  the directory that holds the file. So a junction only the engine's account and the host's
+  administrators can change, pointing to a folder where a broad group may delete a file, passes:
+  restrict the target and the folders above it yourself.
   A right to list or traverse the directory, or to add
   a file to it, is not refused, so a store directory the engine makes under `C:\ProgramData`, which
   inherits that folder's grant to Users, passes. A path spelled as a network share
@@ -467,7 +468,9 @@ than a path is not checked
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
   in the group, and one held in a directory that another account owns or that a group or other may
   write without the sticky bit (vault BACKLOG #5636). A link in a folder above it is judged as the
-  item above says, which reads the owner and mode of the folders at and above that link. Where no
+  item above says, which reads the owner and mode of the folders at and above that link, but not
+  the folders on its target's side above the directory that holds the file, so a root-owned link
+  to a folder under one any account may write passes: restrict those folders yourself. Where no
   link is on the path, only the directory that holds the file has its owner and mode read, not the
   ones above it. A directory a group or other account may write is accepted when it has the sticky
   bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
