@@ -1432,15 +1432,17 @@ POST `/uploads` (or the web-console delegate POST `/ui/uploaded-logs/upload`, wh
 core handler) to browse/re-send it offline. It is **off unless `[store].uploads_dir` is set**, and its
 upload chokepoint enforces a fixed policy independent of the directory-source policy above:
 
-- **Permitted types — text only.** An extension allowlist (`.hl7`, `.hl7v2`, `.txt`, `.xml`) is enforced
-  on the sanitized display filename **and** the content is sniffed against it: `.hl7`/`.hl7v2` must begin
-  with an HL7 header segment (`MSH`/`FHS`/`BHS`), `.xml` with a leading `<`, `.txt` must be NUL-free
-  decodable text (ASVS 5.2.2). A disallowed extension or a content/extension mismatch (e.g. PNG bytes in
-  a `.hl7`) is refused at the chokepoint — before any PHI is written — with **HTTP 400** and a
-  metadata-only `upload.reject` audit. In addition, POST `/uploads` rejects any **non-text or
-  metadata-bearing container** body (a NUL-byte / control-character-dense payload, or JPEG/PNG/PDF/ZIP —
-  incl. DOCX — magic bytes) with **HTTP 415** (ASVS 14.2.8); because only plaintext is ever accepted, no
-  embedded-metadata container (EXIF/XMP/`docProps`) can reach storage, so there is nothing to strip.
+- **Permitted types — text only.** The upload chokepoint (`UploadStore.save`) first refuses any
+  **non-text or metadata-bearing container** body with **HTTP 415** (ASVS 14.2.8): a body that begins
+  with JPEG/PNG/PDF/ZIP (incl. DOCX)/GIF/TIFF magic bytes, holds a NUL byte anywhere, or has a
+  control-character-dense 8 KiB window. Past the leading signature, the check refuses only a NUL
+  anywhere and a control-dense window, so a NUL-free binary payload after a text head can pass.
+  Then an extension allowlist (`.hl7`, `.hl7v2`, `.txt`, `.xml`) is
+  enforced on the sanitized display filename **and** the content is sniffed against it: `.hl7`/`.hl7v2`
+  must begin with an HL7 header segment (`MSH`/`FHS`/`BHS`), `.xml` with a leading `<` (ASVS 5.2.2). A
+  disallowed extension or a content/extension mismatch (e.g. HL7 text in a `.xml`) is refused with
+  **HTTP 400**. Both refusals come before any PHI is written and write a metadata-only `upload.reject`
+  audit. Both upload routes, POST `/uploads` and `/ui/uploaded-logs/upload`, reach that chokepoint.
 - **Maximum size.** `[store].max_upload_bytes` (default **25 MiB**) caps a single uploaded file; the
   global 1 MiB HTTP body cap is raised to this value **only** on the two upload routes.
 - **No decompression / unpacking.** Uploads are **never unpacked** — unpacked size equals file size, so
