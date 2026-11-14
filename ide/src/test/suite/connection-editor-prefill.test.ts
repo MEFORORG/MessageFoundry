@@ -4,6 +4,7 @@ import * as assert from "assert";
 
 import { buildForm, type ConnectionSchema, type SchemaParam } from "../../connectionForm";
 import { connectionEditorScript } from "../../connectionEditorWebview";
+import { CHANNEL_FIELD } from "../../webviewMessaging";
 
 // BACKLOG #5565. Editing or cloning a connection drew the settings as legacy free-text rows from the
 // raw record, even when the engine had described itself. So an inline credential showed in a
@@ -21,6 +22,10 @@ interface DomNode {
 }
 interface JsdomWindow {
   document: DomNode;
+  origin: string;
+  MessageEvent: new (type: string, init?: Record<string, unknown>) => unknown;
+  Event: new (type: string) => unknown;
+  dispatchEvent(event: unknown): boolean;
   close(): void;
   [key: string]: unknown;
 }
@@ -60,7 +65,16 @@ const SCHEMA: ConnectionSchema = {
         port: param({ type: "int", env: true }),
         tls_key_password: param({ secret: true }),
         headers: param({ type: "table" }),
+        // Not on the record: an untouched save must not write the default.
+        tls: param({ type: "bool", default: false }),
+        mode: param({ choices: ["fifo", "unordered"], default: "fifo" }),
+        facility: param({}),
+        suffix: param({ default: "x" }),
       },
+    },
+    file: {
+      doc: "Files on disk.",
+      params: { path: param({}) },
     },
   },
   directionKeys: {
@@ -70,7 +84,8 @@ const SCHEMA: ConnectionSchema = {
 };
 
 /** An outbound record with an inline credential, a table setting, an env reference with a default,
- *  and a table the schema does not describe that happens to carry an "env" key. */
+ *  a table the schema does not describe that happens to carry an "env" key, a value outside a
+ *  select's choices, a str of digits, and a str set to empty on purpose. */
 const RECORD = {
   direction: "outbound",
   name: "OB_SYNTH_ADT",
@@ -81,12 +96,17 @@ const RECORD = {
     tls_key_password: SECRET,
     headers: { "X-Feed": "adt", "X-Tier": "test" },
     routing: { env: "PROD", weight: 2 },
+    mode: "FIFO",
+    facility: "0042",
+    suffix: "",
   },
 };
 
 interface Page {
   readonly window: JsdomWindow;
   readonly posted: Payload[];
+  /** Deliver a message from the host, stamped as webview-receivers.test.ts stamps one. */
+  deliver(data: Payload): void;
 }
 
 const openWindows: JsdomWindow[] = [];
@@ -134,7 +154,20 @@ function load(opts: { clone?: boolean; groups: unknown }): Page {
   });
   window.document.body.appendChild(el);
   assert.deepStrictEqual(errors.map(String), [], "the editor script threw while loading");
-  return { window, posted };
+  return {
+    window,
+    posted,
+    deliver(data): void {
+      window.dispatchEvent(
+        new window.MessageEvent("message", {
+          origin: window.origin,
+          source: null,
+          data: { ...data, [CHANNEL_FIELD]: TOKEN },
+        }),
+      );
+      assert.deepStrictEqual(errors.map(String), [], "the editor script threw handling a message");
+    },
+  };
 }
 
 /** Every text-bearing control in the settings area, as the user sees it. */
@@ -188,17 +221,18 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
       }
     });
 
-    test(`${mode}: an untouched save writes every setting back as it was`, () => {
+    test(`${mode}: an untouched save writes every recorded setting back as it was, and nothing more`, () => {
       const p = load({ clone, groups });
       const settings = saved(p, clone);
-      // The table survives as a table, never "[object Object]" or a JSON string.
-      assert.deepStrictEqual(settings.headers, RECORD.settings.headers);
-      assert.deepStrictEqual(settings.routing, RECORD.settings.routing);
-      // The credential the form never showed is kept, not deleted.
-      assert.strictEqual(settings.tls_key_password, SECRET);
-      // The env reference keeps its default.
-      assert.deepStrictEqual(settings.host, RECORD.settings.host);
-      assert.strictEqual(settings.port, 6661);
+      // The table survives as a table, never "[object Object]" or a JSON string. The env
+      // reference keeps its default; the select keeps a value outside its choices; the str of
+      // digits stays a str; the explicit empty string stays.
+      const { tls_key_password: _secret, ...rest } = RECORD.settings;
+      const { tls_key_password: written, ...others } = settings;
+      assert.deepStrictEqual(others, rest);
+      // An edit keeps the credential the form never showed. A clone does not copy it: the GUI must
+      // not be what writes a new inline credential into the file.
+      assert.strictEqual(written, clone ? undefined : SECRET);
     });
   }
 
@@ -207,6 +241,34 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     const box = p.window.document.querySelector('#settings [data-key="tls_key_password"]');
     box.value = "TLS_KEY_PASSWORD";
     assert.deepStrictEqual(saved(p, false).tls_key_password, { env: "TLS_KEY_PASSWORD" });
+  });
+
+  test("edit: an edited field is read by its declared type", () => {
+    const p = load({ groups });
+    const doc = p.window.document;
+    doc.querySelector('#settings [data-key="facility"]').value = "007";
+    doc.querySelector('#settings [data-key="port"]').value = "6662";
+    doc.querySelector('#settings [data-key="headers"]').value = '{"X-Feed":"orm"}';
+    const settings = saved(p, false);
+    assert.strictEqual(settings.facility, "007", "a str stays text");
+    assert.strictEqual(settings.port, 6662);
+    assert.deepStrictEqual(settings.headers, { "X-Feed": "orm" });
+  });
+
+  test("edit: a transport change never sends the held credential, and the save still keeps it", () => {
+    const p = load({ groups });
+    const transport = p.window.document.getElementById("transport");
+    transport.value = "file";
+    transport.dispatchEvent(new p.window.Event("change"));
+    const asked = p.posted.filter((m) => m.command === "fields");
+    assert.strictEqual(asked.length, 1, "the change asks the host for the new fields");
+    assert.ok(!JSON.stringify(asked[0]).includes(SECRET), "the credential went to the host's field rebuild");
+    // The host rebuilds from what it was sent; back on a transport whose schema declares the key a
+    // secret, the save writes the credential held from the first render.
+    transport.value = "mllp";
+    p.deliver({ command: "fields", groups: buildForm(SCHEMA, "mllp", "outbound", asked[0].settings) });
+    assert.ok(!shownValues(p).some((v) => v.includes(SECRET)), "the credential is shown after the rebuild");
+    assert.strictEqual(saved(p, false).tls_key_password, SECRET);
   });
 });
 
@@ -226,9 +288,13 @@ suite("connection editor — the legacy rows, when the engine cannot describe it
     assert.deepStrictEqual(saved(p, false).routing, RECORD.settings.routing);
   });
 
-  test("a plain env reference is still drawn and saved as one", () => {
+  test("an untouched env reference is saved as it was, its default included", () => {
     const p = load({ groups: null });
-    const settings = saved(p, false);
-    assert.strictEqual(settings.host.env, "PEER_HOST");
+    assert.deepStrictEqual(saved(p, false).host, RECORD.settings.host);
+  });
+
+  test("an untouched row keeps its recorded type: a str of digits stays a str", () => {
+    const p = load({ groups: null });
+    assert.strictEqual(saved(p, false).facility, "0042");
   });
 });
