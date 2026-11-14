@@ -10700,19 +10700,12 @@ def _enforce_posix_paths(
 def _stat_is(path: Path, *, folder: bool) -> bool:
     """Whether ``path`` is a folder, or with ``folder`` false a regular file, following links.
 
-    ``False`` where no object can be opened by that path (:func:`is_missing_directory`), or by a
-    name holding a NUL, so nothing there is read. Any other stat error raises: ``Path.is_dir`` and
-    ``Path.is_file`` answer ``False`` for it too, and the start check then vetted nothing there
-    (vault BACKLOG #6654 items 2 and 17)."""
+    ``False`` where no object can be opened by that path (:func:`is_missing_directory`), so nothing
+    there is read. Any other stat error raises: ``Path.is_dir`` and ``Path.is_file`` answer
+    ``False`` for it too, and the start check then vetted nothing there (vault BACKLOG #6654 items
+    2 and 17)."""
     try:
         mode = path.stat().st_mode
-    except ValueError:
-        # An embedded NUL, which no open accepts either, so nothing there is read.
-        _logger.warning(
-            "the start check skipped %s: no file can have that name",
-            scrub_log_argument(repr(str(path))),
-        )
-        return False
     except OSError as exc:
         if is_missing_directory(exc):
             return False
@@ -10723,31 +10716,25 @@ def _stat_is(path: Path, *, folder: bool) -> bool:
 def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
     """What an open of ``path`` passes through that its writer could re-point, and where it ends.
 
-    The first list holds each link the open follows, a folder link anywhere in the path included,
-    each with the real folder that holds it: whoever can write that folder, or on Windows the link
-    itself, can re-point the link between a vet and a read; and last the real object the open
-    reaches, which the second item names too (vault BACKLOG #2596, #6654 item 5). Where a link
-    leads to a name that is not there, the list ends instead with the real folder that name would
-    be created in, and the second item is ``None``. A path may appear in the list more than once.
-    Only folders holding a link are named: the folders above a path's own folder are not vetted,
-    as for a path with no link.
+    The first list holds the real folder holding each link the open follows, a folder link
+    anywhere in the path included, and on Windows the link itself: whoever can write that folder,
+    or on Windows the link, can re-point it between a vet and a read. A POSIX link's own mode
+    means nothing, so it is not listed. The list ends with the real object the open reaches, which
+    the second item names too (vault BACKLOG #2596, #6654 item 5). Where the open reaches a name
+    that is not there, the list ends instead with the real folder that name would be created in,
+    if a link led there, and the second item is ``None``. A path may appear more than once. Only
+    folders holding a link are named: the folders above a path's own folder are not vetted, as for
+    a path with no link.
 
-    On Windows a path whose real path is its own normalized absolute path passes through no link,
-    so the list is empty and the second item is that path, whether or not it is there; a short
-    (8.3) name in the path makes the two differ, so such a path is walked. Otherwise
-    the path is walked the way the open resolves, one name at a time from the root, so a
-    relative link target names a path from the real folder holding the link: on POSIX ``..`` is
-    the real parent of the folder reached, and on Windows the text is normalized before each pass,
-    as Win32 normalizes it.
+    Walked the way the open resolves, one name at a time from the root, so a relative link target
+    names a path from the real folder holding the link: on POSIX ``..`` is the real parent of the
+    folder reached, and on Windows the text is normalized before each pass, as Win32 normalizes it.
 
     Raises ``OSError`` where a name cannot be stat'ed for any reason but absence, a link cannot be
     read, more than :data:`~messagefoundry.auth.anchor_path.MAX_LINK_HOPS` links are followed, or,
     on Windows, a name holds a colon, a link leads to a device path, a drive with no separator
     after it or a path rooted with no drive, or the name is a reparse point other than a symbolic
-    link or a junction. Each of those would leave a folder the open passes through unread. A walk
-    stats every name from the root, so on Windows a path reached through a link is refused where
-    this account may traverse a folder above it but not read its attributes, though the open
-    itself succeeds."""
+    link or a junction. Each of those would leave a folder the open passes through unread."""
     from messagefoundry.auth.anchor_path import (
         _IO_REPARSE_TAG_MOUNT_POINT,
         _NAME_SURROGATE_BIT,
@@ -10758,22 +10745,13 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
     found: list[Path] = []
     hops = 0
     pending = os.fspath(path.absolute())
-    if windows:
-        plain = os.path.normpath(pending)
-        if os.path.normcase(os.path.realpath(plain)) == os.path.normcase(plain):
-            # The final path of what an open of it reaches is the path itself, so no link
-            # redirects the open and there is nothing to walk. Walking anyway would lstat every
-            # folder above it, which needs read access to each that an account granted only
-            # traverse there lacks, though the open succeeds. Not on POSIX: realpath there is an
-            # lstat walk that reads a name it cannot stat as no link, and an lstat needs no more
-            # access than the open does.
-            return found, Path(plain)
     while True:
         if windows:
             # Win32 collapses ``.`` and ``..`` in the text before it follows any link.
             pending = os.path.normpath(pending)
         drive, rest = os.path.splitdrive(pending)
         cur = drive + os.sep
+        cur_is_folder = True
         parts = [part for part in rest.split(os.sep) if part]
         for index, name in enumerate(parts):
             if name == ".":
@@ -10782,6 +10760,7 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
                 # POSIX only: the kernel takes the parent of the folder already reached, which
                 # holds no link.
                 cur = os.path.dirname(cur)
+                cur_is_folder = True
                 continue
             if windows and ":" in name:
                 # A stream name: joined after a link target, it would restart the path there.
@@ -10793,8 +10772,9 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
                 if is_missing_directory(exc):
                     if found:
                         # A link leads here: whoever can write this folder can create the
-                        # missing name before the read.
-                        found.append(Path(cur))
+                        # missing name before the read. A file met where a folder belongs
+                        # (ENOTDIR) can be replaced by a folder through its own folder.
+                        found.append(Path(cur if cur_is_folder else os.path.dirname(cur)))
                     return found, None
                 raise
             tag = getattr(st, "st_reparse_tag", 0)
@@ -10803,12 +10783,15 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
                     raise OSError(
                         errno.EINVAL, f"a reparse point (tag 0x{tag:08x}) this check cannot follow"
                     )
-                cur = child
+                cur, cur_is_folder = child, stat.S_ISDIR(st.st_mode)
                 continue
             hops += 1
             if hops > MAX_LINK_HOPS:
                 raise OSError(errno.ELOOP, f"more than {MAX_LINK_HOPS} links were followed")
-            found += [Path(cur), Path(child)]
+            found.append(Path(cur))
+            if windows:
+                # GetNamedSecurityInfoW reads a link's own access list, not its target's.
+                found.append(Path(child))
             target = os.readlink(child)
             if windows:
                 target = _windows_link_target(target)
@@ -10860,11 +10843,9 @@ def assert_trusted_start_paths(
     that applies value bytes read earlier needs the folder vetted even when the file has gone since
     (vault BACKLOG #2596).
 
-    Where a file or folder is reached through links, each link, the real folder holding each one
-    and the real object the path ends at, with a file's real folder, are checked too
-    (:func:`_link_chain`). The same policy judges a folder holding a link as it judges the file's
-    own folder, so a link that sits directly in ``C:\\`` or ``C:\\ProgramData``, as Windows ships
-    them, is refused (vault BACKLOG #6654 item 5).
+    Where a file or folder is reached through links, what :func:`_link_chain` names is checked
+    too, by the same policy; docs/SECURITY.md says what that refuses and misses (vault BACKLOG
+    #6654 item 5).
 
     A path that cannot be stat'ed, for any reason but nothing being there, or whose link chain
     cannot be walked, is refused with ``WiringError`` naming it, and the escape does not downgrade
@@ -10886,10 +10867,17 @@ def _file_and_folder(
     regular file, then the folder it sits in, then what :func:`_link_chain` names for it with the
     real file's real folder; then each of ``folders`` that is a folder, with what
     :func:`_link_chain` names for it. A file or folder that is not there adds what its link chain
-    names, if a link leads to it, and nothing otherwise. Raises ``WiringError``, its message
-    starting with ``lead``, for a path that cannot be stat'ed or walked."""
+    names, if a link leads to it, and nothing otherwise; so does a path holding a NUL, which no
+    open accepts, logged as skipped. Raises ``WiringError``, its message starting with ``lead``,
+    for a path that cannot be stat'ed or walked."""
     paths: list[Path] = []
     for path, folder in [*((f, False) for f in files), *((f, True) for f in folders)]:
+        if "\0" in os.fspath(path):
+            _logger.warning(
+                "the start check skipped %s: no file can have that name",
+                scrub_log_argument(repr(os.fspath(path))),
+            )
+            continue
         try:
             present = _stat_is(path, folder=folder)
             chain, end = _link_chain(path)
@@ -10897,8 +10885,10 @@ def _file_and_folder(
             # ValueError: a link target holding a NUL, which lstat refuses.
             refusal = safe_exc(exc)
         else:
-            if not present and not chain:
-                continue  # nothing there, and no link leads anywhere a writer could create it
+            if not present and (end is not None or not chain):
+                # Nothing there, or something that is not a file or folder as asked, with no
+                # dangling link leading anywhere a writer could create one.
+                continue
             if present:
                 given = path.absolute()
                 paths += [given, given.parent] if not folder else [given]

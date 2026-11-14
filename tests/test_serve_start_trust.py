@@ -540,45 +540,31 @@ def test_a_junction_in_the_path_vets_the_folder_holding_it(tmp_path: Path) -> No
     assert {_norm(cfg), _norm(junction), _norm(store), _norm(store / "dev.toml")} <= vetted
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="the fast path is Windows only")
-def test_a_path_through_no_link_needs_no_stat_of_the_folders_above_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An account granted only traverse on a folder above the file can open it but not lstat that
-    folder, so a walk would refuse a start no link is involved in. The folder is named by its long
-    path: a short (8.3) name differs from the real path, so it is walked."""
-    tmp_path = Path(os.path.realpath(tmp_path))
-    _settings, values = _two_files(tmp_path)
-    real_lstat = os.lstat
-
-    def _lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
-        if _norm(Path(path)) == _norm(tmp_path):
-            raise PermissionError(errno.EACCES, "access denied", os.fspath(path))
-        return real_lstat(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "lstat", _lstat)
-    assert _file_and_folder([values]) == [values, values.parent]
+def test_a_link_into_a_file_where_a_folder_belongs_vets_that_file_s_folder(tmp_path: Path) -> None:
+    """A link whose target runs through a regular file reads nothing (ENOTDIR), but whoever can
+    write the folder holding that file can replace it with a folder holding the target."""
+    values = tmp_path / "environments" / "dev.toml"
+    values.parent.mkdir()
+    blob = tmp_path / "store" / "blob"
+    blob.parent.mkdir()
+    blob.write_text("", encoding="utf-8")
+    _link(values, blob / "dev.toml")
+    assert _norm(blob.parent) in _same_paths(_file_and_folder([values]))
 
 
-@pytest.mark.parametrize(
-    ("target", "plain"),
-    [
-        ("\\\\?\\C:\\data\\dev.toml", "C:\\data\\dev.toml"),
-        ("..\\data\\dev.toml", "..\\data\\dev.toml"),
-        ("D:dev.toml", None),
-        ("\\RPC Control\\dev.toml", None),
-        ("\\\\.\\pipe\\dev", None),
-    ],
-)
-def test_a_windows_link_target_the_walk_cannot_follow_raises(
-    target: str, plain: str | None
-) -> None:
-    """A drive with no separator reads from that drive's own working directory, and a target rooted
-    with no drive may name the object namespace, so neither names a folder the walk can vet."""
-    from messagefoundry.config.wiring import _windows_link_target
+@pytest.mark.skipif(sys.platform == "win32", reason="a Windows link's own access list is read")
+def test_a_posix_link_itself_is_not_vetted(tmp_path: Path) -> None:
+    """A POSIX link's own mode means nothing, and the policy's stat follows it: listing a folder
+    link above the file's own folder vetted that folder's target, an ancestor, such as a
+    world-writable /private/tmp behind macOS's /tmp."""
+    from messagefoundry.config.wiring import _link_chain
 
-    if plain is None:
-        with pytest.raises(OSError):
-            _windows_link_target(target)
-    else:
-        assert _windows_link_target(target) == plain
+    store = tmp_path / "store" / "envs"
+    store.mkdir(parents=True)
+    (store / "dev.toml").write_text("", encoding="utf-8")
+    linked = tmp_path / "linked"
+    _link(linked, tmp_path / "store", folder=True)
+    chain, _end = _link_chain(linked / "envs" / "dev.toml")
+    names = _same_paths(chain)
+    assert _norm(tmp_path) in names  # control: the folder holding the link is listed
+    assert _norm(linked) not in names

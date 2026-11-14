@@ -2825,8 +2825,9 @@ folds it. Elsewhere, the default layout, the release reads it into the snapshot 
 against a keyed binding the hold took at request time, which the next paragraph describes. In
 either place a reload with `serve`'s value provider vets the value file before it reads the config
 directory: the file, its
-folder, each link an open of it follows, a folder link anywhere in its path included, the real
-folder holding each link, and the real file and folder the links lead to (`_link_chain` in
+folder, the real folder holding each link an open of it follows, a folder link anywhere in its
+path included, each such link itself on Windows, and the real file and folder the links lead to
+(`_link_chain` in
 [`config/wiring.py`](../messagefoundry/config/wiring.py), vault BACKLOG #6654 item 5). Where a
 link leads to a file that is not there, the folder it would be created in is vetted. A start vets
 the file and the links it follows the same way when the engine is built, before its first load
@@ -2835,10 +2836,11 @@ folder holding a link is judged by the rule the file's own folder is, so a link 
 in `C:\` or `C:\ProgramData`, as Windows ships them, is refused. The file or folder vetted, or a
 name along the links it follows, that cannot be stat'ed, for any reason but nothing being there,
 is refused rather than skipped; on POSIX the policy's own read of each path still skips one that
-stops answering after that stat. A walk stats each name from the root, so on Windows a value file
-reached through a link is refused where the engine's account may traverse a folder above it but
-not read its attributes, though the open would succeed. That vet misses at least the folders above each of those folders, and the
-folders a `subst` drive letter stands for.
+stops answering after that stat. The walk stats each name from the root, so on Windows a value or
+settings file is refused where the engine's account may traverse a folder above it but not read
+its attributes, though the open would succeed. That vet misses at least the folders above each of
+those folders, the folders a `subst` drive letter stands for, and every other `environments/*.toml`
+file the snapshot reads but never applies.
 Where that value file alone cannot be read, the
 reload is refused, released or not, rather than reading it again from disk. Where the config
 directory cannot be read whole, a value file in its `environments/` folder included, a released
