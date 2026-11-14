@@ -893,9 +893,9 @@ def test_parse_roles_is_linear_on_a_run_of_one_span_kind(unit: str) -> None:
 
 
 def test_the_fixtures_flat_writes_reach_the_vocabulary() -> None:
-    """Every flat field write in the fixture reaches the vocabulary. They are plain text: a write in
-    markup the role layer does not read is never mapped (BACKLOG #5556), and the strip itself is
-    pinned by :func:`test_strip_markup_recovers_the_verb`."""
+    """Every flat field write in the fixture reaches the vocabulary. They are written to take the
+    flat reading (ADR 0086 §2(b″), BACKLOG #5556), and the strip itself is pinned by
+    :func:`test_strip_markup_recovers_the_verb`."""
     src = _package_source()
     assert 'copy_field(msg, "PID-5.1", "NK1-2.1")' in src
     assert 'set_field(msg, "MSH-6", "ACME")' in src  # ItemCopy from a literal == set
@@ -939,7 +939,7 @@ def test_unmapped_verb_emits_a_todo_marker_and_is_counted(tmp_path: Path) -> Non
 
     result = import_corepoint(FIXTURES / "acme_adt_package.xml", tmp_path)
     classes = result.channels[0].unmapped_classes
-    # The first action-list's three unmapped verbs, in order, ahead of the role-grammar list's.
+    # The first action-list's unmapped verbs come first, in order.
     assert classes[:3] == ("MsgParse", "EnvLogText", "ItemCustomScript")
     assert result.total_unmapped == len(classes)
 
@@ -1460,8 +1460,8 @@ def test_a_hostile_handle_name_cannot_escape_the_raise_or_its_comment() -> None:
 # A ``<Line>`` whose ``@Data`` is rich text the role layer reads no span in fell back to the flat
 # reading, which has no handle gate and no write gate: a send of another handle rendered as
 # ``Send(dest, msg)``, a write to another handle as a write to ``msg``, and the handle scan skipped
-# both. Now its send is refused, its write is not mapped, and the scan counts both. Plain text, the
-# superseded synthetic model, still takes the flat reading (ADR 0086). All fixtures synthetic.
+# both. Now its send is refused, its write is not mapped, and the scan counts both. Which @Data
+# still takes the flat reading is stated once, in ADR 0086 §2(b″). All fixtures synthetic.
 
 
 def _upper(data: str) -> str:
@@ -1591,7 +1591,7 @@ def test_a_send_in_unread_markup_is_counted_unmapped(tmp_path: Path) -> None:
 
 
 # Each a write of ``"X"`` to ``%OUT/PID-5`` in rich text with no span the role layer reads, which
-# the flat reading maps (its plain-text twin does, below).
+# the flat reading maps (its twin that strip_markup leaves unchanged does, below).
 _UNREAD_MARKUP_WRITES = {
     "entity-quoted-class": (
         '<Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; '
@@ -1614,8 +1614,8 @@ def test_a_write_in_markup_the_role_layer_does_not_read_is_not_mapped(line: str)
 
 
 def test_a_plain_text_write_still_maps() -> None:
-    """The control arm for the write tests: the same statement in plain text takes the flat
-    reading and maps, so the markup alone is what declines it."""
+    """The control arm for the write tests: the same statement, which strip_markup leaves
+    unchanged, takes the flat reading and maps, so the markup alone is what declines it."""
     body = _handler_body(_handler_source('<Line Data="ItemCopy &quot;X&quot; %OUT/PID-5"/>'))
     assert 'set_field(msg, "PID-5", "X")' in body
 
@@ -1644,8 +1644,8 @@ def test_a_send_in_unread_markup_counts_as_a_delivery_of_no_known_handle() -> No
 
 
 def test_a_plain_text_send_still_renders_as_before() -> None:
-    """The control arm, and the gap ADR 0086 §2(b″) records: a send in plain text, the superseded
-    synthetic model, carries no markup at all and still renders as a send of msg."""
+    """The control arm, and the gap ADR 0086 §2(b″) records: a send that strip_markup leaves
+    unchanged takes the flat reading and still renders as a send of msg."""
     body = _handler_body(_handler_source('<Line Data="MsgSend %OUT [OB_FLAT]"/>'))
     assert '    sends.append(Send("OB_FLAT", msg))  # Corepoint MsgSend' in body
 
@@ -3211,8 +3211,8 @@ def test_hostile_xml_values_cannot_inject_code() -> None:
     # &#10; is a character reference, so it survives XML attribute-value normalization as a real
     # newline — the sharpest available test of both the literal and the comment escape paths.
     src = _handler_source(
-        # Plain text, so the write maps and its literal is the escape path under test (a write in
-        # entity markup is never mapped: BACKLOG #5556).
+        # strip_markup leaves it unchanged, so the write takes the flat reading and maps, and its
+        # literal is the escape path under test (ADR 0086 §2(b″), BACKLOG #5556).
         '<Line Data="ItemCopy &quot;A&#10;import os&quot; %ADT/MSH-6"/>'
         '<Line Data="ItemCustomScript %ADT/OBX-5&#10;os.system(&amp;quot;pwned&amp;quot;)"/>'
     )

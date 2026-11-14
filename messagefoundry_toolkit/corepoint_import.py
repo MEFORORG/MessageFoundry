@@ -23,9 +23,9 @@ discharged by the 2026-07-24 amendment). A real Corepoint export is **XML, not J
   run through :func:`strip_markup` to recover the plain ``Verb operand operand …`` statement. This was
   the single biggest schema surprise: without the strip, the overwhelming majority of statements fail
   to classify because the leading token is markup, not a verb. The strip recovers the text only; it
-  maps nothing on its own. A write or a send is read from the role spans (:func:`parse_roles`), and
-  in rich text with no span the role layer reads a write is never mapped and a send is refused
-  (:func:`_unread_markup`, BACKLOG #5556). Only plain text takes the flat reading.
+  maps nothing on its own. A write or a send is read from the role spans (:func:`parse_roles`);
+  which other ``@Data`` takes the flat reading is :func:`_unread_markup`'s call, and ADR 0086
+  §2(b″) states the rule (BACKLOG #5556).
 * **``<Block>`` is a comment / section label, not an action** — it is preserved as a comment in the
   generated module and never emitted as a step. A statement written in the ``@Data`` of any
   element but a ``<Line>`` is marked as a counted TODO and never emitted as a write or a
@@ -729,9 +729,8 @@ def strip_markup(data: str) -> str:
 # Matched case-sensitively it fell out of the role layer into the flat reading, which applies neither
 # the handle gate nor the write gates (BACKLOG #5556). Case is folded on the ASCII letters alone, as
 # HTML folds it, by spelling each letter as a class: ``re.IGNORECASE`` would also fold a long s or a
-# Kelvin sign into ``span`` or a class name. ``\s`` stays Unicode, as it was before the fold: a span
-# spaced with a no-break space is still read, so its label, clone or send meets the same gates as
-# on main. (``re.ASCII`` narrowed it, and such a span became prose: quieter than main.)
+# Kelvin sign into ``span`` or a class name. ``\s`` stays Unicode, so a span spaced with a no-break
+# space is still read as roles, and its label, clone or send takes the role layer's gates.
 _SPAN_OPEN = re.compile(r"<[Ss][Pp][Aa][Nn]\s+[Cc][Ll][Aa][Ss][Ss]=['\"]([A-Za-z-]+)['\"]\s*>")
 _SPAN_CLOSE = re.compile(r"</[Ss][Pp][Aa][Nn]\s*>")
 
@@ -782,10 +781,9 @@ def parse_roles(data: str) -> tuple[RoleToken, ...]:
     is tolerant by design: an unbalanced ``</span>`` simply pops to the enclosing role rather than
     raising, because the export is untrusted data.
 
-    Returns ``()`` when the value carries no recognizable span at all. In plain text that is the
-    caller's signal to fall back to the flat :func:`tokenize_statement` path (a synthetic export).
-    In rich text it is not: :func:`_unread_markup` decides, and such a statement never takes the
-    flat reading's write or send (BACKLOG #5556)."""
+    Returns ``()`` when the value carries no recognizable span at all. That alone is not a signal to
+    fall back to the flat :func:`tokenize_statement` path: :func:`_unread_markup` decides whether
+    the caller may (BACKLOG #5556)."""
     tokens: list[RoleToken] = []
     stack: list[str] = []
     saw_span = False
@@ -827,14 +825,12 @@ def parse_roles(data: str) -> tuple[RoleToken, ...]:
 
 
 def _unread_markup(data: str, roles: tuple[RoleToken, ...]) -> bool:
-    """Whether ``data`` is rich text (a tag or an entity the markup strip decodes) in which
-    :func:`parse_roles` read no span: an exporter's markup in a shape this import does not read.
+    """Whether :func:`parse_roles` read no span in ``data`` and :func:`strip_markup` changes it.
 
     Such a statement names no handle anyone can read, so it must not take the flat reading, which
     has no handle gate and no write gate. THE one test, asked by the render's write and send arms
-    and by the handle scan alike, so the three cannot disagree on it (BACKLOG #5556). Plain text,
-    the superseded synthetic model, is not unread markup and still takes the flat reading (ADR 0086
-    §2(b″))."""
+    and by the handle scan alike, so the three cannot disagree on it. ADR 0086 §2(b″), first gap,
+    states the rule and what follows from it (BACKLOG #5556)."""
     return not roles and strip_markup(data) != data.strip()
 
 
@@ -986,7 +982,7 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
                 return frozenset(), frozenset()
             continue
         if not tokens:
-            continue  # plain text, or unread markup off a Line: no handle roles to learn from
+            continue  # no span read, and not a Line in unread markup: no handle roles to learn from
         inputs.update(t.text for t in tokens if t.source_class == "input-handle")
         # Every live element's handles count, an unmodelled tag included. Past the rule above, a
         # root copy or a send can only sit on a ``<Line>``.
@@ -1120,7 +1116,7 @@ _STATEMENT_VERBS = frozenset(
 )
 # What the marker says for such a statement (:func:`_label_marker`), ahead of the statement itself.
 # Kept short: the two share one 200-character comment. It says "role-marked" because the scan
-# reads handles from role markup alone: a plain-text write or send on a ``<Line>`` of such a list
+# reads handles from role markup alone: a flat-read write or send on a ``<Line>`` of such a list
 # names no handle the scan can read, and still renders as it does in any other list.
 _LABEL_STATEMENT_WHY = (
     "not on a Line, so it may never have run; nothing is mapped and no role-marked handle here "
@@ -1547,9 +1543,9 @@ def _send_refusal(operands: tuple[Operand, ...], held: frozenset[str]) -> str:
     It fails CLOSED: a send is allowed only when :func:`_whole_tree` names a handle in ``held``, the
     same reading :func:`_message_handles` uses to fill ``delivered``. A ``$variable``, a partial path
     or no handle at all is refused, because which message it sends is not known. A send on a
-    ``<Line>`` with no roles never reaches here: in unread markup it is refused outright
-    (:data:`_UNREAD_MARKUP_SEND_REFUSAL`), and in plain text it renders as before (ADR 0086
-    §2(b″)). A send off a ``<Line>`` takes :data:`_LABEL_SEND_REFUSAL` instead, whatever its roles.
+    ``<Line>`` with no roles never reaches here: :func:`_unread_markup` decides between
+    :data:`_UNREAD_MARKUP_SEND_REFUSAL` and the flat reading. A send off a ``<Line>`` takes
+    :data:`_LABEL_SEND_REFUSAL` instead, whatever its roles.
     The handle is untrusted and unbounded, so it is flattened and elided before it enters the
     text."""
     sent = _whole_tree(operands[0]) if operands else ""
@@ -1836,9 +1832,8 @@ def _parse_statement(
     data = _attr(elem, "Data")
     statement = strip_markup(data)
     note = strip_markup(_attr(elem, "Comment"))
-    # The role layer is the primary reading; the flat tokenizer stays the fallback for a plain-text
-    # export (the superseded synthetic model, and any exporter that writes plain @Data). Rich text
-    # with no span it reads takes neither the flat write nor the flat send (:func:`_unread_markup`).
+    # The role layer is the primary reading; the flat tokenizer stays the fallback (the superseded
+    # synthetic model), for a write or a send only where :func:`_unread_markup` allows it.
     roles = parse_roles(data)
     flat_verb, operands = _split_verb(statement)
     # Unspanned runs and ``detail`` spans are NOT inert decoration: measured against the export they
@@ -1948,7 +1943,7 @@ def _parse_statement(
             # is, and not rendered by the flat reading, which has no handle gate (BACKLOG #5556).
             refusal = _UNREAD_MARKUP_SEND_REFUSAL
         else:
-            # Plain text, the superseded synthetic model: renders as before (ADR 0086 §2(b″)).
+            # Not unread markup, so the flat reading: renders as before (ADR 0086 §2(b″)).
             refusal = ""
         return [Control("send", source, statement, args=args, refusal=refusal), *body]
     if kind in ("break", "exit"):

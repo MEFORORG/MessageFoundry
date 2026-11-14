@@ -5,8 +5,8 @@
   Invented end to end: ACME / TEST_LAB / demo.example.org are placeholders (RFC 2606), the field paths
   are ordinary HL7 v2 coordinates, and there is no message content of any kind. It reproduces the
   VALIDATED export SHAPE only (ADR 0086 §2 as amended): the recursive <List> tree, the rich-text
-  markup wrapper on @Data (tags plus double-escaped entities; the first list's field writes are plain
-  text, the flat model, since a write in markup the role layer does not read is never mapped),
+  markup wrapper on @Data (tags plus double-escaped entities; the first list's field writes are
+  written to take the flat reading, which ADR 0086 2(b'') says which @Data takes),
   @Disabled, @Comment, the branch markers
   carried as plain <Line> statements inside their construct, and one verb with no vocabulary mapping.
 -->
@@ -79,9 +79,9 @@
   </ActionList>
 
   <!--
-    The ROLE grammar. Everything above is the flat model: its field writes are plain text, and the
-    rest is in entity-quoted markup the role layer reads no span in (a write there would not be
-    mapped, and its MsgSend is refused: BACKLOG #5556). This list reproduces the
+    The ROLE grammar. Everything above is the flat model: its field writes take the flat reading,
+    and the rest is in entity-quoted markup the role layer reads no span in, which is unread markup
+    (ADR 0086 2(b''), BACKLOG #5556). This list reproduces the
     rich-text markup as the validated export actually writes it — single-quoted SEMANTIC span classes
     (keyword/literal/path/input-handle/other-handle/detail/description/variable), a `%handle` span
     immediately followed by its `/path` span, Corepoint's DASH-separated coordinates (`PID-5-1`, not
