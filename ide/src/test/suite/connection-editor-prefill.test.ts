@@ -4,7 +4,7 @@ import * as assert from "assert";
 
 import { buildForm, type ConnectionSchema, type SchemaParam } from "../../connectionForm";
 import { connectionEditorScript } from "../../connectionEditorWebview";
-import { CHANNEL_FIELD } from "../../webviewMessaging";
+import { CHANNEL_FIELD, channelToken, openChannel, postToSameRender } from "../../webviewMessaging";
 
 // BACKLOG #5565. Editing or cloning a connection drew the settings as legacy free-text rows from the
 // raw record, even when the engine had described itself. So an inline credential showed in a
@@ -39,6 +39,8 @@ type Payload = Record<string, any>;
 
 const TOKEN = "PREFILLtokenPREFILLtok0";
 const SECRET = "synthetic-inline-credential-5565";
+const INLINE_DEFAULT = "synthetic-env-default-5565";
+const OFFDIR_VALUE = "synthetic-off-direction-5565";
 
 function param(overrides: Partial<SchemaParam>): SchemaParam {
   return {
@@ -72,6 +74,9 @@ const SCHEMA: ConnectionSchema = {
         suffix: param({ default: "x" }),
         verify: param({ type: "bool", default: true }),
         db_password: param({ secret: true }),
+        // Applies inbound only: on this outbound record it is drawn off-direction.
+        listen_secret: param({ secret: true, direction: "inbound" }),
+        poll_statement: param({}),
       },
     },
     file: {
@@ -104,7 +109,10 @@ const RECORD = {
     // Not a boolean: the engine refuses it at load, and an untouched save must not turn it into one.
     verify: "yes",
     // A secret env reference whose default is itself an inline credential.
-    db_password: { env: "DB_PW", default: "synthetic-env-default-5565" },
+    db_password: { env: "DB_PW", default: INLINE_DEFAULT },
+    listen_secret: OFFDIR_VALUE,
+    // A text input strips line breaks from what it is given; an untouched save must keep them.
+    poll_statement: "-- new rows\nSELECT id, payload\nFROM mf_inbox",
   },
 };
 
@@ -233,15 +241,36 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
       // The table survives as a table, never "[object Object]" or a JSON string. The env
       // reference keeps its default; the select keeps a value outside its choices; the str of
       // digits stays a str; the explicit empty string stays.
-      const { tls_key_password: _secret, db_password: _ref, ...rest } = RECORD.settings;
-      const { tls_key_password: written, db_password: ref, ...others } = settings;
+      // The multi-line str keeps its line breaks.
+      const { tls_key_password: _s, db_password: _r, listen_secret: _o, ...rest } = RECORD.settings;
+      const { tls_key_password: written, db_password: ref, listen_secret: offDirection, ...others } = settings;
       assert.deepStrictEqual(others, rest);
-      // An edit keeps the credential the form never showed. A clone does not copy it, nor a secret
-      // env reference's inline default: the GUI must not be what writes a new inline credential.
+      // An edit keeps the credentials the form never showed. A clone does not copy them, nor a
+      // secret env reference's inline default: the GUI must not be what writes a new inline credential.
       assert.strictEqual(written, clone ? undefined : SECRET);
+      assert.strictEqual(offDirection, clone ? undefined : OFFDIR_VALUE);
       assert.deepStrictEqual(ref, clone ? { env: "DB_PW" } : RECORD.settings.db_password);
     });
   }
+
+  test("edit: an inline credential can be removed, and kept again", () => {
+    const p = load({ groups });
+    const remove = p.window.document.querySelector('#settings [data-remove-secret="tls_key_password"]');
+    assert.ok(remove, "no way to remove the held inline credential");
+    remove.click();
+    assert.ok(!("tls_key_password" in saved(p, false)), "a removed credential must not be written back");
+    // And the toggle undoes it.
+    const q = load({ groups });
+    const button = q.window.document.querySelector('#settings [data-remove-secret="tls_key_password"]');
+    button.click();
+    button.click();
+    assert.strictEqual(saved(q, false).tls_key_password, SECRET);
+  });
+
+  test("clone: no remove button, since a clone never copies the credential", () => {
+    const p = load({ clone: true, groups });
+    assert.strictEqual(p.window.document.querySelectorAll("[data-remove-secret]").length, 0);
+  });
 
   test("edit: typing an environment key replaces the held credential", () => {
     const p = load({ groups });
@@ -262,20 +291,44 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.deepStrictEqual(settings.headers, { "X-Feed": "orm" });
   });
 
-  test("edit: a transport change never sends the held credential, and the save still keeps it", () => {
+  test("edit: a transport round trip never sends a held credential, and the save keeps every one", () => {
     const p = load({ groups });
     const transport = p.window.document.getElementById("transport");
-    transport.value = "file";
-    transport.dispatchEvent(new p.window.Event("change"));
-    const asked = p.posted.filter((m) => m.command === "fields");
-    assert.strictEqual(asked.length, 1, "the change asks the host for the new fields");
-    assert.ok(!JSON.stringify(asked[0]).includes(SECRET), "the credential went to the host's field rebuild");
-    // The host rebuilds from what it was sent; back on a transport whose schema declares the key a
-    // secret, the save writes the credential held from the first render.
-    transport.value = "mllp";
-    p.deliver({ command: "fields", groups: buildForm(SCHEMA, "mllp", "outbound", asked[0].settings) });
-    assert.ok(!shownValues(p).some((v) => v.includes(SECRET)), "the credential is shown after the rebuild");
-    assert.strictEqual(saved(p, false).tls_key_password, SECRET);
+    const roundTrip = (to: string): Payload => {
+      transport.value = to;
+      transport.dispatchEvent(new p.window.Event("change"));
+      const asked = p.posted.filter((m) => m.command === "fields");
+      const last = asked[asked.length - 1];
+      for (const value of [SECRET, INLINE_DEFAULT, OFFDIR_VALUE]) {
+        assert.ok(!JSON.stringify(last).includes(value), `a held credential went to the field rebuild: ${value}`);
+      }
+      // The host rebuilds from what it was sent.
+      p.deliver({ command: "fields", groups: buildForm(SCHEMA, to, "outbound", last.settings) });
+      return last;
+    };
+    roundTrip("file");
+    roundTrip("mllp");
+    for (const value of [SECRET, INLINE_DEFAULT, OFFDIR_VALUE]) {
+      assert.ok(!shownValues(p).some((v) => v.includes(value)), `a credential is shown after the rebuild: ${value}`);
+    }
+    const settings = saved(p, false);
+    assert.strictEqual(settings.tls_key_password, SECRET);
+    assert.strictEqual(settings.listen_secret, OFFDIR_VALUE, "the off-direction secret survives");
+    assert.deepStrictEqual(settings.db_password, RECORD.settings.db_password, "the env default survives");
+  });
+});
+
+suite("webviewMessaging.postToSameRender (BACKLOG #5565)", () => {
+  test("a reply computed across a re-render is dropped; one for the same render goes out", () => {
+    const sent: Payload[] = [];
+    const webview = { postMessage: (m: Payload) => Promise.resolve(sent.push(m) > 0) };
+    openChannel(webview);
+    const asked = channelToken(webview);
+    assert.notStrictEqual(postToSameRender(webview, asked, { command: "fields" }), undefined);
+    openChannel(webview); // the panel re-rendered while the reply was being computed
+    assert.strictEqual(postToSameRender(webview, asked, { command: "fields" }), undefined);
+    assert.strictEqual(sent.length, 1);
+    assert.strictEqual(sent[0][CHANNEL_FIELD], asked);
   });
 });
 
@@ -303,5 +356,10 @@ suite("connection editor — the legacy rows, when the engine cannot describe it
   test("an untouched row keeps its recorded type: a str of digits stays a str", () => {
     const p = load({ groups: null });
     assert.strictEqual(saved(p, false).facility, "0042");
+  });
+
+  test("an untouched row keeps a multi-line value's line breaks", () => {
+    const p = load({ groups: null });
+    assert.strictEqual(saved(p, false).poll_statement, RECORD.settings.poll_statement);
   });
 });

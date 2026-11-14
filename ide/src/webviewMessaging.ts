@@ -180,6 +180,29 @@ export function postToWebview(
   return webview.postMessage({ ...message, [CHANNEL_FIELD]: token });
 }
 
+/** The channel token of the webview's current render, or undefined before its first. */
+export function channelToken(webview: WebviewTarget): string | undefined {
+  return openTokens.get(webview);
+}
+
+/**
+ * {@link postToWebview} for a reply computed across an `await`: it posts only while the render that
+ * asked, named by the token {@link channelToken} gave when the request arrived, is still the one
+ * showing. postToWebview stamps whatever token is current, so without this a reply that outlived a
+ * re-render reached the NEW document as though addressed to it (BACKLOG #5565: a connection
+ * editor's field rebuild for connection A drawn over connection B). Returns undefined when dropped.
+ */
+export function postToSameRender(
+  webview: WebviewTarget,
+  askedToken: string | undefined,
+  message: Record<string, unknown>,
+): PromiseLike<boolean> | undefined {
+  if (askedToken === undefined || openTokens.get(webview) !== askedToken) {
+    return undefined;
+  }
+  return postToWebview(webview, message);
+}
+
 /**
  * JSON for interpolation into an inline `<script>`, with `<` escaped so no value can close the tag.
  *

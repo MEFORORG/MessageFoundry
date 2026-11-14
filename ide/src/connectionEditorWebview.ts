@@ -81,10 +81,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
 
     function settingRow(key, value, isEnv, cast, original) {
       const wrap = document.createElement('div'); wrap.className = 'setting';
-      if (original !== undefined) ROW_ORIGINAL.set(wrap, { key: key, value: value, isEnv: !!isEnv, cast: cast || '', original: original });
       const k = document.createElement('input'); k.type = 'text'; k.className = 'k'; k.placeholder = 'key'; k.value = key || '';
       const v = document.createElement('input'); v.type = 'text'; v.placeholder = 'value';
       v.value = displayValue(value);
+      // "Untouched" is judged against what the input holds after the assignment, not the recorded
+      // text: a text input strips CR and LF, so a multi-line value never compared equal and was
+      // saved without its line breaks.
+      if (original !== undefined) ROW_ORIGINAL.set(wrap, { key: k.value, shown: v.value, isEnv: !!isEnv, cast: cast || '', original: original });
       // Marked, so the save parses the JSON back into the table.
       if (value !== null && typeof value === 'object') v.dataset.table = '1';
       const castSel = document.createElement('select');
@@ -112,20 +115,31 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // default (envDefault). Kept here rather than in a data- attribute or an input, so no control
     // displays the credential. It is not kept out of the page: INITIAL and FIELD_GROUPS carry it.
     const HELD = new WeakMap();
-    // The inline credentials the record holds, by key. A transport or direction change never sends
-    // them to the host (collectSettings' forHost), since a key the new schema does not declare would
-    // come back as an ordinary field showing its value; a secret field of the same key takes it here.
+    // What each control showed right after it was drawn: an untouched control still shows exactly
+    // this, whatever the browser did to the value on assignment (a text input strips CR and LF).
+    const SHOWN = new WeakMap();
+    // The record's inline credentials (HELD_SECRETS) and secret env references' inline defaults
+    // (HELD_DEFAULTS), by key. A transport or direction change sends the host HELD_MARK in their
+    // place, never the value: the host rebuilds the fields from what it is sent, so the key (and an
+    // off-direction secret's field) survives the round trip, and a key the new schema does not
+    // declare comes back showing the mark rather than the credential. The save swaps the value back.
+    const HELD_MARK = '[held inline credential, not shown]';
     const HELD_SECRETS = new Map();
+    const HELD_DEFAULTS = new Map();
+    // Keys whose inline credential the user chose to remove; the save then writes no value for them.
+    const REMOVED_SECRETS = new Set();
     function heldSecret(f) {
-      if (f.preserveValue !== undefined) return f.preserveValue;
-      return f.secretOnlyEnv ? HELD_SECRETS.get(f.key) : undefined;
+      if (REMOVED_SECRETS.has(f.key)) return undefined;
+      if (f.preserveValue !== undefined && f.preserveValue !== HELD_MARK) return f.preserveValue;
+      return f.secretOnlyEnv || f.preserveValue === HELD_MARK ? HELD_SECRETS.get(f.key) : undefined;
     }
     function renderField(f, into) {
       const wrap = document.createElement('div'); wrap.className = 'field';
       const lab = document.createElement('label');
       lab.textContent = f.label + (f.required ? ' *' : f.conditionallyRequired ? ' †' : '');
       lab.title = f.help || '';
-      if (f.preserveValue !== undefined) HELD_SECRETS.set(f.key, f.preserveValue);
+      if (f.preserveValue !== undefined && f.preserveValue !== HELD_MARK) HELD_SECRETS.set(f.key, f.preserveValue);
+      if (f.secret && f.envDefault !== undefined && f.envDefault !== HELD_MARK) HELD_DEFAULTS.set(f.key, f.envDefault);
       let control;
       const useEnv = f.isEnvRef || f.secretOnlyEnv;
       // A checkbox only while the recorded value is a boolean: a checkbox would read any other value
@@ -154,12 +168,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         // value a number box is given, and the save would then drop the key.
         const numeric = f.value === undefined || f.value === null || typeof f.value === 'number';
         control.type = f.control === 'number' && !useEnv && numeric ? 'number' : 'text';
-        const secretHint = heldSecret(f) === undefined
-          ? 'environment key'
-          : CLONE
-            ? 'environment key (the inline value is not copied to a clone)'
-            : 'environment key (the current inline value is kept, not shown)';
-        control.placeholder = useEnv ? secretHint : (f.placeholder || '');
+        control.placeholder = useEnv ? secretHint(f) : (f.placeholder || '');
         control.value = displayValue(useEnv ? (f.envKey || '') : f.value);
       }
       control.dataset.key = f.key;
@@ -167,9 +176,32 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       if (useEnv) { control.dataset.env = '1'; }
       if (f.cast) { control.dataset.cast = f.cast; }
       HELD.set(control, f);
+      SHOWN.set(control, control.value);
       const hint = document.createElement('div'); hint.className = 'sub'; hint.textContent = f.help || '';
-      wrap.append(lab, control, hint);
+      wrap.append(lab, control);
+      // An inline credential the form holds can be removed, as the legacy row's delete allowed:
+      // leaving the box blank otherwise writes it back. A clone never copies it, so needs no button.
+      if (useEnv && !CLONE && heldSecret(f) !== undefined) {
+        const remove = document.createElement('button'); remove.className = 'secondary';
+        remove.dataset.removeSecret = f.key;
+        remove.textContent = 'Remove the inline value';
+        remove.addEventListener('click', () => {
+          if (REMOVED_SECRETS.has(f.key)) REMOVED_SECRETS.delete(f.key); else REMOVED_SECRETS.add(f.key);
+          remove.textContent = REMOVED_SECRETS.has(f.key) ? 'Keep the inline value' : 'Remove the inline value';
+          control.placeholder = secretHint(f);
+        });
+        wrap.append(remove);
+      }
+      wrap.append(hint);
       into.appendChild(wrap);
+    }
+
+    function secretHint(f) {
+      if (REMOVED_SECRETS.has(f.key)) return 'environment key (the inline value will be removed)';
+      if (heldSecret(f) === undefined) return 'environment key';
+      return CLONE
+        ? 'environment key (the inline value is not copied to a clone)'
+        : 'environment key (the current inline value is kept, not shown)';
     }
 
     function renderGroups(groups) {
@@ -295,7 +327,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
      * itself, the legacy free-text rows. An EMPTY control contributes no key at all — that is what
      * keeps "absent means this engine's default" true and stops a save writing the whole default set.
      * An UNTOUCHED control drawn from the record writes the recorded value back exactly. forHost
-     * is a transport or direction change's request, which never carries a held inline credential.
+     * is a transport or direction change's request: a held inline credential, or a secret env
+     * reference's inline default, goes in it only as HELD_MARK, never as the value.
      */
     function collectSettings(forHost) {
       const settings = {};
@@ -307,17 +340,15 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           const envKey = el.value.trim();
           if (!envKey) {
             // No key typed. An inline credential the record already holds is written back as it
-            // was, unseen; deleting a working credential because the form will not show it would
-            // be its own outage. A clone does not copy it: the GUI must not be what puts a new
-            // inline credential into the file (FieldDescriptor.secretOnlyEnv).
-            const secret = heldSecret(f);
-            if (secret !== undefined && !CLONE && !forHost) settings[key] = secret;
+            // was, unseen (resolved from HELD_MARK below); deleting a working credential because the
+            // form will not show it would be its own outage. Removed on request.
+            if (heldSecret(f) !== undefined) settings[key] = HELD_MARK;
             continue;
           }
           const ref = { env: envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
-          // A secret's env default is an inline credential too, so a clone does not copy it.
-          if (f.envDefault !== undefined && !(CLONE && f.secret)) ref.default = f.envDefault;
+          if (HELD_DEFAULTS.has(key)) ref.default = HELD_MARK;
+          else if (f.envDefault !== undefined) ref.default = f.envDefault;
           settings[key] = ref;
           continue;
         }
@@ -330,7 +361,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           settings[key] = el.checked;
           continue;
         }
-        if (f.value != null && el.value === displayValue(f.value)) {
+        if (f.value != null && el.value === SHOWN.get(el)) {
           settings[key] = f.value;            // untouched: the recorded value, exactly
           continue;
         }
@@ -346,7 +377,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         const envCb = row.querySelector('input[type=checkbox]');
         const castSel = row.querySelector('select');
         const was = ROW_ORIGINAL.get(row);
-        if (was && was.key === inputs[0].value && inputs[1].value === displayValue(was.value) &&
+        if (was && was.key === inputs[0].value && inputs[1].value === was.shown &&
             envCb.checked === was.isEnv && castSel.value === was.cast) {
           settings[key] = was.original;       // untouched: the recorded value, exactly
           continue;
@@ -358,6 +389,28 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           settings[key] = ref;
         } else {
           settings[key] = inputs[1].dataset.table === '1' ? parseTable(raw) : coerce(raw);
+        }
+      }
+      return forHost ? settings : resolveHeld(settings);
+    }
+
+    // Swap HELD_MARK back for the held value on save. A clone gets neither the inline credential nor
+    // a secret env reference's inline default: the GUI must not be what writes a new inline credential
+    // into the file (FieldDescriptor.secretOnlyEnv). A removed credential is written as nothing.
+    function resolveHeld(settings) {
+      for (const key of Object.keys(settings)) {
+        const value = settings[key];
+        if (value === HELD_MARK) {
+          const secret = HELD_SECRETS.get(key);
+          if (secret === undefined || CLONE || REMOVED_SECRETS.has(key)) delete settings[key];
+          else settings[key] = secret;
+        } else if (value !== null && typeof value === 'object' && value.default === HELD_MARK) {
+          // A copy: the value may be a descriptor's own recorded object.
+          const ref = { ...value };
+          const dflt = HELD_DEFAULTS.get(key);
+          if (dflt === undefined || CLONE) delete ref.default;
+          else ref.default = dflt;
+          settings[key] = ref;
         }
       }
       return settings;
@@ -407,7 +460,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     $('delete').addEventListener('click', () => vscode.postMessage({ command: 'delete', name: INITIAL.name }));
 
     // One entry per message its hosts post: at least connectionEditor.ts and configEditors.ts use
-    // this page. Both post "error"; only connectionEditor.ts answers with "fields". A field is a
+    // this page. Both post "error", and both answer the page's "fields" request. A field is a
     // FieldDescriptor from connectionForm.ts: its declared fields with their types. The two
     // unknown-typed values (value, defaultValue, envDefault, preserveValue) are not typed there
     // either, and their presence is not checked: all four are optional there, and FieldDescriptor

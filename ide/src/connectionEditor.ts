@@ -11,7 +11,7 @@ import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
 import { connectionRemoveArgs, connectionServiceConfig, connectionUpsertArgs } from "./connectionWizardModel";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
-import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
+import { STARTUP_BANNERS, channelToken, openChannel, postToSameRender, postToWebview } from "./webviewMessaging";
 import { connectionEditorScript } from "./connectionEditorWebview";
 
 // The ConnObj shape lives in the pure connectionMerge.ts (the mocha-run unit tests import it and
@@ -135,9 +135,11 @@ export async function openConnectionEditor(
       ) {
         // Rebuild the descriptors HERE, so the grouping/typing rules live in the one tested module
         // rather than being reimplemented in webview script.
+        // Dropped if the page re-rendered meanwhile (postToSameRender).
+        const asked = channelToken(current.webview);
         const rebuilt = await formSchemaFor(ws, m.transport, m.direction, m.settings ?? {});
         if (rebuilt) {
-          void postToWebview(current.webview, { command: "fields", groups: rebuilt.groups });
+          void postToSameRender(current.webview, asked, { command: "fields", groups: rebuilt.groups });
         }
       }
     },
