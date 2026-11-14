@@ -56,7 +56,7 @@
 # package list cannot show the two pip-vendored certifi bundles at all. A later digest the pin
 # moves to is inspected by nothing: tests/test_container_build_pins.py refuses only the known-bad
 # digests, so check this block against the FROM line when it moves.
-FROM python:3.14-slim-bookworm@sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527 AS python-base
+FROM python:3.14-slim-bookworm@sha256:3fe1a0b6c2d6b2ebb572906cdabeca75aeb558c0c17db5ffefbcf8094871c32b AS python-base
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------
 FROM python-base AS builder-base
