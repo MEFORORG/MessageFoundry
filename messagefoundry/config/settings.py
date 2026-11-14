@@ -5259,7 +5259,8 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     The one parse ``[egress].allowed_ech_sidecar`` is validated with at load and matched with at
     the gate, which reads the sidecar it dials back through it, so the two cannot read a host or a
     port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
-    host and a port; ``transports.egress.host_port_allowed`` splits at the first. ``None`` for at
+    host and a port. The ``host[:port]`` lists have their own entry parse, in ``transports.egress``
+    (BACKLOG #5915), which differs at least in that a port is optional there. ``None`` for at
     least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
     ``:`` outside brackets, or none inside them; and a host the
     sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this

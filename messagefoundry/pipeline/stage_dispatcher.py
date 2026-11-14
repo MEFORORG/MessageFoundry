@@ -103,7 +103,8 @@ class HoldResult(Enum):
     caller returns. Every other end sends no further retry of that write, leaves its rows
     INFLIGHT, and lets the caller go on as it did before step 2 after its one failed write: a
     per-lane worker loops, a pooled serializer runs its terminal transition, after at most one
-    tail release (``_run_lane`` says when)."""
+    tail release (``_run_lane`` says when). ``RegistryRunner._repend_claimed_on_fault`` names
+    at least one caller that differs."""
 
     LANDED = auto()  # the write landed
     STOPPED = auto()  # the engine is stopping: the rows stay INFLIGHT for the next start
@@ -459,6 +460,7 @@ class StageDispatcher:
         alert_sink: AlertSink | None = None,
         on_lane_paused: Callable[[str], None] | None = None,
         on_lane_stopped: Callable[[str], None] | None = None,
+        stop_rearmed: Callable[[str], bool] | None = None,
         empty_counter: _EmptyClaimObserver | None = None,
         clock: Callable[[], float] | None = None,
         call_later: _CallLater | None = None,
@@ -500,6 +502,13 @@ class StageDispatcher:
         # this to its operator hold and an active-window scheduler never re-arms them (BACKLOG #2072).
         # A T16 content STOP is not reported: its runner STOP site holds it, or not, itself.
         self._on_lane_stopped = on_lane_stopped
+        # Asked (if set) as a T16 content STOP ends: True means the body's STOP is void because a
+        # reload re-deployed what it stopped for while the episode ran, so the lane goes READY
+        # instead (BACKLOG #5708). That reload's notify_work found the lane PROCESSING and only set
+        # dirty, which a STOP does not read, and no wake or sweep re-arms a STOPPED lane. Not dirty
+        # itself: a producer wake or the sweep sets it too, and a STOP the runner holds (the
+        # internal-error policy) must outlive a broadcast that lands mid-episode (_broadcast_to).
+        self._stop_rearmed = stop_rearmed
         self._clock: Callable[[], float] = clock or time.time
         self._call_later = call_later  # resolved to loop.call_later at start() when None
         # Pooled T17 (infra/machinery-fault) bound (ADR 0070 fix B). Policy "stop" STOPs a persistently
@@ -1560,7 +1569,20 @@ class StageDispatcher:
             self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
-            self._to_stopped(lane, st, f"{self._stage.value} lane stopped")
+            # Only with every claimed row re-pended: a READY lane's next claim would pass any still
+            # in flight. Not asked otherwise, so the runner's record stays for its next item to clear.
+            # A STOP has no head re-pend, so `unlanded` is the tail, whose release _land_while_holding
+            # already retried. It ends unlanded at least on SUPERSEDED, where this node may no longer
+            # hold the lease it claimed under, so another node may have led and re-claimed these rows,
+            # and on EXHAUSTED, the stop policy's bound that also STOPs a T17 lane (BACKLOG #5708). The
+            # rows stay INFLIGHT, so the lane stays STOPPED even when a reload restored its inbound:
+            # re-arming it here would claim past them at once. This does not keep it down. A later
+            # notify_work or resume_lane re-arms a STOPPED lane without checking for rows in flight,
+            # as it does after any STOP or T17 bound that left rows unlanded.
+            if not unlanded and self._stop_voided(lane):
+                self._to_ready(lane, woken=True)  # as the reload's notify_work would have
+            else:
+                self._to_stopped(lane, st, f"{self._stage.value} lane stopped")
 
     def _apply_retry(self, lane: str, st: _LaneState, outcome: _LaneOutcome) -> None:
         """Apply a RETRY outcome under the ADR 0070 infra-fault bound (fix B). A T17 zero-progress
@@ -1865,6 +1887,23 @@ class StageDispatcher:
                 lane,
                 exc_info=True,
             )
+
+    def _stop_voided(self, lane: str) -> bool:
+        """Whether the runner says a T16 STOP of ``lane`` is void (``stop_rearmed``). False when no
+        hook is wired, and when the hook raises, which is logged: a fault there keeps the STOP, the
+        state the lane had before the hook existed."""
+        if self._stop_rearmed is None:
+            return False
+        try:
+            return self._stop_rearmed(lane)
+        except Exception:  # noqa: BLE001 — a hook failure must not kill the serializer
+            log.warning(
+                "StageDispatcher %s stop_rearmed raised for lane %s; stopping it",
+                self._stage.value,
+                lane,
+                exc_info=True,
+            )
+            return False
 
     def _report_own_stop(self, lane: str) -> None:
         """Tell the runner (``on_lane_stopped``) about a STOP this dispatcher decided on its own: the

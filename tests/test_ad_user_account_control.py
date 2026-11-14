@@ -2757,6 +2757,7 @@ async def test_a_forfeited_hold_logs_once_when_its_held_passes_raise(
                 *,
                 watermark: _AuditWatermark | None,
                 maps_held: bool = True,
+                not_attempted: int = 0,
             ) -> _RevocationApplied:
                 raise sqlite3.OperationalError("synthetic: the store refused the revocation")
 

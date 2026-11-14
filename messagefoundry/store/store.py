@@ -1913,13 +1913,18 @@ async def deferred_revoke_reports() -> AsyncIterator[None]:
 
 async def _run_to_completion(
     body: Callable[[], Awaitable[None]],
+    *,
+    what: str = "a revoke's seal report",
+    lost: str = "its remaining audit rows and pages were not sent",
 ) -> tuple[bool, BaseException | None]:
     """Run ``body`` as a task awaited through :func:`asyncio.shield`, awaited again after each
     cancel, so a cancel cannot cut it short. Returns whether a cancel landed meanwhile, and the
     body's own failure, for the caller to re-raise or not. Never raises. A failure is logged at
     ERROR with its class, and its traceback at DEBUG only, since a defect's message may carry a
     row value (CLAUDE.md section 9). A body that ends cancelled is logged too, and returned as a
-    ``CancelledError`` (decision d20261110T063908944-857965, item 5)."""
+    ``CancelledError`` (decision d20261110T063908944-857965, item 5). ``what`` names the body and
+    ``lost`` what its unfinished end leaves undone in those lines; the defaults are the revoke's,
+    so its callers pass neither (BACKLOG #5720)."""
     task = asyncio.ensure_future(body())
     cancelled = False
     while not task.done():
@@ -1933,19 +1938,161 @@ async def _run_to_completion(
         except BaseException:  # noqa: BLE001 -- the body's own failure, read from the task below
             pass
     if task.cancelled():
-        log.error(
-            "a revoke's seal report was cancelled before it finished; its remaining audit rows"
-            " and pages were not sent"
-        )
+        log.error("%s was cancelled before it finished; %s", what, lost)
         return cancelled, asyncio.CancelledError()
     failure = task.exception()
     if failure is not None:
-        log.error(
-            "a revoke's seal report failed (%s); its remaining audit rows and pages were not sent",
+        log.error("%s failed (%s); %s", what, type(failure).__name__, lost)
+        log.debug("%s failure", what, exc_info=failure)
+    return cancelled, failure
+
+
+#: How long a failed store open's cleanup may still run once a cancel has landed, before
+#: :func:`cleanup_failed_open` forces the release and stops waiting (BACKLOG #5720, decision
+#: d20261114T002244771-017417). Nothing bounds the cleanup until a cancel lands.
+FAILED_OPEN_CANCEL_BOUND_S = 5.0
+
+# The attribute on an event loop holding the cleanups a cancel stopped waiting for. On the loop,
+# not the module, so the strong reference goes with a closed loop rather than outliving it.
+_ABANDONED_OPEN_CLEANUPS_ATTR = "_mefor_abandoned_open_cleanups"
+
+
+def cancels_at_entry() -> int:
+    """The current task's ``cancelling()`` count, read when a store open starts, so
+    :func:`cleanup_failed_open` counts only a cancel that landed during the open; a cancel the
+    task swallowed earlier is not this open's (BACKLOG #5720, as BACKLOG #5004)."""
+    current = asyncio.current_task()
+    return current.cancelling() if current is not None else 0
+
+
+def _force_failed_open_release(force_release: Callable[[], object]) -> None:
+    """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054)."""
+    try:
+        force_release()
+    except Exception as failure:  # noqa: BLE001 — never mask the open's error
+        log.warning(
+            "forcing the release after a failed store open also failed (%s)",
             type(failure).__name__,
         )
-        log.debug("a revoke's seal report failure", exc_info=failure)
-    return cancelled, failure
+
+
+def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
+    """Retrieve a forced ``stop()``'s outcome so the loop never logs it as never retrieved; a
+    failure there is logged by class (vault BACKLOG #3054)."""
+    if future.cancelled():
+        return
+    failure = future.exception()
+    if failure is not None:
+        log.warning(
+            "stopping a connection after a failed store open failed (%s)", type(failure).__name__
+        )
+
+
+def _stop_unawaited(conn: aiosqlite.Connection) -> None:
+    """``conn.stop()``, with its future's outcome read when it resolves (BACKLOG #5720)."""
+    future = conn.stop()
+    if future is not None:
+        future.add_done_callback(_read_stop_outcome)
+
+
+def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
+    """Keep a strong reference to a cleanup this open stopped waiting for until it finishes, so
+    the loop does not drop it pending (BACKLOG #5720)."""
+    loop = task.get_loop()
+    held: set[asyncio.Future[Any]] | None = getattr(loop, _ABANDONED_OPEN_CLEANUPS_ATTR, None)
+    if held is None:
+        held = set()
+        try:
+            setattr(loop, _ABANDONED_OPEN_CLEANUPS_ATTR, held)
+        except AttributeError:
+            # A loop class that takes no attribute: the references the cleanup's own awaits hold.
+            return
+    held.add(task)
+    task.add_done_callback(held.discard)
+
+
+async def cleanup_failed_open(
+    exc: BaseException,
+    release: Callable[[], Awaitable[None]],
+    force_release: Callable[[], object],
+    *,
+    cancels_before: int,
+) -> None:
+    """Run a failed store open's ``release`` through :func:`_run_to_completion`, so a cancel
+    cannot cut it short and leak what the open built (BACKLOG #5720). ``release`` logs its own
+    failures by class, so none replaces the open's error (vault BACKLOG #3054). Raises a cancel
+    that landed during the open or its cleanup when ``exc`` is an ``Exception``; the caller
+    re-raises ``exc`` otherwise. ``cancels_before`` is :func:`cancels_at_entry`, read when the
+    open started.
+
+    **A cancel still ends a failed open** (decision d20261114T002244771-017417). Nothing bounds the
+    cleanup until a cancel lands; from then it gets at most :data:`FAILED_OPEN_CANCEL_BOUND_S`.
+    The bound starts at once when the open's own end was a cancel, or a cancel this open received
+    under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past
+    the bound, ``force_release`` drops what the open built without waiting, and this stops
+    waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
+    thing a ``GeneratorExit`` runs: a coroutine being closed cannot await, and awaiting would
+    replace the exit with a ``RuntimeError``."""
+    if isinstance(exc, GeneratorExit):
+        _force_failed_open_release(force_release)
+        return
+
+    task = asyncio.ensure_future(
+        _run_to_completion(
+            release,
+            what="a failed store open's cleanup",
+            lost="what the open built may not have been released",
+        )
+    )
+    loop = asyncio.get_running_loop()
+    current = asyncio.current_task()
+    # A cancel this open received, under its own exception or another, has landed already.
+    cancelled = current is not None and current.cancelling() > cancels_before
+    if cancelled or isinstance(exc, asyncio.CancelledError):
+        trigger: str | None = "a cancel"
+    elif not isinstance(exc, Exception):
+        trigger = type(exc).__name__
+    else:
+        trigger = None
+    deadline = None if trigger is None else loop.time() + FAILED_OPEN_CANCEL_BOUND_S
+    while not task.done():
+        remaining = None if deadline is None else deadline - loop.time()
+        if remaining is not None and remaining <= 0:
+            # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
+            _force_failed_open_release(force_release)
+            log.warning(
+                "a failed store open's cleanup did not finish within %s s of %s; what the open"
+                " built was released without waiting for it",
+                FAILED_OPEN_CANCEL_BOUND_S,
+                trigger,
+            )
+            _hold_abandoned_open_cleanup(task)
+            break
+        try:
+            if remaining is None:
+                await asyncio.shield(task)
+            else:
+                await asyncio.wait_for(asyncio.shield(task), remaining)
+        except TimeoutError:
+            continue  # the next pass finds the deadline passed, or the cleanup done
+        except asyncio.CancelledError:
+            # Ours unless only the cleanup task was cancelled: a cancel of this task landing in
+            # the same turn counts too, so it is never dropped (BACKLOG #5720).
+            if not task.cancelled() or (
+                current is not None and current.cancelling() > cancels_before
+            ):
+                cancelled = True
+                if deadline is None:
+                    trigger = "a cancel"
+                    deadline = loop.time() + FAILED_OPEN_CANCEL_BOUND_S
+            if task.cancelled():
+                break
+    if task.done() and (task.cancelled() or task.result()[1] is not None):
+        # The cleanup ended cancelled or failed, so what it should have closed may be open,
+        # the read pool included: drop it without waiting (BACKLOG #5720).
+        _force_failed_open_release(force_release)
+    if cancelled and isinstance(exc, Exception):
+        raise asyncio.CancelledError from exc
 
 
 async def raise_account_epoch(
@@ -10977,8 +11124,9 @@ class MessageStore:
         # checked.
         self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
         self._seal_pager = SealPager()
-        # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
-        # may already count for another store, so close() must not settle its reserve here.
+        # ADR 0196: True from the start of a writable open until it binds this store's salt into
+        # the cipher (BACKLOG #5720). Until then the cipher may count for another store, or for
+        # none, so close() must not settle its reserve here.
         self._cipher_foreign = False
         # BACKLOG #1780: set by open(read_only=True). The handle is `mode=ro`, so it writes nothing
         # at open or at close: no salt, no invocation reserve, no audit genesis row.
@@ -11191,6 +11339,7 @@ class MessageStore:
         the pipeline, and loading them decrypts every cell, which refuses a legacy plaintext value
         the writable open would have sealed first. ``state_get`` and ``reference_view`` therefore
         read empty there. The audit chain's state is loaded, because the audit reads need it."""
+        cancels_before = cancels_at_entry()  # BACKLOG #5720: only this open's cancels
         sync = synchronous.upper()
         if sync not in ("NORMAL", "FULL"):
             raise ValueError(
@@ -11248,15 +11397,15 @@ class MessageStore:
             )
             store._read_only = read_only
             if not read_only:
+                # Foreign until the bind below holds: close() must not settle a cipher this open
+                # has not bound, a failure before the bind included (BACKLOG #5720).
+                store._cipher_foreign = True
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
-                try:
-                    await bind_store_salt(cipher, store._ensure_store_salt)
-                except BaseException:
-                    store._cipher_foreign = True
-                    raise
+                await bind_store_salt(cipher, store._ensure_store_salt)
+                store._cipher_foreign = False
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -11283,26 +11432,56 @@ class MessageStore:
             if store._group_commit is not None:
                 store._group_commit.start()  # spin the committer coroutine (needs the running loop)
             return store
-        except BaseException:
+        except BaseException as exc:
             # Close the store when one was constructed — it owns the read pool's connections too,
             # each with its own worker thread — then the writer either way. `Connection.close` is
             # idempotent (it returns immediately once the connection is gone), so the second call
             # after a successful `store.close()` is a no-op. Both are best-effort: a failure while
-            # cleaning up must never replace the error the caller needs to see.
-            if store is not None:
+            # cleaning up must never replace the error the caller needs to see, so each is logged
+            # by class (vault BACKLOG #3054). Run to completion, so a cancel cannot cut it short
+            # and leave a non-daemon worker thread behind (BACKLOG #5720).
+            async def _close_writer() -> None:
                 try:
-                    await store.close()
-                except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
-                    log.warning("error closing a partially-opened store", exc_info=True)
-            try:
-                await db.close()
-                # `close` returns before the worker thread it stops has left `threading.enumerate()`
-                # (see :func:`_await_connection_worker_exit`). A failed open is the shortest path
-                # there is — one PRAGMA, then straight out — so the caller most often wins that race
-                # here, and the caller of a raising `open` is entitled to find nothing left behind.
-                await _await_connection_worker_exit(db)
-            except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
-                log.warning("error closing the connection after a failed store open", exc_info=True)
+                    await db.close()
+                    # `close` returns before the worker thread it stops has left
+                    # `threading.enumerate()` (see :func:`_await_connection_worker_exit`). A failed
+                    # open is the shortest path there is — one PRAGMA, then straight out — so the
+                    # caller most often wins that race here, and the caller of a raising `open` is
+                    # entitled to find nothing left behind.
+                    await _await_connection_worker_exit(db)
+                except Exception as failure:  # noqa: BLE001 — never mask the real failure
+                    log.warning(
+                        "error closing the connection after a failed store open (%s)",
+                        type(failure).__name__,
+                    )
+
+            async def _release() -> None:
+                try:
+                    if store is not None:
+                        try:
+                            await store.close()
+                        except Exception as failure:  # noqa: BLE001 — never mask the real failure
+                            log.warning(
+                                "error closing a partially-opened store (%s)",
+                                type(failure).__name__,
+                            )
+                finally:
+                    # Whatever store.close() raised, a cancel included (BACKLOG #5720).
+                    await _close_writer()
+
+            # Read now: close() empties the list, and a forced release must still reach each one.
+            conns = [*(store._read_conns if store is not None else ()), db]
+
+            def _force_release() -> None:
+                # interrupt() aborts a statement the worker is running, so the close stop()
+                # queues behind it is reached; stop() does not await it (BACKLOG #5720).
+                for conn in conns:
+                    raw = getattr(conn, "_connection", None)
+                    if raw is not None:
+                        _force_failed_open_release(raw.interrupt)
+                    _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+
+            await cleanup_failed_open(exc, _release, _force_release, cancels_before=cancels_before)
             raise
 
     @classmethod
@@ -11417,10 +11596,12 @@ class MessageStore:
                 conn = await aiosqlite.connect(uri, uri=True)
             else:
                 conn = await aiosqlite.connect(path)
+            # Tracked before its first PRAGMA, so close() reaches it, and its non-daemon worker
+            # thread, when a PRAGMA fails (BACKLOG #5720).
+            self._read_conns.append(conn)
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA query_only=ON")  # defence in depth: a read conn never writes
             await conn.execute("PRAGMA busy_timeout=5000")
-            self._read_conns.append(conn)
             pool.put_nowait(conn)
         self._read_pool = pool
 

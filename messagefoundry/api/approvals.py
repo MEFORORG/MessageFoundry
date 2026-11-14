@@ -54,7 +54,9 @@ import asyncio
 import json
 import logging
 import math
+import threading
 import time
+import weakref
 from collections import Counter
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
@@ -190,6 +192,21 @@ _PARAMS_REFUSALS: Mapping[ReleaseBlocked, tuple[str, str]] = {
 #: Fixed, so a plain ``serve`` recognises its own claims after a restart. Two such engines over one
 #: store would share it; that layout is unsupported for other reasons too (``__main__`` says why).
 DEFAULT_CLAIM_OWNER = "engine"
+
+#: Every gate in this process (BACKLOG #1562). A release any of them is running is live here: no
+#: reconcile in this process moves it and the interrupt route refuses it, so a second app over the
+#: same engine never takes the first app's live releases for leftovers. The lock keeps a gate built
+#: on another thread from changing the set while it is copied.
+_GATES: weakref.WeakSet[ApprovalGate] = weakref.WeakSet()
+_GATES_LOCK = threading.Lock()
+
+
+def _releasing_in_process(approval_id: str) -> bool:
+    """Whether a gate in this process is running the release of ``approval_id`` now."""
+    with _GATES_LOCK:
+        gates = list(_GATES)
+    return any(approval_id in gate._releasing for gate in gates)
+
 
 #: Whether cluster node ``node_id`` heartbeats (BACKLOG #1562): ``True`` for a fresh heartbeat,
 #: ``False`` for a lapsed one or no such node, ``None`` when this engine reads no cluster heartbeats
@@ -576,6 +593,8 @@ class ApprovalGate:
         # When a failed store read of each kind is logged again (BACKLOG #3157): the queue page
         # reads the store on every load, so an outage would otherwise log a traceback per load.
         self._read_faults_reported = SealFailureThrottle()
+        with _GATES_LOCK:
+            _GATES.add(self)
 
     async def _shielded[T](
         self,
@@ -703,11 +722,10 @@ class ApprovalGate:
     async def reconcile_after_restart(self) -> RestartReconciliation:
         """Move this process's leftover ``executing`` rows to ``interrupted`` (BACKLOG #1562).
 
-        Call it once at startup, before the API serves approvals, and once per engine process: a
-        second app over the same engine would take this process's live releases for leftovers.
-        While the owner is not known yet it moves nothing and puts the work off to
-        :meth:`_catch_up_reconcile`, which runs it once the owner is known and over older claims
-        only (BACKLOG #3252). A
+        Call it at startup, before the API serves approvals. It never moves a release a gate in
+        this process is running (:data:`_GATES`). While the owner is not known yet it moves
+        nothing and puts the work off to :meth:`_catch_up_reconcile`, which runs it once the owner
+        is known and over older claims only (BACKLOG #3252). A
         row this process claimed in its previous life and never settled is a release whose outcome
         the gate never recorded. At least three things leave one: the process died mid-run, both of
         :meth:`_settle`'s writes failed (the operation ran), or a claim committed but its reply was
@@ -715,7 +733,9 @@ class ApprovalGate:
         moves to ``interrupted`` with an ``approval.interrupted`` audit row in the SAME write
         (vault BACKLOG #2255), whose ``reason`` is ``engine_restart``. The move keeps the row's
         ``decided_at``, the claim time. Nothing re-runs: an operator records what happened through
-        :meth:`resolve_interrupted`, exactly as for a release cut off by a cancel.
+        :meth:`resolve_interrupted`, exactly as for a release cut off by a cancel. A second app's
+        call in the same process also moves such a row of THIS life that no gate runs, with the
+        same ``engine_restart`` reason, though nothing restarted.
 
         **Only this process's rows.** Engine shards and cluster nodes share one store, so an
         ``executing`` row may be a sibling's release still running. A row moves only when its
@@ -755,6 +775,8 @@ class ApprovalGate:
         for row in await self._verified_rows(
             await self._store.list_executing_approvals(claim_owner=me)
         ):
+            if _releasing_in_process(row.id):
+                continue  # live in this process (_GATES), so not a leftover
             if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
                 continue  # claimed by this process since it started, so not a leftover
             approval_id = row.id
@@ -2737,7 +2759,7 @@ class ApprovalGate:
     ) -> OwnerLiveness:
         """What :meth:`interrupt_stranded` judges of ``row``'s owner (its docstring has the
         tiers). ``heartbeats`` caches each node's verdict across one listing."""
-        if row.id in self._releasing:
+        if _releasing_in_process(row.id):
             return "releasing_here"
         prefix, _, node_id = (row.claim_owner or "").partition(":")
         if prefix != "node" or not node_id:

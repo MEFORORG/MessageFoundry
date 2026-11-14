@@ -622,7 +622,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``(?:...)+`` therefore has one parse of any prefix rather than many. The leading lookbehind is
     # that same complement, so a delimiter-free run costs one match attempt rather than one per
     # character -- the linear-scan property BACKLOG #1437 bought, carried onto this path rather than
-    # given back. ``tests/test_redaction.py`` pins the scan budget for both.
+    # given back. ``tests/test_redaction.py`` times both against the scan budget, and reads both
+    # with a clock-free character meter on at least the input shapes its arms name
+    # (``test_the_field_run_and_segment_patterns_read_each_character_once``, BACKLOG #2958).
     "messagefoundry/redaction.py": (
         "f'\\\\b([A-Z][A-Z0-9]{{2}})([{chars}])[^\\\\r\\\\n]*'",
         "f'(?<![^\\\\s{chars}])[^\\\\s{chars}]*+[{chars}][^\\\\s{chars}]*+(?:[{chars}][^\\\\s{chars}]*+)+'",

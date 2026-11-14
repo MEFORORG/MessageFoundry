@@ -97,6 +97,7 @@ from messagefoundry.config.models import (
     check_db_connect_timeout,
     flag_from_settings,
     remote_file_protocol,
+    require_flag,
     require_hop_reason,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
@@ -1635,6 +1636,48 @@ def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
     return default if value is None else _cast_bool(value)
 
 
+def _bool_literal_problem(key: str, value: Any) -> str | None:
+    """Why the literal ``value`` may not stand on the boolean setting ``key``, or ``None`` when it
+    may (vault BACKLOG #3234). :meth:`Registry.bool_literal_problems` says what is refused and why;
+    :func:`_refuse_bool_literals` asks it too, before a connection's own checks read a flag. The
+    value is withheld.
+
+    Raises :class:`WiringError` when a factory's annotations do not resolve (:func:`_bool_settings`)."""
+    strict = _bool_settings().defaults
+    if key not in strict or isinstance(value, EnvRef):
+        return None
+    if value is None and strict[key] is not None and key not in _COMPOSER_BOOL_SETTINGS:
+        return None
+    try:
+        require_flag(value, f"setting {key!r}")
+    except ValueError as exc:  # names the key and the type, never the value
+        composer = (
+            " (the enabled= flag of a with_* composer)" if key in _COMPOSER_BOOL_SETTINGS else ""
+        )
+        return f"{exc}{composer}{_bool_remedy(value)}"
+    return None
+
+
+def _bool_remedy(value: object) -> str:
+    """The remedy every refusal of a non-bool literal ends with. A false spelling in quotes, which
+    every lax read takes as true, gets a hint that says so; it says the value is a false spelling,
+    never which."""
+    hint = ""
+    if isinstance(value, str) and _BOOL_SPELLINGS.get(value.strip().lower()) is False:
+        hint = " (a false spelling in quotes reads as true)"
+    return f"{hint}; write True, False or an env() reference"
+
+
+def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
+    """Refuse the first non-bool literal on a boolean setting, before a connection's own checks
+    or desugars read one (vault BACKLOG #3234). Those read flags by truthiness, so a quoted false
+    would otherwise be refused as if it were set, or overwritten (``reingress_to`` sets
+    ``capture_response``) before the load's :meth:`Registry.bool_literal_problems` could see it."""
+    for key, value in settings.items():
+        if (bad := _bool_literal_problem(key, value)) is not None:
+            raise WiringError(f"{where}: {bad}")
+
+
 def resolve_env_settings(
     settings: Mapping[str, Any], values: Mapping[str, Any], *, connection: str | None = None
 ) -> dict[str, Any]:
@@ -1736,7 +1779,9 @@ def resolve_env_settings(
         else:
             # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the
             # loosening registers, the build-time capture checks) reads spec.settings, so changing
-            # a literal only in this copy would split one setting into two readings.
+            # a literal only in this copy would split one setting into two readings. The loader
+            # refuses one that is not a bool (Registry.bool_literal_problems); a Registry built in
+            # code and never validated is not checked there.
             resolved[name] = value
     problems: list[str] = []
     if missing:
@@ -5154,8 +5199,7 @@ def _ftp_protocol(tls: bool | EnvRef) -> str | EnvRef:
     the author's cast, reads as FTPS (:func:`_protocol_for_tls` says why). A ``default=`` is read
     here, because :func:`resolve_env_settings` never casts a default.
 
-    A literal is mapped as it always was, with ``bool()``: a code-first literal is outside this
-    item's scope, for the reason the literal arm of :func:`resolve_env_settings` gives."""
+    A literal is a real ``bool`` here: :func:`Ftp` refuses anything else first."""
     if not isinstance(tls, EnvRef):
         return "ftps" if tls else "ftp"
     default = tls.default
@@ -5209,6 +5253,14 @@ def Ftp(
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
+    # vault BACKLOG #3234: a literal tls is turned into the protocol below, so the load's
+    # bool_literal_problems never sees it. bool() read "false" as FTPS and None as plain FTP, the
+    # insecure side, so anything but a bool is refused first, before the CA check reads it too.
+    # require_flag's wording, raised outside any handler (tests/test_from_none_is_not_redaction.py).
+    if not isinstance(tls, (bool, EnvRef)):
+        raise WiringError(
+            f"Ftp: setting 'tls' must be true or false, not {type(tls).__name__}{_bool_remedy(tls)}"
+        )
     # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
     # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
@@ -6410,6 +6462,9 @@ class Registry:
                 "declared, so this graph would receive and send nothing; declare one, or run "
                 "'messagefoundry-toolkit init' to scaffold a starter config"
             )
+        # Before the other rules: some read the same literals laxly, and validate raises only the
+        # first problem, so a symptom would hide the bad literal (vault BACKLOG #3234).
+        yield from self.bool_literal_problems()
         for conn in self.inbound.values():
             if conn.router not in self.routers:
                 yield f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
@@ -6481,6 +6536,55 @@ class Registry:
             and not isinstance(port, bool)
         ]
         return [(a.port, a.label, b.label) for a, b in _binding_conflicts(bindings)]
+
+    def bool_literal_problems(self) -> list[str]:
+        """A literal on a boolean setting that is neither a ``bool`` nor ``None`` (vault BACKLOG
+        #3234). A connector reads most flags with ``bool()`` or plain truthiness, so a code-first
+        ``persistent="false"`` or ``tls_allow_expired="no"`` would read as True; ``connections.toml``
+        already refuses a quoted value there (``_check_setting_types``).
+
+        Refused, never read: a factory's own body and the pre-resolve readers have read the literal
+        by now, so turning it into a bool here would split one setting into two readings, and a
+        refused graph never runs. Here and not in the factories, because a ``with_*`` composer
+        writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
+        registered. ``None`` passes where the setting has one default on every factory: there an
+        explicit ``None`` is that default to ``bool_setting`` (vault BACKLOG #3230). It is refused on
+        a composer's flag, whose reader takes ``None`` as off while the composer's own default is on,
+        and on a setting with no single default. ``env()`` references are read strictly once
+        resolved (:func:`resolve_env_settings`). The value is withheld.
+
+        Only a graph that is validated sees this, as the loader's is; a :class:`Registry` built in
+        code and handed straight to a runner is not checked here."""
+        problems: list[str] = []
+        try:
+            for kind, name, settings, _deployed in self.settings_carriers():
+                for key, value in settings.items():
+                    if (bad := _bool_literal_problem(key, value)) is not None:
+                        problems.append(f"{kind} {name!r}: {bad}")
+        except WiringError as exc:  # a factory whose annotations do not resolve; report, not raise
+            return [str(exc)]
+        return problems
+
+    def settings_carriers(self) -> Iterator[tuple[str, str, Mapping[str, Any], bool]]:
+        """Every declaration that carries transport settings, as ``(kind, name, settings,
+        deployed)``: each inbound and outbound connection, database lookup, FHIR lookup and
+        reference set's source. A reader that must see them all reads this rather than keeping its
+        own copy, so a table added here reaches each of them (:meth:`bool_literal_problems`,
+        :meth:`_declared_encodings`, ``anchor._iter_settings_values``).
+
+        ``deployed`` is the #233 / ADR 0111 flag. Only a connection has one; a lookup, a FHIR lookup
+        and a reference set are always ``True``, there being no declared-but-not-deployed state for
+        them."""
+        for name, ic in self.inbound.items():
+            yield _INBOUND_ENCODING_KIND, name, ic.spec.settings, ic.deployed
+        for name, oc in self.outbound.items():
+            yield "outbound connection", name, oc.spec.settings, oc.deployed
+        for name, lk in self.lookups.items():
+            yield "database lookup", name, lk.settings, True
+        for name, fl in self.fhir_lookups.items():
+            yield "fhir lookup", name, fl.settings, True
+        for name, ref in self.references.items():
+            yield "reference set", name, ref.source.settings, True
 
     def encoding_problems(self) -> list[str]:
         """Human-readable messages for declared ``encoding`` values naming no usable text codec.
@@ -6612,32 +6716,12 @@ class Registry:
         """``(kind, name, value, deployed)`` for every registry entry whose settings carry an
         ``encoding``.
 
-        Every settings-bearing table, because an unusable codec name is a property of the setting and
-        not of the direction it is read in. The table list is the same one
-        ``messagefoundry.config.anchor._iter_settings_values`` walks for ``env()`` refs — keep the two
-        together, since a sixth settings-bearing table added to one and missed here reads as clean.
-
-        ``deployed`` is the #233 / ADR 0111 flag, carried so :func:`resolved_encoding_problems` can
-        honour it without re-deriving it per table. Only a connection has one; a lookup, a FHIR lookup
-        and a reference set are always ``True``, there being no declared-but-not-deployed state for
-        them."""
-        tables: list[tuple[str, Iterable[tuple[str, Mapping[str, Any], bool]]]] = [
-            (
-                _INBOUND_ENCODING_KIND,
-                ((n, c.spec.settings, c.deployed) for n, c in self.inbound.items()),
-            ),
-            (
-                "outbound connection",
-                ((n, c.spec.settings, c.deployed) for n, c in self.outbound.items()),
-            ),
-            ("database lookup", ((n, s.settings, True) for n, s in self.lookups.items())),
-            ("fhir lookup", ((n, s.settings, True) for n, s in self.fhir_lookups.items())),
-            ("reference set", ((n, r.source.settings, True) for n, r in self.references.items())),
-        ]
-        for kind, entries in tables:
-            for name, settings, deployed in entries:
-                if "encoding" in settings:
-                    yield kind, name, settings["encoding"], deployed
+        Every settings-bearing table (:meth:`settings_carriers`), because an unusable codec name is a
+        property of the setting and not of the direction it is read in. ``deployed`` is carried so
+        :func:`resolved_encoding_problems` can honour it without re-deriving it per table."""
+        for kind, name, settings, deployed in self.settings_carriers():
+            if "encoding" in settings:
+                yield kind, name, settings["encoding"], deployed
 
 
 # --- declaration API (writes to the registry being loaded) -------------------
@@ -6858,7 +6942,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)
     ]
-    settings_carriers: list[tuple[str, Mapping[str, Any], bool]] = [
+    hop_carriers: list[tuple[str, Mapping[str, Any], bool]] = [
         *(
             (fhir_lookup_record_name(s.name), s.settings, s.cleartext_accepted)
             for s in registry.fhir_lookups.values()
@@ -6872,7 +6956,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             _attested_reason_text(settings.get("tls_hop_attested_reason")),
             _refused(name, settings, accepted),
         )
-        for name, settings, accepted in settings_carriers
+        for name, settings, accepted in hop_carriers
         if _listed(settings.get("tls_hop_attested"))
     ]
     return sorted(out, key=lambda hop: hop.name)
@@ -8215,6 +8299,7 @@ def build_inbound_connection(
     the caller is responsible for ``add_inbound``. ``content_type`` accepts a :class:`ContentType`
     member **or** its bare string value (``"x12"``, ``"json"``, …); it is coerced to the enum here so a
     raw string can't reach the pipeline and crash later."""
+    _refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
     content_type = _coerce_content_type(name, content_type)
     if (
         spec.type
@@ -8608,6 +8693,7 @@ def build_outbound_connection(
 
     The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
+    _refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
     # ADR 0153 decision 2: the cleartext-acceptance pair is coherence-checked HERE, the one choke point
     # both authoring surfaces pass through, so a flag with no reason (or a reason with no flag) fails at
     # `messagefoundry check` / dry-run rather than at connector construction. Re-raised as a WiringError

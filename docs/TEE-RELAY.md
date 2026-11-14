@@ -118,8 +118,9 @@ fail-closed), `--connect-timeout` / `--send-timeout`, `--max-frame-bytes` (frame
 ## The SQLite log
 
 The relay's only store is SQLite. It records **one row per forwarding leg** (`corepoint` / `mefor`) with
-the outcome, the ACK code, the control id (MSH-10), the message type (MSH-9), the size, and a bounded,
-control-char-scrubbed `detail` (the MSA-3 reason or an error string). **Message bodies are never logged**;
+the outcome, the ACK code, the control id (MSH-10), the message type (MSH-9), the size, and a
+`detail` (the MSA-3 reason or an error string), stored as [PHI.md section 7, the tee relay
+paragraph](PHI.md#7-logging--phi-redaction) says. **Message bodies are never logged**;
 they are persisted only to a separate `relay_capture` table, and only when `--capture-bodies` is set.
 
 `python -m tee naks` prints the recent NAKs (`AE`/`AR`/`CE`/`CR`) and transport errors — the otherwise-
@@ -128,8 +129,12 @@ invisible record of anything a downstream rejected for a message Epic was told `
 ### Export for review (incl. AI analysis)
 
 `python -m tee export` writes the log as **JSON** — a `summary` (counts by leg / outcome / ACK code,
-NAK count, distinct messages, time range) plus the matching `rows`. It is **metadata only — never the
-captured message bodies** (so it's safe to hand to a reviewer or an AI session). Default is stdout; use
+NAK count, distinct messages, time range) plus the matching `rows`. It never holds the captured
+message bodies, but it is **not PHI-safe**: a row's `detail`, stored as [PHI.md section 7, the
+tee relay paragraph](PHI.md#7-logging--phi-redaction) says, can name a patient. The JSON escapes
+every non-ASCII character as `\uXXXX`, so search an export with that in mind.
+`python -m tee naks` prints the same detail. Treat an export as PHI, and check it before you hand it to a reviewer or an AI session.
+Default is stdout; use
 `--out FILE` to write a file. Narrow it with `--since` / `--before` (an age like `24h`/`7d` or a UTC date
 `YYYY-MM-DD`), `--naks-only`, and `--limit N`.
 
@@ -170,10 +175,66 @@ consequences follow from it:
 
 ### Purge
 
-`python -m tee purge` clears the log DB and reclaims disk (`VACUUM`). With no `--before` it purges
+`python -m tee purge` clears the log DB, then scrubs and reclaims disk (`VACUUM`) when the
+paragraphs below say so; `--scrub-only`, below, does that on demand. With no `--before` it purges
 **everything**; `--before <age|date>` deletes only older rows (retention); `--captures-only` drops just
-the captured bodies (the PHI-bearing table) and keeps the NAK/leg log. It **prompts for confirmation**
+the captured bodies and keeps the NAK/leg log. That is not a PHI purge: log rows can carry
+patient-naming ACK text too. It **prompts for confirmation**
 (or refuses, in a non-interactive shell) unless you pass `-y`.
+
+The DB runs in WAL mode, so a deleted row stays in the DB file or its `-wal` file until the
+scrub removes it. When a run deletes at least one row, purge then scrubs:
+a `TRUNCATE` checkpoint, `VACUUM`, and a second checkpoint. That includes a run that deletes only
+log rows. A log row holds no message body, but its detail can carry partner ACK text that
+names a patient. `VACUUM` is part of the scrub. The store zeroes deleted content inside a page
+only where that costs no extra I/O, and leaves a freed page as it was. A B-tree rebalance can also
+leave a stale copy of a deleted row in a page's unused space. Only the rebuild removes these.
+
+**When purge scrubs, and what finishes an unfinished scrub.** This is the one statement of it;
+the code's docstrings link here. A run that deletes rows records that a scrub is owed, in the
+same transaction as the delete, and only a scrub that finishes marks it done. A scrub marks done
+only what was owed when it started, so a purge that ran at the same time keeps its own record. A
+DB from before this record existed counts as owing one scrub. So any later `purge`, even one that
+deletes nothing, or `purge --scrub-only`, finishes an unfinished scrub, or exits 1 if it still
+cannot. A run that deletes nothing and owes nothing skips the scrub. `--scrub-only` always attempts
+the whole scrub; when nothing was owed, a failed attempt leaves nothing owed.
+
+**The scrub is file-level only.** A checkpoint frees the `-wal` file's blocks and `VACUUM` shrinks
+the DB file, but neither overwrites the freed blocks. So the bytes can stay readable on the raw
+volume, and nothing here touches a copy or backup taken before the purge. [PHI.md section
+8](PHI.md#8-retention--purge) states the same limit for the engine store. Put the volume of every
+tee DB, capture on or off, under full-disk encryption, as [section 10](PHI.md#10-secure-deployment--operations-checklist) advises.
+
+`VACUUM` builds its rebuilt copy in a temp file in SQLite's temp directory, which can be on
+another volume. Purge sets `temp_store=FILE` for the `VACUUM`, because in memory a large capture DB
+would fail every purge. A SQLite build compiled to keep temp files in memory
+(`SQLITE_TEMP_STORE=3`) ignores that setting. To keep the copy on a protected volume, point SQLite's temp directory there
+before you run purge. On POSIX, SQLite tries `SQLITE_TMPDIR`, then `TMPDIR`, then its default
+directories such as `/var/tmp` and `/tmp`, and silently skips one that is missing or not
+writable, so a mistyped setting puts the copy in a default directory with nothing reported. On
+Windows it takes the first of `TMP`, `TEMP` and `USERPROFILE` that is set, then the Windows
+directory, without checking that it exists. A missing directory then makes `VACUUM` fail, and the
+scrub report `VACUUM failed`, but only once the copy outgrows SQLite's page cache: a small test DB
+can `VACUUM` without error. Check that the directory exists and the purge account can write to it.
+
+If the scrub does not finish, purge prints `error: ...` and exits 1. The error names the counts it
+deleted and the step that failed. At least these failures do that:
+
+* a checkpoint that cannot finish within about 5 s, because another connection holds a read
+  transaction open or another writer or checkpoint runs;
+* a failed `VACUUM`, for example out of memory or a full disk;
+* an SQLite error, or an out-of-memory error, from a checkpoint.
+
+The scrub runs only after the delete has committed. So when one of those errors prints, the rows
+it counts are gone, but their bytes may still be in the DB file or its `-wal` file. A failure
+before the commit, such as the delete itself timing out, deletes nothing. Other failures end purge with a traceback, at least these: Ctrl-C, which
+prints no counts; and an error while closing the store after a scrub error, which prints the
+`error: ...` line with the counts and then a traceback.
+
+To finish an unfinished scrub without deleting anything, run
+`python -m tee purge --db ./tee.db --scrub-only` once the cause is gone. A plain re-run of the
+purge works too, as above, but deletes under its own arguments. `--scrub-only` needs no `-y`,
+refuses a `--db` path that does not exist, and prints `scrubbed <db>` when the scrub finishes.
 
 ```bash
 python -m tee purge --db ./tee.db --before 7d -y          # retention sweep
@@ -183,7 +244,8 @@ python -m tee purge --db ./tee.db --captures-only -y      # drop only the captur
 ## Limits (by design, for the test-only scope)
 
 * **Test data only** — not hardened for production PHI (no at-rest encryption; the DB is `chmod 0600`
-  best-effort only). Enable `--capture-bodies` only on a protected volume with test data.
+  best-effort only). Keep every tee DB on a protected volume, capture on or off, because a log row's
+  detail can name a patient. Enable `--capture-bodies` only with test data.
 * **Not store-and-forward** — no durable retry queue; recovery of post-trip traffic is delegated to Epic's
   resend/queue (see *Fail-closed* above).
 * **One connection per forward** — the relay dials a fresh MLLP connection per forwarded message (simple
