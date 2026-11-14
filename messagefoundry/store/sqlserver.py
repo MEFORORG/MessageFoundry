@@ -331,6 +331,7 @@ from messagefoundry.store.store import (
     audit_seal_next,
     birth_notify_email,
     build_audit_mac_keys,
+    cancels_at_entry,
     check_caller_event_kind,
     check_executing_owner_filter,
     check_open_store_pin,
@@ -4228,6 +4229,7 @@ class SqlServerStore:
     ) -> SqlServerStore:
         """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
         (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
+        cancels_before = cancels_at_entry()  # BACKLOG #5720: only this open's cancels
         # Resolve the ambient posture ONCE, so every later connection of this store (claim connection,
         # sync-handoff pool) decides as the open did, wherever it is reached from (vault BACKLOG #2354).
         if posture is None:
@@ -4267,8 +4269,6 @@ class SqlServerStore:
         )
         store._pool_executor = executor
         store._read_only = read_only
-        # Set once the salt bind holds: only then is the reserved block this store's to settle.
-        salt_bound = False
         try:
             await store._ensure_schema(create=create, read_only=read_only)
             # Right after the schema, so a later open step that fails still leaves the report
@@ -4290,7 +4290,6 @@ class SqlServerStore:
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
                 await bind_store_salt(store._cipher, store._ensure_store_salt)
-                salt_bound = True
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -4312,8 +4311,9 @@ class SqlServerStore:
                 await store._load_state_cache_noting(folded)
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except BaseException as exc:
-            # Don't leak the pool if first-open initialization fails (M-6), a cancel included, and
-            # settle the block this open reserved rather than forfeit it (BACKLOG #5720). The
+            # Don't leak the pool if first-open initialization fails (M-6), a cancel included
+            # (BACKLOG #5720). The block the open reserved is forfeited, not settled, as before: a
+            # forfeit only over-counts, the conservative direction for the AES-GCM bound. The
             # executor is released in a finally, same as close() above: wait_closed() cannot
             # complete while the pool is wedged, so releasing the executor only on the success path
             # would leak its threads in exactly the case this except exists for.
@@ -4342,7 +4342,7 @@ class SqlServerStore:
                 exc,
                 _release,
                 _force_release,
-                checkpoint=store.checkpoint_cipher_invocations if salt_bound else None,
+                cancels_before=cancels_before,
             )
             raise
         return store

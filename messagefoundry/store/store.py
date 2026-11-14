@@ -1952,6 +1952,18 @@ async def _run_to_completion(
 #: d20261114T002244771-017417). Nothing bounds the cleanup until a cancel lands.
 FAILED_OPEN_CANCEL_BOUND_S = 5.0
 
+# The attribute on an event loop holding the cleanups a cancel stopped waiting for. On the loop,
+# not the module, so the strong reference goes with a closed loop rather than outliving it.
+_ABANDONED_OPEN_CLEANUPS_ATTR = "_mefor_abandoned_open_cleanups"
+
+
+def cancels_at_entry() -> int:
+    """The current task's ``cancelling()`` count, read when a store open starts, so
+    :func:`cleanup_failed_open` counts only a cancel that landed during the open; a cancel the
+    task swallowed earlier is not this open's (BACKLOG #5720, as BACKLOG #5004)."""
+    current = asyncio.current_task()
+    return current.cancelling() if current is not None else 0
+
 
 def _force_failed_open_release(force_release: Callable[[], object]) -> None:
     """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054)."""
@@ -1964,74 +1976,78 @@ def _force_failed_open_release(force_release: Callable[[], object]) -> None:
         )
 
 
+def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
+    """Keep a strong reference to a cleanup this open stopped waiting for until it finishes, so
+    the loop does not drop it pending (BACKLOG #5720)."""
+    loop = task.get_loop()
+    held: set[asyncio.Future[Any]] | None = getattr(loop, _ABANDONED_OPEN_CLEANUPS_ATTR, None)
+    if held is None:
+        held = set()
+        try:
+            setattr(loop, _ABANDONED_OPEN_CLEANUPS_ATTR, held)
+        except AttributeError:
+            # A loop class that takes no attribute: the references the cleanup's own awaits hold.
+            return
+    held.add(task)
+    task.add_done_callback(held.discard)
+
+
 async def cleanup_failed_open(
     exc: BaseException,
     release: Callable[[], Awaitable[None]],
     force_release: Callable[[], object],
     *,
-    checkpoint: Callable[..., Awaitable[object]] | None = None,
+    cancels_before: int,
 ) -> None:
-    """Run a failed store open's cleanup through :func:`_run_to_completion`, so a cancel cannot
-    cut it short and leak what the open built (BACKLOG #5720). ``checkpoint`` is the store's
-    ``checkpoint_cipher_invocations``, passed only once the open has bound the cipher to this
-    store's salt: it then squares the block the open reserved. ``release`` closes what the open
-    built, whatever the settle raised, and logs its own failures by class. A settle failure that
-    reaches here is logged by class too, so neither replaces the open's error (vault BACKLOG
-    #3054). Raises a cancel that landed during the cleanup when ``exc`` is an ``Exception``; the
-    caller re-raises ``exc`` otherwise.
+    """Run a failed store open's ``release`` through :func:`_run_to_completion`, so a cancel
+    cannot cut it short and leak what the open built (BACKLOG #5720). ``release`` logs its own
+    failures by class, so none replaces the open's error (vault BACKLOG #3054). Raises a cancel
+    that landed during the open or its cleanup when ``exc`` is an ``Exception``; the caller
+    re-raises ``exc`` otherwise. ``cancels_before`` is :func:`cancels_at_entry`, read when the
+    open started.
 
     **A cancel still ends a failed open** (decision d20261114T002244771-017417). Nothing bounds the
     cleanup until a cancel lands; from then it gets at most :data:`FAILED_OPEN_CANCEL_BOUND_S`.
-    The bound starts at once when the open's own end was a cancel, or a cancel this task holds
-    under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past that, ``force_release`` drops what the open built
-    without waiting, and this stops waiting for the cleanup. ``force_release`` is synchronous for
-    the same reason it is the only thing a ``GeneratorExit`` runs: a coroutine being closed cannot
-    await, and awaiting would replace the exit with a ``RuntimeError``."""
+    The bound starts at once when the open's own end was a cancel, or a cancel this open received
+    under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past
+    the bound, ``force_release`` drops what the open built without waiting, and this stops
+    waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
+    thing a ``GeneratorExit`` runs: a coroutine being closed cannot await, and awaiting would
+    replace the exit with a ``RuntimeError``."""
     if isinstance(exc, GeneratorExit):
         _force_failed_open_release(force_release)
         return
 
-    async def body() -> None:
-        try:
-            if checkpoint is not None:
-                try:
-                    await checkpoint(settle=True)
-                except Exception as failure:  # noqa: BLE001 — never mask the open's error
-                    log.warning(
-                        "could not settle the AES-GCM invocation bound after a failed store open"
-                        " (%s)",
-                        type(failure).__name__,
-                    )
-        finally:
-            await release()
-
     task = asyncio.ensure_future(
         _run_to_completion(
-            body,
+            release,
             what="a failed store open's cleanup",
             lost="what the open built may not have been released",
         )
     )
     loop = asyncio.get_running_loop()
     current = asyncio.current_task()
-    # A cancel this task already holds, under the open's own exception or another, has landed.
-    cancelled = current is not None and current.cancelling() > 0
-    deadline = (
-        loop.time() + FAILED_OPEN_CANCEL_BOUND_S
-        if cancelled or not isinstance(exc, Exception)
-        else None
-    )
+    # A cancel this open received, under its own exception or another, has landed already.
+    cancelled = current is not None and current.cancelling() > cancels_before
+    if cancelled or isinstance(exc, asyncio.CancelledError):
+        trigger: str | None = "a cancel"
+    elif not isinstance(exc, Exception):
+        trigger = type(exc).__name__
+    else:
+        trigger = None
+    deadline = None if trigger is None else loop.time() + FAILED_OPEN_CANCEL_BOUND_S
     while not task.done():
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
             # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
             _force_failed_open_release(force_release)
             log.warning(
-                "a failed store open's cleanup did not finish within %.0f s of a cancel; what the"
-                " open built was released without waiting for it",
+                "a failed store open's cleanup did not finish within %s s of %s; what the open"
+                " built was released without waiting for it",
                 FAILED_OPEN_CANCEL_BOUND_S,
+                trigger,
             )
-            cancelled = True
+            _hold_abandoned_open_cleanup(task)
             break
         try:
             if remaining is None:
@@ -2045,6 +2061,7 @@ async def cleanup_failed_open(
                 break
             cancelled = True
             if deadline is None:
+                trigger = "a cancel"
                 deadline = loop.time() + FAILED_OPEN_CANCEL_BOUND_S
     if cancelled and isinstance(exc, Exception):
         raise asyncio.CancelledError from exc
@@ -11294,6 +11311,7 @@ class MessageStore:
         the pipeline, and loading them decrypts every cell, which refuses a legacy plaintext value
         the writable open would have sealed first. ``state_get`` and ``reference_view`` therefore
         read empty there. The audit chain's state is loaded, because the audit reads need it."""
+        cancels_before = cancels_at_entry()  # BACKLOG #5720: only this open's cancels
         sync = synchronous.upper()
         if sync not in ("NORMAL", "FULL"):
             raise ValueError(
@@ -11431,7 +11449,7 @@ class MessageStore:
                 for conn in conns:
                     _force_failed_open_release(conn.stop)
 
-            await cleanup_failed_open(exc, _release, _force_release)
+            await cleanup_failed_open(exc, _release, _force_release, cancels_before=cancels_before)
             raise
 
     @classmethod
