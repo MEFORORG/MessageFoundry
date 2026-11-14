@@ -1659,12 +1659,16 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     again (:func:`_masked_only`), but masked text still reaches passes main ran on the unmasked
     text, at least these: the next round after one that masks and also scrubs, the widened stage
     and the encoded run's re-run after a round that masks, and a caller's later call. A pass that
-    is not a fixed point can read it differently there. The credential backstop is the known one,
-    so a text holding its opener
-    (:data:`_USERINFO_OPENER`) keeps every rest, as :func:`_scrub_field_runs` does: ``mask`` is
-    False there. The caller tests that once per text, not once per end tag, which was quadratic.
-    The differential
-    fuzz in ``tests/test_redaction_xml_end_tag.py`` measures the rest; it is not a proof either.
+    is not a fixed point could read it differently there. The differential fuzz in
+    ``tests/test_redaction_xml_end_tag.py`` measures this; it is not a proof either.
+
+    **A text holding the credential backstop's opener (:data:`_USERINFO_OPENER`) keeps every
+    rest**, as :func:`_scrub_field_runs` does: ``mask`` is False there. The exclusion was added
+    when a mask alone forced a round main did not run, and the backstop read further in that round
+    than on main; the round gate (:func:`_masked_only`) now covers that case. It is kept as a
+    conservative choice: the backstop can read further in a later round than in an earlier one,
+    and the passes above still read masked text. The caller tests it once per text, not once per
+    end tag, which was quadratic.
 
     **Which words may be masked depends on what follows them** (:func:`_rest_words` holds the rules
     both share). Where the line ends the text, a caller can glue text onto the last word, so
@@ -2007,8 +2011,8 @@ def _needs_widened_stage(text: str) -> bool:
 
 
 def _redact_rounds(text: str, *, widened: bool) -> str:
-    """One stage of :func:`redact`: the flat and structured passes, repeated until a round changes
-    nothing but end-tag masks (:func:`_masked_only`)."""
+    """One stage of :func:`redact`: the flat and structured passes, repeated until the structured
+    passes change nothing but end-tag masks (:func:`_masked_only`)."""
     credentials = not widened
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:
@@ -2024,8 +2028,10 @@ def _masked_only(text: str, flat: str, *, widened: bool) -> bool:
     """Whether the structured passes turned ``flat`` into ``text`` only by masking end-tag rests in
     place (:func:`_end_tag_rest`, BACKLOG #5925), so the round is the fixed point it was on main.
 
-    **A mask is not a change that sends the text round again.** It uncovers nothing for another
-    pass, and the passes are not all fixed points on their own output, so a round main did not run
+    **A mask is not a change that sends the text round again.** It keeps every character's class
+    (:data:`_SHAPE`), and :func:`_end_tag_rest` masks only where that is not expected to change
+    another pass's reading, which the differential fuzz measures and does not prove. The passes
+    are not all fixed points on their own output, so a round main did not run
     reads differently: ``</given Doe>&Smith, Jones=PID|x`` left ``&[redacted]=PID|[redacted]`` on
     main, and a second round turns that into ``[redacted]``, so the ``PID|`` that took a caller's
     text joined after the answer was gone and the joined value printed. The exact test is the

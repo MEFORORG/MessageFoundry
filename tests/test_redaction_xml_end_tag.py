@@ -530,9 +530,7 @@ def test_the_round_gate_holds_over_generated_joins() -> None:
     point. Here each ``a`` ends on such a shape. Every route is main's with some letters and digits
     masked, and the control, the gate forced off as at 552c25b49e, leaks.
 
-    Measured by hand at 1,500 trials on each of five seeds, this one among them: 0 leaks and 0
-    unmasked routes, against 100 to 481 leaks on the control. A measurement of this corpus, not a
-    proof."""
+    It runs 1,000 trials on one seed: a measurement of this corpus, not a proof."""
     rand = random.Random(59252)
     shipped, forced = _Tally(), _Tally()
     for _ in range(1_000):
