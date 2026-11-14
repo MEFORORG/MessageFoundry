@@ -22,7 +22,10 @@ discharged by the 2026-07-24 amendment). A real Corepoint export is **XML, not J
 * **``@Data`` is wrapped in rich-text markup** (syntax-colouring tags + HTML entities) — it MUST be
   run through :func:`strip_markup` to recover the plain ``Verb operand operand …`` statement. This was
   the single biggest schema surprise: without the strip, the overwhelming majority of statements fail
-  to classify because the leading token is markup, not a verb.
+  to classify because the leading token is markup, not a verb. The strip recovers the text only; it
+  maps nothing on its own. A write or a send is read from the role spans (:func:`parse_roles`), and
+  in rich text with no span the role layer reads a write is never mapped and a send is refused
+  (:func:`_unread_markup`, BACKLOG #5556). Only plain text takes the flat reading.
 * **``<Block>`` is a comment / section label, not an action** — it is preserved as a comment in the
   generated module and never emitted as a step. A statement written in the ``@Data`` of any
   element but a ``<Line>`` is marked as a counted TODO and never emitted as a write or a
@@ -724,12 +727,13 @@ def strip_markup(data: str) -> str:
 # ("/PID-5-1 (Patient Name)"), which makes every path unresolvable for entirely the wrong reason.
 # Tag and attribute names are case-insensitive in HTML, so ``<SPAN CLASS='keyword'>`` is a span too.
 # Matched case-sensitively it fell out of the role layer into the flat reading, which applies neither
-# the handle gate nor the write gates (BACKLOG #5556). ASCII only, as HTML folds case: without
-# ``re.ASCII`` a long s or a Kelvin sign would fold into ``span`` or a class name. It narrows ``\s``
-# to ASCII whitespace too, so a span spaced with a no-break space is unread markup: its send is
-# refused and its write is not mapped, which fails closed.
-_SPAN_OPEN = re.compile(r"<span\s+class=['\"]([A-Za-z-]+)['\"]\s*>", re.IGNORECASE | re.ASCII)
-_SPAN_CLOSE = re.compile(r"</span\s*>", re.IGNORECASE | re.ASCII)
+# the handle gate nor the write gates (BACKLOG #5556). Case is folded on the ASCII letters alone, as
+# HTML folds it, by spelling each letter as a class: ``re.IGNORECASE`` would also fold a long s or a
+# Kelvin sign into ``span`` or a class name. ``\s`` stays Unicode, as it was before the fold: a span
+# spaced with a no-break space is still read, so its label, clone or send meets the same gates as
+# on main. (``re.ASCII`` narrowed it, and such a span became prose: quieter than main.)
+_SPAN_OPEN = re.compile(r"<[Ss][Pp][Aa][Nn]\s+[Cc][Ll][Aa][Ss][Ss]=['\"]([A-Za-z-]+)['\"]\s*>")
+_SPAN_CLOSE = re.compile(r"</[Ss][Pp][Aa][Nn]\s*>")
 
 # Span class → the role this layer reasons about. Unlisted classes fall through to ``"text"`` so a
 # future exporter class is inert rather than a crash — and is still visible in the token stream.

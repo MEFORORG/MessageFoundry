@@ -175,6 +175,11 @@ copy (`MsgTreeCopy`), and the message-lifecycle / logging / alerting verbs (`Msg
 without the export's data dictionary a fabricated path would silently write the wrong field, which is
 strictly worse than a marker a human must clear.
 
+*Narrowed 2026-11-14 (BACKLOG #5556):* this table is the flat reading, of a plain-text statement.
+A statement recovered from markup by `strip_markup()` is not mapped by it: a role-marked one is
+read from its spans under §2(b″), and in rich text with no span the role layer reads, a write is
+never mapped and a send is refused.
+
 **Control flow is emitted as real nested Python** — `if`/`elif`/`else`, `for`, `while`, `break`,
 `try`/`except` — with the *condition* left as an explicit dead placeholder (`if False:` /
 `for _item in []:`) beside the original text, because a Corepoint condition is not a Python
@@ -203,8 +208,8 @@ names no handle and takes the flat reading (the first gap below).
 At least these gaps remain:
 
 - A markup-free `MsgSend` carries no handle role, so it renders as before. *Narrowed 2026-11-14
-  (BACKLOG #5556):* this holds for plain text only. Span markup is matched case-insensitively, in
-  ASCII, so `<SPAN CLASS='keyword'>` is read as roles and takes the handle and write gates. On a
+  (BACKLOG #5556):* this holds for plain text only. Span markup is matched with case folded on
+  the ASCII letters alone, so `<SPAN CLASS='keyword'>` is read as roles and takes the handle and write gates. On a
   `<Line>` whose `@Data` is rich text (a tag or an entity) holding no span the role layer reads, a
   `MsgSend` is refused like a send of an unknown handle, a field write the flat reading would map
   is left unmapped, and the handle scan counts the send as a delivery of no known handle and a

@@ -1500,6 +1500,37 @@ def test_a_write_in_upper_case_markup_to_another_handle_is_not_mapped_onto_msg()
     assert "# TODO: Corepoint ItemClear" in body
 
 
+def test_a_span_spaced_with_a_no_break_space_is_still_read_on_a_block_label() -> None:
+    """Case folding must not narrow the span's whitespace: main read a keyword span spaced with a
+    no-break space, so the label is a statement and the list holds nothing. Read as unread markup
+    instead, the label was prose and the write and the send of ``%ADT`` went live."""
+    label = _role_line("<span class='keyword'>MsgReplace</span> %ADT")
+    label = label.replace("<Line ", "<Block ", 1).replace("/>", ">", 1)
+    block = (
+        f"{label}<List>{_WRITE_INPUT}{_role_send('input-handle', '%ADT', 'OB_A')}</List></Block>"
+    )
+    body = _handler_body(_handler_source(block))
+    assert 'set_field(msg, "MSH-6", "X")' not in body
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+
+
+def test_a_clone_destination_spaced_with_a_no_break_space_still_overwrites_the_input() -> None:
+    """The same whitespace in a clone's destination span: main counted the clone of ``%OUT`` over
+    ``%ADT``, so nothing is held and the send of ``%ADT`` is refused."""
+    clone = _role_line(
+        _span("keyword", "MsgTreeCopy")
+        + " "
+        + _span("other-handle", "%OUT")
+        + _span("path", "/")
+        + " to <span class='input-handle'>%ADT</span>"
+        + _span("path", "/")
+    )
+    body = _handler_body(_handler_source(clone + _role_send("input-handle", "%ADT", "OB_A")))
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+
+
 def test_upper_case_markup_of_the_input_handle_still_maps_and_sends() -> None:
     """The control arm: the same upper-case markup on the input handle reads as roles, so its write
     maps and its send stays live."""
