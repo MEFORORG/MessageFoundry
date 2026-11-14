@@ -933,16 +933,18 @@ def _pr_starts_table(units: _PrUnits, index: int) -> bool:
     return not above_is_row or above_marks[0][1] != marks[0][1] - 1
 
 
-def _pr_is_header(units: _PrUnits, index: int) -> bool:
+def _pr_is_header(units: _PrUnits, index: int, strict: bool) -> bool:
     """Whether a row is a header: a delimiter row sits on the very next line, in the same run of rows.
-    A "---" rule after a table is a unit of its own, not a row, so it makes no header."""
+    A "---" rule after a table is a unit of its own, not a row, so it makes no header. Strict, the
+    pair must also be one GFM renders as a table: one delimiter cell per header cell, each "-" with an
+    optional ":" at its ends."""
     if index + 1 >= len(units) or not units[index + 1][2] or _pr_starts_table(units, index + 1):
         return False
     header, delimiter = units[index][1], units[index + 1][1]
     if _pr_is_delimiter(header) or not _pr_is_delimiter(delimiter):
         return False
-    # As GFM requires of a table: one delimiter cell per header cell, each "-" with optional ":" at
-    # its ends. A pair that fails this renders no table, so a valid header below it still counts.
+    if not strict:
+        return True
     header_cells, delimiter_cells = _pr_cells(header), _pr_cells(delimiter)
     return len(header_cells) == len(delimiter_cells) and all(
         _PR_DELIMITER_CELL.fullmatch(c.strip()) for c in delimiter_cells
@@ -952,18 +954,27 @@ def _pr_is_header(units: _PrUnits, index: int) -> bool:
 def _pr_table_columns(units: _PrUnits) -> list[set[int]]:
     """For each unit, the ASVS columns its table's header names, or none.
 
-    A run of rows on adjacent lines holds at most one table, and it starts at the first header in the
-    run: pipe lines above it render as a paragraph, and a dash-only row below it is data, not a second
-    delimiter. A non-row unit or a blank line ends the run."""
-    columns: list[set[int]] = []
-    current: set[int] = set()
-    in_table = False
-    for index, (_, text, is_row) in enumerate(units):
-        if not is_row or _pr_starts_table(units, index):
-            current, in_table = set(), False
-        if is_row and not in_table and _pr_is_header(units, index):
-            current, in_table = _pr_asvs_columns(text), True
-        columns.append(current)
+    A run of rows on adjacent lines holds at most one table, and it starts at the run's first header
+    GFM would render: pipe lines above it render as a paragraph, and a dash-only row below it is data,
+    not a second delimiter. A run with no GFM-valid pair still takes its first header-shaped pair (a
+    mistyped delimiter still reads as a table to a person), as engine PR 2893 did. A non-row unit or
+    a blank line ends the run."""
+    columns: list[set[int]] = [set() for _ in units]
+    start = 0
+    while start < len(units):
+        end = start + 1
+        if units[start][2]:
+            while end < len(units) and units[end][2] and not _pr_starts_table(units, end):
+                end += 1
+            run = range(start, end)
+            header = next((i for i in run if _pr_is_header(units, i, strict=True)), None)
+            if header is None:
+                header = next((i for i in run if _pr_is_header(units, i, strict=False)), None)
+            if header is not None:
+                names = _pr_asvs_columns(units[header][1])
+                for i in range(header, end):
+                    columns[i] = names
+        start = end
     return columns
 
 

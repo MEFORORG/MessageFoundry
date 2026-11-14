@@ -1139,6 +1139,10 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("11", "map", f"{_REQ} is enforced\n{chr(0x200B)}# in pkg/example_guard.py."),
     # Punctuation binding the identifier to "the row" marks it, so a CI verb after it binds.
     ("10", "verdict", f"{_REQ}: the row is failing."),
+    # Review pass 3's new loss: with no GFM-valid pair in the run, a mistyped delimiter under an
+    # ASVS header still marks the column, as main read it.
+    ("5", "verdict", f"| ASVS | Note | Result |\n|---|---|\n{_ROW}"),
+    ("5", "verdict", f"| ASVS | Note | Result |\n| - - | - - | - - |\n{_ROW}"),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
