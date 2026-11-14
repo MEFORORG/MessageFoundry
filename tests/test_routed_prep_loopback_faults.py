@@ -901,6 +901,15 @@ async def test_the_log_halt_holds_a_voided_stop_repend_until_it_lands_and_keeps_
         return await real_process(name, item, **kwargs)
 
     monkeypatch.setattr(runner, "_process_routed_item", process)
+    claims = [0]
+    real_claim_batch = store.claim_next_fifo_batch
+
+    async def claim_next_fifo_batch(channel_id: str, **kwargs: Any) -> Any:
+        if kwargs.get("stage") == Stage.ROUTED.value:
+            claims[0] += 1
+        return await real_claim_batch(channel_id, **kwargs)
+
+    monkeypatch.setattr(store, "claim_next_fifo_batch", claim_next_fifo_batch)
     transform_ev = (
         runner._lane_event(Stage.ROUTED, LOOP) if runner._per_lane_wake else runner._routed_work
     )
@@ -928,14 +937,15 @@ async def test_the_log_halt_holds_a_voided_stop_repend_until_it_lands_and_keeps_
         assert calls == []
         worker = runner._transform_workers[LOOP]
         await runner._stop_all_for_log_failure(sink="file", reason="disk full")
-        halted_at = len(processed)
+        halted_at, claims_at = len(processed), claims[0]
         state["fail"] = False  # the store heals while the log is still halted
 
         async def settled() -> bool:
             return state["landed"] or worker.done()
 
         assert await _until(settled), "the held re-pend neither landed nor ended"
-        # Positive control that the gate holds: woken, the worker reads the gate again and waits.
+        # Woken, a worker still at its gate reads it again and waits. A worker that returned passes
+        # these waits too; the identity check after the drain is what fails it.
         waits = gate_waits[0]
         runner._wake_lane(Stage.ROUTED, LOOP)
 
@@ -944,6 +954,7 @@ async def test_the_log_halt_holds_a_voided_stop_repend_until_it_lands_and_keeps_
 
         assert await _until(gated_again), "the worker neither waited at its gate nor returned"
         assert processed[halted_at:] == [], "a row was processed while the log was halted"
+        assert claims[0] == claims_at, "the worker claimed while the log was halted"
         assert calls == []
 
         await runner.restart_inbound(LOOP)  # the log works again, so this lifts the halt
@@ -956,7 +967,9 @@ async def test_the_log_halt_holds_a_voided_stop_repend_until_it_lands_and_keeps_
             f"processed after the halt {processed[halted_at:]}"
         )
         assert processed[halted_at:] == message_ids, "the rows were not processed in claim order"
-        assert runner._transform_workers[LOOP] is worker, "the halt ended the worker's hold"
+        assert runner._transform_workers[LOOP] is worker, (
+            "the worker that held the tail was replaced"
+        )
         assert not _lane_down(runner), "the transform lane is down with its inbound deployed"
     finally:
         await runner.stop()
