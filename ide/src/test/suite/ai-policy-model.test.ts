@@ -7,7 +7,6 @@ import * as path from "path";
 import {
   AI_POLICY_CACHE_PREFIX,
   CACHED_PERMIT_MAX_AGE_MS,
-  CARRIED_DENY,
   aiPolicyCacheKey,
   assistantState,
   cachedPolicyOffline,
@@ -230,30 +229,24 @@ suite("aiPolicyCacheKey (BACKLOG #5564)", () => {
     assert.notStrictEqual(aiPolicyCacheKey("not a url"), aiPolicyCacheKey("also not a url"));
   });
 
-  test("K5: a carried deny is a deny to the merge, and nothing else", () => {
-    const merged = mergeAuthoritativePolicy(CARRIED_DENY, policy({ mode: "byo", assistPermitted: null }));
-    assert.strictEqual(merged.assistPermitted, false);
-    assert.strictEqual(merged.mode, "byo", "the fresh mode still comes through");
-    assert.strictEqual(mergeAuthoritativePolicy(CARRIED_DENY, policy({ assistPermitted: true })).assistPermitted, true);
-  });
 });
 
-// BACKLOG #5564: per-engine keys mean a retarget finds no cache. Once any engine has answered, that
-// must fail closed, not fall to the local CLI, or changing the setting bypasses a cached deny.
+// BACKLOG #5564: per-engine keys mean a retarget finds no cache. For an operator-configured target
+// that must fail closed, not fall to the local CLI, or changing the setting bypasses a cached deny.
 suite("pickOfflinePolicy — a retarget does not bypass a cached deny (BACKLOG #5564)", () => {
   const byo = policy({ mode: "byo", assistPermitted: null });
 
-  test("P1: no cache, no engine ever answered: the CLI's policy is used", () => {
+  test("P1: no cache, default target: the CLI's policy is used, as before", () => {
     assert.strictEqual(pickOfflinePolicy(null, byo, 0, false), byo);
   });
 
-  test("P2: no cache for this engine, but an engine has answered: fail closed, not the CLI", () => {
+  test("P2: no cache for a configured target: fail closed, not the CLI", () => {
     const p = pickOfflinePolicy(null, byo, 0, true);
     assert.strictEqual(p.mode, "unverified");
     assert.strictEqual(assistantState(p).enabled, false);
   });
 
-  test("P3: this engine's own cache still answers whatever the flag says", () => {
+  test("P3: this engine's own cache still answers either way", () => {
     const deny = { ...policy({ mode: "off" }), cachedAt: 0 };
     assert.strictEqual(pickOfflinePolicy(deny, byo, 0, true).mode, "off");
     assert.strictEqual(pickOfflinePolicy(deny, byo, 0, false).mode, "off");
@@ -309,20 +302,32 @@ suite("aiPolicy.ts reads the target engine's policy, and keys its cache (BACKLOG
     assert.ok(/cacheKey = aiPolicyCacheKey\(url\);/.test(code), "the key must be derived from the url asked");
   });
 
-  test("T5: with no cache for this engine, a deny seen from any engine stands in for the merge", () => {
-    assert.ok(
-      /get<CachedAiPolicy>\(cacheKey\) \?\? \(denySeen \? CARRIED_DENY : null\)/.test(code),
-      "a deny must carry to an engine with no cache of its own",
-    );
-    assert.ok(/update\(AI_POLICY_DENY_KEY, true\)/.test(code), "a deny must be recorded");
-    assert.ok(/update\(AI_POLICY_DENY_KEY, undefined\)/.test(code), "a permit must clear it");
+  test("T5: no globalState key crosses engines: every policy access is this engine's own key", () => {
+    // Any globalState access at all must be the per-engine key; a global flag would let one engine's
+    // answer or absence decide another's.
+    const all = code.match(/globalState\.(?:get<[^>]+>|get|update)\([^,)]*/g) ?? [];
+    assert.strictEqual(all.length, 3, `expected only the merge read, the write and the offline read: ${all.join(" | ")}`);
+    for (const call of all) {
+      assert.ok(/\(cacheKey$/.test(call), `a globalState access not keyed by engine: ${call}`);
+    }
   });
 
-  test("T4: the offline path passes whether any engine has answered", () => {
+  test("T4: the offline path falls to the CLI only for an unconfigured target", () => {
     assert.ok(
-      /pickOfflinePolicy\(cached, cli, now\(\), heard\)/.test(code),
-      "resolveAiPolicy must tell pickOfflinePolicy whether an engine has answered",
+      /pickOfflinePolicy\(cached, cli, now\(\), targetConfigured\)/.test(code),
+      "resolveAiPolicy must tell pickOfflinePolicy whether the target is configured",
     );
-    assert.ok(/globalState\.update\(AI_POLICY_HEARD_KEY, true\)/.test(code), "a successful read must set the flag");
+    assert.ok(/targetConfigured: engineTargetIsSet,/.test(code), "the production io must read the settings");
+  });
+});
+
+suite("cli.ts engineTargetIsSet (BACKLOG #5564)", () => {
+  test("a set engineUrl or any environment is a configured target", () => {
+    const cli = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "cli.ts"), "utf8");
+    assert.ok(
+      /function engineTargetIsSet\(\): boolean \{\s*return settingIsSet\(config\(\)\.inspect\("engineUrl"\)\) \|\| environments\(\)\.length > 0;/.test(
+        cli,
+      ),
+    );
   });
 });

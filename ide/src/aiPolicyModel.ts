@@ -190,27 +190,10 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
  * The globalState key prefix for a cached authoritative policy. The key is per ENGINE (BACKLOG
  * #5564): with one unscoped key, the answer one engine gave stood in for another, so a permit cached
  * from engine A enabled assistance while engine B was unreachable, and a deny cached from B was
- * replaced by A's answer. A key written before this change is not read. With no cache for an
- * engine, {@link pickOfflinePolicy} fails closed once any engine has answered, and a deny carries
- * ({@link AI_POLICY_DENY_KEY}).
+ * replaced by A's answer. Each engine's policy now comes only from that engine's own answer or its
+ * own cache; no state crosses engines. A key written before this change is not read.
  */
 export const AI_POLICY_CACHE_PREFIX = "messagefoundry.lastAiPolicy@";
-
-/** The globalState flag set once any engine has answered the policy read; see
- *  {@link pickOfflinePolicy}'s `heardFromAnEngine`. It spans workspaces, as globalState does. */
-export const AI_POLICY_HEARD_KEY = "messagefoundry.aiPolicyHeardFromEngine";
-
-/**
- * The globalState flag set while the last evaluable `ai:assist` answer from any engine was a deny.
- * Only the permit is per engine (BACKLOG #5564); a deny still carries to an engine with no cache of
- * its own, as it did under the single unscoped key, so another spelling of the same engine, read
- * without the bearer and answered `null`, cannot shed it. An engine answering `true` clears it.
- */
-export const AI_POLICY_DENY_KEY = "messagefoundry.aiPolicyDenySeen";
-
-/** What {@link mergeAuthoritativePolicy} is given as the cache when only a carried deny exists:
- *  it reads nothing but `assistPermitted`. */
-export const CARRIED_DENY: AiPolicy = { ...UNVERIFIED_POLICY, assistPermitted: false };
 
 /**
  * Pick the policy when the authoritative engine is unreachable. Pure + testable. Order:
@@ -219,27 +202,27 @@ export const CARRIED_DENY: AiPolicy = { ...UNVERIFIED_POLICY, assistPermitted: f
  *       and a cached answer that enables assistance stops doing so once it is too old (BACKLOG
  *       #1154); else
  *   (b) the local CLI's policy, if it positively returned one (it may itself carry mode "off"), but
- *       only while no engine has ever answered; else
+ *       only when no engine target is configured; else
  *   (c) the fail-closed UNVERIFIED policy (assistance disabled) — NEVER silently re-enable BYO.
  *
  * An expired cache does NOT fall through to (b). An IDE that holds a cache has heard from the
  * engine, which is the authority; a local file must not outrank it once its answer expires.
  *
- * `heardFromAnEngine` extends that rule across engines (BACKLOG #5564). The cache is per engine, so
- * retargeting to an unreachable engine, or to another spelling of one, finds no cache. Without this
- * flag that fell to the CLI, so a deny cached from the engine the IDE had been using was bypassed by
- * changing the setting. Once any engine has answered, a target with no cache of its own fails closed.
+ * `targetConfigured` (BACKLOG #5564): the cache is per engine, so an operator-configured target that
+ * is unreachable and has never answered finds no cache. The local CLI is not that engine and must
+ * not answer for it, or retargeting would bypass a deny; such a target fails closed. The CLI stays
+ * the fallback only for the default target, where the local file is the policy's nearest source.
  */
 export function pickOfflinePolicy(
   cached: CachedAiPolicy | null,
   cli: AiPolicy | null,
   nowMs: number = Date.now(),
-  heardFromAnEngine: boolean = false,
+  targetConfigured: boolean = false,
 ): AiPolicy {
   if (cached) {
     return cachedPolicyOffline(cached, nowMs);
   }
-  if (cli && !heardFromAnEngine) {
+  if (cli && !targetConfigured) {
     return cli;
   }
   return UNVERIFIED_POLICY;

@@ -368,30 +368,33 @@ suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
     assert.strictEqual(offlineA.assistPermitted, false, "the same engine, spelled with a slash, is one key");
   });
 
-  test("T21: an ai:assist deny carries to an engine with no cache that answers null", async () => {
-    const ctx = keyedCtx();
-    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: false })));
-    // B could be the same engine spelled another way, read without the bearer.
-    const b = await resolveAiPolicy(ctx, engineIo(B, wire({ assist_permitted: null })));
-    assert.strictEqual(b.assistPermitted, false, "an unattributed answer must not shed a deny");
-    // An evaluable permit still wins outright, so signing in is the way out.
-    const granted = await resolveAiPolicy(ctx, engineIo(B, wire({ assist_permitted: true })));
-    assert.strictEqual(granted.assistPermitted, true);
-  });
-
-  test("T20: retargeting to an engine with no cache fails closed, not to the CLI's byo", async () => {
-    const ctx = keyedCtx();
-    await resolveAiPolicy(ctx, engineIo(A, wire({ mode: "off" })));
-    let cliAsked = false;
-    const offlineB: AiPolicyIo = {
+  /** Engine B is unreachable with no cache; the local CLI would say byo. */
+  function offlineWithCli(configured: boolean): AiPolicyIo & { cliAsked: () => boolean } {
+    let asked = false;
+    return {
       ...engineIo(B, undefined),
       getCliPolicy: async () => {
-        cliAsked = true;
+        asked = true;
         return wire({ mode: "byo" });
       },
+      targetConfigured: () => configured,
+      cliAsked: () => asked,
     };
-    const p = await resolveAiPolicy(ctx, offlineB);
+  }
+
+  test("T20: a configured target with no cache fails closed, not to the CLI's byo", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ mode: "off" })));
+    const io = offlineWithCli(true);
+    const p = await resolveAiPolicy(ctx, io);
     assert.strictEqual(p.mode, "unverified", "a cached off must not be bypassed by changing the setting");
-    assert.strictEqual(cliAsked, false, "the CLI is not consulted once an engine has answered");
+    assert.strictEqual(io.cliAsked(), false, "the CLI is not consulted for a configured target");
+  });
+
+  test("T22: the default target with no cache still falls to the CLI, as before", async () => {
+    const io = offlineWithCli(false);
+    const p = await resolveAiPolicy(keyedCtx(), io);
+    assert.strictEqual(p.mode, "byo");
+    assert.strictEqual(io.cliAsked(), true);
   });
 });
