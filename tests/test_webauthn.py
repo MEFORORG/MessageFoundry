@@ -230,9 +230,11 @@ async def test_fresh_session_is_mfa_pending_until_assertion() -> None:
         await store.close()
 
 
-async def test_assertion_stamps_the_factor_and_re_anchors() -> None:
-    """Vault BACKLOG #2964 item 14 (owner ruling 2026-11-14, ADR 0068 Amendment of that date): the
-    assertion marks the factor and stamps ``reauth_at``, as ``verify_mfa`` does after a good code."""
+@pytest.mark.parametrize("uv", [True, False])
+async def test_assertion_stamps_the_factor_and_re_anchors(uv: bool) -> None:
+    """Vault BACKLOG #2964 item 14 (owner rulings 2026-11-14, "Assertion only" and "Stamp only if
+    UV"): every verified assertion marks the factor and re-anchors the session; ``reauth_at`` is
+    stamped only when the signed authenticator data carries the UV flag."""
     from messagefoundry.auth.tokens import hash_token
 
     store = await MessageStore.open(":memory:")
@@ -250,14 +252,18 @@ async def test_assertion_stamps_the_factor_and_re_anchors() -> None:
         assert options is not None
         challenge = base64url_to_bytes(json.loads(options)["challenge"])
         elevation = await service.finish_webauthn_assertion(
-            fresh, auth.get_response(challenge), client="10.4.4.2", rp_id=RP, origin=ORIGIN
+            fresh,
+            auth.get_response(challenge, user_verified=uv),
+            client="10.4.4.2",
+            rp_id=RP,
+            origin=ORIGIN,
         )
         assert elevation.ok and elevation.token is not None
         # Read back under the ROTATED token: the assertion re-keyed the row.
         after = await store.get_session(hash_token(elevation.token))
         assert after is not None
         assert after.mfa_verified_at is not None
-        assert after.reauth_at is not None
+        assert (after.reauth_at is not None) is uv
         assert after.client == "10.4.4.2"
     finally:
         await store.close()
@@ -1337,9 +1343,9 @@ async def _reaudited(service: AuthService, token: str, address: str) -> bool:
 async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Vault BACKLOG #2964 item 14 (owner ruling 2026-11-14): a passkey proved at the MFA gate from a
-    roamed address leaves the session anchored there with a stamped window, exactly as a TOTP code
-    proved by ``verify_mfa`` does. Each also restarts the new-address dedupe, so a third address
+    """Vault BACKLOG #2964 item 14 (owner rulings 2026-11-14): a user-verified passkey proved at the
+    MFA gate from a roamed address leaves the session anchored there with a stamped window, exactly
+    as a TOTP code proved by ``verify_mfa`` does. Each also restarts the new-address dedupe, so a third address
     flagged before the proof is audited afresh after it."""
     from messagefoundry.auth import totp
     from tests._totp_clock import pin_totp_clock
@@ -1360,7 +1366,11 @@ async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
         assert options is not None
         challenge = base64url_to_bytes(json.loads(options)["challenge"])
         passkey = await service.finish_webauthn_assertion(
-            out.token, auth.get_response(challenge), client="10.7.7.2", rp_id=RP, origin=ORIGIN
+            out.token,
+            auth.get_response(challenge, user_verified=True),
+            client="10.7.7.2",
+            rp_id=RP,
+            origin=ORIGIN,
         )
         assert passkey.ok and passkey.token is not None
         results["passkey"] = await _session_after(service, passkey.token)

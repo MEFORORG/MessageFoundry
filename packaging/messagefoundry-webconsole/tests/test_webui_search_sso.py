@@ -168,8 +168,9 @@ async def test_audit_cookie_not_accepted_on_json_routes(engine: Engine) -> None:
 #
 # Browser-level ceremony tests use the in-repo soft authenticator and are gated FUNCTION-LOCALLY on
 # the [webauthn] extra (a module-level importorskip here would skip the whole webui suite on an
-# extra-less install). The passkey assertion meets the factor and stamps the window; an action-bound
-# route's grant still comes only from the password leg of POST /ui/reauth (ADR 0077). Options ride
+# extra-less install). The passkey assertion meets the factor, and stamps the window only with the
+# UV flag, which the soft authenticator here does not set; an action-bound route's grant comes
+# only from the password leg of POST /ui/reauth (ADR 0077). Options ride
 # HTML-escaped data-* attributes (CSP: no inline script); only the verify legs are JSON POSTs — the
 # sanctioned first cookie-authed JSON under /ui.
 
@@ -250,14 +251,14 @@ async def test_webauthn_browser_enroll_and_stepup_e2e(engine: Engine) -> None:
         assert "Invalid code." not in r.text
         options = _data_attr(r.text, "data-mf-webauthn-get")
 
-        # The passkey leg: assert -> MFA satisfied; the delete is action-bound, so it still owes a grant.
+        # The passkey leg: assert -> MFA satisfied; no UV, no window, and no grant for the delete.
         resp = json.loads(
             auth_a.get_response(base64url_to_bytes(options["challenge"]), sign_count=0)
         )
         r = await c.post("/ui/reauth/webauthn", json={"response": resp}, headers=_SFS)
         assert r.status_code == 200 and r.json() == {"ok": True}
         r = await c.post(delete_path, headers=_SFS)
-        assert r.status_code == 303  # still 303s: only the password leg mints the delete's grant
+        assert r.status_code == 303  # still 303s: only the password leg completes the step-up
 
         # The password leg completes the pair -> continuation auto-retries the delete.
         r = await c.post("/ui/reauth", data={"next": delete_path, "password": PW}, headers=_SFS)

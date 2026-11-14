@@ -213,7 +213,7 @@ def test_an_es256_credential_still_registers_and_asserts() -> None:
             origin=ORIGIN,
             public_key=registered.public_key,
             current_sign_count=0,
-        )
+        ).new_sign_count
         == 0
     )
 
@@ -686,7 +686,7 @@ def _signs_in(respond: Callable[[bytes], str], stored: bytes) -> int:
         origin=ORIGIN,
         public_key=stored,
         current_sign_count=0,
-    )
+    ).new_sign_count
 
 
 def _refused_at_sign_in(

@@ -16622,8 +16622,11 @@ class SqlServerStore:
         now: float | None = None,
         client: str | None = None,
         idp_auth_time: float | None = None,
+        stamp_window: bool = True,
     ) -> None:
-        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
+        stamp = reauth_stamp(
+            time.time() if now is None else now, client, idp_auth_time, stamp_window=stamp_window
+        )
         await self._write_session_txn(token_hash, stamp)
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:

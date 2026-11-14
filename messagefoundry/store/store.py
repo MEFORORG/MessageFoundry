@@ -2259,11 +2259,11 @@ def new_session_record(
 
 
 def reauth_stamp(
-    now: float, client: str | None, idp_auth_time: float | None
+    now: float, client: str | None, idp_auth_time: float | None, *, stamp_window: bool = True
 ) -> Callable[[SessionRecord], SessionRecord]:
     """The change ``mark_session_reauthed`` makes to a session row, for the session write helper.
 
-    ``reauth_at`` becomes ``now``. A ``client`` re-anchors the session's address; ``None`` keeps the
+    ``reauth_at`` becomes ``now``, unless ``stamp_window`` is false, which keeps it. A ``client`` re-anchors the session's address; ``None`` keeps the
     stored one (WP-L3-13). ``idp_auth_time`` only ever moves FORWARD (BACKLOG #2143), so two
     step-ups landing out of order cannot leave the older value behind for a replay to pass."""
     when = float(now)
@@ -2275,7 +2275,7 @@ def reauth_stamp(
             forward = idp
         return replace(
             s,
-            reauth_at=when,
+            reauth_at=when if stamp_window else s.reauth_at,
             client=s.client if client is None else client,
             idp_auth_time=forward,
         )
@@ -20665,8 +20665,11 @@ class MessageStore:
         now: float | None = None,
         client: str | None = None,
         idp_auth_time: float | None = None,
+        stamp_window: bool = True,
     ) -> None:
-        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
+        stamp = reauth_stamp(
+            time.time() if now is None else now, client, idp_auth_time, stamp_window=stamp_window
+        )
         async with _writer_txn(self._db, self._lock):
             await self._write_session(token_hash, stamp)
             await self._commit()

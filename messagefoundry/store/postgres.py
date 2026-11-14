@@ -11387,8 +11387,11 @@ class PostgresStore:
         now: float | None = None,
         client: str | None = None,
         idp_auth_time: float | None = None,
+        stamp_window: bool = True,
     ) -> None:
-        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
+        stamp = reauth_stamp(
+            time.time() if now is None else now, client, idp_auth_time, stamp_window=stamp_window
+        )
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await self._write_session(conn, token_hash, stamp)
 

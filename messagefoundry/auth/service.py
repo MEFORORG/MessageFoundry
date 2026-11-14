@@ -6271,7 +6271,7 @@ class AuthService:
             return False
         # A bad signature writes no row here (see _check_password_and_passkey); the clone signal
         # and a refused stored key do, deferred with the other refused rows.
-        new_count = await self._verify_passkey_signature(
+        verified = await self._verify_passkey_signature(
             user,
             cred,
             response_json=parsed,
@@ -6282,10 +6282,13 @@ class AuthService:
             write=later,
             audit_bad_signature=False,
         )
-        if new_count is None:
+        if verified is None:
             return False
         answer = await self._store.update_webauthn_sign_count(
-            cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
+            cred.credential_id_hash,
+            expected=cred.sign_count,
+            new=verified.new_sign_count,
+            used_at=now,
         )
         if answer != "moved":
             missed, suspect = answer, cred
@@ -6309,9 +6312,9 @@ class AuthService:
         client: str | None,
         write: Callable[[Callable[[], Awaitable[None]]], Awaitable[None]],
         audit_bad_signature: bool,
-    ) -> int | None:
-        """Verify an assertion's signature against stored passkey ``cred``: the new sign count, or
-        ``None`` when it is refused. The one copy of the refusal handling both passkey legs share,
+    ) -> webauthn.AssertionResult | None:
+        """Verify an assertion's signature against stored passkey ``cred``: the new sign count and
+        UV flag, or ``None`` when it is refused. The one copy of the refusal handling both passkey legs share,
         :meth:`finish_webauthn_assertion` and the combined passkey sign-in. ``write`` runs each audit
         row: at once on the second-factor leg, deferred into the failure pad on the sign-in.
 
@@ -8147,9 +8150,9 @@ class AuthService:
                 # ticket or a federated redirect is an AMBIENT proof, and seeding would let the
                 # engine's own login stamp satisfy `has_recent_step_up` for the whole
                 # `step_up_max_age_seconds` window with no directory interaction. So the first
-                # window-gated action demands a real step-up: a directory re-bind or an engine TOTP
-                # or recovery code at the MFA gate for a `kerberos` session, since `verify_mfa`
-                # stamps the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
+                # window-gated action demands a real step-up: a directory re-bind, or an engine TOTP
+                # or recovery code or a user-verified passkey at the MFA gate for a `kerberos`
+                # session, since those stamp the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
                 # #296, #2142).
                 #
                 # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
@@ -15010,7 +15013,8 @@ class AuthService:
 
         A LOCAL login that owes no second factor is the first verification. No directory login is:
         Kerberos and OIDC sessions are born with no window (BACKLOG #1144 step 5). A Kerberos session
-        opens one by a step-up or a code at the MFA gate, an OIDC session only by the IdP step-up
+        opens one by a step-up, a code at the MFA gate or a user-verified passkey there, an OIDC
+        session only by the IdP step-up
         (BACKLOG #2142)."""
         if not token:
             return False
@@ -15140,7 +15144,8 @@ class AuthService:
         * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``),
           once the session has rotated, whether it finishes a sign-in or a step-up. Both also move
           the session's anchor (see :meth:`_same_host`), but not on an OIDC session, whose anchor
-          moves only at the IdP (BACKLOG #2142);
+          moves only at the IdP (BACKLOG #2142). The passkey opens the step-up window only with
+          the UV flag;
         * a factor enrolment confirmed, first or later (``confirm_mfa_enrollment``,
           ``finish_webauthn_registration``); a first one is how a first sign-in under
           ``require_mfa`` finishes. Those callers pass the account as ``enrolment``, and an address
@@ -18147,9 +18152,10 @@ class AuthService:
         origin: str,
     ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
-        factor satisfied, re-anchor it as :meth:`verify_mfa` does (``reauth_at`` and the WP-L3-13
-        client, not on an ``oidc`` session; vault BACKLOG #2964 item 14, owner ruling 2026-11-14,
-        ADR 0068 Amendment of that date) and re-key the session (ASVS 7.2.4). Returns a not-``ok``
+        factor satisfied, re-anchor it to the WP-L3-13 client as :meth:`verify_mfa` does, stamp
+        ``reauth_at`` only when the authenticator reported user verification (not on an ``oidc``
+        session either way; vault BACKLOG #2964 item 14, owner rulings 2026-11-14, ADR 0068
+        Amendments of that date) and re-key the session (ASVS 7.2.4). Returns a not-``ok``
         :class:`Elevation` (never raises) for any invalid input, always audited.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
@@ -18221,7 +18227,7 @@ class AuthService:
         # amendment) is audited with its own slug, so an admin can see why a passkey-only user is
         # stuck; py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 §4).
         # The caller gets the same refusal for each. _verify_passkey_signature holds all three.
-        new_count = await self._verify_passkey_signature(
+        verified = await self._verify_passkey_signature(
             user,
             cred,
             response_json=response_json,
@@ -18232,7 +18238,7 @@ class AuthService:
             write=_write_now,
             audit_bad_signature=True,
         )
-        if new_count is None:
+        if verified is None:
             return Elevation()
         # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account must
         # still be in the directory first, as verify_mfa asks (#2023). Without this an account
@@ -18253,7 +18259,10 @@ class AuthService:
         user = current
         now = time.time()
         answer = await self._store.update_webauthn_sign_count(
-            cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
+            cred.credential_id_hash,
+            expected=cred.sign_count,
+            new=verified.new_sign_count,
+            used_at=now,
         )
         if answer != "moved":
             # Every compare-and-set miss is a clone signal (ADR 0068 decision 4), whatever follows:
@@ -18318,13 +18327,17 @@ class AuthService:
                 await self._store.mark_session_mfa_verified(hash_token(token))
             if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
                 return Elevation(session_lost=True)
-            # Vault BACKLOG #2964 item 14 (owner ruling 2026-11-14): re-anchor the session to the
-            # address that proved the passkey, as verify_mfa does after a good code, so the two
-            # address signals agree. Not on an oidc session, whose anchor moves only at the IdP
-            # (BACKLOG #2142); tests/test_docs_security_pathways.py pins the branch.
+            # Vault BACKLOG #2964 item 14 (owner rulings 2026-11-14, "Assertion only" and "Stamp
+            # only if UV"): re-anchor the session to the address that proved the passkey, as
+            # verify_mfa does after a good code, so the two address signals agree. The step-up
+            # window opens only when the signed authenticator data carried the UV flag. Not on an
+            # oidc session, whose anchor moves only at the IdP (BACKLOG #2142);
+            # tests/test_docs_security_pathways.py pins the branch.
             if session.auth_mechanism != SessionMechanism.OIDC.value:
                 async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
-                    await self._store.mark_session_reauthed(hash_token(token), client=client)
+                    await self._store.mark_session_reauthed(
+                        hash_token(token), client=client, stamp_window=verified.user_verified
+                    )
                 if reauth_stamp.refused:  # BACKLOG #2592: as above, the session has been ended
                     return Elevation(session_lost=True)
                 self._restart_new_ip_dedupe(hash_token(token))

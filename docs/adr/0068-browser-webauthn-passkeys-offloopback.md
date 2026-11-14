@@ -54,9 +54,8 @@ minted `mfa_verified=True`; engine MFA never applies to directory identities —
 **Second factor at the existing WP-14b step-up boundary, browser-only ceremony**; no login-time
 ceremony (the deferred-MFA posture stands — MFA is satisfied lazily at the first step-up).
 
-*Amended 2026-11-14: the assertion now also stamps `reauth_at` and re-anchors, as a TOTP code does;
-see the amendment of that date.* The browser step-up stays **two-credential**: a passkey assertion
-replaces the TOTP-code leg and stamps **`mfa_verified_at` only**; the operator then submits the existing `POST /ui/reauth`
+The browser step-up stays **two-credential**: a passkey assertion replaces the TOTP-code leg and
+stamps **`mfa_verified_at` only**; the operator then submits the existing `POST /ui/reauth`
 password leg, which stamps `reauth_at` **and performs the `mark_session_reauthed(client)` new-IP
 re-anchor**. The completed pair produces both stamps exactly as `verify_mfa` + reauth do today — so
 the WP-L3-13 new-client-IP forced step-up clears and no redirect-loop class exists.
@@ -261,9 +260,9 @@ amendment of that date.*
   after the password-only re-proof (a stolen pre-MFA cookie can never bind a passkey).
   → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_enroll_requires_password_reproof`
 - **AC-2** — WHEN a passkey assertion verifies at `POST /ui/reauth/webauthn`, THE SYSTEM SHALL stamp
-  `mfa_verified_at`, and on any session but an `oidc` one `reauth_at` and the client re-anchor
-  (Amendment 2026-11-14; this criterion first said `mfa_verified_at` ONLY).
-  → `tests/test_webauthn.py::test_assertion_stamps_the_factor_and_re_anchors`
+  `mfa_verified_at` ONLY (no `reauth_at`, no client re-anchor); the subsequent password leg SHALL
+  stamp `reauth_at` and re-anchor the client IP.
+  → `tests/test_webauthn.py::test_assertion_stamps_mfa_only_never_reauth`
 - **AC-3** — WHILE a user's only enrolled factor is WebAuthn, WHEN they hit a `step_up=True` action,
   THE SYSTEM SHALL render the reauth page with the passkey prompt (never divert to
   `enroll_first`, never demand a TOTP code), and the generalized anti-loop check SHALL run before
@@ -775,3 +774,22 @@ there a passkey alone also passes factor binding and removal, which before this 
 
 **Who decided.** The owner, 2026-11-14, answering "#2964 item 14 ... Which do you want?" with
 "Assertion only".
+
+## Amendment (2026-11-14, second) -- the window opens only on a user-verified assertion (vault BACKLOG #2964 item 14)
+
+This narrows the amendment above. Every verified assertion at the MFA gate still marks the factor,
+re-anchors the session to its address and restarts the new-address dedupe. The step-up window
+(`reauth_at`) opens only when the signed authenticator data carries the UV flag: `verify_assertion`
+returns py_webauthn's `user_verified` beside the sign count, and `finish_webauthn_assertion` passes
+it to `mark_session_reauthed(stamp_window=...)`, which without it re-anchors and leaves `reauth_at`
+as it was. `verify_mfa` is unchanged. `user_verification` stays PREFERRED, so a PIN-less key still
+meets the factor, but alone it opens no window; the password leg of `POST /ui/reauth` still does.
+The premise in the amendment above, that a passkey alone passes a window-gated route, now holds only
+for a user-verified assertion.
+
+AC-2 above is superseded: a verified assertion stamps `mfa_verified_at` and the client re-anchor,
+and `reauth_at` only with UV, never on an `oidc` session. Its verifying test is now
+`tests/test_webauthn.py::test_assertion_stamps_the_factor_and_re_anchors`.
+
+**Who decided.** The owner, 2026-11-14, answering "How should a passkey assertion stamp the
+window?" with "Stamp only if UV".

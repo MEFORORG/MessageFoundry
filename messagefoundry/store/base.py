@@ -3377,8 +3377,11 @@ class AuthStore(Protocol):
         now: float | None = None,
         client: str | None = None,
         idp_auth_time: float | None = None,
+        stamp_window: bool = True,
     ) -> None:
-        """Refresh the session's step-up freshness (``reauth_at``). When ``client`` is given, also
+        """Refresh the session's step-up freshness (``reauth_at``), unless ``stamp_window`` is false,
+        which re-anchors only: a passkey assertion without the UV flag (vault BACKLOG #2964 item 14,
+        owner ruling 2026-11-14). When ``client`` is given, also
         re-anchor the session's last-verified client address to it (the new-client-IP risk signal in
         WP-L3-13 uses this so a re-verify from a roamed address clears the forced step-up); a ``None``
         ``client`` leaves the stored address unchanged.

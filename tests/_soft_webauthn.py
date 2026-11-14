@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from webauthn.helpers import bytes_to_base64url, encode_cbor
 
 _FLAG_UP = 0x01  # user present — verify_registration_response requires it by default
+_FLAG_UV = 0x04  # user verified — set on an assertion only when a test asks for it
 _FLAG_AT = 0x40  # attested credential data included (registration only)
 _AAGUID = b"\x00" * 16
 
@@ -131,7 +132,9 @@ class SoftAuthenticator:
             }
         )
 
-    def get_response(self, challenge: bytes, *, sign_count: int | None = None) -> str:
+    def get_response(
+        self, challenge: bytes, *, sign_count: int | None = None, user_verified: bool = False
+    ) -> str:
         """A ``navigator.credentials.get`` response JSON: a REAL ECDSA-P256/SHA256 DER signature
         over ``authenticatorData + sha256(clientDataJSON)``. ``sign_count`` defaults to
         auto-increment; pass an explicit value (incl. a replayed one) for counter tests — 0 stays
@@ -140,7 +143,8 @@ class SoftAuthenticator:
             self.sign_count += 1
         count = self.sign_count if sign_count is None else sign_count
         client_data = _client_data("webauthn.get", challenge, self.origin)
-        auth_data = self._rp_hash() + bytes([_FLAG_UP]) + struct.pack(">I", count)
+        flags = _FLAG_UP | (_FLAG_UV if user_verified else 0)
+        auth_data = self._rp_hash() + bytes([flags]) + struct.pack(">I", count)
         signature = self._key.sign(
             auth_data + hashlib.sha256(client_data).digest(), ec.ECDSA(hashes.SHA256())
         )

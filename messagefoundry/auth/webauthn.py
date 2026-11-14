@@ -626,6 +626,16 @@ def assertion_options(
     return options_to_json(options)
 
 
+@dataclass(frozen=True)
+class AssertionResult:
+    """What a verified assertion proved: the authenticator's new sign count, and whether the
+    signed authenticator data carried the user-verified (UV) flag. Both come from the authenticator
+    data the signature covers, never from client-supplied fields."""
+
+    new_sign_count: int
+    user_verified: bool
+
+
 def verify_assertion(
     *,
     response_json: str | dict[str, Any],
@@ -634,8 +644,8 @@ def verify_assertion(
     origin: str,
     public_key: bytes,
     current_sign_count: int,
-) -> int:
-    """Verify an assertion; return the authenticator's new sign count.
+) -> AssertionResult:
+    """Verify an assertion; return the authenticator's new sign count and its UV flag.
 
     py_webauthn enforces counter increment only when both counts are >0 (synced-passkey 0/0 is
     accepted); the *service* layer applies the strict compare-and-set on top (a CAS miss is the
@@ -678,7 +688,7 @@ def verify_assertion(
         # service's clone-signal classification. The raw types stay caught although the stored
         # key was screened above: the response itself is attacker input too.
         raise _refusal(exc, ceremony="assertion") from exc
-    return verified.new_sign_count
+    return AssertionResult(verified.new_sign_count, bool(verified.user_verified))
 
 
 def parse_response(response_json: str) -> dict[str, Any]:

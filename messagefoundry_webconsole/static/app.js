@@ -570,8 +570,8 @@
   });
 
   // Step-up assertion: run the get() ceremony against the staged options and POST the assertion
-  // to the reauth passkey leg. On success the factor is met and the window stamped — the operator
-  // still enters the password below, the leg that mints an action-bound grant (ADR 0077).
+  // to the reauth passkey leg. On success the factor is met, and the window stamped only with the
+  // UV flag — the operator still enters the password below, which completes the step-up.
   feature("[data-mf-webauthn-get]", function (button) {
     var status = statusNode(button);
     if (!window.PublicKeyCredential) {
