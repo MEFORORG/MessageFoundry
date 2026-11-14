@@ -725,6 +725,10 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   icacls "D:\hl7\config" /inheritance:r /grant "Administrators:(OI)(CI)F" "NT SERVICE\MessageFoundry:(OI)(CI)R"
   icacls "D:\hl7\config" /setowner "*S-1-5-32-544" /T /C
   ```
+  `/T` walks the tree, and the walk goes through a junction (measured with `/reset /T`), so remove
+  any junction or link inside the dir first, or the command changes what it points at. That holds
+  for every `/T` recipe in this section. `/inheritance:r` and `/grant` also leave an explicit entry
+  for any other account in place; read the result with `icacls`.
   The supported one-step way to do this at install time is `install-service.ps1 -LockConfigDir`:
   it strips inherited ACEs and locks the dir to SYSTEM + Administrators (full) and the run-as
   account (read+execute) — no companion flag needed, since the run-as account defaults to the
@@ -733,9 +737,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   folder below it, resets each one's DACL to inherit only those grants, discarding its own
   entries, and reads each owner and DACL back. What the read-back finds is named in a warning
   instead of the "locked" line: at least an entry for another account, an owner it could not set,
-  a missing read for the run-as account, a deny entry on the dir, a junction or link, which it
-  does not enter, and a hard-linked file, whose own entries it keeps because its other names share
-  them. A write grant the run-as account held below the dir becomes read, and
+  a missing read for the run-as account, a deny entry on the dir, a link, a junction or any other
+  folder reparse point, which it does not enter, and a hard-linked file, whose own entries it
+  keeps because its other names share them. A write grant the run-as account held below the dir becomes read, and
   is named in a warning too. It is **opt-in** because the config dir often lives inside a developer's repo
   where stripping inheritance is surprising — for production, point `-Config` at a dedicated
   admin-owned directory and pass `-LockConfigDir`.
@@ -787,6 +791,7 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       Windows. `/T` covers the `*.py` files, which the guard vets individually; `/C` keeps the walk
       going past a file it cannot set (an open editor, an antivirus scan) instead of stopping at the
       first one and leaving the rest on the old owner — check its summary line for skipped files.
+      Remove any junction or link inside the dir first, for the reason given above.
       Setting the owner does **not** grant anyone access — pair it with the DACL recipes above.
   - On **POSIX** hosts the loader **refuses** to load from a group/world-writable directory or module
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine

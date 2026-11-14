@@ -422,10 +422,15 @@ function New-SeceditWorkDirectory {
       belongs to the user, and a process of that user at medium integrity holds FILE_DELETE_CHILD
       there. With it, the process can rename any folder in it, whatever that folder's own DACL says,
       and put its own folder in its place with a policy file of its choosing. So the default parent is
-      %SystemRoot%\Temp, where users may add a folder but not delete or rename one an administrator
-      made. The parent is checked for that before anything is made, so a host whose Windows Temp
-      differs is refused rather than trusted. The Windows folder is asked of the system, not read
-      from $env:SystemRoot: the user can set that variable for their own processes.
+      the Windows folder's Temp. The Windows folder is asked of the system, not read from
+      $env:SystemRoot: the user can set that variable for their own processes.
+
+      WHAT IS CHECKED ON THE PARENT, before anything is made, and nothing more. It must be a folder
+      that is not a reparse point. Its owner must be SYSTEM, Administrators, TrustedInstaller or
+      $OwnerSid. No allow entry that applies to the parent itself may give anyone else
+      delete-child, a DACL change, ownership or GENERIC_ALL; OWNER RIGHTS counts as the owner and
+      CREATOR OWNER is not judged. A parent that fails is refused. DELETE on the parent itself is
+      not checked, and neither is any folder above it.
 
       $Parent and $OwnerSid are parameters so the unelevated tests can make a folder they own.
     #>

@@ -939,8 +939,6 @@ function New-RestrictedDirectory {
       CreateDirectory succeeds on a folder that is already there, so someone who made the path first
       would hand this call their folder. The owner and the protection are read back to catch that.
       $OwnerSid is a parameter so the unelevated tests can make a folder they own.
-      uninstall-service.ps1's New-SeceditWorkDirectory copies this create step; the scripts share no
-      file, so a fix here belongs there too.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$OwnerSid = "S-1-5-32-544")
     $sec = New-Object System.Security.AccessControl.DirectorySecurity
@@ -1196,8 +1194,10 @@ function Set-SecureConfigAcl {
       nothing.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$Account)
-    # Read again here, not only when -Config was judged: icacls follows a junction to its target,
-    # and the path, or a folder above it, may have become one since (Set-SecretsDirAcl does the same).
+    # Read again here, not only when -Config was judged: the path, or a folder above it, may have
+    # become a junction or link since, and the walk below would then list and change what it points
+    # at. Measured: a single-item icacls call reset a symbolic link's target but not a junction's,
+    # and a `/T` walk went through a junction.
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if (-not $item -or -not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         return "'$Path' is no longer a plain folder, so it was not locked"
@@ -1247,8 +1247,8 @@ function Reset-ConfigTreeAcl {
 
       THE WALK IS DONE HERE, NOT WITH `icacls /T`. Measured: `icacls <dir>\* /reset /T /C` reset a
       file in a junction's target outside <dir>, with /L or without. So each item is set on its own,
-      and a junction, symbolic link or folder reparse point (a mounted volume) is neither changed nor
-      entered, and is named instead: what it points at was not locked, and the guard may still load
+      and an item the listing shows as a junction, symbolic link or folder reparse point (a mounted
+      volume) is neither changed nor entered, and is named instead: what it points at was not locked, and the guard may still load
       a module through it. A queued folder is read again before it is listed, in case it has become
       one since. A file reparse point of another kind, such as a cloud-file placeholder, is a file
       and is locked as one.
@@ -1552,10 +1552,15 @@ function New-SeceditWorkDirectory {
       belongs to the user, and a process of that user at medium integrity holds FILE_DELETE_CHILD
       there. With it, the process can rename any folder in it, whatever that folder's own DACL says,
       and put its own folder in its place with a policy file of its choosing. So the default parent is
-      %SystemRoot%\Temp, where users may add a folder but not delete or rename one an administrator
-      made. The parent is checked for that before anything is made, so a host whose Windows Temp
-      differs is refused rather than trusted. The Windows folder is asked of the system, not read
-      from $env:SystemRoot: the user can set that variable for their own processes.
+      the Windows folder's Temp. The Windows folder is asked of the system, not read from
+      $env:SystemRoot: the user can set that variable for their own processes.
+
+      WHAT IS CHECKED ON THE PARENT, before anything is made, and nothing more. It must be a folder
+      that is not a reparse point. Its owner must be SYSTEM, Administrators, TrustedInstaller or
+      $OwnerSid. No allow entry that applies to the parent itself may give anyone else
+      delete-child, a DACL change, ownership or GENERIC_ALL; OWNER RIGHTS counts as the owner and
+      CREATOR OWNER is not judged. A parent that fails is refused. DELETE on the parent itself is
+      not checked, and neither is any folder above it.
 
       $Parent and $OwnerSid are parameters so the unelevated tests can make a folder they own.
     #>
