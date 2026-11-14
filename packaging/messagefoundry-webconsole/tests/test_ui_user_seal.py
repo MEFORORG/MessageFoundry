@@ -205,7 +205,10 @@ async def test_a_refused_delete_of_a_failing_account_answers_its_own_refusal(
     ids=["refused", "read-failed"],
 )
 async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checked_read(
-    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch, failure: Exception
+    keyed: tuple[Engine, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
 ) -> None:
     """The password reset lands through the engine's own checks, then the page that hands over the
     one-time credential names the account. That name is read through the checked read; when it
@@ -231,3 +234,34 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     assert r.status_code == 200
     assert "Temporary password issued" in r.text and "<code>" in r.text
     assert f"Convey this to {victim} " in r.text and "Convey this to victim " not in r.text
+    # The fallback is logged with the account's id.
+    assert any(
+        rec.levelname == "WARNING"
+        and victim in rec.getMessage()
+        and "names the account by id" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+async def test_the_summary_takes_its_roles_from_a_checked_record_only(
+    keyed: tuple[Engine, Path],
+) -> None:
+    """``user_summary_scoped`` with ``role_ids`` None takes the role rows a checked record's seal
+    covered, so the detail page reads none itself. Given a store row nobody checked, it raises
+    rather than read roles the seal did not cover."""
+    from messagefoundry.api.auth_routes import _console_user_summary
+
+    engine, _path = keyed
+    service, _alerts, intact, _victim = await _setup(engine)
+    checked = await service.checked_user(intact)
+    assert checked is not None
+    summary = _console_user_summary(checked, None, show_scope=True)
+    assert summary.roles == [Role.VIEWER.value]
+    raw = await engine.store.get_user(intact)
+    assert raw is not None
+    with pytest.raises(TypeError, match="checked record"):
+        _console_user_summary(raw, None, show_scope=True)
+    # Control: a raw row with its roles passed explicitly still projects, as before.
+    assert _console_user_summary(raw, [Role.VIEWER.value], show_scope=True).roles == [
+        Role.VIEWER.value
+    ]

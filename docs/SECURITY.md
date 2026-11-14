@@ -1657,9 +1657,15 @@ tuple: they act only on the caller's own account.
 | `GET` | `/ad-group-scope-map` | `users:manage` | `require` |
 | `PUT` | `/ad-group-scope-map` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
 
-**What an admin user read reports (BACKLOG #5520).** `GET /users`, `GET /users/{user_id}/permissions`,
-`PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`
-read each account with its whole record checked against its integrity seal. A failure is reported
+**What an admin user read reports (BACKLOG #5520).** At least these read each account with its whole
+record checked against its integrity seal: `GET /users`, `GET /users/{user_id}/permissions`,
+`PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`;
+and in the web console (BACKLOG #5559) `GET /ui/users`, `GET /ui/users/{user_id}`,
+`GET /ui/users/{user_id}/federated-identity` and its unlink confirmation, and
+`POST /ui/users/{user_id}/channel-scope`, each answering 423 for a failing record as its JSON twin
+does. The console pages shown after a password reset, a factor reset or an enrolment code has
+already been issued read the account's name the same way, but when that read fails they name the
+account by its id and still show what was issued, rather than answering 423. A failure is reported
 per account and rate-limited, in each engine process: only the first refusal of an account in
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal

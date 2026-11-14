@@ -897,19 +897,24 @@ from typing import Any
 #: and over the merge with #5931 from ``6737556a16ce6d15`` to ``c537067c6952d93c``.
 #:
 #: BACKLOG #5559: ``AdminHandlers`` gained ``checked_user``, ``auth_routes._checked_user``. The
-#: console's user detail page, federated identity screens, channel scope save and the pages after
-#: a landed reset or enrolment code read the account through it rather than the store, so a
-#: record that fails its seal is a reported 423 there too. An older console on this engine still
-#: reads the store row; a newer console on an older engine would raise AttributeError on those
-#: pages. The digest refuses both pairs at mount. Re-derived with ``--write``, from
-#: ``c537067c6952d93c`` to ``796ce45eeff0cf1e``.
+#: console's user detail page, federated identity screens and channel scope save read the account
+#: through it rather than the store, so a record that fails its seal is a reported 423 there too.
+#: The pages after a landed reset or enrolment code read the account's name through it as well,
+#: but when that read fails they name the account by its id and still render what was issued,
+#: with 200, not 423. ``user_summary_scoped`` also takes ``role_ids`` None for a checked record,
+#: which the digest does not see, as it records field names only. An older console on this engine
+#: still reads the store row; a newer console on an older engine would raise AttributeError on
+#: those pages. The digest refuses both pairs at mount. Re-derived with ``--write``, from
+#: ``c537067c6952d93c`` to ``796ce45eeff0cf1e``. Then ``api.security`` gained
+#: ``account_read_errors``, the failures those post-action pages fall back on, which the console
+#: imports, so the surface grew again: from ``796ce45eeff0cf1e`` to ``080ed019349126b8``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "796ce45eeff0cf1e"
+ENGINE_UI_SEAM: str = "080ed019349126b8"
 
 
 @dataclass(frozen=True, slots=True)

@@ -370,8 +370,8 @@ def _core(*ops: str) -> Field:
 
 
 #: Every ``CoreHandlers`` and ``AdminHandlers`` field. 66 endpoints by identity, as ADR 0215
-#: slice 1 measured (ADR 0207 moved one to a core and added one), 17 cores a JSON route runs
-#: past its gate, 2 sharing a helper with a JSON
+#: slice 1 measured (ADR 0207 moved one to a core and added one), 18 cores a JSON route runs
+#: past its gate (BACKLOG #5559 added ``admin.checked_user``), 2 sharing a helper with a JSON
 #: route, and 3 with no JSON route that carries the console's use.
 _SEAM_FIELDS: dict[str, Field] = {
     "core.list_connections": _endpoint("GET /connections"),
@@ -447,6 +447,8 @@ _SEAM_FIELDS: dict[str, Field] = {
     "core.resolve_action": _endpoint("POST /approvals/{approval_id}/resolve"),
     "admin.list_roles": _endpoint("GET /roles"),
     "admin.list_users": _endpoint("GET /users"),
+    # BACKLOG #5559: the seal-checked account read, which the JSON route's endpoint runs too.
+    "admin.checked_user": _core("GET /users/{user_id}/federated-identity"),
     "admin.list_custom_roles": _endpoint("GET /roles/custom"),
     "admin.create_user": _endpoint("POST /users"),
     "admin.update_user": _endpoint("PATCH /users/{user_id}"),
@@ -586,10 +588,10 @@ _AUTH_SERVICE: dict[str, AuthUse] = {
 
 #: Every ``service.store.<name>`` read the console makes, by what carries it.
 _STORE_READS: dict[str, tuple[str, ...]] = {
-    # The admin user pages read the target account; the notification-address form reads the
-    # caller's own profile email, which its slice 2 route returns.
-    "get_user": ("ADD GET /users/{user_id}", "ADD GET /me/notify-email"),
-    "get_user_role_ids": ("ADD GET /users/{user_id}",),
+    # The notification-address form reads the caller's own profile email, which its slice 2
+    # route returns. The admin user pages read the target account through admin.checked_user
+    # instead (BACKLOG #5559).
+    "get_user": ("ADD GET /me/notify-email",),
     "list_webauthn_credentials": ("ADD GET /me/webauthn",),
     # The heartbeat is in the confinement set and makes no sub-request (ADR 0215 section 3).
     "get_session": (
@@ -650,73 +652,72 @@ _UI_ROUTES: dict[str, Ui] = {
     ),
     "GET /ui/users/{user_id}": _J(
         "ADD GET /users/{user_id};GET /roles;GET /users/{user_id}/federated-identity",
-        f"{_AS} admin.federated_identity_view admin.list_roles admin.user_summary_scoped "
-        "service.store.get_user service.store.get_user_role_ids",
+        f"{_AS} admin.checked_user admin.federated_identity_view admin.list_roles "
+        "admin.user_summary_scoped",
     ),
     "POST /ui/users": _J("POST /users", f"{_AS} admin.create_user admin.list_roles"),
     "POST /ui/users/{user_id}/update": _J(
         "PATCH /users/{user_id}",
-        f"{_AS} admin.federated_identity_view admin.list_roles admin.update_user admin.user_summary_scoped "
-        "service.store.get_user service.store.get_user_role_ids",
+        f"{_AS} admin.checked_user admin.federated_identity_view admin.list_roles "
+        "admin.update_user admin.user_summary_scoped",
     ),
     "POST /ui/users/{user_id}/roles": _J(
         "PUT /users/{user_id}/roles",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.set_user_roles "
-        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped admin.checked_user",
     ),
     "POST /ui/users/{user_id}/channel-scope": _J(
         "PUT /users/{user_id}/channel-scope",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.refuse_own_channel_scope "
-        "admin.set_channel_scope admin.user_summary_scoped service.store.get_user "
-        "service.store.get_user_role_ids",
+        "admin.set_channel_scope admin.user_summary_scoped admin.checked_user",
     ),
     "POST /ui/users/{user_id}/reset-password": _J(
         "POST /users/{user_id}/reset-password",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.reset_user_password "
-        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped admin.checked_user",
     ),
     "POST /ui/users/{user_id}/reset-mfa": _J(
         "POST /users/{user_id}/reset-mfa",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.reset_user_mfa "
-        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped admin.checked_user",
     ),
     "POST /ui/users/{user_id}/enrolment-code": _J(
         "POST /users/{user_id}/enrolment-code",
         f"{_AS} admin.federated_identity_view admin.issue_user_enrolment_code admin.list_roles "
-        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped admin.checked_user",
     ),
     "POST /ui/users/{user_id}/enrolment-code/revoke": _J(
         "DELETE /users/{user_id}/enrolment-code",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.revoke_user_enrolment_code "
-        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped admin.checked_user",
     ),
     "GET /ui/users/{user_id}/federated-identity": _J(
-        "GET /users/{user_id}/federated-identity;ADD GET /users/{user_id}",
-        f"{_AS} admin.federated_identity_view service.store.get_user",
+        "GET /users/{user_id}/federated-identity",
+        f"{_AS} admin.checked_user admin.federated_identity_view",
     ),
     "POST /ui/users/{user_id}/federated-identity/link": _J(
         "PUT /users/{user_id}/federated-identity",
-        f"{_AS} admin.bind_user_federated_identity admin.federated_identity_view "
-        "service.store.get_user",
+        f"{_AS} admin.bind_user_federated_identity admin.checked_user "
+        "admin.federated_identity_view",
     ),
     "GET /ui/users/{user_id}/federated-identity/unlink-confirm": _J(
-        "GET /users/{user_id}/federated-identity;ADD GET /users/{user_id}",
-        f"{_AS} admin.federated_identity_view service.store.get_user",
+        "GET /users/{user_id}/federated-identity",
+        f"{_AS} admin.checked_user admin.federated_identity_view",
     ),
     "POST /ui/users/{user_id}/federated-identity/unlink": _J(
         "DELETE /users/{user_id}/federated-identity",
-        f"{_AS} admin.federated_identity_view admin.unbind_user_federated_identity "
-        "service.store.get_user",
+        f"{_AS} admin.checked_user admin.federated_identity_view "
+        "admin.unbind_user_federated_identity",
     ),
     "POST /ui/users/{user_id}/revoke-sessions": _J(
         "DELETE /users/{user_id}/sessions",
         f"{_AS} admin.admin_revoke_user_sessions admin.federated_identity_view admin.list_roles "
-        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped admin.checked_user",
     ),
     "POST /ui/users/{user_id}/delete": _J(
         "DELETE /users/{user_id}",
         f"{_AS} admin.delete_user admin.federated_identity_view admin.list_roles "
-        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped admin.checked_user",
     ),
     "GET /ui/roles": _J("GET /roles", f"{_AS} admin.list_roles"),
     "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/users:manage", ""),
@@ -1366,9 +1367,10 @@ def test_every_seam_field_is_classified_as_the_app_holds(live: _Live) -> None:
 
 
 def test_the_seam_field_counts_are_the_measured_ones() -> None:
-    """ADR 0215 slice 1 measured 86 fields, 66 of them a JSON route's endpoint by identity."""
+    """ADR 0215 slice 1 measured 86 fields, 66 of them a JSON route's endpoint by identity;
+    BACKLOG #5559 added one core."""
     counts = Counter(f.kind for f in _SEAM_FIELDS.values())
-    assert counts == {"endpoint": 66, "core": 17, "shared": 2, "helper": 3}, counts
+    assert counts == {"endpoint": 66, "core": 18, "shared": 2, "helper": 3}, counts
 
 
 def test_every_ui_deps_field_is_classified() -> None:

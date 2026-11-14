@@ -33,9 +33,11 @@ from messagefoundry.api.auth_models import (
     UserUpdateRequest,
 )
 from messagefoundry.api.security import (
+    account_read_errors,
     initial_credential_window_hours,
     pending_credential_deadline,
 )
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
@@ -50,6 +52,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     AuthService,
 )
+from messagefoundry.controlchars import scrub_log_argument
 
 from .. import pages
 from .._auth import (
@@ -258,22 +261,30 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     async def _shown_name(user_id: str, service: AuthService) -> str:
         """The username a page shows after an action already landed, read as :func:`_checked`
-        reads it, or the id when that read fails in any way. The action's one-time output was
-        already issued and must still be rendered, so nothing here may replace the page with an
-        error (BACKLOG #5559). A refusal is reported by the read itself; any other failure is
-        logged here."""
+        reads it, or the id when that read is refused or fails. The action's one-time output was
+        already issued and must still be rendered, so a refusal or a store failure never replaces
+        the page with an error (BACKLOG #5559). Each fallback logs a WARNING naming the account; a
+        seal failure is also reported by the read itself. A defect still raises."""
+        failures: tuple[type[Exception], ...] = (*account_read_errors(), AttributeError)
         try:
             user = await _checked(user_id, service)
-        except HTTPException:
-            return user_id
-        except Exception as exc:  # noqa: BLE001 -- the issued credential must still be shown
-            _log.warning(
-                "the account name for a page after a landed action could not be read (%s); "
-                "the page names the account by id",
-                type(exc).__name__,
-            )
-            return user_id
-        return str(user.username)
+            # Inside the try: the seam digest records no record attribute, so a skewed engine's
+            # record falls back to the id here rather than losing the issued credential.
+            return str(user.username)
+        except HTTPException as exc:
+            # 404 gone since the action, 423 a record that fails its seal, 503 a Vault Outage.
+            reason = f"answered {exc.status_code}"
+        except failures as exc:
+            if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                raise
+            reason = f"failed ({type(exc).__name__})"
+        _log.warning(
+            "the name of account %s for a page after a landed action was not shown: its checked "
+            "read %s; the page names the account by id",
+            scrub_log_argument(user_id),
+            reason,
+        )
+        return user_id
 
     async def _user_detail(
         user_id: str,
@@ -452,13 +463,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 user_id, body=body, request=request, service=service, identity=identity
             )
         except (ValidationError, HTTPException) as exc:
-            # 423: the account's record fails its integrity seal (BACKLOG #5520). Raised as is,
-            # never re-rendered: the detail page would show the unchecked row the engine refused.
-            if isinstance(exc, HTTPException) and exc.status_code in (
-                status.HTTP_404_NOT_FOUND,
-                status.HTTP_423_LOCKED,
-            ):
+            if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
                 raise
+            # A 423 (BACKLOG #5520) needs no case of its own: the detail page reads the account
+            # through the checked read (BACKLOG #5559), which answers 423 for the same record.
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
             return await _user_detail(user_id, service, identity, error=detail, status_code=400)
         return RedirectResponse(f"/ui/users/{user_id}", status_code=303)

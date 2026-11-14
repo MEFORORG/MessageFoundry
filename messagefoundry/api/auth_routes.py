@@ -375,20 +375,18 @@ async def _refuse_own_channel_scope(
     service: AuthService,
     identity: Identity,
     user_id: str,
-    target: UserRecord | None = None,
 ) -> None:
     """The channel-scope write's self-target refusal (BACKLOG #1149), one definition for both planes.
 
-    The console calls it through the seam before its own form checks (BACKLOG #3393), so a
-    self-target post with a malformed form is still refused and audited, not answered first by a
-    form error. ``set_channel_scope`` runs it again before the write, so the console's call adds
-    the order and takes nothing away."""
+    The console calls it through the seam before its own form checks and its account read
+    (BACKLOG #3393), so a self-target post with a malformed form is still refused and audited, not
+    answered first by a form error. ``set_channel_scope`` runs it again before the write, so the
+    console's call adds the order and takes nothing away."""
     await _refuse_if_self(
         request,
         service,
         identity,
         user_id,
-        target,
         op="channel_scope",
         detail="another administrator must change your own channel scope",
     )

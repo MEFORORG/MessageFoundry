@@ -132,7 +132,7 @@ def test_users_page_hides_the_scope_columns_from_a_reader_who_is_not_shown_scope
 def test_users_page_lists_an_integrity_failed_account_by_id_alone() -> None:
     """BACKLOG #5520: an account whose record fails its seal arrives as its id alone. Its row names
     the id and says the check failed, keeps the table's column count, and links nowhere, since the
-    detail page still reads the row unchecked. The control is an intact account beside it."""
+    detail page answers 423 for it (BACKLOG #5559). The control is an intact account beside it."""
     from messagefoundry.api.auth_models import IntegrityFailedUser, UserSummary
     from messagefoundry_webconsole.pages.admin import users_page
 
@@ -157,8 +157,8 @@ async def test_the_console_update_does_not_render_a_record_that_fails_its_seal(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5520: PATCH's handler answers 423 when the account's record fails its seal. The
-    console's update route raises it as is rather than re-rendering the detail page, which reads the
-    row unchecked and would show what the engine refused to. The seal failure is stood in for at
+    console's update route answers 423 too, and shows nothing of the record: its re-render reads
+    the account through the same checked read (BACKLOG #5559). The seal failure is stood in for at
     the service's checked reader; the control is the same post with the reader intact."""
     from _ui_clients import SAME_ORIGIN, cookie_login, mint_bound_proof, provision, ui_client
 
