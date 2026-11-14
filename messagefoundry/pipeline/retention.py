@@ -254,6 +254,14 @@ class RetentionPass:
     documents_messages_stripped: int = 0
     documents_stripped: int = 0
     documents_bytes_reclaimed: int = 0
+    # BACKLOG #5651: the strip phase ended before its last batch, for one of two causes; the counts
+    # above are what it had committed, and the strip logs the early end at WARNING either way.
+    # A key-service outage is recorded in the audit row when the pass writes one, but is not itself
+    # work: an outage pass must not send an audit row through the failing key service. A failed
+    # batch read is a database fault, so it is work (`documents_strip_read_failed`), and the pass
+    # writes an audit row recording it.
+    documents_strip_ended_early: bool = False
+    documents_strip_read_failed: bool = False
     document_prune_overrides: Mapping[str, int] = field(default_factory=dict)
     # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata-only, on the same
     # window as connection events. Never an open/acknowledged instance.
@@ -322,6 +330,7 @@ class RetentionPass:
             or self.state_purged > 0
             or self.conn_events_purged > 0
             or self.documents_messages_stripped > 0
+            or self.documents_strip_read_failed
             or self.alert_instances_purged > 0
             or self.app_logs_deleted > 0
             or self.app_logs_compressed > 0
@@ -628,7 +637,13 @@ class RetentionRunner:
                 messages_stripped=strip.messages_stripped + part.messages_stripped,
                 documents_stripped=strip.documents_stripped + part.documents_stripped,
                 bytes_reclaimed=strip.bytes_reclaimed + part.bytes_reclaimed,
+                ended_early=part.ended_early,
+                read_failed=part.read_failed,
             )
+            if part.ended_early:
+                # BACKLOG #5651: a key-service outage or a failed batch read. End only this phase;
+                # the rest of the pass still runs.
+                break
         state_purged = 0
         if not _deadline_hit() and s.state_max_age_days > 0:
             state_purged = await self._store.purge_state(
@@ -802,6 +817,8 @@ class RetentionRunner:
             documents_messages_stripped=strip.messages_stripped,
             documents_stripped=strip.documents_stripped,
             documents_bytes_reclaimed=strip.bytes_reclaimed,
+            documents_strip_ended_early=strip.ended_early,
+            documents_strip_read_failed=strip.read_failed,
             document_prune_overrides=doc_overrides,
             alert_instances_purged=alert_instances_purged,
             app_logs_deleted=app_logs_deleted,
@@ -1384,6 +1401,8 @@ class RetentionRunner:
                 "documents_messages_stripped": result.documents_messages_stripped,
                 "documents_stripped": result.documents_stripped,
                 "documents_bytes_reclaimed": result.documents_bytes_reclaimed,
+                "documents_strip_ended_early": result.documents_strip_ended_early,
+                "documents_strip_read_failed": result.documents_strip_read_failed,
                 # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata only.
                 "alert_instances_purged": result.alert_instances_purged,
                 # Application log files deleted this pass (#120) + the window — metadata only, no PHI.

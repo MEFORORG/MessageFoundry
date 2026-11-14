@@ -138,6 +138,9 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     "messagefoundry/store/queue_tag.py": frozenset({_DEK}),
     # BACKLOG #2593: opens message cells and preset criteria, sealed under the DEK, under their tag.
     "messagefoundry/store/cell_tag.py": frozenset({_DEK}),
+    # BACKLOG #5651: the embedded-document strip opens message bodies sealed under the DEK and
+    # re-seals the stripped body under it, through the store cipher.
+    "messagefoundry/store/document_strip.py": frozenset({_DEK}),
     "messagefoundry/store/backup_codec.py": frozenset({_DEK}),
     "messagefoundry/store/keyprovider_vault.py": frozenset({_DEK}),
     # The provider dispatch and the built-in env and DPAPI providers, which source the DEK. In the

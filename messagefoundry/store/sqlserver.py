@@ -86,7 +86,6 @@ from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
 from messagefoundry.odbc_call_gate import require_call_gate as _require_call_gate
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import codec_safe_str, safe_exc, safe_text
 from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
@@ -144,9 +143,10 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.document_strip import (
+    StripCursor,
     StripResult,
-    cutoff_for,
-    log_unreadable_skips,
+    StripUpdate,
+    run_strip_pass,
 )
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
@@ -10294,97 +10294,70 @@ class SqlServerStore:
         OBX-5 ED embed with a self-describing tombstone, keeps the message parseable, and sets
         ``documents_pruned``. Eligibility mirrors :meth:`purge_message_bodies` (per-connection-or-global
         cutoff AND not in-flight). Returns a :class:`StripResult` (counts + bytes; no PHI)."""
-        now = time.time() if now is None else now
-        content_types = content_types or {}
-        # Bound the candidate scan with the LOOSEST finite cutoff (a keep-forever -inf never widens it);
-        # the precise per-connection cutoff is re-checked per row in Python (cutoff_for).
-        finite = [
-            c for c in [older_than, *(connection_cutoffs or {}).values()] if c != float("-inf")
-        ]
-        if not finite:
-            return StripResult()  # everything keep-forever ⇒ nothing to scan
-        scan_cutoff = max(finite)
-        rows = await self._fetchall(
-            "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m"
-            " WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < ?"
-            " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id=m.id"
-            " AND q.status IN (?, ?))",
-            (scan_cutoff, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
-        )
-        msgs = 0
-        docs = 0
-        reclaimed = 0
-        updates: list[tuple[str, float, str]] = []
-        failures: list[CellTagError] = []
-        unreadable: list[object] = []
-        for row in rows:
-            cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
-            if row["received_at"] >= cutoff:
-                continue
-            try:
-                raw = open_message_cell(
-                    self._cipher,
-                    "raw",
-                    row["raw"],
-                    message_id=row["id"],
-                    channel_id=row["channel_id"],
-                )
-            except CipherError as exc:
-                # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
-                # must not abort the whole retention pass. The row is left exactly as found; the
-                # message names only the cell and the message id, never the body (BACKLOG #1169).
-                if isinstance(exc, CellTagError):
-                    # BACKLOG #2593: the read already logged and alerted it, once per hour; it is
-                    # audited below. No second WARNING on every pass.
-                    failures.append(exc)
-                    continue
-                log.warning(
-                    "document strip skipped message %s: its body could not be read: %s",
-                    row["id"],
-                    exc,
-                )
-                continue
-            assert raw is not None  # raw is NOT NULL
-            new_raw, n_docs, n_bytes = _strip_documents(
-                raw,
-                pruned_at=now,
-                min_bytes=min_bytes,
-                content_type=content_types.get(row["channel_id"]),
-                on_unreadable=partial(unreadable.append, row["id"]),
+        stamp = time.time() if now is None else now
+        inflight = (OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value)
+
+        async def fetch(scan_cutoff: float, after: StripCursor, limit: int) -> list[dict[str, Any]]:
+            # BACKLOG #5651: one keyset batch on (received_at, id), so the scan stays on
+            # ix_messages_received, with the cutoff and the in-flight guard on each; _fetchall
+            # gives the connection back before the crypto runs. FLOAT holds no infinity, so the
+            # first batch has no lower bound. The leading >= is the index seek; the OR resolves
+            # ties on received_at by id.
+            page = ""
+            page_params: tuple[Any, ...] = ()
+            if after is not None:
+                page = " AND m.received_at >= ? AND (m.received_at > ? OR m.id > ?)"
+                page_params = (after[0], after[0], after[1])
+            return await self._fetchall(
+                "SELECT TOP (?) m.id, m.channel_id, m.raw, m.received_at FROM messages m"
+                " WHERE m.received_at < ?" + page + " AND m.raw <> ''"
+                " AND m.documents_pruned IS NULL"
+                " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id=m.id"
+                " AND q.status IN (?, ?)) ORDER BY m.received_at, m.id",
+                (limit, scan_cutoff, *page_params, *inflight),
             )
-            if n_docs == 0:
-                continue
-            updates.append(
-                (
-                    self._cipher.encrypt(
-                        new_raw,
-                        aad=message_cell_aad(
-                            "raw", message_id=row["id"], channel_id=row["channel_id"]
-                        ),
-                    ),
-                    now,
-                    row["id"],
-                )
-            )
-            msgs += 1
-            docs += n_docs
-            reclaimed += n_bytes
-        # Before the write, so a failed write does not lose the record of the skips.
-        log_unreadable_skips(unreadable)
-        if updates:
-            async with self._acquire() as conn, self._cursor(conn) as cur:
+
+        async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
+            # The compare-and-swap guard, and its limit, are document_strip's: its module docstring
+            # states both. A failure rolls back the whole batch. The raw
+            # comparison pins a binary collation, and appends a sentinel to both
+            # sides because = ignores trailing spaces. Whether a row landed is read from OUTPUT,
+            # which a session's SET NOCOUNT ON cannot hide, unlike rowcount. The comparand is cast
+            # to NVARCHAR(MAX): a long string may bind as ntext, which supports neither + nor =.
+            # The rollback runs after the cursor block, as _execute_output's does, so no OUTPUT
+            # statement handle is still open on the connection.
+            landed: list[StripUpdate] = []
+            async with self._acquire() as conn:
                 try:
-                    for params in updates:
-                        await cur.execute(
-                            "UPDATE messages SET raw=?, documents_pruned=? WHERE id=?", params
-                        )
+                    async with self._cursor(conn) as cur:
+                        for u in updates:
+                            await cur.execute(
+                                "UPDATE messages SET raw=?, documents_pruned=? OUTPUT inserted.id"
+                                " WHERE id=? AND documents_pruned IS NULL"
+                                " AND (raw + N'|') COLLATE Latin1_General_100_BIN2"
+                                " = (CAST(? AS NVARCHAR(MAX)) + N'|')"
+                                " AND NOT EXISTS (SELECT 1 FROM queue q"
+                                " WHERE q.message_id=messages.id AND q.status IN (?, ?))",
+                                (u.new_cell, stamp, u.message_id, u.stored, *inflight),
+                            )
+                            if await cur.fetchall():
+                                landed.append(u)
                     await self._commit(conn)
                 except Exception:
-                    await conn.rollback()
+                    await self._rollback_or_discard(conn)
                     raise
-        await report_cell_tag_failures(self, failures)
-        return StripResult(
-            messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
+            return landed
+
+        return await run_strip_pass(
+            self._cipher,
+            fetch=fetch,
+            write=write,
+            report=partial(report_cell_tag_failures, self),
+            now=stamp,
+            older_than=older_than,
+            connection_cutoffs=connection_cutoffs,
+            min_bytes=min_bytes,
+            content_types=content_types or {},
         )
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
