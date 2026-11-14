@@ -1976,6 +1976,25 @@ def _force_failed_open_release(force_release: Callable[[], object]) -> None:
         )
 
 
+def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
+    """Retrieve a forced ``stop()``'s outcome so the loop never logs it as never retrieved; a
+    failure there is logged by class (vault BACKLOG #3054)."""
+    if future.cancelled():
+        return
+    failure = future.exception()
+    if failure is not None:
+        log.warning(
+            "stopping a connection after a failed store open failed (%s)", type(failure).__name__
+        )
+
+
+def _stop_unawaited(conn: aiosqlite.Connection) -> None:
+    """``conn.stop()``, with its future's outcome read when it resolves (BACKLOG #5720)."""
+    future = conn.stop()
+    if future is not None:
+        future.add_done_callback(_read_stop_outcome)
+
+
 def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
     """Keep a strong reference to a cleanup this open stopped waiting for until it finishes, so
     the loop does not drop it pending (BACKLOG #5720)."""
@@ -2068,6 +2087,10 @@ async def cleanup_failed_open(
                     deadline = loop.time() + FAILED_OPEN_CANCEL_BOUND_S
             if task.cancelled():
                 break
+    if task.done() and (task.cancelled() or task.result()[1] is not None):
+        # The cleanup ended cancelled or failed, so what it should have closed may be open,
+        # the read pool included: drop it without waiting (BACKLOG #5720).
+        _force_failed_open_release(force_release)
     if cancelled and isinstance(exc, Exception):
         raise asyncio.CancelledError from exc
 
@@ -11450,9 +11473,13 @@ class MessageStore:
             conns = [*(store._read_conns if store is not None else ()), db]
 
             def _force_release() -> None:
-                # stop() queues the close on each worker without awaiting it (BACKLOG #5720).
+                # interrupt() aborts a statement the worker is running, so the close stop()
+                # queues behind it is reached; stop() does not await it (BACKLOG #5720).
                 for conn in conns:
-                    _force_failed_open_release(conn.stop)
+                    raw = getattr(conn, "_connection", None)
+                    if raw is not None:
+                        _force_failed_open_release(raw.interrupt)
+                    _force_failed_open_release(functools.partial(_stop_unawaited, conn))
 
             await cleanup_failed_open(exc, _release, _force_release, cancels_before=cancels_before)
             raise
