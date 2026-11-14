@@ -244,7 +244,7 @@ class _LanePhase(Enum):
     CLAIMING = auto()  # in the current claim_fifo_heads batch (slot reserved)
     PROCESSING = auto()  # a live serializer is draining its claimed prefix (slot consumed)
     PARKED = auto()  # head backing off until park_until; unpark by timer / sweep-due / notify_work
-    # (or claim-gated, ``_LaneState.gated``: no timer, and only release_gated / notify_work unpark it)
+    # (or claim-gated, ``_LaneState.gated``: no timer unparks it, only release_gated / notify_work)
     # Deliberately halted; re-armed by reload / notify_work or an operator resume_lane (#5700).
     STOPPED = auto()
     # Operator PAUSE (connection controls): delivery halted by an operator; queued rows RETAINED PENDING.
@@ -297,8 +297,9 @@ class _LaneState:
     # _reserve_lane_slot / _release_lane_slot; why the phase cannot say this is at the release.
     slot_held: bool = False
     # BACKLOG #5704: PARKED because ``may_claim`` refused the lane (the #122 log-write claim gate), not
-    # because a head is backing off. No timer is armed and no row was touched; the sweep and a stale
-    # timer leave it parked, and only release_gated or notify_work unparks it. Cleared by _unpark.
+    # because a head is backing off. The park arms no timer and touches no row; the sweep, and a
+    # timer the sweep arms for a head not yet due, leave it parked, and only release_gated or
+    # notify_work unparks it. Cleared by _unpark.
     gated: bool = False
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
