@@ -1049,6 +1049,154 @@ def test_a_header_row_marks_only_its_own_table_and_column(sf) -> None:
     assert sf.scan_pr_body(wrong_column) == []
 
 
+#: BACKLOG #3364 steps 5 to 12, engine PR 2893's open review findings. Every body fires with the kind
+#: it is listed under, and each step has a quiet control below: the same shape with what made it a
+#: record taken out.
+_HEAD = "| ASVS | Note | Result |\n|---|---|---|\n"
+_ROW = f"| {_REQ} | the limb | {_PASS.title()} (12 messages) |"
+_PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
+    # Step 5: a dash-only placeholder row after the first data row is data, not a delimiter, so the
+    # row above it is not re-read as a header and the ASVS column stays marked.
+    ("5", "verdict", f"{_HEAD}| a | b | c |\n| - | - | - |\n{_ROW}"),
+    ("5", "verdict", f"{_HEAD}| a | b | c |\n|---|---|---|\n{_ROW}"),
+    # Step 6: a rule or a dash-only paragraph after a table is not a delimiter, so the table's last row
+    # is not read as a header.
+    ("6", "verdict", f"{_HEAD}{_ROW}\n---"),
+    ("6", "verdict", f"{_HEAD}{_ROW}\n- - -"),
+    ("6", "verdict", f"{_HEAD}{_ROW}\n\n---"),
+    # Step 8: an escaped pipe inside a cell is not a cell edge, in the header or in the row.
+    # A spacer cell keeps the verdict away from the identifier, so only the column can mark it.
+    ("8", "verdict", f"| a \\| b | ASVS | Note | Result |\n|---|---|---|---|\n| x {_ROW}"),
+    ("8", "verdict", f"| x | ASVS | Note | Result |\n|---|---|---|---|\n| a \\| b {_ROW}"),
+    # Step 10's must-fire controls: the shapes its false positives took, beside a marked identifier.
+    ("10", "verdict", f"| ASVS {_REQ} | the parser | never fails |"),
+    ("10", "verdict", f"ASVS {_REQ} is cited; the row is not failing now."),
+    ("10", "verdict", f"Set the timeout in ASVS {_REQ}, which is {_NA}."),
+    ("10", "verdict", f"Set the timeout in {_REQ}, which stays {_NA}."),
+    # Step 11: an ASVS major version between "ASVS" and the identifier.
+    ("11", "gap", f"ASVS v5 {_REQ} lacks a row-completeness pin."),
+    ("11", "gap", f"ASVS 5 {_REQ} lacks a row-completeness pin."),
+    # Step 11: header spellings that name the column ASVS.
+    ("11", "verdict", f"| ASVS: | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| ASVS reference | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", "verdict", f"| Requirement (ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # Step 11: underscore emphasis at the word-boundary sites that bind.
+    ("11", "verdict", f"_{_PARTIAL}_: {_REQ}"),
+    ("11", "verdict", f"For {_REQ} the _cell_ stays {_PARTIAL}."),
+    ("11", "verdict", f"For {_REQ} the vault _re-score_ to {_PASS} landed."),
+    ("11", "verdict", f"For {_REQ} the re-read _held_ the cell at {_PARTIAL}."),
+    ("11", "gap", f"The _gap_ keeps {_REQ} open."),
+    ("11", "map", f"{_REQ} is enforced in _pkg/example_guard.py_."),
+    ("11", "map", f"{_REQ} is enforced in _messagefoundry.example_guard_."),
+    ("11", "map", f"{_REQ} is enforced at _github.com/example/repo/blob/main/x.txt_"),
+    ("11", "map", f"{_REQ} is enforced in _scripts/example_guard_ now."),
+    # Step 11: a zero-width character around a cell, around the verdict or the identifier.
+    ("11", "verdict", f"| ASVS {_REQ} | the limb |\u200bisn't {_MET}\u200b|"),
+    ("11", "verdict", f"| ASVS {_REQ} | the limb |\ufeff{_PARTIAL}\u2060|"),
+    # Any invisible format character, not only a zero-width one: a left-to-right mark.
+    ("11", "verdict", f"| ASVS {_REQ} | the limb |{chr(0x200E)}stays {_PARTIAL}{chr(0x200E)}|"),
+    ("11", "verdict", f"| {chr(0x200B)}ASVS `{_REQ}`{chr(0x200B)} | the limb | {_PARTIAL} |"),
+    ("11", "verdict", f"|\u200b{_REQ}\u200b| the limb | stays {_PARTIAL} |"),
+]
+_PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
+    # Step 5: the same placeholder rows under a header that does not name the column ASVS.
+    ("5", f"| Version | Note | Result |\n|---|---|---|\n| a | b | c |\n| - | - | - |\n{_ROW}"),
+    # Step 6: the same rules after a table whose header does not name the column ASVS.
+    ("6", f"| Version | Note | Result |\n|---|---|---|\n{_ROW}\n---"),
+    # Step 8: the escaped pipe moves no column onto the identifier when the header names another.
+    # Split at the escaped pipe, the header puts ASVS over the identifier's column; read whole, not.
+    (
+        "8",
+        f"| a \\| b | Note | ASVS | Ref |\n|---|---|---|---|\n"
+        f"| {_PASS.title()} (12 messages) | the limb | x | {_REQ} |",
+    ),
+    # Step 9: a blank line ends the ASVS-headed table, so a headerless pipe block after it is unmarked.
+    ("9", f"{_HEAD}| a | b | c |\n\n{_ROW}"),
+    ("9", f"{_HEAD}| a | b | c |\n\n| Version | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # Step 10: the three newly flagged lines engine PR 2893 listed.
+    ("10", "| 2.5.1 | parser | never fails |"),
+    ("10", "The row is not failing for 2.5.1 batches."),
+    ("10", "The row isn't passing for 2.5.1 batches."),
+    ("10", f"Set the timeout in 3.4.5, which is {_NA}."),
+    ("10", "| 2.5.1 | parser | is never failing. |"),
+    # Step 11: "ASVS" followed by a version and then a clause boundary marks nothing after it.
+    ("11", f"ASVS 5; {_REQ_B} lacks wheels for this platform."),
+    # Step 11: a header naming a requirement but not ASVS marks no column.
+    ("11", f"| Requirement | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # Step 11: a snake_case join is not emphasis, so these words stay inside their names.
+    ("11", "The `retry_gap` setting is read for 2.5.1 batches."),
+    ("11", "The example_row_is_failing flag is set for 2.5.1 batches."),
+    # Step 11: underscore emphasis on a version lead keeps the version a version.
+    ("11", "_lxml_ 2.9.1 parsing lives in pkg/example_peek.py."),
+    ("11", "_HL7_ V2.5.1 parsing lives in pkg/example_peek.py."),
+    # Step 11: zero-width characters around a cell beside an unmarked HL7 version.
+    ("11", f"| 2.5.1 | ADT^A01 |\u200b{_PASS.title()} (12 messages)\u200b|"),
+]
+
+
+@pytest.mark.parametrize(
+    ("step", "kind", "body"),
+    _PR_FINDINGS_MUST_FIRE,
+    ids=[f"step{step}-{i}" for i, (step, _, _) in enumerate(_PR_FINDINGS_MUST_FIRE)],
+)
+def test_a_pr_body_shape_engine_pr_2893_review_found_is_flagged(
+    sf, step: str, kind: str, body: str
+) -> None:
+    """BACKLOG #3364 steps 5 to 12: each went through engine PR 2893's detector unflagged."""
+    assert kind in _pr_kinds(sf, body), (step, body)
+
+
+@pytest.mark.parametrize(
+    ("step", "body"),
+    _PR_FINDINGS_MUST_STAY_QUIET,
+    ids=[f"step{step}-{i}" for i, (step, _) in enumerate(_PR_FINDINGS_MUST_STAY_QUIET)],
+)
+def test_the_review_finding_repairs_leave_versions_and_other_tables_alone(
+    sf, step: str, body: str
+) -> None:
+    assert sf.scan_pr_body(body) == [], (step, body)
+
+
+def test_a_version_lead_still_binds_without_emphasis(sf) -> None:
+    """The must-fire controls for step 11's two version-lead sites: with no lead word at all, the same
+    sentences are requirement maps, so the quiet cases above are the lead's doing, not the path's."""
+    assert "map" in _pr_kinds(sf, "The 2.9.1 parsing lives in pkg/example_peek.py.")
+    assert "map" in _pr_kinds(sf, "See V2.5.1 parsing in pkg/example_peek.py.")
+
+
+_CELL_CONNECTIVES = [
+    "until",
+    "pending",
+    "because",
+    "since",
+    "while",
+    "unless",
+    "once",
+    "after",
+    "awaiting",
+    "but",
+    "due",
+    "for",
+    "per",
+    "as",
+    "at",
+]
+
+
+@pytest.mark.parametrize("word", _CELL_CONNECTIVES)
+def test_every_cell_connective_binds_a_marked_row_only(sf, word: str) -> None:
+    """Step 12: each of _PR_CELL_GOES_ON's connectives, not a sample of them."""
+    marked = f"| ASVS {_REQ} | the outbound limb | {_PARTIAL} {word} the follow-up |"
+    assert "verdict" in _pr_kinds(sf, marked), marked
+    unmarked = f"| 2.5.1 | ADT^A01 | {_PASS.title()} {word} the nightly |"
+    assert sf.scan_pr_body(unmarked) == [], unmarked
+
+
+def test_the_cell_connective_list_is_the_one_tested(sf) -> None:
+    """Step 12: a connective added to _PR_CELL_GOES_ON without a case above fails here."""
+    assert sorted(sf._PR_CELL_GOES_ON.split("|")) == sorted(_CELL_CONNECTIVES)
+
+
 @pytest.mark.parametrize("line", _PR_RESIDUE_MUST_STAY_QUIET)
 def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str) -> None:
     assert sf.scan_pr_body(line) == [], line
@@ -1069,6 +1217,9 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         # Step 4: a header that marks a column, a run of dashes in a delimiter row, and a long list.
         "| ASVS | x |\n|---|---|\n| " + ", ".join([_REQ] * 8000) + " | the outbound limb |",
         "| ASVS | x |\n|" + "-" * 80000 + "x|\n| 1 | 2 |",
+        # Step 12: the same dash run as a real delimiter row, which the case above is not.
+        "| ASVS | x |\n|" + "-" * 80000 + "|\n| 1 | 2 |",
+        "| ASVS | x |\n" + "|" + "-|" * 40000 + "\n| 1 | 2 |",
         # Identifiers split by a word, so each one takes the column lookup.
         "| ASVS | x |\n|---|---|\n| " + " x ".join([_REQ] * 16000) + " |",
         "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass",
