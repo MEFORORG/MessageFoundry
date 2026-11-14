@@ -5855,9 +5855,9 @@ class RegistryRunner:
 
         **The internal stages are halted at the CLAIM GATE, as the latch is set** (BACKLOG #5704).
         Setting the latch is what gates every inbound (:meth:`_inbound_log_halted`), so no router,
-        transform or response row claimed after that line is processed: a pooled lane still claims
-        and hands the row back once per backoff, and a per_lane worker finishes a batch it had
-        already claimed. The halt never pauses or STOPs an internal lane or touches its hold. The
+        transform or response row claimed after that line is processed: a pooled lane parks before
+        its claim (:meth:`_may_claim_internal`) and hands back a prefix it had already claimed, and a
+        per_lane worker finishes a batch it had already claimed. The halt never pauses or STOPs an internal lane or touches its hold. The
         marks go on in the same await-free step, before this waits for the reload lock, which is the
         race fix: a reload holding that lock rebinds each listener through
         :meth:`_resume_inbound_processing`, which refuses while the latch is set and the log still
@@ -5886,7 +5886,14 @@ class RegistryRunner:
         async with self._reload_lock:
             # Again, for an inbound a reload holding the lock added while this waited: the latch
             # gates it now, and its mark keeps it gated after a later restart clears the latch.
-            self._log_halted.update(self.registry.inbound)
+            # If a probe cleared the latch meanwhile, a listener a reload bound since passed that
+            # probe and this halt does not stop it, so marking it would gate the stages behind an
+            # ACKing listener with no alert naming it. Mark only what stays down.
+            self._log_halted.update(
+                name
+                for name in self.registry.inbound
+                if self._log_write_stopped or name in inbounds or name not in self._sources
+            )
             for name in inbounds:
                 try:
                     await self._stop_inbound_unsafe(name)
@@ -7689,8 +7696,8 @@ class RegistryRunner:
         # unregistered key registers it ALREADY-PAUSED, so the seed cannot arm it (#115).
         self._replay_pooled_pauses()
         # An in-force #122 log-failure halt needs no replay here: it is a claim gate the INGRESS,
-        # ROUTED and RESPONSE adapters read on every claimed row (:meth:`_refuse_log_halted`), not a
-        # lane phase, so the seed below arms lanes the gate then refuses (BACKLOG #5704).
+        # ROUTED and RESPONSE dispatchers read before each claim (:meth:`_may_claim_internal`), not
+        # a lane phase, so the seed below arms lanes the gate then parks (BACKLOG #5704).
         # (3) start each (seed-all-READY + immediate sweep). reset_stale_inflight already ran (engine).
         for dispatcher in self._dispatchers.values():
             await dispatcher.start()

@@ -2615,6 +2615,38 @@ async def test_a_halt_overtaken_by_a_cleared_latch_still_completes(
         await runner.stop()
 
 
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_listener_rebound_past_a_cleared_latch_is_not_gated_by_the_waiting_halt(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    # BACKLOG #5704 review: a reload holding the lock unbinds the listener, a halt latches and
+    # waits, then the reload rebinds the listener, whose probe passes and clears the latch. The
+    # halt read no bound listener, so it stops nothing; it must not mark the rebound inbound
+    # either, or an ACKing listener would feed internal stages gated with no alert naming it.
+    # Without the fix the in-lock re-mark gated INBOUND here.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, claim_mode)
+    await runner.start()
+    try:
+        await runner._reload_lock.acquire()
+        try:
+            await runner._stop_inbound_unsafe(INBOUND)  # the reload's step 1
+            halt = await _halt_waiting_on_the_lock(runner)
+            await runner._start_inbound_unsafe(INBOUND)  # step 2: the probe passes
+            assert not runner._log_write_stopped
+        finally:
+            runner._reload_lock.release()
+        await halt
+
+        assert INBOUND in runner._sources
+        assert INBOUND not in runner._log_halted, "the halt gated a listener it left bound"
+        assert not runner._inbound_log_halted(INBOUND)
+    finally:
+        await runner.stop()
+
+
 async def test_a_gated_pooled_lane_claims_nothing_and_is_never_stopped_while_the_store_is_full(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
