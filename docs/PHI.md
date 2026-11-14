@@ -2411,10 +2411,12 @@ Properties of the anonymizer:
   CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. Each component and subcomponent is read as written, decoded from its
-  escape sequences, and with its invisible characters (Unicode categories Cc and Cf) removed,
-  and each of those readings is also split in several ways: at the escape character, at the
-  message's delimiters, and at whitespace and invisible characters. A reading that is a site
-  code whole counts. The test tables in `tests/test_anon_b224_5632.py` are the specification of
+  escape sequences, and with its invisible characters (Unicode categories Cc and Cf) removed.
+  Each is also split at every invisible character that is not whitespace, such as NUL or a
+  zero-width space; a tab and the unit separator U+001F count as whitespace. A part that holds an
+  escape character is also split at the escape character, at escaped delimiters and at
+  whitespace. A part with none is not split at whitespace, so `Call 971234 today` passes. A
+  reading that is a site code whole counts. The test tables in `tests/test_anon_b224_5632.py` are the specification of
   which forms are found and which are left; this paragraph does not restate them (BACKLOG
   #5632). A part that reads as a site code is replaced, escapes and all, by digits of the same
   width, and a component with subcomponents that reads as one whole is replaced whole, its
