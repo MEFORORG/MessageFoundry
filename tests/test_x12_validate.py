@@ -529,10 +529,12 @@ def test_a_value_holding_the_ack_writers_delimiters_is_a_validation_result() -> 
     ack_ids = {"ISA", "GS", "ST", "AK1", "AK2", "IK3", "IK4", "IK5", "AK9", "SE", "GE", "IEA"}
     segments = [seg.strip() for seg in result.ack.split("~") if seg.strip()]
     assert {seg.split("*", 1)[0] for seg in segments} <= ack_ids
-    # So also check that each IK4 has exactly four elements, the last the whole replaced value: an
-    # echoed "~" or "*" anywhere in the value would cut it or add an element.
-    ik4s = [seg for seg in segments if seg.startswith("IK4*")]
-    assert ik4s and all(seg.split("*")[4:] == ["20?6?5?1?2"] for seg in ik4s)
+    # So also pin the IK4 segments whole: an echoed "~" or "*" anywhere in the value would cut one
+    # or add an element.
+    assert [seg for seg in segments if seg.startswith("IK4*")] == [
+        "IK4*4*373*5*20?6?5?1?2",
+        "IK4*4*373*8*20?6?5?1?2",
+    ]
     assert _DELIMITED_VALUE not in _rendered(result)
 
 
@@ -588,10 +590,10 @@ def test_an_ack_writer_that_raises_on_a_delimiter_ends_as_a_validation_result(
 
 
 def test_an_unterminated_segment_past_pyx12s_limit_is_a_validation_error() -> None:
-    # pyx12 4.1.0 can raise X12Error on a segment of about a megabyte or longer, as it does on this
-    # unterminated one; 4.0.1 could stop reading at a much shorter segment. The pass raises
-    # X12ValidationError, and neither its message nor the pyx12 error it chains holds any of the
-    # input.
+    # pyx12 4.1.0 can raise X12Error on a segment of about a million characters or longer, as it
+    # does on this unterminated one; 4.0.1 could stop reading at a much shorter segment. The pass
+    # raises X12ValidationError, and neither its message nor the pyx12 error it chains holds the
+    # segment's text.
     import pyx12.errors
 
     body = "Q" * (1024 * 1024 + 100)
