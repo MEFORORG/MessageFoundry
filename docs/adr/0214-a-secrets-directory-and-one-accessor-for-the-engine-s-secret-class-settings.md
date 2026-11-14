@@ -156,7 +156,8 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 - **2026-11-13, links on the directory's path are judged (vault BACKLOG #5656, #5657).** The risk
   above that says *"Nor are the folders above the directory checked"* is now partly closed. On
   every platform a junction or link the walk of the directory's path finds is judged by who can
-  change it, as
+  change it, on POSIX by the owner and mode the file system reports, which a network file system
+  such as CIFS or NFS may not enforce, as
   `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py` define. On Windows the check also
   reads the owner and access list of the folder that holds the directory, and refuses the
   directory when a broad group or an application package may delete a file in that folder,
@@ -172,8 +173,11 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   - On Windows, a secrets directory at a drive root, such as a `subst` root `S:\`:
     `_windows_surroundings_problem` returns at `full.parent == full`, before it walks or reads
     anything around the directory.
-  - On Windows, a broad group's `DELETE` on a holder that is not a link:
+  - On Windows, a broad group's `DELETE` on the holder: the holder rule does not refuse it, since
     `_HOLDER_REPLACE_MASK` does not include it.
+  - On Windows, with no link on the path, no folder above the holder is judged:
+    `_windows_surroundings_problem` runs the link rule only when the walk records a link, and a
+    `subst` drive letter is not recorded as one.
 - **2026-11-13, a link is refused on every platform (vault BACKLOG #5636).** Decision 3's "a link
   on Windows" now reads "a link": `broad_access_problem` reads the named path without following a
   link on POSIX too, so a secrets directory, or a file in it, that is itself a link is refused

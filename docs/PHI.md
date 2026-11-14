@@ -415,11 +415,12 @@ than a path is not checked
   account may own the file, as the administrator who copied in your own TLS key may. LOCAL SERVICE
   and NETWORK SERVICE are accounts that many services share, and the check does not report them.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On every platform the check
-  judges each junction or link its walk of the key file's path finds by who can change it, as `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py`
-  define. A key file that is itself a link is refused whoever can change it. The TLS pair
+  judges each junction or link its walk of the key file's path finds by who can change it, on POSIX by the owner and mode the file system reports, which a network file system
+  such as CIFS or NFS may not enforce, as
+  `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py` define. A key file that is itself a link is refused whoever can change it. The TLS pair
   the engine mints is one only it writes, so on Windows its key's owner must also be the engine's
-  own account, SYSTEM or Administrators: a pair another account planted in the store directory
-  is refused (on POSIX every key file's owner must already be the engine's own account or root).
+  own account, SYSTEM or Administrators (on POSIX every key file's owner must already be the
+  engine's own account or root).
   On Windows the check also reads the owner and access list of the directory that holds the key
   file, and refuses the file when one of the groups above or an application package may delete a
   file in that directory, change its access list or take it over (`FILE_DELETE_CHILD`,

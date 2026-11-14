@@ -1,9 +1,9 @@
-- **The key-file access check now judges a junction or link on a key file's path, and on Windows
-  the key file's owner and the directory that holds it.** On every platform a junction or a link
-  the walk of a key file's path finds is judged by who can change it, as `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py`
-  define. On Windows the TLS key the engine mints must be owned by the engine's own account,
-  SYSTEM or Administrators, so a key another account planted in the store directory is refused,
-  and a key file whose owner is a broad group or an application package, or cannot be read, is
+- **The key-file access check now reads, on Windows, a key file's owner and the directory that
+  holds it.** On every platform a junction or a link
+  the walk of a key file's path finds is judged by who can change it, on POSIX by the owner and mode the file system reports, which a network file system
+  such as CIFS or NFS may not enforce, as
+  `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py` define. On Windows the TLS key the engine mints must be owned by the engine's own account,
+  SYSTEM or Administrators, and a key file whose owner is a broad group or an application package, or cannot be read, is
   refused. On Windows the check also reads the owner and access list of the directory that holds
   the key file, and refuses the file when a broad group or an application package may delete a
   file in that directory, change its access list or take it over, or when its owner is such a

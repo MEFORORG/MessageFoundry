@@ -2730,8 +2730,9 @@ secret. Each file in that directory holds one setting and is named exactly as it
   it also refuses a directory or file owned by an account other than the engine's own or root,
   and one held in a directory that such an account owns or that a group or other may write
   without the sticky bit, since any account that may write it may replace what it holds. It
-  judges the links its walk of the directory's path finds and, on Windows, the folder that holds it, as
-  [PHI.md](PHI.md) section 2, *The folders above a key file*, states for a key file. It also
+  judges the links its walk of the directory's path finds, as [PHI.md](PHI.md) section 2, *The
+  folders above a key file*, states for a key file; [ADR 0214's amendment](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments)
+  lists known gaps, at least. It also
   refuses a relative path, a file that is not a regular file, a file named for no setting above
   (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
   whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
