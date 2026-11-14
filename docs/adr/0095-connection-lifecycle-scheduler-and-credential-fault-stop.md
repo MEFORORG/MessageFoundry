@@ -329,7 +329,7 @@ The probe arms and the `FhirLookup` read are not deliveries, so they carry no fa
 raises a plain `DeliveryError`, and the read raises `FhirLookupError`. Both use the same fixed text.
 *Narrowed 2026-10-11: a probe that mints a bearer passes on the token hop's own refusal (B.1),
 which carries the marker; the test-connection route reads it as a `DeliveryError` and shows its
-text.* The peer's algorithm token and scheme word stay on the cause and never reach `queue.last_error`.
+text. Since BACKLOG #2989 item 11 no built configuration reaches that refusal.* The peer's algorithm token and scheme word stay on the cause and never reach `queue.last_error`.
 
 Tests: `tests/test_digest_refusal_classification.py`, at least
 `test_post_reports_a_refused_challenge_as_a_configuration_fault`,

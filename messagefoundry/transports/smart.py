@@ -336,10 +336,12 @@ class _TokenEndpointProvider(abc.ABC):
         # no Proxy-Authorization (byte-identical).
         token_proxy = proxy.for_host(token_url) if proxy else None
         # BACKLOG #2989 item 11: an https token request reaches its web proxy only as a CONNECT, and
-        # urllib raises the proxy's 407 there before the Digest handler sees it, so a proxy set up
-        # for Digest could never let a token be minted (ADR 0095 B.1). Keyed on the proxy resolved
-        # for the TOKEN host, so a token host the proxy bypasses builds. An ECH sidecar takes the
-        # POST over loopback http, which is dialled direct, so the proxy never meets it.
+        # urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest
+        # setup could never answer a challenge on this hop (ADR 0095 B.1). Keyed on the proxy
+        # resolved for the TOKEN host, so a token host the proxy bypasses builds. With an ECH
+        # sidecar the POST is re-addressed to the loopback sidecar, which is dialled direct, so the
+        # proxy never meets it. The data hop refuses Digest for an https destination in
+        # rest.proxy_auth_handler_from_settings.
         if (
             scheme == "https"
             and ech_sidecar is None
@@ -349,10 +351,9 @@ class _TokenEndpointProvider(abc.ABC):
             raise self._ERROR(
                 f"{hop_name_prefix(connection)}{self._LABEL} token endpoint is https and its web "
                 "proxy is set up for Digest (proxy_auth_type='digest'); a 407 from the proxy "
-                "arrives on the CONNECT, where Digest cannot answer it. Give the token host a "
-                "route that crosses no authenticating proxy (proxy_no_proxy, or no proxy "
-                "credential where no other hop needs one), or use proxy_auth_type='basic' "
-                "(ADR 0095 B.1)"
+                "arrives on the CONNECT, where Digest cannot answer it. ADR 0095 B.1 gives the "
+                "remedies, and the cost of proxy_auth_type='basic', which sends the password on "
+                "the CONNECT in recoverable form"
             )
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``

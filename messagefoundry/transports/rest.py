@@ -2486,7 +2486,8 @@ def proxy_config_from_settings(
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
     (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
-    target's scheme (for the digest-over-https refusal).
+    target's scheme (for the digest-over-https refusal; a token hop's https endpoint is refused
+    for Digest in ``smart._TokenEndpointProvider._open_token_hop``).
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
     (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.

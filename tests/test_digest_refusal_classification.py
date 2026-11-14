@@ -686,7 +686,7 @@ _DIGEST_PROXY_REFUSED = "token endpoint is https and its web proxy is set up for
 @pytest.mark.usefixtures("no_bypass")
 def test_an_https_token_endpoint_behind_a_digest_proxy_is_refused_at_build() -> None:
     """BACKLOG #2989 item 11. An https token request meets its web proxy only as a CONNECT, and
-    urllib raises the proxy's 407 there before the Digest handler sees it, so no token could ever
+    urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest setup could
     be minted. The build refuses it as a configuration fault, and nothing reaches the proxy. Fails
     on the code before that change, which built the provider and stopped the lane at send."""
     with (
@@ -696,8 +696,8 @@ def test_an_https_token_endpoint_behind_a_digest_proxy_is_refused_at_build() -> 
         _token_provider_via(proxy.url, auth="digest")
     message = str(ei.value)
     assert message.startswith(f"OAuth2 {_DIGEST_PROXY_REFUSED} ")
-    assert "proxy_auth_type='basic'" in message
-    assert "(ADR 0095 B.1)" in message
+    assert "ADR 0095 B.1 gives the remedies" in message
+    assert "recoverable form" in message
     # The token URL's query and the proxy's address stay out of the refusal.
     assert "SITE-QUERY" not in message
     assert "127.0.0.1" not in message
@@ -741,6 +741,16 @@ def test_a_token_host_the_digest_proxy_bypasses_still_builds() -> None:
         "http://127.0.0.1:3128", auth="digest", bypass=["auth.partner.invalid"]
     )
     assert provider._opener is _shared_no_redirect_opener()
+    assert provider._proxy_auth == {}
+
+
+def test_a_token_host_urllibs_bypass_list_names_still_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token host urllib's own bypass list names gets the proxy handler with no credential and no
+    Digest handler (vault BACKLOG #3442), so the Digest setup never meets it and it builds."""
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
+    provider = _token_provider_via("http://127.0.0.1:3128", auth="digest")
     assert provider._proxy_auth == {}
 
 
