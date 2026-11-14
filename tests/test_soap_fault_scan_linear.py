@@ -133,16 +133,24 @@ def _ref_fault_code(body: str) -> str:
         return ""
     fault_inner = _REF_FAULT_INNER_RE.match(body, fault_tag.end())
     inner = "" if fault_inner is None else fault_inner.group(1)
-    return _ref_first_child_code(inner) or _ref_searched_code(inner)
+    code = _ref_first_child_code(inner)
+    if code:
+        return code
+    plain_end = _REF_FAULT_CLOSE_ANYWHERE_RE.search(body, name_end)
+    return _ref_searched_code(
+        body[name_end : len(body) if plain_end is None else plain_end.start()]
+    )
 
 
+#: The fallback's range ends at the first Fault close tag, markup not stepped over.
+_REF_FAULT_CLOSE_ANYWHERE_RE = re.compile(r"(?i:</\s*(?:[\w.\-]+:)?Fault\s*>)")
 #: The fallback's start-tag names, written out independently of _FAULTCODE_RE and _CODEVALUE_RE.
 _REF_FAULTCODE_NAME_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
 _REF_VALUE_NAME_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
 
 
 def _ref_searched_code(inner: str) -> str:
-    """The fallback: the old patterns' search over the Fault, a Value only ahead of the first
+    """The fallback: the old patterns' search over the old range, a Value only ahead of the first
     faultcode, markup not stepped over (BACKLOG #5912)."""
     faultcode = _REF_FAULTCODE_NAME_RE.search(inner)
     head = inner if faultcode is None else inner[: faultcode.start()]
@@ -461,14 +469,15 @@ def _pr2790_fault_code(body: str) -> str:
 )
 def test_with_no_first_child_code_the_fallback_reads_as_before(body: str) -> None:
     """The PR 2936 hold of 2026-11-14: where the Fault's first child yields no code, the fallback
-    reads each shape as the PR 2790 reading did, so none of these Receiver or Server faults is newly
-    dead-lettered. That keeps the PR 2790 trade for these shapes: a Value outside the Code decides
-    them, as it did before #5912. ``_pr2790_fault_code`` shares this module's patterns and Fault
-    search, so it pins the reading's order, not the patterns. Control: with the fallback patched
+    reads each shape as the PR 2790 reading did, so none is newly dead-lettered. That keeps the PR
+    2790 trade for these shapes: a Value outside the Code decides them, as it did before #5912, so
+    the three whose real code is Sender or Client (the Role one and the two ahead of a faultcode)
+    retry, as main retries them. ``_pr2790_fault_code`` shares this module's patterns and Fault
+    search, so it pins the reading's order; the written-out reference checks the patterns. Control: with the fallback patched
     out, each reads as no code, a permanent fault, as PR 2936 head 933e347fe8 read it."""
     reading = _pr2790_fault_code(body)
     assert soap._RECEIVER_RE.search(reading), "the shape must hold a retryable reading"
-    assert _fault_code(body) == reading
+    assert _fault_code(body) == reading == _ref_fault_code(body)
     assert _outcome(_classify_soap(200, body)) == "transient"
     assert _outcome(_classify_soap(500, body)) == "transient"
     with pytest.MonkeyPatch.context() as patch:
@@ -500,8 +509,9 @@ _VALUE_IN_MARKUP_BEFORE_THE_CODE = {
 def test_a_value_outside_the_first_child_code_does_not_decide_the_fault(
     body: str, code: str
 ) -> None:
-    """Red on the PR 2790 reading, which retried each of these as a Receiver fault: the one place a
-    main-retried reply is now dead-lettered, a Sender code read past a Value inside markup."""
+    """Red on the PR 2790 reading, which retried each of these as a Receiver fault. At least these
+    shapes, a Sender code read past a Value inside markup, are main-retried replies now
+    dead-lettered; a Client fault after a commented Server fault is another."""
     assert soap._RECEIVER_RE.search(_pr2790_fault_code(body)), "the shape must exercise the defect"
     assert _fault_code(body) == code
     assert _outcome(_classify_soap(200, body)) == "soap-sender"
@@ -724,8 +734,11 @@ def test_a_fault_tag_inside_markup_does_not_decide_the_fault(
     body: str, outcome: str, unmarked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A Fault-named tag inside markup is stepped over. Control: each shape holds such a tag, and
-    with the plain tag patterns patched in for the outside-markup ones the shape reads as PR 2936
-    head adfdcd5d31 read it, so a shape whose two outcomes differ is red there."""
+    with the plain tag patterns patched in for the outside-markup ones, and the fallback patched
+    out, the shape reads as PR 2936 head adfdcd5d31 read it, so a shape whose two outcomes differ
+    was red there. With the fallback in place, at least the two body-tag-in-a-comment shapes and
+    comment-code-close-after-a-commented-value still go red without the step-over; the fallback
+    reads the rest as their outcome anyway."""
     spans = [m.span() for m in re.finditer(_REF_MARKUP, body, re.DOTALL)]
     tags = (soap._FAULT_RE, soap._FAULT_END_RE, soap._CODE_END_RE)
     assert any(a < m.start() < b for rx in tags for m in rx.finditer(body) for a, b in spans), (

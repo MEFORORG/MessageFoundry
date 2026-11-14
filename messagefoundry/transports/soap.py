@@ -232,7 +232,8 @@ def _first_child(body: str, pos: int, end: int) -> int:
     BACKLOG #5912: a comment, a CDATA section or a processing instruction is stepped over whole, so
     markup inside one is never taken for the child. Where one has no terminator before ``end``, or
     a ``<!`` opens anything else, such as a DOCTYPE, there is no child: the first-child read then
-    yields no code, and :func:`_fault_code` falls back to :func:`_searched_code`. Each step resumes after the markup it passed, so the search is linear."""
+    yields no code, and :func:`_fault_code` falls back to :func:`_searched_code`. Each step
+    resumes after the markup it passed, so the search is linear."""
     while True:
         lt = body.find("<", pos, end)
         if lt < 0:
@@ -332,18 +333,19 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     SOAP 1.1's ``faultcode`` or SOAP 1.2's ``Code``, which both schemas put first. For ``Code`` the
     code is the ``Value`` that is the Code's own first child, read only up to the Code's close tag.
     A ``Value`` anywhere else in the Fault, in a Subcode, Reason, Node, Role or Detail, never
-    decides permanent versus retryable when the first child yields a code, other than one inside
-    markup, which the fallback below may still read. A Fault or Code close tag
-    inside a comment, a CDATA section or a processing instruction does not end either element
+    decides permanent versus retryable when the first child yields a code. A Fault or Code close
+    tag inside a comment, a CDATA section or a processing instruction does not end either element
     (:func:`_search_outside_markup`).
 
     Where the first-child read yields no code, because the first child is neither element, it
     cannot hold a code, or a ``<!`` the read does not step over (a DOCTYPE, a lowercase
     ``<![cdata[``, an unterminated comment) stops it, the code falls back to the earlier search
-    (:func:`_searched_code`): the first ``faultcode``, or a ``Value`` before it, in the Fault. So a
-    shape the first-child read cannot place, such as a SOAP 1.1 ``faultstring`` before the
-    ``faultcode`` or a SOAP 1.2 ``Reason`` before the ``Code``, reads as it did before #5912, and a
-    Receiver fault there is retried rather than dead-lettered. Only where both reads find nothing is
+    (:func:`_searched_code`), over the range that search read: from the Fault start tag to the
+    first Fault close tag, markup not stepped over. So such a reply reads as it did before #5912. A
+    Receiver fault the first-child read cannot place, after a SOAP 1.1 ``faultstring`` or a SOAP 1.2
+    ``Reason`` say, is retried rather than dead-lettered; and, as before #5912, a ``Value`` ahead of
+    the code element, or after a code element that holds no code, decides the class there, so a
+    Sender fault of such a shape may read as a Receiver one and retry. Only where both reads find nothing is
     the code ``""``, which :func:`_classify_soap` reads as a permanent fault, never as delivered.
     Each read is one scan forward from the Fault, so the whole stays linear in the reply."""
     if fault is None:
@@ -356,7 +358,12 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
         return ""
     fault_end = _search_outside_markup(_FAULT_END_OUTSIDE_MARKUP_RE, body, gt + 1, len(body))
     end = len(body) if fault_end is None else fault_end.start()
-    return _first_child_code(body, gt + 1, end) or _searched_code(body, gt + 1, end)
+    code = _first_child_code(body, gt + 1, end)
+    if code:
+        return code
+    # The earlier search's own range, so the fallback reads no more than it did.
+    plain_end = _FAULT_END_RE.search(body, start)
+    return _searched_code(body, start, len(body) if plain_end is None else plain_end.start())
 
 
 def _first_child_code(body: str, start: int, end: int) -> str:
@@ -382,10 +389,7 @@ def _first_child_code(body: str, start: int, end: int) -> str:
 
 def _searched_code(body: str, start: int, end: int) -> str:
     """The code the earlier search finds in ``body[start:end]``, or ``""``: :func:`_fault_code`'s
-    fallback, the search the code ran before BACKLOG #5912. Its range is not that search's: it
-    starts after the Fault start tag's ``>`` and ends at the first Fault close tag outside markup,
-    where that search ended at the first Fault close tag anywhere, so a ``</Fault>`` in a comment
-    no longer cuts it short. The first ``faultcode`` or ``Value`` start tag
+    fallback, the search the code ran before BACKLOG #5912, given that search's range. The first ``faultcode`` or ``Value`` start tag
     there is the code element, a ``Value`` taken only before the first ``faultcode``, and only that
     first tag is read: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may
     carry an element of the other name. Markup is not stepped over, as it was not before."""

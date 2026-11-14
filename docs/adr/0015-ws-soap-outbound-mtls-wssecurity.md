@@ -158,7 +158,7 @@ whitespace, `/` or `>`, so `<Code.x>` does not match, and `_CODE_END_RE` is its 
 three start-tag patterns is tried at most once, anchored, by the first read: `faultcode` and `Code` at
 the Fault's first child element, `Value` at the Code's first child. Where that read yields no code,
 the fallback searches forward once each for the first `faultcode` and a `Value` ahead of it, the
-search the code ran before #5912, up to the Fault close tag found outside markup. Only a `faultcode` or `Value` match reaches
+search the code ran before #5912, over that search's range. Only a `faultcode` or `Value` match reaches
 `_code_text`; the `_fault_code` docstring says how. The Fault start-tag search and the Fault and Code close-tag searches step over a comment, a CDATA section or a processing instruction whole, with `str.find`, as the first-child search does; `_search_outside_markup` says how. This decision is unchanged.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
 `messagefoundry/`. *(Corrected 2026-11-04: that sentence, the "regex-only" premise and the heading's
 "no XML parser" are no longer true of the codebase. The engine imports XML parsers, and
