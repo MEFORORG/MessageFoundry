@@ -275,8 +275,7 @@ its re-arm genuinely is per-connection.
 *(Note, BACKLOG #5704: the INBOUND tier now takes this ADR's shape too. Its claim gate,
 `_inbound_log_halted`, reads the process latch as well as the per-inbound marks, in the per_lane
 workers' loop top and, under pooled, in a pre-claim predicate on the INGRESS, ROUTED and
-RESPONSE dispatchers: a gated lane parks with no claim and no row write until the gate lifts, and
-only a prefix claimed before the latch is handed back unprocessed. The halt itself
+RESPONSE dispatchers: a gated lane parks with no claim and no row write until the gate lifts. The halt itself
 does not pause or STOP an internal lane. A lane can still STOP while it is in
 force, at least under its own fault policy (the T17 bound, for example when that hand-back's
 reschedule keeps failing on a full store) and through a leadership-loss hand-back; lifting the

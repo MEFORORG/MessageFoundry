@@ -2738,12 +2738,22 @@ def test_a_raising_claim_gate_parks_the_lane_and_spares_the_claimer(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     # BACKLOG #5704 review: a may_claim that raises must not kill the claimer with the lane popped
-    # and still READY, where nothing re-enqueues it. The lane parks gated, as on a refusal, and the
-    # rest of the chunk assembles. Control: the lane the gate answers for claims.
+    # and still READY, where nothing re-enqueues it. The lane parks on a TIMER, not a gate park,
+    # so it asks again after a backoff; the rest of the chunk assembles.
     def gate(lane: str) -> bool:
         if lane == "bad":
             raise KeyError(lane)
         return True
+
+    armed: list[float] = []
+
+    class _Handle:
+        def cancel(self) -> None:
+            pass
+
+    def call_later(delay: float, cb: Callable[[], object]) -> Any:
+        armed.append(delay)
+        return _Handle()
 
     dispatcher = stage_dispatcher.StageDispatcher(
         Stage.ROUTED,
@@ -2752,6 +2762,7 @@ def test_a_raising_claim_gate_parks_the_lane_and_spares_the_claimer(
         lane_provider=set,
         per_lane_limit=1,
         may_claim=gate,
+        call_later=call_later,
     )
     dispatcher.mark_ready("bad")
     dispatcher.mark_ready("ok")
@@ -2760,10 +2771,41 @@ def test_a_raising_claim_gate_parks_the_lane_and_spares_the_claimer(
 
     assert chunk == ["ok"]
     st = dispatcher._states["bad"]
-    assert (st.phase, st.gated) == (stage_dispatcher._LanePhase.PARKED, True)
+    assert (st.phase, st.gated) == (stage_dispatcher._LanePhase.PARKED, False)
+    assert st.park_until is not None and len(armed) == 1
     assert any("KeyError" in r.getMessage() for r in caplog.records)
-    dispatcher.release_gated(["bad"])  # lifting the gate re-arms it
-    assert dispatcher.phase("bad") is stage_dispatcher._LanePhase.READY
+    dispatcher._cancel_timer("bad")
+
+
+async def test_a_claim_gate_that_raises_once_with_no_halt_lets_the_lane_drain(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5704 review: with no halt in force, a gate that raises once and then answers True
+    # must not strand its lane: the timed park ends and the message is delivered.
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.05)
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "pooled")
+    raised: list[str] = []
+
+    def flaky(lane: str) -> bool:
+        if not raised:
+            raised.append(lane)
+            raise RuntimeError("a transient gate fault")
+        return True
+
+    monkeypatch.setattr(runner, "_may_claim_internal", flaky)
+    await runner.start()
+    try:
+        message_id = await store.enqueue_ingress(channel_id=INBOUND, raw=RAW)
+        runner._wake_lane(Stage.INGRESS, INBOUND)
+        assert await _until(lambda: any(outdir.iterdir())), "the lane never drained"
+        assert len(raised) == 1
+        assert not runner._log_write_stopped
+        assert await _until_processed(store, message_id)
+    finally:
+        await runner.stop()
 
 
 def test_lifting_the_gate_releases_only_gate_parked_lanes(store: MessageStore) -> None:

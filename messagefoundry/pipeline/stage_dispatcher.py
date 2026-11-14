@@ -1197,7 +1197,11 @@ class StageDispatcher:
             st = self._states.get(lane)
             if st is None or st.phase is not _LanePhase.READY:
                 continue  # stale: the lane already left READY (e.g. teardown, or a double entry)
-            if not self._lane_may_claim(lane):  # BACKLOG #5704: gated, so park, no claim, no slot
+            may = self._lane_may_claim(lane)
+            if may is None:  # the gate raised: a timed park, so the lane asks again after a backoff
+                self._park(lane, st, self._clock() + _LANE_ERROR_BACKOFF_SECONDS)
+                continue
+            if not may:  # BACKLOG #5704: gated, so park, no claim, no slot
                 self._park_gated(lane, st)
                 continue
             st.phase = _LanePhase.CLAIMING  # T8
@@ -1692,9 +1696,7 @@ class StageDispatcher:
     def _hold_abandoned(self, lane: str) -> bool:
         """Whether a ``pause_lane`` waits on this lane, so its hold ends and the terminal transition
         reaches PAUSED. On every stage: at least a stop or pause of an outbound (an operator's, a
-        schedule window's or a DR park's) pauses an OUTBOUND lane. The #122 fail-closed halt
-        pauses no INGRESS, ROUTED or RESPONSE lane: it is a claim gate in the runner's adapters
-        (BACKLOG #5704), so a hold there runs on until its re-pend lands."""
+        schedule window's or a DR park's) pauses an OUTBOUND lane."""
         st = self._states.get(lane)
         return st is not None and st.pause_pending
 
@@ -1746,9 +1748,7 @@ class StageDispatcher:
         **A pause ends the hold** (``ABANDONED``). It is read at the base interval through the
         backoff, so a pause, a stop of the outbound, the purge that waits on it and the #122 halt
         of the DELIVERY tier are not held until the store heals. :meth:`_hold_abandoned` says what
-        pauses a lane. The #122 halt of an INGRESS, ROUTED or RESPONSE lane pauses nothing, so it
-        does not end that hold: the hold runs on until its write lands or the policy below ends it,
-        and the lane's next claim then meets the runner's claim gate (BACKLOG #5704).
+        pauses a lane.
 
         **At ``infra_fault_stop_after`` consecutive failures the policy decides.** Under ``stop``
         the hold ends (``EXHAUSTED``) and :meth:`_run_lane` raises the lane's ``infra_error_streak``
@@ -2038,19 +2038,19 @@ class StageDispatcher:
         if until is not None:
             self._arm_timer(lane, until)
 
-    def _lane_may_claim(self, lane: str) -> bool:
-        """Ask the pre-claim gate. A raise is logged and read as a refusal, so the lane parks
-        gated rather than killing the claimer with the lane popped and still READY."""
+    def _lane_may_claim(self, lane: str) -> bool | None:
+        """Ask the pre-claim gate; None when it raised, which is logged. The caller parks the lane
+        on a timer rather than letting the raise kill the claimer with the lane popped and READY."""
         try:
             return self._may_claim(lane)
         except Exception as exc:  # noqa: BLE001 — a gate fault must not kill the claimer
             log.error(
-                "StageDispatcher %s may_claim raised %s for lane %s; parking it gated",
+                "StageDispatcher %s may_claim raised %s for lane %s; parking it for a backoff",
                 self._stage.value,
                 type(exc).__name__,
                 lane,
             )
-            return False
+            return None
 
     def _park_gated(self, lane: str, st: _LaneState) -> None:
         """Park a lane the pre-claim gate refused (BACKLOG #5704), with no timer: nothing is due to

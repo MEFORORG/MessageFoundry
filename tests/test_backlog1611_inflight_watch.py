@@ -1395,11 +1395,10 @@ async def test_the_log_halt_leaves_a_held_internal_lane_to_land_and_then_gates_i
     kind: str,
     variant: str,
 ) -> None:
-    """The #122 fail-closed halt (application log unwritable) is a CLAIM GATE (BACKLOG #5704): it
-    does not end a lane HELD on a failed re-pend. The hold writes only to the store and processes
-    nothing, so it runs on until the re-pend lands, and then no row is stranded in flight, which
-    ending it left behind under a worker or lane that later claims past it. Once landed, the gate
-    keeps the row from being processed again. The control, with no halt, re-processes it."""
+    """The #122 fail-closed halt (application log unwritable) is a CLAIM GATE (BACKLOG #5704).
+    In these cases a lane HELD on a failed re-pend runs on under the halt until the re-pend lands.
+    Once landed, the gate keeps the row from being processed again. The control, with no halt,
+    re-processes it."""
     _fast_backoffs(monkeypatch)
     monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.05)
     monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.05)
