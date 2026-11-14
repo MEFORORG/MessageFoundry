@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Final, Protocol, get_args
+from typing import Final, Protocol
 
 from messagefoundry.auth.audit_visibility import (
     LOCK_NOTICE_ID_FIELD,
@@ -70,7 +70,7 @@ from messagefoundry.pipeline.alert_sinks import (
     _refuse_off_allowlist_smtp_host,
     send_plain_email,
 )
-from messagefoundry.store.store import LockoutCounter
+from messagefoundry.store.store import LOCKOUT_COLUMNS
 from messagefoundry.transports.email import checked_sender
 
 log = logging.getLogger(__name__)
@@ -84,8 +84,8 @@ SECURITY_NOTICE_UNDELIVERED_ACTION: Final = "auth.security_notice_undelivered"
 _MAX_RECORDING: Final = 64
 #: The closed set of lock kinds a lock notice's undelivered row may name, and the shape of the
 #: notice id it may carry (BACKLOG #1138). Anything else in the event's detail is left off the row.
-_LOCK_KINDS: Final = frozenset(get_args(LockoutCounter))
-_NOTICE_ID: Final = re.compile(r"[A-Za-z0-9_-]{11}")
+_LOCK_KINDS: Final = frozenset(LOCKOUT_COLUMNS)
+_NOTICE_ID: Final = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 class NoticeAuditSink(Protocol):

@@ -1366,3 +1366,28 @@ async def test_a_failed_second_read_fails_open() -> None:
         assert await service._lock_notice_held_back(user, "sign_in") is False
     finally:
         await _close(store, service)
+
+
+async def test_a_delivered_mail_in_the_window_holds_even_behind_a_newer_failure() -> None:
+    """Two notices of one kind went out in the window, for example from two engine shards: ``a``
+    was delivered and the newer ``b`` failed. ``a`` reached the owner, so the next lock is still
+    held. The control is ``a`` failing too, which releases it."""
+    store, service, _fake, user = await _harness()
+    try:
+        u, a, b = user.username, "a" * 11, "b" * 11
+        await store.record_audit(_LOCK_NOTICE, actor=u, detail=_held("sign_in", a))
+        await store.record_audit(_LOCK_NOTICE, actor=u, detail=_held("sign_in", b))
+        await store.record_audit(
+            _LOCK_NOTICE_UNDELIVERED,
+            actor=u,
+            detail=json.dumps({"lock": "sign_in", "notice_id": b}),
+        )
+        assert await service._lock_notice_held_back(user, "sign_in") is True
+        await store.record_audit(
+            _LOCK_NOTICE_UNDELIVERED,
+            actor=u,
+            detail=json.dumps({"lock": "sign_in", "notice_id": a}),
+        )
+        assert await service._lock_notice_held_back(user, "sign_in") is False
+    finally:
+        await _close(store, service)

@@ -7617,11 +7617,10 @@ notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notic
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
 notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
 holder, and a lock notice its lock kind and the notice id its `auth.lock_notice` row also
-carries, a random token. A lock notice whose send failed keeps that row reading `mailed: true`, but
-the throttle reads the undelivered rows too, and one with the same notice id cancels that row's
-hold, so the next lock of the kind mails again (BACKLOG #1138). The rule is stated on
-`AuthService._lock_notice_held_back`. The row never carries the address, the rest of the
-notice's detail, or the error. The
+carries, a random token. A lock notice whose send failed keeps that row reading `mailed: true`; the
+throttle reads the undelivered rows too, so a later lock of the kind can mail again (BACKLOG
+#1138). `AuthService._lock_notice_held_back` states the rule. The row never carries the address,
+the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
@@ -7658,9 +7657,14 @@ again for the row, and only when a send failed. **Still open, at least:**
   exit may wait for it, or it may be lost with no log line.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
-- A lock notice whose send failed but whose `auth.lock_notice_undelivered` write failed or was cut
-  off keeps its `auth.lock_notice` row's hold, so the throttle holds back the next lock notice of
-  the kind for the rest of its 24 hours.
+- A lock notice whose send failed keeps its `auth.lock_notice` row's hold until its
+  `auth.lock_notice_undelivered` row is written. A lock that reads the throttle before then, for
+  example while the send waits out the relay's timeout, is held back. A write that fails or is cut
+  off keeps the hold for the rest of its 24 hours.
+- A send that raises after the relay accepted the mail, for example on a refused `QUIT`, is
+  recorded as `send_failed` too, so the next lock of the kind mails again.
+- Each failed send re-arms the throttle, so while the relay fails every lock of a kind retries it,
+  and each try holds the relay's one worker until the send fails.
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
 engine waits at most two seconds for pending notices, then cancels any still pending, each with one

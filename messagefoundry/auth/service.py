@@ -3244,16 +3244,16 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True)
 
 
-def _lock_notice_details(rows: Iterable[Any], lock: str) -> Iterator[tuple[Any, dict[str, Any]]]:
-    """Each audit row whose JSON detail names this ``lock`` kind, with that detail, in row order.
-    A row whose detail does not parse as a JSON object is skipped."""
+def _lock_notice_details(rows: Iterable[Any], lock: str) -> Iterator[dict[str, Any]]:
+    """The JSON detail of each audit row that names this ``lock`` kind, in row order. A row whose
+    detail does not parse as a JSON object is skipped."""
     for row in rows:
         try:
             detail = json.loads(row["detail"] or "{}")
         except (TypeError, ValueError):
             continue
         if isinstance(detail, dict) and detail.get("lock") == lock:
-            yield row, detail
+            yield detail
 
 
 def _is_idp_transport_failure(exc: BaseException) -> bool:
@@ -3311,6 +3311,9 @@ _FLOOR_DEFERRED_MARKER: Final[Mapping[str, object]] = MappingProxyType(
 #: it throttles over. See :meth:`AuthService._lock_notice_due`.
 _LOCK_NOTICE_ACTION: Final = LOCK_NOTICE_ACTION
 _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
+#: How many rows of each action one throttle read takes, newest first, both kinds together. A
+#: failed send re-arms the throttle (BACKLOG #1138), so a window can hold more than one row per kind.
+_LOCK_NOTICE_READ_LIMIT: Final = 200
 #: BACKLOG #2216: how long :meth:`AuthService.close_background` lets the
 #: service's background tasks finish at shutdown before it cancels the rest, and how long it then
 #: waits for the cancelled ones to unwind. A task still running at the first bound is queued behind
@@ -20362,13 +20365,14 @@ class AuthService:
     async def _lock_notice_held_back(self, user: UserRecord, lock: str) -> bool:
         """The throttle's READ: whether a notice of this ``lock`` kind already went out in the window.
 
-        **A failed send cancels its own notice's hold (BACKLOG #1138).** When the newest row of the
-        kind that holds a notice back says ``mailed: true``, an ``auth.lock_notice_undelivered``
-        row carrying the same notice id (``LOCK_NOTICE_ID_FIELD``) means that mail never left, so
-        the next lock retries the relay. Matched by id, not by order: the relay drains one queue
-        and can record an earlier notice's failure after a later notice's row, and an older failure
-        must not cancel a later mail. A row without an id, or a failure whose record write failed,
-        cancels nothing, and the hold then stands for the window as before.
+        **A failed send cancels its own notice's hold (BACKLOG #1138).** A ``mailed: true`` row is
+        cancelled by an ``auth.lock_notice_undelivered`` row of the kind carrying the same notice
+        id (``LOCK_NOTICE_ID_FIELD``): that mail never left. The notice is held back while any
+        ``mailed: true`` row of the kind in the window is not cancelled, so once every mail of the
+        kind in the window failed, the next lock retries the relay. Matched by id, not by order:
+        the relay drains one queue and can record an earlier notice's failure after a later
+        notice's row. A row without an id cancels nothing, nor does a failure whose record write
+        failed or has not landed yet; the hold then stands for the window as before.
 
         Kept apart from the row write, so the background task can send the mail between this read
         and :meth:`_record_lock_notice` (BACKLOG #2216). An audit index serves both actions' reads
@@ -20388,24 +20392,34 @@ class AuthService:
         try:
             async with self._lock_notice_read_slots:
                 rows = await self._store.list_audit(
-                    actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
+                    actor=user.username,
+                    action=_LOCK_NOTICE_ACTION,
+                    since=since,
+                    limit=_LOCK_NOTICE_READ_LIMIT,
                 )
-                for _row, detail in _lock_notice_details(rows, lock):
-                    mailed = detail.get("mailed", True) is not False
-                    # A row that mailed nothing holds back only another addressless notice.
-                    if mailed or not mailable:
-                        notice_id = detail.get(LOCK_NOTICE_ID_FIELD)
-                        break
-                else:
+                mailed_ids: set[str] = set()
+                for detail in _lock_notice_details(rows, lock):
+                    if detail.get("mailed", True) is False:
+                        # A row that mailed nothing holds back only another addressless notice.
+                        if not mailable:
+                            return True
+                        continue
+                    notice_id = detail.get(LOCK_NOTICE_ID_FIELD)
+                    if not isinstance(notice_id, str):
+                        return True  # no failure can be matched to it
+                    mailed_ids.add(notice_id)
+                if not mailed_ids:
                     return False
-                if not mailed or not isinstance(notice_id, str):
-                    return True
                 failed = await self._store.list_audit(
                     actor=user.username,
                     action=LOCK_NOTICE_UNDELIVERED_ACTION,
                     since=since,
-                    limit=50,
+                    limit=_LOCK_NOTICE_READ_LIMIT,
                 )
+                return not mailed_ids <= {
+                    detail.get(LOCK_NOTICE_ID_FIELD)
+                    for detail in _lock_notice_details(failed, lock)
+                }
         except Exception as exc:  # noqa: BLE001 - fails open by design, and is logged
             _log.error(
                 "a security-notice throttle read failed (%s); the throttle did not hold the notice "
@@ -20413,10 +20427,6 @@ class AuthService:
                 type(exc).__name__,
             )
             return False
-        return not any(
-            detail.get(LOCK_NOTICE_ID_FIELD) == notice_id
-            for _row, detail in _lock_notice_details(failed, lock)
-        )
 
     async def _record_lock_notice(
         self, user: UserRecord, lock: str, *, handed: bool, notice_id: str

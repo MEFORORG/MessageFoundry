@@ -569,7 +569,10 @@ async def test_the_reauth_crossing_attempt_audits_account_locked_once_and_notifi
         notices = [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
         assert len(notices) == 1
         # ADR 0197: the notice also names the lock and its cycle count, a closed-set detail.
-        assert notices[0].detail == {"failed_attempts": 3, "lock": "sign_in", "cycle": 1}
+        # Every key but the random per-notice id (BACKLOG #1138), which must be there.
+        detail = dict(notices[0].detail)
+        assert isinstance(detail.pop("notice_id"), str)
+        assert detail == {"failed_attempts": 3, "lock": "sign_in", "cycle": 1}
         assert notices[0].client_ip == "10.0.0.9"
     finally:
         # Again here, so a failure above cannot leave the notice running (vault BACKLOG #3120).

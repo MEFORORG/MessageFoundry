@@ -206,7 +206,7 @@ async def test_the_throttle_read_seeks_the_actor_index_on_sqlite(
         throttle = await _plan(
             store,
             monkeypatch,
-            lambda s: s.list_audit(actor="owner", action=action, since=0.0, limit=50),
+            lambda s: s.list_audit(actor="owner", action=action, since=0.0, limit=200),
         )
         control = await _plan(store, monkeypatch, lambda s: s.list_audit(action=_LOCK_NOTICE))
     finally:
