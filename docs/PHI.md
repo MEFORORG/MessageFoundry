@@ -412,8 +412,9 @@ than a path is not checked
 - On Windows it refuses a key file whose owner is one of those groups or an application package,
   or whose owner cannot be read, since an owner may rewrite the access list (vault BACKLOG #5657).
   It does not vet an owner that is one account, or an account you granted yourself: any one
-  account may own the file, as the administrator who copied in your own TLS key may. LOCAL SERVICE
-  and NETWORK SERVICE are accounts that many services share, and the check does not report them.
+  account may own a key file you supply, as the administrator who copied in your own TLS key may,
+  except the TLS key the engine mints (below). LOCAL SERVICE and NETWORK SERVICE are accounts that
+  many services share, and the check does not report them.
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On Windows the check also reads
   the owner and access list of the folder just above the key file in its path, as written, and
   refuses the key file when one of the groups above or an application package may delete a file in that folder, change its access list or take it over, or when that
