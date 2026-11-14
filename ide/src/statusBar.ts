@@ -578,6 +578,15 @@ export class EngineStatusBar implements vscode.Disposable {
     // Read once (BACKLOG #5566): the guard below and every command this Start runs use this one
     // value, so a settings change while a prompt or the provisioning terminal is open cannot split them.
     const serviceConfigArg = startServiceConfig();
+    // A set service config that names no file: serve and provision-admin refuse it, so say so now
+    // rather than prompt for a new store that the refusal would never create.
+    if (serviceConfigArg !== undefined && !isFile(path.resolve(ws, serviceConfigArg))) {
+      notify(
+        `messagefoundry.serviceConfig names "${serviceConfigArg}", which is not a file in this workspace — ` +
+          "serve would refuse it. Correct the setting, or clear it to use the default.",
+      );
+      return;
+    }
     // Fork guard (ADR 0110 §5): with no engine store here, starting would create a NEW database. That is
     // sometimes exactly what the user wants — but it must be a deliberate choice.
     if (!this.controlContextFor(serviceConfigArg).hasStore) {

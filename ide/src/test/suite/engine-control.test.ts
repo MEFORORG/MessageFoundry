@@ -669,6 +669,13 @@ suite("engine control — Start runs against the service TOML the fork guard jud
       /path\.resolve\(ws,\s*serviceConfigArg\s*\?\?\s*serviceConfig\(\)\)/.test(code),
       "the fork guard must judge the file the invocations name",
     );
+    // A set value naming no file is refused before the guard, since serve would refuse it anyway.
+    assert.ok(
+      /if \(serviceConfigArg !== undefined && !isFile\(path\.resolve\(ws, serviceConfigArg\)\)\) \{[\s\S]*?return;/.test(
+        launch[0],
+      ),
+      "a set service config that names no file must stop Start",
+    );
     assert.ok(
       /function startServiceConfig\(\)[^{]*\{\s*return connectionServiceConfig\(serviceConfig\(\),\s*serviceConfigIsSet\(\)\);/.test(
         code,
