@@ -150,6 +150,11 @@ worker strands its claimed row INFLIGHT, and `reset_stale_inflight` is startup/D
 default pooled claim mode by `pause_lane` on each stage dispatcher, under `per_lane` by a loop-top
 gate that returns out of the worker before its next claim. A lane already mid-episode finishes **at
 most its one in-flight head** — bounded, and strictly better than stranding the row.
+*(Note, BACKLOG #5704: superseded in mechanism. The internal stages are now held by a claim gate,
+`_inbound_log_halted`, which reads the latch and the per-inbound marks: per_lane workers WAIT at
+their loop top rather than returning, and the pooled adapters hand a gated row back by
+`reschedule_claimed` and park the lane. No lane is paused, so the halt never changes a lane's phase
+or hold. ADR 0189's note says the rest.)*
 
 **Recovery, measured rather than assumed — the two tiers recover differently and an operator needs
 both halves.** The inbound re-arm rides `_start_inbound_unsafe`, so **anything that starts an inbound

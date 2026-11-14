@@ -2341,6 +2341,9 @@ async def test_a_reload_racing_a_halt_cannot_rebind_a_listener_over_halted_stage
     # the halt, which read its bound list before the lock, then left it bound, ACKing senders over
     # internal stages it had shut down. Both orders: the halt firing between the steps, and the halt
     # firing while the listener is still bound.
+    # NEGATIVE CONTROL, measured rather than built in: with origin/main's wiring_runner.py in place
+    # (BACKLOG #5704 re-cut, 2026-11-13) the between-the-steps order went RED in both claim modes on
+    # the first assertion below, the listener rebound; the bound order passed there too.
     outdir, logdir = tmp_path / "out", tmp_path / "logs"
     outdir.mkdir()
     logdir.mkdir()
@@ -2401,6 +2404,9 @@ async def test_the_halt_gates_every_inbound_as_it_latches_before_it_holds_the_lo
     # a lock holder does meanwhile can let an internal stage claim. An inbound a reload adds later
     # is gated too, by the latch, with no mark of its own.
     runner, _source = _graph(store, _RecordingSink())
+    # Control: before the halt nothing is gated, so the reads below are the halt's doing.
+    assert not runner._inbound_log_halted(INBOUND)
+    assert not runner._inbound_log_halted("IB_ADDED_BY_A_RELOAD")
     await runner._reload_lock.acquire()
     try:
         halt = await _halt_waiting_on_the_lock(runner)
@@ -2734,7 +2740,7 @@ async def test_a_stand_down_leaves_a_poison_stopped_lane_stopped(
         await runner.stop()
 
 
-async def test_a_gated_inbound_does_not_respawn_a_stop_ended_worker(
+async def test_a_gated_inbound_does_not_respawn_a_stop_held_worker(
     store: MessageStore, tmp_path: Path
 ) -> None:
     # per_lane. A worker a content STOP ended stays ended while the gate holds, so the gate lifting
@@ -2750,12 +2756,22 @@ async def test_a_gated_inbound_does_not_respawn_a_stop_ended_worker(
         router.cancel()
         with suppress(asyncio.CancelledError):
             await router
+        runner._hold_for_operator(INBOUND, "inbound")  # the STOP's hold
         runner._log_write_stopped = True
         runner._ensure_inbound_workers(INBOUND)
-        assert runner._router_workers[INBOUND] is router, "a gated inbound's worker was respawned"
+        assert runner._router_workers[INBOUND] is router, "a STOP-held worker was respawned"
+        # With no hold (a worker that exited on a removed inbound), it is respawned while gated,
+        # so its backlog drains once the gate lifts.
+        runner._release_operator_hold(INBOUND, "inbound")
+        runner._ensure_inbound_workers(INBOUND)
+        respawned = runner._router_workers[INBOUND]
+        assert respawned is not router, "a finished worker with no hold was not respawned"
+        respawned.cancel()
+        with suppress(asyncio.CancelledError):
+            await respawned
         del runner._router_workers[INBOUND]
         runner._ensure_inbound_workers(INBOUND)
-        assert runner._router_workers[INBOUND] is not router, "a missing worker was not spawned"
+        assert INBOUND in runner._router_workers, "a missing worker was not spawned"
     finally:
         runner._log_write_stopped = False
         await runner.stop()
@@ -2787,3 +2803,22 @@ async def test_with_no_halt_an_operator_restart_leaves_a_pooled_stopped_lane_as_
         assert ("inbound", INBOUND) in runner._stop_held
     finally:
         await runner.stop()
+
+
+async def test_a_second_halt_latching_keeps_a_refusal_an_earlier_halt_will_stand_down_for(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # H1 waits; a reload's gate refuses INBOUND. A probe clears the latch and the log breaks again,
+    # so H2 latches. If H2 dropped the refusal, H1's stand-down (once another probe clears the
+    # latch) would find nothing to rebind or alert, and the listener would stay down in silence.
+    runner, _source = _graph(store, _RecordingSink())
+    await runner._reload_lock.acquire()
+    try:
+        first = await _halt_waiting_on_the_lock(runner)
+        runner._log_refused_rebinds.add(INBOUND)
+        runner._log_write_stopped = False  # a probe cleared the latch
+        second = await _halt_waiting_on_the_lock(runner)  # the log breaks again
+        assert INBOUND in runner._log_refused_rebinds, "a later halt dropped an earlier refusal"
+    finally:
+        runner._reload_lock.release()
+    await asyncio.gather(first, second)
