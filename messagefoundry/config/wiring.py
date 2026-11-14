@@ -3919,7 +3919,7 @@ def Rest(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -4048,7 +4048,7 @@ def FHIR(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -4521,7 +4521,7 @@ def DICOMweb(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
@@ -5005,7 +5005,7 @@ def Soap(
     | EnvRef
     | None = None,  # #127: forward-proxy auth password — secret, use env()
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
-    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    | None = None,  # #127: "basic" (default) | "digest" (http targets only); ntlm/windows deferred
     proxy_no_proxy: list[str]
     | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
