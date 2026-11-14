@@ -92,8 +92,17 @@ def test_the_axis_parses_and_counts_toward_the_sweep() -> None:
             "cannot BOTH be multi-arm",
         ),
         (
-            _SANDBOX_AB + "\n[connscale.slo]\nfd_monotonic = true\n",
+            # per_lane, so the base-reading check's own per_lane requirement is met and the
+            # sandbox refusal is the one that fires.
+            _SANDBOX_AB.replace('claim_modes = ["pooled"]', 'claim_modes = ["per_lane"]')
+            + "\n[connscale.slo]\nempty_claims_base_reading = true\n",
             "would mix the two sandbox arms",
+        ),
+        (
+            # Its lanes split by arm since BACKLOG #5570, so the reason is now the missing per-arm
+            # "compared at least once" bound, not mixing.
+            _SANDBOX_AB + "\n[connscale.slo]\nfd_monotonic = true\n",
+            "no per-arm bound",
         ),
     ],
 )
@@ -366,6 +375,7 @@ def _record(count: int, sandbox: SandboxReading) -> ConnScaleRecord:
         batch_mode=False,
         mode="fixed_aggregate",
         count=count,
+        trial=0,
         aggregate_rate=5.0,
         metrics_counters=Counters(sent=4, acked=4, sink_received=4),
         ack_hist=Histogram(),

@@ -328,6 +328,7 @@ def _record_over(samples: list[EngineSample], in_hold_samples: int) -> ConnScale
         batch_mode=False,
         mode="fixed_aggregate",
         count=4,
+        trial=0,
         aggregate_rate=10.0,
         metrics_counters=Counters(sent=samples[-1].read),
         ack_hist=Histogram(),

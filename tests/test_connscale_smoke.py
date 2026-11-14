@@ -80,7 +80,9 @@ from harness.load.connscale.profile import load_connscale_profile_text
 from harness.load.connscale.report import (
     ConnScaleRecord,
     ConnScaleReport,
+    MonotonicLane,
     herd_floor_readings,
+    monotonic_lane,
     per_lane_wake_pin,
 )
 from harness.load.connscale.runner import (
@@ -239,20 +241,21 @@ def _assert_fd_probe(records: Sequence[ConnScaleRecord]) -> None:
     # reported monotonic; a 1000-handle collapse at N=12 with both N=24 steps degraded passed the same
     # way, while the unforced control compared 2 pairs and a genuine 1000->100 drop correctly failed.
     #
-    # So require that some (sweep_mode, claim_mode) group -- the SAME key `_monotonic_slo` groups on
-    # (BACKLOG #1101) -- actually has a pair. Grouping on sweep_mode alone would re-introduce the bug
-    # one level up: two readings split across claim modes are never compared with each other.
+    # So require that some lane -- `monotonic_lane`, the SAME key `_monotonic_slo` groups on
+    # (BACKLOG #1101, #5570) -- actually has a pair. A coarser key would re-introduce the bug one
+    # level up: two readings split across claim modes, arms or trials are never compared with each
+    # other.
     #
     # NOT MIRRORED FROM assertion (5). An earlier version of this justified the run-wide bound as "the
     # same bound the reload probe already has". Same SHAPE, wrong ANALOGY: `reload_seconds` feeds no
     # monotonicity SLO, so a single reading there costs nothing. `fd_count_peak` feeds one.
-    measured_per_group: dict[tuple[str, str], int] = {}
+    measured_per_group: dict[MonotonicLane, int] = {}
     for r in records:
         if r.fd_count_peak is not None:
-            key = (r.sweep_mode, r.claim_mode)
+            key = monotonic_lane(r)
             measured_per_group[key] = measured_per_group.get(key, 0) + 1
     assert any(n >= 2 for n in measured_per_group.values()), (
-        f"WALL #4 NEVER COMPARED -- no (sweep_mode, claim_mode) group has two measured readings, so "
+        f"WALL #4 NEVER COMPARED -- no monotonicity lane has two measured readings, so "
         f"`fd_count_monotonic` compared zero pairs and its green says nothing. Measured readings per "
         f"group: {measured_per_group or '{}'} [{detail}]. A single step timing out is tolerated; a run "
         f"in which the FD wall is never compared against itself is not, because the SLO that is "

@@ -717,6 +717,7 @@ def _record_with(audit: IntakeAudit, *, read: int, sent: int) -> ConnScaleRecord
         batch_mode=False,
         mode="fixed_aggregate",
         count=4,
+        trial=0,
         aggregate_rate=10.0,
         # Every message the engine read reached the sink, so only the intake terms can fail.
         metrics_counters=Counters(sent=sent, sink_received=read),
