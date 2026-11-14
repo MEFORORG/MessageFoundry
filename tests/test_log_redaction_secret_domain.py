@@ -433,8 +433,6 @@ FAMILIES: tuple[Family, ...] = (
         secret="pw-D5n_Pass-55",
         patterns=("_DSN_PASSWORD",),
     ),
-    # BACKLOG #5549: an empty username, and an unencoded "@" inside the password, whose tail the
-    # first-"@" class printed.
     Family(
         # BACKLOG #5550: a private key block written on one line, as a bytes repr writes one. A block
         # over several log lines reaches the bundle one line at a time.
@@ -446,6 +444,8 @@ FAMILIES: tuple[Family, ...] = (
         secret="pw-pem_pem-59",
         patterns=("_PEM_PRIVATE_KEY",),
     ),
+    # BACKLOG #5549: an empty username, and an unencoded "@" inside the password, whose tail the
+    # first-"@" class printed.
     Family(
         name="dsn_empty_username",
         line="store dsn redis://:pw-D5n_Pass-56@cache.invalid:6379/0",
@@ -1387,9 +1387,9 @@ def test_both_copies_of_the_dsn_pattern_are_the_same_source() -> None:
     """The two surfaces carry this regex by hand, and a one-sided edit must red HERE.
 
     ``secretscrub`` scrubs at WRITE time and ``support/redact`` at READ time, and both keep their own
-    literal copy of ``_DSN_PASSWORD``. That duplication is deliberate -- the modules are neutral leaves
-    and neither imports the other's patterns -- but it has now been edited by hand twice under BACKLOG
-    #1547, and a narrowing shipped in BOTH copies both times.
+    literal copy of ``_DSN_PASSWORD``. That duplication is deliberate, so a static reader of either
+    module sees the pattern -- but it has been edited by hand twice under BACKLOG #1547 and again
+    under BACKLOG #5549, and each change shipped in BOTH copies.
 
     NOTHING ELSE IN THIS FILE CATCHES A ONE-SIDED FIX DIRECTLY. The differential arm runs over both
     modules, so it would red -- but only for corpus rows the earlier head happens to reach, and only
@@ -4255,12 +4255,9 @@ def test_a_bytes_literal_under_a_later_label_is_hidden(
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
         assert "zq-Bl_B-77" not in out, f"{surface}: {out!r}"
-    for module in (scrub_mod, redact_mod):
-        for name in _STOPPED_PATTERNS:
-            pattern: re.Pattern[str] = getattr(module, name)
-            monkeypatch.setattr(
-                module, name, re.compile(pattern.pattern.replace("(?-i:b)?", ""), pattern.flags)
-            )
+    for module, by_name in _mutated("_BYTES_PREFIX", "").items():
+        for name, pattern in by_name.items():
+            monkeypatch.setattr(module, name, pattern)
     assert any("zq-Bl_B-77" in apply(line) for _surface, apply in _SWALLOW_SURFACES), "control"
 
 
@@ -4277,10 +4274,9 @@ def test_a_bytes_literal_under_a_later_label_is_hidden(
 def test_a_b_that_opens_no_quoted_value_is_read_as_before(line: str) -> None:
     """The prefix is taken only in front of a quoted form that matches, so a value that merely
     starts with "b", or a "b" before an unclosed quote, gets the plain class it always had."""
-    for module in (scrub_mod, redact_mod):
-        for name in _STOPPED_PATTERNS:
+    for module, by_name in _mutated("_BYTES_PREFIX", "").items():
+        for name, before in by_name.items():
             pattern: re.Pattern[str] = getattr(module, name)
-            before = re.compile(pattern.pattern.replace("(?-i:b)?", ""), pattern.flags)
             assert [m.span() for m in pattern.finditer(line)] == [
                 m.span() for m in before.finditer(line)
             ], (module.__name__, name, line)
@@ -4333,16 +4329,14 @@ def test_both_copies_read_a_digest_list_alike() -> None:
         ], line
 
 
-def test_the_digest_list_grows_linearly_in_line_length() -> None:
-    """Three shapes: one long list, one quoted parameter that never closes, and one whose walk
-    checks for a label before every run."""
-    shapes: tuple[Callable[[int], str], ...] = (
-        lambda length: "authorization: Digest " + "ab=cd, " * (length // 7),
-        lambda length: 'authorization: Digest a="' + "x y " * (length // 4),
-        lambda length: 'authorization: Digest a="' + "pass " * (length // 5) + '"',
-    )
-    for module in (scrub_mod, redact_mod):
-        pattern: re.Pattern[str] = module._BEARER
+def _assert_linear(
+    name: str,
+    shapes: tuple[Callable[[int], str], ...],
+    modules: tuple[ModuleType, ...] = (scrub_mod, redact_mod),
+) -> None:
+    """Each module's pattern ``name`` grows no faster than about linearly on every shape."""
+    for module in modules:
+        pattern: re.Pattern[str] = getattr(module, name)
 
         def sub(text: str, pattern: re.Pattern[str] = pattern) -> str:
             return pattern.sub("x", text)
@@ -4352,8 +4346,21 @@ def test_the_digest_list_grows_linearly_in_line_length() -> None:
                 sub, shape(_GROWTH_LENGTHS[0]), shape(_GROWTH_LENGTHS[1]), rounds=5
             )
             assert growth <= _MAX_GROWTH, (
-                f"{module.__name__}._BEARER grew {growth:.1f}x for 8x the length on {shape(40)!r}"
+                f"{module.__name__}.{name} grew {growth:.1f}x for 8x the length on {shape(40)!r}"
             )
+
+
+def test_the_digest_list_grows_linearly_in_line_length() -> None:
+    """Three shapes: one long list, one quoted parameter that never closes, and one whose walk
+    checks for a label before every run."""
+    _assert_linear(
+        "_BEARER",
+        (
+            lambda length: "authorization: Digest " + "ab=cd, " * (length // 7),
+            lambda length: 'authorization: Digest a="' + "x y " * (length // 4),
+            lambda length: 'authorization: Digest a="' + "pass " * (length // 5) + '"',
+        ),
+    )
 
 
 #: ``_DSN_PASSWORD`` as it stood before BACKLOG #5549: one or more user characters, and a password
@@ -4393,28 +4400,18 @@ def test_the_dsn_tail_hides_every_span_the_first_at_tail_hid() -> None:
 def test_the_dsn_tail_grows_linearly_in_line_length() -> None:
     """The password's repetition gives characters back to find its last "@". Three shapes: a run of
     "@" pairs, a run with no "@", and many DSN heads each failing at its own end."""
-    shapes: tuple[Callable[[int], str], ...] = (
-        lambda length: "pg://:" + "a@" * (length // 2) + "x",
-        lambda length: "pg://u:" + "a:" * (length // 2),
-        lambda length: "pg://u:pa " * (length // 10),
+    _assert_linear(
+        "_DSN_PASSWORD",
+        (
+            lambda length: "pg://:" + "a@" * (length // 2) + "x",
+            lambda length: "pg://u:" + "a:" * (length // 2),
+            lambda length: "pg://u:pa " * (length // 10),
+        ),
     )
-    for module in (scrub_mod, redact_mod):
-        pattern: re.Pattern[str] = module._DSN_PASSWORD
-
-        def sub(text: str, pattern: re.Pattern[str] = pattern) -> str:
-            return pattern.sub("x", text)
-
-        for shape in shapes:
-            growth = _growth_between(
-                sub, shape(_GROWTH_LENGTHS[0]), shape(_GROWTH_LENGTHS[1]), rounds=5
-            )
-            assert growth <= _MAX_GROWTH, (
-                f"{module.__name__}._DSN_PASSWORD grew {growth:.1f}x for 8x on {shape(40)!r}"
-            )
 
 
 @pytest.mark.parametrize(
-    ("line", "secret"),
+    ("line", "note"),
     (
         (
             f"-----BEGIN EC {_PK}-----\nMHcCAQEE\nzq-pem_pem-81\n-----END EC {_PK}-----",
@@ -4432,9 +4429,9 @@ def test_the_dsn_tail_grows_linearly_in_line_length() -> None:
         ),
     ),
 )
-def test_a_private_key_block_body_is_hidden_and_its_markers_kept(line: str, secret: str) -> None:
+def test_a_private_key_block_body_is_hidden_and_its_markers_kept(line: str, note: str) -> None:
     out = scrub_credentials(line)
-    assert "zq-pem_pem-81" not in out, (secret, out)
+    assert "zq-pem_pem-81" not in out, (note, out)
     assert out.count("-----") >= 2, out
 
 
@@ -4454,41 +4451,26 @@ def test_a_marker_with_no_key_body_after_it_leaves_the_text(line: str) -> None:
 
 
 def test_the_private_key_block_grows_linearly_in_line_length() -> None:
-    shapes: tuple[Callable[[int], str], ...] = (
-        lambda length: f"-----BEGIN {_PK}-----\n" + "AbC+" * (length // 4),
-        lambda length: "-----[redacted]-----\nAAAA" * (length // 24),
-        lambda length: f"-----BEGIN {_PK}----- x " * (length // 30),
-        lambda length: "-----[redacted]-----\n" + "Ab-" * (length // 3),
+    """One object, which the bundle imports, so one module is measured."""
+    _assert_linear(
+        "_PEM_PRIVATE_KEY",
+        (
+            lambda length: f"-----BEGIN {_PK}-----\n" + "AbC+" * (length // 4),
+            lambda length: "-----[redacted]-----\nAAAA" * (length // 24),
+            lambda length: f"-----BEGIN {_PK}----- x " * (length // 30),
+            lambda length: "-----[redacted]-----\n" + "Ab-" * (length // 3),
+        ),
+        modules=(scrub_mod,),
     )
-    pattern = scrub_mod._PEM_PRIVATE_KEY
-
-    def sub(text: str) -> str:
-        return pattern.sub("x", text)
-
-    for shape in shapes:
-        growth = _growth_between(
-            sub, shape(_GROWTH_LENGTHS[0]), shape(_GROWTH_LENGTHS[1]), rounds=5
-        )
-        assert growth <= _MAX_GROWTH, f"_PEM_PRIVATE_KEY grew {growth:.1f}x on {shape(40)!r}"
 
 
 def test_the_quoted_scheme_token_grows_linearly_in_line_length() -> None:
     """The keyword guard walks the token run once per label. Two shapes: one long run under one
     label, and many labels each with a run that fails at its end."""
-    shapes: tuple[Callable[[int], str], ...] = (
-        lambda length: "token: 'Basic " + "aB0+" * (length // 4) + "x",
-        lambda length: "token: 'Basic aB0+aB0+aB0+aB0= " * (length // 30),
+    _assert_linear(
+        "_BEARER",
+        (
+            lambda length: "token: 'Basic " + "aB0+" * (length // 4) + "x",
+            lambda length: "token: 'Basic aB0+aB0+aB0+aB0= " * (length // 30),
+        ),
     )
-    for module in (scrub_mod, redact_mod):
-        pattern: re.Pattern[str] = module._BEARER
-
-        def sub(text: str, pattern: re.Pattern[str] = pattern) -> str:
-            return pattern.sub("x", text)
-
-        for shape in shapes:
-            growth = _growth_between(
-                sub, shape(_GROWTH_LENGTHS[0]), shape(_GROWTH_LENGTHS[1]), rounds=5
-            )
-            assert growth <= _MAX_GROWTH, (
-                f"{module.__name__}._BEARER grew {growth:.1f}x for 8x the length on {shape(40)!r}"
-            )

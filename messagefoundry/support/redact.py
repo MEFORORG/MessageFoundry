@@ -677,7 +677,8 @@ def redact_log_line(line: str) -> str:
     # its markers kept (BACKLOG #5550). secretscrub's pattern, not a copy, and first, ahead of the PHI
     # pass that would rewrite the begin marker. A block over several log lines reaches this function
     # one line at a time, so its body lines are left to the long-base64 sweep below.
-    body = _PEM_PRIVATE_KEY.sub(lambda m: f"{m.group(1)}{REDACTION_PLACEHOLDER}", body)
+    if "-----" in body:
+        body = _PEM_PRIVATE_KEY.sub(lambda m: f"{m.group(1)}{REDACTION_PLACEHOLDER}", body)
     body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
     body = _MEFOR_SECRET.sub(_keep_label, body)
     body = _BEARER.sub(_keep_label, body)

@@ -160,7 +160,7 @@ the line of labels. The others were measured at 6 KB alone.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 __all__ = [
     "CREDENTIAL_PLACEHOLDER",
@@ -262,6 +262,18 @@ def _alternation(words: tuple[str, ...]) -> str:
     short alternate matching inside a longer word backtracks and retries. It is cost: without it
     ``pass`` matches inside ``password`` on every credential label and the engine walks back."""
     return "|".join(re.escape(word) for word in sorted(words, key=len, reverse=True))
+
+
+def _drop_subsumed(words: Iterable[str]) -> tuple[str, ...]:
+    """``words`` without any word that holds another of them, sorted. For a set read by substring
+    test: text holding the longer word holds the shorter one too. Sorted, so the result does not
+    follow the hash order of the set it came from."""
+    unique = set(words)
+    return tuple(
+        sorted(
+            word for word in unique if not any(other != word and other in word for other in unique)
+        )
+    )
 
 
 # An optional dotted / underscored / hyphenated PREFIX on a credential label, so a snake_case label
@@ -1086,13 +1098,7 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # since the guard is a substring test. That is also what keeps ``sharedaccesskey``, a marker of the
 # camelCase reading, out of the reading before; ``accesskey`` covers it.
 _TOKEN68_GUARD_SET = frozenset(word.casefold() for word in _CAMEL_WORDS + (_ENV_PREFIX,))
-_TOKEN68_GUARD_WORDS = _alternation(
-    tuple(
-        word
-        for word in sorted(_TOKEN68_GUARD_SET)
-        if not any(other != word and other in word for other in _TOKEN68_GUARD_SET)
-    )
-)
+_TOKEN68_GUARD_WORDS = _alternation(_drop_subsumed(_TOKEN68_GUARD_SET))
 _QUOTED_SCHEME_VALUE = "|".join(
     quote
     + r"(?i:bearer|basic)[^\S\r\n]++(?![A-Za-z0-9+/._~-]*?(?i:"
@@ -1467,7 +1473,7 @@ _PEM_PRIVATE_KEY = re.compile(
     r"(-----(?:BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?|(?P<phi>\[redacted\])[A-Z0-9 ]{0,40})-----)"
     r"(?:(?P<line>)(?=[ \t]*+(?:\r?\n|\\[rn])))?"
     r"(?=(?:\s|\\[rn])*+[A-Za-z0-9+/]{4})"
-    r"(?:[A-Za-z0-9+/=\s,:_]|\\[^\r\n]|-(?!----)|\[redacted\])++"
+    r"(?:[A-Za-z0-9+/=\s,:_]++|\\[^\r\n]|-(?!----)|\[redacted\])++"
     r"(?(phi)(?=-----\[redacted\][A-Z0-9 ]{0,40}-----)|(?(line)|(?=-----END )))"
 )
 
@@ -1901,6 +1907,8 @@ _ENV_HINT = _folded((_ENV_PREFIX,))
 _DSN_HINT = (_DSN_MARKER,)
 #: The five dashes both of :data:`_PEM_PRIVATE_KEY`'s markers open with. Not a word: the pattern
 #: is case-sensitive and reads no label, and five dashes hold no letter a fold character could spell.
+#: A letter in the hint would be spelled with a fold character by the gate's fold test, which
+#: expects every hint to admit a label; so a dash banner is admitted and pays the passes.
 _PEM_HINT = ("-----",)
 #: The compound key words alone, for :func:`_reads_camel`. Not a pass gate: ``_KEY_MATERIAL_HINT``
 #: holds them for that.
@@ -1915,36 +1923,19 @@ _CAMEL_PROBE = re.compile(_camel_start(r"\b['\"]?\s*+[:=]"), re.IGNORECASE)
 #: is dropped, because any text holding it holds the shorter one too. Derived, so it cannot drift from
 #: the tuples above -- ``pass`` subsumes ``password``/``passwd``/``passphrase``, ``encryption_key``
 #: subsumes ``encryption_keys_retired``, ``api_key`` subsumes ``intake_api_key_next``, ``accesskey``
-#: subsumes ``sharedaccesskey``. One scan of 24 members instead of 31 (counted with BACKLOG #5545's
-#: compound key words and BACKLOG #5550's key-block dashes), and it rejects the overwhelmingly
-#: common record: the one carrying no credential word at all. The member pass's own words (:data:`_MEMBER_EXTRA_HINT`) are in it too,
-#: so a word added there and nowhere else still admits the record (BACKLOG #5030).
-_ANY_HINT = tuple(
-    sorted(
-        {
-            word
-            for word in {
-                *_CREDENTIAL_HINT,
-                *_TOKEN_HINT,
-                *_MEMBER_EXTRA_HINT,
-                *_KEY_MATERIAL_HINT,
-                *_ENV_HINT,
-                *_DSN_HINT,
-                *_PEM_HINT,
-            }
-            if not any(
-                other != word and other in word
-                for other in {
-                    *_CREDENTIAL_HINT,
-                    *_TOKEN_HINT,
-                    *_MEMBER_EXTRA_HINT,
-                    *_KEY_MATERIAL_HINT,
-                    *_ENV_HINT,
-                    *_DSN_HINT,
-                    *_PEM_HINT,
-                }
-            )
-        }
+#: subsumes ``sharedaccesskey``. One scan of fewer members than the tuples hold together, and it
+#: rejects the overwhelmingly common record: the one carrying no credential word at all. The member
+#: pass's own words (:data:`_MEMBER_EXTRA_HINT`) are in it too, so a word added there and nowhere
+#: else still admits the record (BACKLOG #5030).
+_ANY_HINT = _drop_subsumed(
+    (
+        *_CREDENTIAL_HINT,
+        *_TOKEN_HINT,
+        *_MEMBER_EXTRA_HINT,
+        *_KEY_MATERIAL_HINT,
+        *_ENV_HINT,
+        *_DSN_HINT,
+        *_PEM_HINT,
     )
 )
 
