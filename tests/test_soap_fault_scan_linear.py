@@ -510,6 +510,22 @@ def test_a_commented_fault_close_ends_the_fallback_range() -> None:
     assert _outcome(_classify_soap(200, plain)) == "transient"
 
 
+def test_with_no_body_a_fault_only_in_markup_is_still_read() -> None:
+    """The PR 2936 hold of 2026-11-14 (head 80c41a561a): with no Body start tag and every Fault
+    start tag inside markup, the first of them is still read as the Fault, as on main and as the
+    #5912 changelog says, so this Server fault retries. Control: the shape's only Fault start tag
+    is inside the comment, so the outside-markup search finds none, and the same reply with the
+    commented Fault replaced by plain text is no fault and delivered."""
+    body = "<Envelope><!-- <Fault><faultcode>soap:Server</faultcode></Fault> --></Envelope>"
+    assert soap._BODY_RE.search(body) is None
+    assert soap._search_outside_markup(soap._FAULT_OUTSIDE_MARKUP_RE, body, 0, len(body)) is None
+    assert _fault_code(body) == "soap:Server" == _ref_fault_code(body)
+    assert _outcome(_classify_soap(200, body)) == "transient"
+    assert _outcome(_classify_soap(500, body)) == "transient"
+    no_fault = "<Envelope><!-- note --></Envelope>"
+    assert _classify_soap(200, no_fault) is None
+
+
 #: BACKLOG #5912: where the first child holds the code, a Value outside the Code, here inside markup
 #: ahead of it, does not decide the fault, though the PR 2790 reading took it.
 _VALUE_IN_MARKUP_BEFORE_THE_CODE = {
