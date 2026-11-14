@@ -5,6 +5,7 @@
   of those checks refused would have left a grant row and no refusal row. The refusal row names the
   same permission and a `reason` of `throttled` or `step_up`, and is written only where the grant
   row would have been, so it adds no rows. A second-factor refusal in one of those gates writes
-  `auth.mfa_denied`, as the base gate's does. No request is allowed or refused differently.
-  [SECURITY.md](../docs/SECURITY.md) says which gates do this.
-  (`BACKLOG #1197`)
+  `auth.mfa_denied`, as the base gate's does. No request is allowed or refused differently. A
+  refusal a route body makes after its gate has passed, at least the PHI-read budget a route body
+  charges itself, still follows a grant row. [SECURITY.md](../docs/SECURITY.md) says which gates
+  do this. (`BACKLOG #1197`)

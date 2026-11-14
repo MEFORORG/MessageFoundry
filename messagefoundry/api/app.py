@@ -257,6 +257,7 @@ from messagefoundry.api.security import (
     bearer_token,
     client_ip,
     deadline_utc,
+    drop_route_decision,
     enforce_phi_read_hop,
     enforce_phi_read_pacing,
     get_auth,
@@ -6130,6 +6131,9 @@ def create_app(
         needs ``messages:view_summary``, charges the PHI-read budget, and is audited as
         ``connection_error_reveal``, checked after the per-channel scope so a refused connection
         spends no budget."""
+        if not reveal:
+            # No reveal to admit: this records the gate's grant row before the read.
+            await _admit_reveal(request, identity, None)
         meta = await _connection_metadata_row(engine, identity, name, request)
         if not reveal:
             return redact_unauthorized(meta, identity)
@@ -6517,19 +6521,21 @@ def create_app(
 
         The route's gate leaves its decision row to this check (BACKLOG #1197), so a request it
         refuses records that refusal instead of a grant (:func:`route_decision`)."""
+        if reveal is not None and not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
+            auth = get_auth(request)
+            if auth is not None:
+                await auth.audit_permission_denied(
+                    identity,
+                    Permission.MESSAGES_VIEW_SUMMARY,
+                    request.url.path,
+                    client=client_ip(request),
+                )
+            # Its denial row is this request's decision, so the gate's grant row does not follow.
+            drop_route_decision(request)
+            raise HTTPException(403, "a reveal needs messages:view_summary")
         async with route_decision(request):
             if reveal is None:
                 return
-            if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
-                auth = get_auth(request)
-                if auth is not None:
-                    await auth.audit_permission_denied(
-                        identity,
-                        Permission.MESSAGES_VIEW_SUMMARY,
-                        request.url.path,
-                        client=client_ip(request),
-                    )
-                raise HTTPException(403, "a reveal needs messages:view_summary")
             if not (_matched_route_path(request) or "").startswith("/ui/"):
                 enforce_phi_read_hop(request)
                 # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read

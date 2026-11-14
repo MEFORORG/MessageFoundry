@@ -81,24 +81,26 @@ async def _app(engine: Engine) -> FastAPI:
         ),
     )
     await service.initialize()
-    user_id = await create_local_user_chosen(
-        service,
-        username="boss",
-        password=PW,
-        display_name=None,
-        email=None,
-        roles=[Role.ADMINISTRATOR.value],
-        actor="test",
-    )
-    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
-    user = await service.store.get_user(user_id)
-    assert user is not None and user.password_hash is not None
-    await service.store.set_password(
-        user_id,
-        password_hash=user.password_hash,
-        must_change_password=False,
-        password_generated=False,
-    )
+    # ``watcher`` is a Viewer: monitoring:read without messages:view_summary.
+    for username, role in (("boss", Role.ADMINISTRATOR), ("watcher", Role.VIEWER)):
+        user_id = await create_local_user_chosen(
+            service,
+            username=username,
+            password=PW,
+            display_name=None,
+            email=None,
+            roles=[role.value],
+            actor="test",
+        )
+        await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
+        user = await service.store.get_user(user_id)
+        assert user is not None and user.password_hash is not None
+        await service.store.set_password(
+            user_id,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
+        )
     app = create_app(engine, auth=service)
     gate = Depends(require_step_up_action(_ACTION, Permission.USERS_MANAGE, proof_in_route=True))
 
@@ -131,8 +133,10 @@ def _client(app: FastAPI, ip: str) -> httpx.AsyncClient:
     )
 
 
-async def _login(c: httpx.AsyncClient) -> str:
-    r = await c.post("/auth/login", json={"username": "boss", "password": PW, "provider": "local"})
+async def _login(c: httpx.AsyncClient, username: str = "boss") -> str:
+    r = await c.post(
+        "/auth/login", json={"username": username, "password": PW, "provider": "local"}
+    )
     assert r.status_code == 200, r.text
     return str(r.json()["token"])
 
@@ -211,7 +215,12 @@ async def test_a_request_the_body_does_not_decide_is_settled_after_the_endpoint(
 #: The route-body checks that decide a deferred decision. A route whose body reaches one, directly
 #: or through a helper, must have a gate that defers, or its refusal follows a grant row again.
 _BODY_CHECKS = frozenset(
-    {"_admit_reveal", "spend_step_up_action", "refuse_unless_step_up_window_live"}
+    {
+        "_admit_reveal",
+        "spend_step_up_action",
+        "refuse_unless_step_up_window_live",
+        "route_decision",
+    }
 )
 
 
@@ -227,8 +236,11 @@ def _reaches_a_body_check() -> set[str]:
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 called = calls.setdefault(node.name, set())
                 for sub in ast.walk(node):
-                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
-                        called.add(sub.func.id)
+                    if isinstance(sub, ast.Call):
+                        if isinstance(sub.func, ast.Name):
+                            called.add(sub.func.id)
+                        elif isinstance(sub.func, ast.Attribute):
+                            called.add(sub.func.attr)
     reaching = set(_BODY_CHECKS)
     while grown := {name for name, called in calls.items() if called & reaching} - reaching:
         reaching |= grown
@@ -237,10 +249,11 @@ def _reaches_a_body_check() -> set[str]:
 
 async def test_every_route_whose_body_decides_has_a_deferring_gate(engine: Engine) -> None:
     """RED when: a route whose body reaches a decision block has a gate that does not defer, as a
-    new reveal route copying ``Depends(require(Permission.MONITORING_READ))`` would, or a deferring
+    new reveal route copying ``Depends(require(Permission.MONITORING_READ))`` would; a route whose
+    gate defers never reaches one, so its grant row moves after whatever it does; or a deferring
     gate sits where the route class cannot settle it: below the top level, or on another route
-    class. The count is the positive control: the five reveal routes and the eight
-    ``proof_in_route`` routes are found."""
+    class. The count is the positive control: the five reveal routes and the nine
+    ``proof_in_route`` routes (purge, reload, two exports, edit-resend, four group saves)."""
     app = create_app(engine, auth=AuthService(engine.store, AuthSettings()))
     reaching = _reaches_a_body_check()
     deciding = 0
@@ -255,12 +268,11 @@ async def test_every_route_whose_body_decides_has_a_deferring_gate(engine: Engin
             if _defers_decision(dependant.call):
                 assert dependant.call in top, f"{route.path} nests a deferring gate"
                 assert isinstance(route, AuthenticatedBeforeBodyRoute), route.path
-        if route.endpoint.__name__ in reaching:
-            deciding += 1
-            assert any(_defers_decision(call) for call in top), (
-                f"{route.path} decides in its body behind a gate that does not defer"
-            )
-    assert deciding >= 13, deciding
+        defers = any(_defers_decision(call) for call in top)
+        decides = route.endpoint.__name__ in reaching
+        assert defers == decides, (route.path, "defers" if defers else "decides")
+        deciding += decides
+    assert deciding == 14, deciding
 
 
 async def test_a_lapsed_window_leaves_one_refusal_row(engine: Engine) -> None:
@@ -321,4 +333,26 @@ async def test_a_reveal_over_the_phi_budget_leaves_one_refusal_row(engine: Engin
         _granted(diagnose, _REVEAL),
         _refused(diagnose, _REVEAL, "throttled"),
         _granted(diagnose, _REVEAL),
+    ]
+
+
+async def test_a_reveal_without_view_summary_leaves_only_its_denial_row(engine: Engine) -> None:
+    """A reveal refused because the caller lacks ``messages:view_summary`` writes that
+    permission's ``auth.permission_denied`` row, and the gate's grant row does not follow it. The
+    control is the same Viewer's read with no reveal, which writes one grant row."""
+    app = await _app(engine)
+    path = "/connections/IB_ANY/events"
+    async with _client(app, _HOME) as c:
+        token = await _login(c, "watcher")
+        r = await c.get(path, params={"reveal": 1}, headers=_auth(token))
+        assert r.status_code == 403, r.text
+        denied = (
+            "auth.permission_denied",
+            {"permission": Permission.MESSAGES_VIEW_SUMMARY.value, "path": path},
+        )
+        assert await _decisions(engine, path) == [denied]
+        await c.get(path, headers=_auth(token))
+    assert await _decisions(engine, path) == [
+        denied,
+        _granted(Permission.MONITORING_READ.value, path),
     ]

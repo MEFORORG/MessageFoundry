@@ -1592,14 +1592,33 @@ async def route_decision(request: Request) -> AsyncIterator[None]:
     try:
         yield
     except _GateRefusal as refusal:
-        await _record_gate_refusal(
-            request, deferred.auth, deferred.identity, deferred.permissions, refusal
-        )
+        await _write_deferred(request, deferred, refusal)
         raise
     except Exception:
         setattr(request.state, _DEFERRED_DECISION_STATE, deferred)
         raise
-    await _record_grant(request, deferred.auth, deferred.identity, deferred.permissions)
+    await _write_deferred(request, deferred, None)
+
+
+def drop_route_decision(request: Request) -> None:
+    """Discard the decision a gate left to the route body, for a refusal that wrote its own row.
+
+    A body that refuses on a permission of its own, after writing that permission's
+    ``auth.permission_denied`` row, calls this first, so the gate's grant row does not follow the
+    denial (BACKLOG #1197)."""
+    _take_deferred_decision(request)
+
+
+async def _write_deferred(
+    request: Request, deferred: _DeferredDecision, refusal: Exception | None
+) -> None:
+    """Write a deferred decision's row: ``auth.gate_refused`` for a :class:`_GateRefusal`, and
+    the grant row for anything else."""
+    auth, identity, permissions = deferred.auth, deferred.identity, deferred.permissions
+    if isinstance(refusal, _GateRefusal):
+        await _record_gate_refusal(request, auth, identity, permissions, refusal)
+    else:
+        await _record_grant(request, auth, identity, permissions)
 
 
 def _settle_deferred_grant_after(
@@ -1614,13 +1633,8 @@ def _settle_deferred_grant_after(
 
     async def settle(request: Request, refusal: Exception | None) -> None:
         deferred = _take_deferred_decision(request)
-        if deferred is None:
-            return
-        auth, identity, permissions = deferred.auth, deferred.identity, deferred.permissions
-        if isinstance(refusal, _GateRefusal):
-            await _record_gate_refusal(request, auth, identity, permissions, refusal)
-        else:
-            await _record_grant(request, auth, identity, permissions)
+        if deferred is not None:
+            await _write_deferred(request, deferred, refusal)
 
     async def settled(request: Request) -> Response:
         try:
