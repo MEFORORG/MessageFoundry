@@ -153,42 +153,29 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 ## Amendments
 
-- **2026-11-13, a link on the directory's path is judged (vault BACKLOG #5656, #5657).** The risk
-  above that says *"Nor are the folders above the directory checked"* is now partly closed. The
-  check walks the folders on the directory's path and refuses a junction or link among them that
-  another account can change, judging the link and every folder at or above it by the
-  trust-anchor rules. On Windows it also reads the owner and access list of the folder that holds
-  the directory, at its lexical path without following a link there, except as the first item
-  below says, and refuses one a broad
-  group may delete a file in, change the access list of, or owns. A file in the directory is not
-  walked again; the directory's own check is its walk. `docs/PHI.md` section 2, *The folders
-  above a key file*, states what the check does, and this list says what it leaves out. Below, a
-  link is a junction, a symbolic link or a folder a volume is mounted on, and "the file" is a
-  key file or the secrets directory. The check does not judge, at least:
-  - on Windows, the surroundings of a secrets directory at a drive root, such as a `subst` root
-    `S:\`: `_windows_surroundings_problem` returns at `full.parent == full`, so no folder is
-    walked or read, and only the directory's own owner and access list are judged;
-  - on every platform, where no link is on the path, any folder above the one that holds the
-    file, whether its owner, its access list or its mode; a `subst` drive letter is not judged
-    as a link;
-  - where a link is on the path, a folder on its target's side above the one that holds the
-    file, unless that folder is also at or above a link on the path;
-  - on Windows, when the folder that holds the file is itself a link, its target's owner and
-    access list: the holder rule reads the link's own, and the link rule judges the link;
-  - on Windows, for the folder that holds the file, or for its target when that folder is a
-    link: whether a broad group may rename it (`DELETE`), a right to list it or add a file to it
-    (so a store directory the engine makes under `C:\ProgramData` passes), and what one named
-    account may do to it. So a key file an operator supplied that a named account other than
-    the engine planted through the add-file right is not refused;
-  - on Windows, any junction or folder past a network share (`\\host\share\...`,
-    `\\localhost\C$\...` and a `subst` letter that stands for a share included): the walk
-    stops at the share without refusing, though the holder rule and the file's own access list
-    still run; and a junction a file server resolves behind a mapped drive letter, which is
-    otherwise walked like a local volume.
+- **2026-11-13, links on the directory's path are judged (vault BACKLOG #5656, #5657).** The risk
+  above that says *"Nor are the folders above the directory checked"* is now partly closed. On
+  every platform a junction or link on the directory's path is judged by who can change it, as
+  `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py` define. On Windows the check also
+  reads the owner and access list of the folder that holds the directory, and refuses the
+  directory when a broad group or an application package may delete a file in that folder,
+  change its access list or take it over, or when its owner is such a group or cannot be read.
+  This holds when that folder is an ordinary folder, not a junction, a symbolic link, a folder a
+  volume is mounted on or a drive root. It judges nothing else about that folder or the folders
+  around it: treat any other path shape, and any other right or account, as not judged. A file
+  in the directory is not walked again; the directory's own check is its walk.
 
-  So a junction only the engine's account and the host's administrators can change, pointing to
-  a folder a broad group may delete a file in, passes. A folder the walk probes but cannot read
-  still refuses the file.
+  **Known gaps, at least** (each checked against `restricted_file.py`):
+  - On Windows, a holder that is itself a junction or a directory symbolic link:
+    `read_path(full.parent)` reads the link's own access list, not its target's.
+  - On Windows, a secrets directory at a drive root, such as a `subst` root `S:\`:
+    `_windows_surroundings_problem` returns at `full.parent == full`, before it walks or reads
+    anything around the directory.
+  - On Windows, a broad group's `DELETE` on the holder: `_HOLDER_REPLACE_MASK` does not
+    include it.
+  - On Windows, the folders above the holder when the walk finds no junction, symbolic link or
+    volume mount folder on the path: the link rule runs only when it finds one, and a `subst`
+    drive letter is not one.
 - **2026-11-13, a link is refused on every platform (vault BACKLOG #5636).** Decision 3's "a link
   on Windows" now reads "a link": `broad_access_problem` reads the named path without following a
   link on POSIX too, so a secrets directory, or a file in it, that is itself a link is refused

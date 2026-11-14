@@ -414,48 +414,27 @@ than a path is not checked
   It does not vet an owner that is one account, or an account you granted yourself: any one
   account may own the file, as the administrator who copied in your own TLS key may. LOCAL SERVICE
   and NETWORK SERVICE are accounts that many services share, and the check does not report them.
-- **The folders above a key file** (vault BACKLOG #5656, #5657). On every platform the check walks
-  the folders on the key file's path, from the root down, and judges each junction or link among
-  them by who can change it, since the file is wherever that link leads. The folders above a link
-  are read only where a link is, and the rule is the trust-anchor check's. On Windows a link is
-  refused when an account outside the trust-anchor check's trusted set owns it, or may change it,
-  or may delete, rename or re-point anything in any folder from the
-  one that holds it up to the volume root (`DELETE` on a volume root is not counted, since a root
-  cannot be renamed). That trusted set is at least the engine's own account (never LOCAL SERVICE
-  or NETWORK SERVICE), SYSTEM, Administrators, TrustedInstaller and each direct member of the local
-  Administrators group, and as an owner also a well-known administrator account or group of any
-  domain (`WinTrust` in `auth/anchor_path.py`). On POSIX a link's own owner and mode change nothing, since a symbolic link
-  cannot be re-pointed in place: it passes unless the folder that holds it, or one above, is owned
-  by an account other than the engine's own or root, or may be written by a group or other without
-  the sticky bit, or the link is owned by another account in a sticky folder others may write. So
-  macOS `/tmp`, an ostree host's `/home` and `C:\Users\All Users` pass. A folder a volume is
-  mounted on passes only when its own access list, and those of the folders above it, give no
-  account outside that set a right to change it: one made under `C:\` with the default
-  inheritance gives Authenticated Users Modify and is refused. A link under a folder others may
-  write, at any depth, is refused.
-  So is a link whose access, or a folder whose access, could not be read. A key file that is itself
-  a link is refused whoever can change it. A POSIX mount point is not a link. The TLS pair the
-  engine mints is one only it writes, so on Windows its key's owner must also be the engine's own
-  account, SYSTEM or Administrators: a pair another account planted in the store directory, which
-  a right to add a file there allows, is refused (on POSIX every key file's owner must already be the
-  engine's own account or root). On Windows it also reads the owner and access list of the
-  directory that holds the file, at the file's lexical path without following a link there, and
-  refuses it when one of the groups above or an application package may delete a file in it,
-  change its access list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or
-  `GENERIC_ALL`), or when its owner is such a group or cannot be read. An inherit-only entry on
-  the directory is read as if it applied to the directory itself, so such an entry granting a
-  broad group one of those rights refuses it too. A walk that stops anywhere but at a network
-  share, such as at a folder it cannot read, is refused, and so is a holder whose access list the
-  engine's account may not read: give that account read access to the folder's permissions.
-  It does not judge everything around the file; [ADR 0214's amendment](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments)
-  lists at least what it leaves out. Restrict the folder that holds each key file, the secrets
-  directory, any link target and the folders above them yourself.
+- **The folders above a key file** (vault BACKLOG #5656, #5657). On every platform the check
+  judges each junction or link on the key file's path by who can change it, as `_windows_link_problem` and `_posix_link_problem` in `messagefoundry/restricted_file.py`
+  define. A key file that is itself a link is refused whoever can change it. The TLS pair
+  the engine mints is one only it writes, so on Windows its key's owner must also be the engine's
+  own account, SYSTEM or Administrators: a pair another account planted in the store directory
+  is refused (on POSIX every key file's owner must already be the engine's own account or root).
+  On Windows the check also reads the owner and access list of the directory that holds the key
+  file, and refuses the file when one of the groups above or an application package may delete a
+  file in that directory, change its access list or take it over (`FILE_DELETE_CHILD`,
+  `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when its owner is such a group or cannot be
+  read. This holds when that directory is an ordinary folder, not a junction, a symbolic link, a
+  folder a volume is mounted on or a drive root. A holder whose access list the engine's
+  account may not read is refused: give that account read access to the folder's permissions.
+  It judges nothing else about that directory or the folders around it: treat any other path
+  shape, and any other right or account, as not judged, and restrict the folder that holds each
+  key file, the secrets directory and the folders above them yourself.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
   in the group, and one held in a directory that another account owns or that a group or other may
-  write without the sticky bit (vault BACKLOG #5636). A link in a folder above it is judged as the
-  item above says, by the owner and mode of the folders at and above that link; ADR 0214's
-  amendment lists at least what the check leaves out. A directory a group or other account may write is accepted when it has the sticky
+  write without the sticky bit (vault BACKLOG #5636). A link on its path is judged as the item
+  above says. A directory a group or other account may write is accepted when it has the sticky
   bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
   mints its own TLS key beside the store. **When it mints its own pair and the store directory does
   not exist yet, the engine creates it on POSIX with no group or other write bit (`0755` at most,
