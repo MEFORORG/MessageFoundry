@@ -2947,9 +2947,11 @@ Sender/Receiver class is read only from the Fault's first child element: SOAP 1.
 `Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or
 processing instruction before either child is stepped over, with at least these exceptions, each of
 which leaves no code: such markup that has no terminator; a `<!` that opens anything else, such as a
-DOCTYPE; one that holds a `</Fault>` before the code element, or a `</Code>` between the Code and its
-`Value`; and a Fault-named start tag inside such markup in the Body ahead of the real Fault, which is
-still taken as the Fault. A Fault whose first child is neither, including a SOAP 1.1 Fault whose
+DOCTYPE; and a `</` inside such markup within the `faultcode` or `Value` itself, which still ends the
+code text. A Fault start tag, a `</Fault>` or a `</Code>` inside such markup is stepped over, so the
+real Fault and its code are read; only where every Fault start tag after the first Body start tag,
+or with none there every one, is inside such markup is the first of them taken as the Fault, so such
+a reply never reads as delivered. A Fault whose first child is neither, including a SOAP 1.1 Fault whose
 `faultcode` is not its first child, or whose code element holds no code, reads as a permanent fault.
 The WS-Security check is separate: a WS-Security code anywhere from where the Fault search starts (after
 the first Body start tag when a Fault follows it, else the whole reply), inside the Fault or not, still

@@ -252,9 +252,11 @@ def _search_outside_markup(
     """The first match of ``pattern``'s tag in ``body[pos:end]`` that is not inside a comment, a
     CDATA section or a processing instruction, and starts at or after ``first``, or ``None``.
     ``pattern`` is one of the ``*_OUTSIDE_MARKUP_RE`` patterns, whose other alternatives are those
-    markups' openers. ``pos`` must itself be outside such markup: the scan knows only the markup it
-    opens, which is why a search past a tag that may sit in markup, the Body start tag say, starts
-    from ``0`` and passes that tag's end as ``first``.
+    markups' openers. The scan knows only the markup it opens after ``pos``, so ``pos`` should be
+    outside such markup: :func:`_find_fault` scans from ``0``, or from the end of an earlier match
+    of the same scan, and passes the Body start tag's end as ``first``. Where ``pos`` is inside
+    markup, after a Fault start tag :func:`_find_fault` took from inside markup say, a close tag
+    later in that same markup is taken as real.
 
     BACKLOG #5912: each markup is stepped over whole, as :func:`_first_child` steps over it, except
     for an opener with no terminator before ``end``: :func:`_first_child` reads that as no child,
@@ -309,11 +311,11 @@ def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
             _FAULT_OUTSIDE_MARKUP_RE, body, after.end(), len(body), first=m.end()
         )
     if after is None:
-        after = plain if plain.start() >= m.end() else _FAULT_RE.search(body, m.end())
+        after = _FAULT_RE.search(body, m.end())
     if after is not None:
         return after, m.end()
-    # No Fault follows the Body start tag, so any Fault is before it.
-    return outside or (plain if plain.start() < m.start() else None), 0
+    # No Fault follows the Body start tag, so plain, and any outside-markup one, is before it.
+    return outside or plain, 0
 
 
 def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
@@ -1157,7 +1159,10 @@ class SoapDestination(DestinationConnector):
         code-element checks in ``_code_text``, and BACKLOG #5912 replaced the name scans with up to
         three anchored matches, ``faultcode`` then ``Code`` at the Fault's first child and ``Value``
         at the Code's, each child found by :func:`_first_child`'s Python-level loop, and added the
-        Code close-tag search, so they are not a reading of this code."""
+        Code close-tag search; the PR 2936 repair moved the Fault start-tag search and the Fault
+        and Code close-tag searches into :func:`_search_outside_markup`'s Python-level loop, which
+        a reply of many markup runs makes several times slower. So they are not a reading of this
+        code."""
         # WS-* mode: the Handler returned only the <Body> fragment; wrap + stamp here (post-queue
         # boundary), so the per-call MessageID and Timestamp never live in a pure transform.
         if self._ws_mode:

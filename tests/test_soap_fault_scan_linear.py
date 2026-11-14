@@ -685,6 +685,8 @@ _ENVELOPES = (
     ("<soap:Envelope><soap:Header>", "</soap:Header><soap:Body><soap:Fault>"),
     ("<env:Envelope>", "<env:Body ><env:Fault><env:Code>"),
     ("<Envelope><Header>", "</Header><Body><Fault><Code>"),
+    # BACKLOG #5912: markup holding a Fault start tag between the Body and the real Fault.
+    ("<s:Envelope><s:Header>", "</s:Header><s:Body><!-- <s:Fault> --><?p <Fault>?><s:Fault>"),
     ("", "<soap:Fault>"),
 )
 #: What may come between a Fault's, or a Code's, start tag and its first child: markup the
@@ -733,7 +735,9 @@ def test_random_replies_yield_the_reference_reading() -> None:
     sample read about 54%, 6.8% and 4.5% on 2026-11-04, and 24.8%, 12.6% and 4.5% after BACKLOG
     #5912 on 2026-11-13: a Value outside a Code, and a code element that is not the Fault's first
     child, now yield none, the head fragments gained two Faults that hold a code, and markup the
-    first-child search steps over may precede the code element)."""
+    first-child search steps over may precede the code element; and 25.3%, 16.9% and 3.5% after
+    the PR 2936 repair, the same day, which added markup holding Fault start tags to the head
+    fragments and to one envelope's Body)."""
     rng = random.Random(2827)
     total, with_a_code, anchored, fallback = 5_000, 0, 0, 0
     for _ in range(total):
