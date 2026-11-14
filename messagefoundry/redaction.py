@@ -1585,6 +1585,12 @@ _XML_PHI_END = re.compile(
     r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)\s*+>"
 )
 
+#: A vocabulary end tag followed by a space, outside any walked element: the only kind whose rest
+#: :func:`_end_tag_rest` can mask, since every maskable rest opens with a space.
+_XML_PHI_END_OPEN = re.compile(
+    r"</(?:[A-Za-z_][\w.-]*+:)?(?:family|given|name|birthDate|address|identifier|telecom)(?= )"
+)
+
 #: How a start tag ended: ``>``, ``/>``, or not at all.
 _TAG_OPEN, _TAG_SELF_CLOSED, _TAG_UNTERMINATED = 0, 1, 2
 
@@ -1640,28 +1646,83 @@ def _xml_text(chunk: str, policy: int) -> str:
 
 def _end_tag_rest(text: str, start: int, stop: int) -> str:
     """The rest of an end tag, ``text[start:stop]``, with the words on the tag's own line masked in
-    place when :func:`_maskable_rest` says masking them changes no pass's reading (BACKLOG #5925).
+    place when masking them changes no pass's reading (BACKLOG #5925).
 
     Well-formed XML allows only whitespace there, so a word is a value a malformed tag carried: inside
     the tag (``</family Zqxdoe>``) or after one that never got its ``>`` (``</family Zqxdoe``). It was
     copied as it stood, and printed. It is MASKED, not replaced, for the reason the section on
     :data:`_SHAPE` gives: a placeholder changed the answer's length and dropped words a name run
     would have joined, so a redacted answer joined to a caller's raw text and redacted again printed
-    what main's hid. The mask keeps every character's class, so every later pass, a second call and
-    a limit read the answer as they read main's.
+    what main's hid. The mask keeps every character's class, so a later pass, a second call and a
+    limit read the answer as they read main's, for every input the differential fuzz in
+    ``tests/test_redaction_xml_end_tag.py`` generates. That is a measurement, not a proof.
 
-    Where :func:`_maskable_rest` refuses -- punctuation, a word some pass reads literally, a date,
-    more than :data:`_GLUED_VALUE_MAX` characters -- the rest stays as it stood, and that is the
-    residual, at least these: ``</family Zq, Doe>``, ``</family password: x>``, a rest opening with
-    a tab, and any word after a line break inside the tag."""
+    **Which words may be masked depends on what follows them.** Where the line ends the text, a
+    caller can glue text onto the last word, so :func:`_maskable_rest` decides, with its rules for an
+    answer's end, and the last word may also not end on the head of a camelCase credential label
+    (:func:`_ends_in_camel_head`). Where the tag's ``>``, a ``<`` or a line break follows, nothing
+    can join the last word, and :func:`_closed_rest_maskable` decides with fewer refusals, so a
+    surname such as ``Johnson`` or ``Li`` is masked there.
+
+    Where both refuse, the rest stays as it stood, and that is the residual, at least these: a rest
+    holding punctuation, a tab or a non-ASCII letter (``</family Zq, Doe>``, ``</family Müller>``);
+    one holding a word some pass reads literally, a credential word inside a longer word, or a date
+    (``</family password: x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any
+    word after a line break inside the tag; and, where the rest ends the text, every refusal
+    :func:`_maskable_rest` makes there, a last word with a digit or ending in ``m``, ``b``, ``f`` or
+    ``n`` among them."""
+    if not text.startswith(" ", start):  # every maskable rest opens with a space
+        return text[start:stop]
     line = _END_TAG_LINE.match(text, start, stop)
     end = line.end() if line is not None else start
     if end - start > _GLUED_VALUE_MAX:
         return text[start:stop]
-    rest = _maskable_rest(text, start, end, _HL7_FIELD_RUN, credential=False)
+    if _TRAILING_SPACE.match(text, end) is not None:
+        rest = _maskable_rest(text, start, end, _HL7_FIELD_RUN, credential=False)
+        if rest is not None and _ends_in_camel_head(rest):
+            rest = None
+    else:
+        rest = text[start:end] if _closed_rest_maskable(text[start:end]) else None
     if rest is None:
         return text[start:stop]
     return rest.translate(_SHAPE) + text[end:stop]
+
+
+def _closed_rest_maskable(rest: str) -> bool:
+    """Whether ``rest``, an end tag's rest followed by its ``>``, a ``<`` or a line break, may be
+    masked: one space, then letters, digits and spaces (:data:`_GLUED_VALUE_REST`), no word some
+    pass reads literally (:data:`_ANCHOR_PREFIXES`) or holds a credential word anywhere in it, as a
+    camelCase label such as ``userPwd`` does (:data:`_CAMEL_LABEL_WORDS`), no date, and a last word
+    that does not end on a whole word read with no boundary before it (:data:`_UNBOUNDED_WORDS`):
+    ``ZqMSH`` then ``<^~\\&<`` declares delimiters, and a mask would not."""
+    if _GLUED_VALUE_REST.fullmatch(rest) is None:
+        return False
+    words = _GLUED_WORD.findall(rest.lower())
+    if not words or _DATE_RUN.search(rest) is not None:
+        return False
+    if any(word in _ANCHOR_PREFIXES or _holds_camel_word(word) for word in words):
+        return False
+    return not words[-1].endswith(_UNBOUNDED_WORDS)
+
+
+def _holds_camel_word(word: str) -> bool:
+    """Whether lower-cased ``word`` holds a credential label word anywhere in it."""
+    return any(label in word for label in _CAMEL_LABEL_WORDS)
+
+
+def _ends_in_camel_head(rest: str) -> bool:
+    """Whether ``rest``'s last word holds a credential label word or ends on the head of one that
+    opens a camelCase label: a capital after a lower-case letter or a digit, then the start of the
+    word. ``zqxP`` and a caller's ``assword: x`` read as ``zqxPassword:``, and ``xxxX`` would not."""
+    last = _GLUED_WORD.findall(rest)[-1]
+    if _holds_camel_word(last.lower()):
+        return True
+    return any(
+        last[i].isupper()
+        and (i == 0 or not last[i - 1].isupper())
+        and any(label.startswith(last[i:].lower()) for label in _CAMEL_LABEL_WORDS)
+        for i in range(len(last))
+    )
 
 
 def _scrub_xml_element(
@@ -1731,7 +1792,8 @@ def _redact_xml_elements(text: str) -> str:
     before the cut survives. A closed element is always scrubbed, whatever its text opens with.
 
     Words after an end tag's name, inside a malformed tag or after one with no ``>``, are masked in
-    place where that is safe, and kept as they stood where it is not (:func:`_end_tag_rest`)."""
+    place where that is safe, and kept as they stood where it is not (:func:`_end_tag_rest`), in a
+    walked element and outside one (:func:`_mask_stray_end_tags`)."""
     if "<" not in text:
         return text
     out: list[str] = []
@@ -1743,12 +1805,30 @@ def _redact_xml_elements(text: str) -> str:
         if last_close is None:
             last_close = {close.group(1): close.start() for close in _XML_PHI_END.finditer(text)}
         replacement, end = _scrub_xml_element(text, match, last_close)
-        out.append(text[pos : match.start()])
+        out.append(_mask_stray_end_tags(text, pos, match.start()))
         out.append(replacement)
         pos = end
-    if not out:
+    if not out and "</" not in text:
         return text
-    out.append(text[pos:])
+    out.append(_mask_stray_end_tags(text, pos, len(text)))
+    return "".join(out)
+
+
+def _mask_stray_end_tags(text: str, lo: int, hi: int) -> str:
+    """``text[lo:hi]``, text outside every walked element, with the rest of each vocabulary end tag
+    in it masked as :func:`_end_tag_rest` masks one inside: a second ``</family Zqxdoe>`` after the
+    element closed, one whose start tag a cut removed, or one after an element read as prose."""
+    if text.find("</", lo, hi) == -1:
+        return text[lo:hi]
+    out: list[str] = []
+    pos = lo
+    for tag in _XML_PHI_END_OPEN.finditer(text, lo, hi):
+        rest = _XML_END_TAG_REST.match(text, tag.end(), hi)
+        stop = rest.end() if rest is not None else tag.end()
+        out.append(text[pos : tag.end()])
+        out.append(_end_tag_rest(text, tag.end(), stop))
+        pos = stop
+    out.append(text[pos:hi])
     return "".join(out)
 
 
@@ -2063,18 +2143,30 @@ _ANCHOR_PREFIXES = frozenset(
 #: Every prefix of a word some pass reads with no word boundary before it, so a caller's text glued
 #: after a masked word could complete it: at least the segment ids :data:`_MSH_DELIMITERS` sniffs,
 #: the backstop's opener, and the support bundle's ``mfb64:`` marker (spelled here, as above).
+_UNBOUNDED_WORDS = (
+    *_MSH_DELIMITERS.pattern[3:].split(")", 1)[0].lower().split("|"),
+    _USERINFO_OPENER.split(" ", 1)[0],
+    "mfb",
+)
 _UNBOUNDED_HEADS = tuple(
-    sorted(
-        {
-            word[:end]
-            for word in (
-                *_MSH_DELIMITERS.pattern[3:].split(")", 1)[0].lower().split("|"),
-                _USERINFO_OPENER.split(" ", 1)[0],
-                "mfb",
-            )
-            for end in range(1, len(word) + 1)
-        }
-    )
+    sorted({word[:end] for word in _UNBOUNDED_WORDS for end in range(1, len(word) + 1)})
+)
+#: The credential label words a camelCase start opens on, which the credential filters read inside
+#: a longer word (``userPwd=``, ``clientSecret=``), lower-cased: the glued-label words and the
+#: compound key words. That module imports this one, so they are spelled here; a test holds this set
+#: to its ``_CAMEL_WORDS``. Read by :func:`_end_tag_rest` only.
+_CAMEL_LABEL_WORDS = (
+    *_GLUED_CREDENTIAL_WORDS,
+    "sharedaccesskey",
+    "subscriptionkey",
+    "encryptionkey",
+    "secondarykey",
+    "accountkey",
+    "privatekey",
+    "accesskey",
+    "masterkey",
+    "secretkey",
+    "authkey",
 )
 #: The heads a credential's masked last word is refused on: the ones above, and the bundle marker's
 #: heads that hold digits. A PHI last word that ends the answer is letters only, so it cannot end in

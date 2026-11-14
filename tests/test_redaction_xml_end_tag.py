@@ -81,6 +81,17 @@ def test_main_printed_each_value(text: str, value: str, end_tag: str) -> None:
         ("<family>Smith</family Zqxdoe", "<family>[redacted]</family Xxxxxx"),
         ("<family>Smith</family Zqx 4455>", "<family>[redacted]</family Xxx 0000>"),
         ("<family>Smith</family >", "<family>[redacted]</family >"),
+        # Names ending in a letter a boundary-free word starts with, and short ones, are masked
+        # inside a tag: nothing can join the last word before its ``>``.
+        ("<family>Smith</family Johnson>", "<family>[redacted]</family Xxxxxxx>"),
+        ("<given>Smith</given Li>", "<given>[redacted]</given Xx>"),
+        # A vocabulary end tag outside a walked element: after the element closed, or with its start
+        # tag cut away.
+        (
+            "<family>Smith</family></family Zqxdoe>",
+            "<family>[redacted]</family></family Xxxxxx>",
+        ),
+        ("Smith</family Zqxdoe> tail", "Smith</family Xxxxxx> tail"),
         # The rest of a bracketless tag past its own line is copied as it stood.
         (
             "<family>Smith</family Zqxdoe\nretry 3 of 5 after 200 ms",
@@ -94,15 +105,25 @@ def test_the_rest_is_masked_in_place(text: str, want: str) -> None:
     assert redact(text) == want
 
 
-#: Rests that stay as main left them, the stated residual: punctuation, a word a pass reads
-#: literally, a date, a tab before the word, and a word on a later line inside the tag.
+#: Rests that stay as main left them, the stated residual, at least these: punctuation, a word a
+#: pass reads literally, a credential word inside a longer word, a date, a tab or a non-ASCII letter,
+#: a word on a later line inside the tag, and at the end of the text, a last word a caller's text
+#: could complete (a digit, a boundary-free word's head, a camelCase credential label's head).
 _KEPT = {
     "comma": "<family>Smith</family Zq, Zqxdoe>",
     "credential-label": "<family>Smith</family password: Zqxdoe>",
     "anchor-word": "<family>Smith</family Bearer Zqxdoe>",
+    "camel-credential": "<family>Smith</family userPwd>",
     "date": "<family>Smith</family 1980-05-05 Zqxdoe>",
     "tab": "<family>Smith</family\tZqxdoe>",
+    "tab-after": "<family>Smith</family Zqxdoe\t>",
+    "non-ascii": "<family>Smith</family Zqxödoe>",
     "later-line": "<family>Smith</family\nZqxdoe>",
+    "segment-id-head": "<family>Smith</family ZqMSH>",
+    "end-digit": "<family>Smith</family Zqx 4455",
+    "end-head": "<family>Smith</family Johnson",
+    "end-camel-head": "<family>Smith</family zqxP",
+    "end-camel-word": "<family>Smith</family userPwd",
 }
 
 
@@ -113,11 +134,32 @@ def test_a_rest_a_pass_could_read_differently_stays_as_main_left_it(text: str) -
     assert redaction._redact_xml_elements(text) == main
 
 
-def test_a_credential_label_in_the_rest_still_reaches_the_credential_filter() -> None:
+@pytest.mark.parametrize(
+    ("a", "raw"),
+    [
+        ("<family>Smith</family password: ", "<s3cr3tvalue99>"),
+        # Found by code review round 1: a camelCase label, whole or as a head a caller completes,
+        # which the credential filter reads with no boundary in front (BACKLOG #5545).
+        ("<family>Smith</family userPwd", "=s3cr3tvalue99"),
+        ("<family>Smith</family clientSecret", "=s3cr3tvalue99"),
+        ("<family>Smith</family zqxP", "assword: s3cr3tvalue99"),
+    ],
+)
+def test_a_credential_label_in_the_rest_still_reaches_the_credential_filter(
+    a: str, raw: str
+) -> None:
     """The credential filters after :func:`redact` read the label, so a mask that took it would print
     the value after it: the rest stays, and the filter scrubs the value as on main."""
-    out = secretscrub.scrub_credentials(redact("<family>Smith</family password: <s3cr3tvalue99>"))
-    assert "s3cr3tvalue99" not in out
+    for text in (a + raw, redact(a) + raw):
+        assert "s3cr3tvalue99" not in secretscrub.scrub_credentials(redact(text))
+    with _main():
+        assert "s3cr3tvalue99" not in secretscrub.scrub_credentials(redact(redact(a) + raw))
+
+
+def test_the_camel_label_words_cover_the_credential_filter() -> None:
+    """THE DRIFT PIN: :mod:`redaction` cannot import :mod:`secretscrub`, so it spells the camelCase
+    label words; a word added there and not here fails this."""
+    assert {word.lower() for word in secretscrub._CAMEL_WORDS} <= set(redaction._CAMEL_LABEL_WORDS)
 
 
 # --- THE GATE: a differential fuzz against main, composed joins included ------------------------
@@ -129,7 +171,12 @@ def test_a_credential_label_in_the_rest_still_reaches_the_credential_filter() ->
 # ``a`` and ``raw``, every route over ``redact(a) + raw`` (and ``a + raw``, and the log chain's
 # output plus ``raw``) is compared with main's same route, value by value.
 
-_VALUES = ("Zqxdoe", "Vandtjane", "Plantone", "Kplm7", "Qwerty12", "s3cr3tvalue99", "4455667")
+#: Planted values: synthetic tokens, and surnames that end on a boundary-free word's head or are two
+#: letters long, which the end-of-text rules refuse and the in-tag rules mask.
+_VALUES = (
+    "Zqxdoe", "Vandtjane", "Plantone", "Kplm7", "Qwerty12", "s3cr3tvalue99", "4455667", "Johnson",
+    "Webb", "Kim", "Li",
+)  # fmt: skip
 _STARTS = (
     "<family>", "<given>", "<name>", "<name><given>", "<ns:family>", "<telecom>", "x <family>",
     "<family> ", '<identifier><system value="urn:x">', "<identifier><value>",
@@ -140,7 +187,8 @@ _LABELS = (
     "password:", "password: ", "token=", "Bearer ", "Authorization: Bearer ", "MRN ", "MRN: ",
     "mrn=", '"name": "', "'family': '", "(0010,0010) ", "PatientName=", "PatientID: ", "id=",
     "api_key=", "MEFOR_DB_PASSWORD=", "nonnumeric port: '", "MSH|^~\\&|", "MSH*$~\\#*", "user:",
-    "OtherPatientIDs=", "Patient Name ", "secret ", "mfb64:v1:",
+    "OtherPatientIDs=", "Patient Name ", "secret ", "mfb64:v1:", "userPwd=", "clientSecret: ",
+    "zqxP", "assword: ", "ZqMSH", "^~\\&|", "accessToken=",
 )  # fmt: skip
 _SEPARATORS = (
     " ", " ", "", "\t", "\n", "\r\n", "<", "<b>", ">", "> ", "</family>", "<given>", '"', "'", ",",
@@ -204,35 +252,46 @@ def _composed(a: str, raw: str) -> dict[str, str]:
     return routes
 
 
+class _Tally:
+    """One redactor's results against main's: each ``route: value`` it prints and main does not, how
+    many it hides that main printed, and each route whose output is not main's with some letters and
+    digits masked (:func:`_is_main_masked`)."""
+
+    def __init__(self) -> None:
+        self.leaks: list[str] = []
+        self.unmasked: list[str] = []
+        self.gains = 0
+
+    def add(self, after: dict[str, str], before: dict[str, str], where: str) -> None:
+        for route, out in after.items():
+            if not _is_main_masked(out, before[route]):
+                self.unmasked.append(f"{route}: {where}")
+            for value in _VALUES:
+                if value in out and value not in before[route]:
+                    self.leaks.append(f"{route}: {value} in {where}")
+                elif value in before[route] and value not in out:
+                    self.gains += 1
+
+
 def _differential(
-    trials: int, seed: int, mask: Callable[[str, int, int], str] | None = None
-) -> tuple[list[str], int, list[str]]:
-    """``(leaks, gains, unmasked)`` over ``trials`` composed texts: each ``route: value`` the shipped
-    redactor prints and main does not, how many it hides that main printed, and each route whose
-    output is not main's with some letters and digits masked (:func:`_is_main_masked`). ``mask``
-    replaces :func:`redaction._end_tag_rest`, for the control."""
+    trials: int, seed: int, control: Callable[[str, int, int], str]
+) -> tuple[_Tally, _Tally]:
+    """The shipped redactor's tally and ``control``'s, which replaces
+    :func:`redaction._end_tag_rest`, over ``trials`` composed texts, each compared with main's
+    answer for the same text, computed once."""
     rand = random.Random(seed)  # seeded: a flaky PHI arm gets muted, so this one cannot flake
-    leaks: list[str] = []
-    unmasked: list[str] = []
-    gains = 0
+    shipped, controlled = _Tally(), _Tally()
     for _ in range(trials):
         a = _fragment(rand, element=True)
         raw = _fragment(rand, element=rand.random() < 0.3)
+        where = f"{a!r} + {raw!r}"
         with _main():
             before = _composed(a, raw)
+        shipped.add(_composed(a, raw), before, where)
         with pytest.MonkeyPatch.context() as patch:
-            if mask is not None:
-                patch.setattr(redaction, "_end_tag_rest", mask)
-            after = _composed(a, raw)
-        for route, out in after.items():
-            if not _is_main_masked(out, before[route]):
-                unmasked.append(f"{route}: {a!r} + {raw!r}")
-            for value in _VALUES:
-                if value in out and value not in before[route]:
-                    leaks.append(f"{route}: {value} in {a!r} + {raw!r}")
-                elif value in before[route] and value not in out:
-                    gains += 1
-    return leaks, gains, unmasked
+            patch.setattr(redaction, "_end_tag_rest", control)
+            controlled.add(_composed(a, raw), before, where)
+    return shipped, controlled
 
 
 def _is_main_masked(out: str, main: str) -> bool:
@@ -259,25 +318,25 @@ def test_the_end_tag_mask_redacts_at_least_what_main_did_through_composed_joins(
     masked, so no value main hid prints. The gain count shows the mask is exercised; the replacing
     control shows the corpus can produce the composed-join leak.
 
-    Measured at 1,500 trials: 0 leaks, 0 unmasked routes and 7,856 values hidden that main printed,
-    against 610 leaks on the control. 20,000 more trials over four other seeds, run by hand, also
-    found 0 leaks. These are measurements of this corpus, not a proof for every input."""
-    leaks, gains, unmasked = _differential(1_500, 5925)
-    control, _, _ = _differential(1_500, 5925, mask=_replace_rest)
-    assert control, "the replacing control leaked nothing, so the corpus cannot find the leak"
-    assert gains, "the mask hid nothing main printed, so #5925 is not exercised"
-    assert not leaks, leaks[:5]
-    assert not unmasked, unmasked[:5]
+    Measured at 1,500 trials: 0 leaks, 0 unmasked routes and 9,120 values hidden that main printed,
+    against 612 leaks on the control. 16,000 more trials over four other seeds, run by hand, also
+    found 0 leaks and 0 unmasked routes. The corpus holds the shapes code review found against the
+    first head (camelCase credential labels, a caller completing one, a segment id glued to a tag's
+    ``>``, surnames the end-of-text rules refuse). These are measurements of this corpus, not a
+    proof for every input."""
+    shipped, control = _differential(1_500, 5925, _replace_rest)
+    assert control.leaks, "the replacing control leaked nothing, so the corpus cannot find the leak"
+    assert shipped.gains, "the mask hid nothing main printed, so #5925 is not exercised"
+    assert not shipped.leaks, shipped.leaks[:5]
+    assert not shipped.unmasked, shipped.unmasked[:5]
 
 
 def test_a_composed_join_adds_no_gap_main_did_not_have() -> None:
     """On vocabulary content, where ``redact(a + raw)`` hides a value and ``redact(redact(a) + raw)``
     prints it, main's ``redact(redact(a) + raw)`` printed it too: the mask adds no composed-join gap
-    of its own. The gaps there are main's, counted so the arm is not vacuous; the residual pin below
-    names their cause."""
+    of its own."""
     rand = random.Random(59250)
     regressions: list[str] = []
-    gaps = 0
     for _ in range(1_500):
         a = _fragment(rand, element=True)
         raw = _fragment(rand, element=False)
@@ -285,22 +344,19 @@ def test_a_composed_join_adds_no_gap_main_did_not_have() -> None:
             main_joined = redact(redact(a) + raw)
         whole, joined = redact(a + raw), redact(redact(a) + raw)
         for value in _VALUES:
-            if value not in whole and value in joined:
-                gaps += 1
-                if value not in main_joined:
-                    regressions.append(f"{value} in {a!r} + {raw!r}")
-    assert gaps, "no composed-join gap at all, so the corpus does not reach the case"
+            if value not in whole and value in joined and value not in main_joined:
+                regressions.append(f"{value} in {a!r} + {raw!r}")
     assert not regressions, regressions[:5]
 
 
-def test_an_element_whose_text_was_redacted_reads_as_prose_on_a_second_call() -> None:
-    """A STATED RESIDUAL, main's as well as this fix's. An element that no well-formed end tag closes
-    is walked only on evidence, and ``[redacted]`` opening its text is not evidence, so a second
-    call reads it as prose and an end-tag rest joined after it is not masked. The whole text masks
-    it; the composed join prints it, on main too."""
+def test_an_end_tag_after_an_element_read_as_prose_is_masked_on_a_second_call() -> None:
+    """Found by the composed-join arm: an element no well-formed end tag closes is walked only on
+    evidence, and ``[redacted]`` opening its text is none, so a second call reads it as prose. The
+    vocabulary end tag after it is masked as a stray one, so the composed join hides what the whole
+    text hides, where main printed it."""
     a, raw = "api_key={<given>1980</name Smith of ", "Kplm7>"
     assert "Kplm7" not in redact(a + raw)
-    assert "Kplm7" in redact(redact(a) + raw)
+    assert "Kplm7" not in redact(redact(a) + raw)
     with _main():
         assert "Kplm7" in redact(redact(a) + raw)
 
