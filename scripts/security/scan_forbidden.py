@@ -696,7 +696,9 @@ _PR_MARK_BEFORE = re.compile(
 )
 #: One separator class only: a markup class before _PR_SEP overlaps it and backtracks quadratically.
 _PR_MARK_AFTER = re.compile(
-    rf"(?i){_PR_SEP}(?:cell|row|requirement|anchor|limb|ground|clause|re-?score|re-?read)s?{_PR_NA}"
+    # A bind character may set the noun off ("<id>: the row ..."), and "the" may lead it.
+    rf"(?i)(?:{_PR_SEP}|\s*[:=\u2013\u2014]\s*|\s+--?\s+)(?:the{_PR_SEP})?"
+    r"(?:cell|row|requirement|anchor|limb|ground|clause|re-?score|re-?read)s?" + _PR_NA
 )
 #: Only a list separator, as the words between "ASVS <id>" and the next identifier of the same list.
 _PR_ID_LIST_GAP = re.compile(r"(?:[\s,;/&+*`_\"']|(?i:and|or)(?![A-Za-z0-9]))+")
@@ -714,6 +716,8 @@ _PR_TABLE_DELIMITER_CHARS = frozenset("|:- \t")
 #: A cell edge: a pipe markdown has not escaped. "a \| b" is one cell, so it must not shift the column
 #: a header names or the column an identifier sits in.
 _PR_CELL_PIPE = re.compile(r"(?<!\\)\|")
+#: One cell of a GFM delimiter row: dashes, with an optional alignment colon at either end.
+_PR_DELIMITER_CELL = re.compile(r":?-+:?")
 #: How far a gap word or a code path may sit from the identifier, inside one sentence.
 _PR_WINDOW = 80
 #: A sentence ends at a full stop before a capital, or at an HTML tag: bot bodies carry release notes as
@@ -754,16 +758,19 @@ def _pr_units(body: str) -> _PrUnits:
             parts.clear()
 
     for lineno, raw in enumerate(body.splitlines(), 1):
-        line = _PR_INVISIBLE.sub("", raw).strip()
-        line = _PR_MD_LINK.sub(r"\1", _PR_QUOTE.sub("", line, count=1).strip())
-        if not line:
+        # The line's type (blank, row, heading, list item) is read from the raw text, as GFM reads it:
+        # an invisible character is content there, so a line holding only one is not blank. The
+        # patterns read the content with the invisible characters deleted.
+        structure = _PR_MD_LINK.sub(r"\1", _PR_QUOTE.sub("", raw.strip(), count=1).strip())
+        line = _PR_INVISIBLE.sub("", structure).strip()
+        if not structure:
             flush()
             continue
-        if line.startswith("|") or _PR_HEADING.match(line):
+        if structure.startswith("|") or _PR_HEADING.match(structure):
             flush()
-            units.append(([(0, lineno)], line, line.startswith("|")))
+            units.append(([(0, lineno)], line, structure.startswith("|")))
             continue
-        if _PR_LIST_ITEM.match(line):
+        if _PR_LIST_ITEM.match(structure):
             flush()
         offset = marks[-1][0] + len(parts[-1]) + 1 if parts else 0
         marks.append((offset, lineno))
@@ -931,7 +938,15 @@ def _pr_is_header(units: _PrUnits, index: int) -> bool:
     A "---" rule after a table is a unit of its own, not a row, so it makes no header."""
     if index + 1 >= len(units) or not units[index + 1][2] or _pr_starts_table(units, index + 1):
         return False
-    return not _pr_is_delimiter(units[index][1]) and _pr_is_delimiter(units[index + 1][1])
+    header, delimiter = units[index][1], units[index + 1][1]
+    if _pr_is_delimiter(header) or not _pr_is_delimiter(delimiter):
+        return False
+    # As GFM requires of a table: one delimiter cell per header cell, each "-" with optional ":" at
+    # its ends. A pair that fails this renders no table, so a valid header below it still counts.
+    header_cells, delimiter_cells = _pr_cells(header), _pr_cells(delimiter)
+    return len(header_cells) == len(delimiter_cells) and all(
+        _PR_DELIMITER_CELL.fullmatch(c.strip()) for c in delimiter_cells
+    )
 
 
 def _pr_table_columns(units: _PrUnits) -> list[set[int]]:
@@ -958,15 +973,21 @@ def _pr_in_list(text: str, end: int, m: re.Match[str]) -> bool:
     return _PR_ID_LIST_GAP.fullmatch(text, end, m.start()) is not None
 
 
+def _pr_cells(row: str) -> list[str]:
+    """A header or delimiter row's cells, split at unescaped pipes. One edge pipe comes off each end,
+    not every one: "|| ASVS |" has an empty first cell."""
+    row = row.strip().removeprefix("|")
+    if row.endswith("|") and not row.endswith("\\|"):
+        row = row[:-1]
+    return _PR_CELL_PIPE.split(row)
+
+
 def _pr_asvs_columns(header: str) -> set[int]:
     """The columns of a table header row whose cell names the column ASVS."""
-    # One edge pipe off each end, not every one: "|| ASVS |" has an empty first cell.
-    header = header.strip().removeprefix("|")
-    if header.endswith("|") and not header.endswith("\\|"):
-        header = header[:-1]
-    cells = _PR_CELL_PIPE.split(header)
     return {
-        i for i, c in enumerate(cells) if _PR_TABLE_ASVS_HEAD.search(_PR_CELL_MARKUP.sub(" ", c))
+        i
+        for i, c in enumerate(_pr_cells(header))
+        if _PR_TABLE_ASVS_HEAD.search(_PR_CELL_MARKUP.sub(" ", c))
     }
 
 

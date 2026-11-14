@@ -1123,6 +1123,22 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("10", "verdict", f"| {_REQ} | the parser | never {_MET} |"),
     ("10", "verdict", f"The row stays {_PARTIAL} for {_REQ}."),
     ("10", "verdict", f"The row is not {_PARTIAL} for {_REQ}."),
+    # Review round 3's three losses against main, each flagged by main. A header and delimiter pair
+    # GFM rejects (a cell-count mismatch, a delimiter cell that is not dashes) renders no table, so the
+    # valid ASVS header below it in the same run still marks its column.
+    ("5", "verdict", f"| Version | Note |\n|---|---|---|\n| a | b | c |\n{_HEAD}{_ROW}"),
+    (
+        "5",
+        "verdict",
+        f"| Version | Note | Result |\n| - - | - - | - - |\n| a | b | c |\n{_HEAD}{_ROW}",
+    ),
+    # A line holding only an invisible character is not blank, and one before "- " or "#" starts no
+    # list item or heading, so the paragraph stays whole.
+    ("11", "map", f"{_REQ} is enforced in\n{chr(0x200B)}\npkg/example_guard.py."),
+    ("11", "map", f"{_REQ} is enforced\n{chr(0x200B)}- in pkg/example_guard.py."),
+    ("11", "map", f"{_REQ} is enforced\n{chr(0x200B)}# in pkg/example_guard.py."),
+    # Punctuation binding the identifier to "the row" marks it, so a CI verb after it binds.
+    ("10", "verdict", f"{_REQ}: the row is failing."),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
