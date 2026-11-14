@@ -11853,8 +11853,9 @@ class AuthService:
           started before the rotation can never be finished, which is a dead end, not a retry.
         * ``_new_ip_seen`` — the WP-L3-13 dedupe. Only the audit row and notice depend on it, never
           the step-up. A re-verification drops the entry before it rotates (BACKLOG #2159), so a
-          strand costs something on a rotation WITHOUT one, such as a passkey assertion or an
-          enrolment confirm: every address already reported would be audited and notified again.
+          strand costs something on a rotation WITHOUT one, such as an enrolment confirm or a
+          passkey assertion on an ``oidc`` session: every address already reported would be
+          audited and notified again.
         * ``_reproof_session_failures`` — the BACKLOG #1138 per-session re-proof budget. Stranded,
           any rotation would hand the session a fresh budget of guesses.
 

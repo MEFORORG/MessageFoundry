@@ -805,3 +805,6 @@ before. A user-verified assertion still stamps it.
 **Who decided.** The Manager, 2026-11-14, reading the owner's "Stamp only if UV" as "without UV,
 the window is shut", as the strictly safer option, under the owner's standing instruction of
 2026-10-22.
+
+AC-2's named test, `tests/test_webauthn.py::test_assertion_stamps_mfa_only_never_reauth`, was
+renamed to `tests/test_webauthn.py::test_assertion_stamps_the_factor_and_re_anchors`.

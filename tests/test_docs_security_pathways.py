@@ -983,7 +983,7 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     2. A browser SSO or OIDC session's first sensitive action does not always force a step-up.
        ``verify_mfa`` stamps ``reauth_at``, and neither code route asks whether the session already
        met its factor, so a TOTP or recovery code opens a fresh window at any time. Since vault
-       BACKLOG #2964 item 14 a passkey assertion stamps one too.
+       BACKLOG #2964 item 14 a passkey assertion with the UV flag stamps one too.
     3. Console routes charge the per-actor ceremony budget, ``POST /ui/mfa`` among them. There were
        four when this pass ran; BACKLOG #296 added ``POST /ui/reauth/oidc`` for five, and the doc's
        count is now derived from the route list below rather than written into this test.
@@ -1945,7 +1945,8 @@ def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -
         "6.8.4 fallback says no directory sign-in opens the step-up window."
     )
     # The AD re-bind and the IdP step-up stamp the window and never mark the second factor; the
-    # TOTP leg and, since vault BACKLOG #2964 item 14, the passkey do both.
+    # TOTP leg and, since vault BACKLOG #2964 item 14, the passkey do both (the passkey's window
+    # only with the UV flag).
     for func in (AuthService.reauth, AuthService.complete_oidc_step_up):
         assert _calls_method(func, "mark_session_reauthed"), func.__name__
         assert not _calls_method(func, "mark_session_mfa_verified"), func.__name__
