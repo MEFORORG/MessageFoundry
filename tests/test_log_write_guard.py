@@ -234,8 +234,6 @@ def test_a_roll_does_not_clear_unwritable_only_a_revalidate_does(
     # also does, so it must not move a sink out of ``unwritable`` once the flap window lapses. Only
     # revalidate's probe may. NEGATIVE CONTROL: on the unfixed code the roll after the window resets
     # the streak, writes ``rolled``, fires a ``rolled`` event, and can_log() reads True with no probe.
-    clock = [1000.0]
-    monkeypatch.setattr(logging_guard.time, "monotonic", lambda: clock[0])
     events: list[LogSinkEvent] = []
     guard = LogWriteGuard()
     guard.set_escalation(events.append)
@@ -246,7 +244,9 @@ def test_a_roll_does_not_clear_unwritable_only_a_revalidate_does(
     assert guard.status()[0].state == "unwritable"
     paged = len(events)
 
-    clock[0] += logging_guard._ROLL_FLAP_WINDOW_SECONDS + 1
+    # The window lapses: a negative window makes every elapsed interval exceed it, so this roll starts
+    # a fresh streak of 1, well under the bound, exactly as a roll a minute later would.
+    monkeypatch.setattr(logging_guard, "_ROLL_FLAP_WINDOW_SECONDS", -1.0)
     _break_the_open_handle(handler)
     handler.emit(_record("after the window"))
 
