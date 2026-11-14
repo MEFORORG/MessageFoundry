@@ -433,6 +433,14 @@ those settings, and its Handlers still run with no active environment.
   messages/sets` invocation is unchanged.
 - `validate`, `graph` and `dryrun` still read `--env` for values alone and adopt no refusal.
 
+  **CORRECTED 2026-11-14 (vault BACKLOG #5554):** the bullet above is false of the code.
+  `validate`, `graph` and `dryrun` read `--env` only for the value-file check under
+  `--project-root`. They load no `env()` values and resolve no `env()` reference, and without
+  `--project-root` the flag has no effect. So AC-6's value-resolution clause, and §3's, is not met
+  for these three commands. Their `--env` help now says so and points at `check --env`, whose
+  build check resolves the named environment's values. Whether to build value resolution into
+  them or narrow AC-6 is open; this note decides neither.
+
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now
 reads `MEFOR_ENVIRONMENTS_DIR` above the file's `[environments].dir`, as `serve`'s settings load

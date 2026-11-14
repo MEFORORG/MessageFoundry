@@ -170,7 +170,7 @@ def test_offline_does_not_inherit_serve_posture_refusal(
     cfg = _config_dir(tmp_path)
     rc = main(["check", "--config", str(cfg), "--no-lint", "--json"])
     assert rc == 0  # no required-env refusal offline
-    # And validate/graph with --project-root but no --env also resolve cleanly (value resolution only).
+    # And validate/graph with --project-root but no --env also resolve cleanly (anchoring only).
     assert main(["validate", "--project-root", str(tmp_path), "--config", str(cfg), "--json"]) == 0
     assert main(["graph", "--project-root", str(tmp_path), "--config", str(cfg), "--json"]) == 0
 
@@ -330,7 +330,7 @@ def test_graph_and_dryrun_honor_relative_config_under_root(
 
 
 def _empty_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run from an empty directory, so no developer messagefoundry.toml is in reach."""
+    """Run from an empty directory, so a messagefoundry.toml in the working directory is not read."""
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
@@ -341,15 +341,17 @@ def test_check_env_alone_judges_posture_for_that_name(
 ) -> None:
     # A site naming its environment only on the command line: no messagefoundry.toml, no
     # MEFOR_AI_ENVIRONMENT. A custom name with no production tier is the name serve refuses, so the
-    # gate must refuse it too, not skip posture and exit 0.
+    # gate must refuse it too, not skip posture and exit 0. --project-root suppresses check's upward
+    # search, so a messagefoundry.toml above the temp dir cannot reach the result.
     cfg = _config_dir(tmp_path)
     _empty_cwd(tmp_path, monkeypatch)
-    rc, legs = _cli_check(capsys, "--config", str(cfg), "--env", "poc")
+    anchor = ["--project-root", str(tmp_path), "--config", str(cfg)]
+    rc, legs = _cli_check(capsys, *anchor, "--env", "poc")
     assert rc == 1, legs["posture"]
     assert not legs["posture"]["ok"] and not legs["posture"]["skipped"], legs["posture"]
     assert "production_instance" in str(legs["posture"]["detail"])
     # Control: with no --env nothing names an instance, so posture skips and the gate passes.
-    rc, legs = _cli_check(capsys, "--config", str(cfg))
+    rc, legs = _cli_check(capsys, *anchor)
     assert rc == 0 and legs["posture"]["skipped"], legs["posture"]
 
 
@@ -362,23 +364,25 @@ def _subcommands() -> dict[str, argparse.ArgumentParser]:
     return dict(subparsers.choices)
 
 
-def _env_help(command: str) -> str:
-    actions = _subcommands()[command]._actions
-    action = next(a for a in actions if "--env" in a.option_strings)
-    assert action.help is not None
-    return " ".join(action.help.split())
+def _rendered_help(command: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    """The subcommand's --help as argparse renders it, unwrapped, so a phrase is never split."""
+    monkeypatch.setenv("COLUMNS", "10000")
+    return " ".join(_subcommands()[command].format_help().split())
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
-def test_offline_env_help_says_the_flag_loads_no_values(command: str) -> None:
+def test_offline_env_help_says_the_flag_loads_no_values(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # validate, graph and dryrun read --env only for the value-file check under --project-root.
     # Their help said it selected the file's values, which a site could take as an environment
     # check; it must name what it does and point at check --env, which reads the values.
-    text = _env_help(command)
+    text = _rendered_help(command, monkeypatch)
     assert "selects environments/<env>.toml values" not in text
-    assert "loads no values" in text and "check --env" in text
+    assert "loads no env() values" in text and "check --env does" in text
+    assert "without --project-root it has no effect" in text
     # Control: check's own help still says it reads the name as serve does.
-    assert "read as serve --env reads it" in _env_help("check")
+    assert "read as serve --env reads it" in _rendered_help("check", monkeypatch)
 
 
 def test_validate_env_resolves_no_value_where_check_env_does(
