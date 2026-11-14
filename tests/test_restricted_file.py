@@ -633,7 +633,7 @@ def test_a_holder_like_programdata_or_a_data_drive_holds_no_right_the_holder_rul
     """The controls for the holder refusals below: listing, traversing, adding a file, and the
     Modify a data drive's root hands Authenticated Users, delete no file already in the directory.
     Modify does carry DELETE, which lets its holder rename the directory away; the rule does not
-    read that, and docs/PHI.md section 2 says so."""
+    read that."""
     assert restricted_file._windows_holder_problem(_security(*_PROGRAMDATA_ACES)) is None
     modify = _security((_ALLOW, _FULL, _SYSTEM), (_ALLOW, 0x001301BF, "S-1-5-11"))
     assert restricted_file._windows_holder_problem(modify) is None

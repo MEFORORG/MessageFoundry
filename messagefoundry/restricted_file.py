@@ -381,7 +381,7 @@ _DIRECTORY_REACH_MASK = _REACH_MASK | 0x00000040  # FILE_DELETE_CHILD
 #: purpose: listing, traversing and adding a file do not remove a file already there, and ordinary
 #: folders grant Users those, ``C:\\ProgramData`` included (vault BACKLOG #5657). So a file a broad
 #: group added before the engine first looked, or a holder it renamed away with DELETE, is not
-#: caught here; ``docs/PHI.md`` section 2 says so.
+#: caught here.
 _HOLDER_REPLACE_MASK = (
     0x00000040  # FILE_DELETE_CHILD
     | 0x00040000  # WRITE_DAC
