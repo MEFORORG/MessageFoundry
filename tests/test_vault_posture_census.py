@@ -299,11 +299,11 @@ _CENSUS: list[Row] = sorted(
         ),
         (
             "__main__.py",
-            "_provision_admin.alert",
+            "_provision_admin.page_granted.alert",
             "_raise_offline_administrator_granted",
             "posture",
         ),
-        ("__main__.py", "_provision_admin.reopen", "open_store", "posture"),
+        ("__main__.py", "_provision_admin.page_granted.reopen", "open_store", "posture"),
         ("__main__.py", "_restore", "run_restore", "-"),
         ("__main__.py", "_restore_verify", "run_restore_verify", "-"),
         ("__main__.py", "_cipher_audit", "build_store_cipher", "posture"),

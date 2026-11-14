@@ -24,6 +24,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -33,6 +34,7 @@ from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import (
     SESSIONS_REVOKE_FAILED_ACTION,
     AuthService,
+    FirstAdministratorGrantedSessionsLive,
     FirstAdministratorRefused,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -40,6 +42,8 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.store import AdminGrant, MessageStore
 from tests.test_ad_session_reconcile import _ad_settings, _principal
+from tests.test_b1720_cli_schema_refusal_exit import _PASSWORD as _B1720_PASSWORD
+from tests.test_b1720_cli_schema_refusal_exit import shell as shell  # noqa: F401
 
 _PASSWORD = "Str0ng-Synthetic-Pass!!"
 _NEW_PASSWORD = "An0ther-Synthetic-Pass!!"
@@ -662,8 +666,9 @@ async def test_provision_admin_given_up_after_the_grant_names_the_recovery(
     try:
         service, _, _ = await _roleless_account(store)
         calls = _refusing_over_time(store, None, first_lands=True)
-        with pytest.raises(FirstAdministratorRefused) as refused:
+        with pytest.raises(FirstAdministratorGrantedSessionsLive) as refused:
             await _provision_admin(service, store, None)
+        assert refused.value.username == "bob"
         text = str(refused.value)
         assert "now holds the Administrator role" in text
         assert "messagefoundry admin-revoke-sessions" in text
@@ -796,3 +801,90 @@ async def test_a_provision_refused_at_the_grant_keeps_its_text_when_the_revoke_f
         assert json.loads(missed["detail"])["change"] == "first_administrator_refused"
     finally:
         await store.close()
+
+
+async def test_an_unexpected_grant_outcome_maps_a_given_up_revoke_to_its_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fail-closed branch's revoke given up on is folded into its refusal text, not raised as
+    the raw store error, and recorded as after a grant, since the role may have landed."""
+    _scaled(monkeypatch, attempts=4)
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, _ = await _roleless_account(store)
+
+        async def grant(*_a: Any, **_k: Any) -> object:
+            return object()  # out of contract
+
+        monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", grant)
+        _refusing_over_time(store, None, first_lands=True)
+        with pytest.raises(FirstAdministratorRefused) as refused:
+            await _provision_admin(service, store, None)
+        assert not isinstance(refused.value, FirstAdministratorGrantedSessionsLive)
+        assert isinstance(refused.value.__cause__, StoreAcquireTimeout)
+        assert "The store also refused to end the account's earlier sessions" in str(refused.value)
+        [missed] = [
+            r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
+        ]
+        assert json.loads(missed["detail"])["change"] == "first_administrator_granted"
+    finally:
+        await store.close()
+
+
+def test_the_given_up_text_names_how_to_get_recovery_codes() -> None:
+    """With TOTP enrolled the codes are not shown on this path, so the text names the two ways that
+    work: ``admin-reset-totp`` for the sole enabled Administrator (it refuses one with an enabled
+    peer), and a peer's MFA reset from the web console otherwise."""
+    text = service_module._provision_revoke_missed_text("bob", enrolled=True)
+    assert "messagefoundry admin-reset-totp --username bob" in text
+    assert "only enabled Administrator" in text
+    assert "reset its MFA from the web console" in text
+    assert "admin-reset-totp" not in service_module._provision_revoke_missed_text(
+        "bob", enrolled=False
+    )
+
+
+def test_the_cli_pages_a_granted_run_whose_revoke_was_given_up_on(
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The role is granted, so ``administrator_granted`` is raised (vault BACKLOG #3849 B5) before
+    the command exits non-zero with the service's text."""
+    import sys
+    import types
+
+    from messagefoundry import __main__ as cli
+
+    async def granted_then_missed(*_a: object, **_k: object) -> object:
+        raise FirstAdministratorGrantedSessionsLive(
+            "synthetic sessions live", username="site-admin"
+        )
+
+    paged: list[tuple[str, str]] = []
+
+    async def page(*_a: object, username: str, granted_by: str) -> bool:
+        paged.append((username, granted_by))
+        return True
+
+    monkeypatch.setattr(AuthService, "provision_first_administrator", granted_then_missed)
+    monkeypatch.setattr(cli, "_raise_offline_administrator_granted", page)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _B1720_PASSWORD)
+    code = cli.main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(shell / "provision.db"),
+            "--json",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert [u for u, _ in paged] == ["site-admin"]
+    assert "synthetic sessions live" in out
+    assert "administrator_granted_sessions_live" in out

@@ -1593,6 +1593,17 @@ class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
 
 
+class FirstAdministratorGrantedSessionsLive(FirstAdministratorRefused):
+    """The run granted the Administrator role to ``username``, then gave up on the revoke that
+    ends the account's earlier sessions (vault BACKLOG #3023 residual (4)). Not a decline: the
+    grant stands, so the command still raises the ``administrator_granted`` alert before it exits
+    non-zero with this operator-facing message."""
+
+    def __init__(self, message: str, *, username: str) -> None:
+        super().__init__(message)
+        self.username = username
+
+
 class LastAdministratorRefused(RuntimeError):
     """An administrator's change would have left no enabled administrator (vault BACKLOG #2779).
     Raised before anything is written. The message is the operator-facing refusal."""
@@ -3423,24 +3434,44 @@ _PROVISION_REVOKE_RETRY: Final = _RevokeRetry(
 )
 
 
+#: How long ``provision-admin``'s revoke re-ran before it was given up on, for its texts.
+_PROVISION_REVOKE_GAVE_UP: Final = f"on every attempt, re-running for up to {_PROVISION_REVOKE_RETRY.budget_seconds / 60:g} minutes"
+
+
+#: What ``provision-admin`` tells the operator to do when a revoke after a grant that may have
+#: landed was given up on (vault BACKLOG #3023 residual (4)). A re-run refuses an account that
+#: holds the role, so it names the host command that ends the session instead.
+_PROVISION_REVOKE_RECOVERY: Final = (
+    "Running provision-admin again does not help: it refuses an account that holds the role. Once "
+    "the store answers again, run 'messagefoundry admin-revoke-sessions' on this host, with the "
+    "--service-config or --db this command used: it ends every account's sessions, that one's "
+    "included"
+)
+#: Said after :data:`_PROVISION_REVOKE_RECOVERY` where the give-up wrote its miss row.
+_PROVISION_REVOKE_MISS_ROW: Final = (
+    f". The {SESSIONS_REVOKE_FAILED_ACTION} audit row records the miss, where the store accepted it"
+)
+
+
 def _provision_revoke_missed_text(username: str, *, enrolled: bool) -> str:
     """``provision-admin``'s refusal once the revoke after its grant was given up on (vault BACKLOG
-    #3023 residual (4)). A re-run refuses an account that holds the role, so it names the host
-    command that ends the session instead."""
+    #3023 residual (4)). The recovery codes are not shown on this path; ``admin-reset-totp``
+    replaces them only for the sole enabled Administrator, and otherwise another Administrator
+    resets the account's MFA from the web console, as that command's own help says."""
     codes = (
-        " This run's recovery codes were not shown; the authenticator entry it showed is live."
+        ". This run's recovery codes were not shown; the authenticator entry it showed is live. "
+        "To get recovery codes, run 'messagefoundry admin-reset-totp --username "
+        f"{username}' on this host with the engine stopped if this is the only enabled "
+        "Administrator, or have another Administrator reset its MFA from the web console"
         if enrolled
         else ""
     )
     return (
         f"the account named {username!r} now holds the Administrator role, but the store refused "
-        "to end its earlier sessions on every attempt, re-running for up to "
-        f"{_PROVISION_REVOKE_RETRY.budget_seconds / 60:g} minutes, so a session its earlier holder "
-        "kept may still act as an Administrator. Running provision-admin again does not help: it "
-        "refuses an account that holds the role. Once the store answers again, run "
-        "'messagefoundry admin-revoke-sessions' on this host, with the --service-config or --db "
-        f"this command used: it ends every account's sessions, that one's included.{codes} The "
-        f"{SESSIONS_REVOKE_FAILED_ACTION} audit row records the miss, where the store accepted it"
+        "to end its earlier sessions "
+        f"{_PROVISION_REVOKE_GAVE_UP}, so a session "
+        "its earlier holder kept may still act as an Administrator. "
+        f"{_PROVISION_REVOKE_RECOVERY}{_PROVISION_REVOKE_MISS_ROW}{codes}"
     )
 
 
@@ -5010,9 +5041,9 @@ class AuthService:
             missed = await self._revoke_for_provision(user_id, actor=actor, granted=False)
             if missed is not None:
                 raise FirstAdministratorRefused(
-                    f"the store refused to end the sessions of the account named {username!r} on "
-                    "every attempt, re-running for up to "
-                    f"{_PROVISION_REVOKE_RETRY.budget_seconds / 60:g} minutes, so this run set no "
+                    f"the store refused to end the sessions of the account named {username!r} "
+                    f"{_PROVISION_REVOKE_GAVE_UP}, "
+                    "so this run set no "
                     "password and granted no role; remove any authenticator entry it showed. Once "
                     "the store answers again, run the command "
                     "again: it reads that account and completes it"
@@ -5128,8 +5159,9 @@ class AuthService:
         # write below. After the address write, a crash before the role left the operator's address
         # on a roleless row, and the re-run read it as the earlier holder's, so the earlier holder
         # was never told. An earlier slot would tell them of a takeover that a later refusal leaves
-        # unfinished. A refusal above, on the repair branch, has still cleared their factors and
-        # sessions and tells nobody; that predates #2915 and is shipped open.
+        # unfinished. A refusal above, on the repair branch, has still cleared their factors, and
+        # their sessions unless it is the refusal of a revoke given up on (vault BACKLOG #3023),
+        # and tells nobody; that predates #2915 and is shipped open.
         # BACKLOG #3078 adds at least two refusals after this slot: the guarded grant below, which a
         # race can refuse, and its fail-closed refusal of an unexpected outcome. On the repair
         # branch either refusal leaves the notice sent and the address replaced,
@@ -5227,16 +5259,15 @@ class AuthService:
             # refuses a row that holds the role, so nothing else would clear it.
             row: VerifiedUser | None = None
             may_hold_role = True
+            unexpected_missed: Exception | None = None
             try:
                 if repaired:
                     # The repair branch's second revoke, as on success below, ahead of the read so
                     # a read that raises cannot skip it, and inside this try so a revoke given up
-                    # on still clears the record. Harmless if no role was written.
-                    await self._revoke_after_commit(
-                        user_id,
-                        change="first_administrator_repair",
-                        actor=actor,
-                        retry=_PROVISION_REVOKE_RETRY,
+                    # on still clears the record. Harmless if no role was written. Recorded as
+                    # after a grant, since the role may have landed (vault BACKLOG #3023).
+                    unexpected_missed = await self._revoke_for_provision(
+                        user_id, actor=actor, granted=True
                     )
                 row = (await self._lookup_by_username(username)).user
                 may_hold_role = not (
@@ -5247,11 +5278,24 @@ class AuthService:
             finally:
                 if repaired and may_hold_role:
                     await self._clear_login_addresses(user_id, username=username)
-            raise FirstAdministratorRefused(
-                await self._unexpected_grant_refusal(
-                    username, user_id, row, enrolled=totp_secret is not None
-                )
+            text = await self._unexpected_grant_refusal(
+                username, user_id, row, enrolled=totp_secret is not None
             )
+            if unexpected_missed is not None:
+                # Vault BACKLOG #3023 residual (4): the give-up maps to text, not the raw error.
+                # A plain refusal, so it does not page: this branch's grant is not known to have
+                # landed, and its refusal has never paged.
+                text += (
+                    ". The store also refused to end the account's earlier sessions "
+                    f"{_PROVISION_REVOKE_GAVE_UP}"
+                    + (
+                        f", so one may act as an Administrator. {_PROVISION_REVOKE_RECOVERY}"
+                        if may_hold_role
+                        else "; the account holds no role"
+                    )
+                    + _PROVISION_REVOKE_MISS_ROW
+                )
+            raise FirstAdministratorRefused(text) from unexpected_missed
         if repaired:
             # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
             # still worked until ``set_password`` above, so a sign-in in that window minted a session
@@ -5317,8 +5361,9 @@ class AuthService:
             # A raise would replace the refusal below, which the operator needs.
             defects=(),
         )
-        raise FirstAdministratorRefused(
-            _provision_revoke_missed_text(username, enrolled=totp_secret is not None)
+        raise FirstAdministratorGrantedSessionsLive(
+            _provision_revoke_missed_text(username, enrolled=totp_secret is not None),
+            username=username,
         ) from missed
 
     async def _unexpected_grant_refusal(
@@ -12211,9 +12256,9 @@ class AuthService:
     ) -> Exception | None:
         """``provision-admin``'s repair-branch revoke, on :data:`_PROVISION_REVOKE_RETRY` (vault
         BACKLOG #3023 residual (4)); the refusal it gave up on, or None once it landed. The give-up
-        is recorded as any is, under the change ``first_administrator_granted`` after the grant and
-        ``first_administrator_repair`` before it, so the row says whether the account held the
-        role. The caller refuses the run with text that says what to do. Revoking the role on a
+        is recorded as any is, under the change ``first_administrator_granted`` after a grant
+        that landed or may have, and ``first_administrator_repair`` before it, so the row says
+        whether the account may hold the role. The caller refuses the run with text that says what to do. Revoking the role on a
         give-up is not done: it would leave the install with no Administrator."""
         try:
             await self._revoke_after_commit(
@@ -12226,6 +12271,20 @@ class AuthService:
             if _is_revoke_defect(exc):
                 raise
             return exc
+        except asyncio.CancelledError:
+            # An interrupt, such as Ctrl-C at a terminal that has shown minutes of re-runs, skips
+            # the miss row (vault BACKLOG #3802) and the refusal. The ERROR line is written here,
+            # synchronously, so the operator still learns what to do.
+            if granted:
+                _log.error(
+                    "auth: provision-admin was interrupted while it re-ran the session revoke of "
+                    "account %s after its Administrator grant; a session its earlier holder kept "
+                    "may still act as an Administrator, and no %s row records it. %s",
+                    user_id,
+                    SESSIONS_REVOKE_FAILED_ACTION,
+                    _PROVISION_REVOKE_RECOVERY,
+                )
+            raise
         return None
 
     async def _refused_after_password(
