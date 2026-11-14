@@ -2300,10 +2300,8 @@ class RegistryRunner:
         # Per-inbound rather than one process-wide flag because the RE-ARM is per-connection: a
         # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
         # Read at the CLAIM GATE (:meth:`_inbound_log_halted`) together with the latch, never applied
-        # as a pause or a STOP. The halt itself
-        # does not pause or STOP an internal lane, save by ending the per_lane voided-STOP re-pend
-        # hold, so the STOP a reload voided stands and that lane goes down; _inbound_log_halted
-        # says what else can still STOP one (BACKLOG #5704).
+        # as a pause or a STOP: the halt itself does not pause or STOP an internal lane;
+        # _inbound_log_halted says what can still STOP one (BACKLOG #5704).
         self._log_halted: set[str] = set()
         # The DELIVERY tier's counterpart is :attr:`_delivery_halted`, a derived read below rather
         # than a field here — see that property for why the tier links to the process latch instead
@@ -5915,11 +5913,9 @@ class RegistryRunner:
         Setting the latch is what gates every inbound (:meth:`_inbound_log_halted`), so no router,
         transform or response row claimed after that line is processed: a pooled lane parks before
         its claim (:meth:`_may_claim_internal`) and hands back a prefix it had already claimed, and a
-        per_lane worker finishes a batch it had already claimed. The halt itself
-        does not pause or STOP an internal lane, save that it ends the per_lane voided-STOP re-pend
-        hold, so the STOP a reload voided stands and that lane goes down;
-        :meth:`_inbound_log_halted` states what else can still STOP one.
-        The marks go on in the same await-free step, before this waits for the reload lock, which is
+        per_lane worker finishes a batch it had already claimed. The halt itself does not pause or
+        STOP an internal lane; :meth:`_inbound_log_halted` states what can still STOP one. The marks
+        go on in the same await-free step, before this waits for the reload lock, which is
         the race fix: a reload holding that lock rebinds each listener through
         :meth:`_resume_inbound_processing`, which refuses while the latch is set and the log still
         cannot be written. Once it holds the lock it always completes, whatever happened while it
@@ -6029,11 +6025,9 @@ class RegistryRunner:
     def _lift_log_halt(self, name: str) -> None:
         """Lift the #122 halt's mark on inbound ``name`` and wake its per_lane workers waiting at the
         claim gate. Sync and await-free. Only the mark is lifted, and no internal lane is resumed:
-        the halt itself
-        does not pause or STOP an internal lane, save that it ends the per_lane voided-STOP re-pend
-        hold, so the STOP a reload voided stands and that lane goes down. A lane that STOPped
-        meanwhile, that way or under its own fault policy, stays STOPPED here, as any STOP does
-        (:meth:`_inbound_log_halted`; BACKLOG #5704). A pooled lane the pre-claim gate parked is released with
+        the halt itself does not pause or STOP an internal lane, so it left no lane to resume. A
+        lane that STOPped meanwhile, under its own fault policy or otherwise, stays STOPPED here, as
+        any STOP does (:meth:`_inbound_log_halted`; BACKLOG #5704). A pooled lane the pre-claim gate parked is released with
         :meth:`StageDispatcher.release_gated`, which unparks nothing else."""
         self._log_halted.discard(name)
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
@@ -6285,8 +6279,7 @@ class RegistryRunner:
 
         Lifting the gate unparks only lanes the gate parked, because the halt itself set no other
         phase: a STOP, whatever caused it (:meth:`_inbound_log_halted`), an operator pause and their
-        holds stand as they were, here. Under per_lane the start that called this then respawns
-        the finished workers (:meth:`_ensure_inbound_workers`)."""
+        holds stand as they were."""
         if not self._inbound_log_halted(name):
             return True
         if not self._log_recovery_ok():
@@ -9914,9 +9907,7 @@ class RegistryRunner:
         * ``abandon``, read at the base interval through each backoff, returns ``ABANDONED``. The
           delivery worker and the pooled batch guard pass the negation of :meth:`_lane_may_deliver`,
           so a stop or pause of the outbound and the #122 halt are not held until the store heals
-          (that method says how a schedule window or a DR park reaches it). The transform worker's
-          voided-STOP retry passes :meth:`_inbound_log_halted`, so the #122 halt ends that hold
-          too, the voided STOP stands, and that lane goes down.
+          (that method says how a schedule window or a DR park reaches it).
         * ``give_up_after`` failures return ``EXHAUSTED``. Only the pooled batch guard passes it,
           under ``infra_fault_policy = stop``, since that hold is the pooled dispatcher's. The
           per-lane workers never read the policy and have no ``infra_fault_policy`` STOP path, so
@@ -10054,23 +10045,13 @@ class RegistryRunner:
         instant it fires, before it waits for the reload lock, and what covers an inbound a reload
         adds later, bound or not.
 
-        **What the halt does to a lane, stated once here.** The halt itself
-        does not pause or STOP an internal lane, save that it ends the per_lane voided-STOP re-pend
-        hold. Otherwise it only gates the claim, and a pooled lane the gate
-        refuses is PARKED until the gate lifts, with no timer that unparks it. That one hold: the
-        per_lane :meth:`_transform_worker`, retrying the re-pend of the tail of a STOP a reload
-        voided (BACKLOG #5708), passes this method as the hold's ``abandon``. So the halt ends the
-        hold, the voided STOP stands, and the worker returns with the tail in flight, where without
-        the halt it would go on retrying and, once the re-pend landed, could drain on. That lane is
-        down until something respawns the worker, such as a reload (even while the halt holds,
-        unless a STOP hold is recorded for the inbound) or a start of the inbound that passes the
-        rebind gate and rebinds its listener; a start of a listener still bound respawns nothing.
-        A lane can still STOP while the halt is in
-        force, at least under its own fault policy (the T17 infra-fault bound, for example when a
-        hand-back's reschedule keeps failing on a full store) and through a leadership-loss
-        hand-back (:meth:`_refuse_log_halted`).
-        Lifting the gate does not itself re-arm such a STOP; under per_lane the start that lifts
-        it then respawns the finished workers, as any start does."""
+        **What the halt does to a lane, stated once here.** The halt itself does not pause or STOP
+        an internal lane: it only gates the claim, and a pooled lane the gate refuses parks with no
+        timer that unparks it, and parks again at each claim the gate refuses until it lifts. A lane
+        can still STOP while the halt is in force, at least under its own fault policy (the T17
+        infra-fault bound, for example when a hand-back's reschedule keeps failing on a full store)
+        and through a leadership-loss hand-back (:meth:`_refuse_log_halted`). Lifting the gate does
+        not itself re-arm such a STOP."""
         # A mark gates only an inbound still in the graph: a removed inbound's worker must reach
         # its claim, see the inbound gone and return, rather than wait on a mark nothing lifts. A
         # re-add finds the mark again.
@@ -11275,10 +11256,9 @@ class RegistryRunner:
             # #122 (ADR 0162) THE CLAIM GATE: the application log is unwritable and this process has
             # fail-closed. Checked BEFORE the claim so no row is left INFLIGHT. The worker WAITS here
             # rather than returning (BACKLOG #5704), so the gate stays apart from the worker's life:
-            # a lifted gate needs no respawn, and a respawn cannot resurrect a worker a content STOP
-            # ended. :meth:`_wake_log_gated` wakes it when the gate lifts. Not so the transform
-            # worker the halt ends at its voided-STOP re-pend: that one returned, so it needs a
-            # respawn (:meth:`_inbound_log_halted`).
+            # a lifted gate needs no respawn, and while the gate holds a respawn cannot resurrect a
+            # worker a content STOP ended (:meth:`_ensure_inbound_workers`). :meth:`_wake_log_gated`
+            # wakes it when the gate lifts.
             if self._inbound_log_halted(name):
                 woken = await self._wait_for_work(wait_ev)
                 continue
