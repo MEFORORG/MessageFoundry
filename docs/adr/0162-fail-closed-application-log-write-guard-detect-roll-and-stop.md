@@ -153,8 +153,9 @@ most its one in-flight head** — bounded, and strictly better than stranding th
 *(Note, BACKLOG #5704: superseded in mechanism. The internal stages are now held by a claim gate,
 `_inbound_log_halted`, which reads the latch and the per-inbound marks: per_lane workers WAIT at
 their loop top rather than returning, and a pooled lane parks before its claim, touching no
-row, until the gate lifts. A per_lane worker still finishes a batch it had already claimed, so the
-one-head bound above holds under per_lane only at `fifo_claim_batch = 1`. The halt itself does not pause or STOP an internal lane; a lane can still STOP at least under its own fault policy or a leadership-loss hand-back. ADR 0189's note says the rest.)*
+row, until the gate lifts. A per_lane router or transform worker still finishes a batch it had
+already claimed, so for those lanes the one-head bound above holds under per_lane only at
+`fifo_claim_batch = 1`; the response worker claims one row at a time. The halt itself does not pause or STOP an internal lane; a lane can still STOP at least under its own fault policy or a leadership-loss hand-back. ADR 0189's note says the rest.)*
 
 **Recovery, measured rather than assumed — the two tiers recover differently and an operator needs
 both halves.** The inbound re-arm rides `_start_inbound_unsafe`, so **anything that starts an inbound

@@ -6028,8 +6028,9 @@ class RegistryRunner:
         """Lift the #122 halt's mark on inbound ``name`` and wake its per_lane workers waiting at the
         claim gate. Sync and await-free. Only the mark is lifted, and no paused or STOPPED internal
         lane is resumed: the halt itself does not pause or STOP one. A lane that STOPped meanwhile,
-        under its own fault policy or otherwise, stays STOPPED here, as any STOP does (:meth:`_inbound_log_halted`; BACKLOG #5704). A pooled lane the pre-claim gate parked is released with
-        :meth:`StageDispatcher.release_gated`, which unparks nothing else."""
+        under its own fault policy or otherwise, stays STOPPED here, as any STOP does
+        (:meth:`_inbound_log_halted`; BACKLOG #5704). A pooled lane the pre-claim gate parked is
+        released with :meth:`StageDispatcher.release_gated`, which unparks nothing else."""
         self._log_halted.discard(name)
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
             if self._claim_mode == "pooled":
@@ -9880,10 +9881,11 @@ class RegistryRunner:
         holds the lane (BACKLOG #1611 steps 1 and 2) — the per-lane analogue of the pooled T17 head
         re-pend in :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
         Returns how the hold ended. Only ``STOPPED``, the runner stopping with the rows still held,
-        makes the caller return rather than claim again. ``LANDED`` means the rows still in flight are
-        pending again; every other end leaves them INFLIGHT. Either way the worker loops on, as it did before step 2 after
-        one failed write. Not every caller
-        does: at least the voided-STOP retry in :meth:`_transform_worker` goes on only on ``LANDED``.
+        makes the caller return rather than claim again. On ``LANDED`` the rows still in flight are
+        pending again; every other end leaves them INFLIGHT. On any end but
+        ``STOPPED`` the worker loops on, as it did before step 2 after one failed write. Not every
+        caller does: at least the voided-STOP retry in :meth:`_transform_worker` goes on only on
+        ``LANDED``.
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
         claimed row INFLIGHT. Every claim path selects ``status='pending'``, so a worker that went on
@@ -10052,7 +10054,9 @@ class RegistryRunner:
         an internal lane. It gates the claim, and under pooled hands back a prefix claimed before
         the latch (:meth:`_refuse_log_halted`); a pooled lane the gate refuses parks with no timer
         that unparks it, and parks again at each claim the gate refuses until it lifts. Nor does it
-        end a held re-pend (:meth:`_repend_claimed_on_fault`): the hold goes on as it would without
+        end an internal lane's held re-pend (the per_lane workers' :meth:`_repend_claimed_on_fault`
+        with no ``abandon``, and the pooled ``_land_while_holding``, which reads only a pause, as
+        :meth:`StageDispatcher._hold_abandoned` says): the hold goes on as it would without
         the halt, retrying its store write while the log is halted, and a re-pend that lands meets
         this gate. A lane
         can still STOP while the halt is in force, at least under its own fault policy (the T17

@@ -944,15 +944,16 @@ async def test_the_log_halt_holds_a_voided_stop_repend_until_it_lands_and_keeps_
             return state["landed"] or worker.done()
 
         assert await _until(settled), "the held re-pend neither landed nor ended"
-        # Woken, a worker still at its gate reads it again and waits. A worker that returned passes
-        # these waits too; the identity check after the drain is what fails it.
+        # The worker waits on its lane at least once more. That alone cannot tell the gate from an
+        # empty claim, so the claim count below is what shows the gate held; a worker that
+        # returned passes both, and the identity check after the drain is what fails it.
         waits = gate_waits[0]
         runner._wake_lane(Stage.ROUTED, LOOP)
 
         async def gated_again() -> bool:
             return gate_waits[0] > waits or worker.done()
 
-        assert await _until(gated_again), "the worker neither waited at its gate nor returned"
+        assert await _until(gated_again), "the worker neither waited again nor returned"
         assert processed[halted_at:] == [], "a row was processed while the log was halted"
         assert claims[0] == claims_at, "the worker claimed while the log was halted"
         assert calls == []
