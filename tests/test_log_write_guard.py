@@ -2533,6 +2533,35 @@ async def test_a_gated_inbound_does_not_respawn_a_stop_held_worker(
         await runner.stop()
 
 
+async def test_a_gated_inbound_respawns_a_finished_worker_whose_sibling_stage_holds_the_stop(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # per_lane, BACKLOG #5704 review: the respawn asks whether each worker's OWN stage holds. The
+    # router's INGRESS STOP is held, so its worker stays ended while gated; the transform worker,
+    # finished with no hold of its own, is respawned as with no halt, and the hold stands.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "per_lane")
+    await runner.start()
+    try:
+        router = runner._router_workers[INBOUND]
+        transform = runner._transform_workers[INBOUND]
+        for task in (router, transform):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        runner._hold_for_operator(INBOUND, "inbound", Stage.INGRESS)  # the router STOP's hold
+        runner._log_write_stopped = True
+        runner._ensure_inbound_workers(INBOUND)
+        assert runner._router_workers[INBOUND] is router, "the STOP-held router was respawned"
+        assert runner._transform_workers[INBOUND] is not transform, "the unheld worker stayed down"
+        assert ("inbound", INBOUND) in runner._stop_held, "the respawn released the router's hold"
+    finally:
+        runner._log_write_stopped = False
+        await runner.stop()
+
+
 @pytest.mark.parametrize("stage", [Stage.INGRESS, Stage.ROUTED])
 async def test_with_no_halt_an_operator_restart_leaves_a_pooled_stopped_lane_and_its_hold(
     store: MessageStore, tmp_path: Path, stage: Stage
@@ -2559,6 +2588,32 @@ async def test_with_no_halt_an_operator_restart_leaves_a_pooled_stopped_lane_and
         assert ("inbound", INBOUND) in runner._stop_held
     finally:
         await runner.stop()
+
+
+class _StoppedLaneDispatcher:
+    """Just enough of a StageDispatcher for ``_broadcast_to``: every lane reads STOPPED, and the
+    broadcast itself re-arms them all."""
+
+    def stopped(self, lane: str) -> bool:
+        return True
+
+    def notify_work(self, *, keep_stopped: Callable[[str], bool] | None = None) -> None:
+        return None
+
+
+def test_an_outbound_broadcast_releases_the_hold_of_an_inbound_namesake_kept_by_the_halt(
+    store: MessageStore,
+) -> None:
+    # BACKLOG #5704 review: an inbound and an outbound may share a name, and only an inbound hold is
+    # shared by sibling stages. An OUTBOUND broadcast that re-arms the outbound releases its hold
+    # even while the halt keeps the namesake inbound's INGRESS lane STOPPED.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._log_write_stopped = True
+    runner._hold_for_operator(INBOUND, "inbound", Stage.INGRESS)
+    runner._hold_for_operator(INBOUND, "outbound")
+    runner._broadcast_to(_StoppedLaneDispatcher(), Stage.OUTBOUND)  # type: ignore[arg-type]
+    assert ("outbound", INBOUND) not in runner._stop_held, "the outbound kept a released hold"
+    assert ("inbound", INBOUND) in runner._stop_held
 
 
 def test_a_removed_inbounds_mark_does_not_gate_its_worker(store: MessageStore) -> None:
@@ -2658,9 +2713,11 @@ async def test_a_reload_during_the_halt_re_arms_a_stopped_lane_whose_sibling_sta
 ) -> None:
     # BACKLOG #5704 review: one ("inbound", name) record holds the INGRESS, ROUTED and RESPONSE lanes
     # of an inbound, so the reload broadcast must ask whether the lane's OWN stage recorded the hold.
-    # A lane STOPPED with no hold of its own is re-armed by the reload during the halt, as on main,
-    # while the sibling stage whose STOP is held stays STOPPED and keeps the hold. MEASURED
-    # 2026-11-14: keyed by the inbound alone, the reload left the unheld lane STOPPED.
+    # A lane STOPPED with no hold of its own is re-armed by the reload during the halt and gate-
+    # parked, so the recovery restart releases it: the end state main reaches, where the halt
+    # paused it and the restart resumed it. The sibling whose STOP is held stays STOPPED and keeps
+    # the hold, the gap against main the test below pins. MEASURED 2026-11-14: keyed by the inbound
+    # alone, the reload left the unheld lane STOPPED.
     outdir, logdir = tmp_path / "out", tmp_path / "logs"
     outdir.mkdir()
     logdir.mkdir()
@@ -2690,6 +2747,7 @@ async def test_a_reload_during_the_halt_re_arms_a_stopped_lane_whose_sibling_sta
         await runner.start_outbound(OUTBOUND)
         assert not runner._log_write_stopped and INBOUND not in runner._log_halted
         assert not unheld.stopped(INBOUND), "the recovery restart left the unheld lane STOPPED"
+        assert not unheld._states[INBOUND].gated, "the recovery restart left the lane gate-parked"
         assert held.stopped(INBOUND), "the recovery restart re-armed the held STOP"
     finally:
         await runner.stop()
