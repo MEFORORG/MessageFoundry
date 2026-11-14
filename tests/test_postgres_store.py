@@ -117,6 +117,8 @@ _TABLES = (
     "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
     "processed_files",  # BACKLOG #3424: the ledger contract writes rows a later probe would see
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
+    "pending_approvals",  # vault BACKLOG #5635: an open request sealed under an earlier test's
+    #                     key would stop every key rotation in a later test
     "user_roles",
     "ad_group_role_map",
     "authority_set_seal",  # BACKLOG #2592: the map's seal, under the key of the test that wrote it

@@ -84,6 +84,33 @@ async def _role_with_seal(db: Path, key: str, seal: str) -> str:
     return role_id
 
 
+async def _user_with_totp(db: Path, key: str) -> None:
+    store = await _open(db, key)
+    try:
+        await store.create_user(
+            user_id="u-totp",
+            username="u-totp",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
+        )
+        await store.set_totp_secret("u-totp", secret=_TOTP)
+    finally:
+        await store.close()
+
+
+def _snapshot(db: Path) -> dict[str, list[tuple[Any, ...]]]:
+    """Every column of every users and roles row, read with no store key."""
+    conn = sqlite3.connect(db)
+    try:
+        return {
+            table: sorted(conn.execute(f"SELECT * FROM {table}").fetchall(), key=repr)
+            for table in ("users", "roles")
+        }
+    finally:
+        conn.close()
+
+
 async def _user_seal_holds(db: Path, key: str, *retired: str) -> bool:
     store = await _open(db, key, *retired)
     try:
@@ -116,12 +143,19 @@ def test_a_role_under_a_retired_key_not_supplied_stops_the_run(
     removed is the control: the same store completes once nothing is left under that key."""
     db, uploads, key_a, key_b = rig
     role_id = asyncio.run(_role_with_seal(db, key_a, UNHELD_SEAL))
+    # Rows the passes would re-seal under the new key: the built-in roles and a user with a TOTP
+    # secret, all under the supplied prior key. The abort must leave every one as it was.
+    asyncio.run(_user_with_totp(db, key_a))
+    before = _snapshot(db)
+    assert any("u-totp" in row for row in before["users"])  # control: the user is there
     _env(monkeypatch, key_b, key_a, uploads)
 
     assert main(["rotate-key", "--db", str(db)]) == 1
     captured = capsys.readouterr()
+    assert _snapshot(db) == before  # the pre-flight refused before any pass wrote
     assert "OK:" not in captured.out
     assert "rotation aborted" in captured.err
+    assert "Nothing was written by this pass" in captured.err
     assert "1 user, role, open approval or directory-map record(s) in roles" in captured.err
     assert UNHELD_KEY_ID in captured.err
     rows = asyncio.run(_rows(db, key_b, key_a))

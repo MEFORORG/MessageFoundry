@@ -4934,18 +4934,32 @@ RESEALED_SEAL_COLUMNS: Final = (
 )
 
 
-def unheld_seal_refusal(outcome: ResealOutcome) -> CipherError:
-    """The refusal ``reencrypt_to_active`` raises, before it re-encrypts any cell, when its re-seal
-    passes left a seal naming a key this run does not hold (vault BACKLOG #5635). It stops there
-    because the cell pass would re-encrypt such a user's TOTP secret, which the user's seal covers,
-    and leave the record verifying under no key at all. A ``CipherError``, as a cell no supplied
-    key opens is, so ``rotate-key`` aborts with exit 1, rolls no audit range, writes no stamp and
-    leaves its rotation record open. The text names only tables and non-secret seal key ids."""
+def unheld_seal_refusal(outcome: ResealOutcome, *, before_writes: bool) -> CipherError:
+    """The refusal ``reencrypt_to_active`` raises when a user, role, open approval or directory-map
+    seal names a key this run does not hold (vault BACKLOG #5635). Going on would re-encrypt such a
+    user's TOTP secret, which the user's seal covers, and leave the record verifying under no key.
+    A ``CipherError``, as a cell no supplied key opens is, so ``rotate-key`` aborts with exit 1,
+    rolls no audit range, writes no stamp and leaves its rotation record open.
+
+    ``before_writes`` says which check fired. The pre-flight read runs before any re-seal or cell
+    pass writes. The passes never write over a seal under a key the run does not hold, so with
+    nothing else writing it sees every such seal. The read and the passes are separate
+    transactions, so it is not atomic against a writer running alongside, such as an engine left
+    running; a seal that writer makes is caught by the check after the passes, whose re-seals have
+    by then been committed, and the text says so. The text names only tables and non-secret seal
+    key ids."""
+    done = (
+        "Nothing was written by this pass: the check ran before any re-seal or re-encryption."
+        if before_writes
+        else "The re-seal passes had already committed re-seals and TOTP re-encryptions under the "
+        "active key, so keep that key; no other cell was re-encrypted. A seal appearing after "
+        "the passes means something else wrote to the store during this run: stop it first."
+    )
     return CipherError(
         f"{outcome.unheld} user, role, open approval or directory-map record(s) in "
         f"{', '.join(outcome.unheld_tables)} name a seal key this run does not hold (seal key "
         f"id(s) {', '.join(outcome.unheld_key_ids)}; each such seal starts mfseal:v1:<id>:), so "
-        "they were not re-sealed and no cell was re-encrypted. The causes include at least a prior "
+        f"they were not re-sealed. {done} The causes include at least a prior "
         "key that was not supplied, a key that is lost, and a seal written outside the store. "
         "Supply the prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run; where no key "
         "you hold opens the record, recreate or remove it, then re-run"
@@ -12325,13 +12339,19 @@ class MessageStore:
         # re-sealed under the active key in one write (rotation_reseal), so the loop below finds those
         # secrets already under the active key. The loop then rotates the rest, which are accounts
         # whose record has no seal or fails it and is refused anyway.
+        # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
+        # under a key this run does not hold leaves the store as this method found it.
+        preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if preflight.unheld:
+            self._reseal_outcome = preflight
+            raise unheld_seal_refusal(preflight, before_writes=True)
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
         # Vault BACKLOG #5635: what the passes left under another key, for the command to read.
         self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
-        if self._reseal_outcome.unheld:
-            raise unheld_seal_refusal(self._reseal_outcome)
+        if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
+            raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:

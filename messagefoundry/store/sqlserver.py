@@ -9817,13 +9817,19 @@ class SqlServerStore:
         # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
+        # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
+        # under a key this run does not hold leaves the store as this method found it.
+        preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if preflight.unheld:
+            self._reseal_outcome = preflight
+            raise unheld_seal_refusal(preflight, before_writes=True)
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
         # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
         self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
-        if self._reseal_outcome.unheld:
-            raise unheld_seal_refusal(self._reseal_outcome)
+        if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
+            raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
         # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error (H4):
         # exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop

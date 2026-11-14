@@ -733,8 +733,11 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    (the store open can already have written under the key) and closes it only when a run completes,
    so a run killed or failed after that point leaves it open. **A sealed record under a key the run
    was not given stops it (vault BACKLOG #5635).** When a user, role, open approval or directory-map
-   seal names a key the run does not hold, the store pass aborts before it re-encrypts any cell,
-   naming the tables and the seal key ids, and the command exits 1 with nothing rolled or stamped.
+   seal names a key the run does not hold, a pre-flight read finds it before any re-seal or cell
+   pass writes, and the store pass aborts having written nothing, naming the tables and the seal
+   key ids; the command exits 1 with nothing rolled or stamped. The read is not atomic against a
+   writer running alongside, so a seal such a writer makes during the run is refused after the
+   re-seal passes have committed, and that refusal says so; stop the engine first.
    Supply that key and re-run, or remove a record no key you hold opens. A seal that fails under a
    key the run holds, or is malformed, does not stop it; the run notes it. When a start finds that the key in
    use differs from its stamp, or has none, and the record names that key or cannot be read, `serve`

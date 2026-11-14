@@ -134,6 +134,8 @@ async def store() -> AsyncIterator[object]:
                 "processed_files",  # BACKLOG #3424: ledger rows a later probe would see
                 "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
                 "connection_flag",  # BACKLOG #2623 (no FK): the operator audit contract writes it
+                "pending_approvals",  # vault BACKLOG #5635: an open request sealed under an earlier test's
+                #                     key would stop every key rotation in a later test
                 "user_roles",
                 "ad_group_role_map",
                 "ad_group_scope_map",  # BACKLOG #3187: the width contract writes it

@@ -11656,8 +11656,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # the active key: a re-run with the key supplied goes on from here, and nothing rolls back.
         # One case no key finishes: a row whose tag verified but which is not UTF-8, or not JSON at
         # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308). The store
-        # pass also refuses here, before it re-encrypts any cell, when a user, role, open approval
-        # or directory-map seal names a key this run does not hold (vault BACKLOG #5635): going on
+        # pass also refuses here, from a pre-flight read before any of its writes, when a user, role,
+        # open approval or directory-map seal names a key this run does not hold (#5635): going on
         # would re-encrypt such a user's TOTP secret, which its seal covers, and strand the record
         # under every key. Its message names the tables and seal key ids.
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
