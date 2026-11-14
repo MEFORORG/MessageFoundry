@@ -538,15 +538,16 @@ def lane_label(sweep_mode: str, claim_mode: str) -> str:
 #: The axes of :func:`monotonic_lane` past :func:`lane_label`'s two, each as its label prefix and how
 #: a record's value is read and spelled. The ONE list of them: the lane key and its label both read
 #: it, so an axis cannot be in one and missing from the other.
-_LANE_AXES: tuple[tuple[str, Callable[[ConnScaleRecord], str]], ...] = (
+_LANE_AXES: tuple[tuple[str, Callable[[ConnScaleRecord], str | int]], ...] = (
     ("fuse", lambda r: "on" if r.fuse_thread_hops else "off"),
     ("batch", lambda r: "on" if r.batch_handoff_statements else "off"),
     ("sandbox", lambda r: r.sandbox_mode),
-    ("trial", lambda r: str(r.trial)),
+    # An int, so lanes sort trial=2 before trial=10.
+    ("trial", lambda r: r.trial),
 )
 
 #: ``(sweep_mode, claim_mode, *each _LANE_AXES value)``.
-MonotonicLane = tuple[str, ...]
+MonotonicLane = tuple[str | int, ...]
 
 
 def monotonic_lane(r: ConnScaleRecord) -> MonotonicLane:
@@ -1201,12 +1202,15 @@ class ConnScaleReport:
                 # A real sample with nothing to compare against. Recorded rather than skipped -- it
                 # is the PRIOR for the next N and a reader needs its value. `first_in_lane` is False
                 # where a non-finite reading came first, so a harvest never takes this, a larger N,
-                # as the lane's base.
+                # as the lane's base. `ok` and `prior` are null rather than absent, so a reader can
+                # take them off every row.
                 readings.append(
                     {
                         "lane": label,
                         "count": r.count,
                         "value": val,
+                        "prior": None,
+                        "ok": None,
                         "first_in_lane": first,
                     }
                 )
@@ -1220,6 +1224,7 @@ class ConnScaleReport:
                         "count": r.count,
                         "value": None,
                         "not_finite": str(val),
+                        "prior": pair.prior if math.isfinite(pair.prior) else None,
                         "ok": False,
                         "first_in_lane": first,
                     }

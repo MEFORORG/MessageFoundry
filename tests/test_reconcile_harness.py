@@ -296,6 +296,22 @@ def test_a_message_too_large_to_align_fails_closed(monkeypatch: pytest.MonkeyPat
     assert "order-unchecked" not in {d.kind for d in diff(ORU, inserted)}
 
 
+def test_any_position_segments_are_left_out_of_the_order_check_entirely() -> None:
+    # Two different any-position ids that swap places: every segment's content is the same, so the
+    # pair reconciles, rather than the two being compared against each other at the end.
+    rules = NormalizeRules(any_position_segments=frozenset({"ZA", "ZB"}))
+    left = BASE.replace("\rPV1", "\rZA|1\rPV1") + "\rZB|1"
+    right = BASE.replace("\rPV1", "\rZB|1\rPV1") + "\rZA|1"
+    assert diff(left, right, rules) == []
+    # The same with an any-position id that is also sort_segments, split by the other.
+    rules = NormalizeRules(
+        sort_segments=frozenset({"ZA"}), any_position_segments=frozenset({"ZA", "ZB"})
+    )
+    left = BASE.replace("\rPV1", "\rZA|1\rZB|1\rPV1") + "\rZA|2"
+    right = BASE.replace("\rPV1", "\rZA|2\rZA|1\rPV1") + "\rZB|1"
+    assert diff(left, right, rules) == []
+
+
 def test_with_blanks_keeps_every_other_rule() -> None:
     rules = NormalizeRules(
         sort_segments=frozenset({"NK1"}), any_position_segments=frozenset({"ZPD"})

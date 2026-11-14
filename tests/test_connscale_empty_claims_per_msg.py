@@ -1066,8 +1066,11 @@ def test_the_payload_version_moved_and_the_harvested_ratio_ROWS_did_not() -> Non
     # TWO SHAPES, PINNED SEPARATELY. A lane's first reading has no prior, so it carries no band and no
     # verdict -- writing one would be a threshold computed from nothing. Pinning only the judged row
     # would leave the head row free to grow a fabricated `ok`, which is the exact error the ratio
-    # table's own "first in lane" rendering exists to avoid.
-    assert set(head) == {"lane", "count", "value", "first_in_lane"}, sorted(head)
+    # table's own "first in lane" rendering exists to avoid. Since BACKLOG #5570 the head row carries
+    # `prior` and `ok` as NULL, so a reader can take both off every row; null is the absence of a
+    # verdict, and the values are pinned below so it cannot become one.
+    assert set(head) == {"lane", "count", "value", "prior", "ok", "first_in_lane"}, sorted(head)
+    assert head["prior"] is None and head["ok"] is None, head
     assert set(judged) == {
         "lane",
         "count",
@@ -1454,6 +1457,51 @@ def test_the_payload_keeps_a_non_finite_first_reading_as_the_lanes_base_and_stay
     table = _rows(report.render_readings_markdown(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE))
     assert ["first in lane" in t for t in table] == [False, False, False], table
     assert "no finite prior" in table[1] and "NOT FINITE" in table[0], table
+
+
+def test_every_payload_row_carries_ok_and_prior() -> None:
+    # A consumer reads `ok` and `prior` off every row; a row with no verdict or no prior says so with
+    # null rather than omitting the key.
+    recs = [
+        _rec("fixed_per_conn", 12, per_msg=math.nan),
+        _rec("fixed_per_conn", 24, per_msg=48.0),
+        _rec("fixed_per_conn", 48, per_msg=50.0),
+        _rec("fixed_aggregate", 12, per_msg=40.0),
+    ]
+    rows = _report(*recs).readings_payload(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE)[
+        "readings"
+    ]
+    assert isinstance(rows, list)
+    assert all("ok" in r and "prior" in r for r in rows), rows
+    by_n = {(r["lane"], r["count"]): r for r in rows}
+    assert (
+        by_n[("fixed_aggregate", 12)]["ok"] is None
+        and by_n[("fixed_aggregate", 12)]["prior"] is None
+    )
+    assert (
+        by_n[("fixed_per_conn", 12)]["ok"] is False
+        and by_n[("fixed_per_conn", 12)]["prior"] is None
+    )
+    assert (
+        by_n[("fixed_per_conn", 24)]["ok"] is None and by_n[("fixed_per_conn", 24)]["prior"] is None
+    )
+    assert (
+        by_n[("fixed_per_conn", 48)]["ok"] is True and by_n[("fixed_per_conn", 48)]["prior"] == 48.0
+    )
+
+
+def test_trial_lanes_sort_numerically() -> None:
+    recs = [
+        dataclasses.replace(_rec("fixed_per_conn", n, per_msg=float(n)), trial=t)
+        for t in range(12)
+        for n in (12, 24)
+    ]
+    rows = _report(*recs).readings_payload(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE)[
+        "readings"
+    ]
+    assert isinstance(rows, list)
+    lanes = list(dict.fromkeys(str(r["lane"]) for r in rows))
+    assert lanes == [f"fixed_per_conn/trial={t}" for t in range(12)], lanes
 
 
 def test_a_single_arm_off_its_default_keeps_the_plain_lane_label() -> None:

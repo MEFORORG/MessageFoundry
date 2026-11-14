@@ -196,7 +196,7 @@ def diff(left: str, right: str, rules: NormalizeRules | None = None) -> list[Dif
     ``OBR`` group to another would compare equal although its clinical owner changed (BACKLOG
     #5569). So the order of the segments is compared too: see :func:`_diff_order`. :func:`normalize`
     has already sorted each ``sort_segments`` run and moved each ``any_position_segments`` segment to
-    the end, so neither reads as a move.
+    the end, so neither reads as a move, and the order check leaves any-position segments out.
     """
     rules = rules or NormalizeRules()
     lsegs = normalize(left, rules)
@@ -205,7 +205,7 @@ def diff(left: str, right: str, rules: NormalizeRules | None = None) -> list[Dif
     left_by_id = _group_by_id(lsegs)
     right_by_id = _group_by_id(rsegs)
 
-    out: list[Difference] = _diff_order(lsegs, rsegs)
+    out: list[Difference] = _diff_order(lsegs, rsegs, rules.any_position_segments)
     for seg_id in sorted(left_by_id.keys() | right_by_id.keys()):
         l_occ = left_by_id.get(seg_id, [])
         r_occ = right_by_id.get(seg_id, [])
@@ -236,8 +236,8 @@ _LCS_MAX_CELLS = 1_000_000
 _Key = tuple[str, ...]
 
 
-def _matched(left: list[_Key], right: list[_Key]) -> tuple[set[int], set[int]] | None:
-    """Indices of ``left`` and ``right`` on one longest common subsequence of the two lists.
+def _matched(left: list[_Key], right: list[_Key]) -> set[int] | None:
+    """Indices of ``left`` on one longest common subsequence of the two lists.
 
     The common prefix and suffix are always on some longest one, so only the middle runs the
     quadratic table; two messages that differ by one move or insertion keep that middle small.
@@ -261,19 +261,17 @@ def _matched(left: list[_Key], right: list[_Key]) -> tuple[set[int], set[int]] |
                 table[i + 1][j + 1] + 1 if lm[i] == rm[j] else max(table[i + 1][j], table[i][j + 1])
             )
     l_hit = set(range(lo)) | set(range(n - hi, n))
-    r_hit = set(range(lo)) | set(range(m - hi, m))
     i = j = 0
     while i < len(lm) and j < len(rm):
         if lm[i] == rm[j]:
             l_hit.add(lo + i)
-            r_hit.add(lo + j)
             i += 1
             j += 1
         elif table[i + 1][j] >= table[i][j + 1]:
             i += 1
         else:
             j += 1
-    return l_hit, r_hit
+    return l_hit
 
 
 def _first_shared(keys: list[_Key], other: Counter[_Key]) -> list[_Key]:
@@ -287,10 +285,14 @@ def _first_shared(keys: list[_Key], other: Counter[_Key]) -> list[_Key]:
     return out
 
 
-def _diff_order(lsegs: list[list[str]], rsegs: list[list[str]]) -> list[Difference]:
+def _diff_order(
+    lsegs: list[list[str]], rsegs: list[list[str]], any_position: frozenset[str]
+) -> list[Difference]:
     """A ``segment-order`` row for each segment both sides hold, whole, in a different place.
 
-    Read on whole segments, so a moved segment is told apart from another of its id: an ``NTE``
+    Segments whose id is in ``any_position`` are left out entirely, so their place is never compared,
+    not even against each other. Read on whole segments, so a moved segment is told apart from
+    another of its id: an ``NTE``
     re-parented beside a new ``NTE`` of the same id is still found. A segment only one side holds,
     or whose content changed, is the ``(id, ordinal)`` pairing's to report, and inserting or deleting
     one must not also read as a move, wherever it sits. So the test is whether one longest common
@@ -302,6 +304,8 @@ def _diff_order(lsegs: list[list[str]], rsegs: list[list[str]]) -> list[Differen
     unchanged is tried, and where it cannot, one ``order-unchecked`` row is returned: the gate fails
     closed rather than pass a move it did not look for.
     """
+    lsegs = [s for s in lsegs if _seg_id(s) not in any_position]
+    rsegs = [s for s in rsegs if _seg_id(s) not in any_position]
     l_keys = [tuple(s) for s in lsegs]
     r_keys = [tuple(s) for s in rsegs]
     if l_keys == r_keys:
@@ -317,7 +321,7 @@ def _diff_order(lsegs: list[list[str]], rsegs: list[list[str]]) -> list[Differen
         seg = _seg_id(lsegs[first])
         occ = sum(1 for s in lsegs[: first + 1] if _seg_id(s) == seg)
         return [Difference(seg, occ, None, None, None, "order-unchecked")]
-    l_hit, r_hit = matched
+    l_hit = matched
     paired = Counter(l_keys[p] for p in l_hit)
     # Per segment, the occurrences no alignment keeps although both sides hold them.
     excess = {k: min(c, r_count[k]) - paired[k] for k, c in l_count.items()}
