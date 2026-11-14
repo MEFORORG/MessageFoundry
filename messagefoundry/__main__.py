@@ -1390,16 +1390,17 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
         default=None,
         help="anchor for the config bundle (overrides [environments].base_dir): the config-repo root "
         "that a relative --config / --service-config / environments/<env>.toml resolves against. "
-        "Default = the working directory (unchanged). Match serve so the gate reads the same files.",
+        "Default = the working directory (unchanged). Pass serve's own value so relative paths "
+        "resolve under the same root.",
     )
     p.add_argument(
         "--env",
         default=None,
         help=env_help
-        or "active environment NAME, used only to check that its value file "
-        "(<[environments].dir>/<env>.toml, default environments/) exists under --project-root when "
-        "the graph references env(); without --project-root it has no effect. This command loads "
-        "no env() values, resolves no env() reference and runs no posture check; check --env does.",
+        or "active environment NAME, used only for ADR 0050's value-file check under --project-root, "
+        "which can fail the command when that environment's value file is missing; without "
+        "--project-root it has no effect. This command loads no env() values, resolves no env() "
+        "reference and runs no posture check; check --env does.",
     )
     p.add_argument(
         "--service-config",

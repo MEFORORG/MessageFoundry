@@ -5,7 +5,8 @@ project-root / active-env / service-config flags serve does, resolve the same bu
 suppresses its messagefoundry.toml upward-walk when --service-config / --project-root is supplied —
 WITHOUT adopting serve's required-active-env / explicit-posture refusal. ADR 0050 Amendment A makes
 one exception: `check --env`'s settings checks read the name as `serve --env` does
-(tests/test_checks_gate_parity.py covers it).
+(tests/test_checks_gate_parity.py covers it through run_checks; the vault BACKLOG #5554 tests at the
+end of this file pin it from the command line, and pin what --env does on the other three).
 """
 
 from __future__ import annotations
@@ -389,7 +390,9 @@ def test_validate_env_resolves_no_value_where_check_env_does(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # The behaviour the validate help now states: a value file that lacks a key the graph references
-    # passes validate --env, and fails check --env's build check, which resolves the values.
+    # passes validate --env, and fails check --env's build check, which resolves the values. This
+    # pins today's code, which ADR 0050's 2026-11-14 note records as short of AC-6. If value
+    # resolution is built into validate, this assertion changes with it, by design.
     cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
     (tmp_path / "environments").mkdir()
     (tmp_path / "environments" / "dev.toml").write_text('other = "x"\n', encoding="utf-8")
