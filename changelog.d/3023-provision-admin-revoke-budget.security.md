@@ -4,4 +4,5 @@
   still raises the `administrator_granted` alert, then refuses the command with text naming
   `messagefoundry admin-revoke-sessions`, the host command that ends the earlier holder's session;
   one given up on before the grant refuses it with no password or role written. A run refused
-  after it set the password also ends the account's sessions.
+  after it set the password also tries to end the account's sessions, except a fresh account's run
+  refused for an unexpected grant outcome; a revoke the store refuses is named in the refusal text.
