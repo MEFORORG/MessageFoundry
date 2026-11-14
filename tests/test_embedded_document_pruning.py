@@ -43,7 +43,7 @@ from messagefoundry.store import MessageStore, document_strip
 from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.crypto import CipherUnavailableError, IdentityCipher
 from messagefoundry.store.document_strip import StripResult
-from messagefoundry.store.store import OutboxStatus
+from messagefoundry.store.store import OutboxStatus, load_audit_chain
 
 DAY = 86_400.0
 PRUNED_AT = 1_700_000_000.0
@@ -66,6 +66,11 @@ _DB_NAME = "embedded_doc_pruning.db"
 
 
 # --- backend fixtures (SQLite always; PG/SQLServer skipif-gated) ---------------
+#
+# The server cases run on the shared live databases of the postgres-store and sqlserver-store CI
+# legs (BACKLOG #5651). As in the sibling store suites, a setup failure closes the pool (BACKLOG
+# #1629), and the audit chain is read again from the emptied log, because a keyed chain an earlier
+# file left would make this keyless handle refuse every append.
 
 _PG = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_POSTGRES"),
@@ -87,11 +92,16 @@ async def _open_postgres(_tmp_path):  # pragma: no cover - only runs when gated 
 
     settings = load_settings(environ=os.environ).store
     s = await PostgresStore.open(settings)
-    async with s._pool.acquire() as conn:
-        await conn.execute(
-            "TRUNCATE message_events, audit_log, queue, response, delivered_keys, messages "
-            "RESTART IDENTITY CASCADE"
-        )
+    try:
+        async with s._pool.acquire() as conn:
+            await conn.execute(
+                "TRUNCATE message_events, audit_log, queue, response, delivered_keys, messages "
+                "RESTART IDENTITY CASCADE"
+            )
+        await load_audit_chain(s, read_only=False)
+    except BaseException:
+        await s.close()
+        raise
     return s
 
 
@@ -101,18 +111,23 @@ async def _open_sqlserver(_tmp_path):  # pragma: no cover - only runs when gated
 
     settings = load_settings(environ=os.environ).store
     s = await SqlServerStore.open(settings)
-    async with s._pool.acquire() as conn:
-        cur = await conn.cursor()
-        for table in (
-            "message_events",
-            "audit_log",
-            "queue",
-            "response",
-            "delivered_keys",
-            "messages",
-        ):
-            await cur.execute(f"DELETE FROM {table}")
-        await conn.commit()
+    try:
+        async with s._pool.acquire() as conn:
+            cur = await conn.cursor()
+            for table in (
+                "message_events",
+                "audit_log",
+                "queue",
+                "response",
+                "delivered_keys",
+                "messages",
+            ):
+                await cur.execute(f"DELETE FROM {table}")
+            await conn.commit()
+        await load_audit_chain(s, read_only=False)
+    except BaseException:
+        await s.close()
+        raise
     return s
 
 
