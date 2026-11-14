@@ -2645,6 +2645,56 @@ async def test_a_reload_during_the_halt_leaves_a_content_stopped_pooled_lane_and
         await runner.stop()
 
 
+@pytest.mark.parametrize(
+    ("held_stage", "unheld_stage"),
+    [(Stage.INGRESS, Stage.ROUTED), (Stage.ROUTED, Stage.INGRESS)],
+)
+async def test_a_reload_during_the_halt_re_arms_a_stopped_lane_whose_sibling_stage_holds_the_stop(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held_stage: Stage,
+    unheld_stage: Stage,
+) -> None:
+    # BACKLOG #5704 review: one ("inbound", name) record holds the INGRESS, ROUTED and RESPONSE lanes
+    # of an inbound, so the reload broadcast must ask whether the lane's OWN stage recorded the hold.
+    # A lane STOPPED with no hold of its own is re-armed by the reload during the halt, as on main,
+    # while the sibling stage whose STOP is held stays STOPPED and keeps the hold. MEASURED
+    # 2026-11-14: keyed by the inbound alone, the reload left the unheld lane STOPPED.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "pooled")
+    await runner.start()
+    try:
+        held = runner._dispatchers[held_stage]
+        unheld = runner._dispatchers[unheld_stage]
+        held._to_stopped(INBOUND, held._states[INBOUND], "T17 bound")
+        held._report_own_stop(INBOUND)  # the holding stage records its hold, as at T17
+        unheld._to_stopped(INBOUND, unheld._states[INBOUND], "inbound not in registry")
+        assert ("inbound", INBOUND) in runner._stop_held
+        _kill_every_sink(logdir, monkeypatch)
+        logging.getLogger("t").warning("a record this engine cannot write anywhere")
+        assert await _until(lambda: runner._log_write_stopped), "the halt never fired"
+        assert await _until(lambda: not runner._log_guard_tasks), "the halt never finished"
+        assert held.stopped(INBOUND) and unheld.stopped(INBOUND), "a forced STOP did not stand"
+
+        await runner.reload(_e2e_registry(outdir))
+        assert runner._log_write_stopped  # the log is still dead
+        assert not unheld.stopped(INBOUND), "the reload kept a lane whose sibling holds the STOP"
+        assert held.stopped(INBOUND), "the reload re-armed the held STOP"
+        assert ("inbound", INBOUND) in runner._stop_held, "the reload released the sibling's hold"
+
+        _revive_every_sink(logdir, monkeypatch)
+        await runner.restart_inbound(INBOUND)
+        await runner.start_outbound(OUTBOUND)
+        assert not runner._log_write_stopped and INBOUND not in runner._log_halted
+        assert not unheld.stopped(INBOUND), "the recovery restart left the unheld lane STOPPED"
+        assert held.stopped(INBOUND), "the recovery restart re-armed the held STOP"
+    finally:
+        await runner.stop()
+
+
 async def test_an_unheld_stopped_pooled_lane_runs_after_a_halt_reload_and_the_recovery_restart(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

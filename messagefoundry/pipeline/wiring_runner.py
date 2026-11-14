@@ -1580,6 +1580,14 @@ _HOLD_DIRECTION: dict[Stage, Direction] = {
     Stage.RESPONSE: "inbound",
     Stage.OUTBOUND: "outbound",
 }
+# The internal stages one ("inbound", name) hold covers, and the stage each per_lane inbound worker
+# kind drains (BACKLOG #5704: a log halt keeps STOPPED only the lane whose own stage holds).
+_INTERNAL_STAGES: tuple[Stage, ...] = (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE)
+_WORKER_STAGE: dict[str, Stage] = {
+    "router": Stage.INGRESS,
+    "transform": Stage.ROUTED,
+    "response": Stage.RESPONSE,
+}
 
 
 def _to_lane_result(outcome: tuple[_ItemOutcome, float | None]) -> LaneItemResult:
@@ -2231,6 +2239,10 @@ class RegistryRunner:
         # `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
+        # Which internal stage recorded each ("inbound", name) hold, None for a hold recorded with no
+        # stage. Read only by _log_halt_keeps_stopped, so a log halt keeps STOPPED only the lane whose
+        # own stage holds; the shared record above stays as it is (BACKLOG #5704).
+        self._stop_held_stages: set[tuple[Stage | None, str]] = set()
         # BACKLOG #5708: inbounds whose transform lane's last routed row stopped it because the inbound
         # was missing from the graph, recorded by _apply_routed and read once by whatever ends that
         # STOP (_take_voided_transform_stop). A content STOP never records one.
@@ -2572,7 +2584,11 @@ class RegistryRunner:
         it re-arms. The STOPPED set is read BEFORE the broadcast: a hold whose lane has not reached
         STOPPED yet (the STOP site records it first) is not re-armed by it, and must survive."""
         kind = _HOLD_DIRECTION.get(stage)
-        keep = None if stage is Stage.OUTBOUND else self._log_halt_keeps_stopped
+        keep = (
+            None
+            if stage is Stage.OUTBOUND
+            else functools.partial(self._log_halt_keeps_stopped, stage)
+        )
         rearmed = [
             n
             for k, n in self._stop_held
@@ -2581,18 +2597,23 @@ class RegistryRunner:
         d.notify_work(keep_stopped=keep)
         if kind is not None:
             for n in rearmed:
-                self._release_operator_hold(n, kind)
+                # The inbound record is shared by its internal stages, so a sibling stage the halt
+                # keeps STOPPED keeps the hold too.
+                if not any(self._log_halt_keeps_stopped(s, n) for s in _INTERNAL_STAGES):
+                    self._release_operator_hold(n, kind)
 
-    def _log_halt_keeps_stopped(self, name: str) -> bool:
-        """Whether internal lane ``name`` stays STOPPED through a re-arm (BACKLOG #5704): only while
-        the #122 claim gate holds its inbound AND a STOP holds that inbound, so a reload during the
-        halt neither re-arms a held STOP nor releases its hold. An internal lane is keyed by its
-        inbound's name, and the hold by ``("inbound", name)``, one record for the INGRESS, ROUTED
-        and RESPONSE lanes together: a hold any of them recorded keeps all three STOPPED. When no
-        STOP holds the inbound, a STOPPED lane is re-armed as it is with no halt, and the gate then
-        refuses its claims until it lifts. Read by the pooled broadcast (:meth:`_broadcast_to`) and
-        by the per_lane respawn (:meth:`_ensure_inbound_workers`)."""
-        return self._inbound_log_halted(name) and ("inbound", name) in self._stop_held
+    def _log_halt_keeps_stopped(self, stage: Stage, name: str) -> bool:
+        """Whether ``name``'s ``stage`` lane stays STOPPED through a re-arm (BACKLOG #5704): only
+        while the #122 claim gate holds its inbound AND a STOP that ``stage`` recorded holds it, so a
+        reload during the halt neither re-arms a held STOP nor releases its hold. The hold itself is
+        one ``("inbound", name)`` record for the INGRESS, ROUTED and RESPONSE lanes together, so the
+        stage is read from :attr:`_stop_held_stages`; a hold recorded with no stage counts for every
+        stage. Any other STOPPED lane is re-armed as it is with no halt, and the gate then refuses
+        its claims until it lifts. Read by the pooled broadcast (:meth:`_broadcast_to`) and by the
+        per_lane respawn (:meth:`_ensure_inbound_workers`)."""
+        if not self._inbound_log_halted(name) or ("inbound", name) not in self._stop_held:
+            return False
+        return (stage, name) in self._stop_held_stages or (None, name) in self._stop_held_stages
 
     def _resume_pooled_lane(self, d: StageDispatcher, stage: Stage, name: str) -> None:
         """``d.resume_lane(name)``, lifting the operator hold only when it re-arms something.
@@ -5450,7 +5471,7 @@ class RegistryRunner:
             return
         self._record_failed(name, exc, kind="inbound")
 
-    def _hold_for_operator(self, name: str, kind: Direction) -> None:
+    def _hold_for_operator(self, name: str, kind: Direction, stage: Stage | None = None) -> None:
         """Record that ``name``'s ``kind`` lane halted on a STOP whose cause the calendar must not
         retry (at least a #109 credential fault, a #2083 configuration fault, the internal-error STOP
         policy, or a pooled dispatcher's T17 or claimer-death STOP via :meth:`_pooled_stop_hold`).
@@ -5458,9 +5479,12 @@ class RegistryRunner:
         STOP site as its last step
         before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
         raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
-        to hold. The scheduler reads it through :meth:`_schedule_holds`."""
+        to hold. The scheduler reads it through :meth:`_schedule_holds`. An inbound hold also records
+        ``stage``, the internal stage whose lane STOPped, for :meth:`_log_halt_keeps_stopped`."""
         self._stop_held.add((kind, name))
         self._stop_hold_logged.discard((kind, name))
+        if kind == "inbound":
+            self._stop_held_stages.add((stage, name))
 
     def _log_halt_holds(self, name: str, kind: Direction) -> bool:
         """Whether a #122 log-write halt holds ``name``'s ``kind`` lane down against the scheduler.
@@ -5493,7 +5517,7 @@ class RegistryRunner:
             return None
 
         def _hold(lane: str) -> None:
-            self._hold_for_operator(lane, kind)
+            self._hold_for_operator(lane, kind, stage)
 
         return _hold
 
@@ -5547,6 +5571,8 @@ class RegistryRunner:
         again."""
         self._stop_held.discard((kind, name))
         self._stop_hold_logged.discard((kind, name))
+        if kind == "inbound":
+            self._stop_held_stages -= {(s, n) for s, n in self._stop_held_stages if n == name}
 
     def _schedule_holds(self, name: str, kind: Direction) -> bool:
         """Whether the scheduler must leave ``name``'s ``kind`` lane alone because a recorded STOP
@@ -7434,6 +7460,7 @@ class RegistryRunner:
         # start() re-arms every lane from scratch, so no STOP outlives a full teardown.
         self._stop_held.clear()
         self._stop_hold_logged.clear()
+        self._stop_held_stages.clear()
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
         self._fusion_pool_open_failed = False
@@ -7605,15 +7632,15 @@ class RegistryRunner:
         if ic is not None and ic.spec.type is ConnectorType.LOOPBACK:
             # ADR 0013: a loopback inbound also gets a RESPONSE worker draining its Stage.RESPONSE tokens.
             kinds.append("response")
-        # While the #122 log halt gates this inbound, a worker a content STOP ended (its hold is
-        # recorded) is not respawned: the new worker would wait at the claim gate and then retry the
+        # While the #122 log halt gates this inbound, a worker a content STOP ended (its own stage
+        # recorded the hold) is not respawned: the new worker would wait at the claim gate and then retry the
         # STOP's message the moment the gate lifts, with the hold still recorded (BACKLOG #5704).
         # The next ungated door re-arms it. A worker that RAISED is respawned by its done-callback.
         gated = self._inbound_log_halted(name)
-        held = self._log_halt_keeps_stopped(name)
         rearmed = False
         for kind in kinds:
             task = self._inbound_worker_dict(kind).get(name)
+            held = self._log_halt_keeps_stopped(_WORKER_STAGE[kind], name)
             if task is None or (task.done() and not held):
                 self._spawn_inbound_worker(kind, name)
                 rearmed = rearmed or kind != "response"
@@ -11370,7 +11397,7 @@ class RegistryRunner:
             self._alert_sink.connection_stopped(
                 name, detail=f"router {type(exc).__name__} on {item.id}"
             )
-            self._hold_for_operator(name, "inbound")
+            self._hold_for_operator(name, "inbound", Stage(item.stage))
             return _ItemOutcome.STOPPED, None
         log.warning(
             "router worker %r: router error on %s (%s); dead-lettering",
@@ -11406,7 +11433,7 @@ class RegistryRunner:
             self._alert_sink.connection_stopped(
                 name, detail=f"handler {type(exc).__name__} on {item.id}"
             )
-            self._hold_for_operator(name, "inbound")
+            self._hold_for_operator(name, "inbound", Stage(item.stage))
             return _ItemOutcome.STOPPED, None
         log.warning(
             "transform worker %r: handler error on %s (%s); dead-lettering",
