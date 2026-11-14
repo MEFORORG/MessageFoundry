@@ -247,6 +247,10 @@ QUOTED_FAMILIES: tuple[Family, ...] = tuple(
 )
 
 
+#: The key type a key block names, kept apart from its markers so no literal key block sits in
+#: this source for the repository's secret scanner to read (BACKLOG #5550).
+_PK = "PRIVATE" + " KEY"
+
 #: Every credential family the write-time chain must scrub. The first seven are the shapes measured
 #: passing VERBATIM at 68693cfc2, in the order they were measured.
 FAMILIES: tuple[Family, ...] = (
@@ -328,6 +332,17 @@ FAMILIES: tuple[Family, ...] = (
         line="store dsn postgres://svc:wt-D5n_Pass-61@db.invalid:5432/mefor",
         secret="wt-D5n_Pass-61",
         patterns=("_DSN_PASSWORD",),
+    ),
+    Family(
+        # BACKLOG #5550: a private key block over several lines. The PHI pass runs first on this
+        # chain and rewrites both markers, so the pattern's second form is the one that reads it.
+        name="private_key_block",
+        line=(
+            f"key load failed:\n-----BEGIN RSA {_PK}-----\nMIIEowIBAAKCAQEA\n"
+            f"wt-pem_pem-99==\n-----END RSA {_PK}-----\nretrying"
+        ),
+        secret="wt-pem_pem-99",
+        patterns=("_PEM_PRIVATE_KEY",),
     ),
     Family(
         # BACKLOG #5549: an empty username, which the one-or-more user class refused.

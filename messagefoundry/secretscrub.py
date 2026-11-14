@@ -1431,6 +1431,46 @@ _KEY_MATERIAL = re.compile(
 # number of times. The user's repetition is possessive: it cannot hold the ":" that must follow it.
 _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+):[^\s/]+@")
 
+# A PEM OR OPENSSH PRIVATE KEY BLOCK (BACKLOG #5550): a begin marker, five dashes, ``BEGIN``, a key type
+# ending in ``PRIVATE KEY`` and five dashes again, then the base64 body over many lines, then the end
+# marker spelled the same way with ``END``. No label pattern reads one: the marker
+# is no ``label=`` shape, and under ``private_key=`` the plain value stopped at the space inside the
+# marker, so the body printed whole. A key handed to a loader that then failed, or echoed in a
+# bytes repr, would put the private key on the write-time streams.
+#
+# THE BODY IS REPLACED AND BOTH MARKERS ARE KEPT, so a reader still sees that a key was there, and of
+# what kind. It runs from the begin marker up to the next ``-----``, over what a key body and its RFC
+# 1421 headers hold: base64, white space, ",", ":", "_", a single "-", a backslash escape such as the
+# ``\n`` a repr or a JSON string writes, and the PHI pass's ``[redacted]``. It must open, past white
+# space and escaped line breaks, on four base64 characters.
+#
+# A BEGIN MARKER WITH NO END MARKER AFTER ITS BODY IS READ ONLY WHEN A LINE BREAK FOLLOWS IT, real or
+# escaped, as a key block's marker stands on its own line. That is a block a driver or a log line cut
+# short, and its body is taken up to the first character outside the set, which can over-redact the
+# next words of the message, the direction this module may fail in. A marker followed on its own line
+# by more text, as a diagnostic naming the marker writes it, needs the end marker, so the words after
+# it stay. A key pasted onto one line with spaces, as an environment value holds one, has both.
+#
+# THE SECOND FORM IS THE MARKER THE PHI PASS LEFT, AND IT IS THE ONE THE INSTALLED CHAIN SEES.
+# ``logging_setup`` runs :func:`messagefoundry.redaction.redact` before this pass, and its name-run
+# rule reads ``BEGIN RSA PRIVATE KEY`` as a run of capitalised tokens, so every marker reaches this
+# pass as ``-----[redacted]-----``. That form names no key type, so it is read only with an end
+# marker of the same form after the body: a body between two such markers. That costs coverage in two
+# places, both stated: a block with no end marker prints its body on the installed chain, and a
+# CERTIFICATE or PUBLIC KEY block, which the PHI pass marks the same way, has its body redacted too.
+# Text between two blocks is taken when it opens on four base64 characters, as a second block's body.
+#
+# LINEAR. A match starts only at five dashes, the label is a bounded walk, and the body is possessive
+# over branches that open on different characters and ends at the next ``-----``, so two blocks'
+# bodies never share a character.
+_PEM_PRIVATE_KEY = re.compile(
+    r"(-----(?:BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?|(?P<phi>\[redacted\])[A-Z0-9 ]{0,40})-----)"
+    r"(?:(?P<line>)(?=[ \t]*+(?:\r?\n|\\[rn])))?"
+    r"(?=(?:\s|\\[rn])*+[A-Za-z0-9+/]{4})"
+    r"(?:[A-Za-z0-9+/=\s,:_]|\\[^\r\n]|-(?!----)|\[redacted\])++"
+    r"(?(phi)(?=-----\[redacted\][A-Z0-9 ]{0,40}-----)|(?(line)|(?=-----END )))"
+)
+
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
 #: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,
 #: :data:`_MEMBER_EXTRA_HINT`, admits the member pass beside :data:`_CREDENTIAL_HINT`.
@@ -1859,6 +1899,9 @@ _KEY_MATERIAL_HINT = _folded(_KEY_LABEL_WORDS)
 _SCHEME_HINT = _folded(("bearer",))
 _ENV_HINT = _folded((_ENV_PREFIX,))
 _DSN_HINT = (_DSN_MARKER,)
+#: The five dashes both of :data:`_PEM_PRIVATE_KEY`'s markers open with. Not a word: the pattern
+#: is case-sensitive and reads no label, and five dashes hold no letter a fold character could spell.
+_PEM_HINT = ("-----",)
 #: The compound key words alone, for :func:`_reads_camel`. Not a pass gate: ``_KEY_MATERIAL_HINT``
 #: holds them for that.
 _COMPOUND_HINT = _folded(_COMPOUND_KEY_WORDS)
@@ -1872,9 +1915,9 @@ _CAMEL_PROBE = re.compile(_camel_start(r"\b['\"]?\s*+[:=]"), re.IGNORECASE)
 #: is dropped, because any text holding it holds the shorter one too. Derived, so it cannot drift from
 #: the tuples above -- ``pass`` subsumes ``password``/``passwd``/``passphrase``, ``encryption_key``
 #: subsumes ``encryption_keys_retired``, ``api_key`` subsumes ``intake_api_key_next``, ``accesskey``
-#: subsumes ``sharedaccesskey``. One scan of 23 members instead of 30 (counted with BACKLOG #5545's
-#: compound key words), and it rejects the overwhelmingly common record: the one carrying no
-#: credential word at all. The member pass's own words (:data:`_MEMBER_EXTRA_HINT`) are in it too,
+#: subsumes ``sharedaccesskey``. One scan of 24 members instead of 31 (counted with BACKLOG #5545's
+#: compound key words and BACKLOG #5550's key-block dashes), and it rejects the overwhelmingly
+#: common record: the one carrying no credential word at all. The member pass's own words (:data:`_MEMBER_EXTRA_HINT`) are in it too,
 #: so a word added there and nowhere else still admits the record (BACKLOG #5030).
 _ANY_HINT = tuple(
     sorted(
@@ -1887,6 +1930,7 @@ _ANY_HINT = tuple(
                 *_KEY_MATERIAL_HINT,
                 *_ENV_HINT,
                 *_DSN_HINT,
+                *_PEM_HINT,
             }
             if not any(
                 other != word and other in word
@@ -1897,6 +1941,7 @@ _ANY_HINT = tuple(
                     *_KEY_MATERIAL_HINT,
                     *_ENV_HINT,
                     *_DSN_HINT,
+                    *_PEM_HINT,
                 }
             )
         }
@@ -2161,6 +2206,10 @@ def _run(text: str, placeholder: str, folded: str | None, sub: _Sub | None = Non
     pre-camelCase reading otherwise. Its last argument names the group a replacement writes back
     masked at its end, which only the tracing reads."""
     apply = _plain_sub if sub is None else sub
+    # FIRST, ahead of the label patterns: a ``private_key=`` value would otherwise stop inside the
+    # begin marker and leave the block unreadable here (BACKLOG #5550; see the pattern).
+    if _admits(folded, _PEM_HINT):
+        text = apply(_PEM_PRIVATE_KEY, lambda m: f"{m.group(1)}{placeholder}", text, None)
     if _admits(folded, _ENV_HINT):
         text = apply(_MEFOR_SECRET, lambda m: _keep_label(m, placeholder), text, _BRACED)
     if _admits(folded, _TOKEN_HINT):

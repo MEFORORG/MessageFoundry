@@ -52,6 +52,7 @@ import re
 from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
     _CONNECTION_STRING_MEMBER,
+    _PEM_PRIVATE_KEY,
     _braced_tail,
     _mask_member,
     scrub_credentials,
@@ -672,6 +673,11 @@ def redact_log_line(line: str) -> str:
     ts = _LEADING_TS.match(line)
     prefix, body = (line[: ts.end()], line[ts.end() :]) if ts else ("", line)
     logged_placeholder = REDACTION_PLACEHOLDER in body
+    # A private key block on one line, as a repr or a JSON string writes one, its body replaced and
+    # its markers kept (BACKLOG #5550). secretscrub's pattern, not a copy, and first, ahead of the PHI
+    # pass that would rewrite the begin marker. A block over several log lines reaches this function
+    # one line at a time, so its body lines are left to the long-base64 sweep below.
+    body = _PEM_PRIVATE_KEY.sub(lambda m: f"{m.group(1)}{REDACTION_PLACEHOLDER}", body)
     body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
     body = _MEFOR_SECRET.sub(_keep_label, body)
     body = _BEARER.sub(_keep_label, body)

@@ -90,6 +90,10 @@ from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
 from tests._ast_sites import named_func
 from tests._growth import _growth_between
 
+#: The key type every key block in this file names, kept apart from its markers so no literal key
+#: block sits in this source for the repository's secret scanner to read (BACKLOG #5550).
+_PK = "PRIVATE" + " KEY"
+
 #: A pattern that can never match, used to disable one redactor pattern for the mutation fixture.
 NEVER_MATCHES = re.compile(r"(?!x)x")
 
@@ -431,6 +435,17 @@ FAMILIES: tuple[Family, ...] = (
     ),
     # BACKLOG #5549: an empty username, and an unencoded "@" inside the password, whose tail the
     # first-"@" class printed.
+    Family(
+        # BACKLOG #5550: a private key block written on one line, as a bytes repr writes one. A block
+        # over several log lines reaches the bundle one line at a time.
+        name="private_key_block_repr",
+        line=(
+            f"key load failed b'-----BEGIN {_PK}-----\\nMIIEvQIBADAN\\npw-pem_pem-59\\n"
+            f"-----END {_PK}-----\\n' retrying"
+        ),
+        secret="pw-pem_pem-59",
+        patterns=("_PEM_PRIVATE_KEY",),
+    ),
     Family(
         name="dsn_empty_username",
         line="store dsn redis://:pw-D5n_Pass-56@cache.invalid:6379/0",
@@ -4396,6 +4411,65 @@ def test_the_dsn_tail_grows_linearly_in_line_length() -> None:
             assert growth <= _MAX_GROWTH, (
                 f"{module.__name__}._DSN_PASSWORD grew {growth:.1f}x for 8x on {shape(40)!r}"
             )
+
+
+@pytest.mark.parametrize(
+    ("line", "secret"),
+    (
+        (
+            f"-----BEGIN EC {_PK}-----\nMHcCAQEE\nzq-pem_pem-81\n-----END EC {_PK}-----",
+            "",
+        ),
+        (f"-----BEGIN OPENSSH {_PK}-----\nb3BlbnNz\nzq-pem_pem-81", "a block cut short"),
+        (f"env -----BEGIN {_PK}----- MIIEab zq-pem_pem-81 -----END {_PK}----- ok", ""),
+        (
+            f'{{"k": "-----BEGIN {_PK}-----\\nMIIE\\nzq-pem_pem-81\\n-----END {_PK}-----"}}',
+            "",
+        ),
+        (
+            "-----[redacted]-----\nMIIEvQ\nzq-pem_pem-81\n-----[redacted]-----",
+            "the PHI pass's markers",
+        ),
+    ),
+)
+def test_a_private_key_block_body_is_hidden_and_its_markers_kept(line: str, secret: str) -> None:
+    out = scrub_credentials(line)
+    assert "zq-pem_pem-81" not in out, (secret, out)
+    assert out.count("-----") >= 2, out
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        f"expected a -----BEGIN {_PK}----- header in the key file",
+        "-----[redacted]-----\nnext words of the record",
+        "loaded -----BEGIN CERTIFICATE-----\nMIIBcert\n-----END CERTIFICATE----- ok",
+    ),
+)
+def test_a_marker_with_no_key_body_after_it_leaves_the_text(line: str) -> None:
+    """A diagnostic naming the begin marker, text after a lone PHI marker, and a certificate under
+    its own begin marker are no private key body. A certificate the PHI pass has marked is, as the
+    pattern's comment states."""
+    assert scrub_credentials(line) == line
+
+
+def test_the_private_key_block_grows_linearly_in_line_length() -> None:
+    shapes: tuple[Callable[[int], str], ...] = (
+        lambda length: f"-----BEGIN {_PK}-----\n" + "AbC+" * (length // 4),
+        lambda length: "-----[redacted]-----\nAAAA" * (length // 24),
+        lambda length: f"-----BEGIN {_PK}----- x " * (length // 30),
+        lambda length: "-----[redacted]-----\n" + "Ab-" * (length // 3),
+    )
+    pattern = scrub_mod._PEM_PRIVATE_KEY
+
+    def sub(text: str) -> str:
+        return pattern.sub("x", text)
+
+    for shape in shapes:
+        growth = _growth_between(
+            sub, shape(_GROWTH_LENGTHS[0]), shape(_GROWTH_LENGTHS[1]), rounds=5
+        )
+        assert growth <= _MAX_GROWTH, f"_PEM_PRIVATE_KEY grew {growth:.1f}x on {shape(40)!r}"
 
 
 def test_the_quoted_scheme_token_grows_linearly_in_line_length() -> None:
