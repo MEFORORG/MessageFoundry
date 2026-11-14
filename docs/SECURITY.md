@@ -7402,7 +7402,8 @@ still writes every lock row (ADR 0197 AC-10), and an Administrator reads them al
 In their place, every refused sign-in on an existing, enabled local account writes one
 `auth.login_failed` row with reason `bad_credentials` (plus `combined: true` for a combined sign-in),
 whether a wrong credential or a live lock refused it. Two refusals keep their own rows: an unknown or
-disabled name (`reason: unknown_or_disabled`), and a right password on an expired temporary
+disabled name (`reason: unknown_or_disabled`, also written for an account deleted before the
+sign-in's session was written, BACKLOG #2733), and a right password on an expired temporary
 credential (`auth.temp_password_expired`). That action also records a session ended because its
 temporary credential lapsed, with at least these `at` values: `"session"` with no sign-in attempt
 behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on the same browser,

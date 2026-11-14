@@ -1357,7 +1357,8 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(
 
 async def test_a_session_for_a_missing_account_is_refused(store) -> None:
     """BACKLOG #2733: SQL Server's sign-in wrote an orphaned session for an account that does not
-    exist, where SQLite and Postgres refused it on their key. The shared body is the one they run."""
+    exist. The shared body, which SQLite and Postgres run too, now meets ``create_session``'s own
+    missing-account refusal, not the key; the trust test above checks the key."""
     from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
 
     await assert_a_session_for_a_missing_account_is_refused(store)

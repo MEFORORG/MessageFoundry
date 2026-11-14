@@ -8172,8 +8172,8 @@ class AuthService:
                 # BACKLOG #1474. THE UNBIND'S SESSION SWEEP CANNOT SEE A SESSION THAT DOES NOT EXIST
                 # YET, which is the race this closes: an admin unbinding this account mid-login
                 # revokes what is live at that instant, and without the guard this login's own
-                # INSERT lands just after it. The Kerberos and password legs pass nothing here, so
-                # they take no extra read and no extra statement.
+                # INSERT lands just after it. The password leg passes no guard, so it skips the
+                # binding comparison; its account read still runs, for the session epoch.
                 #
                 # vault BACKLOG #2609. THE WINDOWS SSO LEG NOW PASSES THE MIRROR GUARD, so the
                 # sentence above holds for the password leg only. The refusal further up read
