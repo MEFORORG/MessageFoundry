@@ -4145,8 +4145,8 @@ _SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
 def passkey_cell_undecodable(exc: BaseException) -> bool:
     """Whether ``exc`` is a driver failing to decode a passkey cell while fetching, before any row
     is parsed: pyodbc's ``UnicodeDecodeError``, or sqlite3's ``OperationalError`` told apart only by
-    its message (:func:`escalation_passkeys`). Every reader that counts such a set for nothing
-    asks it."""
+    its message. :func:`passkeys_or_none`, and every other reader that counts such a set for
+    nothing, asks it."""
     if isinstance(exc, UnicodeDecodeError):
         return True
     return isinstance(exc, sqlite3.OperationalError) and str(exc).startswith(_SQLITE_DECODE_FAILURE)
@@ -4183,6 +4183,21 @@ async def escalation_passkeys(
     record = await read_record()
     if record is None or not sets_a_later_sign_in_lock(record.row, threshold, now):
         return None
+    return await passkeys_or_none(
+        read_passkeys, record.row.id, "its sign-in lock keeps its fixed length"
+    )
+
+
+async def passkeys_or_none(
+    read_passkeys: Callable[[], Awaitable[list[WebAuthnCredential]]],
+    user_id: str,
+    outcome: str,
+) -> list[WebAuthnCredential] | None:
+    """The passkey set ``read_passkeys`` reads for ``user_id``, or ``None`` where it cannot be
+    read: a row that does not parse (:class:`PasskeyRowMalformed`), or a cell the driver cannot
+    decode while fetching (:func:`passkey_cell_undecodable`). Logged as a warning naming the
+    account, the failure's class and ``outcome``, what the caller does instead. Any other error is
+    raised."""
     try:
         return await read_passkeys()
     except PasskeyRowMalformed as exc:
@@ -4195,11 +4210,7 @@ async def escalation_passkeys(
             raise
         failure = type(exc).__name__
     # The class name only: a decode error's message and arguments quote the cell.
-    log.warning(
-        "the passkeys of user %s could not be read (%s); its sign-in lock keeps its fixed length",
-        record.row.id,
-        failure,
-    )
+    log.warning("the passkeys of user %s could not be read (%s); %s", user_id, failure, outcome)
     return None
 
 
@@ -4276,6 +4287,33 @@ def removal_keeps_way_past(
     trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
     counts = passkey_counts or passkey_is_way_past
     return trusted and any(counts(c) for c in remaining)
+
+
+async def way_past_passkeys(
+    record: UserAuthzRecord | None,
+    read_passkeys: Callable[[], Awaitable[list[WebAuthnCredential]]],
+    *,
+    totp_counts: TotpCounts | None,
+    drop_totp: bool = False,
+) -> list[WebAuthnCredential]:
+    """The passkey set a conditional write's way-past rule is given (:func:`holds_way_past`,
+    :func:`removal_keeps_way_past`, :func:`totp_removal`), read under the write's lock after
+    ``record``, the account row that lock holds (BACKLOG #3948 step 7).
+
+    Where the write keeps the TOTP (not ``drop_totp``) and ``totp_counts`` counts it on ``record``,
+    the rule passes on the TOTP alone, so no passkey is read for it: a set that cannot be read
+    must not refuse a write the TOTP already allows. A write that reads the set for its own sake
+    still does (the passkey delete re-seals over the new set). A TOTP judged before the lock that no longer counts
+    under it (:meth:`TotpJudgement.moved`) falls back to the read. Where the write removes the TOTP
+    (``drop_totp``) it is the other way round: the passkeys matter only while that TOTP counts
+    (:func:`totp_removal`), so only then are they read. A set that cannot be read
+    (:func:`passkeys_or_none`) is empty here, so it counts as no way past, whatever the seal."""
+    if record is None or bool(_totp_is_way_past(record, totp_counts)) != bool(drop_totp):
+        return []
+    read = await passkeys_or_none(
+        read_passkeys, record.row.id, "it counts as no way past the sign-in lock"
+    )
+    return [] if read is None else read
 
 
 def totp_removal(
@@ -19070,7 +19108,7 @@ class MessageStore:
         return updated
 
     async def _account_passkeys(self, user_id: str) -> list[WebAuthnCredential]:
-        # Closed on the way out, a failed fetch included: escalation_passkeys survives a cell that
+        # Closed on the way out, a failed fetch included: passkeys_or_none survives a cell that
         # does not decode, and an open statement would hold back a WAL checkpoint until GC.
         async with self._db.execute(
             "SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,)
@@ -19289,14 +19327,22 @@ class MessageStore:
             else None
         )
         async with _writer_guard(self._db, self._lock):
-            # The passkeys the condition reads are read under the same writer lock as the write.
+            # The passkeys the condition reads are read under the same writer lock as the write,
+            # and only where the record's TOTP does not already count (way_past_passkeys).
+            passkeys: list[WebAuthnCredential] = []
+            if conditional:
+                passkeys = await way_past_passkeys(
+                    await self._read_user_record(user_id),
+                    lambda: self._account_passkeys(user_id),
+                    totp_counts=totp_counts,
+                )
             change = password_change(
                 password_hash=password_hash,
                 password_generated=password_generated,
                 must_change_password=must_change_password,
                 require_way_past=conditional,
                 now=now,
-                passkeys=await self._account_passkeys(user_id) if conditional else (),
+                passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -19547,10 +19593,20 @@ class MessageStore:
             # ``last_totp_step`` too (:func:`totp_disable`): kept, it would refuse the first code of
             # the next secret inside the same 30 seconds -- which the earlier holder of a row being
             # repaired by ``provision-admin`` could use to block the repair.
+            # The TOTP is what goes, so the set is read wherever that TOTP counts, and one that
+            # cannot be read is empty (way_past_passkeys).
+            passkeys: list[WebAuthnCredential] = []
+            if conditional:
+                passkeys = await way_past_passkeys(
+                    await self._read_user_record(user_id),
+                    lambda: self._account_passkeys(user_id),
+                    totp_counts=totp_counts,
+                    drop_totp=True,
+                )
             change = totp_removal(
                 now,
                 require_way_past=conditional,
-                passkeys=await self._account_passkeys(user_id) if conditional else (),
+                passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -19695,7 +19751,9 @@ class MessageStore:
                 current = await self._read_user_record(user_id)
                 if current is None or not removal_keeps_way_past(
                     current,
-                    await self._account_passkeys(user_id),
+                    await way_past_passkeys(
+                        current, lambda: self._account_passkeys(user_id), totp_counts=totp_counts
+                    ),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
