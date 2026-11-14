@@ -1679,3 +1679,62 @@ async def test_run_to_completion_names_its_caller(caplog) -> None:
         "a revoke's seal report failed (RuntimeError); its remaining audit rows and pages were"
         " not sent" in caplog.text
     )
+
+
+async def test_an_exit_bounds_a_wedged_failed_open_cleanup_without_a_cancel(monkeypatch) -> None:
+    """BACKLOG #5720: an open that ends with ``SystemExit`` must not wait unbounded on a wedged
+    cleanup, so its bound starts at once, with no cancel needed."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    forced: list[str] = []
+    unwedge = asyncio.Event()
+
+    async def wedged_release() -> None:
+        await unwedge.wait()
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            SystemExit(1), wedged_release, lambda: forced.append("forced")
+        )
+    )
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=3)
+        assert task in done, "an exiting open still waited on a wedged release"
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    assert task.result() is None
+    assert forced == ["forced"]
+
+
+async def test_a_cancel_on_every_pass_still_reaches_the_forced_release(monkeypatch) -> None:
+    """BACKLOG #5720: a caller that cancels again on every pass, as a cancel scope does, must not
+    keep the wait from ever reaching the bound."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    forced: list[str] = []
+    unwedge = asyncio.Event()
+    started = asyncio.Event()
+
+    async def wedged_release() -> None:
+        started.set()
+        await unwedge.wait()
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            RuntimeError("open boom"), wedged_release, lambda: forced.append("forced")
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        deadline = asyncio.get_running_loop().time() + 3
+        while not task.done() and asyncio.get_running_loop().time() < deadline:
+            task.cancel()
+            await asyncio.sleep(0)
+        assert task.done(), "repeated cancels kept the cleanup from its bound"
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    assert forced == ["forced"]

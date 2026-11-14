@@ -1952,9 +1952,6 @@ async def _run_to_completion(
 #: d20261114T002244771-017417). Nothing bounds the cleanup until a cancel lands.
 FAILED_OPEN_CANCEL_BOUND_S = 5.0
 
-# Cleanups a cancel stopped waiting for: held so the loop does not lose a pending task.
-_ABANDONED_OPEN_CLEANUPS: set[asyncio.Future[tuple[bool, BaseException | None]]] = set()
-
 
 def _force_failed_open_release(force_release: Callable[[], object]) -> None:
     """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054)."""
@@ -1984,8 +1981,9 @@ async def cleanup_failed_open(
     caller re-raises ``exc`` otherwise.
 
     **A cancel still ends a failed open** (decision d20261114T002244771-017417). Nothing bounds the
-    cleanup until a cancel lands, the open's own included; from then it gets at most
-    :data:`FAILED_OPEN_CANCEL_BOUND_S`. Past that, ``force_release`` drops what the open built
+    cleanup until a cancel lands; from then it gets at most :data:`FAILED_OPEN_CANCEL_BOUND_S`.
+    The bound starts at once when the open's own end was a cancel, or a cancel this task holds
+    under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past that, ``force_release`` drops what the open built
     without waiting, and this stops waiting for the cleanup. ``force_release`` is synchronous for
     the same reason it is the only thing a ``GeneratorExit`` runs: a coroutine being closed cannot
     await, and awaiting would replace the exit with a ``RuntimeError``."""
@@ -2015,32 +2013,33 @@ async def cleanup_failed_open(
         )
     )
     loop = asyncio.get_running_loop()
-    # The open's own cancel has already landed, so its bound starts now.
+    current = asyncio.current_task()
+    # A cancel this task already holds, under the open's own exception or another, has landed.
+    cancelled = current is not None and current.cancelling() > 0
     deadline = (
         loop.time() + FAILED_OPEN_CANCEL_BOUND_S
-        if isinstance(exc, asyncio.CancelledError)
+        if cancelled or not isinstance(exc, Exception)
         else None
     )
-    cancelled = False
     while not task.done():
-        try:
-            if deadline is None:
-                await asyncio.shield(task)
-            else:
-                await asyncio.wait_for(asyncio.shield(task), max(0.0, deadline - loop.time()))
-        except TimeoutError:
-            if task.done():
-                break
+        remaining = None if deadline is None else deadline - loop.time()
+        if remaining is not None and remaining <= 0:
+            # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
             _force_failed_open_release(force_release)
             log.warning(
                 "a failed store open's cleanup did not finish within %.0f s of a cancel; what the"
                 " open built was released without waiting for it",
                 FAILED_OPEN_CANCEL_BOUND_S,
             )
-            _ABANDONED_OPEN_CLEANUPS.add(task)
-            task.add_done_callback(_ABANDONED_OPEN_CLEANUPS.discard)
             cancelled = True
             break
+        try:
+            if remaining is None:
+                await asyncio.shield(task)
+            else:
+                await asyncio.wait_for(asyncio.shield(task), remaining)
+        except TimeoutError:
+            continue  # the next pass finds the deadline passed, or the cleanup done
         except asyncio.CancelledError:
             if task.cancelled():
                 break
