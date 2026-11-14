@@ -640,6 +640,13 @@ def _junction(link: Path, target: Path) -> None:
     )
 
 
+def _file_symlink(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link)
+    except OSError as exc:
+        pytest.skip(f"this account cannot create a file symlink: {exc}")
+
+
 def test_a_link_inside_a_tolerated_cache_refuses(fx: Fx) -> None:
     """git does not delete through a link, so the removal would end ORPHANED (npm link makes these)."""
     elsewhere = fx.root / "elsewhere"
@@ -1004,10 +1011,7 @@ def test_a_file_link_in_the_allocation_registry_is_read_not_refused(fx: Fx) -> N
     target = fx.root / "linked-record.json"
     rec = {"number": "1", "kind": "adr", "title": "t", "worktree": str(fx.tree("venv"))}
     target.write_text(json.dumps(rec), encoding="utf-8")
-    try:
-        os.symlink(target, fx.coord / "alloc" / "adr" / "linked.json")
-    except OSError as exc:
-        pytest.skip(f"this account cannot create a file symlink: {exc}")
+    _file_symlink(fx.coord / "alloc" / "adr" / "linked.json", target)
     rows = remove(fx, [fx.tree("clean")], apply=False)
     assert rows["clean"]["Outcome"] == "WOULD-REMOVE", rows["clean"]
 
@@ -1258,7 +1262,6 @@ def _ignore_like_the_engine(fx: Fx, tree: Path) -> None:
     ("case", "outcome"),
     [
         ("seat-file", "WOULD-REMOVE"),
-        ("scan-tokens", "REFUSED"),
         ("seat-folder", "REFUSED"),
         ("seat-link", "REFUSED"),
     ],
@@ -1266,18 +1269,14 @@ def _ignore_like_the_engine(fx: Fx, tree: Path) -> None:
 def test_only_a_plain_seat_local_file_is_tolerated(fx: Fx, case: str, outcome: str) -> None:
     """The owner's ruling of 2026-11-06, "seat.local.txt only (Recommended)": a tree whose only
     blocking ignored entry is `.claude/seat.local.txt`, a plain file, no longer refuses on that
-    account. Red on a1a686e0a1 for "seat-file". scan-tokens.local.txt, and a seat.local.txt that is a
-    folder or a link, still refuse; those three are the controls."""
+    account. Red on a1a686e0a1 for "seat-file". A seat.local.txt that is a folder or a link still
+    refuses; those two are the controls. scan-tokens.local.txt has its own rule, in the test below."""
     tree = fx.tree("clean")
     _ignore_like_the_engine(fx, tree)
     seat = tree / ".claude" / "seat.local.txt"
     seat.parent.mkdir()
     if case == "seat-file":
         seat.write_text("builder\n", encoding="utf-8")
-    elif case == "scan-tokens":
-        tokens = tree / "scripts" / "security" / "scan-tokens.local.txt"
-        tokens.parent.mkdir(parents=True)
-        tokens.write_text("token\n", encoding="utf-8")
     elif case == "seat-folder":
         seat.mkdir()
         (seat / "x.txt").write_text("x\n", encoding="utf-8")
@@ -1290,6 +1289,86 @@ def test_only_a_plain_seat_local_file_is_tolerated(fx: Fx, case: str, outcome: s
     assert rows["clean"]["Outcome"] == outcome, rows["clean"]
     if outcome == "REFUSED":
         assert "ignored entr(ies) that are not a regenerable cache" in rows["clean"]["Reason"]
+
+
+_TOKENS_REL = Path("scripts") / "security" / "scan-tokens.local.txt"
+#: SYNTHETIC: never the real token list, which must not be read, copied or printed by a test.
+_SYNTHETIC_TOKENS = b"# synthetic\nACME-SYNTHETIC-TOKEN-0001\n"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "identical",
+        "differing",
+        "primary-missing",
+        "primary-folder",
+        "primary-link",
+        "primary-folder-linked",
+        "tree-folder",
+        "tree-link",
+        "tree-junction",
+    ],
+)
+def test_a_scan_tokens_copy_is_tolerated_only_when_identical_to_the_primarys(
+    fx: Fx, case: str
+) -> None:
+    """The owner's ruling of 2026-11-14, asked "Should the prune accept a scan-tokens copy identical
+    to the primary checkout's?" and answering "Yes, brief a fix": new.ps1 copies the ignored leak-gate
+    token list into every new worktree, so a finished tree whose copy is a plain file byte-identical to
+    the primary checkout's own plain copy loses nothing when it goes. Red on 8274fc4ad7 for
+    "identical", which refused. Every other case is a control that still refuses: a copy that
+    differs, a primary copy that is missing, a folder or a link, a primary copy reached through a
+    linked folder (here, into the tree itself, so the removal would delete the only copy), and a
+    tree copy that is a folder, a file symlink or a junction. The token text never reaches a row."""
+    tree = fx.tree("clean")
+    _ignore_like_the_engine(fx, tree)
+    mine = tree / _TOKENS_REL
+    theirs = fx.primary / _TOKENS_REL
+    mine.parent.mkdir(parents=True)
+    if case == "primary-folder-linked":
+        # The primary's scripts/security is a junction into the tree's, so its copy IS the tree's.
+        theirs.parent.parent.mkdir()
+        _junction(theirs.parent, mine.parent)
+    else:
+        theirs.parent.mkdir(parents=True)
+    # The tree's copy.
+    if case == "tree-folder":
+        mine.mkdir()
+        (mine / "x.txt").write_bytes(_SYNTHETIC_TOKENS)
+    elif case == "tree-link":
+        _file_symlink(mine, theirs)
+    elif case == "tree-junction":
+        target = fx.root / "tokens-target"
+        target.mkdir()
+        _junction(mine, target)
+    else:
+        mine.write_bytes(_SYNTHETIC_TOKENS)
+    # The primary checkout's copy.
+    if case in ("identical", "tree-folder", "tree-link", "tree-junction"):
+        theirs.write_bytes(_SYNTHETIC_TOKENS)
+    elif case == "differing":
+        # Same length, one byte apart, so only a content comparison tells them apart.
+        theirs.write_bytes(_SYNTHETIC_TOKENS.replace(b"0001", b"0002"))
+    elif case == "primary-folder":
+        theirs.mkdir()
+    elif case == "primary-link":
+        elsewhere = fx.root / "tokens-elsewhere.txt"
+        elsewhere.write_bytes(_SYNTHETIC_TOKENS)
+        _file_symlink(theirs, elsewhere)
+    _age(fx.primary, tree, 200)
+    rows = remove(fx, [tree], apply=case == "identical")
+    row = rows["clean"]
+    assert "ACME-SYNTHETIC-TOKEN" not in json.dumps(row)
+    if case == "identical":
+        assert row["Outcome"] == "REMOVED", row
+        assert not tree.exists()
+        assert theirs.read_bytes() == _SYNTHETIC_TOKENS
+        return
+    assert row["Outcome"] == "REFUSED", row
+    assert "ignored entr(ies) that are not a regenerable cache" in row["Reason"], row
+    assert "scan-tokens.local.txt" in row["Reason"], row
+    assert tree.is_dir()
 
 
 def test_a_removed_tree_under_a_plain_parent_still_reads_removed(fx: Fx) -> None:

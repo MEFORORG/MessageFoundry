@@ -23,7 +23,8 @@
     $CACHE_DATA_NAME_PATTERN, Get-NestedHazard,
     Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
     Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Test-PlainFile, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
-    $GIT_CONFIG_CARRIER_PATTERN, Get-GitConfigCarriers and $SEAT_LOCAL_REL.
+    $GIT_CONFIG_CARRIER_PATTERN, Get-GitConfigCarriers, $SEAT_LOCAL_REL, $SCAN_TOKENS_REL and
+    Test-SameAsPrimaryCopy.
 #>
 
 #: The variables that falsify a `git -C <path>` reading: the first three point git at another
@@ -599,11 +600,16 @@ function Get-InProgressOperation([string]$Path) {
 
 # Every IGNORED entry `git worktree remove` would delete that is not a regenerable cache
 # ($REGENERABLE_IGNORED_PATTERN): a .env, a *.db store, a build output, a generated corpus. A cache
-# directory that is a link, or cannot be read, counts too, as in remove.ps1 -Path. One more entry is
-# tolerated, by the owner's ruling of 2026-11-06: the seat record $SEAT_LOCAL_REL at the tree's root, as
-# a plain file only. Returns the status lines, or $null when git status cannot be read.
+# directory that is a link, or cannot be read, counts too, as in remove.ps1 -Path. Two more entries are
+# tolerated. By the owner's ruling of 2026-11-06: the seat record $SEAT_LOCAL_REL at the tree's root, as
+# a plain file only. By the owner's ruling of 2026-11-14 (asked "Should the prune accept a scan-tokens
+# copy identical to the primary checkout's?", answered "Yes, brief a fix"), which extends that one: the
+# leak-gate token list $SCAN_TOKENS_REL that new.ps1 copies into every new worktree, only as
+# Test-SameAsPrimaryCopy says, so the removal loses nothing the primary does not keep. Without -Primary
+# that entry refuses. Returns the status lines, or $null when git status cannot be read.
 $SEAT_LOCAL_REL = '.claude/seat.local.txt'
-function Get-UnsafeIgnoredEntries([string]$Path) {
+$SCAN_TOKENS_REL = 'scripts/security/scan-tokens.local.txt'
+function Get-UnsafeIgnoredEntries([string]$Path, [string]$Primary) {
     # --ignored=matching, not the traditional mode: a directory that matches no pattern but holds only
     # ignored content (ide/ around ide/node_modules/) is then listed by what it holds, so the cache
     # inside it can be told from a .env beside it. Traditional mode lists it as one `!! ide/` line.
@@ -618,10 +624,38 @@ function Get-UnsafeIgnoredEntries([string]$Path) {
             if (-not $plain) { $unsafe += "$line (not a plain file, or unreadable)" }
             continue
         }
+        if ($line -ceq "!! $SCAN_TOKENS_REL") {
+            try { $same = Test-SameAsPrimaryCopy $Path $Primary $SCAN_TOKENS_REL }
+            catch { $same = $false }
+            # The line only: the file is a list of forbidden tokens, so its contents are never printed.
+            if (-not $same) { $unsafe += "$line (not a plain file byte-identical to the primary checkout's plain copy, or unreadable)" }
+            continue
+        }
         if ($line -cnotmatch $REGENERABLE_IGNORED_PATTERN) { $unsafe += $line; continue }
         if (-not (Test-PlainDirectory $Path $line.Substring(3).TrimEnd('/'))) { $unsafe += "$line (a link, or unreadable: not a plain directory)" }
     }
     return , $unsafe
+}
+
+# Whether the tree's file at $Rel is a plain file whose bytes equal those of the primary checkout's own
+# plain file at the same $Rel: $false for anything else, and a throw when a read fails, which the caller
+# refuses on. Every folder between $Primary and its copy must be a plain directory too: one linked into
+# the tree would make the primary's copy the tree's own, and the removal would delete the only one. The
+# tree's folders are left to Get-NestedHazard's walk, which refuses any link there. Full contents are
+# compared byte for byte, never a size or a timestamp alone.
+function Test-SameAsPrimaryCopy([string]$Path, [string]$Primary, [string]$Rel) {
+    if (-not $Primary) { return $false }
+    $dir = ''
+    foreach ($part in @($Rel.Split('/') | Select-Object -SkipLast 1)) {
+        $dir = if ($dir) { "$dir/$part" } else { $part }
+        if (-not (Test-PlainDirectory $Primary $dir)) { return $false }
+    }
+    $mine = Join-Path $Path $Rel
+    $theirs = Join-Path $Primary $Rel
+    if (-not ((Test-PlainFile $mine 'the tree''s copy') -and (Test-PlainFile $theirs 'the primary checkout''s copy'))) { return $false }
+    [byte[]]$a = [System.IO.File]::ReadAllBytes($mine)
+    [byte[]]$b = [System.IO.File]::ReadAllBytes($theirs)
+    return $a.Length -eq $b.Length -and [System.Linq.Enumerable]::SequenceEqual($a, $b)
 }
 
 # A tolerated cache name is not enough: the entry must be a real directory inside the tree, not a link
