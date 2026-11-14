@@ -83,13 +83,15 @@ def test_import_script_targets_machine_store() -> None:
     """The helper imports into LocalMachine\\Root (the machine store), not the per-user store."""
     assert _IMPORT_SCRIPT.exists(), "import-db-ca.ps1 helper is missing"
     script = _IMPORT_SCRIPT.read_text(encoding="utf-8")
-    # The store the import actually targets is bound to the machine root store...
-    assert '$StoreLocation = "Cert:\\LocalMachine\\Root"' in script, (
+    # The store the certificates are added through is the machine root store, never the per-user
+    # one (BACKLOG #5561: the script adds each checked certificate through X509Store)...
+    assert "X509Certificates.StoreName]::Root" in script, (
         "helper must bind its import target to the machine root store"
     )
-    # ...and the import call uses that variable (never a hardcoded per-user store).
-    assert "-CertStoreLocation $StoreLocation" in script
-    assert "Import-Certificate" in script
+    assert "X509Certificates.StoreLocation]::LocalMachine" in script
+    assert "StoreLocation]::CurrentUser" not in script
+    # ...and the store every prompt names is read from that same object, so the two cannot drift.
+    assert '$StoreLocation = "Cert:\\$($store.Location)\\$($store.Name)"' in script
     # Requires elevation — part of the operator contract for writing the machine store.
     assert "Administrator" in script
 
