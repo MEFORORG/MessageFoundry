@@ -382,7 +382,7 @@ def _is_main_masked(out: str, main: str) -> bool:
 def _replace_rest(text: str, start: int, stop: int, mask: bool) -> str:
     """The CONTROL: a rest REPLACED by the placeholder wherever it holds a word, the design the
     previous attempt took. It is not class-preserving, so the fuzz must find it leaking. It ignores
-    ``mask``, so it reaches texts holding the backstop's opener too."""
+    ``mask``."""
     rest = text[start:stop]
     return (
         f" {redaction._REDACTED}{'>' if rest.endswith('>') else ''}" if rest.strip(" >") else rest
@@ -395,16 +395,13 @@ def test_the_end_tag_mask_redacts_at_least_what_main_did_through_composed_joins(
     masked, so no value main hid prints. The gain count shows the mask is exercised; the replacing
     control shows the corpus can produce the composed-join leak.
 
-    Measured at 1,500 trials: 0 leaks, 0 unmasked routes and 9,398 values hidden that main printed,
-    against 1,526 leaks on the control, which ignores ``mask`` and so reaches texts holding the
-    backstop's opener. 16,000 more trials over four other seeds, run by hand, also found 0 leaks and
-    0 unmasked routes. The corpus holds the shapes code review found (camelCase credential labels
-    and their heads, a segment id glued to a tag's ``>``, surnames the end-of-text rules refuse,
-    the backstop's opener over a tail a field run shortens). With ``_end_tag_rest`` patched to
-    ignore ``mask``, the same 1,500 trials found 203 leaks; with the head check narrowed to
-    capitals they found none, so that shape rests on the pins above, not on this arm. These are
-    measurements of this corpus, not a
-    proof for every input."""
+    Measured at 1,500 trials: 0 leaks, 0 unmasked routes and 9,398 values hidden that main printed.
+    16,000 more trials over four other seeds, run by hand, also found 0 leaks and 0 unmasked
+    routes. The corpus holds the shapes code review found (camelCase credential labels and their
+    heads, a segment id glued to a tag's ``>``, surnames the end-of-text rules refuse, the
+    backstop's opener over a tail a field run shortens). With the head check narrowed to capitals
+    the same 1,500 trials found no leak, so that shape rests on the pins above, not on this arm.
+    These are measurements of this corpus, not a proof for every input."""
     shipped, control = _differential(1_500, 5925, _replace_rest)
     assert control.leaks, "the replacing control leaked nothing, so the corpus cannot find the leak"
     assert shipped.gains, "the mask hid nothing main printed, so #5925 is not exercised"

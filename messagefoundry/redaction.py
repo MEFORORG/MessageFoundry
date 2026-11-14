@@ -1662,31 +1662,34 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     is not a fixed point could read it differently there. The differential fuzz in
     ``tests/test_redaction_xml_end_tag.py`` measures this; it is not a proof either.
 
-    **A text holding the credential backstop's opener (:data:`_USERINFO_OPENER`) keeps every
-    rest**, as :func:`_scrub_field_runs` does: ``mask`` is False there. The exclusion was added
-    when a mask alone forced a round main did not run, and the backstop read further in that round
-    than on main; the round gate (:func:`_masked_only`) now covers that case. It is kept as a
-    conservative choice: the backstop can read further in a later round than in an earlier one,
-    and the passes above still read masked text. The caller tests it once per text, not once per
+    **A text that holds the credential backstop's opener (:data:`_USERINFO_OPENER`) when the XML
+    pass reads it keeps every rest**: ``mask`` is False there. The exclusion was added when a mask
+    alone forced a round main did not run, and the backstop read further in that round than on
+    main; the round gate (:func:`_masked_only`) now covers that case. It is kept as a conservative
+    choice: the backstop can read further in a later round than in an earlier one, and the passes
+    above still read masked text. :func:`_redact_xml_elements` tests it once per text, not once per
     end tag, which was quadratic.
 
     **Which words may be masked depends on what follows them** (:func:`_rest_words` holds the rules
     both share). Where the line ends the text, a caller can glue text onto the last word, so
     :func:`_maskable_rest` decides with its rules for an answer's end, and the last word may not
     begin a credential label's head either (:func:`_ends_in_camel_head`). Where the tag's ``>``, a
-    ``<`` or a line break follows, nothing can join the last word, so only a whole boundary-free
-    word at its end refuses it, and a surname such as ``Johnson`` or ``Li`` is masked there.
+    ``<`` or a line break follows, a caller's appended text cannot reach the last word, so only a
+    whole boundary-free word at its end refuses it, and a surname such as ``Johnson`` or ``Li`` is
+    masked there.
 
     Where the rules refuse, the rest stays as it stood, and that is the residual, at least these: a
     rest holding punctuation, a tab or a non-ASCII letter (``</family Zq, Doe>``); one holding a word
     some pass reads literally, a credential word inside a longer word, or a date (``</family
     password: x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any word after a
-    line break inside the tag; every rest in a text holding the backstop's opener; every rest whose
+    line break inside the tag; every rest in a text that holds the backstop's opener when the XML
+    pass reads it; every rest whose
     end tag an HL7 field run took before this pass ran, in at least these shapes: a run before the
     element (``a|b|<family>Smith</family Zqxdoe>``), one in its own content (``<given>A^B^C</given
     Zqxdoe>``), and one before a stray end tag (``a|b|</family Zqxdoe>``); and, where the rest ends
     the text, every refusal :func:`_maskable_rest` makes there, a last word with a digit or
-    ending in ``m``, ``b``, ``f`` or ``n`` among them."""
+    ending in ``m``, ``b``, ``f`` or ``n`` among them, and a last word ending on a credential label
+    word's head (:func:`_ends_in_camel_head`, ``</family zqxP``)."""
     if not mask or not text.startswith(" ", start):
         return text[start:stop]
     line = _END_TAG_LINE.match(text, start, stop)
@@ -1804,7 +1807,8 @@ def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
     before the cut survives. A closed element is always scrubbed, whatever its text opens with.
 
     Words after an end tag's name, inside a malformed tag or after one with no ``>``, are masked in
-    place where that is safe, and kept as they stood where it is not (:func:`_end_tag_rest`), in a
+    place where the rules expect that to change no other pass's reading, and kept as they stood
+    elsewhere (:func:`_end_tag_rest`), in a
     walked element and outside one (:func:`_mask_stray_end_tags`). ``masks`` False keeps every one
     as it stood, which is this pass as it was before BACKLOG #5925 (:func:`_masked_only`)."""
     if "<" not in text:
@@ -2012,7 +2016,8 @@ def _needs_widened_stage(text: str) -> bool:
 
 def _redact_rounds(text: str, *, widened: bool) -> str:
     """One stage of :func:`redact`: the flat and structured passes, repeated until the structured
-    passes change nothing but end-tag masks (:func:`_masked_only`)."""
+    passes change nothing but end-tag masks (:func:`_masked_only`), for at most
+    :data:`_STRUCTURED_ROUNDS` rounds; if they run out, the flat passes run once more."""
     credentials = not widened
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:
@@ -2026,14 +2031,16 @@ def _redact_rounds(text: str, *, widened: bool) -> str:
 
 def _masked_only(text: str, flat: str, *, widened: bool) -> bool:
     """Whether the structured passes turned ``flat`` into ``text`` only by masking end-tag rests in
-    place (:func:`_end_tag_rest`, BACKLOG #5925), so the round is the fixed point it was on main.
+    place (:func:`_end_tag_rest`, BACKLOG #5925): with every rest kept, they would have changed
+    nothing, so the round ends.
 
     **A mask is not a change that sends the text round again.** It keeps every character's class
     (:data:`_SHAPE`), and :func:`_end_tag_rest` masks only where that is not expected to change
     another pass's reading, which the differential fuzz measures and does not prove. The passes
     are not all fixed points on their own output, so a round main did not run
     reads differently: ``</given Doe>&Smith, Jones=PID|x`` left ``&[redacted]=PID|[redacted]`` on
-    main, and a second round turns that into ``[redacted]``, so the ``PID|`` that took a caller's
+    main, and a second round turns ``Doe>&[redacted]=PID|[redacted]`` into ``[redacted]``, so the
+    ``PID|`` that took a caller's
     text joined after the answer was gone and the joined value printed. The exact test is the
     structured passes with every rest kept, which change nothing; the class comparison before it
     only skips that pass where some other change is certain."""
