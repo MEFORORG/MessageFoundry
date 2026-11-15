@@ -483,11 +483,12 @@ def _default_nav(active: str) -> Markup:
     # Right cluster: the live status glyphs then Sign out, grouped so nav's space-between keeps the links
     # left and this block flush right (heart sits directly left of Sign out, alerts left of the heart).
     right = el("div", _nav_status_icons(), _logout_form(), class_="navright")
-    # ``data-mf-session-watchdog`` (14.3.1) rides the <nav> element deliberately: a nav is rendered
-    # ONLY on an authenticated page (at least the two unauthenticated entry pages, and the IdP hop on
-    # the sign-in leg, pass nav=Markup("")), so the
-    # hook is present exactly where a live session's rendered PHI needs discarding when that session
-    # ends — with no per-render authentication plumbing to keep in sync. minimal_nav carries it too.
+    # ``data-mf-session-watchdog`` (14.3.1) rides the <nav> element deliberately, so the hook is
+    # present wherever a live session's rendered PHI needs discarding when that session ends, with no
+    # per-render authentication plumbing to keep in sync. minimal_nav carries it too. A page served
+    # without a session must therefore pass nav=Markup(""): at least the two unauthenticated entry
+    # pages and the IdP hop on the sign-in leg do. The OIDC "leaving this site" page does NOT, and it
+    # is served without a session, so the watchdog's first probe sends that browser to the login page.
     return el(
         "nav",
         el("div", brand, *groups, class_="navlinks"),

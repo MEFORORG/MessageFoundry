@@ -169,7 +169,9 @@ def _is_minimal_nav_call(node: ast.expr) -> bool:
 
 def test_every_nav_suppressing_page_builder_is_accounted_for() -> None:
     """A page builder may only suppress the shared chrome by passing ``nav=minimal_nav()`` (which
-    still renders Sign out) unless it is one of the two UNAUTHENTICATED entry pages. Writing a new
+    still renders Sign out) unless it is one of the two UNAUTHENTICATED entry pages, or the IdP hop
+    in ``TRANSIT_BARE_BUILDERS``, whose per-leg choice this walk does not read and
+    ``test_the_idp_hop_signs_out_only_with_a_session`` pins instead. Writing a new
     ``nav=Markup("")`` page fails here — which pinning the five fixed pages could never do."""
     offenders: list[str] = []
     seen_builders: set[str] = set()

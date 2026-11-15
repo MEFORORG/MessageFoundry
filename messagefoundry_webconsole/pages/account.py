@@ -3,13 +3,15 @@
 """Auth/session/account page builders for the /ui ops dashboard (ADR 0065): sign-in, step-up
 re-auth, and the L4b self-service account pages (change password, TOTP MFA lifecycle).
 
-The account pages carry the normal chrome. The UNAUTHENTICATED entry pages (sign-in, the Windows-SSO
-challenge, and the IdP hop on the federated sign-in leg) are bare — ``nav=Markup("")``. Every page
-that is reached WITH a live session but drops the full nav for focus/confinement (step-up re-auth,
-reauth-continue, the forced must-change-password page, passkey enrolment, the federated landing hop,
-the IdP hop on the step-up leg) renders ``nav=minimal_nav()`` instead: the
-wordmark plus the same one-click POST Sign-out form, so an authenticated page never leaves the
-operator without a way out (ASVS 7.4.4). Every dynamic value is placed through the escaping element
+The account pages carry the normal chrome. A page that drops the full nav for focus/confinement and
+is reached WITH a live session renders ``nav=minimal_nav()``: the wordmark plus the same one-click
+POST Sign-out form (ASVS 7.4.4). At least step-up re-auth, reauth-continue, the forced
+must-change-password page, passkey enrolment, the federated landing hop and the IdP hop on the
+step-up leg do. A page served without a session is bare, ``nav=Markup("")``, because
+``minimal_nav`` brings the session watchdog: at least sign-in, the Windows-SSO challenge and the IdP
+hop on the federated sign-in leg are. Two pages break the rule. The sign-in IdP hop is bare even
+for a browser that holds a session it is about to replace, and the OIDC "leaving this site"
+interstitial renders ``minimal_nav`` although it is served without a session. Every dynamic value is placed through the escaping element
 builders in :mod:`.._html`. Secrets are handled once: a password is only ever an
 ``<input type=password>`` (never echoed back), and the TOTP secret / recovery codes render exactly
 once on their dedicated pages.
