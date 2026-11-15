@@ -1080,7 +1080,7 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # A spacer cell keeps the verdict away from the identifier, so only the column can mark it.
     ("8", "verdict", f"| a \\| b | ASVS | Note | Result |\n|---|---|---|---|\n| x {_ROW}"),
     ("8", "verdict", f"| x | ASVS | Note | Result |\n|---|---|---|---|\n| a \\| b {_ROW}"),
-    # Step 10's must-fire controls: the shapes its false positives took, beside a marked identifier.
+    # Step 10's must-fire controls: the shapes of its six named bodies, beside a marked identifier.
     ("10", "verdict", f"| ASVS {_REQ} | the parser | never fails |"),
     ("10", "verdict", f"ASVS {_REQ} is cited; the row is not failing now."),
     ("10", "verdict", f"| ASVS {_REQ} | the parser | has never been failing |"),
@@ -1132,8 +1132,8 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("5", "verdict", f"| Summary |\n{_HEAD}{_ROW}"),
     # Step 8: a header whose first cell is empty keeps its columns where they render.
     ("8", "verdict", f"|| ASVS | Note | Result |\n|---|---|---|---|\n| x {_ROW}"),
-    # Step 10's boundary: an unmarked verdict-state cell after "never", and "row" before a verdict
-    # state, still bind; only the CI verbs are exempt.
+    # An unmarked verdict-state cell after "never", and "row" before a verdict state, bind; step 10
+    # drops a verdict only from its six named whole bodies.
     ("10", "verdict", f"| {_REQ} | the parser | never {_MET} |"),
     ("10", "verdict", f"The row stays {_PARTIAL} for {_REQ}."),
     ("10", "verdict", f"The row is not {_PARTIAL} for {_REQ}."),
@@ -1154,8 +1154,8 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # "the row" then a CI verb that is not negated binds an unmarked identifier too, so this body would
     # bind with no mark and does not test _PR_MARK_AFTER; the negated body after it does.
     ("10", "verdict", f"{_REQ}: the row is failing."),
-    # Punctuation binding the identifier to "the row" marks it (_PR_MARK_AFTER), so a negated state
-    # verb then a CI verb, which step 10 exempts beside an unmarked identifier, binds here.
+    # Punctuation binding the identifier to "the row" marks it (_PR_MARK_AFTER). Step 10 no longer
+    # exempts this body unmarked either, so it pins only that the marked form still binds.
     ("10", "verdict", f"{_REQ}: the row is not failing."),
     # Review pass 3's new loss: with no GFM-valid pair in the run, a mistyped delimiter under an
     # ASVS header still marks the column, as main read it.
@@ -1416,8 +1416,9 @@ _STEP10_QUIET_BODIES = (
     "| 2.5.1 | parser | has never been failing |",
     "Since 2.5.1 the row is not failing.",
 )
-#: Tables whose last row is one of step 10's bodies, under a header that marks it or with a column
-#: mark step 9 removes. The body is not one of the six, so step 10 keeps every hit main reports.
+#: Tables whose last row is one of step 10's bodies, under a header (a Requirement or Cell header,
+#: ASVS in another column, or ASVS over the row's own column) or with a column mark step 9 removes.
+#: The body is not one of the six, so step 10 keeps every hit main reports.
 _STEP10_TABLE_CONTEXT_BODIES = [
     *(
         f"{header}\n|---|---|---|\n| 2.5.1 | parser | never fails |"
@@ -1564,7 +1565,7 @@ _SPLITLINES_ONLY = (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)
 #: report too, at the same line.
 _SUPERSET_EXCEPTIONS = {
     _STEP9_QUIET_BODY: "9",
-    # Step 10: the six whole bodies, compared byte for byte (_PR_STEP10_BODIES).
+    # Step 10: the six whole bodies (_PR_STEP10_BODIES).
     **dict.fromkeys(_STEP10_QUIET_BODIES, "10"),
 }
 
