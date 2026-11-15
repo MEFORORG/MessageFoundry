@@ -182,13 +182,15 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     only trust anchor. :func:`collect_anchor_specs` adds it under the label
     ``store_sqlserver_pin`` (:func:`store_pin_anchor_spec`), so it takes the audited checks of
     items 1 to 4 at start and at every reload. The store checks it too at each open, before any
-    connect, with no audit row, because the store that holds the rows is not open yet. So at
-    ``enforce`` a pin the store refuses stops the start with no row.
+    connect, with no audit row, because the store that holds the rows is not open yet. So a pin
+    the store refuses stops the start with no row: for an ACL or path finding at ``enforce``, and
+    for an unreadable file or refused content at either setting.
     **Not covered**, as in item 9: the driver reads the file by path at each connect, so the
     checked bytes are not the loaded bytes, and the spec carries ``loads_verified_bytes=False``
     and no fingerprint pin. A changed file is used by the next connect. The next start or reload
-    compares it with the last audited fingerprint, and writes ``changed`` and no
-    ``restart_required``, over the hop the next paragraph limits.
+    (a dry-run reload runs none of this preflight) compares it with the last audited
+    fingerprint, and writes ``changed`` and no ``restart_required``, over the hop the next
+    paragraph limits.
 
     **The pin's audit rides the hop the pin protects.** The baseline that compare reads
     (:func:`_last_fingerprint`), and every row this check writes (:func:`_record`), go over the
@@ -214,7 +216,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       the swap. It can answer with no row: then a fresh ``observed`` row is written in place of
       ``changed``. Or it can acknowledge the ``changed`` row, which the real store never
       receives. Where a row is written and its commit returns, the audit tee
-      (:mod:`messagefoundry.store.audit_tee`) still logs a copy. That copy leaves the host only
+      (:mod:`messagefoundry.store.audit_tee`) still logs a copy. A collector receives it only
       where a log forwarder is configured and up, and the first way writes no ``changed`` or
       ``observed`` row to copy.
 
@@ -225,14 +227,16 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     reload.** The store is not closed: the connections already in its pool can stay open,
     whichever server they reach, and a new connect reads the file on disk then, as above. So
     where the refusal follows a swap, correcting the file does not by itself end the pooled
-    connections opened under the swapped pin; a restart after the file is corrected does. A
+    connections opened under the swapped pin; a restart after the file is corrected does. Every
+    login and query those connections carried went to the server the swapped pin admitted, so
+    the store login and that traffic are to be treated as exposed. A
     restart with the swapped file still in place does not undo the swap: the start opens the
     store with that file unless a file check refuses it. Where the refusal follows an ACL or path
     finding on unchanged bytes, the fix is the one its message names. The refusal's own rows
     travel the hop like any other row.
 
     **A reload runs the anchor checks and only one of the store's content checks.** It checks
-    the ACL, the path and a change (items 1, 3 and 4; the spec has no pin), refuses a file it
+    the ACL, a change and the path (items 1, 3 and 4; the spec has no pin), refuses a file it
     cannot read, and runs the private-key refusal (BACKLOG #3745). The store's other content
     checks run at the next store open, not at a reload: at least that the file is one server
     certificate, that it is inside its validity period, and the encryption-header refusal
@@ -2234,8 +2238,8 @@ def collect_anchor_specs(
     AD and API client CAs, then since vault BACKLOG #3188 the settings CAs an engine hop dials with
     (module item 10), then since vault BACKLOG #3714 the SQL Server store pin
     (:func:`store_pin_anchor_spec`). An anchor with no path set is omitted, and so is a dialling CA
-    its hop does not read, so an install with none yields an empty list: the dormant,
-    byte-identical path.
+    its hop does not read and a ``[store].ssl_root_cert`` the store sends as no SQL Server pin, so
+    an install with none yields an empty list: the dormant, byte-identical path.
 
     The four section keywords have no default on purpose. A caller that left one out would leave
     its anchor unchecked with nothing to say so.
