@@ -1435,14 +1435,14 @@ def test_a_reused_provider_name_does_not_hide_the_provider_call() -> None:
         pytest.param(
             "const s = 'a\x0c/* b';\nconst n = Math.random();\n", id="form-feed-in-a-string"
         ),
-        pytest.param(
-            "const s = 'a\u2028/* b';\nconst n = Math.random();\n", id="u2028-in-a-string"
-        ),
+        pytest.param("// c\rconst n = Math.random();\n", id="lone-cr-ends-a-line-comment"),
+        pytest.param("// c\u2028const n = Math.random();\n", id="u2028-ends-a-line-comment"),
+        pytest.param("// c\u2029const n = Math.random();\n", id="u2029-ends-a-line-comment"),
     ],
 )
 def test_a_non_newline_line_break_cannot_open_a_phantom_block(text: str) -> None:
-    # str.splitlines breaks at these too; JS does not end a comment or string there, so the text
-    # after one is not the start of a line and its /* must not open a block.
+    # The stripper splits at JS's own line terminators: a form feed or NEL is not one, so its /*
+    # opens nothing; a lone CR, U+2028 or U+2029 is one, so it ends the // comment before the call.
     assert _gate().randomness_tokens_in(text) == {"Math.random"}
 
 
@@ -1454,7 +1454,13 @@ def test_a_bom_led_file_keeps_its_doc_comment_prose_out_of_the_randomness_arm(
     (root / "a.ts").write_text(
         "\ufeff/**\n * Math.random() is weak\n */\nconst k = 1;\n", encoding="utf-8"
     )
-    assert _gate().discover_non_python(root, repo=tmp_path) == {}
+    # Positive control: the same BOM-led walk does reach a real draw after the comment.
+    (root / "b.ts").write_text(
+        "\ufeff/**\n * header\n */\nconst k = Math.random();\n", encoding="utf-8"
+    )
+    assert _gate().discover_non_python(root, repo=tmp_path) == {
+        "ide/b.ts": frozenset({"Math.random"})
+    }
 
 
 def test_a_tls_value_under_a_second_binding_reaches_its_token() -> None:
@@ -1487,3 +1493,15 @@ def test_a_crypto_binding_does_not_mask_another_bindings_method_rule() -> None:
     )
     found = ops.aggregate(ops.discover_operations_in({"messagefoundry/x.py": source}))
     assert "sign_verify:.sign()" in found["messagefoundry/x.py"], found
+
+
+def test_an_unterminated_block_opener_in_a_string_does_not_hide_the_rest_of_the_file() -> None:
+    # An unterminated block comment is a syntax error, so a /* still open at the end of the text was
+    # string text; the lines after it are scanned again rather than hidden to the end of the file.
+    text = (
+        "const help = `\n/* matches every file\n`;\n"
+        "const n = Math.random();\nconst d = createHash('md5');\n"
+    )
+    gate = _gate()
+    assert gate.randomness_tokens_in(text) == {"Math.random"}
+    assert "hash:createHash[md5]" in gate.non_python_operation_tokens_in(text)

@@ -2231,7 +2231,8 @@ def discover(package: Path) -> dict[str, frozenset[str]]:
 #: fixture that never touches the disk and exercises AT LEAST these matchers: an exact rule, a
 #: prefix rule, an algorithm carried by an ARGUMENT, a method rule, a TLS posture assignment with its
 #: value, a tuple-target, augmented and ``setattr`` posture assignment, a bare sibling import under
-#: ``scripts/``, and a first-party provider reached three ways (absolute import, package re-export,
+#: ``scripts/``, an import name reused by a function-local import, and a first-party provider
+#: reached three ways (absolute import, package re-export,
 #: relative import) from modules with no crypto import of their own, which is the BACKLOG #1164
 #: shape. If the instrument does not report exactly this, one of those matchers is dead, and every
 #: clean result it gives about the tree is void.
@@ -2261,6 +2262,11 @@ _SELF_TEST_SOURCES: dict[str, str] = {
     "selftest/relative.py": "from . import seam\n\n\ndef go():\n    seam.build()\n",
     "scripts/st/helper.py": "import hashlib\n\n\ndef h(b):\n    return hashlib.sha1(b)\n",
     "scripts/st/user.py": "import helper\n\n\ndef go(b):\n    return helper.h(b)\n",
+    # BACKLOG #5579: a function-local import reusing a crypto module's name must not hide it.
+    "selftest/shadow.py": (
+        "import hashlib\n\n\ndef a(b):\n    return hashlib.md5(b)\n\n\n"
+        "def other():\n    from mylib import thing as hashlib\n    return hashlib\n"
+    ),
 }
 _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "selftest/seam.py": frozenset(
@@ -2285,6 +2291,7 @@ _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "selftest/relative.py": frozenset({"tls_context:via selftest.seam"}),
     "scripts/st/helper.py": frozenset({"hash:hashlib.sha1"}),
     "scripts/st/user.py": frozenset({"hash:via scripts.st.helper"}),
+    "selftest/shadow.py": frozenset({"hash:hashlib.md5"}),
 }
 
 
@@ -2379,10 +2386,17 @@ def find_violations(
     return undocumented, stale
 
 
-def _strip_comments(text: str, line_comment: str, block_open: str, block_close: str) -> list[str]:
+def _strip_comments(
+    lines: list[str],
+    line_comment: str,
+    block_open: str,
+    block_close: str,
+    *,
+    rescan_unterminated: bool,
+) -> list[str]:
     """The code of a source, one entry per line, with comments removed. Shared by the JS/TS and
     PowerShell arms so a fix to one stripper reaches the other; this is the one statement of its
-    rules.
+    rules. Each caller splits ``lines`` at its own language's line terminators.
 
     A line whose code starts with ``line_comment`` is a comment. ``block_open`` opens a block
     comment only where it STARTS the remaining code on a line, and the lines up to its
@@ -2390,25 +2404,33 @@ def _strip_comments(text: str, line_comment: str, block_open: str, block_close: 
     block is never skipped for starting with anything else (a JS ``*`` continuation line is code).
     An opener anywhere else (after code, in a string, in a trailing line comment) never opens a
     block, so it cannot hide the lines that follow, and a trailing comment never hides the code
-    before it.
-
-    Lines are split at ``\n`` only. ``str.splitlines`` also breaks at a form feed, NEL or U+2028,
-    none of which ends a JS line comment or string, so a ``// x<NEL>/*`` would have opened a phantom
-    block hiding the real code after it.
+    before it. With ``rescan_unterminated``, a block still open at the end of the text was never a
+    comment (an unterminated block comment is a syntax error), so its lines are scanned again from
+    the line after its opener, with the opener line kept as code.
 
     The rules lean toward scanning too much, but at least the line shapes THE RESIDUAL in
     crypto_operations.py lists are hidden. Stripping exactly would need a lexer per language, and a
     naive strip would cut a line at the ``//`` of a URL and hide what follows."""
-    width = len(block_close)
     code: list[str] = []
     in_block = False
-    for raw in text.split("\n"):
-        line = raw.removesuffix("\r")
+    opened_at = 0
+    i = 0
+    while True:
+        if i == len(lines):
+            if not (in_block and rescan_unterminated):
+                return code
+            # A phantom block: re-scan from just after its opener, keeping the opener line.
+            code.append(lines[opened_at])
+            in_block = False
+            i = opened_at + 1
+            continue
+        line = lines[i]
         if in_block:
             end = line.find(block_close)
             if end < 0:
+                i += 1
                 continue
-            line = line[end + width :]
+            line = line[end + len(block_close) :]
             in_block = False
         while True:
             stripped = line.lstrip()
@@ -2417,13 +2439,22 @@ def _strip_comments(text: str, line_comment: str, block_open: str, block_close: 
             end = stripped.find(block_close, len(block_open))
             if end < 0:
                 in_block = True
+                opened_at = i
                 line = ""
                 break
-            line = stripped[end + width :]
+            line = stripped[end + len(block_close) :]
         stripped = line.strip()
         if stripped and not stripped.startswith(line_comment):
             code.append(line)
-    return code
+        i += 1
+
+
+#: JavaScript's line terminators (ECMA-262 LineTerminatorSequence): LF, CR, CRLF, U+2028, U+2029.
+#: ``str.splitlines`` also breaks at a form feed, vertical tab, NEL and the file separators, none of
+#: which ends a JS line comment or string, so a ``// x<NEL>/*`` would open a phantom block; and a
+#: ``\n``-only split misses a lone CR or U+2028 that DOES end a ``//`` comment, hiding the code
+#: after it.
+_JS_LINE_BREAK = re.compile("\r\n|[\n\r\u2028\u2029]")
 
 
 def _js_code(text: str) -> list[str]:
@@ -2435,7 +2466,7 @@ def _js_code(text: str) -> list[str]:
     The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
     lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
     is unusable."""
-    return _strip_comments(text, "//", "/*", "*/")
+    return _strip_comments(_JS_LINE_BREAK.split(text), "//", "/*", "*/", rescan_unterminated=True)
 
 
 def randomness_tokens_in(text: str) -> set[str]:
@@ -3027,8 +3058,11 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
 
 def _powershell_code(text: str) -> list[str]:
     """The code of a PowerShell source with comments removed, by :func:`_strip_comments`. A
-    single-line ``<# ... #>`` after code is left in place and scanned."""
-    return _strip_comments(text, "#", "<#", "#>")
+    single-line ``<# ... #>`` after code is left in place and scanned. Split by ``splitlines``, as
+    before the stripper was shared, and with no re-scan of an unterminated ``<#``, which keeps
+    ``scripts/asvs/scorecard.py``'s copy of these decisions (``_powershell_code_only``) in step;
+    ``tests/test_asvs_scorecard.py`` pins that parity."""
+    return _strip_comments(text.splitlines(), "#", "<#", "#>", rescan_unterminated=False)
 
 
 def powershell_operation_tokens_in(text: str) -> set[str]:

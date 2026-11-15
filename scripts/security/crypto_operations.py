@@ -60,7 +60,12 @@ seen:
   real tree has such lines: CSS ``/* */`` comments inside the IDE's webview template strings, where
   a ``${...}`` hole would go unseen;
 * for the same stripper: such a string line that STARTS with the line-comment marker (``//``,
-  ``#``), and a PowerShell ``#Requires`` line, are skipped as comments.
+  ``#``), and a PowerShell ``#Requires`` line, are skipped as comments. For PowerShell alone, a
+  ``<#`` that is never closed also hides every line after it to the end of the file. A raw U+2028 or U+2029
+  inside a JS string ends a "line" for the stripper, so the text after it is such a string line;
+* a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
+  ``def go(sig): sig.verify(d)`` in a module that imports a first-party ``sig`` reads as a call to
+  that first-party function and skips the method rule.
 
 Stdlib only, like the gate that imports it.
 """
@@ -382,7 +387,8 @@ def import_aliases(nodes: list[ast.AST], mod: str, is_init: bool) -> dict[str, l
     ALL its targets (BACKLOG #5579). It was last-write-wins, so a function-local
     ``from x import y as hashlib`` replaced the module-level ``hashlib`` for the whole file and hid
     every real ``hashlib`` call in it. A call, a TLS value and a method-rule decision are now each
-    taken under every binding, so one binding cannot mask another's operation. That can over-resolve
+    taken under every IMPORT binding, so one import binding does not mask another's operation; a
+    parameter or assignment is not a binding here (see THE RESIDUAL). That can over-resolve
     a shadowed name into a token for an API the call does not reach, which is the direction meant:
     a spurious row costs a review, a hidden call costs the inventory."""
     aliases: dict[str, list[str]] = {}
@@ -491,6 +497,8 @@ def _resolve_siblings(modules: list[ParsedModule]) -> None:
                 # first-party name and silently drop every operation in the file.
                 if head not in known and f"{package}.{head}" in known:
                     targets[i] = f"{package}.{target}"
+            # Two imports can rewrite to one target; keep the list unique, as ``bind`` does.
+            targets[:] = dict.fromkeys(targets)
 
 
 def _enclosing_functions(tree: ast.Module) -> dict[int, str]:
@@ -636,7 +644,8 @@ def _direct_operations(
                     )
                 continue
             candidates = m.resolve(node.func)
-            hits = [(q, op) for q in candidates if (op := classify_qualified(q)) is not None]
+            classified = [(q, classify_qualified(q)) for q in candidates]
+            hits = [(q, op) for q, op in classified if op is not None]
             if hits:
                 algorithms = _algorithms_in(node, m)
                 for qualified, op in hits:
@@ -644,7 +653,7 @@ def _direct_operations(
                     found.append((node, node.lineno, op, label))
             # The bindings no rule above classified. A hit under one binding must not stop the
             # method rule for another, or a crypto-module binding masks a signer's ``.sign()``.
-            rest = [q for q in candidates if classify_qualified(q) is None]
+            rest = [q for q, op in classified if op is None]
             if hits and not rest:
                 continue
             if isinstance(node.func, ast.Attribute) and node.func.attr in METHOD_RULES:
