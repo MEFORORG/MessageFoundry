@@ -27,8 +27,9 @@
                         inherited git redirect variable (worktree-gates.ps1 Test-WorktreeClean),
       (c) unlocked   -- `git worktree lock` is git's own "in use" flag and this script honours it,
       (d) unoccupied -- no live Claude session is sitting in it OR in a worktree nested inside it, its
-                        git metadata and working tree have not been written within -IdleHours, and
-                        it does not contain another registered worktree.
+                        git metadata and working tree (its top level and cache files, below) have
+                        not been written within -IdleHours, and it does not contain another
+                        registered worktree.
 
     "SIBLING" IS NOT A PREFIX MATCH. The candidate set used to be every registered worktree whose path
     starts with `<primary>-`, which silently includes `<primary>-pins/.claude/worktrees/x` -- a
@@ -61,9 +62,10 @@
          2026-08-18, vetoing the whole repository at once (Get-ReflogLastEntry has the measurement).
          The WORKING TREE is read too, against the same window, through the read
          finished-worktree-removal.ps1 makes (worktree-gates.ps1 Get-WorkingTreeActivity): its top
-         folder, each entry directly under it, and the files in .pytest_cache, .ruff_cache and
-         .mypy_cache, so a session that ran tests, lint or mypy and no git command still vetoes
-         (BACKLOG #5603). The newer of the two readings is the tree's activity.
+         folder, each entry directly under it, and the files in the caches that function names, so
+         a session that ran tests, lint or mypy and no git command still vetoes (BACKLOG #5603). A
+         file edited in place two levels down moves none of these. The newer of the two readings is
+         the tree's activity.
          This is the signal that does NOT depend on a recorded cwd, and it is what covers the fence's
          biggest blind spot -- so it is not a nicety, it is the load-bearing one for the class of
          worktree this tool actually prunes. If it cannot be read, that is a veto too. Confirm a
@@ -81,7 +83,8 @@
       * a cwd recorded as a UNC (\\host\C$\...) or 8.3 short path -- the match is a normalised string
         compare, and neither spelling normalises to the worktree's own path;
       * a session that never registered;
-      * a session that only Writes/Edits files and runs no git command: it touches none of the metadata
+      * a session that only Writes/Edits files below the top level and runs no git command or test,
+        lint or type-check run: it touches none of the git metadata, top-level entries or cache files
         signal 2 reads, so signal 2 goes quiet on it as well;
       * a session whose ONLY git command rewrites the reflog without appending to it -- in practice
         `git gc` or `git reflog expire`. Signal 2 stopped counting that on 2026-08-18 and this is the
@@ -222,8 +225,8 @@
       C4 unlocked         `git worktree lock` is git's own "in use" flag
       C5 unoccupied       no live session in it or in a worktree nested inside it (signal 1)
       C6 clean            no uncommitted tracked changes and no untracked files
-      C7 idle             its private git metadata and its working tree have not been written within
-                          -IdleHours (signal 2)
+      C7 idle             its private git metadata and its working tree's top level and cache files
+                          have not been written within -IdleHours (signal 2)
       C8 merged           the same merge test the worktree pass uses
       C9 unowned          NO SESSION TRANSCRIPT FOR THE OWNING SESSION HAS BEEN WRITTEN WITHIN
                           -IdleHours. The owning session id is parsed out of the worktree name (the
@@ -1083,7 +1086,7 @@ if ($ReapVenvs) {
                 if ($act -gt $idleCut) {
                     Add-Verdict 'C7' 'idle' 'FAIL' "$($tact.What) $actAge h ago, inside the $IdleHours h window"
                 }
-                else { Add-Verdict 'C7' 'idle' 'PASS' "git metadata and working tree last written $actAge h ago, outside the $IdleHours h window" }
+                else { Add-Verdict 'C7' 'idle' 'PASS' "git metadata, and the working tree's top level and cache files, last written $actAge h ago, outside the $IdleHours h window" }
             }
 
             # C9 -- ownership. BOTH of its empty answers are a SKIP, and they are reported as
@@ -1253,7 +1256,7 @@ $blindSpots = @(
     'a session writing into a worktree by absolute path from elsewhere (29% of the writes by primary-seated sessions, measured on this repo)',
     'a cwd recorded as a UNC or 8.3 short path',
     'a session that never registered',
-    'a session that only edits files and runs no git command (invisible to signal 2 as well)'
+    'a session that only edits files below the top level and runs no git command, test, lint or type check (invisible to signal 2 as well)'
 )
 
 if (-not $Json) {
@@ -1271,7 +1274,7 @@ if (-not $Json) {
     Write-Host "  It DOES see VS Code sessions (the match is path-based, not surface-based). It CANNOT see:" -ForegroundColor DarkGray
     foreach ($b in $blindSpots) { Write-Host "    - $b" -ForegroundColor DarkGray }
     if ($activityVeto) {
-        Write-Host ("  Which is why git metadata or a working tree written within {0}h also counts as occupied." -f $IdleHours) -ForegroundColor DarkGray
+        Write-Host ("  Which is why git metadata, or a working tree's top level or cache files, written within {0}h also counts as occupied." -f $IdleHours) -ForegroundColor DarkGray
     }
     foreach ($r in $reducedAssurance) { Write-Host "  REDUCED ASSURANCE: $r" -ForegroundColor Red }
     Write-Host "  refs: $fetchDetail" -ForegroundColor DarkGray
@@ -1824,7 +1827,7 @@ if ($Json) {
                     idleHours     = $_.IdleH
                     safety        = $_.Landed
                     claudeManaged = (Test-ClaudeManagedPath $_.Path)
-                    whyFinished   = "no registered session launched in it or in a tree nested in it (the fence reads launch directories only); contains no other worktree; clean, with no tracked change, no untracked file, no flagged file, no unsafe ignored entry and no nested checkout or link; git metadata and working tree idle $($_.IdleH) h, beyond the $IdleHours h window; holds no coordination claim; $($_.Landed)"
+                    whyFinished   = "no registered session launched in it or in a tree nested in it (the fence reads launch directories only); contains no other worktree; clean, with no tracked change, no untracked file, no flagged file, no unsafe ignored entry and no nested checkout or link; git metadata, and the working tree's top level and cache files, idle $($_.IdleH) h, beyond the $IdleHours h window; holds no coordination claim; $($_.Landed)"
                 }
             })
         # $null when -ReapVenvs was not asked for; an object with `ran: false` when it WAS asked for

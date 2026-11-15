@@ -513,7 +513,11 @@ Occupancy is checked by two independent signals, and **either one vetoes**:
    matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
    pid + process start time. A session in a **nested** worktree vetoes its ancestor too.
 2. **Recent activity** (`-IdleHours`, default **72**) — the newest mtime of the worktree's *private*
-   git metadata (`index`, `HEAD`, `logs/HEAD`, …), not the working files. This is the signal that does
+   git metadata (`index`, `HEAD`, `logs/HEAD`, …), and of the working tree's top level and the files
+   in its test, lint and type-check caches (`Get-WorkingTreeActivity` in
+   [`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1), the read the `.claude/worktrees`
+   removal makes too), so a session that ran tests, lint or mypy and no git command still vetoes. A
+   file edited in place below the top level moves neither reading. This is the signal that does
    **not** depend on a recorded cwd.
 
 **The default was 36 until 2026-09-17, and the old number's own measurement is why it moved.** The

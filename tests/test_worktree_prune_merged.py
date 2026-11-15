@@ -1282,6 +1282,39 @@ def test_a_freshly_written_mypy_cache_holds_a_tree_whose_git_metadata_is_idle(
     assert not wt.exists()
 
 
+def test_the_cache_list_backdate_ages_mirrors_the_gates() -> None:
+    """``_backdate`` ages the caches the working-tree reading dates. A cache added to the gates and
+    not here would leave every tree planting it read as recently active, for a reason no test names."""
+    gates_src = (SCRIPT.parent / "worktree-gates.ps1").read_text(encoding="utf-8")
+    ours = re.search(r"\$WORKING_TREE_ACTIVITY_CACHES = @\(([^)]*)\)", gates_src)
+    assert ours, "the instrument found no list to compare"
+    assert tuple(re.findall(r"'([^']+)'", ours.group(1))) == _ACTIVITY_CACHES
+
+
+def test_a_cache_too_big_to_date_holds_the_tree(fx: Fixture, sleeper: int) -> None:
+    """BACKLOG #5603. Past its cap the working-tree reading does not sample a cache: the file a run
+    just rewrote could be one it never reached, so the tree's activity is unknown and it is held."""
+    live_record(fx, sleeper, fx.primary)
+    wt = fx.sibling("clean")
+    _exclude(fx, ".ruff_cache/")
+    cache = wt / ".ruff_cache"
+    cache.mkdir()
+    for i in range(2001):
+        (cache / f"{i}").write_bytes(b"")
+    _backdate(fx.primary, wt, hours=100)
+    d = by_leaf(run(fx, "-Apply"), "clean")
+    assert d["Decision"] == "SKIP", d
+    assert any("activity unknown (working tree unreadable)" in r for r in d["Reasons"]), d
+    assert wt.exists()
+
+    # Control: at the cap, the same tree prunes.
+    (cache / "0").unlink()
+    _backdate(fx.primary, wt, hours=100)
+    d = by_leaf(run(fx, "-Apply"), "clean")
+    assert d["Decision"] == "PRUNE", d
+    assert d["Outcome"] == "removed", d
+
+
 def test_an_inherited_git_redirect_refuses_the_tree(fx: Fixture, sleeper: int) -> None:
     """BACKLOG #5603. GIT_INDEX_FILE makes status compare the tree against another index.
 
@@ -2676,6 +2709,24 @@ def test_an_empty_reflog_contributes_nothing_rather_than_its_mtime(
 # by hand. These cover the reporting path and, more importantly, that it stays a REPORTING path.
 
 
+def test_a_report_only_tree_with_a_freshly_written_working_tree_is_withheld(
+    fx: Fixture, sleeper: int
+) -> None:
+    """BACKLOG #5603. The report pass reads the working tree too, so a tree whose git metadata is idle
+    but whose folder was just written is withheld rather than suggested."""
+    live_record(fx, sleeper, fx.primary)
+    nested = fx.primary / ".claude" / "worktrees" / "nested"
+    _backdate(fx.primary, nested, hours=100)
+    res = run(fx)
+    # Positive control: idle in both readings, it is reported in the default window.
+    assert "nested" in {r["leaf"] for r in res["reportOnly"]}, res["reportOnly"]
+
+    os.utime(nested, None)
+    res = run(fx)
+    assert "nested" not in {r["leaf"] for r in res["reportOnly"]}
+    assert res["counts"]["reportOnlyHeld"] >= 1
+
+
 def test_a_nested_claude_worktree_is_reported_but_never_a_candidate(
     readonly_fx: Fixture, sleeper: int
 ) -> None:
@@ -2992,6 +3043,22 @@ def test_c6_an_untracked_file_holds_the_venv(fx: Fixture, sleeper: int) -> None:
     assert row["stoppedBy"] == "C6 clean"
     assert "untracked" in row["stoppedDetail"]
     assert only_failing(row) == ["C6"]
+    assert_control_is_reapable(res)
+
+
+def test_c7_a_freshly_written_working_tree_holds_the_venv(fx: Fixture, sleeper: int) -> None:
+    """BACKLOG #5603. C7 reads the working tree too: the git metadata here is 500 h idle."""
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    victim = _plant_venv_tree(fx, "wrote-0b0b0b")
+    os.utime(victim, None)  # the tree's own folder, as a file created and deleted there leaves it
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "wrote-0b0b0b")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C7 idle"
+    assert row["stoppedDetail"].startswith("the working tree was written"), row
+    assert only_failing(row) == ["C7"]
     assert_control_is_reapable(res)
 
 

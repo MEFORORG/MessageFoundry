@@ -75,7 +75,8 @@ $IDLE_FLOOR_HOURS = 12
 $ACTIVITY_MTIME_FILES = @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')
 
 #: The caches a test, lint or type-check run rewrites in place, whose files the working-tree activity
-#: reads date: Get-WorkingTreeActivity here, and remove.ps1's twin of it. One list, so the two agree.
+#: reads date: Get-WorkingTreeActivity here, and remove.ps1's twin of it. One list, so the two read the
+#: same caches; how they read them still differs (the cap, folders, links), so the list is all they share.
 $WORKING_TREE_ACTIVITY_CACHES = @('.pytest_cache', '.ruff_cache', '.mypy_cache')
 
 #: The ignored entries a removal may delete without asking: a `git status --porcelain --ignored` line
@@ -354,23 +355,28 @@ function Get-FlaggedFiles([string]$Path) {
 }
 
 # The newest write to the WORKING TREE: the tree's own folder, each entry directly under it, and the
-# files inside .pytest_cache, .ruff_cache and .mypy_cache (a test, lint or type-check run rewrites those
-# in place, moving no top-level mtime), up to -CacheCap of them in each. The idle reading above sees only
-# git metadata, so a session that edits files and runs no git command is invisible to it. Every caller
-# holds a tree this read finds written inside its idle window: finished-worktree-removal.ps1
-# (Get-ContentRefusal) and prune-merged.ps1 (Get-TreeActivity, its occupancy signal 2, in the decision,
-# report, venv and -Apply re-check passes). Since Get-NestedHazard passes mypy's cache files, this read
-# is what holds a tree a mypy run wrote to. remove.ps1 makes its own twin of it, over the same
-# $WORKING_TREE_ACTIVITY_CACHES. Not every write moves one of these: a file edited in place two levels down moves none. $null
-# when it cannot be read.
+# files inside each cache $WORKING_TREE_ACTIVITY_CACHES names (a test, lint or type-check run rewrites
+# those in place, moving no top-level mtime). The idle reading above sees only git metadata, so a
+# session that edits files and runs no git command is invisible to it. Not every write moves one of
+# these: a file edited in place two levels down moves none. Since Get-NestedHazard passes mypy's cache
+# files, this read is what holds a tree a mypy run wrote to.
+# Callers, at least: finished-worktree-removal.ps1 (Get-ContentRefusal) and prune-merged.ps1
+# (Get-TreeActivity, its occupancy signal 2, in the decision, report, venv and -Apply re-check passes,
+# where -IdleHours 0 and -Name lift it as they lift the git reading). remove.ps1 makes its own twin.
+# $null when it cannot be read, when the cache list is unset, and when a cache holds more than
+# -CacheCap files, which it does not sample: a cache too big to read to the end cannot be dated.
 function Get-WorkingTreeActivity {
     param([string]$Path, [int]$CacheCap = 2000)
+    # A lost list would read no cache at all, so a tree a test run just wrote to would read idle.
+    if (-not $WORKING_TREE_ACTIVITY_CACHES) { return $null }
     try {
         $items = @(Get-Item -LiteralPath $Path -Force -ErrorAction Stop) + @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
         foreach ($cache in $WORKING_TREE_ACTIVITY_CACHES) {
             $dir = Join-Path $Path $cache
             if (Test-Path -LiteralPath $dir -PathType Container) {
-                $items += @(Get-ChildItem -LiteralPath $dir -Recurse -Force -File -ErrorAction Stop | Select-Object -First $CacheCap)
+                $inCache = @(Get-ChildItem -LiteralPath $dir -Recurse -Force -File -ErrorAction Stop | Select-Object -First ($CacheCap + 1))
+                if ($inCache.Count -gt $CacheCap) { return $null }
+                $items += $inCache
             }
         }
     }

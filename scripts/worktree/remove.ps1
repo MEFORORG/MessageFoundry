@@ -795,6 +795,10 @@ if ($stateFiles.Count -eq 0) {
 # `.git` file is a pointer, like `gitdir`.
 # A cache too big to read to the end cannot be dated, so it refuses rather than samples.
 $treeCacheCap = 5000
+# A lost list would date no cache, so a tree a test run just wrote to would read quiet.
+if (-not $WORKING_TREE_ACTIVITY_CACHES) {
+    throw "The list of caches to date (worktree-gates.ps1) is not set, so the tree's last activity is unknown. Nothing was removed."
+}
 $treeFiles = @(Get-Item -LiteralPath $WorktreePath -Force -ErrorAction Stop)
 $treeFiles += @(Get-EntriesOrThrow $WorktreePath 'working-tree entries' | Where-Object { $_.Name -ne '.git' })
 foreach ($cacheName in $WORKING_TREE_ACTIVITY_CACHES) {
