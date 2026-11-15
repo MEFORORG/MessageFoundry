@@ -674,6 +674,9 @@ def test_date_diff_field_a_ts_field_with_an_empty_first_value_raises(start: str)
         ("20260101120000^D", "20260101180000", "hours"),  # day precision on a time of day
         ("20260101^S", "20260104", "days"),  # second precision on a date
         ("20260101^D^X", "20260104", "days"),  # a third component
+        ("20260101^^^X", "20260104", "days"),  # a fourth component, review round e99482de
+        ("20260101^D^^X", "20260104", "days"),  # a fourth component after a code
+        ("2026\\X3031\\01", "20260104", "days"),  # an escape that decodes to a valid stamp
         ("20260101~~20270101", "20260104", "days"),  # a later repetition after an empty one
     ],
 )

@@ -441,10 +441,20 @@ def _check_ts_field(msg: Message, path: str, precision: str) -> None:
     if repeats:
         raise ValueError(f"date_diff_field: {field} repeats; a timestamp field holds one value")
     if comp is None:
+        # The raw field must be exactly the time, or the time, one separator and the code: nothing in
+        # a later component, and no escape sequence, which decoding would otherwise hide (main
+        # parsed the raw field, so it refused both).
+        raw = msg.field(path) or ""
+        stamp = msg.field(f"{path}.1") or ""
         degree = msg.field(f"{path}.2")
-        if msg.field(f"{path}.3") is not None or (
-            degree is not None and _DEGREE_OF_PRECISION.get(degree) != precision
-        ):
+        exact = (
+            raw == stamp
+            if degree is None
+            else len(raw) == len(stamp) + 1 + len(degree)
+            and raw.startswith(stamp)
+            and raw.endswith(degree)
+        )
+        if not exact or (degree is not None and _DEGREE_OF_PRECISION.get(degree) != precision):
             raise ValueError(
                 f"date_diff_field: {path} holds more than a timestamp and the degree of precision "
                 "of its time"
