@@ -918,8 +918,14 @@ def _pr_marked(text: str, m: re.Match[str]) -> bool:
 
 
 def _pr_verdict_bound(text: str, m: re.Match[str], version: bool, marked: bool) -> bool:
-    before = text[max(0, m.start() - 60) : m.start()]
-    after = text[m.end() : m.end() + 80]
+    return _pr_verdict_bound_at(text, m.start(), m.end(), version, marked)
+
+
+def _pr_verdict_bound_at(text: str, start: int, end: int, version: bool, marked: bool) -> bool:
+    """_pr_verdict_bound for the identifier at text[start:end]. It reads only the 60 characters
+    before the identifier and the 80 after it."""
+    before = text[max(0, start - 60) : start]
+    after = text[end : end + 80]
     if not version and (
         _PR_VERDICT_BEFORE.search(before) or (marked and _PR_VERB_BEFORE.search(before))
     ):
@@ -1226,66 +1232,73 @@ def _pr_joined_to_a_word(text: str, start: int) -> bool:
     return at < start and at > 0 and (text[at - 1].isalnum() or text[at - 1] == "_")
 
 
-def _pr_step10_blank(sentence: str, is_row: bool, windows: list[tuple[int, int]]) -> str | None:
-    """The sentence with each of step 10's exempt clauses replaced by spaces, so every offset stays,
-    or None where it holds no exempt clause.
-
-    In prose, a clause is "row", a negated state verb and a CI verb ("the row is not failing"),
-    searched only inside the given windows: the re-check reads nothing outside them, and
-    _PR_PROSE_VERDICT backtracks quadratically on a long markup run, so a search over the whole
-    sentence, which has no length limit, would make the gate far slower than main on such a body.
-    The pattern is tried only where "row" stands in a window, and it reads the sentence itself, not
-    a slice, so the character before a window still counts: "narrow" cut at a window's edge is not
-    "row". Nor is "row" behind markup that joins it to a word ("nar**row**", which GFM renders as
-    one word). In a row, it is a cell's verdict reading, whole or
-    leading, with "never" before a CI verb ("never fails", "is never failing; "), unless the cell
-    opens with "unchanged" or a record verb. A cell is read trimmed and with its markup deleted, as
-    _pr_table_verdict reads it; each reading's clause is mapped back to the characters of the row
-    it came from."""
-    spans: list[tuple[int, int]] = []
-    if not is_row:
-        tried: set[tuple[int, int]] = set()
-        for left, right in windows:
-            for row in _PR_ROW_WORD.finditer(sentence, left, right):
-                if (row.start(), right) in tried:
-                    continue
-                tried.add((row.start(), right))
-                hit = _PR_PROSE_VERDICT.match(sentence, row.start(), right)
-                if (
-                    hit is not None
-                    and hit.group("row") is not None
-                    and hit.group("row_negated") is not None
-                    and hit.group("row_verdict").lower() in _PR_CI_VERDICTS
-                    and not _pr_joined_to_a_word(sentence, row.start())
-                ):
-                    spans.append((hit.start(), hit.end()))
-    else:
-        edges = [-1, *(i for i, ch in enumerate(sentence) if ch == "|"), len(sentence)]
-        for left, right in itertools.pairwise(edges):
-            cell = sentence[left + 1 : right]
-            offset = left + 1
-            lead = len(cell) - len(cell.lstrip(_PR_CELL_EDGE))
-            trimmed = (cell.strip(_PR_CELL_EDGE), [offset + lead + i for i in range(len(cell))])
-            kept = [i for i, ch in enumerate(cell) if ch not in _PR_MARKUP_CHARS]
-            plain = "".join(cell[i] for i in kept)
-            skip = len(plain) - len(plain.lstrip())
-            deleted = (plain.strip(), [offset + kept[skip + i] for i in range(len(plain) - skip)])
-            for text, where in (trimmed, deleted):
-                for hit in (_PR_CELL_VERDICT.fullmatch(text), _PR_CELL_VERDICT_LEAD.match(text)):
-                    if (
-                        hit is not None
-                        and hit.end() > 0
-                        and _PR_CELL_RECORD_PREFIX.match(text) is None
-                        and hit.group("verdict").lower() in _PR_CI_VERDICTS
-                        and _PR_NEVER.search(text, hit.start(), hit.start("verdict")) is not None
-                    ):
-                        spans.append((where[hit.start()], where[hit.end() - 1] + 1))
+def _blank(text: str, spans: list[tuple[int, int]]) -> str | None:
+    """The text with each span replaced by spaces, so every offset stays, or None with no span."""
     if not spans:
         return None
-    chars = list(sentence)
+    chars = list(text)
     for left, right in spans:
         chars[left:right] = " " * (right - left)
     return "".join(chars)
+
+
+def _pr_step10_prose_window(sentence: str, left: int, right: int) -> str | None:
+    """One candidate's prose window, sentence[left:right], with step 10's exempt clauses in it
+    replaced by spaces, or None where it holds none.
+
+    A clause is "row", a negated state verb and a CI verb ("the row is not failing"). Each candidate
+    is checked on its own window, blanked only with the clauses found in it: a clause one window
+    cuts before a word that unbinds it (" over") is no clause in another window that reads on. The
+    pattern runs only inside the window, as main reads a window: _PR_PROSE_VERDICT backtracks
+    quadratically on a long markup run, so a search over the whole sentence, which has no length
+    limit, would make the gate far slower than main on such a body. It is tried only where "row"
+    stands, and it reads the sentence itself, not a slice, so the character before the window still
+    counts: "narrow" cut at a window's edge is not "row". Nor is "row" behind markup that joins it
+    to a word ("nar**row**", which GFM renders as one word)."""
+    spans: list[tuple[int, int]] = []
+    for row in _PR_ROW_WORD.finditer(sentence, left, right):
+        hit = _PR_PROSE_VERDICT.match(sentence, row.start(), right)
+        if (
+            hit is not None
+            and hit.group("row") is not None
+            and hit.group("row_negated") is not None
+            and hit.group("row_verdict").lower() in _PR_CI_VERDICTS
+            and not _pr_joined_to_a_word(sentence, row.start())
+        ):
+            spans.append((hit.start() - left, hit.end() - left))
+    return _blank(sentence[left:right], spans)
+
+
+def _pr_step10_blank_row(sentence: str) -> str | None:
+    """A table row with step 10's exempt cell clauses replaced by spaces, so every offset stays, or
+    None where it holds none.
+
+    A clause is a cell's verdict reading, whole or leading, with "never" before a CI verb ("never
+    fails", "is never failing; "), unless the cell opens with "unchanged" or a record verb. A cell is
+    read trimmed and with its markup deleted, as _pr_table_verdict reads it; each reading's clause is
+    mapped back to the characters of the row it came from."""
+    spans: list[tuple[int, int]] = []
+    edges = [-1, *(i for i, ch in enumerate(sentence) if ch == "|"), len(sentence)]
+    for left, right in itertools.pairwise(edges):
+        cell = sentence[left + 1 : right]
+        offset = left + 1
+        lead = len(cell) - len(cell.lstrip(_PR_CELL_EDGE))
+        trimmed = (cell.strip(_PR_CELL_EDGE), [offset + lead + i for i in range(len(cell))])
+        kept = [i for i, ch in enumerate(cell) if ch not in _PR_MARKUP_CHARS]
+        plain = "".join(cell[i] for i in kept)
+        skip = len(plain) - len(plain.lstrip())
+        deleted = (plain.strip(), [offset + kept[skip + i] for i in range(len(plain) - skip)])
+        for text, where in (trimmed, deleted):
+            for hit in (_PR_CELL_VERDICT.fullmatch(text), _PR_CELL_VERDICT_LEAD.match(text)):
+                if (
+                    hit is not None
+                    and hit.end() > 0
+                    and _PR_CELL_RECORD_PREFIX.match(text) is None
+                    and hit.group("verdict").lower() in _PR_CI_VERDICTS
+                    and _PR_NEVER.search(text, hit.start(), hit.start("verdict")) is not None
+                ):
+                    spans.append((where[hit.start()], where[hit.end() - 1] + 1))
+    return _blank(sentence, spans)
 
 
 def _pr_sentence_found(
@@ -1361,25 +1374,30 @@ def _pr_sentence_found(
         found["verdict"].append(0)
     if not exemptable and not (row_verdict and not row_marked):
         return found
-    # Each candidate's prose window, which holds every character its re-check reads (the binding
-    # reads 60 before the identifier and 80 after it).
-    windows = [
-        (max(0, m.start() - _PR_WINDOW), m.end() + _PR_WINDOW) for m, _ in exemptable if not is_row
-    ]
-    blanked = _pr_step10_blank(sentence, is_row, windows)
-    for m, version in exemptable:
-        if blanked is None or _pr_verdict_bound(blanked, m, version, False):
-            found["verdict"].append(m.start())
-        elif not version and not is_row:
-            window = blanked[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
-            if _pr_prose_verdict(window, False):
+    if is_row:
+        # A row is one window for every identifier in it.
+        blanked = _pr_step10_blank_row(sentence)
+        for m, version in exemptable:
+            if blanked is None or _pr_verdict_bound(blanked, m, version, False):
                 found["verdict"].append(m.start())
-    if (
-        row_verdict
-        and not row_marked
-        and (blanked is None or _pr_table_verdict(blanked, requirement_ids, False))
-    ):
-        found["verdict"].append(0)
+        if (
+            row_verdict
+            and not row_marked
+            and (blanked is None or _pr_table_verdict(blanked, requirement_ids, False))
+        ):
+            found["verdict"].append(0)
+        return found
+    for m, version in exemptable:
+        # The candidate's own prose window holds every character its re-check reads (the binding
+        # reads 60 before the identifier and 80 after it), so it is blanked and read alone.
+        left = max(0, m.start() - _PR_WINDOW)
+        own = _pr_step10_prose_window(sentence, left, m.end() + _PR_WINDOW)
+        if (
+            own is None
+            or _pr_verdict_bound_at(own, m.start() - left, m.end() - left, version, False)
+            or (not version and _pr_prose_verdict(own, False))
+        ):
+            found["verdict"].append(m.start())
     return found
 
 

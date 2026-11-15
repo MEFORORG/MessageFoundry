@@ -1606,17 +1606,29 @@ _STEP10_WORD_EDGE_SHAPES = [
     "The nar`row` is not failing:{pad}1.2.3 today.",
     "The narrow is not failing: 1.2.3 and then\nwe keep the outbound path under watch while{pad}"
     "1.2.4 stays partial.",
+    # Review round-e784ff8b27: a clause one candidate's window cuts before " over" is no clause in
+    # another candidate's window, which reads on, so it must not unbind that candidate's "is met".
+    "Python 3.1.2, _which_ stays partial, as {pad}\nand 1.2.3 is met row is not failing over to"
+    " the backup.",
+    "ASVS:{pad}v5 3.1.2 x "
+    + "y" * 37
+    + "\nand 1.2.3 is met row is not failing over to the backup.",
+    "Python 3.1.2, _which_ stays partial, as {pad}\nso 1.2.3 x the cell is partial row is not"
+    " failing over to the backup.",
 ]
 
 
 @pytest.mark.parametrize("shape", _STEP10_WORD_EDGE_SHAPES)
-def test_step_ten_reads_no_clause_in_a_word_ending_in_row(sf, sf_frozen_main, shape: str) -> None:
+def test_step_ten_drops_no_hit_main_reports_wherever_a_window_edge_falls(
+    sf, sf_frozen_main, shape: str
+) -> None:
     lost = {}
-    for size in range(0, 100):
-        body = shape.format(pad=" " * (size + 1))
-        missing = set(sf_frozen_main.scan_pr_body(body)) - set(sf.scan_pr_body(body))
-        if missing:
-            lost[size] = sorted(missing)
+    for fill in (" ", "y"):
+        for size in range(0, 100):
+            body = shape.format(pad=fill * (size + 1))
+            missing = set(sf_frozen_main.scan_pr_body(body)) - set(sf.scan_pr_body(body))
+            if missing:
+                lost[(fill, size)] = sorted(missing)
     # A positive control: main flags the shape, or the loop compared nothing.
     assert sf_frozen_main.scan_pr_body(shape.format(pad=" "))
     assert not lost, lost
