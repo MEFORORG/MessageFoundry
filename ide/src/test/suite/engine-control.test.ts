@@ -714,7 +714,7 @@ suite("engine control — Start runs against the service TOML the fork guard jud
         return "serviceConfigRefusal runs before a refusal";
       }
       const before = body.slice(0, Math.max(local, trusted));
-      return /\bfs\.|isFile\(|startServiceConfig\(|dbFilesIn\(|controlContext/.test(before)
+      return /\bfs\.|Sync\(|isFile\(|pythonPath\(|startServiceConfig\(|dbFilesIn\(|controlContext/.test(before)
         ? "a filesystem read runs before the refusals"
         : undefined;
     };
@@ -729,6 +729,13 @@ suite("engine control — Start runs against the service TOML the fork guard jud
       ' if (!isLocalEngine(url)) {\n notify(`${url} is remote`);\n return;\n }\n' +
       ' if (!vscode.workspace.isTrusted) {\n notify("trust this workspace to let the IDE run the engine.");\n return;\n }\n';
     assert.strictEqual(gatedFirst(unfixed), "serviceConfigRefusal runs before a refusal");
+    // Control: both refusals ahead of the config check, but a read of the interpreter's path first.
+    const readFirst =
+      "async restartEngine() {\n const python = pythonPath();\n const url = this.currentUrl();\n" +
+      ' if (!isLocalEngine(url)) {\n notify(`${url} is remote`);\n return;\n }\n' +
+      ' if (!vscode.workspace.isTrusted) {\n notify("trust this workspace to let the IDE run the engine.");\n return;\n }\n' +
+      " const refusal = serviceConfigRefusal(ws, startServiceConfig());\n";
+    assert.strictEqual(gatedFirst(readFirst), "a filesystem read runs before the refusals");
     // Start's launchEngine carries the same two messages, so the two refusals read alike.
     const launch = /private async launchEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
     assert.ok(launch, "launchEngine moved — re-point this scan before trusting it");

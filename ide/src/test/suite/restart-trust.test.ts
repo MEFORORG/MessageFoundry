@@ -8,7 +8,7 @@
 // from the repository's own `.vscode/settings.json`, and on Windows a UNC value makes that stat open
 // SMB, with NTLM, to a host the repository chose. So Restart carries Start's two refusals first.
 //
-// This drives the real `restartEngine` against a stubbed `vscode` and a spied `fs.statSync`. It runs
+// This drives the real `restartEngine` against a stubbed `vscode` and spied sync `fs` calls. It runs
 // node-side only, as its siblings do: the Extension Host opens no folder and cannot shut workspace
 // trust (live-debug.test.ts records the same), so no untrusted workspace with the setting can exist
 // there. Each refusal is paired with a trusted control that DOES stat the configured path, so a
@@ -30,7 +30,11 @@ const TRUST_REFUSAL = "MessageFoundry: trust this workspace to let the IDE run t
 
 let stubWorkspace: string | undefined;
 let stubTrusted = true;
+/** The workspace value of `messagefoundry.serviceConfig`, or undefined for a setting left unset. */
+let stubSetting: string | undefined;
 let notices: string[];
+/** The `onDidCloseTerminal` listeners Restart's stop is waiting on. */
+const closeListeners = new Set<(t: unknown) => void>();
 
 const vscodeStub = {
   workspace: {
@@ -42,10 +46,11 @@ const vscodeStub = {
     },
     // The setting as a workspace's own settings.json sets it: a workspace value, so it counts as set.
     getConfiguration: () => ({
-      get: (key: string, fallback: unknown): unknown => (key === "serviceConfig" ? UNC_SETTING : fallback),
+      get: (key: string, fallback: unknown): unknown =>
+        key === "serviceConfig" && stubSetting !== undefined ? stubSetting : fallback,
       inspect: (key: string) =>
         key === "serviceConfig"
-          ? { defaultValue: "messagefoundry.toml", workspaceValue: UNC_SETTING }
+          ? { defaultValue: "messagefoundry.toml", workspaceValue: stubSetting }
           : undefined,
     }),
   },
@@ -53,6 +58,10 @@ const vscodeStub = {
     showInformationMessage: (message: string): Promise<undefined> => {
       notices.push(message);
       return Promise.resolve(undefined);
+    },
+    onDidCloseTerminal: (listener: (t: unknown) => void) => {
+      closeListeners.add(listener);
+      return { dispose: (): void => void closeListeners.delete(listener) };
     },
   },
 };
@@ -121,14 +130,29 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
   setup(() => {
     stubWorkspace = ws;
     stubTrusted = true;
+    stubSetting = UNC_SETTING;
     notices = [];
   });
 
   teardown(() => {
     stubWorkspace = undefined;
+    closeListeners.clear();
   });
 
-  /** What one Restart did: the paths it statted, and whether it stopped or started the engine. */
+  /** The sync `fs` entry points a check could reach a path through; `existsSync` answers false. */
+  const SPIED = [
+    "statSync",
+    "lstatSync",
+    "existsSync",
+    "accessSync",
+    "readdirSync",
+    "readFileSync",
+    "openSync",
+    "realpathSync",
+  ];
+
+  /** What one Restart did: each `fs` call as "<function> <path>", and whether it stopped or started
+   *  the engine. */
   async function restart(url: string): Promise<{ statted: string[]; stopped: boolean; started: boolean }> {
     const statted: string[] = [];
     let stopped = false;
@@ -139,8 +163,10 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
       engineAlive: (): boolean => true,
       engineTerminal: {
         exitStatus: undefined,
-        dispose: (): void => {
+        dispose(): void {
           stopped = true;
+          // The terminal closes a tick later, as a real one does, so Restart's wait for it ends.
+          setImmediate(() => [...closeListeners].forEach((l) => l(this)));
         },
       },
       startEngine: (): Promise<void> => {
@@ -148,17 +174,24 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
         return Promise.resolve();
       },
     };
-    const origStat = fs.statSync;
-    // Records and refuses every stat, never reaching the real filesystem: a stat of the UNC value
+    const originals = new Map(SPIED.map((name) => [name, FS_MODULE[name]]));
+    // Records and refuses every call, never reaching the real filesystem: a stat of the UNC value
     // would otherwise go to the network on Windows.
-    FS_MODULE.statSync = (p: fs.PathLike): never => {
-      statted.push(String(p));
-      throw Object.assign(new Error(`ENOENT: stubbed stat '${String(p)}'`), { code: "ENOENT" });
-    };
+    for (const name of SPIED) {
+      FS_MODULE[name] = (p: fs.PathLike): boolean => {
+        statted.push(`${name} ${String(p)}`);
+        if (name === "existsSync") {
+          return false;
+        }
+        throw Object.assign(new Error(`ENOENT: stubbed ${name} '${String(p)}'`), { code: "ENOENT" });
+      };
+    }
     try {
       await statusBar.EngineStatusBar.prototype.restartEngine.call(owner as never);
     } finally {
-      FS_MODULE.statSync = origStat;
+      for (const [name, original] of originals) {
+        FS_MODULE[name] = original;
+      }
     }
     return { statted, stopped, started };
   }
@@ -188,10 +221,38 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
   test("control: the same setting, trusted and local, IS statted and refused as no file", async () => {
     const run = await restart(LOOPBACK);
 
-    assert.deepStrictEqual(run.statted, [path.resolve(ws, UNC_SETTING)]);
+    assert.deepStrictEqual(run.statted, [`statSync ${path.resolve(ws, UNC_SETTING)}`]);
     assert.strictEqual(notices.length, 1, JSON.stringify(notices));
     assert.match(notices[0], /which is not a file in this workspace/);
     assert.strictEqual(run.stopped, false, "the refusal still comes before the stop");
     assert.strictEqual(run.started, false);
+  });
+
+  // With the setting unset there is no service config refusal, so only the two refusals stand
+  // between a running engine and its stop: a Restart that got past them would act as Stop.
+  for (const [what, url, trusted] of [
+    ["an untrusted workspace", LOOPBACK, false],
+    ["a remote target", REMOTE, true],
+  ] as const) {
+    test(`${what}, setting unset: Restart refuses and does not stop the engine`, async () => {
+      stubSetting = undefined;
+      stubTrusted = trusted;
+      const run = await restart(url);
+
+      assert.deepStrictEqual(run.statted, []);
+      assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+      assert.strictEqual(run.stopped, false, "a refused Restart must not stop the engine");
+      assert.strictEqual(run.started, false);
+    });
+  }
+
+  test("control: setting unset, trusted and local, Restart stops the engine and starts it again", async () => {
+    stubSetting = undefined;
+    const run = await restart(LOOPBACK);
+
+    assert.deepStrictEqual(run.statted, []);
+    assert.deepStrictEqual(notices, []);
+    assert.strictEqual(run.stopped, true);
+    assert.strictEqual(run.started, true);
   });
 });
