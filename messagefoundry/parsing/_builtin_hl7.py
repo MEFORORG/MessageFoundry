@@ -255,16 +255,17 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     field entries start as bare ``str`` (component split is deferred again, per field, to first
     componentized access). MSH segments are never lazy.
 
-    The fields are stored **before** the raw line leaves ``_lazy``. A :meth:`Message.copy` clone shares
-    this tree until one side writes, so another thread can read the segment mid-split. That is not
-    only a free-threaded build: a GIL build can also switch threads between storing the fields and
-    the ``pop``, or inside a deepcopy's loop. A reader that looks at ``_lazy`` before ``fields`` then sees either the raw
-    line or the full field list, never an empty segment (BACKLOG #5801). That holds for at least the
-    readers in this module and the copy-on-write ``copy.deepcopy``, because :func:`parse` puts
-    ``_lazy`` first in the dict; a new reader must keep the same order. It does not make a deepcopy
-    safe against the ``pop`` itself: one that is iterating ``_lazy`` at that moment can still raise
-    ``RuntimeError`` for a dict that changed size. The ``pop`` keeps its default because a racing
-    split of the same segment may have removed it.
+    The fields are stored **before** the raw line leaves ``_lazy``. A :meth:`Message.copy` clone
+    shares this tree until one side writes, so another thread can read the segment mid-split. That
+    can happen on a GIL build too, not only a free-threaded one: the GIL can switch threads between
+    storing the fields and the ``pop``, or inside a deepcopy's loop. A reader that looks at
+    ``_lazy`` before ``fields`` then sees either the raw line or the full field list, never an
+    empty segment (BACKLOG #5801). That holds for at least the readers in this module and the
+    copy-on-write ``copy.deepcopy``, because :func:`parse` puts ``_lazy`` first in the dict; a new
+    reader must keep the same order. It does not make a deepcopy safe against the ``pop`` itself:
+    one that is iterating ``_lazy`` at that moment can still raise ``RuntimeError`` for a dict that
+    changed size. The ``pop`` keeps its default because a racing split of the same segment may have
+    removed it.
     """
     lazy = msg["_lazy"]
     raw = lazy.get(seg_index)

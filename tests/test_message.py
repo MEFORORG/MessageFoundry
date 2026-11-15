@@ -518,7 +518,8 @@ def test_clear_then_rebuild_repeating_block() -> None:
 
 class _ReadOnRemoveLazy(dict[int, str]):
     """A ``_lazy`` map that runs a reader right after an entry leaves it, the instant a reader on
-    another free-threaded thread sharing a :meth:`Message.copy` tree could land in (BACKLOG #5801)."""
+    another thread sharing a :meth:`Message.copy` tree could land in, on a GIL build or a
+    free-threaded one (BACKLOG #5801)."""
 
     def __init__(self, msg: _builtin_hl7.ParsedMessage, seen: list[str]) -> None:
         super().__init__(msg["_lazy"])
