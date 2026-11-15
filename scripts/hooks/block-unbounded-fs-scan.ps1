@@ -79,19 +79,79 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # Blank the CONTENTS of quoted spans, keeping the quotes and the length, so a separator or a
 # find-looking word inside quotes never reaches program position (`echo "find /proc"`). Equal
 # length is what lets an offset into the blanked text index the raw text.
+#
+# READ AS BASH READS IT, NOT AS A QUOTE TOGGLE (BACKLOG #5607). A toggle that blanked every span
+# whole and ignored backslashes allowed three kinds of walk. Inside double quotes bash still runs a
+# `$(...)` or backtick substitution, so `echo "$(find /proc)"` hid the walk; such a substitution is
+# left visible here, and starts its own quoting. An unquoted `"` or `'`, and a `"` inside double
+# quotes, opens or closes nothing, so a toggle shifted every later span by one and blanked the
+# separator and the walk after it. And `$'...'` takes backslash escapes, so `$'\''` is one quote
+# character rather than the end of a span. Unclosed contexts at the end simply stop.
 function Hide-QuotedSpans([string]$Text) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
-    $sb = New-Object System.Text.StringBuilder
-    $quote = $null
-    foreach ($ch in $Text.ToCharArray()) {
-        if ($null -ne $quote) {
-            if ($ch -ceq $quote) { $quote = $null; [void]$sb.Append($ch) }
+    $sb = [System.Text.StringBuilder]::new($Text.Length)
+    # The context stack: top (unquoted), dq, sq, ansi ($'...'), sub ($( inside double quotes, with
+    # its open-paren depth) and bt (a backtick substitution inside double quotes). Only top, sub and
+    # bt are unquoted; a substitution OUTSIDE double quotes needs no context, as it was never blanked.
+    $kinds = [System.Collections.Generic.List[string]]::new()
+    $depths = [System.Collections.Generic.List[int]]::new()
+    $kinds.Add('top'); $depths.Add(0)
+    $prevDollar = $false
+    $n = 0
+    while ($n -lt $Text.Length) {
+        $ch = $Text[$n]
+        $top = $kinds.Count - 1
+        $kind = $kinds[$top]
+        $next = if ($n + 1 -lt $Text.Length) { $Text[$n + 1] } else { $null }
+        if ($kind -ceq 'sq' -or $kind -ceq 'ansi') {
+            if ($kind -ceq 'ansi' -and $ch -ceq '\' -and $null -ne $next) {
+                [void]$sb.Append(' ')
+                [void]$sb.Append($(if ($next -ceq "`n") { $next } else { ' ' }))
+                $n += 2; continue
+            }
+            if ($ch -ceq "'") { $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append($ch) }
             elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
             else { [void]$sb.Append(' ') }
-            continue
+            $n++; continue
         }
-        if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch; [void]$sb.Append($ch); continue }
+        if ($kind -ceq 'dq') {
+            # A backslash survives inside double quotes unless it guards one of " $ ` \ or a newline.
+            if ($ch -ceq '\' -and $null -ne $next -and '"$`\'.IndexOf($next) -ge 0) {
+                [void]$sb.Append('  '); $n += 2; continue
+            }
+            if ($ch -ceq '"') { $kinds.RemoveAt($top); $depths.RemoveAt($top); [void]$sb.Append($ch) }
+            elseif ($ch -ceq '$' -and $next -ceq '(') {
+                $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $n += 2; continue
+            }
+            elseif ($ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch) }
+            elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
+            else { [void]$sb.Append(' ') }
+            $n++; continue
+        }
+        # Unquoted: top, sub or bt. An unquoted backslash escapes the next character, whatever it is.
+        if ($ch -ceq '\') {
+            [void]$sb.Append($ch)
+            if ($null -ne $next) { [void]$sb.Append($next) }
+            $prevDollar = $false
+            $n += 2; continue
+        }
+        if ($ch -ceq "'") {
+            $kinds.Add($(if ($prevDollar) { 'ansi' } else { 'sq' })); $depths.Add(0)
+        }
+        elseif ($ch -ceq '"') { $kinds.Add('dq'); $depths.Add(0) }
+        elseif ($kind -ceq 'sub' -and $ch -ceq '(') { $depths[$top]++ }
+        elseif ($kind -ceq 'sub' -and $ch -ceq ')') {
+            if ($depths[$top] -gt 0) { $depths[$top]-- } else { $kinds.RemoveAt($top); $depths.RemoveAt($top) }
+        }
+        elseif ($kind -ceq 'bt' -and $ch -ceq '`') { $kinds.RemoveAt($top); $depths.RemoveAt($top) }
+        elseif ($kind -ceq 'sub' -and $ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0) }
+        elseif ($kind -cne 'top' -and $ch -ceq '$' -and $next -ceq '(') {
+            $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $prevDollar = $false
+            $n += 2; continue
+        }
         [void]$sb.Append($ch)
+        $prevDollar = ($ch -ceq '$')
+        $n++
     }
     return $sb.ToString()
 }

@@ -604,6 +604,52 @@ def test_the_folding_does_not_reach_a_bounded_command(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
+# ============================================ DENY: a walk the quote masker blanked (BACKLOG #5607)
+
+# THE QUOTE MASKER USED TO BLANK A WHOLE QUOTED SPAN AND IGNORE BACKSLASHES, and each row below was
+# allowed by it. Inside double quotes bash still runs a `$(...)` or backtick substitution, so
+# blanking the span hid a real walk from program position. And a backslash-escaped quote opens or
+# closes nothing, so treating it as a quote shifted every later span by one: the separator and the
+# walk after it fell inside a span that bash never opened. `$'...'` takes backslash escapes too, so
+# `$'\''` is one quote character, not the end of a span.
+QUOTED_SUBSTITUTION_DENY = [
+    pytest.param('echo "$(find /proc)"', id="dollar-substitution-inside-double-quotes"),
+    pytest.param('echo "`find /proc`"', id="backtick-substitution-inside-double-quotes"),
+    pytest.param('echo "x $(grep -r p /proc) y"', id="recursive-grep-substitution-in-prose"),
+    pytest.param('echo "$(echo "inner") $(find /)"', id="second-substitution-after-nested-quotes"),
+    pytest.param('echo "$( (find /proc) )"', id="subshell-inside-a-quoted-substitution"),
+    pytest.param(r"echo \"; find /proc; echo \"", id="escaped-quotes-outside-any-span"),
+    pytest.param(r'echo "a\"b"; find /proc', id="escaped-quote-inside-a-double-quoted-span"),
+    pytest.param(r"echo $'\''; find /proc", id="escaped-quote-inside-ansi-c-quotes"),
+    # The other side of the same rule: an ESCAPED dollar starts no `$'...'`, so the single quotes
+    # after it are plain ones, in which a backslash escapes nothing.
+    pytest.param(r"echo \$'\'; find /proc", id="escaped-dollar-before-plain-single-quotes"),
+]
+
+
+@pytest.mark.parametrize("command", QUOTED_SUBSTITUTION_DENY)
+def test_a_walk_the_quote_masker_used_to_blank_is_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# THE CONTROL FOR THE LIST ABOVE. The cheapest way to pass it is to stop blanking quoted spans at
+# all, which would deny every commit message that names this guard. Each row is prose bash never
+# runs: an escaped quote, an escaped backtick or dollar, and a substitution inside single quotes.
+QUOTED_PROSE_ALLOW = [
+    pytest.param(r'git commit -m "say \"find /proc\" is blocked"', id="escaped-quotes-in-prose"),
+    pytest.param(r'git commit -m "a \`find /proc\` mention"', id="escaped-backticks-in-prose"),
+    pytest.param(r'echo "cost: \$(find /proc)"', id="escaped-dollar-in-prose"),
+    pytest.param("echo '$(find /proc)'", id="substitution-inside-single-quotes"),
+    pytest.param("echo \"$(echo 'find /proc')\"", id="single-quoted-word-inside-a-substitution"),
+    pytest.param(r"echo $'it\'s find /proc'", id="ansi-c-quoted-prose"),
+]
+
+
+@pytest.mark.parametrize("command", QUOTED_PROSE_ALLOW)
+def test_quoted_prose_naming_a_walk_is_still_allowed(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
 # ============================================ the corpora must not quietly shrink
 
 
@@ -628,6 +674,8 @@ EXPECTED_ROW_COUNTS = {
     "OPTION_GRAMMAR_DENY": 12,
     "PRUNE_INERT_DENY": 9,
     "FOLDING_ALLOW": 20,
+    "QUOTED_SUBSTITUTION_DENY": 9,
+    "QUOTED_PROSE_ALLOW": 6,
 }
 
 
