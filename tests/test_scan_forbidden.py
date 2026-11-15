@@ -1051,7 +1051,7 @@ def test_a_header_row_marks_only_its_own_table_and_column(sf) -> None:
 
 #: BACKLOG #3364 steps 5 to 12, engine PR 2893's open review findings. Every body fires with the kind
 #: it is listed under. Most steps have a quiet control below: the same shape with what made it a record
-#: taken out. Step 8 has none: the loose column reading, which keeps every mark main made, still
+#: taken out. Step 8 has none: the loose column reading, which keeps main's column marks, still
 #: shifts a column at an escaped pipe where main did.
 _HEAD = "| ASVS | Note | Result |\n|---|---|---|\n"
 _ROW = f"| {_REQ} | the limb | {_PASS.title()} (12 messages) |"
@@ -1144,7 +1144,7 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # ASVS header still marks the column, as main read it.
     ("5", "verdict", f"| ASVS | Note | Result |\n|---|---|\n{_ROW}"),
     ("5", "verdict", f"| ASVS | Note | Result |\n| - - | - - | - - |\n{_ROW}"),
-    # Review round-edb619bb's losses against main. The GFM readings only add to main's: an invisible
+    # Review round-edb619bb's losses against main, restored by uniting each GFM reading with main's: an invisible
     # character that is the only separator, a no-break-space line inside a table, and an ASVS table
     # stacked under another with no blank line.
     ("11", "map", f"{_REQ}{chr(0x200B)}is enforced in pkg/example_guard.py."),
@@ -1173,6 +1173,10 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
         "verdict",
         f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n>{chr(0xA0)}\n> {_ROW}",
     ),
+    # Review round-35a5429f's new loss: a table whose lines a bare separator joins, with no "\n", is
+    # still read as main read it, a line per separator.
+    ("5", "verdict", _HEAD.replace(chr(10), chr(0x2028)) + _ROW),
+    ("5", "verdict", _HEAD.replace(chr(10), chr(0x0C)) + _ROW),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.

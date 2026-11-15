@@ -757,8 +757,17 @@ PR_BODY_REASONS = {
 _PrUnits = list[tuple[list[tuple[int, int]], str, bool]]
 
 
-def _pr_units(body: str, delete_invisible: bool) -> tuple[_PrUnits, list[int]]:
-    """Split a PR body into the units a sentence can live in, as markdown renders them, and list the
+def _pr_gfm_lines(body: str) -> list[str]:
+    """The body's lines as GFM ends them: at "\\n", "\\r\\n" and "\\r" only. A final line ending opens no
+    line, as str.splitlines reads it."""
+    lines = _PR_LINE_END.split(body)
+    if lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def _pr_units(lines: list[str], delete_invisible: bool) -> tuple[_PrUnits, list[int]]:
+    """Split a PR body's lines into the units a sentence can live in, as markdown renders them, and list the
     blank lines (only spaces and tabs, quote markers aside, as GFM reads one).
 
     A blank line, a list item or a table row starts a new unit, and a heading is a unit of its own; any
@@ -779,9 +788,6 @@ def _pr_units(body: str, delete_invisible: bool) -> tuple[_PrUnits, list[int]]:
             marks.clear()
             parts.clear()
 
-    lines = _PR_LINE_END.split(body)
-    if lines and not lines[-1]:
-        lines.pop()  # A final line ending opens no line, as str.splitlines reads it.
     for lineno, raw in enumerate(lines, 1):
         # The line's type (blank, row, heading, list item) is read from the raw text, as GFM reads it:
         # an invisible character is content there, so a line holding only one is not blank.
@@ -1023,9 +1029,10 @@ def _pr_table_columns(units: _PrUnits, starts: list[bool]) -> list[set[int]]:
 
 
 def _pr_loose_columns(units: _PrUnits, starts: list[bool]) -> list[set[int]]:
-    """For each unit, the ASVS columns as engine PR 2893 read them, which the GFM reading above only
-    adds to: every row above a dash-shaped unit is re-read as a header, and its cells are split at
-    every pipe. A blank line or a non-row unit ends the reading (the one change, for step 9)."""
+    """For each unit, the ASVS columns read close to how engine PR 2893 read them, united with the GFM
+    reading above: every row above a dash-shaped unit is re-read as a header, and its cells are split
+    at every pipe. Unlike engine PR 2893, a blank line ends the reading (step 9, which drops marks by
+    design), and a blank line is counted as GFM counts one (_pr_units)."""
     columns: list[set[int]] = []
     current: set[int] = set()
     for index, (_, text, is_row) in enumerate(units):
@@ -1088,17 +1095,22 @@ def scan_pr_body(body: str) -> list[str]:
     restate a verdict on the same line report it once, rather than storming.
     """
     hits: list[str] = []
-    # The body as written, then, only where it holds one, with its invisible characters deleted: the
-    # second reading only adds.
-    _pr_scan_reading(body, False, hits)
-    if _PR_INVISIBLE.search(body) is not None:
-        _pr_scan_reading(body, True, hits)
+    # The lines as GFM ends them, and, only where they differ, as str.splitlines ends them (a form
+    # feed or U+2028 also ends a line there, as engine PR 2893 read the body). Each as written, and,
+    # only where the body holds one, with its invisible characters deleted. Every extra reading adds.
+    gfm_lines = _pr_gfm_lines(body)
+    split_lines = body.splitlines()
+    invisible = _PR_INVISIBLE.search(body) is not None
+    for lines in (gfm_lines, split_lines) if split_lines != gfm_lines else (gfm_lines,):
+        _pr_scan_reading(lines, False, hits)
+        if invisible:
+            _pr_scan_reading(lines, True, hits)
     return hits
 
 
-def _pr_scan_reading(body: str, delete_invisible: bool, hits: list[str]) -> None:
+def _pr_scan_reading(lines: list[str], delete_invisible: bool, hits: list[str]) -> None:
     """One reading of scan_pr_body, appending each new hit to ``hits``."""
-    units, blanks = _pr_units(body, delete_invisible)
+    units, blanks = _pr_units(lines, delete_invisible)
     starts = _pr_table_starts(units, blanks)
     for (marks, unit, is_row), asvs_columns, loose_columns in zip(
         units, _pr_table_columns(units, starts), _pr_loose_columns(units, starts), strict=True
