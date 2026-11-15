@@ -371,7 +371,9 @@ The console stays a **host-side process**; only its target URL changes.
   setting at every posture, and [the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch)
   says what it means. CORRECTED 2026-11-14 (vault BACKLOG #3533 item 2): this called it the single
   switch that downgrades store TLS, and said CI set it for the self-signed SQL Server container. CI
-  now pins a generated certificate. Give the production DB a CA-trusted cert.
+  now serves a generated certificate and verifies it. CHANGED 2026-11-15 (owner ruling): this said
+  CI pins it, which now holds on the SQL Server 2025 legs only; the SQL Server 2022 legs verify it
+  through the runner's trust store. Give the production DB a CA-trusted cert.
 - **Logs.** Keep the service at INFO (never raise to DEBUG in a PHI container — full-body logging risk
   per the PHI rules). **Off-box log + audit forwarding is built** (`[logging].forward_*` → syslog/SIEM);
   enable it so a container's logs + audit rows reach the org pipeline, both with only best-effort
