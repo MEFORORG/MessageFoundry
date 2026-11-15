@@ -996,6 +996,77 @@ def test_a_reversal_of_a_decision_the_log_does_not_hold_reviews(sb: Sandbox) -> 
     assert code == REVIEW and "the log does not hold and names no item" in why(doc)
 
 
+def _with_roster(sb: Sandbox) -> None:
+    """The real roster, as a checkout has it, so the gate can resolve a seat alias."""
+    roster = sb.repo / "docs" / "roles"
+    roster.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
+
+
+# A SEAT ALIAS FROM docs/roles/seats.json IS THE SAME SEAT (BACKLOG #5604). A decision logged as
+# `mgr` is the manager's, so its reversal is charged to the manager's budget and rate; reading the
+# seat as a bare string would under-charge the seat and leave its no-review path open.
+
+
+def test_a_reversal_logged_under_a_seat_alias_is_charged_to_the_seat(sb: Sandbox) -> None:
+    _with_roster(sb)
+    mine = [rec(at=ago(days=20), seat="mgr", item=f"x{i}") for i in range(2)]
+    seed_vault(sb, calibrated("manager") + mine)
+    seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "two reversals of manager's decisions" in why(doc), why(doc)
+
+
+def test_a_gate_asked_under_an_alias_reads_the_seats_budget(sb: Sandbox) -> None:
+    _with_roster(sb)
+    mine = [rec(at=ago(days=20), seat="manager", item=f"x{i}") for i in range(2)]
+    seed_vault(sb, calibrated("manager") + mine)
+    seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
+    code, doc = gate(sb, seat="mgr")
+    assert code == REVIEW and "two reversals of mgr's decisions" in why(doc), why(doc)
+    assert "not calibrated" not in why(doc), "the alias did not read the seat's calibration"
+
+
+def test_a_reversal_under_an_alias_counts_in_the_seats_14_day_rate(sb: Sandbox) -> None:
+    """Three days old, so outside the 24-hour budget: only the rate can see it."""
+    _with_roster(sb)
+    mine = rec(at=ago(days=4), seat="mgr", item="x")
+    seed_vault(sb, [*calibrated("manager"), mine, reversal(mine, ago(days=3))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "14-day reversal rate 100.0% BREACH" in why(doc), why(doc)
+
+
+# A DECISION THE GATE ANSWERED HALT FOR WAS DEFERRED, NOT ACTED ON (BACKLOG #5604), so it is not a
+# decision the 14-day reversal rate can be diluted by. One reversal against nineteen deferred
+# records read as 5.0 percent, inside the 5 percent breach line, and kept the seat calibrated.
+
+
+@pytest.mark.parametrize(
+    ("gate_answer", "expected"), [("HALT", REVIEW), ("", NO_REVIEW)], ids=["halted", "acted"]
+)
+def test_halted_decisions_do_not_dilute_the_14_day_reversal_rate(
+    sb: Sandbox, gate_answer: str, expected: int
+) -> None:
+    """The acted case is the control: nineteen acted decisions really do put the rate at 5.0%."""
+    reversed_one = rec(at=ago(days=4), seat="manager", item="x")
+    others = [
+        rec(at=ago(days=4, minutes=i + 1), seat="manager", item=f"y{i}", gate=gate_answer)
+        for i in range(19)
+    ]
+    seed_vault(sb, [*calibrated("manager"), reversed_one, *others])
+    seed_vault(sb, [reversal(reversed_one, ago(days=3))])
+    code, doc = gate(sb)
+    assert code == expected, why(doc)
+
+
+def test_a_reversed_halted_decision_still_counts_in_the_rate(sb: Sandbox) -> None:
+    """Deferred and then reversed is still a reversal: excluding it would under-report."""
+    halted = rec(at=ago(days=4), seat="manager", item="x", gate="HALT")
+    seed_vault(sb, [*calibrated("manager"), halted, reversal(halted, ago(days=3))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "14-day reversal rate 100.0% BREACH" in why(doc), why(doc)
+
+
 # --- the chain limit (plan 4.6) --------------------------------------------------------------
 
 

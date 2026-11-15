@@ -36,6 +36,8 @@ $script:DecisionTitlePrefix = 'decision-log '
 
 # Read at load time: inside a function $PSScriptRoot would name the caller's script.
 $script:DecisionHere = $PSScriptRoot
+# Resolve-DecisionSeat reads the roster once, on first use.
+$script:DecisionSeatAliases = $null
 
 # The spool's retry (Invoke-DecisionSpoolIo) is coord-root.ps1's.
 . (Join-Path $PSScriptRoot 'coord-root.ps1')
@@ -618,7 +620,12 @@ function Get-DecisionCalibration {
     $blind = if ($n -lt 60) { "review path, $n/60 samples" }
     elseif ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
     else { $blindOk = $true; 'calibrated' }
-    $recent = @($Decisions | Where-Object { $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) })
+    # A decision the gate answered HALT for was deferred, not acted on, so it does not dilute the
+    # rate -- unless it was reversed anyway, which is still a reversal. BACKLOG #5604.
+    $recent = @($Decisions | Where-Object {
+            $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) -and
+            ([string]$_.gate -ne 'HALT' -or (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed')
+        })
     $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed' }).Count
     $revRate = if ($recent.Count) { $revd / $recent.Count } else { 0 }
     $breach = $revRate -gt 0.05
@@ -690,7 +697,9 @@ function Get-DecisionBudget {
     $Limit = 3
     if ($Seat) {
         $Limit = 2
-        $Reversals = @($Reversals | Where-Object { $_.Seat -eq $Seat -or $null -eq $_.Seat })
+        # A roster alias is the same seat, on either side, so its reversals are charged to it.
+        $own = Resolve-DecisionSeat $Seat
+        $Reversals = @($Reversals | Where-Object { $null -eq $_.Seat -or (Resolve-DecisionSeat $_.Seat) -eq $own })
     }
     $day = [TimeSpan]::FromHours(24)
     # A reversal that could still close the scope at $Now happened in the last 24 hours, and the 24
@@ -758,19 +767,32 @@ function Get-DecisionRecentUnsampledB {
         })
 }
 
+function Resolve-DecisionSeat([string]$Seat) {
+    # A seat name folded to its roster seat (docs/roles/seats.json aliases), trimmed and lower-case.
+    # A name the roster does not map, or a roster that cannot be read, stays as given: the budget and
+    # the rate then read the bare name, as they did before aliases were folded, never a guess.
+    if (-not $Seat) { return '' }
+    $s = $Seat.Trim().ToLowerInvariant()
+    if ($null -eq $script:DecisionSeatAliases) {
+        $script:DecisionSeatAliases = @{}
+        try {
+            $roster = Join-Path (Split-Path -Parent (Split-Path -Parent $script:DecisionHere)) 'docs/roles/seats.json'
+            foreach ($p in ([System.IO.File]::ReadAllText($roster) | ConvertFrom-Json -ErrorAction Stop).aliases.PSObject.Properties) {
+                if ($p.Name -notlike '_*') { $script:DecisionSeatAliases[$p.Name.ToLowerInvariant()] = [string]$p.Value }
+            }
+        } catch {
+            $script:DecisionSeatAliases = @{}
+        }
+    }
+    if ($script:DecisionSeatAliases.ContainsKey($s)) { return [string]$script:DecisionSeatAliases[$s] }
+    return $s
+}
+
 function Test-DecisionLanderSeat([string]$Seat) {
     # The Lander, or a roster alias of it (docs/roles/seats.json). An unreadable roster is no
-    # exemption: this only ever relaxes the cost rung, so a fault must not grant it.
-    if (-not $Seat) { return $false }
-    $s = $Seat.Trim().ToLowerInvariant()
-    if ($s -eq 'lander') { return $true }
-    try {
-        $roster = Join-Path (Split-Path -Parent (Split-Path -Parent $script:DecisionHere)) 'docs/roles/seats.json'
-        $alias = ([System.IO.File]::ReadAllText($roster) | ConvertFrom-Json -ErrorAction Stop).aliases.PSObject.Properties[$s]
-        return [bool]($alias -and [string]$alias.Value -eq 'lander')
-    } catch {
-        return $false
-    }
+    # exemption: this only ever relaxes the cost rung, so a fault must not grant it, and
+    # Resolve-DecisionSeat then leaves an alias unmapped.
+    return ((Resolve-DecisionSeat $Seat) -eq 'lander')
 }
 
 function Get-DecisionJsonValue($Object, [string]$Name) {
