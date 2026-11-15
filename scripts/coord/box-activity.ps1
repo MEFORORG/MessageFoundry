@@ -73,7 +73,8 @@ function Get-BoxRecordHost {
     $f = Get-ChildItem -LiteralPath $dir -Filter *.json -File -Force -EA SilentlyContinue |
          Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     if (-not $f) { return $null }
-    try { $rec = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop } catch { return $null }
+    # -NoEnumerate: unrolled, a one-element array would reach the object check as its element.
+    try { $rec = Read-CoordText $f.FullName | ConvertFrom-Json -NoEnumerate -EA Stop } catch { return $null }
     if ($rec -isnot [System.Management.Automation.PSCustomObject]) { return $null }
     return (Get-CoordRecordHost $rec)
 }

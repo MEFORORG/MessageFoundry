@@ -250,9 +250,10 @@ class TestLocalProbesOnlyCountForThisPcsSeat:
         assert a["Evaluable"] is False, a
 
     def test_a_newest_record_that_is_not_an_object_names_no_host(self, sandbox: Path) -> None:
-        """A JSON array has no `host` and would read as a legacy (this-PC) record."""
+        """A JSON array is not a seat record. ConvertFrom-Json unrolls a one-element array, so
+        without -NoEnumerate its element, which names no host, read as a legacy (this-PC) record."""
         (sandbox / "seats" / "demo-box-0000" / "s1.json").write_text(
-            '[{"host": "ANOTHER-PC-0001"}]', encoding="utf-8"
+            '[{"seat": "builder"}]', encoding="utf-8"
         )
         write_heartbeat(sandbox, age_hours=48)
         a = activity(sandbox)
