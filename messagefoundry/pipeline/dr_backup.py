@@ -2010,7 +2010,8 @@ def _empty_files_in_place(staging: Path, *, spared: Mapping[str, str] | None = N
     empty: a file that refused, or a directory that could not be listed.
 
     A name in ``spared``, directly under ``staging``, is never truncated, and is reported with the
-    note it maps to; its spare marker is kept too, unreported. A restore spares its staged store when that name could not be removed after placement and is
+    note it maps to; its spare marker is kept too, unreported, as is a marker reading ``released``
+    (:func:`_release_spare_marker`). A restore spares its staged store when that name could not be removed after placement and is
     still the restored store's own file, which a volume that misreports its link count would
     otherwise let this empty (BACKLOG #5617; see :func:`_spared_items`).
 
@@ -2045,13 +2046,19 @@ def _empty_files_in_place(staging: Path, *, spared: Mapping[str, str] | None = N
         if reason is not None and not (reason == _OUTSIDE_REASON and reason in unproven):
             unproven.append(reason)
 
+    spares = spared or {}
+
     def _is_spared(at_root: bool, name: str) -> bool:
-        if not (at_root and spared):
+        if not at_root:
             return False
-        if name in spared:
-            unproven.append(f"{name} ({spared[name]})")
+        if name in spares:
+            unproven.append(f"{name} ({spares[name]})")
             return True
-        return _marker_target(name) in spared
+        target = _marker_target(name)
+        if target is None:
+            return False
+        # A marker reading `released` holds that word alone; emptied, it would read as a spare.
+        return target in spares or _read_spare_reason(staging / name) == _SPARE_RELEASED
 
     walked = False
     if sys.platform == "win32":
@@ -2774,6 +2781,10 @@ _SPARE_RESTORED = "restored-store"
 _SPARE_ROLLBACK_FAILED = "rollback-failed"
 #: The file is the only decrypted copy of a store a failed restore placed and then removed.
 _SPARE_ROLLED_BACK = "rolled-back"
+#: The file is spared no longer: written where the marker itself will not go, so the decision lasts
+#: past this run. A marker that reads so spares nothing, and is never emptied, since an empty marker
+#: reads as a spare for a reason that could not be read.
+_SPARE_RELEASED = "released"
 _SPARE_NOTES = {
     _SPARE_RESTORED: "the restored store, not truncated",
     _SPARE_ROLLBACK_FAILED: (
@@ -2828,8 +2839,13 @@ def _write_spare_marker(item: Path, reason: str) -> bool:
             os.close(fd)
         os.replace(tmp, marker)
     except OSError as exc:
-        with contextlib.suppress(OSError):
+        try:
             os.unlink(tmp)
+        except OSError as unlink_exc:
+            # It holds a reason word, no plaintext; the teardown removes or empties it.
+            log.warning(
+                "could not remove the temporary spare marker %s: %s", tmp, safe_exc(unlink_exc)
+            )
         log.error("could not record that %s must not be removed: %s", item, safe_exc(exc))
         return False
     return True
@@ -2853,10 +2869,13 @@ def _withhold_from_sweep(staging: Path) -> None:
         )
 
 
-def _record_spare(item: Path, reason: str) -> None:
-    """:func:`_write_spare_marker`, and where it does not land, :func:`_withhold_from_sweep`."""
-    if not _write_spare_marker(item, reason):
-        _withhold_from_sweep(item.parent)
+def _record_spare(item: Path, reason: str) -> bool:
+    """:func:`_write_spare_marker`, and where it does not land, :func:`_withhold_from_sweep`.
+    ``True`` when the marker landed."""
+    if _write_spare_marker(item, reason):
+        return True
+    _withhold_from_sweep(item.parent)
+    return False
 
 
 def _clear_spare_marker(item: Path) -> bool:
@@ -2872,8 +2891,45 @@ def _clear_spare_marker(item: Path) -> bool:
     return True
 
 
+def _release_spare_marker(item: Path) -> bool:
+    """Put on disk that ``item`` is spared no longer: remove its marker, or where that is refused,
+    rewrite it in place to read ``released``, which spares nothing. Held in memory alone, the
+    decision lasted one run, and the teardown then emptied the marker, which every later sweep
+    reads as a spare (BACKLOG #5617). In place, because a holder that refuses the unlink usually
+    shares write access, and an atomic rename over the marker needs what the unlink did. Written
+    before it is cut to length, so a failure leaves the old reason or an unknown one, both still a
+    spare, and never an empty marker. Never raises; ``False``, logged, when the marker may still
+    spare ``item``."""
+    if _clear_spare_marker(item):
+        return True
+    marker = _spare_marker(item)
+    flags = os.O_WRONLY | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK
+    try:
+        fd = os.open(marker, flags)
+        try:
+            os.write(fd, _SPARE_RELEASED.encode("ascii"))
+            os.ftruncate(fd, len(_SPARE_RELEASED))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        reason = safe_exc(exc)
+    else:
+        if _read_spare_reason(marker) == _SPARE_RELEASED:
+            return True
+        reason = "it did not read back"
+    log.error(
+        "could not record that %s is spared no longer, so its marker may still spare it from "
+        "every later sweep: delete its directory by hand: %s",
+        item,
+        reason,
+    )
+    return False
+
+
 def _read_spare_reason(marker: Path) -> str:
-    """The reason a spare marker holds, or ``""`` when it cannot be read as one."""
+    """The reason a spare marker holds, or ``""`` when it cannot be read as one, logged unless the
+    marker is simply not there."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK
     try:
         fd = os.open(marker, flags)
@@ -2881,7 +2937,10 @@ def _read_spare_reason(marker: Path) -> str:
             return os.read(fd, 64).decode("ascii")
         finally:
             os.close(fd)
-    except (OSError, UnicodeDecodeError):
+    except FileNotFoundError:
+        return ""
+    except (OSError, UnicodeDecodeError) as exc:
+        log.warning("could not read the spare marker %s: %s", marker, safe_exc(exc))
         return ""
 
 
@@ -2890,8 +2949,10 @@ def _spared_items(staging: Path, in_memory: Mapping[str, str] | None) -> dict[st
     mapped to the note that reports it (:func:`_empty_files_in_place`, which keeps their markers
     too): every name a marker records, and the names in ``in_memory``, each with this run's
     reason, while that name is still there. An empty reason in ``in_memory`` unspares its name
-    whatever a marker says: the restore that wrote the marker knows it no longer applies. A marker whose file is gone spares nothing and goes
-    with the directory, so deleting a spared file by hand lets the next sweep finish.
+    whatever a marker says: the restore that wrote the marker knows it no longer applies. A marker
+    that reads ``released`` spares nothing (:func:`_release_spare_marker`). A marker whose file is
+    gone spares nothing and goes with the directory, so deleting a spared file by hand lets the
+    next sweep finish.
 
     Only a restore writes a marker, so only a restore's directory is read for one. ``None`` when that
     directory could not be listed: whether anything in it is spared is then not known."""
@@ -2909,7 +2970,8 @@ def _spared_items(staging: Path, in_memory: Mapping[str, str] | None) -> dict[st
             target = _marker_target(name)
             if target is not None and target in names:
                 reason = _read_spare_reason(staging / name)
-                spared[target] = _SPARE_NOTES.get(reason, _SPARE_NOTE_UNREAD)
+                if reason != _SPARE_RELEASED:
+                    spared[target] = _SPARE_NOTES.get(reason, _SPARE_NOTE_UNREAD)
     for name, reason in (in_memory or {}).items():
         if not reason:
             spared.pop(name, None)
@@ -2979,8 +3041,8 @@ def _teardown_staging(path: Path, *, spared: Mapping[str, str] | None = None) ->
     """:func:`_discard_verify_staging`, then, if the directory survived, put its lock file and marker
     back so the next sweep can prove it abandoned. Never raises. A file a restore spares, in
     ``spared`` or by a marker in the directory, is neither unlinked nor truncated
-    (:func:`_spared_items`); a directory holding one this run spared but could not record is not
-    re-marked, so no sweep ever takes it (BACKLOG #5617).
+    (:func:`_spared_items`); a directory holding one this run spared but could not record, or whose
+    marker still reads another reason, is not re-marked, so no sweep ever takes it (BACKLOG #5617).
 
     A refused removal can take the lock file and marker with it, because ``rmtree`` removes entries in
     listing order and on NTFS the dot-names list first. Left like that, the directory would hold
@@ -3012,10 +3074,14 @@ def _teardown_staging(path: Path, *, spared: Mapping[str, str] | None = None) ->
         )
     if not os.path.lexists(path):
         return leftover
+    # The marker's reason, not its existence: a relabel that failed leaves an older reason, which a
+    # later sweep would read in place of this run's (BACKLOG #5617).
     unrecorded = sorted(
         n
         for n, reason in (spared or {}).items()
-        if reason and _still_there(path / n) and not _still_there(_spare_marker(path / n))
+        if reason
+        and _still_there(path / n)
+        and _read_spare_reason(_spare_marker(path / n)) != reason
     )
     if unrecorded:
         # A spare whose marker could not be written holds for this run alone. Its restore already
@@ -5138,8 +5204,20 @@ def _restore_blocking(
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
             # `published` flips only once the store at `dest_store_path` is one THIS call made.
+            # The staged store is marked spared BEFORE the placement can make it a second name for
+            # the restored store, so no crash point leaves that name unmarked for a later sweep's
+            # fail-safe (BACKLOG #5617). Every path below that finds it no such name unspares it.
+            spared_item = snap
+            _record_spare(snap, spared_reason)
             try:
-                store_bytes = _place_restored_store(snap, dest_store_path)
+                try:
+                    store_bytes = _place_restored_store(snap, dest_store_path)
+                except BaseException:
+                    if not (
+                        _still_there(dest_store_path) and _names_same_file(snap, dest_store_path)
+                    ):
+                        spared_item, spared_reason = _unspare(snap)
+                    raise
             except FileExistsError as exc:
                 raise BackupError(
                     "destination", _OVERWRITE_REFUSAL.format(path=dest_store_path)
@@ -5152,8 +5230,9 @@ def _restore_blocking(
             # file with two links, but a volume that hard-links and reports one link would have
             # it truncate the restored store itself. Placed by a copy, it is a second plaintext
             # copy with no further use. Where the unlink is refused (a scanner holding it) and the
-            # name is still the placed store's own file, it is spared, by a marker every later
-            # teardown and sweep reads as well as this run's, rather than left to the link count.
+            # name is still the placed store's own file, it stays spared, by the marker written
+            # above, which every later teardown and sweep reads as well as this run's, rather than
+            # left to the link count.
             try:
                 snap.unlink()
             except OSError as exc:
@@ -5162,13 +5241,12 @@ def _restore_blocking(
                     snap,
                     safe_exc(exc),
                 )
-                try:
-                    shares_store = os.path.samefile(snap, dest_store_path)
-                except OSError:
-                    shares_store = True  # not known, so the safe answer
-                if shares_store:
-                    spared_item = snap
-                    _record_spare(snap, spared_reason)
+                if not _names_same_file(snap, dest_store_path):
+                    spared_item, spared_reason = _unspare(snap)
+            else:
+                # The name is gone, so its marker spares nothing even where it will not clear.
+                _clear_spare_marker(snap)
+                spared_item = None
 
             # The config bundle is written AFTER the store, and every way it can fail used to leave
             # the store published anyway: a refused member name, a cap, a collision, an archive with
@@ -5200,17 +5278,16 @@ def _restore_blocking(
                         dest_store_path,
                         safe_exc(unlink_exc),
                     )
-            if spared_item is not None and store_removed:
-                # Once the placed store is gone the staged copy is the only one, so it is unspared
-                # and the teardown removes or empties it on its own retry schedule. A marker that
-                # will not go is overridden by an empty reason, which unspares the name.
-                if _clear_spare_marker(spared_item):
-                    spared_item = None
-                else:
-                    spared_reason = ""
-            elif spared_item is not None and _drop_staged_name(spared_item):
+            if spared_item is None or not spared_reason:
+                pass  # nothing spared, or already unspared above
+            elif store_removed:
+                # Once the placed store is gone the staged copy is the only one, so it is unspared,
+                # on disk too, and the teardown removes or empties it on its own retry schedule. A
+                # marker that will not say so is overridden for this run by an empty reason.
+                spared_item, spared_reason = _unspare(spared_item)
+            elif _drop_staged_name(spared_item):
                 spared_item = None
-            elif spared_item is not None:
+            else:
                 # The rollback could not remove the placed store, so the staged name stays a name
                 # for it, and once the operator deletes that store it is the only decrypted copy.
                 # Recorded and reported, never emptied or removed by a sweep; the refusal below
@@ -5288,6 +5365,7 @@ def _restore_blocking(
             # rollback finishes the job where it can, and otherwise relabels and reports it.
             if (
                 spared_item is not None
+                and spared_reason
                 and dest_store_path is not None
                 and not store_removed
                 and not _still_there(dest_store_path)
@@ -5300,13 +5378,19 @@ def _restore_blocking(
                         spared_item,
                     )
                 else:
-                    _write_spare_marker(spared_item, _SPARE_ROLLED_BACK)
+                    # A marker that kept its older reason would have every later sweep report the
+                    # copy as a name for a store that is gone, so its directory is withheld instead.
+                    relabelled = _record_spare(spared_item, _SPARE_ROLLED_BACK)
                     log.error(
                         "the failed restore's rollback removed the placed store at %s only after "
                         "its staging teardown, so the staged copy %s is the only decrypted copy of "
-                        "it, kept unemptied and reported by every sweep: delete it by hand",
+                        "it, kept unemptied; %s: delete it by hand",
                         dest_store_path,
                         spared_item,
+                        "every sweep reports it"
+                        if relabelled
+                        else "its marker could not be relabelled and still reads its earlier "
+                        "reason, so no sweep removes its directory",
                     )
         if not completed:
             # After the staging directory's own teardown and the rollback, so each is empty again.
@@ -5489,6 +5573,22 @@ _CONTRADICTORY_ARCHIVE_REFUSAL = (
 
 def _spare_of(item: Path | None, reason: str) -> dict[str, str]:
     return {} if item is None else {item.name: reason}
+
+
+def _unspare(item: Path) -> tuple[Path | None, str]:
+    """What a restore holds for its teardown once its staged store is spared no longer: nothing
+    where :func:`_release_spare_marker` put that on disk, and otherwise the name with an empty
+    reason, which unspares it for this run's teardown at least."""
+    return (None if _release_spare_marker(item) else item), ""
+
+
+def _names_same_file(item: Path, other: Path) -> bool:
+    """Whether ``item`` and ``other`` name one file. ``True`` when that is not known: for a spare,
+    the safe answer."""
+    try:
+        return os.path.samefile(item, other)
+    except OSError:
+        return True
 
 
 def _drop_staged_name(item: Path) -> bool:
