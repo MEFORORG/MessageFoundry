@@ -10731,15 +10731,14 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
     folder reached, and on Windows the text is normalized before each pass, as Win32 normalizes it.
 
     Raises ``OSError`` where a name cannot be stat'ed for any reason but absence, a link cannot be
-    read, more than :data:`~messagefoundry.auth.anchor_path.MAX_LINK_HOPS` links are followed, or,
-    on Windows, a name holds a colon, a link leads to a device path, a drive with no separator
-    after it or a path rooted with no drive, or the name is a reparse point other than a symbolic
-    link or a junction. Each of those would leave a folder the open passes through unread."""
-    from messagefoundry.auth.anchor_path import (
-        _IO_REPARSE_TAG_MOUNT_POINT,
-        _NAME_SURROGATE_BIT,
-        MAX_LINK_HOPS,
-    )
+    read, more than :data:`_LINK_HOPS` links are followed, or, on Windows, a name in the path or
+    in a link target holds a colon or ends in a space or a dot, a link leads to a device path, a
+    drive with no separator after it or a path rooted with no drive, or the name is a reparse point
+    other than a symbolic link or a junction. Each of those would leave a folder the open passes
+    through unread, or have the walk vet another object than the open reaches: Win32 strips a
+    trailing dot or space where a link's target, opened as written, keeps it, and a joined name
+    holding a colon restarts the path at a drive (``anchor_path.windows_chain`` refuses both)."""
+    from messagefoundry.auth.anchor_path import _IO_REPARSE_TAG_MOUNT_POINT, _NAME_SURROGATE_BIT
 
     windows = os.name == "nt"
     found: list[Path] = []
@@ -10753,6 +10752,13 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
         cur = drive + os.sep
         cur_is_folder = True
         parts = [part for part in rest.split(os.sep) if part]
+        if windows:
+            # Checked over the whole pass before anything is joined, as windows_chain does: a
+            # remaining name ``a:b`` joined after a link target restarts the path at ``a:\``.
+            if any(":" in part for part in parts):
+                raise OSError(errno.EINVAL, "a name in the path holds a colon")
+            if any(part.endswith((" ", ".")) and part not in (".", "..") for part in parts):
+                raise OSError(errno.EINVAL, "a name in the path ends in a space or a dot")
         for index, name in enumerate(parts):
             if name == ".":
                 continue
@@ -10762,9 +10768,6 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
                 cur = os.path.dirname(cur)
                 cur_is_folder = True
                 continue
-            if windows and ":" in name:
-                # A stream name: joined after a link target, it would restart the path there.
-                raise OSError(errno.EINVAL, "a name in the path holds a colon")
             child = os.path.join(cur, name)
             try:
                 st = os.lstat(child)
@@ -10786,8 +10789,8 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
                 cur, cur_is_folder = child, stat.S_ISDIR(st.st_mode)
                 continue
             hops += 1
-            if hops > MAX_LINK_HOPS:
-                raise OSError(errno.ELOOP, f"more than {MAX_LINK_HOPS} links were followed")
+            if hops > _LINK_HOPS:
+                raise OSError(errno.ELOOP, f"more than {_LINK_HOPS} links were followed")
             found.append(Path(cur))
             if windows:
                 # GetNamedSecurityInfoW reads a link's own access list, not its target's.
@@ -10802,6 +10805,11 @@ def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
         else:
             found.append(Path(cur))
             return found, found[-1]
+
+
+#: Past every platform's own bound on a chain of links (40 on Linux, 63 on Windows), so a chain
+#: the open follows is never refused for its length alone.
+_LINK_HOPS: Final = 64
 
 
 def _windows_link_target(text: str) -> str:

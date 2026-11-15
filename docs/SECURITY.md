@@ -2836,8 +2836,10 @@ folder holding a link is judged by the rule the file's own folder is, so a link 
 in `C:\` or `C:\ProgramData`, as Windows ships them, is refused. The file or folder vetted, or a
 name along the links it follows, that cannot be stat'ed, for any reason but nothing being there,
 is refused rather than skipped; on POSIX the policy's own read of each path still skips one that
-stops answering after that stat. The walk stats each name from the root, so on Windows a value or
-settings file is refused where the engine's account may traverse a folder above it but not read
+stops answering after that stat. On Windows a name in the path or in a link's target that holds a
+colon, or ends in a dot or a space, is refused, as `anchor_path.windows_chain` refuses it: there
+the open can reach another object than the walk would vet. The walk stats each name from the
+root, so on Windows a value or settings file is refused where the engine's account may traverse a folder above it but not read
 its attributes, though the open would succeed. That vet misses at least the folders above each of
 those folders, the folders a `subst` drive letter stands for, and every other `environments/*.toml`
 file the snapshot reads but never applies.

@@ -485,7 +485,7 @@ def test_a_dangling_value_file_link_vets_the_folder_it_leads_to(tmp_path: Path) 
 
 
 def test_a_link_past_the_hop_limit_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import messagefoundry.auth.anchor_path as anchor_path
+    import messagefoundry.config.wiring as wiring
 
     values, real = _linked_value_file(tmp_path)
     middle = tmp_path / "elsewhere" / "middle.toml"
@@ -493,9 +493,47 @@ def test_a_link_past_the_hop_limit_refuses(tmp_path: Path, monkeypatch: pytest.M
     values.unlink()
     _link(values, middle)
     assert _norm(real.parent) in _same_paths(_file_and_folder([values]))  # control: two hops pass
-    monkeypatch.setattr(anchor_path, "MAX_LINK_HOPS", 1)
+    monkeypatch.setattr(wiring, "_LINK_HOPS", 1)
     with pytest.raises(WiringError, match="more than 1 links"):
         _file_and_folder([values])
+
+
+def test_the_hop_bound_is_past_every_platform_s_own() -> None:
+    """A chain the open follows is never refused for its length alone: Windows follows 63 links,
+    and the bound was 40, anchor_path's, before (#6654 review)."""
+    import messagefoundry.config.wiring as wiring
+
+    assert wiring._LINK_HOPS >= 63
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 strips a trailing dot or space")
+@pytest.mark.parametrize("suffix", [".", " "])
+def test_a_link_target_ending_in_a_dot_or_space_refuses(suffix: str, tmp_path: Path) -> None:
+    """Win32 strips a trailing dot or space where a link's target, opened as written, keeps it, so
+    the walk vetted ``vals`` while the open read ``vals.`` (round-531bdffe4b finding 1)."""
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "vals").write_text("", encoding="utf-8")
+    values = tmp_path / "dev.toml"
+    try:
+        os.symlink(f"data\\vals{suffix}", values)
+    except OSError:
+        pytest.skip("this account cannot create a file link")
+    with pytest.raises(WiringError, match="ends in a space or a dot"):
+        _file_and_folder([values])
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a drive-like name restarts an ntpath join")
+def test_a_name_holding_a_colon_after_a_folder_link_refuses(tmp_path: Path) -> None:
+    """``os.path.join(target, "a:b")`` restarts at ``a:``, so the walk vetted ``a:\\`` and never
+    the folder the open reads a stream from (round-531bdffe4b finding 2)."""
+    real = tmp_path / "realdir"
+    real.mkdir()
+    (real / "a").write_text("", encoding="utf-8")
+    flink = tmp_path / "flink"
+    _link(flink, real, folder=True)
+    with pytest.raises(WiringError, match="holds a colon"):
+        _file_and_folder([Path(f"{flink}\\a:b")])
 
 
 def test_a_reparse_point_the_walk_cannot_follow_refuses(
