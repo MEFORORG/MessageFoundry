@@ -270,13 +270,16 @@ _KNOWN_FETCH_SITE = _CROSS_ORIGIN_FETCH | _SAME_ORIGIN_FETCH
 _CONFLICTING_FETCH_SITE = "conflicting Sec-Fetch-Site lines rejected"
 
 
-#: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
-#: There are exactly THREE emitters, and between them they cover every shape a termination takes:
-#: :func:`clear_session_cookie` (a route that deletes the cookie — sign-out, and the password change
-#: that revokes every session), :func:`_login_redirect` / :func:`login_redirect_response` (every
-#: SERVER-driven expiry, revoke or disable redirect), and the login RENDER in :mod:`.routes.core`
-#: (a post-termination landing reached by bookmark or Back, recognised by its outcome code or by a
-#: session cookie that no longer authenticates). Deletion and this header are deliberately fused in
+#: ASVS 14.3.1 — the header emitted on responses that END a session's browser-visible life.
+#: There are THREE emitters: :func:`clear_session_cookie` (a route that deletes the cookie —
+#: sign-out, and the password change that revokes every session), :func:`_login_redirect` /
+#: :func:`login_redirect_response` (a SERVER-driven expiry, revoke or disable redirect for a request
+#: that presented the dead session cookie), and the login RENDER in :mod:`.routes.core` (a
+#: post-termination landing reached by bookmark or Back, recognised by its outcome code or by a
+#: session cookie that no longer authenticates). **They do not cover every termination:** a
+#: request that carries no session cookie gets none, including a cross-site navigation after a
+#: termination, which the ``SameSite=Strict`` cookie does not ride (see :func:`_login_redirect`).
+#: Deletion and this header are deliberately fused in
 #: one helper rather than left as two lines a new route must remember to write together.
 #: ``"cache"`` ONLY: ``"cookies"`` is already covered by the explicit cookie deletion (and would clear
 #: the in-flight OIDC flow cookie), and ``"storage"`` would wipe the deliberately-persistent, PHI-free
@@ -322,15 +325,15 @@ def login_redirect_response(
     (rather than a dependency, which raises). Same 14.3.1 header, same default outcome code, so the
     two paths cannot drift apart.
 
-    ``cookie_presented=False`` is for a route a browser can open with no session cookie, such as a
-    bookmarked page: it gets the plain sign-in page, with no outcome code and no header, as
-    :func:`_login_redirect` gives the gate's first visit. The code is dropped with the header
-    because the login render sends the header for an ``expired`` code by itself. The default keeps
-    both for the routes that reach here only after a session existed."""
-    if not cookie_presented:
-        return RedirectResponse("/ui/login", status_code=303)
+    ``cookie_presented=False`` omits the header, as :func:`_login_redirect` does for the gate's first
+    visit. A caller that passes it for a request with no cookie passes an empty ``note`` too, as the
+    gate does, because the login render sends the header for an ``expired`` code by itself. The
+    default is True, unlike :func:`_login_redirect`'s required keyword, so the routes that pass
+    nothing keep the header; at least the POST legs of the second-factor and re-auth pages and the
+    OIDC step-up routes pass nothing, and a cookie-less request there still gets it."""
     resp = RedirectResponse("/ui/login" + (f"?e={note}" if note else ""), status_code=303)
-    resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
+    if cookie_presented:
+        resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
     return resp
 
 

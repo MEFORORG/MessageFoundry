@@ -15,10 +15,13 @@ Four mechanisms are pinned here:
   background routes now validate with ``activity=False``.
 * **The watchdog's heartbeat**, ``GET /ui/session-status``: reachable only with a live session, itself
   non-activity, and reporting the absolute deadline as REMAINING SECONDS read from the session record.
-* **``Clear-Site-Data: "cache"``** on EVERY response that ends a session's browser-visible life: the
+* **``Clear-Site-Data: "cache"``** on the responses that end a session's browser-visible life: the
   logout 303, the change-password 303 (which revokes every session for the user), every server-driven
-  expiry/revoke redirect, and the post-termination login render. Cookie deletion and the header are
-  fused in one helper so a termination route cannot write one without the other.
+  expiry/revoke redirect for a request that presented the dead cookie, and the post-termination login
+  render. A request with no session cookie gets none: a first visit, and also a cross-site
+  navigation after a termination, which the ``SameSite=Strict`` cookie does not ride. Cookie
+  deletion and the header are fused in one helper so a termination route cannot write one without
+  the other.
 * **The client contract** in ``app.js``: blank the document BEFORE navigating, anchor to server
   interaction and never to DOM activity, and surface the auth redirect instead of following it — on
   every fetch, not only the watchdog's own probe.
@@ -366,15 +369,18 @@ async def test_sign_out_always_sends_clear_site_data(engine: Engine) -> None:
             assert out.headers["clear-site-data"] == '"cache"', headers
 
 
-def _gate_request(headers: list[tuple[bytes, bytes]]) -> StarletteRequest:
+def _bare_request(
+    headers: list[tuple[bytes, bytes]], *, method: str = "GET", path: str = "/ui"
+) -> StarletteRequest:
+    """A plain-http request on an app whose state holds nothing, so no auth service is attached."""
     return StarletteRequest(
         {
             "type": "http",
             "http_version": "1.1",
-            "method": "GET",
+            "method": method,
             "scheme": "http",
-            "path": "/ui",
-            "raw_path": b"/ui",
+            "path": path,
+            "raw_path": path.encode(),
             "query_string": b"",
             "root_path": "",
             "headers": [(b"host", b"t"), *headers],
@@ -386,12 +392,12 @@ def _gate_request(headers: list[tuple[bytes, bytes]]) -> StarletteRequest:
 
 
 async def test_the_no_auth_redirect_sends_clear_site_data_only_for_a_presented_cookie() -> None:
-    """With no auth service attached the gate redirects before it reads the token. It follows the
-    same rule: the header only when a session cookie came with the request."""
+    """With no auth service attached the gate redirects without asking anything about the token.
+    It follows the same rule: the header only when a session cookie came with the request."""
     gate = require_ui()
     for headers, expected in (([], False), ([(b"cookie", b"mf_session=dead")], True)):
         with pytest.raises(HTTPException) as caught:
-            await gate(_gate_request(headers))
+            await gate(_bare_request(headers))
         assert caught.value.status_code == 303
         sent = caught.value.headers or {}
         assert sent["Location"] == "/ui/login"
@@ -436,22 +442,7 @@ def test_clearing_the_session_cookie_and_the_header_cannot_be_written_apart() ->
     terminating route had to remember beside ``clear_session_cookie`` — and one of the two routes did
     not. Deleting the session cookie IS the browser-visible end of a session, so the helper emits
     both; this pins that a future termination route cannot get one without the other."""
-    request = StarletteRequest(
-        {
-            "type": "http",
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/ui/logout",
-            "raw_path": b"/ui/logout",
-            "query_string": b"",
-            "root_path": "",
-            "headers": [(b"host", b"t")],
-            "client": ("127.0.0.1", 1234),
-            "server": ("t", 80),
-            "app": SimpleNamespace(state=SimpleNamespace()),
-        }
-    )
+    request = _bare_request([], method="POST", path="/ui/logout")
     resp = StarletteResponse()
     clear_session_cookie(resp, request)
     assert resp.headers["clear-site-data"] == '"cache"'
