@@ -471,9 +471,8 @@ def aggregate_cell_record(
     # harness/load/report.py's copy: both arms above are inequalities an empty, unsettled or
     # undelivering cell satisfies trivially.
     unproven: list[str] = []
-    if agg_sent == 0:
-        unproven.append("nothing was sent — the cell measured nothing")
-    elif agg_sink_received == 0 and engine_written <= 0:
+    # A fleet that sent nothing was refused above, so only the undelivering cell remains here.
+    if agg_sink_received == 0 and engine_written <= 0:
         unproven.append(
             f"nothing was delivered (union sink_received 0, engine_written {engine_written}) — "
             f"no delivery to reconcile"

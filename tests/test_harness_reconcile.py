@@ -77,10 +77,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
+
 from harness.load.connscale import batchbox as bb
 from harness.load.connscale import report as connscale_report
+from harness.load.connscale.runner import ConnScaleError, _ReloadAccount
 from harness.load.connscale.runner import _reconcile as _connscale_reconcile
-from harness.load.connscale.runner import _ReloadAccount
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.estate import report as estate_report
 from harness.load.estate.runner import _reconcile as _estate_reconcile
@@ -1366,12 +1368,13 @@ def test_batchbox_aggregate_clean_control() -> None:
     assert rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
 
 
-def test_batchbox_aggregate_nothing_sent_or_delivered_is_inconclusive() -> None:
+def test_batchbox_aggregate_nothing_sent_is_refused_and_nothing_delivered_is_inconclusive() -> None:
+    # A fleet that sent nothing is refused outright (BACKLOG #5431); the driver turns the refusal
+    # into a failed cell record, which `_failed_cell_record` labels INCONCLUSIVE.
     empty = _band(sent=0, engine_read=0, engine_written=0, sink_received=0)
     empty["traffic"] = {"sent": 0, "acked": 0, "nak": 0, "deferred": 0, "timeouts": 0}
-    rec = bb.aggregate_cell_record(_cell(), [empty])
-    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
-    assert "nothing was sent" in rec.no_loss.detail
+    with pytest.raises(ConnScaleError, match="sent nothing"):
+        bb.aggregate_cell_record(_cell(), [empty])
     undelivered = _band(engine_read=10, engine_written=0, sink_received=0)
     rec = bb.aggregate_cell_record(_cell(), [undelivered])
     assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail

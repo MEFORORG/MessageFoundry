@@ -2034,9 +2034,8 @@ def _reconcile(
         )
     read = final.read - base.read
     written = final.written - base.written
-    # The whole pipeline, not the outbound queue alone: a stalled router or transform leaves every
-    # accepted message in ingress or routed with the outbound reading at 0 (BACKLOG #5574).
-    backlog = max(final.pending + final.inflight, final.in_pipeline)
+    # The whole pipeline, not the outbound queue alone: see EngineSample.backlog (BACKLOG #5435).
+    backlog = final.backlog
     # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
     # the engine deltas may rest on it; the load copy's reasoning is the source of record. The arms
     # that read only client counters (the stranding budget and the reload guards) still prove a loss

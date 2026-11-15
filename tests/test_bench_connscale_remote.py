@@ -245,6 +245,7 @@ def _remote_report(**over: Any) -> rr.ConnScaleRemoteReport:
         "no_loss": NoLoss(True, 8, 8, 8, 8, 0, "ok"),
         "in_pipeline_peak": 0,
         "drain_seconds": 0.5,
+        "counter_reset": None,
     }
     fields.update(over)
     return rr.ConnScaleRemoteReport(**fields)

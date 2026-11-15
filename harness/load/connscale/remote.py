@@ -104,8 +104,9 @@ class ConnScaleRemoteReport:
     @property
     def failures(self) -> list[str]:
         """Why the run FAILS, empty on a PASS. PASS needs the reconcile AND traffic AND a completed
-        drain (BACKLOG #5431): a run that sent nothing reconciles vacuously, and a timed-out drain left
-        rows stranded in some stage, which the outbound-only backlog in the reconcile can miss."""
+        drain (BACKLOG #5431): a run that sent nothing measured nothing, and a timed-out drain left
+        rows stranded in some stage. The reconcile reads both as INCONCLUSIVE too (BACKLOG #5574);
+        they are named here as well so the verdict says why without parsing its detail."""
         out: list[str] = []
         if not self.no_loss.ok:
             label = "inconclusive" if self.no_loss.inconclusive else "loss"
