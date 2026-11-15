@@ -3658,6 +3658,9 @@ if ($tool -in @("Bash", "PowerShell")) {
     # sibling worktrees and the primary alike. Any git failure falls through to ALLOW.
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
+    # The valueless read options rule 3c's read exemptions accept between `config` and the key
+    # (BACKLOG #5588, #5589). Exact spellings only: an abbreviation or a value-taking option is no read.
+    $readOpts = '--(?:get|get-all|get-regexp|local|global|system|worktree|includes|no-includes|null|name-only|show-origin|show-scope)|-z'
     # EVERY DISARM ON A SEGMENT IS JUDGED, not only the first (review round 3411eb8641 on BACKLOG #5642,
     # #5655). The first match is judged first and exactly as before; each later one runs the same body,
     # whose every exit is a `continue` or a deny, so judging more matches can only add a deny.
@@ -3706,20 +3709,23 @@ if ($tool -in @("Bash", "PowerShell")) {
         # ANCHORED AT THE START (BACKLOG #5588). The `config` alternative's via always begins with the
         # word; `--config-env ` also holds it, unanchored, and would have been granted the read exemptions.
         $viaConfig = $via -match '^config\b'
-        # A WRITE MODE BETWEEN `config` AND THE KEY (BACKLOG #5588). `git config --unset <key>` names no
-        # value and still removes the key, so neither read exemption below may excuse it. The flags and
-        # the subcommand words are git's own write modes. git accepts ANY unique prefix of a long
-        # option (measured: `--unset-a <key>` removes the key), so a `--<name>` counts when <name> is a
-        # prefix of a write mode; an ambiguous prefix git would refuse only costs a deny.
-        # $viaRead is "a read exemption may apply".
-        $writeModes = 'unset-all', 'remove-section', 'rename-section', 'replace-all', 'add'
-        $viaWrite = ($via -match '^config\s+(?:set|unset|remove-section|rename-section)\s') -or
-            [bool]@([regex]::Matches($via, '\s--(?<o>[A-Za-z][\w-]*)') | Where-Object {
-                $o = $_.Groups['o'].Value.ToLowerInvariant()
-                @($writeModes | Where-Object { $_.StartsWith($o) }).Count -gt 0 })
-        $viaRead = $viaConfig -and -not $viaWrite
-        # THE EXPLICIT READ FLAGS ARE TESTED BELOW, AGAINST THE DISARMING INVOCATION'S OWN WINDOW, and
-        # they used to be tested here against the WHOLE SEGMENT. See the block after $ownCmdWin.
+        # A READ IS RECOGNISED BY AN ALLOWLIST, NEVER BY THE ABSENCE OF A WRITE MODE (BACKLOG #5588,
+        # #5589). `git config --unset <key>` names no value and still removes the key, so the bare-read
+        # exemption below may not excuse it. A first fix listed git's write modes, and review measured
+        # every way a denylist leaks: git takes any unique prefix (`--unset-a`), the shell collapses
+        # `\--unset` and `--""unset`, and $via starts at the FIRST `config` word on the line, which can
+        # sit in a `-c foo.config=1` key or a `.../config/...` path, so an anchored `unset` test missed
+        # `git -c foo.config=1 config unset <key>`. So the read exemptions apply only when every token
+        # between `config` and the key is an exact, valueless read option -- an optional leading `get`
+        # subcommand, then scope and display flags and the `--get` modes. Anything else, a write mode
+        # included, is not a read here. That denies some odd reads (`--file <f>`, an abbreviation); it
+        # never excuses a write, because none of these tokens takes a value or sets anything.
+        $viaRead = $viaConfig -and ($via -cmatch "^config(?:\s+get)?(?:\s+(?:$readOpts))*\s+$")
+        # For the refusal's wording only: a config-form disarm that is not the plain `config <key> <v>`
+        # shape may REMOVE the key, so "setting" would misdescribe it.
+        $viaWrite = $viaConfig -and -not $viaRead -and ($via -cnotmatch '^config(?:\s+(?:--local|--global|--system|--worktree))*\s+$')
+        # THE EXPLICIT READ FLAGS ARE TESTED BELOW, against $via and $rest (BACKLOG #5589); see the block
+        # after $ownCmdWin for the window they replaced.
         # ...AND THE IMPLICIT ONE (BACKLOG #1306). `git config <key>` with NO VALUE AFTER IT assigns
         # nothing -- it is the bare read, and `--get` is merely its explicit spelling. Measured against
         # real git: bare `git config <key>` exits 1 on an unset key and stores nothing, while
@@ -3843,9 +3849,8 @@ if ($tool -in @("Bash", "PowerShell")) {
         # -- still denies. That is the false deny #5589 names, closed only for the plain shape; widening
         # it needs git's option table, not a regex. The bare read (empty $rest) is excused above.
         # ===============================================================================================
-        $readOpt = '--(?:get|get-all|get-regexp|local|global|system|worktree|includes|no-includes|null|name-only|show-origin|show-scope)|-z'
-        if ($viaRead -and $via -cmatch "^config(?:\s+(?:$readOpt))+\s+$" -and
-            $via -cmatch '\s--get(?:-all|-regexp)?\s' -and $rest -notmatch '[()`{}$<>"]') { continue }
+        if ($viaRead -and $via -cmatch '\s(?:get|--get(?:-all|-regexp)?)\s' -and
+            $rest -notmatch '[()`{}$<>"]') { continue }
 
         # ===============================================================================================
         # AND WHAT DID AN EARLIER STATEMENT OR LINE PUT IN THE ENVIRONMENT? (BACKLOG #1379 class two)
@@ -4047,7 +4052,7 @@ The target path '$(Get-SafeForMessage $where[0])' could not be resolved to an ab
 session's working directory ('$(Get-SafeForMessage $cwdRaw)'), so the check that would normally answer
 "is this the shared configuration of a governed checkout?" cannot run at all.
 
-'$badKey' is on the disarm list: setting it in a governed repository turns off the ledger, claim and
+'$badKey' is on the disarm list: $(if ($viaWrite) { 'changing' } else { 'setting' }) it in a governed repository turns off the ledger, claim and
 secret-leak commit gates for every worktree of it at once. An unanswerable question about that key is
 refused rather than assumed safe.
 

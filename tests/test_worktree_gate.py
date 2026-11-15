@@ -2456,7 +2456,14 @@ def _git_out(repo: Path, *args: str, env: dict[str, str] | None = None, check: b
         cwd=repo,
         capture_output=True,
         text=True,
-        env={**os.environ, **(env or {})},
+        # Repository scope only: a developer's or runner's own global/system config must not
+        # leak into the `--get` reads these tests assert on.
+        env={
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            **(env or {}),
+        },
         check=check,
     )
     return proc.stdout.strip()
@@ -2493,6 +2500,10 @@ def test_real_git_stores_nothing_for_a_read_flag_before_the_key(
     """The ground truth under the multi-argument read exemption: a read flag DIRECTLY after `config`
     makes the trailing arguments a pattern, or an error, and never a stored value. Only directly:
     after a value-taking option it is that option's value (the honours test measures one)."""
+    # Positive control: the same arguments WITHOUT the flag store, and the read below sees it.
+    _git_out(git_primary, "config", "core.hooksPath", "/seen")
+    assert _git_out(git_primary, "config", "--get", "core.hooksPath") == "/seen"
+    _git_out(git_primary, "config", "--unset", "core.hooksPath")
     _git_out(git_primary, "config", flag, "core.hooksPath", "/nope", check=False)
     _git_out(git_primary, "config", "--local", flag, "alias.zz", "status", check=False)
     # `--get` of an unset key exits 1, which is the answer asked for here.
@@ -2531,7 +2542,13 @@ def test_real_git_stores_nothing_for_a_read_flag_before_the_key(
         # #5588: git takes any unique prefix of a long option.
         "git config --unset-a core.hooksPath",
         "git config --unset- core.hooksPath",
-        "git config --uns include.path",
+        # The shell collapses an escape or an empty quote, so git sees `--unset` / `unset`.
+        "git config \\--unset core.hooksPath",
+        'git config --""unset core.hooksPath',
+        'git config un""set core.hooksPath',
+        # The first `config` word on the line is not the subcommand.
+        "git -c foo.config=1 config unset core.hooksPath",
+        "git --config-env=foo.bar=PATH config unset core.hooksPath",
         # Review round 1: a read flag in $via that is not the action, and a write in $rest.
         "git config --comment --get core.hooksPath /dev/null",
         "git config --show-origin --no-show-origin core.hooksPath /dev/null",
@@ -2558,6 +2575,10 @@ def test_rule_3c_denies_the_spellings_it_used_to_miss(
         "git config --get-regexp alias.co .",
         "git config --local --get core.hooksPath x",
         "git config --show-origin --get-all core.hooksPath x",
+        # The bare reads the allowlist still recognises.
+        "git config --local core.hooksPath",
+        "git --no-pager config --get core.hooksPath",
+        "git config get core.hooksPath",
     ],
 )
 def test_rule_3c_allows_multi_argument_reads(
@@ -2565,3 +2586,19 @@ def test_rule_3c_allows_multi_argument_reads(
 ) -> None:
     assert_denied(run_gate(bash(DISARM_WRITE, cwd=git_primary), git_repos_file))  # control
     assert run_gate(bash(cmd, cwd=git_primary), git_repos_file) is None
+
+
+@pytest.mark.parametrize(
+    ("cmd", "opening"),
+    [
+        ("git config --unset core.hooksPath", "BLOCKED: changing 'core.hooksPath'"),
+        ("git config unset core.hooksPath", "BLOCKED: changing 'core.hooksPath'"),
+        (DISARM_WRITE, "BLOCKED: setting 'core.hooksPath'"),
+    ],
+)
+def test_rule_3c_says_changing_for_a_removal(
+    git_primary: Path, git_repos_file: Path, cmd: str, opening: str
+) -> None:
+    """A removal sets nothing, so the refusal must not say it does (BACKLOG #5588)."""
+    reason = assert_denied(run_gate(bash(cmd, cwd=git_primary), git_repos_file))
+    assert reason.startswith(opening), reason
