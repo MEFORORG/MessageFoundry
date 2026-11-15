@@ -2154,8 +2154,10 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> s
     # the link itself holds no plaintext.
     if not stat.S_ISREG(st.st_mode):
         return None
-    # Nor is a HARD link truncated: it shares its bytes with a name outside this directory. No file
-    # the engine stages has a second link, so one here was put there by someone else.
+    # Nor is a HARD link truncated: it shares its bytes with a name outside this directory. The one
+    # file the engine stages with a second link is a restore's extracted store once it is placed by
+    # a link, whose other name IS the restored store (BACKLOG #5617); any other was put there by
+    # someone else.
     if st.st_nlink > 1:
         return f"{name} (hard-linked, not truncated)"
     try:
@@ -2961,7 +2963,13 @@ def _space_shortfall(needs: list[tuple[Path, int]]) -> str | None:
 
 
 class StagingNotPrivateError(OSError):
-    """A secured staging directory did not come out owner-only, so nothing was staged in it."""
+    """A secured staging directory did not come out owner-only, so nothing was staged in it.
+    ``path`` names it, and ``removed`` says whether it is gone again."""
+
+    def __init__(self, message: str, *, path: Path, removed: bool) -> None:
+        super().__init__(message)
+        self.path = path
+        self.removed = removed
 
 
 def _staging_is_private(path: Path) -> bool:
@@ -3018,7 +3026,9 @@ def _open_staging(root: Path, prefix: str, *, secure: bool) -> _Staging:
             + ("" if removed else " (empty, could not be removed; delete it)")
             + "; the engine stages no plaintext there. Use a volume that keeps a directory's mode "
             "or ACL: move the SQLite store's data directory, [backup].destination for a server-DB "
-            "store, or TMP/TEMP/TMPDIR for a standalone restore-verify"
+            "store, or TMP/TEMP/TMPDIR for a standalone restore-verify",
+            path=path,
+            removed=removed,
         )
     try:
         fd = os.open(
@@ -4610,10 +4620,14 @@ def _restore_blocking(
 
     # The config-only route stages in the RESOLVED parent: an unresolved `.` (or `""`) is its own
     # parent, which would stage the decrypted archive inside the bundle's own directory.
-    # Absolute on the store route too: the sweep below tells this run's own directory, which
-    # `mkdtemp` names absolutely, from a dead run's by comparing the paths it lists under this root.
+    # Absolute and normalized on the store route too: the sweep below tells this run's own
+    # directory from a dead run's by comparing the paths it lists under this root with the one
+    # `mkdtemp` returned, which `os.path.abspath` makes, so a relative `--to` or one holding `..`
+    # must read the same way.
     staging_parent = (
-        anchor.absolute().parent if dest_store_path is not None else anchor.resolve().parent
+        Path(os.path.abspath(anchor)).parent
+        if dest_store_path is not None
+        else anchor.resolve().parent
     )
     if dest_store_path is None and staging_parent == anchor.resolve():
         raise BackupError(
@@ -4650,8 +4664,8 @@ def _restore_blocking(
         # restricts it on POSIX, and on Windows under Python 3.13+ writes its own protected DACL
         # (SYSTEM, Administrators, OWNER RIGHTS -- measured on 3.14.6) rather than inheriting the
         # parent's. The files staged inside it are the whole decrypted archive and, on the store
-        # route, the whole extracted store. Both can be full-body PHI at rest (docs/PHI.md section 3), the archive on the config-only route too when a
-        # store-carrying archive is decrypted whole before it is refused, and an archive can also
+        # route, the whole extracted store. Both can be full-body PHI at rest (docs/PHI.md section
+        # 3), the archive on the config-only route too when a store-carrying archive is decrypted whole before it is refused, and an archive can also
         # carry a config bundle that holds secrets. So each is handed to the store's own `_secure_file` the
         # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
         # primitive's contract.
@@ -4674,9 +4688,10 @@ def _restore_blocking(
         except StagingNotPrivateError as exc:
             # Its own words, not `_open_staging`'s: that text names the backup's and verify's
             # settings, none of which moves a restore's staging directory.
+            left = "" if exc.removed else " (empty, could not be removed; delete it)"
             raise BackupError(
                 "destination",
-                f"the restore's staging directory in {staging_parent} did not come out owner-only, "
+                f"the restore's staging directory {exc.path} did not come out owner-only{left}, "
                 "so nothing was decrypted there. Choose a --to or --config-to on a volume that "
                 "keeps a directory's mode or ACL",
             ) from exc
@@ -4914,6 +4929,19 @@ def _restore_blocking(
             # The restore is whole from here. Nothing after this line may roll it back.
             completed = True
         except BaseException as exc:
+            if published and dest_store_path is not None:
+                # The placed store goes before the teardown, not with the rest of the rollback
+                # after it: hard-linked to the staged one, it keeps that file at two links, which
+                # the teardown's fail-safe never truncates, and the rollback would then leave the
+                # staged name as the one full copy. The rollback's own unlink finds it gone.
+                try:
+                    dest_store_path.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    log.warning(
+                        "could not remove the partially restored store at %s: %s",
+                        dest_store_path,
+                        safe_exc(unlink_exc),
+                    )
             leftover = work.release()
             refusal: BaseException = exc
             if isinstance(exc, OSError):
@@ -4943,11 +4971,10 @@ def _restore_blocking(
             # A `finally` rather than an `else`, because the config-only route returns from inside
             # the `try`. On the exception path `release` already ran above and this returns None,
             # so only a restore that completed reaches the refusal below. The store and bundle are
-            # intact;
-            # what is left is the staging directory, which its own remover could not delete. A
-            # BackupError, so the CLI prints a refusal line rather than a traceback, and a kind of
-            # its own, so the line does not read as the restore having failed. The outer `finally`
-            # sees `completed` and leaves the restore alone.
+            # intact; what is left is the staging directory, which its own remover could not
+            # delete. A BackupError, so the CLI prints a refusal line rather than a traceback, and a
+            # kind of its own, so the line does not read as the restore having failed. The outer
+            # `finally` sees `completed` and leaves the restore alone.
             leftover = work.release()
             if leftover is not None:
                 intact: list[str] = []

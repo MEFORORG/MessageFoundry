@@ -821,9 +821,24 @@ def _restore_staging_that_cannot_be_removed(mp: pytest.MonkeyPatch) -> None:
     mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
 
 
+def _skip_without_hard_links(tmp_path: Path) -> None:
+    """Skip where tmp_path cannot hard-link: the restore then places its store by a copy, the
+    teardown empties every staged file, and there is no leftover for a cleanup refusal to name."""
+    probe = tmp_path / "link-probe"
+    probe.write_bytes(b"")
+    try:
+        os.link(probe, tmp_path / "link-probe-2")
+    except OSError:
+        pytest.skip("tmp_path cannot hard-link, so the restore places its store by a copy")
+    finally:
+        (tmp_path / "link-probe-2").unlink(missing_ok=True)
+        probe.unlink()
+
+
 def test_restore_keeps_a_whole_restore_when_its_staging_teardown_fails(
     tmp_path, key_b64, capsys
 ) -> None:
+    _skip_without_hard_links(tmp_path)
     # The regression the rollback brought in. `completed` flipped AFTER the staging block closed, so
     # the one thing between "config bundle written" and "completed" was the staging directory's own
     # teardown -- and when that raised, the rollback read a whole restore as a failed one and deleted
@@ -1562,6 +1577,7 @@ def test_a_refusal_survives_a_real_held_open_staging_file(tmp_path, capsys, monk
 def test_a_restore_staging_leftover_has_its_archive_emptied_and_is_swept(
     tmp_path, key_b64, capsys
 ) -> None:
+    _skip_without_hard_links(tmp_path)
     # BACKLOG #5617. The restore staged the decrypted archive and the extracted store in a
     # `TemporaryDirectory`, outside the lock-and-sweep the backup and verify stage under. When its
     # teardown failed, the whole decrypted archive stayed on the destination volume at full size,
@@ -1663,6 +1679,45 @@ def test_a_refusal_behind_an_os_error_on_its_way_out_is_the_one_reported(
     assert "restore failed (verify)" in err and "staging cap" in err, err
     assert "No space left" not in err, err
     _no_staging_left(tmp_path)
+
+
+def test_a_failed_restore_empties_the_staged_store_its_rollback_unlinked(
+    tmp_path, key_b64, capsys
+) -> None:
+    # A restore that fails after placing its store by a hard link removes the placed store BEFORE
+    # the staging teardown, so the staged copy is down to one link and is emptied, not left as the
+    # one full copy of the store once the rollback has unlinked the other name.
+    _skip_without_hard_links(tmp_path)
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    with pytest.MonkeyPatch.context() as mp:
+        _restore_staging_that_cannot_be_removed(mp)
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
+    err = _refusal(capsys)
+    assert "member-count cap" in err and "Separately" not in err, err
+    assert not dest.exists()
+    (leftover,) = dest.parent.glob("mefor-restore-*")
+    assert (leftover / "extracted_store.db").stat().st_size == 0
+    assert (leftover / "archive.tar").stat().st_size == 0
+    shutil.rmtree(leftover)
+
+
+def test_refusal_in_flight_reads_past_more_than_one_link() -> None:
+    # Nested `with` exits can each raise on the way out, so the refusal can sit two links down.
+    refusal = dr_backup.BackupError("verify", "the cap")
+    try:
+        try:
+            try:
+                raise refusal
+            except dr_backup.BackupError:
+                raise OSError(28, "first close") from None
+        except OSError:
+            raise OSError(28, "second close") from None
+    except OSError as exc:
+        outer = exc
+    assert dr_backup._refusal_in_flight(outer) is refusal
+    assert dr_backup._refusal_in_flight(OSError(28, "alone")) is None
 
 
 def test_restore_refuses_a_staging_directory_that_is_not_owner_only(tmp_path, capsys) -> None:

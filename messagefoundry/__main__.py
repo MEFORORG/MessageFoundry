@@ -12638,6 +12638,7 @@ def _restore(args: argparse.Namespace) -> int:
     from messagefoundry.pipeline.dr_backup import (
         RESTORE_NEEDS_A_DESTINATION,
         BackupError,
+        join_before_checks,
         run_restore,
     )
 
@@ -12679,7 +12680,10 @@ def _restore(args: argparse.Namespace) -> int:
             hint = (
                 f" Choose a newer archive, or pass --allow-old-archive{larger} to restore this one."
             )
-        return _emit_error(f"restore failed ({exc.kind}): {exc}{hint}", as_json=args.json)
+        # The hint goes before any check a staging leftover ends in (BACKLOG #5617).
+        return _emit_error(
+            join_before_checks(f"restore failed ({exc.kind}): {exc}", "", hint), as_json=args.json
+        )
     except _key_unresolved() as exc:  # BACKLOG #3471: it reached the dispatch floor
         return _emit_key_unresolved(exc, as_json=args.json)
 
