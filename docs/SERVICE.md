@@ -803,10 +803,8 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       It has not been measured against the current check either (see `docker/README.md`). And the
       POSIX policy is shared: the `serve` start check of the settings and value files
       (`assert_trusted_start_paths`) judges each path by the same code. That start check does not
-      take this walk either, but it does follow the links an open of each file passes through and
-      vets the folders holding them, except where a relative link reached through a junction on
-      Windows sends the open along another route than the check walks, which it refuses unless
-      both routes reach the same file or neither reaches anything, as the value-file paragraph in
+      take this walk either, but it does walk the links an open of each file passes through, as
+      it models the open, and vets the folders holding them, as the value-file paragraph in
       [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
       states. The config load's trust list still vets each module by its own path, not the links
       it passes through, so the two checks answer a linked file differently.

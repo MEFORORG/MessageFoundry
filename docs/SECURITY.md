@@ -2831,26 +2831,25 @@ file outside the config directory to nothing, as a later paragraph says. In the 
 folds it. Elsewhere, the default layout, the release reads it into the snapshot and checks it
 against a keyed binding the hold took at request time, which the next paragraph describes. In
 either place a reload with `serve`'s value provider vets the value file before it reads the config
-directory: the file, its
-folder, the real folder holding each link an open of it follows, a folder link anywhere in its
-path included, each such link itself on Windows, and the real file and folder the links lead to
-(`_link_chain` in
-[`config/wiring.py`](../messagefoundry/config/wiring.py), vault BACKLOG #6654 item 5), except
-where a relative link reached through a junction sends the open along another route than the
-walk, as below. Where a
+directory: the file, its folder, and, along the links a walk that models the open follows, the
+real folder holding each link, a folder link anywhere in its path included, each such link
+itself on Windows, and the real file and folder the links lead to (`_link_chain` in
+[`config/wiring.py`](../messagefoundry/config/wiring.py), vault BACKLOG #6654 item 5). Where a
 link leads to a file that is not there, the last folder the walk reaches on the way to it is
 vetted. A start vets
 the file and the links it follows the same way when the engine is built, before its first load
 reads the directory; where the value file is not there and no link leads to it, that check does
-not vet its folder. The walk models how the open resolves each link, but on Windows
-a relative link reached through a junction resolves its `..` against the path through the
-junction, not the real folder the walk reached. So the check also stats the value file through
-the open's own resolution and refuses it where that and the walk disagree: one reaches something
-and the other reaches nothing, or `os.path.samefile` says they reach two different ones.
-Where both reach the same file by different routes, a hard link included, or neither reaches
-anything, it passes, and what only the open's route passes through can go unvetted: at least the
-links on it and every folder it passes through, the folder holding the name it reads or would
-create included. A
+not vet its folder. On Windows a relative link reached through a junction resolves its `..`
+against the path through the junction, not the real folder the walk reached (measured), so a
+relative link target holding `..` met after the walk crossed a junction is refused, whether or
+not a file is there. The check also stats the value file through the open's own resolution and
+refuses it where that and the walk disagree: one reaches something and the other reaches
+nothing, or `os.path.samefile` says they reach two different ones. That refuses at least a link
+whose target ends in a separator, which no open can read but the walk reads as the file it
+names; it is refused rather than read as a missing file. Where some other gap in the walk's model
+leads it and the open to the same object by different routes, the check passes, and what only
+the open's route passes through can go unvetted. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades
+neither refusal. A
 folder holding a link is judged by the rule the file's own folder is, so a link that sits directly
 in `C:\` or `C:\ProgramData`, as Windows ships them, is refused. The file or folder vetted, or a
 name along the links it follows, that cannot be stat'ed, for any reason but nothing being there,

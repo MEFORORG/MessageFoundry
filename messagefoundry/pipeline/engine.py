@@ -3221,7 +3221,9 @@ class Engine:
         vetted before its bytes are read too (vault BACKLOG #6654 item 5). So a released
         reload checks those bytes against its approval's binding (:func:`_require_approved`), and
         the provider parses them rather than the file as it is later. A file that is
-        not there is held as none; one that cannot be read raises ``WiringError`` naming it, so a
+        not there is held as none, unless the trust check refuses it first, as it does where the
+        open finds no file but the walk of its links reaches one; one that cannot be read raises
+        ``WiringError`` naming it, so a
         reload, gated or not, never falls back to reading it from disk for that fault. A config
         directory that cannot be read whole still returns ``None``, as above, and then an ungated
         reload reads the values from disk."""

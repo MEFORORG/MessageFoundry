@@ -578,21 +578,6 @@ def test_a_junction_in_the_path_vets_the_folder_holding_it(tmp_path: Path) -> No
     assert {_norm(cfg), _norm(junction), _norm(store), _norm(store / "dev.toml")} <= vetted
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="a junction is a Windows link")
-def test_a_relative_link_behind_a_junction_that_opens_another_file_refuses(tmp_path: Path) -> None:
-    """Measured: a relative link reached through a junction resolves its ``..`` against the path
-    through the junction, so the open reads ``a\\x\\g.toml`` while the walk vetted ``real\\x``
-    and the file its link leads to (round-e90390621c finding 1)."""
-    opened, walked, decoy = _junction_decoy_layout(tmp_path)
-    final = tmp_path / "final" / "values.toml"
-    final.parent.mkdir()
-    final.write_text("", encoding="utf-8")
-    decoy.write_text("", encoding="utf-8")
-    _link(walked, final)
-    with pytest.raises(WiringError, match="another object than the walk"):
-        _file_and_folder([opened])
-
-
 def _junction_decoy_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
     """``a\\b`` a junction to ``real\\c``, holding ``f.toml``, a link to ``..\\x\\g.toml``: the walk
     reads it as ``real\\x\\g.toml`` and the open as ``a\\x\\g.toml`` (measured). Both folders are
@@ -614,28 +599,67 @@ def _junction_decoy_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="a junction is a Windows link")
-@pytest.mark.parametrize(
-    ("reached_by", "refusal"),
-    [
-        ("open", "the open reaches an object where the walk reaches none"),
-        ("walk", "the walk reaches an object where the open reaches none"),
-    ],
-)
-def test_a_file_only_the_open_or_only_the_walk_reaches_refuses(
-    reached_by: str, refusal: str, tmp_path: Path
-) -> None:
-    """The kernel check above ran only where the walk found a file: where the open read a file the
-    walk found nowhere, the folder it was read from went unvetted, and where the walk found a file
-    the open did not, the folder the open would create one in went unvetted (lander hold on
-    fba252d79f, cases a and b)."""
+@pytest.mark.parametrize("state", ["neither", "open-only", "walk-only", "two-files", "hard-link"])
+def test_a_relative_link_climbing_behind_a_junction_refuses(state: str, tmp_path: Path) -> None:
+    """Measured: a relative link reached through a junction resolves its ``..`` against the path
+    through the junction, so the open takes a route the walk never vets (``a\\x``), whichever of
+    the two ends reaches a file: with neither, the open would create the file in ``a\\x``; with
+    a hard link, both reach one file and ``a\\x`` can be swapped (round-e90390621c finding 1, the
+    lander hold on fba252d79f, and round-556c3e48 and round-c42c8e77 findings 1)."""
     opened, walked, decoy = _junction_decoy_layout(tmp_path)
-    # Control: neither reaches a file, so they agree. This pass records a known gap that
-    # docs/SECURITY.md names, the folder the open would create the file in going unvetted; a fix
-    # that refuses it should replace this control rather than read the failure as a regression.
-    _file_and_folder([opened])
-    (decoy if reached_by == "open" else walked).write_text("", encoding="utf-8")
-    with pytest.raises(WiringError, match=refusal):
+    real_c = walked.parent.parent / "c"
+    (real_c / "plain.toml").write_text("", encoding="utf-8")
+    _link(real_c / "rel.toml", Path("plain.toml"))
+    # Control: a relative link with no ``..`` behind the same junction reaches the same folder
+    # either way, and passes.
+    _file_and_folder([opened.parent / "rel.toml"])
+    if state in ("walk-only", "two-files", "hard-link"):
+        walked.write_text("", encoding="utf-8")
+    if state in ("open-only", "two-files"):
+        decoy.write_text("", encoding="utf-8")
+    if state == "hard-link":
+        os.link(walked, decoy)
+    with pytest.raises(WiringError, match="a relative link climbing with '..' follows a junction"):
         _file_and_folder([opened])
+
+
+def test_a_link_target_ending_in_a_separator_refuses(tmp_path: Path) -> None:
+    """The open refuses a file named with a trailing separator (ENOTDIR) and the walk's split
+    drops it, so the walk reaches the file where the open reaches nothing. That is refused as its
+    own cause, not read as a missing file, though no read could open it (round-544ebb5d
+    findings 3 and 4)."""
+    real = tmp_path / "elsewhere" / "dev.toml"
+    real.parent.mkdir()
+    real.write_text("", encoding="utf-8")
+    values = tmp_path / "dev.toml"
+    plain = tmp_path / "plain.toml"
+    try:
+        os.symlink(str(real), plain)
+        os.symlink(str(real) + os.sep, values)
+    except OSError:
+        pytest.skip("this account cannot create a file link")
+    _file_and_folder([plain])  # control: the same target with no separator passes
+    with pytest.raises(WiringError, match="the walk reaches an object where the open reaches none"):
+        _file_and_folder([values])
+
+
+def test_the_escape_does_not_downgrade_a_walk_and_open_disagreement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    """The disagreement vetted nothing the open reads, so the clamped escape, which downgrades a
+    policy refusal under warn, leaves it a refusal (round-544ebb5d finding 8)."""
+    monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
+    monkeypatch.setenv(SECURITY_ENFORCEMENT_ENV, "warn")
+    settings, values = _two_files(tmp_path)
+    fake_windows_readers(lambda path: path == values)
+    assert_trusted_start_paths([settings, values])  # control: a policy refusal is downgraded
+    linked = tmp_path / "linked.toml"
+    try:
+        os.symlink(str(values) + os.sep, linked)
+    except OSError:
+        pytest.skip("this account cannot create a file link")
+    with pytest.raises(WiringError, match="could not vet it: .*the walk reaches an object"):
+        assert_trusted_start_paths([settings, linked])
 
 
 @pytest.mark.parametrize("folder", [False, True], ids=["file", "folder"])
@@ -653,8 +677,8 @@ def test_an_open_and_a_walk_that_disagree_on_presence_refuse(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The same disagreement on every host, with the walk replaced, because the junction layout
-    above is Windows-only; for a folder too, as a reload passes the value file's folder."""
+    """Both arms of the presence check on every host, with the walk replaced, for a file and for
+    a folder, as a reload passes the value file's folder."""
     import messagefoundry.config.wiring as wiring
 
     values = tmp_path / "dev"
