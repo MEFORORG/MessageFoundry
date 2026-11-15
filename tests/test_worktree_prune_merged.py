@@ -1291,6 +1291,32 @@ def test_the_cache_list_backdate_ages_mirrors_the_gates() -> None:
     assert tuple(re.findall(r"'([^']+)'", ours.group(1))) == _ACTIVITY_CACHES
 
 
+def test_the_working_tree_reading_refuses_an_unset_cache_list(tmp_path: Path) -> None:
+    """BACKLOG #5603. A lost cache list would read no cache, so a tree a test run just wrote to would
+    read idle: Get-WorkingTreeActivity returns unknown instead. The first call, with the list as the
+    gates set it, is the control."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "f.txt").write_text("x\n", encoding="utf-8")
+    command = (
+        f". '{SCRIPT.parent / 'worktree-gates.ps1'}'; "
+        "$a = Get-WorkingTreeActivity -Path $env:T_TREE; "
+        "$WORKING_TREE_ACTIVITY_CACHES = $null; "
+        "$b = Get-WorkingTreeActivity -Path $env:T_TREE; "
+        "'{0}|{1}' -f ($null -ne $a), ($null -eq $b)"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "T_TREE": str(tree)},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "True|True", (proc.stdout, proc.stderr)
+
+
 def test_a_cache_too_big_to_date_holds_the_tree(fx: Fixture, sleeper: int) -> None:
     """BACKLOG #5603. Past its cap the working-tree reading does not sample a cache: the file a run
     just rewrote could be one it never reached, so the tree's activity is unknown and it is held."""
@@ -1734,6 +1760,70 @@ def test_a_mypy_run_during_the_apply_window_is_caught_by_the_recheck(
     assert d["OutcomeDetail"].startswith("re-check: the working tree was written"), d
     assert wt.exists()
     assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def _grow_past_the_cap(tmp_path: Path, tree: Path, payload: str = "[]") -> Path:
+    """A gh shim whose first call grows ``tree``'s .ruff_cache past the working-tree reading's cap,
+    which makes that reading unknown: a tree gone unreadable between its decision and its delete."""
+    cache = tree / ".ruff_cache"
+    return gh_shim(
+        tmp_path,
+        payload=payload,
+        side_effect=(
+            f"p = pathlib.Path(r'{cache}')\np.mkdir()\n"
+            "for i in range(2001):\n    (p / str(i)).write_bytes(b'')\n"
+        ),
+    )
+
+
+def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_idle_hours_zero(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """BACKLOG #5603. -IdleHours 0 lifts a RECENT activity reading, never an unreadable one, in the
+    -Apply re-check as in the decision pass.
+
+    Every other sibling is locked, so none reaches its merge test, and the first gh call, which runs
+    the side effect, is ``gone``'s, after ``clean``'s decision, as in the default-mode re-check tests.
+    """
+    _exclude(fx, ".ruff_cache/")
+    _stage_recheck(fx, sleeper)
+    for other in fx.primary.parent.glob("repo-*"):
+        if other.name not in ("repo-clean", "repo-gone"):
+            subprocess.run(
+                ["git", "-C", str(fx.primary), "worktree", "lock", str(other)],
+                capture_output=True,
+                check=False,
+            )
+    shim = _grow_past_the_cap(tmp_path, fx.sibling("clean"))
+
+    res = run(fx, "-Apply", "-IdleHours", "0", skip_gh=False, path_prepend=shim)
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "PRUNE", d["Reasons"]
+    assert d["Outcome"] == "skipped", d
+    assert d["OutcomeDetail"].startswith("re-check: activity became unreadable"), d
+    assert fx.sibling("clean").exists()
+
+
+def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_name(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """BACKLOG #5603. -Name lifts a RECENT activity reading, never an unreadable one, in the -Apply
+    re-check as in the decision pass. ``ahead`` is merged by a PR at its exact tip, so its own merge
+    test makes the one gh call, after its decision and before its delete."""
+    _exclude(fx, ".ruff_cache/")
+    live_record(fx, sleeper, fx.primary)
+    use_github_remote(fx)
+    _backdate(fx.primary, fx.sibling("ahead"), hours=100)
+    tip = _git(fx.primary, "rev-parse", "ahead").strip()
+    payload = json.dumps([{"number": 7, "headRefOid": tip}])
+    shim = _grow_past_the_cap(tmp_path, fx.sibling("ahead"), payload)
+
+    res = run(fx, "-Apply", "-Name", "ahead", skip_gh=False, path_prepend=shim)
+    d = by_leaf(res, "ahead")
+    assert d["Decision"] == "PRUNE", d["Reasons"]
+    assert d["Outcome"] == "skipped", d
+    assert d["OutcomeDetail"].startswith("re-check: activity became unreadable"), d
+    assert fx.sibling("ahead").exists()
 
 
 def test_a_nested_worktree_appearing_mid_run_is_vetoed(

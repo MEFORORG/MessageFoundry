@@ -37,6 +37,7 @@ from tests.test_worktree_remove_path import (
     _git,
     _out,
     build_rig,
+    copy_real_scripts,
     pytestmark,  # noqa: F401  (the same Windows-and-pwsh skip)
     settle_worktrees,
     start_live_process,
@@ -435,6 +436,29 @@ def test_a_reused_quiet_tree_a_worker_just_ran_tests_in_is_refused(
 
     # Control: the same tree once the cache is as old as the rest.
     proc = rig.run(*_target(route, wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_an_unset_cache_list_refuses(rig: Rig) -> None:
+    """BACKLOG #5603. The caches to date come from worktree-gates.ps1. Lost, the loop would date no
+    cache, so a tree a test run just wrote to would read quiet: the script refuses instead."""
+    wt = _sibling(rig, "nolist")
+    copy_real_scripts(rig.root / "copy")
+    gates = rig.root / "copy" / "scripts" / "worktree" / "worktree-gates.ps1"
+    src = gates.read_text(encoding="utf-8")
+    line = re.search(r"^\$WORKING_TREE_ACTIVITY_CACHES = .*$", src, re.M)
+    assert line, "the instrument found no list to unset"
+    gates.write_text(src.replace(line.group(0), "$WORKING_TREE_ACTIVITY_CACHES = @()"), "utf-8")
+
+    script = rig.root / "copy" / "scripts" / "worktree" / "remove.ps1"
+    proc = rig.run("-Path", str(wt), script=script, repo_root=rig.primary)
+    assert proc.returncode != 0
+    assert "list of caches to date" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: the real list, and the same tree is removed.
+    proc = rig.run("-Path", str(wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
 

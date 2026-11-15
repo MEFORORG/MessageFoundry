@@ -61,8 +61,10 @@
         moving after its PR merged carries work that PR did not land;
       * that PR merged more than -HoldHours ago;
       * none of its commit date, its private git files and its last reflog entry moved within
-        -IdleHours (the recent-activity signal prune-merged.ps1 also relies on, read the same way
-        but without that tool's floor);
+        -IdleHours, and without prune-merged.ps1's floor. That is the git half of prune-merged.ps1's
+        recent-activity signal only: this report does not read the working tree (its top level and
+        test, lint and type-check caches), which prune-merged.ps1 and the nightly removal also hold a
+        tree on, so a tree a session ran pytest or mypy in without git can still be proposed here;
       * `git status --porcelain --untracked-files=normal` is empty. An untracked `.venv` alone goes to
         a human, because removing it needs --force, and --force also turns off git's own refusal of a
         tree somebody has started editing since this report ran;
@@ -80,7 +82,8 @@
         cannot be routed through remove.ps1 instead: its -Path refuses every such tree.
     The report shares the nightly .claude/worktrees removal's ownership and flagged-file readers, NOT
     its whole gate set. At least the ignored-file, nested-checkout, could-not-open and working-tree
-    activity checks are the nightly's alone, so a tree the nightly refuses can still be proposed here.
+    activity checks are not read here (prune-merged.ps1 reads the working-tree activity too), so a
+    tree the nightly or prune-merged.ps1 refuses can still be proposed here.
 
     THE FENCE SEES A SESSION BY THE CWD IT LAUNCHED IN. A session writing into a worktree by absolute
     path from somewhere else, or relocated into it after launch, is invisible to it. The activity

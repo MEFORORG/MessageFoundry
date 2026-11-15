@@ -1594,16 +1594,18 @@ if ($Apply -and $prunable.Count -gt 0) {
         # measured coverage of the class of worktree this tool prunes (signal 1 vetoed 0 of 4 real
         # siblings). The window is a gh round trip per candidate -- measured at 0.56s -- plus every
         # removal before this one, which is exactly the interval the re-check exists to close.
+        # Read in every mode: -IdleHours 0 and -Name lift a RECENT reading, never an unreadable one,
+        # as in the decision pass, so a tree that went unreadable since then is still skipped.
+        $t2 = Get-TreeActivity -Path $d.Path
+        $a2 = $t2.When
+        if ($null -eq $a2) {
+            $d.Outcome = 'skipped'
+            $d.OutcomeDetail = "re-check: activity became unreadable ($($t2.What)) -- cannot establish nobody is in it"
+            Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
+            continue
+        }
         if ($activityVeto -and -not $d.Confirmed) {
-            $t2 = Get-TreeActivity -Path $d.Path
-            $a2 = $t2.When
             $cut2 = (Get-Date).AddHours(-1 * $IdleHours)
-            if ($null -eq $a2) {
-                $d.Outcome = 'skipped'
-                $d.OutcomeDetail = "re-check: activity became unreadable ($($t2.What)) -- cannot establish nobody is in it"
-                Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
-                continue
-            }
             if ($a2 -gt $cut2) {
                 $d.Outcome = 'skipped'
                 $d.OutcomeDetail = "re-check: $($t2.What) $([math]::Round(((Get-Date) - $a2).TotalHours, 2)) h ago, inside the $IdleHours h window"

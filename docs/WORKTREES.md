@@ -335,9 +335,10 @@ running batch.
 So `-Path` also refuses on a held **claim** and on **recent activity**, the last four entries in
 the list above. `-Name` refuses on the same four. A claim names the worktree that took it,
 whoever launched the session. Git activity is read from the tree's own git directory. Working-tree
-activity is read from the tree's top folder, each entry directly under it, and `.pytest_cache` and
-`.ruff_cache`. Uncommitted work is dated path by path, at any depth. None is proof that a tree is
-free:
+activity is read from the tree's top folder, each entry directly under it, and every cache
+`$WORKING_TREE_ACTIVITY_CACHES` in [`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1)
+names, `.mypy_cache` among them. Uncommitted work is dated path by path, at any depth. None is
+proof that a tree is free:
 
 - Work that was never claimed, in a tree nobody has committed to or written in for six hours,
   passes all four.
