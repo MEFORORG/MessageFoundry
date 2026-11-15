@@ -1125,12 +1125,12 @@ fleet, so never take them*.
   *"in their filing mechanics only"*, and gives its whole effect as *"a merged PR now files at most
   one row"*. Both overstate how narrow R2 is. Its signed text says *"in its mechanics only"*, with
   no "filing", and decision d20261111T061703900-432f31, decided by the Lander under the owner's
-  delegation of 2026-11-11, reads its next sentence, *"The merge still never waits on an open
-  finding"*, as governing the order of filing and merging too, so filing a row no longer holds the
-  merge. So the Lander's proposal
-  quoted under 2026-10-12, which the owner approved, stays as the record of that day, but no longer
-  states when a row is filed. `CLAUDE.md` section 5 states the order once, in its merge bullet,
-  with the findings that still hold the merge and the authority for the change, so read it there.
+  delegation of 2026-11-11, reads that text as governing the order of filing and merging too, so
+  filing a row no longer holds the merge. A finding that goes to the owner still does, by the
+  owner's ruling of 2026-11-15. So the Lander's proposal quoted under 2026-10-12, which the owner
+  approved, stays as the record of that day, but no longer states when a row is filed. `CLAUDE.md`
+  section 5 states the order once, in its merge bullet, with the authority for the change, so read
+  it there.
 
 - **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
   `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports
