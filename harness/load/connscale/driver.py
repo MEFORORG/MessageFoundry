@@ -14,8 +14,9 @@ own event loop and confound the measurement. One bucket + round-robin yields the
 mean rate without the scheduling overhead.
 
 Connections open in **batches** (``connect_batch``) with a short inter-batch pause to avoid a connect
-thundering-herd polluting the steady-state measurement; stop is cooperative + graced, mirroring
-:meth:`ConnectionPool.stop`.
+thundering-herd polluting the steady-state measurement. Stop is cooperative and graced, as
+:meth:`~harness.load.sender.ConnectionPool.stop` is: each connection writes what is already queued,
+then waits out the grace for replies, and cancels nothing (see :meth:`ConnScaleDriver.stop`).
 """
 
 from __future__ import annotations
@@ -42,8 +43,10 @@ class ConnScaleDriver:
     """Owns N persistent MLLP connections (one per inbound port) and drives them at an aggregate rate.
 
     The N connections share one :class:`~harness.load.correlator.Correlator` + :class:`LiveMetrics`,
-    so the per-message send→ACK timing and the no-loss reconcile aggregate across all N exactly as the
-    load runner does for its pool.
+    so the per-message send→ACK timing and the counters the no-loss reconcile reads aggregate across
+    all N, as the load runner's pool does. The reconcile that reads them is the connscale copy,
+    ``harness.load.connscale.runner._reconcile``, not the load runner's: the two have parted
+    (BACKLOG #1866), and that function is the source of record for what fails a step.
     """
 
     def __init__(
@@ -102,8 +105,9 @@ class ConnScaleDriver:
     async def open(self, *, connect_batch: int, batch_pause_s: float) -> None:
         """Start the N connections in BATCHES of ``connect_batch`` (a short ``batch_pause_s`` between
         batches), so opening N sockets is not itself a transient that pollutes the steady-state
-        measurement. Each connection's reconnect loop starts immediately; the caller separately waits
-        until the engine reports all N inbound rows present before the hold phase."""
+        measurement. Each connection's reconnect loop starts immediately. Waiting for the engine is
+        the caller's: the connscale runner waits until the engine reports all N inbound rows
+        present, while connscale-remote checks only that each band's first and last ports listen."""
         for start in range(0, self._count, max(1, connect_batch)):
             for conn in self._conns[start : start + connect_batch]:
                 conn.start()
@@ -268,5 +272,8 @@ class ConnScaleDriver:
             await asyncio.sleep(_RECONNECT_POLL)
 
     async def stop(self, grace: float) -> None:
-        """Stop offering, grace in-flight ACKs, cancel — identical discipline to ``ConnectionPool.stop``."""
+        """Stop every connection, as ``ConnectionPool.stop`` does. Each one writes the sends already
+        queued on it, then waits up to ``grace`` for outstanding replies; a send still unanswered
+        when its connection closes is counted in ``timeouts`` (unconfirmed), never as sent-and-lost.
+        Nothing is cancelled."""
         await asyncio.gather(*(conn.stop(grace) for conn in self._conns))
