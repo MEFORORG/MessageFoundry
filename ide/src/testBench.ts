@@ -322,9 +322,10 @@ export class TestBench {
    * Rerun a saved collection and flag pass/fail per case. The `dryrun` CLI takes only file paths, so
    * each case's stored input is materialized to a fresh per-run temp dir, owner-only on POSIX, the
    * dir itself is dry-run (`--show-phi`), and in `finally` its case files are deleted, then the dir
-   * if it is then empty. A dir left behind by at least a crash or a case file that cannot be
-   * unlinked has its case files swept, and then the dir if it is empty, by a later open or run once
-   * it is over an hour old, and on POSIX only if this user owns it. A dir that holds no case file but
+   * if it is then empty. A dir left behind by at least a crash has its case files swept, and then
+   * the dir if it is empty, by a later open or run once it is over an hour old, and on POSIX only if
+   * this user owns it; a case file that cannot be unlinked can stay through every later sweep, which
+   * does not retry and does not report the failure. A dir that holds no regular case file but
    * still holds at least an entry named as a case file that is not a regular file, or an entry not
    * named as a case file, has none left to sweep, so it stays until someone removes it
    * (collectionCaseFiles.ts, BACKLOG #5415). Cases align to rows by the unique temp basename the CLI
