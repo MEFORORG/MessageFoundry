@@ -612,7 +612,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         metavar="PRINCIPAL",
         help="also grant READ on the key file to this service principal — a name like "
         "'NT SERVICE\\MessageFoundry' or a SID. SYSTEM is always granted read (so a LocalSystem "
-        "service starts); pass this for a virtual / gMSA service account.",
+        "service starts); pass this for a virtual / gMSA service account. A gMSA may resolve as "
+        "a computer account, so a plain computer account (DOMAIN\\HOST$) is admitted too. Which "
+        "kinds of name are admitted: docs/PHI.md, 'Key files'.",
     )
 
     cert = sub.add_parser(

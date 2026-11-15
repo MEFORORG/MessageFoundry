@@ -408,7 +408,16 @@ than a path is not checked
 - On Windows the check looks for known broad groups: at least Everyone, Authenticated Users, the
   local Users group and the logon classes such as INTERACTIVE. It is a list of known groups. It
   does not prove that only the accounts you meant can reach the file. `protect-key
-  --grant-account` refuses the same list, and refuses a name that is a group or a domain.
+  --grant-account` refuses the same list. A name it is given must resolve to a user account, a
+  well-known account or a computer account; a group, an alias or a domain is refused, and the
+  refusal names the kind the name resolved to. A well-known account here includes SYSTEM, a
+  virtual service account, and well-known groups Windows reports the same way. Among those, at
+  least the broad groups on the list above and an application package are refused, and other
+  well-known groups are admitted. A computer account is admitted
+  because a group managed service account may resolve as one, so **a plain computer account
+  (`DOMAIN\HOST$`) is admitted too**. Do not grant a host's own machine account to reach its local
+  services: nothing here shows that a local SYSTEM or NETWORK SERVICE token carries the machine
+  account's SID, so name the account the service runs as, such as the gMSA.
 - On Windows it refuses a key file whose owner is one of those groups or an application package,
   or whose owner cannot be read, since an owner may rewrite the access list (vault BACKLOG #5657).
   This check does not vet an ordinary allow entry for an account that is neither, one you made
