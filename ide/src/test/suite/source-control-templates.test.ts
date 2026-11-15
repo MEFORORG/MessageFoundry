@@ -108,6 +108,18 @@ suite("The generated pre-commit hook prefers the project .venv (BACKLOG #5414)",
     assert.match(PRE_COMMIT_TEMPLATE, /exec "\$PY" -P -m messagefoundry check /);
   });
 
+  test("the repository's own checked-in hook is the current template", function () {
+    const checkedIn = path.join(__dirname, "..", "..", "..", "..", ".mefor-hooks", "pre-commit");
+    if (!fs.existsSync(checkedIn)) {
+      this.skip();
+    }
+    const rendered = PRE_COMMIT_TEMPLATE.replace(/__CONFIG_DIR__/g, "'samples/config'").replace(
+      /__MESSAGES_DIR__/g,
+      "'samples/messages'",
+    );
+    assert.strictEqual(fs.readFileSync(checkedIn, "utf8").replace(/\r\n/g, "\n"), rendered);
+  });
+
   test("with no python on PATH the hook runs the check through .venv and propagates its exit code", function () {
     this.timeout(30000); // Git for Windows' sh is slow to start
     const sh = findSh();

@@ -5,22 +5,45 @@
 // `messagefoundry.configDir` and its siblings are window-scoped, so a checked-in
 // `.vscode/settings.json` can set them. A command that WRITES under such a setting must not follow it
 // out of the folder (BACKLOG #5410): an absolute path, a `..` climb, or a symlink or junction inside
-// the folder that points elsewhere. The check compares real paths, so the last case is caught too.
-// It is vscode-free so the node-side unit suite can drive it.
+// the folder that points elsewhere, dangling ones included. The check compares real paths, so the
+// link cases are caught too. It is vscode-free so the node-side unit suite can drive it.
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-/** `p`'s real path, or `undefined` when it cannot be read (fails closed on anything but ENOENT). */
+function realpath(p: string): string {
+  try {
+    return fs.realpathSync.native(p);
+  } catch (e) {
+    // The native call fails with EISDIR on some Windows volumes (RAM disks, some virtual drives),
+    // where the JS implementation still answers; an ENOENT is the caller's to handle.
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+      throw e;
+    }
+    return fs.realpathSync(p);
+  }
+}
+
+/**
+ * `p`'s real path: the real path of its nearest existing ancestor, with the missing components
+ * appended. `undefined` when that cannot be read, or when a "missing" component is really a dangling
+ * link, which a later write could follow out of the folder.
+ */
 function realpathOfNearestExisting(p: string): string | undefined {
   const tail: string[] = [];
   let cur = p;
   for (;;) {
     try {
-      return path.join(fs.realpathSync.native(cur), ...tail);
+      return path.join(realpath(cur), ...tail);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
         return undefined;
       }
+    }
+    try {
+      fs.lstatSync(cur);
+      return undefined; // the entry exists but its target does not: a dangling link
+    } catch {
+      // truly absent: keep walking up
     }
     const parent = path.dirname(cur);
     if (parent === cur) {
@@ -32,13 +55,14 @@ function realpathOfNearestExisting(p: string): string | undefined {
 }
 
 /**
- * The real path of `dir` (relative to `ws`, or absolute) when it is the workspace folder or inside
- * it, else `undefined`. Components that do not exist yet are kept as given; they will be created
- * fresh, so no link can sit among them.
+ * `dir` (relative to `ws`, or absolute) resolved against `ws`, when its real path is the workspace
+ * folder's real path or inside it, else `undefined`. The path returned keeps the workspace's own
+ * spelling (a junction, a mapped drive), so editors keyed on the workspace path still match it.
  */
 export function resolveInsideWorkspace(ws: string, dir: string): string | undefined {
+  const logical = path.resolve(ws, dir);
   const root = realpathOfNearestExisting(path.resolve(ws));
-  const target = realpathOfNearestExisting(path.resolve(ws, dir));
+  const target = realpathOfNearestExisting(logical);
   if (root === undefined || target === undefined) {
     return undefined;
   }
@@ -46,5 +70,5 @@ export function resolveInsideWorkspace(ws: string, dir: string): string | undefi
   if (path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`)) {
     return undefined;
   }
-  return target;
+  return logical;
 }

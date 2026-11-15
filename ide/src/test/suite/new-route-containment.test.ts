@@ -48,6 +48,22 @@ suite("resolveInsideWorkspace keeps a configured folder inside the workspace (BA
     assert.strictEqual(resolveInsideWorkspace(ws, "escape"), undefined);
     assert.strictEqual(resolveInsideWorkspace(ws, "escape/deeper"), undefined);
   });
+
+  test("a dangling link inside the workspace is refused, not taken for a folder to create", () => {
+    fs.symlinkSync(path.join(outside, "missing"), path.join(ws, "dangling"), "junction");
+    assert.strictEqual(resolveInsideWorkspace(ws, "dangling"), undefined);
+    assert.strictEqual(resolveInsideWorkspace(ws, "dangling/deeper"), undefined);
+  });
+
+  test("a workspace opened through a link resolves under the workspace's own spelling", () => {
+    const linked = path.join(root, "wslink");
+    fs.symlinkSync(ws, linked, "junction");
+    assert.strictEqual(
+      resolveInsideWorkspace(linked, "samples/config"),
+      path.join(linked, "samples", "config"),
+    );
+    assert.strictEqual(resolveInsideWorkspace(linked, "../outside"), undefined);
+  });
 });
 
 // ---- the wizard, against a vscode stub ----

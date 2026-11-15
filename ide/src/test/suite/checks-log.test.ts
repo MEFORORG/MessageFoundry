@@ -74,6 +74,10 @@ let events: Event[];
 let stubWorkspace: string | undefined;
 /** What the stubbed `messagefoundry check` exits with: 1 is a failed required check. */
 let checkCode = 1;
+/** Whether the stubbed repository already has a commit (BACKLOG #5413: then no baseline is offered). */
+let hasHead = false;
+/** The answer to the "required check hasn't passed" prompt. */
+let baselineAnswer: string | undefined = "Commit baseline anyway";
 
 const CHECK_STDOUT = "FAIL dryrun\r\n  synthetic detail line\nPASS validate";
 
@@ -101,7 +105,7 @@ const vscodeStub = {
       Promise.resolve(message.startsWith("Make the first commit") ? "Run checks & commit" : undefined),
     showWarningMessage: (message: string): Promise<string | undefined> =>
       Promise.resolve(
-        message.startsWith("A required check hasn't passed") ? "Commit baseline anyway" : undefined,
+        message.startsWith("A required check hasn't passed") ? baselineAnswer : undefined,
       ),
     showErrorMessage: nothing,
     showQuickPick: nothing,
@@ -194,6 +198,8 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     stubWorkspace = ws;
     events = [];
     checkCode = 1;
+    hasHead = false;
+    baselineAnswer = "Commit baseline anyway";
     // No process runs. git answers as an existing repository with no remote and no hooks path, and
     // `messagefoundry check` answers with `checkCode` and a multi-line block.
     childProcess.execFile = ((
@@ -208,6 +214,9 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
         done(err, CHECK_STDOUT, "");
       } else if (args.includes("--is-inside-work-tree")) {
         done(null, "true\n", "");
+      } else if (args[0] === "rev-parse" && args.includes("HEAD")) {
+        // An unborn branch fails this, as a freshly initialised repository does.
+        done(hasHead ? null : Object.assign(new Error("stubbed"), { code: 1 }), hasHead ? "0000000\n" : "", "");
       } else if (args[0] === "commit") {
         done(null, "[main (root-commit) 0000000] Initial commit\n", "");
       } else {
@@ -263,6 +272,42 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     const commit = events.findIndex((e) => e.kind === "launch" && e.args[0] === "commit");
     assert.ok(notes >= 0 && commit >= 0, JSON.stringify(events));
     assert.ok(notes < commit, "the hook install was logged after the commit it preceded");
+  });
+
+  /** The git launches, in order, as their argument lists. */
+  const launches = (): string[][] => events.flatMap((e) => (e.kind === "launch" ? [e.args] : []));
+  const isStageAll = (a: string[]): boolean => a[0] === "add" && a.includes("-A");
+
+  test("the tree is staged, inside the workspace only, right before each baseline commit (BACKLOG #5413)", async () => {
+    for (const code of [0, 1]) {
+      checkCode = code;
+      events = [];
+      await sc.setupSourceControl({} as never);
+      const runs = launches();
+      const commit = runs.findIndex((a) => a[0] === "commit");
+      assert.ok(commit > 0, `no commit ran: ${JSON.stringify(runs)}`);
+      assert.deepStrictEqual(runs[commit - 1], ["add", "-A", "--", "."]);
+      assert.strictEqual(runs.filter(isStageAll).length, 1, JSON.stringify(runs));
+    }
+  });
+
+  test("a Cancel at the baseline prompt leaves nothing staged (BACKLOG #5413)", async () => {
+    baselineAnswer = "Cancel";
+    await sc.setupSourceControl({} as never);
+    const runs = launches();
+    // Control: the run reached the pre-flight check, so the prompt was really shown.
+    assert.ok(runs.some((a) => a.includes("check")), JSON.stringify(runs));
+    assert.ok(!runs.some(isStageAll), `the tree was staged: ${JSON.stringify(runs)}`);
+    assert.ok(!runs.some((a) => a[0] === "commit"));
+  });
+
+  test("a repository that already has a commit is offered no baseline and nothing is staged", async () => {
+    hasHead = true;
+    await sc.setupSourceControl({} as never);
+    const runs = launches();
+    assert.ok(runs.some((a) => a[0] === "rev-parse" && a.includes("HEAD")), JSON.stringify(runs));
+    assert.ok(!runs.some(isStageAll), JSON.stringify(runs));
+    assert.ok(!runs.some((a) => a[0] === "commit" || a.includes("check")), JSON.stringify(runs));
   });
 
   test("control: when the check passes, the commit runs the hooks and no bypass is recorded", async () => {

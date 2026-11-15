@@ -481,6 +481,21 @@ function logResult(label: string, res: { stdout: string; stderr: string }): void
   }
 }
 
+// Every unignored file under the workspace folder is staged only once the user has chosen to commit,
+// right before each baseline commit: staging before the prompts would leave the whole tree in the
+// index after a Cancel, one stray `git commit` away from history (BACKLOG #5413). The pre-flight
+// check reads the files on disk, not the index, so it needs nothing staged. The `.` pathspec keeps a
+// workspace that is a subfolder of a larger repository from staging its parent's changes.
+async function stageBaseline(bin: string, ws: string): Promise<boolean> {
+  const res = await git(bin, ["add", "-A", "--", "."], ws);
+  if (res.code !== 0) {
+    logResult(`--- staging the baseline failed: git exit code ${res.code} ---`, res);
+    void vscode.window.showErrorMessage(`MessageFoundry: could not stage the baseline — ${res.stderr.trim()}`);
+    return false;
+  }
+  return true;
+}
+
 // The first commit is the project's BASELINE snapshot. Rather than run `git commit` blind and let the
 // freshly-installed hook block it with a bare "bypass with --no-verify" (which reads as a dead-end and
 // teaches bypass on day one), we PRE-FLIGHT the same gate and branch on the result. Exit 0 iff no
@@ -488,6 +503,11 @@ function logResult(label: string, res: { stdout: string; stderr: string }): void
 // A required failure doesn't stop the baseline: the seed is conventionally exempt, so we offer to
 // commit it and fix forward, with the details one click away — never leading with --no-verify.
 async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
+  // Only a repository with no commits yet gets a baseline. In one with history, staging the whole
+  // tree would sweep the user's work in progress into a commit named "Initial commit".
+  if ((await git(bin, ["rev-parse", "--verify", "-q", "HEAD"], ws)).code === 0) {
+    return;
+  }
   const pick = await vscode.window.showInformationMessage(
     "Make the first commit now? MessageFoundry will run the checks first so you can see the results.",
     "Run checks & commit",
@@ -501,12 +521,10 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   const chk = await run(["check", "--config", configDir(), "--messages", messageSetsDir()], ws);
   logResult("", chk);
 
-  // Every unignored file is staged only once the user has chosen to commit, right before each commit
-  // below: staging before the prompts would leave the whole tree in the index after a Cancel, one
-  // stray `git commit` away from history (BACKLOG #5413). The check reads the files on disk, not the
-  // index, so it needs nothing staged.
   if (chk.code === 0) {
-    await git(bin, ["add", "-A"], ws);
+    if (!(await stageBaseline(bin, ws))) {
+      return;
+    }
     const res = await git(bin, ["commit", "-m", "Initial commit (MessageFoundry checks enabled)"], ws);
     logResult("--- baseline commit ---", res);
     if (res.code === 0) {
@@ -534,7 +552,9 @@ async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
   if (choice === "Commit baseline anyway") {
     // Logged before git runs: the stamped line is the timed record of the bypass itself.
     logChecks(baselineBypassRecord(chk.code));
-    await git(bin, ["add", "-A"], ws);
+    if (!(await stageBaseline(bin, ws))) {
+      return;
+    }
     const res = await git(
       bin,
       ["commit", "-m", "Initial commit (MessageFoundry checks enabled)", "--no-verify"],

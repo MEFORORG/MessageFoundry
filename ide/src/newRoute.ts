@@ -59,11 +59,12 @@ async function createRoute(p: RoutePayload, onCreated?: () => void): Promise<voi
     void vscode.window.showErrorMessage("MessageFoundry: inbound/router/handler/outbound names are all required.");
     return;
   }
-  const configured = configDir();
-  const dir = resolveInsideWorkspace(ws, configured);
+  const dir = resolveInsideWorkspace(ws, configDir());
   if (dir === undefined) {
+    // The setting's value is not echoed: a checked-in settings file controls it, and a notification
+    // renders markdown command links.
     void vscode.window.showErrorMessage(
-      `MessageFoundry: the configDir setting '${configured}' is not inside this workspace folder, so no route was created.`,
+      "MessageFoundry: the messagefoundry.configDir setting does not resolve inside this workspace folder, so no route was created.",
     );
     return;
   }
