@@ -884,11 +884,10 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
     The sets are the same ones the degrade-table check derives: the emitted browser-security headers,
     the ``window.<Feature>`` detects and the session-cookie attributes. Each directive of the two
     policies needs a row or a place in the section's list of other directives, and the in-page
-    referrer tag needs a row while the page shell emits it. So a header, detect or directive the
-    console starts using reds here until the table names it, and a row for any of those cannot be
-    deleted to lift a floor. Rows outside those sets, such as the passkey options, are held by
-    nothing here. The request headers the server reads are held to the same table by
-    ``test_browser_support_doc.py``, which derives them.
+    referrer tag and the two passkey registration options each need a row. So a header, detect or
+    directive the console starts using reds here until the table names it, and a row for any of
+    those cannot be deleted to lift a floor. The request headers the server reads are held to the
+    same table by ``test_browser_support_doc.py``, which derives them.
 
     Names are matched by backticked token rather than by substring, as the degrade-table check does,
     because this table splits ``Content-Security-Policy`` into one row per directive."""
@@ -911,13 +910,27 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
     )
     directives = _policy_directives()
     assert {"script-src", "frame-ancestors", "sandbox"} <= directives, directives
-    section = " ".join(_support_doc_text().split(_VERSION_TABLE_HEADING, 1)[1].split())
+    section = _support_doc_text().split(_VERSION_TABLE_HEADING, 1)[1]
+    section = " ".join(re.split(r"^## ", section, maxsplit=1, flags=re.MULTILINE)[0].split())
     assert _OTHER_DIRECTIVES_LEAD in section, _OTHER_DIRECTIVES_LEAD
     listed = section.split(_OTHER_DIRECTIVES_LEAD, 1)[1].split(". ", 1)[0]
     unnamed = sorted(d for d in directives if d not in named and f"`{d}`" not in listed)
     assert not unnamed, f"no version row and no place in the list of other directives: {unnamed}"
-    if 'name="referrer"' in (_PACKAGE_DIR / "_html.py").read_text(encoding="utf-8"):
-        assert any('`<meta name="referrer">`' in row[0] for row in rows), "the referrer tag row"
+    # The referrer tag and the two passkey options are read from source text. Each read asserts
+    # that it found its marker, so a refactor that renames one reds here instead of switching the
+    # row requirement off.
+    shell = (_PACKAGE_DIR / "_html.py").read_text(encoding="utf-8")
+    assert 'name="referrer"' in shell, "the page shell's referrer tag moved; re-derive this check"
+    passkeys = (Path(messagefoundry.__file__).parent / "auth/webauthn.py").read_text(
+        encoding="utf-8"
+    )
+    for marker, feature in (
+        ("ResidentKeyRequirement.REQUIRED", "residentKey"),
+        ('"credProps"', "credProps"),
+    ):
+        assert marker in passkeys, f"{marker} moved in the registration options; re-derive this"
+        assert feature in named, f"the registration options use {feature}, which has no row"
+    assert any('`<meta name="referrer">`' in row[0] for row in rows), "the referrer tag row"
     nonce_rows = [row for row in rows if "'nonce-...'" in _row_features(row[0])]
     assert len(nonce_rows) == 1, (
         "the CSP nonce-source row, the one feature the console needs to run"
@@ -945,6 +958,10 @@ def test_each_browsers_floor_is_the_latest_version_in_its_column() -> None:
     left_out = [row for row in rows if row[counts] != "yes"]
     for row in left_out:
         assert re.fullmatch(r"no: \S.{10,}", row[counts]), (row[0], row[counts])
+        features = _row_features(row[0])
+        assert features and features <= _OUT_OF_FLOOR, (
+            f"{row[0]} is left out of the floor but _OUT_OF_FLOOR does not name it"
+        )
     assert set().union(*(_row_features(row[0]) for row in left_out)) == _OUT_OF_FLOOR, (
         "the rows left out of the floor changed; leaving a row out lowers a floor without changing "
         "a number, so the page must say why and _OUT_OF_FLOOR must name it"

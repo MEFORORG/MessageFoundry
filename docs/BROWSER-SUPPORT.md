@@ -55,7 +55,8 @@ browser does with them.
 ## One feature decides whether the console works: CSP nonce sources
 
 The console serves a per-response Content-Security-Policy of the form
-`script-src 'nonce-<random>' 'strict-dynamic'`. There is no host allowlist and no inline script. A
+`script-src 'nonce-<random>' 'strict-dynamic'`. There is no host allowlist, and every script, inline
+or loaded from a file, runs only by carrying the nonce. A
 browser that enforces CSP but does not understand a `'nonce-...'` source therefore has no valid script
 source, and blocks every script on the page.
 
@@ -105,7 +106,7 @@ paired with a control that does not depend on the browser.
 | `Cross-Origin-Opener-Policy` | Process isolation for the console's browsing context. | `/ui` opens no cross-origin window and embeds no cross-origin content. The CSP's `frame-ancestors 'none'` still blocks framing. |
 | `Cross-Origin-Resource-Policy` | A cross-origin read block on console resources. | `/ui` serves no resource meant to be embedded elsewhere. |
 | `Reporting-Endpoints` | Delivery of CSP violation reports on the modern route. | Telemetry only, never a control. The legacy `report-uri` directive goes out alongside it, so most such browsers still deliver reports. |
-| `Clear-Site-Data` | Clearing the cache when a session ends. Some browsers apply the `"cache"` value only in part, and older ones not at all: see [the version table](#supported-browser-versions). | The session is revoked on the server, the cookie is deleted, every `/ui` page is `Cache-Control: no-store`, and the idle-logoff script blanks the page before it navigates away. |
+| `Clear-Site-Data` | Clearing the cache when a session ends. Some browsers apply the `"cache"` value only in part, and some versions not at all: see [the version table](#supported-browser-versions). | The session is revoked on the server, the cookie is deleted, every `/ui` page is `Cache-Control: no-store`, and the idle-logoff script blanks the page before it navigates away. |
 | `Cache-Control: no-store` | Cache and back-button suppression for console pages and PHI responses. | `Clear-Site-Data` on session end, the page blanking above, and the server refusing every request a restored page would make. |
 | `X-Content-Type-Options` | MIME-sniffing suppression. | The `/ui` static mount serves only `.css` and `.js`, from one fixed directory, with correct types. The one `/ui` route that serves stored message content as a file, the attachment download, also carries `Content-Disposition: attachment` and a sandbox policy (see its row below). |
 | `X-Frame-Options` | The legacy framing block. | Pure redundancy. `frame-ancestors 'none'` in the CSP is the modern control, and any browser that honours the nonce CSP honours it. |
@@ -142,8 +143,9 @@ the rows that count toward it. No number was chosen to match what already works.
 
 **Nothing enforces these versions.** The console does not read a browser's version and refuses no
 browser for being older. A browser below its floor gets, for each feature it lacks, what that
-feature's row in the tables above says. Four rows here have no row there, and the notes say what
-each costs: CSP `frame-ancestors`, `<meta name="referrer">`, and the two passkey options.
+feature's row in the tables above says. At least these rows that count toward the floor have no row
+there, and the notes say what each costs: CSP `frame-ancestors`, `<meta name="referrer">`, and the
+two passkey options.
 
 ### The floor
 
@@ -154,7 +156,9 @@ each costs: CSP `frame-ancestors`, `<meta name="referrer">`, and the two passkey
 | Firefox | 138 | `Clear-Site-Data` with `"cache"`. | Session cookie `Secure` (not verified). |
 | Safari | 17 | `Clear-Site-Data` with `"cache"`. | Passkey option `residentKey: "required"` (note 6). Passkey extension `credProps` (note 6). Session cookie `Secure` (not verified). `Sec-Fetch-User`. |
 
-A feature in the last column does not raise the floor: either no version of that browser meets it,
+So a floor is the first version that has every counted feature the browser's current releases
+have. It is not the version the console needs to work, which is the CSP nonce-source row. A
+feature in the last column does not raise the floor: either no version of that browser meets it,
 or neither dataset gives a number for it. Its row in the tables above, or its note, says what holds
 without it. At least two of them change what a user sees. Safari sends no `Sec-Fetch-User`, so under
 the `Sec-Fetch-User` row a link into the console from a same-site page, such as another port on the
@@ -199,17 +203,20 @@ seconds (note 3). Both were read from the code and the dataset, not measured in 
 The console's and the attachment download's policies have other directives: `default-src`,
 `script-src`, `style-src`, `img-src`, `connect-src`, `font-src`, `base-uri`, `form-action` and
 `object-src`. Each directive's own entry was read in the same dataset, and none has a later version
-than its browser's floor, so none has a row. BCD also records, under `form-action`, that Firefox
-does not apply it to a redirect after a form is submitted. The console's forms post to its own
-origin.
+than its browser's floor, so none has a row.
+
+BCD also records, under `form-action`, that Chrome, Edge and Safari apply it to the redirect that
+follows a form submission, and that Firefox does not. At least two console forms are answered with
+a redirect to the identity provider: the "leaving this site" page's form (`POST /ui/oidc/start`) and
+the step-up form (`POST /ui/reauth/oidc`). By that record, the console's `form-action 'self'` would
+make Chrome, Edge and Safari refuse that redirect. That was not measured in a browser.
 
 ### Where the numbers come from
 
 - **BCD** is MDN's browser-compat-data, the npm package `@mdn/browser-compat-data` at version
-  **8.1.9**, published 2026-11-12. A cell is the `version_added` of the browser's current support
-  statement, the one with no `version_removed`. That statement counts only when it carries no flag,
-  prefix, alternative name or partial-implementation mark. **none** means BCD records no such
-  statement.
+  **8.1.9**, published 2026-11-12. A cell is the `version_added` of the browser's open support
+  statement, one with no `version_removed`, that carries no flag, prefix, alternative name or
+  partial-implementation mark. **none** means BCD records no such statement.
 - **caniuse** is the npm package `caniuse-db` at version **1.0.30001826**, published 2026-11-11.
   It is used for one row only. BCD 8.1.9 has no entry for a `'nonce-...'` source in `script-src`.
   Its `html.global_attributes.nonce` entry is the HTML attribute, and its versions record when a
@@ -225,8 +232,8 @@ Notes:
    marked partial, so it counts.
 3. BCD marks every Chrome and Edge statement it has for this value partial. Its notes say some
    requests may still be served from the cache until the tab is reloaded, and that the value can
-   cause seconds-long hangs. The console sends it on every redirect to the sign-in page and on
-   sign-out. Firefox applied it from 63 to 93, dropped it in 94, and applied it again from 138.
+   cause seconds-long hangs. The console sends it at least on the sign-in redirect for a request
+   with no live session, on sign-out, and on the sign-in page shown after a session ends. Firefox applied it from 63 to 93, dropped it in 94, and applied it again from 138.
 4. The caniuse feature is CSP Level 2 as a whole, whose description names nonce sources. The cell
    is the first version caniuse marks fully supported, which can be later than nonce support
    alone: caniuse marks Chrome 36 to 39 and Firefox 31 to 44 partial for missing directives, not
@@ -248,7 +255,7 @@ Notes:
 7. Without the tag, the `Referrer-Policy` header still applies.
 
 What this table does not cover: browsers on phones and tablets; the JavaScript language features
-the console's scripts use, which set no number here; the IDE extension's webviews, whose browser is
+the console's scripts use and the CSS features its stylesheet uses, which set no number here; the IDE extension's webviews, whose browser is
 VS Code's own (see [below](#the-ide-extensions-webviews)); and the API documentation pages.
 
 ---
