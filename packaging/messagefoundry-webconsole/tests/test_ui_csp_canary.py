@@ -818,6 +818,19 @@ _VERSION_CELL_RE = re.compile(r"\d+(?:\.\d+)*")
 #: the floor lowers a floor without touching a number, so a new exclusion has to be made here as
 #: well as on the page, which states each reason in the row.
 _OUT_OF_FLOOR = frozenset({"'strict-dynamic'", "report-uri", "report-to", "Reporting-Endpoints"})
+#: Every cell of the feature table with no version, as (browser, the row's lead feature). A literal
+#: for the same reason as :data:`_OUT_OF_FLOOR`: turning a counted cell into ``none`` and moving it
+#: to the floor table's last column lowers a floor with every recomputation still agreeing.
+_NO_VERSION_CELLS = frozenset(
+    {
+        ("Chrome", "Clear-Site-Data"),
+        ("Edge", "Clear-Site-Data"),
+        ("Safari", "residentKey"),
+        ("Safari", "credProps"),
+        ("Safari", "Sec-Fetch-User"),
+    }
+    | {(browser, "Secure") for browser in _BROWSERS}
+)
 #: Where the version section lists the policy directives that have no row of their own.
 _OTHER_DIRECTIVES_LEAD = (
     "The console's and the attachment download's policies have other directives"
@@ -852,6 +865,14 @@ def _row_features(first_cell: str) -> set[str]:
         re.split(r"[:=]", token, maxsplit=1)[0].strip()
         for token in re.findall(r"`([^`]+)`", first_cell)
     }
+
+
+def _lead(first_cell: str) -> str:
+    """The feature a row is FOR: its first backticked token, cut like :func:`_row_features`. The
+    nonce row's lead is the nonce source, not the ``script-src`` it also mentions."""
+    tokens = re.findall(r"`([^`]+)`", first_cell)
+    assert tokens, f"a version row must name its feature in backticks: {first_cell!r}"
+    return re.split(r"[:=]", tokens[0], maxsplit=1)[0].strip()
 
 
 def _items(cell: str) -> dict[str, str]:
@@ -914,7 +935,9 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
     section = " ".join(re.split(r"^## ", section, maxsplit=1, flags=re.MULTILINE)[0].split())
     assert _OTHER_DIRECTIVES_LEAD in section, _OTHER_DIRECTIVES_LEAD
     listed = section.split(_OTHER_DIRECTIVES_LEAD, 1)[1].split(". ", 1)[0]
-    unnamed = sorted(d for d in directives if d not in named and f"`{d}`" not in listed)
+    # a directive is covered by a row FOR it, never by a row that only mentions it
+    leads = {_lead(row[0]) for row in rows}
+    unnamed = sorted(d for d in directives if d not in leads and f"`{d}`" not in listed)
     assert not unnamed, f"no version row and no place in the list of other directives: {unnamed}"
     # The referrer tag and the two passkey options are read from source text. Each read asserts
     # that it found its marker, so a refactor that renames one reds here instead of switching the
@@ -951,7 +974,8 @@ def test_each_browsers_floor_is_the_latest_version_in_its_column() -> None:
     For each browser, ``Supported from`` must equal the latest version among the rows that count,
     ``Set by`` must name every row at that version and no other, and the last column must name every
     counted row with no version (``none`` or ``not verified``) and no row that has one. The rows that
-    do not count must be exactly :data:`_OUT_OF_FLOOR`, each with its reason."""
+    do not count must be exactly :data:`_OUT_OF_FLOOR`, each with its reason, and the cells with no
+    version exactly :data:`_NO_VERSION_CELLS`."""
     header, rows = _version_table(_FEATURE_TABLE_HEADING)
     counts = header.index(_COUNTS_COLUMN)
     counted = [row for row in rows if row[counts] == "yes"]
@@ -965,6 +989,17 @@ def test_each_browsers_floor_is_the_latest_version_in_its_column() -> None:
     assert set().union(*(_row_features(row[0]) for row in left_out)) == _OUT_OF_FLOOR, (
         "the rows left out of the floor changed; leaving a row out lowers a floor without changing "
         "a number, so the page must say why and _OUT_OF_FLOOR must name it"
+    )
+    no_version = {
+        (browser, _lead(row[0]))
+        for row in rows
+        for browser in _BROWSERS
+        if _version(row[header.index(browser)]) is None
+    }
+    assert no_version == _NO_VERSION_CELLS, (
+        "the cells with no version changed; a counted cell turned into 'none' lowers a floor "
+        "without any recomputation disagreeing, so _NO_VERSION_CELLS must name the change: "
+        f"added {sorted(no_version - _NO_VERSION_CELLS)}, gone {sorted(_NO_VERSION_CELLS - no_version)}"
     )
     floor_header, floor_rows = _version_table(_FLOOR_TABLE_HEADING)
     assert [row[0] for row in floor_rows] == list(_BROWSERS), floor_rows

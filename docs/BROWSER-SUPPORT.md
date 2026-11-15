@@ -55,8 +55,10 @@ browser does with them.
 ## One feature decides whether the console works: CSP nonce sources
 
 The console serves a per-response Content-Security-Policy of the form
-`script-src 'nonce-<random>' 'strict-dynamic'`. There is no host allowlist, and every script, inline
-or loaded from a file, runs only by carrying the nonce. A
+`script-src 'nonce-<random>' 'strict-dynamic'`. There is no host allowlist. A script the page
+itself carries, inline or loaded from a file, runs only by carrying the nonce. In a browser that
+understands `'strict-dynamic'`, a script that an already running script adds to the page runs
+without one. A
 browser that enforces CSP but does not understand a `'nonce-...'` source therefore has no valid script
 source, and blocks every script on the page.
 
@@ -156,6 +158,10 @@ two passkey options.
 | Firefox | 138 | `Clear-Site-Data` with `"cache"`. | Session cookie `Secure` (not verified). |
 | Safari | 17 | `Clear-Site-Data` with `"cache"`. | Passkey option `residentKey: "required"` (note 6). Passkey extension `credProps` (note 6). Session cookie `Secure` (not verified). `Sec-Fetch-User`. |
 
+At these floors Chrome, Edge and Safari would, by a dataset record not measured in a browser,
+refuse the redirect after the console's federated sign-in and step-up forms: see
+[A recorded sign-in risk](#a-recorded-sign-in-risk-form-action-and-redirects).
+
 So a floor is the first version that has every counted feature the browser's current releases
 have. It is not the version the console needs to work, which is the CSP nonce-source row. A
 feature in the last column does not raise the floor: either no version of that browser meets it,
@@ -204,6 +210,8 @@ The console's and the attachment download's policies have other directives: `def
 `script-src`, `style-src`, `img-src`, `connect-src`, `font-src`, `base-uri`, `form-action` and
 `object-src`. Each directive's own entry was read in the same dataset, and none has a later version
 than its browser's floor, so none has a row.
+
+### A recorded sign-in risk: form-action and redirects
 
 BCD also records, under `form-action`, that Chrome, Edge and Safari apply it to the redirect that
 follows a form submission, and that Firefox does not. At least two console forms are answered with
