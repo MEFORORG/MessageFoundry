@@ -116,8 +116,17 @@ _WIDE_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_BE)
 #: concatenated into one.
 _LATIN1_BOM = codecs.BOM_UTF8.decode("latin-1")
 
-#: Batch-protocol envelope headers, which may precede the first ``MSH`` and hold no message.
-_ENVELOPE_HEADERS = ("FHS", "BHS")
+#: Batch-protocol envelope lines, headers and trailers, which hold no message and are dropped.
+_ENVELOPE_SEGMENTS = ("FHS", "BHS", "BTS", "FTS")
+
+
+def _line_head(line: str) -> str:
+    """``line`` past any run of MLLP start bytes and UTF-8 byte-order marks, in any order."""
+    while True:
+        rest = line.lstrip("\x0b").removeprefix(_LATIN1_BOM)
+        if rest == line:
+            return line
+        line = rest
 
 
 def _parse(path: Path, data: bytes) -> list[str]:
@@ -194,25 +203,27 @@ def _split_batch(text: str) -> list[str]:
     """Split concatenated HL7 into messages: each ``MSH`` line starts a new one (MLLP wrappers, if any,
     are tolerated since we key off the ``MSH`` prefix of a stripped line).
 
-    A UTF-8 byte-order mark before an ``MSH`` is dropped (see :data:`_LATIN1_BOM`). Content before
-    the first ``MSH`` line, which is all of a file that has none, is kept as one more entry rather
-    than dropped, except ``FHS``/``BHS`` envelope headers: it has no header, so the pairing counts it
-    as unkeyed, and the result cannot read clean with it."""
+    A UTF-8 byte-order mark before an ``MSH`` is dropped (see :data:`_LATIN1_BOM`), and so are
+    batch envelope lines wherever they sit. Content before the first ``MSH`` line, which is all of a
+    file that has none, is kept as one more entry rather than dropped: it has no header, so the
+    pairing counts it as unkeyed, and the result cannot read clean with it."""
     norm = _normalize_line_endings(text)
     msgs: list[str] = []
     current: list[str] = []
     preamble: list[str] = []
     for line in norm.split("\r"):
-        head = line.lstrip("\x0b").removeprefix(_LATIN1_BOM)
+        head = _line_head(line)
+        if head.startswith(_ENVELOPE_SEGMENTS):
+            continue
         if head.startswith("MSH"):
             if current:
                 msgs.append("\r".join(current))
-            current = [head]
+            current = [head.rstrip("\x1c\x0d")]
         elif current:
             stripped = line.rstrip("\x1c\x0d")
             if stripped:
                 current.append(stripped)
-        elif line.strip("\x0b\x1c \t\n") and not head.startswith(_ENVELOPE_HEADERS):
+        elif head.strip("\x0b\x1c \t\n"):
             preamble.append(line)
     if current:
         msgs.append("\r".join(current))

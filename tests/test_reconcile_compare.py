@@ -433,9 +433,19 @@ def test_load_messages_batch_keeps_text_with_no_msh_line_as_an_unkeyed_entry(
     assert load_messages(batch) == ["PID|1||MRN"]
     result = reconcile(load_messages(batch), [_msg("A")], key=("MSH", 10))
     assert result.unkeyed_mefor == 1 and not result.clean
-    # Batch-protocol envelope headers hold no message, so they are not an unkeyed entry.
-    batch.write_text("FHS|^~\\&|S\rBHS|^~\\&|S\r" + _msg("A"), encoding="latin-1")
-    assert [field_value(m, ("MSH", 10)) for m in load_messages(batch)] == ["A"]
+    # Batch envelope lines hold no message: not an unkeyed entry, and not a segment of one.
+    batch.write_text(
+        "FHS|^~\\&|S\rBHS|^~\\&|S\r" + _msg("A") + "BTS|1\rFTS|1\r", encoding="latin-1"
+    )
+    assert load_messages(batch) == [_msg("A").rstrip("\r")]
+    # A mark before the MLLP start byte, a doubled mark, or a line holding only a mark is no content.
+    bom = "\xef\xbb\xbf"
+    for text in (bom + "\x0b" + _msg("A"), bom + bom + _msg("A"), bom + "\r\n" + _msg("A")):
+        batch.write_text(text, encoding="latin-1")
+        assert load_messages(batch) == [_msg("A").rstrip("\r")]
+    # A one-segment framed message keeps no MLLP end byte in its last field.
+    batch.write_bytes(b"\x0bMSH|^~\\&|S|F|R|F|1||ADT^A01|K|P|2.5.1\x1c\r")
+    assert load_messages(batch) == ["MSH|^~\\&|S|F|R|F|1||ADT^A01|K|P|2.5.1"]
     # MLLP framing bytes and blank lines alone are not content.
     batch.write_bytes(b"\x0b" + _msg("A").encode() + b"\x1c\r\n\r\n")
     assert [field_value(m, ("MSH", 10)) for m in load_messages(batch)] == ["A"]
