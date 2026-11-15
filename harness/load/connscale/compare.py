@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import math
 import statistics
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from harness.load.connscale.profile import FUSE_OFF, FUSE_ON
@@ -82,26 +82,55 @@ class _ArmMetrics:
     sink_received: int
     backlog: int
     no_loss_detail: str
+    trials: int = 1
+    # The intake rate's mean over the trials that held zero-loss; ``None`` when none did. The throughput
+    # guard compares against it, so one lossy per_lane trial does not make the whole row incomparable.
+    clean_read_per_s: float | None = None
+    # Every trial's post-load drain completed. Kept apart from the loss reconcile, as ``_FuseArm`` keeps
+    # it: a timed-out drain stranded rows somewhere, which is not the same claim as a lost message.
+    drain_completed: bool = True
 
     @classmethod
-    def from_record(cls, r: ConnScaleRecord) -> _ArmMetrics:
+    def from_records(cls, recs: list[ConnScaleRecord]) -> _ArmMetrics:
+        """One arm's read-off over EVERY trial of its cell (BACKLOG #5429). Keeping only the last trial
+        let an earlier lossy or timed-out trial vanish from a passing verdict, so the loss signal and
+        the drain signal are both all-trials. Rates are trial means; peaks and tail latencies are the
+        worst trial."""
+        last = recs[-1]
+        losses = [
+            r.no_loss.detail if len(recs) == 1 else f"trial {r.trial}: {r.no_loss.detail}"
+            for r in recs
+            if not r.no_loss.ok
+        ]
+
+        def _mean_or_none(values: Iterable[float | None]) -> float | None:
+            present = [v for v in values if v is not None]
+            return statistics.fmean(present) if present else None
+
+        def _max_or_none[T: (int, float)](values: list[T | None]) -> T | None:
+            present = [v for v in values if v is not None]
+            return max(present) if present else None
+
         return cls(
-            claim_mode=r.claim_mode,
-            achieved_read_per_s=r.achieved_read_per_s,
-            achieved_written_per_s=r.achieved_written_per_s,
-            idle_poll_per_s=r.idle_poll_per_s,
-            wake_fanout_per_s=r.wake_fanout_per_s,
-            ack_p99_ms=r.ack_p99_ms,
-            pool_wait_p99_ms=r.pool_wait_p99_ms,
-            cpu_seconds_total=r.cpu_seconds_total,
-            cpu_util_cores_mean=r.cpu_util_cores_mean,
-            fd_count_peak=r.fd_count_peak,
-            working_set_peak_bytes=r.working_set_peak_bytes,
-            no_loss_ok=r.no_loss.ok,
-            sent=r.no_loss.sent,
-            sink_received=r.no_loss.sink_received,
-            backlog=r.no_loss.backlog,
-            no_loss_detail=r.no_loss.detail,
+            claim_mode=last.claim_mode,
+            achieved_read_per_s=statistics.fmean(r.achieved_read_per_s for r in recs),
+            achieved_written_per_s=statistics.fmean(r.achieved_written_per_s for r in recs),
+            idle_poll_per_s=statistics.fmean(r.idle_poll_per_s for r in recs),
+            wake_fanout_per_s=statistics.fmean(r.wake_fanout_per_s for r in recs),
+            ack_p99_ms=max(r.ack_p99_ms for r in recs),
+            pool_wait_p99_ms=_max_or_none([r.pool_wait_p99_ms for r in recs]),
+            cpu_seconds_total=_mean_or_none([r.cpu_seconds_total for r in recs]),
+            cpu_util_cores_mean=_mean_or_none([r.cpu_util_cores_mean for r in recs]),
+            fd_count_peak=_max_or_none([r.fd_count_peak for r in recs]),
+            working_set_peak_bytes=_max_or_none([r.working_set_peak_bytes for r in recs]),
+            no_loss_ok=not losses,
+            sent=sum(r.no_loss.sent for r in recs),
+            sink_received=sum(r.no_loss.sink_received for r in recs),
+            backlog=max(r.no_loss.backlog for r in recs),
+            no_loss_detail="; ".join(losses) or last.no_loss.detail,
+            trials=len(recs),
+            drain_completed=all(r.drain_seconds is not None for r in recs),
+            clean_read_per_s=_mean_or_none([r.achieved_read_per_s for r in recs if r.no_loss.ok]),
         )
 
 
@@ -130,7 +159,13 @@ class ComparisonRow:
     def resilience_win(self) -> bool:
         """per_lane breached zero-loss but pooled held it — the 'pooled survives, per_lane breaks'
         outcome the poller-zeroed throughput delta cannot show."""
-        return not self.pooled_missing and not self.baseline.no_loss_ok and not self.candidate_lost
+        return (
+            not self.pooled_missing
+            and not self.baseline.no_loss_ok
+            and not self.candidate_lost
+            and self.candidate is not None
+            and self.candidate.drain_completed
+        )
 
     @property
     def ok(self) -> bool:
@@ -140,6 +175,9 @@ class ComparisonRow:
         sound*. A baseline that itself breached zero-loss yields no sound throughput comparison, so
         the row passes on the resilience basis (pooled held) rather than on a phantom-zero delta."""
         if self.pooled_missing or self.candidate_lost:
+            return False
+        # A pooled arm whose drain timed out in any trial left rows stranded (BACKLOG #5429).
+        if self.candidate is not None and not self.candidate.drain_completed:
             return False
         if self.collapse_verdict == COLLAPSE_FAIL:
             return False
@@ -161,10 +199,15 @@ class ClaimModeComparison:
     # The window every rate in `rows` was computed over, read off the records (BACKLOG #2012). An A/B
     # from before #1420 or #2024 read a different window, so it does not compare with this one.
     rate_window: str | None = None
+    # ``(sweep_mode, count)`` cells the CANDIDATE produced that the baseline never did (BACKLOG #5429).
+    # They have no row to fail, so the verdict fails on them directly rather than skipping them.
+    orphan_candidate_cells: list[tuple[str, int]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return all(row.ok for row in self.rows) and bool(self.rows)
+        return (
+            all(row.ok for row in self.rows) and bool(self.rows) and not self.orphan_candidate_cells
+        )
 
     @property
     def missing_arms(self) -> int:
@@ -229,6 +272,9 @@ class ClaimModeComparison:
                 "resilience_wins": self.resilience_wins,
                 "worst_collapse": self.worst_collapse,
                 "missing_arms": self.missing_arms,
+                "orphan_candidate_cells": [
+                    {"sweep_mode": sm, "count": n} for sm, n in self.orphan_candidate_cells
+                ],
             },
             "rows": [_row_json(row) for row in self.rows],
             "notes": self.notes,
@@ -251,8 +297,12 @@ class ClaimModeComparison:
             f"overall: {overall}  (candidate_zero_loss_ok={self.candidate_zero_loss_ok}, "
             f"throughput_non_regression={_tnr_label(self.throughput_non_regression)}, "
             f"resilience_wins={self.resilience_wins}, worst_collapse={self.worst_collapse}, "
-            f"missing_arms={self.missing_arms})"
+            f"missing_arms={self.missing_arms}, "
+            f"orphan_candidate_cells={len(self.orphan_candidate_cells)})"
         )
+        if self.orphan_candidate_cells:
+            orphans = ", ".join(f"[{sm}] N={n}" for sm, n in self.orphan_candidate_cells)
+            lines.append(f"POOLED CELLS WITH NO per_lane BASELINE (the A/B fails): {orphans}")
         for row in self.rows:
             lines.append("")
             lines.append(f"[{row.sweep_mode}] N={row.count}")
@@ -325,9 +375,10 @@ def build_comparison(
     )
     missing_detail = missing_detail or {}
 
-    by_key: dict[tuple[str, str, int], ConnScaleRecord] = {}
+    # Every trial of a cell, not the last one (BACKLOG #5429): ``profile.trials`` repeats each cell.
+    by_key: dict[tuple[str, str, int], list[ConnScaleRecord]] = {}
     for r in records:
-        by_key[(r.claim_mode, r.sweep_mode, r.count)] = r
+        by_key.setdefault((r.claim_mode, r.sweep_mode, r.count), []).append(r)
 
     # Iterate the (sweep_mode, count) cells the BASELINE produced, in first-seen order, so the report
     # is stable and a missing pooled arm is detected against the baseline that always runs.
@@ -342,10 +393,9 @@ def build_comparison(
 
     rows: list[ComparisonRow] = []
     for sweep_mode, count in baseline_cells:
-        base_rec = by_key[(baseline_mode, sweep_mode, count)]
-        base = _ArmMetrics.from_record(base_rec)
-        cand_rec = by_key.get((candidate_mode, sweep_mode, count))
-        if cand_rec is None:
+        base = _ArmMetrics.from_records(by_key[(baseline_mode, sweep_mode, count)])
+        cand_recs = by_key.get((candidate_mode, sweep_mode, count))
+        if not cand_recs:
             rows.append(
                 ComparisonRow(
                     sweep_mode=sweep_mode,
@@ -362,13 +412,18 @@ def build_comparison(
                 )
             )
             continue
-        cand = _ArmMetrics.from_record(cand_rec)
+        cand = _ArmMetrics.from_records(cand_recs)
         # The throughput delta is only SOUND when both arms held zero-loss; a breached (drowning)
         # baseline has a poller-zeroed achieved rate we must not read as a pass/fail.
         candidate_lost = not cand.no_loss_ok
-        throughput_comparable = base.no_loss_ok and cand.no_loss_ok
+        # Sound when the pooled arm held zero-loss and at least one per_lane trial did: compare against
+        # the clean per_lane trials only (BACKLOG #5429), not the all-trials mean a drowning trial
+        # zeroes, and not "no comparison" because one trial of several drowned.
+        throughput_comparable = cand.no_loss_ok and base.clean_read_per_s is not None
         thr_ok, thr_delta = _throughput_verdict(
-            base.achieved_read_per_s, cand.achieved_read_per_s, throughput_tolerance
+            base.clean_read_per_s if base.clean_read_per_s is not None else 0.0,
+            cand.achieved_read_per_s,
+            throughput_tolerance,
         )
         collapse, col_delta, ratio = _collapse_verdict(
             base.idle_poll_per_s, cand.idle_poll_per_s, collapse_material_ratio, idle_floor_per_s
@@ -400,6 +455,16 @@ def build_comparison(
             "-- see each arm's recorded reason (on SQL Server one cause is READ_COMMITTED_SNAPSHOT "
             "OFF; set RCSI ON on the target DB)."
         )
+    orphans: list[tuple[str, int]] = []
+    for r in records:
+        key = (r.sweep_mode, r.count)
+        if r.claim_mode == candidate_mode and key not in seen and key not in orphans:
+            orphans.append(key)
+    if orphans:
+        notes.append(
+            f"{len(orphans)} pooled cell(s) with NO per_lane baseline to compare against: "
+            f"{', '.join(f'[{sm}] N={n}' for sm, n in orphans)} -- the A/B fails rather than skip them."
+        )
     return ClaimModeComparison(
         baseline_mode=baseline_mode,
         candidate_mode=candidate_mode,
@@ -409,6 +474,7 @@ def build_comparison(
         rows=rows,
         notes=notes,
         rate_window=records_rate_window(records),
+        orphan_candidate_cells=orphans,
     )
 
 
@@ -475,6 +541,16 @@ def _row_json(row: ComparisonRow) -> dict[str, object]:
             "per_lane_detail": row.baseline.no_loss_detail,
             "pooled_detail": (None if row.candidate is None else row.candidate.no_loss_detail),
         },
+        # Every rate above is a mean over this many trials; a drain that timed out in any trial
+        # fails a pooled row (BACKLOG #5429).
+        "trials": {
+            "per_lane": row.baseline.trials,
+            "pooled": None if row.candidate is None else row.candidate.trials,
+        },
+        "drain_completed": {
+            "per_lane": row.baseline.drain_completed,
+            "pooled": None if row.candidate is None else row.candidate.drain_completed,
+        },
     }
     if row.missing_detail:
         out["missing_detail"] = row.missing_detail
@@ -518,6 +594,8 @@ def _loss_label(row: ComparisonRow) -> str:
     if row.candidate_lost:
         detail = row.candidate.no_loss_detail if row.candidate is not None else ""
         return f"CANDIDATE LOST -- pooled breached zero-loss ({detail})"
+    if row.candidate is not None and not row.candidate.drain_completed:
+        return "CANDIDATE UNDRAINED -- a pooled trial's drain timed out (rows stranded)"
     if row.resilience_win:
         return "RESILIENCE -- per_lane breached zero-loss, pooled held (throughput delta not sound)"
     return "both clean"
@@ -655,8 +733,8 @@ class _FuseArm:
     # whole-pipeline ``in_pipeline`` gauge (NOT-DONE rows across ingress+routed+outbound) reaches 0, so a
     # timeout means rows stranded in SOME stage. A ``None`` here is the WORST case ("never drained"), NOT
     # "unmeasured": a timed-out trial poisons the worst-case so a partial strand can't be dropped. (The
-    # outbound-only ``no_loss.backlog`` can read 0 while ingress/routed still hold rows, so it is NOT a
-    # whole-pipeline gauge — drain completion is.) ---
+    # final ``no_loss.backlog`` is one reading after the drain wait; drain completion is the signal that
+    # the whole pipeline emptied within the timeout, so it is the gate.) ---
     drain_seconds_worst: float | None
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
@@ -1096,9 +1174,8 @@ def _in_pipeline_ok(base: _FuseArm, cand: _FuseArm, tolerance: float) -> bool:
     ``drain_seconds`` only once the whole-pipeline ``in_pipeline`` gauge (NOT-DONE rows across
     ingress+routed+outbound) reaches 0 and the counters settle; on timeout it returns ``None``. So
     ``drain_seconds_worst is None`` means at least one trial's drain never completed — rows stranded in
-    SOME stage. (The outbound-only ``no_loss.backlog`` can read 0 while ingress/routed still hold rows,
-    so it is NOT usable here — a fully-offered arm that strands upstream would false-pass; the whole-
-    pipeline drain gauge is the only reliable one.)
+    SOME stage. (The final ``no_loss.backlog`` is one reading after the drain wait, not the drain
+    itself, so it is not used here; the whole-pipeline drain completion is the gate.)
 
     1. **Candidate fully drained.** If B1's worst drain did NOT complete (``drain_seconds_worst is
        None``) the whole pipeline never emptied — the backlog mirage — so FAIL, never auto-pass. This is

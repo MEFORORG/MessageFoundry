@@ -637,13 +637,22 @@ def _fd_ws_from(readings: list[tuple[float, ProcSample]]) -> tuple[int | None, i
 def _evaluate_slos(profile: EstateProfile, records: list[EstateRecord]) -> list[SloCheck]:
     out: list[SloCheck] = []
     slo = profile.slo
+    # A completed drain is checked UNCONDITIONALLY, not only under ``max_drain_seconds`` (BACKLOG
+    # #5437): that threshold defaults to unset, and a timed-out drain left rows stranded in some stage
+    # that the outbound-only reconcile backlog can miss. An empty record list measured nothing, so it
+    # fails here and in zero_loss rather than passing both vacuously.
+    drained = sum(1 for r in records if r.drain_seconds is not None)
+    all_drained = bool(records) and drained == len(records)
+    out.append(SloCheck("drain_completed", True, f"{drained}/{len(records)}", all_drained))
     if slo.zero_loss:
-        all_ok = all(r.no_loss.ok for r in records)
+        all_ok = bool(records) and all(r.no_loss.ok for r in records)
         out.append(SloCheck("zero_loss", True, all_ok, all_ok))
     if slo.max_drain_seconds is not None:
-        worst = max(
-            (r.drain_seconds for r in records if r.drain_seconds is not None),
-            default=None,
+        # A timed-out drain poisons the worst case: it has no finite time to compare.
+        worst = (
+            max(r.drain_seconds for r in records if r.drain_seconds is not None)
+            if all_drained
+            else None
         )
         ok = worst is not None and worst <= slo.max_drain_seconds
         out.append(

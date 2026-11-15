@@ -10,8 +10,9 @@ started on enter, it binds 127.0.0.1 on the endpoint's port, pins its fresh host
 nothing about the outbound.
 
 What arrived is read by the File sink's own scan over the outbox's local directory, so the rules match:
-files present at start are ignored, dot-files (the engine's ``.<name>.<hex>.part`` upload temp) are
-skipped, each read is capped, and every record carries ``relpath`` and ``inside``. A record also
+files present at start are ignored while unchanged, dot-files (the engine's
+``.<name>.<hex>.part`` upload temp) are skipped, a link is recorded unread, each read is capped, and
+every record carries ``relpath`` and ``inside``. A record also
 carries ``remote_path``, the name the engine published under.
 """
 
