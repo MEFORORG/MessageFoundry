@@ -2305,9 +2305,9 @@ class _MfaStamp:
         self.anchored = False
 
     def __call__(self, s: SessionRecord) -> SessionRecord:
-        anchor = self._anchor
-        self.anchored = anchor is not None and s.mfa_verified_at is None
-        if not self.anchored or anchor is None:  # the second test only narrows the type
+        anchor = self._anchor if s.mfa_verified_at is None else None
+        self.anchored = anchor is not None
+        if anchor is None:
             return replace(s, mfa_verified_at=self._when)
         return replace(
             s,
@@ -20716,8 +20716,9 @@ class MessageStore:
         now: float | None = None,
         anchor: PendingFactorAnchor | None = None,
     ) -> bool:
-        """Stamp a session's second-factor as satisfied (WP-14): after a TOTP/recovery verify, or at
-        issuance for an MFA-delegated AD/Kerberos login. See
+        """Stamp a session's second-factor as satisfied (WP-14): at least after a TOTP/recovery
+        verify, a factor enrolment confirm, a passkey assertion (the one caller that passes an
+        ``anchor``), or at issuance for a sign-in that owes no second factor. See
         :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the answer."""
         stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with _writer_txn(self._db, self._lock):

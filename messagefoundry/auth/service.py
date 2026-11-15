@@ -18165,7 +18165,7 @@ class AuthService:
     ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
         factor satisfied and re-key the session (ASVS 7.2.4). The same factor write, when the row it
-        locks has not met its factor, also re-anchors the session to the WP-L3-13 client as
+        reads in its own transaction has not met its factor, also re-anchors the session to the WP-L3-13 client as
         :meth:`verify_mfa` does and stamps ``reauth_at`` only when the authenticator reported user
         verification, clearing it otherwise. A session that had already met its factor when that
         write ran, and any ``oidc`` session, is neither re-anchored nor stamped (vault BACKLOG #2964

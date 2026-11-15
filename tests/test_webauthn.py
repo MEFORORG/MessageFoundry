@@ -1520,7 +1520,7 @@ async def test_a_factor_met_during_the_assertion_is_not_re_anchored(
     monkeypatch: pytest.MonkeyPatch, interleave: bool
 ) -> None:
     """Vault BACKLOG #2964 item 14, review finding R6: the decision to re-anchor is made inside the
-    factor write, on the row it locks, never on the session row the leg loaded first. Here another
+    factor write, on the row it reads, never on the session row the leg loaded first. Here another
     write meets the session's factor after that load (inside the sign-count write, which runs
     between them), so the passkey's own write must be a plain factor stamp: the anchor, the window
     and the new-address dedupe all stay as they were. ``interleave=False`` is the control: the same

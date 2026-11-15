@@ -3474,10 +3474,11 @@ can pass a different answer.
 **A session minted with no window can still get one before its first sensitive action.** The
 step-up stamps it, and so does a TOTP or recovery code proved at the MFA gate (`POST /ui/mfa` or
 `POST /auth/mfa-verify`), because `verify_mfa` calls `mark_session_reauthed` on every session but an
-`oidc` one. A passkey assertion (`POST /ui/reauth/webauthn`) does the same, but only when the authenticator reports user verification (the UV flag)
-(vault BACKLOG #2964 item 14, owner rulings 2026-11-14), and only when it completes a factor the
-session had not yet met: unlike a code, an assertion on a session that already met its factor
-stamps no window. So a Windows SSO session whose holder
+`oidc` one. A passkey assertion (`POST /ui/reauth/webauthn`) that completes a factor the session
+had not yet met stamps the window too, but only when the authenticator reports user verification
+(the UV flag); without it the assertion still re-anchors the session and clears the window (vault
+BACKLOG #2964 item 14, owner rulings 2026-11-14). Unlike a code, an assertion on a session that
+already met its factor stamps no window. So a Windows SSO session whose holder
 answers the MFA gate with a code or a user-verified passkey passes the window check for `step_up_max_age_seconds` with no further challenge. **An `oidc` session's code opens no
 window** (BACKLOG #2142, ADR 0142 Amendment F; a seat decision under owner delegation 2026-10-08, not
 an owner ruling). The code still meets a pending factor and re-keys the session, but the window opens
@@ -4070,8 +4071,8 @@ BACKLOG #2964 item 14, owner rulings 2026-11-14; see
 [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). An
 assertion on a session that had already met its factor, for example one staged while it was pending
 and answered after another tab met the factor, neither re-anchors nor stamps. The store decides that
-inside the factor write, from the session row it locks (`mark_session_mfa_verified` with an
-anchor). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
+inside the factor write, from the session row that write reads and replaces in one transaction
+(`mark_session_mfa_verified` with an anchor). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
 `/ui`, as the page's GET does, and stages no assertion. An
 action-bound grant still comes only from the credential leg: the password leg of `POST /ui/reauth`,
 or for an `oidc` session the IdP leg, which shows no password field. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **re-proof-only
@@ -4953,8 +4954,10 @@ The honest limits of that model, one sentence each:
   - A step-up does extra store reads before it writes: the account, and whether it owes a factor.
   - A factor enrolment records the address without moving the session's anchor, and so does a
     passkey or a code at the MFA gate on a session the OIDC sign-in minted, and a passkey on a
-    session that had already met its factor. Until a password or
-    IdP step-up moves it, the record and the new-client-IP signal can disagree about that address.
+    session that had already met its factor. Until a later proof moves the anchor, at least a
+    password or IdP step-up, a code at the MFA gate on a session the OIDC sign-in did not mint, or
+    a passkey that completes a pending factor on such a session, the record and the
+    new-client-IP signal can disagree about that address.
 - An administrator's password reset or MFA reset deletes every address in the account's
   known-address record (vault BACKLOG #2946, owner ruling 2026-10-16). So the next sign-in from any
   address seen before the reset is judged first-seen, the holder's usual one included. What that

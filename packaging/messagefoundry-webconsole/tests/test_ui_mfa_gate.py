@@ -422,7 +422,9 @@ async def test_a_satisfied_sessions_refused_code_lands_on_ui_not_on_a_gate(engin
         # Satisfied: the refused code lands on /ui and stages nothing.
         r = await c.post("/ui/mfa", data={"code": "000000"}, headers=SAME_ORIGIN)
         assert r.status_code == 303 and r.headers["location"] == "/ui"
-        assert "data-mf-webauthn-get" not in r.text
+        # Nothing staged: the challenge store holds no assertion for this session. The pending
+        # control above did stage one, which is the assertion that met the factor.
+        assert service._webauthn_challenges.pop((hash_token(token), "assert")) is None
 
 
 async def test_a_valid_code_clears_the_gate(
