@@ -54,12 +54,13 @@ seen:
   no pattern names, a call split across lines (a PowerShell backtick continuation, a multi-line
   JavaScript options object whose key and value sit on different lines), and a file outside the
   walked roots and suffixes;
-* for the PowerShell arm: a ``<#`` inside a string or here-string that opens a line with it. The
-  comment stripper cannot tell it from a real block comment and hides the lines up to the next
-  ``#>``;
-* for the TypeScript/JavaScript arms, the same shape: a line of a multi-line string or template
-  literal that opens with ``/*``. The comment stripper reads it as a block comment and hides the
-  lines up to the next ``*/``.
+* for the comment stripper the TypeScript/JavaScript and PowerShell arms share: a line of a
+  multi-line string, template literal or here-string whose text STARTS with the block opener
+  (``/*``, ``<#``) is read as a block comment, and the lines up to the next closer are hidden. The
+  real tree has such lines: CSS ``/* */`` comments inside the IDE's webview template strings, where
+  a ``${...}`` hole would go unseen;
+* for the same stripper: such a string line that STARTS with the line-comment marker (``//``,
+  ``#``), and a PowerShell ``#Requires`` line, are skipped as comments.
 
 Stdlib only, like the gate that imports it.
 """
@@ -380,9 +381,10 @@ def import_aliases(nodes: list[ast.AST], mod: str, is_init: bool) -> dict[str, l
     anywhere in the file resolves the same way everywhere in it. A name bound more than once keeps
     ALL its targets (BACKLOG #5579). It was last-write-wins, so a function-local
     ``from x import y as hashlib`` replaced the module-level ``hashlib`` for the whole file and hid
-    every real ``hashlib`` call in it. A call is now resolved under each binding and counted when any
-    one of them is an operation. That can over-resolve a shadowed name, which errs toward reporting
-    an operation, never toward hiding one."""
+    every real ``hashlib`` call in it. A call, a TLS value and a method-rule decision are now each
+    taken under every binding, so one binding cannot mask another's operation. That can over-resolve
+    a shadowed name into a token for an API the call does not reach, which is the direction meant:
+    a spurious row costs a review, a hidden call costs the inventory."""
     aliases: dict[str, list[str]] = {}
 
     def bind(local: str, target: str) -> None:
@@ -501,26 +503,27 @@ def _enclosing_functions(tree: ast.Module) -> dict[int, str]:
     return owner
 
 
-def _resolve_reexport(name: str, reexports: dict[str, list[str]]) -> list[str]:
+def _resolve_reexport(name: str, reexports: dict[str, list[str]]) -> set[str]:
     """Follow ``pkg.name -> real.target`` re-export links, so a call through a package ``__init__``
     lands on the function that is actually defined. A name re-exported more than once follows every
-    link (BACKLOG #5579). Returns ``name`` and every name reached, so the caller keeps any of them
-    that is a first-party function. Bounded, so a cycle cannot hang the gate."""
-    reached = {name: None}  # an ordered set
-    frontier = [name]
+    link (BACKLOG #5579). Returns ``name`` and every name reached, so a caller looking for a
+    first-party function to follow keeps any of them. Bounded, so a cycle cannot hang the gate."""
+    reached = {name}
+    frontier = {name}
     for _ in range(8):
-        frontier = list(
-            dict.fromkeys(t for n in frontier for t in reexports.get(n, ()) if t not in reached)
-        )
+        frontier = {t for n in frontier for t in reexports.get(n, ()) if t not in reached}
         if not frontier:
             break
-        reached.update(dict.fromkeys(frontier))
-    return list(reached)
+        reached |= frontier
+    return reached
 
 
 def _lands_on(qualified: str, reexports: dict[str, list[str]], known_functions: set[str]) -> bool:
-    """Whether a qualified callee reaches a first-party module-level function."""
-    return any(name in known_functions for name in _resolve_reexport(qualified, reexports))
+    """Whether EVERY end of a qualified callee's re-export chain is a first-party module-level
+    function. A name with a link is not an end, so a ``def verify`` that a later import rebinds does
+    not count as first-party; a cycle or an over-long chain has no end and does not either."""
+    ends = {n for n in _resolve_reexport(qualified, reexports) if not reexports.get(n)}
+    return bool(ends) and ends <= known_functions
 
 
 def _canonical_algorithm(name: str) -> str | None:
@@ -542,30 +545,35 @@ _ALGORITHM_KEYS: dict[str, str] = {
 def _algorithms_in(call: ast.Call, m: ParsedModule) -> list[str]:
     """Hash algorithms named anywhere in a call's ARGUMENTS, nested calls included
     (``key.sign(data, ec.ECDSA(hashes.SHA256()))``), so the token can carry them."""
-    found: set[str | None] = set()
+    found: set[str] = set()
     for arg in [*call.args, *(kw.value for kw in call.keywords)]:
         for node in ast.walk(arg):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                found.add(_canonical_algorithm(node.value))
+                names = [node.value]
             elif isinstance(node, (ast.Name, ast.Attribute)):
-                found.update(
-                    _canonical_algorithm(qualified.rpartition(".")[2])
+                names = [
+                    qualified.rpartition(".")[2]
                     for qualified in m.resolve(node)
                     if qualified.startswith(("hashlib.", "cryptography.hazmat.primitives.hashes."))
-                )
-    return sorted(algo for algo in found if algo is not None)
+                ]
+            else:
+                continue
+            found.update(algo for name in names if (algo := _canonical_algorithm(name)))
+    return sorted(found)
 
 
-def _value_label(value: ast.expr, m: ParsedModule) -> str:
-    """A short label for the value a TLS attribute is set to, when it is a literal or a named
-    constant (``False``, ``CERT_NONE``, ``TLSv1_2``). Empty when it is anything else."""
+def _value_labels(value: ast.expr | None, m: ParsedModule) -> list[str]:
+    """Short labels for the value a TLS attribute is set to, when it is a literal or a named
+    constant (``False``, ``CERT_NONE``, ``TLSv1_2``): one per binding a named value has (BACKLOG
+    #5579), so a weakening value under any binding reaches a token. ``[""]`` for anything else."""
+    if value is None:
+        return [""]
     if isinstance(value, ast.Constant) and isinstance(value.value, (bool, int, str)):
-        return f" {value.value}"
+        return [f" {value.value}"]
     if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.Invert):
-        inner = _value_label(value.operand, m)
-        return f" ~{inner.strip()}" if inner else ""
-    qualified = m.resolve(value)
-    return f" {qualified[0].rpartition('.')[2]}" if qualified else ""
+        return [f" ~{inner.strip()}" if inner else "" for inner in _value_labels(value.operand, m)]
+    labels = [f" {q.rpartition('.')[2]}" for q in m.resolve(value)]
+    return list(dict.fromkeys(labels)) or [""]
 
 
 _AUG_OPERATORS: dict[type[ast.operator], str] = {
@@ -621,8 +629,11 @@ def _direct_operations(
                 and isinstance(node.args[1], ast.Constant)
                 and node.args[1].value in TLS_POSTURE_ATTRIBUTES
             ):
-                label = _value_label(node.args[2], m) if len(node.args) >= 3 else ""
-                found.append((node, node.lineno, "tls_context", f".{node.args[1].value} ={label}"))
+                value = node.args[2] if len(node.args) >= 3 else None
+                for label in _value_labels(value, m):
+                    found.append(
+                        (node, node.lineno, "tls_context", f".{node.args[1].value} ={label}")
+                    )
                 continue
             candidates = m.resolve(node.func)
             hits = [(q, op) for q in candidates if (op := classify_qualified(q)) is not None]
@@ -631,9 +642,13 @@ def _direct_operations(
                 for qualified, op in hits:
                     label = f"{qualified}[{','.join(algorithms)}]" if algorithms else qualified
                     found.append((node, node.lineno, op, label))
+            # The bindings no rule above classified. A hit under one binding must not stop the
+            # method rule for another, or a crypto-module binding masks a signer's ``.sign()``.
+            rest = [q for q in candidates if classify_qualified(q) is None]
+            if hits and not rest:
                 continue
             if isinstance(node.func, ast.Attribute) and node.func.attr in METHOD_RULES:
-                if candidates and all(_lands_on(q, reexports, known_functions) for q in candidates):
+                if rest and all(_lands_on(q, reexports, known_functions) for q in rest):
                     # A call that lands on a first-party module-level FUNCTION is handled by provider
                     # propagation, which knows whether that function really performs crypto; a
                     # method-name guess would not. Anything else (a first-party class's method, a
@@ -650,7 +665,6 @@ def _direct_operations(
                     found.append((node, node.lineno, op_class, f".{node.func.attr}(){suffix}"))
         elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
             for attr, value in _posture_targets(node):
-                label = _value_label(value, m) if value is not None else ""
                 # The REAL operator: ``&= ~FLAG`` clears a bit that ``|= FLAG`` sets, and one of
                 # them is often the weakening direction, so they must not share a token.
                 sign = (
@@ -658,7 +672,8 @@ def _direct_operations(
                     if isinstance(node, ast.AugAssign)
                     else "="
                 )
-                found.append((node, node.lineno, "tls_context", f".{attr} {sign}{label}"))
+                for label in _value_labels(value, m):
+                    found.append((node, node.lineno, "tls_context", f".{attr} {sign}{label}"))
     return found
 
 

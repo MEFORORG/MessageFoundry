@@ -1015,8 +1015,10 @@ def _service_drift(text: str, live: set[str]) -> list[str]:
 
 
 def _script_code_lines(source: str) -> list[str]:
-    """Lines of a TypeScript or JavaScript file that are not whole-line comments, by the rule
-    ``_is_comment_only`` in ``scripts/security/crypto_inventory_check.py`` uses. A trailing comment
+    """Lines of a TypeScript or JavaScript file that are not whole-line comments, by the per-line
+    rule ``scripts/security/crypto_inventory_check.py`` used before BACKLOG #5578 (its
+    ``_strip_comments`` now tracks block state, so a ``*`` line outside a block counts there and not
+    here). A trailing comment
     stays on its line, so a call named inside one counts, and so does a line inside a block comment
     that does not start with ``*``. The page says so. Code after a closing ``*/`` on a comment line
     is kept, so ``/* reviewed */ execFile(...)`` still counts."""

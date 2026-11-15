@@ -2381,19 +2381,29 @@ def find_violations(
 
 def _strip_comments(text: str, line_comment: str, block_open: str, block_close: str) -> list[str]:
     """The code of a source, one entry per line, with comments removed. Shared by the JS/TS and
-    PowerShell arms so a fix to one stripper reaches the other.
+    PowerShell arms so a fix to one stripper reaches the other; this is the one statement of its
+    rules.
 
     A line whose code starts with ``line_comment`` is a comment. ``block_open`` opens a block
     comment only where it STARTS the remaining code on a line, and the lines up to its
-    ``block_close`` are skipped; code after the close on the same line is kept. An opener anywhere
-    else (after code, in a string, in a trailing line comment) never opens a block, so it cannot
-    hide the lines that follow. Every choice errs toward scanning too much, never too little, except
-    the one the residual in crypto_operations.py names: a string line that STARTS with the opener."""
+    ``block_close`` are skipped; code after the close on the same line is kept. A line inside no
+    block is never skipped for starting with anything else (a JS ``*`` continuation line is code).
+    An opener anywhere else (after code, in a string, in a trailing line comment) never opens a
+    block, so it cannot hide the lines that follow, and a trailing comment never hides the code
+    before it.
+
+    Lines are split at ``\n`` only. ``str.splitlines`` also breaks at a form feed, NEL or U+2028,
+    none of which ends a JS line comment or string, so a ``// x<NEL>/*`` would have opened a phantom
+    block hiding the real code after it.
+
+    The rules lean toward scanning too much, but at least the line shapes THE RESIDUAL in
+    crypto_operations.py lists are hidden. Stripping exactly would need a lexer per language, and a
+    naive strip would cut a line at the ``//`` of a URL and hide what follows."""
     width = len(block_close)
     code: list[str] = []
     in_block = False
-    for raw in text.splitlines():
-        line = raw
+    for raw in text.split("\n"):
+        line = raw.removesuffix("\r")
         if in_block:
             end = line.find(block_close)
             if end < 0:
@@ -2417,19 +2427,10 @@ def _strip_comments(text: str, line_comment: str, block_open: str, block_close: 
 
 
 def _js_code(text: str) -> list[str]:
-    """The code of a TypeScript/JavaScript source, one entry per line, with comments removed.
+    """The code of a TypeScript/JavaScript source with comments removed, by :func:`_strip_comments`.
 
-    A line whose code starts with ``//`` is a comment. A ``/*`` opens a block comment only where it
-    STARTS the remaining code on a line, and the lines up to its ``*/`` are skipped; code after the
-    ``*/`` on the same line is kept and scanned. A line that begins with ``*`` is skipped only INSIDE
-    such a block, so ``* Math.random()`` continuing an expression is scanned (BACKLOG #5578: the old
-    rule skipped every line starting ``/*`` or ``*``, which hid a call after an inline ``/* */`` and
-    a call on a ``*`` continuation line). A ``/*`` anywhere else on a line (after code, in a string,
-    in a trailing ``//`` comment) never opens a block, so it cannot hide the lines that follow, and a
-    trailing comment never hides the code before it. Every choice errs toward scanning too much,
-    never too little, except the one the residual in crypto_operations.py names: a line of a
-    multi-line string or template literal that STARTS with ``/*``. Stripping comments exactly would
-    need a JS lexer, and a naive strip would cut a line at the ``//`` of a URL and hide what follows.
+    BACKLOG #5578: the old rule skipped every line starting ``/*`` or ``*``, which hid a call after
+    an inline ``/* */`` and a call on a ``*`` continuation line.
 
     The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
     lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
@@ -2461,7 +2462,9 @@ def discover_non_python(root: Path, *, repo: Path) -> dict[str, frozenset[str]]:
     """Map repo-relative path -> randomness tokens, for the files that draw randomness at all."""
     out: dict[str, frozenset[str]] = {}
     for path in non_python_sources(root):
-        tokens = randomness_tokens_in(path.read_text(encoding="utf-8"))
+        # utf-8-sig like the operation arms: a BOM is not whitespace to lstrip, so it would hide
+        # the leading ``/**`` of a BOM-led file and turn its prose into scanned code.
+        tokens = randomness_tokens_in(path.read_text(encoding="utf-8-sig"))
         if tokens:
             out[path.relative_to(repo).as_posix()] = frozenset(tokens)
     return out
@@ -3023,14 +3026,8 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
 
 
 def _powershell_code(text: str) -> list[str]:
-    """The code of a PowerShell source, one entry per line, with comments removed.
-
-    A line whose code starts with ``#`` is a comment. A ``<#`` opens a block comment only where it
-    STARTS the remaining code on a line; code after the block's ``#>`` on the same line is kept. A
-    ``<#`` anywhere else (inside a trailing ``#`` comment, a string, or after code) never opens a
-    block, so it cannot hide the lines that follow. A single-line ``<# ... #>`` after code is left in
-    place and scanned. Every choice here errs toward scanning too much, never too little, except the
-    one the residual in crypto_operations.py names: a string that STARTS a line with ``<#``."""
+    """The code of a PowerShell source with comments removed, by :func:`_strip_comments`. A
+    single-line ``<# ... #>`` after code is left in place and scanned."""
     return _strip_comments(text, "#", "<#", "#>")
 
 

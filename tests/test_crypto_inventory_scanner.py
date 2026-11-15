@@ -287,7 +287,7 @@ def test_prose_naming_a_weak_source_is_not_a_hit() -> None:
 
 
 def test_a_trailing_comment_cannot_hide_a_call() -> None:
-    # The conservative direction of _is_comment_only, asserted rather than assumed: only a WHOLLY
+    # The conservative direction of _strip_comments, asserted rather than assumed: only a WHOLLY
     # commented line is skipped, so putting a // earlier on a code line does not launder the draw.
     gate = _gate()
     assert gate.randomness_tokens_in("const n = Math.random(); // harmless, honest\n") == {
@@ -1426,3 +1426,64 @@ def test_a_reused_provider_name_does_not_hide_the_provider_call() -> None:
     }
     found = ops.aggregate(ops.discover_operations_in(sources))
     assert found.get("messagefoundry/user.py") == frozenset({"tls_context:via messagefoundry.seam"})
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("// note\x85/* x\nconst n = Math.random();\n", id="nel-in-a-line-comment"),
+        pytest.param(
+            "const s = 'a\x0c/* b';\nconst n = Math.random();\n", id="form-feed-in-a-string"
+        ),
+        pytest.param(
+            "const s = 'a\u2028/* b';\nconst n = Math.random();\n", id="u2028-in-a-string"
+        ),
+    ],
+)
+def test_a_non_newline_line_break_cannot_open_a_phantom_block(text: str) -> None:
+    # str.splitlines breaks at these too; JS does not end a comment or string there, so the text
+    # after one is not the start of a line and its /* must not open a block.
+    assert _gate().randomness_tokens_in(text) == {"Math.random"}
+
+
+def test_a_bom_led_file_keeps_its_doc_comment_prose_out_of_the_randomness_arm(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ide"
+    root.mkdir()
+    (root / "a.ts").write_text(
+        "\ufeff/**\n * Math.random() is weak\n */\nconst k = 1;\n", encoding="utf-8"
+    )
+    assert _gate().discover_non_python(root, repo=tmp_path) == {}
+
+
+def test_a_tls_value_under_a_second_binding_reaches_its_token() -> None:
+    ops = _gate().crypto_operations
+    source = (
+        "from ssl import CERT_REQUIRED as mode\n\n\ndef f(ctx):\n"
+        "    from ssl import CERT_NONE as mode\n    ctx.verify_mode = mode\n"
+    )
+    found = ops.aggregate(ops.discover_operations_in({"messagefoundry/x.py": source}))
+    assert "tls_context:.verify_mode = CERT_NONE" in found["messagefoundry/x.py"], found
+
+
+def test_a_def_rebound_by_a_later_import_keeps_the_method_rule() -> None:
+    # a.verify is a first-party def, but the import after it rebinds the name, so at runtime the
+    # call is the library's verify. Only a chain that ENDS on first-party functions skips the rule.
+    ops = _gate().crypto_operations
+    sources = {
+        "messagefoundry/a.py": "def verify(x):\n    return x\n\n\nfrom nacl.signing import verify\n",
+        "messagefoundry/b.py": "from messagefoundry import a\n\n\ndef go(s):\n    a.verify(s)\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert "sign_verify:.verify()" in found.get("messagefoundry/b.py", frozenset()), found
+
+
+def test_a_crypto_binding_does_not_mask_another_bindings_method_rule() -> None:
+    ops = _gate().crypto_operations
+    source = (
+        "import secrets as s\n\n\ndef f(data):\n    from mylib import signer as s\n"
+        "    return s.sign(data)\n"
+    )
+    found = ops.aggregate(ops.discover_operations_in({"messagefoundry/x.py": source}))
+    assert "sign_verify:.sign()" in found["messagefoundry/x.py"], found
