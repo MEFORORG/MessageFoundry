@@ -8108,13 +8108,12 @@ internal CA reads it when the connection is built, and the syslog forwarder read
 Those keep the old bytes until they are built again, and a reload writes a `changed` row but no
 `restart_required` row for them. A changed syslog CA takes effect only at a restart.
 
-**The SQL Server `[store].ssl_root_cert` pin's change check cannot vouch for its own hop.** The
-pin is checked at start and at every reload too, but its `changed` row is written to, and the
-baseline it compares with is read from, the store that the pin's own hop reaches. A swapped pin
-that lets another server answer that hop lets that server answer the read with the new
-fingerprint, or take the row, so the real store records nothing. The ACL and path refusals are
-judged on the file and still refuse. Item 11 of the
-[trust anchors module](../messagefoundry/auth/trust_anchors.py) holds the detail.
+**The SQL Server `[store].ssl_root_cert` pin is checked at the next start or reload too, but its
+change check cannot vouch for its own hop.** Its
+baseline is read from, and its rows are written to, the store that pin secures, so a swapped pin
+that lets another server answer the hop can keep its own `changed` row out of the real store.
+Item 11 of the [trust anchors module](../messagefoundry/auth/trust_anchors.py) says when, and
+which checks still refuse.
 
 **What a reload's `restart_required` list covers (BACKLOG #3015).** An empty list in the reload
 response says that no settings anchor with a recorded load changed in the engine process that

@@ -191,12 +191,27 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     ``restart_required``.
 
     **The pin's audit rides the hop the pin protects.** The baseline that compare reads
-    (:func:`_last_fingerprint`), and every row this check writes (:func:`_record`), go through
-    the store this hop reaches. A swapped pin that lets another server answer the hop lets that
-    server answer them too: it can return the new fingerprint, so no ``changed`` row is written,
-    or take the row, so the real store records nothing. So the change audit is only as good as
-    the hop it is meant to catch. The ACL, path and readability refusals are judged on the file,
-    not on the store, so they still refuse; only their rows travel the hop.
+    (:func:`_last_fingerprint`), and every row this check writes (:func:`_record`), go over the
+    store's own connections, which this pin secures. So a swapped pin that lets another server
+    answer the hop can keep its own change out of the real store:
+
+    * At a start, the store is opened before this check runs, and every connection it opens reads
+      the pin on disk. A ``changed`` row reaches the real store only for a new pin the real server
+      also matches, such as a rotation. A pin that admits another server sends the read and the
+      rows there.
+    * At a reload, a pooled connection opened before the swap may still reach the real store,
+      and one opened after it reaches whichever server the swapped pin admits, so the read and
+      a row can go to different servers.
+    * A server that answers can at least return the new fingerprint, so no ``changed`` row is
+      written, or no row at all, so a fresh ``observed`` row is written instead. Or it can
+      acknowledge the ``changed`` row, so the real store records nothing. The audit tee
+      (:mod:`messagefoundry.store.audit_tee`) still logs a copy of a row whose commit returned.
+
+    So the change audit in the store is only as good as the hop it is meant to catch. At least
+    the ACL, path and private-key checks are judged on the file, not on the store: the ACL and
+    path findings refuse at ``enforce`` and warn at ``warn``, as elsewhere, and the private-key
+    refusal refuses at both. Only their rows travel the hop. A file that cannot be read refuses
+    before any row is written.
 
     **A reload runs the anchor checks and none of the store's content checks.** It checks the
     ACL, the path and a change (items 1, 3 and 4; the spec has no pin), and refuses a file it
