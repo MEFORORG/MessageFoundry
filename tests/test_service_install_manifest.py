@@ -1688,15 +1688,10 @@ def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Pa
     withholds the installer's "Config : locked" line. Creating a symbolic link needs the privilege
     an unelevated account has only in Developer Mode, so the test skips without it.
 
-    THE BACKUP AND RESTORE PRIVILEGES ARE SWITCHED OFF WHILE THE HARNESS RUNS. With either one on,
-    an open that asks for backup semantics, as reading LinkType does, is granted SYNCHRONIZE
-    whatever the DACL says, so the deny entry hides nothing and the case is not built. Both hosted
-    Windows legs failed the control (run 43668208722), and the same run reports the restore
-    privilege switched on in their token (tests/test_startup_code_inventory.py). The helper switches
-    them off in this process's token before pwsh starts, and a child process starts with a copy of
-    that token as it then stands, so pwsh and the icacls and whoami it starts run with them off.
-    Where neither is on this changes nothing, and a control that still fails fails the test, naming
-    what whoami reads in the harness."""
+    THE HARNESS STARTS WITH THE BACKUP AND RESTORE PRIVILEGES OFF. Either one lets reading LinkType
+    pass the deny entry; ``_privileges_disabled`` says why. Both hosted Windows legs failed the
+    control while the restore privilege was on (run 43668208722). A control that still fails fails
+    the test, and its message names what whoami reads in the harness."""
     from tests.test_worktree_remove_in_use import _privileges_disabled
 
     probe = tmp_path / "symlink-probe"
