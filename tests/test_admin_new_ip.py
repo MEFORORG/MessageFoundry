@@ -1710,7 +1710,9 @@ def test_the_path_field_hides_no_less_than_main_with_three_handlers_over_quote_v
     shipped handlers hid prints on a sink of this branch's matching line (BACKLOG #3770)."""
     rng = random.Random(3)
     third_hid = 0
-    for _ in range(300):
+    # 400 paths, not 300: the credential stage of BACKLOG #5546 to #5550 hides on the second handler
+    # some of what the third hid before, and 300 paths then held only 9 that the two wrote apart.
+    for _ in range(400):
         path = _corpus_path(rng, _QUOTE_PIECES, prefix="/MEFOR_X=", most=7)
         assert not _hides_no_less_than_main(path, "10.0.0.1", count=3), ascii(path)
         main = _sink_lines(_REPEAT_HEAD + "%s", path, count=3)

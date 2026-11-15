@@ -84,7 +84,7 @@ from typing import TYPE_CHECKING, Literal, TextIO
 # and assert the notice is emitted anyway, with no production test hook (BACKLOG #1591).
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.redaction import safe_exc
-from messagefoundry.secretscrub import _scrub_credentials_base, scrub_added_shapes
+from messagefoundry.secretscrub import scrub_credentials
 
 __all__ = [
     "GuardedFileHandler",
@@ -456,13 +456,7 @@ _PATH_DROPPED = "<rolled-aside path unavailable>"
 _LABEL_DROPPED = "<unnameable sink>"
 
 
-def _guarded(
-    scrub: Callable[[str], str],
-    text: str,
-    *,
-    fallback: str,
-    finish: Callable[[str], str] | None = None,
-) -> str:
+def _guarded(scrub: Callable[[str], str], text: str, *, fallback: str) -> str:
     """Run ``scrub``, bound the result, and NEVER raise — the shared never-raise core (BACKLOG #1591).
 
     **Emit anyway if the scrub itself fails.** A guard that goes silent because its own scrubber
@@ -477,13 +471,9 @@ def _guarded(
     detail: slicing BEFORE the credential pass can cut the terminator a pattern needs — truncating
     ``postgres://u:pw@host`` mid-password leaves ``_DSN_PASSWORD`` no trailing ``@`` to match, and
     the prefix of the secret is then published unmasked. Slicing an already-escaped string can at
-    worst cut one backslash escape short, which cannot produce a control character.
-
-    ``finish`` runs after the slice, for a pass that only shortens text: run before it, that pass
-    would pull text past the limit into view. The credential stage of BACKLOG #5546 to #5550 is one."""
+    worst cut one backslash escape short, which cannot produce a control character."""
     try:
-        head = scrub(text)[:_DIAGNOSTIC_LIMIT]
-        return head if finish is None else finish(head)
+        return scrub(text)[:_DIAGNOSTIC_LIMIT]
     except Exception as exc:
         with contextlib.suppress(Exception):
             # ascii() renders the class name with every control character escaped, so even a
@@ -502,11 +492,8 @@ def _scrub_diagnostic(text: str) -> str:
     and reversing it here would not merely diverge, it would DEFEAT the credential pass: the patterns
     are whitespace-delimited, so ``bearer<LF>tok...`` matches while the escaped ``bearer\\ntok...``
     does not — the token would then reach every consumer in plaintext. The order this module needs is
-    the order the chain already uses, for the same reason.
-
-    The credential pass here is ``scrub_credentials`` without its added stage (BACKLOG #5546 to
-    #5550); :func:`_safe_diagnostic` runs that stage after the slice, as ``_guarded`` says why."""
-    return scrub_control_chars(_scrub_credentials_base(text))
+    the order the chain already uses, for the same reason."""
+    return scrub_control_chars(scrub_credentials(text))
 
 
 def _safe_diagnostic(text: str) -> str:
@@ -542,9 +529,7 @@ def _safe_diagnostic(text: str) -> str:
     expressions that are super-linear in the worst case, and this is the one code path in the engine
     that executes while logging is already broken. Every call site reaches this through
     :func:`_safe_reason`, so the input is always :func:`safe_exc` output and already truncated."""
-    return _guarded(
-        _scrub_diagnostic, text, fallback=_DIAGNOSTIC_DROPPED, finish=scrub_added_shapes
-    )
+    return _guarded(_scrub_diagnostic, text, fallback=_DIAGNOSTIC_DROPPED)
 
 
 def _escape_only(text: str, *, fallback: str) -> str:

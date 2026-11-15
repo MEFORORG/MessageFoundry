@@ -89,23 +89,10 @@ from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
 from tests._ast_sites import named_func
 from tests._growth import _growth_between
+from tests._scrub_stage import without_the_added_stage as _without_the_added_stage
 
 #: A pattern that can never match, used to disable one redactor pattern for the mutation fixture.
 NEVER_MATCHES = re.compile(r"(?!x)x")
-
-
-def _without_the_added_stage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Switch ``secretscrub.scrub_added_shapes`` off on every surface that runs it (BACKLOG #5546 to
-    #5550), for a test whose subject is the passes before it: a differential between two versions
-    of those passes, a positive control that cuts one of them, or a pin on what they still print.
-    The stage runs after all of them and only hides more, so on a surface each of those reads gives
-    at most what it measures here; ``tests/test_secretscrub_added_stage.py`` measures the stage."""
-
-    def identity(text: str, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
-        return text
-
-    monkeypatch.setattr(scrub_mod, "scrub_added_shapes", identity)
-    monkeypatch.setattr(redact_mod, "scrub_added_shapes", identity)
 
 
 #: Module-level patterns that are deliberately NOT secret markers. Each needs a reason, and the exact
@@ -551,10 +538,10 @@ def _applied_gate_names(module: ModuleType, applier: str) -> set[str]:
 
 
 def test_the_family_table_covers_every_applied_pattern() -> None:
-    """Every pattern redact_log_line applies is claimed by a family or named as a non-secret. Its
-    passes live in ``_redact_log_line_layers``; the added stage it runs last is held by
-    ``tests/test_secretscrub_added_stage.py``."""
-    applied = _applied_pattern_names(redact_mod, "_redact_log_line_layers")
+    """Every pattern redact_log_line applies is claimed by a family or named as a non-secret. The
+    added stage it runs last applies its patterns in ``secretscrub.scrub_added_shapes``, and
+    ``tests/test_secretscrub_added_stage.py`` derives and holds those."""
+    applied = _applied_pattern_names(redact_mod, "redact_log_line")
     # Positive control: the derivation must actually find patterns. A silently-empty domain would make
     # every assertion below vacuously true, which is the failure this whole file exists to prevent.
     assert len(applied) >= 5, f"AST derivation found only {sorted(applied)} -- instrument is broken"
@@ -826,7 +813,7 @@ def test_ordinary_engine_diagnostics_are_not_eaten_by_the_credential_patterns(li
 #: cannot see the other regress. The pattern set is derived from the applying function by AST, so
 #: neither module can grow a pattern these guards do not check.
 CREDENTIAL_SURFACES: tuple[tuple[ModuleType, str], ...] = (
-    (redact_mod, "_redact_log_line_layers"),
+    (redact_mod, "redact_log_line"),
     (scrub_mod, "_run"),
 )
 

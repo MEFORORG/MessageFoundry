@@ -601,11 +601,10 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # certain; the run in front of the keyword is a value only by one of two readings.
 #
 # These residuals are the PASSES' own, measured with :func:`scrub_added_shapes` switched off. That
-# stage runs after them on every surface and only hides more, and it hides part of them: a quoted
-# value left glued to a placeholder, or a ``MEFOR_`` value cut after its opening quote, is the remnant
-# it reads (BACKLOG #5547). Over the generated two-label family in
-# ``tests/test_log_redaction_secret_domain.py``, part of the write-time residual lines and every
-# bundle residual line print nothing on their surface, and that test holds both.
+# stage hides part of them: a quoted value left glued to a placeholder, or a ``MEFOR_`` value cut
+# after its opening quote, is the remnant it reads (BACKLOG #5547). Over the generated two-label
+# family in ``tests/test_log_redaction_secret_domain.py``, part of the write-time residual lines and
+# every bundle residual line print nothing on their surface, and that test holds both.
 #
 # OPEN DEFECTS, NOT TRADES: VALUES THIS CHANGE PRINTS THAT THE PATTERNS BEFORE IT HID. Found by code
 # review on 2026-10-05, on both copies and every surface, and not fixed here. THE MECHANISM: the
@@ -646,10 +645,9 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 #
 # ``tests/test_log_redaction_secret_domain.py`` pins each one as still printing, so a fix must
 # update that pin and this list together. The pin reads the passes with :func:`scrub_added_shapes`
-# switched off, since these defects are the passes'. That stage runs after them on every surface and
-# only hides more, so on a surface each line prints at most what is listed here, and it can print
-# less: under the stage ``encryption_key=token=password='hunter2',private_key='abc def=='`` prints
-# nothing on ``scrub_credentials``.
+# switched off, since these defects are the passes'. Under the stage a line can print less:
+# ``encryption_key=token=password='hunter2',private_key='abc def=='`` prints nothing on
+# ``scrub_credentials``.
 
 # A quoted value for the patterns that only took a plain one before BACKLOG #1685's remainder:
 # ``_MEFOR_SECRET``, ``_BEARER`` and ``_KEY_MATERIAL``. ``_CREDENTIAL_KV`` keeps the plain quoted
@@ -1801,8 +1799,7 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     BACKLOG #5545 added can hide more of this function's output but never print what the reading
     before it hid there. The comment on :data:`_CAMEL_START` says what a later pass still sees.
 
-    Last, :func:`scrub_added_shapes` runs over the result (BACKLOG #5546 to #5550). It only replaces
-    text the passes above left, so it hides more and never prints what they hid."""
+    Last, :func:`scrub_added_shapes` runs over the result (BACKLOG #5546 to #5550)."""
     return scrub_added_shapes(_scrub_credentials_base(text, placeholder=placeholder), placeholder)
 
 
@@ -1826,11 +1823,11 @@ def _scrub_credentials_base(text: str, *, placeholder: str = CREDENTIAL_PLACEHOL
 # each review round found a new line those wider patterns printed where the narrower ones hid it: a
 # span that grew took a later label, or a quote an earlier value closed on, or a "|" the PHI pass
 # reads a field run by, so the pass that should have read it never saw it. This stage runs AFTER every
-# pass a surface already runs, on that surface's output, and it only replaces a span with a
-# placeholder. So whatever a surface hid stays hidden ON THAT SURFACE. The surfaces are
-# :func:`scrub_credentials`, and through it ``logging_setup.CredentialScrubFilter``, the last
-# credential filter on every handler; and ``support/redact.redact_log_line``, which runs it over its
-# own final output.
+# pass a surface already runs, on that surface's output; what that buys is stated once, on
+# :func:`scrub_added_shapes`. The surfaces are at least :func:`scrub_credentials` and every caller of
+# it, as ``logging_setup.CredentialScrubFilter`` on every handler and the log-write guard's
+# diagnostic; and ``support/redact.redact_log_line``, which runs it over its own final output, and
+# every caller of that, as the store error text and the support bundle.
 #
 # A SURFACE THAT READS ANOTHER'S OUTPUT AGAIN CAN HIDE LESS. A record a second handler filters, and
 # a log line the support bundle or the log tail reads back, are read again by passes that look for
@@ -1845,7 +1842,8 @@ def _scrub_credentials_base(text: str, *, placeholder: str = CREDENTIAL_PLACEHOL
 # ordinary text, the stage hides more, the direction this module may fail in. Each pattern says where.
 #
 # THE PLACEHOLDER IT READS. Every shape but the key block and the empty-username DSN is read by what
-# follows a placeholder an earlier pass wrote. The pattern names both spellings this repository passes, :data:`CREDENTIAL_PLACEHOLDER` and
+# follows a placeholder an earlier pass wrote. The pattern names both spellings this repository
+# passes, :data:`CREDENTIAL_PLACEHOLDER` and
 # ``support/redact.py``'s ``[REDACTED]``, as literals, so the static ReDoS scan in
 # ``tests/test_security_static.py`` resolves every pattern here; a test holds the two spellings to
 # their constants. A caller passing any other placeholder gets the key block and the empty-username
@@ -1877,26 +1875,30 @@ _STAGE_PHI_MARKER = r"\[redacted\]"
 # marker to ``-----[redacted]-----``. That second form names no key type, so a certificate or public
 # key block the PHI pass marked has its body hidden too. It also spells every END marker, and any
 # dash-wrapped banner of capitalised words, such as ``-----Engine Start-----``, so after it the body
-# must look like a key: the second form below, or one line of space-separated base64 chunks of at
-# least 16 characters each, as a key pasted onto one line holds, before an end marker.
+# must look like a key: the third form below, or one line of space-separated base64 chunks before an
+# end marker, the second form.
 #
-# THE BODY, IN ONE OF TWO FORMS. First, after a ``BEGIN`` marker only, with an end marker after it in
-# either spelling: any text up to the next five dashes that holds no ``=`` followed by a placeholder,
-# the mark of a label a pass already read, so a body never takes a later label. PGP armor headers
-# and the ``\n`` escapes
-# a repr or a JSON string writes are taken. It must open, past white space and escaped line breaks, on
-# four base64 characters. Second, read only when a line break, real or escaped, follows the marker, as
-# a key block's marker stands on its own line: armor header lines (``Name: value``, as PGP's
-# ``Version:`` or an encrypted PEM's ``Proc-Type:`` and ``DEK-Info:``), then the body one whole line
-# at a time, each a run of base64 or base64url characters, a JSON-escaped "/" included, or the
-# placeholder the support bundle's long-base64 sweep wrote over a long line, ending at a
-# line break, a quote (the last line of a truncated repr) or the end of the text, then the end marker
-# if one follows. It ends at the first line that is not that shape: a line holding a space, a quote
-# before its end, or any other character outside that set stays, so the last line of a block cut
-# short prints where text follows it on that line. A line of one word is that shape, and is taken.
-# Either form takes its end marker and writes it back, so the next match cannot read it as a begin
+# THE BODY, IN ONE OF THREE FORMS. First, after a ``BEGIN`` marker only, with an end marker after it
+# in either spelling: any text up to the next five dashes that holds no ``=`` followed by a
+# placeholder, the mark of a label a pass already read, so a body never takes a later label. PGP
+# armor headers and the ``\n`` escapes a repr or a JSON string writes are taken. It must open, past
+# white space and escaped line breaks, on four base64 characters. Second, after the PHI pass's
+# spelling only, a key pasted onto one line: space-separated chunks, each either at least 16 base64
+# characters or a placeholder, then at most one shorter chunk, as the padded end of a key holds, then
+# an end marker. Third, read only when a line break, real or escaped, follows the marker, as a key
+# block's marker stands on its own line: armor header lines (``Name: value``, as PGP's ``Version:``
+# or an encrypted PEM's ``Proc-Type:`` and ``DEK-Info:``), then the body one whole line at a time,
+# each a run of base64 or base64url characters, a JSON-escaped "/" included, or the placeholder the
+# support bundle's long-base64 sweep wrote over a long line, ending at a line break, a quote (the
+# last line of a truncated repr) or the end of the text, then the end marker if one follows. It ends
+# at the first line that is not that shape: a line holding a space, a quote before its end, or any
+# other character outside that set stays, so the last line of a block cut short prints where text
+# follows it on that line. A line of one word is that shape, and is taken. An escaped line break is
+# a backslash run and ``n`` or ``r``, or a backslash run right before a placeholder, since that
+# sweep reads the ``n`` of ``\nMIIE...`` as the first character of its run.
+# Each form takes its end marker and writes it back, so the next match cannot read it as a begin
 # marker in the PHI pass's spelling. A marker followed by words on its own line, as a diagnostic
-# naming it writes, has neither form. The support bundle and the log tail read a log one line at a
+# naming it writes, has no form. The support bundle and the log tail read a log one line at a
 # time, so there a block another
 # tool wrote over several real lines is not read here; its body lines are left to that module's
 # long-base64 sweep. A record this engine wrote had its line breaks escaped, and this stage read it
@@ -1905,23 +1907,44 @@ _STAGE_PHI_MARKER = r"\[redacted\]"
 # LINEAR. A match starts only at five dashes, the key type is bounded, and each body form is possessive
 # over branches that open on different characters. The first form ends at or before the next five
 # dashes, so two blocks' bodies never share a character; a block with no end marker is read twice,
-# once by each form. A header line ends at a line break or a backslash.
+# once by each of the other forms. A second-form chunk holds no "[" or "<", so its walk ends before
+# the next marker in the PHI pass's spelling, and its short chunk cannot open on five dashes. A
+# header line ends at a line break, a backslash or five dashes, so a header walk never passes a
+# later marker.
 _KEY_END_MARKER = r"(-----(?:END [A-Z0-9 ]{0,40}|" + _STAGE_PHI_MARKER + r"[A-Z0-9 ]{0,40})-----)"
-_PRIVATE_KEY_BODY = re.compile(
+_KEY_ESCAPED_BREAK = r"\\++(?:[rn]|(?=" + _STAGE_PLACEHOLDER + r"))"
+_KEY_BREAK = r"(?:\s|" + _KEY_ESCAPED_BREAK + r")"
+_KEY_CHARS = r"[A-Za-z0-9+/=_\-]"
+_KEY_BEGIN_MARKER = (
     r"(-----(?:BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?|(?P<phi>"
     + _STAGE_PHI_MARKER
     + r")[A-Z0-9 ]{0,40})-----)"
-    r"(?:(?(phi)(?!))(?=(?:\s|\\++[rn])*+[A-Za-z0-9+/]{4})(?:[^-=]++|=(?!"
-    + _STAGE_PLACEHOLDER
-    + r")|-(?!----))++"
-    + _KEY_END_MARKER
-    + r"|(?(phi)|(?!))(?:[ \t]++[A-Za-z0-9+/=_\-]{16,}+)++[ \t]++"
-    + _KEY_END_MARKER
-    + r"|(?=[ \t]*+(?:\r?\n|\\++[rn]))"
-    r"(?:(?:\s|\\++[rn])*+[A-Z][A-Za-z-]*+:[^\S\r\n][^\r\n\\]*+(?=\r?\n|\\++[rn]))*+"
-    r"(?:(?:\s|\\++[rn])*+(?:[A-Za-z0-9+/=_\-]++|\\/|" + _STAGE_PLACEHOLDER + r")++"
-    r"(?=[ \t]*+(?:\r?\n|\\++[rn]|\\*+['\"]|\Z)))++"
-    r"(?:(?:\s|\\++[rn])*+" + _KEY_END_MARKER + r")?+)"
+)
+_KEY_FORM_ANY_TEXT = (
+    r"(?(phi)(?!))(?=" + _KEY_BREAK + r"*+[A-Za-z0-9+/]{4})"
+    r"(?:[^-=]++|=(?!" + _STAGE_PLACEHOLDER + r")|-(?!----))++" + _KEY_END_MARKER
+)
+_KEY_FORM_ONE_LINE = (
+    r"(?(phi)|(?!))(?:[ \t]++(?:" + _KEY_CHARS + r"{16,}+|" + _STAGE_PLACEHOLDER + r"))++"
+    r"(?:[ \t]++(?!-----)" + _KEY_CHARS + r"++)?+[ \t]++" + _KEY_END_MARKER
+)
+_KEY_FORM_LINES = (
+    r"(?=[ \t]*+(?:\r?\n|" + _KEY_ESCAPED_BREAK + r"))"
+    r"(?:" + _KEY_BREAK + r"*+[A-Z][A-Za-z-]*+:[^\S\r\n](?:[^\r\n\\-]++|-(?!----))*+"
+    r"(?=\r?\n|\\++[rn]))*+"
+    r"(?:" + _KEY_BREAK + r"*+(?:" + _KEY_CHARS + r"++|\\/|" + _STAGE_PLACEHOLDER + r")++"
+    r"(?=[ \t]*+(?:\r?\n|" + _KEY_ESCAPED_BREAK + r"|\\*+['\"]|\Z)))++"
+    r"(?:" + _KEY_BREAK + r"*+" + _KEY_END_MARKER + r")?+"
+)
+_PRIVATE_KEY_BODY = re.compile(
+    _KEY_BEGIN_MARKER
+    + r"(?:"
+    + _KEY_FORM_ANY_TEXT
+    + r"|"
+    + _KEY_FORM_ONE_LINE
+    + r"|"
+    + _KEY_FORM_LINES
+    + r")"
 )
 
 # A DSN PASSWORD BEHIND AN EMPTY USERNAME (BACKLOG #5549). ``_DSN_PASSWORD`` needs one user character
@@ -1944,12 +1967,13 @@ _DSN_EMPTY_USER_PASSWORD = re.compile(r"://:[^\s/@|^~&]++(?=@)")
 # string, a fragment, a later label or connection-string member, or an HL7 field. A password whose
 # tail holds one of them prints from there, as it did before. What it may take that is no password:
 # on a line with an "@" after the host and none of those characters between, the text up to that "@",
-# as in ``pg://u:p@host,backup@h2``.
+# as in ``pg://u:p@host,backup@h2``. The spaces :func:`_fill` wrote after an empty-username password
+# may stand between the placeholder and its "@".
 #
 # LINEAR. A match starts only at "://"; the user class stops at "/", and so does every segment, so the
 # walks from two DSNs never share a character.
 _DSN_AT_IN_PASSWORD = re.compile(
-    r"(://[^\s:/@]*+:" + _STAGE_PLACEHOLDER + r"@)(?:[^\s/@|^~&?#=;]*+@)++"
+    r"(://[^\s:/@]*+:" + _STAGE_PLACEHOLDER + r" *+@)(?:[^\s/@|^~&?#=;]*+@)++"
 )
 
 # A DIGEST AUTHORIZATION HEADER'S PARAMETERS (BACKLOG #5548). An RFC 7616 header is ``Digest
@@ -2058,26 +2082,75 @@ _MEFOR_GLUED_AFTER_PLACEHOLDER = re.compile(
 )
 
 
+#: What :func:`_fill` writes. A space, because it is the one printable ASCII character every pass a
+#: surface runs again leaves where it stands after a placeholder: each other one was read as part of
+#: the value the placeholder already stands for, and a second handler or the support bundle then
+#: removed it, which gave back the shortening :func:`scrub_added_shapes` exists not to make. A space
+#: is no label, value, base64, separator or marker character, so it completes no pattern here.
+_FILL = " "
+#: A later escape may write a backslash or a quote as two characters, as JSON or a repr writes
+#: them, and a character this matches as up to twelve (anything outside printable ASCII: a line break as
+#: ``\\n``, a format character as ``\\u200b``, one past U+FFFF as a JSON surrogate pair).
+_FILL_WIDE = re.compile(r"[^ -~]")
+
+
+def _fill(span: str) -> str:
+    """Spaces at least as wide as ``span`` under any escape a surface applies after the stage."""
+    width = len(span) + span.count("\\") + span.count("'") + span.count('"')
+    if not (span.isascii() and span.isprintable()):
+        width += 11 * len(_FILL_WIDE.findall(span))
+    return _FILL * width
+
+
+def _keep_head(match: re.Match[str]) -> str:
+    """Group 1, the label and placeholder a pass wrote, then the rest of the match filled."""
+    return match.group(1) + _fill(match.string[match.end(1) : match.end()])
+
+
+def _keep_dsn_host(match: re.Match[str]) -> str:
+    """The user and placeholder, then the run from the placeholder's "@" to the last "@" filled, so
+    the host stays after its "@"."""
+    return match.group(1)[:-1] + _fill(match.string[match.end(1) - 1 : match.end() - 1]) + "@"
+
+
 def scrub_added_shapes(text: str, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
     """``text`` with the five shapes of BACKLOG #5546 to #5550 hidden, read from what an earlier
-    credential pass left. Only replaces: what ``text`` does not hold, the result does not hold.
-    The comment block above the patterns says why it is a stage of its own. Returns the SAME object
-    when nothing matched."""
+    credential pass left. The comment block above the patterns says why it is a stage of its own.
+    Returns the SAME object when nothing matched.
+
+    IT NEVER SHORTENS TEXT, AND IT ONLY HIDES MORE. This is the one place that says so. Each span it
+    takes is written as spaces after the placeholder already there, or as the placeholder and then
+    spaces, and :func:`_fill` makes those spaces at least as many as the span's characters, and as
+    wide as the span under any escape a surface applies after this stage: the control-character
+    escape, a JSON or repr escape, or ``controlchars.log_field_token``. So every character of the
+    result sits at or after where its input character stood, and that holds after the escape too.
+    A slice or a bound taken after this stage, at any site, keeps no input text the same cut of the
+    input kept not, and the stage writes no input text a pass hid. A surface that cut after its
+    redaction before this stage was added, such as the store error text or a bounded log field, is
+    therefore left as it was. What it costs: the spaces show roughly how long the hidden value was,
+    and a value with line breaks or non-ASCII characters widens the line by up to twelve spaces for
+    each. That is accepted, since every alternative either moved later text earlier or needed every
+    cut site to change."""
     if "-----" in text:
-        text = _PRIVATE_KEY_BODY.sub(
-            lambda m: m.group(1) + placeholder + (m.group(3) or m.group(4) or m.group(5) or ""),
-            text,
+
+        def key_body(m: re.Match[str]) -> str:
+            end = m.group(3) or m.group(4) or m.group(5) or ""
+            body = m.string[m.end(1) : m.end() - len(end)]
+            return m.group(1) + placeholder + _fill(body) + end
+
+        text = _PRIVATE_KEY_BODY.sub(key_body, text)
+    if "://:" in text:
+        text = _DSN_EMPTY_USER_PASSWORD.sub(
+            lambda m: "://:" + placeholder + _fill(m.string[m.start() + 4 : m.end()]), text
         )
-    if "://" in text:
-        text = _DSN_EMPTY_USER_PASSWORD.sub(lambda _m: "://:" + placeholder, text)
-        text = _DSN_AT_IN_PASSWORD.sub(r"\1", text)
-    # Group 1 of each pattern below is the label and placeholder a pass wrote; the rest is dropped.
-    if any(written in text for written in _STAGE_PLACEHOLDERS):
-        text = _DIGEST_PARAMS_AFTER_PLACEHOLDER.sub(r"\1", text)
-        text = _PADDED_TOKEN_AFTER_PLACEHOLDER.sub(r"\1", text)
-        text = _QUOTED_AFTER_PLACEHOLDER.sub(r"\1", text)
+    if _STAGE_PLACEHOLDERS[0] in text or _STAGE_PLACEHOLDERS[1] in text:
+        if "://" in text:
+            text = _DSN_AT_IN_PASSWORD.sub(_keep_dsn_host, text)
+        text = _DIGEST_PARAMS_AFTER_PLACEHOLDER.sub(_keep_head, text)
+        text = _PADDED_TOKEN_AFTER_PLACEHOLDER.sub(_keep_head, text)
+        text = _QUOTED_AFTER_PLACEHOLDER.sub(_keep_head, text)
         if "MEFOR_" in text:
-            text = _MEFOR_GLUED_AFTER_PLACEHOLDER.sub(r"\1", text)
+            text = _MEFOR_GLUED_AFTER_PLACEHOLDER.sub(_keep_head, text)
     return text
 
 

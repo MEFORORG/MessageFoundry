@@ -29,6 +29,7 @@ from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import redact_log_line
 from tests._growth import _growth_between
+from tests._scrub_stage import without_the_added_stage as _without_the_added_stage
 
 #: A synthetic value, joined from parts so the file holds no credential-shaped literal.
 _VALUE = "".join(("zq", "7", "cml", "-", "Vx", "_", "42"))
@@ -48,18 +49,6 @@ _CAMEL_LINES = (
     (f"ldap bind: bindPassword='{_VALUE}' refused", "bindPassword="),
     (f"vault: rootPwd={_VALUE}", "rootPwd="),
 )
-
-
-def _without_the_added_stage(patch: pytest.MonkeyPatch) -> None:
-    """Switch ``secretscrub.scrub_added_shapes`` off on every surface that runs it (BACKLOG #5546 to
-    #5550), for a test whose subject is the label passes before it. It only hides more, so on a
-    surface such a test reads at most what the passes print."""
-
-    def identity(text: str, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
-        return text
-
-    patch.setattr(secretscrub, "scrub_added_shapes", identity)
-    patch.setattr(redact_mod, "scrub_added_shapes", identity)
 
 
 def _through_the_chain(text: str) -> str:

@@ -25,11 +25,9 @@ run as the backstop. A credential label may carry a dotted/underscored/hyphenate
 (``client_secret=``, ``bearer_token=``) — see ``_LABEL_PREFIX``.
 
 **The credential stage is two layers**: this module's own copy of the credential patterns, then
-``secretscrub``'s shared pass, :func:`messagefoundry.secretscrub.scrub_credentials` without its added
-stage (BACKLOG #2694). What that buys, what it does not, and why the copy stays, are stated once,
-above :func:`redact_log_line`. That added stage,
-:func:`messagefoundry.secretscrub.scrub_added_shapes` (BACKLOG #5546 to #5550), runs last, over the
-whole line.
+``secretscrub``'s shared pass (BACKLOG #2694, #5546 to #5550). What that buys, what it does not, in
+what order the shared pass runs, and why the copy stays, are stated once, above
+:func:`redact_log_line`.
 
 **The credential VOCABULARY is derived from the engine, not hand-chosen here.**
 ``tests/test_log_redaction_secret_domain.py`` reads the engine's own registry of credential settings —
@@ -66,7 +64,6 @@ from messagefoundry.secretscrub import (
 
 __all__ = [
     "redact_log_line",
-    "redact_log_line_head",
     "redact_log_record",
     "redact_log_text",
     "split_log_lines",
@@ -623,24 +620,7 @@ def redact_log_line(line: str) -> str:
     the stage reads the text it read before the stage was added.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
-    the correct trade-off for a file that leaves the box.
-
-    A caller that keeps only the head of the result calls :func:`redact_log_line_head` instead."""
-    return scrub_added_shapes(_redact_log_line_layers(line), REDACTION_PLACEHOLDER)
-
-
-def redact_log_line_head(line: str, limit: int) -> str:
-    """:func:`redact_log_line` over ``line``, kept to at most ``limit`` characters.
-
-    The head is cut BEFORE the added stage runs, not after. That stage only shortens a line, so cut
-    after it, the head would reach further into the line and print text past where the same cut
-    ended before the stage was added (BACKLOG #5546 to #5550). Cut before it, the result holds
-    nothing the cut head of the layers did not, and the stage still hides what it reads there."""
-    return scrub_added_shapes(_redact_log_line_layers(line)[:limit], REDACTION_PLACEHOLDER)
-
-
-def _redact_log_line_layers(line: str) -> str:
-    """Every pass of :func:`redact_log_line` but the added stage, which it runs last."""
+    the correct trade-off for a file that leaves the box."""
     ts = _LEADING_TS.match(line)
     prefix, body = (line[: ts.end()], line[ts.end() :]) if ts else ("", line)
     logged_placeholder = REDACTION_PLACEHOLDER in body
@@ -668,7 +648,7 @@ def _redact_log_line_layers(line: str) -> str:
     if ";" in body:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
-    return prefix + body
+    return scrub_added_shapes(prefix + body, REDACTION_PLACEHOLDER)
 
 
 def split_log_lines(text: str) -> list[str]:

@@ -3632,7 +3632,8 @@ def test_a_label_glued_on_by_a_label_character_still_goes_with_the_value(
     out, _file = _write_one_record_through_every_sink("text", line, tmp_path, capsys)
     assert _QUERY_TOKEN_VALUE not in out
     assert head not in out and tail not in out, f"the glued value printed on {sep!r}: {out!r}"
-    assert f"retry token={CREDENTIAL_PLACEHOLDER} for svc" in out, out
+    # The stage fills the span it hides with spaces, so the line keeps its length.
+    assert re.search(rf"retry token={re.escape(CREDENTIAL_PLACEHOLDER)} + for svc", out), out
 
 
 def test_the_query_stop_words_are_secretscrubs_label_words() -> None:
