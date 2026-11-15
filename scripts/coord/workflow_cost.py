@@ -190,7 +190,8 @@ _OPERAND_WORDS = frozenset(
     + ["return", "throw", "case", "else", "do"]
 )
 # Of those, the ones a line break may follow: `return`, `throw` and `yield` take a `;` there.
-_LINE_OPERAND_WORDS = _OPERAND_WORDS - {"return", "throw", "yield"}
+_RESTRICTED_WORDS = frozenset(["return", "throw", "yield"])
+_LINE_OPERAND_WORDS = _OPERAND_WORDS - _RESTRICTED_WORDS
 # Keywords after which a `{` opens an object literal; any other word before one ends a statement.
 _EXPRESSION_WORDS = (_OPERAND_WORDS - {"else", "do"}) | {"default", "of"}
 # Words that end a walk back through a class head: none of them can sit inside one.
@@ -346,15 +347,22 @@ def _ends_postfix(text: str, at: int) -> bool:
         k -= 1
     if k < 0 or not (text[k].isalnum() or text[k] in "_$)]"):
         return False
-    word, start = _word_ending_at(text, k)
-    # `o.typeof++` increments a property that happens to share a keyword's name.
-    return word not in _OPERAND_WORDS or _is_property(text, start)
+    return _keyword_ending_at(text, k) not in _OPERAND_WORDS
 
 
 def _is_property(text: str, start: int) -> bool:
-    """Whether the word starting at ``start`` follows a member dot, so it names a property."""
+    """Whether the word starting at ``start`` names a property: after a member dot, or private."""
+    if text[start - 1 : start] == "#":
+        return True
     k = _prev_code(text, start)
     return k >= 0 and text[k] == "." and text[k - 1 : k] != "."  # `...typeof x` spreads
+
+
+def _keyword_ending_at(text: str, k: int) -> str:
+    """The word ending at ``k`` as a candidate keyword: empty where none ends there, and empty
+    where it names a property, as in ``o.typeof++`` or ``extends mix(B).with(M)``."""
+    word, start = _word_ending_at(text, k)
+    return "" if _is_property(text, start) else word
 
 
 def _word_ending_at(text: str, k: int) -> tuple[str, int]:
@@ -770,8 +778,7 @@ def _line_continues(ctx: _Ctx, last: int, nxt: int) -> bool:
     if raw[last] in _OPERATOR_TAIL and ctx.masked[last] == raw[last]:
         return True
     # `typeof`/`in` await an operand too.
-    word, start = _word_ending_at(raw, last)
-    if word in _LINE_OPERAND_WORDS and not _is_property(raw, start):
+    if _keyword_ending_at(raw, last) in _LINE_OPERAND_WORDS:
         return True
     return leads
 
@@ -1108,18 +1115,16 @@ def _is_method_head(ctx: _Ctx, name_start: int, open_idx: int) -> bool:
     code = ctx.code
     k = _prev_code(code, name_start)
     while k >= 0:
-        word, start = _word_ending_at(code, k)
         if code[k] == "*":
             k = _prev_code(code, k)
-        elif word in _MODIFIERS:
-            k = _prev_code(code, start)
+        elif _keyword_ending_at(code, k) in _MODIFIERS:
+            k = _prev_code(code, _word_ending_at(code, k)[1])
         else:
             break
     if kind == "object":
         return k >= 0 and code[k] in "{,"
     # Not in a field's initializer, and not a class expression's heritage held in one.
-    word, _ = _word_ending_at(code, k)
-    return not _awaits_operand(ctx, k) and word != "extends"
+    return not _awaits_operand(ctx, k) and _keyword_ending_at(code, k) != "extends"
 
 
 def _awaits_operand(ctx: _Ctx, k: int) -> bool:
@@ -1182,7 +1187,8 @@ def _after_conditional(ctx: _Ctx, colon: int) -> bool:
             pending += 1
         elif depth == 0 and c == "?":
             after, before = masked[k + 1 : k + 2], masked[k - 1 : k] if k else ""
-            if after not in ("?", ".") and before != "?":
+            chain = after == "." and not masked[k + 2 : k + 3].isdigit()  # `c ?.5 : d`
+            if after != "?" and not chain and before != "?":
                 if not pending:
                     return True
                 pending -= 1
@@ -1207,15 +1213,16 @@ def _brace_kind(ctx: _Ctx, brace: int) -> str:
                 break
             k = _prev_code(code, k)
             continue
-        if code[k] == ".":  # `extends ns.Base`
-            k = _prev_code(code, k)
+        if code[k] == ".":  # `extends ns.Base`, or `ns?.Base`
+            k = _prev_code(code, k - 1 if code[k - 1 : k] == "?" else k)
             continue
         word, start = _word_ending_at(code, k)
         if not word:
             break
-        if word == "class" and not _is_property(code, start):
+        keyword = _keyword_ending_at(code, k)
+        if keyword == "class":
             return "class"
-        if word in _HEAD_STOP:
+        if keyword in _HEAD_STOP:
             break
         k = _prev_code(code, start)
     k = before
@@ -1232,9 +1239,12 @@ def _brace_kind(ctx: _Ctx, brace: int) -> str:
             return "block"  # a label
         # A property's value inside an object; a label or a `case` inside a block.
         return "object" if _brace_kind(ctx, outer) == "object" else "block"
-    word, _ = _word_ending_at(code, k)
-    if word:
-        return "object" if word in _EXPRESSION_WORDS else "block"
+    if _word_ending_at(code, k)[0]:
+        # A property is a value. `return` and `yield` take a `;` at a line break, so a `{` on the
+        # next line opens a block.
+        keyword = _keyword_ending_at(code, k)
+        restricted = keyword in _RESTRICTED_WORDS and "\n" in code[k:brace]
+        return "object" if keyword in _EXPRESSION_WORDS and not restricted else "block"
     # After an operator or a spread's dots an operand is due; after any other value, a `;` is
     # inserted ahead of the `{` and it opens a block.
     return "object" if c == "." or _awaits_operand(ctx, k) else "block"

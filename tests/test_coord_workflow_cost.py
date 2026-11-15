@@ -754,6 +754,47 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
             2,
         ),
         (
+            "a bare block after a property named default",
+            "function review(r) { return agent(r) }\nawait review(0)\nconst Base = mod.default\n"
+            "{\n  review(1)\n  {\n    log(2)\n  }\n}\n",
+            2,
+        ),
+        (
+            "a bare block after yield and a line break",
+            "function review(r) { return agent(r) }\nawait review(0)\nfunction* f() { yield\n"
+            "  {\n    review(1)\n    {\n      log(2)\n    }\n  }\n}\nf()\n",
+            2,
+        ),
+        (
+            "a class method under a heritage ending in a keyword-named method",
+            "function review(r) { return agent(r) }\nclass A extends mix(B).with(M) {\n"
+            "  review(r) { return 1 }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "a class method under a heritage ending in a keyword-named property",
+            "function review(r) { return agent(r) }\nclass A extends mod.default {\n  x = 1\n"
+            "  review(r) { return 1 }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "a class method under an optionally chained heritage",
+            "function review(r) { return agent(r) }\nclass A extends ns?.Base {\n"
+            "  review(r) { return 1 }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "an Allman object method in a conditional with a leading-dot number",
+            "function review(r) { return agent(r) }\nconst api = c ?.5 : {\n  review(r)\n  {\n"
+            "    return 1\n  }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "a postfix private field named like a keyword",
+            "const g = () => this.#in++\n agent(1)\ng()\ng()\n",
+            1,
+        ),
+        (
             "a case label holding a conditional",
             "function review(r) { return agent(r) }\nawait review(0)\nswitch (x) {\n"
             "  case a ? 1 : 2: {\n    review(1)\n    {\n      log(2)\n    }\n  }\n}\n",
