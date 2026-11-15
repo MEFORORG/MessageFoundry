@@ -292,6 +292,24 @@ function policyOnly(p: CachedAiPolicy): AiPolicy {
   return policy;
 }
 
+/**
+ * What a carried entry that is not a deny-shaped object stands for. The carrier is written only
+ * with denies, so any other value is corruption or a hand edit, and it cannot say what was carried.
+ * It fails closed: an `ai:assist` deny under the unverified mode, so the gate disables assistance
+ * with the could-not-verify message, and only its issuer's authoritative permit clears it.
+ */
+const MALFORMED_DENY: AiPolicy = { ...UNVERIFIED_POLICY, assistPermitted: false };
+
+/** A carried entry as the carrier may use it: a deny-shaped object as it is, anything else as
+ *  {@link MALFORMED_DENY}. Never throws, and never reads a non-deny as one. */
+function carriedEntry(value: unknown): AiPolicy {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return MALFORMED_DENY;
+  }
+  const p = value as AiPolicy;
+  return typeof p.mode === "string" && isPolicyDeny(p) ? p : MALFORMED_DENY;
+}
+
 // Every read-modify-write of the carrier runs on this one chain, so two resolves that overlap cannot
 // both read the old map and have the later write drop the earlier one's deny.
 let carrierChain: Promise<unknown> = Promise.resolve();
@@ -301,8 +319,13 @@ function withCarrier<T>(
   step: (carried: CarriedDenies) => { next: CarriedDenies; result: T },
 ): Promise<T> {
   const run = carrierChain.then(async () => {
-    const stored = store.get<CarriedDenies>(AI_POLICY_DENY_KEY);
-    let carried: CarriedDenies = stored !== null && typeof stored === "object" ? { ...stored } : {};
+    const stored = store.get<Record<string, unknown>>(AI_POLICY_DENY_KEY);
+    // Each entry is checked, not only the map: one entry that is not a deny-shaped object would
+    // otherwise throw in isPolicyDeny on every resolve, or slip past it as a non-deny.
+    let carried: CarriedDenies =
+      stored !== null && typeof stored === "object"
+        ? Object.fromEntries(Object.entries(stored).map(([key, value]) => [key, carriedEntry(value)]))
+        : {};
     let migrated = false;
     // The unscoped key, once. A deny in it is carried with an unknown issuer, which any engine's
     // authoritative permit clears: origin/main's rule for that key.
@@ -325,7 +348,13 @@ function withCarrier<T>(
     // The old key goes only once the carrier holding its deny is written: deleted first, a failed
     // write would lose the deny, which fails open. Kept, it is migrated again next time.
     if (legacy !== undefined && persisted) {
-      await store.update(LEGACY_AI_POLICY_KEY, undefined);
+      try {
+        await store.update(LEGACY_AI_POLICY_KEY, undefined);
+      } catch {
+        // Kept, it is migrated again on the next resolve, which retries the delete. The result
+        // above is what this resolve computed; failing it would send an answered target to the
+        // offline path.
+      }
     }
     return result;
   });

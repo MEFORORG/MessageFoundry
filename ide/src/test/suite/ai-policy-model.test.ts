@@ -390,6 +390,64 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
     assert.ok(store.map.has(AI_POLICY_DENY_KEY));
   });
 
+  /** Make every write of `key` throw while `when()` holds. */
+  function failWrites(store: PolicyStore, key: string, when: () => boolean = () => true): void {
+    const write = store.update.bind(store);
+    store.update = async (k: string, value: unknown): Promise<void> => {
+      if (when() && k === key) {
+        throw new Error("synthetic storage failure");
+      }
+      return write(k, value);
+    };
+  }
+
+  test("D4d: a failed delete of the old key does not fail the resolve, and the next resolve retries it", async () => {
+    const store = memStore({ [LEGACY_AI_POLICY_KEY]: { ...policy({ mode: "off" }), cachedAt: 0 } });
+    let failing = true;
+    failWrites(store, LEGACY_AI_POLICY_KEY, () => failing);
+    // Offline: the migrated deny gates, and the resolve still answers.
+    assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "off");
+    assert.ok(store.map.has(LEGACY_AI_POLICY_KEY), "a failed delete keeps the old key");
+    // Online: any engine's permit clears the unknown issuer's deny, and its answer is returned as
+    // computed rather than discarded for the offline path.
+    const online = await answered(store, OTHER, policy({ mode: "byo" }));
+    assert.strictEqual(online.mode, "byo");
+    assert.strictEqual(assistantState(online).enabled, true);
+    assert.ok(store.map.has(LEGACY_AI_POLICY_KEY), "the old key is kept, so the next resolve retries");
+    // The kept key is migrated again: an unreachable target is still denied.
+    assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "off");
+    failing = false;
+    assert.strictEqual((await unreachable(store, LOCAL, cliByo, false)).mode, "off");
+    assert.strictEqual(store.map.has(LEGACY_AI_POLICY_KEY), false, "once the delete succeeds, the key is gone");
+  });
+
+  test("D4e: a failed delete of the old key never turns its deny into a permit", async () => {
+    // An answer that cannot evaluate the permission keeps an old ai:assist deny.
+    const store = memStore({ [LEGACY_AI_POLICY_KEY]: policy({ assistPermitted: false }) });
+    failWrites(store, LEGACY_AI_POLICY_KEY);
+    const tokenless = await answered(store, OTHER, policy({ assistPermitted: null }));
+    assert.strictEqual(assistantState(tokenless).enabled, false, "a failed delete turned a deny into a permit");
+  });
+
+  test("D6: a malformed carried entry fails closed, offline and online, and never throws", async () => {
+    for (const bad of [null, "off", 42, true, [], ["off"], {}, { mode: 7 }, { assistPermitted: false }, { mode: "byo", assistPermitted: true }]) {
+      const label = JSON.stringify(bad);
+      const store = memStore({ [AI_POLICY_DENY_KEY]: { [aiPolicyCacheKey(CENTRAL)]: bad } });
+      const offline = await unreachable(store, LOCAL, cliByo, false);
+      const gate = assistantState(offline);
+      assert.strictEqual(gate.enabled, false, `a malformed entry permitted offline: ${label}`);
+      assert.ok(typeof gate.message === "string" && gate.message.length > 0, `no gate message: ${label}`);
+      // Another engine's tokenless answer does not clear it.
+      const other = await answered(store, OTHER, policy({ assistPermitted: null }));
+      assert.strictEqual(assistantState(other).enabled, false, `a malformed entry permitted online: ${label}`);
+      // A well-formed sibling deny is still applied beside it.
+      const mixed = memStore({
+        [AI_POLICY_DENY_KEY]: { [aiPolicyCacheKey(OTHER)]: bad, [aiPolicyCacheKey(CENTRAL)]: policy({ mode: "off" }) },
+      });
+      assert.strictEqual(assistantState(await unreachable(mixed, LOCAL, cliByo, false)).enabled, false, label);
+    }
+  });
+
   test("D5: two overlapping resolves cannot drop each other's deny", async () => {
     const store = memStore();
     await Promise.all([
