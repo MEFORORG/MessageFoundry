@@ -164,6 +164,7 @@ from messagefoundry.store.gcm_bound import (
     bounded_cipher,
     checkpoint_invocations,
     counts_under_dek,
+    idle_checkpoint_total,
     reserve_invocations_ahead,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
@@ -11448,8 +11449,9 @@ class MessageStore:
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
                 # itself a large burst. A no-op when the cipher carries no bound (keyless /
-                # `vault_transit`).
-                await store.checkpoint_cipher_invocations()
+                # `vault_transit`). Strict, so the open reads THIS store's row rather than trusting a
+                # figure another handle left in the cipher (BACKLOG #5608).
+                await store.checkpoint_cipher_invocations(strict=True)
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
             if store._row_sealer is not None:
@@ -12369,8 +12371,9 @@ class MessageStore:
         SAME cell AAD (ASVS 11.3.3). A retired-key v2 value decrypts with its cell AAD and re-encrypts
         under the active key with the identical AAD (the read AAD never drifts across a rotation); a v1
         value decrypts with None AAD (the cipher dispatches v1→None internally, ignoring ``aad``) and,
-        under the cell-bound writer, upgrades to a cell-bound v4 value. The single seam every rotation
-        loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt AADs."""
+        under the cell-bound writer, upgrades to a cell-bound v4 value. The seam every untagged
+        rotation loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt
+        AADs; the tagged loops use :func:`reseal_unless_tag_failure`, the same pair (BACKLOG #5610)."""
         return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
 
     async def _reencrypt_tagged_to_active(
@@ -18831,24 +18834,23 @@ class MessageStore:
             row = await cur.fetchone()
         return int(row["n"]) if row is not None else 0
 
-    async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
+    async def checkpoint_cipher_invocations(
+        self, *, settle: bool = False, strict: bool = False
+    ) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`.
 
-        Takes the writer lock BEFORE the bound's own per-cipher pass lock (BACKLOG #5608). The
-        rotation and at-rest seal bursts charge the bound with the writer lock already held, so they
-        take the two in that order; a checkpoint taking the pass lock first and then waiting on the
-        writer lock inside its add would deadlock against them. A failed add is rolled back inside
-        the guard, so the bound's own contract (log and retry once hydrated) still decides."""
-        bound = bounded_cipher(self._cipher)
-        if bound is None:
-            return None  # nothing to account, so no reason to take the writer lock
-        if bound.invocation_bound_hydrated:
-            # The usual pass has nothing to add. Read without either lock, so an idle checkpoint
-            # never queues behind (or blocks) a writer; a stale read only defers work to the next
-            # pass, and the refill hook wakes the runner again when the reserve runs low.
-            idle = bound.invocation_settlement() if settle else bound.invocation_reserve_shortfall()
-            if idle == 0:
-                return bound.cumulative_invocations()
+        Takes the writer lock BEFORE the bound's own per-cipher pass lock (BACKLOG #5608). A burst
+        that charges the bound with the writer lock already held, a rotation batch above all, takes
+        the two in that order; a checkpoint taking the pass lock first and then waiting on the writer
+        lock inside its add would deadlock against it. A failed add is rolled back inside the guard,
+        so the bound's own contract decides. One exception: a rollback that outruns its timeout
+        leaves the transaction open, and the guard then raises :class:`UncommittedWriteError`."""
+        if not strict:
+            idle = idle_checkpoint_total(self._cipher, settle=settle)
+            if idle is not None:
+                return idle  # nothing to add, so no reason to queue behind a writer
+        if bounded_cipher(self._cipher) is None:
+            return None
 
         async def add(key_id: str, count: int) -> int:
             try:
@@ -18857,7 +18859,7 @@ class MessageStore:
                 await _unwind_and_raise(self._db, exc, role="writer")
 
         async with _writer_guard(self._db, self._lock):
-            return await checkpoint_invocations(self._cipher, add, settle=settle)
+            return await checkpoint_invocations(self._cipher, add, settle=settle, strict=strict)
 
     async def reserve_upload_quota(
         self,

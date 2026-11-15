@@ -2013,6 +2013,15 @@ class AesGcmCipher(_UnmarkedPolicy):
         with self._count_lock:
             return -self._reserve_remaining
 
+    def forfeit_invocation_reserve(self) -> None:
+        """Drop any unspent reserve, keeping an overspend (BACKLOG #5608).
+
+        A store open calls this through its strict first pass: a reserve still held was charged to
+        the row another store handle read, so counting it against this store's row would subtract
+        invocations that row never saw. Dropping it can only over-count."""
+        with self._count_lock:
+            self._reserve_remaining = min(self._reserve_remaining, 0)
+
     def grant_invocations(self, count: int, cumulative_total: int) -> None:
         """Hand the cipher a reserved block: ``count`` invocations, with ``cumulative_total`` being the
         key's persisted total AFTER the atomic add that reserved them. A NEGATIVE ``count`` is a

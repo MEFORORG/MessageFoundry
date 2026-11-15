@@ -55,11 +55,18 @@ class _Row:
 
 
 async def _hydrated_and_half_spent(row: _Row) -> tuple[AesGcmCipher, int]:
+    """A hydrated cipher holding a 10,000 reserve the row has charged, with nothing yet spent.
+
+    A refund of all but 10,000 of the first block stands in for spending it, so no test pays for tens
+    of thousands of real encrypts; the cipher and the row agree afterwards, as after a real spend."""
     cipher = _cipher()
     await checkpoint_invocations(cipher, row.add)  # reserves and grants the first block
-    spent = _GCM_RESERVE_BLOCK - 10_000
-    for _ in range(spent):
-        cipher.encrypt("x")
+    refund = -(_GCM_RESERVE_BLOCK - 10_000)
+    row.total += refund
+    cipher.grant_invocations(refund, row.total)
+    spent = 0
+    assert cipher.invocation_settlement() == -10_000
+    assert row.total + cipher.invocation_settlement() == spent
     return cipher, spent
 
 
@@ -134,3 +141,22 @@ async def test_a_failure_after_hydration_is_still_logged_and_retried() -> None:
 
     assert await checkpoint_invocations(cipher, _down, settle=True) == 1
     cipher.encrypt("y")  # hydrated, so a transient blip does not stop encrypts
+
+
+async def test_a_strict_pass_fails_closed_even_on_a_hydrated_cipher() -> None:
+    """A store open passes ``strict``: the cipher's figure may come from another store handle, and a
+    failed read of THIS store's row must not leave it encrypting against that figure."""
+    cipher = _cipher()
+    await checkpoint_invocations(cipher, _Row().add)
+    assert cipher.invocation_bound_hydrated
+
+    async def _down(_key_id: str, _count: int) -> int:
+        raise RuntimeError("db is down")
+
+    with pytest.raises(CipherError, match="persisted total"):
+        await checkpoint_invocations(cipher, _down, strict=True)
+    # A strict pass reads the row even when the cipher's own reserve is healthy.
+    exhausted = _Row(total=_GCM_MAX_INVOCATIONS)
+    await checkpoint_invocations(cipher, exhausted.add, strict=True)
+    with pytest.raises(CipherError, match="invocation ceiling"):
+        cipher.encrypt("x")

@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import weakref
 from collections.abc import Awaitable, Callable
 
@@ -89,6 +90,7 @@ __all__ = [
     "bounded_cipher",
     "checkpoint_invocations",
     "counts_under_dek",
+    "idle_checkpoint_total",
     "reserve_invocations_ahead",
 ]
 
@@ -126,44 +128,73 @@ def counts_under_dek(cipher: Cipher | None) -> bool:
     return bound is not None and bound.store_salt is None
 
 
-#: One ``asyncio.Lock`` per bounded cipher, with the loop it was made on (BACKLOG #5608). Every
-#: accounting pass on one cipher reads its state, awaits the persisted add, and applies the grant.
-#: Two passes interleaved there would compute their counts from the same state and could apply the
-#: grants out of the database's order. A settlement refund replaces the cipher's total with the one
-#: its add returned, so a refund granted after a later refill would leave the cipher's figure below
-#: the persisted one by a whole block: an under-count, the one direction this bound may never drift.
-#: Weak on the cipher, so the map never keeps a closed store's key material alive; remade when the
-#: running loop changes, because an ``asyncio.Lock`` is bound to the loop it first waits on.
+#: One ``asyncio.Lock`` per bounded cipher and event loop (BACKLOG #5608). Every accounting pass on
+#: one cipher reads its state, awaits the persisted add, and applies the grant. Two passes interleaved
+#: there would compute their counts from the same state and could apply the grants out of the
+#: database's order. A settlement refund replaces the cipher's total with the one its add returned, so
+#: a refund granted after a later refill would leave the cipher's figure below the persisted one by a
+#: whole block: an under-count, the one direction this bound may never drift. One lock per loop,
+#: because an ``asyncio.Lock`` is bound to the loop it first waits on; both maps are weak, so neither
+#: keeps a closed store's key material or a closed loop alive. The guard serializes the map itself,
+#: since a cipher may be shared with code running in a worker thread.
 _PASS_LOCKS: weakref.WeakKeyDictionary[
-    AesGcmCipher, tuple[asyncio.AbstractEventLoop, asyncio.Lock]
+    AesGcmCipher, weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]
 ] = weakref.WeakKeyDictionary()
+_PASS_LOCKS_GUARD = threading.Lock()
 
 
 def _pass_lock(bound: AesGcmCipher) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
-    held = _PASS_LOCKS.get(bound)
-    if held is None or held[0] is not loop:
-        held = (loop, asyncio.Lock())
-        _PASS_LOCKS[bound] = held
-    return held[1]
+    with _PASS_LOCKS_GUARD:
+        per_loop = _PASS_LOCKS.setdefault(bound, weakref.WeakKeyDictionary())
+        lock = per_loop.get(loop)
+        if lock is None:
+            lock = per_loop[loop] = asyncio.Lock()
+        return lock
+
+
+def _pass_need(bound: AesGcmCipher, *, settle: bool) -> int:
+    """What a checkpoint pass would charge: the exact settlement, or the reserve's shortfall."""
+    return bound.invocation_settlement() if settle else bound.invocation_reserve_shortfall()
+
+
+def idle_checkpoint_total(cipher: Cipher | None, *, settle: bool = False) -> int | None:
+    """The cumulative total when a checkpoint pass would have nothing to do, else ``None``.
+
+    A lock-free read for a backend that would otherwise take a lock only to find the pass idle. Only a
+    hydrated cipher qualifies, so a first contact always runs a full pass. A stale read only defers
+    work to the next pass."""
+    bound = bounded_cipher(cipher)
+    if bound is None or not bound.invocation_bound_hydrated:
+        return None
+    if _pass_need(bound, settle=settle):
+        return None
+    return bound.cumulative_invocations()
 
 
 async def _add_then_grant(bound: AesGcmCipher, add: AddInvocations, need: int) -> None:
-    """Run the persisted add and the in-memory grant as one unit a cancellation cannot split.
+    """Run the persisted add and the in-memory grant as one unit a caller's cancellation cannot split.
 
-    The add runs in its own task, which nothing here cancels, so a cancellation of the caller cannot abandon a write
-    the database may still commit (an aiosqlite statement runs on a worker thread whatever happens to
-    the awaiting coroutine). A cancellation that lands mid-add is held until the add finishes and its
-    grant is applied, then re-raised. Without that, a committed REFUND with no grant would leave the
-    cipher spending a reserve the store no longer holds. Holding the cancellation also keeps the
-    caller's locks, this pass's and a SQLite store's writer lock, held until the add is done with
-    the connection."""
+    The add runs in its own task, which nothing here cancels, so a cancellation of the caller cannot
+    abandon a write the database may still commit (an aiosqlite statement runs on a worker thread
+    whatever happens to the awaiting coroutine). A cancellation that lands mid-add is held until the
+    add finishes and its grant is applied, then re-raised. Without that, a committed REFUND with no
+    grant would leave the cipher spending a reserve the store no longer holds. Holding the
+    cancellation also keeps the caller's locks, this pass's and a SQLite store's writer lock, held
+    until the add is done with the connection.
+
+    THE COST: a cancelled pass returns only once its add does, so a stop waits out the backend's own
+    statement and acquire timeouts while the database is unreachable. THE RESIDUAL: a cancellation
+    of the add task ITSELF, which only a shutdown that cancels every task delivers, can still split
+    the pair; a split reservation over-counts, and a split refund is the final settlement of a
+    process that encrypts nothing after it."""
     task = asyncio.ensure_future(add(bound.invocation_key_id, need))
     cancelled = False
     while not task.done():
         try:
             # `wait`, not `shield`: it never cancels the task, and a failure the task raises after
-            # this caller was cancelled is still read below rather than logged by the loop (BACKLOG #2087).
+            # this caller was cancelled is still read below rather than logged by the loop
+            # (BACKLOG #2087).
             await asyncio.wait((task,))
         except asyncio.CancelledError:
             cancelled = True
@@ -171,32 +202,41 @@ async def _add_then_grant(bound: AesGcmCipher, add: AddInvocations, need: int) -
         raise asyncio.CancelledError  # the add itself was cancelled, so it returned no total
     try:
         total = task.result()
-    except Exception:
+    except Exception as exc:
         if cancelled:
-            raise asyncio.CancelledError from None
+            # The cancellation wins, but the failure is recorded rather than dropped.
+            log.warning(
+                "the AES-GCM invocation bound's add failed after its pass was cancelled",
+                exc_info=True,
+            )
+            raise asyncio.CancelledError from exc
         raise
     bound.grant_invocations(need, total)
     if cancelled:
         raise asyncio.CancelledError
 
 
-async def _account(bound: AesGcmCipher, add: AddInvocations, need: int, what: str) -> None:
+async def _account(
+    bound: AesGcmCipher, add: AddInvocations, need: int, what: str, *, strict: bool = False
+) -> None:
     """Charge ``need`` to the key's persisted total and grant it to the cipher.
 
     Fail-closed on the FIRST hydration (BACKLOG #5608). Until one add has returned the key's persisted
     total, the cipher's figure is only this process's own spend, so a key another process or an
     earlier run had already taken to the ceiling would keep encrypting. That failure raises
     :class:`CipherError` instead of being logged, and the cipher refuses to encrypt until a later pass
-    hydrates it. Once hydrated, a failed add is logged and retried: the cipher's figure then carries
-    the key's lifetime total, so the ceiling still holds against it."""
+    hydrates it. ``strict`` raises the same way on a cipher hydrated before: a store open passes it,
+    because the cipher's figure may come from another store handle and only this store's row is the
+    key's total here. Otherwise a failed add on a hydrated cipher is logged and retried: its figure
+    then carries the key's lifetime total, so the ceiling still holds against it."""
     try:
         await _add_then_grant(bound, add, need)
     except Exception as exc:
-        if not bound.invocation_bound_hydrated:
+        if strict or not bound.invocation_bound_hydrated:
             raise CipherError(
                 f"could not read the AES-GCM invocation bound's persisted total while {what}; this "
                 "data key's lifetime count is unknown, so nothing is encrypted under it until a "
-                "later pass reads it"
+                "pass reads it"
             ) from exc
         log.warning(
             "could not reach the AES-GCM invocation bound for the active key while %s; the "
@@ -207,7 +247,7 @@ async def _account(bound: AesGcmCipher, add: AddInvocations, need: int, what: st
 
 
 async def checkpoint_invocations(
-    cipher: Cipher | None, add: AddInvocations, *, settle: bool = False
+    cipher: Cipher | None, add: AddInvocations, *, settle: bool = False, strict: bool = False
 ) -> int | None:
     """Reconcile the live cipher's spend against its persisted reserve; return the cumulative total.
 
@@ -220,11 +260,15 @@ async def checkpoint_invocations(
     cadence, while a short-lived CLI process that encrypted a handful of values does not permanently burn
     a whole 2**16 block of the key's budget. Idempotent: a second settle finds nothing to correct.
 
+    ``strict=True`` (a store open's first pass) raises on any failed add, so an open never proceeds on
+    a figure another store handle left in the cipher (:func:`_account`).
+
     Returns ``None`` when the store's cipher carries no bound (identity / ``vault_transit``). Passes on
-    one cipher run one at a time, and a cancellation never splits an add from its grant (BACKLOG #5608).
-    Once the cipher is hydrated this never raises: a checkpoint that cannot reach the DB is logged and
-    retried next pass, since the in-process ceiling still holds meanwhile and a transient DB blip must
-    not take the engine down. Before that, a failed add raises :class:`CipherError` (:func:`_account`)."""
+    one cipher run one at a time, and a caller's cancellation never splits an add from its grant
+    (BACKLOG #5608). Once the cipher is hydrated, and unless ``strict``, this never raises: a
+    checkpoint that cannot reach the DB is logged and retried next pass, since the in-process ceiling
+    still holds meanwhile and a transient DB blip must not take the engine down. Before that, a failed
+    add raises :class:`CipherError`."""
     bound = bounded_cipher(cipher)
     if bound is None:
         return None
@@ -233,12 +277,18 @@ async def checkpoint_invocations(
             # First contact: switch the cipher onto the persisted bound so the very first block is
             # reserved before it is spent.
             bound.enable_invocation_bound()
-        need = bound.invocation_settlement() if settle else bound.invocation_reserve_shortfall()
+        if strict:
+            # Any reserve the cipher still holds was charged to the row another handle read, not to
+            # this one, so it is forfeited: an over-count at worst. That also leaves a shortfall, so
+            # a strict pass always reads this store's row.
+            bound.forfeit_invocation_reserve()
+        need = _pass_need(bound, settle=settle)
         # A settlement grant zeroes the reserve exactly (remaining was `-need`), so a repeated settle
         # is a no-op — in EITHER direction, an overspend charged or an unspent reserve refunded; a
         # refill grant hands over a fresh block.
         if need:
-            await _account(bound, add, need, "settling" if settle else "checkpointing")
+            what = "settling" if settle else "checkpointing"
+            await _account(bound, add, need, what, strict=strict)
         return bound.cumulative_invocations()
 
 
