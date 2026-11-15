@@ -757,7 +757,9 @@ async def test_every_miss_of_a_flood_is_written_or_counted_and_the_bound_is_what
     miss is neither its own row nor in a count row once the next window's first miss has written
     the count. The NEGATIVE CONTROL runs the same flood with the bound lifted, on a store of its
     own, and reads one row per miss through the same reader, so the reader can see a flood the
-    bound does not hold, and the first assertion fails on code without the bound."""
+    bound does not hold. On code whose admit always allows, the bounded half's row-count
+    assertion, the one after the precondition that the flood passes the aggregate, is the one that
+    fails."""
     unbounded_store = await MessageStore.open(tmp_path / "unbounded.db")
     try:
         unbounded = await _service(unbounded_store)

@@ -16571,19 +16571,23 @@ class AuthService:
         # or recovery code and charges nothing to the lockout: the caller did not guess wrong, the
         # directory could not vouch for the account. This only ADDS a refusal; a confirmed
         # directory account meets the same lock and lockout feed. A local account is not asked.
-        # BACKLOG #3780 item 2, THE ONE STATEMENT OF THIS RULE: no re-read follows the lookup here,
-        # because the in-queue re-read below is that read. Only the queue's acquisition awaits
-        # between the two, and nothing is spent before the in-queue read, so it still refuses,
-        # before any code is checked, a revocation, a disable or a lock the lookup let land. Only
-        # the lock refusal moves: it now comes after the in-queue ``totp_enabled`` and lapse
-        # checks, as it already did for a local account. The dropped read also supplied the queue's
-        # key, so a rename during the lookup was queued under the new name; the in-queue read now
-        # rejoins the queue under the new name instead, once (see below).
+        # BACKLOG #3780 item 2, THE ONE STATEMENT OF THIS RULE: no holder re-read follows the
+        # lookup here, because the in-queue re-read below is that read. Only the queue's
+        # acquisition awaits between the two, and nothing is spent before the in-queue read, so it
+        # still refuses, before any code is checked, a revocation, a disable or a lock the lookup
+        # let land. A directory account comes back as the row the directory check's role test read
+        # after the lookup, so the queue is keyed, and a lost session named, by the account's name
+        # as it was then, as the dropped re-read did (#2291 class). A lock that row shows landed
+        # during the lookup, and is refused in the queue right after the session read, before the
+        # ``totp_enabled`` and lapse checks, as the dropped re-read refused it before the queue.
         vouched = await self._directory_vouches_for_factor(
             token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
         if isinstance(vouched, Elevation):
             return vouched
+        # The helper returns ``user`` itself for a local account, which no lookup preceded.
+        looked_up = vouched is not user
+        user = vouched
         async with AsyncExitStack() as queue:
             queued_as = user.username
             for may_rejoin in (True, False):
@@ -16623,6 +16627,10 @@ class AuthService:
                 user = loaded
                 await queue.pop_all().aclose()
                 queued_as = loaded.username
+            # Asked of the row read after the lookup, not of the one just read, so a lock set
+            # while this attempt waited in the queue meets the order below, as on a local account.
+            if looked_up and await self._mfa_lock_refused(vouched, client=client):
+                return Elevation(locked=True)
             if not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
@@ -17060,10 +17068,13 @@ class AuthService:
         to carry on with: ``user`` itself for a local account, which is never asked and costs no
         read, or the row read afresh after a confirmed lookup.
 
-        **Except under ``reread=False``,** which skips that re-read and returns ``user`` itself, as
-        read BEFORE the lookup: nothing below about the re-read then holds, and the caller must
-        not use the returned row as fresh. Only :meth:`verify_mfa` passes it; the comment at its
-        call says why (BACKLOG #3780 item 2).
+        **Except under ``reread=False``,** which skips that re-read. For a directory account it
+        returns the row :meth:`_directory_step_up_refusal`'s role test read after the lookup, so
+        its name and lock are as they were then; for a local account, ``user`` itself. Either way
+        the session was not read again and the lock not checked, so nothing below about the
+        re-read then holds, and the caller must read the session and check the lock itself before
+        it checks a proof. At least :meth:`verify_mfa` passes it; the comment at its call says why
+        (BACKLOG #3780 item 2).
 
         The one copy of a block :meth:`verify_mfa` (BACKLOG #2023) and
         :meth:`finish_webauthn_assertion` (BACKLOG #2239) each used to spell out (BACKLOG #3068).
@@ -17094,14 +17105,14 @@ class AuthService:
         if not _is_directory_account(user):
             return user
         refusal = await self._directory_step_up_refusal(user)
-        if refusal is not None:
+        if isinstance(refusal, str):
             detail = {"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}
             if phase is not None:
                 detail["phase"] = phase
             await self._audit(event, actor=user.username, detail=_json(detail), client=client)
             return Elevation(directory_refusal=_directory_refusal(refusal))
         if not reread:
-            return user
+            return refusal
         return await self._factor_holder_current(
             token,
             actor=user.username,
@@ -17148,13 +17159,15 @@ class AuthService:
             return Elevation(locked=report_lock)
         return user
 
-    async def _directory_step_up_refusal(self, user: UserRecord) -> str | None:
+    async def _directory_step_up_refusal(self, user: UserRecord) -> str | VerifiedUser:
         """Why the directory cannot vouch for directory account ``user`` before :meth:`verify_mfa`
         renews its step-up window (BACKLOG #2023) or :meth:`finish_webauthn_assertion` marks its
         factor met (BACKLOG #2239), or before :meth:`confirm_mfa_enrollment` or
-        :meth:`finish_webauthn_registration` marks it met on a first enrolment (BACKLOG #3061), or
-        ``None`` when it can. All four reach it through :meth:`_directory_vouches_for_factor`, which
-        calls it only for an AD row; a local account is never asked.
+        :meth:`finish_webauthn_registration` marks it met on a first enrolment (BACKLOG #3061), or,
+        when it can, the account row the role test below read after the probe (BACKLOG #3780 item
+        2). That row is an account read only, not a re-read of the session or a check of the lock.
+        All four reach it through :meth:`_directory_vouches_for_factor`, which calls it only for an
+        AD row; a local account is never asked.
 
         Without this, an account disabled in the directory kept renewing its window with a good code
         until the reconciliation pass revoked its sessions. The engine row's ``disabled`` flag is
@@ -17188,7 +17201,8 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return ACCOUNT_REFUSED
-        return await self._directory_roles_lost(fresh, answer.groups)
+        lost = await self._directory_roles_lost(fresh, answer.groups)
+        return fresh if lost is None else lost
 
     async def _directory_roles_lost(self, user: VerifiedUser, groups: Iterable[str]) -> str | None:
         """Why the stored authority of directory account ``user`` exceeds what ``groups`` grant,

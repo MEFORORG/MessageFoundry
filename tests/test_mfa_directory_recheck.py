@@ -536,8 +536,9 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
     The in-queue read is now the one re-read after the lookup. RED when: a second read of the
     session, of the account, or a second lock check, comes back between the lookup and the code
     check. The account is read twice: once by the directory check's role test, right after the
-    probe, and once in the queue. The control is that the attempt still succeeds, so the count is
-    of a leg that ran."""
+    probe, and once in the queue. The lock is asked twice, both in the queue: of the row read after
+    the lookup, and of the row read in the queue, neither a read of its own. The control is that
+    the attempt still succeeds, so the count is of a leg that ran."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_probe = e.service._probe_principal
     real_load = e.service._load_session
@@ -590,7 +591,7 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
 
     assert verified.ok is True
     assert looked_up
-    assert reads_before_code == [(1, 2, 1)]
+    assert reads_before_code == [(1, 2, 2)]
 
 
 @pytest.mark.parametrize("change", ["revoke", "disable", "lock"])
@@ -642,12 +643,12 @@ async def test_a_rename_rejoins_the_queue_under_the_new_name_before_the_code(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, when: str
 ) -> None:
     """BACKLOG #3780 item 2. The queue is keyed by the account's name (BACKLOG #1943), and a
-    directory rename needs no queue to land. The read after the lookup used to supply that key,
-    so a rename during the lookup was queued under the new name. The in-queue re-read now does it:
-    a name that keys a different queue from the one held sends the attempt to the new one before
-    the code is checked. RED when: the code is checked while holding the old name's queue, which
-    attempts reading the new name do not join, so a burst split across a rename would overshoot
-    the lockout."""
+    directory rename needs no queue to land. A rename during the lookup is queued under the new
+    name, keyed by the row the directory check read after the lookup, as the dropped re-read keyed
+    it. A rename while the attempt waits is caught by the in-queue re-read: a name that keys a
+    different queue from the one held sends the attempt to the new one before the code is checked.
+    RED when: the code is checked while holding the old name's queue, which attempts reading the
+    new name do not join, so a burst split across a rename would overshoot the lockout."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_probe = e.service._probe_principal
     real_lock = e.service._account_credential_lock
@@ -685,11 +686,90 @@ async def test_a_rename_rejoins_the_queue_under_the_new_name_before_the_code(
     verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 
     assert verified.ok is True
-    assert queued_as == ["jdoe", "jdoe-renamed"]  # queued under the old name, rejoined once
+    if when == "during-lookup":
+        assert queued_as == ["jdoe-renamed"]  # keyed by the row read after the lookup
+    else:
+        assert queued_as == ["jdoe", "jdoe-renamed"]  # queued under the old name, rejoined once
     assert held_at_check == [{service_module._credential_lock_key("jdoe-renamed")}]
     assert e.service._credential_locks == {}
     rows = await store.list_audit(action="auth.mfa_verified")
     assert [r["actor"] for r in rows] == ["jdoe-renamed"]
+
+
+@pytest.mark.parametrize("also", ["totp-off", "lapse"])
+async def test_a_lock_set_during_the_lookup_is_refused_as_locked_whatever_else_lands(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, also: str
+) -> None:
+    """BACKLOG #3780 item 2. A lock that lands during the lookup is refused as ``locked``, with its
+    ``auth.mfa_failed`` row, before anything else that landed in the same window is asked: a
+    self-service TOTP disable, or a temporary credential that lapsed. The re-read the item dropped
+    refused it before the queue, ahead of the in-queue ``totp_enabled`` and lapse checks. RED when:
+    the TOTP disable answers first, with no row and no ``locked``, or the lapse ends the session
+    first."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_probe = e.service._probe_principal
+    real_lapsed = e.service._mfa_lapsed
+    looked_up = False
+
+    async def _probe_while_a_guess_locks(user: Any) -> reconcile.Probe:
+        nonlocal looked_up
+        probe = await real_probe(user)
+        await _lock_second_step(store, e.user_id)
+        if also == "totp-off":
+            await store.disable_totp(e.user_id)
+        looked_up = True
+        return probe
+
+    async def _lapsed_after_the_lookup(*args: Any, **kwargs: Any) -> bool:
+        if also == "lapse" and looked_up:
+            return True
+        return await real_lapsed(*args, **kwargs)
+
+    monkeypatch.setattr(e.service, "_probe_principal", _probe_while_a_guess_locks)
+    monkeypatch.setattr(e.service, "_mfa_lapsed", _lapsed_after_the_lookup)
+
+    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert refused.ok is False and refused.locked is True and refused.session_lost is False
+    assert await _audited_mfa_failures(store) == [{"reason": "locked"}]
+    assert await store.get_session(hash_token(e.token)) is not None
+
+
+async def test_a_lost_session_after_a_rename_during_the_lookup_names_the_new_name(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 2, the #2291 class. A rename lands during the lookup, and the account is
+    deleted while the attempt waits in the queue. The ``session_lost`` row names the account as
+    the read after the lookup found it, as the re-read the item dropped did. RED when: it names
+    the account as it was before the lookup."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_probe = e.service._probe_principal
+    real_lock = e.service._account_credential_lock
+
+    async def _probe_while_renamed(user: Any) -> reconcile.Probe:
+        probe = await real_probe(user)
+        assert await store.set_user_username(
+            e.user_id, "jdoe-renamed", expected_username="jdoe", audits=()
+        )
+        return probe
+
+    @asynccontextmanager
+    async def _queue_while_deleted(username: str) -> AsyncIterator[None]:
+        await store.delete_user(e.user_id)
+        async with real_lock(username):
+            yield
+
+    monkeypatch.setattr(e.service, "_probe_principal", _probe_while_renamed)
+    monkeypatch.setattr(e.service, "_account_credential_lock", _queue_while_deleted)
+
+    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert refused.ok is False and refused.session_lost is True
+    rows = await store.list_audit(action="auth.mfa_failed")
+    lost = [
+        r for r in rows if r["detail"] and json.loads(r["detail"]) == {"reason": "session_lost"}
+    ]
+    assert [r["actor"] for r in lost] == ["jdoe-renamed"]
 
 
 async def test_an_account_deleted_after_the_rejoin_is_audited_under_its_last_read_name(
