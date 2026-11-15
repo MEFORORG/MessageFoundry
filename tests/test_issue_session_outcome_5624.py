@@ -19,7 +19,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -42,7 +42,8 @@ def _no_second_stamp(monkeypatch: pytest.MonkeyPatch, store: Any) -> list[str]:
 
     async def spy(token_hash: str, **kwargs: Any) -> bool:
         calls.append(token_hash)
-        return bool(await real(token_hash, **kwargs))
+        answer: bool = await real(token_hash, **kwargs)
+        return answer
 
     monkeypatch.setattr(store, "mark_session_mfa_verified", spy)
     return calls
@@ -84,7 +85,7 @@ async def test_a_refused_stamp_seal_cannot_end_the_new_session_under_a_success(
         first = await service.login(admin.username, admin.password)
         assert first.ok and first.token is not None
 
-        async def refused(_token_hash: str, **_kwargs: Any) -> None:
+        async def refused(_token_hash: str, **_kwargs: Any) -> NoReturn:
             raise RowSealError("seal refused")
 
         monkeypatch.setattr(store, "mark_session_mfa_verified", refused)
