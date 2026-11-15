@@ -81,10 +81,8 @@ name: Dependabot auto-merge
 
 on: pull_request
 
-permissions:
-  contents: write # complete the merge
-  pull-requests: write # enable auto-merge on the PR
-  security-events: read # read Dependabot alerts for the published-GHSA gate (#2)
+# Nothing at workflow level: each job names exactly what it needs (zizmor excessive-permissions).
+permissions: {}
 
 # NO WORKFLOW-LEVEL `concurrency:` (BACKLOG #5593). The group lives on the `auto-merge` job only, so
 # the `disarm` job is in no group and every run's disarm runs: GitHub keeps one pending entry per group
@@ -96,6 +94,9 @@ jobs:
     runs-on: ubuntu-latest
     # Same author gate as the arming job, which `needs:` this one.
     if: github.event.pull_request.user.login == 'dependabot[bot]'
+    permissions:
+      contents: read
+      pull-requests: write # read and disable the PR's auto-merge request
     timeout-minutes: 5
     steps:
       # BACKLOG #5593. A push to the PR (an A3 lock-resync commit, a rebase, or anyone's commit) changes
@@ -149,6 +150,10 @@ jobs:
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     # An arm only ever follows this run's own disarm; a failed disarm skips this job.
     needs: disarm
+    permissions:
+      contents: write # complete the merge
+      pull-requests: write # enable auto-merge on the PR
+      security-events: read # read Dependabot alerts for the published-GHSA gate (#2)
     # Serialises the ARMING per PR. The disarm job is deliberately outside it (see the note above
     # `jobs:`), so a run this group cancels has already disarmed.
     concurrency:

@@ -967,6 +967,12 @@ def test_every_run_disarms_in_its_own_ungrouped_job_before_any_arm() -> None:
     doc = _load()
     jobs = doc["jobs"]
     assert "concurrency" not in doc, "a workflow-level group would put the disarm job in it too"
+    # Least privilege per job: the disarm job may not complete a merge.
+    assert doc.get("permissions") == {}, doc.get("permissions")
+    assert (jobs.get("disarm") or {}).get("permissions") == {
+        "contents": "read",
+        "pull-requests": "write",
+    }
     disarm_job = jobs.get("disarm")
     assert disarm_job is not None, "no `disarm` job"
     assert "concurrency" not in disarm_job, "the disarm job must not be in a cancellable group"
