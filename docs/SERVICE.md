@@ -801,10 +801,13 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       reaches each file through two links (`<file>` to `..data/<file>`, and `..data` to a dated
       folder the kubelet swaps on update), and that layout has not been measured against the walk.
       It has not been measured against the current check either (see `docker/README.md`). And the
-      POSIX check is shared: the `serve` start check of the settings and value files
-      (`assert_trusted_start_paths`) runs the same code, so adding the walk there changes what
-      every start refuses, and adding it to the config load alone gives the two checks different
-      answers to one question.
+      POSIX policy is shared: the `serve` start check of the settings and value files
+      (`assert_trusted_start_paths`) judges each path by the same code. That start check does not
+      take this walk either, but it does follow the links an open of each file passes through and
+      vets the folders holding them, as the value-file paragraph in
+      [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+      states. The config load's trust list still vets each module by its own path, not the links
+      it passes through, so the two checks answer a linked file differently.
     - **The exposure that leaves is a known limit, not a safe layout.** An account that can write
       any directory above the config directory can rename that directory and put a link or another
       directory in its place. A substitute put there after the check runs unchecked, and one put
