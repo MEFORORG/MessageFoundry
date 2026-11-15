@@ -691,6 +691,9 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
     assert "protect-key" not in refusal
     value = entry.split("=", 1)[1]
     assert not value.strip() or value not in refusal, "the value must never reach the refusal"
+    # An empty entry is told to go, not to move into the directory, which refuses an empty file.
+    told_to_delete = "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
+    assert told_to_delete is (not value.strip())
     [(loosening, twin)] = service_env_loosenings(posture)
     assert loosening == "secret_in_service_environment"
     _assert_twin_of(refusal, twin)
@@ -723,7 +726,10 @@ def test_env_values_are_counted_per_registry_value() -> None:
         "1 MEFOR_VALUE_* variable(s) (in Environment) is set in"
     )
     bare = service_env_refusal(_service(["MEFOR_VALUE_=z"]))
-    assert bare is not None and "rename that env() key first" in bare
+    assert bare is not None
+    assert "The bare name MEFOR_VALUE_ sets no env() key, so delete that entry" in bare
+    assert "rename that env() key" not in bare and "An empty or blank" not in bare
+    assert "The bare name" not in refusal.split("3 MEFOR_VALUE_", 1)[0]
     assert "counted once, without regard to case, under the first registry value" in refusal
     assert "remove it from every value that sets it" in refusal
     # Names are printed nowhere, so the shared ending speaks of what was refused, not named.
@@ -737,10 +743,16 @@ def test_an_env_value_name_the_secrets_directory_refuses_gets_the_rename_hint() 
     itself stays unprinted."""
     odd = service_env_refusal(_service(["MEFOR_VALUE_ACME-HOST=synthetic-value"]))
     assert odd is not None
-    assert "a file name the secrets directory refuses, so rename that env() key first" in odd
+    assert "a file name the secrets directory refuses, so rename that env() key" in odd
     assert "ACME-HOST" not in odd and "synthetic-value" not in odd
     plain = service_env_refusal(_service(["MEFOR_VALUE_ACME_HOST=x"]))
-    assert plain is not None and "rename that env() key first" not in plain
+    assert plain is not None and "rename that env() key" not in plain
+    # Judged as written: str.upper turns the sharp s into SS, which would pass the rule, but the
+    # secrets directory checks the file name before case-folding and refuses it.
+    folded = _service(["MEFOR_VALUE_PA\u00df=synthetic-value"])
+    assert folded.listed_value_names == ("MEFOR_VALUE_PASS",)
+    sharp = service_env_refusal(folded)
+    assert sharp is not None and "rename that env() key" in sharp
 
 
 def test_an_env_provider_reference_named_as_a_value_gets_a_route_that_reads_it() -> None:
@@ -754,7 +766,14 @@ def test_an_env_provider_reference_named_as_a_value_gets_a_route_that_reads_it()
     assert '[secrets].provider = "env" reference names is read from the environment only' in (
         refusal
     )
-    assert 'move that secret to [secrets].provider = "vault" instead' in refusal
+    assert (
+        "Drop that reference instead and put the credential in the secrets directory under the "
+        "setting it stands for"
+    ) in refusal
+    assert (
+        'or, second, use [secrets].provider = "vault", which applies to every such reference in '
+        "the engine"
+    ) in refusal
     # The premise the remedy rests on: the env provider does not read the secrets directory.
     assert "secrets_directory" not in inspect.getsource(EnvSecretProvider)
 

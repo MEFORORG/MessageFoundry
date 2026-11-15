@@ -2609,8 +2609,10 @@ count is above `0` (vault BACKLOG #2613).
   secrets directory, or a value that is not a secret and is the same for every instance to the
   active environment's value file. A `MEFOR_VALUE_*` variable a `[secrets].provider = "env"`
   reference names is refused too, and the secrets directory does not supply it, since that
-  provider reads the environment only; the refusal sends that secret to
-  `[secrets].provider = "vault"`. They also
+  provider reads the environment only; the refusal says to drop the reference and put the
+  credential in the secrets directory under the setting it stands for, or else to use
+  `[secrets].provider = "vault"`, which applies engine-wide. It says to delete an empty entry, or
+  the bare name `MEFOR_VALUE_`, rather than move it. They also
   refuse a store key in their own environment when they found their service but could not read
   its lists, since the key most likely came from there; another secret in their own environment is
   not refused then.

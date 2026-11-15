@@ -5408,8 +5408,8 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # Vault BACKLOG #2595: the service-environment check each engine shard's `serve` makes. A
     # shard reads the same NSSM service as the supervisor, since that service is an ancestor of
-    # both, so every shard would refuse on a secret there. Refused under every enforcement
-    # setting, as in `serve`.
+    # both, so every shard would refuse on what `serve` refuses there: an engine secret, or (vault
+    # #8212) any MEFOR_VALUE_* variable. Refused under every enforcement setting, as in `serve`.
     from messagefoundry.serviceenv import (
         service_env_loosenings,
         service_env_posture,

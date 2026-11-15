@@ -23,7 +23,7 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   them without printing a name it read from the registry. The way in is the secrets directory,
   or the environment's value file for a value that is not a secret and is the same for every
   instance.
-* **Both refusals are ``serve``'s and ``supervise``'s, and the API app factories'.**
+* **Each refusal above is ``serve``'s and ``supervise``'s, and the API app factories'.**
   ``create_app`` and ``create_managed_app`` raise on the same finding as they are built (vault
   BACKLOG #8212 item 1). The loosening ``secret_in_service_environment`` names it for a caller
   that reads the loosenings with no refusal of its own.
@@ -145,6 +145,12 @@ class ServiceEnvPosture:
     keys_in_environment: tuple[str, ...] = ()
     #: Why the reading failed (``UNOBSERVABLE``).
     detail: str = ""
+    #: The ``MEFOR_VALUE_*`` names in ``listed`` that an entry sets empty or blank, so the
+    #: refusal can say to delete it rather than move it.
+    empty_value_names: tuple[str, ...] = ()
+    #: The ``MEFOR_VALUE_*`` names in ``listed`` that an entry spells, as written in the
+    #: registry, with a character the secrets directory refuses in a file name.
+    unplain_value_names: tuple[str, ...] = ()
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -289,8 +295,8 @@ def _names(entries: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
     """The upper-cased names of the variables that ``NAME=value`` entries set to a secret. The
     value is dropped here and never kept. An empty value carries no secret, so its name is not
     kept, except a ``MEFOR_VALUE_*`` name, which the owner's ruling refuses whatever it holds and
-    whose empty value the engine still overlays on the value file. A path in a name that takes either a key or its path is not a secret, so that name is
-    not kept either. Windows compares
+    whose empty value the engine still overlays on the value file. A path in a name that takes
+    either a key or its path is not a secret, so that name is not kept either. Windows compares
     environment names without case, so this does too. Each name is returned with the first
     registry value that sets it."""
     names: dict[str, str] = {}
@@ -305,6 +311,29 @@ def _names(entries: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
             continue
         names.setdefault(name, where)
     return tuple(names.items())
+
+
+def _value_entry_shapes(
+    entries: Sequence[tuple[str, str]],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(empty, unplain)``: the upper-cased ``MEFOR_VALUE_<KEY>`` names an entry sets empty or
+    blank, and those an entry spells with a character other than an ASCII letter, a digit or an
+    underscore. The second is judged on the name as written, before upper-casing, because
+    ``str.upper`` maps some non-ASCII letters onto ASCII ones (``engine_secrets`` holds its file
+    names to the same rule for that reason). The bare prefix is in neither. Names only."""
+    empty: dict[str, None] = {}
+    unplain: dict[str, None] = {}
+    for _where, entry in entries:
+        written, equals, value = entry.partition("=")
+        written = written.strip()
+        name = written.upper()
+        if not equals or not name.startswith(_VALUE_PREFIX) or name == _VALUE_PREFIX:
+            continue
+        if not value.strip():
+            empty[name] = None
+        if not (written.isascii() and _setting_names.is_value_name(name)):
+            unplain[name] = None
+    return tuple(empty), tuple(unplain)
 
 
 def read_service_env_posture(
@@ -344,12 +373,15 @@ def read_service_env_posture(
             ),
         )
     sources = _names(entries)
+    empty, unplain = _value_entry_shapes(entries)
     return ServiceEnvPosture(
         ServiceEnvStatus.OBSERVED,
         service_name=service,
         listed=tuple(name for name, _where in sources),
         sources=sources,
         keys_in_environment=keys,
+        empty_value_names=empty,
+        unplain_value_names=unplain,
     )
 
 
@@ -482,17 +514,31 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "name is counted once, without regard to case, under the first registry value "
                 "that sets it, so remove it from every value that sets it"
             )
-            if any(not _setting_names.is_value_name(name) for name in values):
+            if _VALUE_PREFIX in values:
                 step += (
-                    ". At least one of them is not MEFOR_VALUE_ followed by letters, digits and "
-                    "underscores, a file name the secrets directory refuses, so rename that env() "
-                    "key first"
+                    ". The bare name MEFOR_VALUE_ sets no env() key, so delete that entry rather "
+                    "than move it"
+                )
+            if posture.empty_value_names:
+                step += (
+                    ". An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where "
+                    "an empty override is really wanted, write it in the value file instead, "
+                    "since the secrets directory refuses an empty file"
+                )
+            if posture.unplain_value_names:
+                step += (
+                    ". At least one of them is spelled with a character other than an ASCII "
+                    "letter, a digit or an underscore, a file name the secrets directory refuses, "
+                    "so rename that env() key before moving it there"
                 )
             step += (
                 '. A MEFOR_VALUE_* variable that a [secrets].provider = "env" reference names is '
-                "read from the environment only, never from the secrets directory, so move that "
-                'secret to [secrets].provider = "vault" instead. Renaming it outside MEFOR_VALUE_* '
-                "ends this refusal but leaves it in the registry key"
+                "read from the environment only, never from the secrets directory. Drop that "
+                "reference instead and put the credential in the secrets directory under the "
+                "setting it stands for, such as MEFOR_AUTH_AD_BIND_PASSWORD; or, second, use "
+                '[secrets].provider = "vault", which applies to every such reference in the '
+                "engine. Renaming the variable outside MEFOR_VALUE_* ends this refusal but leaves "
+                "the secret in the registry key"
             )
             cite += ' and "[environments]"'
         steps.append(f"{step}. {cite}")
