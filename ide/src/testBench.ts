@@ -112,8 +112,8 @@ export class TestBench {
       this.panel.reveal();
       return;
     }
-    // A left-behind run directory more than an hour old has its case files swept on the next open,
-    // not only on the next run.
+    // Only on panel creation, not on the reveal above. Which left-behind run directories it tries,
+    // and what stays, is in sweepStaleCaseDirs's docblock (collectionCaseFiles.ts).
     sweepStaleCaseDirs();
     this.panel = vscode.window.createWebviewPanel(
       "messagefoundry.testBench",
@@ -321,15 +321,11 @@ export class TestBench {
   /**
    * Rerun a saved collection and flag pass/fail per case. The `dryrun` CLI takes only file paths, so
    * each case's stored input is materialized to a fresh per-run temp dir, owner-only on POSIX, the
-   * dir itself is dry-run (`--show-phi`), and in `finally` its case files are deleted, then the dir
-   * if it is then empty. A dir left behind by at least a crash has its case files swept, and then
-   * the dir if it is empty, by a later open or run once it is over an hour old, and on POSIX only if
-   * this user owns it; a case file that cannot be unlinked can stay through every later sweep, which
-   * does not retry and does not report the failure. A dir that holds no regular case file but
-   * still holds at least an entry named as a case file that is not a regular file, or an entry not
-   * named as a case file, has none left to sweep, so it stays until someone removes it
-   * (collectionCaseFiles.ts, BACKLOG #5415). Cases align to rows by the unique temp basename the CLI
-   * echoes back in `row.path` (robust to a case that yields no row).
+   * dir itself is dry-run (`--show-phi`), and the `finally` tries to delete it with removeCaseDir.
+   * What that delete and the sweep before each run remove, and what can stay on disk, is in the
+   * deleteCaseDir and sweepStaleCaseDirs docblocks in collectionCaseFiles.ts (BACKLOG #5415). Cases
+   * align to rows by the unique temp basename the CLI echoes back in `row.path` (robust to a case
+   * that yields no row).
    */
   private async runCollection(name: string): Promise<void> {
     if (!this.panel) {
