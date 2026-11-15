@@ -1431,6 +1431,42 @@ def test_hygiene_reports_private_git_read_survives_a_failed_git_file_read(
     assert out == "True/|True/ORIG_HEAD", out
 
 
+def test_hygiene_reports_private_git_read_holds_on_a_dot_git_that_became_a_directory(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5603. Test-Path saw a .git file, and by the read it is a directory: Get-Content
+    refuses that with an InvalidOperationException, which the named catch let end the report. Any
+    failure of the .git read now names '.git', which the report holds the tree on. Test-Path is stood
+    in for, to answer as it did before the swap; the first call, without it, is the control: a .git
+    directory is no linked worktree, so nothing is read and nothing failed."""
+    tree = tmp_path / "tree"
+    (tree / ".git").mkdir(parents=True)
+    command = (
+        f"$ErrorActionPreference = 'Stop'; {_LIFT_PRIVATE_GIT_ACTIVITY}"
+        "$a = Get-PrivateGitActivity $env:T_TREE; "
+        "function global:Test-Path { [CmdletBinding()] param([string]$LiteralPath, "
+        "[string]$PathType) $true }; "
+        "try { $b = Get-PrivateGitActivity $env:T_TREE; "
+        "$r = '{0}/{1}' -f ($null -eq $b.When), $b.Unreadable } "
+        'catch { $r = "threw: $($_.Exception.GetType().Name)" }; '
+        "'{0}/{1}|{2}' -f ($null -eq $a.When), $a.Unreadable, $r"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            "T_TREE": str(tree),
+            "T_SCRIPT": str(SCRIPT.parent / "hygiene-report.ps1"),
+        },
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "True/|True/.git", (proc.stdout, proc.stderr)
+
+
 def test_a_cache_too_big_to_date_holds_the_tree(fx: Fixture, sleeper: int) -> None:
     """BACKLOG #5603. Past its cap the working-tree reading does not sample a cache: the file a run
     just rewrote could be one it never reached, so the tree's activity is unknown and it is held."""

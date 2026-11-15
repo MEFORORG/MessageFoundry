@@ -278,15 +278,19 @@ function ConvertTo-Instant($Value) {
 # Returns When (the newest reading, or $null) and Unreadable (the file whose read failed, or $null). A
 # file a git command deletes between Test-Path and Get-Item sets Unreadable, which the caller holds
 # the tree on, keeping any reading already taken, rather than ending the report under its 'Stop'
-# preference. Caught: ItemNotFoundException, DriveNotFoundException, IOException and
-# UnauthorizedAccessException; anything else still throws.
+# preference. For the admin files, caught: ItemNotFoundException, DriveNotFoundException,
+# IOException and UnauthorizedAccessException; anything else still throws. For the .git file, ANY
+# failure of the path or the read sets Unreadable to '.git': that catch-all ends in a hold naming the
+# file, not a silenced error.
 function Get-PrivateGitActivity([string]$Worktree) {
     $none = [pscustomobject]@{ When = $null; Unreadable = $null }
-    $dot = Join-Path $Worktree '.git'
-    if (-not (Test-Path -LiteralPath $dot -PathType Leaf)) { return $none }
     $txt = ''
-    try { $txt = Get-Content -LiteralPath $dot -Raw -ErrorAction Stop }
-    catch [System.Management.Automation.ItemNotFoundException], [System.Management.Automation.DriveNotFoundException], [System.IO.IOException], [System.UnauthorizedAccessException] { return [pscustomobject]@{ When = $null; Unreadable = '.git' } }
+    try {
+        $dot = Join-Path $Worktree '.git'
+        if (-not (Test-Path -LiteralPath $dot -PathType Leaf)) { return $none }
+        $txt = Get-Content -LiteralPath $dot -Raw -ErrorAction Stop
+    }
+    catch { return [pscustomobject]@{ When = $null; Unreadable = '.git' } }
     if (-not ($txt -match 'gitdir:\s*(\S.*)')) { return $none }
     $gitdir = $Matches[1].Trim()
     if (-not [System.IO.Path]::IsPathRooted($gitdir)) { $gitdir = Join-Path $Worktree $gitdir }
@@ -548,9 +552,12 @@ function Get-CloneReport($R) {
                 $age = ($now - $mergedAt).TotalHours
                 if ($age -lt $HoldHours) { $reasons.Add(("merged {0:N1} h ago, inside the {1} h hold: its session may still be there" -f $age, $HoldHours)) }
             }
+            $gitRead = Get-PrivateGitActivity $e.Path
+            if ($gitRead.Unreadable) {
+                $where = if ($gitRead.Unreadable -eq '.git') { 'the .git file' } else { "$($gitRead.Unreadable) in its git dir" }
+                $reasons.Add("git activity could not be read ($where): a session may still be working there")
+            }
             if ($IdleHours -gt 0) {
-                $gitRead = Get-PrivateGitActivity $e.Path
-                if ($gitRead.Unreadable) { $reasons.Add("git activity could not be read ($($gitRead.Unreadable) in its git dir): a session may still be working there") }
                 $touched = @($gitRead.When)
                 if ($e.Head -and $dates.ContainsKey($e.Head)) { $touched += ConvertTo-Instant $dates[$e.Head] }
                 $newest = $touched | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
