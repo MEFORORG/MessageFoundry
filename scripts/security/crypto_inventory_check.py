@@ -127,6 +127,7 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.append(_HERE)
 import crypto_operations  # noqa: E402
+import js_lexer  # noqa: E402
 
 # The six first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
@@ -2232,7 +2233,8 @@ def discover(package: Path) -> dict[str, frozenset[str]]:
 #: fixture that never touches the disk and exercises AT LEAST these matchers: an exact rule, a
 #: prefix rule, an algorithm carried by an ARGUMENT, a method rule, a TLS posture assignment with its
 #: value, a tuple-target, augmented and ``setattr`` posture assignment, a bare sibling import under
-#: ``scripts/``, and a first-party provider reached three ways (absolute import, package re-export,
+#: ``scripts/``, an import name reused by a function-local import, and a first-party provider
+#: reached three ways (absolute import, package re-export,
 #: relative import) from modules with no crypto import of their own, which is the BACKLOG #1164
 #: shape. If the instrument does not report exactly this, one of those matchers is dead, and every
 #: clean result it gives about the tree is void.
@@ -2262,6 +2264,11 @@ _SELF_TEST_SOURCES: dict[str, str] = {
     "selftest/relative.py": "from . import seam\n\n\ndef go():\n    seam.build()\n",
     "scripts/st/helper.py": "import hashlib\n\n\ndef h(b):\n    return hashlib.sha1(b)\n",
     "scripts/st/user.py": "import helper\n\n\ndef go(b):\n    return helper.h(b)\n",
+    # BACKLOG #5579: a function-local import reusing a crypto module's name must not hide it.
+    "selftest/shadow.py": (
+        "import hashlib\n\n\ndef a(b):\n    return hashlib.md5(b)\n\n\n"
+        "def other():\n    from mylib import thing as hashlib\n    return hashlib\n"
+    ),
 }
 _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "selftest/seam.py": frozenset(
@@ -2286,6 +2293,7 @@ _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "selftest/relative.py": frozenset({"tls_context:via selftest.seam"}),
     "scripts/st/helper.py": frozenset({"hash:hashlib.sha1"}),
     "scripts/st/user.py": frozenset({"hash:via scripts.st.helper"}),
+    "selftest/shadow.py": frozenset({"hash:hashlib.md5"}),
 }
 
 
@@ -2380,30 +2388,44 @@ def find_violations(
     return undocumented, stale
 
 
-def _is_comment_only(line: str) -> bool:
-    """True for a line that is nothing but a ``//`` or block-comment line.
+def _js_code(text: str) -> list[str]:
+    """The code of a TypeScript/JavaScript source, one entry per line: the UNION of two views.
 
-    DELIBERATELY CONSERVATIVE, and the direction matters. A code line carrying a TRAILING comment is
-    still scanned in full, so a call cannot be hidden by putting a ``//`` earlier on the same line;
-    the cost is that a line beginning with ``*`` for some non-comment reason is skipped. The error
-    this can make is a false POSITIVE (flagging a call quoted inside a string), never a false
-    negative, which is the only safe direction for a security gate. Stripping comments properly would
-    need a JS lexer, and a naive strip would cut a line at the ``//`` of a URL and hide what follows.
+    1. The lexer view, :func:`js_lexer.blank_js_comments`, which skips string, template and regex
+       literals and blanks only real comments. It sees what BACKLOG #5578 found hidden: a call after
+       an inline ``/* */``, or on a ``*`` continuation line. The JS line terminators CR, U+2028 and
+       U+2029 are folded to ``\\n`` for it, because each ends a ``//`` comment.
+    2. The per-line view this gate used before #5578: every line, split by ``splitlines``, that does
+       not start with ``//``, ``*`` or ``/*``. A trailing comment stays on its line.
 
-    The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` uses the same rule
-    for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it is unusable.
-    """
-    stripped = line.lstrip()
-    return stripped.startswith(("//", "*", "/*"))
+    The union is the point. The lexer can misread a literal (the residual in crypto_operations.py
+    says how) and blank real code; the per-line view still scans every line it scanned before. So
+    the gate scans at least what it scanned before #5578: the per-line view is unchanged, and only
+    the lexer's input drops a leading BOM. The cost is false positives from both views: the per-line
+    view's old ones (a prose line inside a block comment that does not start with ``*``), and the
+    lexer's (a comment-shaped line inside a template literal, or a real comment line kept after a
+    literal misread).
+
+    The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
+    lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
+    is unusable."""
+    # The BOM is dropped for the lexer only, so a BOM-led ``/**`` opens its comment there; the
+    # per-line view reads the text exactly as it did before #5578.
+    folded = text.removeprefix("\ufeff")
+    for terminator in ("\r\n", "\r", "\u2028", "\u2029"):
+        folded = folded.replace(terminator, "\n")
+    lexed = js_lexer.blank_js_comments(folded).split("\n")
+    per_line = [
+        line for line in text.splitlines() if not line.lstrip().startswith(("//", "*", "/*"))
+    ]
+    return lexed + per_line
 
 
 def randomness_tokens_in(text: str) -> set[str]:
     """The randomness-source tokens (strong and weak) a non-Python source draws from."""
     found: set[str] = set()
     patterns = {**STRONG_RANDOMNESS_PATTERNS, **WEAK_RANDOMNESS_PATTERNS}
-    for line in text.splitlines():
-        if _is_comment_only(line):
-            continue
+    for line in _js_code(text):
         for token, pattern in patterns.items():
             if token not in found and pattern.search(line):
                 found.add(token)
@@ -2738,12 +2760,11 @@ def _pattern_tokens(
 
 
 def non_python_operation_tokens_in(text: str) -> set[str]:
-    """The ``class:token`` operations a TypeScript/JavaScript source performs. Comment-only lines
-    are skipped by the same conservative rule as the randomness arm (:func:`_is_comment_only`)."""
+    """The ``class:token`` operations a TypeScript/JavaScript source performs, read from the same
+    two-view code as the randomness arm (:func:`_js_code`)."""
     found: set[str] = set()
-    for line in text.splitlines():
-        if not _is_comment_only(line):
-            found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)
+    for line in _js_code(text):
+        found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)
     # A cipher-string word counts only where the file pins or names suites (BACKLOG #2020); see
     # ``_CIPHER_STRING`` for why.
     names = {token.split(":", 1)[1].split("[", 1)[0] for token in found}

@@ -35,7 +35,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import make_cipher
 from messagefoundry.store.store import MessageStore
-from tests.test_browser_storage_doc_drift import _js_code
+from scripts.security.js_lexer import blank_js_comments
 from tests.test_provision_first_administrator import _PASSWORD, _key_in_this_shell, _tty
 
 _MODEL = Path(__file__).resolve().parents[1] / "ide" / "src" / "engineControlModel.ts"
@@ -72,7 +72,7 @@ def test_the_probe_argv_here_is_the_one_the_ide_builds() -> None:
     the pin ends at the array's close, so an element added after the flag reds it.
     """
     raw = _MODEL.read_text(encoding="utf-8")
-    src = " ".join(_js_code(raw).split())
+    src = " ".join(blank_js_comments(raw).split())
     # Control: the JSDoc right above the pinned array is in the file and is blanked from the code.
     assert "Each value is bound with" in raw
     assert "Each value is bound with" not in src
