@@ -72,17 +72,33 @@ function unlinkWithRetries(file: string, retries: number): void {
  * only a regular file named as caseFileName names one is unlinked, then `dir` itself is removed with
  * rmdir, which fails and leaves it if anything else is still in it. No recursive rmSync, because in
  * the VS Code extension host (measured on its Node v24.21.0) a recursive rmSync follows a junction
- * and deletes its target's files. Throws on any failure, a directory already gone included.
+ * and deletes its target's files. A case file that cannot be removed does not stop the others: the
+ * rest are still unlinked, then the first error is thrown. Throws on any failure, a directory
+ * already gone included. Open limit: `dir` is checked once, by path, so a directory swapped for a
+ * link between that lstat and the listing is followed.
  */
 function deleteCaseDir(dir: string, retries: number): void {
   if (!fs.lstatSync(dir).isDirectory()) {
     throw new Error("not a plain directory");
   }
+  let first: unknown;
   for (const name of fs.readdirSync(dir)) {
-    const file = path.join(dir, name);
-    if (CASE_FILE.test(name) && fs.lstatSync(file).isFile()) {
-      unlinkWithRetries(file, retries);
+    if (!CASE_FILE.test(name)) {
+      continue;
     }
+    const file = path.join(dir, name);
+    try {
+      if (fs.lstatSync(file).isFile()) {
+        unlinkWithRetries(file, retries);
+      }
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        first ??= e;
+      }
+    }
+  }
+  if (first !== undefined) {
+    throw first;
   }
   fs.rmdirSync(dir);
 }
@@ -92,7 +108,8 @@ export function removeCaseDir(dir: string): void {
   try {
     deleteCaseDir(dir, 3);
   } catch {
-    /* gone already, or a later sweep retries it (sweepStaleCaseDirs) */
+    /* gone already, or a later sweep retries it (sweepStaleCaseDirs); one holding anything but
+       case files stays */
   }
 }
 
@@ -101,8 +118,8 @@ export function removeCaseDir(dir: string): void {
  * symlink) named with CASE_DIR_PREFIX, last modified more than `maxAgeMs` before `now`, and, on POSIX,
  * owned by this process's user. The OS temp directory is shared there, so the prefix alone does not
  * say who made an entry. On Windows the default TEMP is per-user. Each is deleted as removeCaseDir
- * deletes one, without recursing, so a link inside it is never followed and a directory holding
- * anything but case files is left. Returns how many it removed. Best effort: an entry it cannot
+ * deletes one but with no retry, without recursing, so a link inside it is never followed, and a
+ * directory holding anything but case files is left, on every later sweep too. Returns how many it removed. Best effort: an entry it cannot
  * read or remove is skipped.
  */
 export function sweepStaleCaseDirs(

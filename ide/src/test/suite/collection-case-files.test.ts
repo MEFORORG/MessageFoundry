@@ -178,5 +178,12 @@ suite("collectionCaseFiles: a run directory is deleted without recursing (BACKLO
       remove(plain);
       assert.ok(!fs.existsSync(plain), "a directory of case files only was not removed");
     });
+
+    test(`${how}: an entry named like a case file that is not a regular file is left, and the case files around it go`, () => {
+      const dir = materializeCases([BODY, BODY], base);
+      fs.mkdirSync(path.join(dir, caseFileName(9999)));
+      remove(dir);
+      assert.deepStrictEqual(fs.readdirSync(dir), [caseFileName(9999)]);
+    });
   }
 });
