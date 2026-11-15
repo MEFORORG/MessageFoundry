@@ -4653,6 +4653,7 @@ def _restore_blocking(
     # back.
     published = False
     completed = False
+    store_removed = False
     config_written: list[Path] = []
     try:
         # Stage on the DESTINATION volume, not the system temp dir: the extracted store is then placed
@@ -4914,6 +4915,20 @@ def _restore_blocking(
             except OSError as exc:
                 raise BackupError("destination", safe_exc(exc)) from exc
             published = True
+            # The staged name goes at once: placed by a hard link, it is a second name for the
+            # restored store, and the teardown's fail-safe must never be handed it. It refuses a
+            # file with two links, but a volume that hard-links and reports one link would have
+            # it truncate the restored store itself. Placed by a copy, it is a second plaintext
+            # copy with no further use. A refused unlink (a scanner holding it) leaves the
+            # fail-safe's link check as the guard, and is logged.
+            try:
+                snap.unlink()
+            except OSError as exc:
+                log.warning(
+                    "could not remove the staged copy %s of the placed store: %s",
+                    snap,
+                    safe_exc(exc),
+                )
 
             # The config bundle is written AFTER the store, and every way it can fail used to leave
             # the store published anyway: a refused member name, a cap, a collision, an archive with
@@ -4933,9 +4948,12 @@ def _restore_blocking(
                 # The placed store goes before the teardown, not with the rest of the rollback
                 # after it: hard-linked to the staged one, it keeps that file at two links, which
                 # the teardown's fail-safe never truncates, and the rollback would then leave the
-                # staged name as the one full copy. The rollback's own unlink finds it gone.
+                # staged name as the one full copy. Once this unlink succeeds the rollback must not
+                # unlink that path again: through the teardown it is free, and a file there by the
+                # time the rollback runs is another restore's, which won the exclusive create.
                 try:
                     dest_store_path.unlink(missing_ok=True)
+                    store_removed = True
                 except OSError as unlink_exc:
                     log.warning(
                         "could not remove the partially restored store at %s: %s",
@@ -4993,7 +5011,7 @@ def _restore_blocking(
                 )
     finally:
         if published and not completed:
-            _discard_partial_restore(dest_store_path, config_written)
+            _discard_partial_restore(None if store_removed else dest_store_path, config_written)
         if not completed:
             # After the staging directory's own teardown and the rollback, so each is empty again.
             _remove_made_dirs(made_dirs)

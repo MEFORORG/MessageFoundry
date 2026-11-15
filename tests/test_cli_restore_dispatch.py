@@ -821,24 +821,9 @@ def _restore_staging_that_cannot_be_removed(mp: pytest.MonkeyPatch) -> None:
     mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
 
 
-def _skip_without_hard_links(tmp_path: Path) -> None:
-    """Skip where tmp_path cannot hard-link: the restore then places its store by a copy, the
-    teardown empties every staged file, and there is no leftover for a cleanup refusal to name."""
-    probe = tmp_path / "link-probe"
-    probe.write_bytes(b"")
-    try:
-        os.link(probe, tmp_path / "link-probe-2")
-    except OSError:
-        pytest.skip("tmp_path cannot hard-link, so the restore places its store by a copy")
-    finally:
-        (tmp_path / "link-probe-2").unlink(missing_ok=True)
-        probe.unlink()
-
-
 def test_restore_keeps_a_whole_restore_when_its_staging_teardown_fails(
     tmp_path, key_b64, capsys
 ) -> None:
-    _skip_without_hard_links(tmp_path)
     # The regression the rollback brought in. `completed` flipped AFTER the staging block closed, so
     # the one thing between "config bundle written" and "completed" was the staging directory's own
     # teardown -- and when that raised, the rollback read a whole restore as a failed one and deleted
@@ -858,6 +843,8 @@ def test_restore_keeps_a_whole_restore_when_its_staging_teardown_fails(
 
     with pytest.MonkeyPatch.context() as mp:
         _restore_staging_that_cannot_be_removed(mp)
+        # A staged file that could be neither removed nor emptied, so the leftover is reported.
+        mp.setattr(dr_backup, "_empty_files_in_place", lambda staging: ["archive.tar"])
         mp.setattr(dr_backup, "_discard_partial_restore", spy)
         rc = main(_restore_argv(archive, toml, dest, config_dest))
     # Reported, as a refusal line and not a traceback, under a kind that does not say the restore
@@ -870,11 +857,11 @@ def test_restore_keeps_a_whole_restore_when_its_staging_teardown_fails(
     assert dest.is_file() and (config_dest / "feed.py").is_file()
     assert rollbacks == [], "a whole restore was rolled back over its staging teardown"
     # The leftover is named, so the operator can find and remove it. It survived because the thing
-    # that failed was its remover, and it still holds the decrypted store.
+    # that failed was its remover. The staged store is not in it: that name went at placement.
     leftovers = [p for p in dest.parent.iterdir() if p.name.startswith("mefor-restore-")]
     assert len(leftovers) == 1, sorted(p.name for p in dest.parent.iterdir())
     assert leftovers[0].name in err and str(dest) in err, err
-    assert (leftovers[0] / "extracted_store.db").is_file()
+    assert not (leftovers[0] / "extracted_store.db").exists()
     # And the retry is refused for the RIGHT reason now: the destination holds a good store.
     assert main(_restore_argv(archive, toml, dest, config_dest)) == 1
     assert "restore failed (destination)" in _refusal(capsys)
@@ -1577,27 +1564,25 @@ def test_a_refusal_survives_a_real_held_open_staging_file(tmp_path, capsys, monk
 def test_a_restore_staging_leftover_has_its_archive_emptied_and_is_swept(
     tmp_path, key_b64, capsys
 ) -> None:
-    _skip_without_hard_links(tmp_path)
     # BACKLOG #5617. The restore staged the decrypted archive and the extracted store in a
     # `TemporaryDirectory`, outside the lock-and-sweep the backup and verify stage under. When its
     # teardown failed, the whole decrypted archive stayed on the destination volume at full size,
     # and no later run would ever remove it. It now stages like a verify: a failed teardown empties
-    # what it can, keeps the directory marked, and the next run's sweep removes it. The exit 1
-    # below rests on the hard-link placement, which tmp_path's volume supports: the linked store is
-    # the file the teardown reports.
+    # what it can, keeps the directory marked, and the next run's sweep removes it.
+    #
+    # The staged store's name is removed as soon as the store is placed, so the teardown is never
+    # handed a second name for the restored store: on a volume that hard-links and reports one
+    # link, its fail-safe would otherwise truncate the restore itself. With the archive emptied,
+    # nothing in the leftover holds plaintext, and the restore succeeds.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored" / "msg.db"
     with pytest.MonkeyPatch.context() as mp:
         _restore_staging_that_cannot_be_removed(mp)
-        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
-    err = _refusal(capsys)
-    assert "restore failed (cleanup)" in err and "Traceback" not in err, err
+        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 0
+    capsys.readouterr()
     leftovers = [p for p in dest.parent.iterdir() if p.name.startswith("mefor-restore-")]
     assert len(leftovers) == 1, sorted(p.name for p in dest.parent.iterdir())
-    assert leftovers[0].name in err, err
-    # The decrypted archive is emptied in place. The extracted store shares the placed store's
-    # bytes through a hard link where links work, so it is left whole rather than truncating the
-    # restore itself.
+    assert not (leftovers[0] / "extracted_store.db").exists()
     assert (leftovers[0] / "archive.tar").stat().st_size == 0
     # The restore is whole: the store opens and carries its row.
     assert asyncio.run(_read_back(dest, key_b64)) == (1, _RAW_BODY)
@@ -1684,10 +1669,8 @@ def test_a_refusal_behind_an_os_error_on_its_way_out_is_the_one_reported(
 def test_a_failed_restore_empties_the_staged_store_its_rollback_unlinked(
     tmp_path, key_b64, capsys
 ) -> None:
-    # A restore that fails after placing its store by a hard link removes the placed store BEFORE
-    # the staging teardown, so the staged copy is down to one link and is emptied, not left as the
-    # one full copy of the store once the rollback has unlinked the other name.
-    _skip_without_hard_links(tmp_path)
+    # A restore that fails after placing its store leaves no copy of it in its staging leftover:
+    # the staged name went at placement, and the placed store goes in the rollback.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored" / "msg.db"
     with pytest.MonkeyPatch.context() as mp:
@@ -1698,9 +1681,38 @@ def test_a_failed_restore_empties_the_staged_store_its_rollback_unlinked(
     assert "member-count cap" in err and "Separately" not in err, err
     assert not dest.exists()
     (leftover,) = dest.parent.glob("mefor-restore-*")
-    assert (leftover / "extracted_store.db").stat().st_size == 0
+    assert not (leftover / "extracted_store.db").exists()
     assert (leftover / "archive.tar").stat().st_size == 0
     shutil.rmtree(leftover)
+
+
+def test_a_failed_restore_never_unlinks_a_store_another_restore_placed(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The failed restore removes its placed store before its staging teardown, which leaves --to
+    # free for as long as that teardown runs. A second restore can win the exclusive create there
+    # in that window. The rollback after the teardown must not unlink that path again, or it would
+    # delete the second restore's store while that restore reports success.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    real_release = dr_backup._Staging.release
+    winners: list[Path] = []
+
+    def release_while_another_restore_wins(self, *, unless_claimed: bool = False):
+        if not dest.exists() and not winners:
+            # The other restore's exclusive create, inside the window.
+            with open(dest, "xb") as fh:
+                fh.write(b"the other restore's store")
+            winners.append(dest)
+        return real_release(self, unless_claimed=unless_claimed)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        mp.setattr(dr_backup._Staging, "release", release_while_another_restore_wins)
+        assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
+    assert "member-count cap" in _refusal(capsys)
+    assert winners == [dest]
+    assert dest.read_bytes() == b"the other restore's store"
 
 
 def test_refusal_in_flight_reads_past_more_than_one_link() -> None:
