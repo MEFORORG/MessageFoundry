@@ -31,7 +31,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from _ui_clients import create_local_user_chosen
+from fastapi import HTTPException
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
 
@@ -42,7 +44,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole import pages
-from messagefoundry_webconsole._auth import clear_session_cookie
+from messagefoundry_webconsole._auth import CLEAR_SITE_DATA_HEADER, clear_session_cookie, require_ui
 from messagefoundry_webconsole.routes.core import _CLEAR_SITE_DATA_LOGIN_CODES
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
@@ -299,6 +301,82 @@ async def test_revoked_session_navigation_carries_clear_site_data(engine: Engine
         gone = await c.get("/ui/dead-letters", follow_redirects=False)
         assert gone.status_code == 303
         assert gone.headers["clear-site-data"] == '"cache"'
+
+
+#: A session cookie the engine never minted: presented, and never live.
+_DEAD_COOKIE = {"cookie": "mf_session=not-a-live-session-token"}
+
+
+async def test_a_first_visit_redirect_carries_no_clear_site_data(engine: Engine) -> None:
+    """A visitor with NO session cookie never had a session, so the gate's 303 ends nothing and must
+    not ask the browser to clear its cache. ``_login_redirect`` used to stamp the header on every
+    redirect, so the very first visit to /ui carried it."""
+    service = await _service(engine)
+    async with _client(engine, service) as fresh:
+        for path in ("/ui", "/ui/messages"):
+            first = await fresh.get(path, follow_redirects=False)
+            assert first.status_code == 303, path
+            assert first.headers["location"] == "/ui/login", path
+            assert "clear-site-data" not in {k.lower() for k in first.headers}, path
+        assert not fresh.cookies
+
+
+async def test_a_presented_dead_session_cookie_gets_clear_site_data_on_the_redirect(
+    engine: Engine,
+) -> None:
+    """The other half of the condition: a presented cookie that does not authenticate is a
+    post-termination landing, whether or not this engine ever saw the token."""
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        gone = await c.get("/ui", headers=_DEAD_COOKIE, follow_redirects=False)
+        assert gone.status_code == 303
+        assert gone.headers["location"] == "/ui/login?e=expired"
+        assert gone.headers["clear-site-data"] == '"cache"'
+
+
+async def test_sign_out_always_sends_clear_site_data(engine: Engine) -> None:
+    """Sign-out is a termination whatever the request carries: no cookie, a dead one, or a live
+    session (the last is :func:`test_logout_emits_clear_site_data_cache_only`). The condition on
+    the gate's redirect must never reach this route."""
+    service = await _service(engine)
+    for headers in ({}, _DEAD_COOKIE):
+        async with _client(engine, service) as c:
+            out = await c.post("/ui/logout", headers=headers)
+            assert out.status_code == 303, headers
+            assert out.headers["location"] == "/ui/login?e=loggedout", headers
+            assert out.headers["clear-site-data"] == '"cache"', headers
+
+
+def _gate_request(headers: list[tuple[bytes, bytes]]) -> StarletteRequest:
+    return StarletteRequest(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/ui",
+            "raw_path": b"/ui",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"host", b"t"), *headers],
+            "client": ("127.0.0.1", 1234),
+            "server": ("t", 80),
+            "app": SimpleNamespace(state=SimpleNamespace()),
+        }
+    )
+
+
+async def test_the_no_auth_redirect_sends_clear_site_data_only_for_a_presented_cookie() -> None:
+    """With no auth service attached the gate redirects before it reads the token. It follows the
+    same rule: the header only when a session cookie came with the request."""
+    gate = require_ui()
+    for headers, expected in (([], False), ([(b"cookie", b"mf_session=dead")], True)):
+        with pytest.raises(HTTPException) as caught:
+            await gate(_gate_request(headers))
+        assert caught.value.status_code == 303
+        sent = caught.value.headers or {}
+        assert sent["Location"] == "/ui/login"
+        assert (CLEAR_SITE_DATA_HEADER in sent) is expected, headers
 
 
 async def test_password_change_carries_clear_site_data_on_both_legs(engine: Engine) -> None:

@@ -283,6 +283,12 @@ this line.**
   but a release a restart or an operator interrupt moved keeps its claim time there, not the time
   it stopped. Its note no longer says every such release was cut off while it ran: it says the
   engine cannot tell what the operation did. No seam changes. (`BACKLOG #1562`)
+- **A first visit to `/ui` no longer sends `Clear-Site-Data`.** The gate's redirect to the sign-in
+  page sent `Clear-Site-Data: "cache"` to every request it turned away, so a browser with no
+  session cookie was asked to clear its cache on an ordinary landing. The redirect now carries the
+  header only when the request presented a session cookie, which every expiry, revoke and disable
+  still does. Sign-out, the password change and the post-termination sign-in page send it as
+  before. The seam digest moved because the gate's code changed.
 
 ## [0.5.0] — 2026-10-20 — Early Access
 
