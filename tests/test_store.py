@@ -167,22 +167,18 @@ def test_current_user_sid_is_the_process_token_account(monkeypatch: pytest.Monke
 
 @_windows_only
 def test_secure_file_leaves_the_real_token_account_owner_only(tmp_path) -> None:
-    # The real icacls, with a SID principal: the file ends with one explicit entry, the token's,
-    # and no inherited ones.
+    # The real icacls, with a SID principal: the token's account is granted full control and no
+    # inherited entry is left. Explicit SYSTEM, Administrators and OWNER RIGHTS entries a hosted
+    # runner's temp file carries survive the rewrite, as tests/_win_acl.py records.
     import messagefoundry.store.store as store_mod
+    from tests._win_acl import assert_owner_only_rewrite
 
     path = tmp_path / "real.db"
     path.write_bytes(b"x")
     store_mod._secure_file(path)
-    from messagefoundry.config.atomic_edit import _canonical_sid
-
-    sddl = store_mod._read_dacl_sddl(path)
     sid = store_mod._current_user_sid()
-    assert sddl is not None and sid is not None
-    parsed = store_mod._parse_sddl_dacl(sddl)
-    assert parsed is not None and parsed.protected, sddl
-    # SDDL spells a well-known account (SYSTEM, NETWORK SERVICE) by its alias.
-    assert [_canonical_sid(ace[3]) for ace in parsed.aces] == [sid], sddl
+    assert sid is not None
+    assert_owner_only_rewrite(path, sid)
 
 
 @_windows_only

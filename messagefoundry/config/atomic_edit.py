@@ -132,6 +132,10 @@ _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 #: ``OSError``, so it is not reported as a permission. The stat gate has its own rule (:func:`is_file`).
 _REFUSED = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 
+#: A chown is refused by ``EINVAL`` as well as by ``EPERM``: an owner id the mount or user namespace
+#: cannot map (an id-mapped mount, a container). Either way the edit stops before the rename.
+_CHOWN_REFUSED = _REFUSED | {errno.EINVAL}
+
 #: The ``step`` of a refused read, which :func:`_refusal` advises on differently: a read-only
 #: directory refuses no read, so the write advice would send an operator to the wrong fix.
 READ_STEP = "read it"
@@ -368,7 +372,8 @@ def replace_validated(
     On Windows the replace rides out a momentary hold on either file, such as a virus scanner reading
     the new candidate. With ``refused_error`` set, a refusal building the candidate or making the
     replace (``EACCES``, ``EPERM`` or ``EROFS``: a root-owned or read-only directory, or a hold that
-    did not pass) is raised as ``refused_error(message)``. Those steps leave the live file as it
+    did not pass; ``EINVAL`` too for root's chown of the candidate, ``_CHOWN_REFUSED``) is raised as
+    ``refused_error(message)``. Those steps leave the live file as it
     was, since a rename that fails has not happened. What follows the replace, any other
     ``OSError`` past that companion stat, and whatever ``validate`` raises are never converted."""
     # Here, not at module top, so importing the config layer does not import the auth package.
@@ -395,7 +400,10 @@ def replace_validated(
                     # directory before a chown by name. Before the rename, so a chown that fails
                     # leaves the live file as it was.
                     with refused_as(
-                        path, refused_error, "give its edit candidate the file's owner"
+                        path,
+                        refused_error,
+                        "give its edit candidate the file's owner",
+                        refusals=_CHOWN_REFUSED,
                     ):
                         os.fchown(handle.fileno(), *live.posix_owner)
         for companion in companions:
@@ -562,16 +570,20 @@ def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
 
 @contextlib.contextmanager
 def refused_as(
-    path: Path, refused_error: Callable[[str], Exception] | None, step: str
+    path: Path,
+    refused_error: Callable[[str], Exception] | None,
+    step: str,
+    *,
+    refusals: frozenset[int] = _REFUSED,
 ) -> Iterator[None]:
-    """Raise a refusal (``_REFUSED``) from the body, which does ``step`` to ``path``, as
-    ``refused_error(message)``; any other ``OSError``, or any at all when ``refused_error`` is
-    ``None``, propagates unchanged. Only for a step that leaves ``path`` as it was when it fails,
-    because the message says so."""
+    """Raise a refusal (an ``errno`` in ``refusals``, ``_REFUSED`` unless a step names more) from the
+    body, which does ``step`` to ``path``, as ``refused_error(message)``; any other ``OSError``, or
+    any at all when ``refused_error`` is ``None``, propagates unchanged. Only for a step that leaves
+    ``path`` as it was when it fails, because the message says so."""
     try:
         yield
     except OSError as exc:
-        if refused_error is None or exc.errno not in _REFUSED:
+        if refused_error is None or exc.errno not in refusals:
             raise
         raise refused_error(_refusal(path, exc, step)) from exc
 

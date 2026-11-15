@@ -32,6 +32,7 @@ from messagefoundry.config import (
 )
 from messagefoundry.config.code_sets import load_code_set
 from messagefoundry.config.wiring import WiringError, load_config
+from tests._win_acl import assert_owner_only_rewrite, protected_entries
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 
@@ -320,14 +321,24 @@ def test_an_account_editing_its_own_file_changes_no_owner(
 
 
 @posix_only
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        PermissionError(errno.EPERM, "Operation not permitted"),
+        # An owner id this mount or user namespace cannot map: the chown is refused all the same,
+        # and must reach the operator as a refused edit rather than a raw OSError.
+        OSError(errno.EINVAL, "Invalid argument"),
+    ],
+    ids=["EPERM", "EINVAL"],
+)
 def test_a_refused_chown_leaves_the_live_file_as_it_was(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: OSError
 ) -> None:
     path, _ = _a_file_root_does_not_own(tmp_path)
     before = path.read_bytes()
 
     def _refused(*_args: object, **_kwargs: object) -> None:
-        raise PermissionError(errno.EPERM, "Operation not permitted")
+        raise refusal
 
     _as_root(monkeypatch, _refused)
 
@@ -398,14 +409,8 @@ _EDITOR_SID = "S-1-5-21-1000000001-1000000002-1000000003-4242"
 
 def _owner_and_grants(path: Path) -> tuple[str | None, list[str]]:
     """The owner and the granted SIDs of ``path``, each in ``S-1-...`` form."""
-    from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
-
-    sddl = _read_dacl_sddl(path, owner=True)
-    assert sddl is not None
-    parsed = _parse_sddl_dacl(sddl)
-    assert parsed is not None and parsed.protected, sddl
-    owner = atomic_edit._canonical_sid(parsed.owner) if parsed.owner else None
-    return owner, [atomic_edit._canonical_sid(ace[3]) or ace[3] for ace in parsed.aces]
+    _, owner, entries = protected_entries(path)
+    return owner, [sid for *_, sid in entries]
 
 
 def _real_owner(path: Path) -> str:
@@ -453,10 +458,18 @@ def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
     path.write_text(CONNECTIONS_TOML, encoding="utf-8")
     owner = _real_owner(path)
     monkeypatch.setattr(store_mod, "_current_user_sid", lambda: owner)
+    handed_back: list[str] = []
+
+    def _hand_back(_path: Path, foreign: str) -> bool:
+        handed_back.append(foreign)
+        return True
+
+    monkeypatch.setattr(atomic_edit, "_restrict_to_owner_and_editor", _hand_back)
 
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
-    assert _owner_and_grants(path)[1] == [owner]
+    assert handed_back == [], "an edit by the file's own account took the foreign-owner path"
+    assert_owner_only_rewrite(path, owner)
 
 
 @windows_only
