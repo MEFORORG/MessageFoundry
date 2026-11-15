@@ -158,11 +158,9 @@ jobs:
             # To a FILE, not a variable: the -z output carries NULs, which a shell variable drops, and
             # a redirect keeps git's exit status, which `set -e` then acts on.
             raw="$snap/$sha.raw"
-            if git rev-parse -q --verify "${sha}^1" >/dev/null; then
-              git diff-tree -r -z --raw --no-renames "${sha}^1" "$sha" > "$raw"
-            else
-              git diff-tree -r -z --raw --no-renames --root "$sha" > "$raw"
-            fi
+            base=(--root)
+            if git rev-parse -q --verify "${sha}^1" >/dev/null; then base=("${sha}^1"); fi
+            git diff-tree -r -z --raw --no-renames "${base[@]}" "$sha" > "$raw"
             n=0
             # -z raw records are ":oldmode newmode oldsha newsha status" NUL path NUL.
             while IFS= read -r -d '' meta && IFS= read -r -d '' path; do

@@ -757,8 +757,6 @@ jobs:
     runs-on: windows-latest
     # Four hash-locked installs, the largest carrying PySide6. Sized like `sbom-windows`.
     timeout-minutes: 20
-    env:
-      PIP_ONLY_BINARY: ":all:"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

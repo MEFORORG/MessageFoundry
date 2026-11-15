@@ -14,10 +14,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import yaml
+from tests._workflow_contexts import WORKFLOWS, jobs_of
 
 _REPO = Path(__file__).resolve().parents[1]
-_SECURITY = _REPO / ".github" / "workflows" / "security.yml"
 _JOB = "windows-lock-install"
 
 #: The runtime locks a deploying Windows site would install from. A lock exported in the DEP-1 step
@@ -31,8 +30,7 @@ _RUNTIME_LOCKS = (
 
 
 def _job() -> dict:
-    doc = yaml.safe_load(_SECURITY.read_text(encoding="utf-8"))
-    job = doc["jobs"].get(_JOB)
+    job = jobs_of("security.yml").get(_JOB)
     assert job is not None, f"security.yml has no {_JOB!r} job (BACKLOG #5594)"
     return job
 
@@ -85,6 +83,19 @@ def test_each_lock_gets_a_freshly_cleared_venv() -> None:
         assert i > 0 and "-m venv --clear" in code[i - 1], (
             f"{_JOB}'s install {code[i]!r} does not follow a `python -m venv --clear`"
         )
+
+
+def test_the_lock_list_matches_the_dep1_runtime_exports() -> None:
+    """The list above is a copy, so pin it to its source: every lock the DEP-1 step exports, less
+    the CI toolchain locks (``ci/locks/``, Linux-run) and the hashless ``constraints.lock``. A runtime
+    lock added there without being added here, and to the job, reds this."""
+    text = (WORKFLOWS / "security.yml").read_text(encoding="utf-8")
+    exported = set(re.findall(r"^[ \t]*uv export .*-o (\S+)[ \t]*$", text, flags=re.MULTILINE))
+    assert exported, "found no `uv export ... -o` line in security.yml; this check sees nothing"
+    runtime = {p for p in exported if not p.startswith("ci/locks/") and p != "constraints.lock"}
+    assert runtime == set(_RUNTIME_LOCKS), (
+        f"DEP-1 runtime exports {sorted(runtime)} differ from {_JOB}'s list {sorted(_RUNTIME_LOCKS)}"
+    )
 
 
 def test_every_runtime_lock_exists() -> None:

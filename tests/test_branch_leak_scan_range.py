@@ -18,11 +18,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import yaml
 from _bash_resolver import probe_env, require_bash
 
-_ROOT = Path(__file__).resolve().parent.parent
-_WORKFLOW = _ROOT / ".github" / "workflows" / "branch-leak-scan.yml"
+from tests._workflow_contexts import jobs_of, load_workflow
+
+_WORKFLOW = "branch-leak-scan.yml"
 _STEP = "Scan the pushed tree and every pushed commit for forbidden content"
 _ZERO = "0" * 40
 _MARKER = "SYNTHETIC-LEAK-MARKER"
@@ -45,14 +45,14 @@ exit $hit
 """
 
 
-def _doc() -> dict:
-    return yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))
+def _steps() -> list[dict]:
+    return jobs_of(_WORKFLOW)["branch-leak-scan"]["steps"]
 
 
 def _body() -> str:
-    steps = _doc()["jobs"]["branch-leak-scan"]["steps"]
-    step = next((s for s in steps if s.get("name") == _STEP), None)
-    assert step is not None, f"no step named {_STEP!r}"
+    matches = [s for s in _steps() if s.get("name") == _STEP]
+    assert len(matches) == 1, f"expected one step named {_STEP!r}, found {len(matches)}"
+    step = matches[0]
     body = str(step["run"])
     assert "${{" not in body, "the scan body interpolates an Actions expression"
     return body
@@ -123,6 +123,12 @@ def _run(
             "PATH": f"{stub_dir.as_posix()}{os.pathsep}{env.get('PATH', '')}",
         }
     )
+    # The stub must WIN, not merely be first on PATH: Git for Windows' bash can reorder PATH, and a
+    # real python here would run a real scanner against nothing (BACKLOG #1216).
+    which = subprocess.run(
+        [bash, "-c", "command -v python"], capture_output=True, text=True, timeout=60, env=env
+    ).stdout.strip()
+    assert stub_dir.name in which.replace("\\", "/"), f"the python stub lost to {which!r}"
     proc = subprocess.run(
         [bash, "-e", script.as_posix()],
         cwd=repo,
@@ -219,12 +225,11 @@ def test_a_malformed_push_sha_fails_closed(bad: str, bash: str, tmp_path: Path) 
 
 def test_no_push_scan_is_cancelled_by_a_later_one() -> None:
     """A later push's range starts where the earlier one ended, so cancelling loses a range."""
-    conc = _doc()["concurrency"]
+    conc = load_workflow(_WORKFLOW)["concurrency"]
     assert str(conc["group"]).replace(" ", "") == "branch-leak-scan-${{github.run_id}}", conc
     assert conc["cancel-in-progress"] is False, conc
 
 
 def test_checkout_fetches_full_history() -> None:
-    steps = _doc()["jobs"]["branch-leak-scan"]["steps"]
-    checkout = next(s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@"))
+    checkout = next(s for s in _steps() if str(s.get("uses", "")).startswith("actions/checkout@"))
     assert checkout["with"].get("fetch-depth") == 0, checkout
