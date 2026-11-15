@@ -31,8 +31,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 #: harness need not import pytest); any other non-zero code means the run itself broke.
 _PYTEST_TESTS_FAILED = 1
 
+#: The ``<error message=...>`` pytest's junitxml writes for a module that failed to collect.
+_COLLECTION_FAILURE = "collection failure"
 
-@dataclass(frozen=True)
+
+@dataclass
 class PytestRun:
     """What one pytest run reported: each requested file's :class:`Status`, plus a run-level error.
 
@@ -73,7 +76,7 @@ def _parse_junit_by_file(junit_path: Path) -> tuple[dict[str, Status], list[str]
     if not junit_path.is_file():
         return {}, []
     tree = ElementTree.parse(junit_path)
-    # Collect each file's testcase outcomes; precedence within a file: fail/error > pass > skip.
+    # Collect each file's testcase outcomes; precedence within a file: FAIL > ERROR > PASS > SKIP.
     per_file: dict[str, set[Status]] = {}
     unattributed: list[str] = []
     for case in tree.iter("testcase"):
@@ -84,7 +87,10 @@ def _parse_junit_by_file(junit_path: Path) -> tuple[dict[str, Status], list[str]
                 unattributed.append(case.get("name") or case.get("classname") or "(unnamed)")
             continue
         key = _normalize(file_attr)
-        if failed:
+        error = case.find("error")
+        if error is not None and error.get("message") == _COLLECTION_FAILURE:
+            outcome = Status.ERROR  # the module did not import: the check broke, not the product
+        elif failed:
             outcome = Status.FAIL
         elif case.find("skipped") is not None:
             outcome = Status.SKIP
@@ -96,6 +102,8 @@ def _parse_junit_by_file(junit_path: Path) -> tuple[dict[str, Status], list[str]
     for key, outcomes in per_file.items():
         if Status.FAIL in outcomes:
             result[key] = Status.FAIL
+        elif Status.ERROR in outcomes:
+            result[key] = Status.ERROR
         elif Status.PASS in outcomes:
             result[key] = Status.PASS
         else:  # only skips collected
@@ -111,13 +119,14 @@ def _judge_run(
     outside = unattributed + sorted(
         k for k, s in by_file.items() if s is Status.FAIL and k not in requested
     )
+    # A broken-run exit code leads, so it is never hidden behind the failures it caused.
+    if returncode not in (0, _PYTEST_TESTS_FAILED):
+        return f"pytest exited {returncode}"
     if outside:
         more = f" (+{len(outside) - 3} more)" if len(outside) > 3 else ""
         return f"pytest reported failures outside the row files: {', '.join(outside[:3])}{more}"
-    if returncode not in (0, _PYTEST_TESTS_FAILED):
-        return f"pytest exited {returncode}"
     if returncode == _PYTEST_TESTS_FAILED and not any(
-        by_file.get(k) is Status.FAIL for k in requested
+        by_file.get(k) in (Status.FAIL, Status.ERROR) for k in requested
     ):
         return f"pytest exited {returncode} but no row file recorded a failure"
     if node_ids and not requested & by_file.keys():
@@ -128,8 +137,9 @@ def _judge_run(
 def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -> PytestRun:
     """Run the given pytest node-ids once and report a per-file :class:`Status` map.
 
-    Files requested but absent from the result (collection error, missing path) are left out so the
-    caller can mark their rows ``ERROR``. pytest's exit code is checked against that map, so a
+    A file that failed to collect reads ``ERROR``, and the run continues past it so the other rows
+    are still scored; a file absent from the result (a missing path) is left out, so the caller
+    marks its row ``ERROR`` too. pytest's exit code is checked against that map, so a
     failure the map cannot carry becomes ``run_error`` rather than a silent ``PASS``.
     """
     if not node_ids:
@@ -148,6 +158,7 @@ def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -
             # (xunit2) omits it, and without it no result can be attributed to a row.
             "-o",
             "junit_family=xunit1",
+            "--continue-on-collection-errors",
             "-p",
             "no:cacheprovider",
             "-q",

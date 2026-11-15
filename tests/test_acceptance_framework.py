@@ -159,6 +159,22 @@ def test_default_runner_flags_a_broken_run_exit(
     assert default_pytest_runner(["tests/test_a.py"]).run_error == f"pytest exited {int(code)}"
 
 
+def test_collection_error_in_a_row_file_reads_error_not_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broken = '<testcase classname="" name="tests.test_b" file="tests/test_b.py">'
+    broken += '<error message="collection failure">ImportError</error></testcase>'
+    _fake_pytest(monkeypatch, _passing_plus(broken), pytest.ExitCode.TESTS_FAILED)
+    run = default_pytest_runner(["tests/test_a.py", "tests/test_b.py"])
+    assert run == PytestRun({"tests/test_a.py": Status.PASS, "tests/test_b.py": Status.ERROR})
+
+
+def test_broken_run_exit_leads_the_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    fileless = '<testcase classname="" name="internal"><error message="x"/></testcase>'
+    _fake_pytest(monkeypatch, _passing_plus(fileless), pytest.ExitCode.INTERNAL_ERROR)
+    assert default_pytest_runner(["tests/test_a.py"]).run_error == "pytest exited 3"
+
+
 def test_default_runner_flags_exit_1_that_no_row_file_explains(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,7 +240,8 @@ def test_default_runner_flags_a_report_that_attributes_nothing(
     assert "attributed no testcase" in default_pytest_runner(["tests/test_a.py"]).run_error
 
 
-def test_default_runner_attributes_a_real_pytest_run() -> None:
+def test_default_runner_attributes_a_real_pytest_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)  # an outer -k or -m would empty the child
     # One real child run: the hand-written JUnit above carries ``file=``, which pytest's default
     # JUnit family omits, so only a real run proves the argv lets results reach their rows.
     ref = "tests/test_win2025_acceptance.py"
@@ -335,8 +352,6 @@ def test_exit_code() -> None:
 
 
 def test_xlsx_write_back(tmp_path: Path) -> None:
-    import pytest
-
     openpyxl = pytest.importorskip("openpyxl")  # not a project dep — only run where it's available
     from harness.acceptance.report import write_xlsx_status
 
