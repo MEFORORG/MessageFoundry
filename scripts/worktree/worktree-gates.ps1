@@ -186,16 +186,25 @@ function Get-WorktreeActivity {
     $gitdir = ([string]$gitdir).Trim()
     if (-not (Test-Path -LiteralPath $gitdir)) { return $null }
     $newest = $null
-    foreach ($rel in $ACTIVITY_MTIME_FILES) {
-        $f = Join-Path $gitdir $rel
-        if (Test-Path -LiteralPath $f) {
-            $t = (Get-Item -LiteralPath $f -Force).LastWriteTime
-            if ($null -eq $newest -or $t -gt $newest) { $newest = $t }
+    # A git command can delete ORIG_HEAD, MERGE_MSG or the reflog between Test-Path and Get-Item. That
+    # is an UNKNOWN reading, which vetoes, never a throw: under a caller's $ErrorActionPreference =
+    # 'Stop' a throw ended prune-merged.ps1 mid -Apply loop with no receipt (BACKLOG #5603).
+    try {
+        foreach ($rel in $ACTIVITY_MTIME_FILES) {
+            $f = Join-Path $gitdir $rel
+            if (Test-Path -LiteralPath $f) {
+                $t = (Get-Item -LiteralPath $f -Force -ErrorAction Stop).LastWriteTime
+                if ($null -eq $newest -or $t -gt $newest) { $newest = $t }
+            }
         }
+        $log = Join-Path $gitdir 'logs/HEAD'
+        $item = $null
+        if (Test-Path -LiteralPath $log) { $item = Get-Item -LiteralPath $log -Force -ErrorAction Stop }
     }
-    $log = Join-Path $gitdir 'logs/HEAD'
-    if (Test-Path -LiteralPath $log) {
-        $item = Get-Item -LiteralPath $log -Force
+    catch [System.Management.Automation.ItemNotFoundException], [System.IO.IOException], [System.UnauthorizedAccessException] {
+        return $null
+    }
+    if ($null -ne $item) {
         $t = Get-ReflogLastEntry -LogPath $log
         if ($null -eq $t -and $item.Length -gt 0) {
             # Non-empty, and it would not parse. FALL BACK TO THE MTIME, which is the reading this

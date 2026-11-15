@@ -403,7 +403,7 @@ $RepoLeaf = Split-Path $RepoRoot -Leaf
 $activityVeto = ($IdleHours -gt 0)
 $reducedAssurance = @()
 if (-not $activityVeto) {
-    $reducedAssurance += 'activity veto DISABLED (-IdleHours 0): signal 2 is OFF, so a session writing in by absolute path is invisible to this run'
+    $reducedAssurance += 'activity veto DISABLED (-IdleHours 0): a RECENT signal 2 reading no longer vetoes, so a session writing in by absolute path is invisible to this run; an unknown reading still vetoes'
 }
 elseif ($IdleHours -lt $IDLE_FLOOR_HOURS) {
     # Only the literal 0 used to be declared. Everything between 0 and the floor disarmed signal 2 just
@@ -1233,7 +1233,7 @@ if ($ReapVenvs) {
 # line, while the flag it is equivalent to got a red banner.
 $confirmedActually = @($decisions | Where-Object { $_.Confirmed } | ForEach-Object { $_.Leaf })
 if ($confirmedActually.Count -gt 0) {
-    $reducedAssurance += "activity veto OVERRIDDEN by -Name for: $($confirmedActually -join ', ') -- signal 2 is off for those, and signal 1 has been measured vetoing 0 of 4 real siblings"
+    $reducedAssurance += "activity veto OVERRIDDEN by -Name for: $($confirmedActually -join ', ') -- a recent signal 2 reading no longer vetoes those (an unknown one still does), and signal 1 has been measured vetoing 0 of 4 real siblings"
 }
 
 # The gh receipt, written from what the probes ANSWERED (see Test-Merged).

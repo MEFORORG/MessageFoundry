@@ -61,8 +61,13 @@
         moving after its PR merged carries work that PR did not land;
       * that PR merged more than -HoldHours ago;
       * none of its commit date, its private git files and its last reflog entry moved within
-        -IdleHours, and without prune-merged.ps1's floor. That is the git half of prune-merged.ps1's
-        recent-activity signal only: this report does not read the working tree (its top level and
+        -IdleHours, and without prune-merged.ps1's floor. Get-PrivateGitActivity reads the mtimes of
+        index, HEAD, ORIG_HEAD, FETCH_HEAD, COMMIT_EDITMSG and MERGE_MSG in the admin dir the .git
+        file names, and the timestamp in the last line of logs/HEAD, with no fallback to that file's
+        mtime when the line does not parse. It is NOT prune-merged.ps1's reading: WHEN NOTHING CAN BE
+        READ (no .git file, an unreadable one, no admin files and no parseable reflog line) and the
+        commit date is unknown too, it adds no reason and LETS THE TREE THROUGH, where prune-merged.ps1
+        holds a tree whose activity is unknown. Nor does it read the working tree (its top level and
         test, lint and type-check caches), which prune-merged.ps1 and the nightly removal also hold a
         tree on, so a tree a session ran pytest or mypy in without git can still be proposed here;
       * `git status --porcelain --untracked-files=normal` is empty. An untracked `.venv` alone goes to

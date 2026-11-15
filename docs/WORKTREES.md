@@ -574,11 +574,14 @@ since it moves none of the git metadata, top-level entries or cache files it rea
 Everything that **narrows** either signal is named in red on the run and in the JSON receipt, because
 an operator who believes they are fenced when they are not is worse off than one who knows they
 aren't: `-IdleHours 0`; any `-IdleHours` **below the 12h floor** (an occupied worktree has been
-measured at 10.4h idle, so `-IdleHours 0.5` typed for "half an hour" disarms signal 2 completely); an
-explicit `-ConfigRoot`; a **failed fetch** (merge decisions then rest on stale refs); a **gh PR probe
-that errored**; and every **`-Name`-confirmed worktree**. `-Name` is worth spelling out — it is
-`-IdleHours 0` scoped to one tree, and since signal 1 has been measured vetoing 0 of 4 real siblings,
-`-Apply -Name <slug>` can leave a candidate with no working occupancy signal at all. A negative
+measured at 10.4h idle, so `-IdleHours 0.5` typed for "half an hour" releases trees signal 2 would
+have held); an explicit `-ConfigRoot`; a **failed fetch** (merge decisions then rest on stale refs); a
+**gh PR probe that errored**; and every **`-Name`-confirmed worktree**. Under `-IdleHours 0` and
+`-Name`, a **recent** signal 2 reading no longer vetoes; an **unknown** one (the git metadata or the
+working tree could not be read) still does, in the decision pass and the `-Apply` re-check alike.
+`-Name` is worth spelling out — it is `-IdleHours 0` scoped to one tree, and since signal 1 has been
+measured vetoing 0 of 4 real siblings, `-Apply -Name <slug>` can leave a candidate that a session is
+actively working in with no occupancy signal that would stop it. A negative
 `-IdleHours` is refused outright, because it would put the cut-off in the future and disarm signal 2
 while appearing to set it.
 

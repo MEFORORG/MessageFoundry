@@ -1317,6 +1317,49 @@ def test_the_working_tree_reading_refuses_an_unset_cache_list(tmp_path: Path) ->
     assert proc.stdout.strip() == "True|True", (proc.stdout, proc.stderr)
 
 
+def test_a_git_file_vanishing_mid_read_is_an_unknown_reading_not_a_crash(tmp_path: Path) -> None:
+    """BACKLOG #5603. A git command can delete ORIG_HEAD or MERGE_MSG between Get-WorktreeActivity's
+    Test-Path and its Get-Item. Under the callers' $ErrorActionPreference = 'Stop' that used to end
+    prune-merged mid -Apply loop with no receipt; it is an unknown reading now, which vetoes.
+
+    The first call, before Get-Item is stood in for, is the control: the same tree reads a date."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(
+        repo,
+        "-c",
+        "user.email=t@example.invalid",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "seed",
+    )
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". '{SCRIPT.parent / 'worktree-gates.ps1'}'; "
+        "$a = Get-WorktreeActivity -Path $env:T_REPO; "
+        "function global:Get-Item { throw [System.Management.Automation.ItemNotFoundException]::new("
+        "'stub: the file was deleted after Test-Path saw it') }; "
+        "try { $b = Get-WorktreeActivity -Path $env:T_REPO; $r = ($null -eq $b) } "
+        'catch { $r = "threw: $($_.Exception.Message)" }; '
+        "'{0}|{1}' -f ($null -ne $a), $r"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "T_REPO": str(repo)},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "True|True", (proc.stdout, proc.stderr)
+
+
 def test_a_cache_too_big_to_date_holds_the_tree(fx: Fixture, sleeper: int) -> None:
     """BACKLOG #5603. Past its cap the working-tree reading does not sample a cache: the file a run
     just rewrote could be one it never reached, so the tree's activity is unknown and it is held."""
