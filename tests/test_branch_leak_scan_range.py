@@ -13,9 +13,7 @@ out what to scan, never the scanner's detectors.
 
 from __future__ import annotations
 
-import ast
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -156,7 +154,7 @@ def test_content_added_then_removed_in_one_push_is_found(bash: str, tmp_path: Pa
     repo = _Repo(tmp_path)
     _leaked, removed = _leak_then_remove(repo)
     rc, out, calls = _run(bash, repo.path, tmp_path, repo.main, removed)
-    assert calls and calls[0] == "--path .", f"the tip scan must run first: {calls}"
+    assert len(calls) == 1 and calls[0].startswith("--path . "), f"one scan, tip first: {calls}"
     assert rc == 1, f"rc={rc}; the pushed range was not scanned\n{out}"
     # The path stays repository-relative inside each commit's scan root, so a path detector keyed on
     # docs/security/ would still match.
@@ -183,7 +181,7 @@ def test_a_later_push_scans_only_its_own_commits(bash: str, tmp_path: Path) -> N
     leaked, removed = _leak_then_remove(repo)
     rc, out, calls = _run(bash, repo.path, tmp_path, leaked, removed)
     assert rc == 0, f"rc={rc}\n{out}"
-    assert calls == ["--path ."], f"nothing added, so only the tip scan runs: {calls}"
+    assert calls == ["--path ."], f"nothing added, so only the tip is scanned: {calls}"
 
 
 def test_a_clean_push_passes_and_scans_its_commits(bash: str, tmp_path: Path) -> None:
@@ -192,7 +190,7 @@ def test_a_clean_push_passes_and_scans_its_commits(bash: str, tmp_path: Path) ->
     after = _commit(repo.path, "clean", {"src/a.py": "x = 1\n"})
     rc, out, calls = _run(bash, repo.path, tmp_path, repo.main, after)
     assert rc == 0, f"rc={rc}\n{out}"
-    assert len(calls) == 2 and calls[1].startswith("--path ") and after in calls[1], calls
+    assert len(calls) == 1 and calls[0].startswith("--path . ") and after in calls[0], calls
 
 
 def test_a_merge_commit_is_scanned_against_its_first_parent(bash: str, tmp_path: Path) -> None:
@@ -253,7 +251,7 @@ def test_a_push_touching_only_skipped_dirs_is_not_a_refusal(bash: str, tmp_path:
     after = _commit(repo.path, "bundle", {"tool/dist/index.js": "x\n"})
     rc, out, calls = _run(bash, repo.path, tmp_path, repo.main, after)
     assert rc == 0, f"rc={rc}\n{out}"
-    assert calls == ["--path ."], calls
+    assert len(calls) == 1 and after in calls[0], calls
 
 
 def test_a_committed_real_token_list_is_a_hit(bash: str, tmp_path: Path) -> None:
@@ -263,21 +261,6 @@ def test_a_committed_real_token_list_is_a_hit(bash: str, tmp_path: Path) -> None
     after = _commit(repo.path, "undo", {"scripts/security/scan-tokens.local.txt": None})
     rc, out, _ = _run(bash, repo.path, tmp_path, repo.main, after)
     assert rc == 1 and "scan-tokens.local.txt" in out, f"rc={rc}\n{out}"
-
-
-def test_the_skipped_dirs_match_the_scanner() -> None:
-    """The step's skip list is a copy of scan_forbidden.SKIP_DIRS (less .git, which it refuses)."""
-    source = (_REPO / "scripts" / "security" / "scan_forbidden.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    skip = next(
-        ast.literal_eval(node.value)
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "SKIP_DIRS" for t in node.targets)
-    )
-    line = next(ln for ln in _body().splitlines() if "*/node_modules/*" in ln)
-    step = set(re.findall(r"\*/([^/|*]+)/\*", line))
-    assert step == set(skip) - {".git"}, (sorted(step), sorted(skip))
 
 
 def test_checkout_fetches_full_history() -> None:

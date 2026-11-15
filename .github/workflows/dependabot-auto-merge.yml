@@ -101,22 +101,43 @@ jobs:
     steps:
       # BACKLOG #5593. A push to the PR (an A3 lock-resync commit, a rebase, or anyone's commit) changes
       # what was approved, but auto-merge armed on the earlier head would stay armed and merge the new
-      # head once CI went green, whatever this run then decides. So every `synchronize` run DISARMS
-      # first, and only the merge step below re-arms, pinned to the head THIS run evaluated and only
+      # head once CI went green, whatever this run then decides. So every `synchronize` run, and every
+      # `reopened` one (a push to a closed PR emits no synchronize), DISARMS first, and only the merge
+      # step below re-arms, pinned to the head THIS run evaluated and only
       # when every commit on the PR is Dependabot's own (the `authors` step). FAILS CLOSED: when the
       # state cannot be read it disarms anyway, and a failed disarm, or a state that does not read
       # back as disarmed, fails the step, so every later step is skipped and nothing re-arms.
       # What this does not cover: it reads the auto-merge REQUEST only. Once a PR is already in the
       # merge queue, `--disable-auto` does not remove the entry (korus docs/TIPS-AND-TRICKS.md);
-      # whether a push dequeues it is GitHub's behaviour and is not measured here.
+      # whether a push dequeues it is GitHub's behaviour and is not measured here. An auto-merge a
+      # human armed by hand is dropped too, deliberately: the push changed what they approved.
+      #
+      # A STALE RUN does nothing. "Re-run jobs" replays the old payload, so a re-run of an earlier
+      # synchronize run would otherwise disarm the arm a newer run placed and then fail to re-arm.
+      # When the event's head is not the PR's current head, this step emits stale=true without
+      # disarming, and the merge step does not run.
       - name: Disarm auto-merge armed on an earlier head
         id: disarm
-        if: github.event.action == 'synchronize'
+        if: github.event.action == 'synchronize' || github.event.action == 'reopened'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
+          now="$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid 2>/dev/null)" || now="ERR"
+          case "$now" in
+            ""|ERR|*[!0-9a-f]*)
+              echo "::warning::could not read this PR's head — disarming anyway."
+              ;;
+            *)
+              if [ "$now" != "$HEAD_SHA" ]; then
+                echo "::notice::this run's head $HEAD_SHA is not the PR's head $now; the run for the newer head decides."
+                echo "stale=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+          esac
           # `||` outside the substitution, for the reason the ghsa step gives: `gh` writes an error
           # body to stdout, and the shape check below must see the sentinel, not that body.
           armed="$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null)" || armed="ERR"
@@ -138,7 +159,7 @@ jobs:
             echo "::error::auto-merge still reads '${after}' after the disarm — failing closed, nothing re-arms."
             exit 1
           fi
-          echo "::notice::disarmed auto-merge armed on an earlier head; the guardrails below re-evaluate this head."
+          echo "::warning::disarmed auto-merge armed on an earlier head; it re-arms only if the guardrails below admit this head."
 
       - name: Fetch Dependabot metadata
         id: meta
@@ -454,11 +475,14 @@ jobs:
 
       # BACKLOG #5593. fetch-metadata derives every output above from the PR's FIRST commit, its body
       # and its branch name, never from the head, so a commit appended by anyone else would inherit
-      # the first commit's verdict. Re-arming is therefore allowed only when EVERY commit on the PR is
-      # authored by dependabot[bot] and carries a verified signature. That costs nothing today: the
-      # A3 lock-resync commits land only on uv PRs, whose allow row is empty, so those never re-arm.
-      # FAILS CLOSED: an API error, an empty list, an unknown author or an unverified commit all
-      # emit false. Gated on the allow-set so a held PR makes no API call.
+      # the first commit's verdict. Re-arming is therefore allowed only when EVERY commit on the PR has
+      # dependabot[bot] as BOTH author and committer and a signature GitHub verified. The committer is
+      # the half that matters: anyone can write an author, but GitHub verifies a signature against the
+      # COMMITTER's account, so a pusher who names dependabot[bot] as committer cannot sign it valid.
+      # The A3 lock-resync commits name dependabot[bot] as author and are unsigned, so they hold; they
+      # land only on uv PRs, whose allow row is empty, so that costs nothing today. FAILS CLOSED: an
+      # API error, an empty list, any other identity or an unverified commit all emit false. Gated on
+      # the allow-set so a held PR makes no API call.
       - name: Require every commit on the PR to be Dependabot's own
         id: authors
         if: steps.allowset.outputs.eligible == 'true'
@@ -468,16 +492,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
-          rows="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" --jq '.[] | [(.author.login // ""), (.commit.verification.verified | tostring)] | @tsv' 2>/dev/null)" || rows="ERR"
+          rows="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" --jq '.[] | [(.author.login // ""), (.committer.login // ""), (.commit.verification.verified | tostring)] | @tsv' 2>/dev/null)" || rows="ERR"
           if [ "$rows" = "ERR" ] || [ -z "$rows" ]; then
             echo "::warning::could not list this PR's commits — failing closed (manual review)."
             echo "sole_author=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           sole_author=true
-          while IFS="$(printf '\t')" read -r login verified; do
-            if [ "$login" != "dependabot[bot]" ] || [ "$verified" != "true" ]; then
-              echo "::notice::the PR carries a commit by '${login:-<unknown>}' (verified=${verified:-<none>}) — routing to manual review."
+          while IFS="$(printf '\t')" read -r author committer verified; do
+            if [ "$author" != "dependabot[bot]" ] || [ "$committer" != "dependabot[bot]" ] || [ "$verified" != "true" ]; then
+              echo "::notice::the PR carries a commit by '${author:-<unknown>}' committed by '${committer:-<unknown>}' (verified=${verified:-<none>}) — routing to manual review."
               sole_author=false
               break
             fi
@@ -491,6 +515,7 @@ jobs:
         # minor). A non-security (version-track) patch keeps its cooldown-aged auto-merge — neither
         # advisory_ok nor age_ok is required there, which is why both are emitted false on that path.
         if: >-
+          steps.disarm.outputs.stale != 'true' &&
           steps.allowset.outputs.eligible == 'true' &&
           steps.authors.outputs.sole_author == 'true' &&
           (steps.ghsa.outputs.security_track != 'true' ||

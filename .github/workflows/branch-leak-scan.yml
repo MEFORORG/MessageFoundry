@@ -122,7 +122,6 @@ jobs:
             echo "::error::MEFOR_FORBIDDEN_TOKENS is absent on a push run. The branch leak scan cannot run. Check the repository secret (repo-scoped, not environment-scoped)." >&2
             exit 2
           fi
-          python scripts/security/scan_forbidden.py --path .
 
           # THE PUSHED RANGE (BACKLOG #5595). Every git call below fails the step on error: a range that
           # cannot be computed is not a clean range.
@@ -134,7 +133,8 @@ jobs:
             esac
           done
           if [ "$PUSH_AFTER" = "$zero" ]; then
-            echo "branch deleted: no pushed commits to scan."
+            echo "branch deleted: no pushed commits to scan; scanning the checked-out tree only."
+            python scripts/security/scan_forbidden.py --path .
             exit 0
           fi
           exclude=(--not refs/remotes/origin/main)
@@ -173,11 +173,6 @@ jobs:
                   echo "::error::pushed commit $sha names an unsafe path; refusing to write it." >&2
                   exit 2
                   ;;
-                # The scanner's SKIP_DIRS (tests/test_branch_leak_scan_range.py pins the two lists
-                # equal). Writing these out would only make the scanner examine zero files and refuse.
-                */.venv/*|*/venv/*|*/node_modules/*|*/__pycache__/*|*/.mypy_cache/*|*/.ruff_cache/*|*/.pytest_cache/*|*/build/*|*/dist/*)
-                  continue
-                  ;;
               esac
               # The scanner skips this path so a working-tree scan on the owner's machine does not
               # trip on the git-ignored real token list. Inside a pushed COMMIT it is committed by
@@ -198,14 +193,12 @@ jobs:
               files=$((files + n))
             fi
           done <<< "$commits"
-          echo "pushed range: ${#roots[@]} commit(s), $files added or changed file(s)."
-          if [ "$files" -eq 0 ]; then
-            echo "no added or changed files in the pushed range beyond the tip scan above."
-            exit 0
-          fi
-          # Each commit is its own scan root, so a path detector keyed on `docs/security/` still sees
-          # the repository-relative path.
-          python scripts/security/scan_forbidden.py --path "${roots[@]}"
+          echo "pushed range: ${#roots[@]} commit(s) with $files added or changed file(s)."
+          # ONE scan of the tip tree and every commit root. Each commit is its own root, so a path
+          # detector keyed on `docs/security/` still sees the repository-relative path, and the tip
+          # always has files, so the scanner's zero-files refusal cannot fire on a push whose only
+          # files sit under a directory the scanner skips.
+          python scripts/security/scan_forbidden.py --path . "${roots[@]}"
       - name: Say what a failure here does and does not mean
         if: failure()
         run: |

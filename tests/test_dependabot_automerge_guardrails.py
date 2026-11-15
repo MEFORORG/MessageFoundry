@@ -954,9 +954,9 @@ def test_disarm_runs_first_on_every_push() -> None:
     ids = [s.get("id") for s in _steps()]
     assert ids[0] == "disarm", f"the disarm step must be the first step, got {ids}"
     disarm = _step("disarm")
-    assert str(disarm.get("if", "")).replace(" ", "") == "github.event.action=='synchronize'", (
-        f"the disarm step must run on every push to the PR; if: {disarm.get('if')!r}"
-    )
+    assert str(disarm.get("if", "")).replace(" ", "") == (
+        "github.event.action=='synchronize'||github.event.action=='reopened'"
+    ), f"the disarm step must run on every push to the PR, and on reopen; if: {disarm.get('if')!r}"
     assert "continue-on-error" not in disarm, (
         "a disarm failure must fail the job so no later step re-arms"
     )
@@ -973,7 +973,7 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
 
     ``VIEW_FAIL=1`` makes ``pr view`` behave like an HTTP error (JSON body on stdout, non-zero exit),
     ``DISARM_FAIL=1`` makes ``pr merge --disable-auto`` exit non-zero, and ``DISARM_NOOP=1`` makes it
-    exit 0 while leaving the state armed.
+    exit 0 while leaving the state armed. ``GH_HEAD`` is the PR's current head.
     """
     stub_dir = tmp_path / "ghstub"
     stub_dir.mkdir()
@@ -984,6 +984,7 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
         'case "$1 $2" in\n'
         '  "pr view")\n'
         '    if [ "${VIEW_FAIL:-0}" = 1 ]; then echo \'{"message":"Bad credentials"}\'; exit 1; fi\n'
+        '    case "$*" in *headRefOid*) echo "$GH_HEAD"; exit 0 ;; esac\n'
         '    cat "$GH_STATE" ;;\n'
         '  "pr merge")\n'
         '    if [ "${DISARM_FAIL:-0}" = 1 ]; then echo "gh: refused" >&2; exit 1; fi\n'
@@ -1004,6 +1005,8 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
         ("state unreadable: disarms anyway", "true", {"VIEW_FAIL": "1"}, 1, True, "false"),
         ("a refused disarm fails closed", "true", {"DISARM_FAIL": "1"}, 1, True, "true"),
         ("a disarm that did not take fails closed", "true", {"DISARM_NOOP": "1"}, 1, True, "true"),
+        # A re-run of an older run: the newer run's arm is left alone.
+        ("a stale run leaves the arm alone", "true", {"GH_HEAD": "b" * 40}, 0, False, "true"),
     ],
 )
 def test_disarm_step_behaviour(
@@ -1026,9 +1029,14 @@ def test_disarm_step_behaviour(
         "GH_TOKEN": "stub",
         "GH_STATE": state.as_posix(),
         "GH_LOG": log.as_posix(),
+        "HEAD_SHA": "a" * 40,
+        "GH_HEAD": "a" * 40,
         **extra,
     }
     run = _run_step_body("disarm", env, tmp_path, path_prepend=_gh_disarm_stub(tmp_path))
+    assert (run.outputs.get("stale") == "true") is (extra.get("GH_HEAD", "a" * 40) != "a" * 40), (
+        f"{label}: stale={run.outputs.get('stale')!r}{_diagnostic(run)}"
+    )
     assert run.rc == rc, f"{label}: rc={run.rc}, expected {rc}{_diagnostic(run)}"
     called = any("--disable-auto" in ln for ln in log.read_text(encoding="utf-8").splitlines())
     assert called is disarm_called, f"{label}: disarm called={called}{_diagnostic(run)}"
@@ -1055,12 +1063,19 @@ def _gh_rows_stub(tmp_path: Path, rows: str | None) -> Path:
     [
         (
             "only verified Dependabot commits",
-            "dependabot[bot]\ttrue\ndependabot[bot]\ttrue\n",
+            "dependabot[bot]\tdependabot[bot]\ttrue\ndependabot[bot]\tdependabot[bot]\ttrue\n",
             "true",
         ),
-        ("a commit by someone else", "dependabot[bot]\ttrue\nsomeone\ttrue\n", "false"),
-        ("an unverified Dependabot commit", "dependabot[bot]\tfalse\n", "false"),
-        ("an author with no GitHub login", "\ttrue\n", "false"),
+        (
+            "a commit by someone else",
+            "dependabot[bot]\tdependabot[bot]\ttrue\nsomeone\tsomeone\ttrue\n",
+            "false",
+        ),
+        # The spoof: anyone can WRITE dependabot[bot] as author and sign as themselves, and GitHub
+        # then reports verified=true, because it checks the committer's key.
+        ("a spoofed author, signed by its committer", "dependabot[bot]\tsomeone\ttrue\n", "false"),
+        ("an unverified Dependabot commit", "dependabot[bot]\tdependabot[bot]\tfalse\n", "false"),
+        ("an author with no GitHub login", "\tdependabot[bot]\ttrue\n", "false"),
         ("an empty commit list", "", "false"),
         ("the API errors", None, "false"),
     ],

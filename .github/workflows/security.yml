@@ -751,12 +751,14 @@ jobs:
     # flags, and zeroing sspilib's hashes in a copy of the core lock fails the install with a hash
     # mismatch.
     #
-    # NOT YET A REQUIRED CONTEXT. It hard-fails and reports on every pull request and merge-group run,
-    # so a red is visible on the PR, but until branch protection reads it a red does not stop a merge.
-    # tests/test_security_posture.py files it as pending promotion; promoting it is a branch-protection
-    # change the owner makes, recorded in `.github/required-contexts.txt`.
+    # It hard-fails and reports on every pull request and merge-group run. Whether it gates a merge is
+    # `.github/required-contexts.txt`'s answer, not this comment's; tests/test_security_posture.py
+    # grades its posture.
+    #
+    # `ci/locks/release-tools.lock` is here too: it is not a runtime lock, but release.yml's
+    # `sbom-windows` job installs it on Windows, so a gap there would first fail during a release.
     runs-on: windows-latest
-    # Four hash-locked installs, the largest carrying PySide6. Sized like `sbom-windows`.
+    # Five hash-locked installs, the largest carrying PySide6. Sized like `sbom-windows`.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -781,6 +783,8 @@ jobs:
           python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r docker/locks/requirements-sqlserver.lock
           python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
           python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r security/locks/requirements-harness.lock
+          python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
+          python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r ci/locks/release-tools.lock
 
   trivy:
     name: trivy (container image vulnerabilities)

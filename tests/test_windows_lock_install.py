@@ -26,6 +26,14 @@ _RUNTIME_LOCKS = (
     "docker/locks/requirements-core.lock",
     "docker/locks/requirements-sqlserver.lock",
     "security/locks/requirements-harness.lock",
+    # Not a runtime lock, but release.yml's `sbom-windows` job installs it on Windows.
+    "ci/locks/release-tools.lock",
+)
+
+#: DEP-1 exports no Windows job installs: the Linux-run scanner and quality toolchains, and the
+#: hashless constraints file.
+_NOT_ON_WINDOWS = frozenset(
+    {"ci/locks/ci-scanners.lock", "ci/locks/ci-quality.lock", "constraints.lock"}
 )
 
 
@@ -92,12 +100,13 @@ def test_each_lock_gets_a_freshly_cleared_venv() -> None:
 
 def test_the_lock_list_matches_the_dep1_runtime_exports() -> None:
     """The list above is a copy, so pin it to its source: every lock the DEP-1 step exports, less
-    the CI toolchain locks (``ci/locks/``, Linux-run) and the hashless ``constraints.lock``. A runtime
-    lock added there without being added here, and to the job, reds this."""
+    the ones named in ``_NOT_ON_WINDOWS``. A lock added there without being added here, and to the
+    job, reds this; so does a Windows-installed lock filed as not-on-Windows."""
     text = (WORKFLOWS / "security.yml").read_text(encoding="utf-8")
     exported = set(re.findall(r"^[ \t]*uv export .*-o (\S+)[ \t]*$", text, flags=re.MULTILINE))
     assert exported, "found no `uv export ... -o` line in security.yml; this check sees nothing"
-    runtime = {p for p in exported if not p.startswith("ci/locks/") and p != "constraints.lock"}
+    assert exported >= _NOT_ON_WINDOWS, sorted(_NOT_ON_WINDOWS - exported)
+    runtime = exported - _NOT_ON_WINDOWS
     assert runtime == set(_RUNTIME_LOCKS), (
         f"DEP-1 runtime exports {sorted(runtime)} differ from {_JOB}'s list {sorted(_RUNTIME_LOCKS)}"
     )

@@ -537,7 +537,9 @@ LOCK_INSTALLED_TOOLCHAINS = (
     # Linux SBOM step's own install. Moving that Linux step out of `release` into the unprivileged
     # `sbom-linux` job (2026-09-30) moved one install between jobs and left the file's count at seven.
     ("release.yml", "ci/locks/release-tools.lock", 7),
-    ("security.yml", "ci/locks/release-tools.lock", 2),
+    # A THIRD in security.yml since BACKLOG #5594: `windows-lock-install` installs it on Windows,
+    # because release.yml's `sbom-windows` job does.
+    ("security.yml", "ci/locks/release-tools.lock", 3),
     # The last two were installing from a lock with no row here, so no exact count watched them
     # (BACKLOG #1545). `required-workflow-state.yml` installs `ci-scanners.lock` for PyYAML in both of
     # its jobs, `reachable` and `accurate`. `ci.yml`'s packaging build job installs `release-tools.lock`
