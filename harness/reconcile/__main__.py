@@ -56,6 +56,7 @@ def _rules_from_args(args: argparse.Namespace) -> NormalizeRules:
         sort_repetition_fields=frozenset(args.sort_repetition or ()),
         sort_segments=frozenset(s.upper() for s in (args.sort_segment or ())),
         ignore_segments=frozenset(s.upper() for s in (args.ignore_segment or ())),
+        any_position_segments=frozenset(s.upper() for s in (args.any_position_segment or ())),
     )
 
 
@@ -174,6 +175,11 @@ def main(argv: list[str] | None = None) -> int:
         "--sort-segment", action="append", help="segment id whose occurrences are unordered"
     )
     cmp.add_argument("--ignore-segment", action="append", help="segment id dropped from both sides")
+    cmp.add_argument(
+        "--any-position-segment",
+        action="append",
+        help="segment id whose place in the message is not compared (its content still is)",
+    )
     cmp.add_argument("--report-json", help="write the structured report here")
     cmp.add_argument(
         "--max-file-bytes",

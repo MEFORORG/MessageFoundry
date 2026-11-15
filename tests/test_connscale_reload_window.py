@@ -467,6 +467,7 @@ def _record(counters: Counters, reload: runner._ReloadAccount | None) -> ConnSca
         batch_mode=False,
         mode="fixed_aggregate",
         count=12,
+        trial=0,
         aggregate_rate=24.0,
         metrics_counters=counters,
         ack_hist=Histogram(),

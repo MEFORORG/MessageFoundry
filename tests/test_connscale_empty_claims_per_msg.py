@@ -32,6 +32,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import json
+import math
 import pathlib
 import re
 import warnings
@@ -47,6 +48,7 @@ from harness.load.connscale.report import (
     ConnScaleRecord,
     ConnScaleReport,
     NoLoss,
+    SandboxReading,
     herd_floor_readings,
     lane_label,
     monotonic_pairs,
@@ -1064,8 +1066,11 @@ def test_the_payload_version_moved_and_the_harvested_ratio_ROWS_did_not() -> Non
     # TWO SHAPES, PINNED SEPARATELY. A lane's first reading has no prior, so it carries no band and no
     # verdict -- writing one would be a threshold computed from nothing. Pinning only the judged row
     # would leave the head row free to grow a fabricated `ok`, which is the exact error the ratio
-    # table's own "first in lane" rendering exists to avoid.
-    assert set(head) == {"lane", "count", "value", "first_in_lane"}, sorted(head)
+    # table's own "first in lane" rendering exists to avoid. Since BACKLOG #5570 the head row carries
+    # `prior` and `ok` as NULL, so a reader can take both off every row; null is the absence of a
+    # verdict, and the values are pinned below so it cannot become one.
+    assert set(head) == {"lane", "count", "value", "prior", "ok", "first_in_lane"}, sorted(head)
+    assert head["prior"] is None and head["ok"] is None, head
     assert set(judged) == {
         "lane",
         "count",
@@ -1326,3 +1331,204 @@ def test_the_harvest_files_the_current_rate_window_in_its_own_population() -> No
         harvest.WITH_TAIL_FLOOR,
     )
     assert population == harvest.POST_1420
+
+
+# --- BACKLOG #5570: one lane per arm and trial, and a non-finite reading never passes ----------------
+
+#: Each kwarg set puts a record in a second run of the same (sweep_mode, claim_mode): a fusion arm, a
+#: batching arm, a sandbox arm, or a repeat trial. Every one of them shares the lane key the pairing
+#: used to group on.
+_SECOND_RUN = [
+    pytest.param({"fuse_thread_hops": True}, id="fusion-arm"),
+    pytest.param({"batch_handoff_statements": True}, id="batching-arm"),
+    pytest.param(
+        {
+            "sandbox": SandboxReading(
+                requested="subprocess", effective="subprocess", startup_seconds=1.0
+            )
+        },
+        id="sandbox-arm",
+    ),
+    pytest.param({"trial": 1}, id="second-trial"),
+]
+
+
+def _two_runs(second: dict[str, object]) -> list[ConnScaleRecord]:
+    """Two runs of one sweep, each rising with N, the second sitting far below the first.
+
+    Chained into one lane they read 100 -> 10 at N=12 and 90 -> 9 at N=24, two breaches that are
+    comparisons across arms rather than a fall with N.
+    """
+    first = [_rec("fixed_per_conn", 12, per_msg=100.0), _rec("fixed_per_conn", 24, per_msg=110.0)]
+    other = [
+        dataclasses.replace(_rec("fixed_per_conn", 12, per_msg=10.0), **second),  # type: ignore[arg-type]
+        dataclasses.replace(_rec("fixed_per_conn", 24, per_msg=11.0), **second),  # type: ignore[arg-type]
+    ]
+    # Interleaved by N, as a trial-innermost sweep writes them.
+    return [first[0], other[0], first[1], other[1]]
+
+
+@pytest.mark.parametrize("second", _SECOND_RUN)
+def test_a_second_arm_or_trial_is_its_own_lane(second: dict[str, object]) -> None:
+    pairs = monotonic_pairs(_two_runs(second), _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    # One comparison per run, N=12 -> N=24, each inside its own run.
+    assert sorted((p.prior, p.value) for p in pairs) == [(10.0, 11.0), (100.0, 110.0)], pairs
+    assert all(p.ok for p in pairs), pairs
+    assert len({p.label for p in pairs}) == 2, "the two runs must not share one lane label"
+
+
+@pytest.mark.parametrize("second", _SECOND_RUN)
+def test_the_readings_table_has_one_row_per_record_with_its_own_prior(
+    second: dict[str, object],
+) -> None:
+    report = _report(*_two_runs(second))
+    payload = report.readings_payload(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    rows = payload["readings"]
+    assert isinstance(rows, list)
+    # Four records, four rows, each carrying its own value -- not one pair copied onto two rows.
+    assert sorted(r["value"] for r in rows) == [10.0, 11.0, 100.0, 110.0], rows
+    assert sorted(r.get("prior") for r in rows if not r["first_in_lane"]) == [10.0, 100.0], rows
+    assert all(r["ok"] for r in rows if not r["first_in_lane"]), rows
+
+    table = _rows(report.render_readings_markdown(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE))
+    assert len(table) == 4 and len(set(table)) == 4, table
+    assert not [row for row in table if "OUTSIDE BAND" in row], table
+    assert sum("first in lane" in row for row in table) == 2, table
+
+
+def test_the_default_arm_keeps_its_pre_existing_lane_label() -> None:
+    # The labels a single-arm, single-trial run has always written are unchanged, so harvested
+    # readings and SLO detail strings keep meaning what they meant.
+    recs = [_rec("fixed_per_conn", 12, per_msg=1.0), _rec("fixed_per_conn", 24, per_msg=2.0)]
+    (pair,) = monotonic_pairs(recs, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    assert pair.label == "fixed_per_conn"
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_a_non_finite_reading_fails_its_pair(bad: float) -> None:
+    recs = [_rec("fixed_per_conn", 12, per_msg=48.0), _rec("fixed_per_conn", 24, per_msg=bad)]
+    (pair,) = monotonic_pairs(recs, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    assert not pair.ok, f"a {bad} reading passed the band"
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf])
+def test_a_non_finite_first_reading_fails_rather_than_becoming_the_prior(bad: float) -> None:
+    # First in its lane, it has no prior, and it still fails; the next finite reading is then the
+    # lane's first, not a pair blamed on a healthy N.
+    recs = [_rec("fixed_per_conn", 12, per_msg=bad), _rec("fixed_per_conn", 24, per_msg=48.0)]
+    (pair,) = monotonic_pairs(recs, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    assert pair.count == 12 and not pair.ok and not pair.finite, pair
+
+
+def test_a_non_finite_reading_mid_lane_fails_once() -> None:
+    recs = [
+        _rec("fixed_per_conn", 12, per_msg=48.0),
+        _rec("fixed_per_conn", 24, per_msg=math.nan),
+        _rec("fixed_per_conn", 48, per_msg=50.0),
+    ]
+    pairs = monotonic_pairs(recs, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    assert [(p.count, p.ok) for p in pairs] == [(24, False), (48, True)], pairs
+    assert pairs[1].prior == 48.0, "the reading after a NaN is judged against the last finite one"
+    detail = str(_monotonic_slo("m", recs, _KEY).observed)
+    assert detail == "fixed_per_conn@N=24: reading nan is not finite", detail
+    table = _rows(_render(_report(*recs)))
+    assert sum("NOT FINITE" in row for row in table) == 1, table
+    assert not [row for row in table if "OUTSIDE BAND" in row], table
+
+
+def test_the_payload_keeps_a_non_finite_first_reading_as_the_lanes_base_and_stays_json() -> None:
+    recs = [
+        _rec("fixed_per_conn", 12, per_msg=math.nan),
+        _rec("fixed_per_conn", 24, per_msg=48.0),
+        _rec("fixed_per_conn", 48, per_msg=10.0),
+    ]
+    report = _report(*recs)
+    payload = report.readings_payload(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    rows = payload["readings"]
+    assert isinstance(rows, list)
+    # The lane's base is N=12, the reading that came first, not the next finite one.
+    assert [(r["count"], r["first_in_lane"]) for r in rows] == [
+        (12, True),
+        (24, False),
+        (48, False),
+    ]
+    assert rows[0]["value"] is None and rows[0]["not_finite"] == "nan" and rows[0]["ok"] is False
+    json.dumps(payload, allow_nan=False)  # strict JSON: no NaN token anywhere
+    table = _rows(report.render_readings_markdown(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE))
+    assert ["first in lane" in t for t in table] == [False, False, False], table
+    assert "no finite prior" in table[1] and "NOT FINITE" in table[0], table
+
+
+def test_every_payload_row_carries_ok_and_prior() -> None:
+    # A consumer reads `ok` and `prior` off every row; a row with no verdict or no prior says so with
+    # null rather than omitting the key.
+    recs = [
+        _rec("fixed_per_conn", 12, per_msg=math.nan),
+        _rec("fixed_per_conn", 24, per_msg=48.0),
+        _rec("fixed_per_conn", 48, per_msg=50.0),
+        _rec("fixed_aggregate", 12, per_msg=40.0),
+    ]
+    rows = _report(*recs).readings_payload(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE)[
+        "readings"
+    ]
+    assert isinstance(rows, list)
+    assert all("ok" in r and "prior" in r for r in rows), rows
+    by_n = {(r["lane"], r["count"]): r for r in rows}
+    assert (
+        by_n[("fixed_aggregate", 12)]["ok"] is None
+        and by_n[("fixed_aggregate", 12)]["prior"] is None
+    )
+    assert (
+        by_n[("fixed_per_conn", 12)]["ok"] is False
+        and by_n[("fixed_per_conn", 12)]["prior"] is None
+    )
+    assert (
+        by_n[("fixed_per_conn", 24)]["ok"] is None and by_n[("fixed_per_conn", 24)]["prior"] is None
+    )
+    assert (
+        by_n[("fixed_per_conn", 48)]["ok"] is True and by_n[("fixed_per_conn", 48)]["prior"] == 48.0
+    )
+
+
+def test_trial_lanes_sort_numerically() -> None:
+    recs = [
+        dataclasses.replace(_rec("fixed_per_conn", n, per_msg=float(n)), trial=t)
+        for t in range(12)
+        for n in (12, 24)
+    ]
+    rows = _report(*recs).readings_payload(_METRIC, _KEY, tolerance=_MONOTONIC_TOLERANCE)[
+        "readings"
+    ]
+    assert isinstance(rows, list)
+    lanes = list(dict.fromkeys(str(r["lane"]) for r in rows))
+    assert lanes == [f"fixed_per_conn/trial={t}" for t in range(12)], lanes
+
+
+def test_a_single_arm_off_its_default_keeps_the_plain_lane_label() -> None:
+    # A sweep that ran only the sandbox arm varies no axis but N, so its lane reads as before -- the
+    # same label the herd floor block gives it.
+    arm = {
+        "sandbox": SandboxReading(
+            requested="subprocess", effective="subprocess", startup_seconds=1.0
+        )
+    }
+    recs = [
+        dataclasses.replace(_rec("fixed_per_conn", 12, per_msg=40.0), **arm),  # type: ignore[arg-type]
+        dataclasses.replace(_rec("fixed_per_conn", 24, per_msg=50.0), **arm),  # type: ignore[arg-type]
+    ]
+    (pair,) = monotonic_pairs(recs, _KEY, tolerance=_MONOTONIC_TOLERANCE)
+    assert pair.label == "fixed_per_conn"
+    assert [r.label for r in herd_floor_readings(recs, _KEY, base_count=12)] == [pair.label]
+
+
+def test_a_nan_fd_reading_fails_the_fd_monotonicity_slo() -> None:
+    # The FD SLO is the one consumer still graded; it must go red on a NaN rather than read green.
+    recs = [
+        _rec("fixed_per_conn", 12, per_msg=1.0, fd_peak=100),
+        dataclasses.replace(
+            _rec("fixed_per_conn", 24, per_msg=1.0),
+            fd_count_peak=math.nan,  # type: ignore[arg-type]
+        ),
+    ]
+    check = _monotonic_slo("fd_count_monotonic", recs, lambda r: r.fd_count_peak)
+    assert not check.ok, check.observed

@@ -5,11 +5,14 @@ project-root / active-env / service-config flags serve does, resolve the same bu
 suppresses its messagefoundry.toml upward-walk when --service-config / --project-root is supplied —
 WITHOUT adopting serve's required-active-env / explicit-posture refusal. ADR 0050 Amendment A makes
 one exception: `check --env`'s settings checks read the name as `serve --env` does
-(tests/test_checks_gate_parity.py covers it).
+(tests/test_checks_gate_parity.py covers it through run_checks; the vault BACKLOG #5554 tests at the
+end of this file pin it from the command line, and pin what --env does on the other three).
 """
 
 from __future__ import annotations
 
+import argparse
+import functools
 import os
 import textwrap
 from pathlib import Path
@@ -17,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.__main__ import main
+from tests.test_checks_gate_parity import _cli_check
 
 
 @pytest.fixture(autouse=True)
@@ -167,7 +171,7 @@ def test_offline_does_not_inherit_serve_posture_refusal(
     cfg = _config_dir(tmp_path)
     rc = main(["check", "--config", str(cfg), "--no-lint", "--json"])
     assert rc == 0  # no required-env refusal offline
-    # And validate/graph with --project-root but no --env also resolve cleanly (value resolution only).
+    # And validate/graph with --project-root but no --env also resolve cleanly (anchoring only).
     assert main(["validate", "--project-root", str(tmp_path), "--config", str(cfg), "--json"]) == 0
     assert main(["graph", "--project-root", str(tmp_path), "--config", str(cfg), "--json"]) == 0
 
@@ -321,3 +325,84 @@ def test_graph_and_dryrun_honor_relative_config_under_root(
         ]
     )
     assert rc == 0
+
+
+# --- BACKLOG #5554: what --env does on each offline command -------------------------------------
+
+
+def _empty_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run from an empty directory, so a messagefoundry.toml in the working directory is not read."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+
+def test_check_env_alone_judges_posture_for_that_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A site naming its environment only on the command line: no messagefoundry.toml, no
+    # MEFOR_AI_ENVIRONMENT. A custom name with no production tier is the name serve refuses, so the
+    # gate must refuse it too, not skip posture and exit 0. --project-root suppresses check's upward
+    # search, so a messagefoundry.toml above the temp dir cannot reach the result.
+    cfg = _config_dir(tmp_path)
+    _empty_cwd(tmp_path, monkeypatch)
+    anchor = ["--project-root", str(tmp_path), "--config", str(cfg)]
+    rc, legs = _cli_check(capsys, *anchor, "--env", "poc")
+    assert rc == 1, legs["posture"]
+    assert not legs["posture"]["ok"] and not legs["posture"]["skipped"], legs["posture"]
+    assert "production_instance" in str(legs["posture"]["detail"])
+    # Control: with no --env nothing names an instance, so posture skips and the gate passes.
+    rc, legs = _cli_check(capsys, *anchor)
+    assert rc == 0 and legs["posture"]["skipped"], legs["posture"]
+
+
+@functools.cache
+def _subcommands() -> dict[str, argparse.ArgumentParser]:
+    from messagefoundry import __main__ as cli
+
+    parser, _dispatch = cli._build_parser()
+    subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    return dict(subparsers.choices)
+
+
+def _rendered_help(command: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    """The subcommand's --help as argparse renders it in an 80-column terminal."""
+    monkeypatch.setenv("COLUMNS", "80")
+    return _subcommands()[command].format_help()
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_help_says_the_flag_loads_no_values(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # validate, graph and dryrun read --env only for the value-file check under --project-root.
+    # Their help said it selected the file's values, which a site could take as an environment
+    # check; it must name what it does and point at check --env, which reads the values.
+    rendered = _rendered_help(command, monkeypatch)
+    # argparse breaks help on hyphens; a reader copying the flag must not get "--project-".
+    assert "--project-\n" not in rendered
+    text = " ".join(rendered.split())
+    assert "selects environments/<env>.toml values" not in text
+    assert "It selects no values: at least" in text and "left to check --env" in text
+    assert "without --project-root it does nothing" in text
+    # Control: check's own help still says it reads the name as serve does.
+    assert "read as serve --env reads it" in " ".join(_rendered_help("check", monkeypatch).split())
+
+
+def test_validate_env_resolves_no_value_where_check_env_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The behaviour the validate help now states: a value file that lacks a key the graph references
+    # passes validate --env, and fails check --env's build check, which resolves the values. This
+    # pins today's code, which ADR 0050's 2026-11-14 note records as short of AC-6. If value
+    # resolution is built into validate, this assertion changes with it, by design.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    (tmp_path / "environments").mkdir()
+    (tmp_path / "environments" / "dev.toml").write_text('other = "x"\n', encoding="utf-8")
+    _empty_cwd(tmp_path, monkeypatch)
+    argv = ["--project-root", str(tmp_path), "--config", str(cfg), "--env", "dev"]
+    assert main(["validate", *argv, "--json"]) == 0, capsys.readouterr()
+    capsys.readouterr()
+    rc, legs = _cli_check(capsys, *argv)
+    assert rc == 1 and not legs["build-check"]["ok"], legs["build-check"]
+    assert "peer_host" in str(legs["build-check"]["detail"])
