@@ -1822,9 +1822,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         token = session_token(request)
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or identity is None:
-            # A bookmark can open this page with no cookie: that visitor had no session to end, so
-            # no code and no header, as the gate answers a first visit.
-            return login_redirect_response("expired" if token else "", cookie_presented=bool(token))
+            return login_redirect_response()
         if await rotation_comes_first(auth, identity.must_change_password, token, request=request):
             # must_change outranks MFA for an account with no factor, mirroring require()/require_ui:
             # a fresh account is both, and only rotation is reachable until it happens. One that
@@ -1929,9 +1927,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or identity is None:
             # The session ended under the operator (expiry / revoke) — a post-termination landing
-            # like any other, so it carries Clear-Site-Data + the explanatory code (14.3.1). A
-            # visitor with no cookie had no session to end, and gets the plain sign-in page.
-            return login_redirect_response("expired" if token else "", cookie_presented=bool(token))
+            # like any other, so it carries Clear-Site-Data + the explanatory code (14.3.1).
+            return login_redirect_response()
         if identity.must_change_password and not await must_enrol_first(auth, identity, request):
             # Mirror require_ui's confinement (L4b): rotate, or first prove an owed factor (#1954).
             # A session that must enrol before rotating (ADR 0197 Amendment A) re-proves its

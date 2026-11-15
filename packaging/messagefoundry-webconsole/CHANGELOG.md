@@ -236,19 +236,6 @@ this line.**
   the store write. That re-auth reopens the editor on the stored body, so the typed edit is lost.
   Any other refusal before the store write still gives the proof back. The change is in the
   engine handler the console calls; no seam changes. (BACKLOG #3241)
-- **A first visit to `/ui` no longer sends `Clear-Site-Data`, and a cross-site landing after a
-  termination no longer gets it either.** The gate's redirect to the sign-in page sent
-  `Clear-Site-Data: "cache"` to every request it turned away, so a browser with no session cookie
-  was asked to clear its cache on an ordinary landing. The redirect now carries the header only
-  when the request presented a session cookie, and so do the redirects from `GET /ui/mfa` and
-  `GET /ui/reauth`, which a bookmark can open; with no cookie those two also drop the `expired`
-  code. A same-site request after an expiry, revoke or disable presents the dead cookie and still
-  gets the header. A cross-site navigation does not carry the `SameSite=Strict` cookie, so such a
-  landing gets no header and relies on the server-side revoke, `Cache-Control: no-store` and the
-  watchdog. Sign-out, the password change, the post-termination sign-in page and the other
-  session-ended redirects send it as before. With no auth service attached, a request carrying the
-  session cookie twice now gets the 400 for a repeated cookie at the gate rather than after the
-  redirect. The seam digest moved because the gate's code changed.
 
 ### Fixed
 

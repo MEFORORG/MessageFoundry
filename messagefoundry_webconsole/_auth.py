@@ -270,16 +270,13 @@ _KNOWN_FETCH_SITE = _CROSS_ORIGIN_FETCH | _SAME_ORIGIN_FETCH
 _CONFLICTING_FETCH_SITE = "conflicting Sec-Fetch-Site lines rejected"
 
 
-#: ASVS 14.3.1 — the header emitted on responses that END a session's browser-visible life.
-#: There are THREE emitters: :func:`clear_session_cookie` (a route that deletes the cookie —
-#: sign-out, and the password change that revokes every session), :func:`_login_redirect` /
-#: :func:`login_redirect_response` (a SERVER-driven expiry, revoke or disable redirect for a request
-#: that presented the dead session cookie), and the login RENDER in :mod:`.routes.core` (a
-#: post-termination landing reached by bookmark or Back, recognised by its outcome code or by a
-#: session cookie that no longer authenticates). **They do not cover every termination:** a
-#: request that carries no session cookie gets none, including a cross-site navigation after a
-#: termination, which the ``SameSite=Strict`` cookie does not ride (see :func:`_login_redirect`).
-#: Deletion and this header are deliberately fused in
+#: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
+#: There are exactly THREE emitters, and between them they cover every shape a termination takes:
+#: :func:`clear_session_cookie` (a route that deletes the cookie — sign-out, and the password change
+#: that revokes every session), :func:`_login_redirect` / :func:`login_redirect_response` (every
+#: SERVER-driven expiry, revoke or disable redirect), and the login RENDER in :mod:`.routes.core`
+#: (a post-termination landing reached by bookmark or Back, recognised by its outcome code or by a
+#: session cookie that no longer authenticates). Deletion and this header are deliberately fused in
 #: one helper rather than left as two lines a new route must remember to write together.
 #: ``"cache"`` ONLY: ``"cookies"`` is already covered by the explicit cookie deletion (and would clear
 #: the in-flight OIDC flow cookie), and ``"storage"`` would wipe the deliberately-persistent, PHI-free
@@ -292,48 +289,29 @@ CLEAR_SITE_DATA_VALUE = '"cache"'
 NOTIFY_ADDRESS_PAGE = "/ui/account/notify-address"
 
 
-def _login_redirect(note: str = "", *, cookie_presented: bool) -> HTTPException:
+def _login_redirect(note: str = "") -> HTTPException:
     """A 303 redirect (as an exception, to short-circuit a dependency) to the /ui login page.
 
-    Carries :data:`CLEAR_SITE_DATA_HEADER` on the REDIRECT ITSELF (ASVS 14.3.1) whenever the request
-    presented a session cookie. Every SERVER-driven session termination lands here — idle timeout,
-    absolute timeout, revoke ("sign out everywhere else"), admin disable, AD-reconcile revoke — and
-    the browser's next same-site request after one presents the dead cookie, so those are the paths
-    the residual names. Attaching it to the 303 rather than only to the landing page means the
-    header cannot depend on which login URL the browser is sent to, or on the client watchdog having
-    run at all (with JavaScript blocked it never does).
-
-    A request with NO session cookie gets no header: a first visit to ``/ui`` would otherwise ask
-    the browser to clear its cache for the origin on an ordinary unauthenticated landing. **That
-    includes a cross-site navigation after a termination**, such as a link followed from a mail
-    client: the cookie is ``SameSite=Strict``, so the browser withholds it, and neither this 303 nor
-    the login render it reaches sends the header. Such a landing keeps the other 14.3.1 controls:
-    the server-side revoke, ``Cache-Control: no-store`` on every /ui page, and the watchdog's
-    blanking. ``cookie_presented`` has no default, so each caller decides rather than inheriting one.
+    Carries :data:`CLEAR_SITE_DATA_HEADER` on the REDIRECT ITSELF (ASVS 14.3.1). Every SERVER-driven
+    session termination lands here — idle timeout, absolute timeout, revoke ("sign out everywhere
+    else"), admin disable, AD-reconcile revoke — and those are exactly the paths the residual names.
+    Attaching it to the 303 rather than only to the landing page means the header cannot depend on
+    which login URL the browser is sent to, or on the client watchdog having run at all (with
+    JavaScript blocked it never does).
     """
     location = "/ui/login" + (f"?e={note}" if note else "")
-    headers = {"Location": location}
-    if cookie_presented:
-        headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
-    return HTTPException(status.HTTP_303_SEE_OTHER, headers=headers)
+    return HTTPException(
+        status.HTTP_303_SEE_OTHER,
+        headers={"Location": location, CLEAR_SITE_DATA_HEADER: CLEAR_SITE_DATA_VALUE},
+    )
 
 
-def login_redirect_response(
-    note: str = "expired", *, cookie_presented: bool = True
-) -> RedirectResponse:
+def login_redirect_response(note: str = "expired") -> RedirectResponse:
     """The RESPONSE form of :func:`_login_redirect`, for a ROUTE that discovers the session is gone
     (rather than a dependency, which raises). Same 14.3.1 header, same default outcome code, so the
-    two paths cannot drift apart.
-
-    ``cookie_presented=False`` omits the header, as :func:`_login_redirect` does for the gate's first
-    visit. A caller that passes it for a request with no cookie passes an empty ``note`` too, as the
-    gate does, because the login render sends the header for an ``expired`` code by itself. The
-    default is True, unlike :func:`_login_redirect`'s required keyword, so the routes that pass
-    nothing keep the header; at least the POST legs of the second-factor and re-auth pages and the
-    OIDC step-up routes pass nothing, and a cookie-less request there still gets it."""
+    two paths cannot drift apart."""
     resp = RedirectResponse("/ui/login" + (f"?e={note}" if note else ""), status_code=303)
-    if cookie_presented:
-        resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
+    resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
     return resp
 
 
@@ -540,21 +518,17 @@ def require_ui(
 
     async def dependency(request: Request) -> Identity:
         auth = get_auth(request)
-        # Read before the no-auth branch, so both branches judge "a cookie was presented" by the
-        # same test the login render's stale-cookie check uses.
-        token = session_token(request)
         if auth is None:
-            # The browser UI always needs a real session — no allow_no_auth shortcut here. With no
-            # auth no cookie can authenticate, so one presented is a dead one.
-            raise _login_redirect(cookie_presented=bool(token))
+            # The browser UI always needs a real session — no allow_no_auth shortcut here.
+            raise _login_redirect()
+        token = session_token(request)
         identity = await auth.identity_for_token(token, activity=activity)
         if identity is None:
             # A cookie that no longer authenticates IS a post-termination landing (idle/absolute
             # expiry, revoke, admin disable), so name it: the login page then explains itself
-            # instead of appearing as an unexplained form, and both the redirect and the render
-            # carry Clear-Site-Data (14.3.1). A visitor with NO cookie never had a session: plain
-            # form, no code, and no Clear-Site-Data, since there is nothing to end.
-            raise _login_redirect("expired" if token else "", cookie_presented=bool(token))
+            # instead of appearing as an unexplained form, and its render carries Clear-Site-Data
+            # too (14.3.1). A visitor with NO cookie never had a session — plain form, no code.
+            raise _login_redirect("expired" if token else "")
         # ADR 0197 Amendment A: a must-change session that must enrol first may reach the TOTP
         # enrolment path (ENROL_FIRST_UI_ROUTES), the console twin of the JSON plane's
         # _ENROL_FIRST_ROUTES, and nothing else.
@@ -1669,7 +1643,7 @@ def require_ui_step_up(
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
-            raise _login_redirect(cookie_presented=True)  # base admitted a session cookie
+            raise _login_redirect()
         token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
         # Unreachable while the base gate stands, as in require_step_up. Kept so this factory never
@@ -1707,7 +1681,7 @@ def require_ui_reauth_only(
         identity = await base(request)  # cookie auth + permission (+ must-change gate)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
-            raise _login_redirect(cookie_presented=True)  # base admitted a session cookie
+            raise _login_redirect()
         token = session_token(request)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         if new_ip or not await auth.has_recent_step_up(token):
@@ -1788,7 +1762,7 @@ def require_ui_step_up_action(
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
-            raise _login_redirect(cookie_presented=True)  # base admitted a session cookie
+            raise _login_redirect()
         token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
         # Unreachable while the base gate stands; kept for the reason require_ui_step_up gives.
@@ -1847,7 +1821,7 @@ def require_ui_step_up_when_own_sessions_end(
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
-            raise _login_redirect(cookie_presented=True)  # base admitted a session cookie
+            raise _login_redirect()
         token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
         # Unreachable while the base gate stands; kept for the reason require_ui_step_up gives.
@@ -2111,7 +2085,7 @@ def require_ui_reauth_only_action(
         identity = await base(request)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
-            raise _login_redirect(cookie_presented=True)  # base admitted a session cookie
+            raise _login_redirect()
         token = session_token(request)
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         nxt = reauth_next(request) if reauth_next is not None else None

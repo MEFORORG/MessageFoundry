@@ -909,17 +909,12 @@ from typing import Any
 #: ``account_read_errors``, the failures those post-action pages fall back on, which the console
 #: imports, so the surface grew again: from ``796ce45eeff0cf1e`` to ``080ed019349126b8``.
 #:
-#: The console's ``_login_redirect`` sends ``Clear-Site-Data`` only for a request that presented a
-#: session cookie, and ``require_ui``'s gate passes it that answer, so the gate bodies the
-#: snapshot hashes changed. No engine surface changed. Re-derived with ``--write``, from
-#: ``080ed019349126b8`` to ``c6e341f0503ca332``.
-#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "c6e341f0503ca332"
+ENGINE_UI_SEAM: str = "080ed019349126b8"
 
 
 @dataclass(frozen=True, slots=True)
