@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable
 
 import pytest
@@ -534,10 +535,6 @@ class _ReadOnRemoveLazy(dict[int, str]):
             self._read(key)
         return value
 
-    def __delitem__(self, key: int) -> None:
-        super().__delitem__(key)
-        self._read(key)
-
 
 def test_lazy_split_stores_fields_before_dropping_the_raw_line() -> None:
     # The lazy split must never leave a moment where the raw line is gone and the fields are not yet
@@ -555,3 +552,37 @@ def test_lazy_split_stores_fields_before_dropping_the_raw_line() -> None:
     assert seen == ["PID|1||100^^^HOSP^MR||DOE^JANE^Q||19800101|F"]
     assert pid not in tree["_lazy"]
     assert clone.encode() == ADT
+
+
+class _SplitDuringCopySegments(list[_builtin_hl7.Segment]):
+    """A ``segments`` list whose deepcopy lets a lazy split of ``seg_index`` run right after it is
+    copied: a reader on another thread finishing its split in the middle of a copy-on-write copy."""
+
+    def __init__(self, msg: _builtin_hl7.ParsedMessage, seg_index: int) -> None:
+        super().__init__(msg["segments"])
+        self._msg = msg
+        self._seg_index = seg_index
+
+    def __deepcopy__(self, memo: dict[int, object]) -> list[_builtin_hl7.Segment]:
+        copied = copy.deepcopy(list(self), memo)
+        _builtin_hl7._ensure_split(self._msg, self._seg_index)
+        return copied
+
+
+def test_a_split_during_the_copy_on_write_deepcopy_keeps_the_segment() -> None:
+    # copy.deepcopy reads the tree's keys in insertion order. Were segments read before _lazy, a
+    # split landing between the two would leave the private copy with neither the raw line nor the
+    # fields, and it would encode PID as its bare id (BACKLOG #5801).
+    m = Message.parse(ADT)
+    clone = m.copy()
+    tree = m._m
+    pid = _builtin_hl7.segment_index(tree, "PID", 1)
+    assert pid is not None and pid in tree["_lazy"]
+    tree["segments"] = _SplitDuringCopySegments(tree, pid)
+
+    clone.set("PID-8", "M")  # the write takes the private deepcopy
+
+    assert pid not in tree["_lazy"]  # the split did run in the middle of the copy
+    assert clone["PID-5.1"] == "DOE"
+    assert clone.encode() == ADT.replace("19800101|F", "19800101|M")
+    assert m.encode() == ADT

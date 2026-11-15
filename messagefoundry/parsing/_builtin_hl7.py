@@ -241,7 +241,9 @@ def parse(norm: str) -> ParsedMessage:
         segments.append({"id": line.split(field_sep, 1)[0] if line else "", "fields": []})
         lazy[index] = line
 
-    return {"segments": segments, "raw": strmsg + "\r", "seps": seps, "_lazy": lazy}
+    # ``_lazy`` goes in first on purpose: ``copy.deepcopy`` (``Message._ensure_owned``) copies a dict
+    # in insertion order, so it reads ``_lazy`` before ``segments``, the order _ensure_split needs.
+    return {"_lazy": lazy, "segments": segments, "raw": strmsg + "\r", "seps": seps}
 
 
 def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
@@ -252,10 +254,14 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     componentized access). MSH segments are never lazy.
 
     The fields are stored **before** the raw line leaves ``_lazy``. A :meth:`Message.copy` clone shares
-    this tree until one side writes, so under free-threaded Python another reader can look at the
-    segment mid-split; every reader checks ``_lazy`` first and falls back to ``fields``, so at each
-    instant it sees either the raw line or the full field list, never an empty segment (BACKLOG #5801).
-    The ``pop`` keeps its default because a racing split of the same segment may have removed it.
+    this tree until one side writes, so under free-threaded Python another thread can read the
+    segment mid-split. A reader that looks at ``_lazy`` before ``fields`` then sees either the raw
+    line or the full field list, never an empty segment (BACKLOG #5801). That holds for at least the
+    readers in this module and the copy-on-write ``copy.deepcopy``, because :func:`parse` puts
+    ``_lazy`` first in the dict; a new reader must keep the same order. It does not make a deepcopy
+    safe against the ``pop`` itself: one that is iterating ``_lazy`` at that moment can still raise
+    ``RuntimeError`` for a dict that changed size. The ``pop`` keeps its default because a racing
+    split of the same segment may have removed it.
     """
     lazy = msg["_lazy"]
     raw = lazy.get(seg_index)
