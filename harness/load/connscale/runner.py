@@ -405,7 +405,9 @@ async def run_connscale(
     # misses it can pair against a present arm: in a fusion A/B, a cell whose B0 and B1 both failed to
     # start leaves no row and no baseline gap, so nothing else would fail it.
     result_ok = (
-        steps_missed == 0
+        # A sweep that recorded nothing measured nothing, whatever its SLOs read (BACKLOG #5432).
+        bool(records)
+        and steps_missed == 0
         and all(c.ok for c in slos)
         and (comparison is None or comparison.ok)
         and (fuse_comparison is None or fuse_comparison.ok)
@@ -2539,7 +2541,9 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
         # `all()` over nothing is True, so a sweep that kept no record would read zero-loss PASS;
         # this function is shared with the batch-box aggregate, so the guard is here (BACKLOG #5432).
         all_ok = bool(records) and all(r.no_loss.ok for r in records)
-        out.append(SloCheck("zero_loss", True, all_ok, all_ok))
+        # An empty list says so, rather than reading as a message loss.
+        zero_loss_seen: bool | str = all_ok if records else "no step was recorded"
+        out.append(SloCheck("zero_loss", True, zero_loss_seen, all_ok))
     if profile.intake_audit:
         # BACKLOG #1292, and DELIBERATELY NOT folded into zero_loss: this is a per-MESSAGE check and
         # zero_loss is a per-COUNT one, so they can disagree, and each disagreement is informative.

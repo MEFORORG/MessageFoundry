@@ -14,11 +14,14 @@ reads it (load, connscale, estate, multishard and the remote driver) sees a stra
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
+import pytest
+
+from harness.load.connscale import runner as runner_mod
 from harness.load.connscale.profile import ConnScaleProfile, load_connscale_profile_text
 from harness.load.connscale.report import ConnScaleRecord, SloCheck
-from harness.load.connscale.runner import _evaluate_slos
+from harness.load.connscale.runner import _evaluate_slos, run_connscale
 from harness.load.connscale.runner import _reconcile as connscale_reconcile
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.estate.runner import _reconcile as estate_reconcile
@@ -169,6 +172,7 @@ def test_zero_loss_refuses_an_empty_record_list() -> None:
     # `_evaluate_slos` is shared with the batch-box aggregate, so the guard lives here.
     check = _check(_profile(), [], "zero_loss")
     assert not check.ok
+    assert check.observed == "no step was recorded"  # not a loss reading
     assert _check(_profile(), [_rec()], "zero_loss").ok
 
 
@@ -184,3 +188,30 @@ def test_max_drain_seconds_is_poisoned_by_one_timed_out_step() -> None:
     clean = _check(profile, [_rec(drain_seconds=1.0), _rec(drain_seconds=2.5)], "max_drain_seconds")
     assert clean.ok and clean.observed == 2.5
     assert not _check(profile, [], "max_drain_seconds").ok
+
+
+_EMPTY_SWEEP = """
+[connscale]
+name = "empty-sweep"
+counts = [4]
+aggregate_rate = 10.0
+intake_audit = false
+
+[connscale.slo]
+zero_loss = false
+"""
+
+
+async def test_a_sweep_that_recorded_nothing_does_not_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The verdict itself refuses an empty record list, so a profile that grades no SLO on it
+    # (zero_loss off) cannot exit 0 on a sweep that measured nothing. No step runs here at all.
+    async def _never(*_a: Any, **_kw: Any) -> object:
+        raise AssertionError("no step should run")
+
+    monkeypatch.setattr(runner_mod, "_run_one_step", _never)
+    monkeypatch.setattr(ConnScaleProfile, "modes", lambda _self: ())
+    profile = load_connscale_profile_text(_EMPTY_SWEEP)
+    report = await run_connscale(profile, engine_api_port_base=9000, sink_port=8000)
+    assert report.records == []
+    assert all(c.ok for c in report.slos)  # the control: no SLO fails it
+    assert not report.result_ok

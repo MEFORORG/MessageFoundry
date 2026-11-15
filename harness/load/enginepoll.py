@@ -218,7 +218,13 @@ class EngineSample:
         left every accepted message in ingress or routed with this reading 0, and a reconcile run on
         a timed-out drain passed. ``in_pipeline`` already counts the outbound rows, so the two are
         not summed; they come from separate store reads, so the larger one is the fail-closed read.
-        An older engine without ``in_pipeline`` reads 0 there and keeps the outbound reading.
+        On a cluster sample the max is taken over the summed totals, and on a unified store every
+        shard reports the whole store's ``in_pipeline``, so a nonzero reading can be up to N times
+        the true count. Only whether it is zero decides a verdict. An older engine without
+        ``in_pipeline`` reads 0 there and keeps the outbound reading.
+
+        A passing run reads 0 under both meanings, so the emitted ``no_loss.backlog`` moves only on
+        a run that already failed its drain term; no report SCHEMA_VERSION is bumped for that.
         """
         return max(self.outbound_backlog, self.in_pipeline)
 
@@ -580,7 +586,9 @@ async def sample_until_reconciled(
                 if (
                     read >= counters.sent - counters.timeouts
                     and counters.sink_received >= written
-                    and sample.in_pipeline == 0
+                    # `backlog`, not `in_pipeline` alone: the reconcile's drained term reads it,
+                    # and the outbound read can lag the in_pipeline read (BACKLOG #5435).
+                    and sample.backlog == 0
                 ):
                     return sample
         await asyncio.sleep(interval)
@@ -935,8 +943,8 @@ class EnginePoller:
         moving. Returns seconds-to-drain, or ``None`` on timeout.
 
         Drain requires the *aggregate* ``in_pipeline == 0`` (no NOT-DONE rows in ANY stage of ANY
-        shard — ingress, routed, or outbound), the summed outbound backlog + per-edge ``queue_depth``
-        at zero, and ``read``/``written`` unchanged across a poll. Because the cluster sample sums
+        shard — ingress, routed, or outbound), the summed ``backlog`` (which folds ``in_pipeline`` in
+        with the outbound reading) + per-edge ``queue_depth`` at zero, and ``read``/``written`` unchanged across a poll. Because the cluster sample sums
         every shard, this only completes once **every** shard reports ``in_pipeline == 0`` and an
         empty backlog. The ``in_pipeline`` gauge (from ``/stats``) closes the prior blind spot: a
         fully **stalled** router/transform leaves the outbound backlog at 0 but ``in_pipeline > 0``,
@@ -953,7 +961,7 @@ class EnginePoller:
             if cur is None:
                 continue
             stable = prev is not None and cur.read == prev.read and cur.written == prev.written
-            if cur.backlog == 0 and cur.queue_depth == 0 and cur.in_pipeline == 0 and stable:
+            if cur.backlog == 0 and cur.queue_depth == 0 and stable:
                 return loop.time() - start
             prev = cur
         return None
