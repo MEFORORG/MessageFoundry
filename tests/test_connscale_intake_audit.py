@@ -735,9 +735,9 @@ def test_a_counter_reset_leaves_no_shortfall_to_attribute_bug_5574() -> None:
     assert _unexplained_shortfall(c, base, final, counter_reset=reset) == 0
 
 
-def _record_with(audit: IntakeAudit, *, read: int, sent: int) -> ConnScaleRecord:
+def _record_with(audit: IntakeAudit, *, read: int, sent: int, start: int = 0) -> ConnScaleRecord:
     poller = EnginePoller("http://127.0.0.1:1", token=None, origin=0.0)
-    poller._samples = [_sample(0), _sample(read)]
+    poller._samples = [_sample(start), _sample(read)]
     return _build_record(
         claim_mode="per_lane",
         fuse_mode=False,
@@ -783,6 +783,20 @@ def test_a_failing_reconcile_carries_the_audit_verdict_into_its_own_message() ->
     assert "seqs=[0]" in rec.no_loss.detail
     assert rec.intake_audit is audit and rec.intake_audit.engine_suspect
     assert "intake_audit" in rec.to_json_dict()
+
+
+def test_build_record_reads_a_counter_reset_off_its_own_poller_bug_5574() -> None:
+    """The production wiring, not the keyword: ``_build_record`` must derive ``counter_reset`` from
+    the poller it reconciles. Counters that went backwards (30 -> 2) would otherwise read as 2 of 4
+    sends lost on intake. The control is the same counts from a baseline of 0, a proven loss."""
+    audit = not_run("not triggered")
+    rec = _record_with(audit, read=2, sent=4, start=30)
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "went backwards" in rec.no_loss.detail
+    assert "lost" not in rec.no_loss.detail
+    control = _record_with(audit, read=2, sent=4)
+    assert not control.no_loss.ok and not control.no_loss.inconclusive, control.no_loss.detail
+    assert "lost 2 on intake" in control.no_loss.detail
 
 
 def test_a_passing_reconcile_is_left_byte_identical() -> None:

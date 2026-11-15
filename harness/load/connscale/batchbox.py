@@ -470,16 +470,27 @@ def aggregate_cell_record(
     resets: list[str] = []
     blind = 0
     trusted: list[dict[str, Any]] = []
+    # Bands whose own reconcile PROVED a loss while it could judge no engine-delta arm: with the
+    # counters reset or the engine unread, only its client-counter arms (the stranding budget, the
+    # reload guards) ran, and those read nothing another band could correct. The cell keeps that
+    # verdict rather than demote it to INCONCLUSIVE (BACKLOG #5574). A band that judged its engine
+    # arms is not counted: its delivery arm compares one band's sink with the engine-wide written.
+    client_lost = 0
     for r in proc_reports:
         nl = r.get("no_loss", {})
+        unjudged = False
         if "counter_reset" not in nl:
             resets.append("a band report does not say whether the engine counters reset")
         elif nl["counter_reset"] is not None:
             resets.append(escape_for_terminal(str(nl["counter_reset"]), single_line=True))
+            unjudged = True
         elif int(nl.get("backlog", 0) or 0) >= 0:
             trusted.append(r)
         if int(nl.get("backlog", 0) or 0) < 0:
             blind += 1
+            unjudged = True
+        if unjudged and nl.get("ok") is False and nl.get("inconclusive") is False:
+            client_lost += 1
     # Every band reads the SAME engine, so one band's readings are the engine totals and a proven
     # loss needs only the bands that read it cleanly (BACKLOG #5574): one band's reset or blindness
     # must not suppress a loss the others still prove. The two arms differ in what a reset does.
@@ -497,7 +508,7 @@ def aggregate_cell_record(
     # A negative backlog is the metrics-unavailable stand-in, refused below as no reading; only a
     # positive one is rows left in the pipeline.
     drained = backlog <= 0
-    lost = read_short > 0 or deliver_short > 0
+    lost = read_short > 0 or deliver_short > 0 or client_lost > 0
     # Reasons the cell cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: both arms above are inequalities an empty, unsettled or
     # undelivering cell satisfies trivially.
@@ -536,6 +547,11 @@ def aggregate_cell_record(
             f"union sink_received {agg_sink_received} < engine_written {judged_written} "
             f"(lost {deliver_short})"
         )
+    if client_lost:
+        parts.append(
+            f"{client_lost} band(s) proved a loss on client counters alone (their engine arms "
+            f"were not judged) — see the band report"
+        )
     if not drained:
         parts.append(f"backlog {backlog} not drained")
     parts.extend(unproven)
@@ -544,11 +560,13 @@ def aggregate_cell_record(
         if parts
         else "engine_read>=sent, union sink_received>=written, backlog drained"
     )
+    # Publish the engine totals the verdict rests on, where it rests on any, so the artifact's
+    # numbers reproduce its detail; with no clean band they stay the all-band max.
     no_loss = NoLoss(
         ok=no_loss_ok,
         sent=agg_sent,
-        engine_read=engine_read,
-        engine_written=engine_written,
+        engine_read=engine_read if judged_read is None else judged_read,
+        engine_written=engine_written if judged_written is None else judged_written,
         sink_received=agg_sink_received,
         backlog=backlog,
         detail=detail,

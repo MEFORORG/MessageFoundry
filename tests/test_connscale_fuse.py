@@ -284,7 +284,8 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
 
     unsure = [
         replace(r, no_loss=replace(r.no_loss, inconclusive=True))
-        for r in _trials(True, [120.0, 121.0, 119.0], no_loss_ok=False, sink_received=900)
+        # Everything was delivered: the arm only failed to clear itself (a reset, say).
+        for r in _trials(True, [120.0, 121.0, 119.0], no_loss_ok=False)
     ]
     cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + unsure, (False, True))
     assert cmp is not None
@@ -300,6 +301,13 @@ def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed(
     assert cmp is not None
     assert cmp.rows[0].verdict == FUSE_NO_GO
     assert "breached" in cmp.rows[0].reason
+    # An INCONCLUSIVE arm that also never drained is a definite NO-GO on the drain guard, which
+    # the INCONCLUSIVE label must not pre-empt.
+    undrained = [replace(r, drain_seconds=None) for r in unsure]
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + undrained, (False, True))
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO
+    assert "did not fully drain" in cmp.rows[0].reason
 
 
 def test_no_go_when_drain_time_grows() -> None:

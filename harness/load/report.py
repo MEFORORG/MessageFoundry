@@ -645,7 +645,14 @@ def _reconcile(
     sent = counters.sent
     sink_received = counters.sink_received
     base, final = poller.baseline, poller.final
+    # The dead-ACK-path signature reads no engine counter, so it still proves a loss when the
+    # engine metrics are missing or reset; it is computed here, once, for every path (its reasoning
+    # is at its use below). The rig copies keep their client-counter arms the same way (#5574).
+    ack_path_dead = sent > 0 and counters.acked + counters.nak == 0
     if base is None or final is None:
+        detail = "engine metrics unavailable — cannot verify no-loss"
+        if ack_path_dead:
+            detail = f"{sent} sent and the sender saw no reply at all — a dead ACK path; {detail}"
         return NoLoss(
             False,
             sent,
@@ -654,8 +661,8 @@ def _reconcile(
             sink_received,
             -1,
             0,
-            "engine metrics unavailable — cannot verify no-loss",
-            inconclusive=True,
+            detail,
+            inconclusive=not ack_path_dead,
         )
     read = final.read - base.read
     written = final.written - base.written
@@ -666,9 +673,7 @@ def _reconcile(
     # undercounting. No intake or delivery verdict rests on it (BACKLOG #5574). The whole sample run
     # is read, not only its two ends, so a reset hidden by regrowth is still seen. At least this
     # misses a restart of one shard of a cluster whose summed counters and max uptime kept rising.
-    # The dead-ACK-path signature reads no engine counter, so it still proves a loss here; it is
-    # computed here, once, for both paths (its reasoning is at its use below).
-    ack_path_dead = sent > 0 and counters.acked + counters.nak == 0
+    # The dead-ACK-path signature computed above still proves a loss here.
     reset = _counter_reset(poller)
     if reset is not None:
         detail = (

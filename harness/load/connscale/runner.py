@@ -805,6 +805,13 @@ async def _run_started_step(
         # artifact to read.
         if ledger is None:
             audit_live = intake_audit.not_run(_AUDIT_DISABLED, moment=intake_audit.MOMENT_LIVE)
+        elif poller.baseline is None or poller.final is None:
+            # As under a reset below: "no shortfall" would be a false statement, since there is no
+            # read to compare the sends with. The post-mortem still checks every confirmed send.
+            audit_live = intake_audit.not_run(
+                "the engine metrics are unavailable, so there is no count shortfall to attribute",
+                moment=intake_audit.MOMENT_LIVE,
+            )
         elif counter_reset is not None:
             # "No shortfall" would be a false statement here: the counts cannot say either way.
             # The post-mortem below still checks every confirmed send for a row.

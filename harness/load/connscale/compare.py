@@ -552,6 +552,11 @@ def _row_json(row: ComparisonRow) -> dict[str, object]:
             # achieved rate cannot express.
             "per_lane_zero_loss": row.baseline.no_loss_ok,
             "pooled_zero_loss": (None if row.candidate is None else row.candidate.no_loss_ok),
+            # A False above is a proven breach or an INCONCLUSIVE arm; this says which (BACKLOG #5574).
+            "per_lane_zero_loss_inconclusive": row.baseline.no_loss_inconclusive,
+            "pooled_zero_loss_inconclusive": (
+                None if row.candidate is None else row.candidate.no_loss_inconclusive
+            ),
             "candidate_lost": row.candidate_lost,
             "throughput_comparable": row.throughput_comparable,
             "resilience_win": row.resilience_win,
@@ -1316,14 +1321,7 @@ def _fuse_verdict(
     in_pipeline, delivered/offered) gate first — a breach is a NO-GO regardless of the raw intake
     number. Then the throughput bar: below 10% is a NO-GO (fusion banked nothing); >= 10% but within
     trial spread is INCONCLUSIVE (need more/cleaner trials); >= 10% and outside 2σ is a GO."""
-    if candidate_lost and cand.zero_loss_inconclusive:
-        # Still a hard fail (the row's `ok` reads `candidate_lost`), but nothing proved a message
-        # dropped, so it is not called a breach (BACKLOG #5574).
-        return FUSE_INCONCLUSIVE, (
-            "B1 could not clear zero-loss and proved no loss (its reconcile was INCONCLUSIVE) -- "
-            "the run fails closed until a clean measurement clears it"
-        )
-    if candidate_lost:
+    if candidate_lost and not cand.zero_loss_inconclusive:
         return FUSE_NO_GO, "B1 breached zero-loss -- fusion must never drop a message (hard guard)"
     if not in_pipeline_ok:
         if not cand.drain_completed:
@@ -1341,6 +1339,14 @@ def _fuse_verdict(
         shown = "n/a" if cand.delivered_offered is None else f"{cand.delivered_offered:.3f}"
         return FUSE_NO_GO, (
             f"delivered/offered {shown} < {min_delivered_offered:.2f} -- B1 is not keeping up end-to-end"
+        )
+    if candidate_lost:
+        # INCONCLUSIVE, after the drain and keeping-up guards so a definite NO-GO there still reads
+        # as one. Still a hard fail (the row's `ok` reads `candidate_lost`), but nothing proved a
+        # message dropped, so it is not called a breach (BACKLOG #5574).
+        return FUSE_INCONCLUSIVE, (
+            "B1 could not clear zero-loss and proved no loss (its reconcile was INCONCLUSIVE) -- "
+            "the run fails closed until a clean measurement clears it"
         )
     if lift_pct is None:
         return FUSE_INCONCLUSIVE, "B0 baseline intake ~0 -- no sound lift to measure"

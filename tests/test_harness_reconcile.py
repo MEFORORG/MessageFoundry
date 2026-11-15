@@ -1175,6 +1175,17 @@ def test_load_reconcile_metrics_unavailable_is_inconclusive() -> None:
     assert not result.ok and result.inconclusive, result.detail
 
 
+def test_load_reconcile_a_dead_ack_path_stays_loss_without_engine_metrics() -> None:
+    # The dead-ACK-path signature reads no engine counter, as across a reset; the rig copies keep
+    # their client-counter arms when blind too (BACKLOG #5574).
+    poller = cast(EnginePoller, SimpleNamespace(baseline=None, final=None, samples=[]))
+    dead = Counters(sent=90, acked=0, timeouts=90)
+    result = load_reconcile(dead, poller, 1.0, tolerance=0, unconfirmed_budget=4)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "dead ACK path" in result.detail
+    assert "engine metrics unavailable" in result.detail
+
+
 def test_load_reconcile_a_proven_delivery_loss_is_not_called_nothing_delivered() -> None:
     c = Counters(sent=90, acked=90, sink_received=0)
     result = load_reconcile(
@@ -1537,10 +1548,12 @@ def test_batchbox_aggregate_one_band_reset_does_not_hide_a_delivery_loss_another
     # short, which stays INCONCLUSIVE.
     rec = bb.aggregate_cell_record(
         _cell(),
-        [_pair(counter_reset=_RESET, sink_received=7), _pair()],
+        [_pair(counter_reset=_RESET, sink_received=7, engine_written=25), _pair()],
     )
     assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
     assert "lost 3" in rec.no_loss.detail
+    # The published total is the one the verdict rests on, so the artifact reproduces "lost 3".
+    assert rec.no_loss.engine_written == 20
     assert "restarted mid-run" in rec.no_loss.detail
     control = bb.aggregate_cell_record(_cell(), [_pair(counter_reset=_RESET), _pair()])
     assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
@@ -1571,6 +1584,23 @@ def test_batchbox_aggregate_one_blind_band_does_not_hide_an_intake_loss_another_
         _cell(), [_pair(engine_read=0, engine_written=0, backlog=-1), _pair()]
     )
     assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
+
+
+def test_batchbox_aggregate_keeps_a_band_loss_proven_on_client_counters_alone() -> None:
+    # The band saw a reset, so its reconcile judged only its client-counter arms, and those proved a
+    # loss (a stranding flood). The cell used to demote it to INCONCLUSIVE. The control is the same
+    # reset with an INCONCLUSIVE band verdict, which proves nothing.
+    flood = _pair(counter_reset=_RESET, ok=False, inconclusive=False)
+    rec = bb.aggregate_cell_record(_cell(), [flood, _pair()])
+    assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "proved a loss on client counters alone" in rec.no_loss.detail
+    unsure = _pair(counter_reset=_RESET, ok=False, inconclusive=True)
+    control = bb.aggregate_cell_record(_cell(), [unsure, _pair()])
+    assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
+    # A band that judged its engine arms is not counted: its delivery arm compares one band's sink
+    # with the engine-wide written, so its own LOSS can be an artifact of the split.
+    judged = _pair(ok=False, inconclusive=False)
+    assert bb.aggregate_cell_record(_cell(), [judged, _pair()]).no_loss.ok
 
 
 def test_batchbox_aggregate_reports_every_band_reason_not_only_the_first() -> None:

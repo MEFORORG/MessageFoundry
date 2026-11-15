@@ -389,6 +389,9 @@ def test_an_inconclusive_baseline_is_no_resilience_win_and_fails_the_row() -> No
     assert cmp is not None and len(cmp.rows) == 1
     assert not cmp.rows[0].resilience_win
     assert not cmp.rows[0].ok
+    loss = cmp.to_json_dict()["rows"][0]["loss"]  # type: ignore[index]
+    assert loss["per_lane_zero_loss_inconclusive"] is True
+    assert loss["pooled_zero_loss_inconclusive"] is False
 
 
 def test_an_inconclusive_arm_is_labelled_inconclusive_not_a_breach() -> None:
