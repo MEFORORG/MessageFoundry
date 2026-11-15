@@ -3712,20 +3712,21 @@ if ($tool -in @("Bash", "PowerShell")) {
         # A READ IS RECOGNISED BY AN ALLOWLIST, NEVER BY THE ABSENCE OF A WRITE MODE (BACKLOG #5588,
         # #5589). `git config --unset <key>` names no value and still removes the key, so the bare-read
         # exemption below may not excuse it. A first fix listed git's write modes, and review measured
-        # every way a denylist leaks: git takes any unique prefix (`--unset-a`), the shell collapses
+        # at least three ways a denylist leaks: git takes any unique prefix (`--unset-a`), the shell collapses
         # `\--unset` and `--""unset`, and $via starts at the FIRST `config` word on the line, which can
         # sit in a `-c foo.config=1` key or a `.../config/...` path, so an anchored `unset` test missed
         # `git -c foo.config=1 config unset <key>`. So the read exemptions apply only when every token
         # between `config` and the key is an exact, valueless read option -- an optional leading `get`
         # subcommand, then scope and display flags and the `--get` modes. Anything else, a write mode
-        # included, is not a read here. That denies some odd reads (`--file <f>`, an abbreviation); it
-        # never excuses a write, because none of these tokens takes a value or sets anything.
+        # included, is not a read here. That denies some odd reads (`--file <f>`, an abbreviation,
+        # `get --all`). None of these tokens takes a value or sets anything; what follows the key is
+        # $rest, and the one exemption left requires it empty.
         $viaRead = $viaConfig -and ($via -cmatch "^config(?:\s+get)?(?:\s+(?:$readOpts))*\s+$")
         # For the refusal's wording only: a config-form disarm that is not the plain `config <key> <v>`
         # shape may REMOVE the key, so "setting" would misdescribe it.
         $viaWrite = $viaConfig -and -not $viaRead -and ($via -cnotmatch '^config(?:\s+(?:--local|--global|--system|--worktree))*\s+$')
-        # THE EXPLICIT READ FLAGS ARE TESTED BELOW, against $via and $rest (BACKLOG #5589); see the block
-        # after $ownCmdWin for the window they replaced.
+        # THE EXPLICIT READ FLAGS ARE NO LONGER TESTED ON THEIR OWN (BACKLOG #5589); see the block after
+        # $ownCmdWin for the window that did, and why.
         # ...AND THE IMPLICIT ONE (BACKLOG #1306). `git config <key>` with NO VALUE AFTER IT assigns
         # nothing -- it is the bare read, and `--get` is merely its explicit spelling. Measured against
         # real git: bare `git config <key>` exits 1 on an unset key and stores nothing, while
@@ -3834,23 +3835,16 @@ if ($tool -in @("Bash", "PowerShell")) {
         #   * $ownCmdWin ends where $via starts, at the `config` word, so the flag in `git config --get
         #     <key> <pattern>` was in neither half and that read was refused.
         #
-        # THE EXEMPTION IS NOW AN ALLOWLIST OVER $via, NOT A SEARCH FOR A FLAG IN IT. A search was tried
-        # and review measured it excusing real writes: `--comment --get <key> v` (the `--get` is the
-        # comment's VALUE, and git stores v), `--show-origin --no-show-origin <key> v`, and a write in a
-        # substitution after the key, `git config --get alias.x y $(git config <key> v)`. So:
-        #   * every token between `config` and the key must be an exact, valueless option from the list
-        #     below, and one of them must be a `--get` mode; no value-taking option, no abbreviation, no
-        #     negation of a get mode can appear;
-        #   * $rest, the pattern arguments, must hold nothing a shell could run or redirect: no
-        #     parenthesis, backtick, brace, `$`, `<` or `>`.
-        # A double quote is refused too: the scan blanks a quoted span, so `"$(...)"` reaches $rest as
-        # blanks and only the quote is left to show it.
-        # A read outside that shape -- `--file <f> --get`, an abbreviated flag, a double-quoted pattern
-        # -- still denies. That is the false deny #5589 names, closed only for the plain shape; widening
-        # it needs git's option table, not a regex. The bare read (empty $rest) is excused above.
+        # THERE IS NO MULTI-ARGUMENT READ EXEMPTION, AND TWO ATTEMPTS AT ONE ARE WHY. Any text after the
+        # key is $rest, and $rest is where a second command hides: a flag search excused
+        # `--comment --get <key> v` (the `--get` is the comment's VALUE, and git stores v), a negated
+        # `--show-origin`, and a write in a substitution; an allowlist over $via with a character
+        # filter on $rest was then measured excusing a second PowerShell statement after a lone CR,
+        # which neither the segment split nor $rest stops at. So `git config --get <key> <pattern>`
+        # stays DENIED, as it was before #5589. That false deny is the clause of #5589 left open;
+        # closing it needs $rest split as the host shell splits it, not a filter. The only read
+        # excused here is the bare one above, `config [read options] <key>` with nothing after it.
         # ===============================================================================================
-        if ($viaRead -and $via -cmatch '\s(?:get|--get(?:-all|-regexp)?)\s' -and
-            $rest -notmatch '[()`{}$<>"]') { continue }
 
         # ===============================================================================================
         # AND WHAT DID AN EARLIER STATEMENT OR LINE PUT IN THE ENVIRONMENT? (BACKLOG #1379 class two)

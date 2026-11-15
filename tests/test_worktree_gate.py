@@ -2569,23 +2569,34 @@ def test_rule_3c_denies_the_spellings_it_used_to_miss(
 @pytest.mark.parametrize(
     "cmd",
     [
-        # #5589: multi-argument reads, whose read flag sits between `config` and the key.
-        "git config --get core.hooksPath somepattern",
-        "git config --get-all alias.st status",
-        "git config --get-regexp alias.co .",
-        "git config --local --get core.hooksPath x",
-        "git config --show-origin --get-all core.hooksPath x",
-        # The bare reads the allowlist still recognises.
+        # The bare reads the allowlist still recognises. A multi-argument read such as
+        # `git config --get <key> <pattern>` is still denied: see the gate's note on why.
         "git config --local core.hooksPath",
         "git --no-pager config --get core.hooksPath",
+        "git config --show-origin --get-all core.hooksPath",
         "git config get core.hooksPath",
     ],
 )
-def test_rule_3c_allows_multi_argument_reads(
+def test_rule_3c_allows_bare_reads_the_allowlist_names(
     git_primary: Path, git_repos_file: Path, cmd: str
 ) -> None:
     assert_denied(run_gate(bash(DISARM_WRITE, cwd=git_primary), git_repos_file))  # control
     assert run_gate(bash(cmd, cwd=git_primary), git_repos_file) is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git config --get alias.x y\rgit config core.hooksPath /dev/null",
+        "git config --get alias.x\rgit config core.hooksPath /dev/null",
+    ],
+)
+def test_rule_3c_a_read_does_not_hide_a_second_powershell_statement(
+    git_primary: Path, git_repos_file: Path, cmd: str
+) -> None:
+    """PowerShell runs a statement after a lone CR, and $rest does not stop at one (review round 3)."""
+    reason = assert_denied(run_gate(bash(cmd, cwd=git_primary, tool="PowerShell"), git_repos_file))
+    assert "SHARED git configuration" in reason
 
 
 @pytest.mark.parametrize(
