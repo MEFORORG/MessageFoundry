@@ -406,6 +406,99 @@ function Get-UninstallResidueNotice {
     return $lines
 }
 
+function New-SeceditWorkDirectory {
+    <#
+      Make a new folder for the secedit files of Set-ServiceLogonRight (install-service.ps1) or
+      Remove-ServiceLogonRight (uninstall-service.ps1), and return its path. It is made in one step
+      with its final security: owner $OwnerSid, inheritance off, and full control for SYSTEM,
+      Administrators and the owner only. Throws when that cannot be shown. A folder found at the path
+      afterwards is left where it is, because a failed read-back cannot tell this run's folder from
+      one someone made first.
+
+      THE TWO SCRIPTS SHARE NO FILE, so each carries this function, byte for byte, and
+      tests/test_service_install_manifest.py fails when the two copies differ.
+
+      NOT IN THE USER'S TEMP (BACKLOG #5563). Both scripts run elevated, but the user's TEMP
+      belongs to the user, and a process of that user at medium integrity holds FILE_DELETE_CHILD
+      there. With it, the process can rename any folder in it, whatever that folder's own DACL says,
+      and put its own folder in its place with a policy file of its choosing. So the default parent is
+      the Windows folder's Temp. The Windows folder is asked of the system, not read from
+      $env:SystemRoot: the user can set that variable for their own processes.
+
+      WHAT IS CHECKED ON THE PARENT, before anything is made, and nothing more. It must be a folder
+      that is not a reparse point. Its owner must be SYSTEM, Administrators, TrustedInstaller or
+      $OwnerSid. No allow entry that applies to the parent itself may give anyone else
+      delete-child, a DACL change, ownership or GENERIC_ALL; OWNER RIGHTS counts as the owner and
+      CREATOR OWNER is not judged. A parent that fails is refused. DELETE on the parent itself is
+      not checked, and neither is any folder above it.
+
+      $Parent and $OwnerSid are parameters so the unelevated tests can make a folder they own.
+    #>
+    param([string]$Parent, [string]$OwnerSid = "S-1-5-32-544")
+    if (-not $Parent) { $Parent = Join-Path ([Environment]::GetFolderPath("Windows")) "Temp" }
+    # CREATOR OWNER (S-1-3-0) matches no one outside an inherited entry, so it is listed here.
+    $trusted = @(
+        "S-1-5-18", "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",   # TrustedInstaller
+        "S-1-3-0", $OwnerSid)
+    $item = Get-Item -LiteralPath $Parent -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "'$Parent' is not a plain folder"
+    }
+    # Who could rename a folder made here: its owner (WRITE_DAC grants the rest), and anyone the
+    # folder itself gives delete-child, a DACL change, ownership or GENERIC_ALL. Inherit-only entries
+    # apply to what is made inside, which this folder's own DACL replaces. OWNER RIGHTS (S-1-3-4)
+    # names the parent's owner, so the owner arm judges it.
+    $acl = Get-Acl -LiteralPath $Parent -ErrorAction Stop
+    $rights = [System.Security.AccessControl.FileSystemRights]
+    $renameMask = [int]($rights::DeleteSubdirectoriesAndFiles -bor $rights::ChangePermissions -bor
+        $rights::TakeOwnership) -bor 0x10000000
+    $open = @()
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($trusted -notcontains $owner) { $open += "$owner (owner)" } else { $trusted += @("S-1-3-4") }
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        if (([int]$rule.FileSystemRights -band $renameMask) -eq 0) { continue }
+        $sid = "$($rule.IdentityReference)"
+        try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { }
+        if ($trusted -notcontains $sid) { $open += "$sid ($($rule.FileSystemRights))" }
+    }
+    if ($open) {
+        throw ("'$Parent' lets another account rename a folder made in it: " +
+            (($open | Select-Object -Unique) -join ', '))
+    }
+    $path = Join-Path $Parent ("mefor-secedit-" + [guid]::NewGuid().ToString("N"))
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetOwner([Security.Principal.SecurityIdentifier]$OwnerSid)
+    $sec.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @("S-1-5-18", "S-1-5-32-544", $OwnerSid) | Select-Object -Unique) {
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.SecurityIdentifier]$sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    # .NET Framework (Windows PowerShell 5.1) has the overload; .NET (PowerShell 7) moved it to an
+    # extension method. As in install-service.ps1's New-RestrictedDirectory.
+    $overload = [System.IO.Directory].GetMethod('CreateDirectory',
+        [type[]]@([string], [System.Security.AccessControl.DirectorySecurity]))
+    if ($overload) { [void][System.IO.Directory]::CreateDirectory($path, $sec) }
+    else { [System.IO.FileSystemAclExtensions]::Create((New-Object System.IO.DirectoryInfo($path)), $sec) }
+    # CreateDirectory succeeds on a folder already there, so what is there is read back. A folder
+    # someone else made first is left alone, never deleted: it is not this run's.
+    $made = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    $back = Get-Acl -LiteralPath $path -ErrorAction Stop
+    if (($made.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+            $back.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $OwnerSid -or
+            -not $back.AreAccessRulesProtected) {
+        throw "'$path' was there before this run made it, so it is not the private folder asked for"
+    }
+    return $path
+}
+
 function Remove-ServiceLogonRight {
     <#
       Take SeServiceLogonRight back off $Sid, mirroring install-service.ps1's Set-ServiceLogonRight
@@ -424,14 +517,25 @@ function Remove-ServiceLogonRight {
       host includes the ones other services log on with. That is a far larger change than the one
       asked for, so it stops and says so instead.
 
+      THE TWO SECEDIT FILES LIVE IN A FOLDER ONLY ADMINISTRATORS CAN CHANGE (BACKLOG #5563). They
+      sat at fixed names in the user's TEMP, where a process of the same user at medium integrity
+      could rewrite the policy between the export and the import and so change a machine-wide user
+      right. New-SeceditWorkDirectory says where the folder goes and why.
+
       Returns $true only when secedit reported the re-import succeeded.
     #>
     param(
         [Parameter(Mandatory)][string]$Account,
         [Parameter(Mandatory)][string]$Sid
     )
-    $inf = Join-Path $env:TEMP "mefor-secedit-remove-$PID.inf"
-    $sdb = Join-Path $env:TEMP "mefor-secedit-remove-$PID.sdb"
+    try { $work = New-SeceditWorkDirectory } catch {
+        Write-Warning ("A private folder for the secedit files could not be made ($($_.Exception.Message)), " +
+            "so the 'Log on as a service' right for '$Account' was NOT removed. Clear it in " +
+            "secpol.msc under Local Policies, User Rights Assignment.")
+        return $false
+    }
+    $inf = Join-Path $work "remove.inf"
+    $sdb = Join-Path $work "remove.sdb"
     try {
         # $LASTEXITCODE is session-wide and a failed LAUNCH never writes it, so it is cleared before
         # each call and a $null afterwards is treated as "secedit did not run" - the rule the nssm
@@ -441,13 +545,13 @@ function Remove-ServiceLogonRight {
         # maintainer's, and this comment exists so the asymmetry is not read as parity.
         $global:LASTEXITCODE = $null
         & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
-        if ($null -eq $LASTEXITCODE -or $LASTEXITCODE -ne 0 -or -not (Test-Path $inf)) {
+        if ($null -eq $LASTEXITCODE -or $LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $inf)) {
             Write-Warning ("secedit export failed (exit $LASTEXITCODE), so the 'Log on as a " +
                 "service' right for '$Account' was NOT removed. Clear it in secpol.msc under " +
                 "Local Policies, User Rights Assignment.")
             return $false
         }
-        $lines = Get-Content $inf
+        $lines = Get-Content -LiteralPath $inf
         $row = $lines | Where-Object { $_ -match '^\s*SeServiceLogonRight\s*=' } | Select-Object -First 1
         if (-not $row) {
             Write-Host "  Right  : no account holds SeServiceLogonRight; nothing to remove."
@@ -476,7 +580,7 @@ function Remove-ServiceLogonRight {
                 "SeServiceLogonRight = " + ($kept -join ',')
             } else { $line }
         }
-        Set-Content -Path $inf -Value $new -Encoding Unicode
+        Set-Content -LiteralPath $inf -Value $new -Encoding Unicode
         $global:LASTEXITCODE = $null
         & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS | Out-Null
         if ($null -eq $LASTEXITCODE -or $LASTEXITCODE -ne 0) {
@@ -488,7 +592,7 @@ function Remove-ServiceLogonRight {
         Write-Host "  Right  : removed SeServiceLogonRight from '$Account'." -ForegroundColor Green
         return $true
     } finally {
-        Remove-Item $inf, $sdb -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
