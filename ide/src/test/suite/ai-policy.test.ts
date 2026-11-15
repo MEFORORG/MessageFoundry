@@ -393,16 +393,24 @@ suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
     };
   }
 
-  test("T20: a configured target with no cache fails closed, not to the CLI's byo", async () => {
+  test("T20: a configured target with no cache, in an IDE that has never held an answer, fails closed, not to the CLI's byo", async () => {
+    // A fresh store, so neither a carried deny nor an earlier engine answer decides the result:
+    // only the configured target keeps the CLI out.
+    const io = offlineWithCli(true);
+    const p = await resolveAiPolicy(keyedCtx(), io);
+    assert.strictEqual(p.mode, "unverified", "a configured target fell to the local CLI");
+    assert.strictEqual(io.cliAsked(), false, "the CLI is not consulted for a configured target");
+    assert.strictEqual(assistantState(p).enabled, false, "assistance stays disabled");
+  });
+
+  test("T20b: engine A's carried off applies to an unreachable configured target with no cache", async () => {
     const ctx = keyedCtx();
     await resolveAiPolicy(ctx, engineIo(A, wire({ mode: "off" })));
     const io = offlineWithCli(true);
     const p = await resolveAiPolicy(ctx, io);
-    // A's "off" is in the deny carrier, and an unreachable target applies any carried deny, so the
-    // answer is that "off" itself, which is stricter than the bare "unverified" an uncached target gets.
+    // A's "off" is in the deny carrier, and an unreachable target applies any carried deny.
     assert.strictEqual(p.mode, "off", "a cached off must not be bypassed by changing the setting");
-    assert.strictEqual(assistantState(p).enabled, false, "assistance stays disabled");
-    assert.strictEqual(io.cliAsked(), false, "the CLI is not consulted for a configured target");
+    assert.strictEqual(io.cliAsked(), false, "the CLI is not consulted once an engine has answered");
   });
 
   test("T22: the default target with no cache still falls to the CLI, as before", async () => {
