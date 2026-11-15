@@ -1081,9 +1081,10 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
     "ide/src/statusBar.ts": Site(
         5,
-        OPERATOR,
-        _IDE_WORKSPACE + " Two resolve the service config setting, or serve's default "
-        "name, against the workspace and only stat the result.",
+        REVIEWED,
+        "Existence checks only. Two resolve the `messagefoundry.serviceConfig` setting, or serve's "
+        "default name, from the workspace and stat the result; an absolute value stands alone. "
+        "Three are fixed names under the workspace. Nothing is opened through any of them.",
     ),
     "ide/src/stepsView.ts": Site(3, OPERATOR, _IDE_WORKSPACE + " Two are fixed media names."),
     "ide/src/symbolIndex.ts": Site(
