@@ -383,11 +383,14 @@ def _split_top_level(ctx: _Ctx, start: int, end: int) -> list[tuple[int, int]]:
     return parts
 
 
-def _has_spread(ctx: _Ctx, start: int, end: int) -> bool:
-    """Whether any element of the array literal in ``[start, end)`` is a ``...spread``."""
-    return any(
-        ctx.masked[lo:hi].lstrip().startswith("...") for lo, hi in _split_top_level(ctx, start, end)
-    )
+def _has_spread(ctx: _Ctx, parts: list[tuple[int, int]]) -> bool:
+    """Whether any element of a split array literal is a ``...spread``."""
+    return any(ctx.masked[lo:hi].lstrip().startswith("...") for lo, hi in parts)
+
+
+def _is_declared_at(ctx: _Ctx, i: int) -> bool:
+    """Whether the name at ``i`` is being DECLARED there rather than referenced."""
+    return _DECLARED_BEFORE_RE.search(ctx.masked, max(0, i - 16), i) is not None
 
 
 def _word_re(name: str) -> re.Pattern[str]:
@@ -396,11 +399,7 @@ def _word_re(name: str) -> re.Pattern[str]:
 
 def _declaration_count(ctx: _Ctx, name: str) -> int:
     """How many times ``name`` is declared with ``const``/``let``/``var``/``function`` anywhere."""
-    return sum(
-        1
-        for m in _word_re(name).finditer(ctx.masked)
-        if _DECLARED_BEFORE_RE.search(ctx.masked, max(0, m.start() - 16), m.start())
-    )
+    return sum(1 for m in _word_re(name).finditer(ctx.masked) if _is_declared_at(ctx, m.start()))
 
 
 def _first_assignment(ctx: _Ctx, name: str, mutators: bool) -> int | None:
@@ -409,20 +408,16 @@ def _first_assignment(ctx: _Ctx, name: str, mutators: bool) -> int | None:
     Its own declaration is not one. ``mutators`` adds the in-place array methods that change a
     length, and index or ``.length`` assignment -- the shapes that make a literal's count a guess.
     """
-    tail = r"\s*" + _ASSIGN
+    alts = [_ASSIGN]
     if mutators:
-        tail = (
-            r"\s*(?:\.\s*(?:push|unshift|splice|pop|shift)\s*\(|\.\s*length\s*"
-            + _ASSIGN
-            + r"|\[[^\]]*\]\s*"
-            + _ASSIGN
-            + "|"
-            + _ASSIGN
-            + ")"
-        )
-    pattern = re.compile(r"(?<![\w$.])" + re.escape(name) + tail)
+        alts += [
+            r"\.\s*(?:push|unshift|splice|pop|shift)\s*\(",
+            r"\.\s*length\s*" + _ASSIGN,
+            r"\[[^\]]*\]\s*" + _ASSIGN,
+        ]
+    pattern = re.compile(r"(?<![\w$.])" + re.escape(name) + r"\s*(?:" + "|".join(alts) + ")")
     for m in pattern.finditer(ctx.masked):
-        if not _DECLARED_BEFORE_RE.search(ctx.masked, max(0, m.start() - 16), m.start()):
+        if not _is_declared_at(ctx, m.start()):
             return m.start()
     return None
 
@@ -447,9 +442,10 @@ def _collect_array_widths(ctx: _Ctx) -> tuple[dict[str, int], dict[str, str]]:
         if close == -1:
             continue
         name = m.group(1)
-        if _has_spread(ctx, open_idx + 1, close):
+        parts = _split_top_level(ctx, open_idx + 1, close)
+        if _has_spread(ctx, parts):
             unstable[name] = "is built by spread"
-        widths[name] = len(_split_top_level(ctx, open_idx + 1, close))
+        widths[name] = len(parts)
     for name in widths:
         if name in unstable:
             continue
@@ -539,6 +535,7 @@ def _collect_helpers(ctx: _Ctx) -> None:
     pinned to one body, so its calls become unpriced terms instead.
     """
     found: dict[str, list[_Helper]] = {}
+    bodies: list[tuple[int, int]] = []
     for m in _FUNCTION_DECL_RE.finditer(ctx.masked):
         span = _function_body(ctx.masked, m.end() - 1)
         if span:
@@ -554,12 +551,14 @@ def _collect_helpers(ctx: _Ctx) -> None:
         ctx.def_names.update(h.def_at for h in defs)
         # `const review = function review(r) {...}` names one body twice; that is one definition.
         spans = {(h.body_start, h.body_end) for h in defs}
-        if len(spans) > 1 or _declaration_count(ctx, name) - (len(defs) - len(spans)) > 1:
+        double_named = len(defs) - len(spans)
+        if len(spans) > 1 or _declaration_count(ctx, name) - double_named > 1:
             ctx.ambiguous[name] = "is defined more than once in this file"
         elif (at := _first_assignment(ctx, name, mutators=False)) is not None:
             ctx.ambiguous[name] = f"is reassigned at line {ctx.line_of(at)}"
         ctx.helpers[name] = defs[0]
-        ctx.bodies += tuple((h.body_start, h.body_end) for h in defs)
+        bodies.extend(spans)
+    ctx.bodies = tuple(bodies)
     if ctx.helpers:
         names = "|".join(re.escape(n) for n in sorted(ctx.helpers, key=len, reverse=True))
         ctx.token_re = re.compile(_TOKEN_PATTERN + r"|(?<![\w$.])(?P<helper>" + names + r")\s*\(")
@@ -585,7 +584,7 @@ def _width_of(ctx: _Ctx, start: int, end: int) -> tuple[int | None, str]:
     if ctx.masked[lead] == "[":
         close = _match_bracket(ctx.masked, lead)
         if close != -1 and not ctx.masked[close + 1 : end].strip():
-            if _has_spread(ctx, lead + 1, close):
+            if _has_spread(ctx, _split_top_level(ctx, lead + 1, close)):
                 return None, "inline array built by spread"
             return len(_split_top_level(ctx, lead + 1, close)), "inline array"
 
@@ -722,30 +721,21 @@ def _price(ctx: _Ctx, start: int, end: int) -> Cost:
             pos = skip
             continue
 
-        if m.group("helper"):
-            if m.start() in ctx.def_names:  # `function review(` names it, it does not call it
-                pos = m.end()
-                continue
-            open_idx = m.end() - 1
-            close = _match_bracket(ctx.masked, open_idx)
-            if close == -1 or close > end:
-                total = total + Cost(unknowns=(_unreadable(ctx, m.start(), m.group("helper")),))
-                pos = m.end()
-                continue
-            total = total + _price_helper_call(ctx, m.group("helper"), m.start(), open_idx, close)
-            pos = close + 1
+        helper, hook = m.group("helper"), m.group("hook")
+        if helper and m.start() in ctx.def_names:  # `function review(` names it, not a call
+            pos = m.end()
             continue
-
-        if m.group("hook"):
+        if helper or hook:
             open_idx = m.end() - 1
             close = _match_bracket(ctx.masked, open_idx)
             if close == -1 or close > end:
                 # Unreadable rather than absent. Skipping it silently would let one mask desync
                 # truncate the scan while the report still said "exact".
-                total = total + Cost(unknowns=(_unreadable(ctx, m.start(), m.group("hook")),))
+                total = total + Cost(unknowns=(_unreadable(ctx, m.start(), helper or hook),))
                 pos = m.end()
                 continue
-            total = total + _price_hook(ctx, m.group("hook"), m.start(), open_idx, close)
+            pricer = _price_helper_call if helper else _price_hook
+            total = total + pricer(ctx, helper or hook, m.start(), open_idx, close)
             pos = close + 1
             continue
 
