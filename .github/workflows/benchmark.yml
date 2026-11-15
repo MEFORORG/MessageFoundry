@@ -382,9 +382,11 @@ jobs:
       MEFOR_STORE_USERNAME: sa
       MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
       MEFOR_STORE_POOL_SIZE: "40"  # track the shipped default (ADR 0062: 5 -> 40)
-      # The store pins the certificate the container serves; the step that makes it sets
-      # MEFOR_STORE_SSL_ROOT_CERT for the steps after it, since a job env cannot read runner.temp.
-      # Nothing permits a weakened store hop (vault BACKLOG #3533 item 2).
+      # No MEFOR_STORE_SSL_ROOT_CERT: this job's image is SQL Server 2022, so the store verifies the
+      # certificate the container serves through the runner's trust store (Encrypt=yes,
+      # TrustServerCertificate=no), as ci.yml's `store_tls: trust-store` legs do; the matrix there
+      # says why (owner ruling 2026-11-15). The step that makes the certificate adds it to that
+      # store. Nothing permits a weakened store hop (vault BACKLOG #3533 item 2).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python
@@ -440,7 +442,8 @@ jobs:
           done
           "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
-      # The same certificate as ci.yml's sqlserver-store step of the same name, which says why.
+      # The same certificate as ci.yml's sqlserver-store step of the same name, which says why, added
+      # to the runner's trust store, which is how this job's store verifies it.
       - name: Serve TLS from the SQL Server container with a generated certificate
         timeout-minutes: 5
         env:
@@ -469,7 +472,8 @@ jobs:
           docker exec -u 0 "$MSSQL" chmod 444 /var/opt/mssql/tls/server.pem
           docker exec -u 0 "$MSSQL" chmod 644 /var/opt/mssql/mssql.conf
           docker restart "$MSSQL"
-          echo "MEFOR_STORE_SSL_ROOT_CERT=$dir/server.pem" >> "$GITHUB_ENV"
+          sudo cp "$dir/server.pem" /usr/local/share/ca-certificates/mefor-ci-mssql.crt
+          sudo update-ca-certificates
           sqlcmd=/opt/mssql-tools18/bin/sqlcmd
           for i in $(seq 1 60); do
             if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
@@ -509,7 +513,7 @@ jobs:
           MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
           # THE ENFORCEMENT DIAL. This leg is at `warn` because it configures no [alerts] channel (the
-          # sign-in comment above), not for TLS: the store hop is pinned now. ci.yml's `load test
+          # sign-in comment above), not for TLS: the store hop is verified now. ci.yml's `load test
           # (smoke, sqlserver)` leg says why `warn` stays.
           MEFOR_SECURITY_ENFORCEMENT: "warn"
           # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.

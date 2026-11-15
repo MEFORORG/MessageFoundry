@@ -62,8 +62,9 @@ async def _open(target):
         from messagefoundry.config.settings import load_settings
         from messagefoundry.store.sqlserver import SqlServerStore
 
-        # No posture: the CI container's certificate is pinned (MEFOR_STORE_SSL_ROOT_CERT), so the
-        # store opens at the enforcing default, as the parent does (vault BACKLOG #3533 item 2).
+        # No posture: the CI container's certificate is verified, pinned (MEFOR_STORE_SSL_ROOT_CERT)
+        # or through the runner's trust store, so the store opens at the enforcing default, as
+        # the parent does (vault BACKLOG #3533 item 2).
         return await SqlServerStore.open(load_settings(environ=os.environ).store)
     from messagefoundry.store.store import MessageStore
 
