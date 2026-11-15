@@ -9,6 +9,7 @@ import * as vscode from "vscode";
 import { configDir, workspaceDir } from "./cli";
 import { nonce } from "./cspNonce";
 import { SCRIPT_STARTED_MARK, STARTUP_BANNERS } from "./webviewMessaging";
+import { resolveInsideWorkspace } from "./workspaceContainment";
 
 interface RoutePayload {
   ib: { kind: "mllp-in" | "file-in"; name: string; port?: string; directory?: string; pattern?: string };
@@ -19,7 +20,20 @@ interface RoutePayload {
 
 let panel: vscode.WebviewPanel | undefined;
 
+function refuseUntrusted(): boolean {
+  if (vscode.workspace.isTrusted) {
+    return false;
+  }
+  void vscode.window.showWarningMessage(
+    "MessageFoundry: trust this workspace to create a route. The wizard writes a config module that later checks run.",
+  );
+  return true;
+}
+
 export function openNewRoute(context: vscode.ExtensionContext, onCreated?: () => void): void {
+  if (refuseUntrusted()) {
+    return;
+  }
   if (panel) {
     panel.reveal();
     return;
@@ -44,12 +58,27 @@ async function createRoute(p: RoutePayload, onCreated?: () => void): Promise<voi
     void vscode.window.showErrorMessage("MessageFoundry: open a workspace folder first.");
     return;
   }
+  // The module written here runs on every later `check`, dry-run and engine load, and the folder it
+  // lands in comes from a setting a checked-in `.vscode/settings.json` can supply. So the wizard
+  // writes only in a trusted workspace, and only inside the workspace folder (BACKLOG #5410).
+  // openNewRoute refuses first, before any input; this repeats it at the write.
+  if (refuseUntrusted()) {
+    return;
+  }
   // Server-side guard mirroring the form's validation — never write invalid config.
   if (!p.ib.name.trim() || !p.router.trim() || !p.handler.trim() || !p.ob.name.trim()) {
     void vscode.window.showErrorMessage("MessageFoundry: inbound/router/handler/outbound names are all required.");
     return;
   }
-  const dir = path.isAbsolute(configDir()) ? configDir() : path.join(ws, configDir());
+  const dir = resolveInsideWorkspace(ws, configDir());
+  if (dir === undefined) {
+    // The setting's value is not echoed: a checked-in settings file controls it, and a notification
+    // renders markdown command links.
+    void vscode.window.showErrorMessage(
+      "MessageFoundry: the messagefoundry.configDir setting does not resolve inside this workspace folder, so no route was created.",
+    );
+    return;
+  }
   const fileName = `${p.ib.name.trim().replace(/[^A-Za-z0-9_-]/g, "_")}.py`;
   const target = vscode.Uri.file(path.join(dir, fileName));
 
@@ -72,7 +101,11 @@ async function createRoute(p: RoutePayload, onCreated?: () => void): Promise<voi
     onCreated?.();
     void vscode.window.showInformationMessage(`MessageFoundry: created route ${p.ib.name.trim()} → ${p.ob.name.trim()}.`);
   } catch (e) {
-    void vscode.window.showErrorMessage(`MessageFoundry: could not create the route — ${String(e)}`);
+    // The error code only: the message names the target path, which carries the setting's spelling.
+    const code = (e as { code?: unknown })?.code;
+    void vscode.window.showErrorMessage(
+      `MessageFoundry: could not create the route${typeof code === "string" ? ` (${code.replace(/[^A-Za-z0-9_]/g, "")})` : ""}.`,
+    );
   }
 }
 
