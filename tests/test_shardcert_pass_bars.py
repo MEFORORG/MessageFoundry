@@ -7,6 +7,7 @@ Unit tests over synthetic counters and a fake store: no load run, no database.
 
 from __future__ import annotations
 
+import dataclasses
 import types
 from typing import Any
 
@@ -237,3 +238,113 @@ def test_cli_exits_setup_code_when_the_reset_fails(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(shardcert, "run_shardcert", refuse)
     assert cli._run_shardcert([]) == 2
+
+
+def test_colocated_ladder_with_lost_copies_fails_exit_1() -> None:
+    """Store-truth loss (copies missing) on a co-located ladder rung is a correctness FAIL, exit 1."""
+    rec = ShardCertStepRecord.from_report(
+        16.0, _report(sink_received=1000, acked_copies_missing=7000)
+    )
+    ladder = shardcert.ShardCertLadderReport(records=[rec])
+    assert ladder.ok is False
+    assert ladder.exit_code == 1
+    assert ladder.result_label == "FAIL"
+
+
+def test_driver_report_with_lost_copies_fails() -> None:
+    """The two-box driver half, which tallies behind its own drain, still FAILs on missing copies."""
+    rep = shardcert.ShardCertDriverReport(
+        shards=("s1", "s2"),
+        killed_shard=None,
+        sent=1000,
+        acked=1000,
+        delivered_distinct=1000,
+        sink_received=1000,
+        acked_not_delivered=0,
+        lane_inversions=0,
+        lanes_observed=16,
+        lane_repeats=0,
+        engine_done=9000,
+        engine_dead=0,
+        in_pipeline_final=0,
+        drained=True,
+        drain_seconds=1.0,
+        delivering=8,
+        routing=BROADCAST,
+        acked_copies_missing=7000,
+    )
+    assert rep.ok is False
+    assert "LOSS" in rep.render()
+
+
+async def test_colocated_ladder_keeps_measured_rungs_when_a_reset_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5576 (note 3): a later rung's StoreResetFailed stops the climb but keeps the rungs already
+    measured, and the run reads SETUP_DEGRADED (exit 2), not a clean PASS and not a lost report."""
+    good = ShardCertStepRecord.from_report(8.0, _report(), hold_seconds=1.0)
+    calls: list[float] = []
+
+    async def step(*, rate: float, **_k: object) -> ShardCertStepRecord:
+        calls.append(rate)
+        if len(calls) == 2:
+            raise StoreResetFailed("store reset left rows in ['nodes'] after the DELETE")
+        return dataclasses.replace(good, aggregate_rate=rate)
+
+    monkeypatch.setattr(shardcert, "_run_ladder_step", step)
+    ladder = await shardcert.run_shardcert_ladder(rates=[8.0, 16.0, 32.0])
+    assert calls == [8.0, 16.0]
+    assert [r.aggregate_rate for r in ladder.records] == [8.0]
+    assert ladder.aborted_reason is not None and "16" in ladder.aborted_reason
+    assert ladder.exit_code == 2
+    assert ladder.to_json_dict()["aborted_reason"] == ladder.aborted_reason
+
+
+def test_colocated_ladder_abort_on_the_first_rung_is_setup_not_fail() -> None:
+    """A reset that fails before ANY rung ran is a setup failure (exit 2), not a correctness FAIL."""
+    ladder = shardcert.ShardCertLadderReport(
+        aborted_reason="store reset failed before the 8 msg/s rung"
+    )
+    assert ladder.exit_code == 2
+    assert ladder.result_label == "SETUP_DEGRADED"
+    assert "ABORTED" in ladder.render()
+    assert "raise the top rate" not in ladder.render()
+
+
+async def test_engine_posts_setup_failed_and_keeps_its_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The engine half tells the drive (ENGINE_SETUP_FAILED) and re-raises StoreResetFailed; a coord
+    write error must not replace it."""
+    from harness.load.coord import FileDropCoord
+
+    async def failing_reset(_env: object) -> None:
+        raise StoreResetFailed("store reset left rows in ['nodes'] after the DELETE")
+
+    monkeypatch.setattr(shardcert, "_reset_store", failing_reset)
+    c = FileDropCoord(tmp_path, run_id="r")
+    with pytest.raises(StoreResetFailed):
+        await shardcert._reset_store_or_signal(c, {})
+    posted = c.read(shardcert.ENGINE_SETUP_FAILED)
+    # A fixed reason crosses the shared directory, never the driver's text (server, database, table).
+    assert posted is not None and "nodes" not in str(posted["reason"])
+    assert "store reset failed" in str(posted["reason"])
+
+    def broken_post(*_a: object, **_k: object) -> None:
+        raise OSError("coord share unreachable")
+
+    monkeypatch.setattr(c, "post", broken_post)
+    with pytest.raises(StoreResetFailed):
+        await shardcert._reset_store_or_signal(c, {})
+
+
+async def test_engine_setup_reason_is_escaped(tmp_path: Any) -> None:
+    """The reason is another box's text from a shared directory, so control bytes never reach a terminal."""
+    from harness.load.coord import FileDropCoord
+
+    c = FileDropCoord(tmp_path, run_id="r")
+    c.post(shardcert.ENGINE_SETUP_FAILED, {"reason": "bad\x1b[2Jreset\nline"})
+    with pytest.raises(shardcert.EngineSetupFailed) as info:
+        await shardcert._await_shards_ready(c, timeout=5.0)
+    assert "\x1b" not in str(info.value)
+    assert "\n" not in str(info.value)

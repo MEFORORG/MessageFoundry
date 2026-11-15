@@ -1257,6 +1257,57 @@ class StoreResetFailed(RuntimeError):
     """:func:`_reset_store` could not empty a table, so the run would certify against stale rows."""
 
 
+#: The coord message the ENGINE half posts when its setup failed before SHARDS_READY (today: a
+#: :class:`StoreResetFailed`), so the drive half stops at once instead of waiting out its whole
+#: ``shards_ready_timeout`` for a SHARDS_READY that will never come.
+ENGINE_SETUP_FAILED = "engine_setup_failed"
+
+
+class EngineSetupFailed(CoordTimeout):
+    """The ENGINE half posted :data:`ENGINE_SETUP_FAILED`, so no SHARDS_READY will arrive. A
+    :class:`CoordTimeout` so every caller that already treats a missing SHARDS_READY as a rendezvous
+    failure (setup abort, exit 2) handles this the same way, only sooner."""
+
+
+async def _await_shards_ready(coord: FileDropCoord, *, timeout: float) -> dict[str, Any]:
+    """Wait for SHARDS_READY, failing fast on :data:`ENGINE_SETUP_FAILED` (BACKLOG #5576)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        ready = coord.read(SHARDS_READY)
+        if ready is not None:
+            return ready
+        failed = coord.read(ENGINE_SETUP_FAILED)
+        if failed is not None:
+            # The reason is the OTHER box's text read from a shared directory: escape it before it can
+            # reach a terminal through a CLI that prints this exception.
+            reason = escape_for_terminal(str(failed.get("reason")), single_line=True)
+            raise EngineSetupFailed(
+                f"the engine half failed its setup before SHARDS_READY: {reason}"
+            )
+        if loop.time() >= deadline:
+            raise CoordTimeout(
+                f"coord message {SHARDS_READY!r} not received within {timeout}s (dir={coord.directory})"
+            )
+        await asyncio.sleep(0.25)
+
+
+async def _reset_store_or_signal(coord: FileDropCoord, node_env: Mapping[str, str]) -> None:
+    """The ENGINE half's :func:`_reset_store`, telling a waiting drive half at once when it fails
+    (:data:`ENGINE_SETUP_FAILED`). The post is best-effort: a coord write error must not replace the
+    :class:`StoreResetFailed` the CLI turns into exit 2."""
+    try:
+        await _reset_store(node_env)
+    except StoreResetFailed:
+        # A fixed reason, not str(exc): the coord directory is shared across hosts and carries metadata
+        # only, and the driver's error text names the server, database and table. It stays on stderr.
+        with contextlib.suppress(OSError):
+            coord.post(
+                ENGINE_SETUP_FAILED, {"reason": "store reset failed (see the engine box's stderr)"}
+            )
+        raise
+
+
 async def _reset_store(env: Mapping[str, str]) -> None:
     """DELETE the pipeline tables so a re-run starts clean (mirrors test_load_failover_sqlserver).
 
@@ -1270,16 +1321,21 @@ async def _reset_store(env: Mapping[str, str]) -> None:
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.store.sqlserver import SqlServerStore
 
+    driver_error = _store_driver_error()
     # The TLS-escape guard (insecure_tls_allowed) reads os.environ DIRECTLY, so the parent-process
     # store open needs the escape + creds in os.environ, not just the load_settings `environ=` arg.
     with _env_scope(dict(env)):
         settings = load_settings(environ=os.environ).store
         # The escape needs a known warn posture (vault BACKLOG #2354); this rig is a dev container.
-        store = await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
+        try:
+            store = await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
+        except driver_error as exc:
+            raise StoreResetFailed(
+                f"store reset could not open the store: {type(exc).__name__}: {exc}"
+            ) from exc
     try:
         async with store._pool.acquire() as conn:
             cur = await conn.cursor()
-            driver_error = _store_driver_error()
             for table in _RESET_TABLES:
                 try:
                     await cur.execute(
@@ -1289,27 +1345,42 @@ async def _reset_store(env: Mapping[str, str]) -> None:
                     raise StoreResetFailed(
                         f"store reset could not empty {table!r}: {type(exc).__name__}: {exc}"
                     ) from exc
-            await conn.commit()
+            try:
+                await conn.commit()
+            except driver_error as exc:
+                raise StoreResetFailed(
+                    f"store reset could not commit: {type(exc).__name__}: {exc}"
+                ) from exc
             # Read back after the commit: the DELETEs reporting success is not the tables being empty.
             # It is a point-in-time read. A writer still running from an earlier run can refill a table
             # after it, and nothing here stops that. One round trip names every table holding rows.
-            await cur.execute(
-                "SET NOCOUNT ON; DECLARE @left TABLE (t sysname); "
-                + " ".join(
-                    # Nested, not `AND`: T-SQL compiles a whole IF condition and does not promise to
-                    # short-circuit, so `EXISTS (SELECT 1 FROM t)` must sit in its own statement for a
-                    # missing table to be skipped rather than raise error 208.
-                    f"IF OBJECT_ID(N'{t}', N'U') IS NOT NULL IF EXISTS (SELECT 1 FROM {t}) "
-                    f"INSERT INTO @left VALUES (N'{t}');"
-                    for t in _RESET_TABLES
-                )
-                + " SELECT t FROM @left"
-            )
-            left = [str(r[0]) for r in await cur.fetchall()]
+            try:
+                left = await _reset_leftovers(cur)
+            except driver_error as exc:
+                raise StoreResetFailed(
+                    f"store reset could not read back: {type(exc).__name__}: {exc}"
+                ) from exc
             if left:
                 raise StoreResetFailed(f"store reset left rows in {left} after the DELETE")
     finally:
         await store.close()
+
+
+async def _reset_leftovers(cur: Any) -> list[str]:
+    """The reset tables still holding rows, in one round trip."""
+    await cur.execute(
+        "SET NOCOUNT ON; DECLARE @left TABLE (t sysname); "
+        + " ".join(
+            # Nested, not `AND`: T-SQL compiles a whole IF condition and does not promise to
+            # short-circuit, so `EXISTS (SELECT 1 FROM t)` must sit in its own statement for a
+            # missing table to be skipped rather than raise error 208.
+            f"IF OBJECT_ID(N'{t}', N'U') IS NOT NULL IF EXISTS (SELECT 1 FROM {t}) "
+            f"INSERT INTO @left VALUES (N'{t}');"
+            for t in _RESET_TABLES
+        )
+        + " SELECT t FROM @left"
+    )
+    return [str(r[0]) for r in await cur.fetchall()]
 
 
 @dataclass(frozen=True)
@@ -2231,16 +2302,31 @@ class ShardCertLadderReport:
     #: exit 2 — nothing was established about the engine at the stopping rung. ``None`` when the ceiling is
     #: admissible (or engine-bound, which KEEPS its rate) or the climb never stopped.
     ceiling_void_reason: str | None = None
+    #: BACKLOG #5576: the climb stopped because a rung's store reset failed (:class:`StoreResetFailed`).
+    #: The rungs measured before it are kept; the run is SETUP_DEGRADED (exit 2), never a clean PASS.
+    aborted_reason: str | None = None
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def _records_ok(self) -> bool:
+        return all(
+            r.no_loss and r.lane_inversions == 0 and r.stranded_nonterminal == 0
+            for r in self.records
+        )
 
     @property
     def ok(self) -> bool:
         """Every step held the correctness invariants WHILE climbing (no acknowledged loss, per-lane
         FIFO, no stranded rows). The ceiling itself is a MEASUREMENT, not a failure."""
-        return bool(self.records) and all(
-            r.no_loss and r.lane_inversions == 0 and r.stranded_nonterminal == 0
-            for r in self.records
-        )
+        return bool(self.records) and self._records_ok
+
+    @property
+    def _broken(self) -> bool:
+        """A correctness FAIL (exit 1): a measured rung broke an invariant, or nothing was measured and
+        no setup abort explains why. A climb a failed reset stopped before its first rung is SETUP."""
+        if self.records:
+            return not self._records_ok
+        return self.aborted_reason is None
 
     @property
     def ceiling_pool_bound(self) -> bool:
@@ -2271,20 +2357,28 @@ class ShardCertLadderReport:
 
         ARTIFACT 2 adds the POOL: a ceiling measured on a rung that tripped the pre-registered store-pool
         tripwire is a POOL BIND, not an engine ceiling, and must not publish a rate either."""
-        return self.ceiling_void_reason is not None or self.ceiling_pool_bound
+        return (
+            self.ceiling_void_reason is not None
+            or self.ceiling_pool_bound
+            or self.aborted_reason is not None
+        )
 
     @property
     def exit_code(self) -> int:
         """0 (correctness held) / 1 (a correctness break) / 2 (a SETUP degradation — nothing was measured
         about the engine at the rung that stopped the climb, or the STORE POOL was the constraint there)."""
-        if not self.ok:
+        if self._broken:
             return 1
         return 2 if self.setup_degraded else 0
 
     @property
     def result_label(self) -> str:
-        if not self.ok:
+        if self._broken:
             return "FAIL"
+        # An aborted climb outranks POOL_BOUND, as in the two-box report: the climb never finished, so no
+        # ceiling it names (pool-bound or not) is the run's answer.
+        if self.aborted_reason is not None:
+            return "SETUP_DEGRADED"
         # POOL_BOUND is called out by name, not folded into SETUP_DEGRADED: "the pool was the wall" is a
         # specific, actionable finding (raise --store-pool-size and re-run), and the whole point of ARTIFACT
         # 2 is that it must never again be indistinguishable from a claim wall in the headline.
@@ -2396,13 +2490,18 @@ class ShardCertLadderReport:
             #  * ADDED per record: `hold_seconds`, `sent`, `sent_ratio`, `accepted_rate`, the FIDELITY block
             #    (incl. the `deferred_backpressure`/`deferred_schedule` CAUSE SPLIT), `topology`,
             #    `store_pool`.
-            "schema_version": 2,
+            #
+            # v3 (BACKLOG #5575, #5576): per-record `no_loss` now also requires every expected copy of every
+            # ACKed message (a fan-out rung that lost copies was `no_loss: true` in v2), and the new
+            # `aborted_reason` names a climb a failed store reset stopped (exit 2, the rungs before it kept).
+            "schema_version": 3,
             "kind": "shardcert_ladder",
             "result": self.result_label,
             "exit_code": self.exit_code,
             "ceiling_rate": self.ceiling_rate,
             "ceiling_admissible": self.ceiling_admissible,
             "ceiling_void_reason": self.ceiling_void_reason,
+            "aborted_reason": self.aborted_reason,
             # ARTIFACT 2: the ceiling's own rung tripped the pre-registered pool tripwire ⇒ the wall is the
             # STORE POOL, not the engine. Gated (exit 2 / result POOL_BOUND), not merely noted.
             "ceiling_pool_bound": self.ceiling_pool_bound,
@@ -2479,6 +2578,11 @@ class ShardCertLadderReport:
             )
         elif self.ceiling_rate is not None:
             lines.append(f"  ceiling ~ {self.ceiling_rate:g} msg/s (aggregate)")
+        elif self.aborted_reason is not None:
+            lines.append(
+                "  ceiling: NONE — the climb ABORTED before it found one "
+                f"({self.aborted_reason}). Fix the store and re-run."
+            )
         elif self.ceiling_void_reason is not None:
             # NEVER print a rate here: the rung that stopped the climb was not evidence about the engine.
             lines.append(
@@ -2589,20 +2693,28 @@ async def run_shardcert_ladder(
     if not ordered:
         raise ValueError("run_shardcert_ladder needs at least one rate")
     for rate in ordered:
-        rec = await _run_ladder_step(
-            rate=rate,
-            dests=dests,
-            handlers=handlers,
-            delivering=delivering,
-            hold_seconds=hold_seconds,
-            drain_timeout=drain_timeout,
-            store_env=store_env,
-            cwd=cwd,
-            sink_host=sink_host,
-            sink_port=sink_port,
-            store_pool_size=store_pool_size,
-            strict_bands=strict_bands,
-        )
+        try:
+            rec = await _run_ladder_step(
+                rate=rate,
+                dests=dests,
+                handlers=handlers,
+                delivering=delivering,
+                hold_seconds=hold_seconds,
+                drain_timeout=drain_timeout,
+                store_env=store_env,
+                cwd=cwd,
+                sink_host=sink_host,
+                sink_port=sink_port,
+                store_pool_size=store_pool_size,
+                strict_bands=strict_bands,
+            )
+        except StoreResetFailed as exc:
+            # BACKLOG #5576: keep the rungs already measured. Raising would discard them with the report.
+            report.aborted_reason = escape_for_terminal(
+                f"store reset failed before the {rate:g} msg/s rung: {exc}", single_line=True
+            )
+            report.notes.append(f"CLIMB ABORTED: {report.aborted_reason}")
+            break
         report.records.append(rec)
         # ARTIFACT 4: a rung that was not DRIVEN at its own plan is not a ceiling — say so at the moment it
         # is recorded, so a `ceiling_rate` read out of this report is never quoted without the caveat.
@@ -3222,7 +3334,9 @@ async def run_shardcert_engine(
     # record, not left to whatever MEFOR_PIPELINE_CLAIM_MODE happened to be in the parent env.
     node_env["MEFOR_PIPELINE_CLAIM_MODE"] = claim_mode
 
-    await _reset_store(node_env)
+    # A stale failure from an earlier run of this run id must not be read as this one's.
+    coord.clear_messages(ENGINE_SETUP_FAILED)
+    await _reset_store_or_signal(coord, node_env)
 
     killed = _choose_killed(kill, kill_shard, ids_list, owned)
     nodes: dict[str, ShardCertNode] = {}
@@ -3600,7 +3714,7 @@ async def run_shardcert_driver(
 
     The drain poll is https with the remote rig session unless ``allow_insecure``; ``cacert`` is the
     engine box's certificate PEM (see :func:`_remote_engine_poller`)."""
-    ready = await coord.await_message(SHARDS_READY, timeout=shards_ready_timeout)
+    ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
     lanes = int(ready.get("lanes", 1))
@@ -4064,7 +4178,7 @@ async def run_shardcert_driver_worker(
     It NEVER binds a sink (the external sink tier owns delivery) and NEVER spawns an engine — the whole
     point is CPU isolation and horizontal sender scale. **Fail loud** if the band slice is empty / the
     worker count exceeds the bands (see :func:`_band_slice`)."""
-    ready = await coord.await_message(SHARDS_READY, timeout=shards_ready_timeout)
+    ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
     lanes = int(ready.get("lanes", 1))
@@ -4499,7 +4613,10 @@ class ShardCertDriveReport:
             #    cannot say whose fault it was; these can. WARNING: `traffic.fidelity` is therefore NARROWED: a v4
             #    `drive_shortfall` is a v5 `backpressure_bind`, `drive_shortfall` or `offer_shortfall`.
             #  * `traffic.sent_ratio` — so the UNMEASURED 0.98 sent bar can be re-derived from banked runs.
-            "schema_version": 5,
+            #
+            # v6 (BACKLOG #5577) — ADDITIVE: `tallied_behind_gate`, True only when the drive RECEIVED the
+            # ENGINE_DRAINED gate before its sinks tallied. A v5 artifact carries no such key; read it absent.
+            "schema_version": 6,
             "kind": "shardcert_drive",
             "verdict": "PASS" if self.ok else "FAIL",
             "shards": list(self.shards),
@@ -4639,7 +4756,7 @@ async def run_shardcert_drive(
     alone risks reading a teardown-frozen in-flight tail as loss; awaiting the engine's DIRECT store read
     closes that window. Bounded + best-effort — a missing signal degrades to the advisory-drain fallback
     with a note, never a hang."""
-    ready = await coord.await_message(SHARDS_READY, timeout=shards_ready_timeout)
+    ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     dests = int(ready["dests"])
     # BACKLOG #209: REQUIRED keys, never `.get(..., dests)`. These are GATE INPUTS — `delivering` is the

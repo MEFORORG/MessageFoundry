@@ -1190,7 +1190,9 @@ def test_colocated_ladder_report_rolls_up_the_void_rates(monkeypatch: pytest.Mon
 
     assert report.fidelity_void_rates == [80.0, 120.0]  # the shortfall AND the intake bind
     js = report.to_json_dict()
-    assert js["schema_version"] == 2  # v2: +sent +fidelity per record, +the roll-up
+    assert (
+        js["schema_version"] == 3
+    )  # v2: +sent +fidelity per record; v3 (#5575/#5576): copies, abort
     fid = js["fidelity"]
     assert isinstance(fid, dict)
     assert fid["all_admissible"] is False

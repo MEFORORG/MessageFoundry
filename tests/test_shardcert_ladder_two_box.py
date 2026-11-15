@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import pathlib
 import types
 
 import pytest
@@ -2689,8 +2690,10 @@ def test_drive_report_json_carries_the_shape_and_schema_v3() -> None:
     )
     js = drive.to_json_dict()
     # v2: `dests` != fan-out; v3: +routing; v4: +fidelity gate + G (inbound bands); v5: +store_pool and the
-    # DEFERRAL CAUSE SPLIT + sent_ratio ⇒ a stale reader notices rather than silently mis-reading.
-    assert js["schema_version"] == 5
+    # DEFERRAL CAUSE SPLIT + sent_ratio ⇒ a stale reader notices rather than silently mis-reading; v6
+    # (#5577): +tallied_behind_gate.
+    assert js["schema_version"] == 6
+    assert js["tallied_behind_gate"] is False
     topo = js["topology"]
     assert isinstance(topo, dict)
     assert (topo["dests"], topo["handlers"], topo["delivering"]) == (8, 20, 4)
@@ -3715,3 +3718,98 @@ def test_a_pool_bound_ceiling_does_not_mask_a_run_where_nothing_was_measured() -
         rep.result_label == "SETUP_DEGRADED"
     )  # ...but nothing was certified, and THAT is the headline
     assert rep.exit_code == 2
+
+
+# --- BACKLOG #5577, Manager ruling: the gate never softens a fail -----------------------------------------
+
+
+def _gated(*, sink_received: int, drained: bool = True) -> ShardCertDriveReport:
+    return dataclasses.replace(
+        _drive(ingress=24.0, acked=1440, sink_received=sink_received, drained=drained),
+        tallied_behind_gate=True,
+    )
+
+
+def test_gated_sink_shortfall_with_no_store_loss_is_inconclusive() -> None:
+    """The store-truth says every copy was delivered (engine_ok) and the gated sinks came up half short:
+    a genuine observer contradiction, so INCONCLUSIVE, which stops the climb and reads SETUP_DEGRADED."""
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        _gated(sink_received=1440 * 8 // 2),
+        _gate(engine_ok=True),
+        _report(),
+    )
+    assert out.verdict is RungVerdict.INCONCLUSIVE
+    assert out.gated_shortfall is True
+    rep = _rep([out])
+    assert rep.store_truth_unconfirmed is True
+    assert rep.exit_code == 2
+
+
+def test_gated_store_loss_is_not_softened() -> None:
+    """Store-truth loss behind the gate (rows stranded, engine_ok False, the sink short by them) is still
+    the COLLAPSED it was before #5577, never the softer INCONCLUSIVE, and never a gated shortfall."""
+    stranded = 400
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        _gated(sink_received=1440 * 8 - stranded, drained=False),
+        _gate(engine_ok=False, drained=False, stranded=stranded),
+        _report(),
+    )
+    assert out.verdict is RungVerdict.COLLAPSED
+    assert out.gated_shortfall is False
+
+
+@pytest.mark.parametrize(
+    ("sink", "gate_kwargs"),
+    [
+        (1440 * 8 // 2, {"engine_ok": True}),  # gated shortfall, store-truth clean
+        (1440 * 8 - 400, {"engine_ok": False, "drained": False, "stranded": 400}),  # store loss
+    ],
+)
+def test_soak_that_did_not_hold_behind_the_gate_reads_not_sustained(
+    sink: int, gate_kwargs: dict[str, object]
+) -> None:
+    """A soak whose store-truth WAS confirmed and did not hold reads SOAK_NOT_SUSTAINED. Before #5577 the
+    gated-shortfall soak was a FROZEN_TAIL and read that; trigger (c) must not soften it to UNCONFIRMED."""
+    soak = build_rung_outcome(
+        dataclasses.replace(_rung(idx=0, rate=20.0), is_soak=True, index=-1),
+        _gated(sink_received=sink),
+        _gate(**gate_kwargs),  # type: ignore[arg-type]
+        _report(),
+    )
+    rep = _rep([_outcome(20.0, RungVerdict.SUSTAINED)], soak=soak)
+    assert rep.soak_not_sustained is True
+    assert rep.soak_store_truth_unconfirmed is False
+    assert rep.result_label == "SOAK_NOT_SUSTAINED"
+
+
+def test_drive_fails_fast_when_the_engine_setup_failed(tmp_path: pathlib.Path) -> None:
+    """BACKLOG #5576 (note 3): an engine half whose store reset failed posts ENGINE_SETUP_FAILED, and the
+    drive's SHARDS_READY wait stops on it at once instead of waiting out its timeout."""
+    import asyncio
+    import time
+
+    c = coord.FileDropCoord(tmp_path, run_id="r")
+    c.post(_shardcert.ENGINE_SETUP_FAILED, {"reason": "store reset left rows in ['nodes']"})
+    t0 = time.monotonic()
+    with pytest.raises(_shardcert.EngineSetupFailed, match="nodes"):
+        asyncio.run(_shardcert._await_shards_ready(c, timeout=60.0))
+    assert time.monotonic() - t0 < 5.0
+    assert isinstance(_shardcert.EngineSetupFailed("x"), coord.CoordTimeout)
+
+
+def test_blind_collector_soak_behind_the_gate_stays_unconfirmed() -> None:
+    """A gated soak whose sinks saw NOTHING (trigger (b), a blind collector) proves nothing: it stays
+    SOAK_UNCONFIRMED and is not a gated shortfall, which would make it a proven SOAK_NOT_SUSTAINED."""
+    soak = build_rung_outcome(
+        dataclasses.replace(_rung(idx=0, rate=20.0), is_soak=True, index=-1),
+        _gated(sink_received=0),
+        _gate(engine_ok=True),
+        _report(),
+    )
+    assert soak.verdict is RungVerdict.INCONCLUSIVE
+    assert soak.gated_shortfall is False
+    rep = _rep([_outcome(20.0, RungVerdict.SUSTAINED)], soak=soak)
+    assert rep.soak_store_truth_unconfirmed is True
+    assert rep.soak_not_sustained is False

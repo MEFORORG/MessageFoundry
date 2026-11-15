@@ -82,11 +82,13 @@ from harness.load.coord import (
 )
 from harness.load.enginepoll import EMPTY_POOL_STATS, PoolStats
 from harness.load.shardcert import (
+    ENGINE_SETUP_FAILED,
     FIDELITY_ACKED_FLOOR,
     FIDELITY_GATE_VERSION,
     FIDELITY_SENT_FLOOR,
     INBOUND_BAND_CHECK_BASIS,
     PRODUCT_STORE_POOL_SIZE,
+    EngineSetupFailed,
     RungFidelity,
     ShardCertDriveReport,
     ShardCertEngineReport,
@@ -892,6 +894,25 @@ class RungVerdict(enum.Enum):
 _OBSERVER_DISAGREE_TOL = 0.01
 
 
+def is_gated_shortfall(
+    *,
+    drain_gated: bool,
+    engine_ok: bool,
+    acked: int,
+    sink_received: int,
+    delivering: int,
+    tol: float = _OBSERVER_DISAGREE_TOL,
+) -> bool:
+    """A4b trigger (c), BACKLOG #5577: the sinks tallied behind the drain gate, the store-truth is clean,
+    and the sinks are more than ``tol x A x D`` short, but not ZERO (a zero is trigger (b), a blind
+    collector, which proves nothing). The one definition: :func:`observers_inconclusive` fires on it, and
+    :func:`build_rung_outcome` records it, so a soak in this state reads SOAK_NOT_SUSTAINED."""
+    if not (drain_gated and engine_ok) or acked <= 0 or delivering <= 0 or sink_received <= 0:
+        return False
+    expected = acked * delivering
+    return sink_received < expected - tol * expected
+
+
 def observers_inconclusive(
     *,
     engine_ok: bool,
@@ -1045,7 +1066,14 @@ def observers_inconclusive(
     # (c) BACKLOG #5577: the drain gate held the sink tally until the engine reported every row done, so a
     # clean store-truth asserts all A×D copies delivered. A sink materially short of that contradicts it;
     # only a LOST gate (sinks may tally early) makes such a shortfall a benign FROZEN_TAIL.
-    if drain_gated and engine_ok and sink_received < expected - slack:
+    if is_gated_shortfall(
+        drain_gated=drain_gated,
+        engine_ok=engine_ok,
+        acked=acked,
+        sink_received=sink_received,
+        delivering=delivering,
+        tol=tol,
+    ):
         return True
     # (a) the sink over-counts vs the engine store-truth's permitted deliveries. When the engine claims a
     # collapse we need the strand/dead tally to compute the permit; an unknown tally (a sentinel <0) can't
@@ -1258,6 +1286,12 @@ class RungOutcome:
     #: BACKLOG #5577: the drive tallied its sinks behind the ENGINE_DRAINED barrier, which arms the A4b
     #: material-shortfall trigger. Recorded so the verdict can be re-derived from the rung record alone.
     drain_gated: bool = False
+    #: BACKLOG #5577: this rung is INCONCLUSIVE by A4b trigger (c) (:func:`is_gated_shortfall`) on a
+    #: CONFIRMED store-truth. That is not the unknown an unconfirmed INCONCLUSIVE is: the rung demonstrably
+    #: did not show its deliveries, so a soak in this state still reads SOAK_NOT_SUSTAINED, as the
+    #: FROZEN_TAIL it used to be did, never the weaker SOAK_UNCONFIRMED.
+    gated_shortfall: bool = False
+
     #: WHICH SHAPE served this rung (from the drive report, which learned it from SHARDS_READY). Load-bearing
     #: for reading `handlers`/`delivering`: under `partitioned` they are the DERIVED accounting pair (1, 1),
     #: which a legal BROADCAST run can also produce with a totally different lane topology.
@@ -1555,6 +1589,7 @@ class RungOutcome:
                 "outbound_stranded": self.engine_outbound_stranded,
                 "in_pipeline_final": self.engine_in_pipeline_final,
                 "drain_gated": self.drain_gated,  # v9 (#5577): sinks tallied behind the drain gate
+                "gated_shortfall": self.gated_shortfall,  # v9 (#5577): A4b trigger (c) fired
             },
             "in_pipeline_slope": self.in_pipeline_slope,
             "phase_timing": self.phase.to_json_dict(),
@@ -1694,6 +1729,17 @@ def build_rung_outcome(
         # that reached disk after the drive's wait timed out does not make an early tally late.
         drain_gated=drain_gated,
     )
+    gated_shortfall = (
+        verdict is RungVerdict.INCONCLUSIVE
+        and engine_reported
+        and is_gated_shortfall(
+            drain_gated=drain_gated,
+            engine_ok=engine_ok,
+            acked=drive.acked,
+            sink_received=drive.sink_received,
+            delivering=drive.delivering,
+        )
+    )
     # A4b: distinguish this INCONCLUSIVE from the store-truth-unconfirmed one (which already noted itself
     # above) so an operator sees WHY a confirmed rung would not certify — the two observers disagreed.
     if verdict is RungVerdict.INCONCLUSIVE and engine_reported:
@@ -1779,6 +1825,7 @@ def build_rung_outcome(
         engine_routed_stranded=engine_routed_stranded,
         engine_outbound_stranded=engine_outbound_stranded,
         drain_gated=drain_gated,
+        gated_shortfall=gated_shortfall,
         engine_in_pipeline_final=engine_in_pipeline_final,
         in_pipeline_slope=slope,
         phase=phase,
@@ -2447,12 +2494,18 @@ class ConsolidatedLadderReport:
         return (
             self.soak is not None
             and not self.soak_aborted
-            and (self.soak.verdict is RungVerdict.INCONCLUSIVE or self.soak_fidelity_unattributed)
+            # BACKLOG #5577: a gated shortfall's store-truth WAS confirmed; it reads NOT_SUSTAINED instead.
+            and (
+                (self.soak.verdict is RungVerdict.INCONCLUSIVE and not self.soak.gated_shortfall)
+                or self.soak_fidelity_unattributed
+            )
         )
 
     @property
     def soak_not_sustained(self) -> bool:
-        """B9: a soak RAN, its store-truth WAS confirmed, and it did not hold — COLLAPSED or FROZEN_TAIL.
+        """B9: a soak RAN, its store-truth WAS confirmed, and it did not hold — COLLAPSED, FROZEN_TAIL, or
+        (BACKLOG #5577) an INCONCLUSIVE gated shortfall (:attr:`RungOutcome.gated_shortfall`), which was a
+        FROZEN_TAIL before trigger (c) and must not soften to SOAK_UNCONFIRMED.
 
         Excluding INCONCLUSIVE is load-bearing, not defensive. Without it a soak whose engine store-truth
         never arrived (a coord glitch — ``classify_rung`` returns INCONCLUSIVE exactly when
@@ -2484,7 +2537,9 @@ class ConsolidatedLadderReport:
         return (
             self.soak is not None
             and not self.soak_aborted
-            and self.soak.verdict is not RungVerdict.INCONCLUSIVE
+            # BACKLOG #5577: a gated shortfall is INCONCLUSIVE on a CONFIRMED store-truth, the FROZEN_TAIL
+            # it replaced read NOT_SUSTAINED, and the change must not soften that.
+            and (self.soak.verdict is not RungVerdict.INCONCLUSIVE or self.soak.gated_shortfall)
             and not self.soak_drive_shortfall
             and not self.soak_fidelity_unattributed
             and not self.soak_ok
@@ -3378,6 +3433,10 @@ async def run_engine_ladder(
     # after rung 0's handshake, so a startup clear never races a live signal. The drive clears the same pair
     # at the top of run_drive_ladder — clearing from both sides at startup is idempotent.
     base_coord.clear_messages(LADDER_STOP, LADDER_SOAK)
+    # BACKLOG #5576: the drive waits on rung k while this half is still between rungs, so a failure file
+    # an EARLIER run left for rung k would abort it before rung k's own clear. Clear them all now.
+    for planned in [*(r.run_suffix for r in climb), "soak"]:
+        base_coord.for_run(f"{base_coord.run_id}.{planned}").clear_messages(ENGINE_SETUP_FAILED)
 
     for rung in climb:
         # Early-stop: before arming any rung after the first, give the drive's just-posted LADDER_STOP a
@@ -3576,6 +3635,7 @@ async def run_drive_ladder(
     stopped = False
     climb_aborted = False
     soak_aborted = False
+    engine_setup_failed = False
     for rung in climb:
         rung_coord = base_coord.for_run(f"{base_coord.run_id}.{rung.run_suffix}")
         try:
@@ -3594,6 +3654,20 @@ async def run_drive_ladder(
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
             )
+        except EngineSetupFailed as exc:
+            # BACKLOG #5576: the ENGINE half's setup failed (a failed store reset) and it has exited. Not a
+            # drive abort: say whose it was, and post no RUNG_ABORTED to an engine that is gone. LADDER_STOP
+            # still goes out for a half that is still polling. The soak is skipped below.
+            base_coord.post(
+                LADDER_STOP, {"stopped_at": rung.run_suffix, "verdict": "engine_setup_failed"}
+            )
+            notes.append(  # str(exc) is already terminal-escaped by _await_shards_ready
+                f"{rung.run_suffix}: ENGINE setup failed ({exc}) — climb aborted, soak skipped"
+            )
+            engine_setup_failed = True
+            climb_aborted = True
+            stopped = True
+            break
         except CoordTimeout as exc:
             # The engine half never handed off this rung within the window (dead / desynced) — a two-box
             # RENDEZVOUS failure, NOT a bench result. Post LADDER_STOP so the engine stops climbing
@@ -3637,7 +3711,11 @@ async def run_drive_ladder(
             break
 
     # Soak selection + handshake.
-    soak_rate = pick_soak_rate(outcomes, soak_rate_override) if do_soak else None
+    soak_rate = (
+        pick_soak_rate(outcomes, soak_rate_override)
+        if do_soak and not engine_setup_failed
+        else None
+    )
     soak_outcome: RungOutcome | None = None
     if soak_rate is None:
         base_coord.post(LADDER_SOAK, {"skip": True})
@@ -3651,6 +3729,8 @@ async def run_drive_ladder(
         void_sustained = [r for r in sustained if not r.fidelity_admissible]
         if not do_soak:
             notes.append("no soak (soak disabled)")
+        elif engine_setup_failed:
+            notes.append("no soak: the engine half failed its setup and exited")
         elif sustained and len(void_sustained) == len(sustained):
             notes.append(
                 f"no soak: {len(sustained)} of {len(outcomes)} climb rung(s) SUSTAINED but ALL were "
@@ -3706,6 +3786,9 @@ async def run_drive_ladder(
                 soak_coord, timeout_seen=engine_rung_report_timeout
             )
             soak_outcome = build_rung_outcome(soak_rung, drive, gate, report_msg)
+        except EngineSetupFailed as exc:
+            soak_aborted = True
+            notes.append(f"soak: ENGINE setup failed ({exc}) — soak ABORTED (setup-degraded)")
         except CoordTimeout as exc:
             # A soak rendezvous failure does NOT set climb_aborted (the CLIMB already pinned the ceiling), but
             # it IS a setup degradation: the soak never produced a measurement, so it must read as ABORTED
