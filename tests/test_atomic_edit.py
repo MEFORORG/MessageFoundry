@@ -444,9 +444,19 @@ def test_a_file_another_account_owns_stays_that_accounts_on_windows(
     monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _EDITOR_SID)
     # On Windows Server the owner is Administrators; it must still count as another account here.
     monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
+    # The candidate's restriction to the editor alone is recorded, not written: the editor here is a
+    # seam, and a list naming only it would lock this process, the real account, out of the rename.
+    restricted: list[Path] = []
+
+    def _record(target: Path) -> bool:
+        restricted.append(target)
+        return True
+
+    monkeypatch.setattr(atomic_edit, "_restrict_to_editor", _record)
 
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
+    assert [p.name for p in restricted] == [path.name] and restricted[0] != path
     assert _owner_and_grants(path) == (owner, [owner, _EDITOR_SID])
     assert path.read_bytes() == b"x = 1\n"
 
@@ -460,16 +470,7 @@ def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
     # own staging: Python 3.13+ writes both, and SYSTEM, on the mkdtemp directory, and the rename
     # used to carry them onto the file. The token seam reports the file's real owner, so the test
     # means the same on every runner.
-    import messagefoundry.store.store as store_mod
-    from messagefoundry.auth.anchor_path import SYSTEM_SID
-
-    token = store_mod._current_user_sid()
-    assert token is not None
-    folder = folder_granting(tmp_path / "config", token, SYSTEM_SID)
-    path = folder / "connections.toml"
-    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
-    owner = _real_owner(path)
-    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: owner)
+    path, owner = _an_own_file_in_a_folder_without_staging_entries(tmp_path, monkeypatch)
     handed_back: list[str] = []
 
     def _hand_back(_path: Path, foreign: str) -> bool:
@@ -483,6 +484,78 @@ def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
     assert handed_back == [], "an edit by the file's own account took the foreign-owner path"
     assert_owner_only(path, owner)
     assert path.read_bytes() == b"x = 1\n"
+
+
+def _an_own_file_in_a_folder_without_staging_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, str]:
+    """A config file in a folder granting only this account and SYSTEM, and its real owner, which
+    the token seam then reports as the editing account."""
+    import messagefoundry.store.store as store_mod
+    from messagefoundry.auth.anchor_path import SYSTEM_SID
+
+    token = store_mod._current_user_sid()
+    assert token is not None
+    path = folder_granting(tmp_path / "config", token, SYSTEM_SID) / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    owner = _real_owner(path)
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: owner)
+    return path, owner
+
+
+@windows_only
+def test_the_candidate_is_restricted_before_its_first_byte_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import messagefoundry.store.store as store_mod
+
+    path, _ = _an_own_file_in_a_folder_without_staging_entries(tmp_path, monkeypatch)
+    real_write = store_mod._set_security_from_sddl
+    writes: list[tuple[Path, int]] = []
+
+    def _recording(target: Path, sddl: str, *, protected: bool) -> Any:
+        writes.append((target, target.stat().st_size))
+        return real_write(target, sddl, protected=protected)
+
+    monkeypatch.setattr(store_mod, "_set_security_from_sddl", _recording)
+
+    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+
+    (candidate, size), (final, _) = writes
+    assert atomic_edit.is_candidate_dir_name(candidate.parent.name, of=path.name)
+    assert size == 0, "the candidate held bytes before its access list was written"
+    assert final == path
+
+
+@windows_only
+@pytest.mark.parametrize("failing", ["candidate", "both"])
+def test_a_failed_list_write_still_restricts_the_file_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    # A candidate whose list could not be written still ends owner-only, because the replaced file
+    # gets the whole list again. Only when that write fails too does the icacls rewrite run.
+    import messagefoundry.store.store as store_mod
+
+    path, owner = _an_own_file_in_a_folder_without_staging_entries(tmp_path, monkeypatch)
+    real_write = store_mod._set_security_from_sddl
+
+    def _failing(target: Path, sddl: str, *, protected: bool) -> Any:
+        if failing == "both" or target != path:
+            return store_mod._SddlWrite(failure="refused for the test")
+        return real_write(target, sddl, protected=protected)
+
+    secured: list[Path] = []
+    monkeypatch.setattr(store_mod, "_set_security_from_sddl", _failing)
+    monkeypatch.setattr(atomic_edit, "_secure_file", secured.append)
+
+    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+
+    assert path.read_bytes() == b"x = 1\n"
+    if failing == "both":
+        assert secured == [path]
+    else:
+        assert secured == []
+        assert_owner_only(path, owner)
 
 
 @windows_only

@@ -11,9 +11,11 @@ restriction (vault BACKLOG #2782). One copy here replaces the four.
 :func:`replace_validated` writes the new bytes to a CANDIDATE that carries the live file's own name,
 inside a private directory created beside it (unique, and on POSIX owner-only from creation: mode
 0700 for the directory and 0600 for the file; same filesystem, so the final ``os.replace`` is atomic).
-On Windows those modes are ignored, so the candidate is given an exact protected access list before
-its first byte is written (``_restrict_candidate`` says why), and the replaced file is restricted
-again (``store._secure_file``, or as the next paragraph says). The caller's ``validate`` runs
+On Windows those modes do not restrict the file, so the candidate is given a protected access list
+granting the editing account alone before its first byte is written, and the replaced file is given
+it again, or the list the next paragraph describes. ``_restrict_to_editor`` says why that is one
+whole-list write and not ``store._secure_file``, which is only the fallback when the write fails.
+The caller's ``validate`` runs
 against that candidate. Only a candidate
 that validates replaces the live file, so a refused edit never touches the live file at all: its bytes
 and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
@@ -393,7 +395,9 @@ def replace_validated(
             fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 if sys.platform == "win32":
-                    _restrict_candidate(candidate, live.windows_owner)
+                    # Before the first byte, so the candidate never carries its directory's list.
+                    # A failure is logged, and the replaced file is restricted again below.
+                    _restrict_to_editor(candidate)
                 handle.write(data)
                 # On disk before the rename, so a crash just after it cannot leave an empty file.
                 handle.flush()
@@ -416,8 +420,11 @@ def replace_validated(
     finally:
         _remove_private_dir(private)
     _fsync_dir(path.parent)
-    if live.windows_owner is None or not _restrict_to_owner_and_editor(path, live.windows_owner):
-        _secure_file(path)
+    if live.windows_owner is not None and _restrict_to_owner_and_editor(path, live.windows_owner):
+        return
+    if sys.platform == "win32" and _restrict_to_editor(path):
+        return
+    _secure_file(path)
 
 
 @dataclass(frozen=True)
@@ -574,34 +581,34 @@ def _full_control_for(*sids: str | None) -> str:
     return _protected_sddl(dict.fromkeys(filter(None, sids), _FULL_ACCESS))
 
 
-def _restrict_candidate(candidate: Path, owner: str | None) -> None:
-    """Give the new, still empty ``candidate`` a protected access list granting the editing account
-    full control, and ``owner`` too when the live file is another account's (:class:`_LiveSecurity`).
-    Windows only; a failure is logged and the edit goes on, restricted after the rename as before.
+def _restrict_to_editor(path: Path) -> bool:
+    """Replace the access list of ``path`` with a protected one granting the editing account alone
+    full control; ``False``, logged, when the token or the write failed. Windows only.
 
-    The private directory ``mkdtemp`` makes carries its own protected list on Python 3.13+, granting
-    SYSTEM, Administrators and OWNER RIGHTS, and the candidate inherits it. The rename keeps those
-    entries on the replaced file, where the rewrite ``store._secure_file`` makes, which removes only
-    inherited entries, leaves them: an own-account edit left the file granting all four rather than
-    its owner alone. Writing the whole list here, before the first byte, makes the replaced file
-    owner-only whatever the directory carried."""
+    The whole list in one write, never ``store._secure_file``'s ``icacls /inheritance:r``. The
+    private directory ``mkdtemp`` makes on Python 3.13+ grants SYSTEM, Administrators and OWNER
+    RIGHTS, and an own-account edit whose replaced file went through that icacls rewrite was
+    measured granting all four rather than its owner alone; that rewrite does not remove every
+    entry a file carries. :func:`replace_validated` calls this on the candidate before its first
+    byte, and again on the replaced file."""
     from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
 
     editor = _current_user_sid()
     if editor is None:
         _log.warning(
-            "could not read this process's account from its token; the edit candidate for %s keeps "
-            "its directory's access list",
-            candidate.parent,
+            "could not read this process's account from its token to restrict %s",
+            scrub_log_argument(str(path)),
         )
-        return
-    result = _set_security_from_sddl(candidate, _full_control_for(owner, editor), protected=True)
+        return False
+    result = _set_security_from_sddl(path, _full_control_for(editor), protected=True)
     if result.failure is not None or result.dacl_status != 0:
         _log.warning(
-            "could not restrict the edit candidate %s to this account: %s",
-            candidate,
+            "could not restrict %s to this account: %s",
+            scrub_log_argument(str(path)),
             result.failure or f"Win32 status {result.dacl_status}",
         )
+        return False
+    return True
 
 
 def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:

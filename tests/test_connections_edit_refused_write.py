@@ -220,7 +220,9 @@ def test_an_error_after_the_replace_is_never_converted(
     before = path.read_bytes()
     refusal = PermissionError(errno.EACCES, "Permission denied")
 
-    monkeypatch.setattr(atomic_edit, "_secure_file", _raising(refusal))
+    # The first step after the replace on every platform; on Windows the restriction that follows
+    # it is a whole-list write, not _secure_file.
+    monkeypatch.setattr(atomic_edit, "_fsync_dir", _raising(refusal))
 
     with pytest.raises(PermissionError) as caught:
         connections_edit.upsert_connection(tmp_path, ENTRY, validate=_noop)
