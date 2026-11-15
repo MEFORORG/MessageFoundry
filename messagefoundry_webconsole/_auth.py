@@ -249,10 +249,11 @@ async def has_live_session(request: Request, auth: AuthService | None) -> bool:
     """Whether this request carries a session that still authenticates, for a page that may be
     served either way to decide whether it carries the session watchdog (``minimal_nav(session=)``).
 
-    Asked through ``AuthService.session_shows_signed_in``, which ends, revokes, touches and audits
-    no session, so a session a sign-in start presents is left for the callback's supersession to
-    end and record. A cookie that no longer authenticates is no session: the probe would 303 on it
-    and the watchdog would send the browser to the login page.
+    Asked through ``AuthService.session_shows_signed_in``. A session row that fails its integrity
+    seal is ended and reported there, as every read of one is. Otherwise it touches no session and
+    audits no clock or credential refusal, so a session a sign-in start presents is left for the
+    callback's supersession to end and record. A cookie that no longer authenticates is no session:
+    the probe would 303 on it and the watchdog would send the browser to the login page.
     """
     token = session_token(request)
     if not token or auth is None:

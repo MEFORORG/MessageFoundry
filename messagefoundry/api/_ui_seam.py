@@ -910,7 +910,7 @@ from typing import Any
 #: imports, so the surface grew again: from ``796ce45eeff0cf1e`` to ``080ed019349126b8``.
 #:
 #: The OIDC start legs' session read: ``AuthService`` gained ``session_shows_signed_in``, a read
-#: that ends no session, which the console's "leaving this site" page and IdP hop call to decide
+#: that ends a session only when its row fails its integrity seal, which the console's "leaving this site" page and IdP hop call to decide
 #: whether they show Sign-out and the session watchdog. A method the console calls, so a skew
 #: would be an AttributeError at request time. Unnumbered. Re-derived with ``--write``, from ``080ed019349126b8`` to ``bc56eed44a1590fd``.
 #:

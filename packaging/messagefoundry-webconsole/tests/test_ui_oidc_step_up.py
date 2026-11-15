@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
@@ -34,10 +36,12 @@ from _webui_support import PW
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.oidc import FederatedPrincipal
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.store import MessageStore
 from messagefoundry_webconsole._auth import continuation_issued
 from messagefoundry_webconsole.routes.oidc import _step_up_return_key
 
@@ -444,6 +448,78 @@ async def test_the_callback_records_a_lapsed_prior_session_as_superseded(
             },
         )
     ]
+
+
+@pytest.fixture
+async def keyed_engine(tmp_path: Path) -> AsyncIterator[Engine]:
+    """An engine on a keyed store, so each session row carries an integrity seal."""
+    store = await MessageStore.open(
+        tmp_path / "oidc_session_seal.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    engine = Engine(
+        store, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    try:
+        yield engine
+    finally:
+        await engine.stop()
+
+
+async def _seal_failures(engine: Engine, token: str) -> int:
+    """The ``AUTHORITY_SEAL_FAILED_ACTION`` rows that name ``token``'s session."""
+    ref = hash_token(token)[:12]
+    rows = await engine.store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=10_000)
+    return sum(1 for row in rows if f'"session": "{ref}"' in str(row["detail"]))
+
+
+async def test_both_start_legs_end_and_report_a_session_row_that_fails_its_seal(
+    keyed_engine: Engine,
+) -> None:
+    """RED when: the start legs' display read leaves a session row that fails its integrity seal
+    unended and unreported. Before the start legs read the session themselves, the interstitial
+    carried the session watchdog, whose probe ended and reported such a row through
+    ``identity_for_token``; the read that replaced the probe must not do less. The control is an
+    intact session of the same account, which neither leg ends. A lapsed temporary credential, by
+    contrast, is left for the callback: see the lapsed-session tests above (BACKLOG #3749)."""
+    engine = keyed_engine
+    service = await _service(engine, _FakeLdap())
+    await create_local_user_chosen(
+        service,
+        username="ivan",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    tokens = []
+    for _ in range(3):
+        outcome = await service.login("ivan", PW, client="127.0.0.1")
+        assert outcome.ok and outcome.token
+        tokens.append(outcome.token)
+    at_get, at_post, intact = tokens
+    for token in (at_get, at_post):
+        # A sealed field altered outside the store, so the row's seal no longer verifies.
+        await engine.store._db.execute(
+            "UPDATE sessions SET client=? WHERE token_hash=?", ("192.0.2.8", hash_token(token))
+        )
+    await engine.store._db.commit()
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", at_get)
+        leaving = await c.get("/ui/oidc/start", follow_redirects=False)
+        c.cookies.set("mf_session", at_post)
+        hop = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
+    assert leaving.status_code == 200 and "leaving" in leaving.text.lower(), leaving.text
+    assert "data-mf-session-watchdog" not in leaving.text
+    assert "clear-site-data" in leaving.headers
+    assert idp_url(hop)
+    assert 'action="/ui/logout"' not in hop.text
+    for token in (at_get, at_post):
+        assert await _ended(engine, token)
+        assert await _seal_failures(engine, token) == 1
+    assert not await _ended(engine, intact)
+    assert await _seal_failures(engine, intact) == 0
+    assert await service.identity_for_token(intact, activity=False) is not None
 
 
 async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(
