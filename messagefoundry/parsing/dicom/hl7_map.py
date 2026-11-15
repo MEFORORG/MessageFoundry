@@ -88,11 +88,13 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
     """Split a DICOM ``PatientName`` (a ``^``-delimited PN — ``Family^Given^Middle^Prefix^Suffix``,
     with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components.
 
-    Uses the first group with a non-blank component among its first five, so an ideographic-only
-    name is not lost, and ``()`` for an absent or all-blank name. A blank (spaces-only) component
-    is written empty. A name taken from the ideographic or phonetic
-    group carries ``I`` or ``P`` in ``XPN-8`` (name representation code), so a receiver does not
-    read it as the alphabetic name. ``XPN`` puts the suffix before the prefix
+    Uses the first group with a non-blank family, given or middle name, so an ideographic-only name
+    is not lost and a group holding only a prefix or suffix is passed over, and ``()`` when no group
+    has one. A blank (spaces-only) component is written empty. A name taken from the ideographic or
+    phonetic group carries ``I`` or ``P`` in ``XPN-8`` (name representation code), which tells a
+    receiver that reads ``XPN-8`` which group it is. It does not make the text decode: this helper
+    sets no character set, and with ``MSH-18`` empty the message declares ASCII, so the Handler
+    that builds ``MSH`` must declare the set non-ASCII text needs. ``XPN`` puts the suffix before the prefix
     (``Family^Given^Middle^Suffix^Prefix``), so the DICOM prefix and suffix swap places. A PN has
     five components; anything past the fifth is malformed and dropped rather than written into
     ``XPN-6`` onward, which are coded fields. Trailing blank components are dropped too
@@ -104,7 +106,8 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
         [part if part.strip() else "" for part in (group.split("^") + [""] * 5)[:5]]
         for group in patient_name.split("=")[:3]
     ]
-    group_index = next((i for i, parts in enumerate(candidates) if any(parts)), None)
+    # Choose on family, given and middle: a prefix or suffix alone is no name.
+    group_index = next((i for i, parts in enumerate(candidates) if any(parts[:3])), None)
     if group_index is None:
         return ()
     parts = candidates[group_index]
