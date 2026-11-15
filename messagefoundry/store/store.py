@@ -4945,10 +4945,11 @@ def unheld_seal_refusal(outcome: ResealOutcome, *, before_writes: bool) -> Ciphe
     pass writes. The passes never write over a seal under a key the run does not hold, so with
     nothing else writing it sees every such seal. The read and the passes are separate
     transactions, so it is not atomic against a writer running alongside, such as an engine left
-    running. The check after the passes, whose re-seals have by then been committed, catches only
-    a seal that writer makes under a key the run does not hold, and the text says so; one it makes
-    under a retired key the run holds is counted refused and does not stop the run. The text names
-    only tables and non-secret seal key ids."""
+    running. The check after the passes, whose re-seals have by then been committed, reads each
+    sealed table once. It catches only a seal that writer made under a key the run does not hold
+    before that read of the seal's table, and the text says so; one it makes under a retired key
+    the run holds is counted refused and does not stop the run. The text names only tables and
+    non-secret seal key ids."""
     done = (
         "Nothing was written by this pass: the check ran before any re-seal or re-encryption."
         if before_writes
