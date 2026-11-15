@@ -29,8 +29,10 @@ the ingress path must do, and each judgement is a DETECTOR with a positive contr
 * ``resources`` -- heap, OS handles and asyncio tasks, measured across repeated passes of the
   catalogue after a warm-up pass, stay under a fixed growth bound. Instruments: ``tracemalloc``
   traced bytes, ``psutil`` handle (Windows) or descriptor (POSIX) count, ``len(asyncio.all_tasks())``.
-* ``log_body`` -- no log record at INFO or above carries message content. Every catalogue body
-  carries a per-run sentinel in PID-5, and a record whose rendered text contains it is a finding.
+* ``log_body`` -- no log record at INFO or above carries message content. Every catalogue body and
+  every mutation seed carries a per-run sentinel (:func:`carries_sentinel`; HL7 in PID-5 or an NTE,
+  X12 in the subscriber's NM1-03), and a record whose rendered text contains it is a finding.
+  ``tests/test_dast_ingress_sweep.py`` holds every case to that, on all three planes.
   This is a CALL-SITE check: the receipt also says whether the shipped redaction filters would have
   removed the hit, but a hit is a finding either way, because section 9 binds the call site.
 
@@ -98,7 +100,16 @@ _HL7_SEEDS = next(t for t in TARGETS if t.name == "hl7_peek").seeds
 #: liveness probe report a false engine finding.
 _X12_SEED = next(s for s in next(t for t in TARGETS if t.name == "x12_peek").seeds if b"IEA" in s)
 _ISA_LEN = 106  # the fixed-width ISA segment, terminator included
-_IEA_AT = _X12_SEED.rindex(b"IEA")  # the closing IEA segment, which frames the interchange
+
+#: The subscriber's last name in the committed X12 seed, which :func:`x12_interchange` replaces
+#: with the sentinel. Checked at import, so a changed sample is loud rather than a silent no-op.
+_X12_NAME = b"NM1*IL*1*PATIENT*"
+if _X12_NAME not in _X12_SEED:
+    raise RuntimeError(f"the committed X12 seed no longer carries {_X12_NAME!r}")
+
+#: Bytes that only frame a message. A case whose bytes are nothing else has no body to carry a
+#: sentinel (an empty frame, an idle connection); every other case must carry it.
+FRAMING_BYTES = VT + FS + CR + STX + ETX
 
 
 class PolicyError(ValueError):
@@ -142,6 +153,39 @@ def _b(text: str) -> bytes:
     return text.encode("utf-8")
 
 
+def x12_interchange(sentinel: str) -> bytes:
+    """The committed X12 seed with the sentinel as the subscriber's last name (NM1-03), so a logged
+    X12 body is recognisable (vault BACKLOG #5581). The ISA, and so its fixed width, is untouched."""
+    return _X12_SEED.replace(_X12_NAME, b"NM1*IL*1*" + _b(sentinel) + b"*", 1)
+
+
+def _hl7_with_sentinel(seed: bytes, sentinel: str) -> bytes:
+    """An HL7 seed with ``NTE|1||<sentinel>`` inserted after its MSH segment (vault BACKLOG #5581).
+
+    After the MSH, so the header the parser reads first is the seed's own; an NTE, so the sentinel
+    sits in message content rather than in a routing field the engine may log by design."""
+    end = seed.index(b"\r") + 1
+    if seed[end : end + 1] == b"\n":
+        end += 1
+    return seed[:end] + _b(f"NTE|1||{sentinel}\r") + seed[end:]
+
+
+def _through_sentinel(body: bytes, sentinel: str) -> bytes:
+    """``body`` cut just past the sentinel, for a case that drops a connection mid-message."""
+    return body[: body.index(_b(sentinel)) + len(sentinel) + 1]
+
+
+def case_bytes(case: Case) -> bytes:
+    """Every byte a case writes: payload, tail and trickle."""
+    return case.payload + case.tail + case.trickle
+
+
+def carries_sentinel(case: Case, sentinel: str) -> bool:
+    """Whether a case's body carries the sentinel, or it has no body (framing bytes only)."""
+    data = case_bytes(case)
+    return _b(sentinel) in data or not data.translate(None, FRAMING_BYTES)
+
+
 def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
     """The fixed MLLP cases: broken framing first, then hostile HL7 inside a well-formed frame."""
 
@@ -151,6 +195,7 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
     good = msg("DAST-OK")
     pad = cap - len(msg("DAST-CAP")) - len("NTE|1||\r")
     exact = _b(hl7("DAST-CAP", sentinel, extra="NTE|1||" + "X" * pad + "\r"))
+    cut = _through_sentinel(good, sentinel)
     cases = [
         Case("well-formed", "mllp", frame(good)),
         Case("missing-start-vt", "mllp", good + FS + CR),
@@ -164,13 +209,13 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
         Case("pipelined-three", "mllp", frame(msg("P1")) + frame(msg("P2")) + frame(msg("P3"))),
         Case("split-seven-bytes", "mllp", frame(msg("SPLIT")), split=7),
         Case("noise-then-frame", "mllp", b"\x00\xffGARBAGE\r\n" * 16 + frame(good)),
-        Case("binary-garbage-frame", "mllp", frame(bytes(range(32, 256)) * 4)),
+        Case("binary-garbage-frame", "mllp", frame(bytes(range(32, 256)) * 4 + _b(sentinel))),
         Case("idle-after-connect", "mllp", b"", stall=True),
         Case("slowloris-in-frame", "mllp", VT, stall=True, trickle=good * 8),
-        Case("frame-then-truncated-drop", "mllp", frame(good), tail=VT + good[:30], abort=True),
-        Case("drop-mid-frame", "mllp", b"", tail=VT + good[:30], abort=True),
-        Case("oversize-frame", "mllp", VT + b"A" * (cap + 1)),
-        Case("frame-then-oversize", "mllp", frame(good) + VT + b"A" * (cap + 1)),
+        Case("frame-then-truncated-drop", "mllp", frame(good), tail=VT + cut, abort=True),
+        Case("drop-mid-frame", "mllp", b"", tail=VT + cut, abort=True),
+        Case("oversize-frame", "mllp", VT + _b(sentinel) + b"A" * (cap + 1)),
+        Case("frame-then-oversize", "mllp", frame(good) + VT + _b(sentinel) + b"A" * (cap + 1)),
         Case("exactly-at-cap", "mllp", frame(exact)),
         # Hostile HL7 inside a well-formed frame.
         Case("letter-field-separator", "mllp", frame(msg("SEP1", fs="A"))),
@@ -178,7 +223,7 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
         Case("short-encoding-chars", "mllp", frame(msg("SEP3", enc="^"))),
         Case("truncation-char-27", "mllp", frame(msg("SEP4", enc="^~\\&#"))),
         Case("missing-msh", "mllp", frame(_b(f"PID|1||X||{sentinel}^CASE\r"))),
-        Case("msh-only", "mllp", frame(b"MSH|^~\\&|")),
+        Case("msh-only", "mllp", frame(_hl7_with_sentinel(b"MSH|^~\\&|\r", sentinel))),
         # ADR 0191's recorded finding (an empty segment), rebuilt here around the sentinel. Fixed by
         # BACKLOG #1594; kept as a regression case, since both faces must now get the runner's reply.
         Case("blank-segment", "mllp", frame(msg("BLANK", extra="\rPV1|1|I\r"))),
@@ -205,8 +250,8 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
     return cases
 
 
-def tcp_catalogue(cap: int) -> list[Case]:
-    x12 = _X12_SEED
+def tcp_catalogue(sentinel: str, cap: int) -> list[Case]:
+    x12 = x12_interchange(sentinel)
     return [
         Case("well-formed", "tcp", STX + x12 + ETX),
         Case("missing-stx", "tcp", x12 + ETX),
@@ -215,23 +260,25 @@ def tcp_catalogue(cap: int) -> list[Case]:
         Case("empty-frame", "tcp", STX + ETX),
         Case("invalid-utf8", "tcp", STX + x12.replace(b"ZZ", b"\xc0\xaf", 1) + ETX),
         Case("nul-in-body", "tcp", STX + x12.replace(b"ZZ", b"\x00\x00", 1) + ETX),
-        Case("oversize-frame", "tcp", STX + b"A" * (cap + 1)),
-        Case("drop-mid-frame", "tcp", b"", tail=STX + x12[:40], abort=True),
+        Case("oversize-frame", "tcp", STX + _b(sentinel) + b"A" * (cap + 1)),
+        Case("drop-mid-frame", "tcp", b"", tail=STX + _through_sentinel(x12, sentinel), abort=True),
     ]
 
 
-def x12_catalogue(cap: int) -> list[Case]:
-    x12 = _X12_SEED
+def x12_catalogue(sentinel: str, cap: int) -> list[Case]:
+    x12 = x12_interchange(sentinel)
+    # The oversize case keeps its ISA region as before, all separators, with the sentinel after it.
+    oversize = b"ISA" + b"*" * (_ISA_LEN - 3) + _b(sentinel) + b"*" * (cap + 1)
     return [
         Case("well-formed", "x12", x12),
         Case("noise-then-interchange", "x12", b"\x00\xffNOISE" * 32 + x12),
         Case("pipelined-three", "x12", x12 * 3),
-        Case("short-isa", "x12", x12[:60]),
+        Case("short-isa", "x12", x12[:60] + _b(sentinel)),
         Case("isa-without-iea", "x12", x12.replace(b"IEA", b"XEA")),
         Case("invalid-utf8", "x12", x12.replace(b"ZZ", b"\xc0\xaf", 1)),
-        Case("oversize-interchange", "x12", b"ISA" + b"*" * (cap + 1)),
+        Case("oversize-interchange", "x12", oversize),
         Case("idle-after-connect", "x12", b"", stall=True),
-        Case("drop-mid-interchange", "x12", b"", tail=x12[:120], abort=True),
+        Case("drop-mid-interchange", "x12", b"", tail=_through_sentinel(x12, sentinel), abort=True),
     ]
 
 
@@ -270,19 +317,31 @@ def mutate(rng: random.Random, seed: bytes, limit: int) -> bytes:
     return bytes(data[:limit])
 
 
+def mutation_seeds(sentinel: str) -> tuple[tuple[bytes, ...], bytes]:
+    """The HL7 seeds and the X12 interchange the mutator edits, every one carrying the sentinel so
+    the log_body detector can recognise a mutated body on either plane (vault BACKLOG #5581). A
+    mutation may still cut the sentinel out; the seed it starts from never lacks it."""
+    hl7_seeds = (
+        *(_hl7_with_sentinel(s, sentinel) for s in _HL7_SEEDS),
+        _b(hl7("MUTATE", sentinel)),
+    )
+    return hl7_seeds, x12_interchange(sentinel)
+
+
 def mutation_cases(seed: int, count: int, cap: int, sentinel: str) -> list[Case]:
-    """``count`` seeded mutations. HL7 seeds include one carrying the sentinel, so the log_body
-    detector can see a mutated body. X12 mutations edit only what lies between the fixed-width ISA
-    and the closing IEA: an edit inside the ISA moves the terminator and a lost IEA never closes the
-    interchange, and either way the X12 ingress path would go unreached."""
+    """``count`` seeded mutations of :func:`mutation_seeds`. X12 mutations edit only what lies
+    between the fixed-width ISA and the closing IEA: an edit inside the ISA moves the terminator and
+    a lost IEA never closes the interchange, and either way the X12 ingress path would go
+    unreached."""
     rng = random.Random(seed)  # nosec B311 (reproducible fuzz cases, seeded)
     limit = cap // 2
-    hl7_seeds = (*_HL7_SEEDS, _b(hl7("MUTATE", sentinel)))
+    hl7_seeds, x12 = mutation_seeds(sentinel)
+    iea_at = x12.rindex(b"IEA")  # the closing IEA segment, which frames the interchange
     cases = []
     for index in range(count):
         if index % 4 == 3:
-            body = mutate(rng, _X12_SEED[_ISA_LEN:_IEA_AT], limit - len(_X12_SEED))
-            plane, payload = "x12", _X12_SEED[:_ISA_LEN] + body + _X12_SEED[_IEA_AT:]
+            body = mutate(rng, x12[_ISA_LEN:iea_at], limit - len(x12))
+            plane, payload = "x12", x12[:_ISA_LEN] + body + x12[iea_at:]
         else:
             plane, payload = "mllp", frame(mutate(rng, rng.choice(hl7_seeds), limit))
         cases.append(Case(f"mutation-{index}", plane, payload, origin=f"mutation:{seed}:{index}"))
@@ -911,7 +970,9 @@ def apply_profile(policy: dict[str, Any], name: str | None) -> dict[str, Any]:
 
 
 def catalogue(sentinel: str, cap: int) -> list[Case]:
-    return mllp_catalogue(sentinel, cap) + tcp_catalogue(cap) + x12_catalogue(cap)
+    return (
+        mllp_catalogue(sentinel, cap) + tcp_catalogue(sentinel, cap) + x12_catalogue(sentinel, cap)
+    )
 
 
 async def run_sweep(
