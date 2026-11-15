@@ -1504,3 +1504,50 @@ def test_the_bundle_skip_covers_only_a_compiled_js_file(
     target = (tmp_path / rel).resolve()
     target.write_text("contact ACME\n", encoding="utf-8")
     assert sf_main.main([rel]) == 1
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"Set n<limit max=3 in config; ASVS {_REQ} stays {_PARTIAL} -> later.",
+        f"Set n<limit max=3 in config, ASVS {_REQ} stays {_PARTIAL} -> later.",
+    ],
+)
+def test_an_attribute_shaped_bracket_does_not_swallow_a_verdict(sf, line: str) -> None:
+    """Re-brief note 1: ``<x a=`` is a tag only within the bounded attribute grammar. origin/main
+    caught these; the round 2 tag ran on to the ``>`` of the later ``->``."""
+    assert "verdict" in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize("bom", [b"\xff\xfe", b"\xfe\xff"], ids=["16le", "16be"])
+def test_a_stray_byte_order_mark_before_utf8_text_does_not_hide_it(
+    sf, tmp_path: Path, bom: bytes
+) -> None:
+    """Re-brief note 2: a mark the following bytes disagree with is not trusted, as on origin/main."""
+    p = tmp_path / "stray.txt"
+    p.write_bytes(bom + b"contact ACME here\n")
+    assert any("customer name (ACME)" in h for h in sf.scan_file(p))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[x](" + "1" * 60000 + ")",
+        "<b x=" + " " * 60000,
+        "<b x=" + " " * 60000 + ">",
+        "a " + " " * 60000 + "b",
+    ],
+    ids=["digit-target", "open-attr", "closed-attr", "space-run"],
+)
+def test_a_long_pr_body_shape_scans_in_linear_time(sf, body: str) -> None:
+    """Re-brief note 3: each took seconds, quadratic, near GitHub's 65,536-character body limit. Measured well under 0.1 s each at 16k after
+    the fix; the bound is loose for a slow runner."""
+    began = time.perf_counter()
+    sf.scan_pr_body(body)
+    assert time.perf_counter() - began < 1
+
+
+def test_a_boolean_attribute_block_tag_still_ends_a_sentence(sf) -> None:
+    """Re-brief note 4: ``<details open>`` is a block edge, so the id and the path stay apart."""
+    body = f"ASVS {_REQ} stays {_PARTIAL}; see <details open>the code in pkg/example_guard.py</details>"
+    assert _pr_kinds(sf, body) == {"verdict"}

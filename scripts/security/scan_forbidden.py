@@ -668,10 +668,18 @@ _PR_TABLE_DELIMITER_CHARS = frozenset("|:- \t")
 _PR_WINDOW = 80
 #: A sentence ends at a full stop before a capital, or at an HTML tag: bot bodies carry release notes as
 #: HTML, and a tag is a block edge there however the text runs on.
-#: The tag is a real tag name with attributes holding no `<` or `>`: `[^>]*` swallowed an autolink, or
-#: everything from `n<max` to the `>` of a later `->`, as one tag and took its code path with it.
+#: An HTML tag is a tag name and at most 20 attributes, each a name with an optional quoted (500 at
+#: most) or bare (100 at most) value. Every quantifier is bounded or anchored on a different class, so
+#: the tag cannot run past a newline, a `;` or a full stop the way `[^<>]*` did: `n<limit max=3 ...
+#: stays partial -> later` is no tag, so its verdict stays. A boolean attribute (`<details open>`) is one.
+_PR_TAG_NAME = r"[A-Za-z]\w*(?:-\w+)*"
+_PR_TAG_ATTRS = (
+    rf"(?:\s+{_PR_TAG_NAME}"
+    r"""(?:\s*=\s*(?:"[^"<>\n]{0,500}"|'[^'<>\n]{0,500}'|[\w-]{1,100}))?)"""
+    r"{0,20}"
+)
 _PR_SENTENCE_SPLIT = re.compile(
-    r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][\w-]*(?:\s+[\w-]+\s*=[^<>]*)?\s*/?>\s*"
+    rf"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|(?<!\s)\s*</?{_PR_TAG_NAME}{_PR_TAG_ATTRS}\s*/?>\s*"
 )
 _PR_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
 _PR_HEADING = re.compile(r"#{1,6}\s")
@@ -684,15 +692,16 @@ _PR_MD_LINK = re.compile(r"\[([^\]\n]*)\]\(([^)\s]*)\)")
 #: An inline HTML tag, which sits inside a sentence rather than ending one: `<b>`, `<code>`, `<a href>`.
 #: It is taken out of the line before the sentence split, so only a block tag still ends a sentence.
 #: A `<code>` tag reads as a backtick, as markdown writes one; the second reading keeps a tag's
-#: attributes, so an `<a href>` target is read as the markdown one is. No `<` inside the tag, so each
-#: scan stops at the next tag and a long line of unclosed tags stays linear.
+#: attributes, so an `<a href>` target is read as the markdown one is. The attributes are the split's
+#: bounded grammar, so the tag stops where a real one would and stays linear on a long run.
 _PR_INLINE_TAG = re.compile(
     r"</?(?i:(code|kbd|samp|tt)|a|abbr|b|cite|del|dfn|em|i|ins|mark|q|s|small|span|strong|sub|sup|u|var)"
-    r"(?:\s+([\w-]+\s*=[^<>\n]*))?\s*/?>"
+    rf"({_PR_TAG_ATTRS})\s*/?>"
 )
 #: A dotted number inside a link target, which a target reading must not take as a requirement id: a
 #: GitHub ``blob/8.1.8/CHANGES.rst`` link is a version and a path, never a map.
-_PR_TARGET_NUMBER = re.compile(r"\d+(?:\.\d+)+")
+#: Starts only at the first digit of a run, so a long run of digits is read once, not once per digit.
+_PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
 PR_BODY_REASONS = {
     "verdict": "requirement verdict (a requirement id beside its verdict)",
     "gap": "requirement gap (a requirement id beside a gap or residual)",
@@ -1704,6 +1713,18 @@ def _bomless_utf16(head: bytes) -> str | None:
     return None
 
 
+def _wide_shape(body: bytes, codec: str, bom: bytes) -> bool:
+    """Whether the bytes after a byte-order mark have the NUL pattern its encoding gives ASCII text:
+    one NUL in each 2-byte unit for UTF-16, three in each 4-byte unit for UTF-32."""
+    if not body:
+        return True
+    if codec == "utf-16":
+        return _bomless_utf16(body) == ("utf-16-le" if bom == codecs.BOM_UTF16_LE else "utf-16-be")
+    nul_at = (1, 2, 3) if bom == codecs.BOM_UTF32_LE else (0, 1, 2)
+    nuls = b"".join(body[i::4] for i in nul_at)
+    return len(nuls) >= 3 and nuls.count(0) * 10 >= len(nuls) * 9
+
+
 def _read_text(path: Path) -> str | None:
     """The file's text, or ``None`` for binary. Raises ``OSError`` when the file cannot be read, which
     ``scan_file`` reports as a hit: an unread file is not a clean one (BACKLOG #5583).
@@ -1711,10 +1732,12 @@ def _read_text(path: Path) -> str | None:
     A NUL near the start used to mean binary outright, so UTF-16 and UTF-32 text, which a Windows tool
     writes routinely, went unscanned. A byte-order mark or the UTF-16 shape now decodes it first."""
     data = path.read_bytes()
-    for bom, codec in _BOMS:
-        if data.startswith(bom):
-            return data.decode(codec, errors="replace")
     head = data[:_HEAD_BYTES]
+    for bom, codec in _BOMS:
+        # A mark alone is not trusted: a NUL-free UTF-8 body behind a stray `FF FE` would decode as
+        # UTF-16 garbage and hide every token in it. Only a mark the following bytes agree with counts.
+        if data.startswith(bom) and _wide_shape(head[len(bom) :], codec, bom):
+            return data.decode(codec, errors="replace")
     if b"\x00" not in head:
         return data.decode("utf-8", errors="replace")
     wide = _bomless_utf16(head)
