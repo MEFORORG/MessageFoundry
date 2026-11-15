@@ -194,6 +194,25 @@ def test_default_runner_clean_exit_has_no_run_error(monkeypatch: pytest.MonkeyPa
     assert default_pytest_runner(["tests/test_a.py"]) == PytestRun({"tests/test_a.py": Status.PASS})
 
 
+def test_default_runner_drops_pytest_addopts_from_the_child_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An inherited ``-k`` or ``-p no:...`` would deselect a failing test, and its row would read PASS.
+    seen: dict[str, str] = {}
+
+    def fake_run(cmd: list[str], *, env: dict[str, str], **_: Any) -> Any:
+        seen.update(env)
+        target = next(a for a in cmd if a.startswith("--junitxml=")).split("=", 1)[1]
+        Path(target).write_text(_PASSING, encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, int(pytest.ExitCode.OK))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-k nothing_matches")
+    default_pytest_runner(["tests/test_a.py"])
+    assert seen, "the runner never called subprocess.run"
+    assert "PYTEST_ADDOPTS" not in seen
+
+
 def test_default_runner_reports_truncated_junit_instead_of_crashing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

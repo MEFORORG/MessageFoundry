@@ -145,6 +145,9 @@ def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -
     if not node_ids:
         return PytestRun()
     env = dict(os.environ)
+    # An inherited PYTEST_ADDOPTS (an outer ``-k`` or ``-p no:...``) would deselect a failing test
+    # in the child, and its row would read PASS.
+    env.pop("PYTEST_ADDOPTS", None)
     env.setdefault("QT_QPA_PLATFORM", "offscreen")  # console suites need a headless Qt platform
     with tempfile.TemporaryDirectory(prefix="mefor_accept_") as td:
         junit = Path(td) / "junit.xml"
