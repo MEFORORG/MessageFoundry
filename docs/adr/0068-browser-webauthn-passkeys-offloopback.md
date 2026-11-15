@@ -772,7 +772,10 @@ factor, so the decision is made on the row the write replaces. When it applies:
 - without UV, `reauth_at` is cleared, whether or not the address moved, so a window opened earlier
   (for example by a password step-up on the pending session) never follows the anchor to a new
   address. A pending session that stepped up with the password from the same address loses that
-  window; this is accepted as the fail-closed answer.
+  window; this is accepted as the fail-closed answer. The clear covers `reauth_at` only: an
+  action-bound grant (ADR 0077) the pending session minted earlier, for example by
+  `POST /me/reauth` with a purpose, survives the assertion and the rotation, so after the anchor
+  moves it is spendable from the new address. That is left open here, not decided.
 
 No anchor is passed on an `oidc` session, whose window and anchor move only at the IdP (BACKLOG
 #2142). An assertion that reaches a session that has already met its factor, for example one

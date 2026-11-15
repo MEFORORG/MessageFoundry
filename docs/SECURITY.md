@@ -4071,8 +4071,9 @@ BACKLOG #2964 item 14, owner rulings 2026-11-14; see
 [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). An
 assertion on a session that had already met its factor, for example one staged while it was pending
 and answered after another tab met the factor, neither re-anchors nor stamps. The store decides that
-inside the factor write, from the session row that write reads and replaces in one transaction
-(`mark_session_mfa_verified` with an anchor). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
+inside the factor write, from the session row that write reads in its own transaction
+(`mark_session_mfa_verified` with an anchor; its docstring says what each store backend does
+between that read and the write). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
 `/ui`, as the page's GET does, and stages no assertion. An
 action-bound grant still comes only from the credential leg: the password leg of `POST /ui/reauth`,
 or for an `oidc` session the IdP leg, which shows no password field. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **re-proof-only

@@ -2183,8 +2183,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # with the UV flag (vault BACKLOG #2964 item 14; not an oidc session). An assertion that
     # arrives for a session that already met its factor (two tabs share the challenge, which
     # moves with the session's re-key) marks it and re-keys, and moves no anchor and no window.
-    # An action-bound grant still comes only from the
-    # POST /ui/reauth password leg (ADR 0077).
+    # An action-bound grant still comes only from a credential step-up, at least the password
+    # leg of POST /ui/reauth, POST /me/reauth and the IdP leg (ADR 0077), never from this route.
     # NOT registered as a continuation (body-carrying JSON — part of the
     # step-up mechanism itself). MFA-pending sessions pass (the assertion IS the proof);
     # must-change confinement is mirrored manually like /ui/mfa's, NOT like both /ui/reauth

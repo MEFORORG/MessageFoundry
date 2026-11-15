@@ -170,7 +170,7 @@ async def test_audit_cookie_not_accepted_on_json_routes(engine: Engine) -> None:
 # the [webauthn] extra (a module-level importorskip here would skip the whole webui suite on an
 # extra-less install). The passkey assertion meets the factor, and stamps the window only with the
 # UV flag, which the soft authenticator here does not set; an action-bound route's grant comes
-# only from the password leg of POST /ui/reauth (ADR 0077). Options ride
+# from a credential step-up, here the password leg of POST /ui/reauth (ADR 0077). Options ride
 # HTML-escaped data-* attributes (CSP: no inline script); only the verify legs are JSON POSTs — the
 # sanctioned first cookie-authed JSON under /ui.
 

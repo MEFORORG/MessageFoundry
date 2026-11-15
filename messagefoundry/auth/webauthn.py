@@ -18,7 +18,8 @@ Policy pins (ADR 0068 §1/§6): ``attestation=NONE`` (passkey norm — no attest
 requested or stored, and this module configures no attestation trust anchor; the engine's
 operator-supplied anchors are :mod:`messagefoundry.auth.trust_anchors`),
 ``user_verification=PREFERRED`` (``REQUIRED`` would brick PIN-less U2F keys; a passkey-only assertion
-without the UV flag meets the factor but opens no step-up window, vault BACKLOG #2964 item 14; the
+without the UV flag meets the factor but opens no step-up window, and when it completes a pending
+factor it clears one already open, vault BACKLOG #2964 item 14; the
 flag is the authenticator's own report in its signed authenticator data, and with no attestation
 the engine does not verify which authenticator made it, so it is not a factor the engine checked),
 the credential algorithm
