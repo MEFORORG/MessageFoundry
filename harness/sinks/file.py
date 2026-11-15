@@ -21,7 +21,9 @@ component not followed, each capped at the engine's per-message cap, checked aga
 handle, and an over-cap file (or one that grows past the cap while read) recorded with an empty
 payload and a ``refused`` reason rather than read. Only a plain directory is skipped: a symlink (``meta["symlink"]``), FIFO or device is recorded
 unread with the :data:`~harness.bounded_file.NOT_REGULAR` reason, so a link out of the directory
-reads as an escape, not as nothing.
+reads as an escape, not as nothing. A listed name that :func:`_unsafe_listed_name` refuses is
+never joined onto its folder: it is recorded once, unread, with the :data:`UNSAFE_NAME` reason, its
+folder's relative path (``meta["folder"]``) and no ``path`` or ``relpath``.
 """
 
 from __future__ import annotations
@@ -51,6 +53,12 @@ _Signature = tuple[int, int, int, int, int]
 #: import it from there.
 _NAME_SURROGATE = 0x20000000
 
+#: Whether the Windows name rules apply. A module flag, so a test can exercise either set anywhere.
+_WINDOWS = os.name == "nt"
+
+#: The ``refused`` reason for a listed name :func:`_unsafe_listed_name` refuses.
+UNSAFE_NAME = "unsafe name"
+
 
 def _signature(st: os.stat_result) -> _Signature:
     return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns)
@@ -58,6 +66,18 @@ def _signature(st: os.stat_result) -> _Signature:
 
 def _is_link(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_reparse_tag", 0) & _NAME_SURROGATE)
+
+
+def _unsafe_listed_name(name: str) -> bool:
+    """Whether a name read back from a listing must not be joined onto its folder: empty, ``.`` or
+    ``..``, holding a path separator or a NUL, or, on Windows, ending in a dot or a space, which
+    Windows strips so the joined path names another entry (``...`` reads as the folder itself)."""
+    if name in ("", ".", ".."):
+        return True
+    separators = {"/", "\\"} if _WINDOWS else {os.sep, os.altsep or os.sep}
+    if "\0" in name or any(sep in name for sep in separators):
+        return True
+    return _WINDOWS and name[-1] in ". "
 
 
 class FileSink(Sink):
@@ -68,17 +88,22 @@ class FileSink(Sink):
         self.directory = Path(directory)
         self.pattern = pattern
         self._seen: dict[Path, _Signature] = {}
+        #: Listed names refused unjoined, as ``(folder, name)``: each is recorded once.
+        self._seen_unsafe: set[tuple[Path, str]] = set()
         #: The most one file may hold and still be read: the engine's per-message cap.
         self.max_file_bytes = DEFAULT_MAX_MESSAGE_BYTES
 
     def start(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._seen = {path: _signature(st) for path, st in self._entries()}
+        found, unsafe = self._entries()
+        self._seen = {path: _signature(st) for path, st in found}
+        self._seen_unsafe = set(unsafe)
 
-    def _entries(self) -> list[tuple[Path, os.stat_result]]:
-        """``(path, lstat)`` for each candidate under the directory, sorted by path.
+    def _entries(self) -> tuple[list[tuple[Path, os.stat_result]], list[tuple[Path, str]]]:
+        """``(path, lstat)`` for each candidate under the directory, sorted by path, and
+        ``(folder, name)`` for each listed name :func:`_unsafe_listed_name` refused before the join.
 
-        The walk enters only entries that ``lstat`` reads as plain directories. A link, a junction
+        Each listed name is checked before it is joined onto its folder. The walk enters only entries that ``lstat`` reads as plain directories. A link, a junction
         included, is a candidate whatever its name and is not entered. A folder swapped for a link
         after that ``lstat`` is not refused: at least from its listing until each file under it is
         read in :meth:`records`, paths under it go through the link, so a file outside the
@@ -86,6 +111,7 @@ class FileSink(Sink):
         or a folder gone before it is listed, is left out: nothing is there to record or to
         ignore."""
         found: list[tuple[Path, os.stat_result]] = []
+        unsafe: list[tuple[Path, str]] = []
         pending = [self.directory]
         while pending:
             folder = pending.pop()
@@ -95,6 +121,9 @@ class FileSink(Sink):
             except OSError:
                 continue
             for name in names:
+                if _unsafe_listed_name(name):
+                    unsafe.append((folder, name))
+                    continue
                 path = folder / name
                 try:
                     st = path.lstat()
@@ -110,7 +139,7 @@ class FileSink(Sink):
                 ):
                     # A link is never an engine temp, so no name or pattern keeps one out.
                     found.append((path, st))
-        return sorted(found, key=lambda item: item[0])
+        return sorted(found, key=lambda item: item[0]), sorted(unsafe)
 
     def _inside(self, path: Path, link: bool, root: Path) -> bool:
         """Whether ``path`` resolves inside ``root``; False where that cannot be shown. A link is
@@ -127,7 +156,19 @@ class FileSink(Sink):
 
     def records(self) -> list[Record]:
         root = self.directory.resolve()
-        for path, st in self._entries():
+        found, unsafe = self._entries()
+        for folder, name in unsafe:
+            if (folder, name) in self._seen_unsafe:
+                continue  # no lstat to tell a rewrite from the same entry, so recorded once
+            self._seen_unsafe.add((folder, name))
+            meta = {
+                "name": name,
+                "folder": folder.relative_to(self.directory).as_posix(),
+                "inside": "false",
+                "refused": UNSAFE_NAME,
+            }
+            self._add(Record(b"", meta))
+        for path, st in found:
             signature = _signature(st)
             if self._seen.get(path) == signature:
                 continue

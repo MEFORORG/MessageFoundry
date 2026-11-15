@@ -327,3 +327,60 @@ def test_a_symlink_swapped_in_after_the_lstat_is_not_regular(
     monkeypatch.setattr(os, "open", locked)
     with pytest.raises(PermissionError):
         read_capped(target, 1024, follow_symlinks=False)
+
+
+_BAD_NAMES = ("", ".", "..", "a/b", "a\0b", "a\\b", "x.", "x ")
+
+
+@pytest.mark.parametrize("windows", [False, True], ids=["posix-rules", "windows-rules"])
+def test_the_file_sink_refuses_an_unsafe_listed_name_before_joining_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, windows: bool
+) -> None:
+    """Each listed name passes ``_unsafe_listed_name`` before it is joined onto its folder. A name a
+    real listing should never yield (empty, ``.``, ``..``, a separator, a NUL) or, by Windows rules,
+    one ending in a dot or a space, which Windows strips so it aliases another entry, is recorded
+    unread and refused, once, and never joined, entered or read. The names are mocked into the
+    listing, since no filesystem here can create them."""
+    from harness.sinks import file as file_sink
+
+    monkeypatch.setattr(file_sink, "_WINDOWS", windows)
+    real = os.scandir
+
+    class _Entry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _Listing:
+        def __init__(self, folder: Path) -> None:
+            self.folder = folder
+
+        def __enter__(self) -> list[_Entry]:
+            with real(self.folder) as listing:
+                names = [entry.name for entry in listing]
+            if Path(self.folder) == tmp_path:
+                names += _BAD_NAMES
+            return [_Entry(n) for n in names]
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    with FileSink(tmp_path) as sink:
+        (tmp_path / "ok.hl7").write_bytes(_BODY)
+        monkeypatch.setattr(os, "scandir", _Listing)
+        records = sink.records()
+        assert sink.records() == records  # recorded once, not on every scan
+        monkeypatch.setattr(os, "scandir", real)
+    expected = {"", ".", "..", "a/b", "a\0b"}
+    if windows or os.name == "nt":
+        expected.add("a\\b")
+    if windows:
+        expected |= {"x.", "x "}
+    unsafe = file_sink.UNSAFE_NAME
+    refused = {r.meta["name"]: r for r in records if r.meta.get("refused") == unsafe}
+    assert set(refused) == expected
+    for record in refused.values():
+        assert record.payload == b""
+        assert record.meta["inside"] == "false"
+        assert record.meta["folder"] == "."
+        assert "path" not in record.meta  # never joined, so no path to report
+    assert [r.meta["name"] for r in records if "refused" not in r.meta] == ["ok.hl7"]
