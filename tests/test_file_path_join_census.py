@@ -1080,6 +1080,18 @@ IDE_SITES: dict[str, Site] = {
         'ide/src/newRoute.ts::.replace(/[^A-Za-z0-9_-]/g, "_")}.py`',
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/securityEditorModel.ts": Site(
+        5,
+        GUARDED,
+        "The security editor's settings path, from the operator's setting; the rules it must meet "
+        "are in the securityConfigTarget docblock. Two sites in reachesRoot splice a link target "
+        "read from disk, which a repository can hold, onto the rest of the path, and pass the "
+        "result to lstat, readlink and realpath; on Windows those open handles and can contact SMB "
+        "for a UNC target. resolveLinks joins a resolved prefix to the missing tail; when the "
+        "setting reaches the workspace folder, its output, realTarget, is the path the CLI opens, "
+        "and the guard refuses the setting unless realTarget is inside that folder (BACKLOG #5411).",
+        "ide/src/securityEditorModel.ts::!inside(realRoot, realTarget)",
+    ),
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
     "ide/src/statusBar.ts": Site(4, OPERATOR, _IDE_WORKSPACE),
     "ide/src/stepsView.ts": Site(3, OPERATOR, _IDE_WORKSPACE + " Two are fixed media names."),
