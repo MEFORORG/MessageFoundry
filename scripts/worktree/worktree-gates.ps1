@@ -348,15 +348,16 @@ function Get-FlaggedFiles([string]$Path) {
 }
 
 # The newest write to the WORKING TREE: the tree's own folder, each entry directly under it, and the
-# files inside .pytest_cache and .ruff_cache (a test or lint run rewrites those in place, moving no
-# top-level mtime), up to -CacheCap of them. The idle reading above sees only git metadata, so a session
+# files inside .pytest_cache, .ruff_cache and .mypy_cache (a test, lint or type-check run rewrites those
+# in place, moving no top-level mtime; Get-NestedHazard passes mypy's cache files, so this is the read
+# that sees a mypy run), up to -CacheCap of them in each. The idle reading above sees only git metadata, so a session
 # that edits files and runs no git command is invisible to it. Not every write moves one of these: a
 # file edited in place two levels down moves none. $null when it cannot be read.
 function Get-WorkingTreeActivity {
     param([string]$Path, [int]$CacheCap = 2000)
     try {
         $items = @(Get-Item -LiteralPath $Path -Force -ErrorAction Stop) + @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
-        foreach ($cache in '.pytest_cache', '.ruff_cache') {
+        foreach ($cache in '.pytest_cache', '.ruff_cache', '.mypy_cache') {
             $dir = Join-Path $Path $cache
             if (Test-Path -LiteralPath $dir -PathType Container) {
                 $items += @(Get-ChildItem -LiteralPath $dir -Recurse -Force -File -ErrorAction Stop | Select-Object -First $CacheCap)
@@ -597,11 +598,13 @@ function Get-OwnershipHolds {
 $CACHE_DATA_NAME_PATTERN = '(?i)\A(?:\.env(?:\..*)?|.*\.(?:db|db-wal|db-shm|db-journal|sqlite|sqlite3))\z'
 
 #: mypy's own SQLite cache, the one carve-out from $CACHE_DATA_NAME_PATTERN: a file named `cache.db`, or
-#: the sharded `cache.N.db`, or one of their journal sidecars, whose folder is named like a Python version
-#: and sits directly in a folder named `.mypy_cache` (Test-MypyCacheFile reads the folders, not the path
-#: text). Case-sensitive, as the cache directory names are. Read as data, they vetoed most real clean
-#: trees; any other data-named file in a cache directory, .mypy_cache included, still refuses.
-$MYPY_CACHE_DB_PATTERN = '\Acache(?:\.[0-9]+)?\.db(?:-wal|-shm|-journal)?\z'
+#: the sharded `cache.N.db`, whose folder is named like a Python version and sits directly in a folder
+#: named `.mypy_cache` (Test-MypyCacheFile reads the folders, not the path text). Case-sensitive, as the
+#: cache directory names are. Read as data, they vetoed most real clean trees. Their -wal, -shm and
+#: -journal sidecars are NOT exempt: one is there while a connection holds the cache open, which a
+#: removal cannot delete through on Windows. Any other data-named file in a cache directory,
+#: .mypy_cache included, still refuses.
+$MYPY_CACHE_DB_PATTERN = '\Acache(?:\.[0-9]+)?\.db\z'
 
 # True only for a file of mypy's own cache, as $MYPY_CACHE_DB_PATTERN says. An unset pattern exempts
 # nothing, so a lost variable refuses rather than passing every data file in every cache.
@@ -619,8 +622,8 @@ function Test-MypyCacheFile([System.IO.FileSystemInfo]$Entry) {
 # a tolerated cache directory, a file named like data ($CACHE_DATA_NAME_PATTERN, less mypy's own cache
 # files, $MYPY_CACHE_DB_PATTERN). git status never reads into an IGNORED directory, and one holding
 # nothing but nested repositories is not even listed (measured, remove.ps1), so the whole tree is
-# walked rather than the directories git lists: about
-# 20,000 entries in a tenth of a second on a tree with a .venv (measured 2026-11-05). The walk stops at
+# walked rather than the directories git lists: about 20,000 entries in a tenth of a second on a tree
+# with a .venv (measured 2026-11-05). The walk stops at
 # the first hit and never descends a link or a nested .git. Returns '' or what it found, and THROWS when
 # any directory cannot be listed, so the caller refuses.
 function Get-NestedHazard([string]$Path) {

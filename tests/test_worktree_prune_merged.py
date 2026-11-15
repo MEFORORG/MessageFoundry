@@ -1126,8 +1126,9 @@ def test_work_git_status_cannot_see_is_never_pruned(
 def _populate_mypy_cache(fx: Fixture) -> Path:
     """A ``.mypy_cache`` as mypy's SQLite cache leaves it, ignored through info/exclude.
 
-    The names are what a real tree holds, ``cache.db`` and the sharded ``cache.N.db`` with their
-    ``-wal``/``-shm`` sidecars, in mypy's ``<python-version>/`` folder. The info/exclude rule stands
+    The names are what a real tree holds, ``cache.db`` and the sharded ``cache.N.db``, in mypy's
+    ``<python-version>/`` folder, with no ``-wal``/``-shm`` sidecar, as mypy leaves the cache once it
+    has closed it. The info/exclude rule stands
     in for this repository's own top-level ``.mypy_cache/`` rule in ``.gitignore``, which the
     ignored-entry read needs to list the directory as one regenerable entry.
     """
@@ -1135,7 +1136,7 @@ def _populate_mypy_cache(fx: Fixture) -> Path:
     _exclude(fx, ".mypy_cache/")
     ver = wt / ".mypy_cache" / "3.14"
     ver.mkdir(parents=True)
-    for name in ("cache.db", "cache.0.db", "cache.15.db", "cache.0.db-wal", "cache.0.db-shm"):
+    for name in ("cache.db", "cache.0.db", "cache.15.db"):
         (ver / name).write_bytes(b"SQLite format 3\x00")
     (wt / ".mypy_cache" / ".gitignore").write_text("*\n", encoding="utf-8")
     return wt
@@ -1171,6 +1172,11 @@ def test_a_populated_mypy_cache_does_not_hold_a_clean_tree(fx: Fixture, sleeper:
         (
             ".mypy_cache/tmp/cache.db",
             "a data file inside a cache directory at .mypy_cache/tmp/cache.db",
+        ),
+        # A sidecar of mypy's cache: there while a connection holds the cache open.
+        (
+            ".mypy_cache/3.14/cache.0.db-wal",
+            "a data file inside a cache directory at .mypy_cache/3.14/cache.0.db-wal",
         ),
         # mypy's name in another case: the match is case-sensitive.
         (

@@ -60,8 +60,8 @@
       * no file in it is flagged skip-worktree or assume-unchanged, whose edits git status cannot see;
       * `git status --porcelain --untracked-files=all`, run with LC_ALL=C so its warning text is
         untranslated, exits 0, prints nothing, and warns of no folder it could not open;
-      * its private git metadata, and its working tree (the top level, plus the files in .pytest_cache
-        and .ruff_cache), are both idle beyond -IdleHours;
+      * its private git metadata, and its working tree (the top level, plus the files in .pytest_cache,
+        .ruff_cache and .mypy_cache), are both idle beyond -IdleHours;
       * no rebase, am, cherry-pick, merge, revert or bisect is in progress in its own git dir;
       * every IGNORED entry git lists is a regenerable cache directory, by the list remove.ps1 -Path
         tolerates ($REGENERABLE_IGNORED_PATTERN in worktree-gates.ps1, which names them), and a plain

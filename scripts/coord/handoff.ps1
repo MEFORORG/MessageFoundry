@@ -345,7 +345,9 @@ $pointed = @{}
 $boxWorktrees = @{}
 $boxSessions = @{}
 function Set-NewestBoxValue([hashtable]$Map, [string]$Box, $Value, [datetime]$Written) {
-    $v = "$Value".Trim()
+    # A string only: a JSON false or 0 would otherwise become the path 'False' or '0'.
+    if ($Value -isnot [string]) { return }
+    $v = $Value.Trim()
     if (-not $v) { return }
     $prev = $Map[$Box]
     if (-not $prev -or $Written -gt $prev.Written) { $Map[$Box] = @{ Value = $v; Written = $Written } }

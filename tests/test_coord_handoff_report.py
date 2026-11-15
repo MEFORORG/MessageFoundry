@@ -344,16 +344,23 @@ class TestPerBoxDirectoriesAreHeld:
         assert proc.returncode == 1, proc.stdout + proc.stderr
         assert "STALE-IN-A-LIVE-BOX" in proc.stdout
 
-    @pytest.mark.parametrize(
-        "body",
-        [
-            "null",
-            "",
-            "{}",
-            '{"sessionId": "11111111-2222-3333-4444-555555555555"}',
-            '{"worktree": "   "}',
-        ],
+    _NO_WORKTREE_BODIES = (
+        "null",
+        "",
+        "{}",
+        '{"sessionId": "11111111-2222-3333-4444-555555555555"}',
+        '{"worktree": "   "}',
+        '{"worktree": false}',
     )
+
+    def _plant_newer(self, sandbox: Path, body: str) -> None:
+        """A seat file in the box, written after the box's real record."""
+        newer = sandbox / "coord" / "seats" / "box-aaaa" / "zz-newer.json"
+        newer.write_text(body, encoding="utf-8")
+        when = time.time() + 60
+        os.utime(newer, (when, when))
+
+    @pytest.mark.parametrize("body", _NO_WORKTREE_BODIES)
     def test_a_newer_seat_file_naming_no_worktree_does_not_empty_the_box_worktree(
         self, sandbox: Path, body: str
     ) -> None:
@@ -362,14 +369,24 @@ class TestPerBoxDirectoriesAreHeld:
         and the stale document retired (BACKLOG #5598)."""
         put_box(sandbox, "box-aaaa", age_hours=72)
         root = self._live_box(sandbox, transcript_age_hours=1)
-        newer = sandbox / "coord" / "seats" / "box-aaaa" / "zz-newer.json"
-        newer.write_text(body, encoding="utf-8")
-        when = time.time() + 60
-        os.utime(newer, (when, when))
+        self._plant_newer(sandbox, body)
         proc = run(sandbox, "-Retire", "box-aaaa", config_root=root)
         assert proc.returncode == 1, proc.stdout + proc.stderr
         assert "STALE-IN-A-LIVE-BOX" in proc.stdout
         assert (sandbox / "coord" / "handoffs" / "box-aaaa" / "HANDOFF.md").is_file()
+
+    @pytest.mark.parametrize("body", _NO_WORKTREE_BODIES)
+    def test_and_the_same_box_moves_once_its_transcript_is_old(
+        self, sandbox: Path, body: str
+    ) -> None:
+        """PAIR: the newer seat file does not hold the box by itself."""
+        put_box(sandbox, "box-aaaa", age_hours=72)
+        root = self._live_box(sandbox, transcript_age_hours=72)
+        self._plant_newer(sandbox, body)
+        proc = run(sandbox, "-Retire", "box-aaaa", config_root=root)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "STALE-IN-A-LIVE-BOX" not in proc.stdout
+        assert not (sandbox / "coord" / "handoffs" / "box-aaaa").exists()
 
     def test_and_it_moves_once_the_transcript_is_as_old_as_the_document(
         self, sandbox: Path
