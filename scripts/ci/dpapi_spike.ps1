@@ -91,7 +91,7 @@ $lifted = @(
     "Get-FilePinProblem", "Get-BroadWriteHolders", "Set-AdminOnlyAcl", "New-AdminOnlyFolder",
     "Get-NssmHomeProblem",
     "Save-PinnedNssm", "Resolve-Nssm", "Get-ServiceImageProblem", "Set-ServiceImage",
-    "Set-ServiceAccount", "Disable-RefusedService", "Set-ServiceLogonRight",
+    "Set-ServiceAccount", "Disable-RefusedService", "Set-ServiceLogonRight", "New-SeceditWorkDirectory",
     "Get-ServiceSidTypeChoice", "Get-ServiceTokenProblem", "Set-ServiceTokenHardening",
     "Test-LegacyNativeArgumentPassing", "ConvertTo-NativeArgument", "Invoke-Nssm",
     "Assert-NoNssmExpansion", "Stop-ServiceAndConfirm"

@@ -368,7 +368,9 @@ its `MEFOR_*` environment. Two things every instance must state:
   unconditionally ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)).
 
 Secrets and host-specific overrides come from the environment, e.g. `MEFOR_VALUE_<KEY>` for values used
-by `env("…")` in the graph, and `MEFOR_<SECTION>_<KEY>` for service settings. Precedence is **CLI flag >
+by `env("…")` in the graph, and `MEFOR_<SECTION>_<KEY>` for service settings. Under the Windows service,
+neither a secret nor any `MEFOR_VALUE_*` goes in its NSSM list
+([SERVICE.md](SERVICE.md#start--stop--status)). Precedence is **CLI flag >
 `MEFOR_*` env > `messagefoundry.toml` > built-in default**. Full reference:
 [CONFIGURATION.md](CONFIGURATION.md).
 

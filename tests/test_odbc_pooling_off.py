@@ -132,7 +132,6 @@ async def test_the_store_pool_is_created_with_pooling_off(
     settings = types.SimpleNamespace(pool_size=2, connect_timeout=5)
     _pool, executor = await sqlserver.SqlServerStore._create_pool(
         settings,  # type: ignore[arg-type]
-        posture=None,
         maxsize=2,
     )
     assert isinstance(executor, ThreadPoolExecutor)

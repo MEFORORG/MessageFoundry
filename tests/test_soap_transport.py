@@ -8,6 +8,7 @@ as an HTTP-200 body (some servers do that).
 
 from __future__ import annotations
 
+import contextlib
 import email.message
 import http.client
 import io
@@ -23,6 +24,7 @@ from messagefoundry.config.wiring import Soap, WiringError
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
+from messagefoundry.transports.http_auth import with_oauth2_client_credentials
 from messagefoundry.transports.soap import SoapDestination, _classify_soap, _fault_code
 from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
@@ -344,3 +346,227 @@ def test_egress_shares_allowed_http() -> None:
         check_egress_allowed(bad, EgressSettings(allowed_http=["api.example.com"]))
     good = Destination(name="x", type=ConnectorType.SOAP, settings=Soap(url=URL).settings)
     check_egress_allowed(good, EgressSettings(allowed_http=["api.example.com"]))  # no raise
+
+
+# --- BACKLOG #5798: an OAuth2 401 drops the cached bearer and retries ----------------------------
+
+
+class _CountingProvider:
+    def __init__(self) -> None:
+        self.invalidations = 0
+
+    def access_token(self) -> str:
+        return "AT-synthetic"
+
+    def invalidate(self) -> None:
+        self.invalidations += 1
+
+
+def _oauth2_dest(**over: object) -> tuple[SoapDestination, _CountingProvider]:
+    spec = with_oauth2_client_credentials(
+        Soap(url=URL, **over),  # type: ignore[arg-type]
+        token_url="https://auth.example.com/token",
+        client_id="cid",
+        client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+    )
+    d = build_destination(
+        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=spec.settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(d, SoapDestination)
+    provider = _CountingProvider()
+    d._token_provider = provider
+    return d, provider
+
+
+@pytest.mark.parametrize("body", [b"", _SENDER_11.encode()], ids=["no-fault", "sender-fault"])
+async def test_an_oauth2_401_invalidates_the_token_and_retries(body: bytes) -> None:
+    """Mutation: delete the 401 arm in `_post`. Red: the 401 classifies as a permanent
+    NegativeAckError, so the message dead-letters and the provider is never invalidated."""
+    dest, provider = _oauth2_dest()
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("<env/>")
+    assert not isinstance(ei.value, NegativeAckError)  # transient: it retries with a fresh bearer
+    assert provider.invalidations == 1
+    assert str(ei.value) == f"SOAP {URL} returned HTTP 401; refreshing OAuth2 token"
+
+
+_WSSE_401 = b"<soap:Fault><faultcode>wsse:FailedAuthentication</faultcode></soap:Fault>"
+_INVALID_TOKEN_401 = b"<soap:Fault><faultcode>wsse:InvalidSecurityToken</faultcode></soap:Fault>"
+
+
+async def test_an_oauth2_401_carrying_a_ws_security_fault_stays_permanent() -> None:
+    """Round-one review: on a connection that sends a UsernameToken, the fault may name it, and a
+    fresh bearer cannot fix it, so retrying would resend a wrong password for the whole budget. The
+    bearer is still dropped. Mutation: raise the transient in the 401 arm whatever the body. Red:
+    DeliveryError."""
+    dest, provider = _oauth2_dest(
+        soap_version="1.2", ws_security=True, ws_username="svc", ws_password="pw-synthetic"
+    )
+    dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<op/>")
+    assert ei.value.permanent is True and ei.value.code == "wssecurity"
+    assert provider.invalidations == 1
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{}, {"soap_version": "1.2", "ws_security": True}],
+    ids=["no-ws-security", "timestamp-only"],
+)
+@pytest.mark.parametrize("body", [_WSSE_401, _INVALID_TOKEN_401], ids=["failed-auth", "invalid"])
+async def test_an_oauth2_only_401_with_a_ws_security_fault_still_retries(
+    over: dict[str, object], body: bytes
+) -> None:
+    """Round-two review: with no UsernameToken sent, the bearer is the only credential such a fault
+    can name, so it is dropped and the message retries. Mutation: drop the UsernameToken condition
+    from the carve-out. Red: a permanent wssecurity NegativeAckError dead-letters the message."""
+    dest, provider = _oauth2_dest(**over)
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("<op/>")
+    assert not isinstance(ei.value, NegativeAckError)
+    assert provider.invalidations == 1
+
+
+@pytest.mark.parametrize("body", [_WSSE_401, _INVALID_TOKEN_401], ids=["failed-auth", "invalid"])
+async def test_a_ws_security_401_after_its_bearer_retry_is_a_credential_fault(body: bytes) -> None:
+    """Manager repair pass: the engine cannot see every credential an envelope or a connection
+    carries (a Handler's own UsernameToken from body_secrets, a client certificate). The first
+    WS-Security 401 retries with a fresh bearer; the next is a credential fault, so the lane stops
+    rather than spend a failed login on every queued row. The run stays open after it, so a resumed
+    lane stops again on the same fault. Mutation: never set the retried flag. Red: the second send
+    raises a transient DeliveryError and the wrong credential goes out for the whole budget."""
+    dest, provider = _oauth2_dest()
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as first:
+        await dest.send("<op/>")
+    assert not isinstance(first.value, NegativeAckError)
+    for _ in range(2):
+        dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+        with pytest.raises(NegativeAckError) as again:
+            await dest.send("<op/>")
+        assert again.value.permanent is True and again.value.credential_fault is True
+        assert again.value.code == "wssecurity"
+    assert provider.invalidations == 3
+
+
+class _ResetDuringRead(_Resp):
+    """A 2xx whose body read fails: an answer from the endpoint, then a transport failure."""
+
+    def read(self, amt: int = -1) -> bytes:
+        raise ConnectionResetError("reset mid-body")
+
+
+def _between(kind: str) -> _Opener:
+    if kind == "2xx":
+        return _Opener(resp=_Resp(200, b"<soap:Envelope><soap:Body>ok</soap:Body></soap:Envelope>"))
+    if kind == "2xx-read-fails":
+        return _Opener(resp=_ResetDuringRead(200))
+    if kind == "plain-401":
+        return _Opener(exc=_http_error(401, b""))
+    if kind in ("500", "502", "407"):
+        return _Opener(exc=_http_error(int(kind), b""))
+    if kind == "unreachable":
+        return _Opener(exc=urllib.error.URLError("refused"))
+    if kind == "reset":
+        return _Opener(exc=ConnectionResetError("reset"))
+    assert kind == "malformed"
+    return _Opener(exc=http.client.BadStatusLine("garbage"))
+
+
+async def _ws_security_401_then(dest: SoapDestination, kind: str) -> None:
+    dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as first:
+        await dest.send("<op/>")
+    assert not isinstance(first.value, NegativeAckError)  # the run is open
+    dest._opener = _between(kind)  # type: ignore[assignment]
+    with contextlib.suppress(DeliveryError):
+        await dest.send("<op/>")
+    dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize("kind", ["2xx", "2xx-read-fails", "plain-401"])
+async def test_control_a_2xx_or_a_plain_401_between_ends_the_ws_security_401_run(kind: str) -> None:
+    """Only a 2xx or a 401 that is not a WS-Security fault ends the run, so the next WS-Security
+    401 gets its retry again. Mutations: move the 2xx reset after the body read (red:
+    "2xx-read-fails"), or drop the reset on a plain 401 (red: "plain-401")."""
+    dest, _ = _oauth2_dest()
+    await _ws_security_401_then(dest, kind)
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("<op/>")
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+@pytest.mark.parametrize("kind", ["500", "502", "407", "unreachable", "reset", "malformed"])
+async def test_another_status_or_no_answer_between_leaves_the_ws_security_401_run_open(
+    kind: str,
+) -> None:
+    """A 5xx, a 407 (at least these can come from a gateway or proxy rather than the endpoint),
+    or no answer at all leaves the run open, so the next WS-Security 401 is the second in a row:
+    a credential fault. Mutation: reset the flag in the 401 arm for any other status, or in a
+    transport-failure arm. Red: the second WS-Security 401 is retried again."""
+    dest, _ = _oauth2_dest()
+    await _ws_security_401_then(dest, kind)
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<op/>")
+    assert ei.value.permanent is True and ei.value.credential_fault is True
+
+
+_EXPIRED_401 = b"<soap:Fault><faultcode>wsse:MessageExpired</faultcode></soap:Fault>"
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{}, {"soap_version": "1.2", "ws_security": True}],
+    ids=["no-ws-security", "timestamp-only"],
+)
+async def test_an_oauth2_401_message_expired_stays_permanent_without_a_username_token(
+    over: dict[str, object],
+) -> None:
+    """Round-three review: MessageExpired names the envelope's Timestamp, which a fresh bearer
+    cannot fix, so it stays permanent as before #5798 even with no UsernameToken sent. The bearer
+    is still dropped. Mutation: drop the MessageExpired test from the carve-out. Red: DeliveryError,
+    and the message retries for the whole budget."""
+    dest, provider = _oauth2_dest(**over)
+    dest._opener = _Opener(exc=_http_error(401, _EXPIRED_401))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<op/>")
+    assert ei.value.permanent is True and ei.value.code == "wssecurity"
+    assert provider.invalidations == 1
+
+
+@pytest.mark.parametrize("body", [b"", _SENDER_11.encode()], ids=["no-fault", "sender-fault"])
+async def test_a_username_token_connection_still_retries_a_non_ws_security_401(
+    body: bytes,
+) -> None:
+    """Round-three review: the carve-out keys on the fault code, not on the connection alone, so a
+    401 with no WS-Security fault retries with a fresh bearer even where a UsernameToken is sent.
+    Mutation: test only the UsernameToken condition in the carve-out. Red: NegativeAckError."""
+    dest, provider = _oauth2_dest(
+        soap_version="1.2", ws_security=True, ws_username="svc", ws_password="pw-synthetic"
+    )
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("<op/>")
+    assert not isinstance(ei.value, NegativeAckError)
+    assert provider.invalidations == 1
+
+
+async def test_control_an_oauth2_403_stays_permanent_and_keeps_the_token() -> None:
+    dest, provider = _oauth2_dest()
+    dest._opener = _Opener(exc=_http_error(403, b""))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<env/>")
+    assert ei.value.permanent is True
+    assert provider.invalidations == 0
+
+
+async def test_control_a_401_without_a_token_provider_stays_permanent() -> None:
+    dest = _dest(basic_user="svc", basic_password="pw-synthetic")  # noqa: S106 -- synthetic
+    dest._opener = _Opener(exc=_http_error(401, b""))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<env/>")
+    assert ei.value.permanent is True

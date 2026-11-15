@@ -21,6 +21,7 @@ harness.reconcile compare --max-file-bytes`` changes the cap.
 
 from __future__ import annotations
 
+import codecs
 import logging
 import re
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from harness.reconcile.normalize import (
     NormalizeRules,
     ReconcileError,
     Separators,
+    _segments,
     diff,
 )
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -46,17 +48,13 @@ DEFAULT_KEY: tuple[str, int] = ("MSH", 10)
 
 def field_value(raw: str, key: tuple[str, int]) -> str | None:
     """Read ``(segment_id, field_no)`` from a raw HL7 message on its own declared separators (read-only;
-    never slices to mutate). Returns ``None`` if the segment/field is absent. ``MSH-1`` is the field
-    separator, so an ``MSH`` field ``N`` is at split index ``N-1``; every other segment's is at ``N``."""
+    never slices to mutate). Returns ``None`` if the segment/field is absent. The rows are the diff's
+    own, indexed by HL7 field number for every segment, ``MSH-1`` (the separator) included."""
     seg_id, field_no = key
     sep = Separators.from_message(raw)  # raises ReconcileError if there's no MSH header
-    for line in _normalize_line_endings(raw).split("\r"):
-        if not line.strip():
-            continue
-        fields = line.split(sep.field)
-        if fields and fields[0] == seg_id:
-            idx = field_no - 1 if seg_id == "MSH" else field_no
-            return fields[idx] if 0 <= idx < len(fields) else None
+    for fields in _segments(raw, sep):
+        if fields[0] == seg_id:
+            return fields[field_no] if 0 < field_no < len(fields) else None
     return None
 
 
@@ -108,8 +106,36 @@ def _record(path: Path, number: int, line: str) -> str:
     return raw
 
 
+#: Byte-order marks of encodings latin-1 cannot read: decoded byte by byte, the text interleaves NULs
+#: and no line begins with ``MSH``. UTF-32 LE begins with UTF-16 LE's mark, so it is covered.
+_WIDE_BOMS = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_BE)
+
+#: A UTF-8 byte-order mark as the latin-1 decode reads it. HL7 files are read as latin-1, the same
+#: decode the capture sink gives the wire bytes, so the mark is dropped where it leads an ``MSH``
+#: line rather than by decoding the file as UTF-8: at the start of a file, or of each file a tool
+#: concatenated into one.
+_LATIN1_BOM = codecs.BOM_UTF8.decode("latin-1")
+
+#: Batch-protocol envelope lines, headers and trailers, which hold no message and are dropped.
+_ENVELOPE_SEGMENTS = ("FHS", "BHS", "BTS", "FTS")
+
+
+def _line_head(line: str) -> str:
+    """``line`` past any run of MLLP start bytes and UTF-8 byte-order marks, in any order."""
+    while True:
+        rest = line.lstrip("\x0b").removeprefix(_LATIN1_BOM)
+        if rest == line:
+            return line
+        line = rest
+
+
 def _parse(path: Path, data: bytes) -> list[str]:
     """The messages in one file's bytes: a JSONL capture by its ``.jsonl`` name, else HL7."""
+    if data.startswith(_WIDE_BOMS):  # either shape: neither decode reads this as text
+        raise LoadError(
+            f"{path}: starts with a UTF-16 or UTF-32 byte-order mark; save it as UTF-8 or single-byte",
+            over_cap=False,
+        )
     if path.suffix != ".jsonl":
         return _split_batch(data.decode("latin-1"))
     # utf-8-sig drops a byte-order mark, which some Windows tools write before UTF-8 text.
@@ -175,21 +201,34 @@ def load_messages(
 
 def _split_batch(text: str) -> list[str]:
     """Split concatenated HL7 into messages: each ``MSH`` line starts a new one (MLLP wrappers, if any,
-    are tolerated since we key off the ``MSH`` prefix of a stripped line)."""
+    are tolerated since we key off the ``MSH`` prefix of a stripped line).
+
+    A UTF-8 byte-order mark before an ``MSH`` is dropped (see :data:`_LATIN1_BOM`), and so are
+    batch envelope lines wherever they sit. Content before the first ``MSH`` line, which is all of a
+    file that has none, is kept as one more entry rather than dropped: it has no header, so the
+    pairing counts it as unkeyed, and the result cannot read clean with it."""
     norm = _normalize_line_endings(text)
     msgs: list[str] = []
     current: list[str] = []
+    preamble: list[str] = []
     for line in norm.split("\r"):
-        if line.lstrip("\x0b").startswith("MSH"):
+        head = _line_head(line)
+        if head.startswith(_ENVELOPE_SEGMENTS):
+            continue
+        if head.startswith("MSH"):
             if current:
                 msgs.append("\r".join(current))
-            current = [line.lstrip("\x0b")]
+            current = [head.rstrip("\x1c\x0d")]
         elif current:
             stripped = line.rstrip("\x1c\x0d")
             if stripped:
                 current.append(stripped)
+        elif head.strip("\x0b\x1c \t\n"):
+            preamble.append(line)
     if current:
         msgs.append("\r".join(current))
+    if preamble:
+        msgs.insert(0, "\r".join(preamble))
     return msgs
 
 
@@ -225,9 +264,13 @@ class ReconcileResult:
 
     @property
     def clean(self) -> bool:
-        """True iff every matched pair is identical and nothing is unmatched on either side."""
+        """True iff at least one pair was compared, every matched pair is identical, nothing is
+        unmatched or unkeyed on either side, and no key repeats. With no pair the gate checked
+        nothing; a repeated key had its earlier copies discarded unread, and is a doubled output."""
         return (
-            not self.mismatched
+            bool(self.pairs)
+            and not self.duplicate_keys
+            and not self.mismatched
             and not self.mefor_only
             and not self.corepoint_only
             and not self.unkeyed_mefor

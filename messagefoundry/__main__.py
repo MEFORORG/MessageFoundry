@@ -2900,9 +2900,10 @@ def _serve(args: argparse.Namespace) -> int:
     if _start_files_refused(service_config, env_file):
         return 2
 
-    # Vault BACKLOG #2595 and #2601: a store key, or another secret-class setting, in this engine's
-    # own Windows service environment, which NSSM keeps in a registry key any local user can read.
-    # Refused under EVERY enforcement setting (owner ruling 2026-10-01).
+    # Vault BACKLOG #2595 and #2601: a store key, another secret-class setting, or (vault #8212)
+    # any MEFOR_VALUE_* variable, in this engine's own Windows service environment, which NSSM
+    # keeps in a registry key any local user can read. Refused under EVERY enforcement setting
+    # (owner rulings 2026-10-01 and 2026-11-14).
     # messagefoundry/serviceenv.py says what the reading covers.
     from messagefoundry.serviceenv import service_env_posture, service_env_refusal
 
@@ -5412,8 +5413,8 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # Vault BACKLOG #2595: the service-environment check each engine shard's `serve` makes. A
     # shard reads the same NSSM service as the supervisor, since that service is an ancestor of
-    # both, so every shard would refuse on a secret there. Refused under every enforcement
-    # setting, as in `serve`.
+    # both, so every shard would refuse on what `serve` refuses there: an engine secret, or (vault
+    # #8212) any MEFOR_VALUE_* variable. Refused under every enforcement setting, as in `serve`.
     from messagefoundry.serviceenv import (
         service_env_loosenings,
         service_env_posture,
@@ -9438,7 +9439,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     store_slot = _ProvisionStore()
     # The instance hop posture, as `serve` derives it: the auth build takes it, and both store opens
-    # below pass it, so a server store hop is clamped and guarded as `serve` opens it (#200, #201).
+    # below pass it, as `serve` passes it to its own store open (#200, #201).
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
 
     async def administrator_exists() -> tuple[bool, str | None]:
@@ -9690,8 +9691,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # A store key that could not be resolved (the comment above `key_unresolved`). Or the
         # store hop, refused at the open as `serve` refuses it now that the posture is passed: a
-        # server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`
-        # (#5000). Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
+        # server store off-box with no revocation check at `enforce`, or a weakened-TLS store hop
+        # at any posture (#5000, vault BACKLOG #3533 item 2). Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
         # store's live schema falls short of this build's DDL batch: the open rolled the batch back
         # and wrote no marker, and the text lists the differences and the remedy, then says what
         # the open may have changed before it (#5067). Exit 2: could not start, never the
@@ -11537,6 +11538,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.row_seal import ResealOutcome
     from messagefoundry.store.store import audit_roll_refused_for_good
     from messagefoundry.uploads import ResealResult, UploadStore
 
@@ -11658,7 +11660,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    async def run() -> tuple[int, ResealResult, tuple[bool, str], bool]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str], bool, ResealOutcome]:
         import datetime
 
         from messagefoundry.pipeline.secret_rotation import (
@@ -11683,6 +11685,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
             if isinstance(store, SecretRotationMetaStore) and key_id:
                 record_named = await open_rotation_record(store, key_id, today)
             count = await store.reencrypt_to_active()
+            # Vault BACKLOG #5635: what the store pass left under a key it holds and could not
+            # re-seal, for the note below. A record under a key it does not hold aborted the pass.
+            seals = store.reseal_outcome()
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
             # had no rotation of any kind — a rotation re-sealed every database cell and left every
             # uploaded file under the retired key, so the operator's next step (dropping that key)
@@ -11762,7 +11767,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # way out only then: a run with the key already stamped opens no record, and a
             # refusal a re-run or a restored key clears has its own remedy in the roll's error.
             way_out = record_named and not rolled[0] and audit_roll_refused_for_good(rolled[1])
-            return count, uploads, rolled, way_out
+            return count, uploads, rolled, way_out, seals
         finally:
             await store.close()
 
@@ -11776,7 +11781,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         *_key_unresolved(),
     )
     try:
-        count, uploads, (rolled_ok, rolled_msg), name_way_out = run_guarded(run())
+        count, uploads, (rolled_ok, rolled_msg), name_way_out, seals = run_guarded(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -11788,7 +11793,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # record stays open. That is safe precisely because both passes skip what is already under
         # the active key: a re-run with the key supplied goes on from here, and nothing rolls back.
         # One case no key finishes: a row whose tag verified but which is not UTF-8, or not JSON at
-        # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308).
+        # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308). The store
+        # pass also refuses here, from a pre-flight read before any of its writes, when a user, role,
+        # open approval or directory-map seal names a key this run does not hold (#5635): going on
+        # would re-encrypt such a user's TOTP secret, which its seal covers, and strand the record
+        # under every key. Its message names the tables and seal key ids.
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
     except could_not_start as exc:
@@ -11884,6 +11893,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "This run did not stamp the key's rotation date, and no serve start does while the "
             "rotation stands open, though one that came before this run may have.",
             file=sys.stderr,
+        )
+    if seals.refused:
+        # Vault BACKLOG #5635: a seal that fails under a key this run holds, or is malformed, is
+        # left as it is. No key re-seals it, so it must not fail the run, or every later run would
+        # fail on it too (the BACKLOG #3181 precedent). Said here, not only logged.
+        print(
+            f"note: {seals.refused} user, role, open approval or directory-map record(s) were left "
+            "as they are: their seal fails under a key this run holds, or is malformed. The "
+            "causes include at least a change made outside the store and, if an engine was still "
+            "running, a write it made during this run. A record changed outside the store is "
+            "refused on every read and no key re-seals it, so it does not hold this rotation open; "
+            "recreate or remove it. The log names each kind."
         )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
@@ -13714,13 +13735,13 @@ def _command_hop_posture(settings: ServiceSettings) -> HopPosture | None:
     guard, which does nothing with none, refuses an unrevoked off-box hop as ``serve`` does.
 
     At ``warn`` it is ``None``, as these commands passed before. At least these read ``None`` as
-    enforcing: the Vault hops, and the weakened-TLS check and the SQL Server pin's anchor checks,
-    which read the ambient posture for ``None`` and find none stamped on any CLI path. So a weakened
-    store stays refused with ``MEFOR_ALLOW_INSECURE_TLS`` set, an escape ``serve`` honours only at
-    ``[security].enforcement = warn``, and an unattested off-box Vault stays
-    refused, and a SQL Server pin keeps its enforcing anchor checks. Passing the ``warn`` posture
-    would relax each of them, and no command may loosen (Manager decision 2026-10-31, under the
-    owner's delegation of 2026-10-22). The revocation guard then does nothing, so each command calls
+    enforcing: the Vault hops, and the SQL Server pin's anchor checks, which read the ambient
+    posture for ``None`` and find none stamped on any CLI path. So an unattested off-box Vault
+    stays refused, and a SQL Server pin keeps its enforcing anchor checks. Passing the ``warn``
+    posture would relax each of them, and no command may loosen (Manager decision 2026-10-31, under
+    the owner's delegation of 2026-10-22). A weakened store is refused whatever posture is passed,
+    even with ``MEFOR_ALLOW_INSECURE_TLS`` set on an instance at ``[security].enforcement = warn``
+    (vault BACKLOG #3533 item 2). The revocation guard then does nothing, so each command calls
     :func:`_warn_on_an_unrevoked_store_hop` before its open, which says when that logs. Imported here, not at module
     level, so the CLI's import cost stays where it is."""
     from messagefoundry.config.settings import hop_posture_from_ai

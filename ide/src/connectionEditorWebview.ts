@@ -5,8 +5,15 @@
 // loaded without `vscode`. connectionEditor.ts builds the page and embeds this; the unit suite
 // evaluates the SAME source in a jsdom page (webview-receivers.test.ts), so what the tests exercise
 // is what ships.
-import { FIELD_CONTROLS, PARAM_TYPES } from "./connectionForm";
-import { SHAPE_HELPERS, WEBVIEW_GUARD_NOTE, SCRIPT_STARTED_MARK, embedJson, guardScript } from "./webviewMessaging";
+import { ENVREF_KEY_NAMES, FIELD_CONTROLS, PARAM_TYPES } from "./connectionForm";
+import {
+  CHANNEL_FIELD,
+  SHAPE_HELPERS,
+  WEBVIEW_GUARD_NOTE,
+  SCRIPT_STARTED_MARK,
+  embedJson,
+  guardScript,
+} from "./webviewMessaging";
 
 /** What the connection editor's script is seeded with, each embedded as JSON. */
 export interface ConnectionEditorScriptInputs {
@@ -14,6 +21,8 @@ export interface ConnectionEditorScriptInputs {
   routers: readonly string[];
   transports: readonly string[];
   fieldGroups: unknown;
+  /** The transport and direction `fieldGroups` was built for; null when there are none. */
+  fieldGroupsFor: { transport: string; direction: string } | null;
   siblings: unknown;
   clone: boolean | undefined;
 }
@@ -31,6 +40,8 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // null when the engine could not describe them — see FormSchema. Recomputed extension-side on a
     // transport/direction change: the grouping rules live in one tested module, not duplicated here.
     let FIELD_GROUPS = ${embedJson(p.fieldGroups)};
+    // The transport and direction the host built FIELD_GROUPS for, so create mode can show them.
+    const FIELD_GROUPS_FOR = ${embedJson(p.fieldGroupsFor)};
     const SIBLINGS = ${embedJson(p.siblings)};
     const CLONE = ${embedJson(p.clone)};              // #175: create mode pre-filled from INITIAL, new name required
     const EDIT = INITIAL !== null && !CLONE;    // clone is NOT edit: name editable, no delete
@@ -58,12 +69,44 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
 
     function isInbound() { return $('direction').value === 'inbound'; }
 
-    function settingRow(key, value, isEnv, cast) {
+    // The {env = "KEY"} inline table, and nothing else: a non-empty string env key, and no key outside
+    // the list envRefOf in connectionForm.ts uses, embedded from there. So a table-valued setting
+    // that happens to carry an "env" key is a table here too, not a reference (BACKLOG #5565).
+    const ENVREF_KEY_NAMES = ${embedJson(ENVREF_KEY_NAMES)};
+    function isEnvRefValue(val) {
+      if (!val || typeof val !== 'object' || Array.isArray(val)) return false;
+      if (typeof val.env !== 'string' || val.env === '') return false;
+      return Object.keys(val).every((k) => ENVREF_KEY_NAMES.includes(k));
+    }
+
+    // A value as a text input shows it: a table or array as JSON, never String(value), which shows
+    // and saves '[object Object]' (BACKLOG #5565).
+    function displayValue(value) {
+      return value == null ? '' : (typeof value === 'object' ? JSON.stringify(value) : String(value));
+    }
+
+    // A legacy row drawn from the record keeps the record's value here, so an untouched row saves
+    // that value exactly (a table, an env reference's default, a string of digits) rather than what
+    // the free text re-parses to.
+    const ROW_ORIGINAL = new WeakMap();
+
+    function settingRow(key, value, isEnv, cast, original) {
       const wrap = document.createElement('div'); wrap.className = 'setting';
       const k = document.createElement('input'); k.type = 'text'; k.className = 'k'; k.placeholder = 'key'; k.value = key || '';
-      const v = document.createElement('input'); v.type = 'text'; v.placeholder = 'value'; v.value = value == null ? '' : String(value);
+      const v = document.createElement('input'); v.type = 'text'; v.placeholder = 'value';
+      v.value = displayValue(value);
+      // "Untouched" is judged against what the input holds after the assignment, not the recorded
+      // text: a text input strips CR and LF, so a multi-line value never compared equal and was
+      // saved without its line breaks.
+      if (original !== undefined) ROW_ORIGINAL.set(wrap, { key: k.value, shown: v.value, isEnv: !!isEnv, cast: cast || '', original: original });
+      // Marked, so the save parses the JSON back into the table.
+      if (value !== null && typeof value === 'object') v.dataset.table = '1';
       const castSel = document.createElement('select');
-      for (const c of ['', 'int', 'float', 'bool', 'str']) { const o = document.createElement('option'); o.value = c; o.textContent = c || 'cast'; castSel.appendChild(o); }
+      // A recorded cast outside the list gets its own option, so it shows and an untouched save keeps
+      // it for the engine to refuse, rather than the select going blank and the save dropping it.
+      const casts = ['', 'int', 'float', 'bool', 'str'];
+      if (cast && !casts.includes(cast)) casts.push(cast);
+      for (const c of casts) { const o = document.createElement('option'); o.value = c; o.textContent = c || 'cast'; castSel.appendChild(o); }
       castSel.value = cast || '';
       const envLabel = document.createElement('label'); envLabel.className = 'envbox';
       const envCb = document.createElement('input'); envCb.type = 'checkbox'; envCb.checked = !!isEnv;
@@ -81,42 +124,155 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // to the legacy free-text key/value rows when the engine could not describe itself, so an older
     // engine still edits connections. A field whose value the record carries but whose key the schema
     // does not describe arrives in its own group and is rendered here like any other -- never dropped.
-    function renderField(f, into) {
+    // Each schema control keeps its descriptor here, so the save can apply the field's type and
+    // default, write back an untouched control's recorded value exactly, and write back what the
+    // field holds but never shows: an inline credential (preserveValue) and an env reference's
+    // default (envDefault). Kept here rather than in a data- attribute or an input, so no control
+    // displays the credential. It is not kept out of the page: INITIAL and FIELD_GROUPS carry it.
+    const HELD = new WeakMap();
+    // What each control showed right after it was drawn: an untouched control still shows exactly
+    // this, whatever the browser did to the value on assignment (a text input strips CR and LF).
+    const SHOWN = new WeakMap();
+    // The record's inline credentials (HELD_SECRETS) and secret env references' inline defaults
+    // (HELD_DEFAULTS), by key. A transport or direction change sends the host HELD_MARK in their
+    // place, never the value: the host rebuilds the fields from what it is sent, so the key (and an
+    // off-direction secret's field) survives the round trip, and a key the new schema does not
+    // declare comes back showing the mark rather than the credential. The save swaps the value back.
+    const HELD_MARK = '[held inline credential, not shown]';
+    const HELD_SECRETS = new Map();
+    // Each entry is { value, envKey }: the default and the env key it was recorded under, as an
+    // untouched box shows it (line breaks stripped) and trimmed. The default goes back only with
+    // that key, however many rebuilds came between.
+    const HELD_DEFAULTS = new Map();
+    // Keys whose inline credential the user chose to remove; the save then writes no value for them.
+    const REMOVED_SECRETS = new Set();
+    function heldSecret(f) {
+      if (REMOVED_SECRETS.has(f.key)) return undefined;
+      if (f.preserveValue !== undefined && f.preserveValue !== HELD_MARK) return f.preserveValue;
+      // Only where the rebuild was sent the mark: a key the request left out, because the user
+      // removed or cleared it, holds nothing, so the credential is not written back.
+      return f.preserveValue === HELD_MARK ? HELD_SECRETS.get(f.key) : undefined;
+    }
+    // Keys the user chose to remove from the record; the save writes nothing for them. Cleared when
+    // the fields are rebuilt, since the rebuild request already left them out.
+    const REMOVED_KEYS = new Set();
+    // The cast an env() reference needs to read back as the field's declared type.
+    const ENV_CASTS = { int: 'int', float: 'float', bool: 'bool' };
+    // The descriptor a field gets when the user switches it between a literal and env(): empty, so
+    // the save writes nothing until a value or a key is typed.
+    function switchedMode(f, toEnv) {
+      const g = { ...f, isEnvRef: toEnv, value: undefined, envKey: undefined, envDefault: undefined, cast: undefined };
+      if (toEnv && ENV_CASTS[f.type]) g.cast = ENV_CASTS[f.type];
+      return g;
+    }
+    // recorded: the descriptor the record drew, kept across a switch so switching back restores it.
+    // replacing: the field's current element, when a switch redraws it in place.
+    function renderField(f, into, replacing, recorded) {
+      const drawn = recorded || f;
       const wrap = document.createElement('div'); wrap.className = 'field';
       const lab = document.createElement('label');
       lab.textContent = f.label + (f.required ? ' *' : f.conditionallyRequired ? ' †' : '');
       lab.title = f.help || '';
+      if (f.preserveValue !== undefined && f.preserveValue !== HELD_MARK) HELD_SECRETS.set(f.key, f.preserveValue);
+      if (f.secret && f.envDefault !== undefined && f.envDefault !== HELD_MARK) {
+        HELD_DEFAULTS.set(f.key, { value: f.envDefault, envKey: String(f.envKey ?? '').replace(/[\\r\\n]/g, '').trim() });
+      }
       let control;
       const useEnv = f.isEnvRef || f.secretOnlyEnv;
-      if (f.control === 'checkbox' && !useEnv) {
+      // A checkbox only while the recorded value is a boolean: a checkbox would read any other value
+      // as false, and an untouched save would write false in its place (a "yes" the engine refuses
+      // at load becoming a setting it accepts). Any other value gets a text box, saved back as it is.
+      const boolish = f.value === undefined || f.value === null || typeof f.value === 'boolean';
+      if (f.control === 'checkbox' && !useEnv && boolish) {
         control = document.createElement('input'); control.type = 'checkbox';
         control.checked = f.value === true || (f.value === undefined && f.defaultValue === true);
       } else if (f.control === 'select' && !useEnv) {
         control = document.createElement('select');
-        for (const c of ['', ...(f.choices || [])]) {
+        const choices = f.choices || [];
+        const options = ['', ...choices];
+        // A recorded value outside the choices gets its own option, so it shows and an untouched
+        // save keeps it, rather than the select going blank and the save dropping the key.
+        if (f.value != null && !choices.some((c) => String(c) === displayValue(f.value))) options.push(f.value);
+        for (const c of options) {
           const o = document.createElement('option');
-          o.value = String(c); o.textContent = c === '' ? '(default: ' + f.placeholder + ')' : String(c);
+          o.value = displayValue(c); o.textContent = c === '' ? '(default: ' + f.placeholder + ')' : displayValue(c);
           control.appendChild(o);
         }
-        control.value = f.value == null ? '' : String(f.value);
+        control.value = displayValue(f.value);
       } else {
         control = document.createElement('input');
-        control.type = f.control === 'number' && !useEnv ? 'number' : 'text';
-        control.placeholder = useEnv ? 'environment key' : (f.placeholder || '');
-        const shown = useEnv ? (f.envKey || '') : f.value;
-        control.value = shown == null ? '' : (typeof shown === 'object' ? JSON.stringify(shown) : String(shown));
+        // Never a number box, only a numeric keyboard hint: a number box reads text it cannot parse
+        // as "", so a typo was saved as an emptied box and the recorded key was dropped. A text box
+        // posts what was typed; typedValue converts a number and the engine refuses anything else.
+        control.type = 'text';
+        if (f.control === 'number' && !useEnv) control.setAttribute('inputmode', 'decimal');
+        control.placeholder = useEnv ? secretHint(f) : (f.placeholder || '');
+        control.value = displayValue(useEnv ? (f.envKey || '') : f.value);
       }
       control.dataset.key = f.key;
-      control.dataset.kind = f.control;
+      control.dataset.kind = f.control === 'checkbox' && !boolish ? 'text' : f.control;
       if (useEnv) { control.dataset.env = '1'; }
       if (f.cast) { control.dataset.cast = f.cast; }
+      HELD.set(control, f);
+      SHOWN.set(control, control.value);
+      control.disabled = REMOVED_KEYS.has(f.key);
       const hint = document.createElement('div'); hint.className = 'sub'; hint.textContent = f.help || '';
-      wrap.append(lab, control, hint);
-      into.appendChild(wrap);
+      wrap.append(lab, control);
+      // Switch between a literal and env(), as the legacy row's env() box did. Not for a secret: the
+      // form must not be what writes a literal credential into the file (secretOnlyEnv).
+      if (f.envAllowed && !f.secret && !f.secretOnlyEnv) {
+        const envLabel = document.createElement('label'); envLabel.className = 'envbox';
+        const envCb = document.createElement('input'); envCb.type = 'checkbox'; envCb.checked = useEnv;
+        envCb.dataset.envToggle = f.key;
+        envLabel.append(envCb, document.createTextNode('env()'));
+        envCb.addEventListener('change', () => {
+          const next = envCb.checked === !!drawn.isEnvRef ? drawn : switchedMode(drawn, envCb.checked);
+          renderField(next, into, wrap, drawn);
+        });
+        wrap.append(envLabel);
+      }
+      // Remove a setting the record holds, as the legacy row's delete did. A checkbox has no empty
+      // state, so without this a recorded bool could only be set, never dropped to the default.
+      if (drawn.isEnvRef || drawn.value != null) {
+        const drop = document.createElement('button'); drop.className = 'secondary';
+        drop.dataset.removeKey = f.key;
+        const label = () => { drop.textContent = REMOVED_KEYS.has(f.key) ? 'Keep this setting' : 'Remove this setting'; };
+        label();
+        drop.addEventListener('click', () => {
+          if (REMOVED_KEYS.has(f.key)) REMOVED_KEYS.delete(f.key); else REMOVED_KEYS.add(f.key);
+          label();
+          control.disabled = REMOVED_KEYS.has(f.key);
+        });
+        wrap.append(drop);
+      }
+      // An inline credential the form holds can be removed, as the legacy row's delete allowed:
+      // leaving the box blank otherwise writes it back. A clone never copies it, so needs no button.
+      if (useEnv && !CLONE && heldSecret(f) !== undefined) {
+        const remove = document.createElement('button'); remove.className = 'secondary';
+        remove.dataset.removeSecret = f.key;
+        remove.textContent = 'Remove the inline value';
+        remove.addEventListener('click', () => {
+          if (REMOVED_SECRETS.has(f.key)) REMOVED_SECRETS.delete(f.key); else REMOVED_SECRETS.add(f.key);
+          remove.textContent = REMOVED_SECRETS.has(f.key) ? 'Keep the inline value' : 'Remove the inline value';
+          control.placeholder = secretHint(f);
+        });
+        wrap.append(remove);
+      }
+      wrap.append(hint);
+      if (replacing) into.replaceChild(wrap, replacing); else into.appendChild(wrap);
+    }
+
+    function secretHint(f) {
+      if (REMOVED_SECRETS.has(f.key)) return 'environment key (the inline value will be removed)';
+      if (heldSecret(f) === undefined) return 'environment key';
+      return CLONE
+        ? 'environment key (the inline value is not copied to a clone)'
+        : 'environment key (the current inline value is kept, not shown)';
     }
 
     function renderGroups(groups) {
       const host = $('settings'); host.innerHTML = '';
+      REMOVED_KEYS.clear();
       for (const g of groups) {
         const box = document.createElement('details'); box.open = !g.collapsed;
         const sum = document.createElement('summary');
@@ -126,12 +282,16 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         for (const f of g.fields) { renderField(f, box); }
         host.appendChild(box);
       }
+      // Fields that draw nothing, at load in any mode or in a rebuild's reply: the free-text row,
+      // a working form, rather than an empty settings area.
+      if (!host.querySelector('[data-key]')) settingRow('', '', false, '');
     }
 
-    /** Legacy path: the engine could not describe itself, so fall back to free-text key/value rows. */
+    /** Legacy path: no schema fields to draw, so the free-text key/value rows. Rows already drawn,
+     *  and what was typed into them, stay; a blank row is drawn only where there is none. */
     function prefillHints() {
-      if (FIELD_GROUPS) { renderGroups(FIELD_GROUPS); return; }
       if (EDIT) return;
+      if ($('settings').querySelector('.setting')) return;
       $('settings').innerHTML = '';
       settingRow('', '', false, '');
     }
@@ -139,11 +299,20 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
     function requestFields() {
       if (!FIELD_GROUPS) { prefillHints(); return; }
+      // A setting removed before a rebuild is gone: its held default does not return with its key.
+      // So is one whose env key box is empty: the request leaves it out, as it does a removed one.
+      for (const k of REMOVED_KEYS) HELD_DEFAULTS.delete(k);
+      for (const el of document.querySelectorAll('#settings [data-key][data-env="1"]')) {
+        if (!el.value.trim()) HELD_DEFAULTS.delete(el.dataset.key);
+      }
+      // The request names this page's render, so the host can drop a reply that would reach a
+      // newer page: the token current when the host handles it may already be that page's.
       vscode.postMessage({
         command: 'fields',
         transport: $('transport').value,
         direction: $('direction').value,
-        settings: collectSettings(),
+        settings: collectSettings(true),
+        ${CHANNEL_FIELD}: MF_CHANNEL,
       });
     }
 
@@ -163,13 +332,18 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       $('strict').checked = !!INITIAL.strict;
       $('ordering').value = INITIAL.ordering || '';
       if (INITIAL.retry && INITIAL.retry.max_attempts != null) $('maxAttempts').value = String(INITIAL.retry.max_attempts);
+      // The settings: the schema-driven controls whenever the engine described itself (BACKLOG
+      // #5565). The host built FIELD_GROUPS from this very record, so they already carry its values,
+      // with a secret held back rather than shown and a table as JSON. The free-text rows below are
+      // only the fallback for an engine that could not describe itself.
+      if (FIELD_GROUPS) { renderGroups(FIELD_GROUPS); return; }
       const s = INITIAL.settings || {};
       const keys = Object.keys(s);
       if (keys.length) {
         for (const key of keys) {
           const val = s[key];
-          if (val && typeof val === 'object' && 'env' in val) settingRow(key, val.env, true, val.cast || '');
-          else settingRow(key, val, false, '');
+          if (isEnvRefValue(val)) settingRow(key, val.env, true, val.cast || '', val);
+          else settingRow(key, val, false, '', val);
         }
       } else settingRow('', '', false, '');
     }
@@ -187,7 +361,18 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       $('name').placeholder = 'new name (was ' + INITIAL.name + ')';
       prefillFieldsFromInitial();
       setTimeout(() => $('name').focus(), 0);
+    } else if (FIELD_GROUPS && FIELD_GROUPS_FOR && TRANSPORTS.includes(FIELD_GROUPS_FOR.transport) &&
+        [...$('direction').options].some((o) => o.value === FIELD_GROUPS_FOR.direction)) {
+      // Create: the pickers show the transport and direction the host built the fields for, so the
+      // two agree from the first draw and the host's default (MLLP) stays the default.
+      $('transport').value = FIELD_GROUPS_FOR.transport;
+      $('direction').value = FIELD_GROUPS_FOR.direction;
+      renderGroups(FIELD_GROUPS);
     } else {
+      // Create with no schema, or with fields built for a transport or direction the pickers
+      // cannot show: the free-text row, a working form that names no
+      // transport's fields. With a schema, a transport or direction change still asks for that
+      // transport's fields, carrying what was typed.
       prefillHints();
     }
     refreshVisibility();
@@ -204,33 +389,95 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       return text;
     }
 
+    // A table or array typed as JSON parses back to its value; text that does not parse is returned
+    // verbatim, so the engine's validator refuses what the user typed rather than this page guessing
+    // (the rule coerce in connectionForm.ts states for a table).
+    function parseTable(text) {
+      try { return JSON.parse(text); } catch (e) { return text; }
+    }
+
+    // Edited text for a schema field, read by the field's declared type: a table, or a value the
+    // record held as a table, parses as JSON; a select takes the matching choice with its JSON type;
+    // a bool is converted when the text is one; a number only when the text is a finite decimal,
+    // which is narrower than coerce in connectionForm.ts, since a text box here takes any text; anything else, and text that does not convert, is posted verbatim, so the
+    // engine's validator refuses what the user typed rather than this page guessing.
+    const DECIMAL_TEXT = /^-?(\\d+(\\.\\d+)?|\\.\\d+)([eE][-+]?\\d+)?$/;
+    function typedValue(f, raw) {
+      if (f.control === 'table' || (f.value !== null && typeof f.value === 'object')) return parseTable(raw);
+      if (f.control === 'select') {
+        const hit = (f.choices || []).find((c) => String(c) === raw);
+        return hit !== undefined ? hit : raw;
+      }
+      // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
+      // and a leading '+', which would post a number the user never typed. An exponent that
+      // overflows is posted as typed too, since Infinity would cross to the host as null, and so is
+      // an int past the range a JS number holds exactly, which would round to another integer.
+      if (f.type === 'int' || f.type === 'float') {
+        const n = DECIMAL_TEXT.test(raw) ? Number(raw) : NaN;
+        if (!Number.isFinite(n)) return raw;
+        return f.type === 'int' && Number.isInteger(n) && !Number.isSafeInteger(n) ? raw : n;
+      }
+      if (f.type === 'bool') return raw === 'true' ? true : raw === 'false' ? false : raw;
+      return raw;
+    }
+
     /**
      * The settings table the form currently expresses. Two shapes feed it: the schema-driven
      * controls (one per declared setting, keyed by data-key) and, when the engine could not describe
      * itself, the legacy free-text rows. An EMPTY control contributes no key at all — that is what
      * keeps "absent means this engine's default" true and stops a save writing the whole default set.
+     * An UNTOUCHED control drawn from the record writes the recorded value back exactly. forHost
+     * is a transport or direction change's request: a held inline credential, or a secret env
+     * reference's inline default, goes in it only as HELD_MARK, never as the value.
      */
-    function collectSettings() {
+    function collectSettings(forHost) {
       const settings = {};
       for (const el of document.querySelectorAll('#settings [data-key]')) {
         const key = el.dataset.key;
-        if (!key) continue;
+        if (!key || REMOVED_KEYS.has(key)) continue;
+        const f = HELD.get(el);
         if (el.dataset.env === '1') {
           const envKey = el.value.trim();
-          if (!envKey) continue;              // a secret with no key set writes nothing
+          if (!envKey) {
+            // No key typed. An inline credential the record already holds is written back as it
+            // was, unseen (resolved from HELD_MARK below); deleting a working credential because the
+            // form will not show it would be its own outage. Removed on request.
+            if (heldSecret(f) !== undefined) settings[key] = HELD_MARK;
+            continue;
+          }
           const ref = { env: envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
+          // A held inline default goes back only with the env key it was recorded under, compared
+          // trimmed, so an untouched key and the original key typed back after a rebuild keep it,
+          // and a replaced key does not take the old credential as its default. A setting the user
+          // removed loses its held default when the fields are rebuilt (requestFields).
+          // A secret's default is never written from the descriptor: only as the mark, so resolveHeld
+          // decides it and a clone never copies it.
+          const held = HELD_DEFAULTS.get(key);
+          if (held !== undefined) {
+            if (envKey === held.envKey) ref.default = HELD_MARK;
+          } else if (f.envDefault !== undefined && !f.secret) {
+            ref.default = f.envDefault;
+          }
           settings[key] = ref;
           continue;
         }
         if (el.dataset.kind === 'checkbox') {
-          // A checkbox cannot say "untouched"; posting null lets the extension decide (see coerce).
+          // A checkbox has no "untouched" state, so one the record did not set, left at the schema
+          // default, writes nothing: the rule coerce in connectionForm.ts applies. Without it every
+          // edit save wrote an explicit value for each default bool.
+          const dflt = f.defaultValue;
+          if (f.value === undefined && dflt !== undefined && dflt !== null && el.checked === dflt) continue;
           settings[key] = el.checked;
           continue;
         }
+        if (f.value != null && el.value === SHOWN.get(el)) {
+          settings[key] = f.value;            // untouched: the recorded value, exactly
+          continue;
+        }
         const raw = el.value.trim();
-        if (raw === '') continue;             // untouched -> omit the key entirely
-        settings[key] = el.dataset.kind === 'table' ? coerce(raw) : coerce(raw);
+        if (raw === '') continue;             // emptied -> omit the key entirely
+        settings[key] = typedValue(f, raw);
       }
       for (const row of document.querySelectorAll('#settings .setting')) {
         const inputs = row.querySelectorAll('input[type=text]');
@@ -239,12 +486,41 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         const raw = inputs[1].value.trim();
         const envCb = row.querySelector('input[type=checkbox]');
         const castSel = row.querySelector('select');
+        const was = ROW_ORIGINAL.get(row);
+        if (was && was.key === inputs[0].value && inputs[1].value === was.shown &&
+            envCb.checked === was.isEnv && castSel.value === was.cast) {
+          settings[key] = was.original;       // untouched: the recorded value, exactly
+          continue;
+        }
         if (envCb.checked) {
           const ref = { env: raw };
           if (castSel.value) ref.cast = castSel.value;
+          if (was && isEnvRefValue(was.original) && was.original.default !== undefined) ref.default = was.original.default;
           settings[key] = ref;
         } else {
-          settings[key] = coerce(raw);
+          settings[key] = inputs[1].dataset.table === '1' ? parseTable(raw) : coerce(raw);
+        }
+      }
+      return forHost ? settings : resolveHeld(settings);
+    }
+
+    // Swap HELD_MARK back for the held value on save. A clone gets neither the inline credential nor
+    // a secret env reference's inline default: the GUI must not be what writes a new inline credential
+    // into the file (FieldDescriptor.secretOnlyEnv). A removed credential is written as nothing.
+    function resolveHeld(settings) {
+      for (const key of Object.keys(settings)) {
+        const value = settings[key];
+        if (value === HELD_MARK) {
+          const secret = HELD_SECRETS.get(key);
+          if (secret === undefined || CLONE || REMOVED_SECRETS.has(key)) delete settings[key];
+          else settings[key] = secret;
+        } else if (value !== null && typeof value === 'object' && value.default === HELD_MARK) {
+          // A copy: the value may be a descriptor's own recorded object.
+          const ref = { ...value };
+          const held = HELD_DEFAULTS.get(key);
+          if (held === undefined || CLONE) delete ref.default;
+          else ref.default = held.value;
+          settings[key] = ref;
         }
       }
       return settings;
@@ -294,12 +570,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     $('delete').addEventListener('click', () => vscode.postMessage({ command: 'delete', name: INITIAL.name }));
 
     // One entry per message its hosts post: at least connectionEditor.ts and configEditors.ts use
-    // this page. Both post "error"; only connectionEditor.ts answers with "fields". A field is a
+    // this page. Both post "error", and both answer the page's "fields" request. A field is a
     // FieldDescriptor from connectionForm.ts: its declared fields with their types. The two
     // unknown-typed values (value, defaultValue, envDefault, preserveValue) are not typed there
     // either, and their presence is not checked: all four are optional there, and FieldDescriptor
     // says why value and defaultValue can be absent, so a presence check would discard ordinary
-    // "fields" messages. This page does not read envDefault or preserveValue at all. choices is
+    // "fields" messages. This page reads envDefault and preserveValue only to write them back on
+    // save (HELD), and never shows either. choices is
     // required and may be null; envKey, cast and a group's description may be absent and are never
     // null.
     // control and type are closed sets: the lists FieldControl and ParamType are derived from.

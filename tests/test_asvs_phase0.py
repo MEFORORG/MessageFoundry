@@ -28,7 +28,7 @@ from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.settings import AuthSettings, SqlAuth, StoreBackend, StoreSettings
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.logging_setup import ControlCharScrubFilter, configure_logging
 from messagefoundry.parsing import sniff
 from messagefoundry.parsing.sniff import (
@@ -407,9 +407,10 @@ def test_sqlserver_connection_string_refuses_weak_tls(monkeypatch: pytest.Monkey
     )
     with pytest.raises(ValueError):
         connection_string(s)
-    # The explicit dev escape permits it.
+    # The dev escape on a warn instance no longer permits it (vault BACKLOG #3533 item 2).
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    assert "TrustServerCertificate=yes" in connection_string(s, posture=_WARN)
+    with active_hop_posture(_WARN), pytest.raises(ValueError, match="weakened"):
+        connection_string(s)
 
 
 def test_ldap_authenticator_refuses_disabled_cert_verification(

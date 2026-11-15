@@ -1886,6 +1886,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # BACKLOG #2142: an oidc session that already met its factor owes no code, as the GET
             # says for any satisfied session. Nothing rotated, so the cookie is still live.
             return RedirectResponse("/ui", status_code=303)
+        if await auth.mfa_satisfied(token):
+            # A session that already met its factor owes this page nothing, as the GET says, so
+            # its refused code lands on /ui rather than on a gate re-rendered for it. verify_mfa
+            # has already audited and charged the code. The re-render below is pending-only.
+            return RedirectResponse("/ui", status_code=303)
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
         # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
@@ -2173,9 +2178,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     # ADR 0068 decision 6: the browser passkey leg of step-up. A cookie-authed JSON POST
     # (the sanctioned /ui carve — the cookie stays confined to /ui deps; bearer_token()
-    # is untouched) that verifies an assertion and stamps the session's MFA leg ONLY —
-    # the operator still submits POST /ui/reauth (password) for reauth_at + the WP-L3-13
-    # client re-anchor. NOT registered as a continuation (body-carrying JSON — part of the
+    # is untouched) that verifies an assertion, marks the session's factor and, when that
+    # completes a pending factor, re-anchors it as a TOTP code does, stamping the window only
+    # with the UV flag (vault BACKLOG #2964 item 14; not an oidc session). The pages stage an
+    # assertion only after reading that the session has not met its factor, so an ordinary
+    # /ui/reauth step-up
+    # of a satisfied session gets no passkey and steps up with the password. An assertion can
+    # still arrive for a session that met its factor after the ceremony was staged (two tabs
+    # share the challenge, which moves with the session's re-key); it marks the factor and
+    # re-keys, and moves no anchor and no window.
+    # An action-bound grant still comes only from a credential step-up, at least the password
+    # leg of POST /ui/reauth, POST /me/reauth and the IdP leg (ADR 0077), never from this route.
+    # NOT registered as a continuation (body-carrying JSON — part of the
     # step-up mechanism itself). MFA-pending sessions pass (the assertion IS the proof);
     # must-change confinement is mirrored manually like /ui/mfa's, NOT like both /ui/reauth
     # handlers: a must-change session that still owes its factor must pass. For a passkey-only

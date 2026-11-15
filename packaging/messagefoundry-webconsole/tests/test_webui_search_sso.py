@@ -168,8 +168,11 @@ async def test_audit_cookie_not_accepted_on_json_routes(engine: Engine) -> None:
 #
 # Browser-level ceremony tests use the in-repo soft authenticator and are gated FUNCTION-LOCALLY on
 # the [webauthn] extra (a module-level importorskip here would skip the whole webui suite on an
-# extra-less install). The passkey assertion satisfies ONLY the MFA leg; the mandatory password leg
-# of POST /ui/reauth stamps step-up freshness + the new-IP re-anchor (decision 1). Options ride
+# extra-less install). A passkey is staged only after reading that the session has not met its factor; its
+# assertion meets that factor, and stamps the window only with the UV flag, which the soft
+# authenticator here does not set. A session that already met its factor is offered no passkey on
+# /ui/reauth and steps up with the password. An action-bound route's grant comes
+# from a credential step-up, here the password leg of POST /ui/reauth (ADR 0077). Options ride
 # HTML-escaped data-* attributes (CSP: no inline script); only the verify legs are JSON POSTs — the
 # sanctioned first cookie-authed JSON under /ui.
 
@@ -250,14 +253,14 @@ async def test_webauthn_browser_enroll_and_stepup_e2e(engine: Engine) -> None:
         assert "Invalid code." not in r.text
         options = _data_attr(r.text, "data-mf-webauthn-get")
 
-        # The passkey leg: assert -> MFA satisfied (ONLY the MFA leg — the delete is still stale).
+        # The passkey leg: assert -> MFA satisfied; no UV, no window, and no grant for the delete.
         resp = json.loads(
             auth_a.get_response(base64url_to_bytes(options["challenge"]), sign_count=0)
         )
         r = await c.post("/ui/reauth/webauthn", json={"response": resp}, headers=_SFS)
         assert r.status_code == 200 and r.json() == {"ok": True}
         r = await c.post(delete_path, headers=_SFS)
-        assert r.status_code == 303  # still 303s: reauth_at is NOT stamped by the assertion
+        assert r.status_code == 303  # still 303s: only the password leg completes the step-up
 
         # The password leg completes the pair -> continuation auto-retries the delete.
         r = await c.post("/ui/reauth", data={"next": delete_path, "password": PW}, headers=_SFS)

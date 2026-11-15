@@ -1711,8 +1711,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:via messagefoundry.store.store",
             # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
             "sign_verify:via messagefoundry.store.store",
-            "tls_context:.check_hostname = False",
-            "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.config.tls_policy",
         }

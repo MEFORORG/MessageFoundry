@@ -134,6 +134,8 @@ async def store() -> AsyncIterator[object]:
                 "processed_files",  # BACKLOG #3424: ledger rows a later probe would see
                 "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
                 "connection_flag",  # BACKLOG #2623 (no FK): the operator audit contract writes it
+                "pending_approvals",  # vault BACKLOG #5635: an open request sealed under an earlier test's
+                #                     key would stop every key rotation in a later test
                 "user_roles",
                 "ad_group_role_map",
                 "ad_group_scope_map",  # BACKLOG #3187: the width contract writes it
@@ -229,7 +231,6 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 _CANCEL_CHILD = r"""
 import asyncio, os, sys
 from messagefoundry.config.settings import load_settings
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.sqlserver import SqlServerStore, _call_gate
 
 RESOURCE, ROUNDS = sys.argv[1], int(sys.argv[2])
@@ -267,7 +268,7 @@ def check(ok, message):
 
 async def main() -> None:
     store = await SqlServerStore.open(
-        load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
+        load_settings(environ=os.environ).store
     )
     quarantined = []
     real_release_dirty = store._release_dirty
@@ -1464,7 +1465,8 @@ async def test_writes_keyed_to_an_account_queue_behind_its_delete(store, write: 
         del store._write_session
     if write == "mark_session_mfa_verified":
         # The session went with the account, so the stamp found no row and wrote nothing.
-        assert outcome is None and written == [None], (outcome, written)
+        # It answers False, the "no anchor applied" answer (vault BACKLOG #2964 item 14).
+        assert outcome is False and written == [None], (outcome, written)
     else:
         assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
     assert await store.list_known_login_addresses(account, since=0.0) == []
@@ -6037,6 +6039,12 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
             audits=(),
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
+        # Vault BACKLOG #5635: an open request another test left, sealed under its own key,
+        # would stop this run. The fixture does not clear this table, so this test does.
+        async with seed._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("DELETE FROM pending_approvals")
+            await conn.commit()
     finally:
         await seed.close()
 
@@ -6572,6 +6580,30 @@ async def test_role_seal_contract(store) -> None:
             columns = {str(r[0]) for r in await cur.fetchall()}
         assert columns == {f.name for f in fields(RoleRow)}
         await assert_role_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_reseal_outcome_contract(store) -> None:
+    """Vault BACKLOG #5635: ``reencrypt_to_active`` records what its re-seal passes left under a
+    key it does not hold, for ``rotate-key`` to read, on a keyed handle. ``raw`` runs each
+    statement outside the store's helpers. The fixture clears the tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._reseal_outcome_contract import assert_reseal_outcome_contract
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        await assert_reseal_outcome_contract(keyed, raw)
     finally:
         await keyed.close()
 
@@ -7541,11 +7573,10 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
 
     Every string braces the password with :func:`~messagefoundry.odbc_dsn.odbc_brace`. The generic
     builder's (:func:`_build_odbc_dsn`, whose password goes through :func:`_odbc_password` for the
-    ``msodbc`` family) names the host alone, so it reaches the default port; it has
-    ``TrustServerCertificate=yes`` appended, which its ``odbc_params`` allowlist does not take and
-    the container's self-signed certificate needs. The SQL Server preset's (:func:`_build_dsn`)
-    sets that keyword here, and the store's (:func:`connection_string`) takes it from the leg's
-    settings; where the two strings match byte for byte one login covers both. They go through
+    ``msodbc`` family) names the host alone, so it reaches the default port; every string
+    verifies the server's certificate, which the leg's runner trusts (vault BACKLOG #3533 item 2).
+    The store's (:func:`connection_string`) takes its TLS from the leg's settings; where two strings
+    match byte for byte one login covers both. They go through
     aioodbc and pyodbc.
 
     A driver that ended a braced value at its first ``}`` or its first ``};``, or did not turn
@@ -7605,18 +7636,15 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
             await conn.close()
         return (None if row is None else str(row[0])), ""
 
-    generic = (
-        _build_odbc_dsn(
-            {
-                "odbc_driver": "ODBC Driver 18 for SQL Server",
-                "server": base.server or "localhost",
-                "database": "master",
-                "username": login,
-                "password": password,
-                "odbc_params": {"Encrypt": "yes"},
-            }
-        )
-        + "TrustServerCertificate=yes;"
+    generic = _build_odbc_dsn(
+        {
+            "odbc_driver": "ODBC Driver 18 for SQL Server",
+            "server": base.server or "localhost",
+            "database": "master",
+            "username": login,
+            "password": password,
+            "odbc_params": {"Encrypt": "yes"},
+        }
     )
     preset = _build_dsn(
         {
@@ -7625,7 +7653,7 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
             "database": "master",
             "username": login,
             "password": password,
-            "trust_server_certificate": True,
+            # Verifying: CI trusts the server's generated certificate (vault BACKLOG #3533 item 2).
         }
     )
     store = connection_string(

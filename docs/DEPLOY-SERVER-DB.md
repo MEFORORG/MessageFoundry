@@ -31,14 +31,14 @@ Configure `[store]` in the service settings (full reference: [`CONFIGURATION.md`
 - `[store].backend` — `postgres` or `sqlserver` (vs the default `sqlite`).
 - The connection target (host/port/database/auth) — supply secrets via `MEFOR_*` env, never the file.
 - `[store].encrypt` (default **true**) + `[store].trust_server_certificate` (default **false**) —
-  encrypt the DB connection; only weaken with `MEFOR_ALLOW_INSECURE_TLS` on a trusted lab segment.
+  encrypt the DB connection. A weakened setting is refused at every posture, and
+  `MEFOR_ALLOW_INSECURE_TLS` does not lift it (owner ruling 2026-11-14, vault BACKLOG #3533 item 2).
 - `[store].ssl_root_cert` — pin the DB server certificate by **file** so it verifies **without**
   installing anything box-globally into the OS trust store, on the secure posture only (`encrypt = true`,
   `trust_server_certificate = false`). **Postgres:** a **CA-bundle** PEM (chain + hostname still checked) —
   the make-before-break-friendly path. **SQL Server:** the ODBC Driver **18.1+** `ServerCertificate`
   keyword, which pins the **leaf** cert (an exact-cert match — see the leaf-pin rotation caveat in §5.3).
-  The engine sends it with `Encrypt=strict`, so it needs SQL Server 2022 or later; why, and what else
-  it needs, is in the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md). For CA-chain
+  The engine sends it with `Encrypt=strict`; what else it needs is in the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md). For CA-chain
   rotation the machine-store import (§5.2) stays the lighter-touch SQL Server option. Rejected for
   SQLite; a missing file fails loud at load.
 - `[store].pool_size` — see *Pool sizing* below.
@@ -537,7 +537,7 @@ validation to succeed, the database's certificate must chain to a CA the host al
 | Backend | How the DB CA is trusted | Disable validation? |
 |---|---|---|
 | **PostgreSQL** | **Either** pin the CA by file with `[store].ssl_root_cert = <ca.pem>` (no machine-wide install — see §1), **or** import it into the Windows machine stores (§5.2). The file pin is the lighter-touch path. | Never. |
-| **SQL Server (ODBC Driver 18)** | **Machine stores** (the root in `LocalMachine\Root`, any issuing CA in `LocalMachine\CA`, §5.2) are the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). **Never pin the self-signed certificate SQL Server generates when it has no trusted or valid one**: the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md) says why, and how to spot it. | Never. |
+| **SQL Server (ODBC Driver 18)** | **Machine stores** (the root in `LocalMachine\Root`, any issuing CA in `LocalMachine\CA`, §5.2) are the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). **Never pin the self-signed certificate SQL Server generates when it has no trusted or valid one**: the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md) says why, and how to spot it. | Never. |
 
 ### 5.2 Import a private / internal CA into the machine stores (`LocalMachine\Root`, `LocalMachine\CA`)
 
@@ -977,7 +977,7 @@ is **unmeasured** on Linux.
 ## 6. Pre-flight checklist
 
 - [ ] `[store].backend` set to `postgres`/`sqlserver`; connection + auth via `MEFOR_*` env.
-- [ ] `[store].encrypt = true` (and **not** `MEFOR_ALLOW_INSECURE_TLS`) for any PHI deployment.
+- [ ] `[store].encrypt = true` for any PHI deployment. CHANGED 2026-11-14 (vault BACKLOG #3533 item 2): the engine refuses `encrypt = false` at every posture, and `MEFOR_ALLOW_INSECURE_TLS` does not lift it, so this item no longer warns against the escape.
 - [ ] DB CA trusted so `trust_server_certificate = false` validates — Postgres `ssl_root_cert` **or**
       machine-store import; SQL Server **machine store only** (§5). Never `TrustServerCertificate=true`.
 - [ ] `[store].pool_size` sized (default **40**, server-DB only; ≥ 2 hard-required in cluster mode) **and**

@@ -5,7 +5,7 @@
 Pure unit tests (no DB, no asyncpg / aioodbc required) — always run in CI. They assert:
   * Postgres ``_build_ssl`` honors a private CA file (asyncpg SSLContext, still fully verifying).
   * SQL Server ``connection_string`` emits the ODBC Driver 18.1+ ``ServerCertificate`` keyword with
-    ``Encrypt=strict`` on the secure posture, and neither on a weakened / escaped posture.
+    ``Encrypt=strict`` on the secure posture, and refuses a weakened posture, escape or none.
   * ``ssl_root_cert`` is accepted for both server-DB backends but rejected for SQLite (no TLS) and when
     the path does not exist (fail loud at load, #45).
 """
@@ -19,7 +19,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, StoreBackend, StoreSettings
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused
 from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.store.sqlserver import check_pinned_certificate, connection_string
 
@@ -323,17 +323,20 @@ async def test_pool_connect_hook_names_a_slow_build_without_posing_as_pool_exhau
         pytest.param({"encrypt": False}, id="plaintext"),
     ],
 )
-async def test_pool_connect_hook_is_absent_on_the_weakened_escapes(
+async def test_pool_refuses_the_weakened_hops_under_the_escape(
     escape_at_warn: None, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
 ) -> None:
-    """The hook is for VERIFYING hops. The dev escapes keep the plain ``ssl=`` value: a verify-off
-    context reads no trust store, and plaintext has no context at all.
+    """A weakened PostgreSQL store hop is refused before the pool exists, with the escape set on a
+    ``warn`` posture, the one shape that used to open it (owner ruling 2026-11-14, vault BACKLOG
+    #3533 item 2). It used to open with no ``connect`` hook: a verify-off context, or plaintext.
 
-    POSITIVE CONTROL: the verifying hop in the test above does get a hook, so this ``None`` is the
-    branch's doing and not a fake that never records one."""
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    fake = await _pool_with_fake_asyncpg(monkeypatch, _pg(**overrides))
-    assert fake.pool_kwargs["connect"] is None
+    POSITIVE CONTROL: the verifying hop in the tests above opens a pool through the same fake, so
+    this refusal is the weakened settings' doing."""
+    with pytest.raises(StoreTlsRefused, match="Postgres TLS is weakened") as refused:
+        await _pool_with_fake_asyncpg(
+            monkeypatch, _pg(**overrides), posture=HopPosture(enforcing=False)
+        )
+    assert "not even MEFOR_ALLOW_INSECURE_TLS=1" in str(refused.value)
 
 
 # --- SQL Server (the #45 slice) ----------------------------------------------
@@ -381,29 +384,25 @@ def test_connection_string_pin_does_not_lift_the_weakened_refusal(
 
 
 @pytest.mark.parametrize(
-    ("overrides", "tail"),
+    "overrides",
     [
-        pytest.param(
-            {"trust_server_certificate": True},
-            "Encrypt=yes;TrustServerCertificate=yes",
-            id="verify-off",
-        ),
-        pytest.param({"encrypt": False}, "Encrypt=no;TrustServerCertificate=no", id="plaintext"),
+        pytest.param({"trust_server_certificate": True}, id="verify-off"),
+        pytest.param({"encrypt": False}, id="plaintext"),
     ],
 )
-def test_connection_string_escaped_posture_sends_no_pin_and_no_strict(
-    tmp_path: object, escape_at_warn: None, overrides: dict[str, object], tail: str
+@pytest.mark.parametrize("pinned", [True, False], ids=["pin", "no-pin"])
+def test_connection_string_refuses_the_escaped_posture(
+    tmp_path: object, escape_at_warn: None, overrides: dict[str, object], pinned: bool
 ) -> None:
-    """On an escaped dev posture the pin is dropped and strict is not sent. Microsoft documents that
-    strict ignores ``TrustServerCertificate``, so sending it would quietly re-enable verification the
-    operator switched off, and plaintext cannot be strict at all."""
-    # Load refuses this shape (BACKLOG #3714), so this is the store's second guard, built past
-    # validation as an embedder could.
-    settings = _ss(ssl_root_cert=_leaf_file(tmp_path)).model_copy(update=overrides)
-    dsn = connection_string(settings)
-    assert ";ServerCertificate=" not in dsn
-    assert "Encrypt=strict" not in dsn
-    assert dsn.rstrip(";").endswith(tail)
+    """The escape on a ``warn`` posture no longer opens a weakened SQL Server store hop (owner ruling
+    2026-11-14, vault BACKLOG #3533 item 2). It used to build ``Encrypt=yes;TrustServerCertificate=yes``
+    or ``Encrypt=no``, with the pin dropped, and the store login crossed that hop."""
+    # Load refuses the pinned shape (BACKLOG #3714), so build it past validation, as an embedder could.
+    base = _ss(ssl_root_cert=_leaf_file(tmp_path)) if pinned else _ss()
+    settings = base.model_copy(update=overrides)
+    with pytest.raises(StoreTlsRefused, match="SQL Server TLS is weakened") as refused:
+        connection_string(settings)
+    assert "not even MEFOR_ALLOW_INSECURE_TLS=1" in str(refused.value)
 
 
 def test_connection_string_server_certificate_brace_neutralizes_injection(tmp_path: object) -> None:

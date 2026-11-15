@@ -239,6 +239,19 @@ this line.**
 
 ### Fixed
 
+- **Federated sign-in and the IdP step-up reach the identity provider.** `POST /ui/oidc/start` and
+  `POST /ui/reauth/oidc` answered with a 303 to the IdP, which Chromium blocks under the console's
+  `form-action 'self'` because it checks that directive again on the redirect after a form POST.
+  Both now answer 200 with a page that navigates to the same target by meta refresh, with a
+  Continue link as the fallback, and so does `GET /ui/oidc/start` when it skips its interstitial.
+  The CSP is unchanged. The "leaving this site" page and that hop now carry Sign-out and the
+  session watchdog only when the request carries a live session: before, the watchdog on the
+  interstitial sent a browser with no session to the login page before Continue could be clicked.
+  The interstitial sends `Clear-Site-Data: "cache"` to a browser whose session cookie no longer
+  authenticates; the hop does not. Both pages decide through `AuthService.session_shows_signed_in`,
+  which ends a refused session as the watchdog's probe would, except one whose temporary
+  credential has lapsed, which it leaves for the sign-in callback to end and record. Needs the
+  engine seam that carries `AuthService.session_shows_signed_in`.
 - **Edit and resubmit keeps the original's line endings.** A browser submits a textarea's line
   breaks as CRLF, so a direct send of a CR-terminated HL7 body, or a resend of an LF-only payload,
   changed its terminators. The editor now carries the original's style in a hidden `eol` field

@@ -50,6 +50,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     hop_name_prefix,
 )
+from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.transports.base import float_setting
 from messagefoundry.transports.rest import (
     HttpAuthError,
@@ -192,6 +193,26 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
             )
         if auth_style not in ("basic", "post"):
             raise HttpAuthError(f"oauth2_auth_style must be 'basic' or 'post', got {auth_style!r}")
+        # BACKLOG #5800: each grant field is encoded strictly as UTF-8 at every mint, so a value
+        # holding a lone surrogate raised UnicodeEncodeError out of send or test_connection, and that
+        # exception's `object` is the whole value, the client_secret included. Refused here instead,
+        # by setting name only. Strict UTF-8 fails on exactly the surrogate code points, so the
+        # shared predicate decides it with no encode, and nothing raised can chain the value.
+        unencodable = next(
+            (
+                name
+                for name, value in (
+                    ("oauth2_client_id", client_id),
+                    ("oauth2_client_secret", client_secret),
+                    ("oauth2_scope", scope),
+                    ("oauth2_audience", audience),
+                )
+                if value and has_lone_surrogate(value)
+            ),
+            None,
+        )
+        if unencodable is not None:
+            raise HttpAuthError(f"{unencodable} holds a character UTF-8 cannot encode")
         self.client_id = client_id
         self._client_secret = client_secret
         self.scope = scope or None
@@ -210,11 +231,24 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
             trust_anchor=trust_anchor,
             connection=connection,
         )
+        # ASVS 4.2.5: the token URL and the Basic client-credential header are operator-supplied via
+        # env(), so an env value that resolved to an unexpected blob is refused here as a clear config
+        # error. BACKLOG #5800: this ran at each mint, where its ValueError escaped send and
+        # test_connection unclassified. Every value it measures is fixed by now, the proxy's
+        # Proxy-Authorization from _open_token_hop included, so a mint cannot fail it later. The
+        # message names a header and a length, never a value. The grant is built outside the try, so
+        # this arm can only ever chain the length refusal.
+        _, headers = self._grant()
+        try:
+            enforce_outbound_length_limits(self.token_url, headers)
+        except ValueError as exc:
+            raise HttpAuthError(
+                f"OAuth2 token request (oauth2_token_url and the grant headers): {exc}"
+            ) from exc
 
-    def _fetch_token(self) -> tuple[str, float]:
-        """POST the ``client_credentials`` grant and return ``(access_token, ttl)``. PHI/secret-safe: a
-        failure names only the redacted token host + HTTP status — never the secret or the response body
-        (which carries the bearer)."""
+    def _grant(self) -> tuple[bytes, dict[str, str]]:
+        """The ``client_credentials`` grant's form body and headers, built from the configured
+        values alone."""
         form: dict[str, str] = {"grant_type": "client_credentials"}
         if self.scope:
             form["scope"] = self.scope
@@ -231,11 +265,13 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
         else:  # client_secret_post
             form["client_id"] = self.client_id
             form["client_secret"] = self._client_secret
-        data = urllib.parse.urlencode(form).encode("ascii")
-        # ASVS 4.2.5: the token URL and the Basic client-credential header are operator-supplied via
-        # env(), so an env value that resolved to an unexpected blob would otherwise surface as an
-        # opaque IdP-side failure on the first mint rather than as a clear config error.
-        enforce_outbound_length_limits(self.token_url, dict(headers))
+        return urllib.parse.urlencode(form).encode("ascii"), headers
+
+    def _fetch_token(self) -> tuple[str, float]:
+        """POST the ``client_credentials`` grant and return ``(access_token, ttl)``. PHI/secret-safe: a
+        failure names only the redacted token host + HTTP status — never the secret or the response body
+        (which carries the bearer). The grant's encode and length were checked at construction."""
+        data, headers = self._grant()
         return self._post_token(data, headers)
 
 
@@ -544,7 +580,7 @@ def with_oauth2_client_credentials(
     stronger option is therefore a choice you make, named in the paragraph above.
 
     That is a statement about WHICH style is the default. It is not a claim that the header this
-    provider builds follows that section's encoding rule. ``_fetch_token`` base64-encodes the client
+    provider builds follows that section's encoding rule. ``_grant`` base64-encodes the client
     id and secret as written. The section also asks for each to be form-encoded first, and that step
     is not applied. The two forms are the same for an id and secret with no reserved character."""
     _require_http_spec(spec, "OAuth2 client-credentials")

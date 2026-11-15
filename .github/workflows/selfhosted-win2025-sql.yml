@@ -100,8 +100,15 @@ jobs:
       MEFOR_STORE_DATABASE: mefor_ci
       MEFOR_STORE_USERNAME: mefor_ci
       MEFOR_STORE_AUTH: sql
-      MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true" # local SQL self-signed cert
-      MEFOR_ALLOW_INSECURE_TLS: "1" # trusted-network test box only (mirrors the hosted sqlserver leg)
+      # NO WEAKENED TLS. A store or DATABASE connection login over trust_server_certificate=true or
+      # encrypt=false is refused whatever MEFOR_ALLOW_INSECURE_TLS or [security].enforcement says,
+      # except a DATABASE connection that declares tls_hop_attested, which this leg does not
+      # (owner ruling 2026-11-14, vault BACKLOG #3533 item 2), so this leg no longer sets either.
+      # The box's SQL Server must serve a certificate issued for `localhost`. The store pins it with
+      # MEFOR_STORE_SSL_ROOT_CERT, a path in the runner's machine environment like the password, to
+      # a file only administrators and the runner account can write. The DATABASE connector has no
+      # pin, so the machine's Root store must hold the same certificate. The toolchain step checks
+      # the path is set.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -115,6 +122,7 @@ jobs:
           $drv = Get-OdbcDriver -Name "ODBC Driver 18 for SQL Server" -ErrorAction SilentlyContinue
           if (-not $drv) { throw "ODBC Driver 18 for SQL Server is not installed on the runner" }
           if (-not $env:MEFOR_STORE_PASSWORD) { throw "MEFOR_STORE_PASSWORD must be set in the runner's machine environment (it is never committed)" }
+          if (-not $env:MEFOR_STORE_SSL_ROOT_CERT -or -not (Test-Path -LiteralPath $env:MEFOR_STORE_SSL_ROOT_CERT)) { throw "MEFOR_STORE_SSL_ROOT_CERT must name the SQL Server's certificate file in the runner's machine environment; the engine refuses a weakened store hop" }
 
       - name: Install the project (dev + sqlserver extras)
         shell: powershell

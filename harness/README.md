@@ -235,10 +235,11 @@ why. Point it at an inbound that answers in HL7: one with `ack_mode = "none"` ne
 every case would fail the reply rule. The store checks read
 `GET /messages` about twice per case, so on an auth-enabled engine the per-user read limit (120 a
 minute by default) sets the pace: the fuzzer waits out a 429 rather than failing. Exit 0 when every
-invariant held, 1 when one broke, 2 on a setup error (including a 4xx mid-run). A failure prints the
-seed, iteration, layer, mutation and sizes -- never a body -- and writes the exact bytes sent under
-`--fuzz-out` (default: `messagefoundry-harness-fuzz` in the system temp directory, outside any
-checkout). The same seed always produces the same bytes.
+invariant held, 1 when one broke or the run checked nothing (no positive ACK matched to a stored
+row; for `--fuzz-replay`, no case sent), 2 on a setup error (including a 4xx mid-run).
+A failure prints the seed, iteration, layer, mutation and sizes -- never a body -- and writes the
+exact bytes sent under `--fuzz-out` (default: a fresh `messagefoundry-harness-fuzz-*` directory in
+the system temp directory, outside any checkout). The same seed always produces the same bytes.
 
 ### Raw TCP and X12
 
