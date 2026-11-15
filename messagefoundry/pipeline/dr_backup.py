@@ -2005,9 +2005,14 @@ def _fd_walk(
 _walk = _fd_walk
 
 
-def _empty_files_in_place(staging: Path) -> list[str]:
+def _empty_files_in_place(staging: Path, *, spared: frozenset[str] = frozenset()) -> list[str]:
     """Truncate every regular file under ``staging`` to zero bytes. Returns what could NOT be shown
     empty: a file that refused, or a directory that could not be listed.
+
+    A name in ``spared``, directly under ``staging``, is reported and never truncated: a restore
+    passes its staged store there when that name could not be removed after placement and is
+    still the restored store's own file, which a volume that misreports its link count would
+    otherwise let this empty (BACKLOG #5617).
 
     Walked with a walk that reports a listing error, and an ``lstat``, rather than ``Path.rglob`` and
     ``Path.is_file``, which on Python 3.14 swallow ``OSError``: a directory that cannot be listed would
@@ -2040,9 +2045,17 @@ def _empty_files_in_place(staging: Path) -> list[str]:
         if reason is not None and not (reason == _OUTSIDE_REASON and reason in unproven):
             unproven.append(reason)
 
+    def _is_spared(at_root: bool, name: str) -> bool:
+        if at_root and name in spared:
+            unproven.append(f"{name} (the restored store, not truncated)")
+            return True
+        return False
+
     walked = False
     if sys.platform == "win32":
         for dirpath, dirnames, filenames, here in _win_held_walk(staging, unproven, _report):
+            # Both walks are top-down, so the first directory they yield is `staging` itself.
+            at_root = not walked
             walked = True
             kept: list[str] = []
             for d in dirnames:
@@ -2057,12 +2070,15 @@ def _empty_files_in_place(staging: Path) -> list[str]:
                     kept.append(d)
             dirnames[:] = kept
             for name in filenames:
-                _report(_truncate_unfollowed(Path(dirpath) / name, None, here))
+                if not _is_spared(at_root, name):
+                    _report(_truncate_unfollowed(Path(dirpath) / name, None, here))
     else:
         for dirpath, _dirnames, filenames, dirfd in _walk(staging, onerror=_unlisted):
+            at_root = not walked
             walked = True
             for name in filenames:
-                _report(_truncate_unfollowed(Path(dirpath) / name, dirfd, None))
+                if not _is_spared(at_root, name):
+                    _report(_truncate_unfollowed(Path(dirpath) / name, dirfd, None))
     if not walked and not unproven:
         # A walk that yields nothing at all and reports nothing still did not show the root empty.
         unproven.append(f"{staging.name}/ (not listed)")
@@ -2626,7 +2642,7 @@ def _ps_path(text: str) -> str:
     return "(" + " + ".join(parts) + ")"
 
 
-def _discard_verify_staging(staging: Path) -> str | None:
+def _discard_verify_staging(staging: Path, *, spared: frozenset[str] = frozenset()) -> str | None:
     """Remove a DR staging directory -- a backup's snapshot and plaintext tar, or a verify's decrypted
     archive. Never raises.
 
@@ -2649,7 +2665,11 @@ def _discard_verify_staging(staging: Path) -> str | None:
     try:
         if _remove_tree(staging):
             return None
-        unproven = _empty_files_in_place(staging)
+        unproven = (
+            _empty_files_in_place(staging, spared=spared)
+            if spared
+            else _empty_files_in_place(staging)
+        )
         for delay in _STAGING_REMOVE_DELAYS:
             time.sleep(delay)
             if _remove_tree(staging):
@@ -2768,20 +2788,26 @@ class _Staging:
             self._claimed = True
             return True
 
-    def release(self, *, unless_claimed: bool = False) -> str | None:
+    def release(
+        self, *, unless_claimed: bool = False, spared: frozenset[str] = frozenset()
+    ) -> str | None:
         """Drop the lock and remove the directory. Never raises. Returns ``None`` when no file there
         still holds plaintext, or a PHI-free sentence naming the directory when one might (see
         :func:`_discard_verify_staging`). The lock is dropped first because Windows will not delete a
-        file that is still open."""
+        file that is still open. ``spared`` names files directly in the directory that the
+        fail-safe must report rather than truncate (:func:`_empty_files_in_place`)."""
         with self._mutex:
             if self._released or (unless_claimed and self._claimed):
                 return None
             self._released = True
         _unlock_and_close(self._fd)
-        return _teardown_staging(self.path)
+        # `spared` is passed only when set, so a stand-in for a seam keeps its one-argument shape.
+        return (
+            _teardown_staging(self.path, spared=spared) if spared else _teardown_staging(self.path)
+        )
 
 
-def _teardown_staging(path: Path) -> str | None:
+def _teardown_staging(path: Path, *, spared: frozenset[str] = frozenset()) -> str | None:
     """:func:`_discard_verify_staging`, then, if the directory survived, put its lock file and marker
     back so the next sweep can prove it abandoned. Never raises.
 
@@ -2800,7 +2826,9 @@ def _teardown_staging(path: Path) -> str | None:
     if refusal is not None:
         log.error("DR staging: %s", refusal)
         return refusal
-    leftover = _discard_verify_staging(path)
+    leftover = (
+        _discard_verify_staging(path, spared=spared) if spared else _discard_verify_staging(path)
+    )
     if os.path.lexists(path):
         # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
         # otherwise hold this thread in the open until a reader came, which may be never.
@@ -4654,6 +4682,9 @@ def _restore_blocking(
     published = False
     completed = False
     store_removed = False
+    # What the staging teardown must not truncate: the staged store, while it is still a name for
+    # the placed one (set below, only when its unlink after placement is refused).
+    spared: frozenset[str] = frozenset()
     config_written: list[Path] = []
     try:
         # Stage on the DESTINATION volume, not the system temp dir: the extracted store is then placed
@@ -4919,8 +4950,9 @@ def _restore_blocking(
             # restored store, and the teardown's fail-safe must never be handed it. It refuses a
             # file with two links, but a volume that hard-links and reports one link would have
             # it truncate the restored store itself. Placed by a copy, it is a second plaintext
-            # copy with no further use. A refused unlink (a scanner holding it) leaves the
-            # fail-safe's link check as the guard, and is logged.
+            # copy with no further use. Where the unlink is refused (a scanner holding it) and the
+            # name is still the placed store's own file, the teardown is told to spare it rather
+            # than rest on the link count alone, until the placed store itself is rolled back.
             try:
                 snap.unlink()
             except OSError as exc:
@@ -4929,6 +4961,12 @@ def _restore_blocking(
                     snap,
                     safe_exc(exc),
                 )
+                try:
+                    shares_store = os.path.samefile(snap, dest_store_path)
+                except OSError:
+                    shares_store = True  # not known, so the safe answer
+                if shares_store:
+                    spared = frozenset({snap.name})
 
             # The config bundle is written AFTER the store, and every way it can fail used to leave
             # the store published anyway: a refused member name, a cap, a collision, an archive with
@@ -4960,7 +4998,8 @@ def _restore_blocking(
                         dest_store_path,
                         safe_exc(unlink_exc),
                     )
-            leftover = work.release()
+            # Once the placed store is gone the staged copy is the only one, so it is emptied.
+            leftover = work.release(spared=frozenset() if store_removed else spared)
             refusal: BaseException = exc
             if isinstance(exc, OSError):
                 # A refusal already leaving a `with` block, found in the chain: an OSError raised on
@@ -4993,7 +5032,7 @@ def _restore_blocking(
             # delete. A BackupError, so the CLI prints a refusal line rather than a traceback, and a
             # kind of its own, so the line does not read as the restore having failed. The outer
             # `finally` sees `completed` and leaves the restore alone.
-            leftover = work.release()
+            leftover = work.release(spared=spared)
             if leftover is not None:
                 intact: list[str] = []
                 if dest_store_path is not None:

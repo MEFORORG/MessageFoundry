@@ -1686,6 +1686,39 @@ def test_a_failed_restore_empties_the_staged_store_its_rollback_unlinked(
     shutil.rmtree(leftover)
 
 
+def test_a_whole_restore_whose_staged_name_survives_is_never_truncated(
+    tmp_path, key_b64, capsys
+) -> None:
+    # Where the staged store's name cannot be removed after a link placement, it is still the
+    # restored store's own file. A volume that hard-links but reports one link would let the
+    # teardown's fail-safe truncate it, emptying the restore it just reported whole. The seam
+    # stands in for that volume: a truncate that ignores the link count.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    real_unlink = Path.unlink
+
+    def held_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.name == "extracted_store.db" and self.parent.name.startswith("mefor-restore-"):
+            raise PermissionError(13, "held open by a scanner", str(self))
+        real_unlink(self, missing_ok=missing_ok)
+
+    def truncate_ignoring_links(entry: Path, dir_fd: object, here: object) -> None:
+        os.truncate(entry, 0)
+
+    with pytest.MonkeyPatch.context() as mp:
+        _restore_staging_that_cannot_be_removed(mp)
+        mp.setattr(Path, "unlink", held_unlink)
+        mp.setattr(dr_backup, "_truncate_unfollowed", truncate_ignoring_links)
+        rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
+    err = _refusal(capsys)
+    assert rc == 1 and "restore failed (cleanup)" in err, err
+    assert "extracted_store.db (the restored store, not truncated)" in err, err
+    assert asyncio.run(_read_back(dest, key_b64)) == (1, _RAW_BODY)
+    (leftover,) = dest.parent.glob("mefor-restore-*")
+    assert (leftover / "archive.tar").stat().st_size == 0
+    shutil.rmtree(leftover)
+
+
 def test_a_failed_restore_never_unlinks_a_store_another_restore_placed(
     tmp_path, key_b64, capsys
 ) -> None:
@@ -1698,13 +1731,13 @@ def test_a_failed_restore_never_unlinks_a_store_another_restore_placed(
     real_release = dr_backup._Staging.release
     winners: list[Path] = []
 
-    def release_while_another_restore_wins(self, *, unless_claimed: bool = False):
+    def release_while_another_restore_wins(self, **kwargs):
         if not dest.exists() and not winners:
             # The other restore's exclusive create, inside the window.
             with open(dest, "xb") as fh:
                 fh.write(b"the other restore's store")
             winners.append(dest)
-        return real_release(self, unless_claimed=unless_claimed)
+        return real_release(self, **kwargs)
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
