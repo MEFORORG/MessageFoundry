@@ -247,7 +247,8 @@ this line.**
   The CSP is unchanged. The "leaving this site" page and that hop now carry Sign-out and the
   session watchdog only when the request carries a live session: before, the watchdog on the
   interstitial sent a browser with no session to the login page before Continue could be clicked.
-  No seam change.
+  A browser that reaches the interstitial with a session cookie that no longer authenticates gets
+  `Clear-Site-Data: "cache"` there, as the login page sends it. No seam change.
 - **Edit and resubmit keeps the original's line endings.** A browser submits a textarea's line
   breaks as CRLF, so a direct send of a CR-terminated HL7 body, or a resend of an LF-only payload,
   changed its terminators. The editor now carries the original's style in a hidden `eol` field

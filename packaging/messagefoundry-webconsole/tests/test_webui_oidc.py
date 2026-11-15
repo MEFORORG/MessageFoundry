@@ -262,6 +262,9 @@ async def test_the_interstitial_carries_no_watchdog_without_a_live_session(
     assert r.status_code == 200 and "leaving" in r.text.lower(), r.text
     assert "data-mf-session-watchdog" not in r.text
     assert 'action="/ui/logout"' not in r.text
+    # ASVS 14.3.1: a dead cookie is a terminated session, so this landing drops its cached pages,
+    # as the login page the watchdog used to send it to did. With no cookie there is nothing to end.
+    assert ("clear-site-data" in r.headers) == (cookie is not None), r.headers
 
 
 async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) -> None:

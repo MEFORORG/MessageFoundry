@@ -309,6 +309,8 @@ async def test_a_signed_in_browser_keeps_sign_out_on_the_sign_in_pages(
         hop = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
     assert leaving.status_code == 200 and "leaving" in leaving.text.lower(), leaving.text
     assert idp_url(hop)
+    # A live session is not a terminated one, so its cache is kept (ASVS 14.3.1).
+    assert "clear-site-data" not in leaving.headers
     for page in (leaving, hop):
         assert 'action="/ui/logout"' in page.text
         assert "data-mf-session-watchdog" in page.text

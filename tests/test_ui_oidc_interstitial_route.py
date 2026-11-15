@@ -80,6 +80,8 @@ def test_an_external_idp_gets_the_interstitial_not_a_redirect() -> None:
     assert "<code>idp.example.com</code>" in body
     assert 'method="post"' in body  # Continue is a form, not a link
     assert "Cancel" in body
+    # Positive control for _is_interstitial, which the skip tests below use only negatively.
+    assert _is_interstitial(r)
 
 
 def _is_interstitial(r: Any) -> bool:

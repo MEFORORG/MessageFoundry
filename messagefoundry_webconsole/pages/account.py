@@ -185,8 +185,8 @@ def oidc_landing(target: str = "/ui") -> Markup:
     through a document served from OUR origin makes the next navigation same-site, so the cookie is
     unambiguously sent.
 
-    No JavaScript, so this works under the strict ``/ui`` CSP with no nonce and no ``script-src``
-    relaxation. The visible link is the fallback for a browser with meta refresh disabled.
+    The navigation needs no JavaScript, so it asks for no ``script-src`` relaxation under the strict
+    ``/ui`` CSP. The visible link is the fallback for a browser with meta refresh disabled.
 
     ``target`` is ``/ui`` after a sign-in. After a federated step-up (BACKLOG #296) it is the GET
     admin form the step-up unlocked, which the caller has ALREADY validated as a registered /ui
@@ -273,7 +273,9 @@ def leaving_site(
     ``Sec-Fetch-Site`` check — which also closes the pre-existing hole where any external page could
     start a federated sign-in just by linking to the start leg.
 
-    No JavaScript: the ``/ui`` CSP is strict, with no nonce and no ``script-src`` relaxation.
+    Continue and Cancel need no JavaScript, so the page asks for no ``script-src`` relaxation. It
+    is not script-free: with a live session its nav carries the session watchdog, which ``app.js``
+    runs (``minimal_nav``).
     """
     warn = (
         el(

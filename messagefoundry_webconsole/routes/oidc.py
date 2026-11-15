@@ -43,6 +43,10 @@ Two deliberate departures a reviewer will want to check rather than "fix":
 Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter.**
 Both legs are unauthenticated, so an attacker looping them would otherwise be an unbounded
 audit_log-write amplifier. The availability and rate-limit rejects therefore write no audit row.
+One branch is outside it by design: the interstitial GET asks whether the browser holds a live
+session, and that lookup ends, and audits once, a lapsed or tampered session it finds, as the login
+page's stale-cookie check does. It is no amplifier: a session ends once, and a cookie that names no
+session writes nothing.
 The callback picks its limiter from the flow its cookie names (BACKLOG #3374): see
 ``ui_oidc_callback``.
 """
@@ -67,6 +71,8 @@ from messagefoundry.auth.service import AuthService, LoginOutcome, OidcStepUp, O
 
 from .. import pages
 from .._auth import (
+    CLEAR_SITE_DATA_HEADER,
+    CLEAR_SITE_DATA_VALUE,
     allow_reauth_attempt,
     assert_same_origin,
     claim_continuation,
@@ -328,9 +334,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
         if not _interstitial_needed():
             return await ui_oidc_start(request)
+        live = await has_live_session(request, auth)
         # The host SHOWN is the one the predicate judged, read as a browser reads the URL, so a
         # configured string that only looks internal is shown as where it goes (vault BACKLOG #2790).
-        return HTMLResponse(
+        resp = HTMLResponse(
             pages.leaving_site(
                 destination_host=display_host(idp_url) if idp_host else "(not configured)",
                 continue_action="/ui/oidc/start",
@@ -339,10 +346,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 purpose="Continuing will take you to your organization's sign-in provider.",
                 # Without a live session the page carries no watchdog, which would otherwise send
                 # the browser to the login page before Continue could be clicked.
-                session=await has_live_session(request, auth),
+                session=live,
             ),
             status_code=200,
         )
+        if not live and session_token(request):
+            # ASVS 14.3.1, as on the login page: a cookie that no longer authenticates is a
+            # terminated session, so its cached pages are dropped wherever it lands.
+            resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
+        return resp
 
     @app.post("/ui/oidc/start")
     @public_route("the federated sign-in start; a session does not exist yet")
