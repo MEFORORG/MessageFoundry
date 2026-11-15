@@ -16,10 +16,12 @@ The scanner lives under scripts/ (not an installed package), so it is loaded by 
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
 import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -1164,8 +1166,9 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # unmarked id, whether "the row" follows the id directly or a clause away.
     ("10", "verdict", f"For {_REQ} the row is failing."),
     ("10", "verdict", f"{_REQ} was reviewed; the row is still failing."),
-    # Only "\n", "\r\n" and "\r" end a line, as GFM reads one: a form feed or a line separator at a
-    # row's end leaves the table whole. A ">" then a no-break space is a quoted line, not a blank one.
+    # A blank line is a whole GFM line, between "\n", "\r\n" or "\r": a form feed or a line separator at
+    # a row's end opens no blank line, so the table stays whole. A ">" then a no-break space is a quoted
+    # line, not a blank one.
     ("9", "verdict", f"{_HEAD}| a | b | c |{chr(0x0C)}\n{_ROW}"),
     ("9", "verdict", f"{_HEAD}| a | b | c |{chr(0x2028)}\n{_ROW}"),
     (
@@ -1177,6 +1180,14 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # still read as main read it, a line per separator.
     ("5", "verdict", _HEAD.replace(chr(10), chr(0x2028)) + _ROW),
     ("5", "verdict", _HEAD.replace(chr(10), chr(0x0C)) + _ROW),
+    # Review round-23e833d96f's new loss: two separators in a row open an empty line inside a GFM line
+    # with content, which is not a blank line, so the table is not ended there.
+    (
+        "9",
+        "verdict",
+        _HEAD.replace(chr(10), chr(0x2028)) + f"| a | b | c |{chr(0x0C)}{chr(0x2028)}{_ROW}",
+    ),
+    ("9", "verdict", f"Intro.{chr(0x85) * 2}" + _HEAD.replace(chr(10), chr(0x85) * 2) + _ROW),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
@@ -1206,6 +1217,15 @@ _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     ("10", "Since 2.5.1 the row is not failing."),
     # Step 11: zero-width characters around a cell beside an unmarked HL7 version.
     ("11", f"| 2.5.1 | ADT^A01 |\u200b{_PASS.title()} (12 messages)\u200b|"),
+    # Review round-23e833d96f's false positives against main, quiet on main: an emphasis underscore
+    # after "/" starts no code root mid-path, and a negation before "ASVS" in a header cell, however
+    # it is marked up or spaced, names no column.
+    ("11", f"ASVS {_REQ} notes live in site/_tests/notes for reviewers."),
+    ("11", f"{_REQ} notes: see site/_tests/notes."),
+    ("11", f"| Version (**not** ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Version (not an ASVS id) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Version (not  ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    ("11", f"| Not in ASVS | Note | Result |\n|---|---|---|\n{_ROW}"),
 ]
 
 
@@ -1232,6 +1252,170 @@ def test_the_review_finding_repairs_leave_versions_and_other_tables_alone(
     sf, step: str, body: str
 ) -> None:
     assert sf.scan_pr_body(body) == [], (step, body)
+
+
+# --- the frozen-main superset guard ------------------------------------------------------------------
+#: origin/main's scanner before BACKLOG #3364's repairs, vendored byte for byte: blob 0c6e6127 of
+#: scripts/security/scan_forbidden.py, last changed at main 0e10fb14c8. A vendored copy, not ``git show
+#: origin/main``: once this branch merges, origin/main IS the head, and a CI checkout need not hold that
+#: ref. Never edited; the blob id below pins it.
+_FROZEN_MAIN_PATH = (
+    Path(__file__).parent / "fixtures" / "scan_forbidden" / "scan_forbidden_main.py.txt"
+)
+_FROZEN_MAIN_BLOB = "0c6e61278ae36990232a06cf6d88dd2561ec65a0"
+#: The separators str.splitlines ends a line at and GFM does not. GFM's own ("\r" twice is a blank
+#: line) are step 9's to end a table at.
+_SPLITLINES_ONLY = (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)
+#: The bodies main flags that the repairs quiet ON PURPOSE, by name, each with its ruled step. Every
+#: other hit main reports in the constructed set and the tracked corpus, head must report too, at the
+#: same line.
+_SUPERSET_EXCEPTIONS = {
+    # Step 9: a blank line ends an ASVS-headed table, so pipe rows after it are unmarked.
+    "stay-quiet-2-step9": "9",
+    # Step 10: "never" before a CI verb in a cell, and a negated state verb then a CI verb after
+    # "row", beside an unmarked identifier.
+    "stay-quiet-4-step10": "10",
+    "stay-quiet-5-step10": "10",
+    "stay-quiet-6-step10": "10",
+    "stay-quiet-7-step10": "10",
+    "stay-quiet-8-step10": "10",
+    "stay-quiet-15-step10": "10",
+    "reviewer-step10-row": "10",
+}
+
+
+def _frozen_main_bytes() -> bytes:
+    # A Windows checkout may hold the fixture with CRLF; git stores it with LF.
+    return _FROZEN_MAIN_PATH.read_bytes().replace(b"\r\n", b"\n")
+
+
+@pytest.fixture(scope="module")
+def sf_frozen_main():
+    spec = importlib.util.spec_from_loader("scan_forbidden_frozen_main", loader=None)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    # Its module-level paths resolve against the scanner's own location, as they did on main.
+    module.__file__ = str(_SCANNER_PATH)
+    exec(compile(_frozen_main_bytes(), str(_FROZEN_MAIN_PATH), "exec"), module.__dict__)  # noqa: S102
+    return module
+
+
+def _superset_bodies() -> dict[str, str]:
+    """Every must-fire and must-stay-quiet body above, the review rounds' bodies, and tables whose
+    lines each separator joins, one and two in a row, with and without a line ending after them."""
+    bodies: dict[str, str] = {"clean": _PR_CLEAN_BODY}
+    plain = [
+        *_PR_VERDICT_MUST_FIRE,
+        *_PR_GAP_MUST_FIRE,
+        *_PR_MAP_MUST_FIRE,
+        *_PR_VERSION_MUST_STAY_QUIET,
+        *(body for _, body in _PR_RESIDUE_MUST_FIRE),
+        *_PR_RESIDUE_MUST_STAY_QUIET,
+        *_PR_CELL_MARKUP_MUST_FIRE,
+    ]
+    bodies.update({f"plain-{i}": body for i, body in enumerate(plain)})
+    bodies.update(
+        {f"must-fire-{i}-step{s}": body for i, (s, _, body) in enumerate(_PR_FINDINGS_MUST_FIRE)}
+    )
+    bodies.update(
+        {
+            f"stay-quiet-{i}-step{s}": body
+            for i, (s, body) in enumerate(_PR_FINDINGS_MUST_STAY_QUIET)
+        }
+    )
+    marked_head = "| x | ASVS | Note | Result |\n|---|---|---|---|\n"
+    bodies.update(
+        {
+            "reviewer-numbering": f"Intro{chr(0x2028)}more\n\n{_REQ} stays {_PARTIAL}.",
+            "reviewer-numbering-invisible": (
+                f"Intro{chr(0x2028)}more\n\n{_REQ} stays {_PARTIAL}.\n\n"
+                f"ASVS {_REQ} stays{chr(0x200B)} {_PARTIAL}."
+            ),
+            "reviewer-step10-row": f"{_REQ} is listed; the row is not passing yet.",
+            "reviewer-invisible-row": f"{marked_head}{chr(0x200B)}| {_REQ} | x | y | {_PASS} |",
+            "reviewer-escaped-pipe": (
+                f"| Note | Version | ASVS | Result |\n|---|---|---|---|\n"
+                f"| x \\| y | {_REQ} | z | {_PASS.title()} (12 messages) |"
+            ),
+        }
+    )
+    table = f"{_HEAD}| a | b | c |\n{_ROW}"
+    for code in _SPLITLINES_ONLY:
+        for count in (1, 2):
+            join = chr(code) * count
+            name = f"join-{code:04X}x{count}"
+            bodies[name] = table.replace("\n", join)
+            bodies[f"{name}-intro"] = f"Intro.{join}" + table.replace("\n", join)
+            bodies[f"{name}-newline"] = table.replace("\n", join + "\n")
+            bodies[f"{name}-crlf"] = table.replace("\n", join + "\r\n")
+    return bodies
+
+
+_SUPERSET_BODIES = _superset_bodies()
+
+
+def test_the_frozen_main_scanner_is_the_vendored_blob() -> None:
+    data = _frozen_main_bytes()
+    blob = hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
+    assert blob == _FROZEN_MAIN_BLOB
+
+
+def test_every_superset_exception_names_a_body_main_flags(sf_frozen_main) -> None:
+    """An exception that names no body, or a body main does not flag, excuses nothing and is stale."""
+    for name in _SUPERSET_EXCEPTIONS:
+        assert sf_frozen_main.scan_pr_body(_SUPERSET_BODIES[name]), name
+
+
+@pytest.mark.parametrize("name", sorted(_SUPERSET_BODIES))
+def test_the_head_reports_every_hit_main_reports_in_a_constructed_body(
+    sf, sf_frozen_main, name: str
+) -> None:
+    """BACKLOG #3364: the repairs add hits and never lose one main reports, at main's line number,
+    except the deliberate step 9 and step 10 drops named in _SUPERSET_EXCEPTIONS."""
+    if name in _SUPERSET_EXCEPTIONS:
+        pytest.skip(f"step {_SUPERSET_EXCEPTIONS[name]} drops this body's hits on purpose")
+    body = _SUPERSET_BODIES[name]
+    lost = set(sf_frozen_main.scan_pr_body(body)) - set(sf.scan_pr_body(body))
+    assert not lost, (name, sorted(lost))
+
+
+def test_the_head_reports_every_hit_main_reports_in_the_tracked_markdown(
+    sf, sf_frozen_main
+) -> None:
+    """The same superset over every tracked Markdown file, read as a pull request body."""
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.md"],  # noqa: S607
+        cwd=_REPO_ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\0")
+    paths = [_REPO_ROOT / p.decode() for p in listed if p]
+    # A positive control: an empty listing would pass the loop below vacuously.
+    assert len(paths) > 100
+    main_hits = 0
+    lost: list[tuple[str, str]] = []
+    for path in paths:
+        try:
+            body = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        before = set(sf_frozen_main.scan_pr_body(body))
+        main_hits += len(before)
+        lost += [
+            (str(path.relative_to(_REPO_ROOT)), h) for h in before - set(sf.scan_pr_body(body))
+        ]
+    # A second control: main flags the docs' ASVS tables, so a corpus main reads clean measured nothing.
+    assert main_hits > 0
+    assert not lost, lost[:20]
+
+
+def test_a_pr_body_hit_is_reported_once_at_mains_line_number(sf) -> None:
+    """Review round-23e833d96f: a separator only str.splitlines ends a line at no longer reports one
+    finding twice under two numberings, and every reading's hits come back in line order."""
+    body = f"Intro{chr(0x2028)}more\n\n{_REQ} stays {_PARTIAL}."
+    assert sf.scan_pr_body(body) == [f"pr-body:4: {sf.PR_BODY_REASONS['verdict']}"]
+    hits = sf.scan_pr_body(f"{body}\n\nASVS {_REQ} stays{chr(0x200B)} {_PARTIAL}.")
+    assert hits == sorted(hits, key=lambda h: int(h.split(":")[1])) and len(hits) == len(set(hits))
 
 
 _CELL_CONNECTIVES = [
@@ -1298,6 +1482,10 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         # Identifiers split by a word, so each one takes the column lookup.
         "| ASVS | x |\n|---|---|\n| " + " x ".join([_REQ] * 16000) + " |",
         "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass",
+        # Review round-23e833d96f: an invisible character and a line separator, which once added
+        # two whole readings, and a long run of spaces, which the sentence split rescanned per space.
+        "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass" + chr(0x200B) + chr(0x2028),
+        _REQ + " " * 60000 + ": the row" + chr(0x200B) + chr(0x2028),
     ],
 )
 def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
