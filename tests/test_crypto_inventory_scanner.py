@@ -777,6 +777,10 @@ def test_powershell_patterns_and_inventory_map_into_the_taxonomy() -> None:
             "$c = [Security.Cryptography.X509Certificates.X509Certificate2]::new($p)",
             "key_cert:X509",
         ),
+        (
+            "$b = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection",
+            "key_cert:X509",
+        ),
         ("Import-Certificate -FilePath $p -CertStoreLocation $s", "key_cert:Import-Certificate"),
         (
             "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",

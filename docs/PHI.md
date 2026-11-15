@@ -408,7 +408,16 @@ than a path is not checked
 - On Windows the check looks for known broad groups: at least Everyone, Authenticated Users, the
   local Users group and the logon classes such as INTERACTIVE. It is a list of known groups. It
   does not prove that only the accounts you meant can reach the file. `protect-key
-  --grant-account` refuses the same list, and refuses a name that is a group or a domain.
+  --grant-account` refuses the same list. A name it is given must resolve to a user account, a
+  well-known account or a computer account; a group, an alias or a domain is refused, and the
+  refusal names the kind the name resolved to. A well-known account here includes SYSTEM, a
+  virtual service account, and well-known groups Windows reports the same way. Among those, at
+  least the broad groups on the list above and an application package are refused, and other
+  well-known groups are admitted. A computer account is admitted
+  because a group managed service account may resolve as one, so **a plain computer account
+  (`DOMAIN\HOST$`) is admitted too**. Do not grant a host's own machine account to reach its local
+  services: nothing here shows that a local SYSTEM or NETWORK SERVICE token carries the machine
+  account's SID, so name the account the service runs as, such as the gMSA.
 - On Windows it refuses a key file whose owner is one of those groups or an application package,
   or whose owner cannot be read, since an owner may rewrite the access list (vault BACKLOG #5657).
   This check does not vet an ordinary allow entry for an account that is neither, one you made
@@ -1443,7 +1452,7 @@ future claim that this project "has crypto agility" must exclude the audit chain
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
 | Engine API ↔ console | **The engine always serves TLS** ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)) `[BUILT]`, loopback included. An operator certificate (`[api].tls_cert_file`, WP-13a) wins; with none set, the engine mints a self-signed placeholder on first run. Off loopback, `serve` refuses that placeholder. Only `[security].enforcement = warn` with `--allow-insecure-bind` (or `[security].require_encryption_for_remote = false`) accepts it. So an exposed bind needs an operator certificate, with or without a trusted reverse proxy that terminates TLS upstream (`tls_terminated_upstream` + `trusted_proxies`, WP-15) in front of it. That proxy is the one topology where the engine itself serves plaintext: with no `tls_cert_file`, the proxy-to-engine hop is plaintext, and [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) says when `serve` accepts it. HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]`. No LDAP referral is followed, so the bind credentials never leave this hop for a referred host; a referral refuses the sign-in (BACKLOG #2530, 2026-09-30). A multi-domain forest would need a global catalog or a search base in the bound controller's own domain. | — |
-| PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation via `[store].ssl_root_cert` file-pin (Postgres CA-bundle; on SQL Server it is instead a pin of the server's own certificate, ODBC 18.1+ `ServerCertificate` sent with `Encrypt=strict`, see [`CONFIGURATION.md`](CONFIGURATION.md)) **or** a Windows machine-store (`LocalMachine\Root`) CA import. | — |
+| PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation via `[store].ssl_root_cert` file-pin (Postgres CA-bundle; on SQL Server it is instead a pin of the server's own certificate, ODBC 18.1+ `ServerCertificate` sent with `Encrypt=strict`, see [`CONFIGURATION.md`](CONFIGURATION.md)) **or** a Windows machine certificate store CA import; which store each CA goes into, and what each store is a trust anchor for, is in [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.2. | — |
 
 **Hard rule:** never bind the API to `0.0.0.0` (or any non-loopback interface) without an operator
 certificate, whether or not a declared TLS-terminating proxy is in front of it. On the self-signed

@@ -510,6 +510,7 @@ def aggregate_cell_record(
         achieved_written_per_s=achieved_written,
         fuse_thread_hops=cell.fuse_mode,
         batch_handoff_statements=cell.batch_mode,
+        trial=cell.trial,
     )
 
 
@@ -583,6 +584,7 @@ def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
         achieved_written_per_s=0.0,
         fuse_thread_hops=cell.fuse_mode,
         batch_handoff_statements=cell.batch_mode,
+        trial=cell.trial,
     )
 
 

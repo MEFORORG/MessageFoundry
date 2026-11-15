@@ -192,13 +192,21 @@ WARNING (not a refusal) for the advisory cases, so a deliberate cross-root layou
 
 ### 3. Extend the resolution flags to the offline subcommands — value resolution only, *not* serve's posture refusal
 
+*Value resolution, as this heading and this section state it, is not met for
+`validate`/`graph`/`dryrun`: see the 2026-11-14 correction under
+[Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).*
+
 Add `--project-root`, `--env`, and `--service-config` to `validate`, `graph`, `dryrun`, and `check` (today
 they carry **only** `--config`, plus `--messages`). With these flags the gate resolves the **same project
 root and the same active-environment `env()` values** `serve` resolves, so `messagefoundry check` on a CI
-runner validates the view that will actually run.
+runner validates the view that will actually run. *(Not met for `validate`/`graph`/`dryrun`'s
+values: see the 2026-11-14 correction under
+[Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).)*
 
 **Explicitly pinned — the offline gate resolves *values*, it does NOT inherit `serve`'s required-env /
-explicit-posture *refusal*** (`__main__.py:464-481`). `serve` refuses to start without an active
+explicit-posture *refusal*** (`__main__.py:464-481`). *(The values half is not met for
+`validate`/`graph`/`dryrun`: see the 2026-11-14 correction under
+[Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).)* `serve` refuses to start without an active
 environment and demands an explicit posture for a custom env name; the offline tools **do not** adopt that
 refusal, because doing so would *break* the documented gate invocation `messagefoundry check --config config
 --messages messages/sets` (ADR 0017) — that has **no** `--env`. Therefore:
@@ -206,6 +214,8 @@ refusal, because doing so would *break* the documented gate invocation `messagef
 - With **no** `--env`, the offline gate behaves exactly as today (no env values loaded, no posture refusal).
 - With `--env`/`--project-root`/`--service-config`, the gate resolves the **identical root + active-env
   `env()` values** as `serve` for those flags, but never enforces the required-env-/posture-refusal.
+  *(Not met for `validate`/`graph`/`dryrun`'s values: see the 2026-11-14 correction under
+  [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).)*
   **Amended for `check --env` alone** ([Amendment A](#amendment-a-check---env-matches-serve-2026-11-09)):
   given `--env`, `check`'s settings checks read the name as `serve --env` does.
 
@@ -275,6 +285,8 @@ given** — which is exactly AC-6.
   → `tests/test_checks_gate_parity.py::test_every_settings_leg_reads_an_instance_named_by_check_env`
   → `tests/test_checks_gate_parity.py::test_check_env_beats_mefor_ai_environment_and_the_file`
   → `tests/test_cli_offline_resolution.py::test_offline_does_not_inherit_serve_posture_refusal`
+  *Not met for `validate`/`graph`/`dryrun`'s value resolution: see the 2026-11-14 correction under
+  [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).*
 - **AC-7** — THE SYSTEM SHALL honor an explicit **absolute** `--config`/`--service-config`/`--db`/
   `[store].path` as-is even when a project root is set, AND SHALL resolve a **relative**
   `--db`/`[store].path` (indistinguishable post-merge from a file-set relative path) under the root.
@@ -432,6 +444,16 @@ those settings, and its Handlers still run with no active environment.
   environment still skips the `posture` check, so the documented `check --config config --messages
   messages/sets` invocation is unchanged.
 - `validate`, `graph` and `dryrun` still read `--env` for values alone and adopt no refusal.
+
+  **CORRECTED 2026-11-14 (vault BACKLOG #5554):** the bullet's first clause is false of the code.
+  `validate`, `graph` and `dryrun` read `--env` only for the value-file check under
+  `--project-root`, which exits 2 when the graph loads, references `env()`, and has no value file
+  (the AC-3 refusal). They load no `env()` values and resolve no `env()` reference, and without
+  `--project-root` the flag has no effect. So the value-resolution clauses of AC-6 and §3 are not
+  met for these three commands. Their `--env` help now says so and points at `check --env`, whose
+  build check resolves the named environment's values. Whether to build value resolution into
+  them or narrow AC-6 is open, and vault BACKLOG #5554 owns that decision; this note decides
+  neither.
 
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now

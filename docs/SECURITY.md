@@ -1077,6 +1077,10 @@ MessageFoundry states the boundary and adds one opt-in precondition check (#203)
   engine's service account is granted only what it needs (the least-privilege account + ACLs are the
   Windows-service install's job), and at-rest custody is the DPAPI / KeyProvider chain. The precondition
   flag above surfaces the *store* slice of this at start time; the rest is asserted, not engine-checked.
+  `protect-key --grant-account` admits a name that resolves to a computer account, because a group
+  managed service account may resolve as one, so **a plain computer account (`DOMAIN\HOST$`) is
+  admitted too**. Which kinds of name it admits and refuses is stated once, in
+  [PHI.md, "Key files"](PHI.md).
 - **Admin device posture** (managed / compliant admin endpoints) stays **100 % deployment-delegated**:
   enforce it at the reverse proxy (mTLS client certificates) plus MDM in front of an off-loopback `/ui`,
   not inside the engine — the engine has no device-attestation channel and does not attempt one.

@@ -1,5 +1,6 @@
-# HAPI HL7v2 fixtures are vendored byte-verbatim (see README "Provenance"); never
-# let EOL normalization touch them, or the stored bytes drift from upstream and the
-# MPL-2.0 "unmodified" basis no longer holds. -text = store/checkout exactly as-is.
+# HAPI HL7v2 fixtures keep their stored bytes exactly (see README "Provenance"): the verbatim
+# ones match upstream, and the de-identified ones keep upstream's line endings. Never let EOL
+# normalization touch them, or the verbatim files drift from upstream and the MPL-2.0
+# "unmodified" basis no longer holds. -text = store/checkout exactly as-is.
 *.hl7 -text
 *.txt -text

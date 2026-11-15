@@ -7,8 +7,9 @@ ESC sequence could rewrite the prompt asking the operator to trust it, and a rig
 could reorder the name shown. The script runs every such name through ``ConvertTo-PrintableText``
 before ``Write-Host`` or ``ShouldProcess`` shows it.
 
-NOTHING IN CI RUNS THE SCRIPT ITSELF: it needs an elevated Windows session and writes the machine
-trust store. So the static half pins that every console line naming the certificate's Subject or
+NOTHING HERE RUNS THE SCRIPT ITSELF: an import needs an elevated Windows session and writes the
+machine trust store. (``tests/test_import_db_ca_bundle.py`` runs it with ``-WhatIf`` only, which
+writes nothing.) So the static half pins that every console line naming the certificate's Subject or
 Issuer goes through the helper, and the behavioural half lifts the helper's two function
 definitions out of the script's own AST and calls them, never running the script. The behavioural
 half needs ``pwsh`` and skips where there is none, as ``tests/test_net_helper_install_scripts.py``
