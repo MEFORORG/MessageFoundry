@@ -86,7 +86,8 @@ def _load() -> dict:
 
 def _steps() -> list[dict]:
     doc = _load()
-    return doc["jobs"]["auto-merge"]["steps"]
+    # Every job's steps, the disarm job's first: step ids are unique across the workflow.
+    return [s for job in doc["jobs"].values() for s in job["steps"]]
 
 
 def _step(step_id: str) -> dict:
@@ -356,9 +357,11 @@ def test_no_step_overrides_the_default_shell() -> None:
     """
     doc = _load()
     assert "defaults" not in doc, "a workflow-level defaults: block can change the shell"
-    job = doc["jobs"]["auto-merge"]
-    assert "defaults" not in job, "a job-level defaults: block can change the shell"
-    for step in job["steps"]:
+    jobs = doc["jobs"].values()
+    assert all("defaults" not in job for job in jobs), (
+        "a job-level defaults: block can change the shell"
+    )
+    for step in [s for job in jobs for s in job["steps"]]:
         assert "shell" not in step, (
             f"step {step.get('id') or step.get('name')!r} declares an explicit shell:, so the "
             f"behavioural tests no longer mirror what CI runs — update _run_step_body with it"
@@ -382,6 +385,16 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
     assert "steps.ghsa.outputs.advisory_ok == 'true'" in cond
     assert "steps.ghsa.outputs.security_track != 'true'" in cond
     assert "steps.age.outputs.age_ok == 'true'" in cond, "merge not gated on the release-age guard"
+    assert "steps.authors.outputs.sole_author == 'true'" in cond, (
+        "merge not gated on a Dependabot push of one Dependabot commit (BACKLOG #5593)"
+    )
+    # The sender gate is only as good as its binding: the behavioural rows supply SENDER directly.
+    env = _step("authors").get("env") or {}
+    assert str(env.get("SENDER", "")).replace(" ", "") == "${{github.event.sender.login}}", env
+    assert (
+        str(env.get("HEAD_SHA", "")).replace(" ", "") == "${{github.event.pull_request.head.sha}}"
+    )
+    assert str(env.get("EVENT_ACTION", "")).replace(" ", "") == "${{github.event.action}}"
     # the in-scope update-type gate is still present (any patch / dev-only minor)
     assert "version-update:semver-patch" in cond
 
@@ -398,7 +411,7 @@ def test_new_steps_take_every_input_through_env_not_interpolation() -> None:
     This is zizmor template-injection parity asserted in-tree — a PR-controlled value pasted into a
     shell body is a code-execution seam — and it is simultaneously the precondition that lets the
     behavioural tests below execute the shipped bodies verbatim."""
-    for step_id in ("allowset", "age"):
+    for step_id in ("allowset", "age", "authors", "disarm"):
         step = _step(step_id)
         body = str(step.get("run", ""))
         assert "${{" not in body, (
@@ -924,3 +937,278 @@ def test_the_stub_self_certification_fires_when_a_stub_loses(tmp_path: Path) -> 
         pytest.skip("this Git install ships no mingw64 curl, so the wrapper cannot shadow the stub")
     with pytest.raises(AssertionError, match="did NOT win"):
         _assert_stubs_win(str(wrapper), stub_dir, env)
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #5593: disarm on a later push, and arm only on the head this run evaluated
+# --------------------------------------------------------------------------------------------------
+
+
+def test_merge_step_pins_the_evaluated_head() -> None:
+    """The arm call must carry ``--match-head-commit`` bound to the event's head SHA.
+
+    Without it GitHub arms auto-merge on whatever the head is when the call lands, which can be a
+    commit pushed after the guardrails evaluated the earlier one.
+    """
+    merge = next(s for s in _steps() if "gh pr merge --auto" in str(s.get("run", "")))
+    run = str(merge["run"])
+    assert '--match-head-commit "$HEAD_SHA"' in run, f"the arm call is not head-pinned: {run!r}"
+    assert "${{" not in run, "the merge body interpolates an Actions expression; pass it via env:"
+    assert str((merge.get("env") or {}).get("HEAD_SHA", "")).replace(" ", "") == (
+        "${{github.event.pull_request.head.sha}}"
+    ), "HEAD_SHA must be the head the triggering event carried, the one this run evaluated"
+
+
+def test_every_run_disarms_in_its_own_ungrouped_job_before_any_arm() -> None:
+    """The disarm is its own job, in NO concurrency group, on every event the workflow takes, and the
+    arming job needs it. GitHub keeps one pending entry per group and cancels the older pending one,
+    so a disarm inside the group could be cancelled by a later run (a re-run of an `opened` run, say)
+    and an arm on an earlier head would survive. Outside the group every run's disarm runs."""
+    doc = _load()
+    jobs = doc["jobs"]
+    assert "concurrency" not in doc, "a workflow-level group would put the disarm job in it too"
+    # Least privilege per job: the disarm job may not complete a merge.
+    assert doc.get("permissions") == {}, doc.get("permissions")
+    assert (jobs.get("disarm") or {}).get("permissions") == {
+        "contents": "read",
+        "pull-requests": "write",
+    }
+    disarm_job = jobs.get("disarm")
+    assert disarm_job is not None, "no `disarm` job"
+    assert "concurrency" not in disarm_job, "the disarm job must not be in a cancellable group"
+    # Only the author gate: no event-action filter, so opened, synchronize and reopened all disarm.
+    assert str(disarm_job.get("if", "")).replace(" ", "") == (
+        "github.event.pull_request.user.login=='dependabot[bot]'"
+    ), disarm_job.get("if")
+    assert [s.get("id") for s in disarm_job["steps"]] == ["disarm"]
+    arm_job = jobs["auto-merge"]
+    needs = arm_job.get("needs")
+    assert needs == "disarm" or needs == ["disarm"], (
+        f"the arming job must need the disarm job: {needs!r}"
+    )
+    assert "group" in (arm_job.get("concurrency") or {}), "the arming job lost its per-PR group"
+    assert not any(s.get("id") == "disarm" for s in arm_job["steps"]), (
+        "a second disarm in the arm job"
+    )
+    disarm = _step("disarm")
+    assert "if" not in disarm, f"the disarm step must not be skippable: {disarm.get('if')!r}"
+    for owner in (disarm, disarm_job):
+        assert "continue-on-error" not in owner, "a disarm failure must stop the arming job"
+    body = str(disarm["run"])
+    assert "${{" not in body
+    assert "gh pr merge --disable-auto" in body
+    declared = set((disarm.get("env") or {}).keys())
+    undeclared = set(_ENV_REF.findall(body)) - _RUNNER_PROVIDED - declared
+    assert not undeclared, f"disarm reads undeclared env var(s): {sorted(undeclared)}"
+    assert "stale" not in _WORKFLOW.read_text(encoding="utf-8").split("jobs:", 1)[1], (
+        "a stale guard is back; the ungrouped disarm job replaced it"
+    )
+
+
+def _gh_disarm_stub(tmp_path: Path) -> Path:
+    """A ``gh`` that keeps the PR's auto-merge state in ``$GH_STATE`` and logs each call to ``$GH_LOG``.
+
+    ``VIEW_FAIL=1`` makes ``pr view`` behave like an HTTP error (JSON body on stdout, non-zero exit),
+    ``DISARM_FAIL=1`` makes ``pr merge --disable-auto`` exit non-zero, and ``DISARM_NOOP=1`` makes it
+    exit 0 while leaving the state armed.
+    """
+    stub_dir = tmp_path / "ghstub"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "$*" >> "$GH_LOG"\n'
+        'case "$1 $2" in\n'
+        '  "pr view")\n'
+        '    if [ "${VIEW_FAIL:-0}" = 1 ]; then echo \'{"message":"Bad credentials"}\'; exit 1; fi\n'
+        '    cat "$GH_STATE" ;;\n'
+        '  "pr merge")\n'
+        '    if [ "${DISARM_FAIL:-0}" = 1 ]; then echo "gh: refused" >&2; exit 1; fi\n'
+        '    if [ "${DISARM_NOOP:-0}" != 1 ]; then echo false > "$GH_STATE"; fi ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub_dir
+
+
+@pytest.mark.parametrize(
+    ("label", "armed", "extra", "rc", "disarm_called", "end_state"),
+    [
+        ("armed on an earlier head is disarmed", "true", {}, 0, True, "false"),
+        ("not armed: nothing to do", "false", {}, 0, False, "false"),
+        # The body reads no event or head, so these two races reduce to the same row: whatever run
+        # executes it (a re-run of `opened` after an arm on the older head, or a run whose arming job
+        # the group then cancels) leaves the PR disarmed.
+        ("re-run of opened after an arm on the older head", "true", {}, 0, True, "false"),
+        ("a run whose arming job is later cancelled", "true", {}, 0, True, "false"),
+        # Unknown is not "not armed": it disarms anyway, and the read-back decides.
+        ("state unreadable: disarms anyway", "true", {"VIEW_FAIL": "1"}, 1, True, "false"),
+        ("a refused disarm fails closed", "true", {"DISARM_FAIL": "1"}, 1, True, "true"),
+        ("a disarm that did not take", "true", {"DISARM_NOOP": "1"}, 1, True, "true"),
+    ],
+)
+def test_disarm_step_behaviour(
+    label: str,
+    armed: str,
+    extra: dict[str, str],
+    rc: int,
+    disarm_called: bool,
+    end_state: str,
+    tmp_path: Path,
+) -> None:
+    """The disarm body EXECUTED. A non-zero exit is the fail-closed outcome: Actions then skips every
+    later step, the arm step included, so nothing re-arms on a head whose state is unknown."""
+    state = tmp_path / "state"
+    state.write_text(f"{armed}\n", encoding="utf-8")
+    log = tmp_path / "gh.log"
+    log.write_text("", encoding="utf-8")
+    env = {
+        "PR_URL": "https://github.com/example/example/pull/1",
+        "GH_TOKEN": "stub",
+        "GH_STATE": state.as_posix(),
+        "GH_LOG": log.as_posix(),
+        **extra,
+    }
+    run = _run_step_body("disarm", env, tmp_path, path_prepend=_gh_disarm_stub(tmp_path))
+    assert run.rc == rc, f"{label}: rc={run.rc}, expected {rc}{_diagnostic(run)}"
+    called = any("--disable-auto" in ln for ln in log.read_text(encoding="utf-8").splitlines())
+    assert called is disarm_called, f"{label}: disarm called={called}{_diagnostic(run)}"
+    assert state.read_text(encoding="utf-8").strip() == end_state, label
+
+
+def _gh_rows_stub(tmp_path: Path, rows: str | None) -> Path:
+    """A ``gh`` that prints ``rows`` (already the ``--jq`` result), or fails like an HTTP error."""
+    stub_dir = tmp_path / "ghstub"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    if rows is None:
+        body = '#!/usr/bin/env bash\necho \'{"message":"Not Found"}\'\nexit 1\n'
+    else:
+        (stub_dir / "rows.txt").write_text(rows, encoding="utf-8", newline="\n")
+        body = '#!/usr/bin/env bash\ncat "$(dirname "$0")/rows.txt"\n'
+    stub.write_text(body, encoding="utf-8", newline="\n")
+    stub.chmod(0o755)
+    return stub_dir
+
+
+_BOT = "dependabot[bot]"
+_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+_PASS = f"{_HEAD} true login=dependabot[bot]\n"
+
+
+@pytest.mark.parametrize(
+    ("label", "action", "sender", "rows", "expected"),
+    [
+        # The discriminating PASS: a Dependabot push of one verified Dependabot commit at the head.
+        ("Dependabot pushed one Dependabot commit", "synchronize", _BOT, _PASS, "true"),
+        # A human or the Lander pushed: the sender is that person, whatever the commits say.
+        ("a human sender", "synchronize", "someone", _PASS, "false"),
+        ("two commits", "synchronize", _BOT, _PASS + _PASS, "false"),
+        (
+            "a Dependabot sender, human-authored commit",
+            "synchronize",
+            _BOT,
+            f"{_HEAD} true login=someone\n",
+            "false",
+        ),
+        # An empty login is its own visible field, so it fails the whole-line test, not a shift.
+        ("an author with no GitHub login", "synchronize", _BOT, f"{_HEAD} true login=\n", "false"),
+        (
+            "an unverified commit",
+            "synchronize",
+            _BOT,
+            f"{_HEAD} false login=dependabot[bot]\n",
+            "false",
+        ),
+        (
+            "the commit is not the pinned head",
+            "synchronize",
+            _BOT,
+            f"{'b' * 40} true login=dependabot[bot]\n",
+            "false",
+        ),
+        # On reopen the sender is the reopener, which can be Dependabot after someone else's push.
+        ("a reopen", "reopened", _BOT, _PASS, "false"),
+        ("no commits", "synchronize", _BOT, "", "false"),
+        ("the API errors", "synchronize", _BOT, None, "false"),
+    ],
+)
+def test_authors_step_rearms_only_a_dependabot_push_of_one_dependabot_commit(
+    label: str, action: str, sender: str, rows: str | None, expected: str, tmp_path: Path
+) -> None:
+    """fetch-metadata reads only the first commit, so re-arming needs the sender, the commit count
+    and the single commit's author to all be Dependabot's."""
+    run = _run_step_body(
+        "authors",
+        {
+            "EVENT_ACTION": action,
+            "SENDER": sender,
+            "HEAD_SHA": _HEAD,
+            "REPO": "example/example",
+            "PR_NUMBER": "1",
+            "GH_TOKEN": "stub",
+        },
+        tmp_path,
+        path_prepend=_gh_rows_stub(tmp_path, rows),
+    )
+    assert run.rc == 0, f"{label}: rc={run.rc}{_diagnostic(run)}"
+    assert run.outputs.get("sole_author") == expected, f"{label}{_diagnostic(run)}"
+    if label == "an author with no GitHub login":
+        assert "true login=', not" in run.stdout, f"failed for the wrong reason{_diagnostic(run)}"
+
+
+def _gh_arm_stub(tmp_path: Path, arm_ok: bool, head: str | None) -> Path:
+    stub_dir = tmp_path / "ghstub"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    view = "exit 1" if head is None else f"echo {head}"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1 $2" in\n'
+        f'  "pr merge") exit {0 if arm_ok else 1} ;;\n'
+        f'  "pr view") {view} ;;\n'
+        "esac\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    stub.chmod(0o755)
+    return stub_dir
+
+
+_EVALUATED = "a" * 40
+
+
+@pytest.mark.parametrize(
+    ("label", "arm_ok", "head", "rc"),
+    [
+        ("armed", True, _EVALUATED, 0),
+        ("refused because the head moved", False, "b" * 40, 0),
+        ("refused on the evaluated head", False, _EVALUATED, 1),
+        ("refused and the head is unreadable", False, None, 1),
+        # A short hex read is not proof the head moved, so it must not pass green.
+        ("refused and the head read is short", False, "abc", 1),
+        ("refused and the head read is uppercase", False, "B" * 40, 1),
+        ("refused and the head read is 41 characters", False, "b" * 41, 1),
+        ("refused and the head read is garbled", False, "g" * 40, 1),
+    ],
+)
+def test_merge_step_passes_only_a_head_moved_refusal(
+    label: str, arm_ok: bool, head: str | None, rc: int, tmp_path: Path
+) -> None:
+    """The benign race (a push while this run evaluated) is not a red run; anything else is."""
+    merge = next(s for s in _steps() if "gh pr merge --auto" in str(s.get("run", "")))
+    bash = require_bash(tmp_path)
+    script = tmp_path / "merge.sh"
+    script.write_text(str(merge["run"]), encoding="utf-8", newline="\n")
+    stub_dir = _gh_arm_stub(tmp_path, arm_ok, head)
+    env = probe_env(Path(bash), dict(os.environ))
+    env.update({"PR_URL": "https://github.com/example/example/pull/1", "HEAD_SHA": _EVALUATED})
+    env["PATH"] = f"{stub_dir.as_posix()}{os.pathsep}{env.get('PATH', '')}"
+    _assert_stubs_win(bash, stub_dir, env)
+    proc = subprocess.run(
+        [bash, "-e", script.as_posix()], capture_output=True, text=True, timeout=120, env=env
+    )
+    assert proc.returncode == rc, f"{label}: rc={proc.returncode}\n{proc.stdout}{proc.stderr}"
