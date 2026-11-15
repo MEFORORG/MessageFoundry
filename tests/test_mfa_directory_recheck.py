@@ -510,8 +510,9 @@ async def test_a_local_account_is_never_role_checked(
 async def test_a_lock_set_during_the_lookup_is_honoured(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The lookup is a network round trip, so the row is read again after it. Without the re-read, a
-    lock set meanwhile by a concurrent guess would not stop this attempt."""
+    """The lookup is a network round trip, so the row is read again after it: inside the account's
+    queue, before the code is checked (BACKLOG #3780 item 2). Without that read, a lock set
+    meanwhile by a concurrent guess would not stop this attempt."""
     e = await _enrolled_directory_session(store, monkeypatch)
 
     async def _probe_while_a_guess_locks(user: object) -> reconcile.Probe:
@@ -533,17 +534,21 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
     """BACKLOG #3780 item 2. ``verify_mfa`` read the session, the account and its lock right after
     the lookup and again inside the account's queue, with only the queue's acquisition between.
     The in-queue read is now the one re-read after the lookup. RED when: a second read of the
-    session, or a second lock check, comes back between the lookup and the code check. The control
-    is that the attempt still succeeds, so the count is of a leg that ran."""
+    session, of the account, or a second lock check, comes back between the lookup and the code
+    check. The account is read twice: once by the directory check's role test, right after the
+    probe, and once in the queue. The control is that the attempt still succeeds, so the count is
+    of a leg that ran."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_probe = e.service._probe_principal
     real_load = e.service._load_session
+    real_load_user = e.service._load_user
     real_lock_refused = e.service._mfa_lock_refused
     real_verify = e.service._verify_second_factor
     looked_up = False
     reads_after_lookup = 0
+    account_reads_after_lookup = 0
     lock_checks_after_lookup = 0
-    reads_before_code: list[tuple[int, int]] = []
+    reads_before_code: list[tuple[int, int, int]] = []
 
     async def _probe(user: Any) -> reconcile.Probe:
         nonlocal looked_up
@@ -557,6 +562,12 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
             reads_after_lookup += 1
         return await real_load(token_hash)
 
+    async def _load_user(user_id: str) -> Any:
+        nonlocal account_reads_after_lookup
+        if looked_up:
+            account_reads_after_lookup += 1
+        return await real_load_user(user_id)
+
     async def _lock_refused(*args: Any, **kwargs: Any) -> bool:
         nonlocal lock_checks_after_lookup
         if looked_up:
@@ -564,11 +575,14 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
         return await real_lock_refused(*args, **kwargs)
 
     async def _verify(*args: Any, **kwargs: Any) -> bool:
-        reads_before_code.append((reads_after_lookup, lock_checks_after_lookup))
+        reads_before_code.append(
+            (reads_after_lookup, account_reads_after_lookup, lock_checks_after_lookup)
+        )
         return await real_verify(*args, **kwargs)
 
     monkeypatch.setattr(e.service, "_probe_principal", _probe)
     monkeypatch.setattr(e.service, "_load_session", _load)
+    monkeypatch.setattr(e.service, "_load_user", _load_user)
     monkeypatch.setattr(e.service, "_mfa_lock_refused", _lock_refused)
     monkeypatch.setattr(e.service, "_verify_second_factor", _verify)
 
@@ -576,7 +590,7 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
 
     assert verified.ok is True
     assert looked_up
-    assert reads_before_code == [(1, 1)]
+    assert reads_before_code == [(1, 2, 1)]
 
 
 @pytest.mark.parametrize("change", ["revoke", "disable", "lock"])

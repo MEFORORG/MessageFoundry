@@ -17126,7 +17126,8 @@ class AuthService:
 
         For a check that must land just before a factor is written, after awaits in which a
         revocation, a disable or a lock could have landed (BACKLOG #3068).
-        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, both second-
+        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, except for
+        :meth:`verify_mfa`, whose in-queue read takes its place (BACKLOG #3780 item 2), both second-
         factor legs run it again right before ``mark_session_mfa_verified``, and :meth:`verify_mfa`
         runs it on a matched code whose spend failed, before it decides the charge. A session
         revoked or gone, or an account disabled or gone, returns ``session_lost``: the token no longer
