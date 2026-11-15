@@ -276,6 +276,32 @@ def test_no_go_when_b1_breaches_zero_loss() -> None:
     assert not cmp.ok  # a zero-loss breach fails the run's correctness fold
 
 
+def test_an_inconclusive_b1_arm_is_labelled_inconclusive_and_still_fails_closed() -> None:
+    # BACKLOG #5574: a B1 reconcile that could not clear zero-loss but proved no loss used to read
+    # "B1 breached zero-loss". It is named INCONCLUSIVE now, and the run still fails. The proven
+    # breach above is the control: same arm, inconclusive=False, still NO-GO and "breached".
+    from dataclasses import replace
+
+    unsure = [
+        replace(r, no_loss=replace(r.no_loss, inconclusive=True))
+        for r in _trials(True, [120.0, 121.0, 119.0], no_loss_ok=False, sink_received=900)
+    ]
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + unsure, (False, True))
+    assert cmp is not None
+    (row,) = cmp.rows
+    assert row.verdict == FUSE_INCONCLUSIVE
+    assert "breached" not in row.reason and "INCONCLUSIVE" in row.reason
+    assert row.candidate_lost and not row.ok and not cmp.ok
+    guards = cmp.to_json_dict()["rows"][0]["guards"]  # type: ignore[index]
+    assert guards["b1_zero_loss_inconclusive"] is True
+    # One proven-lossy trial beside the inconclusive ones makes the arm a breach again.
+    mixed = [*unsure[:2], *_trials(True, [119.0], no_loss_ok=False, sink_received=900)]
+    cmp = build_fuse_comparison(_trials(False, [100.0, 101.0, 99.0]) + mixed, (False, True))
+    assert cmp is not None
+    assert cmp.rows[0].verdict == FUSE_NO_GO
+    assert "breached" in cmp.rows[0].reason
+
+
 def test_no_go_when_drain_time_grows() -> None:
     # B1's intake is higher but its post-load DRAIN TIME grew far past B0's ⇒ the higher intake rode a
     # larger backlog ⇒ NO-GO. Read from the AUTHORITATIVE drain signal, NOT the /stats-poller

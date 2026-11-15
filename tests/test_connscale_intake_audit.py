@@ -55,6 +55,7 @@ from harness.load.connscale.runner import (
     _evaluate_slos,
     _read_shortfall,
     _reconcile,
+    _unexplained_shortfall,
 )
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.metrics import Counters, Histogram
@@ -691,7 +692,7 @@ def test_read_shortfall_is_the_same_number_the_reconcile_prints() -> None:
     c = Counters(sent=40, timeouts=4)
     base, final = _sample(0), _sample(30)
 
-    short = _read_shortfall(c, base, final, unconfirmed_budget=8)
+    short = _read_shortfall(c, base, final, unconfirmed_budget=8, counter_reset=None)
     no_loss = _reconcile(
         c, base, final, unconfirmed_budget=8, drain_seconds=1.0, counter_reset=None
     )
@@ -706,8 +707,32 @@ def test_read_shortfall_is_the_same_number_the_reconcile_prints() -> None:
 def test_read_shortfall_is_zero_without_engine_gauges() -> None:
     """No samples means no shortfall to ATTRIBUTE. ``_reconcile`` fails the step on its own for that,
     and the audit must not invent a finding out of a missing measurement."""
-    assert _read_shortfall(Counters(sent=10), None, _sample(0), unconfirmed_budget=1) == 0
-    assert _read_shortfall(Counters(sent=10), _sample(0), None, unconfirmed_budget=1) == 0
+    assert (
+        _read_shortfall(
+            Counters(sent=10), None, _sample(0), unconfirmed_budget=1, counter_reset=None
+        )
+        == 0
+    )
+    assert (
+        _read_shortfall(
+            Counters(sent=10), _sample(0), None, unconfirmed_budget=1, counter_reset=None
+        )
+        == 0
+    )
+
+
+def test_a_counter_reset_leaves_no_shortfall_to_attribute_bug_5574() -> None:
+    """A restart or stats reset makes ``final.read - base.read`` no run total. Read off it, a step
+    whose engine counters began again at 0 showed a 40-message "shortfall", and the audit then
+    attributed that phantom to the ``engine_read`` gauge. The control is the same counts with no
+    reset, which do carry the shortfall."""
+    c = Counters(sent=40)
+    base, final = _sample(30), _sample(0)
+    assert _read_shortfall(c, base, final, unconfirmed_budget=1, counter_reset=None) == 70
+    assert _unexplained_shortfall(c, base, final, counter_reset=None) == 70
+    reset = "the engine restarted mid-run"
+    assert _read_shortfall(c, base, final, unconfirmed_budget=1, counter_reset=reset) == 0
+    assert _unexplained_shortfall(c, base, final, counter_reset=reset) == 0
 
 
 def _record_with(audit: IntakeAudit, *, read: int, sent: int) -> ConnScaleRecord:

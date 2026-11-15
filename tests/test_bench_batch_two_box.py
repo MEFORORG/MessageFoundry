@@ -789,6 +789,9 @@ def test_failed_cell_record_is_a_tagged_loss() -> None:
     cell = bb.iter_batch_cells(_profile(), claim_mode="pooled")[3]  # a B1 cell
     rec = bb._failed_cell_record(cell, "boom")
     assert rec.no_loss.ok is False and "boom" in rec.no_loss.detail
+    # The cell measured nothing, so it is INCONCLUSIVE, not a proven loss; it still fails closed
+    # (BACKLOG #5574).
+    assert rec.no_loss.inconclusive is True
     assert rec.drain_seconds is None  # a cell that never ran never drained (poisons the worst case)
     # Tagged with the cell's A/B arm so the batch comparison groups + fails it, not a mystery record.
     assert rec.batch_handoff_statements is cell.batch_mode

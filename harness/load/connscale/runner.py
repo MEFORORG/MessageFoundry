@@ -782,16 +782,22 @@ async def _run_started_step(
         # `_build_record` hands `_reconcile`, and the audit has to be triggered by the shortfall the
         # step will actually REPORT. The two diverge on the drain-timeout path, where the local
         # `final` can be None while the poller still holds an earlier sample.
+        # A counter reset makes the read delta no run total, so neither shortfall below may be
+        # read off it (BACKLOG #5574); `_build_record` reads the same poller for the reconcile.
+        counter_reset = _counter_reset(poller)
         read_short = _read_shortfall(
             metrics.counters,
             poller.baseline,
             poller.final,
             unconfirmed_budget=count,
+            counter_reset=counter_reset,
             reload_stranded=reload_account.stranded if reload_account is not None else 0,
         )
         # The part no excusal forgives, computed HERE because only this side knows whether the
         # excusal was clamped. The audit must not re-derive it -- see `_unexplained_shortfall`.
-        unexplained_short = _unexplained_shortfall(metrics.counters, poller.baseline, poller.final)
+        unexplained_short = _unexplained_shortfall(
+            metrics.counters, poller.baseline, poller.final, counter_reset=counter_reset
+        )
         # The two NOT_RUN reasons answer different questions, and each is stated at the branch it
         # describes. The disabled one has to be reachable on a step that DID have a shortfall: "no
         # shortfall to attribute" printed on a failing step is a false statement about the run, in
@@ -799,6 +805,14 @@ async def _run_started_step(
         # artifact to read.
         if ledger is None:
             audit_live = intake_audit.not_run(_AUDIT_DISABLED, moment=intake_audit.MOMENT_LIVE)
+        elif counter_reset is not None:
+            # "No shortfall" would be a false statement here: the counts cannot say either way.
+            # The post-mortem below still checks every confirmed send for a row.
+            audit_live = intake_audit.not_run(
+                f"{counter_reset} -- the read delta is no run total, so there is no count "
+                f"shortfall to attribute",
+                moment=intake_audit.MOMENT_LIVE,
+            )
         elif read_short > 0:
             audit_live = await intake_audit.run_intake_audit(
                 ledger,
@@ -1964,19 +1978,28 @@ def _read_shortfall(
     final: EngineSample | None,
     *,
     unconfirmed_budget: int,
+    counter_reset: str | None,
     reload_stranded: int = 0,
 ) -> int:
     """``confirmed sent - engine_read`` -- the shortfall ``_reconcile`` reports as intake loss, and
-    the trigger for the LIVE intake audit. 0 when the engine gauges are unavailable (there is then no
-    shortfall to attribute; ``_reconcile`` fails the step on its own for that)."""
-    if base is None or final is None:
+    the trigger for the LIVE intake audit. 0 when the engine gauges are unavailable, or when the
+    engine counters reset mid-step (``counter_reset``, from
+    :func:`harness.load.report._counter_reset`): ``final.read - base.read`` is then no run total,
+    so there is no shortfall to attribute, and ``_reconcile`` reports the step INCONCLUSIVE on its
+    own (BACKLOG #5574). Required, with no default, so a caller cannot hand the audit a phantom
+    shortfall by omission."""
+    if base is None or final is None or counter_reset is not None:
         return 0
     ex = _excusal(c, unconfirmed_budget=unconfirmed_budget, reload_stranded=reload_stranded)
     return c.sent - ex.excused - (final.read - base.read)
 
 
 def _unexplained_shortfall(
-    c: Counters, base: EngineSample | None, final: EngineSample | None
+    c: Counters,
+    base: EngineSample | None,
+    final: EngineSample | None,
+    *,
+    counter_reset: str | None,
 ) -> int:
     """The part of the shortfall NO excusal can forgive -- ``sent - unconfirmed - engine_read``.
 
@@ -1994,8 +2017,10 @@ def _unexplained_shortfall(
     definition of the population. Do not swap in ``_excusal(...).unconfirmed``: since BACKLOG #1292
     that EXCLUDES the reload-stranded sends, and using it would put them back into this remainder,
     so the audit would call a reload-stranded gap a gauge finding.
+
+    0 under a counter reset, for the reason ``_read_shortfall`` gives (BACKLOG #5574).
     """
-    if base is None or final is None:
+    if base is None or final is None or counter_reset is not None:
         return 0
     return c.sent - c.timeouts - (final.read - base.read)
 
@@ -2021,27 +2046,24 @@ def _reconcile(
     """
     sent = c.sent
     sink_received = c.sink_received
+    # Missing engine metrics leave every engine-delta arm unjudged, exactly as a reset does below,
+    # and must not skip the arms that read only client counters: those still prove a loss without
+    # the engine (BACKLOG #5574). The stand-ins 0/0/-1 are what a band report carries for "no
+    # reading" (the batch-box aggregate reads the -1).
+    metrics_missing = base is None or final is None
     if base is None or final is None:
-        return NoLoss(
-            False,
-            sent,
-            0,
-            0,
-            sink_received,
-            -1,
-            "engine metrics unavailable — cannot verify no-loss",
-            inconclusive=True,
-        )
-    read = final.read - base.read
-    written = final.written - base.written
-    # The whole pipeline, not the outbound queue alone: see EngineSample.backlog (BACKLOG #5435).
-    backlog = final.backlog
+        read, written, backlog = 0, 0, -1
+    else:
+        read = final.read - base.read
+        written = final.written - base.written
+        # The whole pipeline, not the outbound queue alone: see EngineSample.backlog (BACKLOG #5435).
+        backlog = final.backlog
     # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
     # the engine deltas may rest on it; the load copy's reasoning is the source of record. The arms
     # that read only client counters (the stranding budget and the reload guards) still prove a loss
     # across it, as the load copy keeps its dead-ACK-path signature. A negative delta is not
     # published.
-    engine_judged = counter_reset is None
+    engine_judged = counter_reset is None and not metrics_missing
     if not engine_judged:
         read, written = max(0, read), max(0, written)
     # A `timeouts`-counted message (in-flight at a connection close with no ACK seen — a mid-run reset
@@ -2140,14 +2162,16 @@ def _reconcile(
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
     # undelivering step satisfies trivially.
     unproven: list[str] = []
-    if counter_reset is not None:
+    if metrics_missing:
+        unproven.append("engine metrics unavailable — cannot verify no-loss")
+    elif counter_reset is not None:
         unproven.append(
             f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
             f"sends, so the intake and delivery arms were not judged"
         )
     if sent == 0:
         unproven.append("nothing was sent — the step measured nothing")
-    elif sink_received == 0 and written <= 0:
+    elif sink_received == 0 and written <= 0 and not metrics_missing:
         unproven.append(
             f"nothing was delivered (sink_received 0, engine_written {written}) — "
             f"no delivery to reconcile"
@@ -2194,7 +2218,7 @@ def _reconcile(
             f"delivered; causes include a dead-letter, a worker refusal, and a rejection "
             f"recorded before its NAK{naked})"
         )
-    if not drained:
+    if not drained and final is not None:
         parts.append(
             f"backlog {backlog} not drained (outbound {final.pending + final.inflight}, "
             f"in_pipeline {final.in_pipeline} not done in any stage)"
@@ -2224,6 +2248,13 @@ def _reconcile(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
             f"({budget} = max(connections, {of_run})) — systemic no-ACK fault "
             f"(possible accepted-and-dropped); nothing excused"
+        )
+    elif unconfirmed > 0 and not engine_judged:
+        # No intake reading to compare them with: a reset clamps `read` and missing metrics zero
+        # it, so "not observed at intake" would be read off a stand-in (BACKLOG #5574).
+        parts.append(
+            f"{unconfirmed} unconfirmed send(s) (no ACK before connection close) — not counted "
+            f"as loss; intake was not judged, so whether they reached the engine is unknown"
         )
     elif unconfirmed > 0 and read < sent:
         # Honest reporting either way: the gap is attributed to unconfirmed sends, not silently absorbed.

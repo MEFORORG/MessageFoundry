@@ -767,6 +767,9 @@ class _FuseArm:
     drain_seconds_worst: float | None
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
+    #: The arm did not hold zero-loss and no trial PROVED a loss: every failing trial's reconcile was
+    #: INCONCLUSIVE (BACKLOG #5574). It still fails closed, but is named for what it is, not a breach.
+    zero_loss_inconclusive: bool
     offered_rate: float
     # --- latency SIGNAL (INFORMATIONAL, not gated) — the "distance insurance" readout the ADR 0075
     # statement-batching bench surfaced: at an injected engine→store RTT, batch-ON showed a LOWER ACK p99
@@ -810,6 +813,10 @@ class _FuseArm:
             drain_seconds_worst=drain_seconds_worst,
             delivered_offered=statistics.fmean(ratios) if ratios else None,
             zero_loss_ok=all(r.no_loss.ok for r in recs) and bool(recs),
+            zero_loss_inconclusive=(
+                not (all(r.no_loss.ok for r in recs) and bool(recs))
+                and all(r.no_loss.inconclusive for r in recs if not r.no_loss.ok)
+            ),
             offered_rate=recs[0].offered_aggregate_rate if recs else 0.0,
             # The informational latency signal (see the field docstring) — trial means of the record's
             # ACK-on-receipt percentiles.
@@ -835,7 +842,7 @@ class FuseComparisonRow:
         bool  # B1 whole-pipeline drain COMPLETED AND drain time flat-or-lower vs B0 (authoritative)
     )
     delivered_offered_ok: bool  # B1 delivered/offered >= the floor
-    candidate_lost: bool  # B1 breached zero-loss (hard fail)
+    candidate_lost: bool  # B1 did not hold zero-loss, a breach or INCONCLUSIVE (hard fail)
     reason: str  # a human one-liner explaining the verdict
     candidate_missing: bool = False
 
@@ -1309,6 +1316,13 @@ def _fuse_verdict(
     in_pipeline, delivered/offered) gate first — a breach is a NO-GO regardless of the raw intake
     number. Then the throughput bar: below 10% is a NO-GO (fusion banked nothing); >= 10% but within
     trial spread is INCONCLUSIVE (need more/cleaner trials); >= 10% and outside 2σ is a GO."""
+    if candidate_lost and cand.zero_loss_inconclusive:
+        # Still a hard fail (the row's `ok` reads `candidate_lost`), but nothing proved a message
+        # dropped, so it is not called a breach (BACKLOG #5574).
+        return FUSE_INCONCLUSIVE, (
+            "B1 could not clear zero-loss and proved no loss (its reconcile was INCONCLUSIVE) -- "
+            "the run fails closed until a clean measurement clears it"
+        )
     if candidate_lost:
         return FUSE_NO_GO, "B1 breached zero-loss -- fusion must never drop a message (hard guard)"
     if not in_pipeline_ok:
@@ -1405,6 +1419,9 @@ def _fuse_row_json(row: FuseComparisonRow) -> dict[str, object]:
             "candidate_lost": row.candidate_lost,
             "b0_zero_loss": row.baseline.zero_loss_ok,
             "b1_zero_loss": (None if row.candidate is None else row.candidate.zero_loss_ok),
+            "b1_zero_loss_inconclusive": (
+                None if row.candidate is None else row.candidate.zero_loss_inconclusive
+            ),
         },
         # INFORMATIONAL latency signal (ADR 0075 distance insurance) — NOT a gate: the GO/NO-GO verdict
         # above is unchanged. ``*_delta_pct`` is (B1 - B0) / B0 * 100, so a NEGATIVE value means B1 is

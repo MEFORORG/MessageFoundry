@@ -497,26 +497,23 @@ def _reconcile(
     """
     sent = c.sent
     sink_received = c.sink_received
+    # Missing engine metrics leave every engine-delta arm unjudged, exactly as a reset does below,
+    # and must not skip the arms that read only client counters: those still prove a loss without
+    # the engine (BACKLOG #5574). The stand-ins 0/0/-1 are what a band report carries for "no
+    # reading" (the batch-box aggregate reads the -1).
+    metrics_missing = base is None or final is None
     if base is None or final is None:
-        return NoLoss(
-            False,
-            sent,
-            0,
-            0,
-            sink_received,
-            -1,
-            "engine metrics unavailable — cannot verify no-loss",
-            inconclusive=True,
-        )
-    read = final.read - base.read
-    written = final.written - base.written
-    # The whole pipeline, not the outbound queue alone: see EngineSample.backlog (BACKLOG #5435).
-    backlog = final.backlog
+        read, written, backlog = 0, 0, -1
+    else:
+        read = final.read - base.read
+        written = final.written - base.written
+        # The whole pipeline, not the outbound queue alone: see EngineSample.backlog (BACKLOG #5435).
+        backlog = final.backlog
     # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
     # the engine deltas may rest on it; the load copy's reasoning is the source of record. The
     # stranding budget reads only client counters, so it still proves a loss across it. A negative
     # delta is not published.
-    engine_judged = counter_reset is None
+    engine_judged = counter_reset is None and not metrics_missing
     if not engine_judged:
         read, written = max(0, read), max(0, written)
     # An unconfirmed send (in-flight at a connection close, no ACK seen) is bounded-excused; past the
@@ -548,14 +545,16 @@ def _reconcile(
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
     # undelivering step satisfies trivially.
     unproven: list[str] = []
-    if counter_reset is not None:
+    if metrics_missing:
+        unproven.append("engine metrics unavailable — cannot verify no-loss")
+    elif counter_reset is not None:
         unproven.append(
             f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
             f"sends, so the intake and delivery arms were not judged"
         )
     if sent == 0:
         unproven.append("nothing was sent — the step measured nothing")
-    elif sink_received == 0 and written <= 0:
+    elif sink_received == 0 and written <= 0 and not metrics_missing:
         unproven.append(
             f"nothing was delivered (sink_received 0, engine_written {written}) — "
             f"no delivery to reconcile"
@@ -577,7 +576,7 @@ def _reconcile(
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
-    if not drained:
+    if not drained and final is not None:
         parts.append(
             f"backlog {backlog} not drained (outbound {final.pending + final.inflight}, "
             f"in_pipeline {final.in_pipeline} not done in any stage)"
@@ -588,6 +587,13 @@ def _reconcile(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
             f"({budget} = max(connections, three quarters of the run)) — systemic no-ACK fault "
             f"(possible accepted-and-dropped); nothing excused"
+        )
+    elif unconfirmed > 0 and not engine_judged:
+        # No intake reading to compare them with: a reset clamps `read` and missing metrics zero
+        # it, so "not observed at intake" would be read off a stand-in (BACKLOG #5574).
+        parts.append(
+            f"{unconfirmed} unconfirmed send(s) (no ACK before connection close) — not counted "
+            f"as loss; intake was not judged, so whether they reached the engine is unknown"
         )
     elif unconfirmed > 0 and read < sent:
         # Honest reporting, as in the two sibling copies: without this branch a bounded-excused run

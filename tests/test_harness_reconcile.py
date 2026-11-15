@@ -1459,6 +1459,57 @@ def test_connscale_reconcile_a_reload_guard_stays_loss_across_a_counter_reset() 
     assert "4 connection(s) never came back" in result.detail
 
 
+def test_rig_reconciles_a_client_counter_loss_stays_loss_without_engine_metrics() -> None:
+    # Missing engine metrics used to return INCONCLUSIVE before any arm ran, so a systemic no-ACK
+    # fault the client counters prove on their own was reported as unproven. The control is the
+    # same missing metrics with every send answered, which stays INCONCLUSIVE.
+    flood = Counters(sent=36, acked=0, timeouts=36)
+    for result in (
+        connscale_reconcile(flood, None, None, unconfirmed_budget=_BUDGET),
+        estate_reconcile(flood, None, None, unconfirmed_budget=_BUDGET),
+    ):
+        assert not result.ok and not result.inconclusive, result.detail
+        assert "systemic no-ACK fault" in result.detail
+        assert "engine metrics unavailable" in result.detail
+        assert (result.engine_read, result.engine_written, result.backlog) == (0, 0, -1)
+        assert "not drained" not in result.detail
+    for control in (
+        connscale_reconcile(_RIG_CLEAN, None, None, unconfirmed_budget=_BUDGET),
+        estate_reconcile(_RIG_CLEAN, None, None, unconfirmed_budget=_BUDGET),
+    ):
+        assert not control.ok and control.inconclusive, control.detail
+
+
+def test_connscale_reconcile_a_reload_guard_stays_loss_without_engine_metrics() -> None:
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=18)
+    reload = _reload(30, sent=30, acked=0, timeouts=30, not_reconnected=4)
+    result = connscale_reconcile(c, None, None, unconfirmed_budget=12, reload=reload)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "4 connection(s) never came back" in result.detail
+
+
+def test_rig_reconciles_do_not_read_unconfirmed_sends_off_a_reset_intake() -> None:
+    # Under a reset `read` is clamped, so "not observed at intake" would be read off a stand-in.
+    # The note is qualified instead. The control, with no reset and the same counts, keeps the
+    # plain note, because there the read is a run total.
+    c = Counters(sent=36, acked=33, timeouts=3, sink_received=33)
+    base = _sample(read=100, written=100)
+    final = _sample(read=33, written=33)
+    for result in (
+        connscale_reconcile(c, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
+        estate_reconcile(c, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
+    ):
+        assert result.inconclusive, result.detail
+        assert "not observed at intake" not in result.detail
+        assert "whether they reached the engine is unknown" in result.detail
+    for control in (
+        connscale_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET),
+        estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET),
+    ):
+        assert "3 unconfirmed send(s)" in control.detail
+        assert "not observed at intake" in control.detail
+
+
 def test_batchbox_aggregate_a_band_that_could_not_read_the_engine_is_inconclusive() -> None:
     # connscale `_reconcile` writes the stand-ins 0 / 0 / -1 when the engine metrics are missing.
     # Read as readings they would say every message was lost.
@@ -1467,6 +1518,75 @@ def test_batchbox_aggregate_a_band_that_could_not_read_the_engine_is_inconclusiv
     assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
     assert "could not read the engine metrics" in rec.no_loss.detail
     assert "lost" not in rec.no_loss.detail
+
+
+def _pair(**over: object) -> dict[str, object]:
+    """One band of a two-band fleet: each band reads the SAME engine, so its engine totals cover
+    both bands' 20 sends."""
+    return _band(**{"engine_read": 20, "engine_written": 20, **over})
+
+
+def test_batchbox_aggregate_two_band_clean_control() -> None:
+    rec = bb.aggregate_cell_record(_cell(), [_pair(), _pair()])
+    assert rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+
+
+def test_batchbox_aggregate_one_band_reset_does_not_hide_a_delivery_loss_another_proves() -> None:
+    # Band B read the engine cleanly: it wrote 20, and the union sink got 17. Band A's reset used to
+    # withhold every arm, so the cell was INCONCLUSIVE. The control is the same reset with nothing
+    # short, which stays INCONCLUSIVE.
+    rec = bb.aggregate_cell_record(
+        _cell(),
+        [_pair(counter_reset=_RESET, sink_received=7), _pair()],
+    )
+    assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "lost 3" in rec.no_loss.detail
+    assert "restarted mid-run" in rec.no_loss.detail
+    control = bb.aggregate_cell_record(_cell(), [_pair(counter_reset=_RESET), _pair()])
+    assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
+    assert "lost" not in control.no_loss.detail
+
+
+def test_batchbox_aggregate_a_reset_leaves_the_intake_arm_unjudged_on_every_band() -> None:
+    # Band B saw no reset, but a reset A saw spans B's deltas too and lowers its read: an intake
+    # shortfall read off B is no proof, so it is not judged.
+    rec = bb.aggregate_cell_record(
+        _cell(),
+        [_pair(counter_reset=_RESET, engine_read=12), _pair(engine_read=12)],
+    )
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "the intake arm was not judged" in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_one_blind_band_does_not_hide_an_intake_loss_another_proves() -> None:
+    rec = bb.aggregate_cell_record(
+        _cell(),
+        [_pair(engine_read=0, engine_written=0, backlog=-1), _pair(engine_read=15)],
+    )
+    assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "engine_read 15 < aggregate sent 20 (lost 5)" in rec.no_loss.detail
+    assert "1 band(s) could not read the engine metrics" in rec.no_loss.detail
+    # The control: the same blind band beside a clean one cannot clear, and proves nothing.
+    control = bb.aggregate_cell_record(
+        _cell(), [_pair(engine_read=0, engine_written=0, backlog=-1), _pair()]
+    )
+    assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
+
+
+def test_batchbox_aggregate_reports_every_band_reason_not_only_the_first() -> None:
+    other = "engine counters went backwards (read 9 -> 1, written 9 -> 1): a stats reset"
+    silent = _pair()
+    no_loss = silent["no_loss"]
+    assert isinstance(no_loss, dict)
+    del no_loss["counter_reset"]
+    rec = bb.aggregate_cell_record(
+        _cell(), [_pair(counter_reset=_RESET), _pair(counter_reset=other), silent]
+    )
+    assert rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "restarted mid-run" in rec.no_loss.detail
+    assert "a stats reset" in rec.no_loss.detail
+    assert "does not say whether the engine counters reset" in rec.no_loss.detail
+    assert "no band read the engine cleanly" in rec.no_loss.detail
 
 
 def test_batchbox_aggregate_escapes_a_band_reset_text_to_one_line() -> None:
