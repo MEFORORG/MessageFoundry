@@ -716,10 +716,10 @@ Manager's watch reached the cloud session 29 seconds after its question.
   being merged, so a conflict resolution the Lander wrote itself needs its own review. The Lander
   reads what the review found. **The Lander may merge when none of the open findings changes
   behaviour or weakens a control, once it has named each open finding on the PR.** The owner's
-  ruling of 2026-10-12, in session, approved the first condition as part of the Lander's proposal
-  *"Let me merge when the open findings are filed as rows and none changes behaviour or weakens a
-  control"*. The naming step, and the order the ledger ruling R2 paragraph below states, replace
-  the proposal's filing-first step. **CORRECTED 2026-11-15:** the bold sentence read *"The Lander
+  ruling of 2026-10-12, in session, approved the condition that none changes behaviour or weakens
+  a control, as part of the Lander's proposal *"Let me merge when the open findings are filed as
+  rows and none changes behaviour or weakens a control"*. The naming step, and the order the
+  ledger ruling R2 paragraph below states, replace the proposal's filing-first step. **CORRECTED 2026-11-15:** the bold sentence read *"The Lander
   may merge when the open findings are filed as rows and none changes behaviour or weakens a
   control (owner ruling 2026-10-12, in session)."* A finding that changes
   behaviour or weakens a control still goes to the owner for a ruling. **CORRECTED 2026-10-12:**
@@ -751,16 +751,16 @@ Manager's watch reached the cloud session 29 seconds after its question.
   instead into the one open row for that module, as an item. The signed text is cited under R5
   above. It says *"The merge still never waits on an open finding, and no finding goes
   unrecorded."* Decision d20261111T061703900-432f31 reads R2's signed text as governing the order of
-  filing and merging. **Filing a finding as a row never holds the merge.** Before the merge, the
-  Lander names each open finding on the PR, one line each, with its filed row or "queued for
-  filing". In a public repository the line names the subject and pastes no row text. The Lander
-  files the queued ones in the next ledger pass, under the sweep in korus `roles/LANDER.md`, *An
-  item left in a PR comment is yours to carry*. A finding that goes to the owner still holds the
-  merge until the owner rules, as the sentences above say. R2 amends the 2026-10-12 ruling in its
-  mechanics only, and its item 4 names one of that ruling's owner routes as unchanged, so its
-  *"never waits"* covers the findings that ruling lets the Lander merge past. The Lander decided
-  the order under the owner's delegation of 2026-11-11; the decision's record gives the question as
-  *"does CLAUDE.md s5 file-before-merge or R2 merge-first govern?"* and the owner's answer as
+  filing and merging. The order is: the Lander names each open finding on the PR, one line each,
+  with its filed row or "queued for filing"; it merges; it files the queued ones in the next ledger
+  pass, under the sweep in korus `roles/LANDER.md`, *An item left in a PR comment is yours to
+  carry*, which also says what the line may quote. **Filing never holds the merge. A finding that
+  goes to the owner holds the merge until the owner rules.** That last rule is the owner's ruling
+  of 2026-11-15, in the Repair Manager's chat. Asked *"Under ledger ruling R2's 'the merge never
+  waits on an open finding', does a finding sent to you for a ruling still hold the merge until you
+  rule?"*, the owner answered *"owner findings still hold the merge"*. The Lander decided the order
+  under the owner's delegation of 2026-11-11; the decision's record gives the question as *"does
+  CLAUDE.md s5 file-before-merge or R2 merge-first govern?"* and the owner's answer as
   *"/driver"*. The authority for this text is the owner confirmation in the Repair Manager's chat,
   2026-11-15: *"Confirmed: fix all 11 findings on korus PR 270 and whatever engine PR 2891 leaves
   open, including the edits to engine CLAUDE.md section 5 and korus roles/LANDER.md, so both repos
