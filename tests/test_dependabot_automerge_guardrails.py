@@ -382,6 +382,9 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
     assert "steps.ghsa.outputs.advisory_ok == 'true'" in cond
     assert "steps.ghsa.outputs.security_track != 'true'" in cond
     assert "steps.age.outputs.age_ok == 'true'" in cond, "merge not gated on the release-age guard"
+    assert "steps.authors.outputs.sole_author == 'true'" in cond, (
+        "merge not gated on every commit being Dependabot's own (BACKLOG #5593)"
+    )
     # the in-scope update-type gate is still present (any patch / dev-only minor)
     assert "version-update:semver-patch" in cond
 
@@ -398,7 +401,7 @@ def test_new_steps_take_every_input_through_env_not_interpolation() -> None:
     This is zizmor template-injection parity asserted in-tree — a PR-controlled value pasted into a
     shell body is a code-execution seam — and it is simultaneously the precondition that lets the
     behavioural tests below execute the shipped bodies verbatim."""
-    for step_id in ("allowset", "age"):
+    for step_id in ("allowset", "age", "authors", "disarm"):
         step = _step(step_id)
         body = str(step.get("run", ""))
         assert "${{" not in body, (
@@ -997,7 +1000,8 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
     [
         ("armed on an earlier head is disarmed", "true", {}, 0, True, "false"),
         ("not armed: nothing to do", "false", {}, 0, False, "false"),
-        ("state unreadable fails closed", "true", {"VIEW_FAIL": "1"}, 1, False, "true"),
+        # Unknown is not "not armed": it disarms anyway, then cannot confirm, so the step is red.
+        ("state unreadable: disarms anyway", "true", {"VIEW_FAIL": "1"}, 1, True, "false"),
         ("a refused disarm fails closed", "true", {"DISARM_FAIL": "1"}, 1, True, "true"),
         ("a disarm that did not take fails closed", "true", {"DISARM_NOOP": "1"}, 1, True, "true"),
     ],
@@ -1029,3 +1033,96 @@ def test_disarm_step_behaviour(
     called = any("--disable-auto" in ln for ln in log.read_text(encoding="utf-8").splitlines())
     assert called is disarm_called, f"{label}: disarm called={called}{_diagnostic(run)}"
     assert state.read_text(encoding="utf-8").strip() == end_state, label
+
+
+def _gh_rows_stub(tmp_path: Path, rows: str | None) -> Path:
+    """A ``gh`` that prints ``rows`` (already the ``--jq`` result), or fails like an HTTP error."""
+    stub_dir = tmp_path / "ghstub"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    if rows is None:
+        body = '#!/usr/bin/env bash\necho \'{"message":"Not Found"}\'\nexit 1\n'
+    else:
+        (stub_dir / "rows.txt").write_text(rows, encoding="utf-8", newline="\n")
+        body = '#!/usr/bin/env bash\ncat "$(dirname "$0")/rows.txt"\n'
+    stub.write_text(body, encoding="utf-8", newline="\n")
+    stub.chmod(0o755)
+    return stub_dir
+
+
+@pytest.mark.parametrize(
+    ("label", "rows", "expected"),
+    [
+        (
+            "only verified Dependabot commits",
+            "dependabot[bot]\ttrue\ndependabot[bot]\ttrue\n",
+            "true",
+        ),
+        ("a commit by someone else", "dependabot[bot]\ttrue\nsomeone\ttrue\n", "false"),
+        ("an unverified Dependabot commit", "dependabot[bot]\tfalse\n", "false"),
+        ("an author with no GitHub login", "\ttrue\n", "false"),
+        ("an empty commit list", "", "false"),
+        ("the API errors", None, "false"),
+    ],
+)
+def test_authors_step_holds_any_commit_not_dependabots_own(
+    label: str, rows: str | None, expected: str, tmp_path: Path
+) -> None:
+    """fetch-metadata reads only the first commit, so an appended commit must hold the PR."""
+    run = _run_step_body(
+        "authors",
+        {"REPO": "example/example", "PR_NUMBER": "1", "GH_TOKEN": "stub"},
+        tmp_path,
+        path_prepend=_gh_rows_stub(tmp_path, rows),
+    )
+    assert run.rc == 0, f"{label}: rc={run.rc}{_diagnostic(run)}"
+    assert run.outputs.get("sole_author") == expected, f"{label}{_diagnostic(run)}"
+
+
+def _gh_arm_stub(tmp_path: Path, arm_ok: bool, head: str | None) -> Path:
+    stub_dir = tmp_path / "ghstub"
+    stub_dir.mkdir()
+    stub = stub_dir / "gh"
+    view = "exit 1" if head is None else f"echo {head}"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1 $2" in\n'
+        f'  "pr merge") exit {0 if arm_ok else 1} ;;\n'
+        f'  "pr view") {view} ;;\n'
+        "esac\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    stub.chmod(0o755)
+    return stub_dir
+
+
+_EVALUATED = "a" * 40
+
+
+@pytest.mark.parametrize(
+    ("label", "arm_ok", "head", "rc"),
+    [
+        ("armed", True, _EVALUATED, 0),
+        ("refused because the head moved", False, "b" * 40, 0),
+        ("refused on the evaluated head", False, _EVALUATED, 1),
+        ("refused and the head is unreadable", False, None, 1),
+    ],
+)
+def test_merge_step_passes_only_a_head_moved_refusal(
+    label: str, arm_ok: bool, head: str | None, rc: int, tmp_path: Path
+) -> None:
+    """The benign race (a push while this run evaluated) is not a red run; anything else is."""
+    merge = next(s for s in _steps() if "gh pr merge --auto" in str(s.get("run", "")))
+    bash = require_bash(tmp_path)
+    script = tmp_path / "merge.sh"
+    script.write_text(str(merge["run"]), encoding="utf-8", newline="\n")
+    stub_dir = _gh_arm_stub(tmp_path, arm_ok, head)
+    env = probe_env(Path(bash), dict(os.environ))
+    env.update({"PR_URL": "https://github.com/example/example/pull/1", "HEAD_SHA": _EVALUATED})
+    env["PATH"] = f"{stub_dir.as_posix()}{os.pathsep}{env.get('PATH', '')}"
+    _assert_stubs_win(bash, stub_dir, env)
+    proc = subprocess.run(
+        [bash, "-e", script.as_posix()], capture_output=True, text=True, timeout=120, env=env
+    )
+    assert proc.returncode == rc, f"{label}: rc={proc.returncode}\n{proc.stdout}{proc.stderr}"

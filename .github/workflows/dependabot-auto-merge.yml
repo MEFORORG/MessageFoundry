@@ -100,14 +100,15 @@ jobs:
     timeout-minutes: 10
     steps:
       # BACKLOG #5593. A push to the PR (an A3 lock-resync commit, a rebase, or anyone's commit) changes
-      # what the guardrails below evaluated, but auto-merge armed on the earlier head would stay armed
-      # and merge the new head once CI went green, whatever this run then decides. So every
-      # `synchronize` run DISARMS first, and only the merge step below re-arms, pinned to the head THIS
-      # run evaluated. FAILS CLOSED: an unreadable state, a failed disarm, or a state still armed after
-      # the disarm fails the step, and every later step is then skipped, so nothing re-arms.
-      # What this does not cover: once a PR is already in the merge queue, `--disable-auto` does not
-      # remove the entry (korus docs/TIPS-AND-TRICKS.md); whether a push dequeues it is GitHub's
-      # behaviour and is not measured here.
+      # what was approved, but auto-merge armed on the earlier head would stay armed and merge the new
+      # head once CI went green, whatever this run then decides. So every `synchronize` run DISARMS
+      # first, and only the merge step below re-arms, pinned to the head THIS run evaluated and only
+      # when every commit on the PR is Dependabot's own (the `authors` step). FAILS CLOSED: when the
+      # state cannot be read it disarms anyway, and a failed disarm, or a state that does not read
+      # back as disarmed, fails the step, so every later step is skipped and nothing re-arms.
+      # What this does not cover: it reads the auto-merge REQUEST only. Once a PR is already in the
+      # merge queue, `--disable-auto` does not remove the entry (korus docs/TIPS-AND-TRICKS.md);
+      # whether a push dequeues it is GitHub's behaviour and is not measured here.
       - name: Disarm auto-merge armed on an earlier head
         id: disarm
         if: github.event.action == 'synchronize'
@@ -121,13 +122,14 @@ jobs:
           armed="$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null)" || armed="ERR"
           case "$armed" in
             false)
-              echo "::notice::auto-merge is not armed on this PR — nothing to disarm."
+              echo "::notice::no auto-merge request is armed on this PR (a merge-queue entry is not read here)."
               exit 0
               ;;
             true) ;;
             *)
-              echo "::error::could not read this PR's auto-merge state — failing closed, nothing re-arms."
-              exit 1
+              # Unknown is not "not armed": an arm on the earlier head may still be live, so disarm
+              # anyway. The read-back below decides whether the step passes.
+              echo "::warning::could not read this PR's auto-merge state — disarming anyway."
               ;;
           esac
           gh pr merge --disable-auto "$PR_URL"
@@ -450,6 +452,38 @@ jobs:
           done <<< "$pairs"
           echo "age_ok=$age_ok" >> "$GITHUB_OUTPUT"
 
+      # BACKLOG #5593. fetch-metadata derives every output above from the PR's FIRST commit, its body
+      # and its branch name, never from the head, so a commit appended by anyone else would inherit
+      # the first commit's verdict. Re-arming is therefore allowed only when EVERY commit on the PR is
+      # authored by dependabot[bot] and carries a verified signature. That costs nothing today: the
+      # A3 lock-resync commits land only on uv PRs, whose allow row is empty, so those never re-arm.
+      # FAILS CLOSED: an API error, an empty list, an unknown author or an unverified commit all
+      # emit false. Gated on the allow-set so a held PR makes no API call.
+      - name: Require every commit on the PR to be Dependabot's own
+        id: authors
+        if: steps.allowset.outputs.eligible == 'true'
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          rows="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" --jq '.[] | [(.author.login // ""), (.commit.verification.verified | tostring)] | @tsv' 2>/dev/null)" || rows="ERR"
+          if [ "$rows" = "ERR" ] || [ -z "$rows" ]; then
+            echo "::warning::could not list this PR's commits — failing closed (manual review)."
+            echo "sole_author=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sole_author=true
+          while IFS="$(printf '\t')" read -r login verified; do
+            if [ "$login" != "dependabot[bot]" ] || [ "$verified" != "true" ]; then
+              echo "::notice::the PR carries a commit by '${login:-<unknown>}' (verified=${verified:-<none>}) — routing to manual review."
+              sole_author=false
+              break
+            fi
+          done <<< "$rows"
+          echo "sole_author=$sole_author" >> "$GITHUB_OUTPUT"
+
       - name: Enable auto-merge for in-scope updates
         # Auto-merge only when: (a) EVERY dependency is on its ecosystem's allow row (#3), AND (b)
         # for the SECURITY track ONLY, a published advisory is confirmed (#2) AND the candidate
@@ -458,6 +492,7 @@ jobs:
         # advisory_ok nor age_ok is required there, which is why both are emitted false on that path.
         if: >-
           steps.allowset.outputs.eligible == 'true' &&
+          steps.authors.outputs.sole_author == 'true' &&
           (steps.ghsa.outputs.security_track != 'true' ||
            (steps.ghsa.outputs.advisory_ok == 'true' &&
             steps.age.outputs.age_ok == 'true')) &&
@@ -467,8 +502,26 @@ jobs:
         # PINNED to the head this run evaluated (BACKLOG #5593): `--match-head-commit` makes GitHub
         # refuse to arm when the PR's head is no longer that commit, so a push that lands while this
         # run is evaluating cannot be armed on the strength of the earlier head's verdict. That push
-        # starts its own run, which the disarm step above serves.
-        run: gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
+        # starts its own run, which the disarm step above serves, so a refusal because the head MOVED
+        # is the expected outcome of that race and passes with a notice. Any other failure is red.
+        run: |
+          set -u
+          if gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"; then
+            exit 0
+          fi
+          now="$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid 2>/dev/null)" || now="ERR"
+          case "$now" in
+            ""|ERR|*[!0-9a-f]*)
+              echo "::error::arming failed and the PR head could not be read."
+              exit 1
+              ;;
+          esac
+          if [ "$now" != "$HEAD_SHA" ]; then
+            echo "::notice::the head moved from $HEAD_SHA to $now while this run evaluated; the run for the new head decides."
+            exit 0
+          fi
+          echo "::error::arming failed on the head this run evaluated."
+          exit 1
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
