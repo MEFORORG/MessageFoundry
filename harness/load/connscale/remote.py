@@ -174,8 +174,12 @@ class ConnScaleRemoteReport:
                 f"  sink: {self.sink_host} ports={list(self.sink_ports)} "
                 f"({len(self.sink_ports)} local listener process-band)",
                 f"  offered={self.offered_aggregate_rate:.0f}/s "
-                f"achieved={self.achieved_aggregate_rate:.0f}/s "
-                f"delivered={self.delivered_aggregate_rate:.0f}/s",
+                + (
+                    f"achieved={self.achieved_aggregate_rate:.0f}/s "
+                    f"delivered={self.delivered_aggregate_rate:.0f}/s"
+                    if self.rates_measured
+                    else "achieved=n/a delivered=n/a (a hold-bracket /stats sample failed)"
+                ),
                 f"  zero_loss={loss} in_pipeline_peak={self.in_pipeline_peak} drain={drain} "
                 f"deferred={self.deferred} timeouts={self.timeouts}",
                 f"  window=[{self.hold_start_iso} .. {self.drain_complete_iso}]",

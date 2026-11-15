@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -431,6 +432,9 @@ def aggregate_cell_record(
     agg_deferred = sum(_traffic(r, "deferred") for r in proc_reports)
     agg_timeouts = sum(_traffic(r, "timeouts") for r in proc_reports)
     agg_sink_received = sum(int(_noloss(r, "sink_received") or 0) for r in proc_reports)
+    if agg_sent <= 0:
+        # A fleet that sent nothing reconciles vacuously (BACKLOG #5431's empty run, at the cell).
+        raise ConnScaleError(f"cell {cell.cell_id}: the fleet sent nothing")
     offered = sum(float(r.get("offered_aggregate_rate", 0.0)) for r in proc_reports)
 
     engine_read = _engine_gauge("engine_read")
@@ -531,7 +535,12 @@ def _bands_rate_window(proc_reports: list[dict[str, Any]]) -> str | None:
     back joined with ``|``, as ``report.records_rate_window`` joins them.
     """
     windows = sorted(
-        {str(r.get("throughput", {}).get("rate_window") or "unrecorded") for r in proc_reports}
+        {
+            str(r.get("throughput", {}).get("rate_window") or "unrecorded")
+            for r in proc_reports
+            # A band whose bracket sample failed measured no rate, so it names no window to join.
+            if r.get("throughput", {}).get("rates_measured") is not False
+        }
     )
     if not windows or windows == ["unrecorded"]:
         return None
@@ -875,8 +884,13 @@ def _ready_number[N: (int, float)](
     not a number (BACKLOG #5428). A bare ``int(ready[key])`` raised KeyError or TypeError, which the
     driver did not catch, so a malformed READY ended it without posting DONE."""
     value = ready.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ConnScaleError(f"READY field {key!r} is {value!r}, not a number")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or (kind is int and value != int(value))
+    ):
+        raise ConnScaleError(f"READY field {key!r} is {value!r}, not a finite {kind.__name__}")
     return kind(value)
 
 
@@ -904,10 +918,15 @@ async def _drive_cell_fleet(
     count = _ready_number(ready, "count", int)
     hold_seconds = _ready_number(ready, "hold_seconds", float, default=60.0)
     drain_timeout = _ready_number(ready, "drain_timeout_s", float, default=300.0)
-    aggregate_rate = _ready_number(ready, "aggregate_rate", float, default=0.0)
+    # Required, and positive: it decides whether any load is offered at all.
+    aggregate_rate = _ready_number(ready, "aggregate_rate", float)
+    if aggregate_rate <= 0.0 or count < 1:
+        raise ConnScaleError(
+            f"READY offers no load: aggregate_rate {aggregate_rate}, count {count}"
+        )
     # Per-connection rate so the SUMMED offered load across the fleet == the profile's aggregate for the
     # cell (each process offers per_conn_rate * its share; the shares sum to `count`).
-    per_conn_rate = aggregate_rate / count if count > 0 else 0.0
+    per_conn_rate = aggregate_rate / count
 
     plans = plan_driver_bands(
         inbound_base=inbound_base, count=count, sink_base=sink_base, sink_procs=sink_procs
@@ -974,6 +993,7 @@ async def run_batch_driver(
     # placeholder trial would skew its arm's mean and spread, and instead fail the run outright, the
     # way run_connscale's `steps_missed` does; a wholly-missing arm also surfaces in the verdict.
     cells_missed = 0
+    cells_failed = 0  # cells whose drive failed: their placeholder records alone must not decide
     missing_detail: dict[tuple[str, str, int], str] = {}
 
     for cell in cells:
@@ -1012,6 +1032,7 @@ async def run_batch_driver(
             # surfaces in the zero-loss SLO + the B0/B1 verdict — never a silent gap in the matrix
             # (mirrors the connscale runner failing a step rather than dropping it).
             notes.append(f"CELL {cell.cell_id} drive failed: {exc}")
+            cells_failed += 1
             record = _failed_cell_record(cell, str(exc))
             done = {"cell_id": cell.cell_id, "error": str(exc)}
         # One record and one DONE per cell, posted outside the try so a failed post cannot add a
@@ -1028,6 +1049,9 @@ async def run_batch_driver(
     result_ok = (
         bool(records)
         and cells_missed == 0
+        # A failed drive fails the run even with zero_loss off, where its 0.0 msg/s placeholder
+        # would otherwise only skew its arm's mean.
+        and cells_failed == 0
         and all(c.ok for c in slos)
         and (batch_comparison is None or batch_comparison.ok)
     )

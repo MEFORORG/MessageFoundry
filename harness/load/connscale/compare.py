@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import math
 import statistics
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from harness.load.connscale.profile import FUSE_OFF, FUSE_ON
@@ -83,6 +83,9 @@ class _ArmMetrics:
     backlog: int
     no_loss_detail: str
     trials: int = 1
+    # The intake rate's mean over the trials that held zero-loss; ``None`` when none did. The throughput
+    # guard compares against it, so one lossy per_lane trial does not make the whole row incomparable.
+    clean_read_per_s: float | None = None
     # Every trial's post-load drain completed. Kept apart from the loss reconcile, as ``_FuseArm`` keeps
     # it: a timed-out drain stranded rows somewhere, which is not the same claim as a lost message.
     drain_completed: bool = True
@@ -100,7 +103,7 @@ class _ArmMetrics:
             if not r.no_loss.ok
         ]
 
-        def _mean_or_none(values: list[float | None]) -> float | None:
+        def _mean_or_none(values: Iterable[float | None]) -> float | None:
             present = [v for v in values if v is not None]
             return statistics.fmean(present) if present else None
 
@@ -127,6 +130,7 @@ class _ArmMetrics:
             no_loss_detail="; ".join(losses) or last.no_loss.detail,
             trials=len(recs),
             drain_completed=all(r.drain_seconds is not None for r in recs),
+            clean_read_per_s=_mean_or_none([r.achieved_read_per_s for r in recs if r.no_loss.ok]),
         )
 
 
@@ -155,7 +159,13 @@ class ComparisonRow:
     def resilience_win(self) -> bool:
         """per_lane breached zero-loss but pooled held it — the 'pooled survives, per_lane breaks'
         outcome the poller-zeroed throughput delta cannot show."""
-        return not self.pooled_missing and not self.baseline.no_loss_ok and not self.candidate_lost
+        return (
+            not self.pooled_missing
+            and not self.baseline.no_loss_ok
+            and not self.candidate_lost
+            and self.candidate is not None
+            and self.candidate.drain_completed
+        )
 
     @property
     def ok(self) -> bool:
@@ -406,9 +416,14 @@ def build_comparison(
         # The throughput delta is only SOUND when both arms held zero-loss; a breached (drowning)
         # baseline has a poller-zeroed achieved rate we must not read as a pass/fail.
         candidate_lost = not cand.no_loss_ok
-        throughput_comparable = base.no_loss_ok and cand.no_loss_ok
+        # Sound when the pooled arm held zero-loss and at least one per_lane trial did: compare against
+        # the clean per_lane trials only (BACKLOG #5429), not the all-trials mean a drowning trial
+        # zeroes, and not "no comparison" because one trial of several drowned.
+        throughput_comparable = cand.no_loss_ok and base.clean_read_per_s is not None
         thr_ok, thr_delta = _throughput_verdict(
-            base.achieved_read_per_s, cand.achieved_read_per_s, throughput_tolerance
+            base.clean_read_per_s if base.clean_read_per_s is not None else 0.0,
+            cand.achieved_read_per_s,
+            throughput_tolerance,
         )
         collapse, col_delta, ratio = _collapse_verdict(
             base.idle_poll_per_s, cand.idle_poll_per_s, collapse_material_ratio, idle_floor_per_s
@@ -718,8 +733,8 @@ class _FuseArm:
     # whole-pipeline ``in_pipeline`` gauge (NOT-DONE rows across ingress+routed+outbound) reaches 0, so a
     # timeout means rows stranded in SOME stage. A ``None`` here is the WORST case ("never drained"), NOT
     # "unmeasured": a timed-out trial poisons the worst-case so a partial strand can't be dropped. (The
-    # outbound-only ``no_loss.backlog`` can read 0 while ingress/routed still hold rows, so it is NOT a
-    # whole-pipeline gauge — drain completion is.) ---
+    # final ``no_loss.backlog`` is one reading after the drain wait; drain completion is the signal that
+    # the whole pipeline emptied within the timeout, so it is the gate.) ---
     drain_seconds_worst: float | None
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
@@ -1159,9 +1174,8 @@ def _in_pipeline_ok(base: _FuseArm, cand: _FuseArm, tolerance: float) -> bool:
     ``drain_seconds`` only once the whole-pipeline ``in_pipeline`` gauge (NOT-DONE rows across
     ingress+routed+outbound) reaches 0 and the counters settle; on timeout it returns ``None``. So
     ``drain_seconds_worst is None`` means at least one trial's drain never completed — rows stranded in
-    SOME stage. (The outbound-only ``no_loss.backlog`` can read 0 while ingress/routed still hold rows,
-    so it is NOT usable here — a fully-offered arm that strands upstream would false-pass; the whole-
-    pipeline drain gauge is the only reliable one.)
+    SOME stage. (The final ``no_loss.backlog`` is one reading after the drain wait, not the drain
+    itself, so it is not used here; the whole-pipeline drain completion is the gate.)
 
     1. **Candidate fully drained.** If B1's worst drain did NOT complete (``drain_seconds_worst is
        None``) the whole pipeline never emptied — the backlog mirage — so FAIL, never auto-pass. This is

@@ -323,6 +323,39 @@ def test_an_orphan_candidate_cell_fails_the_ab_bug_5429() -> None:
     assert "NO per_lane BASELINE (the A/B fails): [fixed_aggregate] N=1000" in cmp.render_table()
 
 
+def test_one_lossy_baseline_trial_keeps_the_throughput_guard_bug_5429() -> None:
+    # per_lane drowned in trial 0 only; pooled held zero-loss at a quarter of the rate on every trial.
+    # The regression must still fail against the clean per_lane trials, not pass as a resilience win.
+    recs = [
+        _record(
+            claim_mode="per_lane", count=500, achieved_read=0.0, idle_poll=100.0, no_loss_ok=False
+        ),
+        _record(claim_mode="pooled", count=500, achieved_read=100.0, idle_poll=0.0),
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _record(claim_mode="pooled", count=500, achieved_read=100.0, idle_poll=0.0),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    (row,) = cmp.rows
+    assert row.baseline.clean_read_per_s == 400.0
+    assert row.throughput_comparable
+    assert not row.throughput_ok
+    assert not cmp.ok
+
+
+def test_an_undrained_pooled_arm_is_not_a_resilience_win_bug_5429() -> None:
+    recs = [
+        _record(
+            claim_mode="per_lane", count=500, achieved_read=0.0, idle_poll=100.0, no_loss_ok=False
+        ),
+        _timed_out(_record(claim_mode="pooled", count=500, achieved_read=399.0, idle_poll=0.0)),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert not cmp.ok
+    assert cmp.resilience_wins == 0
+
+
 def test_trials_aggregate_to_the_mean_rate_bug_5429() -> None:
     recs = [
         _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),

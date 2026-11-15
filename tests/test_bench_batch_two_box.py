@@ -948,6 +948,12 @@ async def test_a_well_formed_run_still_passes_bug_5428(monkeypatch: pytest.Monke
         ),
         pytest.param(lambda r: {**r, "count": None}, id="null-field"),
         pytest.param(lambda r: {**r, "sink_procs": "6"}, id="string-field"),
+        pytest.param(lambda r: {**r, "count": float("inf")}, id="infinite-field"),
+        pytest.param(lambda r: {**r, "inbound_base": 20000.7}, id="fractional-port"),
+        pytest.param(
+            lambda r: {k: v for k, v in r.items() if k != "aggregate_rate"}, id="no-offered-rate"
+        ),
+        pytest.param(lambda r: {**r, "aggregate_rate": 0.0}, id="zero-offered-rate"),
     ],
 )
 async def test_a_malformed_ready_fails_its_cell_and_still_posts_done_bug_5428(
@@ -958,7 +964,7 @@ async def test_a_malformed_ready_fails_its_cell_and_still_posts_done_bug_5428(
     report, cells, first_done = await _drive_against_stub_engine(monkeypatch, ready)
     assert len(report.records) == len(cells)
     assert report.records[0].no_loss.ok is False
-    assert "READY field" in report.records[0].no_loss.detail
+    assert "READY" in report.records[0].no_loss.detail
     assert first_done is not None
     assert first_done["cell_id"] == cells[0].cell_id
     assert "error" in first_done
@@ -980,6 +986,30 @@ def test_a_cell_with_no_measured_band_rate_is_refused_bug_5431() -> None:
     assert bb.aggregate_cell_record(cell, [band, unmeasured]).achieved_read_per_s == 100.0
     with pytest.raises(ConnScaleError, match="no band measured"):
         bb.aggregate_cell_record(cell, [unmeasured, dict(unmeasured)])
+    # The unmeasured band names no window, so the cell keeps the measured band's.
+    unmeasured_nowin = dict(
+        band, throughput={**band["throughput"], "rates_measured": False, "rate_window": None}
+    )
+    assert bb.aggregate_cell_record(cell, [band, unmeasured_nowin]).rate_window == "hold_bracket"
+
+
+def test_a_cell_whose_fleet_sent_nothing_is_refused_bug_5431() -> None:
+    cell = bb.iter_batch_cells(_profile(), claim_mode="pooled")[0]
+    empty = _fake_proc(sent=0, sink=0, read=0.0, arm_b1=False)
+    with pytest.raises(ConnScaleError, match="sent nothing"):
+        bb.aggregate_cell_record(cell, [empty])
+
+
+async def test_a_failed_drive_fails_the_run_without_the_zero_loss_slo_bug_5428(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = _MINIMAL_BATCH + "\n[connscale.slo]\nzero_loss = false\n"
+    report, cells, _ = await _drive_against_stub_engine(
+        monkeypatch, lambda r: {**r, "count": None}, profile_text=text
+    )
+    assert len(report.records) == len(cells)
+    assert not report.result_ok
+    assert report.exit_code != 0
 
 
 def test_a_two_box_cell_names_the_window_its_bands_report() -> None:
