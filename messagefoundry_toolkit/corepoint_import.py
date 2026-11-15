@@ -937,14 +937,15 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     **plus its whole-tree clones**. A clone — a ``MsgTreeCopy`` of the input's ROOT into another
     handle — holds exactly the input's content, so a write to it is a write to what ``msg`` will be; a
     *partial* copy is not, and is excluded, because the destination tree then holds only the sub-node
-    that was copied. A handle that ALSO receives a whole-tree copy of anything else (another tree, a
-    ``$variable``, a partial path) is not held, since its content may be that other thing; when that
-    handle is the input itself, nothing is held.
+    that was copied. A handle that ALSO receives, in a copy the scan reads (it skips a markup-free
+    one), a whole-tree copy of anything else (another tree, a ``$variable``, a partial path) is not
+    held, since its content may be that other thing; when that handle is the input itself, nothing
+    is held.
 
-    ``subject`` is ``held`` when the scan reads no send (it skips a markup-free one), the one held
-    handle the live sends it reads deliver when they deliver exactly one, and empty otherwise. Two
-    held handles are two trees in Corepoint, and folding both onto one ``msg`` would put a write meant
-    for one into the other's send. An empty subject means :func:`_map_roles` maps no path-bearing
+    ``subject`` is ``held`` when the scan reads no send (it skips a markup-free one), the handle the
+    live sends it reads deliver when every one of them delivers that same handle and it is held, and
+    empty otherwise. Two held handles are two trees in Corepoint, and folding both onto one ``msg``
+    would put a write meant for one into the other's send. An empty subject means :func:`_map_roles` maps no path-bearing
     statement, so each one it reads degrades to a TODO — the honest output, because a cross-message
     write rendered as ``msg.set`` silently mutates the wrong message. A write that takes the flat
     reading is not gated by the subject (ADR 0086 §2(b″)). On the step 1 path, a role-parsed
