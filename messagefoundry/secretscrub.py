@@ -1889,8 +1889,10 @@ _STAGE_PHI_MARKER = r"\[redacted\]"
 # block's marker stands on its own line: armor header lines (``Name: value``, as PGP's ``Version:``
 # or an encrypted PEM's ``Proc-Type:`` and ``DEK-Info:``), then the body one whole line at a time,
 # each a run of base64 or base64url characters, a JSON-escaped "/" included, or the placeholder the
-# support bundle's long-base64 sweep wrote over a long line, ending at a line break, a quote (the
-# last line of a truncated repr) or the end of the text, then the end marker if one follows. It ends
+# support bundle's long-base64 sweep wrote over a long line, alone on its line, so a line a pass
+# left as ``label=`` and a placeholder ends the body and keeps its label; ending at a line break, a
+# quote that closes a value (the last line of a truncated repr: white space, ",", ")", "]", "}" or
+# the end follows it) or the end of the text, then the end marker if one follows. It ends
 # at the first line that is not that shape: a line holding a space, a quote before its end, or any
 # other character outside that set stays, so the last line of a block cut short prints where text
 # follows it on that line. A line of one word is that shape, and is taken. An escaped line break is
@@ -1932,8 +1934,8 @@ _KEY_FORM_LINES = (
     r"(?=[ \t]*+(?:\r?\n|" + _KEY_ESCAPED_BREAK + r"))"
     r"(?:" + _KEY_BREAK + r"*+[A-Z][A-Za-z-]*+:[^\S\r\n](?:[^\r\n\\-]++|-(?!----))*+"
     r"(?=\r?\n|\\++[rn]))*+"
-    r"(?:" + _KEY_BREAK + r"*+(?:" + _KEY_CHARS + r"++|\\/|" + _STAGE_PLACEHOLDER + r")++"
-    r"(?=[ \t]*+(?:\r?\n|" + _KEY_ESCAPED_BREAK + r"|\\*+['\"]|\Z)))++"
+    r"(?:" + _KEY_BREAK + r"*+(?:(?:" + _KEY_CHARS + r"++|\\/)++|" + _STAGE_PLACEHOLDER + r")"
+    r"(?=[ \t]*+(?:\r?\n|" + _KEY_ESCAPED_BREAK + r"|\\*+['\"](?=[\s,)\]}]|\Z)|\Z)))++"
     r"(?:" + _KEY_BREAK + r"*+" + _KEY_END_MARKER + r")?+"
 )
 _PRIVATE_KEY_BODY = re.compile(
@@ -1950,13 +1952,14 @@ _PRIVATE_KEY_BODY = re.compile(
 # A DSN PASSWORD BEHIND AN EMPTY USERNAME (BACKLOG #5549). ``_DSN_PASSWORD`` needs one user character
 # before the ":", so ``redis://:pw@cache`` and ``postgres://:pw@db``, as Redis and PostgreSQL may
 # write a password with no user, were no match. Here the ":" right after "://" opens the password, and
-# it runs to the "@" that ends it. It stops at white space, "/" and "@", as the userinfo does, and at
-# the HL7 separators "|", "^", "~" and "&", so a run never crosses a field of an HL7 line. A password
-# holding one of those prints, as it did before.
+# it runs to the "@" that ends it. It stops at white space, "/" and "@", as the userinfo does, at
+# the HL7 separators "|", "^", "~" and "&", so a run never crosses a field of an HL7 line, and at
+# "=", "?", "#", ";", a quote, "<", ">", "[" and "]", so it never takes a label, a placeholder or a
+# query a pass already read. A password holding one of those prints, as it did before.
 #
 # LINEAR. A match starts only at "://:", and the run ends at the next "/", which every later "://"
 # holds.
-_DSN_EMPTY_USER_PASSWORD = re.compile(r"://:[^\s/@|^~&]++(?=@)")
+_DSN_EMPTY_USER_PASSWORD = re.compile(r"://:[^\s/@|^~&=?#;'\"<>\[\]]++(?=@)")
 
 # A DSN PASSWORD HOLDING AN UNENCODED "@" (BACKLOG #5549). A URL parser ends the userinfo at the LAST
 # "@" of the authority, which is how a driver reads it, but ``_DSN_PASSWORD`` ends the password at the
@@ -2050,11 +2053,17 @@ _QUOTED_AFTER_PLACEHOLDER = re.compile(
 # so a placeholder followed directly by a value character there is that remnant, or the text after a
 # quoted value the pattern took with its closer, as in ``MEFOR_X='v'abc 'w'``; both are hidden. The
 # run is taken to the first quote that closes a value, one followed by white space, punctuation that
-# ends a value, an HL7 separator or the end of the text, and that quote with it. A quote followed by
-# anything else is inside the value and taken. A run that reaches the line's end or the next
-# placeholder first is left, as it printed before, so it never runs into a later label's value.
-# Punctuation right after the placeholder, such as the ")" or "," after a closed quoted value or the
-# "}" a braced value closes on, is no remnant.
+# ends a value, an HL7 separator or the end of the text, spaces inside the literal included, and then
+# on through whatever is glued after that quote; a run with no such quote, before a line break or a
+# placeholder, is taken to the next white space. Quotes, later labels and placeholders in the glued
+# part are taken, and a line break and the other white space the control-character escape writes as
+# a backslash escape count as glue, since that is how a later reading sees them. That is where a
+# second handler, and the support bundle reading the log, would end it: ``_MEFOR_SECRET`` read again takes the placeholder and what is glued to it, one quote per pass, so
+# their readings under the code before this stage hid all of it. Stopping sooner and writing spaces
+# would end that glue, and those readings would then print the rest. What it costs: a label glued
+# to the run, and its placeholder, are hidden with it. Punctuation right after the placeholder, such
+# as the ")" or "," after a closed quoted value or the "}" a braced value closes on, is no remnant,
+# and stays glued as the passes left it.
 #
 # UNDER A NAME HOLDING A CREDENTIAL WORD, as ``MEFOR_DB_PASSWORD=b'v w'``, a later pass takes the
 # literal's first word as well, and leaves ``MEFOR_DB_PASSWORD=<redacted> w'``: white space, then a
@@ -2064,21 +2073,25 @@ _QUOTED_AFTER_PLACEHOLDER = re.compile(
 # a ``MEFOR_`` value that ends in an apostrophe, as ``MEFOR_PORT=6661 and the operators' notes``, is
 # hidden up to the apostrophe.
 #
-# LINEAR. A match starts only at a ``MEFOR_`` name and placeholder, and its run ends at the next
-# placeholder at the latest, which every later match starts with.
+# LINEAR. A match starts only at a ``MEFOR_`` name and placeholder. The run to a closing quote ends
+# at a line break or the next placeholder at the latest, which every later match starts with, and
+# only then is the walk to white space tried; a glued run ends at white space, and a later start
+# inside it is passed over with it. The run after white space ends at the next placeholder at the
+# latest.
 _MEFOR_VALUE_CLOSER = r"['\"](?=[\s,;:.)\]}|&>^~'\"!/]|\Z)"
+_MEFOR_GLUE = r"(?:\S|[\r\n\x0b\x0c\x1c-\x1f\x85\u2028\u2029])"
 _MEFOR_GLUED_AFTER_PLACEHOLDER = re.compile(
     r"(\bMEFOR_[A-Z0-9_]++=" + _STAGE_PLACEHOLDER + r")"
     r"(?:(?=[^\s'\"(){}\[\],;:.])"
-    r"(?:(?!"
+    r"(?:(?:(?!"
     + _STAGE_PLACEHOLDER
     + r")[^'\"\r\n]|['\"](?![\s,;:.)\]}|&>^~'\"!/]|\Z))*+"
     + _MEFOR_VALUE_CLOSER
-    + r"|[^\S\r\n]++(?:(?!"
-    + _STAGE_PLACEHOLDER
-    + r")[^'\"\r\n])*+"
-    + _MEFOR_VALUE_CLOSER
-    + r")"
+    + _MEFOR_GLUE
+    + r"*+|"
+    + _MEFOR_GLUE
+    + r"++)"
+    r"|[^\S\r\n]++(?:(?!" + _STAGE_PLACEHOLDER + r")[^'\"\r\n])*+" + _MEFOR_VALUE_CLOSER + r")"
 )
 
 
@@ -2125,9 +2138,10 @@ def scrub_added_shapes(text: str, placeholder: str = CREDENTIAL_PLACEHOLDER) -> 
     escape, a JSON or repr escape, or ``controlchars.log_field_token``. So every character of the
     result sits at or after where its input character stood, and that holds after the escape too.
     A slice or a bound taken after this stage, at any site, keeps no input text the same cut of the
-    input kept not, and the stage writes no input text a pass hid. A surface that cut after its
-    redaction before this stage was added, such as the store error text or a bounded log field, is
-    therefore left as it was. What it costs: the spaces show roughly how long the hidden value was,
+    input kept not, and the stage writes no input text a pass hid. That is a property of one reading.
+    A surface that reads its own output again, as a second handler or a bounded log field's settled
+    reading does, runs the passes over the spaces, and the comment above the patterns says what that
+    can change. What it costs: the spaces show roughly how long the hidden value was,
     and a value with line breaks or non-ASCII characters widens the line by up to twelve spaces for
     each. That is accepted, since every alternative either moved later text earlier or needed every
     cut site to change."""

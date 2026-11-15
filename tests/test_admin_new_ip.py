@@ -67,6 +67,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
 from tests._bound_proof import prove
+from tests._scrub_stage import without_the_added_stage
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 NEW_USER = {
@@ -1656,7 +1657,11 @@ def test_a_third_handler_does_not_unhide_the_path() -> None:
     reviewer's vector: main's forwarder wrote ``path=/MEFOR_X=<redacted> seen_ip=10.0.0.1``."""
     path, seen = _THIRD_HANDLER_HID[0], "10.0.0.1"
     seen_text = _bounded_address_text(seen)
-    main = _sink_lines(_OVER_HEAD + "path=%s%s", path, _seen_tail(seen_text), count=3)
+    with pytest.MonkeyPatch.context() as patch:
+        # As main ran, before the credential stage of BACKLOG #5546 to #5550, which hides the
+        # name on the first sink.
+        without_the_added_stage(patch)
+        main = _sink_lines(_OVER_HEAD + "path=%s%s", path, _seen_tail(seen_text), count=3)
     # The control: main's second sink printed the name and its third hid it.
     assert "DOE" in main[1] and "DOE" not in main[2], [ascii(line) for line in main]
     ours = _sink_lines(_REPEAT_HEAD + "%s", _new_ip_path_field(path), count=3)
@@ -1710,15 +1715,17 @@ def test_the_path_field_hides_no_less_than_main_with_three_handlers_over_quote_v
     shipped handlers hid prints on a sink of this branch's matching line (BACKLOG #3770)."""
     rng = random.Random(3)
     third_hid = 0
-    # 400 paths, not 300: the credential stage of BACKLOG #5546 to #5550 hides on the second handler
-    # some of what the third hid before, and 300 paths then held only 9 that the two wrote apart.
-    for _ in range(400):
+    for _ in range(300):
         path = _corpus_path(rng, _QUOTE_PIECES, prefix="/MEFOR_X=", most=7)
         assert not _hides_no_less_than_main(path, "10.0.0.1", count=3), ascii(path)
-        main = _sink_lines(_REPEAT_HEAD + "%s", path, count=3)
+        with pytest.MonkeyPatch.context() as patch:
+            without_the_added_stage(patch)
+            main = _sink_lines(_REPEAT_HEAD + "%s", path, count=3)
         third_hid += main[1] != main[2]
     # The control: the corpus holds paths that main's third handler wrote differently from its
-    # second, so a reading taken at two handlers is tested here.
+    # second, so a reading taken at two handlers is tested here. Read with the credential stage of
+    # BACKLOG #5546 to #5550 off, as main ran: that stage hides most of those paths' differences on
+    # the first handler, which is what makes the control's corpus.
     assert third_hid >= 10, third_hid
 
 
@@ -1730,6 +1737,9 @@ def test_a_reading_still_changing_at_the_cap_logs_the_placeholder(
     (BACKLOG #3770). The reviewer's path changes on main's third handler pass."""
     import messagefoundry.logging_setup as logging_setup
 
+    # The pass count below is the handlers' as main ran them. The credential stage of BACKLOG #5546
+    # to #5550 settles this path on its first pass, so it is off here; the cap is this test's subject.
+    without_the_added_stage(monkeypatch)
     path = _THIRD_HANDLER_HID[0]
     # The control: with the shipped cap the path reads, and its name is hidden.
     assert _new_ip_path_field(path) == '"/MEFOR_u005F_X_u003D_<redacted>"'

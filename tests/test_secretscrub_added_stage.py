@@ -378,6 +378,29 @@ def test_a_long_hidden_value_pulls_no_cut_text_into_view(surface: str, text: str
         assert "zq-tail-value" not in apply(text)
 
 
+@pytest.mark.parametrize(
+    "path",
+    ('/MEFOR_X=a"b"\'zq-tail-value', '/MEFOR_A_PW=vq0b"vq1pwd=-b"\'zq-tail-value'),
+)
+def test_a_mefor_remnant_is_hidden_to_white_space_on_the_settled_reading(path: str) -> None:
+    """The bounded field reads the chain until it settles, and under the code before the stage each
+    later pass took one more quote of a ``MEFOR_`` remnant until white space. The stage takes the
+    whole run at once, so spaces never end it early and the settled reading hides it all."""
+    assert "zq-tail-value" not in _new_ip_path_field(path)
+    with pytest.MonkeyPatch.context() as patch:
+        without_the_added_stage(patch)
+        assert "zq-tail-value" not in _new_ip_path_field(path)
+
+
+def test_a_key_body_and_an_empty_username_password_keep_a_label_a_pass_read() -> None:
+    """Neither takes a ``label=`` and its placeholder: a later reading would read that label's value
+    again, and the label tells the reader which credential was there."""
+    out = scrub_credentials(f"-----BEGIN RSA {_PK}-----\nMIIEowIB\npassword=hunter2\nnext")
+    assert f"\npassword={CREDENTIAL_PLACEHOLDER}\nnext" in out and "MIIEowIB" not in out, out
+    out = scrub_credentials("redis://:MEFOR_REDIS_PW=x'y'@cache.invalid")
+    assert f"MEFOR_REDIS_PW={CREDENTIAL_PLACEHOLDER}" in out, out
+
+
 def test_the_guard_diagnostic_keeps_its_bound() -> None:
     """The stage can lengthen text, and the log-write guard cuts after all of its redaction, the
     stage included, so the guard's bound still holds on a line the stage lengthens."""
@@ -566,6 +589,14 @@ _OLD_BRANCH_PROBES: tuple[str, ...] = (
     f"X: -----BEGIN RSA {_PK}-----\nX: -----BEGIN RSA {_PK}-----\na b zq-Hd_A-83",
     "/api/x token=<redacted>'zq-Gl_A-84 zq-Gl_B-85' x/zq-tail-value",
     "redis://:zq-Dsn_P-86@cache.invalid password=b'zq-Gl_C-87 w' then MEFOR_A='zq-Gl_D-88'",
+    # The fourth review's shapes, each printed on a surface that reads again: a MEFOR_ remnant the
+    # spaces cut short, an empty-username DSN run over a label, and a key line holding a label.
+    '/MEFOR_X=a"b"\'zq-Rr_A-89',
+    "redis://:MEFOR_REDIS_PW=x'y'@cache.invalid zq-Rr_B-90",
+    'MEFOR_A_PW=vq0b"vq1pwd=-b"\'vq5token=zq-Rr_C-91',
+    "pg://:MEFOR_A_PW=vq1<redacted>vq2'vq31970-01-01@vq5:vq6Bearer zq-Rr_D-92{",
+    f"-vq0\\nvq1-----BEGIN {_PK}-----\nvq2_password: vq4\n-----END {_PK}-----zq-Rr_E-93",
+    "Digest MEFOR_A_PW=vq19x1b'vq19x2b\"vq19x3'b'password=\"vq19x7\nzq-Rr_F-94",
 )
 
 #: What a substring of a line counts as for the guard: every run of characters that are not
@@ -656,6 +687,9 @@ class _Reading:
     #: On the two re-read surfaces: each secret printed now that the write-time chain did NOT print
     #: with the stage off, so a log line the code before the stage never wrote.
     beyond_first_surface: list[str]
+    #: On the two re-read surfaces: each secret printed now that the same re-read hid with the stage
+    #: off.
+    reread_newly: list[str]
 
 
 def _reading(monkeypatch: pytest.MonkeyPatch, corpus: list[str]) -> _Reading:
@@ -665,7 +699,7 @@ def _reading(monkeypatch: pytest.MonkeyPatch, corpus: list[str]) -> _Reading:
         before = _surface_outputs(corpus)
     secrets = [_secrets(line) for line in corpus]
     direct = {name for name, _apply in _SURFACES}
-    reading = _Reading([], 0, [])
+    reading = _Reading([], 0, [], [])
     for name in after:
         for i, line in enumerate(corpus):
             for secret in secrets[i]:
@@ -674,8 +708,11 @@ def _reading(monkeypatch: pytest.MonkeyPatch, corpus: list[str]) -> _Reading:
                     if now and not was:
                         reading.newly.append(f"{name}: {secret!r} in {line!r}")
                     reading.hidden_now += was and not now
-                elif now and secret not in before["write-time chain"][i]:
+                    continue
+                if now and secret not in before["write-time chain"][i]:
                     reading.beyond_first_surface.append(f"{name}: {secret!r} in {line!r}")
+                if now and not was:
+                    reading.reread_newly.append(f"{name}: {secret!r} in {line!r}")
     return reading
 
 
@@ -684,11 +721,12 @@ def test_the_stage_prints_nothing_the_code_before_it_hid(monkeypatch: pytest.Mon
     may print that the same surface hid with the stage off. The reverse count must be above zero, or
     the stage hid nothing and nothing was compared.
 
-    The two surfaces that read the chain's output again are held to less, and that is stated rather
-    than hidden behind an exemption: no secret may print there that the write-time chain did not
-    print with the stage off, so neither prints text the code before the stage never logged. They can
-    hide less than they did, since a span the stage took can hold a label they would have read; the
-    stage comment in ``secretscrub.py`` says so, and how many there are is measured, not refused."""
+    The two surfaces that read the chain's output again are held to the same on this corpus, and,
+    beyond it, to printing nothing the write-time chain did not print with the stage off. That second
+    hold is the one the stage comment in ``secretscrub.py`` states for every line: a re-read can hide
+    less than it did where the spaces end a run a later pass read whole. Other seeds of the same
+    generator find such lines, each a whitespace-free HL7 field run the PHI pass took whole on its
+    second reading; this corpus holds none, so a shape fixed here that comes back reds."""
     corpus = [*_OLD_BRANCH_PROBES, *_seeded_corpus(3000, 5546)]
     reading = _reading(monkeypatch, corpus)
     assert not reading.newly, (
@@ -696,6 +734,7 @@ def test_the_stage_prints_nothing_the_code_before_it_hid(monkeypatch: pytest.Mon
     )
     assert reading.hidden_now > 0, "the stage hid nothing, so the comparison proved nothing"
     assert not reading.beyond_first_surface, reading.beyond_first_surface[:3]
+    assert not reading.reread_newly, reading.reread_newly[:3]
 
 
 def test_the_guard_can_fail(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -828,7 +867,7 @@ def test_the_stage_never_shortens_what_it_reads(monkeypatch: pytest.MonkeyPatch)
         return out
 
     replace_the_added_stage(monkeypatch, recording)
-    wide = "password=b'\\\\ \"\U0001f511​\né' tail"
+    wide = "password=b'\\\\ \"\U0001f511\u200b\n\u00e9' tail"
     corpus = [*_OLD_BRANCH_PROBES, *_seeded_corpus(1500, 5551), wide]
     _surface_outputs(corpus)
     for surface, apply in _CLIP_SURFACES:
@@ -892,6 +931,8 @@ _GROWTH_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     ("_MEFOR_GLUED_AFTER_PLACEHOLDER", lambda n: "MEFOR_A=<redacted>" + "a'b" * (n // 3)),
     ("_MEFOR_GLUED_AFTER_PLACEHOLDER", lambda n: "MEFOR_A=<redacted>x " * (n // 20)),
     ("_MEFOR_GLUED_AFTER_PLACEHOLDER", lambda n: "MEFOR_A=<redacted>" + "<" * n),
+    ("_MEFOR_GLUED_AFTER_PLACEHOLDER", lambda n: "MEFOR_A=<redacted>a\n" * (n // 20)),
+    ("_MEFOR_GLUED_AFTER_PLACEHOLDER", lambda n: "MEFOR_A=<redacted>a" + "b c" * (n // 3)),
 )
 
 

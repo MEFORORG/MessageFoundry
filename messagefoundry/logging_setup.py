@@ -374,8 +374,9 @@ _LABEL_WITH_ITS_VALUE_OUTSIDE = (
 #: and "+". Where the label's value is not quoted, as in ``token=a;password=b`` or
 #: ``token=a;password=``, the value runs on and is hidden whole, as before. A single value holding
 #: a bare ";" or "," is hidden whole too. The ".", "-" and "_" are label characters, so a label glued on by one of them still goes
-#: with the value: ``token=a.password="v w"`` still prints "v w". That residual is #2966's and
-#: #3122's, not this filter's.
+#: with the value: ``token=a.password="v w"`` printed "v w" through the chain until the credential
+#: stage of BACKLOG #5546 to #5550, which hides the quoted run this filter leaves glued to its
+#: placeholder. This filter still leaves it; the shape is #2966's and #3122's, not this filter's.
 #:
 #: Other shapes still print the later value, at least these, and each printed the same before:
 #: a braced value (``;PWD={p w}``, also #2966's); an unquoted value after a space
