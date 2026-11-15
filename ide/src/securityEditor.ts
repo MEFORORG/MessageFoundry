@@ -39,7 +39,7 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
   // after a trust grant. configPath() checks again, before any file-system call.
   if (!vscode.workspace.isTrusted) {
     void vscode.window.showWarningMessage(
-      "MessageFoundry: trust this workspace to edit its security settings. The editor checks the folders its settings path passes through for links.",
+      "MessageFoundry: trust this workspace to edit its security settings. The editor reads the workspace's folders to check its settings path.",
     );
     return;
   }
@@ -93,7 +93,10 @@ function configPath(ws: string, current: vscode.WebviewPanel): string | undefine
   const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
   // Unread scope counts as the workspace's, so the check is never skipped by a missing answer.
   const fromWorkspace = seen === undefined || seen.workspaceValue !== undefined || seen.workspaceFolderValue !== undefined;
-  const target = securityConfigTarget(ws, serviceConfig(), { fromWorkspace, trusted: vscode.workspace.isTrusted }, { lstat: fs.lstatSync });
+  const target = securityConfigTarget(ws, serviceConfig(), { fromWorkspace, trusted: vscode.workspace.isTrusted }, {
+    lstat: fs.lstatSync,
+    realpath: fs.realpathSync.native,
+  });
   if (!target.ok) {
     postToWebview(current.webview, { command: "error", message: `${target.problem}. Nothing was read or written.` });
     return undefined;

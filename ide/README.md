@@ -196,7 +196,7 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
-  that passes through a link; set an outside file in user settings. It does not catch a user-set
+  that passes through a link it can detect; set an outside file in user settings. It does not catch a user-set
   alias into the folder, at least a subst drive or a junction. The rules and that open limit are in
   the `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in

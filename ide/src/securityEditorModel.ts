@@ -19,34 +19,43 @@ function inside(root: string, target: string): boolean {
   return rel !== "" && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
 }
 
-/** The one file-system read the link check makes, as fs.lstatSync makes it: it throws an error
- *  carrying `code` for a path it cannot read. */
+/** The file-system reads the link check makes, as fs.lstatSync and fs.realpathSync.native make
+ *  them: each throws an error carrying `code` for a path it cannot read. */
 export interface LinkFs {
   lstat(p: string): { isSymbolicLink(): boolean };
+  realpath(p: string): string;
 }
 
-/** Whether `e` says only that the path does not exist, the one read error the check passes over. */
+/** Whether `e` says only that the path does not exist, the one lstat error the check passes over. */
 function missing(e: unknown): boolean {
   const code = typeof e === "object" && e !== null ? (e as { code?: unknown }).code : undefined;
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
-/** Whether no existing path from `root` down to `target`, both ends included, is a link. `target`
- *  lies inside `root`. Each path is lstat'd, so a dangling link counts. The walk stops at the first
- *  path that does not exist, since nothing below it can. Any other read error answers false. */
-function noLinkBelow(root: string, target: string, fsx: LinkFs): boolean {
-  let at = root;
-  for (const part of ["", ...path.relative(root, target).split(path.sep)]) {
-    at = path.join(at, part);
+/** Whether `rel`, a relative path inside `root`, passes through no link. The rules are rule 2 of
+ *  {@link securityConfigTarget}. */
+function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
+  let deepest = root;
+  for (const part of rel.split(path.sep)) {
+    const next = path.join(deepest, part);
     try {
-      if (fsx.lstat(at).isSymbolicLink()) {
+      if (fsx.lstat(next).isSymbolicLink()) {
         return false;
       }
     } catch (e) {
-      return missing(e);
+      if (!missing(e)) {
+        return false;
+      }
+      break; // nothing below a path that does not exist can exist
     }
+    deepest = next;
   }
-  return true;
+  try {
+    const expected = path.join(fsx.realpath(root), path.relative(root, deepest));
+    return path.relative(expected, fsx.realpath(deepest)) === "";
+  } catch {
+    return false; // any realpath error refuses
+  }
 }
 
 /**
@@ -61,17 +70,22 @@ function noLinkBelow(root: string, target: string, fsx: LinkFs): boolean {
  * 2. Workspace-set value (`scope.fromWorkspace` true: the workspace's own settings, which a
  *    repository's `.vscode/settings.json` can set): the path, as spelled, must lie inside the
  *    workspace folder. One that leaves it by `..`, is absolute elsewhere, or is the folder itself is
- *    refused. Then every existing path from the workspace folder down to the target, both included,
- *    must lstat as not a link (a symbolic link or a junction), a dangling one included. An lstat
- *    error other than ENOENT or ENOTDIR refuses.
+ *    refused. Then every existing path below the workspace folder, down to the target, must lstat as
+ *    not a link, a dangling one included; the walk stops at the first that does not exist. The
+ *    deepest existing one must then realpath to the folder's own realpath joined with the same
+ *    parts, because lstat does not report every reparse point as a link, at least not a junction
+ *    onto a volume GUID path. An lstat error other than ENOENT or ENOTDIR, or any realpath error,
+ *    refuses. An 8.3 short name below the folder is refused too, since realpath spells it in full.
+ *    The workspace folder itself may be reached through a link: the repository cannot make it one.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
- *    the default `messagefoundry.toml` included, it gets the link check of rule 2, and the folder
- *    itself is refused. Otherwise it is accepted as written, with no file-system call.
+ *    the default `messagefoundry.toml` included, it gets the checks of rule 2, and the folder itself
+ *    is refused. Otherwise it is accepted as written, with no file-system call.
  *
  * Open limit: rule 3 compares spellings only. A user-set path that reaches the workspace folder by
  * an alias is accepted as written, and no link the repository holds is checked on it. That covers at
  * least a subst drive, an 8.3 short name, a UNC spelling of the folder, a junction or symbolic link
- * outside the folder that leads into it, and a mapped network drive.
+ * outside the folder that leads into it, and a mapped network drive. Nor does this check cover the
+ * files the CLI creates beside the target, or a link made between this check and the CLI's write.
  */
 export function securityConfigTarget(
   workspace: string,
@@ -87,8 +101,9 @@ export function securityConfigTarget(
   }
   const root = path.resolve(workspace);
   const target = path.resolve(root, setting);
+  const rel = path.relative(root, target);
   // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
-  if (path.relative(root, target) === "") {
+  if (rel === "") {
     return { ok: false, problem: "messagefoundry.serviceConfig names the workspace folder itself, not a file" };
   }
   if (!inside(root, target)) {
@@ -102,7 +117,7 @@ export function securityConfigTarget(
     }
     return { ok: true, path: target };
   }
-  if (!noLinkBelow(root, target, fsx)) {
+  if (!noLinkBelow(root, rel, fsx)) {
     return {
       ok: false,
       problem:
@@ -110,7 +125,8 @@ export function securityConfigTarget(
         "or whose folders cannot be read. Name a path whose folders are all plain folders",
     };
   }
-  return { ok: true, path: target };
+  // Spelled from the workspace folder as the walk was, so the CLI opens the path that was checked.
+  return { ok: true, path: path.join(root, rel) };
 }
 
 /** The file one editor panel now shows (BACKLOG #5411). Save writes only to this file, so a setting
