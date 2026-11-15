@@ -204,7 +204,11 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   user settings too, counts as set, so a workspace without that file cannot save a connection edit
   until the file exists or the setting is cleared. The flag is left off at least when
   the setting is unset or blank; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
-  one, the file this setting's default names, and no file if not.
+  one, the file this setting's default names, and no file if not. The status bar's Start and
+  Restart pass the same value as `--service-config`, and refuse one that names no file in the
+  workspace before they start or stop anything. A value set to the default name counts too, so in
+  a workspace without that file they refuse rather than offer to create a new engine; clear the
+  setting to get that offer back.
 - `messagefoundry.engineUrl` (default `https://127.0.0.1:8765`) — engine API URL used by
   *Stage → Promote* when no named environments are configured. **Machine-scoped** (a workspace file
   cannot retarget a promote, and with it your credentials, at another host). https by default

@@ -98,7 +98,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       // Marked, so the save parses the JSON back into the table.
       if (value !== null && typeof value === 'object') v.dataset.table = '1';
       const castSel = document.createElement('select');
-      for (const c of ['', 'int', 'float', 'bool', 'str']) { const o = document.createElement('option'); o.value = c; o.textContent = c || 'cast'; castSel.appendChild(o); }
+      // A recorded cast outside the list gets its own option, so it shows and an untouched save keeps
+      // it for the engine to refuse, rather than the select going blank and the save dropping it.
+      const casts = ['', 'int', 'float', 'bool', 'str'];
+      if (cast && !casts.includes(cast)) casts.push(cast);
+      for (const c of casts) { const o = document.createElement('option'); o.value = c; o.textContent = c || 'cast'; castSel.appendChild(o); }
       castSel.value = cast || '';
       const envLabel = document.createElement('label'); envLabel.className = 'envbox';
       const envCb = document.createElement('input'); envCb.type = 'checkbox'; envCb.checked = !!isEnv;
@@ -138,7 +142,9 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     function heldSecret(f) {
       if (REMOVED_SECRETS.has(f.key)) return undefined;
       if (f.preserveValue !== undefined && f.preserveValue !== HELD_MARK) return f.preserveValue;
-      return f.secretOnlyEnv || f.preserveValue === HELD_MARK ? HELD_SECRETS.get(f.key) : undefined;
+      // Only where the rebuild was sent the mark: a key the request left out, because the user
+      // removed or cleared it, holds nothing, so the credential is not written back.
+      return f.preserveValue === HELD_MARK ? HELD_SECRETS.get(f.key) : undefined;
     }
     // Keys the user chose to remove from the record; the save writes nothing for them. Cleared when
     // the fields are rebuilt, since the rebuild request already left them out.
@@ -374,10 +380,12 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       }
       // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
       // and a leading '+', which would post a number the user never typed. An exponent that
-      // overflows is posted as typed too, since Infinity would cross to the host as null.
+      // overflows is posted as typed too, since Infinity would cross to the host as null, and so is
+      // an int past the range a JS number holds exactly, which would round to another integer.
       if (f.type === 'int' || f.type === 'float') {
         const n = DECIMAL_TEXT.test(raw) ? Number(raw) : NaN;
-        return Number.isFinite(n) ? n : raw;
+        if (!Number.isFinite(n)) return raw;
+        return f.type === 'int' && Number.isInteger(n) && !Number.isSafeInteger(n) ? raw : n;
       }
       if (f.type === 'bool') return raw === 'true' ? true : raw === 'false' ? false : raw;
       return raw;

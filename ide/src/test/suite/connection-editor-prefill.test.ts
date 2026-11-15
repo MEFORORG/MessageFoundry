@@ -135,7 +135,7 @@ function closeWindows(): void {
   }
 }
 
-function load(opts: { clone?: boolean; groups: unknown }): Page {
+function load(opts: { clone?: boolean; groups: unknown; initial?: unknown }): Page {
   const errors: unknown[] = [];
   const posted: Payload[] = [];
   const virtualConsole = new VirtualConsole();
@@ -164,7 +164,7 @@ function load(opts: { clone?: boolean; groups: unknown }): Page {
   });
   const el = window.document.createElement("script");
   el.textContent = connectionEditorScript(TOKEN, {
-    initial: RECORD,
+    initial: opts.initial ?? RECORD,
     routers: ["route_adt"],
     transports: ["mllp", "file"],
     fieldGroups: opts.groups,
@@ -306,7 +306,7 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     port.value = "66x2";
     assert.strictEqual(saved(p, false).port, "66x2", "the typed text must be posted for the engine to refuse");
     // Text a number box would have refused is not converted either: the engine sees what was typed.
-    for (const typed of ["0x1F90", "0b1", "0o17", "+6662", "Infinity", "1e400", "-1e309"]) {
+    for (const typed of ["0x1F90", "0b1", "0o17", "+6662", "Infinity", "1e400", "-1e309", "12345678901234567891"]) {
       const h = load({ groups });
       h.window.document.querySelector('#settings [data-key="port"]').value = typed;
       assert.strictEqual(saved(h, false).port, typed, `${typed} must be posted as typed`);
@@ -320,6 +320,23 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     r.window.document.querySelector('#settings [data-key="port"]').value = "66x2";
     r.window.document.querySelector('#settings [data-remove-key="port"]').click();
     assert.ok(!("port" in saved(r, false)), "Remove must still remove");
+  });
+
+  test("edit: an inline credential removed during a transport round trip is not written back", () => {
+    const p = load({ groups });
+    const transport = p.window.document.getElementById("transport");
+    const switchTo = (to: string): void => {
+      transport.value = to;
+      transport.dispatchEvent(new p.window.Event("change"));
+      const asked = p.posted.filter((m) => m.command === "fields");
+      p.deliver({ command: "fields", groups: buildForm(SCHEMA, to, "outbound", asked[asked.length - 1].settings) });
+    };
+    switchTo("file");
+    const remove = p.window.document.querySelector('#settings [data-remove-key="tls_key_password"]');
+    assert.ok(remove, "the held credential has no remove control on the file transport");
+    remove.click();
+    switchTo("mllp");
+    assert.ok(!("tls_key_password" in saved(p, false)), "the removed credential came back on save");
   });
 
   test("edit: a transport round trip never sends a held credential, and the save keeps every one", () => {
@@ -478,6 +495,12 @@ suite("connection editor — the legacy rows, when the engine cannot describe it
   test("an untouched row keeps its recorded type: a str of digits stays a str", () => {
     const p = load({ groups: null });
     assert.strictEqual(saved(p, false).facility, "0042");
+  });
+
+  test("an untouched env reference keeps a cast outside the cast list, for the engine to refuse", () => {
+    const initial = { ...RECORD, settings: { host: { env: "PEER_HOST", cast: "INT" } } };
+    const p = load({ groups: null, initial });
+    assert.deepStrictEqual(saved(p, false).host, { env: "PEER_HOST", cast: "INT" });
   });
 
   test("an untouched row keeps a multi-line value's line breaks", () => {

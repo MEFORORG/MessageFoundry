@@ -99,7 +99,7 @@ export function serveCommandLine(configDir: string, serviceConfig?: string): str
 export function serveCommandHint(): string {
   return (
     `\`${serveCommandLine("<configDir>")}\`, adding \`--service-config=<file>\` when ` +
-    "messagefoundry.serviceConfig is set"
+    "messagefoundry.serviceConfig is set and not blank"
   );
 }
 

@@ -492,6 +492,20 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
     }
   });
 
+  test("D6b: a carrier map that is not a plain object fails closed, and any engine's permit clears it", async () => {
+    for (const bad of [null, "off", 42, true, ["off"], [{ mode: "off" }]]) {
+      const label = JSON.stringify(bad);
+      // CENTRAL's own cache permits, so only the carrier can disable it.
+      const store = memStore({
+        [AI_POLICY_DENY_KEY]: bad,
+        [aiPolicyCacheKey(CENTRAL)]: { ...policy({ assistPermitted: true }), cachedAt: 0 },
+      });
+      assert.strictEqual(assistantState(await unreachable(store, CENTRAL, cliByo, true)).enabled, false, label);
+      await answered(store, OTHER, policy({ assistPermitted: true }));
+      assert.strictEqual(assistantState(await unreachable(store, CENTRAL, cliByo, true)).enabled, true, `not cleared: ${label}`);
+    }
+  });
+
   test("D7: once any engine has answered, an unreachable default target does not fall to the CLI", async () => {
     // A configured target answered a permit, which is now expired; the target was then cleared back
     // to the default, which has no cache of its own. The local file must not outrank an engine.

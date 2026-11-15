@@ -203,7 +203,8 @@ export const AI_POLICY_CACHE_PREFIX = "messagefoundry.lastAiPolicy@";
  *       and a cached answer that enables assistance stops doing so once it is too old (BACKLOG
  *       #1154); else
  *   (b) the local CLI's policy, if it positively returned one (it may itself carry mode "off"), but
- *       only when no engine target is configured; else
+ *       only when no engine target is configured and the IDE has never held an engine's answer
+ *       (`targetConfigured` and `answeredBefore` below); else
  *   (c) the fail-closed UNVERIFIED policy (assistance disabled) — NEVER silently re-enable BYO.
  *
  * An expired cache does NOT fall through to (b). An IDE that holds a cache has heard from the
@@ -352,11 +353,17 @@ function withCarrier<T>(
   const run = carrierChain.then(async () => {
     const stored = store.get<Record<string, unknown>>(AI_POLICY_DENY_KEY);
     // Each entry is checked, not only the map: one entry that is not a deny-shaped object would
-    // otherwise throw in isPolicyDeny on every resolve, or slip past it as a non-deny.
-    let carried: CarriedDenies =
-      stored !== null && typeof stored === "object"
-        ? Object.fromEntries(Object.entries(stored).map(([key, value]) => [key, carriedEntry(value)]))
-        : {};
+    // otherwise throw in isPolicyDeny on every resolve, or slip past it as a non-deny. A stored map
+    // that is not a plain object cannot say what it carried either, so it fails closed as one
+    // malformed deny with an unknown issuer, which any engine's authoritative permit clears.
+    let carried: CarriedDenies;
+    if (stored === undefined) {
+      carried = {};
+    } else if (stored !== null && typeof stored === "object" && !Array.isArray(stored)) {
+      carried = Object.fromEntries(Object.entries(stored).map(([key, value]) => [key, carriedEntry(value)]));
+    } else {
+      carried = { [UNKNOWN_DENY_ISSUER]: MALFORMED_DENY };
+    }
     let migrated = false;
     // The unscoped key, once. A deny in it is carried with an unknown issuer, which any engine's
     // authoritative permit clears: origin/main's rule for that key.
