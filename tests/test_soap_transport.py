@@ -8,6 +8,7 @@ as an HTTP-200 body (some servers do that).
 
 from __future__ import annotations
 
+import contextlib
 import email.message
 import http.client
 import io
@@ -454,31 +455,57 @@ async def test_a_ws_security_401_after_its_bearer_retry_is_permanent(body: bytes
     assert not isinstance(third.value, NegativeAckError)
 
 
-@pytest.mark.parametrize(
-    "between",
-    [_Resp(200, b"<soap:Envelope><soap:Body>ok</soap:Body></soap:Envelope>"), None],
-    ids=["2xx", "plain-401"],
-)
-async def test_control_another_answer_between_ends_the_ws_security_401_run(
-    between: _Resp | None,
-) -> None:
-    """A 2xx accepted the bearer, and a 401 with no WS-Security fault is not the same answer, so
-    either one between two WS-Security 401s gives the second its retry."""
-    dest, _ = _oauth2_dest()
+class _ResetDuringRead(_Resp):
+    """A 2xx whose body read fails: an answer from the endpoint, then a transport failure."""
+
+    def read(self, amt: int = -1) -> bytes:
+        raise ConnectionResetError("reset mid-body")
+
+
+def _between(kind: str) -> _Opener:
+    if kind == "2xx":
+        return _Opener(resp=_Resp(200, b"<soap:Envelope><soap:Body>ok</soap:Body></soap:Envelope>"))
+    if kind == "2xx-read-fails":
+        return _Opener(resp=_ResetDuringRead(200))
+    if kind == "plain-401":
+        return _Opener(exc=_http_error(401, b""))
+    if kind == "500":
+        return _Opener(exc=_http_error(500, b""))
+    assert kind == "unreachable"
+    return _Opener(exc=urllib.error.URLError("refused"))
+
+
+async def _ws_security_401_then(dest: SoapDestination, kind: str) -> None:
     dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
     with pytest.raises(DeliveryError):
         await dest.send("<op/>")
-    if between is not None:
-        dest._opener = _Opener(resp=between)  # type: ignore[assignment]
+    dest._opener = _between(kind)  # type: ignore[assignment]
+    with contextlib.suppress(DeliveryError):
         await dest.send("<op/>")
-    else:
-        dest._opener = _Opener(exc=_http_error(401, b""))  # type: ignore[assignment]
-        with pytest.raises(DeliveryError):
-            await dest.send("<op/>")
     dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize("kind", ["2xx", "2xx-read-fails", "plain-401", "500"])
+async def test_control_another_answer_between_ends_the_ws_security_401_run(kind: str) -> None:
+    """Any answer from the endpoint other than a WS-Security 401 ends the run, so the next
+    WS-Security 401 gets its retry. Mutations: delete the reset in the 401 arm's `else:` (red:
+    "500"), or move the 2xx reset after the body read (red: "2xx-read-fails")."""
+    dest, _ = _oauth2_dest()
+    await _ws_security_401_then(dest, kind)
     with pytest.raises(DeliveryError) as ei:
         await dest.send("<op/>")
     assert not isinstance(ei.value, NegativeAckError)
+
+
+async def test_no_answer_between_does_not_end_the_ws_security_401_run() -> None:
+    """A connection failure is no answer from the endpoint, so the run goes on and the next
+    WS-Security 401 is the second in a row: permanent. Mutation: reset the flag in the URLError
+    arm. Red: the second WS-Security 401 is retried again."""
+    dest, _ = _oauth2_dest()
+    await _ws_security_401_then(dest, "unreachable")
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<op/>")
+    assert ei.value.permanent is True and ei.value.code == "wssecurity"
 
 
 _EXPIRED_401 = b"<soap:Fault><faultcode>wsse:MessageExpired</faultcode></soap:Fault>"

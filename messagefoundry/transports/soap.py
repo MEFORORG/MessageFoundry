@@ -1297,6 +1297,9 @@ class SoapDestination(DestinationConnector):
             raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
+                # BACKLOG #5798: a 2xx is an answer from the endpoint other than a WS-Security 401,
+                # so it ends that run. First, so a 2xx whose read below raises still ends it.
+                self._wssecurity_401_retried = False
                 # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
                 # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
@@ -1310,8 +1313,6 @@ class SoapDestination(DestinationConnector):
                 headers = capture_response_headers(
                     getattr(resp, "headers", None), self.capture_response_headers
                 )
-                # A 2xx accepted the bearer, so it ends any WS-Security 401 run (BACKLOG #5798).
-                self._wssecurity_401_retried = False
                 return body, status, headers
         except urllib.error.HTTPError as exc:
             try:
