@@ -29,10 +29,13 @@ the ingress path must do, and each judgement is a DETECTOR with a positive contr
 * ``resources`` -- heap, OS handles and asyncio tasks, measured across repeated passes of the
   catalogue after a warm-up pass, stay under a fixed growth bound. Instruments: ``tracemalloc``
   traced bytes, ``psutil`` handle (Windows) or descriptor (POSIX) count, ``len(asyncio.all_tasks())``.
-* ``log_body`` -- no log record at INFO or above carries message content. Every catalogue body and
-  every mutation seed carries a per-run sentinel (:func:`carries_sentinel`; HL7 in PID-5 or an NTE,
-  X12 in the subscriber's NM1-03), and a record whose rendered text contains it is a finding.
-  ``tests/test_dast_ingress_sweep.py`` holds every case to that, on all three planes.
+* ``log_body`` -- no log record at INFO or above carries message content. Every catalogue case
+  that writes a body, every mutation seed and every liveness probe carries a per-run sentinel
+  (:func:`carries_sentinel`; HL7 in PID-5 or an NTE, X12 in the subscriber's NM1-03), and a record
+  whose rendered text contains it is a finding. ``tests/test_dast_ingress_sweep.py`` holds every
+  case to that, on all three planes. It checks the bytes a case WRITES: a case that splits a body
+  across frames, and a mutation that cuts the sentinel out, can still hand the engine a frame
+  without it, and a log of that frame would be missed.
   This is a CALL-SITE check: the receipt also says whether the shipped redaction filters would have
   removed the hit, but a hit is a finding either way, because section 9 binds the call site.
 
@@ -92,8 +95,8 @@ DETECTORS = ("reply", "count_and_log", "liveness", "time", "resources", "log_bod
 VT, FS, CR = b"\x0b", b"\x1c", b"\r"
 STX, ETX = b"\x02", b"\x03"
 
-#: The seeds ADR 0191 fuzzes the parsers with in-process, reused here over a socket, and the one
-#: finding that harness has recorded, replayed at a live listener.
+#: The seeds ADR 0191 fuzzes the parsers with in-process, and the one finding that harness has
+#: recorded. They reach the socket with the sentinel appended (:func:`mutation_seeds`).
 _HL7_SEEDS = next(t for t in TARGETS if t.name == "hl7_peek").seeds
 #: A COMPLETE interchange. `next` raises at import when the committed sample is missing, which is
 #: loud; falling back to the fuzz target's truncated literal would make every raw-TCP and X12
@@ -110,6 +113,11 @@ if _X12_NAME not in _X12_SEED:
 #: Bytes that only frame a message. A case whose bytes are nothing else has no body to carry a
 #: sentinel (an empty frame, an idle connection); every other case must carry it.
 FRAMING_BYTES = VT + FS + CR + STX + ETX
+
+#: Cases that write a bare header and no message content, so they carry no sentinel: adding one
+#: would change the shape they exist to send. ``msh-only`` is a lone unterminated MSH, and
+#: ``short-isa`` an ISA cut short, where any byte appended lands on its fixed separator offsets.
+HEADER_ONLY_CASES = frozenset({"mllp:msh-only", "x12:short-isa"})
 
 
 class PolicyError(ValueError):
@@ -160,14 +168,15 @@ def x12_interchange(sentinel: str) -> bytes:
 
 
 def _hl7_with_sentinel(seed: bytes, sentinel: str) -> bytes:
-    """An HL7 seed with ``NTE|1||<sentinel>`` inserted after its MSH segment (vault BACKLOG #5581).
+    """An HL7 fuzz seed with an ``NTE|1||<sentinel>`` segment appended (vault BACKLOG #5581).
 
-    After the MSH, so the header the parser reads first is the seed's own; an NTE, so the sentinel
-    sits in message content rather than in a routing field the engine may log by design."""
-    end = seed.index(b"\r") + 1
-    if seed[end : end + 1] == b"\n":
-        end += 1
-    return seed[:end] + _b(f"NTE|1||{sentinel}\r") + seed[end:]
+    Appended, so every byte of the seed reaches the socket as ADR 0191 wrote it; an NTE, so the
+    sentinel sits in message content rather than in a routing field the engine may log by design.
+    A seed that does not end on a segment terminator gets one first, so the NTE never runs on into
+    its last field; one that does gets none, so no blank segment is added. These are fuzz inputs
+    built as bytes, not messages the engine handles."""
+    lead = b"" if seed.endswith((b"\r", b"\n")) else b"\r"
+    return seed + lead + _b(f"NTE|1||{sentinel}\r")
 
 
 def _through_sentinel(body: bytes, sentinel: str) -> bytes:
@@ -181,9 +190,14 @@ def case_bytes(case: Case) -> bytes:
 
 
 def carries_sentinel(case: Case, sentinel: str) -> bool:
-    """Whether a case's body carries the sentinel, or it has no body (framing bytes only)."""
+    """Whether a case's body carries the sentinel, or it has no body: framing bytes only, or a
+    bare header (:data:`HEADER_ONLY_CASES`)."""
     data = case_bytes(case)
-    return _b(sentinel) in data or not data.translate(None, FRAMING_BYTES)
+    return (
+        _b(sentinel) in data
+        or not data.translate(None, FRAMING_BYTES)
+        or f"{case.plane}:{case.name}" in HEADER_ONLY_CASES
+    )
 
 
 def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
@@ -223,7 +237,7 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
         Case("short-encoding-chars", "mllp", frame(msg("SEP3", enc="^"))),
         Case("truncation-char-27", "mllp", frame(msg("SEP4", enc="^~\\&#"))),
         Case("missing-msh", "mllp", frame(_b(f"PID|1||X||{sentinel}^CASE\r"))),
-        Case("msh-only", "mllp", frame(_hl7_with_sentinel(b"MSH|^~\\&|\r", sentinel))),
+        Case("msh-only", "mllp", frame(b"MSH|^~\\&|")),
         # ADR 0191's recorded finding (an empty segment), rebuilt here around the sentinel. Fixed by
         # BACKLOG #1594; kept as a regression case, since both faces must now get the runner's reply.
         Case("blank-segment", "mllp", frame(msg("BLANK", extra="\rPV1|1|I\r"))),
@@ -273,7 +287,7 @@ def x12_catalogue(sentinel: str, cap: int) -> list[Case]:
         Case("well-formed", "x12", x12),
         Case("noise-then-interchange", "x12", b"\x00\xffNOISE" * 32 + x12),
         Case("pipelined-three", "x12", x12 * 3),
-        Case("short-isa", "x12", x12[:60] + _b(sentinel)),
+        Case("short-isa", "x12", x12[:60]),
         Case("isa-without-iea", "x12", x12.replace(b"IEA", b"XEA")),
         Case("invalid-utf8", "x12", x12.replace(b"ZZ", b"\xc0\xaf", 1)),
         Case("oversize-interchange", "x12", oversize),
@@ -749,15 +763,17 @@ def _judge(result: CaseResult, got: bytes) -> None:
 
 
 async def probe_liveness(
-    target: IngressTarget, plane: str, index: int, budget: Budget
+    target: IngressTarget, plane: str, index: int, budget: Budget, sentinel: str = "LIVENESS"
 ) -> str | None:
-    """A well-formed message on a fresh connection must be accepted and persisted. ``None`` = alive."""
+    """A well-formed message on a fresh connection must be accepted and persisted. ``None`` = alive.
+
+    The sweep passes its sentinel, so the body sent after every case is one log_body recognises."""
     if plane == "mllp":
-        payload = frame(_b(hl7(f"LIVE{index}", "LIVENESS")))
+        payload = frame(_b(hl7(f"LIVE{index}", sentinel)))
     elif plane == "tcp":
-        payload = STX + _X12_SEED + ETX
+        payload = STX + x12_interchange(sentinel) + ETX
     else:
-        payload = _X12_SEED
+        payload = x12_interchange(sentinel)
     before = await _counts(target, plane)
     try:
         reader, writer = await _connect(target, plane, budget)
@@ -1022,7 +1038,7 @@ async def run_sweep(
                 index = len(results)
                 results.append(await run_case(target, case, budget))
                 await target.after_case(index)
-                failure = await probe_liveness(target, case.plane, index, budget)
+                failure = await probe_liveness(target, case.plane, index, budget, sentinel)
                 probes += 1
                 if failure is not None:
                     liveness.append(finding("liveness", case.plane, case.name, failure))

@@ -358,6 +358,15 @@ def test_canary_bfla_is_detected(tmp_path: Path) -> None:
         "function-level authorization."
     )
     assert receipt["bfla_violations"] >= 5, receipt["bfla_violations"]
+    # Vault BACKLOG #5580, through run_sweep's own scoring loop: the over-granted identity meets
+    # the action-bound step-up wall on PATCH /users/{user_id}, and that 403 must be a finding.
+    assert any(
+        f["pass_name"] == "bfla-write"
+        and f["path"] == "/users/{user_id}"
+        and f["observed_status"] == 403
+        and "step-up" in f["expected"]
+        for f in receipt["findings"]
+    ), [f for f in receipt["findings"] if f["observed_status"] == 403]
     assert receipt["negative_non_401"] == 0, (
         "the bfla canary must inject ONLY an authorization defect; a negative finding here means it "
         "also broke authentication, and the two canaries would no longer be independent"
@@ -1022,18 +1031,24 @@ def test_bfla_oracle_treats_404_as_a_violation() -> None:
     assert any("404" in line and "bfla" in line for line in errors), errors
 
 
-def test_the_engine_step_up_refusal_carries_the_header_the_bfla_oracle_reads() -> None:
-    """Vault BACKLOG #5580: the oracle reads the header names the engine really sends.
+async def test_the_engine_step_up_refusal_carries_the_header_the_bfla_oracle_reads() -> None:
+    """Vault BACKLOG #5580: the oracle reads the headers the engine really sends.
 
-    The sweep's constants are a copy of what ``_step_up_refusal`` writes; if the engine renamed a
-    header, the BFLA pass would silently go back to scoring a step-up 403 as a refusal."""
-    import inspect
-
+    Drives the engine's own ``_step_up_refusal`` and reads the headers off the exception it
+    returns, so a renamed header reds this test whether or not the literal moved."""
     from messagefoundry.api import security
 
-    source = inspect.getsource(security._step_up_refusal)
-    assert f'"{STEP_UP_REQUIRED_HEADER}"' in source, source
-    assert f'"{STEP_UP_ACTION_HEADER}"' in source, source
+    class _Auth:
+        async def session_steps_up_at_idp(self, _token: str | None) -> bool:
+            return False
+
+    window = await security._step_up_refusal(_Auth(), "t")  # type: ignore[arg-type]
+    bound = await security._step_up_refusal(_Auth(), "t", "purge")  # type: ignore[arg-type]
+    assert window.status_code == bound.status_code == 403
+    assert is_step_up_challenge(403, httpx.Headers(window.headers or {}))
+    assert is_step_up_challenge(403, httpx.Headers(bound.headers or {}))
+    assert (bound.headers or {}).get(STEP_UP_ACTION_HEADER) == "purge"
+    assert STEP_UP_REQUIRED_HEADER in (window.headers or {})
 
 
 def test_a_step_up_403_to_the_low_privilege_caller_is_not_a_refusal() -> None:

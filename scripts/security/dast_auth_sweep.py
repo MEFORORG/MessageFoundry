@@ -244,8 +244,12 @@ def is_bfla_refused(status: int, step_up_challenged: bool) -> bool:
     passed: RBAC admitted a caller the route's permission set excludes, and only the step-up wall
     stood in front of the handler. Scoring that 403 as a refusal, as :func:`is_refused` alone does,
     would let an RBAC bypass on any step-up route pass the sweep with no finding.
-    ``X-MFA-Required`` is not read: that gate sits above the permission loop, so it says nothing
-    about RBAC.
+
+    ``X-MFA-Required`` is not read. ``_admit`` raises it ABOVE the permission loop, so on its own it
+    cannot tell a refusal from a bypass, although some gates also raise it after the loop; the
+    scanned posture leaves MFA off, so no BFLA probe meets it. Nor is a post-permission 429 from
+    the admin-write pacing told apart: the posture disables that limiter. Both are latent blind
+    spots of a header-based oracle, recorded here rather than assumed away.
     """
     return is_refused(status) and not step_up_challenged
 
@@ -353,7 +357,7 @@ async def _reach_probe(
     the method and path template go into ``reproved`` and ``reproof_refused``, never the action: it
     is a header value.
     """
-    response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
+    response = await _send(client, row.method, url, token)
     action = response.headers.get(STEP_UP_ACTION_HEADER)
     if response.status_code != 403 or not action:
         return response.status_code, token
@@ -365,7 +369,7 @@ async def _reach_probe(
         reproof_refused.append(f"{row.method} {row.path}")
         return response.status_code, token
     reproved.append(f"{row.method} {row.path}")
-    response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
+    response = await _send(client, row.method, url, token)
     return response.status_code, token
 
 
@@ -385,7 +389,8 @@ async def _write_pass(
     """Probe ``rows`` with ``username``'s session, keeping that session alive across side effects.
     Returns the results and the session's token as the pass left it. Each result is ``(row,
     status, step-up challenged)``; the flag is measured on the BFLA path only and is ``False`` on
-    the reach path, where a step-up 403 is re-proved instead.
+    the reach path, where :func:`_reach_probe` re-proves an action-bound step-up 403 and scores
+    any other refusal as unreached.
 
     With ``reproved`` given, each probe passes an action-bound step-up wall through
     :func:`_reach_probe`, which records the row there, or in ``reproof_refused`` when the engine

@@ -12,7 +12,7 @@
     "_canary_floor_units": "The canary floors below are compared against negative_non_401, bfla_violations and write_bfla_violations, which count PROBES, not rows. The open-auth canary sends 2 probes per gated row, so its finding count is roughly twice the row count -- do not re-derive a floor from a row number.",
     "open-auth_min_negative_findings": "measured 196 failing PROBES (98 of 99 gated rows x 2 probes; the holdout is the mTLS-only GET /service/identity) on 2026-07-31 against 2fd1ad8a",
     "bfla_min_violations": "measured 19 failing PROBES (all 19 GET BFLA candidates) on 2026-07-31 against 2fd1ad8a",
-    "bfla_min_write_violations": "measured 40 failing PROBES of 43 write BFLA candidates on 2026-09-05 against c57903c2; the 3 that still refused the over-granted identity are the action-scoped step-up rows under /users/{user_id}",
+    "bfla_min_write_violations": "measured 40 failing PROBES of 43 write BFLA candidates on 2026-09-05 against c57903c2; the 3 that still refused the over-granted identity are the action-scoped step-up rows under /users/{user_id}. Since vault BACKLOG #5580 (2026-11-14) a step-up 403 to the low-privilege caller is itself a violation, so those rows now count: measured 52 of 52 write probes violating under the canary, 11 of them by a step-up 403. The floor is unchanged",
     "max_write_session_rebuilds": "measured 1 on 2026-09-05 against c57903c2 -- POST /auth/logout answers a valid administrator token 200 and revokes the session"
   },
   "floors": {

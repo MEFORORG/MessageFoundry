@@ -30,6 +30,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT, MLLPSource
 from scripts.security.dast_ingress_sweep import (
+    HEADER_ONLY_CASES,
     KNOWN_DEFECT_DISCRIMINATORS,
     PROFILE_BOUNDS,
     Budget,
@@ -470,7 +471,8 @@ def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
     """Vault BACKLOG #5581: the log_body detector recognises a logged body only by its sentinel, so a
     body without one is a blind spot. Before the fix every raw-TCP and X12 case, and every mutation
     seed but one, carried none, while the module said every catalogue body did. A case may lack it
-    only when it writes framing bytes alone (an empty frame, an idle connection)."""
+    only when it writes framing bytes alone (an empty frame, an idle connection) or a bare header
+    (``HEADER_ONLY_CASES``)."""
     sentinel = "ZZDASTSENTINEL0000013E"
     cases = catalogue(sentinel, _CAP)
     assert {c.plane for c in cases} == {"mllp", "tcp", "x12"}, "a plane dropped out of the census"
@@ -482,10 +484,9 @@ def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
     assert sentinel.encode() in x12
 
     # Positive control: the exemption covers framing-only cases and nothing that has a body.
-    exempt = [c for c in cases if sentinel.encode() not in case_bytes(c)]
-    assert exempt and all(c.name in ("empty-frame", "idle-after-connect") for c in exempt), [
-        f"{c.plane}:{c.name}" for c in exempt
-    ]
+    exempt = {f"{c.plane}:{c.name}" for c in cases if sentinel.encode() not in case_bytes(c)}
+    framing_only = {"mllp:empty-frame", "tcp:empty-frame", "mllp:idle-after-connect"}
+    assert exempt == framing_only | {"x12:idle-after-connect"} | HEADER_ONLY_CASES, exempt
     assert not carries_sentinel(Case("x", "tcp", b"\x02body\x03"), sentinel)
 
 
