@@ -31,7 +31,9 @@
 # A `cwd` THOSE RULES REFUSE READS NO NOTE. Falling back to CLAUDE_PROJECT_DIR there would read,
 # delete and inject the PRIMARY session's note into this one, so its recipient never sees it. The
 # hook says so on a `[steer]` line instead, at most once per $FAULT_COOLDOWN_MINUTES for each
-# session, because it runs before every tool call. A missing helper is the same fault.
+# session, because it runs before every tool call. Input that names no session id and no cwd has no
+# key that is the session's alone, so that fault is said on every call. A missing helper is the
+# same fault.
 #
 # Fail-open: any error here must never block a tool call.
 # ASCII-only on purpose (PS 5.1 ANSI-read lesson); run under pwsh 7 by the hook.
@@ -70,11 +72,12 @@ function Write-Context([string]$Text) {
     [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
 }
 
-# Say a fault once per cooldown per key, never on every tool call. Without the helper there is no
-# throttle (Test-CcxSayOnce lives there), so the notice is said every time: noise, never quiet.
+# Say a fault once per cooldown per key, not on every tool call. Without the helper there is no
+# throttle (Test-CcxSayOnce lives there), so the notice is said every time: noise, never quiet. An
+# empty key is said every time too.
 function Write-FaultOnce([string]$Key, [string]$Text) {
     $emit = $true
-    if (Get-Command Test-CcxSayOnce -ErrorAction SilentlyContinue) {
+    if ($Key -and (Get-Command Test-CcxSayOnce -ErrorAction SilentlyContinue)) {
         $emit = Test-CcxSayOnce -Key $Key -Minutes $FAULT_COOLDOWN_MINUTES `
             -Dir (Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-steer-fault')
     }
@@ -95,7 +98,12 @@ try {
         if ($s.Root) { $project = $s.Root }
         elseif ($s.Reason) {
             $fault = $s.Reason
-            $faultKey = if ($s.SessionId) { 'sid:' + $s.SessionId } else { 'cwd:' + [string]$s.Payload.cwd }
+            # Input that names neither (unparsed, or a blank cwd) has no key that is this session's
+            # alone; CLAUDE_PROJECT_DIR names the primary for every session. So it is said every
+            # time: one session's stamp must not silence another's.
+            $faultKey = if ($s.SessionId) { 'sid:' + $s.SessionId }
+                        elseif ($s.Payload -and [string]$s.Payload.cwd) { 'cwd:' + [string]$s.Payload.cwd }
+                        else { '' }
         }
     } catch {
         $fault = "the hook could not read its input ($($_.Exception.Message))"

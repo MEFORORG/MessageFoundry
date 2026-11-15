@@ -334,17 +334,23 @@ def test_a_pinned_session_with_no_cwd_answers_for_its_pin(tmp_path: Path) -> Non
     assert other["Dir"] is None and other["Reason"] == "", other
 
 
-def test_an_open_stdin_outside_every_checkout_stays_silent(tmp_path: Path) -> None:
-    """Outside every checkout a hook stays put in silence; an open stdin used to make it a fault."""
+def test_an_open_stdin_is_a_fault_inside_a_checkout_and_out_of_one(tmp_path: Path) -> None:
+    """BACKLOG #5586. Outside every checkout an open stdin used to answer with no Reason, and a caller
+    with no Reason falls back: steer-inject to CLAUDE_PROJECT_DIR, which can name the primary. An
+    open stdin says nothing about the cwd the input would have named, so it is a fault everywhere."""
     outside = tmp_path / "no-repo"
     outside.mkdir()
     probe = tmp_path / "timeout.ps1"
     probe.write_text(
-        f". '{HELPER}'\n$script:CcxHookInputTimedOut = $true\n"
+        # What Read-CcxHookInput leaves behind when stdin is still open at its bound.
+        f". '{HELPER}'\n$script:CcxHookInputFault = 'the hook input was still open'\n"
         f"$o = Resolve-CcxHookSession -Text '' -StartDir '{outside}'\n"
         "$r = Resolve-CcxHookSession -Text '' -StartDir $args[0]\n"
         f"$x = Resolve-CcxHookSession -Text '' -StartDir '{outside}' -AllowOutside\n"
-        "@{ outside = $o.Reason; inside = $r.Reason; anchored = $x.Reason } | ConvertTo-Json -Compress\n",
+        "$script:CcxHookInputFault = ''\n"
+        f"$c = Resolve-CcxHookSession -Text '' -StartDir '{outside}'\n"
+        "@{ outside = $o.Reason; inside = $r.Reason; anchored = $x.Reason; control = $c.Reason }"
+        " | ConvertTo-Json -Compress\n",
         encoding="utf-8",
     )
     repo, _ = _primary_with(tmp_path, "linked")
@@ -358,11 +364,112 @@ def test_an_open_stdin_outside_every_checkout_stays_silent(tmp_path: Path) -> No
     )
     assert proc.returncode == 0, proc.stderr
     got = json.loads(proc.stdout)
-    assert got["outside"] == "", got
-    # The controls: inside a checkout, or for an -AllowOutside caller (mail-drain's anchor case),
-    # the same open stdin is a fault.
-    assert "still open" in got["inside"], got
-    assert "still open" in got["anchored"], got
+    for where in ("outside", "inside", "anchored"):
+        assert "still open" in got[where], got
+    # The control: the same empty input from a read that closed is no input, not a fault.
+    assert got["control"] == "", got
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #5586: every input the helper cannot use is a Reason. Before, each of these answered with
+# no Dir and an empty Reason, which every caller reads as "stay where you started": the primary.
+# --------------------------------------------------------------------------------------------------
+
+
+def _resolve_bytes(repo: Path, tmp_path: Path, stdin: bytes, flags: str = "") -> dict[str, Any]:
+    probe = tmp_path / "resolve-raw.ps1"
+    probe.write_text(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+        f". '{HELPER}'\n$t = Read-CcxHookInput\n"
+        f"$r = Resolve-CcxHookSession -Text $t {flags}\n"
+        "$p = Get-CcxHookPayloadCwd -Text $t\n"
+        "[pscustomobject]@{ Dir = $r.Dir; Named = $r.Named; Reason = $r.Reason;"
+        " PNamed = $p.Named; PReason = $p.Reason } | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    return dict(json.loads(_run(probe, repo, stdin).stdout.decode("utf-8")))
+
+
+@pytest.mark.parametrize(
+    ("stdin", "why"),
+    [
+        (b"{not json at all", "not readable JSON"),
+        (b"null", "not a JSON object"),
+        (b"[1, 2]", "not a JSON object"),
+        (b'"just a string"', "not a JSON object"),
+        (b'{"cwd": "", "session_id": "s1"}', "blank cwd"),
+        (b'{"cwd": "   ", "session_id": "s1"}', "blank cwd"),
+        (b'{"cwd": null, "session_id": "s1"}', "blank cwd"),
+        (b'[{"cwd": "C:\\\\", "session_id": "s1"}]', "not a JSON object"),
+        (b'{"cwd": ".", "session_id": "s1"}', "relative cwd"),
+        (b'{"cwd": "\\\\Code", "session_id": "s1"}', "relative cwd"),
+    ],
+)
+def test_input_the_helper_cannot_use_is_a_fault(tmp_path: Path, stdin: bytes, why: str) -> None:
+    repo, _ = _primary_with(tmp_path, "linked")
+    got = _resolve_bytes(repo, tmp_path, stdin)
+    assert got["Dir"] is None and got["Named"] is True, got
+    assert why in got["Reason"], got
+    # Get-CcxHookPayloadCwd, which hooks such as collision_gate call directly, agrees.
+    assert got["PNamed"] is True and why in got["PReason"], got
+
+
+def test_an_object_with_no_cwd_is_still_no_fault(tmp_path: Path) -> None:
+    """The control for the arm above: a JSON object with no `cwd` field is an older harness."""
+    repo, _ = _primary_with(tmp_path, "linked")
+    got = _resolve_bytes(repo, tmp_path, b'{"session_id": "s1"}')
+    assert got["Reason"] == "" and got["PReason"] == "" and got["PNamed"] is False, got
+
+
+def test_a_stdin_read_that_throws_is_a_fault(tmp_path: Path) -> None:
+    """A redirected stdin the hook may not read (a write-only handle) used to read as no input."""
+    repo, _ = _primary_with(tmp_path, "linked")
+    probe = tmp_path / "read-error.ps1"
+    probe.write_text(
+        f". '{HELPER}'\n$t = Read-CcxHookInput\n"
+        "$r = Resolve-CcxHookSession -Text $t\n"
+        "@{ Reason = $r.Reason; Err = $script:CcxHookInputFault } | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    sink = tmp_path / "write-only.bin"
+    with sink.open("wb") as handle:
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe)],
+            cwd=str(repo),
+            stdin=handle,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+        )
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(proc.stdout)
+    assert got["Err"], f"the fixture did not make the read throw, so this proves nothing: {got}"
+    assert "could not be read" in got["Reason"], got
+    assert "could not be read" in proc.stderr, proc.stderr
+
+
+def test_a_cwd_named_to_a_hook_started_outside_every_checkout_is_a_fault(tmp_path: Path) -> None:
+    """Started in no checkout, the hook cannot check a `cwd` against a repository. Staying put in
+    silence let steer-inject read CLAUDE_PROJECT_DIR's note instead."""
+    _, wt = _primary_with(tmp_path, "linked")
+    outside = Path(os.path.realpath(tmp_path)) / "no-repo"
+    outside.mkdir()
+    got = _resolve(outside, tmp_path, {"cwd": str(wt), "session_id": "s1"})
+    assert got["Dir"] is None and "in no checkout this hook can read" in got["Reason"], got
+    # mail-drain's -AnchorRepo case: an -AllowOutside caller stays put there in silence, as before.
+    anchored = _resolve(
+        outside, tmp_path, {"cwd": str(wt), "session_id": "s1"}, "-ReadOnly -AllowOutside"
+    )
+    assert anchored["Dir"] is None and anchored["Reason"] == "", anchored
+    # The controls: no cwd there is no fault, and -AllowOutside still takes a cwd in no checkout.
+    assert _resolve(outside, tmp_path, {"session_id": "s1"})["Reason"] == ""
+    # A cwd that is the start directory itself is answered by staying put.
+    assert _resolve(outside, tmp_path, {"cwd": str(outside), "session_id": "s1"})["Reason"] == ""
+    scratch = Path(os.path.realpath(tmp_path)) / "scratch"
+    scratch.mkdir()
+    took = _resolve(outside, tmp_path, {"cwd": str(scratch)}, "-ReadOnly -AllowOutside")
+    assert took["Dir"] and _same_dir(took["Dir"], scratch) and took["Reason"] == "", took
 
 
 def test_a_launch_that_cannot_replace_the_pin_keeps_no_stale_one(tmp_path: Path) -> None:
