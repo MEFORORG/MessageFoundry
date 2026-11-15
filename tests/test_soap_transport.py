@@ -430,6 +430,57 @@ async def test_an_oauth2_only_401_with_a_ws_security_fault_still_retries(
     assert provider.invalidations == 1
 
 
+@pytest.mark.parametrize("body", [_WSSE_401, _INVALID_TOKEN_401], ids=["failed-auth", "invalid"])
+async def test_a_ws_security_401_after_its_bearer_retry_is_permanent(body: bytes) -> None:
+    """Manager repair pass: the engine cannot see every credential an envelope or a connection
+    carries (a Handler's own UsernameToken from body_secrets, a client certificate), so a wrong one
+    is resent at most once. The first WS-Security 401 retries with a fresh bearer; the same answer
+    next time is permanent, as before #5798. Mutation: never set the retried flag. Red: the second
+    send raises a transient DeliveryError and the wrong credential goes out for the whole budget."""
+    dest, provider = _oauth2_dest()
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as first:
+        await dest.send("<op/>")
+    assert not isinstance(first.value, NegativeAckError)
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as second:
+        await dest.send("<op/>")
+    assert second.value.permanent is True and second.value.code == "wssecurity"
+    assert provider.invalidations == 2
+    # The run is over, so a later WS-Security 401 gets its one retry again.
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as third:
+        await dest.send("<op/>")
+    assert not isinstance(third.value, NegativeAckError)
+
+
+@pytest.mark.parametrize(
+    "between",
+    [_Resp(200, b"<soap:Envelope><soap:Body>ok</soap:Body></soap:Envelope>"), None],
+    ids=["2xx", "plain-401"],
+)
+async def test_control_another_answer_between_ends_the_ws_security_401_run(
+    between: _Resp | None,
+) -> None:
+    """A 2xx accepted the bearer, and a 401 with no WS-Security fault is not the same answer, so
+    either one between two WS-Security 401s gives the second its retry."""
+    dest, _ = _oauth2_dest()
+    dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError):
+        await dest.send("<op/>")
+    if between is not None:
+        dest._opener = _Opener(resp=between)  # type: ignore[assignment]
+        await dest.send("<op/>")
+    else:
+        dest._opener = _Opener(exc=_http_error(401, b""))  # type: ignore[assignment]
+        with pytest.raises(DeliveryError):
+            await dest.send("<op/>")
+    dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("<op/>")
+    assert not isinstance(ei.value, NegativeAckError)
+
+
 _EXPIRED_401 = b"<soap:Fault><faultcode>wsse:MessageExpired</faultcode></soap:Fault>"
 
 

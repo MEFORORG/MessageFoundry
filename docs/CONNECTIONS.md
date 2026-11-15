@@ -3027,7 +3027,12 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 - **Scope:** WS-Security here is `Timestamp` + `UsernameToken` only; **XML-DSig body signing is not yet
   supported** (ADR 0015 §4).
 - A WS-Security auth/expiry fault (`FailedAuthentication` / `InvalidSecurityToken` / `MessageExpired`)
-  **dead-letters** (a credential/expiry reject won't fix on a retry).
+  **dead-letters** (a credential/expiry reject won't fix on a retry), with one exception. On a
+  connection with OAuth2 client credentials that sends no `UsernameToken` (`ws_security` with
+  `ws_username`), an HTTP `401` carrying `FailedAuthentication` or `InvalidSecurityToken` drops the
+  cached bearer and **retries once** with a fresh one. If the connection's next answer from the
+  endpoint is again such a `401`, it dead-letters, so a wrong credential the engine cannot see (a
+  Handler's own `UsernameToken`, a client certificate) is resent at most once. `MessageExpired` always dead-letters (BACKLOG #5798).
 
 ```python
 from messagefoundry import outbound, Soap, env
