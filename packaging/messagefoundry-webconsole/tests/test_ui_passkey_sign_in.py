@@ -285,23 +285,23 @@ async def test_a_staged_challenge_is_popped_by_the_sign_in_post_even_without_an_
 
 
 @pytest.mark.parametrize("assertion", [None, "{}"], ids=["password-only", "with-assertion"])
-@pytest.mark.parametrize("b_throttled", [True, False], ids=["b-throttled", "b-has-room"])
+@pytest.mark.parametrize("b_state", ["throttled", "has-room", "global-full"])
 async def test_a_begin_leg_from_one_address_pays_for_the_sign_in_post_from_another(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, assertion: str | None, b_throttled: bool
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, assertion: str | None, b_state: str
 ) -> None:
     """BACKLOG #3937 step 28: pins the SHIPPED behaviour; a change requiring the two addresses to
     match inverts this test rather than keeping it green. The begin leg charges control 2 under ITS
-    address, and ``POST /ui/login`` moves that hit without charging or consulting the POST's
-    address, so a POST from B carrying a handle A's begin leg staged, with or without an assertion,
-    is admitted whether control 2 refuses B or has room for it, and B is not charged. A's hit is
-    moved to the POST's moment, under A, and counts once in the global budget. The begin leg had
-    already charged A and the global budget, as a POST from A would have, so an attacker holding
-    both addresses gains no attempt; what a third party holding the handle cookie costs A is stated
-    in docs/SECURITY.md, *The combined passkey sign-in*.
+    address, and ``POST /ui/login`` moves that hit without charging or consulting control 2 for the
+    POST, so a POST from B carrying a handle A's begin leg staged is admitted whether control 2
+    refuses B, has room for it, or is refusing everyone on the global ceiling, and B is not charged.
+    The skip is the route's, taken before any account is read, so it holds with or without an
+    assertion. A's hit is moved to the POST's moment, under A, and counts once in the global
+    budget; docs/SECURITY.md, *The combined passkey sign-in*, states why that gains a caller nothing
+    and what it costs A.
 
-    RED when: the skip charges or consults B's address (the throttled POST is refused, or B's bucket
-    or the global window gains a hit); the renewal frees A's hit or leaves it at the begin leg's
-    moment, in A's bucket or the global window; or it counts A's hit twice."""
+    RED when: the skip charges or consults control 2 for B (a throttled or global-full POST is
+    refused, or B's bucket or the global window gains a hit); the renewal frees A's hit or leaves it
+    at the begin leg's moment, in A's bucket or the global window; or it counts A's hit twice."""
     from messagefoundry.auth import webauthn as wa
 
     clock = [1_000.0]
@@ -310,7 +310,7 @@ async def test_a_begin_leg_from_one_address_pays_for_the_sign_in_post_from_anoth
     monkeypatch.setattr(
         "messagefoundry.auth.ratelimit.time", types.SimpleNamespace(monotonic=lambda: clock[0])
     )
-    service = await _counted_service(engine, budget=5, per_ip=1 if b_throttled else 2)
+    service = await _counted_service(engine, budget=5, per_ip=1 if b_state == "throttled" else 2)
     service._preauth_challenges = wa.PreAuthChallengePool(clock=lambda: clock[0])
     limiter = service._login_limiter
     assert limiter is not None
@@ -323,10 +323,15 @@ async def test_a_begin_leg_from_one_address_pays_for_the_sign_in_post_from_anoth
         assert begun.status_code == 200
         clock[0] += 10
         assert (await b.post("/ui/login", data=login)).status_code == 303  # t=10, charged
-        if b_throttled:
+        if b_state == "throttled":
+            assert (await b.post("/ui/login", data=login)).status_code == 429
+        elif b_state == "global-full":
+            assert _left(service) == 3  # t=10: A's hit, B's, and these three fill the ceiling
             assert (await b.post("/ui/login", data=login)).status_code == 429
         # Only the handle cookie, exactly as the begin leg set it.
-        b.cookies.jar.set_cookie(next(c for c in a.cookies.jar if c.name == _COOKIE))
+        handle = [c for c in a.cookies.jar if c.name == _COOKIE]
+        assert len(handle) == 1, "the begin leg did not set exactly one handle cookie"
+        b.cookies.jar.set_cookie(handle[0])
         clock[0] += 49
         paid = await b.post("/ui/login", data=paying)  # t=59
         assert paid.status_code == 303, "the shipped cross-address skip now asks B's address"
@@ -335,7 +340,10 @@ async def test_a_begin_leg_from_one_address_pays_for_the_sign_in_post_from_anoth
     # A refusal is not counted, so B holds only its charged POST and A only its moved hit.
     assert list(limiter._hits["192.0.2.20"]) == [1_010.0], "the paid POST charged B"
     assert list(limiter._hits["192.0.2.10"]) == [1_059.0], "the renewal did not move A's hit"
-    assert list(limiter._global_hits) == [1_010.0, 1_059.0], "the global window is not B, then A"
+    probes = [1_010.0] * 3 if b_state == "global-full" else []
+    assert list(limiter._global_hits) == [1_010.0, *probes, 1_059.0], (
+        "global: not B, probes, moved A"
+    )
 
 
 async def test_a_passkey_row_that_does_not_parse_is_the_uniform_refusal_on_ui_login(
