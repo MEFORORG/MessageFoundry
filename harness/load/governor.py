@@ -4,10 +4,11 @@
 
 Two loop models share one connection pool, differing only in *when* the next send is admitted:
 
-* **open** — a rate-scheduled producer. It tracks an ideal next-send deadline (a token bucket, not a
-  per-message ``sleep(1/rate)``, so jitter doesn't drift) and, at high rates, emits the whole batch
-  due since the last tick. If the pool can't accept a send (engine lagging), it's counted as
-  *deferred* rather than dropped silently — that's how ``offered ≫ achieved`` becomes visible.
+* **open** — a rate-scheduled producer. It accumulates the integral of the phase's rate curve as
+  send credit (not a per-message ``sleep(1/rate)``, so jitter doesn't drift, and a ramp offers what
+  its curve integrates to) and, at high rates, emits the whole batch due since the last tick. If
+  the pool can't accept a send (engine lagging), it's counted as *deferred* rather than dropped
+  silently — that's how ``offered ≫ achieved`` becomes visible.
 * **closed** — holds exactly ``concurrency`` messages in flight via a semaphore released on each
   ACK/timeout. The achieved rate is whatever the engine drains, so it measures *max sustainable
   throughput* without a local backlog inflating the number.
@@ -25,6 +26,12 @@ from harness.load.sender import Dispatcher
 _BATCH_CAP = 4096  # max sends emitted in one open-loop tick (bounds catch-up after a stall)
 _IDLE_SLEEP = 0.02
 _MAX_TICK_SLEEP = 0.05
+# Floor on an open-loop tick: without it, float rounding can leave the credit a hair under 1.0 and
+# ask for a sleep of ~1e-15 s again and again. A send due sooner than this rides the next batch.
+_MIN_TICK_SLEEP = 0.001
+# Credit within this of a whole send counts as that send, so float rounding of an integral that is
+# exactly a whole number (0 -> 1000 msg/s over 10 s is 5000) cannot leave the last send unoffered.
+_CREDIT_EPSILON = 1e-6
 _ACQUIRE_POLL = 0.1
 
 
@@ -58,34 +65,52 @@ class RateGovernor:
             self._counters.deferred_backpressure += 1
 
     async def _run_open(self, phase: Phase, mix: TypeMix, stop: asyncio.Event) -> None:
+        # The number of sends due by time t is the INTEGRAL of the rate curve up to t, accumulated
+        # per tick as `credit` (trapezoid rule, exact for the linear ramps profiles define). It used
+        # to be a next-send deadline stepped by `1 / rate` at the moment of each send, which a ramp
+        # never pulled in as its rate rose (a ramp from 0.002 msg/s scheduled its second send 500 s
+        # out) and a zero-rate stretch never advanced, so the return to a positive rate fired the
+        # whole stretch's worth at once (BACKLOG #5573). A zero-rate tick adds zero credit here.
         sampler = self._corpus.sampler(mix)
         loop = asyncio.get_running_loop()
         start = loop.time()
-        next_due = start
+        last_t = 0.0
+        last_rate = phase.rate_at(0.0)
+        credit = 0.0
         while not stop.is_set():
-            now = loop.time()
-            elapsed = now - start
-            if elapsed >= phase.duration_s:
-                return
-            rate = phase.rate_at(elapsed)
-            if rate <= 0.0:
-                await asyncio.sleep(_IDLE_SLEEP)
-                continue
-            interval = 1.0 / rate
+            elapsed = loop.time() - start
+            t = min(elapsed, phase.duration_s)
+            rate = phase.rate_at(t)
+            credit += (last_rate + rate) / 2.0 * (t - last_t)
+            last_t, last_rate = t, rate
             emitted = 0
-            while next_due <= now and emitted < _BATCH_CAP:
+            while credit >= 1.0 - _CREDIT_EPSILON and emitted < _BATCH_CAP:
                 self._emit_one(sampler)
-                next_due += interval
+                credit -= 1.0
                 emitted += 1
-            if next_due <= now:
+            if credit >= 1.0 - _CREDIT_EPSILON:
                 # Still behind after the batch cap: the GENERATOR could not even schedule the sends this
                 # tick (it never reached a pool, so no engine ever saw them). This is the genuinely
                 # RIG-side deferral — the one a DRIVE SHORTFALL verdict may honestly rest on.
-                behind = int((now - next_due) / interval) + 1
+                behind = int(credit + _CREDIT_EPSILON)
                 self._counters.deferred += behind
                 self._counters.deferred_schedule += behind
-                next_due = now + interval
-            await asyncio.sleep(max(0.0, min(next_due - loop.time(), _MAX_TICK_SLEEP)))
+                credit -= behind
+            if elapsed >= phase.duration_s:
+                # Offer the part-send the curve left at the end, so a phase offers the CEILING of
+                # its integral, as the old schedule (first send at t=0) did: a phase integrating
+                # to 0.5 sends one, not none.
+                if credit > _CREDIT_EPSILON and emitted < _BATCH_CAP:
+                    self._emit_one(sampler)
+                return
+            if rate <= 0.0:
+                await asyncio.sleep(_IDLE_SLEEP)
+                continue
+            # Sleep until the next send is due at the current rate; a rising rate is picked up on
+            # the next tick, which `_MAX_TICK_SLEEP` keeps short.
+            await asyncio.sleep(
+                max(_MIN_TICK_SLEEP, min(max(0.0, 1.0 - credit) / rate, _MAX_TICK_SLEEP))
+            )
 
     async def _run_closed(self, phase: Phase, mix: TypeMix, stop: asyncio.Event) -> None:
         sampler = self._corpus.sampler(mix)
