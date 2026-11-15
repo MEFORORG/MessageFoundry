@@ -426,8 +426,10 @@ _PR_REQ_ID = re.compile(
 _PR_NB = r"(?<![A-Za-z0-9])"
 _PR_NA = r"(?![A-Za-z0-9])"
 #: The same edges, where an underscore joined to a letter or digit on its other side is a snake_case
-#: name, not emphasis: "_gap_" is the word "gap", "retry_gap" is not.
-_PR_EB = _PR_NB + r"(?<![A-Za-z0-9]_)"
+#: name, not emphasis: "_gap_" is the word "gap", "retry_gap" is not. Before the word, one or two
+#: emphasis underscores count only after a non-word character, so a match never starts inside a word
+#: run ("x__messagefoundry"), which kept _PR_CODE linear.
+_PR_EB = r"(?:(?<!\w)|(?<=(?<!\w)_)|(?<=(?<!\w)__))"
 _PR_EA = _PR_NA + r"(?!_[A-Za-z0-9])"
 #: Words after which a dotted triple is a version. A missed entry costs a false positive the author can
 #: rephrase around; a lead never hides a verdict stated with a record verb (see _PR_STRONG_VERB).
@@ -737,6 +739,11 @@ _PR_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-
 _PR_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
 _PR_HEADING = re.compile(r"#{1,6}\s")
 _PR_QUOTE = re.compile(r"(?:>\s?)+")
+#: Quote markers as GFM reads them for a blank line: only a space or tab after each ">", so a ">" then
+#: a no-break space is a line with content, not a blank one.
+_PR_QUOTE_BLANK = re.compile(r"^(?:[ \t]*>[ \t]?)+")
+#: GFM's line endings, and only those: a form feed or U+2028 inside a line does not end it.
+_PR_LINE_END = re.compile(r"\r\n|\r|\n")
 #: A markdown link reads as its text: `[<id>](url) stays partial` is the identifier beside its verdict.
 _PR_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
 PR_BODY_REASONS = {
@@ -772,12 +779,15 @@ def _pr_units(body: str, delete_invisible: bool) -> tuple[_PrUnits, list[int]]:
             marks.clear()
             parts.clear()
 
-    for lineno, raw in enumerate(body.splitlines(), 1):
+    lines = _PR_LINE_END.split(body)
+    if lines and not lines[-1]:
+        lines.pop()  # A final line ending opens no line, as str.splitlines reads it.
+    for lineno, raw in enumerate(lines, 1):
         # The line's type (blank, row, heading, list item) is read from the raw text, as GFM reads it:
         # an invisible character is content there, so a line holding only one is not blank.
         structure = _PR_MD_LINK.sub(r"\1", _PR_QUOTE.sub("", raw.strip(), count=1).strip())
         line = _PR_INVISIBLE.sub("", structure).strip() if delete_invisible else structure
-        if not _PR_QUOTE.sub("", raw.strip(" \t"), count=1).strip(" \t"):
+        if not _PR_QUOTE_BLANK.sub("", raw).strip(" \t"):
             blanks.append(lineno)
         if not structure:
             flush()
@@ -1078,9 +1088,11 @@ def scan_pr_body(body: str) -> list[str]:
     restate a verdict on the same line report it once, rather than storming.
     """
     hits: list[str] = []
-    # The body as written, then with its invisible characters deleted: the second reading only adds.
-    for delete_invisible in (False, True):
-        _pr_scan_reading(body, delete_invisible, hits)
+    # The body as written, then, only where it holds one, with its invisible characters deleted: the
+    # second reading only adds.
+    _pr_scan_reading(body, False, hits)
+    if _PR_INVISIBLE.search(body) is not None:
+        _pr_scan_reading(body, True, hits)
     return hits
 
 

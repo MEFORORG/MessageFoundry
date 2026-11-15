@@ -1050,8 +1050,9 @@ def test_a_header_row_marks_only_its_own_table_and_column(sf) -> None:
 
 
 #: BACKLOG #3364 steps 5 to 12, engine PR 2893's open review findings. Every body fires with the kind
-#: it is listed under, and each step has a quiet control below: the same shape with what made it a
-#: record taken out.
+#: it is listed under. Most steps have a quiet control below: the same shape with what made it a record
+#: taken out. Step 8 has none: the loose column reading, which keeps every mark main made, still
+#: shifts a column at an escaped pipe where main did.
 _HEAD = "| ASVS | Note | Result |\n|---|---|---|\n"
 _ROW = f"| {_REQ} | the limb | {_PASS.title()} (12 messages) |"
 _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
@@ -1163,6 +1164,15 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # unmarked id, whether "the row" follows the id directly or a clause away.
     ("10", "verdict", f"For {_REQ} the row is failing."),
     ("10", "verdict", f"{_REQ} was reviewed; the row is still failing."),
+    # Only "\n", "\r\n" and "\r" end a line, as GFM reads one: a form feed or a line separator at a
+    # row's end leaves the table whole. A ">" then a no-break space is a quoted line, not a blank one.
+    ("9", "verdict", f"{_HEAD}| a | b | c |{chr(0x0C)}\n{_ROW}"),
+    ("9", "verdict", f"{_HEAD}| a | b | c |{chr(0x2028)}\n{_ROW}"),
+    (
+        "9",
+        "verdict",
+        f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n>{chr(0xA0)}\n> {_ROW}",
+    ),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
@@ -1203,7 +1213,9 @@ _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
 def test_a_pr_body_shape_engine_pr_2893_review_found_is_flagged(
     sf, step: str, kind: str, body: str
 ) -> None:
-    """BACKLOG #3364 steps 5 to 12: each went through engine PR 2893's detector unflagged."""
+    """BACKLOG #3364 steps 5 to 12. Most bodies went through engine PR 2893's detector unflagged. The
+    rest are regression pins that main flags and an earlier round of this branch lost, or controls
+    beside a marked identifier; each is commented where it is listed."""
     assert kind in _pr_kinds(sf, body), (step, body)
 
 
@@ -1271,9 +1283,14 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         # Step 4: a header that marks a column, a run of dashes in a delimiter row, and a long list.
         "| ASVS | x |\n|---|---|\n| " + ", ".join([_REQ] * 8000) + " | the outbound limb |",
         "| ASVS | x |\n|" + "-" * 80000 + "x|\n| 1 | 2 |",
-        # Step 12: the same dash run as a real delimiter row, which the case above is not.
-        "| ASVS | x |\n|" + "-" * 80000 + "|\n| 1 | 2 |",
-        "| ASVS | x |\n" + "|" + "-|" * 40000 + "\n| 1 | 2 |",
+        # Step 12: the same dash run in a GFM-valid delimiter row for the two-cell header, which the
+        # case above is not, so the strict header check times its delimiter-cell match over the run.
+        "| ASVS | x |\n|" + "-" * 80000 + "|---|\n| 1 | 2 |",
+        "| ASVS | x |\n|:" + "-" * 80000 + ":|:---:|\n| 1 | 2 |",
+        # Emphasis underscores inside one long word run: a code-path match may start only after a
+        # non-word character, not at every "messagefoundry" in the run.
+        f"| {_REQ} | " + "__messagefoundry" * 5000 + " |",
+        f"| {_REQ} | " + ("messagefoundry" + chr(0xE9)) * 5000 + " |",
         # Identifiers split by a word, so each one takes the column lookup.
         "| ASVS | x |\n|---|---|\n| " + " x ".join([_REQ] * 16000) + " |",
         "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass",
