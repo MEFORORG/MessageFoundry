@@ -1692,9 +1692,11 @@ def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Pa
     an open that asks for backup semantics, as reading LinkType does, is granted SYNCHRONIZE
     whatever the DACL says, so the deny entry hides nothing and the case is not built. Both hosted
     Windows legs failed the control (run 43668208722), and the same run reports the restore
-    privilege switched on in their token (tests/test_startup_code_inventory.py). pwsh copies the
-    token as it stands, so it reads with them off. Where neither is on this changes nothing, and a
-    control that still fails fails the test."""
+    privilege switched on in their token (tests/test_startup_code_inventory.py). The helper switches
+    them off in this process's token before pwsh starts, and a child process starts with a copy of
+    that token as it then stands, so pwsh and the icacls and whoami it starts run with them off.
+    Where neither is on this changes nothing, and a control that still fails fails the test, naming
+    what whoami reads in the harness."""
     from tests.test_worktree_remove_in_use import _privileges_disabled
 
     probe = tmp_path / "symlink-probe"
@@ -1710,16 +1712,16 @@ def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Pa
     # Denying SYNCHRONIZE empties LinkType (measured on pwsh 7.6).
     & icacls $hidden /L /deny "${me}:(S)" | Out-Null
     if ("$((Get-Item -LiteralPath $hidden -Force).LinkType)") {
-      $held = @(whoami /priv | Select-String 'SeBackupPrivilege|SeRestorePrivilege') -join '; '
-      throw "CONTROL FAILED: the deny entry did not hide the link's type (whoami /priv: $held)"
+      # By full path: under Git Bash, as on the CI legs, a bare whoami is MSYS's, which has no /priv.
+      $whoami = Join-Path $env:SystemRoot 'System32\whoami.exe'
+      $held = @(& $whoami /priv | Select-String 'SeBackupPrivilege|SeRestorePrivilege') -join '; '
+      if (-not $held) { $held = 'neither listed' }
+      throw ("CONTROL FAILED: the deny entry did not hide the link's type (privileges this " +
+        "test switched off: $wereOn; whoami /priv here: $held)")
     }
 """
     with _privileges_disabled() as were_on:
-        try:
-            got = _config_lockdown(tmp_path, prepare)
-        except AssertionError as e:
-            e.add_note(f"backup or restore privileges switched off for the harness: {were_on}")
-            raise
+        got = _config_lockdown(tmp_path, f"    $wereOn = {were_on}\n" + prepare)
     assert "S-1-5-32-547" in got["before"]["target"], "CONTROL FAILED: the target has no grant"
     assert "S-1-5-32-547" in got["after"]["target"], (
         "the reset followed a link whose type it could not read and rewrote a file OUTSIDE the "
