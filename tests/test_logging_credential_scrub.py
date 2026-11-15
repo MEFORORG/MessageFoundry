@@ -364,9 +364,12 @@ def test_the_hint_gates_never_change_the_result(fam: Family) -> None:
     the gate and the pattern are built from one word tuple. That is an argument; this is the check.
     A gate that has drifted narrower than its pattern shows up here as a disagreement, and nowhere
     else -- the family assertions above would still pass, because a narrowed gate that happens to
-    admit the fixture is indistinguishable from a correct one."""
+    admit the fixture is indistinguishable from a correct one.
+
+    Read on the passes the gate admits, without the stage ``scrub_credentials`` runs after them
+    (BACKLOG #5546 to #5550): ``_run`` does not run that stage, and no word gate admits it."""
     for line in (fam.line, fam.secret, fam.line.upper(), fam.line.lower()):
-        assert secretscrub.scrub_credentials(line) == secretscrub._run(
+        assert secretscrub._scrub_credentials_base(line) == secretscrub._run(
             line, CREDENTIAL_PLACEHOLDER, None
         ), f"{fam.name}: the admission gate changed the result on {line!r}"
 

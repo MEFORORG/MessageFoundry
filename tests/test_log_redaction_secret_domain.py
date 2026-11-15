@@ -93,6 +93,21 @@ from tests._growth import _growth_between
 #: A pattern that can never match, used to disable one redactor pattern for the mutation fixture.
 NEVER_MATCHES = re.compile(r"(?!x)x")
 
+
+def _without_the_added_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Switch ``secretscrub.scrub_added_shapes`` off on every surface that runs it (BACKLOG #5546 to
+    #5550), for a test whose subject is the passes before it: a differential between two versions
+    of those passes, a positive control that cuts one of them, or a pin on what they still print.
+    The stage runs after all of them and only hides more, so on a surface each of those reads gives
+    at most what it measures here; ``tests/test_secretscrub_added_stage.py`` measures the stage."""
+
+    def identity(text: str, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
+        return text
+
+    monkeypatch.setattr(scrub_mod, "scrub_added_shapes", identity)
+    monkeypatch.setattr(redact_mod, "scrub_added_shapes", identity)
+
+
 #: Module-level patterns that are deliberately NOT secret markers. Each needs a reason, and the exact
 #: set is asserted below so adding a member is a deliberate edit rather than a silent widening.
 NOT_A_SECRET_PATTERN = {
@@ -2369,10 +2384,12 @@ def test_a_plain_value_does_not_swallow_a_later_quoted_label(
         assert not hidden, f"{surface}: the labels {hidden} were swallowed -- got {out!r}"
 
 
-def test_no_two_label_line_prints_either_value() -> None:
+def test_no_two_label_line_prints_either_value(monkeypatch: pytest.MonkeyPatch) -> None:
     """The generated family, every line on every surface: neither value may print, except on the one
     residual shape, and that one must still print. TWO-SIDED, so the residual can neither grow nor be
-    closed without this test being edited to say so."""
+    closed without this test being edited to say so. Read with the added stage off: it hides part of
+    the residual on every surface, and secretscrub's RESIDUALS comment says so."""
+    _without_the_added_stage(monkeypatch)
     cases = _swallow_family_cases()
     assert len(cases) == 9 * 9 * 9 * 2
     write_time_residual = {
@@ -2397,6 +2414,22 @@ def test_no_two_label_line_prints_either_value() -> None:
             f"{surface}: the residual no longer prints on {closed[:3]}. Good news -- update "
             "_is_known_residual and secretscrub's RESIDUALS comment to say it is closed."
         )
+    # THE SURFACES AS THEY SHIP, with the added stage back on: it hides part of the write-time
+    # residual and all of the bundle's, as the RESIDUALS comment says, and prints nothing new.
+    monkeypatch.undo()
+    for surface, apply in _SWALLOW_SURFACES:
+        residual = bundle_residual if apply is redact_log_line else write_time_residual
+        shipped = {
+            line
+            for _first, _sep, _second, line in cases
+            if any(value in apply(line) for value in _SWALLOW_VALUES)
+        }
+        if apply is redact_log_line:
+            assert not shipped, (
+                f"{surface}: {len(shipped)} lines print, first {sorted(shipped)[:3]}"
+            )
+        else:
+            assert shipped < residual, f"{surface}: the stage no longer hides part of the residual"
 
 
 def _without_the_stop(module: ModuleType) -> dict[str, re.Pattern[str]]:
@@ -2418,6 +2451,9 @@ def _without_the_stop(module: ModuleType) -> dict[str, re.Pattern[str]]:
 
 
 def _patched_without_the_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The added stage hides the remnant a swallowed label leaves, so a control for the stop reads
+    # the passes alone.
+    _without_the_added_stage(monkeypatch)
     for module in (scrub_mod, redact_mod):
         for name, pattern in _without_the_stop(module).items():
             monkeypatch.setattr(module, name, pattern)
@@ -3178,7 +3214,12 @@ def _secret_passes_only(monkeypatch: pytest.MonkeyPatch) -> None:
     The connection-string member pass (BACKLOG #5030) goes too. It is not one of the five patterns
     compared, it runs after all of them, and on each side it hides a different span of what they
     left, so leaving it on compares it with itself. That it only adds redaction is held by
-    ``tests/test_connection_string_member_scrub.py``."""
+    ``tests/test_connection_string_member_scrub.py``.
+
+    The added stage (BACKLOG #5546 to #5550) goes for the same reason: it runs after every one of
+    the five, reads what they left, and hides a different span of it on each side.
+    ``tests/test_secretscrub_added_stage.py`` holds that it only adds redaction."""
+    _without_the_added_stage(monkeypatch)
     monkeypatch.setattr(redact_mod, "_redact_phi", lambda text: text)
     monkeypatch.setattr(redact_mod, "_LONG_B64", NEVER_MATCHES)
     monkeypatch.setattr(redact_mod, "_CONNECTION_STRING_MEMBER", NEVER_MATCHES)
@@ -3424,9 +3465,13 @@ def test_the_open_cascade_defects_still_print(
     The second half uses the differential's own baseline. :func:`_pre_change_patterns` is patched
     into both real modules and run through the real pass order. The same passes are taken out as the
     differential takes out. That replaces a hand-built replay of the passes, which could drift from
-    what the modules do. Values are matched as substrings here, not as ``vq`` atoms."""
+    what the modules do. Values are matched as substrings here, not as ``vq`` atoms.
+
+    Both halves read the passes with the added stage off, since the defects are theirs; the stage
+    hides some of these values on the surfaces, as secretscrub's OPEN DEFECTS comment says."""
     line, atoms = case
     assert atoms, f"no atoms to look for in {line!r}, so neither side checks anything"
+    _without_the_added_stage(monkeypatch)
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
         hidden = [atom for atom in atoms if atom not in out]
@@ -3798,7 +3843,8 @@ def _newly_printed(corpus: list[str], before: list[str], after: list[str]) -> li
 
 def test_the_bundle_prints_nothing_its_own_passes_hid(monkeypatch: pytest.MonkeyPatch) -> None:
     """The second layer may only hide more. Whole ``redact_log_line``, PHI pass included, with and
-    without ``scrub_credentials``: no value atom the bundle's own passes hid may print.
+    without ``secretscrub._scrub_credentials_base``: no value atom the bundle's own passes hid may
+    print.
 
     The full probe behind ``redact_log_line``'s comment ran 822,616 lines; this is the slice that
     found the defect, plus a seeded structured corpus. Two other arms keep it honest. The layer must
@@ -3811,7 +3857,7 @@ def test_the_bundle_prints_nothing_its_own_passes_hid(monkeypatch: pytest.Monkey
     corpus = [*fold_head, *_structured_lines(3000), *_REVIEW_SHAPES]
     shipped = [redact_log_line(line) for line in corpus]
     with monkeypatch.context() as patch:
-        patch.setattr(redact_mod, "scrub_credentials", lambda text, *, placeholder: text)
+        patch.setattr(redact_mod, "_scrub_credentials_base", lambda text, *, placeholder: text)
         own_only = [redact_log_line(line) for line in corpus]
     with monkeypatch.context() as patch:
         for name in _applied_pattern_names(scrub_mod, "_run"):

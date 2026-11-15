@@ -54,7 +54,8 @@ from messagefoundry.secretscrub import (
     _CONNECTION_STRING_MEMBER,
     _braced_tail,
     _mask_member,
-    scrub_credentials,
+    _scrub_credentials_base,
+    scrub_added_shapes,
 )
 
 __all__ = [
@@ -608,7 +609,10 @@ def redact_log_line(line: str) -> str:
     so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
     #2694); its last pass masks the words of a connection-string member's value. Then that member
     mask runs once more over the whole joined line (BACKLOG #5030). A final long-base64 sweep catches
-    any residual key/token run.
+    any residual key/token run. Last, :func:`messagefoundry.secretscrub.scrub_added_shapes` reads what
+    all of that left (BACKLOG #5546 to #5550). The second layer here is
+    ``secretscrub._scrub_credentials_base``, the shared pass without that stage, so every pass before
+    the stage reads the text it read before the stage was added.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
     the correct trade-off for a file that leaves the box."""
@@ -628,7 +632,7 @@ def redact_log_line(line: str) -> str:
     # The second credential layer; see the comment above this function.
     pieces = [body] if logged_placeholder else body.split(REDACTION_PLACEHOLDER)
     body = REDACTION_PLACEHOLDER.join(
-        scrub_credentials(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
+        _scrub_credentials_base(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
     )
     # A connection-string member, its value's words masked to the next ";" (BACKLOG #5030).
     # secretscrub's own pattern and mask, not a copy, run LAST of the credential passes: after the PHI
@@ -639,7 +643,8 @@ def redact_log_line(line: str) -> str:
     if ";" in body:
         body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
-    return prefix + body
+    # The added stage (BACKLOG #5546 to #5550); see the docstring.
+    return scrub_added_shapes(prefix + body, REDACTION_PLACEHOLDER)
 
 
 def split_log_lines(text: str) -> list[str]:

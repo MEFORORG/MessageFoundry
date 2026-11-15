@@ -50,6 +50,18 @@ _CAMEL_LINES = (
 )
 
 
+def _without_the_added_stage(patch: pytest.MonkeyPatch) -> None:
+    """Switch ``secretscrub.scrub_added_shapes`` off on every surface that runs it (BACKLOG #5546 to
+    #5550), for a test whose subject is the label passes before it. It only hides more, so on a
+    surface such a test reads at most what the passes print."""
+
+    def identity(text: str, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
+        return text
+
+    patch.setattr(secretscrub, "scrub_added_shapes", identity)
+    patch.setattr(redact_mod, "scrub_added_shapes", identity)
+
+
 def _through_the_chain(text: str) -> str:
     """``text`` as a log message through the filters ``_install_phi_filters`` puts on a handler."""
     handler = logging.NullHandler()
@@ -168,17 +180,25 @@ def test_a_plain_value_does_not_swallow_a_later_quoted_camelcase_label() -> None
         assert not printed, f"{name}: {len(printed)} lines printed, first {printed[:3]}"
 
 
-def test_the_support_bundle_still_prints_a_swallowed_camelcase_label() -> None:
-    """A RESIDUAL, pinned so its closing is noticed. ``support/redact.py`` runs its own copy of the
-    label patterns first, and that copy has neither the camelCase start nor the split walk, so its
-    plain value runs over the later camelCase label as every copy did before BACKLOG #5545. Its
-    second layer, this module, then sees only the placeholder and the quoted value after it."""
+def test_the_support_bundle_still_prints_a_swallowed_camelcase_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A RESIDUAL OF THE LABEL PASSES, pinned so its closing is noticed. ``support/redact.py`` runs
+    its own copy of the label patterns first, and that copy has neither the camelCase start nor the
+    split walk, so its plain value runs over the later camelCase label as every copy did before
+    BACKLOG #5545. Its second layer, this module, then sees only the placeholder and the quoted value
+    after it. Read with the added stage off: that stage hides the quoted value glued to the
+    placeholder, so the whole of ``redact_log_line`` prints none of these lines."""
+    assert not _printing(_swallow_lines(), redact_log_line)
+    _without_the_added_stage(monkeypatch)
     assert _printing(_swallow_lines(), redact_log_line)
 
 
 def test_the_swallow_lines_print_without_the_split_walk(monkeypatch: pytest.MonkeyPatch) -> None:
     """THE POSITIVE CONTROL: with each walk taking a whole run of letters and digits again, as
-    before BACKLOG #5545, most lines print, so the green above is the split walk's work."""
+    before BACKLOG #5545, most lines print, so the green above is the split walk's work. The added
+    stage is off, since it hides what a swallowed label leaves."""
+    _without_the_added_stage(monkeypatch)
     for name in ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL"):
         pattern: re.Pattern[str] = getattr(secretscrub, name)
         assert secretscrub._RUN_UNIT in pattern.pattern, name
@@ -508,7 +528,7 @@ def _surfaces_before(patch: pytest.MonkeyPatch) -> None:
     so that is the whole of the reading before it on the chain and in the bundle."""
     patch.setattr(secretscrub, "scrub_credentials", _scrub_before)
     patch.setattr(logging_setup, "scrub_credentials", _scrub_before)
-    patch.setattr(redact_mod, "scrub_credentials", _scrub_before)
+    patch.setattr(redact_mod, "_scrub_credentials_base", _scrub_before)
 
 
 #: Every surface a line reaches, plus the two that read a surface's output again: a record two
@@ -528,7 +548,9 @@ _READS = {"chain twice": "write-time chain", "bundle of chain": "write-time chai
 def _newly_printed(monkeypatch: pytest.MonkeyPatch, corpus: list[str]) -> tuple[list[str], int]:
     """``(atoms a surface prints that the reading before BACKLOG #5545 hid, the count the reverse
     way)``. On a derived surface, an atom the reading before printed on the surface it reads is not
-    counted: the log held it under both readings."""
+    counted: the log held it under both readings. Both readings run with the added stage off, which
+    came after BACKLOG #5545 and reads what either leaves."""
+    _without_the_added_stage(monkeypatch)
     after = {name: [apply(line) for line in corpus] for name, apply in _DIFFERENTIAL}
     with monkeypatch.context() as patch:
         _surfaces_before(patch)
@@ -662,6 +684,7 @@ def test_the_chain_twice_residual_is_a_value_the_first_pass_already_printed(
     first pass already printed under ``origin/main``, and none otherwise; on the credential scrub,
     the chain and the bundle, none."""
     line = "dbPass = vq0_vq1|client_secret: vq2&vq3"
+    _without_the_added_stage(monkeypatch)
     assert _prints("vq3", _through_the_chain(_through_the_chain(line)))
     with monkeypatch.context() as patch:
         _surfaces_before(patch)

@@ -3358,7 +3358,7 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
     line takes, so the hostile target is emitted through the chain production installs, exactly as
     the arm above does, the stdout it produced is stored as the newest log file, and
     ``_read_log_tail`` reads it back. Since BACKLOG #2694 that read runs BOTH patterns: the twin
-    first, then ``secretscrub.scrub_credentials`` as a second layer, and this arm times the two
+    first, then ``secretscrub._scrub_credentials_base`` as a second layer, and this arm times the two
     together, as the reader runs them. :func:`_read_back_growth` says why the clock covers the
     per-line redaction and not the file read.
 
@@ -3431,7 +3431,7 @@ def test_a_stored_hostile_access_line_costs_the_log_read_back_linear_time(
     assert sentinel not in raw_line, "the read-back printed the password"
     assert hidden in raw_line, "the password is hidden, but the scheme, user or host went with it"
     with monkeypatch.context() as m:
-        m.setattr(support_redact, "scrub_credentials", lambda text, **_: text)
+        m.setattr(support_redact, "_scrub_credentials_base", lambda text, **_: text)
         (twin_only,) = _read_back(raw_dir)
         m.setattr(support_redact, "_DSN_PASSWORD", re.compile(r"(?!)"))
         (neither,) = _read_back(raw_dir)
@@ -3621,15 +3621,18 @@ def test_a_query_value_with_no_label_value_outside_it_is_hidden_whole(line: str)
 def test_a_label_glued_on_by_a_label_character_still_goes_with_the_value(
     sep: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """THE RESIDUAL, TWO-SIDED. ".", "-" and "_" are label characters, so the query value does not
-    stop there and the quoted value still prints through the chain. That shape is owned by #2966's
-    owner ruling and #3122, not by #3002. If this goes red because the value no longer prints, the
-    residual is closed: say so on #2966 and #3122, and delete this test."""
+    """THE RESIDUAL, NOW CLOSED ON THE CHAIN. ".", "-" and "_" are label characters, so the query
+    value does not stop there, and before BACKLOG #5547 the quoted value printed through the chain;
+    that shape is owned by #2966's owner ruling and #3122, not by #3002. The query filter still
+    leaves it, as ``token=<placeholder>"v w"``: a quoted run glued to a placeholder, which
+    ``secretscrub.scrub_added_shapes`` hides as the remnant of a bytes literal. So the value is hidden
+    and the label went with the query value."""
     head, tail = _QUERY_SECOND_VALUES
     line = f'retry token={_QUERY_TOKEN_VALUE}{sep}password="{head} {tail}" for svc'
     out, _file = _write_one_record_through_every_sink("text", line, tmp_path, capsys)
     assert _QUERY_TOKEN_VALUE not in out
-    assert f'"{head} {tail}"' in out, f"the glued residual is closed on {sep!r}: {out!r}"
+    assert head not in out and tail not in out, f"the glued value printed on {sep!r}: {out!r}"
+    assert f"retry token={CREDENTIAL_PLACEHOLDER} for svc" in out, out
 
 
 def test_the_query_stop_words_are_secretscrubs_label_words() -> None:
