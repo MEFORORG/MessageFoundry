@@ -112,6 +112,7 @@ export class TestBench {
       this.panel.reveal();
       return;
     }
+    sweepStaleCaseDirs(); // a crashed run's case files go on the next open, not only the next run
     this.panel = vscode.window.createWebviewPanel(
       "messagefoundry.testBench",
       "MessageFoundry Test Bench",
@@ -285,6 +286,7 @@ export class TestBench {
       name: r.source,
       input: r.raw,
       expected: r.deliveries.map((d) => ({ to: d.to, payload: d.payload })),
+      disposition: r.disposition,
     }));
     map[name] = { name, cases };
     this.dropRun();

@@ -74,8 +74,14 @@ of volatile fields (MSH-7, MSH-10).**
   **materializes each case's stored input to a fresh per-run temp directory** (`os.tmpdir()`),
   dry-runs it (`--show-phi`, so expected/actual bodies are full), compares each case's new deliveries
   against its stored `expected` via `compareMessages`, and **deletes the temp directory in a
-  `finally`** — PHI on disk is transient and cleaned, never left behind. Pass/fail is shown per case;
+  `finally`**. A hard crash can still leave the directory behind; *Consequences* says what removes
+  it (amended 2026-11-14, BACKLOG #5415). Pass/fail is shown per case;
   a click on a case shows its expected-vs-actual differences (see *Reveal on click*).
+- **A case must also end where it did (amended 2026-11-14, BACKLOG #5416).** An errored Router or
+  Handler delivers nothing, so the delivery compare alone passed a case that expects no delivery. A
+  case now records the disposition its row had when saved, and a rerun passes only with that same
+  disposition and, unless the recorded one is `error`, no error text. A case saved before the field
+  existed fails on any rerun with error text or an `error` disposition.
 - **Reveal on click (amended 2026-09-29, BACKLOG #2437, ASVS 14.2.6, owner ruling R13).** The run
   view shows each case's name, PASS or FAIL, and disposition. It shows no field value and no error
   text. The host keeps each case's differences and error. The webview asks for one case when the
@@ -136,10 +142,12 @@ existing Load / before-after / Coverage-Profiling panes and the `--show-phi` pos
 steer (ADR 0030) and the in-UI notice; workspaceState is not encrypted, so authors must not save real
 PHI. Rerun writes transient PHI to a temp dir — always cleaned in `finally`, but a hard crash mid-run
 could leave a temp file. *Amended 2026-11-14 (BACKLOG #5415):* the run's directory is owner-only
-(`0700`) and each case file is created exclusively and owner-only (`0600`) on POSIX; on Windows the
-per-user temp directory's ACL governs. A directory a crash left behind is deleted by the next
-collection run once it is over an hour old, and not before, so a run in another window survives; until
-that next run it stays on disk. The dry-run is handed the directory, not one path per case, so a large
+(`0700`) and each case file is created exclusively and owner-only (`0600`) on POSIX; on Windows
+those modes do nothing and the temp directory's own ACL governs, which is owner-only for the default
+per-user TEMP but not for a shared directory TEMP is pointed at. A directory a crash left behind is
+deleted when the Test Bench next opens or next runs a collection, once it is over an hour old, and
+not before, so a run in another window survives; on POSIX only a directory this user owns is
+deleted. Until then it stays on disk, with no bound if the Test Bench is not used again. The dry-run is handed the directory, not one path per case, so a large
 collection no longer grows the command line (`ide/src/collectionCaseFiles.ts`). The volatile policy is a fixed default;
 a feed with other volatile fields (e.g. a bespoke timestamp segment) may show a false regression until
 a future per-collection override lands.

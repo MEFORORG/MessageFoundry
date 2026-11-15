@@ -12,6 +12,7 @@ import {
   judgeCollectionRun,
   pickCaseDetail,
   releaseRun,
+  type CaseRerun,
   type ExpectedDelivery,
 } from "../../testCollections";
 
@@ -207,6 +208,55 @@ suite("testCollections.judgeCollectionRun — an errored rerun fails the case", 
   test("error text fails it whatever the disposition says", () => {
     const run = judgeCollectionRun([filtered], [{ disposition: "filtered", error: "boom", deliveries: [] }]);
     assert.strictEqual(run.summaries[0].pass, false);
+  });
+
+  test("a rerun row with no disposition fails the case instead of aborting the run", () => {
+    const bad = { error: null, deliveries: [] } as unknown as CaseRerun;
+    const run = judgeCollectionRun([filtered, filtered], [bad, { disposition: "filtered", error: null, deliveries: [] }]);
+    assert.deepStrictEqual(
+      run.summaries.map((s) => s.pass),
+      [false, true],
+    );
+  });
+});
+
+// BACKLOG #5416: a case saved with its disposition must rerun to the same one, so a deliberate error
+// case stays green and a FILTERED case that now goes UNROUTED fails.
+suite("testCollections.judgeCollectionRun — the recorded disposition", () => {
+  const input = hl7(MSH("20200101010101", "C1"), "PID|1||A");
+  const saved = (disposition: string) => ({ name: disposition, input, expected: [], disposition });
+  const rerun = (disposition: string, error: string | null = null): CaseRerun => ({
+    disposition,
+    error,
+    deliveries: [],
+  });
+
+  test("the same disposition passes, compared without case", () => {
+    assert.strictEqual(judgeCollectionRun([saved("FILTERED")], [rerun("filtered")]).summaries[0].pass, true);
+  });
+
+  test("another disposition that also delivers nothing fails", () => {
+    assert.strictEqual(judgeCollectionRun([saved("filtered")], [rerun("unrouted")]).summaries[0].pass, false);
+  });
+
+  test("an errored rerun of a case saved clean fails", () => {
+    const run = judgeCollectionRun([saved("filtered")], [rerun("error", "router/handler error: boom")]);
+    assert.strictEqual(run.summaries[0].pass, false);
+  });
+
+  test("error text fails a case saved clean even when the disposition matches", () => {
+    assert.strictEqual(judgeCollectionRun([saved("filtered")], [rerun("filtered", "boom")]).summaries[0].pass, false);
+  });
+
+  test("a case saved as an error passes when it errors again, and fails when it stops erroring", () => {
+    const run = judgeCollectionRun(
+      [saved("error"), saved("error")],
+      [rerun("error", "parse error: bad MSH"), rerun("filtered")],
+    );
+    assert.deepStrictEqual(
+      run.summaries.map((s) => s.pass),
+      [true, false],
+    );
   });
 });
 

@@ -94,6 +94,36 @@ suite("collectionCaseFiles.sweepStaleCaseDirs — what a crashed run left (BACKL
     assert.ok(fs.existsSync(f));
   });
 
+  test("a symlink named like a run directory is never followed or removed", function () {
+    if (!POSIX) {
+      this.skip(); // a Windows symlink needs a privilege a test runner may not hold
+    }
+    const target = fs.mkdtempSync(path.join(base, "target-"));
+    fs.writeFileSync(path.join(target, "keep.hl7"), BODY);
+    const link = path.join(base, CASE_DIR_PREFIX + "link");
+    fs.symlinkSync(target, link);
+    assert.strictEqual(sweepStaleCaseDirs(base, Date.now() + 10 * STALE_CASE_DIR_MS), 0);
+    assert.ok(fs.existsSync(path.join(target, "keep.hl7")));
+  });
+
+  test("on POSIX a run directory another user owns is left alone", function () {
+    if (!POSIX) {
+      this.skip();
+    }
+    const dir = materializeCases([BODY], base);
+    const getuid = process.getuid;
+    const later = Date.now() + 10 * STALE_CASE_DIR_MS;
+    try {
+      // Pretend to be a different user: the directory's owner then no longer matches.
+      (process as { getuid?: () => number }).getuid = () => (getuid ? getuid() : 0) + 1;
+      assert.strictEqual(sweepStaleCaseDirs(base, later), 0);
+      assert.ok(fs.existsSync(dir));
+    } finally {
+      (process as { getuid?: () => number }).getuid = getuid;
+    }
+    assert.strictEqual(sweepStaleCaseDirs(base, later), 1); // control: as its owner, it goes
+  });
+
   test("an unreadable base removes nothing and does not throw", () => {
     assert.strictEqual(sweepStaleCaseDirs(path.join(base, "missing")), 0);
   });

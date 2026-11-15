@@ -25,8 +25,10 @@ export function caseFileName(i: number): string {
 
 /**
  * Write each input to its own file in a fresh directory under `base`, and return the directory. The
- * directory is owner-only (0700) and each file is created exclusively and owner-only (0600), so no
- * other local account can read a body while the run lasts. On any failure the directory is removed
+ * directory is 0700 and each file is created exclusively at 0600, which on POSIX keeps every other
+ * local account from reading a body while the run lasts. Windows ignores those modes, so there the
+ * temp directory's own ACL governs: owner-only for the default per-user TEMP, not for a shared
+ * directory TEMP is pointed at. On any failure the directory is removed
  * before the error is rethrown, so no partial set of bodies stays behind.
  */
 export function materializeCases(inputs: readonly string[], base: string = os.tmpdir()): string {
@@ -45,16 +47,20 @@ export function materializeCases(inputs: readonly string[], base: string = os.tm
 /** Remove a run's directory. Best effort: a cleanup error must not mask the run's own result. */
 export function removeCaseDir(dir: string): void {
   try {
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Retries ride out a scanner or indexer briefly holding a just-written case file on Windows.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   } catch {
-    /* a later run's sweep retries it (sweepStaleCaseDirs) */
+    /* a later sweep retries it (sweepStaleCaseDirs) */
   }
 }
 
 /**
  * Delete the run directories under `base` that a crashed run left behind: a real directory (never a
- * symlink) named with CASE_DIR_PREFIX and last modified more than `maxAgeMs` before `now`. Returns how
- * many it removed. Best effort: an entry it cannot read or remove is skipped.
+ * symlink) named with CASE_DIR_PREFIX, last modified more than `maxAgeMs` before `now`, and, on POSIX,
+ * owned by this process's user. The OS temp directory is shared there, so the prefix alone does not
+ * say who made an entry, and a recursive delete must never walk a tree another account controls. On
+ * Windows the default TEMP is per-user. Returns how many it removed. Best effort: an entry it cannot
+ * read or remove is skipped.
  */
 export function sweepStaleCaseDirs(
   base: string = os.tmpdir(),
@@ -67,6 +73,7 @@ export function sweepStaleCaseDirs(
   } catch {
     return 0;
   }
+  const uid = process.getuid?.();
   let removed = 0;
   for (const name of names) {
     if (!name.startsWith(CASE_DIR_PREFIX)) {
@@ -75,7 +82,7 @@ export function sweepStaleCaseDirs(
     const dir = path.join(base, name);
     try {
       const st = fs.lstatSync(dir);
-      if (!st.isDirectory() || now - st.mtimeMs <= maxAgeMs) {
+      if (!st.isDirectory() || (uid !== undefined && st.uid !== uid) || now - st.mtimeMs <= maxAgeMs) {
         continue;
       }
       fs.rmSync(dir, { recursive: true, force: true });

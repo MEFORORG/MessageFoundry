@@ -1050,9 +1050,11 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/cli.ts": Site(2, OPERATOR, "Fixed venv interpreter paths under the workspace."),
     "ide/src/collectionCaseFiles.ts": Site(
         3,
-        INTERNAL,
-        "A temp directory the extension made, generated case-file names, and names read back from"
-        " listing the OS temp directory, kept only when they carry the extension's own prefix.",
+        GUARDED,
+        "A temp directory the extension made and generated case-file names, plus names read back"
+        " from listing the shared OS temp directory, which another account can plant; the sweep"
+        " deletes one only if it is a real directory this user owns (POSIX).",
+        "ide/src/collectionCaseFiles.ts::st.uid !== uid",
     ),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/editorToolbar.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
