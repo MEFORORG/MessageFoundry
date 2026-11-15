@@ -83,23 +83,22 @@ class _ArmMetrics:
     backlog: int
     no_loss_detail: str
     trials: int = 1
+    # Every trial's post-load drain completed. Kept apart from the loss reconcile, as ``_FuseArm`` keeps
+    # it: a timed-out drain stranded rows somewhere, which is not the same claim as a lost message.
+    drain_completed: bool = True
 
     @classmethod
     def from_records(cls, recs: list[ConnScaleRecord]) -> _ArmMetrics:
         """One arm's read-off over EVERY trial of its cell (BACKLOG #5429). Keeping only the last trial
-        let an earlier lossy or timed-out trial vanish from a passing verdict, so the loss signal is
-        all-trials and a timed-out drain counts against it: ``await_drain`` never saw the whole-pipeline
-        gauge reach 0, so rows were stranded somewhere, which is the fusion comparator's reading too.
-        Rates are trial means; peaks and tail latencies are the worst trial."""
+        let an earlier lossy or timed-out trial vanish from a passing verdict, so the loss signal and
+        the drain signal are both all-trials. Rates are trial means; peaks and tail latencies are the
+        worst trial."""
         last = recs[-1]
-        failures: list[str] = []
-        for i, r in enumerate(recs):
-            label = f"trial {i}: " if len(recs) > 1 else ""
-            if not r.no_loss.ok:
-                failures.append(f"{label}{r.no_loss.detail}")
-            if r.drain_seconds is None:
-                failures.append(f"{label}drain timed out")
-        detail = "; ".join(failures) or last.no_loss.detail
+        losses = [
+            r.no_loss.detail if len(recs) == 1 else f"trial {r.trial}: {r.no_loss.detail}"
+            for r in recs
+            if not r.no_loss.ok
+        ]
 
         def _mean_or_none(values: list[float | None]) -> float | None:
             present = [v for v in values if v is not None]
@@ -121,12 +120,13 @@ class _ArmMetrics:
             cpu_util_cores_mean=_mean_or_none([r.cpu_util_cores_mean for r in recs]),
             fd_count_peak=_max_or_none([r.fd_count_peak for r in recs]),
             working_set_peak_bytes=_max_or_none([r.working_set_peak_bytes for r in recs]),
-            no_loss_ok=not failures,
+            no_loss_ok=not losses,
             sent=sum(r.no_loss.sent for r in recs),
             sink_received=sum(r.no_loss.sink_received for r in recs),
             backlog=max(r.no_loss.backlog for r in recs),
-            no_loss_detail=detail,
+            no_loss_detail="; ".join(losses) or last.no_loss.detail,
             trials=len(recs),
+            drain_completed=all(r.drain_seconds is not None for r in recs),
         )
 
 
@@ -165,6 +165,9 @@ class ComparisonRow:
         sound*. A baseline that itself breached zero-loss yields no sound throughput comparison, so
         the row passes on the resilience basis (pooled held) rather than on a phantom-zero delta."""
         if self.pooled_missing or self.candidate_lost:
+            return False
+        # A pooled arm whose drain timed out in any trial left rows stranded (BACKLOG #5429).
+        if self.candidate is not None and not self.candidate.drain_completed:
             return False
         if self.collapse_verdict == COLLAPSE_FAIL:
             return False
@@ -287,6 +290,9 @@ class ClaimModeComparison:
             f"missing_arms={self.missing_arms}, "
             f"orphan_candidate_cells={len(self.orphan_candidate_cells)})"
         )
+        if self.orphan_candidate_cells:
+            orphans = ", ".join(f"[{sm}] N={n}" for sm, n in self.orphan_candidate_cells)
+            lines.append(f"POOLED CELLS WITH NO per_lane BASELINE (the A/B fails): {orphans}")
         for row in self.rows:
             lines.append("")
             lines.append(f"[{row.sweep_mode}] N={row.count}")
@@ -520,6 +526,16 @@ def _row_json(row: ComparisonRow) -> dict[str, object]:
             "per_lane_detail": row.baseline.no_loss_detail,
             "pooled_detail": (None if row.candidate is None else row.candidate.no_loss_detail),
         },
+        # Every rate above is a mean over this many trials; a drain that timed out in any trial
+        # fails a pooled row (BACKLOG #5429).
+        "trials": {
+            "per_lane": row.baseline.trials,
+            "pooled": None if row.candidate is None else row.candidate.trials,
+        },
+        "drain_completed": {
+            "per_lane": row.baseline.drain_completed,
+            "pooled": None if row.candidate is None else row.candidate.drain_completed,
+        },
     }
     if row.missing_detail:
         out["missing_detail"] = row.missing_detail
@@ -563,6 +579,8 @@ def _loss_label(row: ComparisonRow) -> str:
     if row.candidate_lost:
         detail = row.candidate.no_loss_detail if row.candidate is not None else ""
         return f"CANDIDATE LOST -- pooled breached zero-loss ({detail})"
+    if row.candidate is not None and not row.candidate.drain_completed:
+        return "CANDIDATE UNDRAINED -- a pooled trial's drain timed out (rows stranded)"
     if row.resilience_win:
         return "RESILIENCE -- per_lane breached zero-loss, pooled held (throughput delta not sound)"
     return "both clean"

@@ -262,6 +262,12 @@ def test_remote_result_ok_refuses_an_empty_or_undrained_run_bug_5431() -> None:
     undrained = _remote_report(drain_seconds=None)
     assert not undrained.result_ok
     assert undrained.exit_code == 1
+    # Each FAIL names its reason in the console and the JSON.
+    assert empty.failures == ["nothing was sent"]
+    assert "FAIL: nothing was sent" in empty.render_console()
+    assert undrained.to_json_dict()["failures"] == ["the drain timed out"]
+    assert "drain=TIMED-OUT" in undrained.render_console()
+    assert _remote_report().failures == []
 
 
 def test_remote_json_names_no_rate_window_when_a_bracket_sample_failed_bug_5431() -> None:
@@ -273,6 +279,8 @@ def test_remote_json_names_no_rate_window_when_a_bracket_sample_failed_bug_5431(
     unmeasured = _remote_report(rates_measured=False).to_json_dict()["throughput"]
     assert isinstance(unmeasured, dict)
     assert unmeasured["rate_window"] is None
+    assert unmeasured["rates_measured"] is False
+    assert measured["rates_measured"] is True
 
 
 async def test_run_connscale_remote_marks_unsampled_rates_bug_5431(

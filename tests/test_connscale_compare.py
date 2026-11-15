@@ -275,8 +275,32 @@ def test_a_timed_out_candidate_trial_fails_the_cell_bug_5429() -> None:
     cmp = build_comparison(recs, ("per_lane", "pooled"))
     assert cmp is not None
     assert not cmp.ok
-    assert cmp.rows[0].candidate is not None
-    assert "trial 0: drain timed out" in cmp.rows[0].candidate.no_loss_detail
+    (row,) = cmp.rows
+    assert row.candidate is not None
+    assert not row.candidate.drain_completed
+    # A timed-out drain is not reported as a lost message: the reconcile held.
+    assert row.candidate.no_loss_ok
+    assert not row.candidate_lost
+    assert "CANDIDATE UNDRAINED" in cmp.render_table()
+    rows = cmp.to_json_dict()["rows"]
+    assert isinstance(rows, list)
+    assert rows[0]["drain_completed"] == {"per_lane": True, "pooled": False}
+    assert rows[0]["trials"] == {"per_lane": 2, "pooled": 2}
+
+
+def test_a_timed_out_baseline_drain_keeps_the_throughput_guard_bug_5429() -> None:
+    # per_lane's drain timed out but its reconcile held; pooled regressed to a quarter of the rate. The
+    # throughput comparison must stay sound and fail the row, not pass as a resilience win.
+    recs = [
+        _timed_out(_record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0)),
+        _record(claim_mode="pooled", count=500, achieved_read=100.0, idle_poll=0.0),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert not cmp.ok
+    assert cmp.rows[0].throughput_comparable
+    assert not cmp.rows[0].throughput_ok
+    assert cmp.resilience_wins == 0
 
 
 def test_an_orphan_candidate_cell_fails_the_ab_bug_5429() -> None:
@@ -296,6 +320,7 @@ def test_an_orphan_candidate_cell_fails_the_ab_bug_5429() -> None:
     assert isinstance(summary, dict)
     assert summary["orphan_candidate_cells"] == [{"sweep_mode": "fixed_aggregate", "count": 1000}]
     assert any("NO per_lane baseline" in n for n in cmp.notes)
+    assert "NO per_lane BASELINE (the A/B fails): [fixed_aggregate] N=1000" in cmp.render_table()
 
 
 def test_trials_aggregate_to_the_mean_rate_bug_5429() -> None:

@@ -17,7 +17,7 @@ import re
 import sys
 import tempfile
 import types
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -857,14 +857,18 @@ async def test_batch_driver_crashed_band_fails_cell_not_absent(
 
 
 async def _drive_against_stub_engine(
-    monkeypatch: pytest.MonkeyPatch, first_ready: dict[str, Any]
+    monkeypatch: pytest.MonkeyPatch,
+    first_ready: Callable[[dict[str, Any]], dict[str, Any]] | None,
+    *,
+    profile_text: str = _MINIMAL_BATCH,
 ) -> tuple[Any, list[Any], dict[str, Any] | None]:
-    """Run the driver half against a stand-in engine box whose FIRST cell posts ``first_ready`` and
-    every other cell a well-formed READY. Returns the report, the cells and the first cell's DONE."""
+    """Run the driver half against a stand-in engine box whose FIRST cell posts its well-formed READY
+    passed through ``first_ready`` (unchanged when ``None``) and every other cell a well-formed READY.
+    Returns the report, the cells and the first cell's DONE."""
     import asyncio
 
     _install_driver_fakes(monkeypatch)
-    profile = _profile()
+    profile = load_connscale_profile_text(profile_text)
     with tempfile.TemporaryDirectory() as tmp:
         coord = FileDropCoord(tmp, run_id="batch_ab")
         cells = bb.iter_batch_cells(profile, claim_mode="pooled")
@@ -886,7 +890,8 @@ async def _drive_against_stub_engine(
                     "drain_timeout_s": profile.drain_timeout_s,
                     "aggregate_rate": 24.0,
                 }
-                cc.post(BATCH_CELL_READY, first_ready if i == 0 else well_formed)
+                ready = well_formed if i or first_ready is None else first_ready(well_formed)
+                cc.post(BATCH_CELL_READY, ready)
                 await cc.await_message(BATCH_CELL_DONE, timeout=10.0, interval=0.02)
 
         driver_task = asyncio.create_task(
@@ -905,34 +910,55 @@ async def _drive_against_stub_engine(
     return report, cells, first_done
 
 
-async def test_a_cell_whose_engine_failed_to_start_is_a_failed_record_bug_5428(
-    monkeypatch: pytest.MonkeyPatch,
+def _engine_error(ready: dict[str, Any]) -> dict[str, Any]:
+    return {"cell_id": ready["cell_id"], "error": "engine did not start: boom"}
+
+
+@pytest.mark.parametrize("zero_loss", [True, False])
+async def test_a_cell_whose_engine_failed_to_start_fails_the_run_bug_5428(
+    monkeypatch: pytest.MonkeyPatch, zero_loss: bool
 ) -> None:
-    # One B0 trial's engine never started; the other five cells run clean with a +50% lift. Dropping
-    # that cell from the records used to let the run read GO and exit 0.
+    # One B0 trial's engine never started; the other five cells run clean with a +50% lift. Only a
+    # note recorded the miss, so the run read GO and exited 0. It must fail with or without the
+    # zero-loss SLO, and without a 0.0 msg/s placeholder trial skewing the B0 mean.
+    text = _MINIMAL_BATCH + f"\n[connscale.slo]\nzero_loss = {str(zero_loss).lower()}\n"
     report, cells, first_done = await _drive_against_stub_engine(
-        monkeypatch, {"cell_id": "ignored", "error": "engine did not start: boom"}
+        monkeypatch, _engine_error, profile_text=text
     )
-    assert len(report.records) == len(cells)
-    failed = report.records[0]
-    assert failed.no_loss.ok is False
-    assert "engine error: engine did not start: boom" in failed.no_loss.detail
-    assert failed.batch_handoff_statements == cells[0].batch_mode
+    assert len(report.records) == len(cells) - 1
+    assert all(r.no_loss.ok for r in report.records)
+    assert any("never ran" in n for n in report.notes)
     assert first_done == {"cell_id": cells[0].cell_id, "skipped": True}
     assert not report.result_ok
     assert report.exit_code != 0
 
 
+async def test_a_well_formed_run_still_passes_bug_5428(monkeypatch: pytest.MonkeyPatch) -> None:
+    report, cells, _ = await _drive_against_stub_engine(monkeypatch, None)
+    assert len(report.records) == len(cells)
+    assert report.result_ok
+    assert report.exit_code == 0
+
+
+@pytest.mark.parametrize(
+    "ready",
+    [
+        pytest.param(
+            lambda r: {k: v for k, v in r.items() if k != "inbound_base"}, id="missing-field"
+        ),
+        pytest.param(lambda r: {**r, "count": None}, id="null-field"),
+        pytest.param(lambda r: {**r, "sink_procs": "6"}, id="string-field"),
+    ],
+)
 async def test_a_malformed_ready_fails_its_cell_and_still_posts_done_bug_5428(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, ready: Callable[[dict[str, Any]], dict[str, Any]]
 ) -> None:
-    # No inbound_base, and a count that is not a number: int(ready[...]) raises KeyError or TypeError,
-    # which used to end the driver without posting DONE, stranding the engine box on its wait.
-    report, cells, first_done = await _drive_against_stub_engine(
-        monkeypatch, {"cell_id": "x", "count": None, "api_port": 9000}
-    )
+    # int(ready[...]) raised KeyError or TypeError, which the driver did not catch, so a malformed
+    # READY ended it without posting DONE and stranded the engine box on its wait.
+    report, cells, first_done = await _drive_against_stub_engine(monkeypatch, ready)
     assert len(report.records) == len(cells)
     assert report.records[0].no_loss.ok is False
+    assert "READY field" in report.records[0].no_loss.detail
     assert first_done is not None
     assert first_done["cell_id"] == cells[0].cell_id
     assert "error" in first_done
@@ -942,15 +968,18 @@ async def test_a_malformed_ready_fails_its_cell_and_still_posts_done_bug_5428(
 async def test_the_driver_report_names_the_engine_over_https_bug_5428(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    report, _, _ = await _drive_against_stub_engine(
-        monkeypatch, {"cell_id": "ignored", "error": "engine did not start: boom"}
-    )
+    report, _, _ = await _drive_against_stub_engine(monkeypatch, None)
     assert report.engine_url.startswith("https://10.0.0.5")
 
 
-# --------------------------------------------------------------------------------------------------
-# BACKLOG #2012 -- the two-box outputs name their rate window, and it is not the sweep's
-# --------------------------------------------------------------------------------------------------
+def test_a_cell_with_no_measured_band_rate_is_refused_bug_5431() -> None:
+    cell = bb.iter_batch_cells(_profile(), claim_mode="pooled")[0]
+    band = _fake_proc(sent=10, sink=10, read=100.0, arm_b1=False)
+    unmeasured = dict(band, throughput={**band["throughput"], "rates_measured": False})
+    # One measured band is enough: every band reads the same engine.
+    assert bb.aggregate_cell_record(cell, [band, unmeasured]).achieved_read_per_s == 100.0
+    with pytest.raises(ConnScaleError, match="no band measured"):
+        bb.aggregate_cell_record(cell, [unmeasured, dict(unmeasured)])
 
 
 def test_a_two_box_cell_names_the_window_its_bands_report() -> None:
