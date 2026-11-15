@@ -50,6 +50,7 @@ from typing import Any
 import pytest
 
 from tests._dead_pid import never_live_pid
+from tests.test_worktree_remove_path import _is_link
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "worktree" / "prune-merged.ps1"
 
@@ -141,8 +142,20 @@ def _age_reflog(gitdir: Path, when: float) -> None:
     os.utime(log, (when, when))
 
 
-def _backdate(primary: Path, worktree: Path, hours: float) -> None:
-    """Age a worktree's PRIVATE git metadata so the activity veto releases it."""
+#: The caches whose files worktree-gates.ps1 Get-WorkingTreeActivity reads,
+#: its $WORKING_TREE_ACTIVITY_CACHES.
+_ACTIVITY_CACHES = (".pytest_cache", ".ruff_cache", ".mypy_cache")
+
+
+def _backdate(primary: Path, worktree: Path, hours: float, *, working_tree: bool = True) -> None:
+    """Age a worktree's PRIVATE git metadata, and by default its working tree, so the activity veto
+    releases it.
+
+    Signal 2 reads both (BACKLOG #5603): the working tree as Get-WorkingTreeActivity does, its top
+    folder, each entry directly under it, and the files in the three caches. ``working_tree=False``
+    ages the git metadata alone, for a test of the working-tree reading. A link is not followed, so
+    nothing outside the tree is touched.
+    """
     gitdir = _gitdir(worktree)
     when = time.time() - hours * 3600
     for rel in (*_GITDIR_FILES, "logs/HEAD"):
@@ -150,6 +163,15 @@ def _backdate(primary: Path, worktree: Path, hours: float) -> None:
         if f.exists():
             os.utime(f, (when, when))
     _age_reflog(gitdir, when)
+    if not working_tree:
+        return
+    entries = [worktree, *(e for e in worktree.iterdir() if not _is_link(e))]
+    for cache in _ACTIVITY_CACHES:
+        top = worktree / cache
+        if top.is_dir() and not _is_link(top):
+            entries += [f for f in top.rglob("*") if f.is_file() and not _is_link(f)]
+    for entry in entries:
+        os.utime(entry, (when, when))
 
 
 class Fixture:
@@ -1173,10 +1195,18 @@ def test_a_populated_mypy_cache_does_not_hold_a_clean_tree(fx: Fixture, sleeper:
             ".mypy_cache/tmp/cache.db",
             "a data file inside a cache directory at .mypy_cache/tmp/cache.db",
         ),
-        # A sidecar of mypy's cache: there while a connection holds the cache open.
+        # The sidecars of mypy's cache: there while a connection holds the cache open.
         (
             ".mypy_cache/3.14/cache.0.db-wal",
             "a data file inside a cache directory at .mypy_cache/3.14/cache.0.db-wal",
+        ),
+        (
+            ".mypy_cache/3.14/cache.0.db-shm",
+            "a data file inside a cache directory at .mypy_cache/3.14/cache.0.db-shm",
+        ),
+        (
+            ".mypy_cache/3.14/cache.db-journal",
+            "a data file inside a cache directory at .mypy_cache/3.14/cache.db-journal",
         ),
         # mypy's name in another case: the match is case-sensitive.
         (
@@ -1223,6 +1253,33 @@ def test_a_db_outside_the_caches_still_holds_a_tree_with_a_mypy_cache(
     ), d["Reasons"]
     assert wt.exists()
     assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def test_a_freshly_written_mypy_cache_holds_a_tree_whose_git_metadata_is_idle(
+    fx: Fixture, sleeper: int
+) -> None:
+    """BACKLOG #5603. A session that ran mypy and no git command moves only mypy's cache files.
+
+    Once the walk stopped reading those files as data, the git metadata was the only idle reading
+    left, and it cannot see that run. The working-tree reading can. ``cache.0.db`` is touched in
+    place, as a second mypy run leaves it, so neither the top folder nor any entry under it moves:
+    only the read inside ``.mypy_cache`` sees it.
+    """
+    live_record(fx, sleeper, fx.primary)
+    wt = _populate_mypy_cache(fx)
+    _backdate(fx.primary, wt, hours=100)
+    os.utime(wt / ".mypy_cache" / "3.14" / "cache.0.db", None)
+    d = by_leaf(run(fx, "-Apply"), "clean")
+    assert d["Decision"] == "SKIP", d
+    assert d["Reason"].startswith("recently active (the working tree was written"), d["Reasons"]
+    assert wt.exists()
+
+    # Control: the same tree, with the cache as old as the rest, prunes in the default window.
+    _backdate(fx.primary, wt, hours=100)
+    d = by_leaf(run(fx, "-Apply"), "clean")
+    assert d["Decision"] == "PRUNE", d
+    assert d["Outcome"] == "removed", d
+    assert not wt.exists()
 
 
 def test_an_inherited_git_redirect_refuses_the_tree(fx: Fixture, sleeper: int) -> None:
@@ -1621,6 +1678,25 @@ def test_activity_is_rechecked_before_the_removal(
     assert d["Outcome"] == "skipped"
     assert d["OutcomeDetail"].startswith("re-check: git metadata was touched")
     assert fx.sibling("clean").exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def test_a_mypy_run_during_the_apply_window_is_caught_by_the_recheck(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """BACKLOG #5603. The re-check reads the working tree too: a mypy run between the decision and
+    the delete touches no git metadata, only mypy's cache."""
+    wt = _populate_mypy_cache(fx)
+    _stage_recheck(fx, sleeper)
+    cache = wt / ".mypy_cache" / "3.14" / "cache.0.db"
+    shim = gh_shim(tmp_path, side_effect=f"os.utime(r'{cache}', None)\n")
+
+    res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "PRUNE"
+    assert d["Outcome"] == "skipped"
+    assert d["OutcomeDetail"].startswith("re-check: the working tree was written"), d
+    assert wt.exists()
     assert by_leaf(res, "gone")["Outcome"] == "removed"
 
 
@@ -2906,6 +2982,9 @@ def test_c6_an_untracked_file_holds_the_venv(fx: Fixture, sleeper: int) -> None:
     plant_control(fx)
     victim = _plant_venv_tree(fx, "messy-ff6600")
     (victim / "brand_new_module.py").write_text("# never committed anywhere\n", encoding="utf-8")
+    # Old untracked work: C7 reads the working tree too (BACKLOG #5603), so a fresh write would also
+    # fail C7 and the row would no longer isolate C6.
+    _backdate(fx.primary, victim, hours=500.0)
 
     res = run(fx, "-ReapVenvs")
     row = venv_row(res, "messy-ff6600")

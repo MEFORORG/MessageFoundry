@@ -63,8 +63,8 @@
       * a target whose own git directory was written to in the last six hours: a commit, a checkout,
         a merge or a fetch. Nothing here can tell whether what did that has finished;
       * a target whose working tree was written to in the last six hours: its top directory, any
-        entry directly under it, or anything in .pytest_cache or .ruff_cache. A worker that only
-        reads files and runs tests leaves no git trace, but a FINISHED test run rewrites
+        entry directly under it, or anything in .pytest_cache, .ruff_cache or .mypy_cache. A worker
+        that only reads files and runs tests leaves no git trace, but a FINISHED test run rewrites
         .pytest_cache (vault BACKLOG #2985, part B item 1). A run still in progress has written
         nothing there yet, so this does not see one;
       * a target holding uncommitted work written in the last six hours, at any depth (vault BACKLOG
@@ -789,12 +789,15 @@ if ($stateFiles.Count -eq 0) {
 # tree, in a reused tree, that has only read files and run tests leaves no git trace at all. What it
 # does leave: pytest rewrites .pytest_cache on every run, and anything created or deleted directly
 # under the root changes the root's own write time. So the root, every entry directly under it, and
-# everything in the two small caches are read. The worktree's `.git` file is a pointer, like `gitdir`.
+# everything in the small caches worktree-gates.ps1 Get-WorkingTreeActivity reads are read, from its
+# own list, $WORKING_TREE_ACTIVITY_CACHES (.mypy_cache since BACKLOG #5603: a mypy run rewrites it and
+# nothing else). The worktree's
+# `.git` file is a pointer, like `gitdir`.
 # A cache too big to read to the end cannot be dated, so it refuses rather than samples.
 $treeCacheCap = 5000
 $treeFiles = @(Get-Item -LiteralPath $WorktreePath -Force -ErrorAction Stop)
 $treeFiles += @(Get-EntriesOrThrow $WorktreePath 'working-tree entries' | Where-Object { $_.Name -ne '.git' })
-foreach ($cacheName in @('.pytest_cache', '.ruff_cache')) {
+foreach ($cacheName in $WORKING_TREE_ACTIVITY_CACHES) {
     $cache = $treeFiles | Where-Object { $_.Name -eq $cacheName -and $_ -is [System.IO.DirectoryInfo] -and
         -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) } | Select-Object -First 1
     if (-not $cache) { continue }

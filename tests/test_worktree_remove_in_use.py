@@ -395,8 +395,19 @@ def test_name_refuses_a_target_holding_a_registered_worktree(rig: Rig) -> None:
 # --- vault BACKLOG #2985, part B item 1: a claim that names the PARENT tree ----------------------------
 
 
+@pytest.mark.parametrize(
+    "cache_file",
+    [
+        ".pytest_cache/v/cache/nodeids",
+        # A mypy run rewrites only its own cache (BACKLOG #5603), the cache list
+        # worktree-gates.ps1 Get-WorkingTreeActivity reads too.
+        ".mypy_cache/3.14/cache.db",
+    ],
+)
 @pytest.mark.parametrize("route", ROUTES)
-def test_a_reused_quiet_tree_a_worker_just_ran_tests_in_is_refused(rig: Rig, route: str) -> None:
+def test_a_reused_quiet_tree_a_worker_just_ran_tests_in_is_refused(
+    rig: Rig, route: str, cache_file: str
+) -> None:
     """The residue the Lander's review named. A tree two days quiet and clean, whose worker's claim
     names the PARENT tree, was removed with exit 0 while the worker only read files and ran tests:
     no commit, checkout or fetch, so no git state moved. A test run rewrites .pytest_cache, and
@@ -408,11 +419,11 @@ def test_a_reused_quiet_tree_a_worker_just_ran_tests_in_is_refused(rig: Rig, rou
     parent = rig.add(rig.primary / ".claude" / "worktrees" / "parent")
     wt = _sibling(rig, "reused")
     _claim(rig, "9301", parent)
-    nodeids = wt / ".pytest_cache" / "v" / "cache" / "nodeids"
+    nodeids = wt / cache_file
     nodeids.parent.mkdir(parents=True)
     nodeids.write_text("[]\n", encoding="utf-8")
     settle_worktrees(rig.primary)
-    # What the worker's test run leaves behind, and nothing else.
+    # What the worker's run leaves behind, and nothing else.
     nodeids.write_text('["tests/test_x.py::test_y"]\n', encoding="utf-8")
 
     proc = rig.run(*_target(route, wt), "-Force", settle=False)

@@ -12,7 +12,8 @@
     prune-merged.ps1, so the nightly removal judges a tree exactly the way the report that listed it
     did. Two copies of a safety check drift, and the copy that drifts is the one nobody tests.
 
-    Defines in the caller's scope: $IDLE_FLOOR_HOURS, $ACTIVITY_MTIME_FILES, $REGENERABLE_IGNORED_PATTERN,
+    Defines in the caller's scope: $IDLE_FLOOR_HOURS, $ACTIVITY_MTIME_FILES, $WORKING_TREE_ACTIVITY_CACHES,
+    $REGENERABLE_IGNORED_PATTERN,
     Test-PresentOrThrow, Get-EntriesOrThrow (both moved here from remove.ps1, which dot-sources this file
     for them), Get-ReflogLastEntry, Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header
     says what it can and cannot see), Test-WorktreeClean, Get-HiddenWorkReasons, Get-SetGitRedirects, Get-TipHolders, Test-ClaudeManagedPath,
@@ -72,6 +73,10 @@ $IDLE_FLOOR_HOURS = 12
 #: Metadata whose MTIME is the activity reading. `logs/HEAD` is deliberately NOT in this list; it is
 #: read by content instead, for the reason written out over Get-ReflogLastEntry.
 $ACTIVITY_MTIME_FILES = @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')
+
+#: The caches a test, lint or type-check run rewrites in place, whose files the working-tree activity
+#: reads date: Get-WorkingTreeActivity here, and remove.ps1's twin of it. One list, so the two agree.
+$WORKING_TREE_ACTIVITY_CACHES = @('.pytest_cache', '.ruff_cache', '.mypy_cache')
 
 #: The ignored entries a removal may delete without asking: a `git status --porcelain --ignored` line
 #: for an IGNORED DIRECTORY named node_modules, __pycache__, .pytest_cache, .mypy_cache or .ruff_cache
@@ -171,7 +176,8 @@ function Get-WorktreeActivity {
     # The worktree's PRIVATE git metadata only. Deliberately NOT the working files: a venv install or a
     # test run churns those, so their mtimes would veto everything forever and the veto would stop
     # meaning anything. The cost is that a session which only edits files and runs no git command is
-    # invisible to this signal too -- stated in the header rather than papered over.
+    # invisible to this signal too -- stated in the header rather than papered over. Its callers that
+    # remove a tree pair it with Get-WorkingTreeActivity, a narrower working-tree read (BACKLOG #5603).
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     $gitdir = & git -C $Path rev-parse --absolute-git-dir 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $gitdir) { return $null }
@@ -349,15 +355,19 @@ function Get-FlaggedFiles([string]$Path) {
 
 # The newest write to the WORKING TREE: the tree's own folder, each entry directly under it, and the
 # files inside .pytest_cache, .ruff_cache and .mypy_cache (a test, lint or type-check run rewrites those
-# in place, moving no top-level mtime; Get-NestedHazard passes mypy's cache files, so this is the read
-# that sees a mypy run), up to -CacheCap of them in each. The idle reading above sees only git metadata, so a session
-# that edits files and runs no git command is invisible to it. Not every write moves one of these: a
-# file edited in place two levels down moves none. $null when it cannot be read.
+# in place, moving no top-level mtime), up to -CacheCap of them in each. The idle reading above sees only
+# git metadata, so a session that edits files and runs no git command is invisible to it. Every caller
+# holds a tree this read finds written inside its idle window: finished-worktree-removal.ps1
+# (Get-ContentRefusal) and prune-merged.ps1 (Get-TreeActivity, its occupancy signal 2, in the decision,
+# report, venv and -Apply re-check passes). Since Get-NestedHazard passes mypy's cache files, this read
+# is what holds a tree a mypy run wrote to. remove.ps1 makes its own twin of it, over the same
+# $WORKING_TREE_ACTIVITY_CACHES. Not every write moves one of these: a file edited in place two levels down moves none. $null
+# when it cannot be read.
 function Get-WorkingTreeActivity {
     param([string]$Path, [int]$CacheCap = 2000)
     try {
         $items = @(Get-Item -LiteralPath $Path -Force -ErrorAction Stop) + @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
-        foreach ($cache in '.pytest_cache', '.ruff_cache', '.mypy_cache') {
+        foreach ($cache in $WORKING_TREE_ACTIVITY_CACHES) {
             $dir = Join-Path $Path $cache
             if (Test-Path -LiteralPath $dir -PathType Container) {
                 $items += @(Get-ChildItem -LiteralPath $dir -Recurse -Force -File -ErrorAction Stop | Select-Object -First $CacheCap)
