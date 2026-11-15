@@ -71,7 +71,9 @@ def _record(
     counters.sent = samples[-1].read
     counters.acked = samples[-1].read
     metrics = LiveMetrics(counters=counters, ack=Histogram(), e2e=Histogram())
-    poller = cast(EnginePoller, SimpleNamespace(baseline=samples[0], final=samples[-1]))
+    poller = cast(
+        EnginePoller, SimpleNamespace(baseline=samples[0], final=samples[-1], samples=samples)
+    )
     return runner._build_record(
         profile=profile,
         metrics=metrics,

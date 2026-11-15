@@ -692,7 +692,9 @@ def test_read_shortfall_is_the_same_number_the_reconcile_prints() -> None:
     base, final = _sample(0), _sample(30)
 
     short = _read_shortfall(c, base, final, unconfirmed_budget=8)
-    no_loss = _reconcile(c, base, final, unconfirmed_budget=8)
+    no_loss = _reconcile(
+        c, base, final, unconfirmed_budget=8, drain_seconds=1.0, counter_reset=None
+    )
 
     assert short == 6  # 40 sent - 4 excused - 30 read
     assert not no_loss.ok

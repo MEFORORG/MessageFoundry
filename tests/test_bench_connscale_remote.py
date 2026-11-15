@@ -88,6 +88,7 @@ def _install_remote_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
             rec.poller_tokens.append(token)
             self.baseline: Any = None
             self.final: Any = None
+            self.samples: list[Any] = []
 
         async def open(self) -> None:
             return None

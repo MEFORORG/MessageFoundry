@@ -55,6 +55,7 @@ from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.report import _counter_reset
 from harness.load.rigadmin import RIG_SESSION
 from harness.load.sink import CorrelationSink
 
@@ -413,7 +414,14 @@ def _build_record(
     # Budget = the step's connection count — the small-run FLOOR under the reconcile's half-the-run
     # excusal fraction, never a per-connection stranding allowance. `read >= sent // 2` holds here
     # regardless of it (an estate step CAN send on the order of its connection count).
-    no_loss = _reconcile(c, base, final, unconfirmed_budget=profile.count)
+    no_loss = _reconcile(
+        c,
+        base,
+        final,
+        unconfirmed_budget=profile.count,
+        drain_seconds=drain_seconds,
+        counter_reset=_counter_reset(poller),
+    )
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
     rate_window = samples[:in_hold_samples]  # the window is defined in `_throughput_rates`
     read_per_s, written_per_s = _throughput_rates(rate_window)
@@ -475,7 +483,18 @@ def _reconcile(
     final: EngineSample | None,
     *,
     unconfirmed_budget: int,
+    drain_seconds: float | None,
+    counter_reset: str | None,
 ) -> NoLoss:
+    """The step's no-loss verdict: PASS, LOSS, or INCONCLUSIVE (``ok`` False, ``inconclusive``).
+
+    INCONCLUSIVE is a step that cannot clear itself although no arm proved a loss (BACKLOG #5574),
+    in the shapes ``harness.load.report._reconcile`` names: missing engine metrics, nothing sent,
+    nothing delivered, a timed-out drain (``drain_seconds`` None), rows still in some stage, or
+    engine counters that reset mid-step (``counter_reset``, from
+    :func:`harness.load.report._counter_reset`). Both are required, with no default, so a caller
+    that forgets one cannot pass by omission.
+    """
     sent = c.sent
     sink_received = c.sink_received
     if base is None or final is None:
@@ -487,10 +506,27 @@ def _reconcile(
             sink_received,
             -1,
             "engine metrics unavailable — cannot verify no-loss",
+            inconclusive=True,
         )
     read = final.read - base.read
     written = final.written - base.written
-    backlog = final.backlog
+    # The whole pipeline, not the outbound queue alone: a stalled router or transform leaves every
+    # accepted message in ingress or routed with the outbound reading at 0 (BACKLOG #5574).
+    backlog = max(final.pending + final.inflight, final.in_pipeline)
+    # A restart, a stats reset or a purge makes final - baseline no run total, so no intake or
+    # delivery arm may rest on it; the load copy's reasoning is the source of record.
+    if counter_reset is not None:
+        return NoLoss(
+            False,
+            sent,
+            max(0, read),
+            max(0, written),
+            sink_received,
+            backlog,
+            f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
+            f"sends, and the drain and delivery arms were not judged",
+            inconclusive=True,
+        )
     # An unconfirmed send (in-flight at a connection close, no ACK seen) is bounded-excused; past the
     # budget it is a systemic no-ACK fault. The bound is a FRACTION of the run (at most three quarters), floored
     # by the connection count — NOT "~one per connection", a model this sender breaks because
@@ -514,7 +550,21 @@ def _reconcile(
     floor_short = sent // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    ok = read_short <= 0 and floor_short <= 0 and deliver_short <= 0 and drained and not over_budget
+    lost = read_short > 0 or floor_short > 0 or deliver_short > 0 or over_budget
+    # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
+    # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
+    # undelivering step satisfies trivially.
+    unproven: list[str] = []
+    if sent == 0:
+        unproven.append("nothing was sent — the step measured nothing")
+    elif sink_received == 0 and written <= 0:
+        unproven.append(
+            f"nothing was delivered (sink_received 0, engine_written {written}) — "
+            f"no delivery to reconcile"
+        )
+    if drain_seconds is None:
+        unproven.append("the drain timed out — the final counts are an unsettled snapshot")
+    ok = not lost and drained and not unproven
     parts: list[str] = []
     if read_short > 0:
         parts.append(
@@ -530,7 +580,11 @@ def _reconcile(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
     if not drained:
-        parts.append(f"backlog {backlog} not drained")
+        parts.append(
+            f"backlog {backlog} not drained (outbound {final.pending + final.inflight}, "
+            f"in_pipeline {final.in_pipeline} not done in any stage)"
+        )
+    parts.extend(unproven)
     if over_budget:
         parts.append(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
@@ -546,7 +600,9 @@ def _reconcile(
             f"not observed at intake — not counted as loss"
         )
     detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
-    return NoLoss(ok, sent, read, written, sink_received, backlog, detail)
+    return NoLoss(
+        ok, sent, read, written, sink_received, backlog, detail, inconclusive=not ok and not lost
+    )
 
 
 def _throughput_rates(samples: list[EngineSample]) -> tuple[float, float]:

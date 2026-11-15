@@ -339,6 +339,7 @@ def _fake_proc(sent: int, sink: int, read: float, arm_b1: bool) -> dict[str, Any
             "sink_received": sink,
             "backlog": 0,
             "detail": "",
+            "counter_reset": None,  # what connscale-remote writes (BACKLOG #5574)
         },
         "throughput": {
             "rate_window": "hold_bracket",  # what connscale-remote writes (BACKLOG #2012)
@@ -379,6 +380,7 @@ def test_aggregate_cell_record_flags_loss() -> None:
             "sink_received": 1,
             "backlog": 0,
             "detail": "",
+            "counter_reset": None,
         },
         "throughput": {
             "achieved_aggregate_rate": 5.0,
@@ -399,6 +401,12 @@ def test_aggregate_cell_record_drain_timeout_poisons() -> None:
     timed_out["throughput"]["drain_seconds"] = None  # one band never drained
     rec = bb.aggregate_cell_record(cell, [ok_proc, timed_out])
     assert rec.drain_seconds is None  # None poisons the worst-case drain
+    # ...and the cell's no-loss verdict: an unsettled snapshot cannot clear it (BACKLOG #5574).
+    assert rec.no_loss.ok is False and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "drain timed out" in rec.no_loss.detail
+    # The control: the same two bands, both drained, clear the cell.
+    clean = bb.aggregate_cell_record(cell, [ok_proc, _fake_proc(10, 10, 100.0, arm_b1=False)])
+    assert clean.no_loss.ok is True, clean.no_loss.detail
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1056,6 +1064,7 @@ def test_the_remote_report_json_names_its_rate_window() -> None:
         no_loss=NoLoss(True, 8, 8, 8, 8, 0, "ok"),
         in_pipeline_peak=0,
         drain_seconds=0.5,
+        counter_reset=None,
     )
     throughput = remote.to_json_dict()["throughput"]
     assert isinstance(throughput, dict)

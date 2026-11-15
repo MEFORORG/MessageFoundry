@@ -54,6 +54,7 @@ from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.multishard import _build_ms_corpus
 from harness.load.profile import TypeMix
+from harness.load.report import _counter_reset
 from harness.load.rigadmin import REMOTE_RIG_SESSION
 
 _STOP_GRACE = 5.0
@@ -91,6 +92,10 @@ class ConnScaleRemoteReport:
     no_loss: NoLoss
     in_pipeline_peak: int
     drain_seconds: float | None
+    #: :func:`harness.load.report._counter_reset` over this band's poller: what the batch aggregate
+    #: reads to know the engine counters reset mid-cell (BACKLOG #5574). Required, so a band report
+    #: can never omit it by default; the aggregate refuses to clear a cell whose band names none.
+    counter_reset: str | None
     notes: list[str] = field(default_factory=list)
     # False when a hold-bracket ``/stats`` sample failed, so the rates above are a placeholder 0.0 and
     # not a hold-bracket reading; the JSON then names no rate window (BACKLOG #5431).
@@ -103,7 +108,8 @@ class ConnScaleRemoteReport:
         rows stranded in some stage, which the outbound-only backlog in the reconcile can miss."""
         out: list[str] = []
         if not self.no_loss.ok:
-            out.append(f"loss: {self.no_loss.detail}")
+            label = "inconclusive" if self.no_loss.inconclusive else "loss"
+            out.append(f"{label}: {self.no_loss.detail}")
         if self.sent <= 0:
             out.append("nothing was sent")
         if self.drain_seconds is None:
@@ -120,7 +126,7 @@ class ConnScaleRemoteReport:
 
     def to_json_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,  # 1 -> 2: no_loss.inconclusive and counter_reset (BACKLOG #5574)
             "kind": "connscale_remote",
             "result": "PASS" if self.result_ok else "FAIL",
             "exit_code": self.exit_code,
@@ -160,12 +166,20 @@ class ConnScaleRemoteReport:
                 "sink_received": self.no_loss.sink_received,
                 "backlog": self.no_loss.backlog,
                 "detail": self.no_loss.detail,
+                "inconclusive": self.no_loss.inconclusive,
+                "counter_reset": self.counter_reset,
             },
             "notes": self.notes,
         }
 
     def render_console(self) -> str:
-        loss = "OK" if self.no_loss.ok else f"LOSS ({self.no_loss.detail})"
+        loss = (
+            "OK"
+            if self.no_loss.ok
+            else f"INCONCLUSIVE ({self.no_loss.detail})"
+            if self.no_loss.inconclusive
+            else f"LOSS ({self.no_loss.detail})"
+        )
         drain = "TIMED-OUT" if self.drain_seconds is None else f"{self.drain_seconds:.2f}s"
         return "\n".join(
             [
@@ -377,7 +391,15 @@ async def run_connscale_remote(
 
         c = metrics.counters.snapshot()
         base_sample, final_sample = poller.baseline, poller.final
-        no_loss = _reconcile(c, base_sample, final_sample, unconfirmed_budget=n * count)
+        counter_reset = _counter_reset(poller)
+        no_loss = _reconcile(
+            c,
+            base_sample,
+            final_sample,
+            unconfirmed_budget=n * count,
+            drain_seconds=drain_seconds,
+            counter_reset=counter_reset,
+        )
         in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
         rates_measured = False
         if hold_begin is not None and hold_end is not None and hold_elapsed_s > 0:
@@ -407,6 +429,7 @@ async def run_connscale_remote(
             no_loss=no_loss,
             in_pipeline_peak=in_pipeline_peak,
             drain_seconds=drain_seconds,
+            counter_reset=counter_reset,
             notes=notes,
             rates_measured=rates_measured,
         )

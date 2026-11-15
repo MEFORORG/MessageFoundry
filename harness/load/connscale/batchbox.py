@@ -462,17 +462,49 @@ def aggregate_cell_record(
 
     read_short = agg_sent - engine_read
     deliver_short = engine_written - agg_sink_received
-    no_loss_ok = read_short <= 0 and deliver_short <= 0 and backlog == 0
+    drained = backlog == 0
+    lost = read_short > 0 or deliver_short > 0
+    # Reasons the cell cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
+    # harness/load/report.py's copy: both arms above are inequalities an empty, unsettled or
+    # undelivering cell satisfies trivially.
+    unproven: list[str] = []
+    if agg_sent == 0:
+        unproven.append("nothing was sent — the cell measured nothing")
+    elif agg_sink_received == 0 and engine_written <= 0:
+        unproven.append(
+            f"nothing was delivered (union sink_received 0, engine_written {engine_written}) — "
+            f"no delivery to reconcile"
+        )
+    if drain_seconds is None:
+        unproven.append("a band's drain timed out — the final counts are an unsettled snapshot")
+    # A band whose engine counters reset mid-cell makes every engine delta in it no run total, so
+    # neither arm above may rest on it. A band report that does not say is refused, never read as
+    # "no reset": a missing field must not clear a cell.
+    resets: list[str] = []
+    for r in proc_reports:
+        nl = r.get("no_loss", {})
+        if "counter_reset" not in nl:
+            resets.append("a band report does not say whether the engine counters reset")
+        elif nl["counter_reset"] is not None:
+            resets.append(str(nl["counter_reset"]))
+    if resets:
+        lost = False
+        unproven.append(
+            f"{resets[0]} — the read/written deltas cannot be reconciled against this cell's "
+            f"sends, and the loss arms were not judged"
+        )
+    no_loss_ok = not lost and drained and not unproven
     parts: list[str] = []
-    if read_short > 0:
+    if read_short > 0 and not resets:
         parts.append(f"engine_read {engine_read} < aggregate sent {agg_sent} (lost {read_short})")
-    if deliver_short > 0:
+    if deliver_short > 0 and not resets:
         parts.append(
             f"union sink_received {agg_sink_received} < engine_written {engine_written} "
             f"(lost {deliver_short})"
         )
-    if backlog != 0:
+    if not drained:
         parts.append(f"backlog {backlog} not drained")
+    parts.extend(unproven)
     detail = (
         "; ".join(parts)
         if parts
@@ -486,6 +518,7 @@ def aggregate_cell_record(
         sink_received=agg_sink_received,
         backlog=backlog,
         detail=detail,
+        inconclusive=not no_loss_ok and not lost,
     )
 
     return ConnScaleRecord(

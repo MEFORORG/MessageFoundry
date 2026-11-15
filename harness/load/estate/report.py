@@ -22,7 +22,7 @@ EXIT_SLO_VIOLATION = 1
 
 # 2 since BACKLOG #2011: records gained `rate_window`, `in_hold_samples` and `make_up_samples`, and
 # every rate-derived value moved to the window `runner._throughput_rates` defines.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # 2 -> 3: no_loss.inconclusive (BACKLOG #5574)
 
 #: Names the window an estate record's rates were computed over (BACKLOG #2011). The window, and what
 #: moved when it changed, are defined once in `harness.load.estate.runner._throughput_rates`. No reader
@@ -49,6 +49,10 @@ class NoLoss:
     sink_received: int
     backlog: int
     detail: str
+    #: ``ok`` is False and nothing proved a loss: the step cannot clear itself (BACKLOG #5574), as
+    #: in ``harness.load.report.NoLoss``. ``detail`` holds the reasons. It still fails zero_loss.
+    #: Defaulted, so a constructor that names no verdict reads as a loss rather than a pass.
+    inconclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +148,7 @@ class EstateRecord:
                 "sink_received": self.no_loss.sink_received,
                 "backlog": self.no_loss.backlog,
                 "detail": self.no_loss.detail,
+                "inconclusive": self.no_loss.inconclusive,
             },
             "ack_ms": {
                 "p50": round(self.ack_p50_ms, 3),
@@ -202,10 +207,14 @@ class EstateReport:
                 f"{r.count:>6}{r.simple_count:>8}{r.hub_count:>6}{r.hub_fanout:>5}"
                 f"{r.target_total_event_rate:>10.1f}{r.achieved_total_event_rate:>10.1f}"
                 f"{r.achieved_per_conn_event_rate:>9.3f}{r.sent:>9}{r.in_pipeline_peak:>7}"
-                f"{('ok' if r.no_loss.ok else 'FAIL'):>8}{_na(_round_or_none(r.cpu_us_per_event, 2)):>11}"
+                f"{_noloss_cell(r.no_loss):>8}{_na(_round_or_none(r.cpu_us_per_event, 2)):>11}"
                 f"{r.ack_p99_ms:>9.1f}"
             )
         lines.append(f"rates: rate_window={RATE_WINDOW} (the post-drain final is excluded)")
+        # BACKLOG #5574: a step that could not clear itself says why, beside the table.
+        for r in self.records:
+            if r.no_loss.inconclusive:
+                lines.append(f"no-loss INCONCLUSIVE: N={r.count} -- {r.no_loss.detail}")
         for r in self.records:
             if r.in_hold_samples < 2:
                 lines.append(
@@ -234,6 +243,14 @@ class EstateReport:
             f"{'' if self.result_ok else f' ({violated} violated)'} -> exit {self.exit_code}"
         )
         return "\n".join(lines)
+
+
+def _noloss_cell(no_loss: NoLoss) -> str:
+    """The table's no-loss cell: ``ok``, ``INCONCL`` (nothing proved a loss, BACKLOG #5574), or
+    ``FAIL``."""
+    if no_loss.ok:
+        return "ok"
+    return "INCONCL" if no_loss.inconclusive else "FAIL"
 
 
 def _na(value: object) -> object:

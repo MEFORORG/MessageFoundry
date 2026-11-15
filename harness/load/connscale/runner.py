@@ -85,6 +85,7 @@ from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.report import _counter_reset
 from harness.load.rigadmin import RIG_SESSION
 from harness.load.sender import _BACKOFF_MAX
 from harness.load.sink import CorrelationSink
@@ -1775,7 +1776,15 @@ def _build_record(
     # rate x ACK-latency): `_reconcile` treats the count only as a small-run FLOOR under its
     # half-the-run fraction, and its separate intake floor keeps `read >= sent // 2` required here
     # even when `count` exceeds half the step's sends (the short-hold smoke cells).
-    no_loss = _reconcile(c, base, final, unconfirmed_budget=count, reload=ra)
+    no_loss = _reconcile(
+        c,
+        base,
+        final,
+        unconfirmed_budget=count,
+        drain_seconds=drain_seconds,
+        counter_reset=_counter_reset(poller),
+        reload=ra,
+    )
     live = audit_live if audit_live is not None else intake_audit.not_run("audit not wired")
     post = audit_final if audit_final is not None else intake_audit.not_run("audit not wired")
     # BACKLOG #1292: ATTRIBUTE the reconcile's own failure text, never soften it. `ok` is untouched --
@@ -1993,8 +2002,19 @@ def _reconcile(
     final: EngineSample | None,
     *,
     unconfirmed_budget: int,
+    drain_seconds: float | None,
+    counter_reset: str | None,
     reload: _ReloadAccount | None = None,
 ) -> NoLoss:
+    """The step's no-loss verdict: PASS, LOSS, or INCONCLUSIVE (``ok`` False, ``inconclusive``).
+
+    INCONCLUSIVE is the step that cannot clear itself although no arm proved a loss (BACKLOG
+    #5574), in the shapes ``harness.load.report._reconcile`` names: the engine metrics are
+    missing, nothing was sent, nothing was delivered, the drain timed out (``drain_seconds`` None),
+    rows are still in some stage, or the engine counters reset mid-step. ``counter_reset`` is
+    :func:`harness.load.report._counter_reset` over the step's poller, or None when it saw none.
+    Both are required, with no default, so a caller that forgets one cannot pass by omission.
+    """
     sent = c.sent
     sink_received = c.sink_received
     if base is None or final is None:
@@ -2006,10 +2026,27 @@ def _reconcile(
             sink_received,
             -1,
             "engine metrics unavailable — cannot verify no-loss",
+            inconclusive=True,
         )
     read = final.read - base.read
     written = final.written - base.written
-    backlog = final.backlog
+    # The whole pipeline, not the outbound queue alone: a stalled router or transform leaves every
+    # accepted message in ingress or routed with the outbound reading at 0 (BACKLOG #5574).
+    backlog = max(final.pending + final.inflight, final.in_pipeline)
+    # A restart, a stats reset or a purge makes final - baseline no run total, so no intake or
+    # delivery arm may rest on it; the load copy's reasoning is the source of record.
+    if counter_reset is not None:
+        return NoLoss(
+            False,
+            sent,
+            max(0, read),
+            max(0, written),
+            sink_received,
+            backlog,
+            f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
+            f"sends, and the drain and delivery arms were not judged",
+            inconclusive=True,
+        )
     # A `timeouts`-counted message (in-flight at a connection close with no ACK seen — a mid-run reset
     # or the stop-grace expiring) is UNCONFIRMED, not lost: `sent` was counted at write-buffer time, so
     # the frame may never have left the closed socket. Requiring `read >= sent` false-fails exactly when
@@ -2096,15 +2133,34 @@ def _reconcile(
     not_back = offered and reload is not None and reload.not_reconnected > 0
     no_sends = offered and sent_after == 0
     no_reply = offered and sent_after > 0 and replies_after == 0
-    ok = (
-        read_short <= 0
-        and floor_short <= 0
-        and deliver_short <= 0
-        and write_short <= 0
-        and drained
-        and not over_budget
-        and not (not_back or no_sends or no_reply)
+    # `write_short` proves a loss only once the pipeline is empty: before that, a message still in
+    # ingress or routed reads exactly like a dead-letter, so an undrained step is INCONCLUSIVE on
+    # it rather than LOSS (BACKLOG #5574).
+    write_lost = write_short > 0 and drained
+    lost = (
+        read_short > 0
+        or floor_short > 0
+        or deliver_short > 0
+        or write_lost
+        or over_budget
+        or not_back
+        or no_sends
+        or no_reply
     )
+    # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
+    # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
+    # undelivering step satisfies trivially.
+    unproven: list[str] = []
+    if sent == 0:
+        unproven.append("nothing was sent — the step measured nothing")
+    elif sink_received == 0 and written <= 0:
+        unproven.append(
+            f"nothing was delivered (sink_received 0, engine_written {written}) — "
+            f"no delivery to reconcile"
+        )
+    if drain_seconds is None:
+        unproven.append("the drain timed out — the final counts are an unsettled snapshot")
+    ok = not lost and drained and not unproven
     parts: list[str] = []
     if read_short > 0:
         parts.append(
@@ -2124,7 +2180,12 @@ def _reconcile(
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
-    if write_short > 0:
+    if write_short > 0 and not drained:
+        parts.append(
+            f"engine_written {written} < engine_read {read} with rows still in the pipeline — "
+            f"not judged as a loss until it drains"
+        )
+    elif write_short > 0:
         naked = (
             f"; {c.nak} send(s) were NAKed, and a NAK counts here only where its row was recorded"
             if c.nak
@@ -2136,7 +2197,11 @@ def _reconcile(
             f"before its NAK, and a message still in an earlier stage{naked})"
         )
     if not drained:
-        parts.append(f"backlog {backlog} not drained")
+        parts.append(
+            f"backlog {backlog} not drained (outbound {final.pending + final.inflight}, "
+            f"in_pipeline {final.in_pipeline} not done in any stage)"
+        )
+    parts.extend(unproven)
     if not_back and reload is not None:
         parts.append(
             f"{reload.not_reconnected} connection(s) never came back "
@@ -2183,7 +2248,9 @@ def _reconcile(
         if parts
         else "read>=sent, written>=read, sink_received>=written, backlog drained"
     )
-    return NoLoss(ok, sent, read, written, sink_received, backlog, detail)
+    return NoLoss(
+        ok, sent, read, written, sink_received, backlog, detail, inconclusive=not ok and not lost
+    )
 
 
 def _no_reply_detail(reload: _ReloadAccount, sent_after: int) -> str:
