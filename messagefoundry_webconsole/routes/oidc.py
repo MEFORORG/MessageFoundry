@@ -43,10 +43,8 @@ Two deliberate departures a reviewer will want to check rather than "fix":
 Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter.**
 Both legs are unauthenticated, so an attacker looping them would otherwise be an unbounded
 audit_log-write amplifier. The availability and rate-limit rejects therefore write no audit row.
-One branch is outside it by design: the interstitial GET asks whether the browser holds a live
-session, and that lookup ends, and audits once, a lapsed or tampered session it finds, as the login
-page's stale-cookie check does. It is no amplifier: a session ends once, and a cookie that names no
-session writes nothing.
+The interstitial GET's session lookup and dead-cookie branch are not rate-limited; see
+``ui_oidc_interstitial``.
 The callback picks its limiter from the flow its cookie names (BACKLOG #3374): see
 ``ui_oidc_callback``.
 """
@@ -408,6 +406,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 "federated sign-in unavailable: [security].web_console_public_address is not set"
             )
             return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
+        # Asked before the flow is staged: a store fault here must not leave a staged flow that no
+        # cookie names holding a flow-cache slot until its TTL ends. A browser may start a sign-in
+        # while it holds a session it is about to replace, and then the hop keeps its Sign-out.
+        live = await has_live_session(request, auth)
         try:
             # ASVS 7.2.4: hand over the session this browser holds NOW; the engine stages its hash
             # and ends it only once the IdP proof succeeds. Why here and not at the callback: see
@@ -423,14 +425,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except FlowError:
             await auth.audit_oidc_reject("start_failed", client=client)
             return RedirectResponse("/ui/login?e=oidc_failed", status_code=303)
-        # A browser may start a sign-in while it holds a session it is about to replace.
-        return _idp_hop(
-            request,
-            auth,
-            flow_id,
-            authorization_url,
-            session=await has_live_session(request, auth),
-        )
+        return _idp_hop(request, auth, flow_id, authorization_url, session=live)
 
     @app.post("/ui/reauth/oidc")
     @public_route("the federated re-authentication a step-up gate sends the browser to")

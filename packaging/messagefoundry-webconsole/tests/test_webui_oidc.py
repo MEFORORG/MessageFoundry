@@ -243,6 +243,36 @@ async def test_oidc_start_post_answers_with_a_navigating_page_not_a_303(
     assert "data-mf-session-watchdog" not in r.text
 
 
+class _StoreFault(Exception):
+    """A session read that fails, standing in for a locked or unavailable store."""
+
+
+async def test_a_store_fault_on_the_liveness_read_stages_no_flow(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``POST /ui/oidc/start`` asks whether the browser holds a live session only after
+    it has staged the flow. A store fault on that read then fails the request with a staged flow
+    that no cookie names, holding a flow-cache slot until its TTL ends. The control: the same POST
+    with a working read stages exactly one flow."""
+    service = _oidc_service(engine)
+    await service.initialize()
+    flows = service._oidc_flows
+    assert flows is not None
+
+    async def faulting(*_a: object, **_k: object) -> None:
+        raise _StoreFault("session read failed")
+
+    async with _oidc_client(engine, service) as c:
+        # A cookie, so the liveness read reaches the store at all.
+        c.cookies.set("mf_session", "not-a-live-session")
+        assert idp_url(await c.post("/ui/oidc/start", follow_redirects=False))
+        assert len(flows._entries) == 1  # positive control: a working read stages one flow
+        monkeypatch.setattr(service, "identity_for_token", faulting)
+        with pytest.raises(_StoreFault):
+            await c.post("/ui/oidc/start", follow_redirects=False)
+    assert len(flows._entries) == 1, "the failed start left a flow staged"
+
+
 @pytest.mark.parametrize("cookie", [None, "not-a-live-session"], ids=["no-cookie", "dead-cookie"])
 async def test_the_interstitial_carries_no_watchdog_without_a_live_session(
     engine: Engine, cookie: str | None

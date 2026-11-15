@@ -285,12 +285,13 @@ _CONFLICTING_FETCH_SITE = "conflicting Sec-Fetch-Site lines rejected"
 
 
 #: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
-#: There are exactly THREE emitters, and between them they cover every shape a termination takes:
-#: :func:`clear_session_cookie` (a route that deletes the cookie — sign-out, and the password change
-#: that revokes every session), :func:`_login_redirect` / :func:`login_redirect_response` (every
-#: SERVER-driven expiry, revoke or disable redirect), and the login RENDER in :mod:`.routes.core`
-#: (a post-termination landing reached by bookmark or Back, recognised by its outcome code or by a
-#: session cookie that no longer authenticates). Deletion and this header are deliberately fused in
+#: There are at least four emitters: :func:`clear_session_cookie` (a route that deletes the
+#: cookie — sign-out, and the password change that revokes every session), :func:`_login_redirect`
+#: / :func:`login_redirect_response` (every SERVER-driven expiry, revoke or disable redirect), the
+#: login RENDER in :mod:`.routes.core` (a post-termination landing reached by bookmark or Back,
+#: recognised by its outcome code or by a session cookie that no longer authenticates), and the
+#: OIDC "leaving this site" interstitial in :mod:`.routes.oidc` (a session cookie that no longer
+#: authenticates). Deletion and this header are deliberately fused in
 #: one helper rather than left as two lines a new route must remember to write together.
 #: ``"cache"`` ONLY: ``"cookies"`` is already covered by the explicit cookie deletion (and would clear
 #: the in-flight OIDC flow cookie), and ``"storage"`` would wipe the deliberately-persistent, PHI-free
