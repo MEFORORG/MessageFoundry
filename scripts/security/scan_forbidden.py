@@ -775,46 +775,42 @@ PR_BODY_REASONS = {
 _PrUnits = list[tuple[list[tuple[int, int]], str, bool]]
 
 
-def _pr_lines(body: str) -> tuple[list[str], list[int]]:
+def _pr_lines(body: str) -> tuple[list[str], list[int], list[int]]:
     """The body's one line model: its lines as str.splitlines reads them, so a hit reports the line
-    number main reported, and the numbers of its blank lines as GFM counts them.
+    number main reported, and the numbers of its blank lines as GFM counts them, in two lists.
 
     A blank line is a whole GFM line (between "\\n", "\\r\\n" or "\\r") holding only spaces and tabs.
-    Its quote markers are stripped first only where the GFM line above it is quoted too, so a lone
-    ">" line between the rows of a quoted table ends it (step 9), and one between the rows of an
-    unquoted table does not, as main read it (_pr_is_blank). A separator only str.splitlines reads (a form feed,
-    U+2028) ends a line here but never makes a blank one: the line it ends, or the empty line it
-    opens, lies inside a GFM line with content, so it ends no table (step 9)."""
+    A quote blank is one holding only quote markers besides, a blank line inside a quote; it ends
+    only a quoted table (_pr_table_starts). A ">" then a no-break space is a quoted line with
+    content, neither. A separator only str.splitlines reads (a form feed, U+2028) ends a line here
+    but never makes a blank one: the line it ends, or the empty line it opens, lies inside a GFM line
+    with content, so it ends no table (step 9)."""
     lines: list[str] = []
     blanks: list[int] = []
+    quote_blanks: list[int] = []
+
+    def classify(line: str) -> None:
+        if not line.strip(" \t"):
+            blanks.append(len(lines))
+        elif not _PR_QUOTE_BLANK.sub("", line).strip(" \t"):
+            quote_blanks.append(len(lines))
+
     start = 0
     # Whether the current line starts a GFM line: the body's start, or a GFM line ending before it.
     whole = True
-    # Whether the GFM line above the current one opens with a quote marker.
-    quoted = False
     for end in _PR_LINE_END.finditer(body):
         lines.append(body[start : end.start()])
         gfm_end = end.group() in _PR_GFM_LINE_ENDS
-        if whole:
-            if gfm_end and _pr_is_blank(lines[-1], quoted):
-                blanks.append(len(lines))
-            quoted = _PR_QUOTE_BLANK.match(lines[-1]) is not None
+        if whole and gfm_end:
+            classify(lines[-1])
         whole = gfm_end
         start = end.end()
     # A final line ending opens no line, as str.splitlines reads it.
     if start < len(body):
         lines.append(body[start:])
-        if whole and _pr_is_blank(lines[-1], quoted):
-            blanks.append(len(lines))
-    return lines, blanks
-
-
-def _pr_is_blank(line: str, quoted: bool) -> bool:
-    """A GFM blank line: only spaces and tabs, once its quote markers are stripped where the line
-    above is quoted. A ">" then a no-break space is a quoted line with content. A quote-marker-only
-    line under an unquoted line is not blank here: main read no blank line at all, so a lone ">" in
-    an unquoted ASVS table must not reset its column."""
-    return not (_PR_QUOTE_BLANK.sub("", line) if quoted else line).strip(" \t")
+        if whole:
+            classify(lines[-1])
+    return lines, blanks, quote_blanks
 
 
 def _pr_units(lines: list[str], delete_invisible: bool) -> _PrUnits:
@@ -1013,22 +1009,42 @@ def _pr_is_delimiter(row: str) -> bool:
     return "-" in row and set(row) <= _PR_TABLE_DELIMITER_CHARS
 
 
-def _pr_table_starts(units: _PrUnits, blanks: list[int]) -> list[bool]:
+def _pr_table_starts(
+    units: _PrUnits, lines: list[str], blanks: list[int], quote_blanks: list[int]
+) -> list[bool]:
     """For each unit, whether it starts a run of rows: it is a row, and the unit above is not a row or
     a blank line (only spaces and tabs, as GFM reads one) lies between them. A line holding only a
-    no-break space emits no unit either, but GFM does not count it blank, so it ends no table."""
+    no-break space emits no unit either, but GFM does not count it blank, so it ends no table.
+
+    A quote blank (only quote markers) between two rows ends the run only inside a quoted table: the
+    run's first row, the row above and the row below all open with a quote marker. Anywhere else, a
+    lone ">" between rows does not end the run, as main read no blank line at all."""
+
+    def between(found: list[int], above: int, below: int) -> bool:
+        return bisect.bisect_right(found, above) < bisect.bisect_left(found, below)
+
+    def quoted(lineno: int) -> bool:
+        return _PR_QUOTE_BLANK.match(lines[lineno - 1]) is not None
+
     starts = []
+    run_line = 0
     for index, (marks, _, is_row) in enumerate(units):
         above = units[index - 1] if index else None
-        starts.append(
-            is_row
-            and (
-                above is None
-                or not above[2]
-                or bisect.bisect_right(blanks, above[0][0][1])
-                < bisect.bisect_left(blanks, marks[0][1])
+        line = marks[0][1]
+        start = is_row and (
+            above is None
+            or not above[2]
+            or between(blanks, above[0][0][1], line)
+            or (
+                between(quote_blanks, above[0][0][1], line)
+                and quoted(run_line)
+                and quoted(above[0][0][1])
+                and quoted(line)
             )
         )
+        if start:
+            run_line = line
+        starts.append(start)
     return starts
 
 
@@ -1082,12 +1098,19 @@ def _pr_table_columns(units: _PrUnits, starts: list[bool]) -> list[set[int]]:
 def _pr_loose_columns(units: _PrUnits, starts: list[bool]) -> list[set[int]]:
     """For each unit, the ASVS columns read close to how engine PR 2893 read them, united with the GFM
     reading above: every row above a dash-shaped unit is re-read as a header, and its cells are split
-    at every pipe. Unlike engine PR 2893, a blank line ends the reading (step 9, which drops marks by
-    design), and a blank line is counted as GFM counts one (_pr_lines)."""
+    at every pipe. Unlike engine PR 2893, a blank line between data rows ends the reading (step 9,
+    which drops marks by design), and a blank line is counted as GFM counts one (_pr_lines). A blank
+    line right before or right after a dash-shaped row ends nothing, as main read none: between a
+    header and its delimiter, or between the delimiter and the first data row, the header still
+    marks the rows below."""
     columns: list[set[int]] = []
     current: set[int] = set()
     for index, (_, text, is_row) in enumerate(units):
-        if not is_row or starts[index]:
+        if not is_row or (
+            starts[index]
+            and not _pr_is_delimiter(text)
+            and not (index and units[index - 1][2] and _pr_is_delimiter(units[index - 1][1]))
+        ):
             current = set()
         if (
             is_row
@@ -1155,10 +1178,10 @@ def scan_pr_body(body: str) -> list[str]:
     restate a verdict on the same line report it once, rather than storming.
     """
     found: set[tuple[int, int]] = set()
-    lines, blanks = _pr_lines(body)
+    lines, blanks, quote_blanks = _pr_lines(body)
     units = _pr_units(lines, delete_invisible=False)
     # Both readings share the units' kinds and lines, so they share where each run of rows starts.
-    starts = _pr_table_starts(units, blanks)
+    starts = _pr_table_starts(units, lines, blanks, quote_blanks)
     asvs = _pr_table_columns(units, starts)
     loose = _pr_loose_columns(units, starts)
     for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):

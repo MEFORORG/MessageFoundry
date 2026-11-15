@@ -1203,6 +1203,29 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
         _HEAD.replace(chr(10), chr(0x2028)) + f"| a | b | c |{chr(0x0C)}{chr(0x2028)}{_ROW}",
     ),
     ("9", "verdict", f"Intro.{chr(0x85) * 2}" + _HEAD.replace(chr(10), chr(0x85) * 2) + _ROW),
+    # Review round-6926d71d81 finding 1, each flagged by main: a quote-marker-only line under a quoted
+    # row inside an unquoted ASVS table is not a blank line, lone, padded or doubled, with the row
+    # below it unquoted or quoted. Only a quoted table ends at one.
+    *(
+        ("9", "verdict", f"{_HEAD}> | a | b | c |\n{marker}\n{below}{_ROW}")
+        for marker in (">", "  >  ", "> >")
+        for below in ("", "> ")
+    ),
+    # A quoted table whose row below the quote-marker-only line is unquoted keeps the mark too.
+    ("9", "verdict", f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n>\n{_ROW}"),
+    # Finding 3, each flagged by main: a blank line between an ASVS header and its delimiter, or
+    # between the delimiter and the first data row, lone, padded or doubled, ends nothing, unquoted or
+    # quoted.
+    *(
+        ("9", "verdict", body)
+        for blank in ("", "  ", "\n")
+        for body in (
+            f"| ASVS | Note | Result |\n{blank}\n|---|---|---|\n{_ROW}",
+            f"{_HEAD}{blank}\n{_ROW}",
+        )
+    ),
+    ("9", "verdict", f"> | ASVS | Note | Result |\n>\n> |---|---|---|\n> {_ROW}"),
+    ("9", "verdict", f"> {_HEAD.replace(chr(10), chr(10) + '> ')}\n> {_ROW}"),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
