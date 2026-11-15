@@ -1085,8 +1085,7 @@ IDE_SITES: dict[str, Site] = {
         "Existence checks only; nothing is opened through any of them. Three are fixed names under "
         "the workspace. Two `path.resolve` the `messagefoundry.serviceConfig` setting, or serve's "
         "default name, from the workspace and stat the result; the setting may name a path outside "
-        "it. Restart runs that stat before its workspace-trust check, so there the setting can come "
-        "from an untrusted workspace's own settings (reported on PR 2966, not fixed here).",
+        "it.",
     ),
     "ide/src/stepsView.ts": Site(3, OPERATOR, _IDE_WORKSPACE + " Two are fixed media names."),
     "ide/src/symbolIndex.ts": Site(

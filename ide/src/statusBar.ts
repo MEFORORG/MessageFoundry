@@ -759,6 +759,18 @@ export class EngineStatusBar implements vscode.Disposable {
 
   /** Restart: stop the engine we own (waiting for the process to actually exit so the port frees), then start. */
   async restartEngine(): Promise<void> {
+    // Start's own target and trust refusals, first: the service config check below stats a path the
+    // workspace's settings name, and in an untrusted workspace that path is the repository's choice
+    // (a UNC value opens SMB, with NTLM, to a host it names). Nothing may touch the filesystem first.
+    const url = this.currentUrl();
+    if (!isLocalEngine(url)) {
+      notify(`${url} is a remote engine — the IDE can only start a local (loopback) engine.`);
+      return;
+    }
+    if (!vscode.workspace.isTrusted) {
+      notify("trust this workspace to let the IDE run the engine.");
+      return;
+    }
     // The Start below would refuse a service config that names no file, so refuse BEFORE stopping
     // the running engine; otherwise a refused Restart acts as Stop (BACKLOG #5566).
     const ws = workspaceDir();

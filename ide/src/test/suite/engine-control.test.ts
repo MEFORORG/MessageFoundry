@@ -698,6 +698,48 @@ suite("engine control — Start runs against the service TOML the fork guard jud
     assert.ok(/serviceConfigRefusal\(ws, startServiceConfig\(\)\)/.test(body));
   });
 
+  test("Restart refuses a remote target and an untrusted workspace before it stats the service config", () => {
+    // The service config check stats a path the workspace's own settings name, so in an untrusted
+    // workspace the repository picks it; a UNC value would open SMB to a host it names.
+    const gatedFirst = (body: string): string | undefined => {
+      const local = body.search(/if \(!isLocalEngine\(url\)\) \{\s*notify\([^;]*\);\s*return;/);
+      const trusted = body.search(
+        /if \(!vscode\.workspace\.isTrusted\) \{\s*notify\("trust this workspace to let the IDE run the engine\."\);\s*return;/,
+      );
+      const stat = body.search(/serviceConfigRefusal\(/);
+      if (local < 0 || trusted < 0 || stat < 0) {
+        return `a check is missing (local ${local}, trusted ${trusted}, stat ${stat})`;
+      }
+      if (stat < local || stat < trusted) {
+        return "serviceConfigRefusal runs before a refusal";
+      }
+      const before = body.slice(0, Math.max(local, trusted));
+      return /\bfs\.|isFile\(|startServiceConfig\(|dbFilesIn\(|controlContext/.test(before)
+        ? "a filesystem read runs before the refusals"
+        : undefined;
+    };
+    const restart = /async restartEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    assert.ok(restart, "restartEngine moved — re-point this scan before trusting it");
+    assert.strictEqual(gatedFirst(restart[0]), undefined);
+    // Control: the order this method had before the fix, where Restart statted first.
+    const unfixed =
+      "async restartEngine() {\n const ws = workspaceDir();\n" +
+      " const refusal = ws === undefined ? undefined : serviceConfigRefusal(ws, startServiceConfig());\n" +
+      " const url = this.currentUrl();\n" +
+      ' if (!isLocalEngine(url)) {\n notify(`${url} is remote`);\n return;\n }\n' +
+      ' if (!vscode.workspace.isTrusted) {\n notify("trust this workspace to let the IDE run the engine.");\n return;\n }\n';
+    assert.strictEqual(gatedFirst(unfixed), "serviceConfigRefusal runs before a refusal");
+    // Start's launchEngine carries the same two messages, so the two refusals read alike.
+    const launch = /private async launchEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    assert.ok(launch, "launchEngine moved — re-point this scan before trusting it");
+    for (const message of [
+      "is a remote engine — the IDE can only start a local (loopback) engine.`",
+      '"trust this workspace to let the IDE run the engine."',
+    ]) {
+      assert.ok(launch[0].includes(message) && restart[0].includes(message), message);
+    }
+  });
+
   test("the unreachable-engine hint names the --service-config Start adds", () => {
     const hint = serveCommandHint();
     assert.ok(hint.includes(serveCommandLine("<configDir>")));
