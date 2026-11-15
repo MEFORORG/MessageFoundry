@@ -548,7 +548,7 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.row_seal import probe_row_sealer_at_start
+from messagefoundry.store.row_seal import TransitSealUnavailableError, probe_row_sealer_at_start
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -11514,6 +11514,7 @@ _PROVISION_ADMIN_HINT = (
 async def _assert_security_notice_is_deliverable(
     store: Store,
     *,
+    auth: AuthService,
     auth_settings: AuthSettings,
     alerts_settings: AlertsSettings | None,
     security_settings: SecuritySettings | None,
@@ -11573,35 +11574,65 @@ async def _assert_security_notice_is_deliverable(
     Deliberately narrow: it asks only whether SOME enabled administrator carries an address, not
     whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
     which is a different and much larger change.
+
+    **It reads the accounts through the auth service's checked list, never the store's readers
+    (BACKLOG #5629).** The store's ``list_users`` and ``get_user_role_ids`` return rows unchecked,
+    so on a keyed store a ``notify_email``, a ``disabled`` flag or a ``user_roles`` row written
+    outside the store would have passed this gate on an Administrator no seal covers. On a keyed
+    store every field the gate weighs -- the address, the flag and the role rows -- now comes from a
+    record that passed its seal. One that fails, or that Vault transit cannot verify, is reported
+    by the service and does not count, and the refusal says how many were left out, so it does not
+    read as a store with no account at all. A keyless store has no seal, so there the rows are
+    taken as read. One pass answers both halves, from one snapshot. A Vault transit Outage leaves
+    the question unsettled: under ``enforce`` with the gate on it refuses, and otherwise it is one
+    WARNING, as the dials promise.
     """
     alerts = alerts_settings or AlertsSettings()
     # The two preconditions of the deliverability question. Either one false skips the refusal: the
     # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
     gated = auth_settings.notify_security_events and alerts.security_notifications_required
-    # Addressed accounts first, so the common start stops at the first addressed Administrator and
-    # never reads the roles of the rest of the table. Once an Administrator WITHOUT an address is
-    # reached, every account after it lacks one too, so the question is settled there.
-    enabled = sorted(
-        (u for u in await store.list_users() if not u.disabled), key=lambda u: not u.notify_email
+    enforcement = (security_settings or SecuritySettings()).enforcement
+    try:
+        listed = await auth.list_checked_users()
+    except TransitSealUnavailableError as exc:
+        detail = (
+            "the accounts could not be checked against their integrity seal because Vault transit "
+            "did not answer, so whether any security notice reaches an Administrator is unsettled. "
+            "Restore Vault transit and start again"
+        )
+        if gated and enforcement is SecurityEnforcement.ENFORCE:
+            raise RuntimeError(f"refusing to start a PHI instance: {detail}") from exc
+        _log.warning("the security-notice gate could not run: %s", detail)
+        return
+    failed = sum(1 for entry in listed if entry.user is None)
+    admins = [
+        u
+        for u in (entry.user for entry in listed)
+        if u is not None and not u.disabled and Role.ADMINISTRATOR.value in u.role_ids
+    ]
+    administrator_exists = bool(admins)
+    if administrator_exists and (not gated or any(u.notify_email for u in admins)):
+        return
+    # A record left out still exists, so the refusal must not read as a store with no account at
+    # all: it says how many were left out, and the service's seal report names each one and why.
+    left_out = (
+        f" {failed} account record(s) could not be verified against their integrity seal and were"
+        " not counted; the seal-failure warning names each one and its cause. If an Administrator"
+        " is among them, resolve that record before creating another"
+        if failed
+        else ""
     )
-    administrator_exists = False
-    for user in enabled:
-        if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
-            continue
-        if user.notify_email or not gated:
-            return
-        administrator_exists = True
-        break
     if not administrator_exists:
         # A SQLite store file named absolutely, since the operator's shell may sit in another
         # directory than the service; a server backend's descriptor is server/database, names no
         # file, and is left as it is.
         where = str(Path(store.path).resolve()) if Path(store.path).is_file() else store.path
         detail = (
-            "no enabled Administrator exists in this store, so no enabled account holds the role "
+            f"no enabled Administrator{' whose record passes its integrity seal' if failed else ''} "
+            "exists in this store, so no enabled account holds the role "
             "that manages users and roles, and every out-of-band security notice about the most "
             "privileged accounts would reach nobody. The engine creates no account on its own. "
-            f"{_PROVISION_ADMIN_HINT.format(store=where)}."
+            f"{_PROVISION_ADMIN_HINT.format(store=where)}.{left_out}"
         )
         if not gated:
             # AC-12: the gate is skipped, so this is the one line that says no enabled Administrator
@@ -11617,9 +11648,8 @@ async def _assert_security_notice_is_deliverable(
             "the host with `messagefoundry admin-set-notify-email --username <administrator> "
             "--email <address>`, run against this store with the engine stopped, or accept the "
             "pull-only /me/security-events feed in writing via "
-            "[alerts].security_notifications_required=false"
+            f"[alerts].security_notifications_required=false.{left_out}"
         )
-    enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
         raise RuntimeError(f"refusing to start a PHI instance: {detail}")
     _log.warning("PHI instance with no deliverable security-notice recipient: %s", detail)
@@ -13165,8 +13195,10 @@ def create_managed_app(
                     security_notifier.start()
                 # BACKLOG #2131: before engine.start() for #1923's reason. On a first run no
                 # enabled Administrator exists yet, and the gate's refusal must stop startup before
-                # any connection starts rather than after. Both touch only the store: initialize()
-                # seeds the built-in roles and the gate reads the users. A refusal here also comes
+                # any connection starts rather than after. initialize() seeds the built-in roles;
+                # the gate reads the users through the service's checked list, which on a keyed
+                # store verifies each seal (a Vault transit call each under vault_transit) and can
+                # write a seal-failure audit row and raise its alert. A refusal here also comes
                 # before the start's opt-in audit-chain walk, so that walk cannot alert on such a
                 # start. Vault BACKLOG #3145 item 2 is declined: the walk runs inside engine.start(),
                 # and moving it ahead of this gate reorders the start whose failure paging
@@ -13176,6 +13208,7 @@ def create_managed_app(
                 app.state.auth = auth
                 await _assert_security_notice_is_deliverable(
                     store,
+                    auth=auth,
                     auth_settings=auth_settings,
                     alerts_settings=alerts_settings,
                     security_settings=security_settings,
