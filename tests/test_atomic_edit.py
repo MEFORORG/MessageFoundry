@@ -275,7 +275,7 @@ def _a_file_root_does_not_own(tmp_path: Path) -> tuple[Path, os.stat_result]:
 def _as_root(monkeypatch: pytest.MonkeyPatch, chown: Callable[..., None]) -> None:
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr(os, "getegid", lambda: 0)
-    monkeypatch.setattr(os, "chown", chown)
+    monkeypatch.setattr(os, "fchown", chown)
 
 
 @posix_only
@@ -285,16 +285,16 @@ def test_root_gives_the_replaced_file_back_to_its_owner(
     """Root used to leave the edited file owned by root at 0600, so the service account that owns
     it could no longer read it. The chown is simulated, so this runs as any account."""
     path, st = _a_file_root_does_not_own(tmp_path)
-    chowned: list[tuple[str, int, int]] = []
+    chowned: list[tuple[int, int]] = []
 
-    def _record(target: str, uid: int, gid: int, *, follow_symlinks: bool = True) -> None:
-        chowned.append((Path(target).name, uid, gid))
+    def _record(_fd: int, uid: int, gid: int) -> None:
+        chowned.append((uid, gid))
 
     _as_root(monkeypatch, _record)
 
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
-    assert chowned == [("connections.toml", st.st_uid, st.st_gid)]
+    assert chowned == [(st.st_uid, st.st_gid)]
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert path.read_bytes() == b"x = 1\n"
 
@@ -312,7 +312,7 @@ def test_an_account_editing_its_own_file_changes_no_owner(
 
     monkeypatch.setattr(os, "geteuid", lambda: st.st_uid)
     monkeypatch.setattr(os, "getegid", lambda: st.st_gid)
-    monkeypatch.setattr(os, "chown", _forbidden)
+    monkeypatch.setattr(os, "fchown", _forbidden)
 
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
@@ -368,6 +368,28 @@ def _with_uid(st: os.stat_result, uid: int) -> os.stat_result:
     fields = list(st)
     fields[stat.ST_UID] = uid
     return os.stat_result(fields)
+
+
+@posix_only
+def test_a_lock_name_planted_as_a_hard_link_is_never_handed_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The folder's owner could hard-link the lock name to a file root owns; the hand-over must not
+    # chown it. Simulated as root, like the test above.
+    path, _ = _a_file_root_does_not_own(tmp_path)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"root's")
+    os.link(victim, atomic_edit.lock_path_for(path))
+    given: list[tuple[int, int]] = []
+    real_fstat = os.fstat
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "fstat", lambda fd: _with_uid(real_fstat(fd), 0))
+    monkeypatch.setattr(os, "fchown", lambda _fd, uid, gid: given.append((uid, gid)))
+
+    with atomic_edit.edit_lock(path):
+        pass
+
+    assert given == []
 
 
 #: An editing account no real account here is, reported through the token seam.
@@ -445,14 +467,25 @@ def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
         ("BA", _EDITOR_SID, True, None),
         ("BA", _EDITOR_SID, False, "S-1-5-32-544"),
         ("SY", _EDITOR_SID, True, "S-1-5-18"),
+        ("BU", _EDITOR_SID, False, None),
+        ("WD", _EDITOR_SID, False, None),
+        ("SY", None, False, None),
     ],
-    ids=["alias-is-self", "administrators-elevated", "administrators-not-held", "system"],
+    ids=[
+        "alias-is-self",
+        "administrators-elevated",
+        "administrators-not-held",
+        "system",
+        "users-is-never-granted",
+        "everyone-is-never-granted",
+        "no-token",
+    ],
 )
 def test_who_counts_as_another_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     owner: str,
-    editor: str,
+    editor: str | None,
     admins: bool,
     foreign: str | None,
 ) -> None:

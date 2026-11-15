@@ -12,7 +12,7 @@ restriction (vault BACKLOG #2782). One copy here replaces the four.
 inside a private directory created beside it (unique, and on POSIX owner-only from creation: mode
 0700 for the directory and 0600 for the file; same filesystem, so the final ``os.replace`` is atomic).
 On Windows those modes are ignored and the candidate carries the directory's inherited access list
-until ``store._secure_file`` restricts the replaced file, the same window the old ``mkstemp`` writer
+until the replaced file is restricted (``store._secure_file``, or as the next paragraph says), the same window the old ``mkstemp`` writer
 had; the directory's own access list is the control there (``docs/SERVICE.md``). The caller's ``validate`` runs against that candidate. Only a candidate
 that validates replaces the live file, so a refused edit never touches the live file at all: its bytes
 and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
@@ -22,8 +22,10 @@ edit run as another account, such as root or an elevated administrator editing a
 account owns, would otherwise have left it owned by and restricted to the editing account, so the
 account that reads it could no longer. On POSIX, root gives the candidate the live file's owner and
 group before the rename, and the mode is still 0600. On Windows, a live file another account owns
-is restricted to that account and the editing one, and its ownership is given back, rather than to
-the editing account alone. An edit by the file's own account, or by an elevated administrator of a
+is restricted to that account and the editing one rather than to the editing account alone, and
+its ownership is given back where Windows lets this account do that (it needs the restore privilege
+enabled, which an elevated administrator holds but does not enable; otherwise the editor owns it, and
+a later edit by that editor makes the owner-only rewrite). An edit by the file's own account, or by an elevated administrator of a
 file Administrators owns, is the owner-only rewrite it always was.
 A config file that is itself a link is refused rather than replaced: the rename would put a detached
 regular file where the link was and leave its target unedited.
@@ -144,6 +146,10 @@ _STAT_STEP = "stat it"
 #: ``ERROR_ACCESS_DENIED`` as a true denial (both measured on Windows 11). So the wording on Windows
 #: names both causes.
 _WINDOWS = sys.platform == "win32"
+
+#: The bit of a reparse tag that marks a name surrogate: a symbolic link, a junction or another
+#: link-like reparse point such as a WSL symlink. The value ``uploads._NAME_SURROGATE_TAG`` holds.
+_NAME_SURROGATE_TAG = 0x20000000
 
 #: Text-mode translation would rewrite every ``\n`` as ``\r\n`` on Windows; the bytes go out verbatim.
 _O_BINARY = getattr(os, "O_BINARY", 0)
@@ -280,7 +286,8 @@ def edit_lock(
     # locked it. The refusal names the lock file, though its advice speaks of owners, not modes.
     # Owner-only, like the files it guards: every edit leaves the edited file 0600, so an account
     # that could not open a lock an editor created could not edit that file either, and root opens
-    # a 0600 file regardless. Wider access gains nothing.
+    # a 0600 file regardless. Wider access gains nothing. A root edit gives the file back to its
+    # owner, so root hands a lock it holds to the folder's owner too (_give_root_lock_to_folder_owner).
     # O_NOFOLLOW where the platform has it: a lock path planted as a link is refused, not followed.
     # O_NONBLOCK so a lock path planted as a FIFO cannot block the open before the timeout runs.
     flags = (os.O_RDONLY if _WINDOWS else os.O_RDWR) | os.O_CREAT | _O_BINARY
@@ -327,6 +334,10 @@ def _give_root_lock_to_folder_owner(fd: int, folder: Path) -> None:
     try:
         lock = os.fstat(fd)
         owner = os.stat(folder)
+        # Only a lock file that is nothing else: the folder's owner could have planted the lock name
+        # as a hard link to a file root owns, and the chown would hand that file over.
+        if not stat.S_ISREG(lock.st_mode) or lock.st_nlink != 1:
+            return
         if lock.st_uid == 0 and owner.st_uid != 0:
             os.fchown(fd, owner.st_uid, owner.st_gid)
     except OSError as exc:
@@ -379,11 +390,14 @@ def replace_validated(
                 # On disk before the rename, so a crash just after it cannot leave an empty file.
                 handle.flush()
                 os.fsync(handle.fileno())
-        if live.posix_owner is not None and sys.platform != "win32":
-            # Before the rename, so the live file is never owned by the editing account: a chown
-            # that fails here leaves the live file as it was.
-            with refused_as(path, refused_error, "give its edit candidate the file's owner"):
-                os.chown(candidate, *live.posix_owner, follow_symlinks=False)
+                if live.posix_owner is not None and sys.platform != "win32":
+                    # Through the handle, never by path: the folder's owner could swap the private
+                    # directory before a chown by name. Before the rename, so a chown that fails
+                    # leaves the live file as it was.
+                    with refused_as(
+                        path, refused_error, "give its edit candidate the file's owner"
+                    ):
+                        os.fchown(handle.fileno(), *live.posix_owner)
         for companion in companions:
             # The stat gate: a companion read as absent would validate the candidate without it.
             if is_file(companion, refused_error=refused_error):
@@ -414,7 +428,13 @@ def _refuse_a_link(path: Path, refused_error: Callable[[str], Exception] | None)
     """Refuse an edit of ``path`` when ``path`` itself is a link: ``os.replace`` replaces the link,
     not its target, so the edit would land in a detached regular file and leave the target as it
     was (vault BACKLOG #5619). A folder above it that is a link is followed, as every reader does."""
-    if not (os.path.islink(path) or os.path.isjunction(path)):
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return  # nothing there, or a stat the editors' own gates already answered for
+    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    surrogate = reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
+    if not (stat.S_ISLNK(info.st_mode) or surrogate):
         return
     message = (
         f"{path.name} was not changed: it is a link, and an edit would replace the link with a "
@@ -430,7 +450,12 @@ def _live_security(path: Path) -> _LiveSecurity:
     """Whose the live file is, where the edit must keep it so; see :class:`_LiveSecurity`."""
     try:
         st = os.stat(path, follow_symlinks=False)
-    except OSError:
+    except FileNotFoundError:
+        return _LiveSecurity()  # a file the edit creates
+    except OSError as exc:
+        _log.warning(
+            "could not read who owns %s; the edit restricts it to this account: %s", path, exc
+        )
         return _LiveSecurity()
     if not stat.S_ISREG(st.st_mode):
         return _LiveSecurity()
@@ -463,23 +488,38 @@ def _canonical_sid(sid: str) -> str | None:
 
 def _foreign_windows_owner(path: Path) -> str | None:
     """The SID of the account that owns ``path`` when that is not this process's account, else
-    ``None``. ``None`` too when the owner cannot be read, which the read logs, and the edit then
-    makes the owner-only rewrite it always made.
+    ``None``. ``None`` too when the owner, the token or the token's groups cannot be read, and for
+    an owner many accounts hold, such as Users; the edit then makes the owner-only rewrite it always
+    made.
 
     Administrators as the owner is this account's own when its token holds Administrators enabled:
     that is the default owner of an elevated administrator's files on Windows Server, and such a
     file is the administrator's own."""
     from messagefoundry.auth.anchor_path import ADMINISTRATORS_SID
-    from messagefoundry.restricted_file import administrators_enabled
+    from messagefoundry.restricted_file import (
+        RestrictedFileError,
+        _is_broad_group,
+        _is_package_sid,
+        administrators_enabled,
+    )
     from messagefoundry.store.store import _SDDL_OWNER, _current_user_sid, _read_dacl_sddl
 
     sddl = _read_dacl_sddl(path, owner=True)
     match = _SDDL_OWNER.search(sddl) if sddl is not None else None
     owner = _canonical_sid(match.group(1)) if match is not None else None
-    if owner is None or owner == _current_user_sid():
+    editor = _current_user_sid()
+    if owner is None or editor is None or owner == editor:
         return None
-    if owner == ADMINISTRATORS_SID and administrators_enabled():
+    # An owner many accounts hold is never granted the file: the owner-only rewrite drops it.
+    if _is_broad_group(owner) or _is_package_sid(owner):
         return None
+    if owner == ADMINISTRATORS_SID:
+        try:
+            if administrators_enabled():
+                return None
+        except RestrictedFileError as exc:
+            _log.warning("could not read this process's groups for %s: %s", path, exc)
+            return None
     return owner
 
 
