@@ -530,11 +530,17 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   flag, where SMART and OAuth2 had read it as off and signing had already refused it, and on
   `Ftp(tls=...)`, where it used to mean plain FTP. The hop-policy flags, `tls_hop_attested`,
   `cleartext_accepted` and `tls_revocation_attested`, refuse it too, as they refused any value
-  but `True` or `False` before. Not every reading is covered. The rule covers the settings a
-  connection, lookup or reference factory takes and the composers' `enabled` flags, in a graph
-  the loader validates. It does not yet cover at least the flags `inbound()` and `outbound()`
-  take themselves, such as `simulate` or `deployed`, so write those as real booleans. Some checks
-  inside a factory still read a flag before this one does, so a quoted value there can stop the
+  but `True` or `False` before. The flags `inbound()` and `outbound()` take themselves, such as
+  `simulate`, `deployed`, `auto_start`, `strict` and `capture_ack`, must be a real `True` or
+  `False` as well. Any other value there, such as a string or a number, stops the load when the
+  connection is declared, before any check reads the flag. An `env()` reference stops it too,
+  because nothing resolves one on those flags. A `None` stops it as well, except on `capture_ack`
+  and `capture_connection_errors`, where it means inherit the service default. `connections.toml`
+  already refused anything but `true` or `false` for the ones it takes. Not every reading is
+  covered. The rule covers the settings a connection, lookup or reference factory takes and the
+  composers' `enabled` flags, in a graph the loader validates, and the flags `inbound()` and
+  `outbound()` take, whenever a connection is declared. Some checks inside a factory still read
+  one of the factory's own settings before this one does, so a quoted value there can stop the
   load with an error about the flag's effect instead. At least some checks
   read a setting before `env()` resolves, so they see the reference and not its value. A cast you
   write yourself runs first, so `cast=lambda s: bool(s)` still keeps the builtin's trap. Give a

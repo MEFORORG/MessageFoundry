@@ -1658,14 +1658,17 @@ def _bool_literal_problem(key: str, value: Any) -> str | None:
     return None
 
 
-def _bool_remedy(value: object) -> str:
-    """The remedy every refusal of a non-bool literal ends with. A false spelling in quotes, which
-    every lax read takes as true, gets a hint that says so; it says the value is a false spelling,
-    never which."""
-    hint = ""
+def _quoted_false_hint(value: object) -> str:
+    """A hint for a false spelling in quotes, which every lax read takes as true. It says the value
+    is a false spelling, never which."""
     if isinstance(value, str) and _BOOL_SPELLINGS.get(value.strip().lower()) is False:
-        hint = " (a false spelling in quotes reads as true)"
-    return f"{hint}; write True, False or an env() reference"
+        return " (a false spelling in quotes reads as true)"
+    return ""
+
+
+def _bool_remedy(value: object) -> str:
+    """The remedy every refusal of a non-bool literal ends with, after :func:`_quoted_false_hint`."""
+    return f"{_quoted_false_hint(value)}; write True, False or an env() reference"
 
 
 def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
@@ -1676,6 +1679,34 @@ def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
     for key, value in settings.items():
         if (bad := _bool_literal_problem(key, value)) is not None:
             raise WiringError(f"{where}: {bad}")
+
+
+def _refuse_non_bool_flags(
+    where: str, flags: Mapping[str, object], *, none_inherits: tuple[str, ...] = ()
+) -> None:
+    """Refuse a flag ``inbound()`` or ``outbound()`` takes itself that is not a real ``bool``
+    (vault BACKLOG #3234). The engine reads most of these by truthiness and resolves no ``env()``
+    on them, so ``simulate="false"``, a non-zero number or a reference would read True. ``0`` and
+    ``1`` are refused too, as :func:`~messagefoundry.config.models.require_flag` refuses them.
+    ``None`` passes only on a flag in ``none_inherits``, where it means inherit the service
+    default. The hop-policy flags are not passed here: their own checks refuse a non-bool first."""
+    for key, value in flags.items():
+        inherits = key in none_inherits
+        if value is None and inherits:
+            continue
+        try:
+            require_flag(value, key)
+        except ValueError as exc:  # names the key and the type, never the value
+            problem = str(exc)
+        else:
+            continue
+        # Raised outside the handler, so the chain stays empty (tests/test_from_none_is_not_redaction.py).
+        # Validation, a pydantic model, stores strict="false" as False, so the quoted-false hint
+        # would be untrue there.
+        hint = "" if key == "strict" else _quoted_false_hint(value)
+        env_hint = " (no env() is resolved on this flag)" if _is_nested_envref(value) else ""
+        tail = "; write True or False, or None to inherit" if inherits else "; write True or False"
+        raise WiringError(f"{where}: {problem}{hint}{env_hint}{tail}")
 
 
 def resolve_env_settings(
@@ -8300,6 +8331,19 @@ def build_inbound_connection(
     member **or** its bare string value (``"x12"``, ``"json"``, …); it is coerced to the enum here so a
     raw string can't reach the pipeline and crash later."""
     _refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
+    # Before any check below reads one: the content_type check read strict="false" as strict on.
+    _refuse_non_bool_flags(
+        f"inbound connection {name!r}",
+        {
+            "strict": strict,
+            "inline": inline,
+            "auto_start": auto_start,
+            "deployed": deployed,
+            "capture_ack": capture_ack,
+            "capture_connection_errors": capture_connection_errors,
+        },
+        none_inherits=("capture_ack", "capture_connection_errors"),
+    )
     content_type = _coerce_content_type(name, content_type)
     if (
         spec.type
@@ -8694,6 +8738,10 @@ def build_outbound_connection(
     The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
     _refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
+    _refuse_non_bool_flags(
+        f"outbound connection {name!r}",
+        {"simulate": simulate, "auto_start": auto_start, "deployed": deployed},
+    )
     # ADR 0153 decision 2: the cleartext-acceptance pair is coherence-checked HERE, the one choke point
     # both authoring surfaces pass through, so a flag with no reason (or a reason with no flag) fails at
     # `messagefoundry check` / dry-run rather than at connector construction. Re-raised as a WiringError
