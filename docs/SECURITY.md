@@ -791,7 +791,8 @@ attempt was made. The window discloses no per-bucket timing, though it does tell
 configured window, and it is never too early while nothing spends the bucket again: its oldest attempt
 leaves within it. A sign-in POST that moves a passkey begin leg's hit re-stamps it, in the begin
 leg's bucket and in the global window ([WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068),
-*The combined passkey sign-in*), so either can still be full when the window has passed. Before this, the PHI-read `429` sent a literal `10` and
+*The combined passkey sign-in*), so either can still be full when the window has passed; any other address's ordinary charge also
+refills the global window. Before this, the PHI-read `429` sent a literal `10` and
 `POST /ui/login` a literal `30`, each against a default 60 s window, so a client that honoured
 either could have retried too early. The routes that send no `Retry-After`
 are unchanged; the [Route → limiter map](#route--limiter-map) names them.
@@ -802,7 +803,9 @@ gates log both. The write floor's `Retry-After` does not differ: the paragraph a
 
 The floor reaches every non-GET `/ui` route gated by `require_ui`; **nine are not so gated** (seven
 with federation off). Seven (five with federation off) charge their own auth-surface budget
-instead: `POST /ui/login`, `POST /ui/login/passkey` (where passkeys are available; elsewhere it
+instead: `POST /ui/login` (except one a staged passkey challenge pays for, which moves the begin
+leg's hit instead; [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey
+sign-in*), `POST /ui/login/passkey` (where passkeys are available; elsewhere it
 answers 404 first) and `POST /ui/oidc/start` the sign-in window, and `POST /ui/mfa`, `POST /ui/reauth`,
 `POST /ui/reauth/webauthn` and `POST /ui/reauth/oidc` the per-actor ceremony budget. The remaining two, `POST /ui/logout` and
 `POST /ui/csp-report`, charge nothing (BACKLOG #287).
@@ -4165,7 +4168,7 @@ offers every caller a passkey button. `POST /ui/login/passkey` charges the sign-
 list**, so the options say nothing about any account. Its handle goes back as an HttpOnly,
 `SameSite=Strict` cookie, never keyed by client address. `POST /ui/login` then carries the password
 and the assertion together. **One passkey sign-in costs one unit of control 2, as a password
-sign-in does** (BACKLOG #3937). The route pops the challenge on arrival, whatever the outcome,
+sign-in does, unless its ceremony outlasts the window** (BACKLOG #3937). The route pops the challenge on arrival, whatever the outcome,
 before it charges the sign-in limiter. Where the begin leg's hit is still in the window, popping
 MOVES that hit to now instead of charging a second one, so the sign-in is counted from the moment
 it is spent and a begin leg's budget cannot be spent in a later window. A challenge outlives the
@@ -4384,7 +4387,8 @@ listed in [BROWSER-SUPPORT.md](BROWSER-SUPPORT.md#two-configurations-turn-the-wa
 **Browser AD login (L5b).** The browser AD **password** sign-in is **retired** (BACKLOG #1137).
 `/ui/login` has no provider selector. Its only form is local username and password, and Windows SSO
 and OIDC appear as links when available (`kerberos_available`, `oidc_available`). A POST that still carries `provider=ad` is charged to the
-sign-in window first. Once past that window, it reaches the **same** `auth.login` seam as the JSON
+sign-in window first, unless a staged passkey challenge pays for it ([WebAuthn
+passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey sign-in*). Once admitted, it reaches the **same** `auth.login` seam as the JSON
 surface, and the engine refuses it and audits the attempt, so the engine is the single place that
 refuses. Directory
 accounts sign in by **Windows SSO** (`GET /ui/sso`) or **OIDC** (`/ui/oidc/start`), and each such
@@ -7133,7 +7137,9 @@ option E, owner ruling 2026-09-27.* (3) A holder of one factor can hold a local 
 `lockout_max_minutes` per cycle, and a leaked-password list can do that to many accounts at once.
 *Accepted with option E, owner ruling 2026-09-27.* (4) **Control 2's global ceiling is its own
 denial lever**: 60 attempts a minute across all clients refuse every sign-in on the engine, the
-owner's combined sign-in included, so a username-only caller can still keep a TOTP-enrolled owner
+owner's combined sign-in included, except a `POST /ui/login` whose passkey begin leg was charged
+before the ceiling filled ([WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined
+passkey sign-in*), so a username-only caller can still keep a TOTP-enrolled owner
 out, by denying everyone; behind an undeclared proxy or a shared NAT that costs only about 600
 requests an hour. *Accepted for 6.1.1 scoring, owner ruling 2026-09-27.* (5) The owner's own typos
 can reach the escalating second-step lock: a combined sign-in with one factor wrong counts there,
@@ -7356,7 +7362,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /auth/login` | sign-in window | |
 | `POST /auth/negotiate` | sign-in window | |
 | `POST /auth/mfa-verify` | sign-in window | an **authenticated** route drawing the sign-in budget (it is a mid-login challenge); also feeds the per-account lockout |
-| `POST /ui/login` | sign-in window | 429 carries a `Retry-After` of the whole sign-in window |
+| `POST /ui/login` | sign-in window, except a POST a staged passkey challenge pays for ([WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey sign-in*) | 429 carries a `Retry-After` of the whole sign-in window |
 | `POST /ui/login/passkey` | sign-in window | the passkey sign-in's begin leg (ADR 0197 Amendment A wave 2), charged **before** it stages a challenge; how `POST /ui/login` then spends that charge (`StagedChallenge.paid`) is stated once, under [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey sign-in*. 429 as `POST /ui/login` |
 | `GET /ui/sso` | sign-in window | the token-bearing leg only; the RFC 4559 challenge leg is deliberately unthrottled |
 | `POST /ui/oidc/start`, `GET /ui/oidc/callback` | sign-in window; the callback's step-up return draws the per-actor ceremony budget instead | one browser login charges it **twice**. The callback reads the flow its cookie names first: a live step-up flow's return charges a key of its own for the user that flow names, as the `POST /ui/reauth/oidc` row says, and every other callback charges the sign-in window (BACKLOG #3374). **Note the verb, and the condition on the GET.** The start leg is a **POST** since the ASVS 3.7.3 interstitial. By default `GET /ui/oidc/start` renders the "you are leaving this site" page, stages **no** flow and charges **no** limiter; the flow starts only when the operator confirms with the POST. **The GET skips that page** when `[security].external_link_interstitial` is off, or when the IdP's authorization host is inside `[security].organization_domains` or on `[security].external_link_allowlist` (`_interstitial_needed()` false). It then runs the POST leg itself (`ui_oidc_start`): the same-origin check, this limiter, the `Sec-Fetch-Mode` check and a staged flow, with the same 303 on a throttle. So the GET charges the window and stages a flow exactly when the interstitial is skipped. |
