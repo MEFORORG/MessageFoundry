@@ -854,13 +854,15 @@ decision 4; TLS support for them is BACKLOG #311).
 
 **What the escape means. This is the one statement of it; other pages link here.** Several
 connectors **fail closed** on a weakened-TLS or cleartext configuration. The environment variable
-`MEFOR_ALLOW_INSECURE_TLS` lifts that refusal in the cells listed below, and only there, and only on
-an instance at `[security].enforcement = warn`. At `enforce`, the default, it has no effect in any
+`MEFOR_ALLOW_INSECURE_TLS` lifts that refusal in at least the cells listed below, and only on an
+instance at `[security].enforcement = warn`. At `enforce`, the default, it has no effect in any
 cell. Where it applies it lifts that one refusal and nothing else: each entry names the other
-conditions its hop must still meet, and the credential rule still refuses what it reaches. It
-never reaches the store hop or a SQL Server `DATABASE` connection, and it changes no cleartext-hop
-decision: the two non-connection cells below still pass it to the cleartext-hop authority, but only
-at `warn`, where that authority already WARNs. It exists for **dev / trusted-lab** use only. Some of the same cells also
+conditions its hop must still meet, and the credential rule still refuses what it reaches. At least two of
+those cells open a **cleartext** hop: Direct SMTP submission, and the Email `use_tls = false`
+pre-check. It never reaches the store hop or a SQL Server `DATABASE` connection. The two
+non-connection cells below pass it to the cleartext-hop authority, but only at `warn`, where that
+authority already WARNs, so it changes neither one's result. It exists for **dev / trusted-lab**
+use only. Some of the same cells also
 open for a per-connection `tls_hop_attested` or a loopback host, at any posture; the entries below
 say which.
 

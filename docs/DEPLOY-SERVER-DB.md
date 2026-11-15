@@ -958,7 +958,7 @@ is **unmeasured** on Linux.
 ## 6. Pre-flight checklist
 
 - [ ] `[store].backend` set to `postgres`/`sqlserver`; connection + auth via `MEFOR_*` env.
-- [ ] `[store].encrypt = true` (and **not** `MEFOR_ALLOW_INSECURE_TLS`) for any PHI deployment.
+- [ ] `[store].encrypt = true` for any PHI deployment. CHANGED 2026-11-14 (vault BACKLOG #3533 item 2): the engine refuses `encrypt = false` at every posture, and `MEFOR_ALLOW_INSECURE_TLS` does not lift it, so this item no longer warns against the escape.
 - [ ] DB CA trusted so `trust_server_certificate = false` validates — Postgres `ssl_root_cert` **or**
       machine-store import; SQL Server **machine store only** (§5). Never `TrustServerCertificate=true`.
 - [ ] `[store].pool_size` sized (default **40**, server-DB only; ≥ 2 hard-required in cluster mode) **and**

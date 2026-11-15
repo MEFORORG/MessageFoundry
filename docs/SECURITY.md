@@ -1329,9 +1329,11 @@ lines matching the extended pattern `create_pool|connect\(`, where `store/sqlser
 that both *"fall back to the unclamped escape when no posture is set"*, so each new caller outside
 the construction gate had to remember to pass one. Now a caller that forgets is refused, and one that
 needs the escape on a `warn` instance passes that posture. CHANGED 2026-11-14 (owner ruling, vault
-BACKLOG #3533 item 2): neither the store nor a SQL Server `DATABASE` hop asks either predicate any
-more. `_weakened_tls_permitted` takes only the connection's attestation, and the store refuses a
-weakened hop at every posture, so no caller's posture opens either one.
+BACKLOG #3533 item 2): the store no longer asks either predicate, and refuses a weakened hop at
+every posture. A SQL Server `DATABASE` hop still asks `_weakened_tls_permitted`, but it now reads
+no posture and no escape: it returns only the connection's `tls_hop_attested`. So no caller's
+posture opens either hop, and the paragraph's first sentence no longer describes
+`_weakened_tls_permitted`.
 
 **A plain `ldap://` bind is refused at every posture (vault BACKLOG #3533).** The
 `ad_allow_insecure_ldap` opt-in is removed, and a config that still sets it is refused by name.
