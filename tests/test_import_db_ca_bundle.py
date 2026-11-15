@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import itertools
 import json
 import os
 import shutil
@@ -173,6 +174,8 @@ def files(
         "pem_bundle": b"subject=ignored text\n" + _pem(root, inter),
         "p7b_with_leaf": pkcs7.serialize_certificates([root, leaf], der),
         "pem_with_unconstrained": _pem(root, chain["unconstrained"][0]),
+        # PEM keeps its order, where a .p7b's certificate SET may be re-sorted.
+        "pem_two_refused": _pem(root, leaf, chain["no_cert_sign"][0]),
         "pfx": pkcs12.serialize_key_and_certificates(
             b"x", root_key, root, None, serialization.NoEncryption()
         ),
@@ -403,24 +406,44 @@ def test_a_file_without_a_self_signed_root_imports_nothing(
     assert "What if" not in out
 
 
+_NOT_A_CA = "its basic constraints say it is not a CA"
+_NO_CERT_SIGN = "its key usage does not allow it to sign certificates"
+
+
+@pytest.mark.parametrize(
+    ("name", "refused"),
+    [
+        ("p7b_with_leaf", [("leaf", _NOT_A_CA)]),
+        ("pem_two_refused", [("leaf", _NOT_A_CA), ("no_cert_sign", _NO_CERT_SIGN)]),
+    ],
+)
 def test_a_bundle_holding_a_non_ca_imports_nothing(
-    chain: dict[str, tuple[x509.Certificate, _Key]], files: dict[str, Path]
+    name: str,
+    refused: list[tuple[str, str]],
+    chain: dict[str, tuple[x509.Certificate, _Key]],
+    files: dict[str, Path],
 ) -> None:
-    proc = _run_whatif(files["p7b_with_leaf"])
+    proc = _run_whatif(files[name])
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
     assert "Nothing was imported" in out
-    leaf, root = _thumb(chain["leaf"][0]), _thumb(chain["root"][0])
-    # The printed list holds the leaf's reason as a whole line, and only it: pwsh's error view
-    # rewraps at the console width, and at the 80 columns of a Linux runner that split the
+    thumbs = [_thumb(chain[key][0]) for key, _why in refused]
+    # The printed list holds each reason as a whole line, in file order, and nothing else: pwsh's
+    # error view rewraps at the console width, and at a Linux runner's 80 columns that split a
     # thumbprint from its reason.
     lines = proc.stdout.splitlines()
     assert "Refused:" in lines, out
-    refused = lines[lines.index("Refused:") + 1 :]
-    assert refused == [f"  {leaf}: its basic constraints say it is not a CA"], out
-    # The error itself names the refused thumbprint and not the CA beside it. The error view's
-    # source-line excerpt shows code, not a thumbprint, so this reads the message.
-    assert leaf in proc.stderr and root not in proc.stderr, proc.stderr
+    listed = itertools.takewhile(
+        lambda ln: ln.startswith("  "), lines[lines.index("Refused:") + 1 :]
+    )
+    assert list(listed) == [
+        f"  {t}: {why}" for t, (_key, why) in zip(thumbs, refused, strict=True)
+    ], out
+    # The error names every refused thumbprint, in order, and not the root CA beside them. The
+    # error view's source-line excerpt shows code, not a thumbprint, so this reads the message.
+    at = [proc.stderr.find(t) for t in thumbs]
+    assert -1 not in at and at == sorted(at), proc.stderr
+    assert _thumb(chain["root"][0]) not in proc.stderr, proc.stderr
     # Refused before a single import is offered, even the CA beside it.
     assert "What if" not in out
 

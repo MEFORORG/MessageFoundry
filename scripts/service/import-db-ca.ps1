@@ -415,7 +415,7 @@ try {
 
 Write-Host "The file holds $($bundle.Count) certificate(s):"
 $now = [datetime]::Now
-$refusals = @()
+$refusals = [System.Collections.Generic.List[object]]::new()
 # The store each certificate is shown with is the one it is offered for and written to.
 $entries = @(foreach ($cert in $bundle) {
     $target = $stores[(Get-CaStoreName -Certificate $cert)]
@@ -429,20 +429,19 @@ $entries = @(foreach ($cert in $bundle) {
         Write-Warning "$($cert.Thumbprint) is outside its validity period; a chain through it will not validate."
     }
     $why = Get-CaRefusal -Certificate $cert
-    if ($why) { $refusals += [pscustomobject]@{ Thumbprint = $cert.Thumbprint; Why = $why } }
+    if ($why) { $refusals.Add([pscustomobject]@{ Thumbprint = $cert.Thumbprint; Why = $why }) }
     @{ Certificate = $cert; Target = $target }
 })
 if ($refusals.Count -gt 0) {
-    # Each reason is printed on its own line, not put in the error: pwsh 7's default error view
-    # (ConciseView) joins a message's lines and rewraps them at the console width, which splits a
-    # thumbprint from its reason. The error still names every refused thumbprint, for a caller
-    # that catches it or keeps only the error stream.
+    # Printed one per line for the operator. pwsh 7's default error view rewraps a message at the
+    # console width, which can split a thumbprint from its reason. The error repeats each pair on
+    # one line, for a caller that catches it or keeps only the error stream.
     Write-Host ""
     Write-Host "Refused:"
     foreach ($refusal in $refusals) { Write-Host "  $($refusal.Thumbprint): $($refusal.Why)" }
     throw ("Nothing was imported. Every certificate in the file must be a CA that may sign " +
-        "certificates and carries no private key. Refused, each with its reason above: " +
-        ((@($refusals) | ForEach-Object { $_.Thumbprint }) -join ', ') + ".")
+        "certificates and carries no private key. Refused: " +
+        (($refusals | ForEach-Object { "$($_.Thumbprint) ($($_.Why))" }) -join '; ') + ".")
 }
 if (-not ($entries | Where-Object { $_.Target -eq $stores['Root'] })) {
     # Without its root an issuing CA validates nothing over SChannel, and over the engine's Python TLS
