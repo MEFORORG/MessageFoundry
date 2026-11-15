@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from harness.drivers import Injection
 from harness.drivers.mllp import MLLPDriver
 from harness.endpoints import Endpoints
-from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError
+from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, frame_neutralised
 
 REPLY = "reply"
 CLOSED = "closed"
@@ -45,9 +45,6 @@ _MAX_REPLY_BYTES = 1024 * 1024
 #: case gets one ACK per message it carries, so 16 replies at the frame ceiling is far past any real
 #: answer. Without it, an engine that kept writing would never hit the per-read timeout.
 _MAX_EXCHANGE_BYTES = 16 * _MAX_REPLY_BYTES
-
-#: Start block, end block and trailing CR: what MLLP adds around each payload.
-_FRAME_OVERHEAD = 3
 
 
 @dataclass(frozen=True)
@@ -108,11 +105,12 @@ class WireMLLPDriver(MLLPDriver):
 def _read_replies(sock: socket.socket) -> Exchange:
     decoder = MLLPDecoder(max_frame_bytes=_MAX_REPLY_BYTES)
     replies: list[bytes] = []
-    received = 0
+    #: Every byte read, kept so the framing is checked exactly; bounded by the exchange ceiling.
+    received = bytearray()
     try:
         while chunk := sock.recv(65536):
-            received += len(chunk)
-            if received > _MAX_EXCHANGE_BYTES:
+            received += chunk
+            if len(received) > _MAX_EXCHANGE_BYTES:
                 detail = f"the engine sent over {_MAX_EXCHANGE_BYTES} reply bytes for one case"
                 return Exchange(MALFORMED, tuple(replies), detail)
             replies.extend(decoder.feed(chunk))
@@ -124,11 +122,16 @@ def _read_replies(sock: socket.socket) -> Exchange:
         return Exchange(RESET, tuple(replies), str(exc))
     if decoder.in_frame:
         return Exchange(MALFORMED, tuple(replies), "the engine closed inside a reply frame")
-    framed = sum(len(r) + _FRAME_OVERHEAD for r in replies)
-    if received != framed:
-        # The decoder discards bytes outside a frame, so count them: an engine that writes
-        # anything but whole SB..FS CR frames is answering in something other than MLLP.
-        detail = f"{received - framed} reply byte(s) outside an MLLP frame"
+    if received != b"".join(frame_neutralised(r) for r in replies):
+        # The decoder discards bytes outside a frame and closes one on the end block alone, so a
+        # byte count would pass a wrong trailer, or one frame short its CR beside one with two.
+        # Compared byte for byte with what a conforming engine writes: each reply framed as its
+        # listeners frame one (ADR 0205 rule 1), a frame byte in the payload neutralised. So a reply
+        # carrying a start byte as data fails too, where the bare frame() would have matched it.
+        detail = (
+            f"the {len(received)} reply byte(s) are not exactly {len(replies)} SB..FS CR "
+            "frame(s): bytes outside an MLLP frame, a wrong trailer, or a frame byte in a reply"
+        )
         return Exchange(MALFORMED, tuple(replies), detail)
     return Exchange(REPLY if replies else CLOSED, tuple(replies))
 

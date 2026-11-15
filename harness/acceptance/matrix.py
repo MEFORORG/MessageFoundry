@@ -63,6 +63,11 @@ class MatrixRow:
     refs: tuple[str, ...] = ()
     notes: str = ""
 
+    @property
+    def is_per_db(self) -> bool:
+        """Whether the row certifies every backend, so each server-DB suite must run."""
+        return self.per_db == PER_DB
+
 
 # Section titles (A–H) mirror the markdown matrix headings.
 SECTIONS: dict[str, str] = {

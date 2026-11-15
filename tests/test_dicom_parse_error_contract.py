@@ -20,8 +20,10 @@ All objects here are synthetic and PHI-free.
 from __future__ import annotations
 
 import base64
+import decimal
 import sys
 import traceback
+import zlib
 from collections.abc import Callable, Sequence
 
 import pytest
@@ -41,7 +43,7 @@ from messagefoundry.parsing.dicom import (  # noqa: E402
 from messagefoundry.parsing.dicom import dataset as dataset_module  # noqa: E402
 from messagefoundry.parsing.dicom import peek as peek_module  # noqa: E402
 from messagefoundry.parsing.dicom._deps import parse_error_types  # noqa: E402
-from tests._dicom_sample import make_sr_part10  # noqa: E402
+from tests._dicom_sample import make_deflated_part10, make_sr_part10  # noqa: E402
 
 #: A preamble, ``DICM``, then a (0002,0000) group length with VR UL and a 3-byte value. UL needs a
 #: multiple of 4 bytes, so pydicom raises BytesLengthException when it reads the file meta.
@@ -238,6 +240,57 @@ def test_a_recursion_error_from_dcmread_is_a_dicom_error(
     seed = make_sr_part10()
     _inflate.guard_part10_deflate(seed, force=False)  # the guard passes it, so dcmread is reached
     _assert_wrapped(parse, wrapper, seed, RecursionError, raised_in="_recursing_dcmread")
+
+
+#: A Deflated Explicit VR LE body that is no deflate stream: the first byte reads as a reserved
+#: block type. The guard stands aside on zlib.error, so dcmread's one-shot inflate meets it.
+_CORRUPT_DEFLATE_BODY = b"\x07not-a-deflate-stream"
+
+
+@pytest.mark.parametrize(("surface", "parse", "wrapper"), _SURFACES, ids=[s[0] for s in _SURFACES])
+def test_a_corrupt_deflated_body_is_a_dicom_error(
+    surface: str, parse: _Parse, wrapper: type[DicomError]
+) -> None:
+    """BACKLOG #5803: the deflate guard returns quietly on ``zlib.error`` and leaves the object to
+    ``dcmread``, whose own inflate then raised ``zlib.error`` straight out of both parse surfaces."""
+    seed = make_deflated_part10(_CORRUPT_DEFLATE_BODY)
+    _inflate.guard_part10_deflate(seed, force=False)  # the guard passes it, so dcmread meets it
+    _assert_wrapped(parse, wrapper, seed, zlib.error, raised_in="read_partial")
+
+
+def _raising_dcmread(exc_type: type[BaseException]) -> Callable[..., object]:
+    def _dcmread(*_args: object, **_kwargs: object) -> object:
+        # A fresh instance per call, so no traceback carries over from another surface's run.
+        raise exc_type("simulated")
+
+    return _dcmread
+
+
+@pytest.mark.parametrize(
+    "exc_type",
+    [
+        pytest.param(OverflowError, id="overflow"),
+        pytest.param(ZeroDivisionError, id="zero-division"),
+        pytest.param(decimal.InvalidOperation, id="decimal-invalid"),
+        pytest.param(LookupError, id="lookup"),
+    ],
+)
+@pytest.mark.parametrize(("surface", "parse", "wrapper"), _SURFACES, ids=[s[0] for s in _SURFACES])
+def test_an_arithmetic_or_lookup_error_from_dcmread_is_a_dicom_error(
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    parse: _Parse,
+    wrapper: type[DicomError],
+    exc_type: type[BaseException],
+) -> None:
+    """BACKLOG #5803: an ``ArithmeticError`` and a ``LookupError`` that is neither ``KeyError`` nor
+    ``IndexError`` escaped the tuple. As with ``RecursionError`` above, the trigger is a raised
+    exception rather than a crafted object, because what the contract needs is the handler."""
+    module = peek_module if surface == "peek" else dataset_module
+    monkeypatch.setattr(module, "load_dcmread", lambda: _raising_dcmread(exc_type))
+    seed = make_sr_part10()
+    _inflate.guard_part10_deflate(seed, force=False)  # the guard passes it, so dcmread is reached
+    _assert_wrapped(parse, wrapper, seed, exc_type, raised_in="_dcmread")
 
 
 def test_recursion_error_is_named_and_is_not_a_deploy_error() -> None:

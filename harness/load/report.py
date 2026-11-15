@@ -941,7 +941,9 @@ def _engine_summary(
 ) -> EngineSummary:
     samples = poller.samples
     base, final = poller.baseline, poller.final
-    peak_backlog = max((s.backlog for s in samples), default=0)
+    # The outbound queue's peak, as this field has always reported; the drain verdict reads the
+    # whole-pipeline `backlog` instead (BACKLOG #5435).
+    peak_backlog = max((s.outbound_backlog for s in samples), default=0)
     peak_qd = max((s.queue_depth for s in samples), default=0)
     growth = (final.db_size_bytes - base.db_size_bytes) if base and final else 0
     dead = (final.out_dead - base.out_dead) if base and final else 0

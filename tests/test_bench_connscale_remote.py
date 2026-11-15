@@ -219,3 +219,85 @@ def test_connscale_remote_cli_threads_flags(monkeypatch: pytest.MonkeyPatch) -> 
     assert captured["sink_ports"] == 4
     assert captured["count"] == 512
     assert captured["engine_index_base"] == 3
+
+
+def _remote_report(**over: Any) -> rr.ConnScaleRemoteReport:
+    from harness.load.connscale.report import NoLoss
+
+    fields: dict[str, Any] = {
+        "engine_bands": 1,
+        "count_per_band": 4,
+        "per_conn_rate": 1.0,
+        "offered_aggregate_rate": 4.0,
+        "engine_index_base": 0,
+        "sink_host": "127.0.0.1",
+        "sink_ports": (40000,),
+        "hold_start_iso": "2026-09-30T00:00:00Z",
+        "drain_complete_iso": "2026-09-30T00:00:05Z",
+        "achieved_aggregate_rate": 4.0,
+        "delivered_aggregate_rate": 4.0,
+        "sent": 8,
+        "acked": 8,
+        "nak": 0,
+        "deferred": 0,
+        "timeouts": 0,
+        "no_loss": NoLoss(True, 8, 8, 8, 8, 0, "ok"),
+        "in_pipeline_peak": 0,
+        "drain_seconds": 0.5,
+    }
+    fields.update(over)
+    return rr.ConnScaleRemoteReport(**fields)
+
+
+def test_remote_result_ok_refuses_an_empty_or_undrained_run_bug_5431() -> None:
+    from harness.load.connscale.report import NoLoss
+
+    assert _remote_report().result_ok
+    # Nothing sent: the reconcile passes vacuously, the verdict must not.
+    empty = _remote_report(sent=0, acked=0, no_loss=NoLoss(True, 0, 0, 0, 0, 0, "ok"))
+    assert not empty.result_ok
+    assert empty.exit_code == 1
+    assert empty.to_json_dict()["result"] == "FAIL"
+    # A timed-out drain: rows may be stranded upstream of the outbound backlog the reconcile reads.
+    undrained = _remote_report(drain_seconds=None)
+    assert not undrained.result_ok
+    assert undrained.exit_code == 1
+    # Each FAIL names its reason in the console and the JSON.
+    assert empty.failures == ["nothing was sent"]
+    assert "FAIL: nothing was sent" in empty.render_console()
+    assert undrained.to_json_dict()["failures"] == ["the drain timed out"]
+    assert "drain=TIMED-OUT" in undrained.render_console()
+    assert _remote_report().failures == []
+
+
+def test_remote_json_names_no_rate_window_when_a_bracket_sample_failed_bug_5431() -> None:
+    from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW
+
+    measured = _remote_report().to_json_dict()["throughput"]
+    assert isinstance(measured, dict)
+    assert measured["rate_window"] == HOLD_BRACKET_RATE_WINDOW
+    unmeasured = _remote_report(rates_measured=False).to_json_dict()["throughput"]
+    assert isinstance(unmeasured, dict)
+    assert unmeasured["rate_window"] is None
+    assert unmeasured["rates_measured"] is False
+    assert measured["rates_measured"] is True
+
+
+async def test_run_connscale_remote_marks_unsampled_rates_bug_5431(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_remote_fakes(monkeypatch)  # every /stats sample is None, and the drain times out
+    report = await rr.run_connscale_remote(
+        engine_urls=["http://10.0.0.5:9000"],
+        engine_host="10.0.0.5",
+        inbound_bases=[20000],
+        sink_host="10.0.0.9",
+        sink_bases=[40000],
+        sink_ports=1,
+        count=2,
+        per_conn_rate=1.0,
+        hold_seconds=0.1,
+        drain_timeout=1.0,
+    )
+    assert not report.rates_measured
+    assert not report.result_ok
