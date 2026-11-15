@@ -287,8 +287,8 @@ def test_prose_naming_a_weak_source_is_not_a_hit() -> None:
 
 
 def test_a_trailing_comment_cannot_hide_a_call() -> None:
-    # The conservative direction of _strip_comments, asserted rather than assumed: only a WHOLLY
-    # commented line is skipped, so putting a // earlier on a code line does not launder the draw.
+    # The conservative direction of _js_code's per-line view, asserted rather than assumed: a code
+    # line is scanned whole, so putting a // later on a code line does not launder the draw.
     gate = _gate()
     assert gate.randomness_tokens_in("const n = Math.random(); // harmless, honest\n") == {
         "Math.random"
@@ -1371,10 +1371,10 @@ def test_an_operation_on_a_line_starting_with_a_comment_token_is_found(text: str
 
 
 def test_a_multi_line_block_comment_still_hides_its_prose() -> None:
-    # The other half: inside a real block, a call named in prose (with or without a leading *) is
-    # not a call. cspNonce.ts depends on this; test_the_real_cspnonce_draw_is_not_a_false_positive
-    # holds it on the real file.
-    text = "/**\n * Math.random() is xorshift128+.\n   createHash('md5') too.\n */\n"
+    # The other half: inside a real block, a call named on a *-led prose line is not a call.
+    # cspNonce.ts depends on this; test_the_real_cspnonce_draw_is_not_a_false_positive holds it on
+    # the real file. A prose line with no leading * still counts, as it did before #5578.
+    text = "/**\n * Math.random() is xorshift128+.\n * createHash('md5') too.\n */\n"
     gate = _gate()
     assert gate.randomness_tokens_in(text) == set()
     assert gate.non_python_operation_tokens_in(text) == set()
@@ -1464,8 +1464,9 @@ def test_a_bom_led_file_keeps_its_doc_comment_prose_out_of_the_randomness_arm(
     )
     gate = _gate()
     assert gate.discover_non_python(root, repo=tmp_path) == {"ide/b.ts": frozenset({"Math.random"})}
-    # And the text APIs drop the BOM themselves, not only the file read.
-    assert gate.randomness_tokens_in("\ufeff/**\n * Math.random() weak\n */\n") == set()
+    # And the text APIs drop the BOM themselves, not only the file read: without that, the per-line
+    # view reads a BOM-led one-line doc comment as code.
+    assert gate.randomness_tokens_in("\ufeff/** Math.random() is weak */\nconst k = 1;\n") == set()
 
 
 def test_a_tls_value_under_a_second_binding_reaches_its_token() -> None:
@@ -1540,8 +1541,35 @@ def test_a_template_line_starting_a_comment_opener_does_not_hide_later_code(clos
     assert "hash:createHash[md5]" in gate.non_python_operation_tokens_in(text)
 
 
-def test_an_unterminated_block_comment_is_kept_as_code_by_the_lexer() -> None:
+def test_a_lexer_misread_cannot_hide_a_line_the_per_line_view_scanned() -> None:
+    # A TypeScript non-null ``!`` before a division reads as a regex opener to the lexer, which
+    # then loses string parity and blanks real code. The per-line view still scans the line.
+    text = 'const r = m.get(k)! / total; const s = "a/b"; const u = "http://y"; const n = Math.random();\n'
+    assert _gate().randomness_tokens_in(text) == {"Math.random"}
+
+
+def test_the_lexer_reads_a_regex_after_await_and_default() -> None:
     from scripts.security.js_lexer import blank_js_comments
 
-    assert "Math.random" in blank_js_comments("const a = 1; /* opens\nconst n = Math.random();\n")
-    assert "secret" not in blank_js_comments("/* secret */ const a = 1;\n")
+    for text in (
+        "export default /\\/\\//; const n = 1;\n",
+        "const z = await /\\/\\//; const n = 1;\n",
+    ):
+        assert "const n = 1;" in blank_js_comments(text), text
+
+
+def test_a_rebound_provider_def_is_not_a_provider_landing() -> None:
+    # a.verify is a crypto def that a later import rebinds to the library, so a call to a.verify
+    # never reaches the def: it must not be counted as a call through that provider.
+    ops = _gate().crypto_operations
+    sources = {
+        "messagefoundry/a.py": (
+            "import ssl\n\n\ndef verify(s):\n    return ssl.create_default_context()\n\n\n"
+            "from nacl.signing import verify\n"
+        ),
+        "messagefoundry/x.py": (
+            "from messagefoundry.a import verify\n\n\ndef go(s):\n    return verify(s)\n"
+        ),
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert "tls_context:via messagefoundry.a" not in found.get("messagefoundry/x.py", frozenset())

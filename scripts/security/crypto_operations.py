@@ -57,10 +57,11 @@ seen:
 * for the PowerShell arm: a ``<#`` inside a string or here-string that opens a line with it. The
   comment stripper cannot tell it from a real block comment and hides the lines up to the next
   ``#>``;
-* for the TypeScript/JavaScript arms: a literal the comment lexer (``js_lexer.py``) misreads. It
-  decides regex-versus-division from the previous token only, ends a quoted string at a newline,
-  and treats a template's ``${...}`` hole as string. A misread that puts it outside a real string
-  can read a ``/*`` or ``//`` inside that string as a comment and hide what follows;
+* for the TypeScript/JavaScript arms: a line that STARTS with ``//``, ``*`` or ``/*`` and holds
+  code, inside a region the comment lexer (``js_lexer.py``) misreads. The per-line view skips such
+  a line, and a misread lexer blanks it. At least these misread a literal: regex-versus-division
+  decided from the previous token only (a TypeScript ``x! / y``, a ``)`` before a regex), a quoted
+  string ended at a newline, and a U+2028 or U+2029 inside a string, which is folded to a newline;
 * a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
   ``def go(sig): sig.verify(d)`` in a module that imports a first-party ``sig`` reads as a call to
   that first-party function and skips the method rule.
@@ -524,11 +525,17 @@ def _resolve_reexport(name: str, reexports: dict[str, list[str]]) -> set[str]:
     return reached
 
 
+def _chain_ends(qualified: str, reexports: dict[str, list[str]]) -> set[str]:
+    """The ends of a qualified callee's re-export chain: the names it reaches that link nowhere. A
+    name with a link is not an end, so a ``def verify`` that a later import rebinds is not one; a
+    cycle or an over-long chain has none."""
+    return {n for n in _resolve_reexport(qualified, reexports) if not reexports.get(n)}
+
+
 def _lands_on(qualified: str, reexports: dict[str, list[str]], known_functions: set[str]) -> bool:
     """Whether EVERY end of a qualified callee's re-export chain is a first-party module-level
-    function. A name with a link is not an end, so a ``def verify`` that a later import rebinds does
-    not count as first-party; a cycle or an over-long chain has no end and does not either."""
-    ends = {n for n in _resolve_reexport(qualified, reexports) if not reexports.get(n)}
+    function (:func:`_chain_ends`)."""
+    ends = _chain_ends(qualified, reexports)
     return bool(ends) and ends <= known_functions
 
 
@@ -743,7 +750,7 @@ def discover_operations_in_modules(modules: list[ParsedModule]) -> list[Operatio
             landed = {
                 target
                 for qualified in m.resolve(node.func)
-                for target in _resolve_reexport(qualified, reexports)
+                for target in _chain_ends(qualified, reexports)
                 if target in known_functions
             }
             for target in sorted(landed):

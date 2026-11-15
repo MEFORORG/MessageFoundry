@@ -2388,26 +2388,33 @@ def find_violations(
 
 
 def _js_code(text: str) -> list[str]:
-    """The code of a TypeScript/JavaScript source, one entry per line, with comments blanked by
-    :func:`js_lexer.blank_js_comments`, which skips string, template and regex literals.
+    """The code of a TypeScript/JavaScript source, one entry per line: the UNION of two views.
 
-    BACKLOG #5578: the old rule skipped every line starting ``/*`` or ``*``, which hid a call after
-    an inline ``/* */`` and a call on a ``*`` continuation line; a line rule that tracked block state
-    instead hid code after a template-literal line starting ``/*``. A literal is kept as code, so a
-    call or a prose mention inside a string still counts, which errs toward scanning too much. At
-    least the literal misreads THE RESIDUAL in crypto_operations.py lists can still hide code.
+    1. The lexer view, :func:`js_lexer.blank_js_comments`, which skips string, template and regex
+       literals and blanks only real comments. It sees what BACKLOG #5578 found hidden: a call after
+       an inline ``/* */``, or on a ``*`` continuation line. The JS line terminators CR, U+2028 and
+       U+2029 are folded to ``\\n`` for it, because each ends a ``//`` comment.
+    2. The per-line view this gate used before #5578: every line, split by ``splitlines``, that does
+       not start with ``//``, ``*`` or ``/*``. A trailing comment stays on its line.
 
-    The JS line terminators CR, CRLF, U+2028 and U+2029 are folded to ``\\n`` first, because each ends
-    a ``//`` comment and the lexer ends one only at ``\\n``. A leading BOM is dropped, so a BOM-led
-    ``/**`` still opens its comment.
+    The union is the point. The lexer can misread a literal (the residual in crypto_operations.py
+    says how) and blank real code; the per-line view still scans every line it scanned before. So
+    the gate never scans less than it did before #5578. The cost is the per-line view's old false
+    positives: a prose line inside a block comment that does not start with ``*``. A leading BOM is
+    dropped first, so a BOM-led ``/** ... */`` line is comment-led in both views.
 
     The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
     lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
     is unusable."""
     text = text.removeprefix("\ufeff")
+    folded = text
     for terminator in ("\r\n", "\r", "\u2028", "\u2029"):
-        text = text.replace(terminator, "\n")
-    return js_lexer.blank_js_comments(text).split("\n")
+        folded = folded.replace(terminator, "\n")
+    lexed = js_lexer.blank_js_comments(folded).split("\n")
+    per_line = [
+        line for line in text.splitlines() if not line.lstrip().startswith(("//", "*", "/*"))
+    ]
+    return lexed + per_line
 
 
 def randomness_tokens_in(text: str) -> set[str]:
@@ -2434,8 +2441,7 @@ def discover_non_python(root: Path, *, repo: Path) -> dict[str, frozenset[str]]:
     """Map repo-relative path -> randomness tokens, for the files that draw randomness at all."""
     out: dict[str, frozenset[str]] = {}
     for path in non_python_sources(root):
-        # utf-8-sig like the operation arms: a BOM is not whitespace to lstrip, so it would hide
-        # the leading ``/**`` of a BOM-led file and turn its prose into scanned code.
+        # utf-8-sig, like the operation arms, so the file read drops a BOM before _js_code does.
         tokens = randomness_tokens_in(path.read_text(encoding="utf-8-sig"))
         if tokens:
             out[path.relative_to(repo).as_posix()] = frozenset(tokens)
@@ -2751,8 +2757,8 @@ def _pattern_tokens(
 
 
 def non_python_operation_tokens_in(text: str) -> set[str]:
-    """The ``class:token`` operations a TypeScript/JavaScript source performs. Comments are
-    removed by the same conservative rule as the randomness arm (:func:`_js_code`)."""
+    """The ``class:token`` operations a TypeScript/JavaScript source performs, read from the same
+    two-view code as the randomness arm (:func:`_js_code`)."""
     found: set[str] = set()
     for line in _js_code(text):
         found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)

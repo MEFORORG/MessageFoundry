@@ -27,6 +27,9 @@ _REGEX_KEYWORDS = frozenset(
         "throw",
         "new",
         "yield",
+        "await",
+        "default",
+        "instanceof",
     }
 )
 
@@ -38,8 +41,7 @@ def blank_js_comments(source: str) -> str:
     after an operator, an opening bracket or a keyword such as ``return``) so a ``//`` inside one is
     not read as a comment. A template literal's ``${}`` holes are treated as string. A quote with no
     closing quote on its line ends at the newline, so one misread cannot run to the end of the file.
-    A ``/*`` with no ``*/`` after it is an unterminated block comment, a syntax error, so it is kept
-    as code rather than blanking the rest of the file. Newlines are kept, so line numbers hold.
+    Newlines are kept, so line numbers hold.
     """
     out: list[str] = []
     i, n = 0, len(source)
@@ -59,7 +61,7 @@ def blank_js_comments(source: str) -> str:
             prev = "x" if i and source[i - 1] == "." else source[i:end]
             i = end
             continue
-        elif char == "/" and nxt in ("/", "*") and (nxt == "/" or "*/" in source[i + 2 :]):
+        elif char == "/" and nxt in ("/", "*"):
             close = source.find("\n" if nxt == "/" else "*/", i + 2)
             end = n if close == -1 else close + (0 if nxt == "/" else 2)
             out.append("".join(c if c == "\n" else " " for c in source[i:end]))

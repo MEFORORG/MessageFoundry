@@ -1017,8 +1017,9 @@ def _service_drift(text: str, live: set[str]) -> list[str]:
 def _script_code_lines(source: str) -> list[str]:
     """Lines of a TypeScript or JavaScript file that are not whole-line comments, by a per-line
     rule: a line starting ``//`` is dropped, and a line starting ``*`` or ``/*`` is dropped up to
-    its ``*/``. It keeps no block state, unlike ``_strip_comments`` in
-    ``scripts/security/crypto_inventory_check.py``. A trailing comment stays on its line, so a call named inside one counts, and so does a line inside a block comment
+    its ``*/``. It keeps no block state; ``scripts/security/js_lexer.py`` is the string-aware
+    view the crypto inventory gate uses. A trailing comment stays on its line, so a call named
+    inside one counts, and so does a line inside a block comment
     that does not start with ``*``. The page says so. Code after a closing ``*/`` on a comment line
     is kept, so ``/* reviewed */ execFile(...)`` still counts."""
     kept: list[str] = []
