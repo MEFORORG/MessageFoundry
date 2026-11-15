@@ -20897,9 +20897,9 @@ class MessageStore:
         anchor: PendingFactorAnchor | None = None,
     ) -> bool:
         """Stamp a session's second-factor as satisfied (WP-14), after a factor ceremony: at least a
-        TOTP/recovery verify, a factor enrolment confirm, or a passkey assertion (the one caller
-        that passes an ``anchor``). A sign-in that owes no factor is stamped in
-        ``create_session``'s own INSERT instead (BACKLOG #5624). See
+        TOTP/recovery verify, a factor enrolment confirm, or a passkey assertion, which passes an
+        ``anchor``. Session issuance does not call this; :meth:`AuthStore.create_session` says how
+        its ``mfa_verified`` stamps the row in the INSERT (BACKLOG #5624). See
         :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the answer."""
         stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with _writer_txn(self._db, self._lock):

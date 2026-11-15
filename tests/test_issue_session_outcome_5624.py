@@ -40,9 +40,9 @@ def _no_second_stamp(monkeypatch: pytest.MonkeyPatch, store: Any) -> list[str]:
     calls: list[str] = []
     real = store.mark_session_mfa_verified
 
-    async def spy(token_hash: str, **kwargs: Any) -> None:
+    async def spy(token_hash: str, **kwargs: Any) -> bool:
         calls.append(token_hash)
-        await real(token_hash, **kwargs)
+        return bool(await real(token_hash, **kwargs))
 
     monkeypatch.setattr(store, "mark_session_mfa_verified", spy)
     return calls
