@@ -392,9 +392,7 @@ def test_a_hit_stands_when_usage_reads_unknown_overall(sb: Sandbox) -> None:
 @pytest.mark.parametrize("seat", ["lander", "land"])
 def test_the_lander_is_exempt_from_the_halt(sb: Sandbox, seat: str) -> None:
     """The roster's aliases count too; the sandbox gets the real roster, as a checkout has it."""
-    roster = sb.repo / "docs" / "roles"
-    roster.mkdir(parents=True)
-    shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
+    _with_roster(sb)
     seed_vault(sb, calibrated(seat))
     write_fake_usage(_usage_path(sb), usage(99.0, state="CRITICAL"))
     code, doc = gate(sb, seat=seat)

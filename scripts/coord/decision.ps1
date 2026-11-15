@@ -378,7 +378,7 @@ function Invoke-DecisionGate {
         # A roster alias is the same seat, so a decision logged as `mgr` is the manager's (#5604).
         $canonSeat = Resolve-DecisionSeat $Seat
         $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Decisions @($all | Where-Object {
-                $_.kind -eq 'decision' -and (Resolve-DecisionSeat ([string]$_.seat)) -eq $canonSeat -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
+                $_.kind -eq 'decision' -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id)) -and (Resolve-DecisionSeat ([string]$_.seat)) -eq $canonSeat
             })
         if (-not $cal.Calibrated) {
             $why.Add("calibration: $Seat's Class B is not calibrated ($($cal.Blind); 14-day reversal rate $($cal.RateText))")
