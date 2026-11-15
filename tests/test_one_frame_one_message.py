@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+import messagefoundry.transports.framing as framing_mod
 from messagefoundry import actions
 from messagefoundry.config.models import (
     ConnectorType,
@@ -645,7 +646,7 @@ def test_frame_reply_still_raises_when_a_usable_charset_cannot_hold_the_reply() 
 
 @pytest.mark.parametrize("encoding", ["ascii", "latin-1", "cp1252"])
 def test_frame_reply_replaces_what_a_narrow_charset_cannot_hold(
-    encoding: str, caplog: pytest.LogCaptureFixture
+    encoding: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5799: the listener replies after the commit, so a raise here closed the connection
     unanswered and the sender resent a message already stored. The reply now stays in its declared
@@ -653,6 +654,8 @@ def test_frame_reply_replaces_what_a_narrow_charset_cannot_hold(
     UnicodeEncodeError in frame_reply. Red: the call raises."""
     reply = MSH + CR + "MSA|AA|CTRL1|中文" + CR
     connection = f"IB_NARROW_{encoding.upper()}"
+    # The warn-once set is module state; a fresh one makes the test independent of run order.
+    monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
     with caplog.at_level("WARNING", logger="messagefoundry.transports.framing"):
         wire = frame_reply(MLLP_CODEC, reply, encoding, connection=connection)
         # A narrow charset meets the same characters on every message, so a second reply adds no
@@ -665,6 +668,31 @@ def test_frame_reply_replaces_what_a_narrow_charset_cannot_hold(
     # Neither the reply nor the setting reaches the log, and this is not the utf-8 fallback.
     assert "CTRL1" not in warnings[0] and encoding not in warnings[0]
     assert "utf-8" not in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "msh2",
+    ["?~" + BS + "&", "^?" + BS + "&", "^~?&", "^~" + BS + "?"],
+    ids=["comp", "rep", "esc", "sub"],
+)
+def test_frame_reply_refuses_a_replacement_that_is_one_of_the_replys_delimiters(msh2: str) -> None:
+    """BACKLOG #5799, round-two review: HL7 lets a sender pick ``?`` as a delimiter, and the ACK
+    echoes it, so a ``?`` written for an unencodable character would become structure (ADR 0206).
+    Such a reply is refused with the fixed error, chaining nothing. Mutation: drop the delimiter
+    check in _encode_replacing. Red: the call returns a reply with an extra delimiter."""
+    reply = f"MSH|{msh2}|R|RF|S|F|20260101||ACK|CTRL1|P|2.5" + CR + "MSA|AA|CTRL1|中" + CR
+    with pytest.raises(UnicodeError, match="one of its own delimiters") as ei:
+        frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_QDELIM")
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+def test_control_a_field_separator_of_question_mark_is_refused_too() -> None:
+    reply = "MSH?^~" + BS + "&?R?RF" + CR + "MSA?AA?CTRL1?中" + CR
+    with pytest.raises(UnicodeError, match="one of its own delimiters"):
+        frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_QDELIM")
+    # And a reply needing no replacement is untouched by the check, delimiters and all.
+    clean = "MSH?^~" + BS + "&?R?RF" + CR
+    assert frame_reply(MLLP_CODEC, clean, "ascii") == MLLP_CODEC.frame(clean.encode("ascii"))
 
 
 @pytest.mark.parametrize("declared", [b"latin-1", 8859])

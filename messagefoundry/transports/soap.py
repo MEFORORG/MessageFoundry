@@ -33,8 +33,8 @@ Code, and where that yields none, from the Fault's first faultcode or a Value ah
 (``_fault_code`` says how). An unrecognized fault is treated as permanent. With no fault, the HTTP
 status decides: 2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter; a connection/timeout
 error retries. With OAuth2 client credentials configured, an HTTP 401 drops the cached bearer and
-retries, as the REST and FHIR connectors do, unless its body is a WS-Security fault, which stays
-permanent (BACKLOG #5798). Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the SOAP
+retries, as the REST and FHIR connectors do, unless the connection also sends a WS-Security
+UsernameToken and the body is a WS-Security fault, which stays permanent (BACKLOG #5798). Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the SOAP
 fault role + HTTP status are.
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** (minting a fresh ``<wsa:MessageID>``
@@ -1320,11 +1320,18 @@ class SoapDestination(DestinationConnector):
                 # revoked or expired between mint and use. Drop it and retry with a fresh one
                 # (transient); classifying the 401 permanent dead-lettered the message and left the
                 # bad token cached for every later send. A 403 stays permanent below, as there.
-                # A WS-Security fault names the envelope's own credential, which a fresh bearer
-                # cannot fix, so it stays the permanent failure it was: retrying it would resend a
-                # wrong UsernameToken for the whole retry budget. Secret-safe: the redacted URL only.
+                # A WS-Security fault on a connection that sends a UsernameToken may name that
+                # envelope credential, which a fresh bearer cannot fix, so there it stays the
+                # permanent failure it was: retrying would resend a wrong password for the whole
+                # retry budget. With no UsernameToken sent, the bearer is the only credential the
+                # fault can name, so it retries like any other 401. Secret-safe: the redacted URL only.
                 self._token_provider.invalidate()
-                if not (isinstance(failure, NegativeAckError) and failure.code == "wssecurity"):
+                sends_username_token = self.ws_security and bool(self.ws_username)
+                if not (
+                    sends_username_token
+                    and isinstance(failure, NegativeAckError)
+                    and failure.code == "wssecurity"
+                ):
                     raise DeliveryError(
                         f"SOAP {_redact_url(self.url)} returned HTTP 401; refreshing OAuth2 token"
                     ) from exc

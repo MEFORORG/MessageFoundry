@@ -28,6 +28,7 @@ from messagefoundry.framing import (
     FramePayloadError,
     codec_for,
 )
+from messagefoundry.parsing._builtin_hl7 import _extract_separators
 from messagefoundry.parsing.split import _sends_more_than_one_message
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
@@ -158,8 +159,9 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     the codec's replacement character, for the same reason a frame byte becomes a space (BACKLOG
     #5799). Before, that reply raised to the listener's last-resort arm, which closed the connection
     unanswered, so the sender resent a message already stored. A codec that cannot replace, such as
-    ``idna``, still raises, with a fixed ``UnicodeError`` that chains nothing, since the strict
-    encode's error holds the whole reply. Usable is decided by probing the NAME, as ``decode_body``
+    ``idna``, or an ``MSH``-led reply whose own delimiters include the replacement ``?``
+    (:func:`_encode_replacing`), still raises, with a fixed ``UnicodeError`` that chains nothing,
+    since the strict encode's error holds the whole reply. Usable is decided by probing the NAME, as ``decode_body``
     decides it: a usable codec can also raise a bare ``UnicodeError`` for one reply, which still
     raises here. ``connection`` names the listener in the warning each fallback logs, once per
     connection for each, since a narrow charset meets the same characters message after message.
@@ -196,7 +198,18 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
     """``reply`` in ``encoding`` with each character the charset cannot hold replaced, for
     :func:`frame_reply`. A codec that refuses the ``replace`` handler raises a fixed
     ``UnicodeError``, outside the handler, so neither error's text or ``object`` rides the chain.
-    The warning names the connection, never the reply or the setting."""
+    The warning names the connection, never the reply or the setting.
+
+    The ``replace`` handler writes ``?`` on encode. An ``MSH``-led reply declares its own
+    delimiters in MSH-1 and MSH-2, and HL7 lets a sender pick ``?`` as one, so where it is a
+    delimiter or the segment terminator a replaced data character would become structure (ADR
+    0206). That reply is refused with the same fixed error instead. A reply not led by ``MSH`` has
+    no declared delimiters to collide with."""
+    if _REPLACEMENT in _reply_delimiters(reply):
+        raise UnicodeError(
+            "the reply holds characters its charset cannot encode, and the replacement is one of "
+            "its own delimiters"
+        )
     body: bytes | None
     try:
         body = reply.encode(encoding, errors="replace")
@@ -212,3 +225,15 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
             connection,
         )
     return body
+
+
+#: What Python's ``replace`` error handler writes in place of a character on encode.
+_REPLACEMENT = "?"
+
+
+def _reply_delimiters(reply: str) -> frozenset[str]:
+    """The delimiters an ``MSH``-led ``reply`` declares, read as the parser reads them, plus the
+    segment terminator; empty for any other reply. Read only: nothing here changes the reply."""
+    if not reply.startswith("MSH") or len(reply) < 4:
+        return frozenset()
+    return frozenset((*_extract_separators(reply.partition("\r")[0]), "\r"))
