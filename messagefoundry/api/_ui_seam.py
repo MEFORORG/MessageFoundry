@@ -896,12 +896,30 @@ from typing import Any
 #: Re-derived with ``--write``, on the branch from ``4b5769ef2c675677`` to ``8386df80553a4313``,
 #: and over the merge with #5931 from ``6737556a16ce6d15`` to ``c537067c6952d93c``.
 #:
+#: BACKLOG #5559: ``AdminHandlers`` gained ``checked_user``, ``auth_routes._checked_user``, and the
+#: console's user pages read the account through it rather than the store. What each page answers
+#: for a record that fails its seal is docs/SECURITY.md's to say, in *What an admin user read
+#: reports*. Two changes the digest does not see, as it records field names only:
+#: ``user_summary_scoped`` takes ``role_ids`` None for a checked record, and
+#: ``refuse_own_channel_scope`` lost its ``target`` parameter, which the console no longer passes.
+#: So an older console on this engine would raise TypeError on every channel scope save, which
+#: passed ``target``, and a newer console on an older engine would raise AttributeError on the user
+#: pages, which call ``checked_user``. The digest refuses both pairs at mount. Re-derived with
+#: ``--write``, from ``c537067c6952d93c`` to ``796ce45eeff0cf1e``. Then ``api.security`` gained
+#: ``account_read_errors``, the failures those post-action pages fall back on, which the console
+#: imports, so the surface grew again: from ``796ce45eeff0cf1e`` to ``080ed019349126b8``.
+#:
+#: The OIDC start legs' session read: ``AuthService`` gained ``session_shows_signed_in``, which
+#: the console's "leaving this site" page and IdP hop call to decide whether they show Sign-out
+#: and the session watchdog. A method the console calls, so a skew would be an AttributeError at
+#: request time. Unnumbered. Re-derived with ``--write``, from ``080ed019349126b8`` to ``bc56eed44a1590fd``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "c537067c6952d93c"
+ENGINE_UI_SEAM: str = "bc56eed44a1590fd"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1024,6 +1042,9 @@ class AdminHandlers:
 
     list_roles: Callable[..., Awaitable[Any]]
     list_users: Callable[..., Awaitable[Any]]
+    # BACKLOG #5559: ``auth_routes._checked_user``, the seal-checked account read the console's
+    # user pages make; its docstring says what it answers.
+    checked_user: Callable[..., Awaitable[Any]]
     list_custom_roles: Callable[..., Awaitable[Any]]
     create_user: Callable[..., Awaitable[Any]]
     update_user: Callable[..., Awaitable[Any]]

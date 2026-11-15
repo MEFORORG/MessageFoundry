@@ -66,6 +66,7 @@ from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix
+from harness.load.report import _counter_reset
 from harness.load.rigadmin import RIG_SESSION
 
 if TYPE_CHECKING:
@@ -217,6 +218,7 @@ class MultiShardRecord:
                 "sink_received": self.no_loss.sink_received,
                 "backlog": self.no_loss.backlog,
                 "detail": self.no_loss.detail,
+                "inconclusive": self.no_loss.inconclusive,
             },
             "pool_wait": {"p95_ms": self.pool_wait_p95_ms},
             "ack_ms": {
@@ -241,7 +243,13 @@ class MultiShardRecord:
         }
 
     def render_console(self) -> str:
-        loss = "OK" if self.no_loss.ok else f"LOSS ({self.no_loss.detail})"
+        loss = (
+            "OK"
+            if self.no_loss.ok
+            else f"INCONCLUSIVE ({self.no_loss.detail})"
+            if self.no_loss.inconclusive
+            else f"LOSS ({self.no_loss.detail})"
+        )
         pool = "n/a" if self.pool_wait_p95_ms is None else f"{self.pool_wait_p95_ms:.1f}ms"
         drain = "n/a" if self.drain_seconds is None else f"{self.drain_seconds:.2f}s"
         return (
@@ -277,7 +285,7 @@ class MultiShardReport:
 
     def to_json_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,  # 1 -> 2: no_loss.inconclusive (BACKLOG #5574)
             "kind": "multishard",
             "store_backend": self.store_backend,
             "cluster_enabled": self.cluster_enabled,
@@ -620,7 +628,14 @@ def _build_record(
     # Budget = total connection count across every engine — a small-run FLOOR under the reconcile's
     # half-the-run excusal fraction, not the retired "~one stranded in-flight per connection" model.
     # Its independent intake floor keeps `read >= sent // 2` required whatever this value is.
-    no_loss = _reconcile(c, base, final, unconfirmed_budget=engines * count_per_engine)
+    no_loss = _reconcile(
+        c,
+        base,
+        final,
+        unconfirmed_budget=engines * count_per_engine,
+        drain_seconds=drain_seconds,
+        counter_reset=_counter_reset(poller),
+    )
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
     # Aggregate achieved/delivered rate = the read/written delta across EXACTLY the hold window
     # (bracket samples + measured wall time), so the number is a true steady-state rate. The

@@ -39,6 +39,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from messagefoundry_webconsole import pages
+from messagefoundry_webconsole._html import minimal_nav
 from tests._logout_rows import logout_details, logout_rows, temp_password_expired_rows
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
@@ -50,6 +51,11 @@ _SERVICE_LOGGER = "messagefoundry.auth.service"
 
 #: The pages/*.py builders allowed to suppress the nav entirely: both are reached WITHOUT a session.
 UNAUTHENTICATED_BARE_BUILDERS = frozenset({"login", "sso_challenge"})
+
+#: The builders that may be served with or without a session, and so pass ``minimal_nav(session=)``
+#: with what their route found: Sign-out and the session watchdog only with a live session. Any other
+#: builder that passes ``session=`` is an offender: it could drop Sign-out from an authenticated page.
+SESSION_OPTIONAL_BUILDERS = frozenset({"idp_handoff", "leaving_site"})
 
 _PAGES_DIR = Path(messagefoundry_webconsole.__file__).parent / "pages"
 
@@ -117,6 +123,29 @@ def test_unauthenticated_pages_render_no_sign_out() -> None:
     assert LOGOUT_FORM not in pages.sso_challenge()
 
 
+def _leaving(*, session: bool) -> str:
+    return pages.leaving_site(
+        destination_host="idp.example", continue_action="/ui/oidc/start", session=session
+    )
+
+
+def test_session_optional_pages_sign_out_only_with_a_session() -> None:
+    """The OIDC "leaving this site" page and the IdP hop can be served without a session. Then the
+    session watchdog's first probe would send the browser to the login page before the operator
+    could continue, so without a session they carry neither the watchdog nor a Sign-out with
+    nothing to sign out of. With one they keep both (ASVS 7.4.4, 14.3.1)."""
+    url = "https://idp.example/authorize?state=s"
+    for without, with_ in (
+        (pages.idp_handoff(url, session=False), pages.idp_handoff(url, session=True)),
+        (_leaving(session=False), _leaving(session=True)),
+        (str(minimal_nav(session=False)), str(minimal_nav())),
+    ):
+        assert "data-mf-session-watchdog" not in without
+        assert LOGOUT_FORM not in without
+        assert "data-mf-session-watchdog" in with_
+        assert LOGOUT_FORM in with_
+
+
 # --- builder enumeration: a NEW bare authenticated page fails here --------------------------------
 
 
@@ -138,17 +167,21 @@ def _page_calls_with_nav(tree: ast.AST) -> list[tuple[str, ast.Call]]:
     return found
 
 
-def _is_minimal_nav_call(node: ast.expr) -> bool:
+def _is_minimal_nav_call(node: ast.expr, owner: str) -> bool:
+    """``minimal_nav()``, or ``minimal_nav(session=...)`` in a builder that may be served either way."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "minimal_nav"
+        and (not node.keywords or owner in SESSION_OPTIONAL_BUILDERS)
     )
 
 
 def test_every_nav_suppressing_page_builder_is_accounted_for() -> None:
     """A page builder may only suppress the shared chrome by passing ``nav=minimal_nav()`` (which
-    still renders Sign out) unless it is one of the two UNAUTHENTICATED entry pages. Writing a new
+    still renders Sign out) unless it is one of the two UNAUTHENTICATED entry pages. Only a builder
+    in ``SESSION_OPTIONAL_BUILDERS`` may pass ``minimal_nav(session=...)``, whose result
+    ``test_session_optional_pages_sign_out_only_with_a_session`` pins. Writing a new
     ``nav=Markup("")`` page fails here — which pinning the five fixed pages could never do."""
     offenders: list[str] = []
     seen_builders: set[str] = set()
@@ -157,7 +190,7 @@ def test_every_nav_suppressing_page_builder_is_accounted_for() -> None:
         for owner, call in _page_calls_with_nav(tree):
             seen_builders.add(owner)
             nav = next(kw.value for kw in call.keywords if kw.arg == "nav")
-            if _is_minimal_nav_call(nav) or owner in UNAUTHENTICATED_BARE_BUILDERS:
+            if _is_minimal_nav_call(nav, owner) or owner in UNAUTHENTICATED_BARE_BUILDERS:
                 continue
             offenders.append(f"{path.name}:{call.lineno} in {owner}()")
     # The walk must still be finding the known sites — a silently-empty walk would "pass" forever.
@@ -165,6 +198,8 @@ def test_every_nav_suppressing_page_builder_is_accounted_for() -> None:
         "login",
         "sso_challenge",
         "oidc_landing",
+        "idp_handoff",
+        "leaving_site",
         "reauth",
         "reauth_continue",
         "password_page",

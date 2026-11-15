@@ -118,7 +118,9 @@ inert.
   a host that installs the engine alone carries neither.
 - `messagefoundry restore --config-to` writes a backup's config files into a folder, so a restore
   is only as trusted as the backup it reads. Section 7 says what holds that read.
-- The VS Code extension's new-route command writes a new module into your config directory.
+- The VS Code extension's new-route command writes a new module into your config directory. It
+  writes only in a trusted workspace, and refuses a `messagefoundry.configDir` that resolves
+  outside the workspace folder, through a link included.
 
 Each writes code that runs with the engine's rights on its next start. Review what they wrote
 before you point the engine at it.
@@ -829,6 +831,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads your workspace's `.gitignore` and `.gitattributes`, to add the lines they lack | `sourceControl.ts` |
 | It reads files that ship inside the extension: its HL7 schema tables and its snippets | `hl7schema.ts`, `insertElement.ts` |
 | It reads a value you typed into the extension's connection form | `connectionForm.ts` |
+| Its page script reads, as JSON, the text in a connection editor field that is a table or held a table or array. That text is at least the recorded value from your config, what you typed over it, and a choice the schema offered. Text that does not parse is posted trimmed, for the engine's validator to judge. | `connectionEditorWebview.ts` |
 | It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 | It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
@@ -862,6 +865,9 @@ or compression library:
   type its extension names. Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.
+- `parsing/dicom/_deps.py` imports `zlib` only to name `zlib.error` in the tuple of parse errors
+  that the DICOM parsers turn into a `DicomError` (BACKLOG #5803). It calls nothing in `zlib`,
+  decompresses nothing and opens no archive, so it has nothing to bound.
 - `pipeline/dr_backup.py` reads a disaster-recovery backup, which is a tar archive, on
   `messagefoundry restore` and `restore-verify`. `_extract_member` never uses a member's stored name
   as a path: it streams the store member into one fixed file name. The reader accepts only an
@@ -899,11 +905,11 @@ administrator rights. What each one grants or changes:
 
 | Script | What it grants or changes |
 |---|---|
-| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. Sets the service's privilege list and its SID type. With `-EngineWheel`, first builds the engine install under `C:\Program Files\MessageFoundry\engine`: it runs the `-BasePython` interpreter and pip as administrator, installing the `requirements.lock` and engine wheel it checks against `-RequirementsLockSha256` and `-EngineWheelSha256`, binary wheels only ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*). |
-| `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
+| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy, made in a new administrator-only folder under the Windows folder's `Temp`. Rewrites the permissions and owner of the data directory, and grants read on the config directory. With `-LockConfigDir`, instead rewrites the permissions and owner of the config directory and the folders it locks with it, and of the files and folders in them (see below). Sets the service's privilege list and its SID type. With `-EngineWheel`, first builds the engine install under `C:\Program Files\MessageFoundry\engine`: it runs the `-BasePython` interpreter and pip as administrator, installing the `requirements.lock` and engine wheel it checks against `-RequirementsLockSha256` and `-EngineWheelSha256`, binary wheels only ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*). |
+| `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back, working in a new administrator-only folder under the Windows folder's `Temp`. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
-| `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
+| `import-db-ca.ps1` | Adds the CA certificates in one file to the machine stores `Cert:\LocalMachine\Root` and `Cert:\LocalMachine\CA`. Which CA goes where, and what each store is a trust anchor for, is in [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.2. Refuses the whole file if, at least, any certificate in it is not a CA or carries a private key, or the file holds no self-signed root. With `-WhatIf` it only shows what it would add, and runs without administrator rights. |
 | `measure-store-access.ps1` | A measurement script, in the assessment's operator-run scope. [`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2 puts this folder in by its scope sentence, and names this script in by owner ruling of 2026-10-05. It measures whether the service account and the operator can both open one store; it is not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. Unless `-AppExe` names another, it also takes the `messagefoundry` command from `PATH` (`Get-Command messagefoundry`) and runs it while elevated, at least for `gen-key`, which mints the run's store key, and `protect-key`, which writes the service's key file. The `python` probe starts import the engine's own code from whatever install that `python` finds, whatever `-AppExe` says. In the CI job `windows-service-smoke`, whose install step installs the engine editable, both are the checkout's. The installer's check of the engine install ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*) never covers the `python` starts, and covers `protect-key` only when `-AppExe` names the launcher it checks; `gen-key` runs before the installer does. So whoever could write a folder on `PATH`, or the install those commands load, would run code as administrator and would see the store key. The `protect-key` start is handed that store key in its environment, as `MEFOR_STORE_ENCRYPTION_KEY`, which is cleared after it exits. So are at least the `python` probe starts that screen the password and provision the administrator. Those starts and the probe start that signs in are also handed, as `MEFOR_W0_ADMIN_PASSWORD`, the synthetic administrator password, or for the screen each candidate it tries. Without `-AppExe`, the service itself runs the engine in the installer's default install root, not the `PATH` `messagefoundry`. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke`, which runs this script, runs NSSM the same way. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
@@ -927,8 +933,11 @@ Other switches on `install-service.ps1` change more than the service:
 
 - `-LockConfigDir` turns off permission inheritance on the config directory and limits it to
   SYSTEM, Administrators and the service account. It also makes Administrators the owner of the
-  directory and of everything in it. It does the same to the value file's folder, and to the
-  settings file's folder when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
+  directory and of each file and folder in it that it does not skip, and resets each one's
+  permissions to inherit from the directory, discarding the entries it carried itself; nothing
+  records them. [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2) says which items
+  it skips. The switch does the same to the value file's folder, and to the settings file's folder
+  when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
   Without the switch, the script only adds a read grant.
 - `-SuppressCrashDumps` writes machine-wide Windows Error Reporting keys under `HKLM`. They are
   keyed by program name. So they affect every process with that name on the machine, not only the

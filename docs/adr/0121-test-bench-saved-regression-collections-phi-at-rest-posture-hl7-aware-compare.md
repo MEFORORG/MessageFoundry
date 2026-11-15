@@ -74,8 +74,21 @@ of volatile fields (MSH-7, MSH-10).**
   **materializes each case's stored input to a fresh per-run temp directory** (`os.tmpdir()`),
   dry-runs it (`--show-phi`, so expected/actual bodies are full), compares each case's new deliveries
   against its stored `expected` via `compareMessages`, and **deletes the temp directory in a
-  `finally`** — PHI on disk is transient and cleaned, never left behind. Pass/fail is shown per case;
+  `finally`**. A hard crash can still leave the directory behind; *Consequences* says what removes
+  it (amended 2026-11-14, BACKLOG #5415). Pass/fail is shown per case;
   a click on a case shows its expected-vs-actual differences (see *Reveal on click*).
+  *Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):* this supersedes "deletes the temp directory
+  in a `finally`" and "*Consequences* says what removes it" above. The `finally` tries to delete the
+  directory and the sweep in *Consequences* can try later, but neither always removes it, and
+  case files can stay with it. The first half of that sentence, "A hard crash can still leave the
+  directory behind", still holds, and a crash is not the only way a directory is left. What is
+  removed and what stays is recorded in the `deleteCaseDir` and `sweepStaleCaseDirs` docblocks in
+  `ide/src/collectionCaseFiles.ts`.
+- **A case must also end where it did (amended 2026-11-14, BACKLOG #5416).** An errored Router or
+  Handler delivers nothing, so the delivery compare alone passed a case that expects no delivery. A
+  case now records the disposition its row had when saved, and a rerun passes only with that same
+  disposition and, unless the recorded one is `error`, no error text. A case saved before the field
+  existed fails on any rerun with error text or an `error` disposition.
 - **Reveal on click (amended 2026-09-29, BACKLOG #2437, ASVS 14.2.6, owner ruling R13).** The run
   view shows each case's name, PASS or FAIL, and disposition. It shows no field value and no error
   text. The host keeps each case's differences and error. The webview asks for one case when the
@@ -93,6 +106,23 @@ of volatile fields (MSH-7, MSH-10).**
 **Must not break:** no new engine/CLI surface; no PHI to a repo file, `globalState`, or a log; the
 temp materialization is always cleaned up; the compare never hardcodes `|^~\&` (reads MSH); the
 existing Load / before-after / Coverage-Profiling panes and the `--show-phi` posture are untouched.
+
+**Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):** this supersedes "the temp materialization
+is always cleaned up" in the sentence above: it is not always cleaned up, and case files can stay on
+disk. What must not break in its place: a run tries to delete its directory, in its `finally`, or
+before the error is rethrown when a case file fails to write; a sweep tries to delete old run
+directories when a Test Bench panel is created and before a collection run writes its own
+directory; and the delete never recurses, never follows a link that is an entry in the run
+directory, unlinks only regular files named as case files in that directory, and refuses a run
+directory or a case file that the OS does not resolve to its own expected path, a junction that
+lstats as a plain directory included, as steps 1 and 2 of the `deleteCaseDir` docblock say. The exceptions
+allowed are of at least two kinds. One is a run whose `finally` does not run or never completes, at
+least because the process ends before it (a crash, or a window close or reload while the dry-run
+is pending) or because the dry-run never returns (it runs with `timeoutMs` 0, no timeout); the
+`sweepStaleCaseDirs` docblock lists these. The other is a race in which another process swaps the
+run directory, an entry in it, or a directory above it, after the run made it or the sweep listed
+it. The races known to remain, what the delete removes, and what stays are recorded in the
+`deleteCaseDir` and `sweepStaleCaseDirs` docblocks in `ide/src/collectionCaseFiles.ts`.
 
 ## Acceptance Criteria
 
@@ -135,9 +165,28 @@ existing Load / before-after / Coverage-Profiling panes and the `--show-phi` pos
 (machine-local, but plaintext in VS Code's per-workspace storage). Mitigated by the synthetic-case
 steer (ADR 0030) and the in-UI notice; workspaceState is not encrypted, so authors must not save real
 PHI. Rerun writes transient PHI to a temp dir — always cleaned in `finally`, but a hard crash mid-run
-could leave a temp file (OS temp reaping bounds the exposure). The volatile policy is a fixed default;
+could leave a temp file. *Amended 2026-11-14 (BACKLOG #5415):* the run's directory is owner-only
+(`0700`) and each case file is created exclusively and owner-only (`0600`) on POSIX; on Windows
+those modes do nothing and the temp directory's own ACL governs, which is owner-only for the default
+per-user TEMP but not for a shared directory TEMP is pointed at. A directory a crash left behind is
+deleted when the Test Bench next opens or next runs a collection, once it is over an hour old, and
+not before, so a run in another window survives; on POSIX only a directory this user owns is
+deleted. Until then it stays on disk, with no bound if the Test Bench is not used again. The dry-run is handed the directory, not one path per case, so a large
+collection no longer grows the command line (`ide/src/collectionCaseFiles.ts`). The volatile policy is a fixed default;
 a feed with other volatile fields (e.g. a bespoke timestamp segment) may show a false regression until
 a future per-collection override lands.
+
+*Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):* this supersedes, in the paragraph above,
+"always cleaned in `finally`", the sentence beginning "A directory a crash left behind is deleted",
+and the sentence "Until then it stays on disk, with no bound if the Test Bench is not used again".
+The `finally` tries to delete a run directory and a later sweep can try to, but neither always
+removes it: case files, and the directory holding them, can stay with no bound, and a sweep can
+unlink the case files of a run still going more than an hour after its directory was last
+modified, in another window included. The sweep runs when a Test Bench panel is created and before
+a collection run writes its directory; which directories it tries, and the races that can get past its checks, are in
+the docblocks named below. The rest of the sentence beginning "Rerun writes transient PHI", "but a
+hard crash mid-run could leave a temp file", still holds. The detail is recorded in the
+`deleteCaseDir` and `sweepStaleCaseDirs` docblocks in `ide/src/collectionCaseFiles.ts`.
 
 **Out of scope** — Per-collection custom ignore policies (future amendment); encrypting
 `workspaceState`; cross-workspace/shared collections; any engine/CLI change (e.g. a `dryrun` stdin
@@ -183,7 +232,9 @@ message files. A command to delete every saved collection, including stranded on
 
 **What it does not change.** Case bodies are still PHI when an author saves real messages, so the
 synthetic-case steer and the in-UI notice stay. The rerun still materializes inputs to a temp
-directory and deletes it in `finally`.
+directory and deletes it in `finally`. *Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):* this
+supersedes "deletes it in `finally`": the `finally` tries to delete it and does not always succeed,
+as the dated note beneath *Must not break* says.
 
 ## Amendment 2026-10-20 -- the SecretStorage key carries a scheme version (BACKLOG #3426)
 

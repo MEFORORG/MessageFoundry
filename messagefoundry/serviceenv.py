@@ -17,7 +17,13 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   says.** The same ruling covers it. Its protected alternative is the secrets directory
   ``MEFOR_SECRETS_DIRECTORY`` names (:mod:`messagefoundry.engine_secrets`, ADR 0214), and the
   refusal points there (vault BACKLOG #2595, slice B).
-* **Both refusals are ``serve``'s and ``supervise``'s, and the API app factories'.**
+* **So does every ``MEFOR_VALUE_*`` variable there, whatever ``[security].enforcement`` says.**
+  The owner ruled on 2026-11-14 that the same ruling covers an ``env()`` value (vault BACKLOG
+  #8212 item 7). The engine cannot tell which of them is a secret, so it refuses each, and counts
+  them without printing a name it read from the registry. The way in is the secrets directory,
+  or the environment's value file for a value that is not a secret and is the same for every
+  instance.
+* **Each refusal above is ``serve``'s and ``supervise``'s, and the API app factories'.**
   ``create_app`` and ``create_managed_app`` raise on the same finding as they are built (vault
   BACKLOG #8212 item 1). The loosening ``secret_in_service_environment`` names it for a caller
   that reads the loosenings with no refusal of its own.
@@ -34,8 +40,11 @@ by something else, such as a shell, even when that shell itself runs under some 
 
 **What it does not cover**, at least: a service host other than NSSM, an ``nssm.exe`` renamed to
 something else, a launcher between NSSM and the interpreter that is not a Python interpreter or
-the ``messagefoundry`` launcher, and a connector secret an operator names through ``env()``,
-whose name the engine cannot know.
+the ``messagefoundry`` launcher, and a variable an operator names as a ``[secrets].provider =
+"env"`` reference, whose name the engine does not read here, unless that name starts with
+``MEFOR_VALUE_``, which is refused as every such name is; and any secret or ``MEFOR_VALUE_*``
+variable, other than a store key, that reaches the engine from the machine-wide environment. An
+``env()`` value's ``MEFOR_VALUE_*`` name in the service's own lists is covered.
 
 **Not a refusal when the read fails, with one exception.** An engine that cannot walk its
 ancestors, or cannot read its service's lists, reports ``service_environment_unobservable`` and
@@ -82,6 +91,9 @@ DIRECTORY_CLASS_NAMES: tuple[str, ...] = _setting_names.DIRECTORY_SETTING_NAMES
 #: ``engine_secrets.SECRETS_DIRECTORY_VARIABLE``, spelled out so no identifier here says the word
 #: the CodeQL note above is about; ``tests/test_service_env_secrets.py`` holds the two equal.
 _DIRECTORY_VARIABLE = "MEFOR_SECRETS_DIRECTORY"
+
+#: The prefix of an ``env()`` value's variable. Every listed name that starts with it refuses.
+_VALUE_PREFIX = _setting_names.VALUE_PREFIX
 
 #: Names that take either the secret itself or a path to a file that holds it. Only the inline
 #: form is a secret, the rule ``settings._FILE_INLINE_PEM_KEYS`` applies to the config file.
@@ -133,6 +145,12 @@ class ServiceEnvPosture:
     keys_in_environment: tuple[str, ...] = ()
     #: Why the reading failed (``UNOBSERVABLE``).
     detail: str = ""
+    #: The ``MEFOR_VALUE_*`` names in ``listed`` that an entry sets empty or blank, so the
+    #: refusal can say to delete it rather than move it.
+    empty_value_names: tuple[str, ...] = ()
+    #: The ``MEFOR_VALUE_*`` names in ``listed`` that an entry spells, as written in the
+    #: registry, with a character the secrets directory refuses in a file name.
+    unplain_value_names: tuple[str, ...] = ()
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -145,10 +163,29 @@ class ServiceEnvPosture:
         :data:`DIRECTORY_CLASS_NAMES`, never from the registry."""
         return tuple(name for name in DIRECTORY_CLASS_NAMES if name in self.listed)
 
+    @property
+    def listed_value_names(self) -> tuple[str, ...]:
+        """The ``MEFOR_VALUE_*`` names the service's environment lists set. Unlike the two
+        properties above, these come from the registry, so a refusal counts them and never prints
+        one: an operator may have typed a value where the name goes. The bare prefix is one too:
+        it names no ``env()`` key, but a value set under it is as readable as any other."""
+        return tuple(name for name in self.listed if name.startswith(_VALUE_PREFIX))
+
     def named_with_source(self, names: Sequence[str]) -> str:
         """``names``, each with the registry value that sets it."""
         where = dict(self.sources)
         return ", ".join(f"{name} (in {where[name]})" if name in where else name for name in names)
+
+    def counted_with_source(self, names: Sequence[str]) -> str:
+        """How many of ``names`` each registry value sets, with no name printed. The names were
+        de-duplicated without regard to case as they were read, each credited to the first
+        registry value that sets it, so a name a later value also sets is counted there only."""
+        where = dict(self.sources)
+        counts: dict[str, int] = {}
+        for name in names:
+            source = where.get(name, "an unknown value")
+            counts[source] = counts.get(source, 0) + 1
+        return ", ".join(f"{n} MEFOR_VALUE_* variable(s) (in {src})" for src, n in counts.items())
 
 
 class ServiceProbe(Protocol):
@@ -256,20 +293,47 @@ class _WindowsProbe:
 
 def _names(entries: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
     """The upper-cased names of the variables that ``NAME=value`` entries set to a secret. The
-    value is dropped here and never kept. An empty value sets nothing, and a path in a name that
-    takes either a key or its path is not a secret, so neither name is kept. Windows compares
+    value is dropped here and never kept. An empty value carries no secret, so its name is not
+    kept, except a ``MEFOR_VALUE_*`` name, which the owner's ruling refuses whatever it holds and
+    whose empty value the engine still overlays on the value file. A path in a name that takes
+    either a key or its path is not a secret, so that name is not kept either. Windows compares
     environment names without case, so this does too. Each name is returned with the first
     registry value that sets it."""
     names: dict[str, str] = {}
     for where, entry in entries:
-        name, _, value = entry.partition("=")
+        name, equals, value = entry.partition("=")
         name = name.strip().upper()
-        if not name or not value.strip():
+        # An ``env()`` value is kept even when empty: the engine overlays an empty one on the
+        # value file, so it still decides what ``env()`` returns (vault BACKLOG #8212 item 7).
+        if not name or not (value.strip() or (equals and name.startswith(_VALUE_PREFIX))):
             continue
         if name in _INLINE_PEM_NAMES and "-----BEGIN" not in value:
             continue
         names.setdefault(name, where)
     return tuple(names.items())
+
+
+def _value_entry_shapes(
+    entries: Sequence[tuple[str, str]],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(empty, unplain)``: the upper-cased ``MEFOR_VALUE_<KEY>`` names an entry sets empty or
+    blank, and those an entry spells with a character other than an ASCII letter, a digit or an
+    underscore. The second is judged on the name as written, before upper-casing, because
+    ``str.upper`` maps some non-ASCII letters onto ASCII ones (``engine_secrets`` holds its file
+    names to the same rule for that reason). The bare prefix is in neither. Names only."""
+    empty: dict[str, None] = {}
+    unplain: dict[str, None] = {}
+    for _where, entry in entries:
+        written, equals, value = entry.partition("=")
+        written = written.strip()
+        name = written.upper()
+        if not equals or not name.startswith(_VALUE_PREFIX) or name == _VALUE_PREFIX:
+            continue
+        if not value.strip():
+            empty[name] = None
+        if not (written.isascii() and _setting_names.is_value_name(name)):
+            unplain[name] = None
+    return tuple(empty), tuple(unplain)
 
 
 def read_service_env_posture(
@@ -309,12 +373,15 @@ def read_service_env_posture(
             ),
         )
     sources = _names(entries)
+    empty, unplain = _value_entry_shapes(entries)
     return ServiceEnvPosture(
         ServiceEnvStatus.OBSERVED,
         service_name=service,
         listed=tuple(name for name, _where in sources),
         sources=sources,
         keys_in_environment=keys,
+        empty_value_names=empty,
+        unplain_value_names=unplain,
     )
 
 
@@ -385,11 +452,12 @@ def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
     """Why ``serve``, ``supervise`` or an API app factory must not start, whatever the enforcement
     setting, or None.
 
-    Every secret-class name in the service's environment lists refuses: a key-class name, and
-    each name the secrets directory supplies. The owner's 2026-10-01 ruling refuses them always,
-    so ``[security].enforcement = "warn"`` does not reopen it. A known service whose lists could
-    not be read refuses only on a store key in this process's environment, since only the store
-    key's names are read from it."""
+    Every secret-class name in the service's environment lists refuses, a key-class name and each
+    name the secrets directory supplies, and so does every ``MEFOR_VALUE_*`` name (the owner's
+    2026-11-14 ruling). The owner's 2026-10-01 ruling refuses them always, so
+    ``[security].enforcement = "warn"`` does not reopen it. A known
+    service whose lists could not be read refuses only on a store key in this process's
+    environment, since only the store key's names are read from it."""
     found = _refusal_findings(posture)
     if found is None:
         return None
@@ -401,8 +469,12 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     which the ``secret_in_service_environment`` entry has no refusal to attach to."""
     keys = posture.listed_keys
     others = posture.listed_directory_names
-    if keys or others:
-        found = f"{posture.named_with_source((*keys, *others))} is set in {_where(posture)}"
+    values = posture.listed_value_names
+    if keys or others or values:
+        named = [posture.named_with_source((*keys, *others))] if keys or others else []
+        if values:
+            named.append(posture.counted_with_source(values))
+        found = f"{', '.join(named)} is set in {_where(posture)}"
     elif posture.status is ServiceEnvStatus.UNOBSERVABLE and posture.service_name is not None:
         if not posture.keys_in_environment:
             return None
@@ -425,12 +497,51 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             '`messagefoundry rotate-key`, not in the service. See docs/SERVICE.md, "Protect the '
             'store encryption key at rest"'
         )
-    if others:
-        steps.append(
-            f"Put {', '.join(others)} in the secrets directory MEFOR_SECRETS_DIRECTORY names, as "
-            "one restricted file per setting named as its variable. See docs/CONFIGURATION.md, "
-            '"The secrets directory"'
+    if others or values:
+        put = [", ".join(others)] if others else []
+        if values:
+            put.append("each MEFOR_VALUE_* variable")
+        step = (
+            f"Put {' and '.join(put)} in the secrets directory MEFOR_SECRETS_DIRECTORY names, as "
+            "one restricted file per setting named as its variable"
         )
+        cite = 'See docs/CONFIGURATION.md, "The secrets directory"'
+        if values:
+            step += (
+                ". A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
+                "of the environment may go in its value file instead, environments/<env>.toml by "
+                "default, keyed by the name after MEFOR_VALUE_ in lower case. Each MEFOR_VALUE_* "
+                "name is counted once, without regard to case, under the first registry value "
+                "that sets it, so remove it from every value that sets it"
+            )
+            if _VALUE_PREFIX in values:
+                step += (
+                    ". The bare name MEFOR_VALUE_ sets no env() key, so delete that entry rather "
+                    "than move it"
+                )
+            if posture.empty_value_names:
+                step += (
+                    ". An empty or blank MEFOR_VALUE_* entry is refused too: delete it, or, where "
+                    "an empty override is really wanted, write it in the value file instead, "
+                    "since the secrets directory refuses an empty file"
+                )
+            if posture.unplain_value_names:
+                step += (
+                    ". At least one of them is spelled with a character other than an ASCII "
+                    "letter, a digit or an underscore, a file name the secrets directory refuses, "
+                    "so rename that env() key before moving it there"
+                )
+            step += (
+                '. A MEFOR_VALUE_* variable that a [secrets].provider = "env" reference names is '
+                "read from the environment only, never from the secrets directory. Drop that "
+                "reference instead and put the credential in the secrets directory under the "
+                "setting it stands for, such as MEFOR_AUTH_AD_BIND_PASSWORD; or, second, use "
+                '[secrets].provider = "vault", which applies to every such reference in the '
+                "engine. Renaming the variable outside MEFOR_VALUE_* ends this refusal but leaves "
+                "the secret in the registry key"
+            )
+            cite += ' and "[environments]"'
+        steps.append(f"{step}. {cite}")
         if _DIRECTORY_VARIABLE not in posture.listed:
             # Two routes, because install-service.ps1 refuses an existing directory the service
             # does not name: an operator whose later `nssm set` dropped the variable must not be
@@ -442,14 +553,14 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "entries, before any re-run of the installer, which refuses an existing directory "
                 "the service does not name. `nssm set` replaces that whole list, so read it first "
                 "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
-                "back every entry but the names refused above: see docs/SERVICE.md, "
+                "back every entry but those refused above: see docs/SERVICE.md, "
                 '"Start / stop / status". Where none exists yet, the bullet "The other secrets: '
                 'a secrets directory" under docs/SERVICE.md, "Protect the store encryption key at '
                 'rest", says how the directory is created'
             )
     return (
-        f"{found}. Any local user may be able to read that key, and with it each value named. "
-        f"Remove each name from the service's lists. {'. '.join(steps)}"
+        f"{found}. Any local user may be able to read that key, and with it each value refused "
+        f"here. Remove each refused variable from the service's lists. {'. '.join(steps)}"
     )
 
 

@@ -165,23 +165,31 @@ export function buildConnObj(state: WizardState): WizardConnObj {
  * denies an unlisted outbound host by default. With no flag it reads `./messagefoundry.toml` in the
  * workspace, and only if that file exists.
  *
- * A set setting is always passed, whether or not its file exists, even where it spells the default
- * name. The CLI then refuses a missing file and names it, rather than checking the edit against a
- * file the setting did not name. A blank setting is passed as it is, and a non-string one as an
- * empty string, and `connection` refuses both as blank. The alert and security editors pass the
- * same setting unconditionally too, so no surface drops it.
+ * A set setting that is not blank is always passed, whether or not its file exists, even where it
+ * spells the default name. The CLI then refuses a missing file and names it, rather than checking the edit against a
+ * file the setting did not name. A non-string setting, which only a hand edit produces, is passed
+ * as an empty string, and `connection` refuses it as blank.
  *
- * Only an unset setting leaves the flag off. Its default names `messagefoundry.toml`, the same file
- * the CLI falls back to, so the edit is checked against that file where it exists. Where it does
- * not, the edit is checked against no file rather than refused, so a new workspace can still edit
- * its connections.
+ * An unset setting leaves the flag off, and so does a blank or whitespace-only one: clearing the
+ * Settings box stores "", which VS Code still reports as set (BACKLOG #5566). The default names
+ * `messagefoundry.toml`, the same file the CLI falls back to, so the edit is checked against that
+ * file where it exists. Where it does not, the edit is checked against no file rather than refused,
+ * so a new workspace can still edit its connections.
+ *
+ * Start and Restart read the setting through this same function (`startServiceConfigValue` in
+ * engineControlModel.ts is it), so the two never resolve one setting to two files. Not every
+ * surface uses it yet: at least the alert and security editors and the certificate inventory pass
+ * the setting as it is, so a blank one is refused there.
  */
 export function connectionServiceConfig(setting: unknown, isSet: boolean): string | undefined {
   if (!isSet) {
     return undefined;
   }
   // The manifest declares a string, but VS Code does not enforce it on a hand-edited settings.json.
-  return typeof setting === "string" ? setting : "";
+  if (typeof setting !== "string") {
+    return "";
+  }
+  return setting.trim() === "" ? undefined : setting;
 }
 
 /**

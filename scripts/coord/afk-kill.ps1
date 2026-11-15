@@ -117,8 +117,10 @@ function Get-SkillInstructionSource {
     # one source whose session has just lost both skills.
     $text = Read-CcxHookInput
     if ($script:CcxHookInputTimedOut) { throw 'the hook input was still open when the read stopped waiting' }
+    if ($script:CcxHookInputFault) { throw $script:CcxHookInputFault }
     $payload = $null
-    if (-not [string]::IsNullOrWhiteSpace($text)) { $payload = $text | ConvertFrom-Json -ErrorAction Stop }
+    # -NoEnumerate, as the helper parses it, so an array holding one object is refused here too.
+    if (-not [string]::IsNullOrWhiteSpace($text)) { $payload = $text | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     $p = Get-CcxHookPayloadCwd -Payload $payload
     if ($p.Reason) { throw $p.Reason }
     if (-not $p.Named) { throw 'the hook input names no cwd' }

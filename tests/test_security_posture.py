@@ -158,7 +158,8 @@ _SUPERSEDED_SECURITY_JOBS = frozenset(
 # first, to names nothing yet reports, wedges it identically. `security.yml` carries the step list
 # above the composite jobs, with an amendment recording which steps have been taken.
 #
-# THE BUCKET IS EMPTY AS OF 2026-09-15 and the mechanism is kept for the next staged job. The owner
+# THE BUCKET WAS EMPTY FROM 2026-09-15 until BACKLOG #5594 (see below), and the mechanism was kept for
+# the next staged job. The owner
 # added both composite contexts to branch protection, a pull request recorded them in
 # .github/required-contexts.txt, and the same pull request moved both names into
 # _BLOCKING_SECURITY_JOBS above -- which drags them under every rule in this module for the first
@@ -186,7 +187,12 @@ _SUPERSEDED_SECURITY_JOBS = frozenset(
 # `test_required_jobs_declare_no_skippable_job_level_if`, all of which are live on them. The guard
 # that cannot go vacuous is `test_every_security_job_is_classified`: it asserts SET EQUALITY over
 # every job in the workflow, so emptying this bucket is only legal if each name landed in another.
-_PENDING_PROMOTION_SECURITY_JOBS: frozenset[str] = frozenset()
+#
+# HOLDS ONE JOB: `windows-lock-install` (BACKLOG #5594). It hard-fails on every pull request and is
+# filed here so it reaches branch protection already graded. Promoting it is the owner's
+# branch-protection decision, not yet taken; if the owner declines, the job moves out of this bucket
+# into one that says so, since this bucket asserts the job should become required.
+_PENDING_PROMOTION_SECURITY_JOBS: frozenset[str] = frozenset({"windows-lock-install"})
 
 #: Every job this module grades, whatever its posture. `test_every_security_job_is_classified`
 #: asserts this is SET-EQUAL to the workflow's real job keys, which is what lets other rules build on

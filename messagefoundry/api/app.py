@@ -446,7 +446,7 @@ from messagefoundry.logging_setup import (
     level_refused_on_production,
     set_runtime_level,
 )
-from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
+from messagefoundry.parsing.sniff import attachment_mime_agrees
 from messagefoundry.pipeline import (
     ApprovedConfig,
     ConfigDigestMismatch,
@@ -573,6 +573,7 @@ from messagefoundry.uploads import (
     UploadedFileMeta,
     UploadError,
     UploadNotFoundError,
+    UploadNotTextError,
     UploadPathError,
     UploadQuotaError,
     UploadRetentionRunner,
@@ -9155,9 +9156,10 @@ def create_app(
         under the store DEK when a key is set); step-up-gated + audited (metadata only).
 
         **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
-        ``.txt`` / ``.xml``). A metadata-bearing binary container (JPEG/PNG/PDF/ZIP incl. DOCX) or any
-        non-text body is refused with **HTTP 415** before anything is written — so no embedded metadata
-        (EXIF/XMP/docProps) can ever be stored.
+        ``.txt`` / ``.xml``). A body that begins with a metadata-bearing binary container's signature
+        (JPEG/PNG/PDF/ZIP incl. DOCX/GIF/TIFF), or holds a NUL byte or a control-dense 8 KiB window,
+        is refused with **HTTP 415** before anything is written. What this lets through is
+        stated in docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types".
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
         to you and to authorized operators holding ``files:access_any`` (administrators). Your username
@@ -9181,20 +9183,6 @@ def create_app(
             raise HTTPException(413, str(exc)) from None
         except MultipartError as exc:
             raise HTTPException(400, str(exc)) from None
-        # ASVS 14.2.8: enforce the feature's text-only format contract at the route, BEFORE save. A binary
-        # container (JPEG/PNG/PDF/ZIP incl. DOCX) or a non-text body (NUL / control-dense) is refused with
-        # 415 + a metadata-only upload.reject audit — nothing is written, so no embedded-metadata container
-        # can reach the store (closes "no metadata stripping" without a stripping engine). Covers both
-        # POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
-        nontext = nontext_upload_reason(part.data)
-        if nontext is not None:
-            await engine.store.record_audit(
-                "upload.reject",
-                actor=identity.username,
-                detail=json.dumps({"reason": nontext}),
-                client=client_ip(request),
-            )
-            raise HTTPException(415, nontext) from None
         outage: str | None = None
         try:
             # uploader_id (the immutable account id) is the ownership + quota key; uploader (the
@@ -9207,6 +9195,18 @@ def create_app(
             )
         except UploadTooLargeError as exc:
             raise HTTPException(413, str(exc)) from None
+        except UploadNotTextError as exc:
+            # ASVS 14.2.8: the feature's text-only format contract, checked by save() before anything
+            # is written (BACKLOG #5551 moved it there from this route). docs/CONNECTIONS.md
+            # ("Permitted types") states what it refuses and what it lets through. The answer and the
+            # audit carry the reason only, never the file name or content.
+            await engine.store.record_audit(
+                "upload.reject",
+                actor=identity.username,
+                detail=json.dumps({"reason": exc.reason}),
+                client=client_ip(request),
+            )
+            raise HTTPException(415, exc.reason) from None
         except UploadContentError as exc:
             # ASVS 5.2.2: disallowed extension or content/extension mismatch. Refuse with 400 and a
             # metadata-only audit: the reason without the file name (#2619), NEVER any content. Covers
@@ -12513,9 +12513,11 @@ def create_managed_app(
         # BACKLOG #2193: the alerts test send builds an EmailTransport per request, and its SMTP
         # login takes the revocation guard a live alert takes, so it reads this same posture.
         app.state.alert_hop_posture = _hop_posture
-        # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
-        # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
-        # never relax a production-PHI store hop. None (no [ai]) fails closed (vault BACKLOG #2354).
+        # #200 (ADR 0092): thread the derived instance posture to the store open, for the checks that
+        # read one (the SQL Server pin's anchor checks, the PostgreSQL revocation guard). The weakened-
+        # TLS refusal reads none: it refuses at every posture (vault BACKLOG #3533 item 2). With None
+        # (no [ai]) and no ambient stamp, the pin's anchor checks enforce (vault BACKLOG #2354), but the PostgreSQL
+        # revocation guard does not run: it no-ops on an unstamped posture (see open_store).
         # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this

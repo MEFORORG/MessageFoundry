@@ -9,16 +9,25 @@ knob (``stop`` default | ``dead_letter``) selects the behaviour."""
 
 from __future__ import annotations
 
+import email.message
+import io
+import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
+from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import Registry
+from messagefoundry.config.wiring import Registry, Soap
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.http_auth import with_oauth2_client_credentials
+from messagefoundry.transports.soap import SoapDestination
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
 BODY = "MSH|^~\\&|XFORM|||||20260101||ADT^A01|OUT1|P|2.5.1\r"
@@ -247,3 +256,64 @@ def test_credential_fault_policy_validated_at_construction(store: MessageStore) 
             credential_fault_policy="bogus",
             egress=EgressSettings(deny_by_default=False),
         )
+
+
+# --- BACKLOG #5798: a SOAP WS-Security 401 that a fresh bearer did not fix stops the lane ---------
+
+_WSSE_401 = b"<soap:Fault><faultcode>wsse:FailedAuthentication</faultcode></soap:Fault>"
+
+
+class _Bearer:
+    def access_token(self) -> str:
+        return "AT-synthetic"
+
+    def invalidate(self) -> None:
+        pass
+
+
+class _Raising401:
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> NoReturn:
+        raise urllib.error.HTTPError(
+            req.full_url, 401, "err", email.message.Message(), io.BytesIO(_WSSE_401)
+        )
+
+
+async def test_a_soap_ws_security_401_after_a_fresh_bearer_stops_the_lane(
+    store: MessageStore,
+) -> None:
+    """The first attempt retries with a fresh bearer; the second is a credential fault, so the
+    lane stops and keeps the row un-dead-lettered rather than spend a failed login on every queued
+    row. Mutation: raise the second WS-Security 401 without credential_fault. Red: the row is
+    dead-lettered and the lane advances."""
+    spec = with_oauth2_client_credentials(
+        Soap(url="https://api.example.com/svc"),
+        token_url="https://auth.example.com/token",
+        client_id="cid",
+        client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+    )
+    soap = build_destination(
+        Destination(name=DEST, type=ConnectorType.SOAP, settings=spec.settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(soap, SoapDestination)
+    soap._token_provider = _Bearer()
+    soap._opener = _Raising401()  # type: ignore[assignment]
+    await _seed_outbound(store)
+    sink = _RecordingSink()
+    runner = _runner(store, sink)
+    runner._destinations[DEST] = soap
+
+    first = await store.claim_next_fifo(DEST, now=1.0)
+    assert first is not None
+    outcome = await runner._process_delivery_item(DEST, first)
+    assert outcome[0] is _ItemOutcome.PROCESSED  # re-pended for the fresh-bearer retry
+    assert not sink.stopped
+
+    second = await store.claim_next_fifo(DEST, now=1e12)  # past any backoff deadline
+    assert second is not None
+    outcome = await runner._process_delivery_item(DEST, second)
+    assert outcome[0] is _ItemOutcome.STOPPED
+    status, _attempts, _last_error = await _row_state(store, second.message_id)
+    assert status == OutboxStatus.PENDING.value  # kept, not dead-lettered
+    assert sink.stopped and sink.stopped[0][0] == DEST
+    assert "credential fault" in sink.stopped[0][1]

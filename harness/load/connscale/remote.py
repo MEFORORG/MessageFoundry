@@ -41,7 +41,7 @@ from datetime import UTC, datetime
 
 from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.report import HOLD_BRACKET_RATE_WINDOW, NoLoss
-from harness.load.connscale.runner import ConnScaleError, _reconcile
+from harness.load.connscale.runner import ConnScaleError, _Excusal, _excusal, _reconcile
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import (
     SIGN_IN_ERRORS,
@@ -54,6 +54,7 @@ from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.multishard import _build_ms_corpus
 from harness.load.profile import TypeMix
+from harness.load.report import _counter_reset
 from harness.load.rigadmin import REMOTE_RIG_SESSION
 
 _STOP_GRACE = 5.0
@@ -91,11 +92,39 @@ class ConnScaleRemoteReport:
     no_loss: NoLoss
     in_pipeline_peak: int
     drain_seconds: float | None
+    #: :func:`harness.load.report._counter_reset` over this band's poller: what the batch aggregate
+    #: reads to know the engine counters reset mid-cell (BACKLOG #5574). Required, so a band report
+    #: can never omit it by default; the aggregate refuses to clear a cell whose band names none.
+    counter_reset: str | None
+    #: The stranding budget this band's ``_reconcile`` judged its sends by, computed from the same
+    #: counters and budget argument (BACKLOG #5574). The batch aggregate reads it rather than work
+    #: the budget out again from report fields: only this producer knows what it passed. Required,
+    #: so a band report can never omit it; the aggregate refuses to clear a cell without it.
+    stranding: _Excusal
     notes: list[str] = field(default_factory=list)
+    # False when a hold-bracket ``/stats`` sample failed, so the rates above are a placeholder 0.0 and
+    # not a hold-bracket reading; the JSON then names no rate window (BACKLOG #5431).
+    rates_measured: bool = True
+
+    @property
+    def failures(self) -> list[str]:
+        """Why the run FAILS, empty on a PASS. PASS needs the reconcile AND traffic AND a completed
+        drain (BACKLOG #5431): a run that sent nothing measured nothing, and a timed-out drain left
+        rows stranded in some stage. The reconcile reads both as INCONCLUSIVE too (BACKLOG #5574);
+        they are named here as well so the verdict says why without parsing its detail."""
+        out: list[str] = []
+        if not self.no_loss.ok:
+            label = "inconclusive" if self.no_loss.inconclusive else "loss"
+            out.append(f"{label}: {self.no_loss.detail}")
+        if self.sent <= 0:
+            out.append("nothing was sent")
+        if self.drain_seconds is None:
+            out.append("the drain timed out")
+        return out
 
     @property
     def result_ok(self) -> bool:
-        return self.no_loss.ok
+        return not self.failures
 
     @property
     def exit_code(self) -> int:
@@ -103,10 +132,12 @@ class ConnScaleRemoteReport:
 
     def to_json_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            # 1 -> 2: no_loss.inconclusive, counter_reset and stranding (BACKLOG #5574)
+            "schema_version": 2,
             "kind": "connscale_remote",
             "result": "PASS" if self.result_ok else "FAIL",
             "exit_code": self.exit_code,
+            "failures": self.failures,
             "engine_bands": self.engine_bands,
             "count_per_band": self.count_per_band,
             "per_conn_rate": round(self.per_conn_rate, 4),
@@ -119,7 +150,9 @@ class ConnScaleRemoteReport:
             },
             "throughput": {
                 # Engine reads at the hold's start and end, over its length (BACKLOG #2012).
-                "rate_window": HOLD_BRACKET_RATE_WINDOW,
+                "rate_window": HOLD_BRACKET_RATE_WINDOW if self.rates_measured else None,
+                # False: a bracket sample failed and the two rates below are a placeholder 0.0.
+                "rates_measured": self.rates_measured,
                 "achieved_aggregate_rate": round(self.achieved_aggregate_rate, 2),
                 "delivered_aggregate_rate": round(self.delivered_aggregate_rate, 2),
                 "in_pipeline_peak": self.in_pipeline_peak,
@@ -140,13 +173,28 @@ class ConnScaleRemoteReport:
                 "sink_received": self.no_loss.sink_received,
                 "backlog": self.no_loss.backlog,
                 "detail": self.no_loss.detail,
+                "inconclusive": self.no_loss.inconclusive,
+                "counter_reset": self.counter_reset,
+                # The band's own stranding arm, which reads only its client counters, so the batch
+                # aggregate keeps it whatever the band's engine arms did (BACKLOG #5574).
+                "stranding": {
+                    "unconfirmed": self.stranding.unconfirmed,
+                    "budget": self.stranding.budget,
+                    "over_budget": self.stranding.over_budget,
+                },
             },
             "notes": self.notes,
         }
 
     def render_console(self) -> str:
-        loss = "OK" if self.no_loss.ok else f"LOSS ({self.no_loss.detail})"
-        drain = "n/a" if self.drain_seconds is None else f"{self.drain_seconds:.2f}s"
+        loss = (
+            "OK"
+            if self.no_loss.ok
+            else f"INCONCLUSIVE ({self.no_loss.detail})"
+            if self.no_loss.inconclusive
+            else f"LOSS ({self.no_loss.detail})"
+        )
+        drain = "TIMED-OUT" if self.drain_seconds is None else f"{self.drain_seconds:.2f}s"
         return "\n".join(
             [
                 f"connscale-remote (driver-only) -- {self.engine_bands} engine band(s), "
@@ -154,11 +202,16 @@ class ConnScaleRemoteReport:
                 f"  sink: {self.sink_host} ports={list(self.sink_ports)} "
                 f"({len(self.sink_ports)} local listener process-band)",
                 f"  offered={self.offered_aggregate_rate:.0f}/s "
-                f"achieved={self.achieved_aggregate_rate:.0f}/s "
-                f"delivered={self.delivered_aggregate_rate:.0f}/s",
+                + (
+                    f"achieved={self.achieved_aggregate_rate:.0f}/s "
+                    f"delivered={self.delivered_aggregate_rate:.0f}/s"
+                    if self.rates_measured
+                    else "achieved=n/a delivered=n/a (a hold-bracket /stats sample failed)"
+                ),
                 f"  zero_loss={loss} in_pipeline_peak={self.in_pipeline_peak} drain={drain} "
                 f"deferred={self.deferred} timeouts={self.timeouts}",
                 f"  window=[{self.hold_start_iso} .. {self.drain_complete_iso}]",
+                *(f"  FAIL: {reason}" for reason in self.failures),
                 f"RESULT: {'PASS' if self.result_ok else 'FAIL'} -> exit {self.exit_code}",
             ]
         )
@@ -352,9 +405,23 @@ async def run_connscale_remote(
 
         c = metrics.counters.snapshot()
         base_sample, final_sample = poller.baseline, poller.final
-        no_loss = _reconcile(c, base_sample, final_sample, unconfirmed_budget=n * count)
+        counter_reset = _counter_reset(poller)
+        # One budget argument for both, so the published stranding arm is the one `_reconcile`
+        # judged. No reload probe runs here, so nothing is excused as reload stranding.
+        unconfirmed_budget = n * count
+        stranding = _excusal(c, unconfirmed_budget=unconfirmed_budget)
+        no_loss = _reconcile(
+            c,
+            base_sample,
+            final_sample,
+            unconfirmed_budget=unconfirmed_budget,
+            drain_seconds=drain_seconds,
+            counter_reset=counter_reset,
+        )
         in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
+        rates_measured = False
         if hold_begin is not None and hold_end is not None and hold_elapsed_s > 0:
+            rates_measured = True
             achieved = max(0.0, (hold_end.read - hold_begin.read) / hold_elapsed_s)
             delivered = max(0.0, (hold_end.written - hold_begin.written) / hold_elapsed_s)
         else:
@@ -380,7 +447,10 @@ async def run_connscale_remote(
             no_loss=no_loss,
             in_pipeline_peak=in_pipeline_peak,
             drain_seconds=drain_seconds,
+            counter_reset=counter_reset,
+            stranding=stranding,
             notes=notes,
+            rates_measured=rates_measured,
         )
     finally:
         for driver in drivers:

@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -64,6 +65,7 @@ from harness.load.connscale.runner import (
 )
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import EngineNode, FailoverError, _await_port
+from messagefoundry.terminal_text import escape_for_terminal
 
 _HEALTH_TIMEOUT = 30.0
 _PORTS_READY_TIMEOUT = 60.0
@@ -370,6 +372,35 @@ def build_remote_argv(
 # --- the driver-side per-cell aggregation (pure) -----------------------------
 
 
+def _band_stranding(report: Mapping[str, Any]) -> tuple[bool | None, str]:
+    """The stranding arm one band's ``_reconcile`` judged, as the band published it.
+
+    ``(True, why)`` over budget, ``(False, "")`` within it, ``(None, "")`` when the report does not
+    say, or says something its own numbers contradict (BACKLOG #5574): a missing or malformed field
+    must not clear the arm. The verdict is read, never worked out again here, because only the band
+    knows the budget argument it passed (connscale-remote computes it with the same ``_excusal`` call
+    ``_reconcile`` makes); the check here is only that ``over_budget`` is ``unconfirmed > budget``,
+    the comparison ``_excusal`` makes.
+    """
+    stranding = report.get("no_loss", {}).get("stranding")
+    if not isinstance(stranding, Mapping):
+        return None, ""
+    over, unconfirmed, budget = (stranding.get(k) for k in ("over_budget", "unconfirmed", "budget"))
+    if (
+        not isinstance(over, bool)
+        or not all(isinstance(v, int) and not isinstance(v, bool) for v in (unconfirmed, budget))
+        or over != (unconfirmed > budget)
+    ):
+        return None, ""
+    if not over:
+        return False, ""
+    band = escape_for_terminal(str(report.get("engine_index_base", "?")), single_line=True)
+    return True, (
+        f"band at engine index {band}: {unconfirmed} unconfirmed sends exceed its stranding budget "
+        f"({budget}) — systemic no-ACK fault, judged on that band's client counters alone"
+    )
+
+
 def aggregate_cell_record(
     cell: BatchCell,
     proc_reports: list[dict[str, Any]],
@@ -431,11 +462,23 @@ def aggregate_cell_record(
     agg_deferred = sum(_traffic(r, "deferred") for r in proc_reports)
     agg_timeouts = sum(_traffic(r, "timeouts") for r in proc_reports)
     agg_sink_received = sum(int(_noloss(r, "sink_received") or 0) for r in proc_reports)
+    if agg_sent <= 0:
+        # A fleet that sent nothing reconciles vacuously (BACKLOG #5431's empty run, at the cell).
+        raise ConnScaleError(f"cell {cell.cell_id}: the fleet sent nothing")
     offered = sum(float(r.get("offered_aggregate_rate", 0.0)) for r in proc_reports)
 
     engine_read = _engine_gauge("engine_read")
     engine_written = _engine_gauge("engine_written")
     backlog = _engine_gauge("backlog")
+    # A band whose hold-bracket /stats sample failed reports a placeholder 0.0 rate and no rate window
+    # and says so with `rates_measured: false` (BACKLOG #5431; a report from before then lacks the key
+    # and is read as measured). Every band reads the same engine, so one measured band suffices; with
+    # none, the cell has no rate and must fail rather than read as a measured 0.0 msg/s.
+    if not any(_thr(r, "rates_measured") is not False for r in proc_reports):
+        raise ConnScaleError(
+            f"cell {cell.cell_id}: no band measured a hold-bracket rate (every /stats bracket "
+            "sample failed)"
+        )
     achieved_read = max(float(_thr(r, "achieved_aggregate_rate") or 0.0) for r in proc_reports)
     achieved_written = max(float(_thr(r, "delivered_aggregate_rate") or 0.0) for r in proc_reports)
     in_pipeline_peak = max((int(_thr(r, "in_pipeline_peak") or 0) for r in proc_reports), default=0)
@@ -447,32 +490,141 @@ def aggregate_cell_record(
         max(float(d) for d in drains) if drains and all(d is not None for d in drains) else None
     )
 
-    read_short = agg_sent - engine_read
-    deliver_short = engine_written - agg_sink_received
-    no_loss_ok = read_short <= 0 and deliver_short <= 0 and backlog == 0
+    # A band whose engine counters reset mid-cell makes every engine delta no run total, and a band
+    # report that does not say is refused, never read as "no reset": a missing field must not clear
+    # a cell. A band that could not read the engine at all reports the stand-ins 0/0/-1 (connscale
+    # `_reconcile`), which are not readings either. Each such band is a reason the cell cannot
+    # clear, and every reason is reported, not only the first. The reset text comes out of another
+    # process's report file, so it is escaped to one line.
+    resets: list[str] = []
+    blind = 0
+    trusted: list[dict[str, Any]] = []
+    # Bands whose own reconcile PROVED a loss while it could judge no engine-delta arm: with the
+    # counters reset or the engine unread, only its client-counter arms (the stranding budget, the
+    # reload guards) ran, and those read nothing another band could correct. The cell keeps that
+    # verdict rather than demote it to INCONCLUSIVE (BACKLOG #5574). A band that judged its engine
+    # arms is not counted: its delivery arm compares one band's sink with the engine-wide written.
+    client_lost = 0
+    # The stranding arm, read off EVERY band's published `no_loss.stranding`, whatever its engine
+    # arms did (BACKLOG #5574). It reads only that band's sends and timeouts, so no other band can
+    # correct it, and a band over budget is a loss the cell keeps. Taking it off the band's overall
+    # verdict would keep it only where the engine arms went unjudged: the same flood beside a clean
+    # engine read would pass the cell, and beside a reset would fail it.
+    stranding: list[str] = []
+    stranding_unjudged = 0
+    for r in proc_reports:
+        over_budget, why = _band_stranding(r)
+        nl = r.get("no_loss", {})
+        engine_unjudged = False
+        if "counter_reset" not in nl:
+            resets.append("a band report does not say whether the engine counters reset")
+        elif nl["counter_reset"] is not None:
+            resets.append(escape_for_terminal(str(nl["counter_reset"]), single_line=True))
+            engine_unjudged = True
+        elif int(nl.get("backlog", 0) or 0) >= 0:
+            trusted.append(r)
+        if int(nl.get("backlog", 0) or 0) < 0:
+            blind += 1
+            engine_unjudged = True
+        # A band already counted over the stranding budget is not counted twice, and one whose
+        # client-only loss is kept needs no stranding arm to clear it, so it is not called unjudged.
+        if (
+            engine_unjudged
+            and not over_budget
+            and nl.get("ok") is False
+            and nl.get("inconclusive") is False
+        ):
+            client_lost += 1
+        elif over_budget is None:
+            stranding_unjudged += 1
+        elif over_budget:
+            stranding.append(why)
+    # Every band reads the SAME engine, so one band's readings are the engine totals and a proven
+    # loss needs only the bands that read it cleanly (BACKLOG #5574): one band's reset or blindness
+    # must not suppress a loss the others still prove. The two arms differ in what a reset does.
+    #   delivery: a reset only ever LOWERS the engine counters, so a written delta taken across one
+    #             is a lower bound of what the engine wrote, and a union sink short of it is a loss
+    #             whichever band saw the reset.
+    #   intake:   the same lower bound makes `sent - read` an OVERestimate, so no band's read may
+    #             judge intake once any band names a reset (or will not say).
+    judged_written = max((int(_noloss(r, "engine_written")) for r in trusted), default=None)
+    judged_read = (
+        None if resets else max((int(_noloss(r, "engine_read")) for r in trusted), default=None)
+    )
+    read_short = 0 if judged_read is None else agg_sent - judged_read
+    deliver_short = 0 if judged_written is None else judged_written - agg_sink_received
+    # A negative backlog is the metrics-unavailable stand-in, refused below as no reading; only a
+    # positive one is rows left in the pipeline.
+    drained = backlog <= 0
+    lost = read_short > 0 or deliver_short > 0 or bool(stranding) or client_lost > 0
+    # Reasons the cell cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
+    # harness/load/report.py's copy: both arms above are inequalities an empty, unsettled or
+    # undelivering cell satisfies trivially.
+    unproven: list[str] = []
+    # A fleet that sent nothing was refused above, so only the undelivering cell remains here.
+    if agg_sink_received == 0 and engine_written <= 0:
+        unproven.append(
+            f"nothing was delivered (union sink_received 0, engine_written {engine_written}) — "
+            f"no delivery to reconcile"
+        )
+    if drain_seconds is None:
+        unproven.append("a band's drain timed out — the final counts are an unsettled snapshot")
+    if resets:
+        unjudged = (
+            "the intake arm was not judged"
+            if trusted
+            else "the intake and delivery arms were not judged (no band read the engine cleanly)"
+        )
+        unproven.append(
+            f"{'; '.join(dict.fromkeys(resets))} — the read/written deltas cannot be reconciled "
+            f"against this cell's sends, so {unjudged}"
+        )
+    if blind:
+        unjudged = (
+            "the cell cannot clear"
+            if trusted
+            else "the loss arms were not judged (no band read the engine cleanly)"
+        )
+        unproven.append(f"{blind} band(s) could not read the engine metrics — {unjudged}")
+    if stranding_unjudged:
+        unproven.append(
+            f"{stranding_unjudged} band report(s) do not say whether their sends broke the "
+            f"stranding budget (no_loss.stranding.over_budget) — their stranding arm was not judged"
+        )
+    no_loss_ok = not lost and drained and not unproven
     parts: list[str] = []
     if read_short > 0:
-        parts.append(f"engine_read {engine_read} < aggregate sent {agg_sent} (lost {read_short})")
+        parts.append(f"engine_read {judged_read} < aggregate sent {agg_sent} (lost {read_short})")
     if deliver_short > 0:
         parts.append(
-            f"union sink_received {agg_sink_received} < engine_written {engine_written} "
+            f"union sink_received {agg_sink_received} < engine_written {judged_written} "
             f"(lost {deliver_short})"
         )
-    if backlog != 0:
+    parts.extend(stranding)
+    if client_lost:
+        parts.append(
+            f"{client_lost} band(s) proved a loss on client counters alone (their engine arms "
+            f"were not judged) — see the band report"
+        )
+    if not drained:
         parts.append(f"backlog {backlog} not drained")
+    parts.extend(unproven)
     detail = (
         "; ".join(parts)
         if parts
         else "engine_read>=sent, union sink_received>=written, backlog drained"
     )
+    # Publish the engine totals the verdict rests on, where it rests on any, so the artifact's
+    # numbers reproduce its detail; with no clean band they stay the all-band max.
     no_loss = NoLoss(
         ok=no_loss_ok,
         sent=agg_sent,
-        engine_read=engine_read,
-        engine_written=engine_written,
+        engine_read=engine_read if judged_read is None else judged_read,
+        engine_written=engine_written if judged_written is None else judged_written,
         sink_received=agg_sink_received,
         backlog=backlog,
         detail=detail,
+        inconclusive=not no_loss_ok and not lost,
     )
 
     return ConnScaleRecord(
@@ -510,6 +662,7 @@ def aggregate_cell_record(
         achieved_written_per_s=achieved_written,
         fuse_thread_hops=cell.fuse_mode,
         batch_handoff_statements=cell.batch_mode,
+        trial=cell.trial,
     )
 
 
@@ -521,7 +674,12 @@ def _bands_rate_window(proc_reports: list[dict[str, Any]]) -> str | None:
     back joined with ``|``, as ``report.records_rate_window`` joins them.
     """
     windows = sorted(
-        {str(r.get("throughput", {}).get("rate_window") or "unrecorded") for r in proc_reports}
+        {
+            str(r.get("throughput", {}).get("rate_window") or "unrecorded")
+            for r in proc_reports
+            # A band whose bracket sample failed measured no rate, so it names no window to join.
+            if r.get("throughput", {}).get("rates_measured") is not False
+        }
     )
     if not windows or windows == ["unrecorded"]:
         return None
@@ -530,12 +688,15 @@ def _bands_rate_window(proc_reports: list[dict[str, Any]]) -> str | None:
 
 def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
     """A cell whose >= 6 sink-PROCESS fleet could not be driven or aggregated (a crashed remote band, an
-    empty/short fleet, a null engine gauge), materialised as an EXPLICIT failed/loss
-    :class:`ConnScaleRecord` (``no_loss.ok = False``, zero throughput) tagged with the cell's A/B arm.
+    empty/short fleet, a fleet that sent nothing, a null engine gauge), materialised as an EXPLICIT
+    failed :class:`ConnScaleRecord` (``no_loss.ok = False``, zero throughput) tagged with the cell's
+    A/B arm. It is INCONCLUSIVE, not LOSS (BACKLOG #5574): the cell measured nothing, so nothing
+    proved a message lost, which is how the reconcilers label a step that sent nothing. It fails
+    closed all the same.
 
     It surfaces in the ``zero_loss`` SLO (``all(r.no_loss.ok …)`` turns False) and, because it carries the
     cell's ``batch_handoff_statements``/``fuse_thread_hops``/``claim_mode`` tags, in the B0/B1 batch
-    verdict (its arm's ``zero_loss_ok`` collapses → the cell counts as a candidate loss). So a broken
+    verdict (its arm's ``zero_loss_ok`` collapses → a candidate loss on a B1 cell; on a B0 cell the zero-loss SLO is what fails). So a broken
     band FAILS the cell loudly instead of vanishing from the no-loss accounting — the same "fail the step,
     never drop it" posture the connscale runner takes. ``drain_seconds=None`` poisons the worst-case
     drain (a cell that never ran never drained)."""
@@ -547,6 +708,7 @@ def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
         sink_received=0,
         backlog=0,
         detail=f"cell drive failed: {detail}",
+        inconclusive=True,
     )
     # No `rate_window`: the cell measured no rate, so it names no window (BACKLOG #2012).
     return ConnScaleRecord(
@@ -583,6 +745,7 @@ def _failed_cell_record(cell: BatchCell, detail: str) -> ConnScaleRecord:
         achieved_written_per_s=0.0,
         fuse_thread_hops=cell.fuse_mode,
         batch_handoff_statements=cell.batch_mode,
+        trial=cell.trial,
     )
 
 
@@ -857,6 +1020,23 @@ async def _run_remote_proc(argv: list[str], report_path: Path, cwd: Path) -> dic
     return data
 
 
+def _ready_number[N: (int, float)](
+    ready: Mapping[str, Any], key: str, kind: type[N], *, default: N | None = None
+) -> N:
+    """One numeric field of a READY payload, refused as :class:`ConnScaleError` when it is missing or
+    not a number (BACKLOG #5428). A bare ``int(ready[key])`` raised KeyError or TypeError, which the
+    driver did not catch, so a malformed READY ended it without posting DONE."""
+    value = ready.get(key, default)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or (kind is int and value != int(value))
+    ):
+        raise ConnScaleError(f"READY field {key!r} is {value!r}, not a finite {kind.__name__}")
+    return kind(value)
+
+
 async def _drive_cell_fleet(
     cell: BatchCell,
     ready: Mapping[str, Any],
@@ -874,17 +1054,22 @@ async def _drive_cell_fleet(
     A band that RAISES (a crashed remote process) fails the WHOLE cell (raises :class:`ConnScaleError`)
     rather than silently shrinking the fleet into a partial aggregate — the caller records it as an
     explicit failed/loss cell so a crashed band can never vanish from the no-loss accounting."""
-    inbound_base = int(ready["inbound_base"])
-    api_port = int(ready["api_port"])
-    sink_base = int(ready["sink_base"])
-    sink_procs = int(ready["sink_procs"])
-    count = int(ready["count"])
-    hold_seconds = float(ready.get("hold_seconds", 60.0))
-    drain_timeout = float(ready.get("drain_timeout_s", 300.0))
-    aggregate_rate = float(ready.get("aggregate_rate", 0.0))
+    inbound_base = _ready_number(ready, "inbound_base", int)
+    api_port = _ready_number(ready, "api_port", int)
+    sink_base = _ready_number(ready, "sink_base", int)
+    sink_procs = _ready_number(ready, "sink_procs", int)
+    count = _ready_number(ready, "count", int)
+    hold_seconds = _ready_number(ready, "hold_seconds", float, default=60.0)
+    drain_timeout = _ready_number(ready, "drain_timeout_s", float, default=300.0)
+    # Required, and positive: it decides whether any load is offered at all.
+    aggregate_rate = _ready_number(ready, "aggregate_rate", float)
+    if aggregate_rate <= 0.0 or count < 1:
+        raise ConnScaleError(
+            f"READY offers no load: aggregate_rate {aggregate_rate}, count {count}"
+        )
     # Per-connection rate so the SUMMED offered load across the fleet == the profile's aggregate for the
     # cell (each process offers per_conn_rate * its share; the shares sum to `count`).
-    per_conn_rate = aggregate_rate / count if count > 0 else 0.0
+    per_conn_rate = aggregate_rate / count
 
     plans = plan_driver_bands(
         inbound_base=inbound_base, count=count, sink_base=sink_base, sink_procs=sink_procs
@@ -947,16 +1132,25 @@ async def run_batch_driver(
     cells = iter_batch_cells(profile, claim_mode=claim_mode)
     records: list[ConnScaleRecord] = []
     notes: list[str] = []
+    # Cells whose engine never started (BACKLOG #5428). They stay out of `records`, because a 0.0 msg/s
+    # placeholder trial would skew its arm's mean and spread, and instead fail the run outright, the
+    # way run_connscale's `steps_missed` does; a wholly-missing arm also surfaces in the verdict.
+    cells_missed = 0
+    cells_failed = 0  # cells whose drive failed: their placeholder records alone must not decide
+    missing_detail: dict[tuple[str, str, int], str] = {}
 
     for cell in cells:
         cell_coord = coord.for_run(f"{coord.run_id}.{cell.cell_id}")
         ready = await cell_coord.await_message(BATCH_CELL_READY, timeout=cell_timeout)
         if ready.get("error"):
-            # The engine could not start this cell — record the miss (build_batch_comparison surfaces a
-            # missing arm) and release the engine so the matrix stays in lockstep.
-            notes.append(f"CELL {cell.cell_id} skipped: engine error: {ready['error']}")
+            # The engine could not start this cell -- release it so the matrix stays in lockstep.
+            cells_missed += 1
+            detail = f"engine error: {ready['error']}"
+            missing_detail[(cell.claim_mode, cell.sweep_mode, cell.count)] = detail
+            notes.append(f"CELL {cell.cell_id} skipped: {detail}")
             cell_coord.post(BATCH_CELL_DONE, {"cell_id": cell.cell_id, "skipped": True})
             continue
+        done: dict[str, Any]
         try:
             proc_reports, band_count = await _drive_cell_fleet(
                 cell,
@@ -967,37 +1161,47 @@ async def run_batch_driver(
                 report_dir=report_dir,
             )
             record = aggregate_cell_record(cell, proc_reports, expected_bands=band_count)
-            records.append(record)
-            cell_coord.post(
-                BATCH_CELL_DONE,
-                {
-                    "cell_id": cell.cell_id,
-                    "sent": record.sent,
-                    "sink_received": record.no_loss.sink_received,
-                    "no_loss_ok": record.no_loss.ok,
-                    "achieved_read_per_s": round(record.achieved_read_per_s, 2),
-                    "rate_window": record.rate_window,
-                },
-            )
+            done = {
+                "cell_id": cell.cell_id,
+                "sent": record.sent,
+                "sink_received": record.no_loss.sink_received,
+                "no_loss_ok": record.no_loss.ok,
+                "achieved_read_per_s": round(record.achieved_read_per_s, 2),
+                "rate_window": record.rate_window,
+            }
         except (ConnScaleError, OSError, ValueError) as exc:
-            # A cell whose fleet couldn't be driven or aggregated (a crashed band, an empty/short fleet,
-            # a null engine gauge) is recorded as an EXPLICIT failed/loss cell so it surfaces in the
-            # zero-loss SLO + the B0/B1 verdict — never a silent gap in the matrix (mirrors the connscale
-            # runner failing a step rather than dropping it).
+            # A cell whose fleet couldn't be driven or aggregated (a malformed READY, a crashed band, an
+            # empty/short fleet, a null engine gauge) is recorded as an EXPLICIT failed/loss cell so it
+            # surfaces in the zero-loss SLO + the B0/B1 verdict — never a silent gap in the matrix
+            # (mirrors the connscale runner failing a step rather than dropping it).
             notes.append(f"CELL {cell.cell_id} drive failed: {exc}")
-            records.append(_failed_cell_record(cell, str(exc)))
-            cell_coord.post(BATCH_CELL_DONE, {"cell_id": cell.cell_id, "error": str(exc)})
+            cells_failed += 1
+            record = _failed_cell_record(cell, str(exc))
+            done = {"cell_id": cell.cell_id, "error": str(exc)}
+        # One record and one DONE per cell, posted outside the try so a failed post cannot add a
+        # second, failed record for a cell that already ran.
+        records.append(record)
+        cell_coord.post(BATCH_CELL_DONE, done)
 
-    batch_comparison = build_batch_comparison(records, profile.batch_modes)
+    if cells_missed:
+        notes.append(f"{cells_missed} cell(s) never ran (engine failed to start): the run FAILS")
+    batch_comparison = build_batch_comparison(
+        records, profile.batch_modes, missing_detail=missing_detail
+    )
     slos = _evaluate_slos(profile, records)
     result_ok = (
         bool(records)
+        and cells_missed == 0
+        # A failed drive fails the run even with zero_loss off, where its 0.0 msg/s placeholder
+        # would otherwise only skew its arm's mean.
+        and cells_failed == 0
         and all(c.ok for c in slos)
         and (batch_comparison is None or batch_comparison.ok)
     )
     return ConnScaleReport(
         profile=profile.name,
-        engine_url=f"http://{engine_host} (per-cell API ports)",
+        # The engine always serves TLS (ADR 0172), and build_remote_argv dials it over https.
+        engine_url=f"https://{engine_host} (per-cell API ports)",
         db_backend=profile.store_backend,
         shim_installed=False,
         records=records,

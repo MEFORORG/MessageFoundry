@@ -203,7 +203,9 @@ def reference_statement(settings: Mapping[str, Any], *, name: str | None = None)
 
 
 def database_source_dsn(settings: Mapping[str, Any], *, connection: str | None = None) -> str:
-    """Build a DATABASE reference source's DSN, refusing weakened TLS under the AMBIENT hop posture.
+    """Build a DATABASE reference source's DSN, refusing weakened TLS unless the set is attested.
+
+    The refusal reads no hop posture: it holds at every posture (vault BACKLOG #3533 item 2).
 
     The one place both callers build it: the sync, just before it dials, and ``build_check``, so
     weakened TLS that every sync would refuse also fails ``messagefoundry check``, dry-run and
@@ -262,12 +264,14 @@ async def _load_database_source(
     then keeps the last-good snapshot, as for any source failure.
 
     ``posture`` is the instance hop posture (vault BACKLOG #2354). A sync runs after start, outside
-    every ``active_hop_posture`` scope, so without it the weakened-TLS refusal in ``_build_dsn`` read
-    no posture and fell back to the then-UNCLAMPED ``MEFOR_ALLOW_INSECURE_TLS`` escape. Under
-    ``enforce`` that let a DatabaseRef with ``encrypt=false`` cross in the clear, where the
-    ``db_lookup`` twin refuses the same hop. Today no posture fails closed, and the escape is
-    honoured only on an instance at ``[security].enforcement = warn``. ``None`` keeps the ambient
-    posture, so a caller already inside a scope is unchanged. ``name`` is the reference set, so a
+    every ``active_hop_posture`` scope, so it is handed down and stamped here. Since vault BACKLOG
+    #3533 item 2 no cell under that stamp reads it, so it is inert: a DatabaseRef is always the SQL
+    Server preset, and the weakened-TLS refusal and attestation audit line in ``_build_dsn`` read
+    none. The refusal refuses a DatabaseRef with
+    ``encrypt=false`` or ``trust_server_certificate=true`` at every posture, unless the set is
+    attested, even with ``MEFOR_ALLOW_INSECURE_TLS`` set at ``[security].enforcement = warn``
+    (vault BACKLOG #3533 item 2). ``None``
+    keeps the ambient posture, so a caller already inside a scope is unchanged. ``name`` is the reference set, so a
     refusal or an attestation line names it.
 
     Once the pool is open, the login's fixed-role membership is probed before the statement runs

@@ -230,9 +230,13 @@ async def test_fresh_session_is_mfa_pending_until_assertion() -> None:
         await store.close()
 
 
-async def test_assertion_stamps_mfa_only_never_reauth() -> None:
-    """ADR 0068 decision 1: the assertion satisfies ONLY the MFA leg — reauth_at stays untouched
-    (the password leg of /ui/reauth re-anchors; skipping that here is the loop-class defense)."""
+@pytest.mark.parametrize("uv", [True, False])
+async def test_assertion_stamps_the_factor_and_re_anchors(uv: bool) -> None:
+    """Vault BACKLOG #2964 item 14 (owner rulings 2026-11-14, "Assertion only" and "Stamp only if
+    UV"): a verified assertion that completes a pending factor marks the factor and re-anchors the
+    session; ``reauth_at`` is stamped only when the signed authenticator data carries the UV flag,
+    and cleared without it. The window is seeded open first, so the non-UV case proves the clear
+    rather than a value that was never set."""
     from messagefoundry.auth.tokens import hash_token
 
     store = await MessageStore.open(":memory:")
@@ -241,18 +245,35 @@ async def test_assertion_stamps_mfa_only_never_reauth() -> None:
         identity, token, password = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
 
-        out = await service.login(ADMIN_USERNAME, password)
+        out = await service.login(ADMIN_USERNAME, password, client="10.4.4.1")
         fresh = out.token
         assert fresh is not None
         before = await store.get_session(hash_token(fresh))
         assert before is not None and before.reauth_at is None  # MFA-pending: no seeded step-up
-        ok, fresh = await _assert_once(service, fresh, auth)
-        assert ok is True
+        seeded = time.time() - 60
+        await store.mark_session_reauthed(hash_token(fresh), now=seeded)
+        before = await store.get_session(hash_token(fresh))
+        assert before is not None and before.reauth_at == seeded and before.mfa_verified_at is None
+        options = await service.begin_webauthn_assertion(fresh, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        elevation = await service.finish_webauthn_assertion(
+            fresh,
+            auth.get_response(challenge, user_verified=uv),
+            client="10.4.4.2",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert elevation.ok and elevation.token is not None
         # Read back under the ROTATED token: the assertion re-keyed the row.
-        after = await store.get_session(hash_token(fresh))
+        after = await store.get_session(hash_token(elevation.token))
         assert after is not None
         assert after.mfa_verified_at is not None
-        assert after.reauth_at is None  # NEVER stamped by the assertion
+        if uv:
+            assert after.reauth_at is not None and after.reauth_at > seeded
+        else:
+            assert after.reauth_at is None
+        assert after.client == "10.4.4.2"
     finally:
         await store.close()
 
@@ -1269,11 +1290,11 @@ async def test_extra_less_install_raises_legibly(monkeypatch: pytest.MonkeyPatch
 # --- the first-seen sign-in address record (vault BACKLOG #2145) ------------------------------------
 
 
-async def test_a_passkey_assertion_records_its_address_but_does_not_re_anchor() -> None:
+async def test_a_passkey_assertion_records_its_address_and_re_anchors() -> None:
     """The assertion finishes a sign-in that owed a factor, so its address joins the account's
-    known-address record and the next sign-in from it is not reported. It does not move the
-    session's anchor (ADR 0068 decision 1), so the mid-session signal still reports that address.
-    The two signals are independent, and this pins where they part."""
+    known-address record and the next sign-in from it is not reported. It also moves the session's
+    anchor there, as ``verify_mfa`` does (vault BACKLOG #2964 item 14), so the mid-session signal
+    does not report that address and the two signals agree."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
@@ -1295,7 +1316,7 @@ async def test_a_passkey_assertion_records_its_address_but_does_not_re_anchor() 
         assert elevation.ok and elevation.token is not None
 
         assert await store.list_known_login_addresses(uid, since=0.0) == ["10.5.5.6"]
-        assert await service.flag_new_client_ip(elevation.token, "10.5.5.6", path="/ui/x")
+        assert not await service.flag_new_client_ip(elevation.token, "10.5.5.6", path="/ui/x")
 
         async def _rows(action: str) -> int:
             return len(await store.list_audit(actor=ADMIN_USERNAME, action=action))
@@ -1306,6 +1327,399 @@ async def test_a_passkey_assertion_records_its_address_but_does_not_re_anchor() 
         # Neither NEW nor failed open: the second count tells KNOWN apart from an unjudged verdict.
         after = (await _rows("auth.login_new_ip"), await _rows("auth.login_address_unevaluated"))
         assert after == before
+    finally:
+        await store.close()
+
+
+async def _session_after(service: AuthService, token: str) -> tuple[str | None, bool]:
+    """The session's anchor and whether its step-up window is stamped."""
+    from messagefoundry.auth.tokens import hash_token
+
+    row = await service._store.get_session(hash_token(token))
+    assert row is not None
+    return row.client, row.reauth_at is not None
+
+
+async def _reaudited(service: AuthService, token: str, address: str) -> bool:
+    """Whether flagging ``address`` writes a new audit row, which a dedupe kept across the proof
+    would suppress as a repeat."""
+    action = "auth.new_address_reverify_required"
+    before = len(await service._store.list_audit(action=action))
+    assert await service.flag_new_client_ip(token, address, path="/ui/x")
+    return len(await service._store.list_audit(action=action)) == before + 1
+
+
+async def test_a_passkey_at_the_mfa_gate_leaves_the_anchor_verify_mfa_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2964 item 14 (owner rulings 2026-11-14): a user-verified passkey proved at the
+    MFA gate from a roamed address leaves the session anchored there with a stamped window, exactly
+    as a TOTP code proved by ``verify_mfa`` does. Each also restarts the new-address dedupe, so a third address
+    flagged before the proof is audited afresh after it."""
+    from messagefoundry.auth import totp
+    from tests._totp_clock import pin_totp_clock
+
+    results: dict[str, tuple[str | None, bool]] = {}
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        out = await service.login(ADMIN_USERNAME, password, client="10.7.7.1")
+        assert out.ok and out.mfa_required and out.token is not None
+        assert await _session_after(service, out.token) == ("10.7.7.1", False)
+        assert await service.flag_new_client_ip(out.token, "10.7.7.2", path="/ui/x")
+        assert await service.flag_new_client_ip(out.token, "10.7.7.3", path="/ui/x")
+        options = await service.begin_webauthn_assertion(out.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        passkey = await service.finish_webauthn_assertion(
+            out.token,
+            auth.get_response(challenge, user_verified=True),
+            client="10.7.7.2",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert passkey.ok and passkey.token is not None
+        results["passkey"] = await _session_after(service, passkey.token)
+        assert not await service.flag_new_client_ip(passkey.token, "10.7.7.2", path="/ui/x")
+        assert await _reaudited(service, passkey.token, "10.7.7.3")
+    finally:
+        await store.close()
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        enroll = await service.begin_mfa_enrollment(identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t0), token=token
+        )
+        assert confirmed.ok
+        out = await service.login(ADMIN_USERNAME, password, client="10.7.7.1")
+        assert out.ok and out.mfa_required and out.token is not None
+        assert await _session_after(service, out.token) == ("10.7.7.1", False)
+        assert await service.flag_new_client_ip(out.token, "10.7.7.2", path="/ui/x")
+        assert await service.flag_new_client_ip(out.token, "10.7.7.3", path="/ui/x")
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        code = await service.verify_mfa(
+            out.token, totp.totp(enroll.secret, now=t1), client="10.7.7.2"
+        )
+        assert code.ok and code.token is not None
+        results["code"] = await _session_after(service, code.token)
+        assert not await service.flag_new_client_ip(code.token, "10.7.7.2", path="/ui/x")
+        assert await _reaudited(service, code.token, "10.7.7.3")
+    finally:
+        await store.close()
+
+    assert results["passkey"] == results["code"] == ("10.7.7.2", True)
+
+
+async def test_a_non_uv_assertion_shuts_an_open_window_as_it_re_anchors() -> None:
+    """Vault BACKLOG #2964 item 14 (Manager reading of the owner's "Stamp only if UV"): a window
+    opened at one address must not follow the anchor when a presence-only tap re-anchors the
+    session elsewhere. The window here is opened by the password step-up, which stamps a session
+    that still owes its factor; the non-UV assertion that then completes the factor clears
+    ``reauth_at``."""
+    from messagefoundry.auth.tokens import hash_token
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        out = await service.login(ADMIN_USERNAME, password, client="10.3.3.1")
+        assert out.ok and out.mfa_required and out.identity is not None and out.token is not None
+        stepped = await service.reauth(out.identity, password, token=out.token, client="10.3.3.1")
+        assert stepped.ok and stepped.token is not None
+        assert await service.has_recent_step_up(stepped.token) is True
+        assert await service.mfa_satisfied(stepped.token) is False  # the factor is still owed
+        options = await service.begin_webauthn_assertion(stepped.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        elevation = await service.finish_webauthn_assertion(
+            stepped.token,
+            auth.get_response(challenge, user_verified=False),
+            client="10.3.3.2",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert elevation.ok and elevation.token is not None
+        row = await store.get_session(hash_token(elevation.token))
+        assert row is not None and row.client == "10.3.3.2"
+        assert row.mfa_verified_at is not None and row.reauth_at is None
+        assert await service.has_recent_step_up(elevation.token) is False
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("uv", [True, False])
+async def test_an_assertion_on_a_session_that_met_its_factor_moves_nothing(
+    monkeypatch: pytest.MonkeyPatch, uv: bool
+) -> None:
+    """Vault BACKLOG #2964 item 14, two tabs: a passkey ceremony staged while the session was
+    pending survives a TOTP code from another tab (the challenge moves with the re-key), and its
+    assertion then reaches a session that has met its factor. It marks the factor and re-keys, and
+    moves neither the anchor nor the window the code stamped, with UV or without. RED when: the
+    passkey leg re-anchors and stamps a session that has met its factor (the anchor moves to the
+    third address, and with UV the window is stamped again; without UV it is cleared)."""
+    from messagefoundry.auth import totp
+    from messagefoundry.auth.tokens import hash_token
+    from tests._totp_clock import pin_totp_clock
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        enroll = await service.begin_mfa_enrollment(identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t0), token=token
+        )
+        assert confirmed.ok and confirmed.token is not None
+        auth, _ = await _enroll(service, identity, confirmed.token)
+        out = await service.login(ADMIN_USERNAME, password, client="10.6.6.1")
+        assert out.ok and out.mfa_required and out.token is not None
+        # Tab one stages the passkey while the session is pending.
+        options = await service.begin_webauthn_assertion(out.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        # Tab two meets the factor with a code from a second address: anchored there, window open.
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        code = await service.verify_mfa(
+            out.token, totp.totp(enroll.secret, now=t1), client="10.6.6.2"
+        )
+        assert code.ok and code.token is not None
+        met = await store.get_session(hash_token(code.token))
+        assert met is not None and met.client == "10.6.6.2" and met.reauth_at is not None
+        # Tab one's assertion lands on the satisfied session, from a third address.
+        again = await service.finish_webauthn_assertion(
+            code.token,
+            auth.get_response(challenge, user_verified=uv),
+            client="10.6.6.3",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert again.ok and again.token is not None and again.token != code.token
+        row = await store.get_session(hash_token(again.token))
+        assert row is not None
+        assert (row.client, row.reauth_at) == ("10.6.6.2", met.reauth_at)
+        assert await service.flag_new_client_ip(again.token, "10.6.6.3", path="/ui/x")
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("interleave", [True, False])
+async def test_a_factor_met_during_the_assertion_is_not_re_anchored(
+    monkeypatch: pytest.MonkeyPatch, interleave: bool
+) -> None:
+    """Vault BACKLOG #2964 item 14, review finding R6: the decision to re-anchor is made inside the
+    factor write, on the row it reads, never on the session row the leg loaded first. Here another
+    write meets the session's factor after that load (inside the sign-count write, which runs
+    between them), so the passkey's own write must be a plain factor stamp: the anchor, the window
+    and the new-address dedupe all stay as they were. ``interleave=False`` is the control: the same
+    flow with no interleaved stamp moves the anchor, stamps the window and restarts the dedupe. RED
+    on the guard this replaced, which decided from the first load and re-anchored the factor-met
+    row."""
+    from messagefoundry.auth.tokens import hash_token
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        out = await service.login(ADMIN_USERNAME, password, client="198.51.100.1")
+        assert out.ok and out.mfa_required and out.token is not None
+        pending = hash_token(out.token)
+        seeded = time.time() - 60
+        await store.mark_session_reauthed(pending, now=seeded, client="198.51.100.1")
+        # An address reported before the assertion: a dedupe restart reports it again after.
+        assert await service.flag_new_client_ip(out.token, "203.0.113.5", path="/ui/x")
+        options = await service.begin_webauthn_assertion(out.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+
+        real_count = store.update_webauthn_sign_count
+
+        async def count_after_a_factor_stamp(*args: Any, **kwargs: Any) -> Any:
+            await store.mark_session_mfa_verified(pending)  # another leg met the factor
+            return await real_count(*args, **kwargs)
+
+        if interleave:
+            monkeypatch.setattr(store, "update_webauthn_sign_count", count_after_a_factor_stamp)
+        elevation = await service.finish_webauthn_assertion(
+            out.token,
+            auth.get_response(challenge, user_verified=True),
+            client="192.0.2.9",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert elevation.ok and elevation.token is not None
+        row = await store.get_session(hash_token(elevation.token))
+        assert row is not None and row.mfa_verified_at is not None
+        if interleave:
+            assert (row.client, row.reauth_at) == ("198.51.100.1", seeded)
+            assert not await _reaudited(service, elevation.token, "203.0.113.5")
+        else:
+            assert row.client == "192.0.2.9"
+            assert row.reauth_at is not None and row.reauth_at > seeded
+            assert await _reaudited(service, elevation.token, "203.0.113.5")
+    finally:
+        await store.close()
+
+
+async def test_a_non_uv_passkey_is_never_weaker_than_a_code_completing_the_same_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2964 item 14, the parity rule: a passkey assertion that completes a pending
+    factor must never leave the session weaker than a TOTP code (``verify_mfa``, unchanged by this
+    item) completing the same pending factor. Both paths run side by side from the same state: a
+    pending session at address A that minted an ADR 0077 grant by a password step-up there, whose
+    factor is then completed from address B. Measured on each: where the anchor ends, whether the
+    window is open, whether the new-address signal (the one every new-address refusal asks) still
+    fires from B, and whether the grant is spendable from B. A non-UV passkey must match the code
+    on every one, or be stricter. RED when: the non-UV passkey leaves any of them more permissive
+    than the code does."""
+    from messagefoundry.auth import totp
+    from messagefoundry.auth.service import STEP_UP_ACTION_MESSAGE_EXPORT as export
+    from tests._totp_clock import pin_totp_clock
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        enroll = await service.begin_mfa_enrollment(identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t0), token=token
+        )
+        assert confirmed.ok and confirmed.token is not None
+        auth, _ = await _enroll(service, identity, confirmed.token)
+
+        async def pending_with_grant() -> str:
+            out = await service.login(ADMIN_USERNAME, password, client="10.11.0.1")
+            assert out.ok and out.mfa_required and out.identity is not None
+            assert out.token is not None
+            stepped = await service.reauth(
+                out.identity, password, token=out.token, client="10.11.0.1", purpose=export
+            )
+            assert stepped.ok and stepped.token is not None
+            assert not await service.mfa_satisfied(stepped.token)
+            return stepped.token
+
+        async def measure(current: str) -> dict[str, object]:
+            client, window = await _session_after(service, current)
+            return {
+                "anchor": client,
+                "window_open": window,
+                "new_address_signal_from_b": await service.flag_new_client_ip(
+                    current, "10.11.0.2", path="/ui/x"
+                ),
+                "grant_spendable_from_b": await service.has_action_step_up(current, export),
+            }
+
+        pending = await pending_with_grant()
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        code = await service.verify_mfa(
+            pending, totp.totp(enroll.secret, now=t1), client="10.11.0.2"
+        )
+        assert code.ok and code.token is not None
+        by_code = await measure(code.token)
+
+        pending = await pending_with_grant()
+        options = await service.begin_webauthn_assertion(pending, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        tap = await service.finish_webauthn_assertion(
+            pending,
+            auth.get_response(challenge, user_verified=False),
+            client="10.11.0.2",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert tap.ok and tap.token is not None
+        by_tap = await measure(tap.token)
+
+        # The measurement, stated: the code moves the anchor to B, opens the window, lifts the
+        # new-address signal from B and leaves the grant spendable there.
+        assert by_code == {
+            "anchor": "10.11.0.2",
+            "window_open": True,
+            "new_address_signal_from_b": False,
+            "grant_spendable_from_b": True,
+        }
+        # The non-UV passkey matches it on everything but the window, which it shuts: stricter.
+        assert by_tap == {**by_code, "window_open": False}
+        for key in ("window_open", "grant_spendable_from_b"):
+            assert not (by_tap[key] and not by_code[key]), key  # never more permissive
+        signal = "new_address_signal_from_b"  # here the permissive answer is False
+        assert not (by_code[signal] and not by_tap[signal]), signal
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_registration_does_not_re_anchor() -> None:
+    """Control for vault BACKLOG #2964 item 14: enrolment keeps the anchor where it was. ADR 0197
+    Amendment A lets a holder of the password alone enrol, so a registration proves nothing about
+    the address it came from, and the mid-session signal still reports that address."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        _, _, password = await login_admin(service)
+        out = await service.login(ADMIN_USERNAME, password, client="10.8.8.1")
+        assert out.ok and out.identity is not None and out.token is not None
+        anchored, stamped = await _session_after(service, out.token)
+        assert anchored == "10.8.8.1"
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                out.identity, token=out.token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        challenge = base64url_to_bytes(opts["challenge"])
+        elevation = await service.finish_webauthn_registration(
+            out.identity,
+            SoftAuthenticator(rp_id=RP, origin=ORIGIN).create_response(challenge),
+            label="k",
+            token=out.token,
+            rp_id=RP,
+            origin=ORIGIN,
+            client="10.8.8.2",
+        )
+        assert elevation.ok and elevation.token is not None
+        assert await _session_after(service, elevation.token) == ("10.8.8.1", stamped)
+        assert await service.flag_new_client_ip(elevation.token, "10.8.8.2", path="/ui/x")
+    finally:
+        await store.close()
+
+
+async def test_a_totp_enrolment_confirm_does_not_re_anchor() -> None:
+    """Control for vault BACKLOG #2964 item 14, the TOTP half: confirming an enrolment from a new
+    address leaves the anchor where it was, for the reason the passkey control gives."""
+    from tests._totp_clock import fresh_totp
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        _, _, password = await login_admin(service)
+        out = await service.login(ADMIN_USERNAME, password, client="10.9.9.1")
+        assert out.ok and out.identity is not None and out.token is not None
+        anchored, stamped = await _session_after(service, out.token)
+        assert anchored == "10.9.9.1"
+        enroll = await service.begin_mfa_enrollment(out.identity)
+        elevation = await service.confirm_mfa_enrollment(
+            out.identity, fresh_totp(enroll.secret), token=out.token, client="10.9.9.2"
+        )
+        assert elevation.ok and elevation.token is not None
+        assert await _session_after(service, elevation.token) == ("10.9.9.1", stamped)
+        assert await service.flag_new_client_ip(elevation.token, "10.9.9.2", path="/ui/x")
     finally:
         await store.close()
 

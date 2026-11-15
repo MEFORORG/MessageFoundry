@@ -2191,9 +2191,9 @@ jobs:
     # for its own 66/55. Sizing a cap close to the observed run buys no detection and costs red builds
     # on green suites, and a gate that cries wolf gets deleted. The engine Windows legs carry 66/55 for
     # a bigger suite; 40/30 was proportionate here and well clear at -n 4. It went to 45/35, then to
-    # 60/48 on both legs. Since 2026-10-23 the caps are PER LEG: windows-2025 is 80/67, every other leg
-    # stays 60/48. The paragraphs below are why -- that sentence about sizing a cap close to the
-    # observed run is the rule that moved it, applied to its own tier.
+    # 60/48 on both legs. Since 2026-10-23 the caps are PER LEG: windows-2025 was 80/67 and is 115/100
+    # since 2026-11-14, every other leg stays 60/48. The paragraphs below are why -- that sentence
+    # about sizing a cap close to the observed run is the rule that moved it, applied to its own tier.
     #
     # RE-DERIVED FOR THE WINDOWS LEG'S -n 3 EXPERIMENT (BACKLOG #1109, against #1304), because the
     # trigger at the bottom of this note fires on its own change. The paragraphs above are the caps'
@@ -2395,6 +2395,9 @@ jobs:
     # days. This note makes NO runway claim from that: a daily median on a bimodal leg does not
     # support one.
     #
+    # SUPERSEDED FOR windows-2025 ON 2026-11-14 (see "RE-DERIVED A FOURTH TIME" below); the 80/67
+    # sizing and the nesting row in the next paragraph are its record, not the caps in force.
+    #
     # THE STEP CAP IS 67 = ceil_minute(1.35x 49:06). The kills were cut short, so their true durations
     # are longer than 48:08. The progress figure is tests done over tests collected, so the [98%] kill,
     # job 120484240748, gives its full length as about 48:07 / 0.98 = 49:06. That is an ESTIMATE:
@@ -2402,7 +2405,7 @@ jobs:
     # longest of the four. The JOB cap is 80. Setup is the larger of the two pools' windows maxima,
     # 4:33 (run 39664551193, job 119446204553), above the old pool's 3:13:
     #
-    #   windows-2025    setup 4:33, pad 4:30, step cap 67:00: 76:03 of 80:00, slack 3:57
+    #   windows-2025    setup 4:33, pad 4:30, step cap 67:00: 76:03 of 80:00, slack 3:57  <- SUPERSEDED 2026-11-14
     #
     # The largest job-minus-step time on windows-2025 in this pool is 4:40, which is setup plus the
     # `if: always()` steps, and it fits in setup plus slack. EVERY OTHER LEG KEEPS 48/60, through the
@@ -2417,17 +2420,79 @@ jobs:
     # above. Whether to keep -n 3 stays BACKLOG #1109's call. THE CAP IS NOT THE FIX for the slow
     # population: finding what makes some windows-2025 runs take half as long again is unfiled work.
     #
+    # RE-DERIVED A FOURTH TIME, 2026-11-14, FOR windows-2025 ONLY, TO 115/100, under an owner ruling
+    # of 2026-11-14 in the Lander's session: asked "How should the slow windows harness leg be
+    # fixed?", with raising the step timeout or splitting the tier as the options, the owner answered
+    # "Raise the timeout". The 51:32 trigger below had fired and nothing read it, as the "NOTHING
+    # READS THE TRIGGER BELOW FOR YOU" paragraph after this block says will happen. The 67-minute
+    # cap then killed the step at least five times on 2026-11-14, on four heads, each with no F or
+    # E in the progress line and no FAILED in the job log, and each turned the required `CI gate`
+    # red:
+    #
+    #   run 43565011443  job 132356944784  PR 2939 403f31dee1, attempt 1  killed 67:08  last [97%]
+    #   run 43588751540  job 132428879971  PR 2947 bb1d9b6cfe, attempt 1  killed 67:07  last [99%]
+    #   run 43602637847  job 132470698933  PR 2947 0be8cfa25a, attempt 1  killed 67:08  last [99%]
+    #   run 43602637847  job 132489474794  PR 2947 0be8cfa25a, attempt 2  killed 67:08  last [98%]
+    #   run 43612946074  job 132501859343  push `main` 6bae356760         killed 67:08  last [100%]
+    #
+    # The `main` kill printed its [100%] progress line 36 ms before the kill: a suite that had run
+    # every test was killed in its last second. Pool: every ci.yml run CREATED from
+    # 2026-11-14T00:00:00Z to 2026-11-14T19:06:30Z UTC, 102 runs, read by the 2026-10-07 method
+    # (rows from push, pull_request and workflow_dispatch; jobs with ?filter=all; a row is this STEP
+    # keyed on its own conclusion, duration = its completed_at minus started_at; identical-stamp
+    # re-run copies dropped). windows-2025 has 49 green steps, from 40:16 to 66:54. The largest,
+    # 66:54, is run 43581274972 (job 132406419622, push `main` deaf82ea90), and run 43534005584 (job
+    # 132258607452) also took 66:54. Twelve greens took 65:26 or longer, within 1:42 of the kill.
+    # One more step failed at 66:16, under the cap, and is not a kill.
+    #
+    # One day is NOT a week's pool, so this gives a LOWER BOUND on the worst green and no trend. The
+    # kills are runs that wanted longer than the cap, so the largest green, 66:54, is right-censored
+    # again for the reason recorded above; the gap to the cap is not the evidence for that, the kills
+    # are.
+    #
+    # THE STEP CAP IS 100. The 2026-10-23 method gives 94: the [97%] kill, the lowest progress of the
+    # five, puts its full length at about 67:08 / 0.97 = 69:13, an ESTIMATE for the reason given
+    # there, and ceil_minute(1.35x 69:13) = ceil(93.43) = 94. The [100%] kill bounds its own run
+    # near 67:08, inside that estimate. The 6 minutes above 94 are a CHOICE, not a derivation. The
+    # leg is growing: the 2026-10-23 pool's largest green was 47:58 and this day's is 66:54, 22 days
+    # later. Both are censored maxima, of a week's pool and of one day's, so the 19 minutes between
+    # them is an order of magnitude, not a rate. Each cap this note sized at the rule's minimum on
+    # this leg has been outgrown. 100 is ceil_minute(1.35x 74:04), so it holds the 1.35 rule for a
+    # run about 4:50 longer than the 69:13 estimate. The JOB cap is 115. Setup keeps the 2026-10-23
+    # pool's maximum, 4:33, far above this day's windows-2025 setup, 0:43 to 1:15 from job start to
+    # the step's start over every job that was not cancelled:
+    #
+    #   windows-2025    setup 4:33, pad 4:30, step cap 100:00: 109:03 of 115:00, slack 5:57
+    #
+    # The job rule the engine note states gives less: the 2026-10-23 pool's largest job-minus-step
+    # time, 4:40, is the worst overhead, and 100 + ceil_minute(1.5x 4:40) = 100 + 7 = 107. 115 is
+    # taken over 107 so that the nesting row above holds with the pad, as each earlier row in this
+    # note does. Both are far under GitHub's 360-minute job limit. EVERY OTHER LEG KEEPS 60/48. On
+    # ubuntu, in the same pool, setup on the 58 green jobs took 0:30 to 0:55 by the same reading,
+    # inside its 2026-10-07 nesting row's 5:06, and the GREEN steps took 17:29 to 28:58. The largest
+    # is run 43588751540 (job 132428879883), and ceil_minute(1.35x 28:58) = 40 is inside its 48.
+    #
+    # THE CAP IS STILL NOT THE FIX, and this change names no cause. What is growing the leg is not
+    # measured here; the slow-population question and the worker lever above are untouched, and
+    # splitting the tier was the option the owner did not take.
+    #
     # NOTHING READS THE TRIGGER BELOW FOR YOU, and pairing this step with scripts/ci/step_margin.py the
     # way the engine and web console steps are paired is not a few lines: it needs a `--mark` step and
     # a margin step, a margin-cap knob in the `tooling_matrix` the `changes` job builds, a row per leg
     # in scripts/ci/step_margin_baseline.toml with its pool file, and an entry in the per-job tables
     # tests/test_ci_step_margin.py checks. That is its own change, and it is unfiled.
     #
+    # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 76:55 -- the 100-minute
+    # cap divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates -- or if
+    # any run is killed at the 100-minute step cap, or if TOOLING_WORKERS changes, and re-measure in
+    # any case after a week, because the leg was still growing when this was written. THE PARAGRAPH
+    # BELOW IS THE TRIGGER THIS REPLACES, kept as its record:
+    #
     # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 51:32 -- the 67-minute cap
     # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates -- or if any
     # run is killed at the 67-minute step cap, or if TOOLING_WORKERS changes, and re-measure in any
     # case after a week, because the slow population's median was still rising when this was written.
-    # THE PARAGRAPH BELOW IS THE TRIGGER THIS REPLACES, kept as its record:
+    # THE PARAGRAPH BELOW IS THE TRIGGER BEFORE THAT, kept as its record:
     #
     # RE-DERIVE IF a GREEN windows-2025 run of this tier is observed above 36:55 -- the 48-minute cap
     # divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it gates, which do not
@@ -2445,8 +2510,8 @@ jobs:
     # or it stops meaning anything.
     # `pytest_workers` is NOT this tier's knob and never was -- see the TOOLING_WORKERS note on the
     # step below.
-    # Per leg, see "RE-DERIVED A THIRD TIME" above: windows-2025 80, every other leg 60.
-    timeout-minutes: ${{ matrix.os == 'windows-2025' && 80 || 60 }}
+    # Per leg, see "RE-DERIVED A FOURTH TIME" above: windows-2025 115, every other leg 60.
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 115 || 60 }}
     defaults:
       run:
         shell: bash
@@ -2558,9 +2623,9 @@ jobs:
       # carry. It was deliberately not ported blind: it is a behaviour change whose zero cost was
       # measured on the engine tier's history and on no sample from this one. See BACKLOG #1304.
       - name: Harness tests (pytest)
-        # Per leg, windows-2025 67 and every other leg 48; see the job cap above for the derivation.
+        # Per leg, windows-2025 100 and every other leg 48; see the job cap above for the derivation.
         # Each must stay under its own leg's job cap with setup.
-        timeout-minutes: ${{ matrix.os == 'windows-2025' && 67 || 48 }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 100 || 48 }}
         env:
           # Same reason as the apt step above: collection imports the Qt modules whether or not this
           # job executes them, and the shipped ones construct QApplication at import on some paths.
@@ -3263,7 +3328,9 @@ jobs:
           # tests/_lockout_store_contract.py is the lockout body both server store suites run.
           # ci/python-version is the interpreter every one of these legs runs, so a patch bump
           # must meet them on its own PR rather than first on the nightly after the merge.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|retention|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota|embedded_document_pruning)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/_lockout_store_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|\.github/workflows/ci\.yml)'; then
+          # scripts/ci/db-tls-cert.sh makes the certificate these legs' databases serve and the engine
+          # verifies (vault BACKLOG #3533 item 2), so an edit to it alone must pull them.
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|reference_sync|retention|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/sqlserver_roles|messagefoundry/(logging_setup|redaction)|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota|embedded_document_pruning)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/_lockout_store_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|scripts/ci/db-tls-cert\.sh|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -3516,12 +3583,22 @@ jobs:
     # is a deliberate edit: read the tag's current digest from the registry and change every site of
     # that image, here and in benchmark.yml, in one commit. tests/test_ci_tool_and_image_pins.py
     # refuses a service image with no digest.
+    #
+    # `store_tls` IS HOW EACH LEG'S STORE VERIFIES THE SERVER (owner ruling 2026-11-15, vault BACKLOG
+    # #3533 item 2). `pin`: the store pins the generated certificate with MEFOR_STORE_SSL_ROOT_CERT,
+    # which the engine sends as ServerCertificate with Encrypt=strict (TDS 8.0). `trust-store`: no
+    # pin, so the engine sends Encrypt=yes with TrustServerCertificate=no, and the driver verifies the
+    # certificate's chain and host name against the runner's OS trust store, which holds the
+    # generated certificate. 2022 is `trust-store` because SQL Server 2022 on Linux refused every
+    # strict login with error 17821 under every configuration tried (runs 43704495127, 43706665689,
+    # 43708107058; microsoft/mssql-docker#878). Neither leg weakens TLS: the engine refuses
+    # trust_server_certificate=true and encrypt=false at every posture.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { image: "mcr.microsoft.com/mssql/server:2022-latest@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090", label: "2022" }
-          - { image: "mcr.microsoft.com/mssql/server:2025-latest@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726", label: "2025" }
+          - { image: "mcr.microsoft.com/mssql/server:2022-latest@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090", label: "2022", store_tls: "trust-store" }
+          - { image: "mcr.microsoft.com/mssql/server:2025-latest@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726", label: "2025", store_tls: "pin" }
     services:
       mssql:
         image: ${{ matrix.image }}
@@ -3592,6 +3669,60 @@ jobs:
           "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
 
+      # THE ENGINE NEVER WEAKENS TLS TO THIS SERVER (owner ruling 2026-11-14, vault BACKLOG #3533
+      # item 2): a store or DATABASE connection login over trust_server_certificate=true or
+      # encrypt=false is refused, whatever MEFOR_ALLOW_INSECURE_TLS or [security].enforcement says,
+      # except a DATABASE connection that declares tls_hop_attested, which no leg here does.
+      # So the service container serves a certificate generated here, and the runner's trust store
+      # holds it. On a `store_tls: pin` leg the steps below that open the store also pin it with
+      # MEFOR_STORE_SSL_ROOT_CERT; on a `trust-store` leg they verify it through the trust store,
+      # as the DATABASE connector, which has no pin, does on both. A `services:` container starts
+      # before any step, so the files are copied in and the server restarted, after its first boot
+      # has finished.
+      # sqlcmd's -C in the readiness loops is the CI tool's own login, not the engine's.
+      - name: Serve TLS from the SQL Server container with a generated certificate
+        timeout-minutes: 5
+        env:
+          MSSQL: ${{ job.services.mssql.id }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mssql-tls"
+          bash scripts/ci/db-tls-cert.sh "$dir"
+          # The image ships no mssql.conf; refuse to overwrite one rather than drop its settings.
+          if docker exec "$MSSQL" test -e /var/opt/mssql/mssql.conf; then
+            docker exec "$MSSQL" cat /var/opt/mssql/mssql.conf
+            echo "::error::the SQL Server image now ships an mssql.conf; merge the [network] TLS lines into it rather than replace it"
+            exit 1
+          fi
+          printf '%s\n' '[network]' \
+            'tlscert = /var/opt/mssql/tls/server.pem' 'tlskey = /var/opt/mssql/tls/server.key' \
+            > "$dir/mssql.conf"
+          docker exec -u 0 "$MSSQL" mkdir -p /var/opt/mssql/tls
+          docker cp "$dir/server.pem" "$MSSQL:/var/opt/mssql/tls/server.pem"
+          docker cp "$dir/server.key" "$MSSQL:/var/opt/mssql/tls/server.key"
+          docker cp "$dir/mssql.conf" "$MSSQL:/var/opt/mssql/mssql.conf"
+          # Read the account the image runs as rather than assume it; the files must be its own.
+          uid="$(docker exec "$MSSQL" id -u)"
+          echo "the image runs as uid ${uid}"
+          docker exec -u 0 "$MSSQL" chown -R "${uid}:0" /var/opt/mssql/tls /var/opt/mssql/mssql.conf
+          docker exec -u 0 "$MSSQL" chmod 500 /var/opt/mssql/tls
+          docker exec -u 0 "$MSSQL" chmod 400 /var/opt/mssql/tls/server.key
+          docker exec -u 0 "$MSSQL" chmod 444 /var/opt/mssql/tls/server.pem
+          docker exec -u 0 "$MSSQL" chmod 644 /var/opt/mssql/mssql.conf
+          docker restart "$MSSQL"
+          sudo cp "$dir/server.pem" /usr/local/share/ca-certificates/mefor-ci-mssql.crt
+          sudo update-ca-certificates
+          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+          for i in $(seq 1 60); do
+            if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server is up again"; exit 0
+            fi
+            echo "waiting for SQL Server after the restart ($i)"; sleep 2
+          done
+          docker logs --tail 80 "$MSSQL" 2>&1
+          echo "::error::SQL Server did not come back within 120 s of the restart that loads the generated certificate"
+          exit 1
+
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
@@ -3601,6 +3732,55 @@ jobs:
 
       - name: Install project (dev + sqlserver extras)
         run: uv pip install --system --constraint constraints.lock -e ".[dev,sqlserver]"
+
+      # The engine's driver logins, so a leg whose server cannot be verified reds HERE with a clear
+      # message, not as a store suite failure. The store's login follows the leg's `store_tls`: on
+      # `pin`, Encrypt=strict pinning the certificate with ServerCertificate (TDS 8.0); on
+      # `trust-store`, Encrypt=yes with TrustServerCertificate=no, verified against the runner's
+      # trust store and the host name. The DATABASE connector's is that Encrypt=yes login on both. It
+      # checks the driver's TLS only. The engine's own pin checks (check_pinned_certificate: the
+      # anchor file's permissions, its single-certificate parse, its validity window) run at store
+      # open, so a pin they refuse still reds the suites. The engine never sends
+      # TrustServerCertificate=yes to this server.
+      - name: Check the engine's verified logins to SQL Server
+        timeout-minutes: 3
+        env:
+          STORE_TLS: ${{ matrix.store_tls }}
+        run: |
+          python - "$RUNNER_TEMP/mssql-tls/server.pem" "$STORE_TLS" <<'PY'
+          import sys
+
+          import pyodbc
+
+          base = (
+              "DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1433;DATABASE=master;"
+              "UID=sa;PWD={Str0ng_P@ssw0rd!};"
+          )
+          verified = base + "Encrypt=yes;TrustServerCertificate=no;"
+          if sys.argv[2] == "pin":
+              store = (
+                  "store, Encrypt=strict with the pinned certificate",
+                  base + "Encrypt=strict;ServerCertificate={" + sys.argv[1] + "};",
+              )
+          elif sys.argv[2] == "trust-store":
+              store = ("store, Encrypt=yes verified by the trust store", verified)
+          else:
+              sys.exit(f"::error::unknown matrix.store_tls {sys.argv[2]!r}; expected pin or trust-store")
+          logins = {
+              store[0]: store[1],
+              "DATABASE connector, Encrypt=yes verified by the trust store": verified,
+          }
+          failed = False
+          for name, dsn in logins.items():
+              try:
+                  pyodbc.connect(dsn, timeout=10).close()
+                  print(f"CONNECTED: {name}")
+              except pyodbc.Error as exc:
+                  failed = True
+                  reason = exc.args[-1] if exc.args else type(exc).__name__
+                  print(f"::error::REFUSED: {name}: {reason}")
+          sys.exit(1 if failed else 0)
+          PY
 
       - name: Run the SQL Server store suite (against the real DB)
         env:
@@ -3613,11 +3793,11 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-          # The service container uses a self-signed cert, so trust_server_certificate=true is
-          # required to connect. The store's TLS-hardening guard refuses that MITM-able combination
-          # unless this escape is set — exactly the trusted-network dev/test case it exists for.
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          # The certificate the service container serves, pinned (Encrypt=strict) on a `store_tls: pin`
+          # leg; empty on a `trust-store` leg, which sends no pin and verifies it through the runner's
+          # trust store (Encrypt=yes). Why per leg is at the matrix; why there is no weakened-TLS
+          # alternative is at the step that makes the certificate. Every step below sets it the same way.
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
           # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
           PYTHONFAULTHANDLER: "1"
         # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it never retries a test failure. A native crash of our own can still be retried away (BACKLOG #2049). See scripts/ci/retry-native-crash.sh.
@@ -3636,13 +3816,9 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-          # Same trusted-network TLS escape as the store suite (self-signed container cert): ODBC Driver
-          # 18 defaults to Encrypt=yes + verify, so trust_server_certificate=true is required to connect,
-          # and the store's TLS-hardening guard needs MEFOR_ALLOW_INSECURE_TLS to permit it. Exercises the
-          # SqlServerCoordinator leader-lease (MERGE WITH(HOLDLOCK) acquire/renew/take-over, self-fence,
-          # membership) against the real T-SQL the faked-driver tests can't.
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
+          # Exercises the SqlServerCoordinator leader-lease (MERGE WITH(HOLDLOCK) acquire/renew/
+          # take-over, self-fence, membership) against the real T-SQL the faked-driver tests can't.
           # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
           PYTHONFAULTHANDLER: "1"
         # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it never retries a test failure. A native crash of our own can still be retried away (BACKLOG #2049). See scripts/ci/retry-native-crash.sh.
@@ -3661,10 +3837,9 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-          # Same trusted-network TLS escape (self-signed container cert). Drives two coordinators sharing
-          # the store through real DB-clock lease expiry + the full start()/stop() election + failover.
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
+          # Drives two coordinators sharing the store through real DB-clock lease expiry + the full
+          # start()/stop() election + failover.
           # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
           PYTHONFAULTHANDLER: "1"
         # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it never retries a test failure. A native crash of our own can still be retried away (BACKLOG #2049). See scripts/ci/retry-native-crash.sh.
@@ -3680,10 +3855,10 @@ jobs:
           MEFOR_STORE_DATABASE: MessageFoundry
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          # The connector suite reuses the same MEFOR_STORE_* connection env + the trusted-network TLS
-          # escape (self-signed container cert), exactly like the store suite above. This is the live
-          # aioodbc/ODBC round-trip backing the connector's "production" status (PR D).
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          # The connector suite reuses the same MEFOR_STORE_* connection env. The connector has no
+          # pin, so it verifies the container's certificate against the runner's trust store, which
+          # holds it. This is the live aioodbc/ODBC round-trip backing the connector's "production"
+          # status (PR D).
           # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
           PYTHONFAULTHANDLER: "1"
         # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it never retries a test failure. A native crash of our own can still be retried away (BACKLOG #2049). See scripts/ci/retry-native-crash.sh.
@@ -3702,15 +3877,15 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
           # Gate #3 capstone + the FIRST LIVE PROOF of the SQL Server on-promotion recovery under a real
           # crash: two `serve` nodes share this container, the harness SIGKILLs the primary mid-load and
           # hard-asserts the host-independent CONFORMANCE invariants (zero acknowledged loss, per-lane FIFO,
           # no split-brain, bounded duplicates, a recovered + drained pipeline). Recovery *time* is reported,
           # not hard-gated (host-variable — see docs/LOAD-TESTING.md). This run guards the #285 claim-FIFO
           # fix. The orchestrator spawns the nodes with the cluster env, provisions their rig
-          # Administrator and signs in (harness/load/rigadmin.py); they inherit MEFOR_STORE_*.
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          # Administrator and signs in (harness/load/rigadmin.py); they inherit MEFOR_STORE_*,
+          # the pin included on a `store_tls: pin` leg.
           # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
           PYTHONFAULTHANDLER: "1"
         # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it never retries a test failure. A native crash of our own can still be retried away (BACKLOG #2049). See scripts/ci/retry-native-crash.sh.
@@ -3729,8 +3904,7 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
           # If every retry below still crashes, dump the native (C-level) frame so the upstream
           # pyodbc bug can be diagnosed from the log. faulthandler only DUMPS — it never kills.
           PYTHONFAULTHANDLER: "1"
@@ -3789,8 +3963,7 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
           PYTHONFAULTHANDLER: "1"
         # SQL Server has declared supports_response_capture + supports_pt_reingress True since ADR 0013
         # landed, and the store suite above proves the T-SQL — but the CONNECTOR->RUNNER half of the RTE
@@ -3813,8 +3986,7 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
           PYTHONFAULTHANDLER: "1"
         # Every file here is MEFOR_TEST_SQLSERVER-gated at MODULE level, so before this step they were
         # collected nowhere and reported nothing — not a pass, not a skip, on any trigger. That covered
@@ -3846,8 +4018,7 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
           PYTHONFAULTHANDLER: "1"
         # ADR 0048/0049 disaster recovery, SQL Server side: the seed gate that must REFUSE to activate a
         # standby onto a non-empty store, the .mfbak backup runner against a real server DB, and the DR7
@@ -3872,8 +4043,7 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
           PYTHONFAULTHANDLER: "1"
         # BACKLOG #1008 (ASVS 13.2.2). The preflight's POLICY is backend-free and runs on every leg;
         # its SQL is not, and `IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` / `HAS_PERMS_BY_NAME` execute
@@ -4150,6 +4320,78 @@ jobs:
       - name: Install project (dev + postgres extras)
         run: uv pip install --system --constraint constraints.lock -e ".[dev,postgres]"
 
+      # THE ENGINE NEVER WEAKENS TLS TO THIS SERVER (owner ruling 2026-11-14, vault BACKLOG #3533
+      # item 2): a store login over encrypt=false or trust_server_certificate=true is refused,
+      # whatever MEFOR_ALLOW_INSECURE_TLS or [security].enforcement says. So the service container
+      # serves a certificate generated here, and the runner's trust store holds it: the store
+      # verifies it, host name included, as it verifies any server with no [store].ssl_root_cert.
+      # No pin, so the env of every step below stays the same as postgres-store-windows's
+      # (tests/test_ci_postgres_windows_leg.py). Postgres reloads its ssl settings without a restart.
+      - name: Serve TLS from the Postgres container with a generated certificate
+        timeout-minutes: 5
+        env:
+          PG: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/pg-tls"
+          bash scripts/ci/db-tls-cert.sh "$dir"
+          docker cp "$dir/server.pem" "$PG:/var/lib/postgresql/server.pem"
+          docker cp "$dir/server.key" "$PG:/var/lib/postgresql/server.key"
+          docker exec -u 0 "$PG" chown postgres:postgres /var/lib/postgresql/server.pem /var/lib/postgresql/server.key
+          docker exec -u 0 "$PG" chmod 600 /var/lib/postgresql/server.key
+          docker exec "$PG" psql -U postgres -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.pem'" \
+            -c "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key'" \
+            -c "ALTER SYSTEM SET ssl = on" \
+            -c "SELECT pg_reload_conf()"
+          sudo cp "$dir/server.pem" /usr/local/share/ca-certificates/mefor-ci-postgres.crt
+          sudo update-ca-certificates
+          # Ready means the runner's own OpenSSL verifies the chain AND the host name.
+          out=""
+          for i in $(seq 1 15); do
+            if out="$(timeout 10 openssl s_client -starttls postgres -connect localhost:5432 \
+              -servername localhost -verify_return_error -verify_hostname localhost </dev/null 2>&1)"; then
+              grep -m1 "Verify return code" <<<"$out"
+              exit 0
+            fi
+            echo "waiting for Postgres to serve the generated certificate ($i)"; sleep 2
+          done
+          echo "$out"
+          docker logs --tail 80 "$PG" 2>&1
+          echo "::error::Postgres did not serve a certificate the runner verifies within 30 s of the reload"
+          exit 1
+
+      # The store's own verifying login, so a leg that cannot verify reds HERE with a clear message.
+      - name: Check the store's verified login to Postgres
+        timeout-minutes: 3
+        run: |
+          python - <<'PY'
+          import asyncio
+          import ssl
+          import sys
+
+          import asyncpg
+
+
+          async def main() -> None:
+              ctx = ssl.create_default_context()
+              conn = await asyncpg.connect(
+                  host="localhost", port=5432, user="postgres", password="mefor",
+                  database="messagefoundry", ssl=ctx, timeout=10,
+              )
+              try:
+                  print("CONNECTED, ssl in use:", await conn.fetchval("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()"))
+              finally:
+                  await conn.close()
+
+
+          try:
+              asyncio.run(main())
+          except (OSError, ssl.SSLError, asyncpg.PostgresError) as exc:
+              print(f"::error::the store's verified login to Postgres was refused: {type(exc).__name__}: {exc}")
+              sys.exit(1)
+          PY
+
       - name: Run the Postgres store suite (against the real DB)
         env:
           MEFOR_TEST_POSTGRES: "1"
@@ -4160,11 +4402,8 @@ jobs:
           MEFOR_STORE_DATABASE: messagefoundry
           MEFOR_STORE_USERNAME: postgres
           MEFOR_STORE_PASSWORD: mefor
-          # The service container speaks plaintext (no TLS), so encrypt=false; the store's
-          # TLS-hardening guard refuses that MITM-able combination unless this trusted-network
-          # dev/test escape is set.
-          MEFOR_STORE_ENCRYPT: "false"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          # Verified TLS: the container serves a certificate the runner's trust store holds (the
+          # step that makes it says why there is no weakened-TLS alternative).
         run: pytest tests/test_postgres_store.py tests/test_adr0157_postgres_fence.py -v
 
       - name: Run the failover-LOAD test (two nodes, SIGKILL the primary mid-load, against the real DB)
@@ -4182,9 +4421,7 @@ jobs:
           # per-lane FIFO, no split-brain, bounded duplicates, a recovered + drained pipeline). Recovery
           # time is reported, not hard-gated. The orchestrator spawns the nodes with the cluster env
           # itself, provisions their rig Administrator and signs in (harness/load/rigadmin.py); they
-          # inherit MEFOR_STORE_* (incl. the plaintext-TLS escape) from here.
-          MEFOR_STORE_ENCRYPT: "false"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
+          # inherit MEFOR_STORE_* from here, and verify the server as the store suite does.
         run: pytest tests/test_load_failover_postgres.py -v
 
       - name: Run the throughput-lever backend invariants on real Postgres (B1 inline, B2 batch-claim, ...)
@@ -4197,8 +4434,6 @@ jobs:
           MEFOR_STORE_DATABASE: messagefoundry
           MEFOR_STORE_USERNAME: postgres
           MEFOR_STORE_PASSWORD: mefor
-          MEFOR_STORE_ENCRYPT: "false"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
         # The throughput levers' MEFOR_TEST_POSTGRES-gated invariants (esp. the FOR-UPDATE no-SKIP-LOCKED
         # locked-head-BLOCKS twin of #285, and the batch FIFO/crash tests) live in their own files. APPEND
         # each new lever's test file per docs/archive/throughput/throughput-build-plan.md.
@@ -4229,8 +4464,6 @@ jobs:
           MEFOR_STORE_DATABASE: messagefoundry
           MEFOR_STORE_USERNAME: postgres
           MEFOR_STORE_PASSWORD: mefor
-          MEFOR_STORE_ENCRYPT: "false"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
           # FORCE a below-default pool (4 connections) so the perf_counter-measured acquire-WAIT
           # histogram (the PRIMARY pool-wait signal) is non-trivial even at small N: ~3N inbound workers
           # contend for 4 connections, so acquires actually queue and the percentiles populate. The
@@ -4253,8 +4486,6 @@ jobs:
           MEFOR_STORE_DATABASE: messagefoundry
           MEFOR_STORE_USERNAME: postgres
           MEFOR_STORE_PASSWORD: mefor
-          MEFOR_STORE_ENCRYPT: "false"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
         # The Postgres twin of the sqlserver-store leg's RTE step (same backend-parametrized case, the
         # `postgres` param). Postgres declares the same two capability flags True, so the same
         # connector->runner gap existed here.
@@ -4270,8 +4501,6 @@ jobs:
           MEFOR_STORE_DATABASE: messagefoundry
           MEFOR_STORE_USERNAME: postgres
           MEFOR_STORE_PASSWORD: mefor
-          MEFOR_STORE_ENCRYPT: "false"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
         # These are MEFOR_TEST_POSTGRES-gated at MODULE level, so until this step existed they were
         # collected nowhere and reported nothing — not a pass, not a skip. The SQL Server failover twin
         # (test_cluster_failover_sqlserver.py) has run for some time; its Postgres counterpart never had.
@@ -4293,8 +4522,6 @@ jobs:
           MEFOR_STORE_DATABASE: messagefoundry
           MEFOR_STORE_USERNAME: postgres
           MEFOR_STORE_PASSWORD: mefor
-          MEFOR_STORE_ENCRYPT: "false"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
         # ADR 0048/0049 disaster recovery: the seed gate that must REFUSE to activate a standby onto a
         # non-empty store, the .mfbak backup runner against a real server DB, and the DR7 config-only
         # backup + DbaDelegatedError path. All three are module-gated and were never executed against
@@ -4315,8 +4542,6 @@ jobs:
           MEFOR_STORE_DATABASE: messagefoundry
           MEFOR_STORE_USERNAME: postgres
           MEFOR_STORE_PASSWORD: mefor
-          MEFOR_STORE_ENCRYPT: "false"
-          MEFOR_ALLOW_INSECURE_TLS: "1"
         # BACKLOG #1008 (ASVS 13.2.2), the Postgres twin of the SQL Server step — see its comment for
         # why this file needs naming here even though tests/test_serverdb_ci_coverage.py does not flag
         # it. `pg_has_role` / `rolsuper` / `has_database_privilege` execute against a real server or
@@ -4375,13 +4600,16 @@ jobs:
       MEFOR_STORE_DATABASE: messagefoundry
       MEFOR_STORE_USERNAME: postgres
       MEFOR_STORE_PASSWORD: mefor
-      # The preinstalled server is reached over loopback without TLS, as the ubuntu container is, so
-      # the same trusted-network dev/test escape applies.
-      MEFOR_STORE_ENCRYPT: "false"
-      MEFOR_ALLOW_INSECURE_TLS: "1"
+      # Verified TLS, as on the ubuntu job: the preinstalled server serves a certificate generated
+      # below, which the machine's Root store holds. Why there is no weakened-TLS alternative is at
+      # the ubuntu job's step that makes its certificate.
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Generate the PostgreSQL server certificate
+        timeout-minutes: 2
+        run: bash scripts/ci/db-tls-cert.sh "$RUNNER_TEMP/pg-tls"
 
       - name: Start the preinstalled PostgreSQL and create the database
         shell: pwsh
@@ -4406,6 +4634,24 @@ jobs:
             -c "CREATE DATABASE $env:MEFOR_STORE_DATABASE" `
             -c "ALTER ROLE $env:MEFOR_STORE_USERNAME PASSWORD '$env:MEFOR_STORE_PASSWORD'"
           if ($LASTEXITCODE -ne 0) { throw "psql exited $LASTEXITCODE" }
+          # Serve the generated certificate. Paths relative to the data directory, whose ACL the
+          # copies inherit, so the service account can read them. Postgres reloads ssl settings.
+          $env:PGPASSWORD = $env:MEFOR_STORE_PASSWORD
+          $tls = Join-Path $env:RUNNER_TEMP 'pg-tls'
+          $data = (& "$env:PGBIN\psql.exe" -h localhost -p $port -U $env:MEFOR_STORE_USERNAME -d postgres -tA -c "SHOW data_directory" | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $data)) { throw "could not read the data directory: '$data'" }
+          Copy-Item -LiteralPath (Join-Path $tls 'server.pem') -Destination (Join-Path $data 'server.pem')
+          Copy-Item -LiteralPath (Join-Path $tls 'server.key') -Destination (Join-Path $data 'server.key')
+          & "$env:PGBIN\psql.exe" -h localhost -p $port -U $env:MEFOR_STORE_USERNAME -d postgres `
+            -v ON_ERROR_STOP=1 `
+            -c "ALTER SYSTEM SET ssl_cert_file = 'server.pem'" `
+            -c "ALTER SYSTEM SET ssl_key_file = 'server.key'" `
+            -c "ALTER SYSTEM SET ssl = on" `
+            -c "SELECT pg_reload_conf()"
+          if ($LASTEXITCODE -ne 0) { throw "psql exited $LASTEXITCODE" }
+          # The machine's Root store, which Python's default context reads on Windows.
+          certutil -addstore -f Root (Join-Path $tls 'server.pem')
+          if ($LASTEXITCODE -ne 0) { throw "certutil exited $LASTEXITCODE" }
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -4421,6 +4667,44 @@ jobs:
 
       - name: Install project (dev + postgres extras)
         run: uv pip install --system --constraint constraints.lock -e ".[dev,postgres]"
+
+      # The store's own verifying login, as on the ubuntu job, so a leg that cannot verify reds HERE.
+      # The reload is asynchronous, so the check retries for a short while.
+      - name: Check the store's verified login to Postgres
+        timeout-minutes: 3
+        run: |
+          python - <<'PY'
+          import asyncio
+          import ssl
+          import sys
+          import time
+
+          import asyncpg
+
+
+          async def main() -> None:
+              ctx = ssl.create_default_context()
+              conn = await asyncpg.connect(
+                  host="localhost", port=5432, user="postgres", password="mefor",
+                  database="messagefoundry", ssl=ctx, timeout=10,
+              )
+              try:
+                  print("CONNECTED, ssl in use:", await conn.fetchval("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()"))
+              finally:
+                  await conn.close()
+
+
+          last: BaseException | None = None
+          for _ in range(15):
+              try:
+                  asyncio.run(main())
+                  sys.exit(0)
+              except (OSError, ssl.SSLError, asyncpg.PostgresError) as exc:
+                  last = exc
+                  time.sleep(2)
+          print(f"::error::the store's verified login to Postgres was refused: {type(last).__name__}: {last}")
+          sys.exit(1)
+          PY
 
       - name: Run the Postgres store suite (against the real DB)
         run: pytest --timeout=120 tests/test_postgres_store.py tests/test_adr0157_postgres_fence.py -v
@@ -4670,13 +4954,13 @@ jobs:
     runs-on: ubuntu-24.04
     # Smoke the end-to-end SQL Server store path on every supported major (2022/2025). Push/dispatch-only,
     # so no PR cost; fail-fast: false keeps the two legs independent. Digest-pinned; why, and how to
-    # move a digest, is at the sqlserver-store matrix above.
+    # move a digest, is at the sqlserver-store matrix above. `store_tls` is as there, which says why.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { image: "mcr.microsoft.com/mssql/server:2022-latest@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090", label: "2022" }
-          - { image: "mcr.microsoft.com/mssql/server:2025-latest@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726", label: "2025" }
+          - { image: "mcr.microsoft.com/mssql/server:2022-latest@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090", label: "2022", store_tls: "trust-store" }
+          - { image: "mcr.microsoft.com/mssql/server:2025-latest@sha256:2b5b581621126574f3d1f75e78d3eebe8d05aedb59ad0cfdf9aa42cb0634d726", label: "2025", store_tls: "pin" }
     services:
       mssql:
         image: ${{ matrix.image }}
@@ -4746,6 +5030,56 @@ jobs:
           "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
 
+      # The same generated certificate as sqlserver-store's step of the same name, which says why. A
+      # `store_tls: trust-store` leg also adds it to the runner's trust store, which is how its store
+      # verifies it; a `pin` leg leaves the trust store alone, so its store login rests on the pin.
+      - name: Serve TLS from the SQL Server container with a generated certificate
+        timeout-minutes: 5
+        env:
+          MSSQL: ${{ job.services.mssql.id }}
+          STORE_TLS: ${{ matrix.store_tls }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mssql-tls"
+          bash scripts/ci/db-tls-cert.sh "$dir"
+          if docker exec "$MSSQL" test -e /var/opt/mssql/mssql.conf; then
+            docker exec "$MSSQL" cat /var/opt/mssql/mssql.conf
+            echo "::error::the SQL Server image now ships an mssql.conf; merge the [network] TLS lines into it rather than replace it"
+            exit 1
+          fi
+          printf '%s\n' '[network]' \
+            'tlscert = /var/opt/mssql/tls/server.pem' 'tlskey = /var/opt/mssql/tls/server.key' \
+            > "$dir/mssql.conf"
+          docker exec -u 0 "$MSSQL" mkdir -p /var/opt/mssql/tls
+          docker cp "$dir/server.pem" "$MSSQL:/var/opt/mssql/tls/server.pem"
+          docker cp "$dir/server.key" "$MSSQL:/var/opt/mssql/tls/server.key"
+          docker cp "$dir/mssql.conf" "$MSSQL:/var/opt/mssql/mssql.conf"
+          uid="$(docker exec "$MSSQL" id -u)"
+          echo "the image runs as uid ${uid}"
+          docker exec -u 0 "$MSSQL" chown -R "${uid}:0" /var/opt/mssql/tls /var/opt/mssql/mssql.conf
+          docker exec -u 0 "$MSSQL" chmod 500 /var/opt/mssql/tls
+          docker exec -u 0 "$MSSQL" chmod 400 /var/opt/mssql/tls/server.key
+          docker exec -u 0 "$MSSQL" chmod 444 /var/opt/mssql/tls/server.pem
+          docker exec -u 0 "$MSSQL" chmod 644 /var/opt/mssql/mssql.conf
+          docker restart "$MSSQL"
+          case "$STORE_TLS" in
+            trust-store)
+              sudo cp "$dir/server.pem" /usr/local/share/ca-certificates/mefor-ci-mssql.crt
+              sudo update-ca-certificates ;;
+            pin) ;;
+            *) echo "::error::unknown matrix.store_tls '$STORE_TLS'; expected pin or trust-store"; exit 1 ;;
+          esac
+          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+          for i in $(seq 1 60); do
+            if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server is up again"; exit 0
+            fi
+            echo "waiting for SQL Server after the restart ($i)"; sleep 2
+          done
+          docker logs --tail 80 "$MSSQL" 2>&1
+          echo "::error::SQL Server did not come back within 120 s of the restart that loads the generated certificate"
+          exit 1
+
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
@@ -4777,35 +5111,25 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-          MEFOR_ALLOW_INSECURE_TLS: "1"  # trusted-network escape for the container's self-signed cert
+          # The certificate the service container serves, pinned (Encrypt=strict) on a `store_tls: pin`
+          # leg; empty on a `trust-store` leg, which verifies it through the runner's trust store
+          # (Encrypt=yes). Nothing permits a weakened store hop any more (owner ruling 2026-11-14,
+          # vault BACKLOG #3533 item 2).
+          MEFOR_STORE_SSL_ROOT_CERT: ${{ matrix.store_tls == 'pin' && format('{0}/mssql-tls/server.pem', runner.temp) || '' }}
           # THE DATA-CLASS DECLARATION THIS LEG USED TO CARRY IS GONE (BACKLOG #1279). Every instance
-          # carries patient data now, so `handles_real_patient_data = false` no longer exists and this
-          # leg names the ONE gate it actually needs relaxed instead.
+          # carries patient data now, so `handles_real_patient_data = false` no longer exists.
           #
-          # THE GATE, and why it is the enforcement dial and not something narrower. This job was RED
-          # for four consecutive nights (2026-07-27..30) on:
-          #     ValueError: SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false)
-          # `weakened_tls_escape_permitted` clamps `MEFOR_ALLOW_INSECURE_TLS` INERT while the instance
-          # is enforcing (#200 / ADR 0092 decision 2), so the escape above does nothing under the
-          # shipped `enforce`. The clamp used to require enforcing AND PHI, and declaring the box
-          # synthetic was how this leg escaped it; with every instance PHI the only key left is the
-          # enforcement dial. `warn` honors the escape and keeps every gate reporting.
+          # WHY `warn`. It was set because this job was RED for four consecutive nights (2026-07-27..30)
+          # on a weakened-TLS refusal: the leg trusted the container's self-signed certificate, and
+          # the MEFOR_ALLOW_INSECURE_TLS escape was honoured only at `warn`. The store hop is now
+          # verified, by the pin or the trust store, and the escape no longer reaches it, so TLS is
+          # not why this leg is at `warn`. It
+          # stays there because the notification gate an enforcing leg must satisfy only warns at
+          # `warn`, and this leg configures no [alerts] channel (the sign-in comment above). Moving it
+          # to `enforce` means configuring one; that is not part of this change. `warn` downgrades
+          # gates to warnings and silences none.
           #
-          # It is what makes the leg run at all, and the reason a narrower fix does not exist here: the
-          # container's certificate is self-signed and GitHub starts a `services:` container before any
-          # step runs, so a cert generated in a step cannot be mounted into it. There is no per-hop
-          # attestation for the store hop to carry instead.
-          #
-          # WHAT THIS GIVES UP, stated plainly: the leg no longer exercises the enforcing path. Its
-          # actual job is a load/throughput smoke of the SQL Server store, and `sqlserver-store` carries
-          # the functional coverage. Restoring `enforce` here needs a REAL certificate — the job moved
-          # off `services:` onto a `docker run` with a generated cert mounted and trusted — which is
-          # worth doing deliberately, not as a side effect of unbreaking a nightly. Note this is now a
-          # NARROWER relaxation than the one it replaces: the retired declaration silenced nineteen
-          # gates, `enforcement: warn` downgrades them to warnings and silences none.
-          #
-          # The provisions below are now REQUIRED rather than courtesy: under the PHI posture a keyless
+          # The provisions below are REQUIRED rather than courtesy: under the PHI posture a keyless
           # start, an unbounded retention window and an unlisted egress each have their own gate.
           MEFOR_SECURITY_ENFORCEMENT: "warn"
           # Bounded PHI-body retention windows + a locked-down egress allowlisting the loopback sink.
@@ -4830,12 +5154,12 @@ jobs:
           # on BOTH sqlserver legs as well: this step passes no --db, so [store].path keeps its default
           # relative "messagefoundry.db" and is anchored under the project root the same way.
           #
-          # MEFOR_ALLOW_INSECURE_TLS ABOVE IS NOT THE FIX AND WAS NOT MISCONFIGURED. It is the ENGINE's
-          # escape for a hop the engine DIALS -- here the engine-to-mssql hop, paired with
-          # MEFOR_STORE_TRUST_SERVER_CERTIFICATE. Nothing in messagefoundry/api/ or
-          # messagefoundry/apiclient/ reads it, so it has no reach over this hop, which runs the other
-          # way: a CI-side client reaching the engine's API listener. Do not widen it to cover this --
-          # that would turn a scoped outbound escape into a listener-verification off switch.
+          # MEFOR_ALLOW_INSECURE_TLS IS NOT THE FIX FOR THIS HOP. It is the ENGINE's escape for some
+          # hops the engine DIALS, and it no longer reaches the engine-to-mssql hop at all. Nothing in
+          # messagefoundry/api/ or messagefoundry/apiclient/ reads it, so it has no reach over this
+          # hop, which runs the other way: a CI-side client reaching the engine's API listener. Do not
+          # widen it to cover this -- that would turn a scoped outbound escape into a
+          # listener-verification off switch.
           cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
           key="$GITHUB_WORKSPACE/api-generated-key.pem"
           # One anchor for the readiness curl AND the harness poller; see the sqlite leg for why these
@@ -5224,14 +5548,40 @@ jobs:
           Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY
           if ($provisioned -ne 0) { throw "could not provision the rig Administrator (exit $provisioned)" }
           if ($protected -ne 0 -or -not (Test-Path $storeKeyFile)) { throw "protect-key could not write the store key file (exit $protected)" }
+          # Vault BACKLOG #8212 item 7: the service refuses any MEFOR_VALUE_* variable in its NSSM
+          # environment, so the registry endpoint's values (placeholders, never used, see below)
+          # reach it as files in the secrets directory install-service.ps1 made and named to the
+          # service as MEFOR_SECRETS_DIRECTORY. The path is read back from the service's list here,
+          # because `nssm set` below replaces that list and must name it again. WriteAllText creates
+          # each file, so it takes the directory's restricted access list; a moved file would keep
+          # its old one. Then the engine's own check runs on the directory, prints names only, and
+          # fails unless it read exactly the names written.
+          $parametersKey = "HKLM:\SYSTEM\CurrentControlSet\Services\MessageFoundry\Parameters"
+          $secretsEntry = @((Get-ItemProperty -LiteralPath $parametersKey -Name AppEnvironmentExtra).AppEnvironmentExtra |
+            Where-Object { $_ -like "MEFOR_SECRETS_DIRECTORY=*" })
+          if ($secretsEntry.Count -ne 1) { throw "the installer named $($secretsEntry.Count) secrets directories to the service, not one" }
+          $secretsDir = $secretsEntry[0].Substring("MEFOR_SECRETS_DIRECTORY=".Length)
+          if (-not (Test-Path -LiteralPath $secretsDir -PathType Container)) { throw "the secrets directory '$secretsDir' the installer named is not there" }
+          $registryValues = [ordered]@{
+            "MEFOR_VALUE_REGISTRY_CLIENT_CERT" = $cert
+            "MEFOR_VALUE_REGISTRY_CLIENT_KEY" = $key
+            "MEFOR_VALUE_REGISTRY_KEY_PASSWORD" = "smoke-key-pass"
+            "MEFOR_VALUE_REGISTRY_USER" = "smoke-user"
+            "MEFOR_VALUE_REGISTRY_PASSWORD" = "smoke-pass"
+          }
+          foreach ($name in $registryValues.Keys) {
+            [System.IO.File]::WriteAllText((Join-Path $secretsDir $name), $registryValues[$name])
+          }
+          python -c "import sys; from messagefoundry.engine_secrets import open_secrets_directory as o; d = o({'MEFOR_SECRETS_DIRECTORY': sys.argv[1]}); got = sorted(d.read_values()) if d else []; print(got); sys.exit(0 if got == sorted(sys.argv[2:]) else 3)" $secretsDir @($registryValues.Keys)
+          if ($LASTEXITCODE -ne 0) { throw "the engine refuses the secrets directory '$secretsDir', or did not read the registry values from it (exit $LASTEXITCODE)" }
           # The service's own environment. With sign-in on it carries two things for the rig account:
           # require_mfa off (provision-admin enrols an authenticator app at a terminal and offers no
           # other way, so the account has none; the bind is loopback), and an [alerts] channel (an
           # enforcing start refuses without a way to send account-security notices; the gate reads
-          # configuration only, and nothing listens there). It also supplies the registry endpoint's
-          # secrets (cert/key/password + WS-Security creds) so the SOAP feed wires — placeholders, never used
-          # since no VXU is sent; the non-secret endpoints live in environments/prod.toml (selected by
-          # the -Environment prod passed to install-service.ps1 above).
+          # configuration only, and nothing listens there). It names the secrets directory above, which
+          # supplies the registry endpoint's secrets (cert/key/password + WS-Security creds) so the SOAP
+          # feed wires — placeholders, never used since no VXU is sent; the non-secret endpoints live in
+          # environments/prod.toml (selected by the -Environment prod passed to install-service.ps1 above).
           # `prod` also FAIL-CLOSES on unrestricted egress (a transform could send PHI anywhere): lock it
           # down (deny_by_default) AND allowlist the samples/config graph's 8 outbound destinations, or the
           # engine refuses to start at wiring. [egress] is SERVICE settings (MEFOR_EGRESS_*), NOT an
@@ -5270,11 +5620,7 @@ jobs:
             "MEFOR_EGRESS_ALLOWED_TCP=payer-prod.example.org:6662,rte-prod.example.org:6663,rte-result-prod.example.org:6664" `
             "MEFOR_EGRESS_ALLOWED_HTTP=iis-prod.example.org:8443,fhir-prod.example.org" `
             "MEFOR_EGRESS_ALLOWED_FILE_DIRS=out" `
-            "MEFOR_VALUE_REGISTRY_CLIENT_CERT=$cert" `
-            "MEFOR_VALUE_REGISTRY_CLIENT_KEY=$key" `
-            "MEFOR_VALUE_REGISTRY_KEY_PASSWORD=smoke-key-pass" `
-            "MEFOR_VALUE_REGISTRY_USER=smoke-user" `
-            "MEFOR_VALUE_REGISTRY_PASSWORD=smoke-pass"
+            "MEFOR_SECRETS_DIRECTORY=$secretsDir"
 
       # BACKLOG #2504: cache the copy the installer checked. !cancelled(), so a failure later in the
       # install step (the cert, the key, the service settings) does not stop it being saved; the

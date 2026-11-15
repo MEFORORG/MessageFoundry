@@ -468,9 +468,9 @@ replication to the DR site fast.
 ### 4.6 Listener TLS certificate
 
 The engine connects with `Encrypt=yes` and **verifies** the server certificate. Setting
-`[store].trust_server_certificate = true` or `encrypt = false` is **refused at startup**, unless
-the break-glass `MEFOR_ALLOW_INSECURE_TLS` is set (never in production, because of PHI). This has
-three consequences for the AG:
+`[store].trust_server_certificate = true` or `encrypt = false` is **refused at startup**, at every
+posture; `MEFOR_ALLOW_INSECURE_TLS` does not lift it (owner ruling 2026-11-14, vault BACKLOG #3533
+item 2). This has three consequences for the AG:
 
 - ODBC Driver 18 validates against the **Windows machine trust store** (`LocalMachine\Root`), and
   there is no CA-file keyword. Import the DB CA on **every engine VM in both DCs**

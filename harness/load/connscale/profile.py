@@ -506,19 +506,33 @@ def _validate_sandbox(profile: ConnScaleProfile, where: str) -> None:
             f"{where}: fuse_modes includes true with sandbox_modes naming {SANDBOX_SUBPROCESS!r}; "
             f"the engine disables fusion under the subprocess sandbox, so that arm would not be fused"
         )
-    # These checks group records by (sweep_mode, claim_mode), so with two sandbox arms they would
-    # pair an off reading with a subprocess one and grade neither arm on its own.
+    # The two empty-claims checks group records by (sweep_mode, claim_mode), so with two sandbox arms
+    # they would grade one arm's base reading and never the other's. `fd_monotonic` keeps each arm in
+    # its own lane since BACKLOG #5570, but it skips an unmeasured reading, and the only bound that it
+    # compared anything at all is the CI smoke's, over any lane: an arm whose FD probe never measured
+    # would pass unseen beside one that did.
     if len(profile.sandbox_modes) > 1:
-        for key, armed in (
-            ("fd_monotonic", profile.slo.fd_monotonic),
-            ("empty_claims_base_reading", profile.slo.empty_claims_base_reading),
-            ("empty_claims_herd_floor_legs", bool(profile.slo.empty_claims_herd_floor_legs)),
+        mixes = (
+            "groups records by sweep mode and claim mode only, so it would mix the two sandbox arms"
+        )
+        for key, armed, why in (
+            (
+                "fd_monotonic",
+                profile.slo.fd_monotonic,
+                "has no per-arm bound that it compared each sandbox arm at least once, so an arm "
+                "whose FD probe never measured would pass unseen",
+            ),
+            ("empty_claims_base_reading", profile.slo.empty_claims_base_reading, mixes),
+            (
+                "empty_claims_herd_floor_legs",
+                bool(profile.slo.empty_claims_herd_floor_legs),
+                mixes,
+            ),
         ):
             if armed:
                 raise ConnScaleProfileError(
-                    f"{where}: slo.{key} groups records by sweep mode and claim mode only, so with "
-                    f"sandbox_modes={list(profile.sandbox_modes)} it would mix the two sandbox arms; "
-                    f"unset {key} for a sandbox A/B"
+                    f"{where}: slo.{key} {why}, with "
+                    f"sandbox_modes={list(profile.sandbox_modes)}; unset {key} for a sandbox A/B"
                 )
 
 

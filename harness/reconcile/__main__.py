@@ -12,7 +12,8 @@ Two subcommands:
 
 * ``compare`` — offline: pair MEFOR's capture against Corepoint's export for one connection (by a
   configurable match key) and diff each pair, normalizing engine-non-deterministic fields. Exits non-zero
-  if anything differs, so it can gate a per-connection sign-off.
+  if anything differs, if nothing was compared, or if a key repeats, so it can gate a per-connection
+  sign-off.
 
       python -m harness.reconcile compare --connection IB_ACME_ADT \
         --mefor captures/IB_ACME_ADT.jsonl --corepoint exports/IB_ACME_ADT.hl7 \
@@ -45,7 +46,8 @@ from messagefoundry.mllpcodec import DEFAULT_MAX_FRAME_BYTES, AckMode
 def _parse_field(spec: str) -> tuple[str, int]:
     """Parse a ``SEG-FIELD`` token (e.g. ``MSH-10``, ``PID-3``) into ``(segment_id, field_no)``."""
     seg, _, num = spec.partition("-")
-    if not seg or not num.isdigit():
+    if not seg or not num.isdigit() or int(num) < 1:
+        # Field 0 is the segment id, not a field: as a key it pairs nothing, as a blank it erases the id.
         raise argparse.ArgumentTypeError(f"expected SEG-FIELD (e.g. MSH-10), got {spec!r}")
     return (seg.upper(), int(num))
 
@@ -56,6 +58,7 @@ def _rules_from_args(args: argparse.Namespace) -> NormalizeRules:
         sort_repetition_fields=frozenset(args.sort_repetition or ()),
         sort_segments=frozenset(s.upper() for s in (args.sort_segment or ())),
         ignore_segments=frozenset(s.upper() for s in (args.ignore_segment or ())),
+        any_position_segments=frozenset(s.upper() for s in (args.any_position_segment or ())),
     )
 
 
@@ -98,7 +101,7 @@ def _run_compare(args: argparse.Namespace) -> int:
         print(f"compare: {exc}{hint}", file=sys.stderr)
         return 2
     except (OSError, ValueError) as exc:
-        # Unreadable or undecodable input is exit 2 too: 1 means "the outputs differ". A malformed
+        # Unreadable or undecodable input is exit 2 too: 1 means "not clean". A malformed
         # JSONL line is a LoadError above, which names the line and never its content.
         # By class only: a decode or JSON error can quote the input, which may be a message.
         print(f"compare: an input could not be read ({type(exc).__name__})", file=sys.stderr)
@@ -112,10 +115,17 @@ def _run_compare(args: argparse.Namespace) -> int:
     )
     print(render_text(result))
     if args.report_json:
-        Path(args.report_json).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.report_json).write_text(
-            json.dumps(render_json(result), indent=2), encoding="utf-8"
-        )
+        try:
+            Path(args.report_json).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.report_json).write_text(
+                json.dumps(render_json(result), indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            # 2, never the traceback's 1, which reads as "the outputs differ" on a clean pair.
+            print(
+                f"compare: the report could not be written ({type(exc).__name__})", file=sys.stderr
+            )
+            return 2
     return 0 if result.clean else 1
 
 
@@ -174,6 +184,11 @@ def main(argv: list[str] | None = None) -> int:
         "--sort-segment", action="append", help="segment id whose occurrences are unordered"
     )
     cmp.add_argument("--ignore-segment", action="append", help="segment id dropped from both sides")
+    cmp.add_argument(
+        "--any-position-segment",
+        action="append",
+        help="segment id whose place in the message is not compared (its content still is)",
+    )
     cmp.add_argument("--report-json", help="write the structured report here")
     cmp.add_argument(
         "--max-file-bytes",

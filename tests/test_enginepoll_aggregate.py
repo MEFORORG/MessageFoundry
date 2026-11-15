@@ -122,7 +122,8 @@ def test_sample_is_per_field_sum_across_shards(monkeypatch: pytest.MonkeyPatch) 
     assert sample is not None
     assert sample.read == 160  # 100 + 50 + 10
     assert sample.written == 140  # 90 + 40 + 10
-    assert sample.backlog == 6  # (3+2) + (1+0) + 0
+    assert sample.outbound_backlog == 6  # (3+2) + (1+0) + 0
+    assert sample.backlog == 6  # max(outbound 6, in_pipeline 6) (BACKLOG #5435)
     assert sample.in_pipeline == 6  # 5 + 1 + 0
     assert sample.queue_depth == 6  # 5 + 1 + 0
 

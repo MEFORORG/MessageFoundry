@@ -566,8 +566,9 @@ def check_integrity(raw: str) -> list[str]:
     """Structural integrity tie-out for one interchange (a pure helper, opt-in).
 
     Returns a list of human-readable problems (empty when the interchange ties out): the control-number
-    pairs ISA13==IEA02, GS06==GE02, ST02==SE02, the counts GE01==#ST, IEA01==#GS, and an ST, GS or
-    ISA left without its SE, GE or IEA. This is *not*
+    pairs ISA13==IEA02, GS06==GE02, ST02==SE02, the counts GE01==#ST, IEA01==#GS, an ST, GS or
+    ISA left without its SE, GE or IEA, an SE or GE with no open ST or GS, and an ST outside any GS
+    (BACKLOG #5808). This is *not*
     implementation-guide validation (deferred) — just the envelope self-consistency a receiver can cheaply
     confirm. Raises :class:`X12PeekError` only if the interchange header itself is unparseable."""
     isa = find_isa_start(raw)
@@ -607,17 +608,23 @@ def check_integrity(raw: str) -> list[str]:
                 problems.append(f"GS06 {get(current_gs, 6)!r} has no GE")
             current_gs, st_in_group = fields, 0
         elif tag == "ST":
+            if current_gs is None:
+                problems.append(f"ST02 {get(fields, 2)!r} is outside a GS")
             current_st, seg_in_set = fields, 1  # the ST itself is segment 1 of the set
             st_in_group += 1
         elif tag == "SE":
-            if current_st is not None:
+            if current_st is None:
+                problems.append(f"SE02 {get(fields, 2)!r} has no ST")
+            else:
                 if get(fields, 2) != get(current_st, 2):
                     problems.append(f"SE02 {get(fields, 2)!r} != ST02 {get(current_st, 2)!r}")
                 if get(fields, 1) != str(seg_in_set):
                     problems.append(f"SE01 {get(fields, 1)!r} != actual segment count {seg_in_set}")
             current_st = None
         elif tag == "GE":
-            if current_gs is not None:
+            if current_gs is None:
+                problems.append(f"GE02 {get(fields, 2)!r} has no GS")
+            else:
                 if get(fields, 2) != get(current_gs, 6):
                     problems.append(f"GE02 {get(fields, 2)!r} != GS06 {get(current_gs, 6)!r}")
                 if get(fields, 1) != str(st_in_group):

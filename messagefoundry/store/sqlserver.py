@@ -73,7 +73,6 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StorePrivilegeStatus,
     StoreSettings,
-    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
@@ -188,8 +187,10 @@ from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     USER_KIND,
     AnyRowSealer,
+    ResealOutcome,
     RowSealError,
     SealPager,
+    classify_unrotated,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -284,6 +285,7 @@ from messagefoundry.store.store import (
     OutboxStatus,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -416,6 +418,8 @@ from messagefoundry.store.store import (
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    unheld_seal_refusal,
+    unrotated_seal_queries,
     user_disabled_change,
     user_insert_params,
     user_reseal_params,
@@ -3245,35 +3249,30 @@ def check_pinned_certificate(
         )
 
 
-def connection_string(settings: StoreSettings, *, posture: HopPosture | None = None) -> str:
+def connection_string(settings: StoreSettings) -> str:
     """Build an ODBC connection string for the Microsoft ODBC Driver 18 from store settings.
 
     Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (STORE-5, BACKLOG #3714). Identity
     fields are also validated up front (see ``StoreSettings._no_odbc_injection``).
 
-    ``posture`` is the deriving instance's :class:`HopPosture` (threaded from ``open_store`` by the
-    serve/engine caller). ``None`` reads the ambient posture, and with none the escape is NOT
-    permitted (vault BACKLOG #2354). CORRECTED: this read *"``None`` (a backup/restore utility,
-    embedding, or unit test) leaves the escape unclamped"*; that let a CLI command cross a weakened
-    store hop under ``enforce``.
+    A weakened hop is refused whatever the posture, even with ``MEFOR_ALLOW_INSECURE_TLS`` set on an
+    instance at ``[security].enforcement = warn`` (owner ruling 2026-11-14, vault BACKLOG #3533
+    item 2), so this takes no posture. It used to take one, and the escape on such an instance let
+    the store login cross that hop.
 
     It reads no file. The pin's own checks are :func:`check_pinned_certificate`, which the store runs
     once per open (vault BACKLOG #2223)."""
-    if posture is None:
-        posture = current_hop_posture()
-    # A weakened TLS posture (TrustServerCertificate=yes, or Encrypt=no) is MITM-able, so it REFUSES
-    # unless the explicit MEFOR_ALLOW_INSECURE_TLS dev escape is set (ASVS 12.3.2) — it can't be
-    # silently turned on in production. #200 (ADR 0092 decision 2): the engine<->store hop routes the
-    # escape through the ONE clamp (weakened_tls_escape_permitted) so the escape can NEVER relax a
-    # production-PHI store hop (previously the escape crossed prod, violating decision 2). It stays a
-    # STRICT verify-off cell (no gradient warn-and-cross) and keeps NO second escape.
-    weakened = settings.trust_server_certificate or not settings.encrypt
-    if weakened and not weakened_tls_escape_permitted(posture):
+    # A weakened TLS posture (TrustServerCertificate=yes, or Encrypt=no) is MITM-able, and every
+    # store connection logs in across it (a password, a Kerberos/NTLM exchange or an Entra token),
+    # so it is REFUSED with no escape (ASVS 12.3.2; owner ruling 2026-11-14, vault BACKLOG #3533
+    # item 2). The SQL Server twin of store.postgres._build_ssl.
+    if settings.trust_server_certificate or not settings.encrypt:
         raise StoreTlsRefused(
             "SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
-            f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
-            "instance at [security].enforcement = warn to allow it for a trusted-network dev/test "
-            "bind (the escape has no effect while enforcing, the default, or with no posture)."
+            "MITM-able, and the store login would cross it. Use a trusted server certificate, or pin "
+            "the server's own certificate with [store].ssl_root_cert. Nothing permits a weakened "
+            f"store hop, not even {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+            "[security].enforcement = warn."
         )
     parts = [
         "DRIVER={ODBC Driver 18 for SQL Server}",
@@ -3299,7 +3298,7 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
         parts.append("MultiSubnetFailover=Yes")
     # Pin the DB server's certificate by file WITHOUT a machine-wide trust import (#45), via the ODBC
     # Driver 18.1+ `ServerCertificate` keyword, only on the SECURE posture (encrypt on, verify on; the
-    # weakened branch above already refused or escaped). The pin goes out with Encrypt=strict, and the
+    # weakened branch above already refused). The pin goes out with Encrypt=strict, and the
     # engine checks the pinned certificate itself at store open (check_pinned_certificate). Why strict,
     # what it needs of the server, and what it was tested on: the `ssl_root_cert` row of
     # docs/CONFIGURATION.md (vault BACKLOG #2223). Not a revocation control.
@@ -3506,6 +3505,8 @@ class SqlServerStore:
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
     backend = StoreBackend.SQLSERVER
+    # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
+    _reseal_outcome: ResealOutcome = ResealOutcome()
     # H1 fence state (ADR 0157). Class defaults so a store built via object.__new__ (several offline
     # suites) reads as unfenced, and its SQL stays character-identical, instead of raising.
     _leader_epoch: int | None = None
@@ -3520,16 +3521,12 @@ class SqlServerStore:
         audit_mac_key: bytes | None = None,
         audit_mac_fn: AuditMacFn | None = None,
         message_events: str = "all",
-        posture: HopPosture | None = None,
     ) -> None:
         self._pool = pool
         # Set by open() when this store owns the pool. Stays None when a caller supplies a pool it
         # built itself, so close() never shuts down an executor it did not create.
         self._pool_executor: ThreadPoolExecutor | None = None
         self._settings = settings
-        # #200 (ADR 0092): the deriving instance posture, so reconnect / sync-handoff-pool rebuilds re-run
-        # the weakened-TLS clamp against the real production-PHI posture (not the unclamped escape).
-        self._posture = posture
         self._cipher: Cipher = cipher or IdentityCipher()
         # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
         self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
@@ -4047,7 +4044,7 @@ class SqlServerStore:
 
         disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         return await aioodbc.connect(
-            dsn=connection_string(self._settings, posture=self._posture),
+            dsn=connection_string(self._settings),
             autocommit=False,
             timeout=self._settings.connect_timeout,  # the LOGIN timeout (#1626), not a DSN keyword
         )
@@ -4231,8 +4228,8 @@ class SqlServerStore:
         """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
         (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
         cancels_before = cancels_at_entry()  # BACKLOG #5720: only this open's cancels
-        # Resolve the ambient posture ONCE, so every later connection of this store (claim connection,
-        # sync-handoff pool) decides as the open did, wherever it is reached from (vault BACKLOG #2354).
+        # Resolve the ambient posture ONCE, for the pin's checks and the database probe below (vault
+        # BACKLOG #2354). No connection reads it: a weakened hop refuses at every posture (#3533).
         if posture is None:
             posture = current_hop_posture()
         # Vault BACKLOG #2223: the pin's own checks, once, off the loop, before any connect.
@@ -4255,10 +4252,8 @@ class SqlServerStore:
             # management the runtime login issues no ALTER DATABASE, so there is nothing to do before
             # the pool; _verify_schema_external reads the two options on a pooled connection instead.
             # A read-only open issues no ALTER either (#1780).
-            await cls._ensure_database_options(settings, posture=posture)
-        pool, executor = await cls._create_pool(
-            settings, posture=posture, maxsize=settings.pool_size
-        )
+            await cls._ensure_database_options(settings)
+        pool, executor = await cls._create_pool(settings, maxsize=settings.pool_size)
         store = cls(
             pool,
             settings,
@@ -4266,7 +4261,6 @@ class SqlServerStore:
             audit_mac_key=audit_mac_key,
             audit_mac_fn=audit_mac_fn,
             message_events=message_events,
-            posture=posture,
         )
         store._pool_executor = executor
         store._read_only = read_only
@@ -4786,7 +4780,6 @@ class SqlServerStore:
     async def _ensure_database_options(
         settings: StoreSettings,
         *,
-        posture: HopPosture | None = None,
         fail_closed: bool = True,
     ) -> None:
         """Enable READ_COMMITTED_SNAPSHOT (RCSI) so the staged claim/finalize paths read on a
@@ -4833,7 +4826,7 @@ class SqlServerStore:
         disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
         db = settings.database
         remedy = _rcsi_remedy(db)
-        dsn = connection_string(settings, posture=posture)
+        dsn = connection_string(settings)
 
         async def _rcsi_on_after_a_peer() -> bool:
             """Re-read RCSI on FRESH connections after our ALTER failed: a concurrent opener's ALTER
@@ -5560,7 +5553,7 @@ class SqlServerStore:
 
     @classmethod
     async def _create_pool(
-        cls, settings: StoreSettings, *, posture: HopPosture | None, maxsize: int
+        cls, settings: StoreSettings, *, maxsize: int
     ) -> tuple[Any, ThreadPoolExecutor]:
         """The aioodbc pool and its DEDICATED executor, for :meth:`open` and :meth:`provision_schema`.
 
@@ -5577,7 +5570,7 @@ class SqlServerStore:
         executor = _build_pool_executor(settings, maxsize)
         try:
             pool = await aioodbc.create_pool(
-                dsn=connection_string(settings, posture=posture),
+                dsn=connection_string(settings),
                 minsize=1,
                 maxsize=max(1, maxsize),
                 autocommit=False,
@@ -5611,7 +5604,7 @@ class SqlServerStore:
         report a partial result rather than a success."""
         # Vault BACKLOG #2223: before the first connect, which the options step makes.
         await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
-        await cls._ensure_database_options(settings, posture=posture, fail_closed=False)
+        await cls._ensure_database_options(settings, fail_closed=False)
         async with cls._one_connection_store(settings, posture=posture) as store:
             applied = await store._ensure_schema(provisioning=True)
             row = await store._fetchone(
@@ -5643,8 +5636,8 @@ class SqlServerStore:
         the executor to the store, so :meth:`close` releases it."""
         # Vault BACKLOG #2223: the pin's own checks, as :meth:`open` runs them.
         await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
-        pool, executor = await cls._create_pool(settings, posture=posture, maxsize=1)
-        store = cls(pool, settings, posture=posture)
+        pool, executor = await cls._create_pool(settings, maxsize=1)
+        store = cls(pool, settings)
         store._pool_executor = executor
         try:
             yield store
@@ -5838,7 +5831,7 @@ class SqlServerStore:
         import pyodbc
 
         disable_driver_manager_pooling()  # BACKLOG #2049: a close must end the server session
-        dsn = connection_string(self._settings, posture=self._posture)
+        dsn = connection_string(self._settings)
         login_timeout = self._settings.connect_timeout
 
         def _factory() -> Any:
@@ -9782,6 +9775,7 @@ class SqlServerStore:
         Each batch's re-encrypt list is built UP FRONT so an undecryptable value raises BEFORE any
         UPDATE (all-or-nothing; PHI never dropped). Skips rows already under the active key and
         blank/purged values."""
+        self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
@@ -9810,9 +9804,19 @@ class SqlServerStore:
         # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
+        # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
+        # under a key this run does not hold leaves the store as this method found it.
+        preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if preflight.unheld:
+            self._reseal_outcome = preflight
+            raise unheld_seal_refusal(preflight, before_writes=True)
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
+        # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
+            raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
         # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error (H4):
         # exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop
@@ -15046,6 +15050,22 @@ class SqlServerStore:
         2)."""
         await _hold_account_row(cur, user_id, "UPDLOCK, ROWLOCK")
 
+    def reseal_outcome(self) -> ResealOutcome:
+        """store.py's ``MessageStore.reseal_outcome`` states the contract (vault BACKLOG #5635)."""
+        return self._reseal_outcome
+
+    async def _unrotated_seals(self) -> list[tuple[str, object]]:
+        """store.py's ``MessageStore._unrotated_seals`` states the contract (vault BACKLOG #5635)."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return []
+        active = f"{SEAL_PREFIX}{sealer.key_id}:%"
+        seals: list[tuple[str, object]] = []
+        for table, sql in unrotated_seal_queries("?", collate=" COLLATE Latin1_General_100_BIN2"):
+            rows = await self._fetchall(sql, (active,))
+            seals.extend((table, r["seal"]) for r in rows)
+        return seals
+
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
         store.py's ``MessageStore.reseal_user_records`` states the contract."""
@@ -15838,12 +15858,39 @@ class SqlServerStore:
         await self._write_user_txn(user_id, lambda r: full_authentication_clear(r, now))
 
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None:
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """See the SQLite twin (BACKLOG #5633): the clear and ``audit`` share one transaction. This
+        leg is CI-only, so a divergence from the SQLite and Postgres bodies surfaces first in CI.
+        Same lock order as ``replace_totp_enrolment``: the in-process gate, then the connection."""
         now = time.time() if now is None else now
-        await self._write_user_txn(
-            user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
-        )
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        if (
+                            await self._write_user(
+                                cur,
+                                user_id,
+                                lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now),
+                            )
+                            is None
+                        ):
+                            await conn.rollback()
+                            return False  # nothing written, so nothing audited
+                        appended = await self._append_audits(cur, (audit,), now=now)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard, as replace_totp_enrolment does.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits((audit,), appended, ts=now)
+        return True
 
     async def record_login_failure(
         self,
@@ -16647,8 +16694,16 @@ class SqlServerStore:
         stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
         await self._write_session_txn(token_hash, stamp)
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        await self._write_session_txn(token_hash, mfa_stamp(time.time() if now is None else now))
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
+        written = await self._write_session_txn(token_hash, stamp)
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None

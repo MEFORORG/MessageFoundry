@@ -21,17 +21,14 @@ import pytest
 
 from messagefoundry import odbc_dsn
 from messagefoundry.config.settings import (
-    INSECURE_TLS_ESCAPE_ENV,
     SqlAuth,
     StoreBackend,
     StoreSettings,
 )
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.store.sqlserver import connection_string
 from messagefoundry.transports.database import _build_dsn
 
-_WARN = HopPosture(enforcing=False)
 _REPO = Path(__file__).resolve().parents[1]
 
 
@@ -129,28 +126,19 @@ def _store(**update: object) -> StoreSettings:
             {
                 "auth": SqlAuth.INTEGRATED,
                 "multi_subnet_failover": True,
-                "trust_server_certificate": True,
                 "ssl_root_cert": "C:\\pins\\db.pem",
             },
             "DRIVER={ODBC Driver 18 for SQL Server};SERVER=db.example,1433;DATABASE={mefor};"
-            "APP={app}}x};Trusted_Connection=yes;MultiSubnetFailover=Yes;Encrypt=yes;"
-            "TrustServerCertificate=yes;",
-            id="escaped-verify-off-drops-pin",
-        ),
-        pytest.param(
-            {"auth": SqlAuth.ENTRA, "encrypt": False, "ssl_root_cert": "C:\\pins\\db.pem"},
-            "DRIVER={ODBC Driver 18 for SQL Server};SERVER=db.example,1433;DATABASE={mefor};"
-            "APP={app}}x};Authentication=ActiveDirectoryDefault;Encrypt=no;"
-            "TrustServerCertificate=no;",
-            id="escaped-plaintext-drops-pin",
+            "APP={app}}x};Trusted_Connection=yes;MultiSubnetFailover=Yes;"
+            "ServerCertificate={C:\\pins\\db.pem};Encrypt=strict;TrustServerCertificate=no;",
+            id="integrated-failover-pin",
         ),
     ],
 )
-def test_the_store_string_is_unchanged(
-    monkeypatch: pytest.MonkeyPatch, update: dict[str, object], expected: str
-) -> None:
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    assert connection_string(_store(**update), posture=_WARN) == expected
+def test_the_store_string_is_unchanged(update: dict[str, object], expected: str) -> None:
+    # The two weakened shapes this table held (verify-off, plaintext) are refused at every posture
+    # now (vault BACKLOG #3533 item 2); tests/test_store_ssl.py pins that refusal.
+    assert connection_string(_store(**update)) == expected
 
 
 # --- the DATABASE connector's string, byte for byte as before ------------------------------------

@@ -403,6 +403,7 @@ const connection: Receiver = {
         routers: ["route_adt"],
         transports: ["mllp", "file"],
         fieldGroups: buildForm(SCHEMA, "mllp", "inbound", {}),
+        fieldGroupsFor: { transport: "mllp", direction: "inbound" },
         siblings: undefined,
         clone: undefined,
       }),
@@ -1425,6 +1426,81 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       input.dispatchEvent(new p.window.Event("input"));
       assert.ok(p.window.document.getElementById("field-" + key).classList.contains("loosened"), `${key}: an edit is not marked`);
     }
+  });
+
+  // BACKLOG #5412: a number field that is cleared, or holds text that is not a whole number at or
+  // above the field's minimum, must never be saved as 0, which for the retention switch is the
+  // insecure keep-indefinitely value. A cleared field resets the switch to its secure default; any
+  // other bad value refuses the Save, names the field and posts nothing.
+  test("Security Settings: a cleared number field is saved as a reset to the default, never as 0", () => {
+    const ints = FIELDS.filter((f) => f.type === "int");
+    assert.ok(ints.some((f) => f.key === "delete_message_bodies_after_days"), "the retention switch is not a number field");
+    for (const f of ints) {
+      const p = security.load();
+      p.deliver(variant(STATE_OK, (c) => (c.state.values[f.key] = 7)));
+      const input = p.window.document.getElementById("in-" + f.key);
+      for (const blank of [""]) {
+        p.posted.length = 0;
+        input.value = blank;
+        input.dispatchEvent(new p.window.Event("input"));
+        p.window.document.getElementById("save").click();
+        assert.strictEqual(p.posted.length, 1, `${f.key}=${JSON.stringify(blank)}: Save did not post`);
+        assert.strictEqual(p.posted[0].updates[f.key], null, `${f.key}=${JSON.stringify(blank)}: not sent as a reset`);
+        assert.ok(
+          !p.window.document.getElementById("field-" + f.key).classList.contains("loosened"),
+          `${f.key}=${JSON.stringify(blank)}: a cleared field is marked loosened`,
+        );
+      }
+      assert.strictEqual(refusalShown(p), "", `${f.key}: a cleared field was refused`);
+    }
+  });
+
+  test("Security Settings: Save refuses a number below the minimum or not a whole number, and posts nothing", () => {
+    const ints = FIELDS.filter((x) => x.type === "int");
+    assert.deepStrictEqual(ints.filter((x) => x.min !== undefined).map((x) => x.key), ["delete_message_bodies_after_days"]);
+    for (const f of ints) {
+      // "unparseable" is what a browser holds for text it cannot read as a number, such as "1e": an
+      // empty value with validity.badInput set. jsdom never sets badInput, so the case stubs it.
+      for (const bad of [...(f.min === undefined ? [] : [String(f.min - 1)]), "1.5", "unparseable"]) {
+        const p = security.load();
+        p.deliver(STATE_OK);
+        const input = p.window.document.getElementById("in-" + f.key);
+        if (bad === "unparseable") {
+          Object.defineProperty(input, "validity", { configurable: true, value: { badInput: true } });
+          input.value = "";
+        } else {
+          input.value = bad;
+        }
+        input.dispatchEvent(new p.window.Event("input"));
+        p.window.document.getElementById("save").click();
+        assert.strictEqual(p.posted.length, 0, `${f.key}=${bad}: Save posted a bad value`);
+        assert.ok(refusalShown(p).includes(f.label), `${f.key}=${bad}: the refusal does not name the field: "${refusalShown(p)}"`);
+        // Fixing the value lets Save through again: the refusal holds nothing back.
+        delete input.validity;
+        input.value = "5";
+        input.dispatchEvent(new p.window.Event("input"));
+        p.window.document.getElementById("save").click();
+        assert.strictEqual(p.posted.length, 1, `${f.key}: a good value after a refusal did not post`);
+        assert.strictEqual(p.posted[0].updates[f.key], 5);
+      }
+    }
+    // A session limit has no minimum: 0 or less is stricter, and the engine takes it, so a stored
+    // negative value does not block a Save of some other switch.
+    const neg = security.load();
+    neg.deliver(variant(STATE_OK, (c) => (c.state.values.max_session_hours = -1)));
+    neg.window.document.getElementById("save").click();
+    assert.strictEqual(neg.posted.length, 1, "a stored negative session limit blocked Save");
+    assert.strictEqual(neg.posted[0].updates.max_session_hours, -1);
+    // THE CONTROL: an explicit 0 the operator types is still sent as 0, and marked loosened.
+    const p = security.load();
+    p.deliver(STATE_OK);
+    const input = p.window.document.getElementById("in-delete_message_bodies_after_days");
+    input.value = "0";
+    input.dispatchEvent(new p.window.Event("input"));
+    assert.ok(p.window.document.getElementById("field-delete_message_bodies_after_days").classList.contains("loosened"));
+    p.window.document.getElementById("save").click();
+    assert.strictEqual(p.posted.length, 1);
+    assert.strictEqual(p.posted[0].updates.delete_message_bodies_after_days, 0);
   });
 
   for (const r of RECEIVERS) {

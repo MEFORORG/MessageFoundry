@@ -720,8 +720,9 @@ async def _collect(
     store = await open_store(
         settings.store,
         keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-        # The instance's own dial, so MEFOR_ALLOW_INSECURE_TLS behaves as under serve (vault
-        # BACKLOG #2354: with no posture it would be refused whatever the dial says).
+        # The instance's own dial, so the store's posture-keyed checks behave as under serve (vault
+        # BACKLOG #2354). A weakened store hop is refused whatever the dial says (vault BACKLOG
+        # #3533 item 2), so MEFOR_ALLOW_INSECURE_TLS changes nothing here.
         posture=hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement),
     )
     try:

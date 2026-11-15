@@ -16,16 +16,21 @@ The scanner lives under scripts/ (not an installed package), so it is loaded by 
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import importlib.util
 import io
 import json
+import random
 import re
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
+
+#: pytest's param type, read from an instance rather than imported from pytest's private modules.
+ParameterSet = type(pytest.param(None))
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCANNER_PATH = _REPO_ROOT / "scripts" / "security" / "scan_forbidden.py"
@@ -1518,14 +1523,14 @@ def test_the_review_finding_repairs_leave_versions_and_other_tables_alone(
 
 
 # --- the frozen-main superset guard ------------------------------------------------------------------
-#: origin/main's scanner before BACKLOG #3364's repairs, vendored byte for byte: blob 0c6e6127 of
-#: scripts/security/scan_forbidden.py, last changed at main 0e10fb14c8. A vendored copy, not ``git show
-#: origin/main``: once this branch merges, origin/main IS the head, and a CI checkout need not hold that
-#: ref. Never edited; the blob id below pins it.
+#: origin/main's scanner before BACKLOG #3364's repairs, vendored byte for byte: blob ac2aa30e of
+#: scripts/security/scan_forbidden.py, last changed at main 73d9236f3b (BACKLOG #5582's readings). A
+#: vendored copy, not ``git show origin/main``: once this branch merges, origin/main IS the head, and a
+#: CI checkout need not hold that ref. Never edited; the blob id below pins it.
 _FROZEN_MAIN_PATH = (
     Path(__file__).parent / "fixtures" / "scan_forbidden" / "scan_forbidden_main.py.txt"
 )
-_FROZEN_MAIN_BLOB = "0c6e61278ae36990232a06cf6d88dd2561ec65a0"
+_FROZEN_MAIN_BLOB = "ac2aa30e7a42c4ecaa388dab9a03326b51af74cc"
 #: The separators str.splitlines ends a line at and GFM does not. GFM's own ("\r" twice is a blank
 #: line) are step 9's to end a table at.
 _SPLITLINES_ONLY = (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)
@@ -2019,3 +2024,703 @@ def test_the_pr_body_workflow_reads_the_body_safely_and_is_not_required() -> Non
     _, script = step_script(workflow, key, "Scan the pull request body")
     assert '--pr-body-event "$GITHUB_EVENT_PATH"' in script
     assert context_of(key, job) not in required_contexts()
+
+
+# --- batch 479: four fail-open gaps (BACKLOG #5582, #5583, #5584, #5585) ------------------------------
+
+
+def test_scan_text_names_no_estate_token_in_its_reason(sf) -> None:
+    """BACKLOG #5584. The anonymizer leak-check raises and logs these reasons, and the estate token IS
+    the private string, so the reason says which kind fired and never which token."""
+    reasons = sf.scan_text("ZPD|1|xwidgetcox|acmecorp", include_estate=True)
+    assert reasons.count("estate token") == 1, reasons
+    for token in _SYNTH_ESTATE:
+        assert not any(token in r.lower() for r in reasons), reasons
+
+
+def test_scan_text_sees_a_name_inside_an_underscore_identifier(sf, tmp_path: Path) -> None:
+    """BACKLOG #5584. ``scan_file`` already read a name inside ``OB_<NAME>_ORU``; the body scan did not."""
+    text = "route OB_ACME_ORU onward"
+    p = tmp_path / "feed.txt"
+    p.write_text(text + "\n", encoding="utf-8")
+    assert sf.scan_file(p), "control: the file scan must see it, or this asserts nothing"
+    assert "customer name (ACME)" in sf.scan_text(text)
+    # A phrase pattern takes no identifier pass, in either scan: snake_case is not a phrase.
+    sf.FORBIDDEN.append((re.compile(r"\bwidget co\b", re.I), "partner phrase"))
+    assert "partner phrase" not in sf.scan_text("a widget_co value")
+
+
+@pytest.mark.parametrize("flag", ["--print-detector-counts", "--assert-floor-fresh", "--self-test"])
+def test_a_staged_file_named_like_a_terminal_flag_does_not_end_the_scan(
+    sf_main, tmp_path: Path, flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5585. pre-commit passes the staged names after its args, so a file named like a
+    terminal flag used to turn the commit gate into a report that exited 0 having scanned nothing."""
+    _clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main([str(dirty / "leak.md"), flag]) == 2
+    assert "unknown option" in capsys.readouterr().err
+
+
+def test_a_terminal_flag_alone_still_runs_its_mode(sf_main) -> None:
+    """The control: the whole command line is still a terminal mode."""
+    assert sf_main.main(["--print-detector-counts"]) == 0
+
+
+@pytest.mark.parametrize("segment", ["build", "dist", "venv", "node_modules", ".venv"])
+def test_a_tracked_or_staged_file_under_a_build_directory_is_scanned(
+    sf_main, tmp_path: Path, segment: str
+) -> None:
+    """BACKLOG #5585. A file the tracked or staged scan names is content git holds, wherever it sits."""
+    leak = tmp_path / "pkg" / segment / "leak.md"
+    leak.parent.mkdir(parents=True)
+    leak.write_text("contact ACME about this\n", encoding="utf-8")
+    assert sf_main.main([str(leak)]) == 1
+
+
+def test_the_path_walk_still_skips_an_untracked_environment(sf_main, tmp_path: Path) -> None:
+    """The --path walk meets untracked environments and build output, so it keeps its skip."""
+    root = tmp_path / "tree"
+    (root / "node_modules").mkdir(parents=True)
+    (root / "node_modules" / "leak.md").write_text("contact ACME\n", encoding="utf-8")
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(root)]) == 0
+
+
+def test_only_a_vendored_action_bundle_keeps_the_dist_skip(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The narrowed skip: a JavaScript action's compiled bundle, and no other ``dist`` directory."""
+    monkeypatch.chdir(tmp_path)
+    for rel in (".github/actions/example/dist/index.js", "pkg/dist/index.js"):
+        (tmp_path / rel).parent.mkdir(parents=True)
+        (tmp_path / rel).write_text("contact ACME\n", encoding="utf-8")
+    assert sf_main.main([".github/actions/example/dist/index.js"]) == 0
+    assert sf_main.main(["pkg/dist/index.js"]) == 1
+    # Anchored: the same directories under another root are not the vendored bundle.
+    (tmp_path / "x/.github/actions/example/dist").mkdir(parents=True)
+    (tmp_path / "x/.github/actions/example/dist/index.js").write_text("ACME\n", encoding="utf-8")
+    assert sf_main.main(["x/.github/actions/example/dist/index.js"]) == 1
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-16-be", "utf-32"])
+def test_utf16_and_utf32_text_is_scanned(sf, tmp_path: Path, encoding: str) -> None:
+    """BACKLOG #5583. A NUL near the start meant binary outright, so wide text went unscanned."""
+    p = tmp_path / "wide.txt"
+    p.write_bytes(("first line\nThis note mentions ACME here.\n" * 3).encode(encoding))
+    hits = sf.scan_file(p)
+    assert any("customer name (ACME)" in h for h in hits), hits
+
+
+def test_an_unreadable_file_is_a_hit_not_a_clean_file(
+    sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5583. An unread file used to read as empty and pass."""
+    p = tmp_path / "locked.md"
+    p.write_text("contact ACME\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self == p:
+            raise PermissionError(13, "denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    hits = sf.scan_file(p, "locked.md")
+    assert hits and "unreadable" in hits[0] and "not scanned" in hits[0], hits
+    assert str(tmp_path) not in hits[0], "the hit must not echo the absolute path"
+
+
+def test_a_binary_file_does_not_count_as_scanned(
+    sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5583. A run whose files were all binary examined nothing, and must say so."""
+    root = tmp_path / "bin"
+    root.mkdir()
+    (root / "blob.bin").write_bytes(b"\x00\x01\x02 ACME 203.0.113.9")
+    assert sf_main.main(["--path", str(root)]) == 2
+    capsys.readouterr()
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(root)]) == 0
+    err = capsys.readouterr().err
+    assert "examined 1 file(s)" in err and "1 more were binary" in err, err
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"ASVS {_REQ} is enforced in [the guard](pkg/example_guard.py).",
+        f"ASVS <b>{_REQ}</b> is enforced by <code>pkg/example_guard.py</code>.",
+        f'ASVS {_REQ} is enforced in <a href="pkg/example_guard.py">the guard</a>.',
+        f"<p>ASVS <em>{_REQ}</em> lives in <code>pkg/example_guard.py</code></p>",
+    ],
+)
+def test_a_code_path_in_a_link_target_or_across_inline_tags_is_a_map(sf, line: str) -> None:
+    """BACKLOG #5582. Link targets were stripped and every HTML tag ended a sentence, so these passed."""
+    assert "map" in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # A block tag still ends a sentence: the pinned release-notes control, restated.
+        "<p>Changes in 7.1.2: fix</p><p>the residual leak in pkg/example_linux.py</p>",
+        # A link to a document is not a map, and a bare identifier is still unruled.
+        f"See [the notes](docs/EXAMPLE.md) for {_REQ_B}.",
+        "Bumps <code>lxml</code> from 6.1.1 to 6.1.2 in <code>requirements.lock</code>.",
+    ],
+)
+def test_the_second_reading_leaves_block_tags_documents_and_versions_alone(sf, line: str) -> None:
+    assert sf.scan_pr_body(line) == [], line
+
+
+def test_a_mid_line_angle_bracket_is_not_read_as_a_quote(sf) -> None:
+    """The quote marker was unanchored, so it deleted a line's first ``>`` wherever it sat."""
+    assert sf._pr_units(["a -> b"], False, sf._PR_TEXT)[0][1] == "a -> b"
+    assert sf._pr_units(["> quoted"], False, sf._PR_TEXT)[0][1] == "quoted"
+
+
+def test_an_unreadable_file_fails_the_run_as_an_instrument(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2, not 1: an unread file wants its permissions fixed, not content removed."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    locked = root / "locked.md"
+    locked.write_text("fine\n", encoding="utf-8")
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self == locked:
+            raise PermissionError(13, "denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert sf_main.main(["--path", str(root)]) == 2
+
+
+def test_a_staged_file_named_show_context_is_not_dropped(
+    sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5585. ``--show-context`` from anywhere in argv dropped a staged file of that name."""
+    _clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main([str(dirty / "leak.md"), "--show-context"]) == 2
+    assert "unknown option" in capsys.readouterr().err
+    assert sf_main.main(["--show-context", str(dirty / "leak.md")]) == 1
+
+
+def test_a_file_named_like_a_build_directory_is_walked(sf_main, tmp_path: Path) -> None:
+    """Only directory parts are skipped: a file named ``build`` is not a build directory."""
+    root = tmp_path / "tree"
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "build").write_text("contact ACME\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"ASVS {_REQ} is enforced in <https://github.com/example/repo/blob/main/pkg/example_guard.py>.",
+        f"Retries cap at n<max; ASVS {_REQ} is enforced in pkg/example_guard.py -> done.",
+    ],
+)
+def test_a_bracket_that_is_not_a_tag_does_not_swallow_the_code_path(sf, line: str) -> None:
+    """The split's tag ran to the next ``>`` anywhere, so an autolink or a ``<`` and a later ``->``
+    took the code path with them once the quote marker stopped eating the line's first ``>``."""
+    assert "map" in _pr_kinds(sf, line), line
+
+
+def test_the_target_reading_adds_maps_only_and_hits_stay_in_line_order(sf) -> None:
+    """A link target's words are a URL's, so the second reading adds a code map and nothing else."""
+    assert sf.scan_pr_body(f"See [the notes](docs/gaps.md) about {_REQ_B}.") == []
+    body = "\n\n".join(
+        [
+            f"ASVS {_REQ} stays {_PARTIAL}.",
+            f"ASVS {_REQ} is enforced in [the guard](pkg/example_guard.py).",
+            f"ASVS {_REQ} is enforced by `pkg/example_guard.py`.",
+        ]
+    )
+    lines = [int(h.split(":")[1]) for h in sf.scan_pr_body(body)]
+    assert lines == sorted(lines) and len(lines) == 3, lines
+
+
+@pytest.mark.parametrize("lead", ["<a", "<b", "<i", "<em"])
+def test_a_bracket_before_an_inline_tag_name_does_not_swallow_a_verdict(sf, lead: str) -> None:
+    """Round 2: a bare ``<a`` followed by words is no tag, in either the inline pass or the split."""
+    line = f"Latency stays {lead} second; ASVS {_REQ} stays {_PARTIAL} -> fine."
+    assert "verdict" in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'Sourced from <a href="https://github.com/example/lib/blob/8.1.8/CHANGES.rst">its changelog</a>.',
+        "See [changelog](https://github.com/example/lib/blob/3.4.5/CHANGES.rst).",
+    ],
+)
+def test_a_version_inside_a_link_target_is_not_a_requirement(sf, line: str) -> None:
+    assert sf.scan_pr_body(line) == [], line
+
+
+def test_a_line_of_only_inline_tags_does_not_break_the_paragraph(sf) -> None:
+    body = f'ASVS {_REQ} stays\n<a name="x"></a>\n{_PARTIAL} for now.'
+    assert "verdict" in _pr_kinds(sf, body)
+
+
+def test_a_content_hit_beside_an_unreadable_file_keeps_exit_1(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    locked = root / "locked.md"
+    locked.write_text("fine\n", encoding="utf-8")
+    (root / "leak.md").write_text("contact ACME\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self == locked:
+            raise PermissionError(13, "denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
+@pytest.mark.parametrize(
+    "rel", [".github/actions/example/dist/README.md", ".github/actions/example/dist/../../leak.js"]
+)
+def test_the_bundle_skip_covers_only_a_compiled_js_file(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rel: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".github/actions/example/dist").mkdir(parents=True)
+    target = (tmp_path / rel).resolve()
+    target.write_text("contact ACME\n", encoding="utf-8")
+    assert sf_main.main([rel]) == 1
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"Set n<limit max=3 in config; ASVS {_REQ} stays {_PARTIAL} -> later.",
+        f"Set n<limit max=3 in config, ASVS {_REQ} stays {_PARTIAL} -> later.",
+    ],
+)
+def test_an_attribute_shaped_bracket_does_not_swallow_a_verdict(sf, line: str) -> None:
+    """Re-brief note 1: ``<x a=`` is a tag only within the bounded attribute grammar. origin/main
+    caught these; the round 2 tag ran on to the ``>`` of the later ``->``."""
+    assert "verdict" in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize(
+    "bom", [b"\xff\xfe", b"\xfe\xff", b"\xff\xfe\x00\x00"], ids=["16le", "16be", "32le"]
+)
+def test_a_stray_byte_order_mark_before_utf8_text_does_not_hide_it(
+    sf, tmp_path: Path, bom: bytes
+) -> None:
+    """Re-brief note 2: a mark the following bytes disagree with is not trusted, as on origin/main."""
+    p = tmp_path / "stray.txt"
+    p.write_bytes(bom + b"contact ACME here\n")
+    assert any("customer name (ACME)" in h for h in sf.scan_file(p))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[x](" + "1" * 60000 + ")",
+        "<b x=" + " " * 30000 + "y",
+        "a " + " " * 60000 + "b",
+        "[" * 60000,
+        "[x](" * 15000,
+    ],
+    ids=["digit-target", "attr-space-run", "space-run", "bracket-run", "link-run"],
+)
+def test_a_long_pr_body_shape_scans_in_linear_time(sf, body: str) -> None:
+    """Re-brief note 3. Each shape was quadratic before this fix, measured in seconds near GitHub's
+    65,536-character body limit, and each now scans in well under 0.1 s at that size. The bound is
+    loose so a loaded runner does not fail it."""
+    began = time.perf_counter()
+    sf.scan_pr_body(body)
+    assert time.perf_counter() - began < 2
+
+
+def test_a_boolean_attribute_block_tag_still_ends_a_sentence(sf) -> None:
+    """Re-brief note 4: ``<details open>`` is a block edge, so the id and the path stay apart."""
+    body = f"ASVS {_REQ} stays {_PARTIAL}; see <details open>the code in pkg/example_guard.py</details>"
+    assert _pr_kinds(sf, body) == {"verdict"}
+
+
+def test_wide_text_mostly_above_latin1_behind_its_mark_is_still_scanned(sf, tmp_path: Path) -> None:
+    """Re-brief review: a mark whose bytes disagree is read both ways, so a UTF-16 ``tree`` listing
+    full of box-drawing characters is not dropped as binary."""
+    p = tmp_path / "tree.txt"
+    p.write_bytes(("│├── " * 200 + "OB_ACME_FEED\n").encode("utf-16"))
+    assert any("customer name (ACME)" in h for h in sf.scan_file(p))
+
+
+@pytest.mark.parametrize(
+    ("line", "kind"),
+    [
+        (f"ASVS {_REQ} where x<y or z > w still has a residual gap.", "gap"),
+        (f"ASVS {_REQ} when n<max and m > 0 see pkg/example_guard.py", "map"),
+    ],
+)
+def test_a_prose_comparison_is_not_a_tag(sf, line: str, kind: str) -> None:
+    """A tag closes with ``>`` straight after its attributes, so ``x<y or z > w`` stays prose."""
+    assert kind in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Bumps lib. See <a href=https://github.com/example/lib/blob/16.9.97/src/core.py>notes</a> here.",
+        'Release notes.</p> <img src="https://github.com/o/r/blob/16.9.97/docs/shot.png"> and '
+        "<code>pkg/a.py</code>",
+    ],
+)
+def test_an_unquoted_or_second_tag_in_a_run_is_still_a_tag(sf, line: str) -> None:
+    """An unquoted value is a value, and a tag the previous split's trailing space reached still
+    splits, so neither leaves a version-shaped target in the text as a requirement id."""
+    assert sf.scan_pr_body(line) == [], line
+
+
+# --- The baseline: the PR-body scan reports at least what origin/main's did (BACKLOG #5582) -----------
+#
+# The oracle below is origin/main's PR-body reading, copied here verbatim rather than imported from the
+# scanner's own baseline pass, so a later edit to that pass cannot also move the yardstick. It reuses
+# the scanner's identifier and evidence helpers, which BACKLOG #5582 did not change.
+
+_MAIN_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
+_MAIN_QUOTE = re.compile(r"(?:>\s?)+")
+_MAIN_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
+
+
+def _main_pr_units(sf, body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
+    units: list[tuple[list[tuple[int, int]], str, bool]] = []
+    marks: list[tuple[int, int]] = []
+    parts: list[str] = []
+
+    def flush() -> None:
+        if parts:
+            units.append((list(marks), " ".join(parts), False))
+            marks.clear()
+            parts.clear()
+
+    for lineno, raw in enumerate(body.splitlines(), 1):
+        line = _MAIN_MD_LINK.sub(r"\1", _MAIN_QUOTE.sub("", raw.strip(), count=1).strip())
+        if not line:
+            flush()
+            continue
+        if line.startswith("|") or sf._PR_HEADING.match(line):
+            flush()
+            units.append(([(0, lineno)], line, line.startswith("|")))
+            continue
+        if sf._PR_LIST_ITEM.match(line):
+            flush()
+        offset = marks[-1][0] + len(parts[-1]) + 1 if parts else 0
+        marks.append((offset, lineno))
+        parts.append(line)
+    flush()
+    return units
+
+
+def _main_pr_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
+    if is_row:
+        return [(0, unit)]
+    sentences, start = [], 0
+    for split in _MAIN_SENTENCE_SPLIT.finditer(unit):
+        sentences.append((start, unit[start : split.start()]))
+        start = split.end()
+    sentences.append((start, unit[start:]))
+    return sentences
+
+
+def _main_scan_pr_body(sf, body: str) -> list[str]:
+    hits: list[str] = []
+    units = _main_pr_units(sf, body)
+    asvs_columns: set[int] = set()
+    for index, (marks, unit, is_row) in enumerate(units):
+        if not is_row:
+            asvs_columns = set()
+        elif (
+            not sf._pr_is_delimiter(unit)
+            and index + 1 < len(units)
+            and sf._pr_is_delimiter(units[index + 1][1])
+        ):
+            asvs_columns = sf._pr_asvs_columns(unit)
+        for start, sentence in _main_pr_sentences(unit, is_row):
+            found: dict[str, int] = {}
+            for p in sf._RECORD_PAIR:
+                pair = p.search(sentence)
+                if pair is not None and sf._PR_REQ_ID.search(sentence, pair.start(), pair.end()):
+                    found["verdict"] = pair.start()
+                    break
+            ids = sf._pr_requirement_ids(sentence)
+            evidence = None
+            row_marked = False
+            previous: tuple[int, bool] | None = None
+            pipes = [i for i, ch in enumerate(sentence) if ch == "|"] if asvs_columns else []
+            for m, version in ids:
+                window = (
+                    sentence
+                    if is_row
+                    else sentence[max(0, m.start() - sf._PR_WINDOW) : m.end() + sf._PR_WINDOW]
+                )
+                marked = not version and (
+                    sf._pr_marked(sentence, m)
+                    or (
+                        previous is not None
+                        and previous[1]
+                        and sf._pr_in_list(sentence, previous[0], m)
+                    )
+                    or (
+                        bool(asvs_columns)
+                        and bisect.bisect_left(pipes, m.start()) - 1 in asvs_columns
+                    )
+                )
+                previous = (m.end(), marked)
+                row_marked = row_marked or marked
+                if "verdict" not in found and (
+                    sf._pr_verdict_bound(sentence, m, version, marked)
+                    or (not version and not is_row and sf._pr_prose_verdict(window, marked))
+                ):
+                    found["verdict"] = m.start()
+                if version or ("gap" in found and "map" in found):
+                    continue
+                if evidence is None or not is_row:
+                    evidence = sf._pr_evidence(window)
+                gap, marked_gap, code, symbol = evidence
+                if "gap" not in found and (gap or (marked_gap and marked)):
+                    found["gap"] = m.start()
+                if "map" not in found and (code or (symbol and marked)):
+                    found["map"] = m.start()
+            requirement_ids = {m.group(0) for m, version in ids if not version}
+            if (
+                is_row
+                and "verdict" not in found
+                and sf._pr_table_verdict(sentence, requirement_ids, row_marked)
+            ):
+                found["verdict"] = 0
+            for kind in sf.PR_BODY_REASONS:
+                if kind in found:
+                    line = sf._pr_line_at(marks, start + found[kind])
+                    hit = f"pr-body:{line}: {sf.PR_BODY_REASONS[kind]}"
+                    if hit not in hits:
+                        hits.append(hit)
+    return hits
+
+
+#: The shapes the fourth review round found origin/main catching and 6652dd2f missing, by cause: a
+#: target holding parens, an id after a mid-line ``->`` read as a pin, a closing inline tag that no
+#: longer ended the clause, and tags the bounded grammar rejects no longer splitting.
+_MAIN_CAUGHT_BRANCH_MISSED = [
+    pytest.param(
+        f"ASVS {_REQ} is enforced in "
+        "[the guard](https://learn.example.com/x(v=vs.85)/pkg/example_guard.py).",
+        id="paren-target",
+    ),
+    pytest.param(f"Next steps -> {_REQ} has a residual gap", id="arrow-pin"),
+    pytest.param(f"ASVS {_REQ} is met</b> over time", id="closing-inline-tag"),
+    pytest.param(f"ASVS {_REQ} passes</b> through review", id="closing-inline-tag-2"),
+    pytest.param(f"Done<br >{_REQ} has a residual gap", id="space-before-close"),
+    pytest.param(f'Done<p xml:lang="en">{_REQ} has a residual gap', id="colon-attribute"),
+    pytest.param(f'Done<p title="{"x" * 600}">{_REQ} has a residual gap', id="long-value"),
+]
+
+
+@pytest.mark.parametrize("body", _MAIN_CAUGHT_BRANCH_MISSED)
+def test_a_body_origin_main_caught_is_still_caught(sf, body: str) -> None:
+    """Review round 4 on 6652dd2f. The oracle must fire, or the containment asserts nothing."""
+    main_hits = _main_scan_pr_body(sf, body)
+    assert main_hits, "control: origin/main's reading must catch this shape"
+    assert set(main_hits) <= set(sf.scan_pr_body(body)), body
+
+
+def _harvested_pr_bodies() -> list[str]:
+    """Every string a fixture in this module holds: the ``_PR_*`` lists and every parametrize value.
+    Some are not PR bodies (flags, encodings), which only widens the corpus; the test's control counts
+    the bodies the oracle fires on. The long timing shapes are left out, as the oracle is quadratic
+    on them; the baseline's cut on such a shape is pinned by its own test."""
+    found: list[str] = []
+
+    def take(value: object) -> None:
+        if isinstance(value, ParameterSet):  # a tuple, so it must be read before the tuple branch
+            take(value.values)
+        elif isinstance(value, str):
+            found.append(value)
+        elif isinstance(value, (list, tuple)):
+            for v in value:
+                take(v)
+
+    for name, value in list(globals().items()):
+        if name.startswith("_PR_"):
+            take(value)
+        for mark in getattr(value, "pytestmark", []):
+            if mark.name == "parametrize":
+                take(list(mark.args[1]))
+    return [s for s in dict.fromkeys(found) if len(s) <= 10_000]
+
+
+def _generated_pr_bodies(count: int = 600) -> list[str]:
+    """A seeded corpus of the joins the four misses came from: leads, ids, tags, links and verdicts."""
+    rng = random.Random(5582)
+    leads = [
+        "",
+        "ASVS ",
+        "V",
+        "version ",
+        "Next steps -> ",
+        "Bumps lib to ",
+        "n<max; ",
+        "| ASVS | ",
+    ]
+    joins = [
+        " ",
+        "</b> ",
+        "<b>",
+        "<br >",
+        "<br>",
+        ". ",
+        "\n",
+        "\n\n",
+        "> ",
+        " -> ",
+        "<p a=1>",
+        " | ",
+    ]
+    tails = [
+        f"stays {_PARTIAL}",
+        "is met",
+        "has a residual gap",
+        "is enforced in pkg/example_guard.py",
+        "passes over time",
+        "[guard](a(v=1)/pkg/example_guard.py)",
+        "<code>pkg/example_guard.py</code>",
+        f"| {_PASS} |",
+        "will pass in this PR",
+    ]
+    bodies = []
+    for _ in range(count):
+        parts: list[str] = []
+        for _ in range(rng.randint(1, 3)):
+            ident = rng.choice([_REQ, _REQ_B, "6.1.2"])
+            parts += [rng.choice(leads), ident, rng.choice(joins), rng.choice(tails)]
+            parts.append(rng.choice(joins))
+        bodies.append("".join(parts))
+    return bodies
+
+
+def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf, sf_frozen_main) -> None:
+    """The structural property: the baseline is one pass of the union, so this holds by construction,
+    and the test pins it against two oracles: the pre-BACKLOG #5582 reading rebuilt here, and the
+    vendored origin/main scanner with #5582's readings. A body in ``_SUPERSET_EXCEPTIONS`` is quieted
+    on purpose and is left out; its own test pins that main flags it."""
+    harvested = set(_harvested_pr_bodies())
+    fired_harvested = fired_generated = 0
+    for body in [*harvested, *_generated_pr_bodies()]:
+        if body in _SUPERSET_EXCEPTIONS:
+            continue
+        main_hits = set(_main_scan_pr_body(sf, body)) | set(sf_frozen_main.scan_pr_body(body))
+        if main_hits:
+            if body in harvested:
+                fired_harvested += 1
+            else:
+                fired_generated += 1
+        missed = main_hits - set(sf.scan_pr_body(body))
+        assert not missed, (body, sorted(missed))
+    # Controls: the oracle fires on many fixtures and many generated bodies, or this proves nothing.
+    assert fired_harvested > 100 and fired_generated > 100, (fired_harvested, fired_generated)
+
+
+_PROSE = "This paragraph explains the change in plain words and names no requirement at all. "
+
+
+@pytest.mark.parametrize("body", _MAIN_CAUGHT_BRANCH_MISSED)
+@pytest.mark.parametrize("layout", ["one-line", "wrapped"])
+def test_a_main_caught_shape_past_the_cap_is_still_caught(sf, body: str, layout: str) -> None:
+    """Round 5: a blanket cut at 2000 characters lost main's reading of every long paragraph. Past the
+    cap the baseline reads with linear-time equals of main's patterns, so it reads the whole body."""
+    filler = _PROSE * 30
+    if layout == "wrapped":
+        filler = "\n".join(_PROSE.strip() for _ in range(30)) + "\n"
+    long_body = filler + body
+    assert len(long_body) > sf._PR_BASE_CAP
+    main_hits = _main_scan_pr_body(sf, long_body)
+    assert main_hits, "control: origin/main's reading must catch this shape"
+    assert set(main_hits) <= set(sf.scan_pr_body(long_body)), layout
+
+
+_LONG_BODIES_MAIN_READS_FAST = [
+    pytest.param(
+        "## Changes\n\n```\n"
+        + "".join(f" pkg/{'x' * 80}{i:03}.py {' ' * 10}| 2 +-\n" for i in range(131))
+        + "```\nNext steps -> 16.9.97 has a residual gap",
+        id="diffstat",
+    ),
+    pytest.param(
+        "the loop runs while i<n and j<m " * 120 + "\nNext steps -> 16.9.97 has a residual gap",
+        id="comparisons",
+    ),
+    pytest.param("[a " * 800 + "](x) ASVS 16.9.97 is met</b> over time", id="nested-brackets"),
+    pytest.param(_PROSE * 40 + "ASVS 16.9.97 is met</b> over time " + _PROSE * 40, id="mid-shape"),
+]
+
+
+@pytest.mark.parametrize("body", _LONG_BODIES_MAIN_READS_FAST)
+def test_a_long_body_keeps_main_s_reading_whole(sf, body: str) -> None:
+    """Round 6: a cost-model cut lost main's hit on bodies like these, which main reads in
+    milliseconds. The baseline cuts nothing now."""
+    main_hits = _main_scan_pr_body(sf, body)
+    assert main_hits, "control: origin/main's reading must catch this shape"
+    assert set(main_hits) <= set(sf.scan_pr_body(body))
+
+
+def _fuzz_strings(alphabet: str, count: int, longest: int) -> list[str]:
+    rng = random.Random(len(alphabet) * 7919 + longest)
+    return ["".join(rng.choices(alphabet, k=rng.randint(0, longest))) for _ in range(count)]
+
+
+def test_the_linear_link_sub_equals_main_s_pattern(sf) -> None:
+    """The baseline reads a long line with this in place of main's link pattern, so they must agree."""
+    changed = 0
+    for text in _fuzz_strings("[]()[]()[]()aa \t \x1c\n", 4000, 40):
+        expected = _MAIN_MD_LINK.sub(r"\1", text)
+        changed += expected != text
+        assert sf._pr_base_link_sub(text) == expected, repr(text)
+    assert changed > 100, "control: the corpus must hold links, or the equality is vacuous"
+
+
+def test_the_linear_split_equals_main_s_pattern(sf) -> None:
+    """The baseline splits a long paragraph with this in place of main's split pattern."""
+    split = 0
+    for text in _fuzz_strings("<>/bB. !?\t \x1cA*`[(\"'#-", 4000, 40):
+        expected = [(m.start(), m.end()) for m in _MAIN_SENTENCE_SPLIT.finditer(text)]
+        split += bool(expected)
+        assert sf._pr_base_split_spans(text) == expected, repr(text)
+    assert split > 100, "control: the corpus must hold splits, or the equality is vacuous"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[" * 1600 + "a](" + "x" * 63_900,
+        "[" * 65_000,
+        "a" + " " * 65_000 + "b",
+        "<a " * 21_000,
+        ("[" * 1999 + "\n") * 32,
+    ],
+    ids=["shared-target", "brackets", "space-run", "open-tags", "bracket-lines"],
+)
+def test_the_baseline_stays_linear_at_the_body_limit(sf, body: str) -> None:
+    began = time.perf_counter()
+    sf.scan_pr_body(body)
+    assert time.perf_counter() - began < 2
+
+
+def test_the_union_is_deduplicated_and_sorted_by_line_then_kind(sf) -> None:
+    body = f"ASVS {_REQ} stays {_PARTIAL}, a residual gap in pkg/example_guard.py\n\nx\n\n" * 2
+    hits = sf.scan_pr_body(body)
+    assert len(hits) == len(set(hits)), hits
+    order = list(sf.PR_BODY_REASONS.values())
+    keys = [(int(h.split(":")[1]), order.index(h.split(": ", 1)[1])) for h in hits]
+    assert keys == sorted(keys) and len(keys) == 6, hits

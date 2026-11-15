@@ -89,7 +89,6 @@ from messagefoundry.api import tls as api_tls
 from messagefoundry.apiclient import client as apiclient
 from messagefoundry.auth import oidc_http
 from messagefoundry.auth.ldap import LdapAuthenticator
-from messagefoundry.config import settings as settings_module
 from messagefoundry.config import tls_policy, tls_probe
 from messagefoundry.config.settings import ApiSettings, AuthSettings, StoreSettings
 from messagefoundry.store import postgres
@@ -409,14 +408,6 @@ def _dicom_listener(k: Kit) -> object:
     return dicom._server_ssl_context(settings)
 
 
-def _postgres_verify_off(k: Kit) -> object:
-    k.monkeypatch.setenv(settings_module.INSECURE_TLS_ESCAPE_ENV, "1")
-    # The escape needs a known warn posture (vault BACKLOG #2354).
-    return postgres._build_ssl(
-        StoreSettings(trust_server_certificate=True), posture=tls_policy.HopPosture(enforcing=False)
-    )
-
-
 def _ldaps(k: Kit) -> object:
     """The real caller: ``LdapAuthenticator`` builds its ``NarrowedTls``, which runs the factory
     once at construction. Since BACKLOG #2494 that factory builds the context each LDAPS
@@ -476,8 +467,6 @@ _SITES: dict[str, Callable[[Kit], object]] = {
             logging_setup.SyslogForward(host="localhost", protocol="tls", tls_verify=False)
         )
     ),
-    "messagefoundry/store/postgres.py::_build_ssl::"
-    "'Postgres store (TLS verification disabled)'": _postgres_verify_off,
     "messagefoundry/store/postgres.py::_verifying_context::connector": lambda k: (
         postgres._verifying_context(StoreSettings())
     ),

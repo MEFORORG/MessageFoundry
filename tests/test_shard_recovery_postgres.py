@@ -9,8 +9,8 @@ primitive coverage in ``test_postgres_store.py``).
 
 **Gated**: skipped unless ``MEFOR_TEST_POSTGRES`` is set (plus ``MEFOR_STORE_*`` connection env), so
 it's a no-op locally and in normal CI; a CI Postgres service-container job runs it for real. Requires
-the ``postgres`` extra (``asyncpg``); for a loopback dev Postgres (``encrypt=false``) also set
-``MEFOR_ALLOW_INSECURE_TLS=1``.
+the ``postgres`` extra (``asyncpg``), and a server speaking verified TLS: ``encrypt=false`` is
+refused at every posture (vault BACKLOG #3533 item 2).
 
 THE TARGET INVARIANT, simulated in-process: two engine shards share ONE store; shard A "crashes"
 mid-flight at EVERY stage while shard B is live mid-flight. Shard A's restart runs

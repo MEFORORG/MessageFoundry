@@ -53,7 +53,7 @@ Token-file format (sectioned; ``#`` comments and blank lines ignored):
 Usage:
   scan_forbidden.py [FILE ...]      # scan the given files (how pre-commit invokes it)
   scan_forbidden.py --path DIR      # scan every text file under DIR
-  scan_forbidden.py --show-context  # also print the matched line/value (NEVER used in CI -- a hit
+  scan_forbidden.py --show-context ...  # FIRST argument only; also print the matched line/value (NEVER used in CI -- a hit
                                     #   means the content already sits in a tracked file, so echoing
                                     #   it would copy the leak into public CI logs; default is
                                     #   reasons-only: location + category, never the matched text)
@@ -70,20 +70,26 @@ Usage:
                                     #   built for, because a ratio that silently drops those reads as
                                     #   full coverage over a hole.
 
-Exit: 0 clean, 1 forbidden content found (fail closed), 2 usage error / required-tokens-missing /
-self-test failure (an instrument that cannot see is not a content hit; the two need different fixes).
+Exit: 0 clean, 1 forbidden content found (fail closed), 2 for an instrument that cannot see, at least a
+usage error, required tokens missing, a self-test failure, a --path run that read no file, and an
+unreadable file with no content hit beside it (it is not a content hit; the two need different fixes).
+The terminal modes (--print-detector-counts, --assert-floor-fresh, --self-test, --pr-body) count only
+as the whole command line.
 """
 
 from __future__ import annotations
 
 import bisect
+import codecs
+import errno
 import json
 import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 # --------------------------------------------------------------------------------------------------
 # Structural detectors (NO customer data -- safe to commit). These run regardless of the token source.
@@ -663,26 +669,95 @@ _PR_TABLE_DELIMITER_CHARS = frozenset("|:- \t")
 _PR_WINDOW = 80
 #: A sentence ends at a full stop before a capital, or at an HTML tag: bot bodies carry release notes as
 #: HTML, and a tag is a block edge there however the text runs on.
-_PR_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
+#: An HTML tag is a tag name and at most 20 attributes, each a name with an optional quoted (500 at
+#: most) or unquoted (200 at most, as HTML allows one) value, closed by `>` straight after them or by
+#: `/>`. Every quantifier is bounded or anchored on a different class, so the tag cannot run past a
+#: newline, a `;` or a full stop the way `[^<>]*` did: `n<limit max=3 ... stays partial -> later` is no
+#: tag, so its verdict stays, and nor is prose like `x<y or z > w`. A boolean attribute
+#: (`<details open>`) is one.
+_PR_TAG_NAME = r"[A-Za-z]\w*(?:-\w+)*"
+_PR_TAG_ATTRS = (
+    rf"(?:\s+{_PR_TAG_NAME}"
+    r"""(?:\s*=\s*(?:"[^"<>\n]{0,500}"|'[^'<>\n]{0,500}'|[^\s"'<>=`]{1,200}))?)"""
+    r"{0,20}"
+)
+_PR_TAG_END = r"(?:\s*/>|>)"
+#: The whitespace lead starts only at the head of a run, so a long run is read once; it is optional so
+#: a tag the previous split's trailing whitespace already reached still splits.
+_PR_SENTENCE_SPLIT = re.compile(
+    rf"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])"
+    rf"|(?:(?<!\s)\s+)?</?{_PR_TAG_NAME}{_PR_TAG_ATTRS}{_PR_TAG_END}\s*"
+)
 _PR_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
 _PR_HEADING = re.compile(r"#{1,6}\s")
-_PR_QUOTE = re.compile(r"(?:>\s?)+")
+#: Anchored: unanchored, it deleted the first `>` anywhere in a line, the close of the line's first tag.
+_PR_QUOTE = re.compile(r"^(?:>\s?)+")
 #: A markdown link reads as its text: `[<id>](url) stays partial` is the identifier beside its verdict.
-_PR_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
+#: The body is read a second time with each target kept after its text, so a link whose TARGET is the
+#: code path maps the identifier to code too (BACKLOG #5582).
+#: No `[` in the text and no bracket in the target, so each scan stops at the next one and a run of
+#: `[` or of `[x](` stays linear.
+_PR_MD_LINK = re.compile(r"\[([^\[\]\n]*)\]\(([^()\[\]\s]*)\)")
+#: An inline HTML tag, which sits inside a sentence rather than ending one: `<b>`, `<code>`, `<a href>`.
+#: It is taken out of the line before the sentence split, so only a block tag still ends a sentence.
+#: A `<code>` tag reads as a backtick, as markdown writes one; the second reading keeps a tag's
+#: attributes, so an `<a href>` target is read as the markdown one is. The attributes are the split's
+#: bounded grammar, so the tag stops where a real one would and stays linear on a long run.
+_PR_INLINE_TAG = re.compile(
+    r"</?(?i:(code|kbd|samp|tt)|a|abbr|b|cite|del|dfn|em|i|ins|mark|q|s|small|span|strong|sub|sup|u|var)"
+    rf"({_PR_TAG_ATTRS}){_PR_TAG_END}"
+)
+#: A dotted number inside a link target, which a target reading must not take as a requirement id: a
+#: GitHub ``blob/8.1.8/CHANGES.rst`` link is a version and a path, never a map.
+#: Starts only at the first digit of a run, so a long run of digits is read once, not once per digit.
+_PR_TARGET_NUMBER = re.compile(r"(?<!\d)\d+(?:\.\d+)+")
+#: The baseline reading's patterns, kept as origin/main had them before BACKLOG #5582 changed the
+#: reading. The baseline is one pass of :func:`scan_pr_body`, so the scan reports at least every hit
+#: that reading reported: the rewrites above found more, and missed some main caught, three review
+#: rounds running. Do not tighten them: a change here is a change to the floor.
+_PR_BASE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][^>]*>\s*")
+_PR_BASE_QUOTE = re.compile(r"(?:>\s?)+")
+_PR_BASE_MD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
+#: The longest line, and paragraph, the baseline reads with the patterns above. Their link and split
+#: backtrack on a long run (`[` with no `]`, whitespace with no tag after it, `<x` with no `>`), so past
+#: this the baseline runs :func:`_pr_base_link_sub` and :func:`_pr_base_split_spans` instead, which give
+#: the same output in linear time (a test checks them against the patterns). Nothing is cut.
+_PR_BASE_CAP = 2000
+#: The lookahead class of the full-stop split, as ``_PR_BASE_SENTENCE_SPLIT`` spells it.
+_PR_BASE_SPLIT_LOOKAHEAD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ*`[(\"'#>-")
 PR_BODY_REASONS = {
     "verdict": "requirement verdict (a requirement id beside its verdict)",
     "gap": "requirement gap (a requirement id beside a gap or residual)",
     "map": "requirement-to-code map (a requirement id beside a code path)",
 }
+#: Hits on one line sort in this order, so the union of the readings prints the same way every run.
+_PR_REASON_ORDER = {reason: i for i, reason in enumerate(PR_BODY_REASONS.values())}
 
 
-def _pr_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
+def _pr_inline(line: str, targets: bool) -> str:
+    """A line with its links read as their text and its inline tags taken out. With ``targets``, each
+    link's target follows its text and each inline tag leaves its attributes, so a target is read too."""
+
+    def tag(m: re.Match[str]) -> str:
+        if m.group(1):
+            return "`"
+        attrs = m.group(2)
+        return f" {_PR_TARGET_NUMBER.sub('n', attrs)} " if targets and attrs else ""
+
+    def link(m: re.Match[str]) -> str:
+        return f"{m.group(1)} {_PR_TARGET_NUMBER.sub('n', m.group(2))}" if targets else m.group(1)
+
+    return _PR_MD_LINK.sub(link, _PR_INLINE_TAG.sub(tag, line))
+
+
+def _pr_units(body: str, targets: bool = False) -> list[tuple[list[tuple[int, int]], str, bool]]:
     """Split a PR body into the units a sentence can live in, as markdown renders them.
 
     A blank line, a list item or a table row starts a new unit, and a heading is a unit of its own; any
     other line continues the paragraph above it, so a hard-wrapped sentence is read whole. A quote is
     read without its `>` markers, so a wrapped quote is one paragraph too. Each unit carries
-    (offset, line) marks so a hit can be reported at the line its identifier sits on.
+    (offset, line) marks so a hit can be reported at the line its identifier sits on. ``targets`` is
+    :func:`_pr_inline`'s.
     """
     units: list[tuple[list[tuple[int, int]], str, bool]] = []
     marks: list[tuple[int, int]] = []
@@ -695,7 +770,134 @@ def _pr_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
             parts.clear()
 
     for lineno, raw in enumerate(body.splitlines(), 1):
-        line = _PR_MD_LINK.sub(r"\1", _PR_QUOTE.sub("", raw.strip(), count=1).strip())
+        unquoted = _PR_QUOTE.sub("", raw.strip(), count=1).strip()
+        line = _pr_inline(unquoted, targets).strip()
+        # A line that held only inline tags is transparent, not a paragraph break.
+        if unquoted and not line:
+            continue
+        if not line:
+            flush()
+            continue
+        if line.startswith("|") or _PR_HEADING.match(line):
+            flush()
+            units.append(([(0, lineno)], line, line.startswith("|")))
+            continue
+        if _PR_LIST_ITEM.match(line):
+            flush()
+        offset = marks[-1][0] + len(parts[-1]) + 1 if parts else 0
+        marks.append((offset, lineno))
+        parts.append(line)
+    flush()
+    return units
+
+
+def _pr_next(stops: list[int], at: int, end: int) -> int:
+    """The first stop at or after ``at``, or ``end``."""
+    i = bisect.bisect_left(stops, at)
+    return stops[i] if i < len(stops) else end
+
+
+def _pr_base_link_sub(line: str) -> str:
+    r"""``_PR_BASE_MD_LINK.sub(r"\1", line)``, in linear time. Each part of the pattern stops at the first
+    character it cannot take, and backtracking cannot make a shorter run end on the character the next
+    part needs, so a match is found by lookups: the next `]` or newline, then `(`, then the next `)` or
+    whitespace, which must be `)`."""
+    n = len(line)
+    text_ends = [i for i, c in enumerate(line) if c in "]\n"]
+    target_ends = [i for i, c in enumerate(line) if c == ")" or c.isspace()]
+    out: list[str] = []
+    pos = i = 0
+    while (i := line.find("[", i)) != -1:
+        j = _pr_next(text_ends, i + 1, n)
+        if j + 1 < n and line[j] == "]" and line[j + 1] == "(":
+            k = _pr_next(target_ends, j + 2, n)
+            if k < n and line[k] == ")":
+                out += [line[pos:i], line[i + 1 : j]]
+                pos = i = k + 1
+                continue
+        i += 1
+    out.append(line[pos:])
+    return "".join(out)
+
+
+def _pr_base_split_spans(unit: str) -> list[tuple[int, int]]:
+    """The (start, end) of every ``_PR_BASE_SENTENCE_SPLIT`` match in ``unit``, in linear time. Each
+    alternative's whitespace run ends where the run does, since a shorter run leaves whitespace where
+    the lookahead or the `<` must be; the tag runs to the next `>`."""
+    n = len(unit)
+    run_end = list(range(n + 1))
+    for p in range(n - 1, -1, -1):
+        if unit[p].isspace():
+            run_end[p] = run_end[p + 1]
+    closes = [i for i, c in enumerate(unit) if c == ">"]
+
+    def letter(at: int) -> bool:
+        return at < n and unit[at].isascii() and unit[at].isalpha()
+
+    spans: list[tuple[int, int]] = []
+    p = 0
+    while p < n:
+        e = run_end[p]
+        if (
+            e > p
+            and e < n
+            and p > 0
+            and unit[p - 1] in ".!?"
+            and unit[e] in _PR_BASE_SPLIT_LOOKAHEAD
+        ):
+            spans.append((p, e))
+            p = e
+            continue
+        if e < n and unit[e] == "<":
+            name = e + 2 if e + 1 < n and unit[e + 1] == "/" else e + 1
+            if letter(name):
+                g = _pr_next(closes, name + 1, n)
+                if g < n:
+                    spans.append((p, run_end[g + 1]))
+                    p = run_end[g + 1]
+                    continue
+        p += 1
+    return spans
+
+
+def _pr_base_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
+    """:func:`_pr_sentences` with origin/main's split: the pattern itself up to ``_PR_BASE_CAP``, and
+    its linear-time equal past it."""
+    if is_row:
+        return [(0, unit)]
+    if len(unit) <= _PR_BASE_CAP:
+        spans = [(m.start(), m.end()) for m in _PR_BASE_SENTENCE_SPLIT.finditer(unit)]
+    else:
+        spans = _pr_base_split_spans(unit)
+    sentences, start = [], 0
+    for begin, end in spans:
+        sentences.append((start, unit[start:begin]))
+        start = end
+    sentences.append((start, unit[start:]))
+    return sentences
+
+
+def _pr_base_units(body: str) -> list[tuple[list[tuple[int, int]], str, bool]]:
+    """:func:`_pr_units` as origin/main had it, the baseline reading: links read as their text, the
+    first `>` of a line taken out wherever it sits, and every HTML tag left for the split to end a
+    sentence at. Nothing is cut: a long line takes the link pattern's linear-time equal (see
+    ``_PR_BASE_CAP``)."""
+    units: list[tuple[list[tuple[int, int]], str, bool]] = []
+    marks: list[tuple[int, int]] = []
+    parts: list[str] = []
+
+    def flush() -> None:
+        if parts:
+            units.append((list(marks), " ".join(parts), False))
+            marks.clear()
+            parts.clear()
+
+    for lineno, raw in enumerate(body.splitlines(), 1):
+        unquoted = _PR_BASE_QUOTE.sub("", raw.strip(), count=1).strip()
+        if len(unquoted) <= _PR_BASE_CAP:
+            line = _PR_BASE_MD_LINK.sub(r"\1", unquoted)
+        else:
+            line = _pr_base_link_sub(unquoted)
         if not line:
             flush()
             continue
@@ -867,9 +1069,38 @@ def scan_pr_body(body: str) -> list[str]:
 
     Reasons only, never the matched text. One hit per kind per LINE: sentences of one paragraph that
     restate a verdict on the same line report it once, rather than storming.
+
+    Read three times, and the hits are the union (BACKLOG #5582). The baseline is origin/main's reading
+    (:func:`_pr_base_units`, ``_PR_BASE_SENTENCE_SPLIT``), so no rewrite of the readings below it can
+    report less than it did. The second reads each link as its text and each inline tag as no edge, and the third keeps each link's
+    target beside it, so a code path only a target names is seen. Every reading keeps each line where
+    it was, so the hits merge by (line, kind), sorted by line and then in ``PR_BODY_REASONS`` order.
     """
+    base = _pr_base_units(body)
+    hits = _pr_unit_hits(base, _pr_base_sentences)
+    as_text = _pr_units(body)
+    # With no `<` the two splits are the same full-stop rule, so equal units would only repeat the
+    # baseline's hits.
+    if "<" in body or as_text != base:
+        hits += _pr_unit_hits(as_text, _pr_sentences)
+    # No link and no tag means no target, so the third reading would only repeat the second.
+    with_targets = _pr_units(body, targets=True) if "](" in body or "<" in body else as_text
+    if with_targets != as_text:
+        # Only a map: the third reading exists so a target's code path counts, and a target's words
+        # are a URL's, not the body's own verdict or gap.
+        extra = _pr_unit_hits(with_targets, _pr_sentences)
+        hits += [h for h in extra if h.endswith(PR_BODY_REASONS["map"])]
+    return sorted(
+        dict.fromkeys(hits),
+        key=lambda h: (int(h.split(":", 2)[1]), _PR_REASON_ORDER[h.split(": ", 1)[1]]),
+    )
+
+
+def _pr_unit_hits(
+    units: list[tuple[list[tuple[int, int]], str, bool]],
+    sentences: Callable[[str, bool], list[tuple[int, str]]],
+) -> list[str]:
     hits: list[str] = []
-    units = _pr_units(body)
     asvs_columns: set[int] = set()
     for index, (marks, unit, is_row) in enumerate(units):
         if not is_row:
@@ -880,7 +1111,7 @@ def scan_pr_body(body: str) -> list[str]:
             and _pr_is_delimiter(units[index + 1][1])
         ):
             asvs_columns = _pr_asvs_columns(unit)
-        for start, sentence in _pr_sentences(unit, is_row):
+        for start, sentence in sentences(unit, is_row):
             found: dict[str, int] = {}
             # The tree scan's tight pair, before the version filter can set its identifier aside: what
             # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
@@ -961,6 +1192,10 @@ _SITE_SKIP_NAMES = {
     "common_passwords.txt",
 }
 
+#: Directories a ``--path`` WALK skips: tool caches, virtual environments and build output that sit
+#: untracked in a working tree, where a whole-tree scan would otherwise read third-party code. Applied
+#: in ``--path`` mode only. A tracked or staged file is content git already holds, whatever directory it
+#: sits in, so the tracked and staged scans read it (BACKLOG #5585).
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -981,11 +1216,20 @@ SKIP_DIRS = {
 SKIP_PATHS = ("scripts/security/scan-tokens.local.txt",)
 
 
+#: A vendored JavaScript action's compiled bundle, which .gitignore re-includes under the same glob. It
+#: is third-party code bundled from node_modules, so the name detectors false-positive on it; its own
+#: source beside it is scanned. This is the narrowed form of what the blanket ``dist`` directory skip
+#: did for it before BACKLOG #5585: only a .js file directly in such a dist directory, and no path with a
+#: ``.`` or ``..`` component, not every ``dist`` segment in the tree.
+_VENDORED_ACTION_BUNDLE = re.compile(r"\.github/actions/(?:[\w-][\w.-]*/)+dist/[\w-][\w.-]*\.js")
+
+
 def _is_skipped(posix: str) -> bool:
     # ``posix`` is ALWAYS relative to the scan root (main() derives it that way in --path mode too), so
     # this is an EXACT path match, never a suffix match. A suffix test would skip a same-named file at a
-    # different path, which must still be scanned.
-    return posix in SKIP_PATHS
+    # different path, which must still be scanned. The bundle pattern is a ``fullmatch`` for the
+    # same reason.
+    return posix in SKIP_PATHS or _VENDORED_ACTION_BUNDLE.fullmatch(posix) is not None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1512,6 +1756,13 @@ def _takes_ident_pass(pat: re.Pattern[str]) -> bool:
     return " " not in src and r"\s" not in src
 
 
+def _name_matches(pat: re.Pattern[str], text: str, unwrapped: str) -> bool:
+    """One name pattern against ``text``, and against ``unwrapped`` (``text`` with ``_IDENT_SEP``
+    neutralised) when it takes the identifier pass. The ONE rule both ``scan_file`` and ``scan_text``
+    apply, so the two cannot drift again (BACKLOG #5584)."""
+    return bool(pat.search(text) or (_takes_ident_pass(pat) and pat.search(unwrapped)))
+
+
 def _load_allowlist() -> list[re.Pattern[str]]:
     """Optional line-regex allowlist for vetted false positives (one regex per line, '#' comments).
 
@@ -1597,14 +1848,66 @@ def _candidate_files(argv: list[str]) -> list[tuple[Path, str]]:
     return [(Path(p), Path(p).as_posix()) for p in _git_tracked()]
 
 
+#: Byte-order marks, longest first: a UTF-32-LE mark begins with the UTF-16-LE one. The wide entries of
+#: the table in messagefoundry/security/audit_all_platforms.py, copied because this file loads
+#: standalone by path; UTF-8 needs no entry here, since a NUL-free file decodes as UTF-8 anyway.
+_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+_HEAD_BYTES = 4096
+
+
+def _bomless_utf16(head: bytes) -> str | None:
+    """The UTF-16 codec a head with no byte-order mark is written in, or ``None``. Text in the ASCII
+    range, which every token is, has a NUL in every other byte and none between; binary has neither."""
+    for codec, nul_at in (("utf-16-le", 1), ("utf-16-be", 0)):
+        nuls, others = head[nul_at::2], head[1 - nul_at :: 2]
+        if (
+            len(nuls) >= 2
+            and nuls.count(0) * 10 >= len(nuls) * 9
+            and others.count(0) * 10 <= len(others)
+        ):
+            return codec
+    return None
+
+
+def _wide_shape(body: bytes, codec: str, bom: bytes) -> bool:
+    """Whether the bytes after a byte-order mark have the NUL pattern its encoding gives ASCII text:
+    one NUL in each 2-byte unit for UTF-16, three in each 4-byte unit for UTF-32."""
+    if not body:
+        return True
+    if codec == "utf-16":
+        return _bomless_utf16(body) == ("utf-16-le" if bom == codecs.BOM_UTF16_LE else "utf-16-be")
+    nul_at = (1, 2, 3) if bom == codecs.BOM_UTF32_LE else (0, 1, 2)
+    nuls = b"".join(body[i::4] for i in nul_at)
+    return len(nuls) >= 3 and nuls.count(0) * 10 >= len(nuls) * 9
+
+
 def _read_text(path: Path) -> str | None:
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return None
-    if b"\x00" in data[:4096]:  # binary file -- nothing to scan
-        return None
-    return data.decode("utf-8", errors="replace")
+    """The file's text, or ``None`` for binary. Raises ``OSError`` when the file cannot be read, which
+    ``scan_file`` reports as a hit: an unread file is not a clean one (BACKLOG #5583).
+
+    A NUL near the start used to mean binary outright, so UTF-16 and UTF-32 text, which a Windows tool
+    writes routinely, went unscanned. A byte-order mark or the UTF-16 shape now decodes it first."""
+    data = path.read_bytes()
+    head = data[:_HEAD_BYTES]
+    for bom, codec in _BOMS:
+        if not data.startswith(bom):
+            continue
+        wide_text = data.decode(codec, errors="replace")
+        if _wide_shape(head[len(bom) :], codec, bom):
+            return wide_text
+        # The bytes disagree with the mark: a UTF-8 body behind a stray mark, or wide text mostly above
+        # U+00FF (box drawing, CJK). Neither reading can be ruled out, so both are scanned: picking one
+        # hid every token of the other (fail closed).
+        return wide_text + "\n" + data.decode("utf-8", errors="replace")
+    if b"\x00" not in head:
+        return data.decode("utf-8", errors="replace")
+    wide = _bomless_utf16(head)
+    return data.decode(wide, errors="replace") if wide is not None else None
 
 
 def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = False) -> list[str]:
@@ -1614,16 +1917,30 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     safe to print in public CI logs. ``show_context`` additionally appends the matched value and the
     trimmed line -- for local triage only, never CI.
     """
+    return _scan_file(path, rel_posix, show_context=show_context)[0]
+
+
+#: What ``_scan_file`` did with a file's content: read it as text, set it aside unread (binary, or
+#: under a forbidden path), or fail to read it at all.
+_FileState = Literal["read", "unread", "unreadable"]
+
+
+def _scan_file(
+    path: Path, rel_posix: str | None = None, *, show_context: bool = False
+) -> tuple[list[str], _FileState]:
+    """``scan_file``'s hits, and what became of the file's content. A binary file is judged by its name
+    and location only, so the run must not count it as scanned, and an unreadable one is an instrument
+    failure, not a clean file (BACKLOG #5583)."""
     posix = rel_posix if rel_posix is not None else path.as_posix()
     if _is_skipped(posix):
-        return []
+        return [], "unread"
     # LOCATION before content, and deliberately before the binary/unreadable early-return below: a
     # forbidden path is a hit whatever its bytes are, and a PDF or an image under docs/security/ is
     # exactly as much of a leak as the markdown beside it. Reported at line 0 because the finding is
     # the path itself and there is no line to point at -- the reason names the file, not a location
     # inside it. Scanning stops here; content hits on a file that must not exist add nothing.
     if reason := forbidden_path_reason(posix):
-        return [f"{path}:0: {reason}"]
+        return [f"{path}:0: {reason}"], "unread"
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
     # filename, and a module need not repeat its own name in its text. Placed before the binary
@@ -1639,9 +1956,15 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     # content veto and cannot reach this, exactly as it cannot reach the location rule.
     if _ESTATE_ID_SHAPE.search(posix):
         hits.append(f"{posix}:0: {_ESTATE_ID_REASON}, in the file NAME")
-    text = _read_text(path)
+    try:
+        text = _read_text(path)
+    except OSError as exc:
+        # The errno name only: the message can carry the path's absolute form, a user-home path.
+        why = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+        hits.append(f"{posix}:0: unreadable ({why}), so its content was not scanned (fail closed)")
+        return hits, "unreadable"
     if text is None:
-        return hits
+        return hits, "unread"
     ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
     site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
     for lineno, line in enumerate(text.splitlines(), 1):
@@ -1657,7 +1980,7 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
         # Substitution preserves length, so offsets and ``show_context`` stay meaningful.
         unwrapped = _IDENT_SEP.sub(" ", line)
         for pat, reason in FORBIDDEN:
-            if pat.search(line) or (_takes_ident_pass(pat) and pat.search(unwrapped)):
+            if _name_matches(pat, line, unwrapped):
                 hits.append(f"{posix}:{lineno}: {reason}{ctx}")
         if site_scan:
             for m in _SITE_CODE_FILE.finditer(line):
@@ -1704,7 +2027,7 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
                 if estate_pat.search(line):
                     hits.append(f"{posix}:{lineno}: estate token{ctx}")
                     break
-    return hits
+    return hits, "read"
 
 
 def scan_text(text: str, *, include_estate: bool = False) -> list[str]:
@@ -1718,10 +2041,15 @@ def scan_text(text: str, *, include_estate: bool = False) -> list[str]:
     fabricated dates), so the anonymizer checks it **field-anchored** instead
     (``surrogates.message_has_site_code``). Returns REASONS ONLY -- never the matched text -- so a
     caller may raise/log the result without leaking PHI.
+
+    The name patterns get the same identifier pass ``scan_file`` gives them, so a token inside an
+    underscore-joined identifier is found here too (BACKLOG #5584). The estate reason names no token:
+    the token IS the private estate string, and the leak-check raises and logs these reasons.
     """
     reasons: list[str] = []
+    unwrapped = _IDENT_SEP.sub(" ", text)
     for pat, reason in FORBIDDEN:
-        if pat.search(text):
+        if _name_matches(pat, text, unwrapped):
             reasons.append(reason)
     for m in _IPV4.finditer(text):
         if not _ALLOWED_IP.match(m.group(0)):
@@ -1729,7 +2057,8 @@ def scan_text(text: str, *, include_estate: bool = False) -> list[str]:
             break
     if include_estate:
         lowered = text.lower()
-        reasons.extend(f"estate token ({token})" for token in ESTATE_TOKENS if token in lowered)
+        if any(token in lowered for token in ESTATE_TOKENS):
+            reasons.append("estate token")
     return reasons
 
 
@@ -2161,11 +2490,17 @@ def main(argv: list[str]) -> int:
     reload_tokens()
     # SEC-04 / BACKLOG #1368. Both are read BEFORE the require/floor parsing below, because each is a
     # terminal mode that reports and exits rather than scanning.
-    if "--print-detector-counts" in argv:
+    #
+    # Each terminal mode must be the WHOLE command line, as the body modes above are (BACKLOG #5585).
+    # pre-commit passes ``--require-tokens`` and then the staged names, so a staged file spelled like
+    # one of these flags used to switch the commit gate into reporting and exiting 0 without scanning
+    # anything. Anywhere else the flag falls through to ``_parse_require_flag``, which refuses it.
+    terminal = argv[0] if len(argv) == 1 else None
+    if terminal == "--print-detector-counts":
         for line in _detector_count_report(loaded_token_counts()):
             print(line)
         return 0
-    if "--assert-floor-fresh" in argv:
+    if terminal == "--assert-floor-fresh":
         spec = os.environ.get("MEFOR_MIN_DETECTORS", "").strip()
         if not spec:
             print(
@@ -2198,7 +2533,7 @@ def main(argv: list[str]) -> int:
     # floor asks whether the list fell BELOW it, --assert-floor-fresh asks whether it outgrew it, and
     # this asks whether what loaded can FIRE. Only the last one can see a table that is fully
     # populated, fully fresh, and inert.
-    if "--self-test" in argv:
+    if terminal == "--self-test":
         if not TOKENS_PRESENT:
             print(
                 "scan_forbidden: --self-test needs a loaded token source; refusing rather than "
@@ -2217,8 +2552,12 @@ def main(argv: list[str]) -> int:
         # cannot see. They call for different actions and must not share an exit code.
         return 2 if failures else 0
 
-    show_context = "--show-context" in argv
-    rest = [a for a in argv if a != "--show-context"]
+    # First only, for the reason the terminal modes above are whole-line only: taken from anywhere, a
+    # staged file named ``--show-context`` was dropped unscanned and switched on value echoing.
+    # Anywhere else ``_parse_require_flag`` refuses it. A staged file named ``--path`` still switches
+    # the run to path mode; that needs a ``--`` separator from pre-commit (BACKLOG #5585, remainder).
+    show_context = bool(argv) and argv[0] == "--show-context"
+    rest = argv[1:] if show_context else list(argv)
     try:
         flag_require, minimum, rest = _parse_require_flag(rest)
     except ValueError as exc:
@@ -2272,14 +2611,31 @@ def main(argv: list[str]) -> int:
 
     path_mode = bool(rest) and rest[0] == "--path"
     hits: list[str] = []
+    # Only a file whose content was read as text counts as scanned. A binary file is judged by its name
+    # and location only, and an unreadable one fails the run with exit 2; counting either as scanned let
+    # a run whose files were all unread report coverage it did not have (BACKLOG #5583).
     scanned = 0
+    unread = 0
+    unreadable = 0
     for abs_path, rel in _candidate_files(rest):
         # SKIP_DIRS is evaluated on the RELATIVE parts, so a scan-root path component that happens to be
-        # named build/venv/dist/… can no longer short-circuit the scan of every file.
-        if not abs_path.is_file() or set(Path(rel).parts) & SKIP_DIRS or _is_skipped(rel):
+        # named build/venv/dist/… can no longer short-circuit the scan of every file. It applies to the
+        # --path walk only, so the tracked and staged scans read such a file; the CI --path scans still
+        # skip it, because the walk cannot tell tracked from untracked (BACKLOG #5585, remainder). Only
+        # the DIRECTORY parts count: a file named ``build`` is not a build directory. A ``.git`` FILE is
+        # a worktree's pointer to its git directory, and is skipped as that directory is.
+        if not abs_path.is_file() or _is_skipped(rel):
             continue
-        scanned += 1
-        hits.extend(scan_file(abs_path, rel, show_context=show_context))
+        posix_rel = Path(rel)
+        if path_mode and (set(posix_rel.parent.parts) & SKIP_DIRS or posix_rel.name == ".git"):
+            continue
+        file_hits, state = _scan_file(abs_path, rel, show_context=show_context)
+        hits.extend(file_hits)
+        if state == "read":
+            scanned += 1
+        else:
+            unread += 1
+            unreadable += state == "unreadable"
 
     # PRINT WHAT WAS SCANNED, not just what was loaded. Exit 0 plus a token-count line cannot tell a
     # caller whether the files they named were examined -- and when --path silently dropped trailing
@@ -2287,17 +2643,31 @@ def main(argv: list[str]) -> int:
     # having to suspect it.
     if path_mode:
         print(
-            f"scan_forbidden: examined {scanned} file(s) across {len(rest) - 1} named path(s).",
+            f"scan_forbidden: examined {scanned} file(s) across {len(rest) - 1} named path(s); "
+            f"{unread} more were binary, unreadable or under a forbidden path, so their content "
+            "was not scanned.",
             file=sys.stderr,
         )
 
     # A --path scan that examined ZERO files is not a pass: it means the whole tree was skipped (a
     # SKIP_DIRS component in the path, or an empty/wrong tree). Refuse rather than report a vacuous clean.
-    if path_mode and scanned == 0:
+    # A hit outranks the refusal: a run whose only file sits under a forbidden path still reports it.
+    if path_mode and scanned == 0 and not hits:
         print(
-            "scan_forbidden: --path examined ZERO files (all skipped, or empty tree) — refusing "
+            "scan_forbidden: --path examined ZERO files (all skipped or unread, or empty tree) — refusing "
             "(fail closed). Check the scan path for a SKIP_DIRS component (build/venv/dist/…).",
             file=sys.stderr,
+        )
+        return 2
+
+    # 2, not 1: an unread file is an instrument that could not see, which wants its permissions or lock
+    # fixed, not content removed. The same split as --self-test's.
+    # A content hit outranks it: a confirmed leak keeps exit 1 and its own advice, beside the unread list.
+    if unreadable and len(hits) == unreadable:
+        _report_hits(
+            "UNREADABLE FILES -- their content was not scanned (fail closed):",
+            hits,
+            "Fix the file's permissions or lock, then scan again. Any content hit above still applies.",
         )
         return 2
 

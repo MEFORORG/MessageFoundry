@@ -375,20 +375,18 @@ async def _refuse_own_channel_scope(
     service: AuthService,
     identity: Identity,
     user_id: str,
-    target: UserRecord | None = None,
 ) -> None:
     """The channel-scope write's self-target refusal (BACKLOG #1149), one definition for both planes.
 
-    The console calls it through the seam before its own form checks (BACKLOG #3393), so a
-    self-target post with a malformed form is still refused and audited, not answered first by a
-    form error. ``set_channel_scope`` runs it again before the write, so the console's call adds
-    the order and takes nothing away."""
+    The console calls it through the seam before its own form checks and its account read
+    (BACKLOG #3393), so a self-target post with a malformed form is still refused and audited, not
+    answered first by a form error. ``set_channel_scope`` runs it again before the write, so the
+    console's call adds the order and takes nothing away."""
     await _refuse_if_self(
         request,
         service,
         identity,
         user_id,
-        target,
         op="channel_scope",
         detail="another administrator must change your own channel scope",
     )
@@ -518,7 +516,7 @@ def _user_summary(
 
 def _console_user_summary(
     user: UserRecord,
-    role_ids: list[str],
+    role_ids: list[str] | None,
     *,
     show_scope: bool,
     credential_expires_at: float | None = None,
@@ -529,7 +527,14 @@ def _console_user_summary(
     discloses, where a withholding default would read a real scope as deny-all and offer to save
     that over it. The seam field is named ``user_summary_scoped`` so the rename moves the seam
     digest: a console from before the keyword refuses to mount, rather than mounting and failing on
-    its user pages (``_ui_seam.py`` history)."""
+    its user pages (``_ui_seam.py`` history).
+
+    ``role_ids`` None takes the role rows a :class:`VerifiedUser`'s seal covered, so the console
+    reads no record attribute for them (BACKLOG #5559); any other record raises TypeError."""
+    if role_ids is None:
+        if not isinstance(user, VerifiedUser):
+            raise TypeError("role_ids=None takes a checked record, whose seal covered its roles")
+        role_ids = list(user.role_ids)
     return _user_summary(
         user,
         role_ids,
@@ -2632,6 +2637,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     return AdminHandlers(
         list_roles=list_roles,
         list_users=list_users,
+        checked_user=_checked_user,
         list_custom_roles=list_custom_roles,
         create_user=create_user,
         update_user=update_user,

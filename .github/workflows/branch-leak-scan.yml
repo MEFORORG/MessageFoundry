@@ -45,8 +45,17 @@ name: Branch leak scan
 #
 # COST, stated because CI cost is a live constraint here -- live enough that security.yml dropped its
 # post-merge `push: branches: [main]` arm on 2026-09-08 as a re-scan of a tree its merge_group run had
-# just scanned: one ubuntu job, checkout plus setup-python plus a stdlib-only scanner, no install step
-# and no dependency resolution.
+# just scanned: one ubuntu job, a full-history checkout plus setup-python plus a stdlib-only scanner,
+# no install step and no dependency resolution.
+#
+# WHAT IT SCANS (BACKLOG #5595): the TIP working tree, and then every file each commit in the pushed
+# range added or changed, at that commit. Scanning only the tip missed content added in one pushed
+# commit and removed in a later one: the earlier commit is still public by SHA while the tip is clean.
+# The range is the push's `before..after`, less what `origin/main` already holds, since main's content
+# went through the merge queue's scan. A new branch (a zero `before`) and a force-push whose `before`
+# is not in this clone fall back to everything not on `origin/main`, which is a superset and so safe.
+# A merge commit is diffed against its FIRST parent, so content a conflict resolution introduced is
+# scanned too.
 
 on:
   push:
@@ -58,12 +67,13 @@ on:
     branches-ignore:
       - main
 
-concurrency:
-  # Per-ref: a rapid re-push supersedes its own in-flight scan. Cancelling here is safe in a way it is
-  # not for a required context -- nothing gates on this job's conclusion, and the newer push runs the
-  # same scan over a superset of the same refs.
-  group: branch-leak-scan-${{ github.ref }}
-  cancel-in-progress: true
+# NO `concurrency:` BLOCK, so no push's scan is ever cancelled or dropped (BACKLOG #5595). This used
+# to be a per-ref group with cancel-in-progress, on the premise that "the newer push runs the same scan
+# over a superset of the same refs". That premise is FALSE: each run scans the commits ITS push added,
+# and a later push's range starts where the earlier one ended, so the earlier range is not in it. A
+# force-push can also drop the earlier commits from the branch, yet they stay public by SHA. A per-ref
+# group without cancel-in-progress would not fix it either: GitHub keeps one pending run per group and
+# cancels the older pending one. tests/test_branch_leak_scan_range.py refuses the block's return.
 
 permissions:
   contents: read
@@ -82,10 +92,12 @@ jobs:
           # the flag costs nothing. Fixed here rather than suppressed in .github/zizmor.yml: that file
           # is for findings that are safe-by-design, and this one is simply fixable.
           persist-credentials: false
+          # FULL HISTORY, for the range scan below: it needs every pushed commit and origin/main.
+          fetch-depth: 0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ci/python-version
-      - name: Scan the pushed tree for forbidden content
+      - name: Scan the pushed tree and every pushed commit for forbidden content
         # Same scanner, same fail-closed posture, same per-section floor as security.yml's
         # forbidden-content job. The floor is what makes "fail closed" mean anything: a
         # partially-mangled secret can load a handful of detectors and pass with a green tick, so
@@ -95,6 +107,8 @@ jobs:
         # var, which is an opaque value rather than an Actions-expression sink.
         env:
           MEFOR_FORBIDDEN_TOKENS: ${{ secrets.MEFOR_FORBIDDEN_TOKENS }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
         run: |
           if [ -n "$MEFOR_FORBIDDEN_TOKENS" ]; then
             export MEFOR_REQUIRE_TOKENS=1
@@ -108,12 +122,92 @@ jobs:
             echo "::error::MEFOR_FORBIDDEN_TOKENS is absent on a push run. The branch leak scan cannot run. Check the repository secret (repo-scoped, not environment-scoped)." >&2
             exit 2
           fi
-          python scripts/security/scan_forbidden.py --path .
+
+          # THE PUSHED RANGE (BACKLOG #5595). Every git call below fails the step on error: a range that
+          # cannot be computed is not a clean range.
+          set -euo pipefail
+          zero=0000000000000000000000000000000000000000
+          for sha in "$PUSH_BEFORE" "$PUSH_AFTER"; do
+            case "$sha" in
+              *[!0-9a-f]*|"") echo "::error::push SHA '$sha' is not a hex object id." >&2; exit 2 ;;
+            esac
+            # Exactly 40: a short hex value would resolve as an abbreviated id.
+            if [ "${#sha}" -ne 40 ]; then echo "::error::push SHA '$sha' is not 40 hex characters." >&2; exit 2; fi
+          done
+          if [ "$PUSH_AFTER" = "$zero" ]; then
+            echo "branch deleted: no pushed commits to scan; scanning the checked-out tree only."
+            python scripts/security/scan_forbidden.py --path .
+            exit 0
+          fi
+          exclude=(--not refs/remotes/origin/main)
+          if [ "$PUSH_BEFORE" != "$zero" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            exclude+=("$PUSH_BEFORE")
+          else
+            echo "no usable 'before' (new branch, or a force-push whose old head is not here): scanning everything not on origin/main."
+          fi
+          commits="$(git rev-list "$PUSH_AFTER" "${exclude[@]}")"
+          snap="$RUNNER_TEMP/branch-leak-scan-commits"
+          rm -rf "$snap"
+          mkdir -p "$snap"
+          roots=()
+          files=0
+          while read -r sha; do
+            [ -n "$sha" ] || continue
+            root="$snap/$sha"
+            # To a FILE, not a variable: the -z output carries NULs, which a shell variable drops, and
+            # a redirect keeps git's exit status, which `set -e` then acts on.
+            raw="$snap/$sha.raw"
+            base=(--root)
+            if git rev-parse -q --verify "${sha}^1" >/dev/null; then base=("${sha}^1"); fi
+            # --no-commit-id: with --root, diff-tree otherwise writes the commit id first, which shifts
+            # every meta/path pair below by one and skipped every file of a root commit.
+            git diff-tree -r -z --raw --no-renames --no-commit-id "${base[@]}" "$sha" > "$raw"
+            n=0
+            # -z raw records are ":oldmode newmode oldsha newsha status" NUL path NUL.
+            while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+              read -r _ newmode _ blob status <<< "$meta"
+              case "$status" in A|M|T) ;; *) continue ;; esac
+              # A gitlink has no blob here. A symlink's blob is its target text, written as a regular
+              # file so the scanner reads that text and never follows the link.
+              case "$newmode" in 100644|100755|120000) ;; *) continue ;; esac
+              case "/$path/" in
+                //*|*/../*|*/./*|*/.git/*)
+                  echo "::error::pushed commit $sha names an unsafe path; refusing to write it." >&2
+                  exit 2
+                  ;;
+              esac
+              # The scanner skips this path so a working-tree scan on the owner's machine does not
+              # trip on the git-ignored real token list. Inside a pushed COMMIT it is committed by
+              # definition, so its presence is the leak.
+              if [ "$path" = "scripts/security/scan-tokens.local.txt" ]; then
+                echo "::error::pushed commit $sha commits scripts/security/scan-tokens.local.txt, the real token list." >&2
+                exit 1
+              fi
+              case "$path" in
+                */*) mkdir -p "$root/${path%/*}" ;;
+                *) mkdir -p "$root" ;;
+              esac
+              git cat-file blob "$blob" > "$root/$path"
+              n=$((n + 1))
+            done < "$raw"
+            if [ "$n" -gt 0 ]; then
+              roots+=("$root")
+              files=$((files + n))
+            fi
+          done <<< "$commits"
+          echo "pushed range: ${#roots[@]} commit(s) with $files added or changed file(s)."
+          # ONE scan of the tip tree and every commit root. Each commit is its own root, so a path
+          # detector keyed on `docs/security/` still sees the repository-relative path, and the tip
+          # always has files, so the scanner's zero-files refusal cannot fire on a push whose only
+          # files sit under a directory the scanner skips.
+          python scripts/security/scan_forbidden.py --path . "${roots[@]}"
       - name: Say what a failure here does and does not mean
         if: failure()
         run: |
-          echo "::warning::This branch carries forbidden content and it is ALREADY PUBLIC -- the push"
-          echo "::warning::completed before this ran. This job detects; it cannot prevent."
+          echo "::warning::Either this branch carries forbidden content, or the scan could not run. Read"
+          echo "::warning::the scan step's log: a FORBIDDEN CONTENT report or an ::error:: naming a leak means"
+          echo "::warning::the content is ALREADY PUBLIC -- the push completed before this ran; this job"
+          echo "::warning::detects, it cannot prevent. Any other refusal is the instrument failing, not a leak."
           echo "::warning::Respond: delete the branch, assess what was exposed, and check whether the"
           echo "::warning::pre-push guard was bypassed (--no-verify) or simply never installed"
           echo "::warning::(pwsh -NoProfile -File scripts/coord/install-git-hooks.ps1)."

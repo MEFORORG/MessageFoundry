@@ -48,6 +48,9 @@ def test_field_value_reads_on_own_separators() -> None:
     assert field_value(_msg("CID1"), ("MSH", 9)) == "ADT^A05^ADT_A05"
     assert field_value(_msg("CID1"), ("PID", 5)) == "DOE^JANE"
     assert field_value(_msg("CID1"), ("ZZZ", 2)) is None  # absent segment
+    # MSH-1 is the separator, on the same field numbering the diff uses, never the segment id.
+    assert field_value(_msg("CID1"), ("MSH", 1)) == "|"
+    assert field_value(_msg("CID1"), ("PID", 0)) is None
 
 
 def test_load_messages_jsonl_batch_and_dir(tmp_path: Path) -> None:
@@ -333,3 +336,116 @@ def test_load_messages_jsonl_takes_a_bom_and_any_line_break(tmp_path: Path) -> N
     jsonl.write_bytes((records[0] + "\r\r\n" + "nope\n").encode())
     with pytest.raises(LoadError, match="line 3 is not valid JSON"):
         load_messages(jsonl)
+
+
+def test_reconcile_is_not_clean_when_nothing_was_compared() -> None:
+    """BACKLOG #5424: with no pair there is nothing the sign-off gate checked, so it cannot pass,
+    whether both inputs were empty or every message was unkeyed on both sides."""
+    assert not reconcile([], [], key=("MSH", 10)).clean
+    assert not reconcile([_msg("")], [_msg("")], key=("MSH", 10)).clean
+    # Keyed on both sides, nothing unkeyed, but no key in common: only the pair check fails it.
+    disjoint = reconcile([_msg("A")], [_msg("B")], key=("MSH", 10))
+    assert not disjoint.pairs and not disjoint.unkeyed_mefor and not disjoint.unkeyed_corepoint
+    assert not disjoint.clean
+    text = render_text(reconcile([], []))
+    assert "nothing was compared" in text and "DIFFERENCES" in text
+
+
+def test_reconcile_is_not_clean_with_a_duplicate_key_even_when_the_last_copies_match() -> None:
+    """BACKLOG #5424: only the last copy of a duplicated key is compared, so an earlier copy that
+    differs is never looked at, and a doubled output is itself a difference."""
+    mefor = [_msg("A", name="DOE^JOHN"), _msg("A")]
+    corepoint = [_msg("A")]
+    result = reconcile(mefor, corepoint, key=("MSH", 10))
+    assert result.duplicate_keys == ["A"] and not result.mismatched
+    assert not result.clean
+    assert "duplicate keys" in render_text(result)
+
+
+def test_compare_cli_exits_non_zero_over_empty_inputs_and_duplicate_keys(tmp_path: Path) -> None:
+    """BACKLOG #5422: the CLI exits on ``clean``, so zero compared messages or a duplicate key used
+    to exit 0, a pass, on a gate meant for a per-connection sign-off."""
+    empty = tmp_path / "empty.hl7"
+    empty.write_bytes(b"")
+    assert reconcile_main(["compare", "--mefor", str(empty), "--corepoint", str(empty)]) == 1
+    doubled = tmp_path / "doubled.hl7"
+    doubled.write_text(_msg("A") + _msg("A"), encoding="latin-1")
+    once = tmp_path / "once.hl7"
+    once.write_text(_msg("A"), encoding="latin-1")
+    assert reconcile_main(["compare", "--mefor", str(doubled), "--corepoint", str(once)]) == 1
+    assert reconcile_main(["compare", "--mefor", str(once), "--corepoint", str(once)]) == 0
+    # Field 0 is the segment id: as a key it would pair nothing, so it is refused at parse time.
+    with pytest.raises(SystemExit):
+        reconcile_main(
+            ["compare", "--mefor", str(once), "--corepoint", str(once), "--key", "PID-0"]
+        )
+
+
+def test_compare_cli_exits_two_when_the_report_cannot_be_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5422: an unwritable --report-json raised an uncaught OSError, so the process exited
+    1, the code for "the outputs differ", on a pair that was clean."""
+    once = tmp_path / "once.hl7"
+    once.write_text(_msg("A"), encoding="latin-1")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, not a directory", encoding="utf-8")
+    argv = ["compare", "--mefor", str(once), "--corepoint", str(once)]
+    assert reconcile_main([*argv, "--report-json", str(blocker / "sub" / "r.json")]) == 2
+    assert "report could not be written" in capsys.readouterr().err
+    assert reconcile_main([*argv, "--report-json", str(tmp_path / "out" / "r.json")]) == 0
+
+
+def test_load_messages_batch_strips_a_utf8_bom_and_refuses_a_wide_one(tmp_path: Path) -> None:
+    """BACKLOG #5423: an HL7 file was decoded as latin-1 with its byte-order mark kept, so the first
+    message's line no longer began with ``MSH`` and the message was dropped. The mark is now dropped
+    where it leads an ``MSH``, the file still read as latin-1 like the capture, so bytes compare as
+    bytes; a UTF-16 or UTF-32 mark is refused, since latin-1 would read it as noise."""
+    bom8 = b"\xef\xbb\xbf"
+    batch = tmp_path / "export.hl7"
+    batch.write_bytes(bom8 + (_msg("A") + _msg("B", name="M\u00dcLLER^J")).encode())
+    msgs = load_messages(batch)
+    assert [field_value(m, ("MSH", 10)) for m in msgs] == ["A", "B"]
+    assert field_value(msgs[1], ("PID", 5)) == "M\u00dcLLER^J".encode().decode("latin-1")
+    # Two BOM-led files concatenated into one, as `copy /b a+b` makes, are still two messages.
+    batch.write_bytes(bom8 + _msg("A").encode() + bom8 + _msg("B").encode())
+    assert [field_value(m, ("MSH", 10)) for m in load_messages(batch)] == ["A", "B"]
+    for bom in (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff"):
+        batch.write_bytes(bom + _msg("A").encode("utf-16-le"))
+        with pytest.raises(LoadError, match="UTF-16 or UTF-32"):
+            load_messages(batch)
+    jsonl = tmp_path / "cap.jsonl"
+    jsonl.write_bytes(b"\xff\xfe" + json.dumps({"raw": _msg("A")}).encode("utf-16-le"))
+    with pytest.raises(LoadError, match="UTF-16 or UTF-32"):
+        load_messages(jsonl)
+
+
+def test_load_messages_batch_keeps_text_with_no_msh_line_as_an_unkeyed_entry(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5423: text before the first ``MSH`` line, or a file with none, was discarded, so it
+    reached neither the pairing nor the unkeyed counts and the gate could pass without it."""
+    batch = tmp_path / "export.hl7"
+    batch.write_text("not a message\r" + _msg("A"), encoding="latin-1")
+    msgs = load_messages(batch)
+    assert len(msgs) == 2
+    batch.write_text("PID|1||MRN\r", encoding="latin-1")
+    assert load_messages(batch) == ["PID|1||MRN"]
+    result = reconcile(load_messages(batch), [_msg("A")], key=("MSH", 10))
+    assert result.unkeyed_mefor == 1 and not result.clean
+    # Batch envelope lines hold no message: not an unkeyed entry, and not a segment of one.
+    batch.write_text(
+        "FHS|^~\\&|S\rBHS|^~\\&|S\r" + _msg("A") + "BTS|1\rFTS|1\r", encoding="latin-1"
+    )
+    assert load_messages(batch) == [_msg("A").rstrip("\r")]
+    # A mark before the MLLP start byte, a doubled mark, or a line holding only a mark is no content.
+    bom = "\xef\xbb\xbf"
+    for text in (bom + "\x0b" + _msg("A"), bom + bom + _msg("A"), bom + "\r\n" + _msg("A")):
+        batch.write_text(text, encoding="latin-1")
+        assert load_messages(batch) == [_msg("A").rstrip("\r")]
+    # A one-segment framed message keeps no MLLP end byte in its last field.
+    batch.write_bytes(b"\x0bMSH|^~\\&|S|F|R|F|1||ADT^A01|K|P|2.5.1\x1c\r")
+    assert load_messages(batch) == ["MSH|^~\\&|S|F|R|F|1||ADT^A01|K|P|2.5.1"]
+    # MLLP framing bytes and blank lines alone are not content.
+    batch.write_bytes(b"\x0b" + _msg("A").encode() + b"\x1c\r\n\r\n")
+    assert [field_value(m, ("MSH", 10)) for m in load_messages(batch)] == ["A"]

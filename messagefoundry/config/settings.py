@@ -399,8 +399,8 @@ INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 def insecure_tls_allowed() -> bool:
     """Whether the dev escape for insecure TLS overrides is SET to a true value (ASVS 12.3.2).
 
-    Set is not honoured. Certificate-validation overrides (``trust_server_certificate=true`` for
-    SQL Server, for one) are MITM-able, so the escape lets one through only when
+    Set is not honoured. Certificate-validation overrides (``tls_verify=false`` on MLLP, for one)
+    are MITM-able, so the escape lets one through only when
     ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``. The
     cells ask :func:`weakened_tls_escape_permitted` or :func:`hop_insecure_escape_downgrades`, which
     add that condition. Under ``enforce``, the default, or where the code knows no posture, the
@@ -439,15 +439,16 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
 
     The **weakened-TLS / cleartext-escape** cells route their global-escape check through
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
-    ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
-    (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
+    ``--allow-insecure-bind`` API-bind clamp). That is **at least** the MLLP
     and the anonymous FTPS ``tls_verify=false`` context, **and — since #329 —** the SFTP
     unknown-host-key acceptance for a login with no ``password``
     (:mod:`messagefoundry.transports.remotefile`). The credential hops it no longer reaches are
     named once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
-    :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
-    out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
+    :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the out-of-gate
+    #329 cells, whose construction never stamps the contextvar). The engine<->store hop and the SQL
+    Server DATABASE connection no longer ask: a weakened one refuses at every posture (owner ruling
+    2026-11-14, vault BACKLOG #3533 item 2). Semantics: the escape must
     be set, AND a posture must be known, AND it must not be enforcing. For a known posture this is
     :func:`hop_insecure_escape_downgrades`, which it calls rather than repeats (vault BACKLOG #3753).
 
@@ -1202,8 +1203,9 @@ class StoreSettings(_Section):
 
         * On SQL SERVER or SQLITE: neither ever sees an ``SSLContext`` — SQL Server pins via an ODBC
           keyword string and SQLite uses no TLS — so no CRL can be loaded on either.
-        * With ``encrypt=false`` or ``trust_server_certificate=true``: ``_build_ssl`` returns no
-          context or a verify-off one, and a CRL means nothing on a hop that verifies no certificate.
+        * With ``encrypt=false`` or ``trust_server_certificate=true``: the hop verifies no
+          certificate, so a CRL means nothing there. ``_build_ssl`` refuses such a hop at open in
+          any case (vault BACKLOG #3533 item 2); this names the CRL setting at load.
 
         Before BACKLOG #300 this also refused ``ssl_crl_file`` without ``ssl_root_cert``, because the
         default path returned ``True`` and asyncpg built the context. The engine builds that context
@@ -10364,7 +10366,8 @@ def security_loosenings(
     ``service_env`` is the third PROCESS observation (vault BACKLOG #2595, #2601), from
     :func:`messagefoundry.serviceenv.service_env_posture`: whether the engine runs under an NSSM
     Windows service, whether its registry-held environment lists could be read, and whether a
-    store key reaches it through its environment. An engine secret in those lists refuses the
+    store key reaches it through its environment. An engine secret or any ``MEFOR_VALUE_*``
+    variable in those lists refuses the
     start of ``serve`` and ``supervise``, and the build of ``create_app`` and
     ``create_managed_app``, which never reach this registry then; a caller that reads it with no
     refusal of its own gets what they refuse as ``secret_in_service_environment``, where the
