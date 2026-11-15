@@ -1029,6 +1029,9 @@ re-checks by writing a real record to each dead sink at the moment you ask, so a
 against a still-broken disk leaves the connection halted (and its listener down) and raises another
 `log_write_failed` naming the refusal, rather than quietly resuming with no log. That is deliberate:
 otherwise "restart it again" would be a way around the control.
+`GET /status` may report a flapping sink `unwritable` even when nothing was halted: from the roll
+that trips the flap bound until a roll more than 60 s after its last roll or failure, or until the
+engine re-validates the log, which it does at least on a restart (ADR 0162 amendment B).
 A `/config/reload` on its own is **not enough**: it re-arms the inbounds it re-binds, so messages
 start being routed again, but it deliberately never resumes a paused **outbound** (that is an
 operator decision), so the backlog moves one stage and stops. Restarting the service does both.
