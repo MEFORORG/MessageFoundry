@@ -2213,14 +2213,17 @@ def test_a_placement_that_fails_after_its_link_is_rolled_back_by_the_restore(
     assert not dest.parent.exists()
 
 
+@pytest.mark.parametrize("held_for", ["one unlink", "every unlink"])
 def test_a_copy_that_fails_keeps_its_own_error_when_its_partial_file_will_not_go(
-    tmp_path, key_b64, capsys
+    tmp_path, key_b64, capsys, held_for
 ) -> None:
     # A copy placement dies mid-stream, and the unlink of its partial file is refused. That
     # unlink's error used to replace the copy's own, so the refusal named the wrong cause; it is
-    # logged at ERROR instead.
+    # logged at ERROR instead. The partial file is this restore's, so its rollback tries again:
+    # it goes where the hold lifts, and the refusal names it where it does not.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored" / "msg.db"
+    refusals: list[Path] = []
 
     def no_link(*args: Any, **kwargs: Any) -> None:
         raise OSError(1, "Operation not permitted")
@@ -2228,15 +2231,58 @@ def test_a_copy_that_fails_keeps_its_own_error_when_its_partial_file_will_not_go
     def full(*args: Any) -> None:
         raise OSError(28, "No space left on device")
 
+    def held(path: Path) -> bool:
+        if path == dest and (held_for == "every unlink" or not refusals):
+            refusals.append(path)
+            return True
+        return False
+
     errors = _ErrorRecords()
     with pytest.MonkeyPatch.context() as mp, errors.on(dr_backup.log):
-        _hold(mp, lambda p: p == dest)
+        _hold(mp, held)
         mp.setattr(os, "link", no_link)
         mp.setattr(shutil, "copyfileobj", full)
         assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
     (refusal,) = [line for line in _refusal(capsys).splitlines() if line.startswith("error:")]
     assert "No space left" in refusal and "held open" not in refusal, refusal
     assert any("partial copy" in m and str(dest) in m for m in errors.messages), errors.messages
+    if held_for == "one unlink":
+        assert not dest.exists(), "the rollback did not retry the partial copy at --to"
+    else:
+        assert dest.exists()
+        assert f"partially restored store at {dest} could not be removed" in refusal, refusal
+
+
+def test_fsync_dir_never_turns_a_failed_close_into_a_raise(caplog) -> None:
+    # A marker that landed must never be reported as a failed write because the directory's
+    # handle would not close after its flush.
+    import types
+
+    def refuse_close(fd: int) -> None:
+        raise OSError(5, "Input/output error")
+
+    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.WARNING, dr_backup.log.name):
+        mp.setattr(dr_backup, "sys", types.SimpleNamespace(platform="linux"))
+        mp.setattr(os, "open", lambda *args, **kwargs: 12345)
+        mp.setattr(os, "fsync", lambda fd: None)
+        mp.setattr(os, "close", refuse_close)
+        dr_backup._fsync_dir(Path("synthetic-dir"))
+    assert any("could not close" in r.getMessage() for r in caplog.records), caplog.records
+
+
+def test_a_placement_cleans_up_when_on_placed_did_not_return(tmp_path) -> None:
+    # The caller owns the rollback of --to only once `on_placed` has returned; an interrupt inside
+    # it, before the caller recorded that it owns the file, must not leave the file with nobody.
+    src = tmp_path / "extracted_store.db"
+    src.write_bytes(b"synthetic store")
+    dest = tmp_path / "msg.db"
+
+    def interrupted() -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        dr_backup._place_restored_store(src, dest, on_placed=interrupted)
+    assert not dest.exists() and src.read_bytes() == b"synthetic store"
 
 
 def test_a_released_marker_that_cannot_be_read_is_never_emptied(tmp_path) -> None:
@@ -2293,7 +2339,8 @@ def test_a_late_relabel_that_fails_withholds_the_directory_and_says_so(
         _refuse_marker_reason(mp, "rolled-back")
         mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
         assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
-    assert "member-count cap" in _refusal(capsys)
+    err = _refusal(capsys)
+    assert "member-count cap" in err, err
     assert len(store_refusals) == 1 and not dest.exists()
     (leftover,) = dest.parent.glob("mefor-restore-*")
     staged = leftover / "extracted_store.db"
@@ -2302,6 +2349,9 @@ def test_a_late_relabel_that_fails_withholds_the_directory_and_says_so(
     assert any("could not be relabelled" in m and str(staged) in m for m in errors.messages), (
         errors.messages
     )
+    # The refusal is worded after that withholding, so it promises no sweep.
+    (refusal,) = [line for line in err.splitlines() if line.startswith("error:")]
+    assert "which no sweep removes" in refusal and "the next sweep removes" not in refusal, refusal
     shutil.rmtree(leftover)
 
 

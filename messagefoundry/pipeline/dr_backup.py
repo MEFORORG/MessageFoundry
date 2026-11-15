@@ -2862,7 +2862,10 @@ def _fsync_dir(directory: Path) -> None:
     except OSError as exc:
         log.warning("could not flush a spare marker's rename in %s: %s", directory, safe_exc(exc))
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError as exc:
+            log.warning("could not close %s after flushing it: %s", directory, safe_exc(exc))
 
 
 def _write_spare_marker(item: Path, reason: str) -> bool:
@@ -2883,9 +2886,6 @@ def _write_spare_marker(item: Path, reason: str) -> bool:
         finally:
             os.close(fd)
         os.replace(tmp, marker)
-        # The rename too, before the caller links: else a power loss could keep a link the restore
-        # makes next and lose the marker that spares its second name.
-        _fsync_dir(item.parent)
     except OSError as exc:
         try:
             os.unlink(tmp)
@@ -2896,6 +2896,10 @@ def _write_spare_marker(item: Path, reason: str) -> bool:
             )
         log.error("could not record that %s must not be removed: %s", item, safe_exc(exc))
         return False
+    # The rename too, before the caller links: else a power loss could keep a link the restore
+    # makes next and lose the marker that spares its second name. Outside the `try` above, so
+    # nothing it does can report a marker that landed as one that did not.
+    _fsync_dir(item.parent)
     return True
 
 
@@ -5044,6 +5048,7 @@ def _restore_blocking(
     published = False
     completed = False
     store_removed = False
+    rolled_back = False
     # What the staging teardown must neither unlink nor truncate: the staged store, while it is
     # or may become a name for the placed one (set just before the placement, and unset or given
     # an empty reason, which unspares it, on every path that finds it no such name).
@@ -5420,6 +5425,22 @@ def _restore_blocking(
                     spared_item,
                 )
             leftover = work.release(spared=_spare_of(spared_item, spared_reason))
+            # The rest of the rollback runs here, after the teardown and before the refusal is
+            # worded, so the refusal states what the rollback left rather than what it might.
+            withheld = left_at_dest = False
+            if published:
+                rolled_back = True
+                withheld, left_at_dest = _finish_rollback(
+                    dest_store_path, store_removed, config_written, spared_item, spared_reason
+                )
+            if leftover is not None and withheld:
+                leftover = leftover.replace(_NEXT_SWEEP, _NO_SWEEP)
+            if left_at_dest:
+                kept = (
+                    f"the partially restored store at {dest_store_path} could not be removed: "
+                    "delete it by hand, or a retry refuses to overwrite it"
+                )
+                leftover = kept if leftover is None else f"{leftover}. Separately, {kept}"
             refusal: BaseException = exc
             if isinstance(exc, OSError):
                 # A refusal already leaving a `with` block, found in the chain: an OSError raised on
@@ -5475,40 +5496,12 @@ def _restore_blocking(
                     ),
                 )
     finally:
-        if published and not completed:
-            _discard_partial_restore(None if store_removed else dest_store_path, config_written)
-            # Where the rollback's second attempt removed the placed store after the teardown had
-            # spared the staged name, that name is now the only decrypted copy of it. The
-            # rollback finishes the job where it can, and otherwise relabels and reports it.
-            if (
-                spared_item is not None
-                and spared_reason
-                and dest_store_path is not None
-                and not store_removed
-                and not _still_there(dest_store_path)
-            ):
-                if _drop_staged_name(spared_item):
-                    log.warning(
-                        "the failed restore's rollback removed the placed store at %s and its "
-                        "staged copy %s on a later attempt: neither is left to delete by hand",
-                        dest_store_path,
-                        spared_item,
-                    )
-                else:
-                    # A marker that kept its older reason would have every later sweep report the
-                    # copy as a name for a store that is gone, so its directory is withheld instead.
-                    relabelled = _record_spare(spared_item, _SPARE_ROLLED_BACK)
-                    log.error(
-                        "the failed restore's rollback removed the placed store at %s only after "
-                        "its staging teardown, so the staged copy %s is the only decrypted copy of "
-                        "it, kept unemptied; %s: delete it by hand",
-                        dest_store_path,
-                        spared_item,
-                        "its marker says so"
-                        if relabelled
-                        else "its marker could not be relabelled and still reads its earlier "
-                        "reason, so no sweep removes its directory",
-                    )
+        if published and not completed and not rolled_back:
+            # Only where the staging block's own handler did not reach its rollback.
+            rolled_back = True
+            _finish_rollback(
+                dest_store_path, store_removed, config_written, spared_item, spared_reason
+            )
         if not completed:
             # After the staging directory's own teardown and the rollback, so each is empty again.
             _remove_made_dirs(made_dirs)
@@ -5760,6 +5753,50 @@ def _drop_staged_name(item: Path) -> bool:
         safe_exc(cast(OSError, refused)),  # the loop runs at least once, and each miss sets it
     )
     return False
+
+
+def _finish_rollback(
+    dest_store_path: Path | None,
+    store_removed: bool,
+    written: list[Path],
+    spared_item: Path | None,
+    spared_reason: str,
+) -> tuple[bool, bool]:
+    """The rest of a failed :func:`_restore_blocking`'s rollback, run once after its staging
+    teardown: :func:`_discard_partial_restore`, never on a placed store the rollback already
+    removed, then the staged name a late removal of that store leaves as the only decrypted copy.
+    Returns whether the staging directory was withheld from every sweep here, and whether the
+    store this restore placed is still at ``dest_store_path``."""
+    _discard_partial_restore(None if store_removed else dest_store_path, written)
+    left = dest_store_path is not None and not store_removed and _still_there(dest_store_path)
+    # Where this second attempt removed the placed store after the teardown had spared the staged
+    # name, that name is now the only decrypted copy of it. The rollback finishes the job where it
+    # can, and otherwise relabels and reports it.
+    if spared_item is None or not spared_reason or dest_store_path is None or store_removed or left:
+        return False, left
+    if _drop_staged_name(spared_item):
+        log.warning(
+            "the failed restore's rollback removed the placed store at %s and its staged copy %s "
+            "on a later attempt: neither is left to delete by hand",
+            dest_store_path,
+            spared_item,
+        )
+        return False, left
+    # A marker that kept its older reason would have every later sweep report the copy as a name
+    # for a store that is gone, so its directory is withheld instead.
+    relabelled = _record_spare(spared_item, _SPARE_ROLLED_BACK)
+    log.error(
+        "the failed restore's rollback removed the placed store at %s only after its staging "
+        "teardown, so the staged copy %s is the only decrypted copy of it, kept unemptied; %s: "
+        "delete it by hand",
+        dest_store_path,
+        spared_item,
+        "its marker says so"
+        if relabelled
+        else "its marker could not be relabelled and still reads its earlier reason, so no "
+        "sweep removes its directory",
+    )
+    return not relabelled, left
 
 
 def _discard_partial_restore(dest_store_path: Path | None, written: list[Path]) -> None:
@@ -6069,10 +6106,10 @@ def _place_restored_store(
     ``before_link`` runs just before the link, and may raise to refuse the placement;
     ``before_copy`` just before the copy fallback. The restore marks and unmarks ``src`` spared
     with them (BACKLOG #5617). ``on_placed`` runs once the link or the copy has made ``dest`` this
-    call's own file; a caller that passes it owns the rollback of ``dest`` from then on, and a
-    failure after that leaves ``dest`` for it, so ``dest`` is never unlinked twice, the second time
-    perhaps as another restore's store. Without ``on_placed`` a failure after the placement removes
-    ``dest`` again, logged where that removal fails."""
+    call's own file, and also when a failed copy's partial file at ``dest`` cannot be removed. Once
+    it has returned, the caller owns the rollback of ``dest``, and a failure after that leaves
+    ``dest`` for it, so ``dest`` is not unlinked by both. Until then, a failure after the placement
+    removes ``dest`` here, logged where that removal fails."""
     # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path. It is the
     # store-trio rule, not bare _secure_file: restored into a hardened data directory, an owner-only
     # file would lock the service account out of the store it is about to open (ADR 0183 Wave 0b).
@@ -6111,22 +6148,27 @@ def _place_restored_store(
                 try:
                     dest.unlink(missing_ok=True)
                 except OSError as exc:
-                    # Logged, never raised: it would replace the copy's own failure.
+                    # Logged, never raised: it would replace the copy's own failure. The truncated
+                    # file is this call's, so a caller that owns rollbacks is handed it to retry.
                     log.error(
                         "could not remove the partial copy of the store at %s, a truncated store "
-                        "a retry refuses to overwrite: delete it by hand: %s",
+                        "a retry refuses to overwrite: %s",
                         dest,
                         safe_exc(exc),
                     )
+                    if on_placed is not None:
+                        on_placed()
+    owned = False
     try:
         if on_placed is not None:
             on_placed()
+            owned = True
         _secure_store_file(dest, dir_grants=_store_dir_grants(dest.parent))
     except BaseException:
         # Best-effort and non-raising by contract, so this is an interrupt: the file at ``dest``
         # is this call's, and goes, as a copy that dies mid-stream does above, unless the caller
-        # owns its rollback.
-        if on_placed is None:
+        # has taken over its rollback, which it has only once ``on_placed`` returned.
+        if not owned:
             try:
                 dest.unlink(missing_ok=True)
             except OSError as exc:
