@@ -135,7 +135,13 @@ function closeWindows(): void {
   }
 }
 
-function load(opts: { clone?: boolean; groups: unknown; initial?: unknown; transports?: string[] }): Page {
+function load(opts: {
+  clone?: boolean;
+  groups: unknown;
+  initial?: unknown;
+  transports?: string[];
+  fieldGroupsFor?: { transport: string; direction: string };
+}): Page {
   const errors: unknown[] = [];
   const posted: Payload[] = [];
   const virtualConsole = new VirtualConsole();
@@ -169,6 +175,7 @@ function load(opts: { clone?: boolean; groups: unknown; initial?: unknown; trans
     routers: ["route_adt"],
     transports: opts.transports ?? ["mllp", "file"],
     fieldGroups: opts.groups,
+    fieldGroupsFor: opts.fieldGroupsFor,
     siblings: undefined,
     clone: opts.clone,
   });
@@ -340,6 +347,24 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.ok(!("tls_key_password" in saved(p, false)), "the removed credential came back on save");
   });
 
+  test("edit: a secret env reference's key emptied and retyped, with no transport change, drops its inline default", () => {
+    const p = load({ groups });
+    const box = p.window.document.querySelector('#settings [data-key="db_password"]');
+    const type = (text: string): void => {
+      box.value = text;
+      box.dispatchEvent(new p.window.Event("input"));
+    };
+    type("");
+    type("DB_PW2");
+    assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW2" }, "the cleared inline default came back");
+    // Control: retyping the key without emptying the box keeps the default.
+    const q = load({ groups });
+    const qbox = q.window.document.querySelector('#settings [data-key="db_password"]');
+    qbox.value = "DB_PW3";
+    qbox.dispatchEvent(new q.window.Event("input"));
+    assert.deepStrictEqual(saved(q, false).db_password, { env: "DB_PW3", default: INLINE_DEFAULT });
+  });
+
   for (const how of ["removed", "cleared"]) {
     test(`edit: a secret env reference's inline default ${how} before a transport round trip is not written back`, () => {
       const p = load({ groups });
@@ -465,31 +490,74 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
   });
 });
 
-suite("connection editor — create mode draws the fields for the transport the picker shows (BACKLOG #5565)", () => {
+suite("connection editor: create mode shows the transport whose fields are drawn (BACKLOG #5565)", () => {
   teardown(closeWindows);
 
-  test("the picker and the fields agree from the first draw, and a save never mixes them", () => {
-    // The hosts build the create form for mllp, but the picker shows the engine's first transport.
-    const p = load({ initial: null, groups: buildForm(SCHEMA, "mllp", "inbound", {}), transports: ["file", "mllp"] });
+  const keys = (p: Page): string[] =>
+    [...p.window.document.querySelectorAll("#settings [data-key]")].map((c: DomNode) => c.dataset.key);
+
+  test("the picker shows the transport the host built the fields for, not the list's first", () => {
+    // The hosts build the create form for mllp, while the engine's sorted list starts elsewhere.
+    const p = load({
+      initial: null,
+      groups: buildForm(SCHEMA, "mllp", "inbound", {}),
+      fieldGroupsFor: { transport: "mllp", direction: "inbound" },
+      transports: ["file", "mllp"],
+    });
     const doc = p.window.document;
-    const picker = doc.getElementById("transport").value;
-    assert.strictEqual(picker, "file");
-    const keys = (): string[] => [...doc.querySelectorAll("#settings [data-key]")].map((c: DomNode) => c.dataset.key);
-    assert.ok(!keys().includes("host"), `mllp's fields are drawn under the ${picker} picker: ${keys().join(", ")}`);
-    doc.getElementById("name").value = "IB_SYNTH_FILE";
+    assert.strictEqual(doc.getElementById("transport").value, "mllp", "the picker and the drawn fields disagree");
+    assert.strictEqual(doc.getElementById("direction").value, "inbound");
+    assert.ok(keys(p).includes("host"), `mllp's fields are not drawn: ${keys(p).join(", ")}`);
+    doc.getElementById("name").value = "IB_SYNTH_MLLP";
     doc.getElementById("router").value = "route_adt";
+    doc.querySelector('#settings [data-key="port"]').value = "6661";
     doc.getElementById("save").click();
     const save = p.posted.filter((m) => m.command === "save");
     assert.strictEqual(save.length, 1);
-    assert.strictEqual(save[0].conn.transport, "file");
-    assert.ok(!("host" in (save[0].conn.settings ?? {})), "a save posted the file transport with mllp's settings");
-    // The page asked for the picker's transport and direction, and draws the reply.
-    const asked = p.posted.filter((m) => m.command === "fields");
-    assert.strictEqual(asked.length, 1, "the page did not ask for the picker's fields");
-    assert.strictEqual(asked[0].transport, "file");
-    assert.strictEqual(asked[0].direction, doc.getElementById("direction").value);
-    p.deliver({ command: "fields", groups: buildForm(SCHEMA, "file", asked[0].direction, asked[0].settings) });
-    assert.deepStrictEqual(keys(), ["path"]);
+    assert.strictEqual(save[0].conn.transport, "mllp");
+    assert.strictEqual(save[0].conn.settings.port, 6661);
+    assert.strictEqual(p.posted.filter((m) => m.command === "fields").length, 0, "no load-time rebuild");
+  });
+
+  test("an outbound create form selects the outbound direction", () => {
+    const p = load({
+      initial: null,
+      groups: buildForm(SCHEMA, "mllp", "outbound", {}),
+      fieldGroupsFor: { transport: "mllp", direction: "outbound" },
+      transports: ["file", "mllp"],
+    });
+    assert.strictEqual(p.window.document.getElementById("direction").value, "outbound");
+  });
+
+  test("no create path leaves the settings area empty", () => {
+    const cases: Array<[string, Parameters<typeof load>[0]]> = [
+      ["fields for a listed transport", {
+        initial: null,
+        groups: buildForm(SCHEMA, "mllp", "inbound", {}),
+        fieldGroupsFor: { transport: "mllp", direction: "inbound" },
+      }],
+      ["fields for a transport the picker does not list", {
+        initial: null,
+        groups: buildForm(SCHEMA, "mllp", "inbound", {}),
+        fieldGroupsFor: { transport: "mllp", direction: "inbound" },
+        transports: ["file"],
+      }],
+      ["fields with no record of what they were built for", {
+        initial: null,
+        groups: buildForm(SCHEMA, "mllp", "inbound", {}),
+        transports: ["file", "mllp"],
+      }],
+      ["no fields: an engine that cannot describe itself", { initial: null, groups: null }],
+    ];
+    for (const [label, opts] of cases) {
+      const p = load(opts);
+      const controls = p.window.document.querySelectorAll("#settings input, #settings select");
+      assert.ok(controls.length > 0, `the settings area is empty: ${label}`);
+      if (keys(p).length > 0) {
+        // Schema fields are drawn only under the picker that names their transport.
+        assert.strictEqual(p.window.document.getElementById("transport").value, opts.fieldGroupsFor?.transport, label);
+      }
+    }
   });
 });
 

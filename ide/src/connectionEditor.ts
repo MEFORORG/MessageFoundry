@@ -38,7 +38,7 @@ export async function formSchemaFor(
   try {
     const schema = await connectionSchema(cwd);
     const transports = Object.keys(schema.transports).sort();
-    return { transports, groups: buildForm(schema, transport, direction, settings) };
+    return { transports, groups: buildForm(schema, transport, direction, settings), transport, direction };
   } catch {
     return undefined; // logged by the caller's status surface; the form still opens
   }
@@ -248,6 +248,9 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
 export interface FormSchema {
   transports: string[];
   groups: FieldGroup[];
+  /** What `groups` was built for. A new connection's pickers show these, so they match the fields. */
+  transport: string;
+  direction: "inbound" | "outbound";
 }
 
 export function connectionFormHtml(
@@ -375,6 +378,7 @@ export function connectionFormHtml(
     routers,
     transports: form?.transports?.length ? form.transports : TRANSPORTS,
     fieldGroups: form?.groups ?? null,
+    fieldGroupsFor: form ? { transport: form.transport, direction: form.direction } : null,
     siblings,
     clone,
   })}
