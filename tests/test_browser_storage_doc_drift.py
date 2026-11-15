@@ -27,7 +27,7 @@ import re
 
 import pytest
 
-from scripts.security.js_lexer import blank_js_comments as _js_code
+from scripts.security.js_lexer import blank_js_comments
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _PHI_MD = _ROOT / "docs" / "PHI.md"
@@ -42,7 +42,9 @@ _PREFIX_LITERAL = re.compile(r'PREFIX\s*=\s*"([^"]+)"')
 
 @functools.cache
 def _app_js_code() -> str:
-    return _js_code(_APP_JS.read_text(encoding="utf-8"))
+    # Comment-blanked, never raw (BACKLOG #2056): app.js names localStorage in comments, so a raw
+    # read stayed True after the real storage calls were deleted.
+    return blank_js_comments(_APP_JS.read_text(encoding="utf-8"))
 
 
 def _storage_bullet() -> str:
@@ -115,19 +117,19 @@ def test_js_code_blanks_comments_and_keeps_code() -> None:
     """The instrument, pinned both ways: a comment is ABSENT, a string or a call is PRESENT, and a
     ``//`` inside a string or a regex literal does not start a comment."""
     mention = '// localStorage\n/* var PREFIX = "old:v1:"; */\nvar x = 1;\n'
-    assert "localStorage" not in _js_code(mention)
-    assert not _PREFIX_LITERAL.findall(_js_code(mention))
+    assert "localStorage" not in blank_js_comments(mention)
+    assert not _PREFIX_LITERAL.findall(blank_js_comments(mention))
     real = (
         r'var u = "http://h/x"; var r = s.replace(/\//g, "_"); var t = `a//b`;' + "\n"
         'var PREFIX = "mfcols:v2:"; localStorage.setItem(PREFIX, "1"); // trailing\n'
     )
-    code = _js_code(real)
+    code = blank_js_comments(real)
     assert _PREFIX_LITERAL.findall(code) == ["mfcols:v2:"]
     assert "localStorage.setItem" in code and "trailing" not in code
     assert '"http://h/x"' in code and "`a//b`" in code
-    after_keyword = _js_code('function f(s) { return /"/.test(s); } // gone\nvar k = 1;\n')
+    after_keyword = blank_js_comments('function f(s) { return /"/.test(s); } // gone\nvar k = 1;\n')
     assert "gone" not in after_keyword and "var k = 1;" in after_keyword
-    assert "localStorage" not in _js_code("var r = obj.in / 2; // localStorage\n")
+    assert "localStorage" not in blank_js_comments("var r = obj.in / 2; // localStorage\n")
 
 
 def test_the_presence_probes_fail_when_the_storage_code_is_gone() -> None:
@@ -141,7 +143,7 @@ def test_the_presence_probes_fail_when_the_storage_code_is_gone() -> None:
         "localStorage.", "window.noStorage."
     )
     assert "localStorage" in mutated and "mfcols:v2:" in mutated, "the mentions must survive"
-    code = _js_code(mutated)
+    code = blank_js_comments(mutated)
     assert "localStorage" not in code
     assert not _PREFIX_LITERAL.findall(code)
     assert "mfcols:v2:" not in code

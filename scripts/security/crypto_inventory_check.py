@@ -2399,9 +2399,12 @@ def _js_code(text: str) -> list[str]:
 
     The union is the point. The lexer can misread a literal (the residual in crypto_operations.py
     says how) and blank real code; the per-line view still scans every line it scanned before. So
-    the gate never scans less than it did before #5578. The cost is the per-line view's old false
-    positives: a prose line inside a block comment that does not start with ``*``. A leading BOM is
-    dropped first, so a BOM-led ``/** ... */`` line is comment-led in both views.
+    the gate scans at least what it scanned before #5578, except one deliberate narrowing: a leading
+    BOM is dropped first, so a BOM-led ``/** ... */`` or ``//`` first line is a comment in both
+    views, where before it was scanned. The cost is false positives from both views: the per-line
+    view's old ones (a prose line inside a block comment that does not start with ``*``), and the
+    lexer's (a comment-shaped line inside a template literal, or a real comment line kept after a
+    literal misread).
 
     The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
     lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it

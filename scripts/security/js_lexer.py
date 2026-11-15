@@ -3,9 +3,15 @@
 """A small string-aware JavaScript/TypeScript comment blanker, shared by the tests and the gates.
 
 Moved here from ``tests/test_browser_storage_doc_drift.py`` (BACKLOG #5578) so the crypto inventory
-gate's JS/TS arms read the same code view the doc-drift probes do. The gate's old line rule read a
-``/*`` that began a line inside a template literal as a block comment and hid real code up to the
-next ``*/`` anywhere in the file; a lexer that skips string, template and regex literals does not.
+gate's JS/TS arms can read the same code view the doc-drift probes do. A line-based stripper that
+tracked block state, tried while building #5578 and never merged, read a ``/*`` that began a line
+inside a template literal as a block comment and hid real code up to the next ``*/`` anywhere in the
+file. A lexer that skips string, template and regex literals does not.
+
+Its consumers want opposite safe directions. The doc-drift probes need a comment mention NOT to
+count (BACKLOG #2056: ``app.js`` names ``localStorage`` in comments, so a raw scan stayed True after
+the real storage calls were deleted). The crypto gate needs a misread NOT to hide code, so it unions
+this view with its per-line view rather than tuning the lexer toward keeping text.
 """
 
 from __future__ import annotations

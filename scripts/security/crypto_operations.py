@@ -527,8 +527,9 @@ def _resolve_reexport(name: str, reexports: dict[str, list[str]]) -> set[str]:
 
 def _chain_ends(qualified: str, reexports: dict[str, list[str]]) -> set[str]:
     """The ends of a qualified callee's re-export chain: the names it reaches that link nowhere. A
-    name with a link is not an end, so a ``def verify`` that a later import rebinds is not one; a
-    cycle or an over-long chain has none."""
+    name with a link is not an end, so a ``def verify`` its module also binds by an import is not
+    one; a cycle, a self-link or an over-long chain has none. Used only to decide when the method
+    rule may be skipped, where too few ends keeps the rule and so errs toward reporting."""
     return {n for n in _resolve_reexport(qualified, reexports) if not reexports.get(n)}
 
 
@@ -747,10 +748,14 @@ def discover_operations_in_modules(modules: list[ParsedModule]) -> list[Operatio
         for node in m.nodes:
             if not isinstance(node, ast.Call):
                 continue
+            # Every name the chain REACHES, not only its ends: a def its module also binds by an
+            # import (function-local, earlier, or the same name re-imported) may still be what the
+            # call reaches at runtime, and binding order and scope are not modelled. Counting it
+            # can over-report a provider; dropping it would hide the call.
             landed = {
                 target
                 for qualified in m.resolve(node.func)
-                for target in _chain_ends(qualified, reexports)
+                for target in _resolve_reexport(qualified, reexports)
                 if target in known_functions
             }
             for target in sorted(landed):

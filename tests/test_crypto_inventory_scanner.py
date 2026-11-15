@@ -1558,18 +1558,32 @@ def test_the_lexer_reads_a_regex_after_await_and_default() -> None:
         assert "const n = 1;" in blank_js_comments(text), text
 
 
-def test_a_rebound_provider_def_is_not_a_provider_landing() -> None:
-    # a.verify is a crypto def that a later import rebinds to the library, so a call to a.verify
-    # never reaches the def: it must not be counted as a call through that provider.
+def test_a_provider_def_its_module_also_imports_is_still_followed() -> None:
+    # #5579 on the provider side: a.build is a crypto def, and a function-local import in a.py binds
+    # the same name. The call from x.py reaches the def at runtime, so it must stay a provider call.
     ops = _gate().crypto_operations
+    nl = chr(10)
     sources = {
-        "messagefoundry/a.py": (
-            "import ssl\n\n\ndef verify(s):\n    return ssl.create_default_context()\n\n\n"
-            "from nacl.signing import verify\n"
+        "messagefoundry/a.py": nl.join(
+            [
+                "import ssl",
+                "",
+                "",
+                "def build():",
+                "    return ssl.create_default_context()",
+                "",
+                "",
+                "def legacy():",
+                "    from old import build",
+                "    return build",
+                "",
+            ]
         ),
-        "messagefoundry/x.py": (
-            "from messagefoundry.a import verify\n\n\ndef go(s):\n    return verify(s)\n"
+        "messagefoundry/x.py": nl.join(
+            ["from messagefoundry.a import build", "", "", "def go():", "    return build()", ""]
         ),
     }
     found = ops.aggregate(ops.discover_operations_in(sources))
-    assert "tls_context:via messagefoundry.a" not in found.get("messagefoundry/x.py", frozenset())
+    assert "tls_context:via messagefoundry.a" in found.get("messagefoundry/x.py", frozenset()), (
+        found
+    )

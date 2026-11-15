@@ -79,7 +79,7 @@ from typing import NamedTuple
 
 import pytest
 
-from scripts.security.js_lexer import blank_js_comments as _js_code
+from scripts.security.js_lexer import blank_js_comments
 from tests._ast_sites import callee_name, find_funcs, parse_source
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -284,11 +284,11 @@ def _powershell_code() -> Callable[[str], list[str]]:
 
 
 def _code_text(path: Path) -> str:
-    """``path``'s code with comments removed: :func:`_js_code` for TypeScript, which skips strings,
+    """``path``'s code with comments removed: :func:`blank_js_comments` for TypeScript, which skips strings,
     and the crypto gate's PowerShell stripper, whose limits the module docstring lists."""
     text = path.read_text(encoding="utf-8-sig")
     if path.suffix == ".ts":
-        return _js_code(text)
+        return blank_js_comments(text)
     if path.suffix == ".ps1":
         return "\n".join(_powershell_code()(text))
     raise ValueError(f"no comment stripper for {path.suffix} files")
