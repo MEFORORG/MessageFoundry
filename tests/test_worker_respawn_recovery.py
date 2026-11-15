@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, RetryPolicy
+from messagefoundry.config.models import BatchConfig, ConnectorType, RetryPolicy
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -72,8 +72,8 @@ def _fast_backoffs(monkeypatch: pytest.MonkeyPatch) -> None:
 def _registry(
     tmp_path: Path,
     *,
-    router: Callable[[Message], list[str]] | None = None,
-    handler: Callable[[Message], Any] | None = None,
+    router: Any = None,
+    handler: Any = None,
 ) -> Registry:
     """IB -> r -> h -> OB. The inbox is its own empty directory, so the listener picks up nothing."""
     inbox, outdir = tmp_path / "in", tmp_path / "out"
@@ -395,3 +395,48 @@ async def test_a_worker_that_returns_or_is_cancelled_hands_on_nothing(store: Mes
     taken = runner._take_dead_rows(tasks["raise"])
     assert taken is not None and taken.ids == ["row-1"]
     assert runner._take_dead_rows(tasks["raise"]) is None  # taken once
+
+
+@pytest.mark.parametrize("per_lane", [True, False])
+async def test_a_death_inside_a_batch_hands_the_extras_to_the_respawn(
+    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch, per_lane: bool
+) -> None:
+    """A batching outbound coalesces rows past the head inside its body. A death there skips the
+    worker's fault arm, so the batch guard must put the extras in the worker's held list for the
+    respawn to re-pend; otherwise they stay in flight while the next batch claims past them. The
+    pooled path (no ``extras_out``) is held: the death goes on and nothing is re-pended there. On
+    the code before this change the per-lane list stays empty."""
+    runner = RegistryRunner(
+        _registry(tmp_path),
+        store,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
+    for _ in range(3):
+        await store.enqueue_message(
+            channel_id="IB", raw=_hl7("B"), deliveries=[("OB", "p")], now=1.0
+        )
+    head = await store.claim_next_fifo("OB", now=2.0)
+    assert head is not None
+    extras: list[str] = []
+
+    async def coalesce_then_die(name: str, cfg: Any, items: list[Any]) -> Any:
+        for _ in range(2):
+            more = await store.claim_next_fifo(name, now=2.0)
+            assert more is not None
+            items.append(more)
+            extras.append(more.id)
+        raise _Kill
+
+    monkeypatch.setattr(runner, "_deliver_coalesced_batch", coalesce_then_die)
+    held: list[str] = [head.id]
+    with pytest.raises(_Kill):
+        await runner._process_delivery_batch(
+            "OB",
+            head,
+            BatchConfig(max_count=3, max_wait_ms=1),
+            extras_out=held if per_lane else None,
+        )
+    assert held == ([head.id, *extras] if per_lane else [head.id])
+    # Nothing was re-pended here on either path: the per-lane respawn does it, the pooled half waits.
+    assert await store.inflight_by_lane(stage=Stage.OUTBOUND.value) == {"OB": (3, 2.0)}

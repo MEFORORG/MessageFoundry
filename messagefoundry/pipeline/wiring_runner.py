@@ -11031,7 +11031,14 @@ class RegistryRunner:
         members: list[OutboxItem] = [head]
         try:
             return await self._deliver_coalesced_batch(name, cfg, members)
-        except Exception:
+        except BaseException as exc:
+            if extras_out is not None and not isinstance(exc, Exception):
+                # A death (#1611 step 2, per-lane half): the worker's arm never runs, but its
+                # respawn re-pends what this task held, which must include the extras.
+                extras_out.extend(it.id for it in members[1:])
+                raise
+            if not isinstance(exc, Exception):
+                raise  # the pooled serializer is not respawned; that half of #4607 is held
             # EXCEPT, never FINALLY. Every normal return below has already resolved all N (done /
             # dead-lettered / re-pended failed) or handed them back (leadership lost, a pause, the
             # #122 halt), so a `finally`
