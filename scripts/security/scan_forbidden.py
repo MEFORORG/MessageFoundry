@@ -77,6 +77,7 @@ self-test failure (an instrument that cannot see is not a content hit; the two n
 from __future__ import annotations
 
 import bisect
+import itertools
 import json
 import os
 import re
@@ -577,17 +578,10 @@ _PR_VERDICT_BEFORE = re.compile(
 _PR_CELL_VERDICT = re.compile(
     rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}(?P<verdict>{_PR_VERDICT})"
 )
-#: "never fails" and "never passing" describe a component, not a verdict: the CI verbs after "never"
-#: bind only a marked row. "never met" and "never partial" are verdict states and still bind.
+#: "never fails" and "never passing" describe a component, not a verdict: a cell clause with a CI verb
+#: after "never" is one of step 10's exempt clauses (_pr_step10_blank). "never met" and "never partial"
+#: are verdict states, not exempt.
 _PR_NEVER = re.compile(rf"(?i){_PR_NB}never{_PR_NA}")
-#: A verdict stated after step 10's CI verb, in a cell or a sentence: a verdict state ("is never
-#: failing; partial"), or a record verb before any verdict ("is not failing but stays failing", "re-scored
-#: as failing"). Either makes the text a verdict again, so step 10 does not exempt it. No markup class
-#: after _PR_SEP, which already takes markup: the two overlap and backtrack quadratically on a long run
-#: of markup in a cell, which has no length limit.
-_PR_GOES_ON_TO_VERDICT = re.compile(
-    rf"(?i){_PR_NB}(?:{_PR_VERDICT_STATE}|{_PR_STRONG_VERB}{_PR_SEP}{_PR_QUALIFIER}{_PR_VERDICT})"
-)
 #: The cell openings that state a verdict whatever follows: "unchanged" and a record verb.
 _PR_CELL_RECORD_PREFIX = re.compile(rf"(?i)(?:unchanged|{_PR_STRONG_VERB}){_PR_NA}")
 #: A cell that OPENS with a verdict and goes on: "unchanged, partial. No build reaches it."
@@ -607,6 +601,8 @@ _PR_CELL_VERDICT_LEAD = re.compile(
 )
 #: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
 _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
+#: The characters _PR_MARKUP matches, as a set, for a per-character test.
+_PR_MARKUP_CHARS = frozenset("*`_\"'")
 #: The characters _PR_MARKUP matches plus every space character (a tab and a no-break space included),
 #: as str.strip takes them, to trim only a cell's ends.
 _PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`_\"'"
@@ -952,23 +948,15 @@ def _pr_verdict_bound(text: str, m: re.Match[str], version: bool, marked: bool) 
 
 
 def _pr_prose_verdict(window: str, marked: bool) -> bool:
-    """The record's nouns and hold verbs carrying a verdict a clause away from the identifier."""
-    # "row" is also a store row and a test-table row: "the row is not failing" beside an unmarked
-    # identifier is CI prose, so a negated state verb and a CI verb after "row" bind only a marked one.
-    # Every other form binds as before: "cell" is record vocabulary, and "the row is failing" and "the
-    # row went from failing to partial" state a verdict, and so does a sentence that goes on to one
-    # ("the row is not failing but stays partial").
-    if marked:
-        return bool(_PR_PROSE_VERDICT.search(window) or _PR_BARE_HOLD.search(window))
-    if any(
-        hit.group("row") is None
-        or hit.group("row_negated") is None
-        or hit.group("row_verdict").lower() not in _PR_CI_VERDICTS
-        or _PR_GOES_ON_TO_VERDICT.search(window, hit.end()) is not None
-        for hit in _PR_PROSE_VERDICT.finditer(window)
-    ):
+    """The record's nouns and hold verbs carrying a verdict a clause away from the identifier, as main
+    reads them. Step 10's exemption is not here: it is an overlay over the whole binding
+    (_pr_step10_blank)."""
+    if _PR_PROSE_VERDICT.search(window):
         return True
-    return any(_PR_VERDICT_END.match(window, hold.end()) for hold in _PR_BARE_HOLD.finditer(window))
+    return any(
+        marked or _PR_VERDICT_END.match(window, hold.end())
+        for hold in _PR_BARE_HOLD.finditer(window)
+    )
 
 
 def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
@@ -997,25 +985,12 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
         parts = [p for p in _PR_CELL_LIST.split(_PR_CELL_ID_LEAD.sub("", cell)) if p]
         return bool(parts) and all(p in keys for p in parts)
 
-    def describes_a_component(hit: re.Match[str]) -> bool:
-        return (
-            not marked
-            # A cell opening with "unchanged" or a record verb states a verdict, "never" or not.
-            and _PR_CELL_RECORD_PREFIX.match(hit.string) is None
-            and hit.group("verdict").lower() in _PR_CI_VERDICTS
-            # Anywhere before the verdict: "never fails", and "has never been failing" too.
-            and _PR_NEVER.search(hit.string, hit.start(), hit.start("verdict")) is not None
-            # A cell that goes on to a verdict ("is never failing; partial") states a verdict.
-            and _PR_GOES_ON_TO_VERDICT.search(hit.string, hit.end()) is None
-        )
-
     def is_verdict(cell: str) -> bool:
-        whole = _PR_CELL_VERDICT.fullmatch(cell)
-        return whole is not None and not describes_a_component(whole)
+        return _PR_CELL_VERDICT.fullmatch(cell) is not None
 
     def opens_with_verdict(cell: str) -> bool:
         lead = _PR_CELL_VERDICT_LEAD.match(cell)
-        if lead is None or describes_a_component(lead):
+        if lead is None:
             return False
         # A cell that goes on in words ("is passing for the nightly") is CI prose as often as a record,
         # so it binds only a row whose identifier is marked.
@@ -1232,69 +1207,140 @@ def _pr_scan_unit(
     loose_columns: set[int],
     hits: set[tuple[int, int]],
 ) -> None:
-    """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind)."""
+    """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind).
+
+    Step 10 is an overlay on the full reading, never a change inside it. A verdict an identifier the
+    text does not mark binds (or a row's, where no identifier in it is marked) is dropped only when
+    the sentence, read again with step 10's exempt clauses blanked out (_pr_step10_blank), no longer
+    binds it: then nothing but the exempt clause made it a verdict."""
     marks, unit_text, is_row = unit
     for start, sentence in _pr_sentences(unit_text, is_row):
-        # Every identifier that binds a kind is recorded, not only the first: a repair that makes an
-        # earlier identifier bind must not move a hit off the line main reported it at.
-        found: dict[str, list[int]] = {kind: [] for kind in PR_BODY_REASONS}
-        # The tree scan's tight pair, before the version filter can set its identifier aside: what
-        # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
-        # requirement shape, since the tree scan's own shape admits every dotted triple.
-        for p in _RECORD_PAIR:
-            pair = p.search(sentence)
-            if pair is not None and _PR_REQ_ID.search(sentence, pair.start(), pair.end()):
-                found["verdict"].append(pair.start())
-                break
-        ids = _pr_requirement_ids(sentence)
-        # A table pairs an identifier cell with any other cell, so a row is one whole window, and
-        # its searches run once rather than once per identifier: a row is unbounded in length.
-        evidence: _PrEvidence | None = None
-        row_marked = False
-        previous: tuple[int, bool] | None = None
-        # Where the cell edges sit, found once for the row; an identifier's column is then a lookup.
-        # The GFM reading counts unescaped pipes; the loose reading, every pipe. Either may mark.
-        pipes = [p.start() for p in _PR_CELL_PIPE.finditer(sentence)] if asvs_columns else []
-        all_pipes = [i for i, ch in enumerate(sentence) if ch == "|"] if loose_columns else []
-        for m, version in ids:
-            window = (
-                sentence
-                if is_row
-                else sentence[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
-            )
-            marked = not version and (
-                _pr_marked(sentence, m)
-                or (previous is not None and previous[1] and _pr_in_list(sentence, previous[0], m))
-                or (bool(asvs_columns) and bisect.bisect_left(pipes, m.start()) - 1 in asvs_columns)
-                or (
-                    bool(loose_columns)
-                    and bisect.bisect_left(all_pipes, m.start()) - 1 in loose_columns
+        found, exemptable = _pr_sentence_found(sentence, is_row, asvs_columns, loose_columns)
+        if exemptable.intersection(found["verdict"]):
+            blanked = _pr_step10_blank(sentence, is_row)
+            if blanked != sentence:
+                still = set(
+                    _pr_sentence_found(blanked, is_row, asvs_columns, loose_columns)[0]["verdict"]
                 )
-            )
-            previous = (m.end(), marked)
-            row_marked = row_marked or marked
-            if _pr_verdict_bound(sentence, m, version, marked) or (
-                not version and not is_row and _pr_prose_verdict(window, marked)
-            ):
-                found["verdict"].append(m.start())
-            if version:
-                continue
-            if evidence is None or not is_row:
-                evidence = _pr_evidence(window)
-            gap, marked_gap, code, symbol = evidence
-            if gap or (marked_gap and marked):
-                found["gap"].append(m.start())
-            if code or (symbol and marked):
-                found["map"].append(m.start())
-        requirement_ids = {m.group(0) for m, version in ids if not version}
-        if (
-            is_row
-            and not found["verdict"]
-            and _pr_table_verdict(sentence, requirement_ids, row_marked)
-        ):
-            found["verdict"].append(0)
+                found["verdict"] = [
+                    at for at in found["verdict"] if at not in exemptable or at in still
+                ]
         for kind_index, kind in enumerate(PR_BODY_REASONS):
             hits.update((_pr_line_at(marks, start + at), kind_index) for at in found[kind])
+
+
+def _pr_step10_blank(sentence: str, is_row: bool) -> str:
+    """The sentence with each of step 10's exempt clauses replaced by spaces, so every offset stays.
+
+    In prose, a clause is "row", a negated state verb and a CI verb ("the row is not failing"). In a
+    row, it is a cell's verdict reading, whole or leading, with "never" before a CI verb ("never
+    fails", "is never failing; "), unless the cell opens with "unchanged" or a record verb. A cell is
+    read trimmed and with its markup deleted, as _pr_table_verdict reads it; each reading's clause is
+    mapped back to the characters of the row it came from."""
+    spans: list[tuple[int, int]] = []
+    if not is_row:
+        spans = [
+            (hit.start(), hit.end())
+            for hit in _PR_PROSE_VERDICT.finditer(sentence)
+            if hit.group("row") is not None
+            and hit.group("row_negated") is not None
+            and hit.group("row_verdict").lower() in _PR_CI_VERDICTS
+        ]
+    else:
+        edges = [-1, *(i for i, ch in enumerate(sentence) if ch == "|"), len(sentence)]
+        for left, right in itertools.pairwise(edges):
+            cell = sentence[left + 1 : right]
+            offset = left + 1
+            lead = len(cell) - len(cell.lstrip(_PR_CELL_EDGE))
+            trimmed = (cell.strip(_PR_CELL_EDGE), [offset + lead + i for i in range(len(cell))])
+            kept = [i for i, ch in enumerate(cell) if ch not in _PR_MARKUP_CHARS]
+            plain = "".join(cell[i] for i in kept)
+            skip = len(plain) - len(plain.lstrip())
+            deleted = (plain.strip(), [offset + kept[skip + i] for i in range(len(plain) - skip)])
+            for text, where in (trimmed, deleted):
+                for hit in (_PR_CELL_VERDICT.fullmatch(text), _PR_CELL_VERDICT_LEAD.match(text)):
+                    if (
+                        hit is not None
+                        and hit.end() > 0
+                        and _PR_CELL_RECORD_PREFIX.match(text) is None
+                        and hit.group("verdict").lower() in _PR_CI_VERDICTS
+                        and _PR_NEVER.search(text, hit.start(), hit.start("verdict")) is not None
+                    ):
+                        spans.append((where[hit.start()], where[hit.end() - 1] + 1))
+    if not spans:
+        return sentence
+    chars = list(sentence)
+    for left, right in spans:
+        chars[left:right] = " " * (right - left)
+    return "".join(chars)
+
+
+def _pr_sentence_found(
+    sentence: str, is_row: bool, asvs_columns: set[int], loose_columns: set[int]
+) -> tuple[dict[str, list[int]], set[int]]:
+    """Every binding in one sentence of a unit, by kind, as offsets into it, with no step 10
+    exemption; and the verdict offsets step 10 may exempt: an unmarked identifier's, and a row's own
+    (offset 0) where no identifier in it is marked."""
+    # Every identifier that binds a kind is recorded, not only the first: a repair that makes an
+    # earlier identifier bind must not move a hit off the line main reported it at.
+    found: dict[str, list[int]] = {kind: [] for kind in PR_BODY_REASONS}
+    exemptable: set[int] = set()
+    # The tree scan's tight pair, before the version filter can set its identifier aside: what
+    # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
+    # requirement shape, since the tree scan's own shape admits every dotted triple.
+    for p in _RECORD_PAIR:
+        pair = p.search(sentence)
+        if pair is not None and _PR_REQ_ID.search(sentence, pair.start(), pair.end()):
+            found["verdict"].append(pair.start())
+            break
+    ids = _pr_requirement_ids(sentence)
+    # A table pairs an identifier cell with any other cell, so a row is one whole window, and
+    # its searches run once rather than once per identifier: a row is unbounded in length.
+    evidence: _PrEvidence | None = None
+    row_marked = False
+    previous: tuple[int, bool] | None = None
+    # Where the cell edges sit, found once for the row; an identifier's column is then a lookup.
+    # The GFM reading counts unescaped pipes; the loose reading, every pipe. Either may mark.
+    pipes = [p.start() for p in _PR_CELL_PIPE.finditer(sentence)] if asvs_columns else []
+    all_pipes = [i for i, ch in enumerate(sentence) if ch == "|"] if loose_columns else []
+    for m, version in ids:
+        window = (
+            sentence if is_row else sentence[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
+        )
+        marked = not version and (
+            _pr_marked(sentence, m)
+            or (previous is not None and previous[1] and _pr_in_list(sentence, previous[0], m))
+            or (bool(asvs_columns) and bisect.bisect_left(pipes, m.start()) - 1 in asvs_columns)
+            or (
+                bool(loose_columns)
+                and bisect.bisect_left(all_pipes, m.start()) - 1 in loose_columns
+            )
+        )
+        previous = (m.end(), marked)
+        row_marked = row_marked or marked
+        if _pr_verdict_bound(sentence, m, version, marked) or (
+            not version and not is_row and _pr_prose_verdict(window, marked)
+        ):
+            found["verdict"].append(m.start())
+            if not marked:
+                exemptable.add(m.start())
+        if version:
+            continue
+        if evidence is None or not is_row:
+            evidence = _pr_evidence(window)
+        gap, marked_gap, code, symbol = evidence
+        if gap or (marked_gap and marked):
+            found["gap"].append(m.start())
+        if code or (symbol and marked):
+            found["map"].append(m.start())
+    requirement_ids = {m.group(0) for m, version in ids if not version}
+    # A row's own verdict is read whether or not an identifier bound one: step 10 may drop the
+    # identifier's, and the row's line must keep any other verdict it holds.
+    if is_row and _pr_table_verdict(sentence, requirement_ids, row_marked):
+        found["verdict"].append(0)
+        if not row_marked:
+            exemptable.add(0)
+    return found, exemptable
 
 
 # Skip routable-IP detection (only) where dotted numbers are package versions, not hosts.
