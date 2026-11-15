@@ -230,6 +230,19 @@ def test_a_blind_canary_exits_2_not_1() -> None:
     assert "blind" in messages[0]
 
 
+def test_the_log_body_canary_needs_three_catalogue_hits_beside_the_probes() -> None:
+    """Vault BACKLOG #5581: the 3 liveness probes now carry the sentinel, so the log-body canary's
+    total floor must still demand 3 catalogue hits on top of them, as the old floor of 3 did."""
+
+    def hits(n: int) -> dict[str, Any]:
+        one = {"detector": "log_body", "plane": "all", "case": "messagefoundry", "detail": "x"}
+        return {"canary": "log-body", "findings": [dict(one) for _ in range(n)]}
+
+    assert evaluate(hits(3 + 2), _policy())[0] == 2, "3 probe hits plus 2 catalogue hits passed"
+    assert evaluate(hits(3 + 3), _policy())[0] == 1
+    assert evaluate(hits(7), _policy())[0] == 1, "the measured 7 hits no longer pass"
+
+
 def test_the_leak_canary_floors_heap_and_handles_separately() -> None:
     heap_only = {"detector": "resources", "plane": "all", "case": "heap", "detail": "x"}
     code, _ = evaluate({"canary": "leak", "findings": [heap_only]}, _policy())
