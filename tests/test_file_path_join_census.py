@@ -1049,11 +1049,13 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/chat.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/cli.ts": Site(2, OPERATOR, "Fixed venv interpreter paths under the workspace."),
     "ide/src/collectionCaseFiles.ts": Site(
-        3,
+        4,
         GUARDED,
         "A temp directory the extension made and generated case-file names, plus names read back"
         " from listing the shared OS temp directory, which another account can plant; the sweep"
-        " deletes one only if it is a real directory this user owns (POSIX).",
+        " deletes one only if it is a real directory this user owns (POSIX). Names listed from a"
+        " run directory are unlinked only when they match the case-file name and lstat as a"
+        " regular file, and the directory goes only by rmdir, never a recursive delete.",
         "ide/src/collectionCaseFiles.ts::st.uid !== uid",
     ),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),

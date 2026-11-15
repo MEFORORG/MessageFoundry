@@ -14,6 +14,7 @@ import {
   securityShowArgs,
 } from "../../securityEditorModel";
 import { FIELDS } from "../../securityEditorWebview";
+import { unlinkLinks } from "../unlinkLinks";
 
 // BACKLOG #5411: the Security Settings editor's host-side checks, run vscode-free. The editor writes
 // the [security] posture, so each check fails closed: the service-settings path follows the rules
@@ -50,23 +51,6 @@ function modelFs(entries: Record<string, string>, realpaths: Record<string, stri
       return r;
     },
   };
-}
-
-/** Unlinks every link at or below `dir`, a junction included, without following any. The VS Code
- *  extension host's recursive rmSync follows a junction into its target, and fails with "The name of
- *  the file cannot be resolved by the system" on two junctions that lead into each other, as the
- *  open-limit test below makes; measured on its Node v24.21.0, while plain Node v24.20.0 does
- *  neither. So the teardown removes the links before it removes the folders. */
-function unlinkLinks(dir: string): void {
-  for (const name of fs.readdirSync(dir)) {
-    const p = path.join(dir, name);
-    const st = fs.lstatSync(p);
-    if (st.isSymbolicLink()) {
-      fs.unlinkSync(p);
-    } else if (st.isDirectory()) {
-      unlinkLinks(p);
-    }
-  }
 }
 
 /** The 8.3 short spelling of the existing folder `long`, as cmd's `%~s` prints it, with every

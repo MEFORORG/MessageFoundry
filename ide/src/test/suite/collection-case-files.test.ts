@@ -15,6 +15,7 @@ import {
   removeCaseDir,
   sweepStaleCaseDirs,
 } from "../../collectionCaseFiles";
+import { unlinkLinks } from "../unlinkLinks";
 
 const BODY = "MSH|^~\\&|APP|FAC|RCV|RFAC|20200101010101||ADT^A01|C1|P|2.5\rPID|1||SYNTH^TEST";
 const POSIX = process.platform !== "win32";
@@ -127,4 +128,55 @@ suite("collectionCaseFiles.sweepStaleCaseDirs — what a crashed run left (BACKL
   test("an unreadable base removes nothing and does not throw", () => {
     assert.strictEqual(sweepStaleCaseDirs(path.join(base, "missing")), 0);
   });
+});
+
+suite("collectionCaseFiles: a run directory is deleted without recursing (BACKLOG #5415)", () => {
+  let base: string;
+  setup(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "mefor-casefiles-test-"));
+  });
+  teardown(() => {
+    try {
+      unlinkLinks(base);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  // Each way a run directory is deleted: at the end of its run, and by a later run's sweep.
+  const deleters: [string, (dir: string) => void][] = [
+    ["removeCaseDir", removeCaseDir],
+    ["sweepStaleCaseDirs", (dir) => void sweepStaleCaseDirs(path.dirname(dir), Date.now() + 10 * STALE_CASE_DIR_MS)],
+  ];
+
+  for (const [how, remove] of deleters) {
+    test(`${how}: a junction inside a run directory leaves its target's files intact`, function () {
+      const dir = materializeCases([BODY], base);
+      const target = fs.mkdtempSync(path.join(base, "target-"));
+      // A case-named file in the target too: it must survive as much as any other.
+      for (const name of ["keep.txt", caseFileName(0)]) {
+        fs.writeFileSync(path.join(target, name), BODY);
+      }
+      try {
+        fs.symlinkSync(target, path.join(dir, "linked"), "junction");
+      } catch {
+        this.skip(); // creating a link can need a privilege the runner lacks
+      }
+      remove(dir);
+      assert.deepStrictEqual(fs.readdirSync(target).sort(), [caseFileName(0), "keep.txt"].sort(), "a file in the junction's target was deleted");
+      // The run's own case file goes; the directory stays, since the link is still in it.
+      assert.deepStrictEqual(fs.readdirSync(dir), ["linked"]);
+    });
+
+    test(`${how}: a run directory holding a file that is not a case file is left in place`, () => {
+      const dir = materializeCases([BODY, BODY], base);
+      fs.writeFileSync(path.join(dir, "notes.txt"), "x");
+      remove(dir);
+      assert.deepStrictEqual(fs.readdirSync(dir), ["notes.txt"]);
+      // THE CONTROL: a directory of case files only goes.
+      const plain = materializeCases([BODY, BODY], base);
+      remove(plain);
+      assert.ok(!fs.existsSync(plain), "a directory of case files only was not removed");
+    });
+  }
 });

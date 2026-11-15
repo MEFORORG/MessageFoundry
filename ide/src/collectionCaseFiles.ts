@@ -23,6 +23,9 @@ export function caseFileName(i: number): string {
   return `case_${String(i).padStart(4, "0")}.hl7`;
 }
 
+/** A name caseFileName writes, the only name a run directory's deletion unlinks. */
+const CASE_FILE = /^case_\d{4,}\.hl7$/;
+
 /**
  * Write each input to its own file in a fresh directory under `base`, and return the directory. The
  * directory is 0700 and each file is created exclusively at 0600, which on POSIX keeps every other
@@ -44,13 +47,52 @@ export function materializeCases(inputs: readonly string[], base: string = os.tm
   return dir;
 }
 
+/** Unlink `file`, retrying `retries` times 100 ms apart on EBUSY or EPERM, as a scanner or indexer
+ *  briefly holding a just-written case file on Windows causes. A file already gone is not an error. */
+function unlinkWithRetries(file: string, retries: number): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.unlinkSync(file);
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        return;
+      }
+      if (attempt >= retries || (code !== "EBUSY" && code !== "EPERM")) {
+        throw e;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+}
+
+/**
+ * Delete a run's directory without ever recursing. `dir` must lstat as a plain directory; in it,
+ * only a regular file named as caseFileName names one is unlinked, then `dir` itself is removed with
+ * rmdir, which fails and leaves it if anything else is still in it. No recursive rmSync, because in
+ * the VS Code extension host (measured on its Node v24.21.0) a recursive rmSync follows a junction
+ * and deletes its target's files. Throws on any failure, a directory already gone included.
+ */
+function deleteCaseDir(dir: string, retries: number): void {
+  if (!fs.lstatSync(dir).isDirectory()) {
+    throw new Error("not a plain directory");
+  }
+  for (const name of fs.readdirSync(dir)) {
+    const file = path.join(dir, name);
+    if (CASE_FILE.test(name) && fs.lstatSync(file).isFile()) {
+      unlinkWithRetries(file, retries);
+    }
+  }
+  fs.rmdirSync(dir);
+}
+
 /** Remove a run's directory. Best effort: a cleanup error must not mask the run's own result. */
 export function removeCaseDir(dir: string): void {
   try {
-    // Retries ride out a scanner or indexer briefly holding a just-written case file on Windows.
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    deleteCaseDir(dir, 3);
   } catch {
-    /* a later sweep retries it (sweepStaleCaseDirs) */
+    /* gone already, or a later sweep retries it (sweepStaleCaseDirs) */
   }
 }
 
@@ -58,8 +100,9 @@ export function removeCaseDir(dir: string): void {
  * Delete the run directories under `base` that a crashed run left behind: a real directory (never a
  * symlink) named with CASE_DIR_PREFIX, last modified more than `maxAgeMs` before `now`, and, on POSIX,
  * owned by this process's user. The OS temp directory is shared there, so the prefix alone does not
- * say who made an entry, and a recursive delete must never walk a tree another account controls. On
- * Windows the default TEMP is per-user. Returns how many it removed. Best effort: an entry it cannot
+ * say who made an entry. On Windows the default TEMP is per-user. Each is deleted as removeCaseDir
+ * deletes one, without recursing, so a link inside it is never followed and a directory holding
+ * anything but case files is left. Returns how many it removed. Best effort: an entry it cannot
  * read or remove is skipped.
  */
 export function sweepStaleCaseDirs(
@@ -85,7 +128,7 @@ export function sweepStaleCaseDirs(
       if (!st.isDirectory() || (uid !== undefined && st.uid !== uid) || now - st.mtimeMs <= maxAgeMs) {
         continue;
       }
-      fs.rmSync(dir, { recursive: true, force: true });
+      deleteCaseDir(dir, 0);
       removed++;
     } catch {
       /* gone already, or not ours to remove */
