@@ -2010,8 +2010,10 @@ def _empty_files_in_place(staging: Path, *, spared: Mapping[str, str] | None = N
     empty: a file that refused, or a directory that could not be listed.
 
     A name in ``spared``, directly under ``staging``, is never truncated, and is reported with the
-    note it maps to; its spare marker is kept too, unreported, as is a marker reading ``released``
-    (:func:`_release_spare_marker`). A restore spares its staged store when that name could not be removed after placement and is
+    note it maps to; its spare marker is kept too, unreported. In a restore's directory any other
+    marker holding one of the restore's reasons is kept unreported, ``released`` included
+    (:func:`_release_spare_marker`), since emptied it would read as a spare; one that cannot be read
+    at that moment is kept and reported. A restore spares its staged store when that name could not be removed after placement and is
     still the restored store's own file, which a volume that misreports its link count would
     otherwise let this empty (BACKLOG #5617; see :func:`_spared_items`).
 
@@ -2059,10 +2061,18 @@ def _empty_files_in_place(staging: Path, *, spared: Mapping[str, str] | None = N
         target = _marker_target(name)
         if target is None:
             return False
-        # A marker reading `released` holds that word alone; emptied, it would read as a spare.
-        return target in spares or (
-            reads_markers and _read_spare_reason(staging / name) == _SPARE_RELEASED
-        )
+        if target in spares:
+            return True
+        if not reads_markers:
+            return False
+        # A marker holding one of the restore's reasons holds that word alone, and emptied it would
+        # read as a spare, `released` included. One that cannot be read at this moment may be
+        # either, so it is kept and reported; only one that reads as something else is emptied.
+        found = _read_spare_marker(staging / name)
+        if found is None:
+            unproven.append(f"{name} {_UNREAD_MARKER}")
+            return True
+        return found in _SPARE_REASONS
 
     walked = False
     if sys.platform == "win32":
@@ -2789,18 +2799,27 @@ _SPARE_ROLLED_BACK = "rolled-back"
 #: past this run. A marker that reads so spares nothing, and is never emptied, since an empty marker
 #: reads as a spare for a reason that could not be read.
 _SPARE_RELEASED = "released"
+#: How a note ends for a directory a sweep can still take, and how the teardown words it instead for
+#: one it withholds from every sweep (:func:`_teardown_staging`).
+_NEXT_SWEEP = "and the next sweep removes this directory"
+_NO_SWEEP = "and then this directory, which no sweep removes"
 _SPARE_NOTES = {
     _SPARE_RESTORED: "the restored store, not truncated",
     _SPARE_ROLLBACK_FAILED: (
         "a second name for the placed store the failed restore's rollback could not remove, not "
-        "truncated: delete it by hand with that store, and the next sweep removes this directory"
+        f"truncated: delete it by hand with that store, {_NEXT_SWEEP}"
     ),
     _SPARE_ROLLED_BACK: (
         "the only decrypted copy of the store the failed restore rolled back, not truncated: "
-        "delete it by hand, and the next sweep removes this directory"
+        f"delete it by hand, {_NEXT_SWEEP}"
     ),
 }
 _SPARE_NOTE_UNREAD = "spared by a restore for a reason that could not be read, not truncated"
+#: Every reason a restore writes into a marker.
+_SPARE_REASONS = frozenset({*_SPARE_NOTES, _SPARE_RELEASED})
+#: What the fail-safe reports, after the name, for a marker it could not read (see
+#: :func:`_empty_files_in_place`).
+_UNREAD_MARKER = "(a spare marker that could not be read, not truncated)"
 
 
 def _spare_marker(item: Path) -> Path:
@@ -2824,6 +2843,28 @@ def _still_there(path: Path) -> bool:
     return True
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Make a rename in ``directory`` durable, on POSIX. Windows exposes no directory handle to
+    flush through :func:`os.open`, so this does nothing there. Never raises: a failure, as on a
+    network mount that refuses a directory fsync, is logged at WARNING, and the rename it was to
+    make durable then survives a process crash but not necessarily a power loss."""
+    if sys.platform == "win32":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        log.warning(
+            "could not open %s to flush a spare marker's rename: %s", directory, safe_exc(exc)
+        )
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        log.warning("could not flush a spare marker's rename in %s: %s", directory, safe_exc(exc))
+    finally:
+        os.close(fd)
+
+
 def _write_spare_marker(item: Path, reason: str) -> bool:
     """Record, beside ``item``, that no teardown or sweep may unlink or truncate it, and why.
     Atomic: written whole to a temporary name and renamed over the marker, so a reader finds the
@@ -2842,6 +2883,9 @@ def _write_spare_marker(item: Path, reason: str) -> bool:
         finally:
             os.close(fd)
         os.replace(tmp, marker)
+        # The rename too, before the caller links: else a power loss could keep a link the restore
+        # makes next and lose the marker that spares its second name.
+        _fsync_dir(item.parent)
     except OSError as exc:
         try:
             os.unlink(tmp)
@@ -2958,14 +3002,20 @@ def _not_a_plain_marker(marker: Path) -> str | None:
 
 
 def _read_spare_reason(marker: Path) -> str:
-    """The reason a spare marker holds, or ``""`` when it cannot be read as one, logged unless the
-    marker is simply not there. A name :func:`_not_a_plain_marker` refuses is not opened."""
+    """The reason a spare marker holds, or ``""`` when it is not there or cannot be read as one
+    (:func:`_read_spare_marker`)."""
+    return _read_spare_marker(marker) or ""
+
+
+def _read_spare_marker(marker: Path) -> str | None:
+    """What a spare marker holds: ``""`` when it is not there, and ``None``, logged, when it is
+    there but cannot be read as one. A name :func:`_not_a_plain_marker` refuses is not opened."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK
     try:
         refused = _not_a_plain_marker(marker)
         if refused is not None:
             log.warning("did not read the spare marker %s: %s", marker, refused)
-            return ""
+            return None
         fd = os.open(marker, flags)
         try:
             return os.read(fd, 64).decode("ascii")
@@ -2975,7 +3025,7 @@ def _read_spare_reason(marker: Path) -> str:
         return ""
     except (OSError, UnicodeDecodeError) as exc:
         log.warning("could not read the spare marker %s: %s", marker, safe_exc(exc))
-        return ""
+        return None
 
 
 def _records_another_reason(item: Path, reason: str) -> bool:
@@ -3107,6 +3157,17 @@ def _teardown_staging(path: Path, *, spared: Mapping[str, str] | None = None) ->
     # Read here, the one teardown every path runs (a release and the sweep alike), so no path can
     # unlink or truncate a file a restore spared in an earlier run (BACKLOG #5617).
     held = _spared_items(path, spared)
+    # The marker's reason, not its existence: a relabel that failed leaves an older reason, which a
+    # later sweep would read in place of this run's (BACKLOG #5617). Read before the discard, so the
+    # notes it reports never promise a sweep that will not take the directory.
+    unrecorded = sorted(
+        n
+        for n, reason in (spared or {}).items()
+        if reason and _still_there(path / n) and _records_another_reason(path / n, reason)
+    )
+    for n in unrecorded:
+        if held and n in held:
+            held[n] = held[n].replace(_NEXT_SWEEP, _NO_SWEEP)
     leftover: str | None
     if held is None:
         leftover = (
@@ -3119,13 +3180,6 @@ def _teardown_staging(path: Path, *, spared: Mapping[str, str] | None = None) ->
         )
     if not os.path.lexists(path):
         return leftover
-    # The marker's reason, not its existence: a relabel that failed leaves an older reason, which a
-    # later sweep would read in place of this run's (BACKLOG #5617).
-    unrecorded = sorted(
-        n
-        for n, reason in (spared or {}).items()
-        if reason and _still_there(path / n) and _records_another_reason(path / n, reason)
-    )
     if unrecorded:
         # A spare whose marker could not be written holds for this run alone. Its restore already
         # withheld the directory from every sweep while it held the lock (`_record_spare`); this
@@ -5252,9 +5306,14 @@ def _restore_blocking(
             # second name for the restored store, so no crash point leaves that name unmarked for a
             # later sweep's fail-safe, and unspared before a copy placement, which makes it no
             # such name (BACKLOG #5617). A marker that cannot be written, or removed before a copy,
-            # refuses the placement while nothing is placed yet. A placement that raises has
-            # removed what it placed (`_place_restored_store`), so the staged store is then no
-            # such name, unless that removal failed too and the file at --to is still the same.
+            # refuses the placement while nothing is placed yet. `published` flips the moment the
+            # link or the copy lands, so a placement that raises after that is rolled back like any
+            # later failure, and the staged store stays spared while it is a name for that file.
+
+            def _placed() -> None:
+                nonlocal published
+                published = True
+
             spared_item = snap
             try:
                 try:
@@ -5263,6 +5322,7 @@ def _restore_blocking(
                         dest_store_path,
                         before_link=lambda: _spare_before_link(snap),
                         before_copy=lambda: _unspare_before_copy(snap),
+                        on_placed=_placed,
                     )
                 except BaseException:
                     if not (
@@ -5340,9 +5400,9 @@ def _restore_blocking(
             elif _drop_staged_name(spared_item):
                 spared_item = None
             elif not published:
-                # The placement raised with the staged name possibly a name for the file at --to,
-                # which this restore did not publish and so does not roll back: it stays spared as
-                # it is, under the reason already written.
+                # The placement raised before its link or copy landed, and whether the staged name
+                # is a name for the file at --to, which is not this restore's, could not be told:
+                # it stays spared as it is, under the reason already written.
                 pass
             else:
                 # The rollback could not remove the placed store, so the staged name stays a name
@@ -5994,6 +6054,7 @@ def _place_restored_store(
     *,
     before_link: Callable[[], object] | None = None,
     before_copy: Callable[[], object] | None = None,
+    on_placed: Callable[[], object] | None = None,
 ) -> tuple[int, bool]:
     """Put the verified ``store.db`` at ``dest`` without ever overwriting, and return its size and
     whether it was placed by a link, so that ``src`` is a second name for it.
@@ -6007,8 +6068,11 @@ def _place_restored_store(
 
     ``before_link`` runs just before the link, and may raise to refuse the placement;
     ``before_copy`` just before the copy fallback. The restore marks and unmarks ``src`` spared
-    with them (BACKLOG #5617). Nothing it placed survives its own failure: a failure after the
-    link or the copy removes ``dest`` again, logged where that removal fails."""
+    with them (BACKLOG #5617). ``on_placed`` runs once the link or the copy has made ``dest`` this
+    call's own file; a caller that passes it owns the rollback of ``dest`` from then on, and a
+    failure after that leaves ``dest`` for it, so ``dest`` is never unlinked twice, the second time
+    perhaps as another restore's store. Without ``on_placed`` a failure after the placement removes
+    ``dest`` again, logged where that removal fails."""
     # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path. It is the
     # store-trio rule, not bare _secure_file: restored into a hardened data directory, an owner-only
     # file would lock the service account out of the store it is about to open (ADR 0183 Wave 0b).
@@ -6044,16 +6108,29 @@ def _place_restored_store(
             # ``except``, so nothing is caught and no failure mode is missed. It runs after ``with out``
             # has closed the handle, which Windows requires before an unlink.
             if not placed:
-                dest.unlink(missing_ok=True)
+                try:
+                    dest.unlink(missing_ok=True)
+                except OSError as exc:
+                    # Logged, never raised: it would replace the copy's own failure.
+                    log.error(
+                        "could not remove the partial copy of the store at %s, a truncated store "
+                        "a retry refuses to overwrite: delete it by hand: %s",
+                        dest,
+                        safe_exc(exc),
+                    )
     try:
+        if on_placed is not None:
+            on_placed()
         _secure_store_file(dest, dir_grants=_store_dir_grants(dest.parent))
     except BaseException:
         # Best-effort and non-raising by contract, so this is an interrupt: the file at ``dest``
-        # is this call's, and goes, as a copy that dies mid-stream does above.
-        try:
-            dest.unlink(missing_ok=True)
-        except OSError as exc:
-            log.error("could not remove the store just placed at %s: %s", dest, safe_exc(exc))
+        # is this call's, and goes, as a copy that dies mid-stream does above, unless the caller
+        # owns its rollback.
+        if on_placed is None:
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError as exc:
+                log.error("could not remove the store just placed at %s: %s", dest, safe_exc(exc))
         raise
     return size, linked
 

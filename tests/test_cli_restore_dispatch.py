@@ -1927,7 +1927,9 @@ def test_a_relabel_that_cannot_be_recorded_keeps_its_directory_from_every_sweep(
         mp.setattr(dr_backup._Staging, "release", release)
         mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
         assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
-    capsys.readouterr()
+    err = _refusal(capsys)
+    # The refusal names the file without promising a sweep that will never take the directory.
+    assert "which no sweep removes" in err and "the next sweep removes" not in err, err
     assert marked_at_release and not any(marked_at_release), marked_at_release
     (leftover,) = dest.parent.glob("mefor-restore-*")
     staged = leftover / "extracted_store.db"
@@ -2175,6 +2177,97 @@ def test_a_placement_interrupted_after_its_link_removes_what_it_placed(tmp_path)
         with pytest.raises(KeyboardInterrupt):
             dr_backup._place_restored_store(src, dest)
     assert not dest.exists() and src.read_bytes() == b"synthetic store"
+
+
+def test_a_placement_that_fails_after_its_link_is_rolled_back_by_the_restore(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The link lands, then the placement raises, and the first unlink of --to is refused. The
+    # store at --to is this restore's own file, so the restore rolls it back; it used to leave it
+    # unpublished, never rolled back, behind a retry the never-overwrite refusal blocks.
+    from messagefoundry.store import store as store_mod
+
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    store_refusals: list[Path] = []
+
+    def held(path: Path) -> bool:
+        if path == dest and not store_refusals:
+            store_refusals.append(path)
+            return True
+        return False
+
+    def fails(path: Path, *, dir_grants: object) -> None:
+        raise RuntimeError("synthetic failure after the link")
+
+    with pytest.MonkeyPatch.context() as mp:
+        _hold(mp, held)
+        mp.setattr(store_mod, "_secure_store_file", fails)
+        mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
+        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) != 0
+    capsys.readouterr()
+    assert store_refusals == [dest]
+    assert not dest.exists(), "the store this restore placed was left at --to"
+    # The restore removes the directory it made for --to only once it is empty, so its absence
+    # shows the staging directory went too.
+    assert not dest.parent.exists()
+
+
+def test_a_copy_that_fails_keeps_its_own_error_when_its_partial_file_will_not_go(
+    tmp_path, key_b64, capsys
+) -> None:
+    # A copy placement dies mid-stream, and the unlink of its partial file is refused. That
+    # unlink's error used to replace the copy's own, so the refusal named the wrong cause; it is
+    # logged at ERROR instead.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+
+    def no_link(*args: Any, **kwargs: Any) -> None:
+        raise OSError(1, "Operation not permitted")
+
+    def full(*args: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    errors = _ErrorRecords()
+    with pytest.MonkeyPatch.context() as mp, errors.on(dr_backup.log):
+        _hold(mp, lambda p: p == dest)
+        mp.setattr(os, "link", no_link)
+        mp.setattr(shutil, "copyfileobj", full)
+        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
+    (refusal,) = [line for line in _refusal(capsys).splitlines() if line.startswith("error:")]
+    assert "No space left" in refusal and "held open" not in refusal, refusal
+    assert any("partial copy" in m and str(dest) in m for m in errors.messages), errors.messages
+
+
+def test_a_released_marker_that_cannot_be_read_is_never_emptied(tmp_path) -> None:
+    # Emptied, a `released` marker would read as a spare for a reason that could not be read, and
+    # every later sweep would keep its directory. One the fail-safe cannot read at that moment is
+    # kept and reported, never emptied.
+    staging = tmp_path / "mefor-restore-x"
+    staging.mkdir()
+    item = staging / "extracted_store.db"
+    item.write_bytes(b"synthetic")
+    assert dr_backup._write_spare_marker(item, "released")
+
+    def unreadable(marker: Path) -> str | None:
+        raise PermissionError(13, "held open without read sharing")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_not_a_plain_marker", unreadable)
+        unproven = dr_backup._empty_files_in_place(staging)
+    assert dr_backup._spare_marker(item).read_bytes() == b"released"
+    assert any("could not be read" in u for u in unproven), unproven
+    assert item.stat().st_size == 0
+
+
+def test_a_spare_marker_rename_is_flushed_before_it_counts_as_written(tmp_path) -> None:
+    item = tmp_path / "extracted_store.db"
+    item.write_bytes(b"synthetic")
+    flushed: list[Path] = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_fsync_dir", flushed.append)
+        assert dr_backup._write_spare_marker(item, "restored-store")
+    assert flushed == [tmp_path]
 
 
 def test_a_late_relabel_that_fails_withholds_the_directory_and_says_so(
