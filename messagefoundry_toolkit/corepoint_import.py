@@ -827,9 +827,8 @@ def parse_roles(data: str) -> tuple[RoleToken, ...]:
 def _unread_markup(data: str, roles: tuple[RoleToken, ...]) -> bool:
     """Whether :func:`parse_roles` read no span in ``data`` and :func:`strip_markup` changes it.
 
-    The render emits no live write or send for such a statement (ADR 0086 §2(b″)'s gaps). THE one
-    test, asked by the render's write and send arms and by the handle scan alike, so the three
-    cannot disagree on it. ADR 0086 §2(b″), first gap, states the rule and what follows from it
+    The render emits no live write or send for such a statement. THE one test, asked by the
+    render's write and send arms and by the handle scan alike, so the three cannot disagree on it. ADR 0086 §2(b″), first gap, states the rule and what follows from it
     (BACKLOG #5556)."""
     return not roles and strip_markup(data) != data.strip()
 
@@ -951,11 +950,6 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     message. A write that takes the flat reading is not gated by the subject (ADR 0086 §2(b″)). On
     the step 1 path, a role-parsed ``MsgSend`` on a ``<Line>`` of anything outside ``held`` is
     refused by :func:`_send_refusal` (BACKLOG #313).
-
-    On a ``<Line>`` in markup the role layer does not read (:func:`_unread_markup`), the scan counts
-    a send as delivering ``""``, as it does a role-parsed send of no handle, and a list holding a
-    ``MsgTreeCopy`` there holds nothing (BACKLOG #5556). The render refuses that send with
-    :data:`_UNREAD_MARKUP_SEND_REFUSAL`.
 
     The scan skips ``@Disabled`` statements exactly where :func:`_parse_statement` does, and reads each
     verb and kind through the same helpers. It is **flow-insensitive**: it does not see statement order
