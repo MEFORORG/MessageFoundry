@@ -607,7 +607,7 @@ _CONSOLE_SCRIPT_LAUNCHER = read_service_env_posture(
     [
         _CONSOLE_SCRIPT_LAUNCHER,
         ServiceEnvPosture(ServiceEnvStatus.NOT_A_SERVICE),
-        _service(["MEFOR_VALUE_PARTNER_HOST=example.test"]),
+        _service(["MEFOR_AI_ENVIRONMENT=prod", "MEFOR_VALUE_PARTNER_HOST="]),
         _service([], MEFOR_STORE_ENCRYPTION_KEY=_KEY_VALUE),
         read_service_env_posture(
             probe=_Probe(ancestors=_UNDER_NSSM, services={100: "MessageFoundry"}, unreadable=True),
@@ -633,18 +633,101 @@ def test_an_embedded_app_builds_where_serve_would_not_refuse(
 
 
 def test_a_non_secret_variable_in_the_nssm_list_is_neither_refused_nor_named() -> None:
-    """``MEFOR_VALUE_*`` names are an operator's ``env()`` values, not secret-class settings, and
-    the windows-service-smoke rig sets some in its NSSM list."""
+    """A setting that is not secret-class, and the secrets directory's own path, are left alone.
+    An empty ``MEFOR_VALUE_*`` entry sets nothing, so it is not read as one."""
     posture = _service(
         [
             "MEFOR_AI_ENVIRONMENT=prod",
             "MEFOR_SECURITY_REQUIRE_MFA=false",
-            "MEFOR_VALUE_REGISTRY_PASSWORD=x",
+            "MEFOR_VALUE_PARTNER_HOST=",
             "MEFOR_SECRETS_DIRECTORY=C:/ProgramData/MessageFoundry-secrets",
         ]
     )
     assert service_env_refusal(posture) is None
     assert service_env_loosenings(posture) == []
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["MEFOR_VALUE_REGISTRY_PASSWORD=synthetic-value", "mefor_value_partner_host=example.test"],
+)
+def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
+    """Vault BACKLOG #8212 item 7, the owner's ruling of 2026-11-14: every ``MEFOR_VALUE_*``
+    variable in the service's lists refuses, a host name as well as a password, since the engine
+    cannot tell which is a secret. The remedy names both ways in: the secrets directory for a
+    secret, the environment's value file for anything else."""
+    name = entry.split("=", 1)[0].upper()
+    posture = _service([entry, "MEFOR_AI_ENVIRONMENT=prod"])
+    assert posture.listed_value_names == (name,)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert f"{name} (in Parameters\\AppEnvironmentExtra) is set in" in refusal
+    assert "'MessageFoundry'" in refusal
+    assert (
+        "Put each MEFOR_VALUE_* value that is a secret in the secrets directory "
+        "MEFOR_SECRETS_DIRECTORY names"
+    ) in refusal
+    assert "environments/<env>.toml" in refusal
+    assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
+    assert _ENFORCEMENT_NOTE in refusal
+    assert "protect-key" not in refusal
+    assert entry.split("=", 1)[1] not in refusal, "the value must never reach the refusal"
+    [(loosening, twin)] = service_env_loosenings(posture)
+    assert loosening == "secret_in_service_environment"
+    _assert_twin_of(refusal, twin)
+
+
+def test_an_env_value_name_that_is_not_plain_is_counted_and_never_spelled() -> None:
+    """The value names come from the registry, not from a fixed list, so one that breaks the
+    letters-digits-underscores rule is refused without being printed."""
+    posture = _service(["MEFOR_VALUE_ODD NAME=synthetic-value", "MEFOR_VALUE_PLAIN=x"])
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "ODD NAME" not in refusal and "synthetic-value" not in refusal
+    assert (
+        "MEFOR_VALUE_PLAIN (in Parameters\\AppEnvironmentExtra), 1 more MEFOR_VALUE_* name(s) "
+        "not spelled here"
+    ) in refusal
+    only_odd = service_env_refusal(_service(["MEFOR_VALUE_ODD NAME=synthetic-value"]))
+    assert only_odd is not None and only_odd.startswith("1 more MEFOR_VALUE_* name(s)")
+
+
+def test_a_directory_secret_and_an_env_value_share_one_remedy_sentence() -> None:
+    posture = _service(
+        [
+            "MEFOR_STORE_PASSWORD=x",
+            "MEFOR_VALUE_PARTNER_HOST=example.test",
+            "MEFOR_SECRETS_DIRECTORY=C:/s",
+        ]
+    )
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert (
+        "Put MEFOR_STORE_PASSWORD and each MEFOR_VALUE_* value that is a secret in the secrets "
+        "directory MEFOR_SECRETS_DIRECTORY names"
+    ) in refusal
+    assert refusal.count('"The secrets directory"') == 1
+    assert "set no MEFOR_SECRETS_DIRECTORY" not in refusal
+
+
+def test_the_smoke_legs_nssm_list_is_one_serve_does_not_refuse() -> None:
+    """The windows-service-smoke leg replaces the service's NSSM list with ``nssm set``, and the
+    merge queue is the first place it runs. So the list it sets is read here and judged by the
+    refusal, which a ``MEFOR_VALUE_*`` entry there would trip, and it must name the secrets
+    directory the leg writes the registry endpoint's values to."""
+    pytest.importorskip("yaml")
+    from tests._workflow_contexts import step_script
+
+    script = step_script("ci.yml", "windows-service-smoke", "Install the service")[1]
+    block = script.split('nssm.exe" set MessageFoundry AppEnvironmentExtra `', 1)[1]
+    entries: list[str] = []
+    for line in block.splitlines()[1:]:
+        entries.append(line.strip().rstrip("`").strip().strip('"'))
+        if not line.rstrip().endswith("`"):
+            break
+    assert "MEFOR_SECURITY_REQUIRE_MFA=false" in entries, f"CONTROL FAILED: {entries}"
+    assert service_env_refusal(_service(entries)) is None, entries
+    assert "MEFOR_SECRETS_DIRECTORY=$secretsDir" in entries
 
 
 # --- the loosening entry (key-custody slice S2a) ---------------------------------------------------

@@ -2599,7 +2599,12 @@ count is above `0` (vault BACKLOG #2613).
   key file ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)), and each
   other secret-class setting, whose way in is the secrets directory that `MEFOR_SECRETS_DIRECTORY`
   names, one restricted file per setting
-  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). They also
+  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). Every
+  `MEFOR_VALUE_*` variable in those lists is refused too, a host name as well as a password, since
+  the engine cannot tell which `env()` value is a secret (owner ruling 2026-11-14, vault BACKLOG
+  #8212); the refusal sends a secret to the secrets directory and any other value to the active
+  environment's value file. A `MEFOR_VALUE_*` name that is not only letters, digits and
+  underscores is counted in the refusal rather than spelled. They also
   refuse a store key in their own environment when they found their service but could not read
   its lists, since the key most likely came from there; another secret in their own environment is
   not refused then.
@@ -2645,7 +2650,8 @@ count is above `0` (vault BACKLOG #2613).
   list or the service's own `Environment` value, and from the machine-wide environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
-  and a secret a connection reads through `env()`, whose name only your config knows.
+  and a variable named by a `[secrets].provider = "env"` reference, whose name only your config
+  knows. An `env()` value's `MEFOR_VALUE_*` variable is covered, as *What is refused* says.
 
 ---
 

@@ -692,8 +692,13 @@ NSSM environment.
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
   of the engine's own secret settings other than the store key and its retired keys here from the
   service's NSSM list, where `serve` and `supervise` refuse it if the engine could read that
-  list, and not if it could not (the previous bullet links where that is stated);
-  a `MEFOR_VALUE_*` value there is not refused.
+  list, and not if it could not (the previous bullet links where that is stated).
+  **Every `MEFOR_VALUE_*` value there is refused the same way**, a host name as well as a password,
+  since the engine cannot tell which is a secret (owner ruling 2026-11-14, vault BACKLOG #8212).
+  Move one that is a secret here, as a file named as its variable, and any other to the active
+  environment's value file, `environments/<env>.toml` by default
+  ([CONFIGURATION.md](CONFIGURATION.md), `[environments]`), keyed by the name after
+  `MEFOR_VALUE_` in lower case.
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:
