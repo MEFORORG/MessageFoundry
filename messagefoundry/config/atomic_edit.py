@@ -14,10 +14,10 @@ inside a private directory created beside it (unique, and on POSIX owner-only fr
 On Windows those modes do not restrict the file, so the candidate is given a protected access list
 granting the editing account, and the live file's owner when that is another account, before its
 first byte is written. An own-account replaced file is then given the editing account's list
-alone; a foreign-owned one gets the list the next paragraph describes. ``_restrict_to_editor`` says why that is one whole-list write
-and not ``store._secure_file``, which is only the fallback when the write fails. The caller's
-``validate`` runs against that candidate. Only a candidate
-that validates replaces the live file, so a refused edit never touches the live file at all: its bytes
+alone; a foreign-owned one gets the list the next paragraph describes. ``_restrict_to_editor``
+says why that is one whole-list write and not ``store._secure_file``, which is only the fallback
+when the write fails. The caller's ``validate`` runs against that candidate. Only a candidate that
+validates replaces the live file, so a refused edit never touches the live file at all: its bytes
 and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
 
 The replaced file keeps its OWNER (vault BACKLOG #5619). An edit restricts it to its owner, and an
@@ -28,11 +28,14 @@ group before the rename, and the mode is still 0600. On Windows, a live file ano
 is restricted to that account at full control and the editing one at read only, rather than to
 the editing account alone. The editor may not write it, because the config loader refuses a file a
 non-owner, non-admin account can write (``wiring._evaluate_config_dacl``). The candidate grants
-the editor full control until the rename, since this account writes, renames and removes it. The
-file's ownership is given back where Windows lets this account do that (it needs the restore privilege
-enabled, which an elevated administrator holds but does not enable; otherwise the editor owns it, and
-a later edit by that editor makes the owner-only rewrite). An edit by the file's own account, or by an elevated administrator of a
-file Administrators owns, makes the owner-only rewrite: on Windows the one entry it leaves grants
+the editor full control until the rename, so no step of the edit depends on what the private
+directory grants. The file's ownership is given back where Windows lets this account do that (it
+needs the restore privilege enabled, which an elevated administrator holds but does not enable;
+otherwise the editor owns it, still at read only). Either way, a later edit of that file by the
+same editor replaces a file it may not delete, so it succeeds only where the folder lets the editor
+delete files in it, as Administrators' full control of a folder does; elsewhere it is refused and
+the file is left as it was. An edit by the file's own account, or by an elevated administrator of
+a file Administrators owns, makes the owner-only rewrite: on Windows the one entry it leaves grants
 the editing account, not SYSTEM, Administrators or another reader. That holds only when this
 process's account can be read from its token and the list can be written. When the token cannot be
 read, no list is written, the edit logs it, and the file keeps what its staging directory gave it.
@@ -608,8 +611,8 @@ def _restrict_to_editor(
     """Replace the access list of ``path`` with a protected one granting ``owner`` full control
     when one is given, and the editing account full control, or read only beside another owner
     unless ``editor_writes`` (:func:`_owner_and_editor_list`); ``False``, logged, when the token or
-    the write failed. Windows only. The candidate takes ``editor_writes``, since this account must
-    still write, rename and remove it.
+    the write failed. Windows only. The candidate takes ``editor_writes``, so no step of the edit
+    depends on what the private directory grants.
 
     The whole list in one write, never ``store._secure_file``'s ``icacls /inheritance:r``. The
     private directory ``mkdtemp`` makes on Python 3.13+ grants SYSTEM, Administrators and OWNER
@@ -646,9 +649,10 @@ def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
     The owner-only rewrite would grant the editing account alone, so an elevated administrator's
     edit of a file the service account owns would leave the service unable to read it (vault
     BACKLOG #5619). The editor keeps read only, because the config loader refuses a file a
-    non-owner, non-admin account can write (:func:`_owner_and_editor_list`). Naming another account as the owner needs the restore privilege, which an elevated
-    administrator holds but does not enable; when that is refused the access list alone is written
-    and the refusal is logged, since the access list is what lets the owner read it."""
+    non-owner, non-admin account can write (:func:`_owner_and_editor_list`). Naming another account
+    as the owner needs the restore privilege, which an elevated administrator holds but does not
+    enable; when that is refused the access list alone is written and the refusal is logged, since
+    the access list is what lets the owner read it."""
     from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
 
     editor = _current_user_sid()

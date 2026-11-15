@@ -472,14 +472,25 @@ def test_a_foreign_owners_edited_file_passes_the_config_source_check_on_windows(
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
     probes = _win32_config_source_probes()
-    security = probes.read_path(path)
-    assert security.status == 0 and security.owner_sid is not None and security.aces is not None
-    verdict = _evaluate_config_dacl(
-        security.owner_sid, security.aces, owner, probes.owner_in_admins
-    )
-    assert verdict is None, verdict
+
+    def _verdict() -> str | None:
+        security = probes.read_path(path)
+        assert security.status == 0 and security.owner_sid is not None
+        assert security.aces is not None
+        return _evaluate_config_dacl(
+            security.owner_sid, security.aces, owner, probes.owner_in_admins
+        )
+
+    assert _verdict() is None
     assert path.read_bytes() == b"x = 1\n"
     assert protected_entries(path)[2] == [("A", "", "FA", owner), ("A", "", "FR", _EDITOR_SID)]
+    # The control: the same reader and check refuse this file once the editor may write it, the
+    # list this path wrote before, so the verdict above is not passing on a reading it cannot make.
+    written = store_mod._set_security_from_sddl(
+        path, f"D:P(A;;FA;;;{owner})(A;;FA;;;{_EDITOR_SID})", protected=True
+    )
+    assert written.failure is None and written.dacl_status == 0, written
+    assert _verdict() == f"a non-owner, non-admin principal ({_EDITOR_SID}) has write access"
 
 
 @windows_only
