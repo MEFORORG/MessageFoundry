@@ -1659,6 +1659,57 @@ def test_a_junction_in_the_config_dir_is_not_followed_and_is_named(tmp_path: Pat
     )
 
 
+def test_the_walk_changes_a_link_itself_never_its_target() -> None:
+    """A file link whose own DACL denies read shows an empty LinkType, so ``$isLink`` does not skip
+    it and the walk reaches its per-item calls. Without ``/L`` icacls follows the link and re-owns
+    and resets its target, which may lie outside the config dir. Both per-item calls must carry
+    ``/L``; on a file that is not a link, ``/L`` changes nothing (measured)."""
+    m = re.search(r"(?ms)^function Reset-ConfigTreeAcl \{.*?^\}", _script_text())
+    assert m is not None, "Reset-ConfigTreeAcl is missing from install-service.ps1"
+    calls = re.findall(r"^\s*& icacls \$item (.*)$", m.group(0), re.MULTILINE)
+    assert len(calls) == 2, f"expected the walk's two per-item icacls calls, found: {calls}"
+    for verb in ("/setowner", "/reset"):
+        hits = [c for c in calls if verb in c.split()]
+        assert len(hits) == 1, f"no single per-item {verb} call in the walk: {calls}"
+        assert hits[0].split()[0] == "/L", (
+            f"the walk's per-item {verb} lacks /L, so it acts on a link's target: {hits[0]}"
+        )
+
+
+@_windows_only
+def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Path) -> None:
+    """The behaviour behind the static pin above. Creating a symbolic link needs the privilege an
+    unelevated account has only in Developer Mode, so the test skips without it."""
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(tmp_path)
+    except OSError as e:
+        pytest.skip(f"SKIP (nothing run): this account cannot create a symbolic link ({e})")
+    probe.unlink()
+    prepare = r"""
+    & icacls $paths.target /grant '*S-1-5-32-547:R' | Out-Null
+    $hidden = Join-Path $cfg 'hidden.py'
+    New-Item -ItemType SymbolicLink -Path $hidden -Target $paths.target | Out-Null
+    # Denying SYNCHRONIZE empties LinkType and still lets Get-Acl read the link (measured on
+    # pwsh 7.6). A denied read would hide the type too, but unelevated the walk's own Get-Acl of the
+    # item would then fail, since this account cannot take ownership to regain READ_CONTROL.
+    & icacls $hidden /L /deny "${me}:(S)" | Out-Null
+    if ("$((Get-Item -LiteralPath $hidden -Force).LinkType)") {
+      throw "CONTROL FAILED: the deny entry did not hide the link's type"
+    }
+"""
+    got = _config_lockdown(tmp_path, prepare)
+    assert "S-1-5-32-547" in got["before"]["target"], "CONTROL FAILED: the target has no grant"
+    assert "S-1-5-32-547" in got["after"]["target"], (
+        "the reset followed a link whose type it could not read and rewrote a file OUTSIDE the "
+        "config dir"
+    )
+    assert got["after"]["targetOwner"] == got["before"]["targetOwner"], (
+        "the owner step followed a link whose type it could not read and re-owned a file OUTSIDE "
+        "the config dir"
+    )
+
+
 @_windows_only
 def test_every_owner_in_the_config_tree_is_read_back(tmp_path: Path) -> None:
     """The guard refuses a dir or *.py whose owner it cannot trust, so an owner the lockdown could

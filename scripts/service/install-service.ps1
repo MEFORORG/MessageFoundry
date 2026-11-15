@@ -1251,11 +1251,13 @@ function Reset-ConfigTreeAcl {
       volume) is neither changed nor entered, and is named instead: what it points at was not locked, and the guard may still load
       a module through it. A queued folder is read again before it is listed, in case it has become
       one since. A file reparse point of another kind, such as a cloud-file placeholder, is a file
-      and is locked as one.
+      and is locked as one. So is a file link whose own DACL hides its link type from the listing;
+      the per-item calls pass /L, so they change the link itself and never its target.
 
-      A FILE WITH A HARD LINK keeps its own entries and is named. Its other names, perhaps outside
-      $Path, share its DACL, and the entries it inherits still follow $Path, as any change to the
-      folder that holds it would make them.
+      A FILE THE LISTING SHOWS AS HARD-LINKED keeps its own entries and is named. Its other names,
+      perhaps outside $Path, share its DACL, and the entries it inherits still follow $Path, as any
+      change to the folder that holds it would make them. A hard-linked file whose link type cannot
+      be read is locked as a file, which changes it under every name it has.
 
       A WRITE GRANT FOR $Account BELOW $Path IS DROPPED TO READ by the reset, and named in a warning:
       a folder a connection writes to does not belong in a config dir the guard executes from.
@@ -1342,7 +1344,10 @@ function Reset-ConfigTreeAcl {
                 continue
             }
             # Owner first: a child whose DACL leaves Administrators out can be reset only by its owner.
-            & icacls $item /setowner "*S-1-5-32-544" | Out-Null
+            # /L here and on /reset below: a link whose own DACL hides its type from $isLink reaches
+            # this point, and without /L icacls follows it and changes its target, perhaps outside
+            # $Path. On a file that is not a link, /L changes nothing (measured).
+            & icacls $item /L /setowner "*S-1-5-32-544" | Out-Null
             if ($accountSid) {
                 $held = @((Get-Acl -LiteralPath $item -ErrorAction SilentlyContinue).Access | Where-Object {
                         -not $_.IsInherited -and
@@ -1352,7 +1357,7 @@ function Reset-ConfigTreeAcl {
                           catch { $false }) })
                 if ($held) { $narrowed += "'$item'" }
             }
-            & icacls $item /reset | Out-Null
+            & icacls $item /L /reset | Out-Null
             if ($LASTEXITCODE -ne 0) { $problems += "the DACL of '$item' could not be reset (icacls exit $LASTEXITCODE)" }
             $problems += @(& $readBack $item)
             if ($child.PSIsContainer) { $pending.Enqueue($item) }
