@@ -1910,12 +1910,37 @@ def test_a_spare_that_cannot_be_recorded_keeps_its_directory_from_every_sweep(
     staged = leftover / "extracted_store.db"
     size = staged.stat().st_size
     assert not (leftover / ".lock-held").exists()
+    # The lock file stays, so a config walk still prunes the directory as staging.
+    assert dr_backup._is_staging_dir(leftover)
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(dr_backup, "_truncate_unfollowed", _truncate_ignoring_links)
         owner = dr_backup._owner_of(leftover)
         assert dr_backup._sweep_abandoned_staging(dest.parent, owner=owner, own=dest) == 0
     assert staged.stat().st_size == size
     assert asyncio.run(_read_back(dest, key_b64)) == (1, _RAW_BODY)
+    shutil.rmtree(leftover)
+
+
+def test_a_rolled_back_staged_copy_is_emptied_even_when_its_marker_will_not_clear(
+    tmp_path, key_b64, capsys
+) -> None:
+    # The failed restore removes its placed store, so the staged copy is the only one left and is
+    # no longer spared. A marker that will not clear must not keep it full: the restore overrides
+    # it, and the teardown empties the copy.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    with pytest.MonkeyPatch.context() as mp:
+        _restore_staging_that_cannot_be_removed(mp)
+        _hold(mp, _is_staged_store)
+        mp.setattr(dr_backup, "_clear_spare_marker", lambda item: False)
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
+    err = _refusal(capsys)
+    assert "member-count cap" in err and "not truncated" not in err, err
+    assert not dest.exists()
+    (leftover,) = dest.parent.glob("mefor-restore-*")
+    assert (leftover / "extracted_store.db.mefor-spared").exists()
+    assert (leftover / "extracted_store.db").stat().st_size == 0
     shutil.rmtree(leftover)
 
 
