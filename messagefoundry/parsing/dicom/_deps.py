@@ -85,7 +85,8 @@ def parse_error_types() -> tuple[type[BaseException], ...]:
     LE body, which the deflate guard leaves to ``dcmread`` on purpose (see
     :func:`messagefoundry.parsing.dicom._inflate.bounded_inflate_or_error`). ``LookupError`` is
     named rather than ``KeyError`` and ``IndexError`` alone, so its other subclasses are caught too,
-    and ``OverflowError`` covers a numeric conversion overflow (BACKLOG #5803). The accessors on a
+    and ``ArithmeticError`` for the same reason: it covers ``OverflowError``, ``ZeroDivisionError``
+    and ``decimal.InvalidOperation`` from a numeric conversion (BACKLOG #5803). The accessors on a
     parsed :class:`~messagefoundry.parsing.dicom.dataset.DicomDataset` read values after ``parse``
     returns, outside this wrap; ``measurements()``, which walks the whole SR tree, applies the same
     tuple itself.
@@ -110,5 +111,5 @@ def parse_error_types() -> tuple[type[BaseException], ...]:
         zlib.error,
         AttributeError,
         LookupError,
-        OverflowError,
+        ArithmeticError,
     )

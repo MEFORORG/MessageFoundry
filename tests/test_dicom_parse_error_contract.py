@@ -20,6 +20,7 @@ All objects here are synthetic and PHI-free.
 from __future__ import annotations
 
 import base64
+import decimal
 import sys
 import traceback
 import zlib
@@ -257,36 +258,39 @@ def test_a_corrupt_deflated_body_is_a_dicom_error(
     _assert_wrapped(parse, wrapper, seed, zlib.error, raised_in="read_partial")
 
 
-def _raising_dcmread(exc: BaseException) -> Callable[..., object]:
+def _raising_dcmread(exc_type: type[BaseException]) -> Callable[..., object]:
     def _dcmread(*_args: object, **_kwargs: object) -> object:
-        raise exc
+        # A fresh instance per call, so no traceback carries over from another surface's run.
+        raise exc_type("simulated")
 
     return _dcmread
 
 
 @pytest.mark.parametrize(
-    "exc",
+    "exc_type",
     [
-        pytest.param(OverflowError("simulated overflow"), id="overflow"),
-        pytest.param(LookupError("simulated lookup"), id="lookup"),
+        pytest.param(OverflowError, id="overflow"),
+        pytest.param(ZeroDivisionError, id="zero-division"),
+        pytest.param(decimal.InvalidOperation, id="decimal-invalid"),
+        pytest.param(LookupError, id="lookup"),
     ],
 )
 @pytest.mark.parametrize(("surface", "parse", "wrapper"), _SURFACES, ids=[s[0] for s in _SURFACES])
-def test_an_overflow_or_lookup_error_from_dcmread_is_a_dicom_error(
+def test_an_arithmetic_or_lookup_error_from_dcmread_is_a_dicom_error(
     monkeypatch: pytest.MonkeyPatch,
     surface: str,
     parse: _Parse,
     wrapper: type[DicomError],
-    exc: BaseException,
+    exc_type: type[BaseException],
 ) -> None:
-    """BACKLOG #5803: ``OverflowError`` and a ``LookupError`` that is neither ``KeyError`` nor
+    """BACKLOG #5803: an ``ArithmeticError`` and a ``LookupError`` that is neither ``KeyError`` nor
     ``IndexError`` escaped the tuple. As with ``RecursionError`` above, the trigger is a raised
     exception rather than a crafted object, because what the contract needs is the handler."""
     module = peek_module if surface == "peek" else dataset_module
-    monkeypatch.setattr(module, "load_dcmread", lambda: _raising_dcmread(exc))
+    monkeypatch.setattr(module, "load_dcmread", lambda: _raising_dcmread(exc_type))
     seed = make_sr_part10()
     _inflate.guard_part10_deflate(seed, force=False)  # the guard passes it, so dcmread is reached
-    _assert_wrapped(parse, wrapper, seed, type(exc), raised_in="_dcmread")
+    _assert_wrapped(parse, wrapper, seed, exc_type, raised_in="_dcmread")
 
 
 def test_recursion_error_is_named_and_is_not_a_deploy_error() -> None:
