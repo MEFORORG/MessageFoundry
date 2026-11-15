@@ -31,7 +31,9 @@
 # A `cwd` THOSE RULES REFUSE READS NO NOTE. Falling back to CLAUDE_PROJECT_DIR there would read,
 # delete and inject the PRIMARY session's note into this one, so its recipient never sees it. The
 # hook says so on a `[steer]` line instead, at most once per $FAULT_COOLDOWN_MINUTES for each
-# session, because it runs before every tool call. A missing helper is the same fault.
+# session, because it runs before every tool call. Input that names no session id and no cwd has no
+# key that is the session's alone, so that fault is said on every call. A missing helper is the
+# same fault.
 #
 # Fail-open: any error here must never block a tool call.
 # ASCII-only on purpose (PS 5.1 ANSI-read lesson); run under pwsh 7 by the hook.
@@ -70,7 +72,7 @@ function Write-Context([string]$Text) {
     [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
 }
 
-# Say a fault once per cooldown per key, never on every tool call. Without the helper there is no
+# Say a fault once per cooldown per key, not on every tool call. Without the helper there is no
 # throttle (Test-CcxSayOnce lives there), so the notice is said every time: noise, never quiet. An
 # empty key is said every time too.
 function Write-FaultOnce([string]$Key, [string]$Text) {

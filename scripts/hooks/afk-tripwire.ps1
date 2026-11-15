@@ -133,7 +133,9 @@ function Split-TripwireSegments([string]$Text, [string]$Dialect = 'literal') {
         }
         # A line continuation, bash's or PowerShell's, joins two lines into one command; with CRLF
         # line ends it is three characters.
-        if (($ch -eq '\' -or $ch -eq '`') -and $i + 1 -lt $n -and ($Text[$i + 1] -eq "`n" -or $Text[$i + 1] -eq "`r")) {
+        # Each shell's own character only: PowerShell runs the line after `D:\x\` as a new command.
+        $joins = if ($Dialect -eq 'bash') { $ch -eq '\' } elseif ($Dialect -eq 'pwsh') { $ch -eq '`' } else { $ch -eq '\' -or $ch -eq '`' }
+        if ($joins -and $i + 1 -lt $n -and ($Text[$i + 1] -eq "`n" -or $Text[$i + 1] -eq "`r")) {
             $i += $(if ($Text[$i + 1] -eq "`r" -and $i + 2 -lt $n -and $Text[$i + 2] -eq "`n") { 3 } else { 2 })
             continue
         }
@@ -274,10 +276,14 @@ function Find-Tripwires([string]$Command, [int]$Depth, $Hits, [string]$Shell = '
     # sees is recorded. Reading the other shell's escapes too would shift every later span in text
     # that merely holds its escape character (a path ending `\` under PowerShell) and record acts
     # that are only mentioned. A reading whose escape character the text lacks would only repeat the
-    # literal one, so it is skipped.
+    # literal one, so it is skipped. Either character counts for either shell, because the literal
+    # reading joins a line ending in either, and each shell joins only on its own. A doubled quote
+    # alone changes content, never where spans end.
     $dialects = @('literal')
-    if ($Shell -in @('bash', '') -and $text.Contains('\')) { $dialects += 'bash' }
-    if ($Shell -in @('pwsh', '') -and ($text.Contains('`') -or $text.Contains("''") -or $text.Contains('""'))) { $dialects += 'pwsh' }
+    if ($text.Contains('\') -or $text.Contains('`')) {
+        if ($Shell -in @('bash', '')) { $dialects += 'bash' }
+        if ($Shell -in @('pwsh', '')) { $dialects += 'pwsh' }
+    }
     $scannedBodies = [System.Collections.Generic.HashSet[string]]::new()
     $segments = [System.Collections.Generic.List[object]]::new()
     foreach ($dialect in $dialects) {
@@ -354,8 +360,7 @@ try {
         try {
             # The record names the acts, never the command text, which can carry a secret.
             $decision = Join-Path (Split-Path -Parent $PSScriptRoot) 'coord/decision.ps1'
-            $toolProp = $j.PSObject.Properties['tool_name']
-            $tool = if ($toolProp) { [string]$toolProp.Value } else { 'shell' }
+            $tool = if ($toolProp) { $toolName } else { 'shell' }
             $out = @(& $decision -Log -Kind tripwire -Class C -Session $sid -NoPost -Note "$tool command carried: $what" 2>$null)
             $id = @($out | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^LOGGED (\S+)' } | ForEach-Object { $Matches[1] })
             $logged = if ($id) { "Recorded as tripwire $($id[0]) in the decision log." } else { 'Not recorded: decision.ps1 wrote no record.' }

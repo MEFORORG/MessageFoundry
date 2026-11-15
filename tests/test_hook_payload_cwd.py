@@ -402,6 +402,7 @@ def _resolve_bytes(repo: Path, tmp_path: Path, stdin: bytes, flags: str = "") ->
         (b'{"cwd": null, "session_id": "s1"}', "blank cwd"),
         (b'[{"cwd": "C:\\\\", "session_id": "s1"}]', "not a JSON object"),
         (b'{"cwd": ".", "session_id": "s1"}', "relative cwd"),
+        (b'{"cwd": "\\\\Code", "session_id": "s1"}', "relative cwd"),
     ],
 )
 def test_input_the_helper_cannot_use_is_a_fault(tmp_path: Path, stdin: bytes, why: str) -> None:
@@ -463,6 +464,8 @@ def test_a_cwd_named_to_a_hook_started_outside_every_checkout_is_a_fault(tmp_pat
     assert anchored["Dir"] is None and anchored["Reason"] == "", anchored
     # The controls: no cwd there is no fault, and -AllowOutside still takes a cwd in no checkout.
     assert _resolve(outside, tmp_path, {"session_id": "s1"})["Reason"] == ""
+    # A cwd that is the start directory itself is answered by staying put.
+    assert _resolve(outside, tmp_path, {"cwd": str(outside), "session_id": "s1"})["Reason"] == ""
     scratch = Path(os.path.realpath(tmp_path)) / "scratch"
     scratch.mkdir()
     took = _resolve(outside, tmp_path, {"cwd": str(scratch)}, "-ReadOnly -AllowOutside")

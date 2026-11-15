@@ -157,7 +157,8 @@ function Get-CcxHookPayloadCwd {
         return $out
     }
     # A relative cwd would resolve against where the hook runs, the primary under the desktop app.
-    if (-not [System.IO.Path]::IsPathRooted($dir)) {
+    # Fully qualified, because on Windows `\x` and `D:x` count as rooted and still resolve against it.
+    if (-not [System.IO.Path]::IsPathFullyQualified($dir)) {
         $out.Reason = "the hook input names the relative cwd $dir, which says nothing about where the session is"
         return $out
     }
@@ -374,15 +375,17 @@ function Resolve-CcxHookSession {
           Dir        the directory to answer for, or $null to stay where the hook started.
           Root       the worktree root Dir sits in; $null with Dir, or for a -AllowOutside answer.
           Source     'cwd', 'pin', or 'start' when Dir is $null.
-          Reason     set when the input NAMED a cwd and this refused it: the fault to say aloud.
+          Reason     the fault to say aloud: a cwd this refused, or input it could not read or
+                     parse as one object. Named is then $true; Payload may be $null.
           Note       set when Dir is the pinned worktree and not the `cwd`: why the `cwd` was not used.
           Pinned     the worktree the pin records after this call, or $null.
           Named, SessionId, Event, Payload  what the input said.
 
         A hook started outside every checkout has no repository to check a `cwd` against and nowhere
-        to pin. It stays where it started: in silence when the input names no `cwd`, and with a
-        Reason for any `cwd` it does not take. Only -AllowOutside takes one, and only one that sits
-        in no checkout; for one in a checkout it stays put in silence, as before.
+        to pin. It stays where it started, in silence when the input names no `cwd` or names the
+        start directory itself. Any other `cwd` it does not take is a Reason. Only -AllowOutside
+        takes one, and only one that sits in no checkout; for one in a checkout it stays put in
+        silence, as before.
     #>
     param(
         [string] $Text,
@@ -435,11 +438,12 @@ function Resolve-CcxHookSession {
         # No repository to check against and nowhere to pin. A `cwd` in some checkout is not this
         # session's own (it launched in none), so the hook stays put. -AllowOutside still takes a
         # `cwd` that sits in no checkout, and stays put in silence for one in a checkout, because
-        # mail-drain's -AnchorRepo case answers for where it started. For any other caller a named
-        # `cwd` is a fault: staying put in silence let steer-inject read CLAUDE_PROJECT_DIR instead.
+        # mail-drain's -AnchorRepo case answers for where it started. A `cwd` that IS the start
+        # directory is answered by staying put. For any other caller any other named `cwd` is a
+        # fault: staying put in silence let steer-inject read CLAUDE_PROJECT_DIR instead.
         if ($p.Reason) { $out.Reason = $p.Reason }
         elseif ($p.Cwd -and $AllowOutside -and -not (Get-CcxWorktreeRoot $p.Cwd)) { $out.Dir = $p.Cwd; $out.Source = 'cwd' }
-        elseif ($p.Named -and -not $AllowOutside) {
+        elseif ($p.Named -and -not $AllowOutside -and -not (Test-CcxSamePath $p.Cwd $StartDir)) {
             $out.Reason = "the hook started in $StartDir, which is in no checkout this hook can read, so it cannot check the hook input's cwd $($p.Cwd) against a repository"
         }
         return $out

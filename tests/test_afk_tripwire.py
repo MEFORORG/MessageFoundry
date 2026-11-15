@@ -172,6 +172,12 @@ MUST_PASS = [
 BY_TOOL = [
     pytest.param(
         "PowerShell",
+        "Set-Location D:\\Code\\x\\\ngit push --force origin b",
+        True,
+        id="pwsh-trailing-backslash-is-no-continuation",
+    ),
+    pytest.param(
+        "PowerShell",
         'Write-Output "say `"hi" ; git push --force origin b ; Write-Output "end"',
         True,
         id="pwsh-backtick-escaped-quote-hits",
