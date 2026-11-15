@@ -6,8 +6,8 @@
   folder the walk reaches on the way to the missing name. On Windows a relative link target
   holding `..` met after a junction is refused, because the open resolves it against the path
   through the junction. A path is also refused where only one of the walk and the open reaches
-  anything, or `os.path.samefile` says they reach two different ones, such as a link whose target
-  ends in a separator. A reload vets the engine's own value file before it reads the config
+  anything, or `os.path.samefile` says they reach two different ones, such as one whose final link
+  names a file with a trailing separator. A reload vets the engine's own value file before it reads the config
   directory, so one in its `environments/` folder is vetted before its bytes are read; the other
   `environments/*.toml` files the snapshot reads are not. A file or folder the check cannot stat,
   or a link it cannot read, is refused rather than skipped. `docs/SECURITY.md` names what else

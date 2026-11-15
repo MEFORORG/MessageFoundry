@@ -10713,12 +10713,13 @@ def _stat_mode(path: Path) -> int | None:
 
 
 def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
-    """What an open of ``path`` passes through that its writer could re-point, and where it ends.
+    """What a walk modelling an open of ``path`` passes through that its writer could re-point,
+    and where the walk ends.
 
-    The first list holds the real folder holding each link the open follows, a folder link
+    The first list holds the real folder holding each link the walk follows, a folder link
     anywhere in the path included, and on Windows the link itself: whoever can write that folder,
     or on Windows the link, can re-point it between a vet and a read. A POSIX link's own mode
-    means nothing, so it is not listed. The list ends with the real object the open reaches, which
+    means nothing, so it is not listed. The list ends with the real object the walk reaches, which
     the second item names too (vault BACKLOG #2596, #6654 item 5). Where the walk meets a name
     that is not there, the list ends instead with the last real folder the walk reached on the way
     to it, or, for a file met where a folder belongs, the folder holding that file, if a link led
@@ -10873,8 +10874,8 @@ def assert_trusted_start_paths(
     that: nothing about it was vetted (vault BACKLOG #6654 item 2). So is a path whose open and
     walk disagree, where one reaches an object and the other none, or ``os.path.samefile`` says
     they reach two: the walk vetted another route than the open takes. That includes a path no
-    open can read but the walk can, such as one through a link whose target ends in a separator,
-    which is refused rather than read as absent. A file or folder that both
+    open can read but the walk can, such as one whose final link names a file with a trailing
+    separator, which is refused rather than read as absent. A file or folder that both
     find not there is not itself checked, because nothing reads it; what its link chain names,
     if a link leads to it, still is.
 
@@ -10910,8 +10911,8 @@ def _file_and_folder(
             present = mode is not None and (stat.S_ISDIR if folder else stat.S_ISREG)(mode)
             chain, end = _link_chain(path)
             # The kernel's own answer, against the walk's, for any gap left in the walk's model:
-            # a link target ending in a separator, for one, which the open refuses (ENOTDIR) and
-            # the walk's split drops, or a ``\\?\`` target the walk normalizes and the open takes
+            # a final link naming a file with a trailing separator, for one, which the open
+            # refuses (ENOTDIR) and the walk's split drops, or a ``\\?\`` target the walk normalizes and the open takes
             # literally. Where they disagree the walk vetted another route than the open takes.
             if mode is not None and end is None:
                 raise OSError(

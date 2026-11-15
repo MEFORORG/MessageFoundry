@@ -2844,11 +2844,12 @@ against the path through the junction, not the real folder the walk reached (mea
 relative link target holding `..` met after the walk crossed a junction is refused, whether or
 not a file is there. The check also stats the value file through the open's own resolution and
 refuses it where that and the walk disagree: one reaches something and the other reaches
-nothing, or `os.path.samefile` says they reach two different ones. That refuses at least a link
-whose target ends in a separator, which no open can read but the walk reads as the file it
-names; it is refused rather than read as a missing file. Where some other gap in the walk's model
-leads it and the open to the same object by different routes, the check passes, and what only
-the open's route passes through can go unvetted. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades
+nothing, or `os.path.samefile` says they reach two different ones. That refuses at least a
+value file whose final link names a file with a trailing separator, which the open cannot read
+but the walk reads as that file; it is refused rather than read as a missing file. Where some
+other gap in the walk's model leads it and the open by different routes to the same object, or
+to nothing, the check passes, and what only the open's route passes through can go unvetted,
+the folder where a writer could plant the file before a read included. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades
 neither refusal. A
 folder holding a link is judged by the rule the file's own folder is, so a link that sits directly
 in `C:\` or `C:\ProgramData`, as Windows ships them, is refused. The file or folder vetted, or a

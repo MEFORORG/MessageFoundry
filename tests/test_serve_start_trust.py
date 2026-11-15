@@ -603,8 +603,8 @@ def _junction_decoy_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
 def test_a_relative_link_climbing_behind_a_junction_refuses(state: str, tmp_path: Path) -> None:
     """Measured: a relative link reached through a junction resolves its ``..`` against the path
     through the junction, so the open takes a route the walk never vets (``a\\x``), whichever of
-    the two ends reaches a file: with neither, the open would create the file in ``a\\x``; with
-    a hard link, both reach one file and ``a\\x`` can be swapped (round-e90390621c finding 1, the
+    the two ends reaches a file: with neither, a writer of ``a\\x`` can plant the file there
+    before the next read; with a hard link, both reach one file and ``a\\x`` can be swapped (round-e90390621c finding 1, the
     lander hold on fba252d79f, and round-556c3e48 and round-c42c8e77 findings 1)."""
     opened, walked, decoy = _junction_decoy_layout(tmp_path)
     real_c = walked.parent.parent / "c"
@@ -698,6 +698,33 @@ def test_an_open_and_a_walk_that_disagree_on_presence_refuse(
     check()  # control: a replaced walk that agrees with the open passes
     walk_end[0] = None if reached_by == "open" else other
     with pytest.raises(WiringError, match=refusal):
+        check()
+
+
+@pytest.mark.parametrize("folder", [False, True], ids=["file", "folder"])
+def test_an_open_and_a_walk_that_reach_two_objects_refuse(
+    folder: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The samefile arm on every host, with the walk replaced: the junction test no longer reaches
+    it, because the walk refuses that layout first (round-3f4ddc7f finding 2)."""
+    import messagefoundry.config.wiring as wiring
+
+    values = tmp_path / "dev"
+    other = tmp_path / "other"
+    for made in (values, other):
+        if folder:
+            made.mkdir()
+        else:
+            made.write_text("", encoding="utf-8")
+
+    def check() -> list[Path]:
+        return _file_and_folder([], [values]) if folder else _file_and_folder([values])
+
+    walk_end = [values]
+    monkeypatch.setattr(wiring, "_link_chain", lambda _path: ([tmp_path], walk_end[0]))
+    check()  # control: a replaced walk ending where the open does passes
+    walk_end[0] = other
+    with pytest.raises(WiringError, match="another object than the walk"):
         check()
 
 
