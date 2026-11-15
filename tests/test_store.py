@@ -77,8 +77,14 @@ async def test_open_restricts_db_file_to_owner(tmp_path) -> None:
 _windows_only = pytest.mark.skipif(sys.platform != "win32", reason="icacls DACL is Windows-only")
 
 
+#: The account the token seam reports in these tests, a SID no real account here holds.
+_TOKEN_SID = "S-1-5-21-1000000001-1000000002-1000000003-1001"
+
+
 def _capture_icacls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    """Capture the icacls argv _secure_file would run (no real icacls), as the user 'minter'."""
+    """Capture the icacls argv _secure_file would run (no real icacls), with the process token
+    reporting ``_TOKEN_SID`` and ``USERNAME`` naming someone else entirely."""
+    import messagefoundry.store.store as store_mod
 
     captured: list[list[str]] = []
 
@@ -87,6 +93,7 @@ def _capture_icacls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         stderr = ""
         stdout = ""
 
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _TOKEN_SID)
     monkeypatch.setenv("USERNAME", "minter")
 
     def _run(argv: list[str], **kw: object) -> _R:
@@ -109,7 +116,69 @@ def test_secure_file_default_is_owner_only(monkeypatch: pytest.MonkeyPatch) -> N
     store_mod._secure_file(Path("store.db"))
     argv = captured[0]
     assert os.path.basename(argv[0]).lower() == "icacls.exe"  # the pin has its own test
-    assert argv[1:] == ["store.db", "/inheritance:r", "/grant:r", "minter:F"]
+    assert argv[1:] == ["store.db", "/inheritance:r", "/grant:r", f"*{_TOKEN_SID}:F"]
+
+
+@_windows_only
+@pytest.mark.parametrize("username", ["Everyone", ""], ids=["other-principal", "empty"])
+def test_secure_file_grants_the_token_account_whatever_username_says(
+    monkeypatch: pytest.MonkeyPatch, username: str
+) -> None:
+    # Vault BACKLOG #5612. The grant used to name %USERNAME%, so an inherited value naming another
+    # principal would have been granted Full Control of a PHI store, and an empty one skipped the
+    # restriction, leaving the file its inherited access list. Neither may reach the argv now.
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    captured = _capture_icacls(monkeypatch)
+    monkeypatch.setenv("USERNAME", username)
+    store_mod._secure_file(Path("store.db"))
+    assert captured, "the restriction was skipped"
+    assert captured[0][1:] == ["store.db", "/inheritance:r", "/grant:r", f"*{_TOKEN_SID}:F"]
+
+
+@_windows_only
+def test_secure_file_logs_and_grants_nobody_when_the_token_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    captured = _capture_icacls(monkeypatch)
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: None)
+    with caplog.at_level("WARNING"):
+        store_mod._secure_file(Path("store.db"))
+    assert captured == []
+    assert "could not read this process's account from its token" in caplog.text
+
+
+@_windows_only
+def test_current_user_sid_is_the_process_token_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The real reader, against the real token: a SID literal, unmoved by USERNAME.
+    import messagefoundry.store.store as store_mod
+
+    before = store_mod._current_user_sid()
+    monkeypatch.setenv("USERNAME", "Everyone")
+    assert before is not None and before.startswith("S-1-")
+    assert store_mod._current_user_sid() == before
+
+
+@_windows_only
+def test_secure_file_leaves_the_real_token_account_owner_only(tmp_path) -> None:
+    # The real icacls, with a SID principal: the file ends with one explicit entry, the token's,
+    # and no inherited ones.
+    import messagefoundry.store.store as store_mod
+
+    path = tmp_path / "real.db"
+    path.write_bytes(b"x")
+    store_mod._secure_file(path)
+    sddl = store_mod._read_dacl_sddl(path)
+    sid = store_mod._current_user_sid()
+    assert sddl is not None and sid is not None
+    assert sddl.startswith("D:P"), sddl
+    assert sddl.count("(") == 1 and sddl.endswith(f";;;{sid})"), sddl
 
 
 @_windows_only

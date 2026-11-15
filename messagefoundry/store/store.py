@@ -8177,23 +8177,17 @@ def delivery_key(
 _OWNER_ONLY = stat.S_IRUSR | stat.S_IWUSR  # 0o600
 
 
-def _current_user() -> str | None:
-    """The current OS user for an owner-only DACL: ``%USERNAME%``, or when that is empty (some
-    NSSM/service contexts) ``getpass.getuser``. That reads ``LOGNAME``, ``USER``, ``LNAME`` and
-    ``USERNAME`` from the environment, in that order; on Windows it has no ``pwd`` database to fall
-    back on, so with none of them set it raises ``OSError`` and this returns ``None``. So on
-    Windows, the one platform :func:`_secure_file` calls this on, every source is an environment
-    variable, never the process token, and an inherited or overridden variable names whoever it
-    says."""
-    user = os.environ.get("USERNAME")
-    if user:
-        return user
-    try:
-        import getpass
+def _current_user_sid() -> str | None:
+    """The SID of the account this process runs as, read from its own token, for an owner-only
+    DACL; ``None`` when the token could not be read. Windows only, and a seam for tests.
 
-        return getpass.getuser() or None
-    except Exception:  # getpass can raise if it can't resolve a name
-        return None
+    Never an environment variable (vault BACKLOG #5612). ``USERNAME`` is inherited, so a service
+    started with another account's value, or a caller that set it, would have the restriction grant
+    Full Control to whoever it names; and where it is empty, the restriction used to be skipped and
+    the file kept its inherited access list. The token names the account Windows itself checks."""
+    from messagefoundry.restricted_file import _windows_engine_sid
+
+    return _windows_engine_sid()
 
 
 # Backlog #106: a keep-forever retention cutoff is carried as ``float('-inf')`` (``received_at < -inf``
@@ -8510,14 +8504,16 @@ def _secure_file(path: Path) -> None:
     """
     try:
         if os.name == "nt":
-            user = _current_user()
-            if not user:
+            sid = _current_user_sid()
+            if not sid:
                 log.warning(
-                    "could not determine current user; %s keeps its inherited (possibly broad) ACL "
-                    "— set a directory ACL per docs/SERVICE.md",
+                    "could not read this process's account from its token; %s keeps its inherited "
+                    "(possibly broad) ACL — set a directory ACL per docs/SERVICE.md",
                     path,
                 )
                 return
+            # The principal is the token's SID in icacls's ``*S-...`` form, never a name, so no
+            # environment variable or name lookup chooses who is granted (vault BACKLOG #5612).
             # icacls is pinned to its absolute System32 path and invoked without a shell; the
             # principal is a single argv token, never a shell word, so it can't inject a flag
             # (low-27/STORE-5). The pin is what makes "fixed system tool" true:
@@ -8526,7 +8522,7 @@ def _secure_file(path: Path) -> None:
             # planted icacls.exe that exits 0 would leave this PHI-adjacent file its inherited
             # (possibly broad) ACL while reporting nothing (BACKLOG #1769).
             result = subprocess.run(  # nosec B603 B607
-                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
                 check=False,
                 env=system_tool_environment(),  # the platform's start-up names only (#2716)
                 capture_output=True,
@@ -9046,25 +9042,28 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
     return grants
 
 
-def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:
-    """Replace the DACL of ``path`` with a PROTECTED one naming exactly ``grants``, and its owner with
-    ``owner`` when one is given, in one call; log and return ``False`` on failure. Windows only. A
-    seam for tests.
+@dataclass(frozen=True)
+class _SddlWrite:
+    """What :func:`_set_security_from_sddl` managed. ``failure`` says why nothing was written.
+    ``owner_status`` is the Win32 status of the owner-and-DACL write, ``None`` when the SDDL named no
+    owner; ``dacl_status`` is that of the DACL-only write made when there was no owner write or it
+    was refused, ``None`` when it was not needed."""
 
-    One SetNamedSecurityInfoW call rather than icacls, for two measured reasons: icacls cannot drop
-    an unnamed principal's explicit entry while granting, so it takes two calls, and after the first
-    of them a caller whose access was only that entry is refused by the second (exit 5). Setting the
-    whole DACL at once needs only WRITE_DAC, which the owner always holds, and leaves no intermediate
-    state. Setting the owner needs more (an elevated Administrator may name Administrators); when that
-    is refused the DACL alone is still written, and the refusal is logged."""
+    failure: str | None = None
+    owner_status: int | None = None
+    dacl_status: int | None = None
+
+
+def _set_security_from_sddl(path: Path, sddl: str, *, protected: bool) -> _SddlWrite:
+    """Write the owner and DACL ``sddl`` describes onto ``path`` in one SetNamedSecurityInfoW call,
+    and the DACL alone when the owner is refused. Windows only; logs nothing, so each caller words
+    its own warning. A NULL or absent DACL is never written, because a NULL DACL grants Everyone full
+    control. ``protected`` blocks inheritance; otherwise the folder's inheritable entries apply."""
     if sys.platform != "win32":
-        return False
+        return _SddlWrite(failure="this is not Windows")
     import ctypes
     from ctypes import wintypes
 
-    # Written in the canonical SDDL spelling (lower-case ``0x`` hex); only COMPARISONS upper-case.
-    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS)};;;{sid})" for sid in grants)
-    sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
@@ -9105,60 +9104,81 @@ def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = N
     kernel32.LocalFree.restype = ctypes.c_void_p
     descriptor = ctypes.c_void_p()
     if not convert(sddl, 1, ctypes.byref(descriptor), None):
-        log.warning(
-            "could not restrict %s: its DACL %s did not convert (Win32 status %s)",
-            path,
-            sddl,
-            ctypes.get_last_error(),
+        return _SddlWrite(
+            failure=f"its DACL {sddl} did not convert (Win32 status {ctypes.get_last_error()})"
         )
-        return False
     try:
         present, defaulted = wintypes.BOOL(), wintypes.BOOL()
         dacl = ctypes.c_void_p()
         ok = get_dacl(
             descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)
         )
-        # A NULL DACL grants Everyone full control, so it must never reach SetNamedSecurityInfoW.
         if not ok or not present or not dacl.value:
-            log.warning(
-                "could not restrict %s: no DACL was built (Win32 status %s)",
-                path,
-                ctypes.get_last_error(),
-            )
-            return False
+            return _SddlWrite(failure=f"no DACL was built (Win32 status {ctypes.get_last_error()})")
         se_file_object = 1
-        dacl_info = (
-            0x4 | 0x80000000
-        )  # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
-        if owner:
-            owner_sid = ctypes.c_void_p()
-            owner_defaulted = wintypes.BOOL()
-            if (
-                get_owner(descriptor, ctypes.byref(owner_sid), ctypes.byref(owner_defaulted))
-                and owner_sid.value
-            ):
-                status = set_info(
-                    str(path), se_file_object, dacl_info | 0x1, owner_sid, None, dacl, None
-                )
-                if status == 0:
-                    return True
-                log.warning(
-                    "could not restrict %s: its owner is outside the hardened directory's principals "
-                    "and could not be changed (Win32 status %s); an owner keeps WRITE_DAC",
-                    path,
-                    status,
-                )
-        status = set_info(str(path), se_file_object, dacl_info, None, None, dacl, None)
-        if status != 0:
-            log.warning(
-                "could not restrict %s to its hardened directory's principals (Win32 status %s)",
-                path,
-                status,
+        dacl_security_information = 0x4
+        protection = _PROTECTED_DACL if protected else _UNPROTECTED_DACL
+        dacl_info = dacl_security_information | protection
+        owner_sid = ctypes.c_void_p()
+        owner_defaulted = wintypes.BOOL()
+        owner_status: int | None = None
+        if (
+            get_owner(descriptor, ctypes.byref(owner_sid), ctypes.byref(owner_defaulted))
+            and owner_sid.value
+        ):
+            owner_status = set_info(
+                str(path), se_file_object, dacl_info | 0x1, owner_sid, None, dacl, None
             )
-            return False
-        return not owner
+            if owner_status == 0:
+                return _SddlWrite(owner_status=0)
+        dacl_status = set_info(str(path), se_file_object, dacl_info, None, None, dacl, None)
+        return _SddlWrite(owner_status=owner_status, dacl_status=dacl_status)
     finally:
         kernel32.LocalFree(descriptor)
+
+
+#: PROTECTED_DACL_SECURITY_INFORMATION and UNPROTECTED_DACL_SECURITY_INFORMATION.
+_PROTECTED_DACL = 0x80000000
+_UNPROTECTED_DACL = 0x20000000
+
+
+def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:
+    """Replace the DACL of ``path`` with a PROTECTED one naming exactly ``grants``, and its owner with
+    ``owner`` when one is given, in one call; log and return ``False`` on failure. Windows only. A
+    seam for tests.
+
+    One SetNamedSecurityInfoW call rather than icacls, for two measured reasons: icacls cannot drop
+    an unnamed principal's explicit entry while granting, so it takes two calls, and after the first
+    of them a caller whose access was only that entry is refused by the second (exit 5). Setting the
+    whole DACL at once needs only WRITE_DAC, which the owner always holds, and leaves no intermediate
+    state. Setting the owner needs more (an elevated Administrator may name Administrators); when that
+    is refused the DACL alone is still written, and the refusal is logged."""
+    if sys.platform != "win32":
+        return False
+    # Written in the canonical SDDL spelling (lower-case ``0x`` hex); only COMPARISONS upper-case.
+    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS)};;;{sid})" for sid in grants)
+    sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
+    result = _set_security_from_sddl(path, sddl, protected=True)
+    if result.failure is not None:
+        log.warning("could not restrict %s: %s", path, result.failure)
+        return False
+    if result.owner_status == 0:
+        return True
+    if result.owner_status is not None:
+        log.warning(
+            "could not restrict %s: its owner is outside the hardened directory's principals "
+            "and could not be changed (Win32 status %s); an owner keeps WRITE_DAC",
+            path,
+            result.owner_status,
+        )
+    if result.dacl_status != 0:
+        log.warning(
+            "could not restrict %s to its hardened directory's principals (Win32 status %s)",
+            path,
+            result.dacl_status,
+        )
+        return False
+    return not owner
 
 
 def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
