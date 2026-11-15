@@ -1154,6 +1154,11 @@ FEDERATED_SIGN_IN_REQUIRED = "federated_sign_in_required"
 #: browser layer's code map, so it shows as generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
+#: The closed-set reason a directory sign-in is refused with when its account row was deleted after
+#: the sign-in read it and before its session insert (BACKLOG #5624). Before, such a sign-in was
+#: audited as a binding change (``federated_sign_in_required`` or ``federated_subject_unbound``).
+ACCOUNT_DELETED = "account_deleted"
+
 #: The closed-set reason a directory answer is refused with when it names another directory object
 #: than the row's own (BACKLOG #1471 at sign-in, #2027 at the step-up re-bind).
 DIRECTORY_IDENTITY_CONFLICT = "directory_identity_conflict"
@@ -1925,15 +1930,22 @@ class _BindingChangedMidLogin(Exception):
 
     Raised by :meth:`AuthService._issue_session` when the store refuses the insert, and caught by
     :meth:`AuthService._complete_ad_login` and :meth:`AuthService._login_local`, which render it as
-    an audited refusal.
+    an audited refusal. ``account_deleted`` says which cause it was (BACKLOG #5624), so a directory
+    leg does not report a deleted account as a binding change.
 
     **Signalled by raising because the alternative loses the race it exists to close.** The store
     refuses inside the same transaction that re-reads the binding, so there is no point at which the
     caller could have asked "is it still bound?" and acted on the answer — a second call would be a
     second transaction. The exception carries the refusal out of a method whose whole contract is
-    "returns the token". The store's one ``False`` does not say which cause it was, so a directory
-    leg reports a deleted account as a binding change.
+    "returns the token". The store's one ``False`` does not say which cause it was, so
+    :meth:`AuthService._issue_session` reads the account once more to tell them apart. An id that
+    names no row then was deleted: no later write brings it back. An id that names a row was refused
+    for its binding, because the guarded insert refuses a present row only on its pair.
     """
+
+    def __init__(self, *, account_deleted: bool = False) -> None:
+        super().__init__("account deleted" if account_deleted else "binding changed")
+        self.account_deleted = account_deleted
 
 
 class FederatedSubjectHeld(RuntimeError):
@@ -7132,10 +7144,9 @@ class AuthService:
         presented = (principal_claims.issuer, principal_claims.subject)
         bound = await self._load_user_by_federated_subject(*presented)
         if bound is not None and (bound.oidc_issuer, bound.oidc_subject) != presented:
-            # BYTE-EXACT, whatever the backend's collation. SQL Server compares these columns under
-            # the database default, usually case-insensitive, so `abc` can find the row bound to `ABC`.
-            # That was harmless while the lookup only vetoed; now it SELECTS the account, so a pair
-            # that differs in any byte is not this account's pair.
+            # BYTE-EXACT, whatever the backend's collation. SQL Server's columns are BIN2 now
+            # (BACKLOG #5613), but this check does not rest on the DDL: the lookup SELECTS the
+            # account, so a pair that differs in any byte is not this account's pair.
             bound = None
         if bound is None:
             # ADR 0184 AC-4, and the owner ruling it rests on (2026-09-06): the administrative
@@ -8503,33 +8514,32 @@ class AuthService:
                 idp_auth_time=idp_auth_time,
                 supersedes_hash=supersedes_hash,
             )
-        except _BindingChangedMidLogin:
+        except _BindingChangedMidLogin as changed:
+            # No session was minted. A bind (Windows SSO) or an unbind (federated) landed between
+            # the refusal check and the insert, and the caller gets the answer the check gives;
+            # or the row was deleted in that window, which is named for what happened (BACKLOG
+            # #5624), not reported as a binding change. NOT THE SAME AS THAT CHECK IN ONE WAY:
+            # the role, scope and profile sync above already ran, so a directory role change this
+            # sign-in wrote in this window is applied and audited, and it ends the account's
+            # other sessions.
+            if changed.account_deleted:
+                reason = ACCOUNT_DELETED
+            elif federated:
+                reason = "federated_subject_unbound"
+            else:
+                reason = FEDERATED_SIGN_IN_REQUIRED
             if not federated:
-                # A bind landed between the refusal check and the insert, so no session was
-                # minted. The caller gets the answer the check gives. NOT THE SAME AS THAT
-                # CHECK IN ONE WAY: the role, scope and profile sync above already ran, so a
-                # directory role change this sign-in wrote in this window is applied and
-                # audited, and it ends the account's other sessions. The reason is
-                # also written for a row deleted in the same window, which the guard
-                # refuses too; that row has no binding to look for.
                 refused = await self._refuse_directory_row(
-                    principal.username,
-                    FEDERATED_SIGN_IN_REQUIRED,
-                    client=client,
-                    extra=outcome_extra,
+                    principal.username, reason, client=client, extra=outcome_extra
                 )
                 return replace(refused, roles_gained=roles_gained)
             await self._directory_reject_audit(
-                principal.username,
-                "oidc",
-                "federated_subject_unbound",
-                client=client,
-                extra=outcome_extra,
+                principal.username, "oidc", reason, client=client, extra=outcome_extra
             )
             return LoginOutcome(
                 ok=False,
                 error="federated sign-in failed",
-                reason="federated_subject_unbound",
+                reason=reason,
                 roles_gained=roles_gained,
             )
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
@@ -12097,20 +12107,23 @@ class AuthService:
             # step-up. _complete_ad_login defaults it to None for its Kerberos callers, and raises
             # ValueError when a federated mint arrives without one.
             idp_auth_time=idp_auth_time,
+            # No second factor pending (MFA is not required for this user, or the federated IdP
+            # asserted one): the session's 2nd factor is satisfied at issuance so the step-up gate
+            # never blocks it. An MFA-required login leaves it NULL until POST /auth/mfa-verify
+            # (WP-14) -- including the Kerberos leg, which asserts nothing and mints at the minimum.
+            #
+            # BACKLOG #5624: stamped IN THE INSERT, not by a second transaction. A separate
+            # ``mark_session_mfa_verified`` wrote nothing on a row revoked in between, and a refused
+            # seal ended the row, yet this method went on to supersede the caller's prior session
+            # and hand back a dead token as a success.
+            mfa_verified=mfa_verified,
         )
         if not issued:
             # An unbind or a bind revoked this account's sessions while this login was in flight,
             # so issuing now would hand back a token the revocation could never have seen; or the
             # account was deleted under it (BACKLOG #2733). Nothing was written, so there is
-            # nothing to undo.
-            raise _BindingChangedMidLogin()
-        if mfa_verified:
-            # No second factor pending (MFA is not required for this user, or the federated IdP
-            # asserted one): mark the session's 2nd factor satisfied at issuance so the step-up gate
-            # never blocks it. An MFA-required login leaves it NULL until POST /auth/mfa-verify
-            # (WP-14) -- including the Kerberos leg, which asserts nothing and mints at the minimum.
-            async with self._sealed_stamp(token_hash):
-                await self._store.mark_session_mfa_verified(token_hash)
+            # nothing to undo. One more read tells the two apart (BACKLOG #5624).
+            raise _BindingChangedMidLogin(account_deleted=not await self._user_id_held(user_id))
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
         await self._enforce_session_cap(user_id, client=client)
@@ -13220,6 +13233,16 @@ class AuthService:
         so a caller can tell an account deleted from one whose record fails its check (BACKLOG
         #3068)."""
         return await self._store.get_user(user_id) is not None
+
+    async def _federated_subject_held_elsewhere(
+        self, issuer: str, subject: str, user_id: str
+    ) -> bool:
+        """:meth:`_username_held`, for the federated pair: whether a row other than ``user_id``
+        holds it, sealed or not (BACKLOG #5625). The unique index refuses a second holder whatever
+        its seal says, so a bind must ask the raw row, not :meth:`_load_user_by_federated_subject`,
+        which reads a failing holder as none."""
+        holder = await self._store.get_user_by_federated_subject(issuer, subject)
+        return holder is not None and holder.id != user_id
 
     async def _verified(self, user: UserRecord | None) -> _SealCheck:
         """``user`` with its whole authorization record checked against its seal (BACKLOG #2592):
@@ -20031,6 +20054,11 @@ class AuthService:
         user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
+        # BACKLOG #5625: the row's own id from here on. SQL Server compares ids in the database's
+        # collation, usually case-insensitive, so a case variant of the id finds the row; every
+        # comparison and write below must then use the id the row holds, or the holder check reads
+        # the account's own row as another account's.
+        user_id = user.id
         # First, and whatever pair the caller expected: a retried bind whose first try landed
         # changes nothing, and must not be told that a competing change happened.
         if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
@@ -20084,8 +20112,11 @@ class AuthService:
                 " this account, create it again one of those two ways, then bind the new account."
                 " Removing the account discards its user_id and what is keyed on it"
             )
-        holder = await self._load_user_by_federated_subject(issuer, subject)
-        if holder is not None and holder.id != user_id:
+        # The RAW row, not the seal-checked one (BACKLOG #5625). A holder whose record fails its
+        # seal reads as no holder through the checked loader, yet ux_users_federated_subject still
+        # refuses the write below; on a rebind that refusal came after the clear, leaving this
+        # account unbound and signed out. Refusing on the raw pair keeps the binding it has.
+        if await self._federated_subject_held_elsewhere(issuer, subject, user_id):
             await audit_refused(
                 "federated_subject_held", user.username, previous_binding_removed=False
             )

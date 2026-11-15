@@ -1141,7 +1141,13 @@ def test_each_backend_declares_column_types_as_its_catalog_spells_them() -> None
     ms = mssql_declared().column_shapes
     assert ms["webauthn_credentials"]["credential_id_hash"] == ColumnShape("nvarchar(128)", False)
     assert ms["secret_rotation_meta"]["fingerprint"] == ColumnShape("nvarchar(max)", False)
-    assert ms["users"]["oidc_issuer"] == ColumnShape("nvarchar(256)", True)
+    # BACKLOG #5613: BIN2, so two OIDC subjects differing only in case are two keys.
+    assert ms["users"]["oidc_issuer"] == ColumnShape(
+        "nvarchar(256)", True, collation="latin1_general_100_bin2"
+    )
+    assert ms["users"]["oidc_subject"] == ColumnShape(
+        "nvarchar(256)", True, collation="latin1_general_100_bin2"
+    )
     assert ms["users"]["totp_enabled"] == ColumnShape("bit", False)
     assert any(c.identity for t in ms.values() for c in t.values())
     assert any(c.collation == "latin1_general_100_bin2" for t in ms.values() for c in t.values())
