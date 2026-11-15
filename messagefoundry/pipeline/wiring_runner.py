@@ -5763,9 +5763,8 @@ class RegistryRunner:
         # than the built Source (stream_threshold_bytes is a wiring field, not a transport setting), and
         # it WARNS where its neighbours refuse. See the function for why a refusal is not available here.
         warn_unbudgeted_streaming_inbound(ic, budget=self._stream_inflight_budget)
-        # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
-        # weakened-TLS refusal on it), matching the exposure-check posture threading above. Off the
-        # event loop (engine PR 2815, hold F2).
+        # #200 (ADR 0092): stamp the posture for the source build too, matching the exposure-check
+        # posture threading above. Off the event loop (engine PR 2815, hold F2).
         source = await _build_off_loop(
             self._hop_posture,
             functools.partial(build_source, source_cfg, egress=self._egress),

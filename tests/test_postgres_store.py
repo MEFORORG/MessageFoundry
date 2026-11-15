@@ -7,8 +7,7 @@ so it's a no-op locally and in normal CI. A CI Postgres service-container job se
 for real. Requires the ``postgres`` extra (``asyncpg``). The server must speak verified TLS: a
 store hop with ``encrypt=false`` or ``trust_server_certificate=true`` is refused at every posture,
 whatever ``MEFOR_ALLOW_INSECURE_TLS`` says (vault BACKLOG #3533 item 2), so the fixture errors on
-that refusal rather than skipping. CI generates the server's certificate and names it in
-``MEFOR_STORE_SSL_ROOT_CERT``.
+that refusal rather than skipping.
 
 Beyond the SQL Server parity tests, this also exercises the **staged pipeline** Postgres supports
 (ingress → routed → outbound, finalize PROCESSED; the ROUTED→FILTERED collapse), reference snapshots,

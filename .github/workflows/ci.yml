@@ -3598,8 +3598,8 @@ jobs:
       # item 2): a store or DATABASE connection login over trust_server_certificate=true or
       # encrypt=false is refused, whatever MEFOR_ALLOW_INSECURE_TLS or [security].enforcement says,
       # except a DATABASE connection that declares tls_hop_attested, which no leg here does.
-      # So the service container serves a certificate generated here, and every engine step below
-      # pins it with MEFOR_STORE_SSL_ROOT_CERT. The runner's trust store holds it too, for the
+      # So the service container serves a certificate generated here, and the steps below that open
+      # the store pin it with MEFOR_STORE_SSL_ROOT_CERT. The runner's trust store holds it too, for the
       # DATABASE connector, which has no pin. A `services:` container starts before any step, so
       # the files are copied in and the server restarted, after its first boot has finished.
       # sqlcmd's -C in the readiness loops is the CI tool's own login, not the engine's.
@@ -3704,9 +3704,8 @@ jobs:
           MEFOR_STORE_AUTH: sql
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-          # The certificate the service container serves, pinned (Encrypt=strict). Every engine step
-          # below pins it the same way; why there is no weakened-TLS alternative is at the step that
-          # makes it.
+          # The certificate the service container serves, pinned (Encrypt=strict); why there is no
+          # weakened-TLS alternative is at the step that makes it.
           MEFOR_STORE_SSL_ROOT_CERT: ${{ runner.temp }}/mssql-tls/server.pem
           # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
           PYTHONFAULTHANDLER: "1"

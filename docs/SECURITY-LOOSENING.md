@@ -51,16 +51,15 @@ credential-shaped under a neutral header name, over plain `http` off this machin
 of this section. This section is the one statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
-or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
-or starts the service, with two exceptions. SFTP: the host key is known only once the server
+or when an SSH host key is unknown. The engine refuses each case below before the credential is
+sent, at a point that depends on the hop. SFTP, for example: the host key is known only once the server
 answers, so that refusal comes at connect, before the password is sent. The AI broker: the engine
 builds it for each `POST /ai/chat`, so that request is refused and answers `503`, and the refusal
 names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
 `tls_hop_attested`, `cleartext_accepted` and a loopback host, with one exception: on the plain
 `http` row a loopback host still carries a credential, since that hop never leaves this machine.
-Each refusal names the connection, or
-the `[auth]` setting for the AD bind, and offers only settings that can fix it. A verify-off refusal
+Each refusal offers only settings that can fix it. A verify-off refusal
 names a header off the allowlist apart from any credential. Where such headers are all it lists, it
 also offers removing them. The engine then judges the hop as one with no credential, under its own
 levers. `Email` and `Direct`

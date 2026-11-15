@@ -120,7 +120,7 @@ def test_db_unattested_is_refused_at_every_posture(
 
 
 def test_db_shared_predicate_fails_closed_with_no_posture(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The one predicate every weakened-TLS cell asks. An explicit warn posture is the control arm.
+    # The shared escape predicate. An explicit warn posture is the control arm.
     from messagefoundry.config.settings import (
         weakened_tls_escape_permitted,
         weakened_tls_escape_permitted_here,
@@ -128,7 +128,7 @@ def test_db_shared_predicate_fails_closed_with_no_posture(monkeypatch: pytest.Mo
 
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     assert weakened_tls_escape_permitted(None) is False
-    with active_hop_posture(None):  # nothing stamped, even under a stamping session fixture
+    with active_hop_posture(None):  # nothing stamped
         assert weakened_tls_escape_permitted_here() is False
     assert weakened_tls_escape_permitted(STAGING_PHI) is True
     assert weakened_tls_escape_permitted(PROD_PHI) is False

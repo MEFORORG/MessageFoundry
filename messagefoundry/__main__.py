@@ -9311,7 +9311,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     store_slot = _ProvisionStore()
     # The instance hop posture, as `serve` derives it: the auth build takes it, and both store opens
-    # below pass it, so a server store hop is clamped and guarded as `serve` opens it (#200, #201).
+    # below pass it, as `serve` passes it to its own store open (#200, #201).
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
 
     async def administrator_exists() -> tuple[bool, str | None]:
