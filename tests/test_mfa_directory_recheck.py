@@ -701,15 +701,16 @@ async def test_a_lock_set_during_the_lookup_is_refused_as_locked_whatever_else_l
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, also: str, window: str
 ) -> None:
     """BACKLOG #3780 item 2. A lock that lands during the lookup, in the probe or in the role test
-    that follows it, is refused as ``locked``, with its ``auth.mfa_failed`` row, before anything
-    else that landed in the same window is asked: a self-service TOTP disable, or a temporary
-    credential that lapsed. The re-read the item dropped refused it before the queue, ahead of the
-    in-queue ``totp_enabled`` and lapse checks. RED when: the TOTP disable answers first, with no
-    row and no ``locked``, or the lapse answers ``session_lost`` first."""
+    that follows it, writes its ``auth.mfa_failed`` locked row whatever else landed in the same
+    window, as the re-read the item dropped did. With a self-service TOTP disable it answers
+    ``locked``. With a temporary credential that lapsed, the lapse is still asked and ends the
+    session with its ``auth.temp_password_expired`` row, the stronger end state, so both rows are
+    written. RED when: the TOTP disable answers first, with no row and no ``locked``, or a lapse
+    goes unasked, or either row is missing."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_probe = e.service._probe_principal
     real_roles_lost = e.service._directory_roles_lost
-    real_lapsed = e.service._mfa_lapsed
+    real_lapsed = e.service._credential_lapsed
     landed = False
 
     async def _land() -> None:
@@ -730,19 +731,67 @@ async def test_a_lock_set_during_the_lookup_is_refused_as_locked_whatever_else_l
             await _land()
         return await real_roles_lost(*args, **kwargs)
 
-    async def _lapsed_once_landed(*args: Any, **kwargs: Any) -> bool:
-        if also == "lapse" and landed:
-            return True
-        return await real_lapsed(*args, **kwargs)
+    def _lapsed_once_landed(user: Any, now: float) -> bool:
+        return (also == "lapse" and landed) or real_lapsed(user, now)
 
     monkeypatch.setattr(e.service, "_probe_principal", _probe)
     monkeypatch.setattr(e.service, "_directory_roles_lost", _roles_lost)
-    monkeypatch.setattr(e.service, "_mfa_lapsed", _lapsed_once_landed)
+    monkeypatch.setattr(e.service, "_credential_lapsed", _lapsed_once_landed)
 
     refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 
     assert landed
-    assert refused.ok is False and refused.locked is True and refused.session_lost is False
+    assert await _audited_mfa_failures(store) == [{"reason": "locked"}]
+    expired = await store.list_audit(action="auth.temp_password_expired")
+    if also == "lapse":
+        assert refused.ok is False and refused.session_lost is True and refused.locked is False
+        assert len(expired) == 1
+        assert not await _live_session(store, e.token), "the lapsed session was not ended"
+    else:
+        assert refused.ok is False and refused.locked is True and refused.session_lost is False
+        assert expired == []
+        assert await _live_session(store, e.token)
+
+
+async def _live_session(store: MessageStore, token: str) -> bool:
+    """Whether the session ``token`` names is still there and not revoked."""
+    session = await store.get_session(hash_token(token))
+    return session is not None and session.revoked_at is None
+
+
+async def test_a_lock_and_a_lapse_during_the_wait_end_the_session_and_keep_both_rows(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 2. A lock and a lapse that land while the attempt waits in the queue: the
+    lapse ends the session and writes ``auth.temp_password_expired``, answering ``session_lost``,
+    as on main, where the lapse was asked ahead of the lock. The lock's ``auth.mfa_failed`` row is
+    written too. RED when: the lock answers alone and the lapsed session is left live, or the lock
+    row is missing."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_lock = e.service._account_credential_lock
+    real_lapsed = e.service._credential_lapsed
+    queued = False
+
+    @asynccontextmanager
+    async def _queue_while_both_land(username: str) -> AsyncIterator[None]:
+        nonlocal queued
+        await _lock_second_step(store, e.user_id)
+        queued = True
+        async with real_lock(username):
+            yield
+
+    def _lapsed_once_queued(user: Any, now: float) -> bool:
+        return queued or real_lapsed(user, now)
+
+    monkeypatch.setattr(e.service, "_account_credential_lock", _queue_while_both_land)
+    monkeypatch.setattr(e.service, "_credential_lapsed", _lapsed_once_queued)
+
+    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert queued
+    assert refused.ok is False and refused.session_lost is True
+    assert len(await store.list_audit(action="auth.temp_password_expired")) == 1
+    assert not await _live_session(store, e.token), "the lapsed session was not ended"
     assert await _audited_mfa_failures(store) == [{"reason": "locked"}]
 
 

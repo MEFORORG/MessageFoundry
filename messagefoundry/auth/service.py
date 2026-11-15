@@ -16576,10 +16576,11 @@ class AuthService:
         # acquisition awaits between the two, and nothing is spent before the in-queue read, so it
         # still refuses, before any code is checked, a revocation, a disable or a lock the lookup
         # let land. A directory account comes back as the row the directory check's role test read
-        # after the lookup, so the queue is keyed, and a lost session named, by the account's name
-        # as it was then, as the dropped re-read did (#2291 class). A lock is refused in the queue
-        # right after the session read, before the ``totp_enabled`` and lapse checks, as the
-        # dropped re-read refused one that landed during the lookup before the queue.
+        # after the lookup, so the queue is keyed by the account's name as it was then, as the
+        # dropped re-read keyed it. A session lost during the lookup is named by the in-queue
+        # read, with the account's current name while its row is still there (#2291 class); the
+        # dropped re-read named it with the name read before the lookup. The lock is asked in the queue right after the session
+        # read, before the ``totp_enabled`` and lapse checks (see below).
         vouched = await self._directory_vouches_for_factor(
             token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
@@ -16625,16 +16626,23 @@ class AuthService:
                 user = loaded
                 await queue.pop_all().aclose()
                 queued_as = loaded.username
-            # The lock first, on the row just read: a lock that landed during the lookup or its
-            # role test is refused as ``locked`` with its row whatever else landed with it, as the
-            # dropped re-read refused it ahead of these checks. A lock that landed during the wait
-            # is refused the same way, on a local account too, rather than after them.
-            if await self._mfa_lock_refused(user, client=client):
-                return Elevation(locked=True)
-            if not user.totp_enabled:
+            else:
+                # Unreachable: the last pass breaks or returns. Guarded so an edit to the loop can
+                # never let the code check below run without the account's queue held (#1943).
+                raise RuntimeError("verify_mfa left its queue loop without holding the queue")
+            # The lock is asked first, on the row just read, and its row written: a lock that
+            # landed during the lookup or its role test is audited as ``locked`` whatever else
+            # landed with it, as the dropped re-read audited it ahead of these checks. The lapse
+            # is still asked of a locked account, and ends its session, as a lapse during the
+            # wait did ahead of the lock. So a lock and a lapse together keep both rows and the
+            # ended session; a lock alone answers ``locked``, before ``totp_enabled``.
+            locked = await self._mfa_lock_refused(user, client=client)
+            if not locked and not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
                 return Elevation(session_lost=True)
+            if locked:
+                return Elevation(locked=True)
             now = time.time()
             # The enrolment this code is checked against: the factor write below lands only while
             # the row still holds it. Every enable stamps ``totp_enrolled_at`` afresh, as
