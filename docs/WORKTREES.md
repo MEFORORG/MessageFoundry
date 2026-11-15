@@ -516,8 +516,10 @@ Occupancy is checked by two independent signals, and **either one vetoes**:
    git metadata (`index`, `HEAD`, `logs/HEAD`, …), and of the working tree's top level and the files
    in its test, lint and type-check caches (`Get-WorkingTreeActivity` in
    [`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1), the read the `.claude/worktrees`
-   removal makes too), so a session that ran tests, lint or mypy and no git command still vetoes. A
-   file edited in place below the top level moves neither reading. This is the signal that does
+   removal makes too), so a session that ran pytest or mypy at the tree's root and no git command
+   still vetoes. Not every run writes its cache (ruff leaves `.ruff_cache` alone when no file
+   changed), and a file edited in place below the top level moves neither reading. This is the
+   signal that does
    **not** depend on a recorded cwd.
 
 **The default was 36 until 2026-09-17, and the old number's own measurement is why it moved.** The
@@ -564,8 +566,9 @@ that session and this script. The run therefore prints how many candidates signa
 rather than letting "the fence ran" imply "the fence covered it".
 
 What neither signal sees, printed on every run: a cwd recorded as a UNC or 8.3 short path; a session
-that never registered; and a session that only edits files and runs no git command (invisible to
-signal 2 as well, since it touches none of the metadata files).
+that never registered; and a session that only edits files below the top level and runs no git
+command and no test or type check that rewrites a root-level cache (invisible to signal 2 as well,
+since it moves none of the git metadata, top-level entries or cache files it reads).
 
 Everything that **narrows** either signal is named in red on the run and in the JSON receipt, because
 an operator who believes they are fenced when they are not is worse off than one who knows they

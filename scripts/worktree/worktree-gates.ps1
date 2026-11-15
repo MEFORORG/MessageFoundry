@@ -174,11 +174,12 @@ function Get-ReflogLastEntry {
 
 function Get-WorktreeActivity {
     param([string]$Path)
-    # The worktree's PRIVATE git metadata only. Deliberately NOT the working files: a venv install or a
-    # test run churns those, so their mtimes would veto everything forever and the veto would stop
-    # meaning anything. The cost is that a session which only edits files and runs no git command is
-    # invisible to this signal too -- stated in the header rather than papered over. Its callers that
-    # remove a tree pair it with Get-WorkingTreeActivity, a narrower working-tree read (BACKLOG #5603).
+    # The worktree's PRIVATE git metadata only. Deliberately NOT every working file: a venv install
+    # churns thousands of them, so reading them all would veto far longer than any session works. The
+    # cost is that a session which only edits files and runs no git command is invisible to this
+    # signal -- stated in the header rather than papered over. Its callers that remove a tree pair it
+    # with Get-WorkingTreeActivity, a narrower working-tree read that a test or mypy run moves and an
+    # install does not (BACKLOG #5603); a run that wrote within the window meant to hold the tree.
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     $gitdir = & git -C $Path rev-parse --absolute-git-dir 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $gitdir) { return $null }
@@ -362,7 +363,9 @@ function Get-FlaggedFiles([string]$Path) {
 # files, this read is what holds a tree a mypy run wrote to.
 # Callers, at least: finished-worktree-removal.ps1 (Get-ContentRefusal) and prune-merged.ps1
 # (Get-TreeActivity, its occupancy signal 2, in the decision, report, venv and -Apply re-check passes,
-# where -IdleHours 0 and -Name lift it as they lift the git reading). remove.ps1 makes its own twin.
+# where -IdleHours 0 and -Name lift a recent reading but not an unreadable one, as for the git
+# reading). remove.ps1 makes its own twin. Only caches at the tree's root are read, and a run that
+# writes nothing to its cache (ruff, with no file changed) moves none of this.
 # $null when it cannot be read, when the cache list is unset, and when a cache holds more than
 # -CacheCap files, which it does not sample: a cache too big to read to the end cannot be dated.
 function Get-WorkingTreeActivity {

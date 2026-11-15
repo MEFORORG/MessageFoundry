@@ -62,10 +62,12 @@
          2026-08-18, vetoing the whole repository at once (Get-ReflogLastEntry has the measurement).
          The WORKING TREE is read too, against the same window, through the read
          finished-worktree-removal.ps1 makes (worktree-gates.ps1 Get-WorkingTreeActivity): its top
-         folder, each entry directly under it, and the files in the caches that function names, so
-         a session that ran tests, lint or mypy and no git command still vetoes (BACKLOG #5603). A
-         file edited in place two levels down moves none of these. The newer of the two readings is
-         the tree's activity.
+         folder, each entry directly under it, and the files in the caches that function names at
+         the tree's root, so a session that ran pytest or mypy there and no git command still vetoes
+         (BACKLOG #5603). Not every run writes its cache: ruff leaves .ruff_cache untouched when no
+         file changed. A file edited in place two levels down moves none of these. The newer of the
+         two readings is the tree's activity. An unreadable working tree, which includes a cache too
+         big to date, vetoes even under -Name and -IdleHours 0, as unreadable git metadata does.
          This is the signal that does NOT depend on a recorded cwd, and it is what covers the fence's
          biggest blind spot -- so it is not a nicety, it is the load-bearing one for the class of
          worktree this tool actually prunes. If it cannot be read, that is a veto too. Confirm a
@@ -83,9 +85,10 @@
       * a cwd recorded as a UNC (\\host\C$\...) or 8.3 short path -- the match is a normalised string
         compare, and neither spelling normalises to the worktree's own path;
       * a session that never registered;
-      * a session that only Writes/Edits files below the top level and runs no git command or test,
-        lint or type-check run: it touches none of the git metadata, top-level entries or cache files
-        signal 2 reads, so signal 2 goes quiet on it as well;
+      * a session that only Writes/Edits files below the top level and runs no git command, and no
+        test or type-check run that rewrites a root-level cache (a lint run with nothing changed
+        writes none): it touches none of the git metadata, top-level entries or cache files signal 2
+        reads, so signal 2 goes quiet on it as well;
       * a session whose ONLY git command rewrites the reflog without appending to it -- in practice
         `git gc` or `git reflog expire`. Signal 2 stopped counting that on 2026-08-18 and this is the
         price: the same write that used to veto the entire repository for 36 hours now vetoes nothing.
@@ -625,7 +628,7 @@ function Get-TreeActivity([string]$Path) {
     $git = Get-WorktreeActivity -Path $Path
     if ($null -eq $git) { return [pscustomobject]@{ When = $null; What = 'git metadata unreadable' } }
     $tree = Get-WorkingTreeActivity -Path $Path
-    if ($null -eq $tree) { return [pscustomobject]@{ When = $null; What = 'working tree unreadable' } }
+    if ($null -eq $tree) { return [pscustomobject]@{ When = $null; What = 'working tree unreadable, or a cache too big to date' } }
     if ($tree -gt $git) { return [pscustomobject]@{ When = $tree; What = 'the working tree was written' } }
     return [pscustomobject]@{ When = $git; What = 'git metadata was touched' }
 }
@@ -1256,7 +1259,7 @@ $blindSpots = @(
     'a session writing into a worktree by absolute path from elsewhere (29% of the writes by primary-seated sessions, measured on this repo)',
     'a cwd recorded as a UNC or 8.3 short path',
     'a session that never registered',
-    'a session that only edits files below the top level and runs no git command, test, lint or type check (invisible to signal 2 as well)'
+    'a session that only edits files below the top level and runs no git command and no test or type check that rewrites a root-level cache (invisible to signal 2 as well)'
 )
 
 if (-not $Json) {

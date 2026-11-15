@@ -1304,7 +1304,10 @@ def test_a_cache_too_big_to_date_holds_the_tree(fx: Fixture, sleeper: int) -> No
     _backdate(fx.primary, wt, hours=100)
     d = by_leaf(run(fx, "-Apply"), "clean")
     assert d["Decision"] == "SKIP", d
-    assert any("activity unknown (working tree unreadable)" in r for r in d["Reasons"]), d
+    assert any(
+        "activity unknown (working tree unreadable, or a cache too big to date)" in r
+        for r in d["Reasons"]
+    ), d
     assert wt.exists()
 
     # Control: at the cap, the same tree prunes.
@@ -3065,13 +3068,16 @@ def test_c7_a_freshly_written_working_tree_holds_the_venv(fx: Fixture, sleeper: 
 def test_c7_recent_git_metadata_holds_the_venv(fx: Fixture, sleeper: int) -> None:
     live_record(fx, sleeper, fx.primary)
     plant_control(fx)
-    # Not backdated: `worktree add` stamped its metadata seconds ago.
-    _plant_venv_tree(fx, "fresh-006611", idle_hours=0.0)
+    # The working tree 500 h idle and only the git metadata fresh, so the git reading alone holds it:
+    # its pair, test_c7_a_freshly_written_working_tree_holds_the_venv, isolates the other reading.
+    victim = _plant_venv_tree(fx, "fresh-006611")
+    os.utime(_gitdir(victim) / "HEAD", None)
 
     res = run(fx, "-ReapVenvs")
     row = venv_row(res, "fresh-006611")
     assert row["verdict"] == "SKIP"
     assert row["stoppedBy"] == "C7 idle"
+    assert row["stoppedDetail"].startswith("git metadata was touched"), row
     assert "inside the 72 h window" in row["stoppedDetail"]
     assert only_failing(row) == ["C7"]
     assert_control_is_reapable(res)
