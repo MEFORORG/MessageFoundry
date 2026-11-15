@@ -15093,9 +15093,10 @@ class SqlServerStore:
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
         # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
-        # rather than the recyclable sAMAccountName. NOTE, as with get_user_by_federated_subject
-        # below, that the comparison is the DATABASE's and this column carries no explicit COLLATE:
-        # under a case-insensitive server default two ids differing only in case would match here.
+        # rather than the recyclable sAMAccountName. NOTE that the comparison is the DATABASE's and
+        # this column carries no explicit COLLATE, unlike the pair get_user_by_federated_subject
+        # below reads, which is BIN2 since BACKLOG #5613. Under a case-insensitive server default
+        # two ids differing only in case would match here.
         # The normaliser in auth/ldap.py emits ONE case, so that divergence is not reachable through
         # the login path -- it is recorded because the byte-exact comparison SQLite and Postgres
         # perform is the property a reader would assume.

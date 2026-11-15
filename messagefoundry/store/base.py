@@ -3239,8 +3239,12 @@ class AuthStore(Protocol):
         declared ``Latin1_General_100_BIN2``, because under a case-insensitive default two subjects
         differing only in case would be one key. BIN2 still pads trailing spaces, so ``abc`` and
         ``abc `` match there; the bind refuses a subject with surrounding space, and a caller that
-        SELECTS an account through this compares the pair itself. A users table built before that
-        DDL keeps its old collation.
+        SELECTS an account through this compares the pair itself. On SQL Server the schema batch
+        gives BIN2 only to a pair it creates, adds, or re-types from NVARCHAR(MAX). It converts no
+        other pair, such as one already NVARCHAR(256) under any collation but
+        ``Latin1_General_100_BIN2``: an open that runs the batch refuses it instead
+        (:mod:`~messagefoundry.store.server_schema_verify` says what that check compares and when
+        it runs).
 
         Deliberately a lookup rather than a scan: it sits on the federated login path, and
         ``list_users()`` would make every sign-in O(number of accounts).
