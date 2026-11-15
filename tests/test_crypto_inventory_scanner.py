@@ -1431,9 +1431,12 @@ def test_a_reused_provider_name_does_not_hide_the_provider_call() -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        pytest.param("// note\x85/* x\nconst n = Math.random();\n", id="nel-in-a-line-comment"),
         pytest.param(
-            "const s = 'a\x0c/* b';\nconst n = Math.random();\n", id="form-feed-in-a-string"
+            "// note\x85/* x\nconst n = Math.random();\n/** doc */\n", id="nel-in-a-line-comment"
+        ),
+        pytest.param(
+            "const s = 'a\x0c/* b';\nconst n = Math.random();\n/** doc */\n",
+            id="form-feed-in-a-string",
         ),
         pytest.param("// c\rconst n = Math.random();\n", id="lone-cr-ends-a-line-comment"),
         pytest.param("// c\u2028const n = Math.random();\n", id="u2028-ends-a-line-comment"),
@@ -1441,8 +1444,9 @@ def test_a_reused_provider_name_does_not_hide_the_provider_call() -> None:
     ],
 )
 def test_a_non_newline_line_break_cannot_open_a_phantom_block(text: str) -> None:
-    # The stripper splits at JS's own line terminators: a form feed or NEL is not one, so its /*
-    # opens nothing; a lone CR, U+2028 or U+2029 is one, so it ends the // comment before the call.
+    # A form feed or NEL is not a JS line terminator, so the /* after one is inside the comment or
+    # string and opens nothing; the later */ would close a phantom block if it did. A lone CR, U+2028
+    # or U+2029 IS one, so it ends the // comment before the call.
     assert _gate().randomness_tokens_in(text) == {"Math.random"}
 
 
@@ -1458,27 +1462,35 @@ def test_a_bom_led_file_keeps_its_doc_comment_prose_out_of_the_randomness_arm(
     (root / "b.ts").write_text(
         "\ufeff/**\n * header\n */\nconst k = Math.random();\n", encoding="utf-8"
     )
-    assert _gate().discover_non_python(root, repo=tmp_path) == {
-        "ide/b.ts": frozenset({"Math.random"})
-    }
+    gate = _gate()
+    assert gate.discover_non_python(root, repo=tmp_path) == {"ide/b.ts": frozenset({"Math.random"})}
+    # And the text APIs drop the BOM themselves, not only the file read.
+    assert gate.randomness_tokens_in("\ufeff/**\n * Math.random() weak\n */\n") == set()
 
 
 def test_a_tls_value_under_a_second_binding_reaches_its_token() -> None:
+    # The weakening binding is the MODULE-level one, so last-write-wins (the function-local import
+    # is walked later) dropped it: this fails on origin/main's import_aliases.
     ops = _gate().crypto_operations
     source = (
-        "from ssl import CERT_REQUIRED as mode\n\n\ndef f(ctx):\n"
-        "    from ssl import CERT_NONE as mode\n    ctx.verify_mode = mode\n"
+        "from ssl import CERT_NONE as mode\n\n\ndef f(ctx):\n"
+        "    from ssl import CERT_REQUIRED as mode\n    ctx.verify_mode = mode\n"
     )
     found = ops.aggregate(ops.discover_operations_in({"messagefoundry/x.py": source}))
     assert "tls_context:.verify_mode = CERT_NONE" in found["messagefoundry/x.py"], found
 
 
-def test_a_def_rebound_by_a_later_import_keeps_the_method_rule() -> None:
-    # a.verify is a first-party def, but the import after it rebinds the name, so at runtime the
-    # call is the library's verify. Only a chain that ENDS on first-party functions skips the rule.
+def test_a_name_reexported_to_a_library_and_a_first_party_def_keeps_the_method_rule() -> None:
+    # a.verify is bound twice: to the library's verify at module level and to a first-party def by a
+    # function-local import. Last-write-wins kept only the def, so the call read as first-party and
+    # the method rule was skipped. The rule is skipped only when EVERY binding ends first-party.
     ops = _gate().crypto_operations
     sources = {
-        "messagefoundry/a.py": "def verify(x):\n    return x\n\n\nfrom nacl.signing import verify\n",
+        "messagefoundry/c.py": "def verify(x):\n    return x\n",
+        "messagefoundry/a.py": (
+            "from nacl.signing import verify\n\n\ndef other():\n"
+            "    from messagefoundry.c import verify\n    return verify\n"
+        ),
         "messagefoundry/b.py": "from messagefoundry import a\n\n\ndef go(s):\n    a.verify(s)\n",
     }
     found = ops.aggregate(ops.discover_operations_in(sources))
@@ -1486,9 +1498,11 @@ def test_a_def_rebound_by_a_later_import_keeps_the_method_rule() -> None:
 
 
 def test_a_crypto_binding_does_not_mask_another_bindings_method_rule() -> None:
+    # The signer is the MODULE-level binding and secrets the function-local one, so last-write-wins
+    # read the call as secrets.sign only: this fails on origin/main.
     ops = _gate().crypto_operations
     source = (
-        "import secrets as s\n\n\ndef f(data):\n    from mylib import signer as s\n"
+        "from mylib import signer as s\n\n\ndef f(data):\n    import secrets as s\n"
         "    return s.sign(data)\n"
     )
     found = ops.aggregate(ops.discover_operations_in({"messagefoundry/x.py": source}))
@@ -1496,8 +1510,6 @@ def test_a_crypto_binding_does_not_mask_another_bindings_method_rule() -> None:
 
 
 def test_an_unterminated_block_opener_in_a_string_does_not_hide_the_rest_of_the_file() -> None:
-    # An unterminated block comment is a syntax error, so a /* still open at the end of the text was
-    # string text; the lines after it are scanned again rather than hidden to the end of the file.
     text = (
         "const help = `\n/* matches every file\n`;\n"
         "const n = Math.random();\nconst d = createHash('md5');\n"
@@ -1505,3 +1517,31 @@ def test_an_unterminated_block_opener_in_a_string_does_not_hide_the_rest_of_the_
     gate = _gate()
     assert gate.randomness_tokens_in(text) == {"Math.random"}
     assert "hash:createHash[md5]" in gate.non_python_operation_tokens_in(text)
+
+
+@pytest.mark.parametrize(
+    "closer",
+    [
+        pytest.param('const g = "src/**/*.ts";\n', id="later-glob-string"),
+        pytest.param("/** doc */\nfunction f() {}\n", id="later-jsdoc"),
+    ],
+)
+def test_a_template_line_starting_a_comment_opener_does_not_hide_later_code(closer: str) -> None:
+    # BACKLOG #5578 re-cut. A template-literal line that starts with /* is string text. The
+    # line-rule stripper read it as a block comment and hid every line up to the next */ anywhere
+    # in the file, here a glob string or a JSDoc; origin/main's per-line rule and the lexer both see
+    # the calls.
+    text = (
+        "const tpl = `\n/* rules\n`;\nconst n = Math.random();\n"
+        "const d = createHash('md5');\n" + closer
+    )
+    gate = _gate()
+    assert gate.randomness_tokens_in(text) == {"Math.random"}
+    assert "hash:createHash[md5]" in gate.non_python_operation_tokens_in(text)
+
+
+def test_an_unterminated_block_comment_is_kept_as_code_by_the_lexer() -> None:
+    from scripts.security.js_lexer import blank_js_comments
+
+    assert "Math.random" in blank_js_comments("const a = 1; /* opens\nconst n = Math.random();\n")
+    assert "secret" not in blank_js_comments("/* secret */ const a = 1;\n")

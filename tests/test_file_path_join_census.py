@@ -79,8 +79,8 @@ from typing import NamedTuple
 
 import pytest
 
+from scripts.security.js_lexer import blank_js_comments as _js_code
 from tests._ast_sites import callee_name, find_funcs, parse_source
-from tests.test_browser_storage_doc_drift import _js_code
 
 _ROOT = Path(__file__).resolve().parent.parent
 

@@ -54,15 +54,13 @@ seen:
   no pattern names, a call split across lines (a PowerShell backtick continuation, a multi-line
   JavaScript options object whose key and value sit on different lines), and a file outside the
   walked roots and suffixes;
-* for the comment stripper the TypeScript/JavaScript and PowerShell arms share: a line of a
-  multi-line string, template literal or here-string whose text STARTS with the block opener
-  (``/*``, ``<#``) is read as a block comment, and the lines up to the next closer are hidden. The
-  real tree has such lines: CSS ``/* */`` comments inside the IDE's webview template strings, where
-  a ``${...}`` hole would go unseen;
-* for the same stripper: such a string line that STARTS with the line-comment marker (``//``,
-  ``#``), and a PowerShell ``#Requires`` line, are skipped as comments. For PowerShell alone, a
-  ``<#`` that is never closed also hides every line after it to the end of the file. A raw U+2028 or U+2029
-  inside a JS string ends a "line" for the stripper, so the text after it is such a string line;
+* for the PowerShell arm: a ``<#`` inside a string or here-string that opens a line with it. The
+  comment stripper cannot tell it from a real block comment and hides the lines up to the next
+  ``#>``;
+* for the TypeScript/JavaScript arms: a literal the comment lexer (``js_lexer.py``) misreads. It
+  decides regex-versus-division from the previous token only, ends a quoted string at a newline,
+  and treats a template's ``${...}`` hole as string. A misread that puts it outside a real string
+  can read a ``/*`` or ``//`` inside that string as a comment and hide what follows;
 * a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
   ``def go(sig): sig.verify(d)`` in a module that imports a first-party ``sig`` reads as a call to
   that first-party function and skips the method rule.

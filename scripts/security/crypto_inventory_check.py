@@ -127,6 +127,7 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.append(_HERE)
 import crypto_operations  # noqa: E402
+import js_lexer  # noqa: E402
 
 # The six first-party roots the gate walks — byte-identical (as basenames) to
 # ``tests/test_security_static.py``'s ``_CRYPTO_ROOTS`` (#283 owns that pin; this gate consumes it).
@@ -2386,87 +2387,27 @@ def find_violations(
     return undocumented, stale
 
 
-def _strip_comments(
-    lines: list[str],
-    line_comment: str,
-    block_open: str,
-    block_close: str,
-    *,
-    rescan_unterminated: bool,
-) -> list[str]:
-    """The code of a source, one entry per line, with comments removed. Shared by the JS/TS and
-    PowerShell arms so a fix to one stripper reaches the other; this is the one statement of its
-    rules. Each caller splits ``lines`` at its own language's line terminators.
-
-    A line whose code starts with ``line_comment`` is a comment. ``block_open`` opens a block
-    comment only where it STARTS the remaining code on a line, and the lines up to its
-    ``block_close`` are skipped; code after the close on the same line is kept. A line inside no
-    block is never skipped for starting with anything else (a JS ``*`` continuation line is code).
-    An opener anywhere else (after code, in a string, in a trailing line comment) never opens a
-    block, so it cannot hide the lines that follow, and a trailing comment never hides the code
-    before it. With ``rescan_unterminated``, a block still open at the end of the text was never a
-    comment (an unterminated block comment is a syntax error), so its lines are scanned again from
-    the line after its opener, with the opener line kept as code.
-
-    The rules lean toward scanning too much, but at least the line shapes THE RESIDUAL in
-    crypto_operations.py lists are hidden. Stripping exactly would need a lexer per language, and a
-    naive strip would cut a line at the ``//`` of a URL and hide what follows."""
-    code: list[str] = []
-    in_block = False
-    opened_at = 0
-    i = 0
-    while True:
-        if i == len(lines):
-            if not (in_block and rescan_unterminated):
-                return code
-            # A phantom block: re-scan from just after its opener, keeping the opener line.
-            code.append(lines[opened_at])
-            in_block = False
-            i = opened_at + 1
-            continue
-        line = lines[i]
-        if in_block:
-            end = line.find(block_close)
-            if end < 0:
-                i += 1
-                continue
-            line = line[end + len(block_close) :]
-            in_block = False
-        while True:
-            stripped = line.lstrip()
-            if not stripped.startswith(block_open):
-                break
-            end = stripped.find(block_close, len(block_open))
-            if end < 0:
-                in_block = True
-                opened_at = i
-                line = ""
-                break
-            line = stripped[end + len(block_close) :]
-        stripped = line.strip()
-        if stripped and not stripped.startswith(line_comment):
-            code.append(line)
-        i += 1
-
-
-#: JavaScript's line terminators (ECMA-262 LineTerminatorSequence): LF, CR, CRLF, U+2028, U+2029.
-#: ``str.splitlines`` also breaks at a form feed, vertical tab, NEL and the file separators, none of
-#: which ends a JS line comment or string, so a ``// x<NEL>/*`` would open a phantom block; and a
-#: ``\n``-only split misses a lone CR or U+2028 that DOES end a ``//`` comment, hiding the code
-#: after it.
-_JS_LINE_BREAK = re.compile("\r\n|[\n\r\u2028\u2029]")
-
-
 def _js_code(text: str) -> list[str]:
-    """The code of a TypeScript/JavaScript source with comments removed, by :func:`_strip_comments`.
+    """The code of a TypeScript/JavaScript source, one entry per line, with comments blanked by
+    :func:`js_lexer.blank_js_comments`, which skips string, template and regex literals.
 
     BACKLOG #5578: the old rule skipped every line starting ``/*`` or ``*``, which hid a call after
-    an inline ``/* */`` and a call on a ``*`` continuation line.
+    an inline ``/* */`` and a call on a ``*`` continuation line; a line rule that tracked block state
+    instead hid code after a template-literal line starting ``/*``. A literal is kept as code, so a
+    call or a prose mention inside a string still counts, which errs toward scanning too much. At
+    least the literal misreads THE RESIDUAL in crypto_operations.py lists can still hide code.
+
+    The JS line terminators CR, CRLF, U+2028 and U+2029 are folded to ``\\n`` first, because each ends
+    a ``//`` comment and the lexer ends one only at ``\\n``. A leading BOM is dropped, so a BOM-led
+    ``/**`` still opens its comment.
 
     The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
     lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
     is unusable."""
-    return _strip_comments(_JS_LINE_BREAK.split(text), "//", "/*", "*/", rescan_unterminated=True)
+    text = text.removeprefix("\ufeff")
+    for terminator in ("\r\n", "\r", "\u2028", "\u2029"):
+        text = text.replace(terminator, "\n")
+    return js_lexer.blank_js_comments(text).split("\n")
 
 
 def randomness_tokens_in(text: str) -> set[str]:
@@ -3057,12 +2998,38 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
 
 
 def _powershell_code(text: str) -> list[str]:
-    """The code of a PowerShell source with comments removed, by :func:`_strip_comments`. A
-    single-line ``<# ... #>`` after code is left in place and scanned. Split by ``splitlines``, as
-    before the stripper was shared, and with no re-scan of an unterminated ``<#``, which keeps
-    ``scripts/asvs/scorecard.py``'s copy of these decisions (``_powershell_code_only``) in step;
-    ``tests/test_asvs_scorecard.py`` pins that parity."""
-    return _strip_comments(text.splitlines(), "#", "<#", "#>", rescan_unterminated=False)
+    """The code of a PowerShell source, one entry per line, with comments removed.
+
+    A line whose code starts with ``#`` is a comment. A ``<#`` opens a block comment only where it
+    STARTS the remaining code on a line; code after the block's ``#>`` on the same line is kept. A
+    ``<#`` anywhere else (inside a trailing ``#`` comment, a string, or after code) never opens a
+    block, so it cannot hide the lines that follow. A single-line ``<# ... #>`` after code is left in
+    place and scanned. Every choice here errs toward scanning too much, never too little, except the
+    one the residual in crypto_operations.py names: a string that STARTS a line with ``<#``."""
+    code: list[str] = []
+    in_block = False
+    for raw in text.splitlines():
+        line = raw
+        if in_block:
+            end = line.find("#>")
+            if end < 0:
+                continue
+            line = line[end + 2 :]
+            in_block = False
+        while True:
+            stripped = line.lstrip()
+            if not stripped.startswith("<#"):
+                break
+            end = stripped.find("#>", 2)
+            if end < 0:
+                in_block = True
+                line = ""
+                break
+            line = stripped[end + 2 :]
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            code.append(line)
+    return code
 
 
 def powershell_operation_tokens_in(text: str) -> set[str]:
