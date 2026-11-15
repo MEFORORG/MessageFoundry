@@ -76,16 +76,15 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  *    another entry. Measured through Python 3.14.7's open, it dropped at least every trailing dot
  *    and space from the file name and one trailing dot from a folder name, and kept a folder name's
  *    trailing space. The check refuses every such name, the ones kept as written included. Then
- *    every existing path below
- *    the workspace folder, down to the target, must lstat as
- *    not a link, a dangling one included; the walk stops at the first that does not exist. The
- *    deepest existing one must then realpath to the folder's own realpath joined with the same
- *    parts, because lstat does not report every reparse point as a link, at least not a junction
- *    onto a volume GUID path. An lstat error other than ENOENT or ENOTDIR, or any realpath error,
- *    refuses. An 8.3 short name below the folder is refused too, since realpath spells it in full.
- *    The workspace folder the operator opened, or trusted, is taken as given and is not checked: it
- *    may be a link, and a repository's `.code-workspace` file can choose it, since the workspace
- *    folder used is the first in `folders`.
+ *    every existing path below the workspace folder, down to the target, must lstat as not a link,
+ *    a dangling one included; the walk stops at the first that does not exist. The deepest
+ *    existing one must then realpath to the folder's own realpath joined with the same parts,
+ *    because lstat does not report every reparse point as a link, at least not a junction onto a
+ *    volume GUID path. An lstat error other than ENOENT or ENOTDIR, or any realpath error, the
+ *    folder's own included, refuses. An 8.3 short name below the folder is refused too, since
+ *    realpath spells it in full. The workspace folder the operator opened, or trusted, is taken as
+ *    given and is not checked for a link: it may be one, and a repository's `.code-workspace` file
+ *    can choose it, since the workspace folder used is the first in `folders`.
  * 3. User-set value: the operator's own choice. If it lies inside the workspace folder as spelled,
  *    the default `messagefoundry.toml` included, it gets the checks of rule 2, and the folder itself
  *    is refused. Otherwise it is accepted as written, with no file-system call.

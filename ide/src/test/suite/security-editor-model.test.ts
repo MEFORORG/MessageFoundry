@@ -69,10 +69,14 @@ function unlinkLinks(dir: string): void {
   }
 }
 
-/** The 8.3 short spelling of the existing folder `long`, as cmd's `%~s` prints it, or undefined
- *  where cmd fails or prints no folder that exists, as for a name its code page cannot print. It is
- *  `long` itself where the volume made no short name for it. */
+/** The 8.3 short spelling of the existing folder `long`, as cmd's `%~s` prints it, with every
+ *  component that has a short name shortened, or undefined where `long` holds a character cmd
+ *  would expand, cmd fails, or it prints no folder that exists, as for a name its code page cannot
+ *  print. It is `long` itself where no component has a short name. */
 function shortName(long: string): string | undefined {
+  if (/[%*?"^&]/.test(long)) {
+    return undefined;
+  }
   const r = spawnSync("cmd.exe", ["/d", "/s", "/c", `"for %I in ("${long}") do @echo %~sI"`], {
     encoding: "utf8",
     windowsVerbatimArguments: true,
@@ -90,13 +94,16 @@ suite("security editor host checks", () => {
     outside = fs.mkdtempSync(path.join(os.tmpdir(), "mf-secedit-out-"));
   });
   teardown(() => {
-    for (const dir of [ws, outside]) {
-      if (fs.existsSync(dir)) {
-        unlinkLinks(dir);
+    try {
+      for (const dir of [ws, outside]) {
+        if (fs.existsSync(dir)) {
+          unlinkLinks(dir);
+        }
       }
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
     }
-    fs.rmSync(ws, { recursive: true, force: true });
-    fs.rmSync(outside, { recursive: true, force: true });
   });
 
   test("a path inside the workspace resolves to its absolute file, existing or not, at either scope", () => {
@@ -253,14 +260,15 @@ suite("security editor host checks", () => {
     }
     const longDir = path.join(ws, "mf-secedit-long-folder-name");
     fs.mkdirSync(path.join(longDir, "ws", "conf"), { recursive: true });
-    const spelled = (p: string) => path.resolve(p).toLowerCase();
+    const same = (a: string, b: string) => path.relative(a, b) === "";
     const shortDir = shortName(longDir);
     let base: string;
-    if (shortDir !== undefined && spelled(shortDir) !== spelled(longDir)) {
+    if (shortDir !== undefined && !same(shortDir, longDir)) {
       base = shortDir;
-    } else if (spelled(real.realpath(ws)) !== spelled(ws)) {
-      // The new folder got no short name, but os.tmpdir() already spells an ancestor as an alias,
-      // as the CI runner's RUNNER~1, so the long folder is itself reached through one.
+    } else if (ws.split(path.sep).some((part) => /~\d+$/.test(part)) && !same(real.realpath(ws), ws)) {
+      // Nothing got a short name now, but os.tmpdir() already spells an ancestor in the 8.3 form,
+      // as the CI runner's RUNNER~1, and realpath spells it otherwise, so the long folder is itself
+      // reached through one.
       base = longDir;
     } else {
       // Measured: cmd's %~s printed no short name for the new folder, and no ancestor is spelled
