@@ -134,9 +134,11 @@ def counts_under_dek(cipher: Cipher | None) -> bool:
 #: database's order. A settlement refund replaces the cipher's total with the one its add returned, so
 #: a refund granted after a later refill would leave the cipher's figure below the persisted one by a
 #: whole block: an under-count, the one direction this bound may never drift. One lock per loop,
-#: because an ``asyncio.Lock`` is bound to the loop it first waits on; both maps are weak, so neither
-#: keeps a closed store's key material or a closed loop alive. The guard serializes the map itself,
-#: since a cipher may be shared with code running in a worker thread.
+#: because an ``asyncio.Lock`` is bound to the loop it first waits on. Both maps are weak, so a closed
+#: store's key material is never kept alive; a lock that was ever contended does hold its loop, until
+#: the cipher goes. The guard serializes the map itself, since a cipher may be shared with code
+#: running in a worker thread. RESIDUAL: passes on two different loops are not serialized against
+#: each other; nothing in the engine runs one cipher's passes on two loops at once.
 _PASS_LOCKS: weakref.WeakKeyDictionary[
     AesGcmCipher, weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]
 ] = weakref.WeakKeyDictionary()
@@ -146,7 +148,9 @@ _PASS_LOCKS_GUARD = threading.Lock()
 def _pass_lock(bound: AesGcmCipher) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     with _PASS_LOCKS_GUARD:
-        per_loop = _PASS_LOCKS.setdefault(bound, weakref.WeakKeyDictionary())
+        per_loop = _PASS_LOCKS.get(bound)
+        if per_loop is None:
+            per_loop = _PASS_LOCKS[bound] = weakref.WeakKeyDictionary()
         lock = per_loop.get(loop)
         if lock is None:
             lock = per_loop[loop] = asyncio.Lock()
@@ -172,7 +176,9 @@ def idle_checkpoint_total(cipher: Cipher | None, *, settle: bool = False) -> int
     return bound.cumulative_invocations()
 
 
-async def _add_then_grant(bound: AesGcmCipher, add: AddInvocations, need: int) -> None:
+async def _add_then_grant(
+    bound: AesGcmCipher, add: AddInvocations, need: int, *, floor: int | None = None
+) -> None:
     """Run the persisted add and the in-memory grant as one unit a caller's cancellation cannot split.
 
     The add runs in its own task, which nothing here cancels, so a cancellation of the caller cannot
@@ -187,7 +193,10 @@ async def _add_then_grant(bound: AesGcmCipher, add: AddInvocations, need: int) -
     statement and acquire timeouts while the database is unreachable. THE RESIDUAL: a cancellation
     of the add task ITSELF, which only a shutdown that cancels every task delivers, can still split
     the pair; a split reservation over-counts, and a split refund is the final settlement of a
-    process that encrypts nothing after it."""
+    process that encrypts nothing after it.
+
+    ``floor`` is the cipher's figure before a strict pass: the grant's total is raised to at least
+    ``floor + need``, so reading a row another handle never charged cannot lower the figure."""
     task = asyncio.ensure_future(add(bound.invocation_key_id, need))
     cancelled = False
     while not task.done():
@@ -211,13 +220,21 @@ async def _add_then_grant(bound: AesGcmCipher, add: AddInvocations, need: int) -
             )
             raise asyncio.CancelledError from exc
         raise
+    if floor is not None:
+        total = max(total, floor + need)
     bound.grant_invocations(need, total)
     if cancelled:
         raise asyncio.CancelledError
 
 
 async def _account(
-    bound: AesGcmCipher, add: AddInvocations, need: int, what: str, *, strict: bool = False
+    bound: AesGcmCipher,
+    add: AddInvocations,
+    need: int,
+    what: str,
+    *,
+    strict: bool = False,
+    floor: int | None = None,
 ) -> None:
     """Charge ``need`` to the key's persisted total and grant it to the cipher.
 
@@ -230,7 +247,7 @@ async def _account(
     key's total here. Otherwise a failed add on a hydrated cipher is logged and retried: its figure
     then carries the key's lifetime total, so the ceiling still holds against it."""
     try:
-        await _add_then_grant(bound, add, need)
+        await _add_then_grant(bound, add, need, floor=floor)
     except Exception as exc:
         if strict or not bound.invocation_bound_hydrated:
             raise CipherError(
@@ -273,22 +290,28 @@ async def checkpoint_invocations(
     if bound is None:
         return None
     async with _pass_lock(bound):
+        if settle and not bound.invocation_bound_enabled:
+            # Nothing was reserved, so nothing is owed; enabling here would leave a bound that has
+            # read no row, and the cipher would refuse every later encrypt.
+            return bound.cumulative_invocations()
         if not bound.invocation_bound_enabled:
             # First contact: switch the cipher onto the persisted bound so the very first block is
             # reserved before it is spent.
             bound.enable_invocation_bound()
+        floor = None
         if strict:
             # Any reserve the cipher still holds was charged to the row another handle read, not to
             # this one, so it is forfeited: an over-count at worst. That also leaves a shortfall, so
             # a strict pass always reads this store's row.
             bound.forfeit_invocation_reserve()
+            floor = bound.cumulative_invocations() if bound.invocation_bound_hydrated else None
         need = _pass_need(bound, settle=settle)
         # A settlement grant zeroes the reserve exactly (remaining was `-need`), so a repeated settle
         # is a no-op — in EITHER direction, an overspend charged or an unspent reserve refunded; a
         # refill grant hands over a fresh block.
         if need:
             what = "settling" if settle else "checkpointing"
-            await _account(bound, add, need, what, strict=strict)
+            await _account(bound, add, need, what, strict=strict, floor=floor)
         return bound.cumulative_invocations()
 
 

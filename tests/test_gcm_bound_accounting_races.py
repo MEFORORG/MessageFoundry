@@ -160,3 +160,27 @@ async def test_a_strict_pass_fails_closed_even_on_a_hydrated_cipher() -> None:
     await checkpoint_invocations(cipher, exhausted.add, strict=True)
     with pytest.raises(CipherError, match="invocation ceiling"):
         cipher.encrypt("x")
+
+
+async def test_a_strict_pass_against_a_row_another_handle_never_charged_never_lowers_the_count() -> (
+    None
+):
+    """Round-2 review case: a cipher hydrated against one row, with real spend, then a strict pass
+    against a fresh row. The fresh row's total alone would put the figure back near zero."""
+    cipher = _cipher()
+    await checkpoint_invocations(cipher, _Row().add)
+    for _ in range(3):
+        cipher.encrypt("x")
+    before = cipher.cumulative_invocations()
+    assert before == 3
+    await checkpoint_invocations(cipher, _Row().add, strict=True)
+    assert cipher.cumulative_invocations() >= before
+
+
+async def test_a_settle_before_any_pass_leaves_the_cipher_able_to_encrypt() -> None:
+    row = _Row()
+    cipher = _cipher()
+    assert await checkpoint_invocations(cipher, row.add, settle=True) == 0
+    assert not cipher.invocation_bound_enabled
+    cipher.encrypt("x")  # nothing was reserved, so nothing refuses
+    assert row.total == 0

@@ -85,9 +85,11 @@ build does not assume they are covered:
   `_charge_archive_invocations` runs. The frames stay in `self._frames`. The next run that finishes
   its build charges them, under its own key. A one-shot `backup`, or a rotation in between, loses
   them or charges the wrong key. The charge itself also logs and swallows a failed add.
-- **A failing counter write falls back quietly.** `checkpoint_invocations` and
-  `reserve_invocations_ahead` log a warning and fall back to the in-process count when the add
-  fails. If `cipher_meta` writes keep failing, each restart restarts from a stale row.
+- **A failing counter write falls back quietly, once the count has been read.** After a pass
+  has read the key's persisted total, `checkpoint_invocations` and `reserve_invocations_ahead`
+  log a warning and fall back to the in-process count when the add fails. If `cipher_meta` writes
+  keep failing, each restart restarts from a stale row. Before that first read, and on a store
+  open's first pass, a failed add raises and the cipher refuses to encrypt (BACKLOG #5608).
 - **The full restore-verify opens a scratch copy under the live key.** Both
   `[backup].full_restore_verify` and the CLI `restore-verify --full` reach `_full_open_check`, which
   opens the snapshot through the real store. Anything that open seals is charged only to the

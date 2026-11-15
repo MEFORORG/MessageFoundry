@@ -2018,7 +2018,9 @@ class AesGcmCipher(_UnmarkedPolicy):
 
         A store open calls this through its strict first pass: a reserve still held was charged to
         the row another store handle read, so counting it against this store's row would subtract
-        invocations that row never saw. Dropping it can only over-count."""
+        invocations that row never saw. Dropping it can only raise the figure; the strict pass also
+        floors its grant at the figure from before (``gcm_bound._add_then_grant``), so reading a row
+        that other handle never charged cannot lower it either."""
         with self._count_lock:
             self._reserve_remaining = min(self._reserve_remaining, 0)
 
