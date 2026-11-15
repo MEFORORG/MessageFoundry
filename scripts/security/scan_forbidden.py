@@ -53,7 +53,7 @@ Token-file format (sectioned; ``#`` comments and blank lines ignored):
 Usage:
   scan_forbidden.py [FILE ...]      # scan the given files (how pre-commit invokes it)
   scan_forbidden.py --path DIR      # scan every text file under DIR
-  scan_forbidden.py --show-context  # also print the matched line/value (NEVER used in CI -- a hit
+  scan_forbidden.py --show-context ...  # FIRST argument only; also print the matched line/value (NEVER used in CI -- a hit
                                     #   means the content already sits in a tracked file, so echoing
                                     #   it would copy the leak into public CI logs; default is
                                     #   reasons-only: location + category, never the matched text)
@@ -70,8 +70,11 @@ Usage:
                                     #   built for, because a ratio that silently drops those reads as
                                     #   full coverage over a hole.
 
-Exit: 0 clean, 1 forbidden content found (fail closed), 2 usage error / required-tokens-missing /
-self-test failure (an instrument that cannot see is not a content hit; the two need different fixes).
+Exit: 0 clean, 1 forbidden content found (fail closed), 2 for an instrument that cannot see, at least a
+usage error, required tokens missing, a self-test failure, a --path run that read no file, and an
+unreadable file with no content hit beside it (it is not a content hit; the two need different fixes).
+The terminal modes (--print-detector-counts, --assert-floor-fresh, --self-test, --pr-body) count only
+as the whole command line.
 """
 
 from __future__ import annotations
@@ -668,7 +671,7 @@ _PR_WINDOW = 80
 #: The tag is a real tag name with attributes holding no `<` or `>`: `[^>]*` swallowed an autolink, or
 #: everything from `n<max` to the `>` of a later `->`, as one tag and took its code path with it.
 _PR_SENTENCE_SPLIT = re.compile(
-    r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][\w-]*(?:\s[^<>]*)?/?>\s*"
+    r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|\s*</?[A-Za-z][\w-]*(?:\s+[\w-]+\s*=[^<>]*)?\s*/?>\s*"
 )
 _PR_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
 _PR_HEADING = re.compile(r"#{1,6}\s")
@@ -685,8 +688,11 @@ _PR_MD_LINK = re.compile(r"\[([^\]\n]*)\]\(([^)\s]*)\)")
 #: scan stops at the next tag and a long line of unclosed tags stays linear.
 _PR_INLINE_TAG = re.compile(
     r"</?(?i:(code|kbd|samp|tt)|a|abbr|b|cite|del|dfn|em|i|ins|mark|q|s|small|span|strong|sub|sup|u|var)"
-    r"(?=[\s/>])([^<>\n]*)>"
+    r"(?:\s+([\w-]+\s*=[^<>\n]*))?\s*/?>"
 )
+#: A dotted number inside a link target, which a target reading must not take as a requirement id: a
+#: GitHub ``blob/8.1.8/CHANGES.rst`` link is a version and a path, never a map.
+_PR_TARGET_NUMBER = re.compile(r"\d+(?:\.\d+)+")
 PR_BODY_REASONS = {
     "verdict": "requirement verdict (a requirement id beside its verdict)",
     "gap": "requirement gap (a requirement id beside a gap or residual)",
@@ -701,10 +707,13 @@ def _pr_inline(line: str, targets: bool) -> str:
     def tag(m: re.Match[str]) -> str:
         if m.group(1):
             return "`"
-        return f" {m.group(2)} " if targets and m.group(2).strip() else ""
+        attrs = m.group(2)
+        return f" {_PR_TARGET_NUMBER.sub('n', attrs)} " if targets and attrs else ""
 
-    line = _PR_INLINE_TAG.sub(tag, line)
-    return _PR_MD_LINK.sub(r"\1 \2" if targets else r"\1", line)
+    def link(m: re.Match[str]) -> str:
+        return f"{m.group(1)} {_PR_TARGET_NUMBER.sub('n', m.group(2))}" if targets else m.group(1)
+
+    return _PR_MD_LINK.sub(link, _PR_INLINE_TAG.sub(tag, line))
 
 
 def _pr_units(body: str, targets: bool = False) -> list[tuple[list[tuple[int, int]], str, bool]]:
@@ -727,7 +736,11 @@ def _pr_units(body: str, targets: bool = False) -> list[tuple[list[tuple[int, in
             parts.clear()
 
     for lineno, raw in enumerate(body.splitlines(), 1):
-        line = _pr_inline(_PR_QUOTE.sub("", raw.strip(), count=1).strip(), targets).strip()
+        unquoted = _PR_QUOTE.sub("", raw.strip(), count=1).strip()
+        line = _pr_inline(unquoted, targets).strip()
+        # A line that held only inline tags is transparent, not a paragraph break.
+        if unquoted and not line:
+            continue
         if not line:
             flush()
             continue
@@ -1036,16 +1049,17 @@ SKIP_PATHS = ("scripts/security/scan-tokens.local.txt",)
 #: A vendored JavaScript action's compiled bundle, which .gitignore re-includes under the same glob. It
 #: is third-party code bundled from node_modules, so the name detectors false-positive on it; its own
 #: source beside it is scanned. This is the narrowed form of what the blanket ``dist`` directory skip
-#: did for it before BACKLOG #5585: only this location, not every ``dist`` segment in the tree.
-_VENDORED_ACTION_BUNDLE = re.compile(r"\.github/actions/(?:[^/]+/)+dist/")
+#: did for it before BACKLOG #5585: only a .js file directly in such a dist directory, and no path with a
+#: ``.`` or ``..`` component, not every ``dist`` segment in the tree.
+_VENDORED_ACTION_BUNDLE = re.compile(r"\.github/actions/(?:[\w-][\w.-]*/)+dist/[\w-][\w.-]*\.js")
 
 
 def _is_skipped(posix: str) -> bool:
     # ``posix`` is ALWAYS relative to the scan root (main() derives it that way in --path mode too), so
     # this is an EXACT path match, never a suffix match. A suffix test would skip a same-named file at a
-    # different path, which must still be scanned. The bundle pattern is anchored by ``match`` for the
+    # different path, which must still be scanned. The bundle pattern is a ``fullmatch`` for the
     # same reason.
-    return posix in SKIP_PATHS or _VENDORED_ACTION_BUNDLE.match(posix) is not None
+    return posix in SKIP_PATHS or _VENDORED_ACTION_BUNDLE.fullmatch(posix) is not None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2459,7 +2473,8 @@ def main(argv: list[str]) -> int:
 
     # 2, not 1: an unread file is an instrument that could not see, which wants its permissions or lock
     # fixed, not content removed. The same split as --self-test's.
-    if unreadable:
+    # A content hit outranks it: a confirmed leak keeps exit 1 and its own advice, beside the unread list.
+    if unreadable and len(hits) == unreadable:
         _report_hits(
             "UNREADABLE FILES -- their content was not scanned (fail closed):",
             hits,

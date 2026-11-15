@@ -1449,3 +1449,58 @@ def test_the_target_reading_adds_maps_only_and_hits_stay_in_line_order(sf) -> No
     )
     lines = [int(h.split(":")[1]) for h in sf.scan_pr_body(body)]
     assert lines == sorted(lines) and len(lines) == 3, lines
+
+
+@pytest.mark.parametrize("lead", ["<a", "<b", "<i", "<em"])
+def test_a_bracket_before_an_inline_tag_name_does_not_swallow_a_verdict(sf, lead: str) -> None:
+    """Round 2: a bare ``<a`` followed by words is no tag, in either the inline pass or the split."""
+    line = f"Latency stays {lead} second; ASVS {_REQ} stays {_PARTIAL} -> fine."
+    assert "verdict" in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'Sourced from <a href="https://github.com/example/lib/blob/8.1.8/CHANGES.rst">its changelog</a>.',
+        "See [changelog](https://github.com/example/lib/blob/3.4.5/CHANGES.rst).",
+    ],
+)
+def test_a_version_inside_a_link_target_is_not_a_requirement(sf, line: str) -> None:
+    assert sf.scan_pr_body(line) == [], line
+
+
+def test_a_line_of_only_inline_tags_does_not_break_the_paragraph(sf) -> None:
+    body = f'ASVS {_REQ} stays\n<a name="x"></a>\n{_PARTIAL} for now.'
+    assert "verdict" in _pr_kinds(sf, body)
+
+
+def test_a_content_hit_beside_an_unreadable_file_keeps_exit_1(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    locked = root / "locked.md"
+    locked.write_text("fine\n", encoding="utf-8")
+    (root / "leak.md").write_text("contact ACME\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self == locked:
+            raise PermissionError(13, "denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert sf_main.main(["--path", str(root)]) == 1
+
+
+@pytest.mark.parametrize(
+    "rel", [".github/actions/example/dist/README.md", ".github/actions/example/dist/../../leak.js"]
+)
+def test_the_bundle_skip_covers_only_a_compiled_js_file(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rel: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".github/actions/example/dist").mkdir(parents=True)
+    target = (tmp_path / rel).resolve()
+    target.write_text("contact ACME\n", encoding="utf-8")
+    assert sf_main.main([rel]) == 1
