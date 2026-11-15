@@ -906,6 +906,61 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
             "  return review(r)\n}))\n",
             6,
         ),
+        (
+            "a generator method after a class field with no initializer",
+            "function review(r) { return agent(r) }\nawait review(0)\nclass A {\n  x\n"
+            "  *review(r) { return 1 }\n}\n",
+            1,
+        ),
+        (
+            "a generator method after a class field holding an arrow block",
+            "function review(r) { return agent(r) }\nawait review(0)\nclass A {\n"
+            "  h = () => {}\n  *review(r) { return 1 }\n}\n",
+            1,
+        ),
+        (
+            "a function declared after return and a line break",
+            "export default async function main() {\n  const R = [1, 2, 3]\n"
+            "  await parallel(R.map(r => () => review(r)))\n  return\n"
+            "  function review(r) { return agent(r) }\n}\n",
+            3,
+        ),
+        (
+            "a regex after a function declared under return",
+            "if (x) return\nfunction g() {}\n/'/.test(s) && await agent(1)\n",
+            1,
+        ),
+        (
+            "a function declared after a case label",
+            "switch (x) {\n  case 1: function g() {}\n  /'/.test(s) && await agent(1)\n}\n",
+            1,
+        ),
+        (
+            "an object method named async on the next line",
+            "function review(r) { return agent(r) }\nawait review(0)\n"
+            "const o = { async\n, review(r) { return 1 } }\n",
+            1,
+        ),
+        (
+            "an arrow block body is not called by the next line",
+            "const g = r => () => { return 1 }\n[1, 2].forEach(x => agent(x))\ng(1)\ng(2)\n",
+            2,
+        ),
+        (
+            "a regex after an arrow block body",
+            "const f = () => {}\n/'/.test(s) && await agent(1)\n",
+            1,
+        ),
+        (
+            "an object method named agent",
+            "const o = { agent(r) { return 1 } }\nawait agent(1)\n",
+            1,
+        ),
+        (
+            "a regex flag named like an array",
+            "const g = [1, 2, 3]\nconst ok = /x/g.test(s)\nawait parallel(g.map(r => () => agent(r)))\n",
+            3,
+        ),
     ],
 )
 def test_shapes_the_helper_rules_must_not_misread(

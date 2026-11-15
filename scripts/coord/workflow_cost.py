@@ -331,6 +331,7 @@ _MODIFIERS["object"] = _MODIFIERS["class"] - {"static"}
 # Tokens that can name a class or object member.
 _KEY_KINDS = frozenset(["word", "private", "string", "number"])
 _WORD_RE = re.compile(r"(?:[^\W\d]|\$)[\w$]*")
+_FLAGS_RE = re.compile(r"[A-Za-z]*")  # a regex literal's flags, part of the literal
 _NUMBER_RE = re.compile(
     r"(?:0[xXoObB][\da-fA-F_]+|(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d+)?)n?"
 )
@@ -344,11 +345,13 @@ _PUNCT_RE = re.compile(
 def _continues(cat: str, text: str, nxt: int) -> bool:
     """Whether an expression whose line ends in a token of category ``cat`` goes on at ``nxt``.
 
-    THE ONE CONTINUATION TEST. A line ending in an operator awaits its operand, whatever the next
-    line opens with. Otherwise the next line continues it only by opening with a binary operator: a
+    THE ONE CONTINUATION TEST. A line ending a statement or opening a block goes on to nothing. A
+    line ending in an operator awaits its operand, whatever the next line opens with. Otherwise the next line continues it only by opening with a binary operator: a
     ``++``/``--`` there is a prefix operator after an inserted ``;``, and a postfix result cannot be
     called, indexed or dotted, so ASI splits before ``(``, ``[`` and ``.`` after one.
     """
+    if cat == _END:  # nothing continues a statement that has ended, or a block that opened
+        return False
     leads = not text.startswith(_POSTFIX, nxt) and _LEADS_ON_RE.match(text, nxt) is not None
     if cat == _AFTER_POSTFIX:
         return leads and text[nxt] not in "([."
@@ -493,7 +496,8 @@ class _Lexer:
                 end, kind = self.template(i), "template"
             # A regex that does not close on its line is division, which keeps the scan in sync.
             elif c == "/" and st.cat not in _VALUES and (closed := _regex_close(src, i)) != -1:
-                end, kind = closed + 1, "regex"
+                flags = _FLAGS_RE.match(src, closed + 1)
+                end, kind = (flags.end() if flags else closed + 1), "regex"
             elif m := _WORD_RE.match(src, i):
                 end, kind = m.end(), "word"
             elif c == "#" and (m := _WORD_RE.match(src, i + 1)):
@@ -517,6 +521,8 @@ class _Lexer:
         """Classify one token and move the bracket and member state past it."""
         text = self.src[start:end]
         top = st.stack[-1]
+        if st.newline and st.cat == _RESTRICTED:
+            st.cat = _END  # `return`, `throw`, `yield` take a `;` at a line break
         brk = st.newline and not _continues(st.cat, self.src, start)
         if brk:
             top.conditionals = 0  # an inserted `;` ends the statement and its conditionals
@@ -581,6 +587,8 @@ class _Lexer:
     @staticmethod
     def expression(st: _Scan) -> bool:
         """Whether a ``class`` or ``function`` keyword here starts an expression."""
+        if st.text == ":" and st.colon == "label":  # a labelled or `case` declaration
+            return False
         cat, kw = (st.cat2, st.kw2) if st.text == "async" else (st.cat, st.kw)
         return cat in (_OPERAND, _RESTRICTED) and kw not in ("export", "else", "do")
 
@@ -600,8 +608,8 @@ class _Lexer:
             return _Frame("{", "block", st.params.closes_value, owner=st.params.owner)
         if role == "static":
             return _Frame("{", "block", False, owner=top)
-        if st.text == "=>":
-            return _Frame("{", "block")
+        if st.text == "=>":  # nothing calls, indexes or operates on an arrow function
+            return _Frame("{", "block", False)
         heads = st.classes
         if heads and heads[-1][0] == len(st.stack) and (st.kw == "class" or st.cat == _VALUE):
             return _Frame("{", "class", heads.pop()[1], member="start")
@@ -615,16 +623,15 @@ class _Lexer:
         After a statement's end, a ``)`` or a value it opens a block -- a ``;`` is inserted ahead
         of it after a value -- and after an operator it opens an object. After a ``:`` it takes
         the colon's kind: an object key's or a conditional's value, or a label's or ``case``'s
-        statement. ``return`` and ``yield`` take a ``;`` at a line break, so a ``{`` on the next
-        line opens a block.
+        statement. ``return`` and ``yield`` take a ``;`` at a line break, which ``token`` reads
+        as a statement's end, so a ``{`` on the next line opens a block.
         """
         if st.cat == _END:
             return "block"
         if st.text == ":":
             return "object" if st.colon in ("key", "cond") else "block"
         if st.kw:
-            broken = st.cat == _RESTRICTED and st.newline
-            return "object" if st.kw in _EXPRESSION_WORDS and not broken else "block"
+            return "object" if st.kw in _EXPRESSION_WORDS else "block"
         return "block" if st.cat in _VALUES else "object"
 
     def close(self, st: _Scan, text: str) -> str:
@@ -697,7 +704,7 @@ class _Lexer:
                 return ""
             if state == "mod":
                 if fr.modifier == "async" and st.newline:
-                    fr.member = "start"  # `async` then a line break is a field named async
+                    fr.member = "named"  # no modifier across a line break: `async` is the name
                     continue
                 if kind == "word" and text in _MODIFIERS[fr.kind]:
                     fr.name, fr.modifier = name, text
@@ -733,7 +740,7 @@ class _Lexer:
                 return ""
             if text == "}":
                 return ""
-            if cls and brk:  # a field with no initializer, ended by a line break
+            if cls and st.newline:  # a field with no initializer: a line break ends it
                 fr.member = "start"
                 continue
             fr.member = "init"
@@ -1234,7 +1241,7 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
             continue
         # `{ review(r) {...} }` or `get review() {` defines a method of the same name: a function
         # value, not a call. The lexer read which names head a method.
-        method_head = bool(helper) and m.start() in ctx.method_heads
+        method_head = m.start() in ctx.method_heads
         if (helper or hook) and not method_head:
             open_idx = m.end() - 1
             close = _match_bracket(ctx.masked, open_idx)
