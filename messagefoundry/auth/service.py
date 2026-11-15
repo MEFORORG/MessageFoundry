@@ -12605,9 +12605,10 @@ class AuthService:
         A row that fails its integrity seal is ended and reported, by :meth:`_load_session`, as
         every read of a session row is. Unlike :meth:`identity_for_token`, this method touches no
         session, and a row it refuses after that read, on its clock, its owner's lapsed temporary
-        credential or its epoch, reads ``False``, is not audited, and is left as it is. So a session a sign-in start presents
-        is still there for the callback's supersession to end and record (BACKLOG #3749). An
-        account record that fails its own seal is reported, as every read of it is.
+        credential or its epoch, reads ``False``, is not audited, and is left as it is. So a
+        session a sign-in start presents is still there for the callback's supersession to end,
+        and a lapsed credential is recorded there (BACKLOG #3749). An account record that fails
+        its own seal is reported, as every read of it is.
         """
         if not token:
             return False

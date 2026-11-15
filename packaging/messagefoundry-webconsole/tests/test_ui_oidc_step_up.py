@@ -335,8 +335,8 @@ _EXPIRY_HOURS = 72
 
 
 async def _lapsed_local_sessions(service: AuthService, engine: Engine) -> tuple[str, str]:
-    """Two sessions of a local account whose admin-issued temporary credential lapsed a minute
-    after both were opened: the one a test presents, and one for its control."""
+    """Two sessions of a local account whose admin-issued temporary credential lapsed, its
+    deadline backdated to a minute before now: the one a test presents, and one for its control."""
     user_id = await create_local_user_chosen(
         service,
         username="ivan",
