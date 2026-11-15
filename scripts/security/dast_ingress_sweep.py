@@ -29,8 +29,15 @@ the ingress path must do, and each judgement is a DETECTOR with a positive contr
 * ``resources`` -- heap, OS handles and asyncio tasks, measured across repeated passes of the
   catalogue after a warm-up pass, stay under a fixed growth bound. Instruments: ``tracemalloc``
   traced bytes, ``psutil`` handle (Windows) or descriptor (POSIX) count, ``len(asyncio.all_tasks())``.
-* ``log_body`` -- no log record at INFO or above carries message content. Every catalogue body
-  carries a per-run sentinel in PID-5, and a record whose rendered text contains it is a finding.
+* ``log_body`` -- no log record at INFO or above carries message content. Bodies carry a per-run
+  sentinel (:func:`run_sentinel`; HL7 in PID-5 or an NTE, X12 in the subscriber's NM1-03), and a
+  record whose rendered text contains it is a finding. ``tests/test_dast_ingress_sweep.py`` holds
+  every catalogue case and mutation seed to :func:`carries_sentinel`; the liveness probes carry it
+  too. NOT covered, at least: the header-only and framing-only cases, the trickle of
+  ``slowloris-in-frame`` (the listener closes it long before the sentinel's bytes arrive), a frame
+  that a split case such as ``end-byte-mid-body`` cuts off before the sentinel, and a mutation that
+  cuts the sentinel out (measured: about 45 percent of mutations). A log of any of those bodies
+  would be missed.
   This is a CALL-SITE check: the receipt also says whether the shipped redaction filters would have
   removed the hit, but a hit is a finding either way, because section 9 binds the call site.
 
@@ -90,15 +97,29 @@ DETECTORS = ("reply", "count_and_log", "liveness", "time", "resources", "log_bod
 VT, FS, CR = b"\x0b", b"\x1c", b"\r"
 STX, ETX = b"\x02", b"\x03"
 
-#: The seeds ADR 0191 fuzzes the parsers with in-process, reused here over a socket, and the one
-#: finding that harness has recorded, replayed at a live listener.
+#: The seeds ADR 0191 fuzzes the parsers with in-process, and the one finding that harness has
+#: recorded. They reach the socket with the sentinel appended (:func:`mutation_seeds`).
 _HL7_SEEDS = next(t for t in TARGETS if t.name == "hl7_peek").seeds
 #: A COMPLETE interchange. `next` raises at import when the committed sample is missing, which is
 #: loud; falling back to the fuzz target's truncated literal would make every raw-TCP and X12
 #: liveness probe report a false engine finding.
 _X12_SEED = next(s for s in next(t for t in TARGETS if t.name == "x12_peek").seeds if b"IEA" in s)
 _ISA_LEN = 106  # the fixed-width ISA segment, terminator included
-_IEA_AT = _X12_SEED.rindex(b"IEA")  # the closing IEA segment, which frames the interchange
+
+#: The subscriber's last name in the committed X12 seed, which :func:`x12_interchange` replaces
+#: with the sentinel. Checked at import, so a changed sample is loud rather than a silent no-op.
+_X12_NAME = b"NM1*IL*1*PATIENT*"
+if _X12_NAME not in _X12_SEED:
+    raise RuntimeError(f"the committed X12 seed no longer carries {_X12_NAME!r}")
+
+#: Bytes that only frame a message. A case whose bytes are nothing else has no body to carry a
+#: sentinel (an empty frame, an idle connection); every other case must carry it.
+FRAMING_BYTES = VT + FS + CR + STX + ETX
+
+#: Cases that write a bare header and no message content, so they carry no sentinel: adding one
+#: would change the shape they exist to send. ``msh-only`` is a lone unterminated MSH, and
+#: ``short-isa`` an ISA cut short, where any byte appended lands on its fixed separator offsets.
+HEADER_ONLY_CASES = frozenset({"mllp:msh-only", "x12:short-isa"})
 
 
 class PolicyError(ValueError):
@@ -142,6 +163,52 @@ def _b(text: str) -> bytes:
     return text.encode("utf-8")
 
 
+def x12_interchange(sentinel: str) -> bytes:
+    """The committed X12 seed with the sentinel as the subscriber's last name (NM1-03), so a logged
+    X12 body is recognisable (vault BACKLOG #5581). The ISA, and so its fixed width, is untouched."""
+    return _X12_SEED.replace(_X12_NAME, b"NM1*IL*1*" + _b(sentinel) + b"*", 1)
+
+
+def _hl7_with_sentinel(seed: bytes, sentinel: str) -> bytes:
+    """An HL7 fuzz seed with an ``NTE|1||<sentinel>`` segment appended (vault BACKLOG #5581).
+
+    Appended, so every byte of the seed reaches the socket as ADR 0191 wrote it; an NTE, so the
+    sentinel sits in message content rather than in a routing field the engine may log by design.
+    A seed that does not end on a segment terminator gets one first, so the NTE never runs on into
+    its last field; one that does gets none, so no blank segment is added. These are fuzz inputs
+    built as bytes, not messages the engine handles."""
+    lead = b"" if seed.endswith((b"\r", b"\n")) else b"\r"
+    return seed + lead + _b(f"NTE|1||{sentinel}\r")
+
+
+def _through_sentinel(body: bytes, sentinel: str) -> bytes:
+    """``body`` cut just past the sentinel, for a case that drops a connection mid-message."""
+    marker = _b(sentinel)
+    return body[: body.index(marker) + len(marker) + 1]
+
+
+def run_sentinel(seed: int) -> str:
+    """The run's sentinel, derived from its seed so a receipt's seed names it."""
+    return f"ZZDASTSENTINEL{seed:08X}"
+
+
+def case_bytes(case: Case) -> bytes:
+    """The bytes a case writes that reach the engine whole: payload and tail. The trickle is left
+    out, because the listener closes a trickling peer after its first few bytes."""
+    return case.payload + case.tail
+
+
+def carries_sentinel(case: Case, sentinel: str) -> bool:
+    """Whether a case's body carries the sentinel, or it has no body: framing bytes only, or a
+    bare header (:data:`HEADER_ONLY_CASES`)."""
+    data = case_bytes(case)
+    return (
+        _b(sentinel) in data
+        or not data.translate(None, FRAMING_BYTES)
+        or f"{case.plane}:{case.name}" in HEADER_ONLY_CASES
+    )
+
+
 def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
     """The fixed MLLP cases: broken framing first, then hostile HL7 inside a well-formed frame."""
 
@@ -151,6 +218,7 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
     good = msg("DAST-OK")
     pad = cap - len(msg("DAST-CAP")) - len("NTE|1||\r")
     exact = _b(hl7("DAST-CAP", sentinel, extra="NTE|1||" + "X" * pad + "\r"))
+    cut = _through_sentinel(good, sentinel)
     cases = [
         Case("well-formed", "mllp", frame(good)),
         Case("missing-start-vt", "mllp", good + FS + CR),
@@ -164,13 +232,13 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
         Case("pipelined-three", "mllp", frame(msg("P1")) + frame(msg("P2")) + frame(msg("P3"))),
         Case("split-seven-bytes", "mllp", frame(msg("SPLIT")), split=7),
         Case("noise-then-frame", "mllp", b"\x00\xffGARBAGE\r\n" * 16 + frame(good)),
-        Case("binary-garbage-frame", "mllp", frame(bytes(range(32, 256)) * 4)),
+        Case("binary-garbage-frame", "mllp", frame(bytes(range(32, 256)) * 4 + _b(sentinel))),
         Case("idle-after-connect", "mllp", b"", stall=True),
         Case("slowloris-in-frame", "mllp", VT, stall=True, trickle=good * 8),
-        Case("frame-then-truncated-drop", "mllp", frame(good), tail=VT + good[:30], abort=True),
-        Case("drop-mid-frame", "mllp", b"", tail=VT + good[:30], abort=True),
-        Case("oversize-frame", "mllp", VT + b"A" * (cap + 1)),
-        Case("frame-then-oversize", "mllp", frame(good) + VT + b"A" * (cap + 1)),
+        Case("frame-then-truncated-drop", "mllp", frame(good), tail=VT + cut, abort=True),
+        Case("drop-mid-frame", "mllp", b"", tail=VT + cut, abort=True),
+        Case("oversize-frame", "mllp", VT + _b(sentinel) + b"A" * (cap + 1)),
+        Case("frame-then-oversize", "mllp", frame(good) + VT + _b(sentinel) + b"A" * (cap + 1)),
         Case("exactly-at-cap", "mllp", frame(exact)),
         # Hostile HL7 inside a well-formed frame.
         Case("letter-field-separator", "mllp", frame(msg("SEP1", fs="A"))),
@@ -205,8 +273,8 @@ def mllp_catalogue(sentinel: str, cap: int) -> list[Case]:
     return cases
 
 
-def tcp_catalogue(cap: int) -> list[Case]:
-    x12 = _X12_SEED
+def tcp_catalogue(sentinel: str, cap: int) -> list[Case]:
+    x12 = x12_interchange(sentinel)
     return [
         Case("well-formed", "tcp", STX + x12 + ETX),
         Case("missing-stx", "tcp", x12 + ETX),
@@ -215,13 +283,15 @@ def tcp_catalogue(cap: int) -> list[Case]:
         Case("empty-frame", "tcp", STX + ETX),
         Case("invalid-utf8", "tcp", STX + x12.replace(b"ZZ", b"\xc0\xaf", 1) + ETX),
         Case("nul-in-body", "tcp", STX + x12.replace(b"ZZ", b"\x00\x00", 1) + ETX),
-        Case("oversize-frame", "tcp", STX + b"A" * (cap + 1)),
-        Case("drop-mid-frame", "tcp", b"", tail=STX + x12[:40], abort=True),
+        Case("oversize-frame", "tcp", STX + _b(sentinel) + b"A" * (cap + 1)),
+        Case("drop-mid-frame", "tcp", b"", tail=STX + _through_sentinel(x12, sentinel), abort=True),
     ]
 
 
-def x12_catalogue(cap: int) -> list[Case]:
-    x12 = _X12_SEED
+def x12_catalogue(sentinel: str, cap: int) -> list[Case]:
+    x12 = x12_interchange(sentinel)
+    # The oversize case keeps its ISA region as before, all separators, with the sentinel after it.
+    oversize = b"ISA" + b"*" * (_ISA_LEN - 3) + _b(sentinel) + b"*" * (cap + 1)
     return [
         Case("well-formed", "x12", x12),
         Case("noise-then-interchange", "x12", b"\x00\xffNOISE" * 32 + x12),
@@ -229,9 +299,9 @@ def x12_catalogue(cap: int) -> list[Case]:
         Case("short-isa", "x12", x12[:60]),
         Case("isa-without-iea", "x12", x12.replace(b"IEA", b"XEA")),
         Case("invalid-utf8", "x12", x12.replace(b"ZZ", b"\xc0\xaf", 1)),
-        Case("oversize-interchange", "x12", b"ISA" + b"*" * (cap + 1)),
+        Case("oversize-interchange", "x12", oversize),
         Case("idle-after-connect", "x12", b"", stall=True),
-        Case("drop-mid-interchange", "x12", b"", tail=x12[:120], abort=True),
+        Case("drop-mid-interchange", "x12", b"", tail=_through_sentinel(x12, sentinel), abort=True),
     ]
 
 
@@ -270,19 +340,31 @@ def mutate(rng: random.Random, seed: bytes, limit: int) -> bytes:
     return bytes(data[:limit])
 
 
+def mutation_seeds(sentinel: str) -> tuple[tuple[bytes, ...], bytes]:
+    """The HL7 seeds and the X12 interchange the mutator edits, every one carrying the sentinel so
+    the log_body detector can recognise a mutated body on either plane (vault BACKLOG #5581). A
+    mutation may still cut the sentinel out; the seed it starts from never lacks it."""
+    hl7_seeds = (
+        *(_hl7_with_sentinel(s, sentinel) for s in _HL7_SEEDS),
+        _b(hl7("MUTATE", sentinel)),
+    )
+    return hl7_seeds, x12_interchange(sentinel)
+
+
 def mutation_cases(seed: int, count: int, cap: int, sentinel: str) -> list[Case]:
-    """``count`` seeded mutations. HL7 seeds include one carrying the sentinel, so the log_body
-    detector can see a mutated body. X12 mutations edit only what lies between the fixed-width ISA
-    and the closing IEA: an edit inside the ISA moves the terminator and a lost IEA never closes the
-    interchange, and either way the X12 ingress path would go unreached."""
+    """``count`` seeded mutations of :func:`mutation_seeds`. X12 mutations edit only what lies
+    between the fixed-width ISA and the closing IEA: an edit inside the ISA moves the terminator and
+    a lost IEA never closes the interchange, and either way the X12 ingress path would go
+    unreached."""
     rng = random.Random(seed)  # nosec B311 (reproducible fuzz cases, seeded)
     limit = cap // 2
-    hl7_seeds = (*_HL7_SEEDS, _b(hl7("MUTATE", sentinel)))
+    hl7_seeds, x12 = mutation_seeds(sentinel)
+    iea_at = x12.rindex(b"IEA")  # the closing IEA segment, which frames the interchange
     cases = []
     for index in range(count):
         if index % 4 == 3:
-            body = mutate(rng, _X12_SEED[_ISA_LEN:_IEA_AT], limit - len(_X12_SEED))
-            plane, payload = "x12", _X12_SEED[:_ISA_LEN] + body + _X12_SEED[_IEA_AT:]
+            body = mutate(rng, x12[_ISA_LEN:iea_at], limit - len(x12))
+            plane, payload = "x12", x12[:_ISA_LEN] + body + x12[iea_at:]
         else:
             plane, payload = "mllp", frame(mutate(rng, rng.choice(hl7_seeds), limit))
         cases.append(Case(f"mutation-{index}", plane, payload, origin=f"mutation:{seed}:{index}"))
@@ -690,15 +772,17 @@ def _judge(result: CaseResult, got: bytes) -> None:
 
 
 async def probe_liveness(
-    target: IngressTarget, plane: str, index: int, budget: Budget
+    target: IngressTarget, plane: str, index: int, budget: Budget, sentinel: str
 ) -> str | None:
-    """A well-formed message on a fresh connection must be accepted and persisted. ``None`` = alive."""
+    """A well-formed message on a fresh connection must be accepted and persisted. ``None`` = alive.
+
+    The sweep passes its sentinel, so the body sent after every case is one log_body recognises."""
     if plane == "mllp":
-        payload = frame(_b(hl7(f"LIVE{index}", "LIVENESS")))
+        payload = frame(_b(hl7(f"LIVE{index}", sentinel)))
     elif plane == "tcp":
-        payload = STX + _X12_SEED + ETX
+        payload = STX + x12_interchange(sentinel) + ETX
     else:
-        payload = _X12_SEED
+        payload = x12_interchange(sentinel)
     before = await _counts(target, plane)
     try:
         reader, writer = await _connect(target, plane, budget)
@@ -800,7 +884,7 @@ async def _quiesce(target: IngressTarget, budget: Budget) -> int:
 
 
 async def measure_resources(
-    target: IngressTarget, cases: Sequence[Case], passes: int, budget: Budget
+    target: IngressTarget, cases: Sequence[Case], passes: int, budget: Budget, sentinel: str
 ) -> tuple[Resources, list[dict[str, str]]]:
     """Warm up with one pass, then measure growth across ``passes`` more. Every repeat is still
     judged, and a liveness probe closes each pass, so a defect that shows only on a repeat or a
@@ -815,7 +899,7 @@ async def measure_resources(
                 ).findings
             )
         for plane in PLANES:
-            if (failure := await probe_liveness(target, plane, 0, budget)) is not None:
+            if (failure := await probe_liveness(target, plane, 0, budget, sentinel)) is not None:
                 findings.append(finding("liveness", plane, label, failure))
 
     async def quiesce(label: str) -> None:
@@ -911,7 +995,9 @@ def apply_profile(policy: dict[str, Any], name: str | None) -> dict[str, Any]:
 
 
 def catalogue(sentinel: str, cap: int) -> list[Case]:
-    return mllp_catalogue(sentinel, cap) + tcp_catalogue(cap) + x12_catalogue(cap)
+    return (
+        mllp_catalogue(sentinel, cap) + tcp_catalogue(sentinel, cap) + x12_catalogue(sentinel, cap)
+    )
 
 
 async def run_sweep(
@@ -926,7 +1012,7 @@ async def run_sweep(
     budget = Budget.from_policy(policy, canary=canary)
     cap = budget.cap
     seed = int(policy["seed"]) if seed is None else seed
-    sentinel = f"ZZDASTSENTINEL{seed:08X}"
+    sentinel = run_sentinel(seed)
     fixed = catalogue(sentinel, cap)
     cases = list(fixed)
     if canary is not None:
@@ -961,7 +1047,7 @@ async def run_sweep(
                 index = len(results)
                 results.append(await run_case(target, case, budget))
                 await target.after_case(index)
-                failure = await probe_liveness(target, case.plane, index, budget)
+                failure = await probe_liveness(target, case.plane, index, budget, sentinel)
                 probes += 1
                 if failure is not None:
                     liveness.append(finding("liveness", case.plane, case.name, failure))
@@ -989,7 +1075,7 @@ async def run_sweep(
                 ]
                 passes = int(policy["resource_bounds"]["passes"])
                 resources, resource_findings = await measure_resources(
-                    target, resource_cases, passes, budget
+                    target, resource_cases, passes, budget, sentinel
                 )
             posture_out = target.posture
     finally:

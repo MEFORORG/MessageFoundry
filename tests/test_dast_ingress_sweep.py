@@ -30,6 +30,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.transports.mllp import _HANDLER_FAILURE_NAK_TEXT, MLLPSource
 from scripts.security.dast_ingress_sweep import (
+    HEADER_ONLY_CASES,
     KNOWN_DEFECT_DISCRIMINATORS,
     PROFILE_BOUNDS,
     Budget,
@@ -38,14 +39,18 @@ from scripts.security.dast_ingress_sweep import (
     PolicyError,
     _judge,
     apply_profile,
+    carries_sentinel,
+    case_bytes,
     catalogue,
     classify_replies,
     evaluate,
     load_policy,
     main,
     mutation_cases,
+    mutation_seeds,
     reference_frames,
     run_case,
+    run_sentinel,
 )
 from scripts.security.dast_ingress_target import (
     CANARIES,
@@ -223,6 +228,19 @@ def test_a_blind_canary_exits_2_not_1() -> None:
     code, messages = evaluate(receipt, _policy())
     assert code == 2
     assert "blind" in messages[0]
+
+
+def test_the_log_body_canary_needs_three_catalogue_hits_beside_the_probes() -> None:
+    """Vault BACKLOG #5581: the 3 liveness probes now carry the sentinel, so the log-body canary's
+    total floor must still demand 3 catalogue hits on top of them, as the old floor of 3 did."""
+
+    def hits(n: int) -> dict[str, Any]:
+        one = {"detector": "log_body", "plane": "all", "case": "messagefoundry", "detail": "x"}
+        return {"canary": "log-body", "findings": [dict(one) for _ in range(n)]}
+
+    assert evaluate(hits(3 + 2), _policy())[0] == 2, "3 probe hits plus 2 catalogue hits passed"
+    assert evaluate(hits(3 + 3), _policy())[0] == 1
+    assert evaluate(hits(7), _policy())[0] == 1, "the measured 7 hits no longer pass"
 
 
 def test_the_leak_canary_floors_heap_and_handles_separately() -> None:
@@ -461,6 +479,42 @@ def test_x12_mutations_still_form_interchanges() -> None:
     # Measured 5 of 12 at seed 318 once the ISA and IEA were held fixed, against 0 of 6 before. The
     # rest are edits that legitimately break the interchange (a terminator inserted, a segment cut).
     assert decoded >= len(x12) // 3, (decoded, len(x12))
+
+
+def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
+    """Vault BACKLOG #5581: the log_body detector recognises a logged body only by its sentinel, so a
+    body without one is a blind spot. Before the fix every raw-TCP and X12 case, and every mutation
+    seed but one, carried none, while the module said every catalogue body did. A case may lack it
+    only when it writes framing bytes alone (an empty frame, an idle connection) or a bare header
+    (``HEADER_ONLY_CASES``)."""
+    sentinel = run_sentinel(int(_policy()["seed"]))
+    cases = catalogue(sentinel, _CAP)
+    assert {c.plane for c in cases} == {"mllp", "tcp", "x12"}, "a plane dropped out of the census"
+    blind = [f"{c.plane}:{c.name}" for c in cases if not carries_sentinel(c, sentinel)]
+    assert not blind, f"catalogue cases the log_body detector could not recognise: {blind}"
+
+    hl7_seeds, x12 = mutation_seeds(sentinel)
+    assert hl7_seeds and all(sentinel.encode() in seed for seed in hl7_seeds)
+    assert sentinel.encode() in x12
+
+    # Positive control: the exemption covers framing-only cases and nothing that has a body.
+    exempt = {f"{c.plane}:{c.name}" for c in cases if sentinel.encode() not in case_bytes(c)}
+    framing_only = {
+        "mllp:empty-frame",
+        "tcp:empty-frame",
+        "mllp:idle-after-connect",
+        "mllp:slowloris-in-frame",
+    }
+    assert exempt == framing_only | {"x12:idle-after-connect"} | HEADER_ONLY_CASES, exempt
+    assert not carries_sentinel(Case("x", "tcp", b"\x02body\x03"), sentinel)
+
+
+def test_the_sentinel_keeps_the_x12_seed_an_interchange() -> None:
+    """The X12 sentinel sits in NM1-03, after the fixed-width ISA, so the well-formed X12 and raw-TCP
+    cases still decode as one interchange each."""
+    cases = {(c.plane, c.name): c for c in catalogue(run_sentinel(int(_policy()["seed"])), _CAP)}
+    assert len(reference_frames("x12", cases[("x12", "well-formed")].payload, _CAP)[0]) == 1
+    assert len(reference_frames("tcp", cases[("tcp", "well-formed")].payload, _CAP)[0]) == 1
 
 
 def test_the_at_cap_case_is_at_the_cap_and_not_over_it() -> None:

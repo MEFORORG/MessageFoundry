@@ -4,7 +4,9 @@
     "measured": "2026-09-26 on Windows 11 against branch b100-dast-ingress (origin/main 58f15e31f merged with ddbfc16a6), seed 318, 24 mutations",
     "remeasured_why": "The first measurement the same day (mllp 57 cases, 81 frames, 41 NAKs) was taken before the code review corrected the mutation corpus (a sentinel-bearing seed added, X12 mutations kept off the ISA) and the at-cap case (it was one byte over). Those numbers were a property of the old corpus, so the floors were re-cut from this measurement, not lowered to pass a run.",
     "cases_per_plane": "measured mllp 58 (40 catalogue + 18 mutations), tcp 9, x12 15 (9 catalogue + 6 mutations)",
-    "min_frames_decoded": "measured tcp 7 and x12 9 (6 catalogue + 3 mutation)",
+    "min_frames_decoded": "measured tcp 7 and x12 9 (6 catalogue + 3 mutation). Re-measured on 2026-11-14 for vault BACKLOG #5581, which plants the log_body sentinel in every catalogue body and mutation seed: tcp 7 and x12 8 reference frames at seed 318 with 24 mutations, because the changed seeds change the mutation draws. Case counts are unchanged. The floors stay under both",
+    "canary_log_body_floor": "measured 7 sentinel hits under the log-body canary on 2026-11-14 for vault BACKLOG #5581, against 4 before it, because the 3 liveness probes now carry the sentinel too. The policy floors a total only, so the floor rose from 3 to 6: the 3 probe hits plus at least 3 catalogue hits, the bar the old floor of 3 set on catalogue hits alone. 3 probe hits plus 2 catalogue hits (5) now fail",
+    "reply_counts_2026_11_14": "re-measured at seed 318 with 24 mutations for vault BACKLOG #5581, whose changed seeds change the mutation draws: mllp accepted replies 38 and rejected 16 (39 and 15 before), x12 frames 8 (10 before), tcp unchanged at 7. The catalogue's own counts are unchanged, so the reply floors stand",
     "min_mllp_frames_decoded": "measured 54 (36 catalogue + 18 mutation)",
     "min_mllp_accepted_replies": "measured 39 (25 catalogue). Re-measured 40 (26 catalogue) on 2026-09-26 with engine PR 1579 merged, because the blank-segment frame that decodes is now accepted",
     "min_mllp_rejected_replies": "measured 10 in the catalogue (14 with mutations) after merging engine PR 1583, up from 8, because both blank-segment frames then got a NAK. Re-measured 9 in the catalogue (13 with mutations) on 2026-09-26 with engine PR 1579 merged. BACKLOG #1594 drops the empty line, so the blank-segment frame that decodes is now accepted. Only its invalid-UTF-8 face is still NAKed. The floor follows the catalogue's own count down to 9, because that frame's correct reply changed. A mutation draw still cannot trip it",
@@ -64,7 +66,7 @@
     "floors": {
       "no-reply": 3,
       "ack-and-drop": 3,
-      "log-body": 3,
+      "log-body": 6,
       "stall": 1,
       "leak": 1,
       "listener-down": 2
