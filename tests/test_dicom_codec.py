@@ -219,7 +219,8 @@ def test_hl7_map_builds_oru_segments_with_escaping_round_trip() -> None:
 
 def test_person_name_components_splits_pn() -> None:
     assert hl7_map.person_name_components("Doe^Jane^Q") == ("Doe", "Jane", "Q")
-    assert hl7_map.person_name_components("Alpha=Beta") == ("Alpha",)  # alphabetic group only
+    # The alphabetic group names someone, so it is used and the alternate is not.
+    assert hl7_map.person_name_components("Alpha=Beta") == ("Alpha",)
     assert hl7_map.person_name_components(None) == ()
 
 
@@ -246,12 +247,15 @@ def test_person_name_components_splits_pn() -> None:
             "^^^Dr=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="prefix-only-group"
         ),
         pytest.param("^^^^Jr", (), id="suffix-alone"),
-        # A family name in a later group beats a given name alone in an earlier one.
-        pytest.param(
-            "^Testgiven=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="family-beats-given"
-        ),
-        # With no family name anywhere, the first group with a given or middle name is chosen.
+        # PS3.5: the alphabetic group is primary, so any family, given or middle name in it wins.
+        pytest.param("^Testgiven=Yamada^Taro", ("", "Testgiven"), id="alphabetic-given-wins"),
+        pytest.param("^John^Q=^^^^=Smith", ("", "John", "Q"), id="alphabetic-given-middle-wins"),
+        pytest.param("^A=^B", ("", "A"), id="alphabetic-before-alternate"),
         pytest.param("^Testgiven=^^^Dr", ("", "Testgiven"), id="given-alone"),
+        # With no name in the alphabetic group: an alternate with a family name, in group order,
+        # then an alternate with a given or middle name.
+        pytest.param("=^A=Smith", ("Smith", *[""] * 6, "P"), id="alternate-family-first"),
+        pytest.param("=^A=^B", ("", "A", *[""] * 5, "I"), id="first-alternate-given"),
         pytest.param("^^^Dr=^^Q", ("", "", "Q", *[""] * 4, "I"), id="middle-alone"),
         pytest.param("^^^^", (), id="all-empty"),
         pytest.param("== ", (), id="blank-groups"),

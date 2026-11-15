@@ -88,10 +88,13 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
     """Split a DICOM ``PatientName`` (a ``^``-delimited PN — ``Family^Given^Middle^Prefix^Suffix``,
     with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components.
 
-    Uses the first group with a non-blank family name. Only when no group has one does it use the
-    first group with a non-blank given or middle name, so an ideographic-only name is not lost, a
-    given name alone does not hide a later family name, and a group holding only a prefix or
-    suffix is passed over. It returns ``()`` when no group has any of the three. A blank
+    DICOM PS3.5, section 6.2.1 (the PN value representation), puts the alphabetic group first and
+    makes the ideographic and phonetic groups alternate representations of the same name. So the
+    alphabetic group is used whenever any of its family, given or middle components is non-blank.
+    Otherwise the first alternate group, in that order, with a family name is used, and failing
+    that the first alternate group with a given or middle name, so an ideographic-only name is not
+    lost and a group holding only a prefix or suffix is passed over. It returns ``()`` when no
+    group has a family, given or middle name. A blank
     (spaces-only) component is written empty. A name taken from the ideographic or phonetic group
     carries ``I`` or ``P`` in ``XPN-8`` (name representation code), which tells a receiver that
     reads ``XPN-8`` which group it is. It does not make the text decode. This helper sets no
@@ -109,17 +112,23 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
         [part if part.strip() else "" for part in (group.split("^") + [""] * 5)[:5]]
         for group in patient_name.split("=")[:3]
     ]
-    # A family name first; failing that, a given or middle name. A prefix or suffix is no name.
-    group_index = next((i for i, parts in enumerate(candidates) if parts[0]), None)
+    # The alphabetic group if it names anyone; then an alternate with a family name; then an
+    # alternate with a given or middle name. A prefix or suffix alone is no name.
+    alternates = list(enumerate(candidates))[1:]
+    group_index: int | None = 0 if any(candidates[0][:3]) else None
     if group_index is None:
-        group_index = next((i for i, parts in enumerate(candidates) if any(parts[1:3])), None)
+        group_index = next((i for i, parts in alternates if parts[0]), None)
+    if group_index is None:
+        group_index = next((i for i, parts in alternates if any(parts[1:3])), None)
     if group_index is None:
         return ()
     parts = candidates[group_index]
     parts[3], parts[4] = parts[4], parts[3]
     if group_index:
         parts += ["", "", "IP"[group_index - 1]]  # XPN-6 and XPN-7 empty, then XPN-8
-    while not parts[-1]:  # any() above keeps at least one non-empty component
+    # Every pass above chose a group with a non-empty family, given or middle component, so this
+    # stops before the list is empty.
+    while not parts[-1]:
         parts.pop()
     return tuple(parts)
 
