@@ -2630,8 +2630,8 @@ _SCHEMA: list[str] = [
         -- read-then-write atomic. 256 is this file's dominant width (55 uses); the composite
         -- key is then 2 x 256 x 2 bytes = 1024, inside the 1700-byte nonclustered limit.
         -- NVARCHAR(450), the other precedent here, would be 1800 across two columns and fail.
-        -- BACKLOG #5613: BIN2, so the pair and that index compare byte for byte, as SQLite and
-        -- Postgres do. Under a case-insensitive default two OIDC subjects differing only in case
+        -- BACKLOG #5613: BIN2, so the pair and that index compare case- and accent-exactly, as
+        -- SQLite and Postgres do. Under a case-insensitive default two OIDC subjects differing only in case
         -- were one key: the second could neither be bound nor sign in. state.[key] says what BIN2
         -- leaves alone (trailing spaces); the bind refuses a subject with surrounding space.
         oidc_issuer NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL,
@@ -15104,8 +15104,8 @@ class SqlServerStore:
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
-        # issuer. Byte-exact through the columns' BIN2 collation (BACKLOG #5613); the base
-        # protocol's docstring says why that matters.
+        # issuer. Case-exact through the columns' BIN2 collation (BACKLOG #5613); the base
+        # protocol's docstring says what that leaves (trailing spaces).
         d = await self._fetchone(
             f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
         )

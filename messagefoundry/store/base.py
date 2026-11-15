@@ -3234,10 +3234,13 @@ class AuthStore(Protocol):
         the holder when a federated mint finds the pair moved; and
         :meth:`AuthService.bind_federated_subject`, which refuses a pair another account holds.
 
-        **The match is byte-exact on every backend** (BACKLOG #5613). SQLite and Postgres compare
-        text that way by default; SQL Server's columns and ``ux_users_federated_subject`` are
+        **Case and accent are exact on every backend** (BACKLOG #5613). SQLite and Postgres compare
+        text byte for byte by default; SQL Server's columns and ``ux_users_federated_subject`` are
         declared ``Latin1_General_100_BIN2``, because under a case-insensitive default two subjects
-        differing only in case would be one key.
+        differing only in case would be one key. BIN2 still pads trailing spaces, so ``abc`` and
+        ``abc `` match there; the bind refuses a subject with surrounding space, and a caller that
+        SELECTS an account through this compares the pair itself. A users table built before that
+        DDL keeps its old collation.
 
         Deliberately a lookup rather than a scan: it sits on the federated login path, and
         ``list_users()`` would make every sign-in O(number of accounts).

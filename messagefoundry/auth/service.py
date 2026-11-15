@@ -1154,9 +1154,10 @@ FEDERATED_SIGN_IN_REQUIRED = "federated_sign_in_required"
 #: browser layer's code map, so it shows as generic.
 DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 
-#: The closed-set reason a directory sign-in is refused with when its account row was deleted after
-#: the sign-in read it and before its session insert (BACKLOG #5624). Before, such a sign-in was
-#: audited as a binding change (``federated_sign_in_required`` or ``federated_subject_unbound``).
+#: The closed-set reason a directory sign-in is refused with when its account row is gone at its
+#: session insert (BACKLOG #5624). Before, such a sign-in was audited as a binding change
+#: (``federated_sign_in_required`` or ``federated_subject_unbound``). A delete that lands earlier,
+#: during the role sync, can be refused there first, as ``account_refused``.
 ACCOUNT_DELETED = "account_deleted"
 
 #: The closed-set reason a directory answer is refused with when it names another directory object
@@ -12124,7 +12125,9 @@ class AuthService:
             # so issuing now would hand back a token the revocation could never have seen; or the
             # account was deleted under it (BACKLOG #2733). Nothing was written, so there is
             # nothing to undo. One more read tells the two apart (BACKLOG #5624).
-            raise _BindingChangedMidLogin(account_deleted=not await self._user_id_held(user_id))
+            # An unguarded insert is refused only for a missing row, so it needs no read.
+            deleted = require_federated_subject is None or not await self._user_id_held(user_id)
+            raise _BindingChangedMidLogin(account_deleted=deleted)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
         await self._enforce_session_cap(user_id, client=client)
@@ -13054,8 +13057,9 @@ class AuthService:
         :meth:`_lookup_user`, :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
         :meth:`_load_user_by_federated_subject`, :meth:`list_checked_users`,
         :meth:`_checked_by_id` and :meth:`_verified`, the ONLY readers of the store's user readers
-        in this service, beside the three existence questions; ``tests/test_user_seal.py`` holds
-        that. See :meth:`_verified` for what ``None`` covers."""
+        in this service, beside the existence questions (at least :meth:`_username_held`,
+        :meth:`_user_id_held` and :meth:`_federated_subject_held_elsewhere`);
+        ``tests/test_user_seal.py`` holds the list. See :meth:`_verified` for what ``None`` covers."""
         return (await self._lookup_user(user_id)).user
 
     async def _lookup_user(self, user_id: str) -> _UserLookup:
@@ -13245,10 +13249,11 @@ class AuthService:
         holder = await self._store.get_user_by_federated_subject(issuer, subject)
         if holder is None or holder.id == user_id:
             return False
-        # Checked for its report alone: a holder whose record fails its seal is reported as the
-        # checked loader would report it (BACKLOG #2592), so the refusal is not its only trace.
-        await self._verified(holder)
-        return True
+        # Checked too: a holder whose record fails its seal is reported as the checked loader
+        # reports it (BACKLOG #2592), and one the check reads as gone or rebound since the raw
+        # read holds nothing, so the bind is not refused on it.
+        check = await self._verified(holder)
+        return check.failed or check.user is not None
 
     async def _verified(self, user: UserRecord | None) -> _SealCheck:
         """``user`` with its whole authorization record checked against its seal (BACKLOG #2592):
