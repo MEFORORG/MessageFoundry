@@ -45,10 +45,11 @@ async def _gate(store: Any, service: AuthService) -> None:
     )
 
 
-async def _refuses(store: Any, service: AuthService, why: str) -> None:
+async def _refuses(store: Any, service: AuthService, why: str) -> str:
     with pytest.raises(RuntimeError) as exc:
         await _gate(store, service)
     assert "refusing to start" in str(exc.value), why
+    return str(exc.value)
 
 
 async def _account(store: Any, user_id: str, roles: list[str]) -> None:
@@ -75,8 +76,10 @@ async def assert_notice_gate_reads_sealed_rows(store: Any, raw: RawSql) -> None:
     await _account(store, "gate-addr", [admin])
     await _refuses(store, service, "no address yet")  # the starting state
     await raw("UPDATE users SET notify_email=? WHERE id=?", (_ADDRESS, "gate-addr"))
-    await _refuses(store, service, "a raw notify_email must not satisfy the gate")
+    refused = await _refuses(store, service, "a raw notify_email must not satisfy the gate")
     assert any("gate-addr" in a for a in alerts)  # the failing record was reported
+    # The record still exists, so the refusal says one was left out rather than only "none exists".
+    assert "1 account record(s) failed their integrity check" in refused
     await store.delete_user("gate-addr")
     # Control: the same address through the store satisfies it.
     await _account(store, "gate-addr-ok", [admin])
@@ -93,6 +96,7 @@ async def assert_notice_gate_reads_sealed_rows(store: Any, raw: RawSql) -> None:
         ("gate-role", admin, 1.0, None),
     )
     await _refuses(store, service, "a raw user_roles row must not satisfy the gate")
+    assert any("gate-role" in a for a in alerts)  # evidence the raw write took effect
     await store.delete_user("gate-role")
     # Control: the same grant through the store satisfies it.
     await _account(store, "gate-role-ok", [Role.VIEWER.value])
@@ -110,6 +114,7 @@ async def assert_notice_gate_reads_sealed_rows(store: Any, raw: RawSql) -> None:
     await _refuses(store, service, "a disabled Administrator receives nothing")
     await raw("UPDATE users SET disabled=? WHERE id=?", (False, "gate-off"))
     await _refuses(store, service, "a raw disabled flag must not satisfy the gate")
+    assert any("gate-off" in a for a in alerts)  # evidence the raw write took effect
     await store.delete_user("gate-off")
     # Control: the same change through the store satisfies it.
     await _account(store, "gate-off-ok", [admin])

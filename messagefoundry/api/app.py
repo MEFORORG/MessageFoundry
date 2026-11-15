@@ -303,7 +303,7 @@ from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 # mount_ui), so the engine imports + boots + serves the JSON API with the console ABSENT. serve_ui-on
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
-from messagefoundry.auth import Identity, Permission
+from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
@@ -11575,26 +11575,40 @@ async def _assert_security_notice_is_deliverable(
     whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
     which is a different and much larger change.
 
-    **It asks the auth service's checked predicates, never the store's readers
+    **It reads the accounts through the auth service's checked list, never the store's readers
     (BACKLOG #5629).** The store's ``list_users`` and ``get_user_role_ids`` return rows unchecked,
     so on a keyed store a ``notify_email``, a ``disabled`` flag or a ``user_roles`` row written
-    outside the store would have passed this gate on an Administrator no seal covers. Every field
-    the gate weighs -- the address, the flag and the role rows -- comes from a record that passed
-    its seal; one that fails is reported by the service and does not count. A Vault transit Outage
-    raises out of the start, which is the fail-closed answer: the gate cannot be settled without it.
+    outside the store would have passed this gate on an Administrator no seal covers. On a keyed
+    store every field the gate weighs -- the address, the flag and the role rows -- now comes from a
+    record that passed its seal; one that fails is reported by the service, does not count, and is
+    named in the refusal, so the operator is not sent to ``provision-admin`` over an account that
+    exists. A keyless store has no seal, so there the rows are taken as read. One pass answers both
+    halves, from one snapshot. A Vault transit Outage raises out of the start, which is the
+    fail-closed answer: the gate cannot be settled without it.
     """
     alerts = alerts_settings or AlertsSettings()
     # The two preconditions of the deliverability question. Either one false skips the refusal: the
     # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
     gated = auth_settings.notify_security_events and alerts.security_notifications_required
-    # The service's own predicates, which read only checked records, so the gate and the service
-    # agree on who counts as an enabled Administrator. The second scan runs only on the refusal
-    # and warning paths.
-    if gated and await auth.has_notifiable_admin():
+    listed = await auth.list_checked_users()
+    failed = sum(1 for entry in listed if entry.user is None)
+    admins = [
+        u
+        for u in (entry.user for entry in listed)
+        if u is not None and not u.disabled and Role.ADMINISTRATOR.value in u.role_ids
+    ]
+    administrator_exists = bool(admins)
+    if administrator_exists and (not gated or any(u.notify_email for u in admins)):
         return
-    administrator_exists = await auth.has_enabled_administrator()
-    if administrator_exists and not gated:
-        return
+    # A record that fails its seal still exists, so the refusal must not read as a store with no
+    # account at all: it says how many were left out, which the seal-failure report names.
+    left_out = (
+        f" {failed} account record(s) failed their integrity check and were not counted; the"
+        " integrity alert and audit row name each one, and an Administrator among them must be"
+        " resolved before this check can count it"
+        if failed
+        else ""
+    )
     if not administrator_exists:
         # A SQLite store file named absolutely, since the operator's shell may sit in another
         # directory than the service; a server backend's descriptor is server/database, names no
@@ -11604,7 +11618,7 @@ async def _assert_security_notice_is_deliverable(
             "no enabled Administrator exists in this store, so no enabled account holds the role "
             "that manages users and roles, and every out-of-band security notice about the most "
             "privileged accounts would reach nobody. The engine creates no account on its own. "
-            f"{_PROVISION_ADMIN_HINT.format(store=where)}."
+            f"{_PROVISION_ADMIN_HINT.format(store=where)}.{left_out}"
         )
         if not gated:
             # AC-12: the gate is skipped, so this is the one line that says no enabled Administrator
@@ -11620,7 +11634,7 @@ async def _assert_security_notice_is_deliverable(
             "the host with `messagefoundry admin-set-notify-email --username <administrator> "
             "--email <address>`, run against this store with the engine stopped, or accept the "
             "pull-only /me/security-events feed in writing via "
-            "[alerts].security_notifications_required=false"
+            f"[alerts].security_notifications_required=false.{left_out}"
         )
     enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
@@ -13169,7 +13183,8 @@ def create_managed_app(
                 # BACKLOG #2131: before engine.start() for #1923's reason. On a first run no
                 # enabled Administrator exists yet, and the gate's refusal must stop startup before
                 # any connection starts rather than after. Both touch only the store: initialize()
-                # seeds the built-in roles and the gate reads the users. A refusal here also comes
+                # seeds the built-in roles and the gate reads the users through the service's
+                # checked list, which can write a seal-failure audit row and raise its alert. A refusal here also comes
                 # before the start's opt-in audit-chain walk, so that walk cannot alert on such a
                 # start. Vault BACKLOG #3145 item 2 is declined: the walk runs inside engine.start(),
                 # and moving it ahead of this gate reorders the start whose failure paging
