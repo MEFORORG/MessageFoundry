@@ -1127,7 +1127,9 @@ def _populate_mypy_cache(fx: Fixture) -> Path:
     """A ``.mypy_cache`` as mypy's SQLite cache leaves it, ignored through info/exclude.
 
     The names are what a real tree holds, ``cache.db`` and the sharded ``cache.N.db`` with their
-    ``-wal``/``-shm`` sidecars, in mypy's ``<python-version>/`` folder.
+    ``-wal``/``-shm`` sidecars, in mypy's ``<python-version>/`` folder. The info/exclude rule stands
+    in for this repository's own top-level ``.mypy_cache/`` rule in ``.gitignore``, which the
+    ignored-entry read needs to list the directory as one regenerable entry.
     """
     wt = fx.sibling("clean")
     _exclude(fx, ".mypy_cache/")
@@ -1140,10 +1142,7 @@ def _populate_mypy_cache(fx: Fixture) -> Path:
 
 
 def test_a_populated_mypy_cache_does_not_hold_a_clean_tree(fx: Fixture, sleeper: int) -> None:
-    """mypy's own SQLite cache is the regenerable cache ``.mypy_cache`` is tolerated as.
-
-    Read as data, ``.mypy_cache/<ver>/cache.N.db`` vetoed about 67 of 96 real clean trees.
-    """
+    """mypy's own SQLite cache is the regenerable cache ``.mypy_cache`` is tolerated as, not data."""
     live_record(fx, sleeper, fx.primary)
     _populate_mypy_cache(fx)
     res = run(fx, "-Apply", "-IdleHours", "0")
@@ -1161,13 +1160,23 @@ def test_a_populated_mypy_cache_does_not_hold_a_clean_tree(fx: Fixture, sleeper:
             ".mypy_cache/3.14/dev.db",
             "a data file inside a cache directory at .mypy_cache/3.14/dev.db",
         ),
-        # mypy's name, but in another cache directory.
+        # mypy's name and version folder, but in another cache directory.
         (
-            ".pytest_cache/cache.0.db",
-            "a data file inside a cache directory at .pytest_cache/cache.0.db",
+            ".pytest_cache/3.14/cache.0.db",
+            "a data file inside a cache directory at .pytest_cache/3.14/cache.0.db",
         ),
         # mypy's name, but at the cache's top rather than in a version folder.
         (".mypy_cache/cache.db", "a data file inside a cache directory at .mypy_cache/cache.db"),
+        # mypy's name, but in a folder not named like a Python version.
+        (
+            ".mypy_cache/tmp/cache.db",
+            "a data file inside a cache directory at .mypy_cache/tmp/cache.db",
+        ),
+        # mypy's name in another case: the match is case-sensitive.
+        (
+            ".mypy_cache/3.14/CACHE.7.DB",
+            "a data file inside a cache directory at .mypy_cache/3.14/CACHE.7.DB",
+        ),
     ],
 )
 def test_other_data_beside_a_mypy_cache_still_holds_the_tree(
@@ -1201,9 +1210,11 @@ def test_a_db_outside_the_caches_still_holds_a_tree_with_a_mypy_cache(
     res = run(fx, "-Apply", "-IdleHours", "0")
     d = by_leaf(res, "clean")
     assert d["Decision"] == "SKIP", d
-    assert any("ignored entr(ies) that are not a regenerable cache" in r for r in d["Reasons"]), d[
-        "Reasons"
-    ]
+    # The entry named is dev.db, not one of mypy's files listed one by one.
+    assert any(
+        "1 ignored entr(ies) that are not a regenerable cache" in r and "dev.db)" in r
+        for r in d["Reasons"]
+    ), d["Reasons"]
     assert wt.exists()
     assert by_leaf(res, "gone")["Outcome"] == "removed"
 

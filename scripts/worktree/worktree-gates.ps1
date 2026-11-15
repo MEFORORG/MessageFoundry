@@ -20,7 +20,7 @@
     Get-ClaimedWorktreeIndex, Test-RegistryPresentOrThrow, Get-AllocationRefusal, Get-TreeClaimsDirs
     and Get-OwnershipHolds (moved here from finished-worktree-removal.ps1, so hygiene-report.ps1 reads
     them too), Get-FlaggedFiles,
-    $CACHE_DATA_NAME_PATTERN, $MYPY_CACHE_DB_PATTERN, Get-NestedHazard,
+    $CACHE_DATA_NAME_PATTERN, $MYPY_CACHE_DB_PATTERN, Test-MypyCacheFile, Get-NestedHazard,
     Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
     Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Test-PlainFile, Test-PlainFileItem, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
     $GIT_CONFIG_CARRIER_PATTERN, Get-GitConfigCarriers, $SEAT_LOCAL_REL, $SCAN_TOKENS_REL and
@@ -596,12 +596,21 @@ function Get-OwnershipHolds {
 #: denylist, so it catches only these names; it does not make a cache directory safe to delete.
 $CACHE_DATA_NAME_PATTERN = '(?i)\A(?:\.env(?:\..*)?|.*\.(?:db|db-wal|db-shm|db-journal|sqlite|sqlite3))\z'
 
-#: mypy's own SQLite cache, the one carve-out from $CACHE_DATA_NAME_PATTERN: `cache.db`, or the sharded
-#: `cache.N.db`, and their journal sidecars, in mypy's `<python-version>/` folder directly below a
-#: `.mypy_cache`. Matched against the path relative to the tree, case-sensitively as the cache directory
-#: names are. Read as data, they vetoed most real clean trees (a review counted about 67 of 96); any
-#: other data-named file in a cache directory, .mypy_cache included, still refuses.
-$MYPY_CACHE_DB_PATTERN = '\A(?:.*/)?\.mypy_cache/[0-9]+\.[0-9]+/cache(?:\.[0-9]+)?\.db(?:-wal|-shm|-journal)?\z'
+#: mypy's own SQLite cache, the one carve-out from $CACHE_DATA_NAME_PATTERN: a file named `cache.db`, or
+#: the sharded `cache.N.db`, or one of their journal sidecars, whose folder is named like a Python version
+#: and sits directly in a folder named `.mypy_cache` (Test-MypyCacheFile reads the folders, not the path
+#: text). Case-sensitive, as the cache directory names are. Read as data, they vetoed most real clean
+#: trees; any other data-named file in a cache directory, .mypy_cache included, still refuses.
+$MYPY_CACHE_DB_PATTERN = '\Acache(?:\.[0-9]+)?\.db(?:-wal|-shm|-journal)?\z'
+
+# True only for a file of mypy's own cache, as $MYPY_CACHE_DB_PATTERN says. An unset pattern exempts
+# nothing, so a lost variable refuses rather than passing every data file in every cache.
+function Test-MypyCacheFile([System.IO.FileSystemInfo]$Entry) {
+    if (-not $MYPY_CACHE_DB_PATTERN -or $Entry -isnot [System.IO.FileInfo]) { return $false }
+    $dir = $Entry.Directory
+    return ($Entry.Name -cmatch $MYPY_CACHE_DB_PATTERN) -and ($dir.Name -cmatch '\A[0-9]+\.[0-9]+\z') -and
+        ($null -ne $dir.Parent) -and ($dir.Parent.Name -ceq '.mypy_cache')
+}
 
 # The first thing in the working tree that git status cannot see and the removal must not take, walked
 # from the tree's own root: a nested git checkout (an entry named `.git`, file or directory, at any depth
@@ -635,7 +644,7 @@ function Get-NestedHazard([string]$Path) {
                     $cache = $inCache -or ($e.Name -cin $cacheNames) -or ($here -ieq $root -and $e.Name -ceq '.venv')
                     $pending.Push(@($e.FullName, $cache))
                 }
-                elseif ($inCache -and $e.Name -match $CACHE_DATA_NAME_PATTERN -and $rel -cnotmatch $MYPY_CACHE_DB_PATTERN) { return "a data file inside a cache directory at $rel" }
+                elseif ($inCache -and $e.Name -match $CACHE_DATA_NAME_PATTERN -and -not (Test-MypyCacheFile $e)) { return "a data file inside a cache directory at $rel" }
             }
         }
     }

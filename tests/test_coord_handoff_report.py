@@ -344,13 +344,22 @@ class TestPerBoxDirectoriesAreHeld:
         assert proc.returncode == 1, proc.stdout + proc.stderr
         assert "STALE-IN-A-LIVE-BOX" in proc.stdout
 
-    @pytest.mark.parametrize("body", ["null", "", "{}"])
-    def test_a_newer_seat_file_with_no_record_in_it_does_not_shadow_the_box_record(
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "null",
+            "",
+            "{}",
+            '{"sessionId": "11111111-2222-3333-4444-555555555555"}',
+            '{"worktree": "   "}',
+        ],
+    )
+    def test_a_newer_seat_file_naming_no_worktree_does_not_empty_the_box_worktree(
         self, sandbox: Path, body: str
     ) -> None:
-        """A seat file that parses to null, or to anything that names no worktree or session, is
-        not the box's newest record. Taken as one, it emptied the worktree the activity read uses,
-        so the fresh transcript went unread and the stale document retired (BACKLOG #5598)."""
+        """A newer seat file that parses to null, or names no worktree, does not empty the worktree
+        an older record named. Taken as the box's record, it did, so the fresh transcript went unread
+        and the stale document retired (BACKLOG #5598)."""
         put_box(sandbox, "box-aaaa", age_hours=72)
         root = self._live_box(sandbox, transcript_age_hours=1)
         newer = sandbox / "coord" / "seats" / "box-aaaa" / "zz-newer.json"

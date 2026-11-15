@@ -337,10 +337,19 @@ function Get-PointerKeys([string]$PointerPath) {
     return $keys
 }
 $pointed = @{}
-# The newest seat record of each box that is this machine's to judge (Test-CoordRecordIsHere), by the
-# record file's write time, for the live-box hold below: another PC's session id and worktree path name
-# nothing in this PC's registry or transcript store.
-$boxRecords = @{}
+# Each box's worktree and session for the live-box hold below, each taken from the newest seat record
+# that names one, by the record file's write time, among the records this machine is to judge
+# (Test-CoordRecordIsHere): another PC's session id and worktree path name nothing in this PC's registry
+# or transcript store. Taken apart, so a newer record with a blank worktree or no session cannot empty
+# what an older one named (BACKLOG #5598).
+$boxWorktrees = @{}
+$boxSessions = @{}
+function Set-NewestBoxValue([hashtable]$Map, [string]$Box, $Value, [datetime]$Written) {
+    $v = "$Value".Trim()
+    if (-not $v) { return }
+    $prev = $Map[$Box]
+    if (-not $prev -or $Written -gt $prev.Written) { $Map[$Box] = @{ Value = $v; Written = $Written } }
+}
 if (Test-Path -LiteralPath $seatsDir) {
     foreach ($f in @(Get-ChildItem -LiteralPath $seatsDir -Recurse -Filter *.json -File -EA SilentlyContinue)) {
         try { $rec = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
@@ -348,14 +357,13 @@ if (Test-Path -LiteralPath $seatsDir) {
         if ($rec.handoff -and $rec.handoff.path) {
             foreach ($k in @(Get-PointerKeys ([string]$rec.handoff.path))) { $pointed[$k] = $true }
         }
-        # Only a record that names a worktree or a session can stand for its box. A file that parses to
-        # null, a scalar, an array or an empty object names no host, so it reads as this machine's, and
-        # as the newest it emptied the worktree and session the hold reads with (BACKLOG #5598).
-        if ($rec -isnot [System.Management.Automation.PSCustomObject] -or -not ($rec.worktree -or $rec.sessionId)) { continue }
+        # A file that parses to null or a scalar names no host either, so it would read as this
+        # machine's; it supplies nothing, and Set-NewestBoxValue skips a blank value.
+        if ($rec -isnot [System.Management.Automation.PSCustomObject]) { continue }
         if (-not (Test-CoordRecordIsHere $rec)) { continue }
         $box = Split-Path $f.DirectoryName -Leaf
-        $prev = $boxRecords[$box]
-        if (-not $prev -or $f.LastWriteTimeUtc -gt $prev.Written) { $boxRecords[$box] = @{ Rec = $rec; Written = $f.LastWriteTimeUtc } }
+        Set-NewestBoxValue $boxWorktrees $box $rec.worktree $f.LastWriteTimeUtc
+        Set-NewestBoxValue $boxSessions $box $rec.sessionId $f.LastWriteTimeUtc
     }
 }
 foreach ($e in $entries) { if ($pointed.ContainsKey($e.Name)) { $e.Flags += 'POINTED-AT' } }
@@ -390,7 +398,7 @@ foreach ($e in $entries) {
 # every fence says do not touch, while the document inside it went stale a day ago. -Where creates
 # a box directory, so the hold has entries to read.
 #
-# The box's newest seat record supplies its worktree and session (BACKLOG #5598). Read with an empty
+# The box's seat records supply its worktree and session (BACKLOG #5598). Read with an empty
 # worktree, Get-BoxActivity could see only the heartbeat, so a box whose hooks are off -- no heartbeat,
 # a transcript written an hour ago -- read as having no activity at all, and its stale document retired
 # without a hold. The newest activity is the youngest of the heartbeat and the transcript, and a live
@@ -400,9 +408,8 @@ foreach ($e in $entries) {
     $e.Box = $e.Name
     $doc = Join-Path $e.Path 'HANDOFF.md'
     if (-not (Test-Path -LiteralPath $doc -PathType Leaf)) { continue }
-    $boxRec = if ($boxRecords[$e.Name]) { $boxRecords[$e.Name].Rec } else { $null }
-    $boxWt = if ($boxRec -and $boxRec.worktree) { [string]$boxRec.worktree } else { '' }
-    $boxSid = if ($boxRec -and $boxRec.sessionId) { [string]$boxRec.sessionId } else { '' }
+    $boxWt = if ($boxWorktrees[$e.Name]) { $boxWorktrees[$e.Name].Value } else { '' }
+    $boxSid = if ($boxSessions[$e.Name]) { $boxSessions[$e.Name].Value } else { '' }
     $act = Get-BoxActivity -BoxKey $e.Name -WorktreePath $boxWt -SessionId $boxSid -SeatsDir $seatsDir -ConfigRoot $ConfigRoot -RepoHint $RepoHint -FreshHours $FreshHours -Now $now
     $docAgeH = [math]::Round(($now - (Get-Item -LiteralPath $doc).LastWriteTimeUtc).TotalHours, 2)
     $ages = @(@($act.WriterAliveAgeH, $act.TranscriptAgeH) | Where-Object { $null -ne $_ })
