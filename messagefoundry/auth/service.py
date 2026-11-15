@@ -16638,12 +16638,22 @@ class AuthService:
                 if directory:
                     # The dropped re-read's order: the lock is asked first, on the row just read,
                     # and its row written, so a lock that landed during the lookup or its role test
-                    # is audited as ``locked`` whatever else landed with it. A lock with moved keys
-                    # answers ``locked``, as that re-read did when its read found the row.
+                    # is audited as ``locked`` whatever else landed with it. With TOTP on, the lapse
+                    # is asked next, of a locked account and of one whose keys moved too, and ends
+                    # its session, as a lapse during the wait did ahead of the lock and of a rename;
+                    # so a lock and a lapse together keep both rows and the ended session. With TOTP
+                    # turned off the lapse is not asked: the account holds no factor to name on a
+                    # lapse row, and main never asked it of one either. Then a lock answers
+                    # ``locked``, with moved keys too, as that re-read did when its read found the
+                    # row. A directory account never rejoins: a rename moved its keys.
                     locked = await self._mfa_lock_refused(user, client=client)
+                    if user.totp_enabled and await self._mfa_lapsed(
+                        token, user, client=client, factor_checked=False
+                    ):
+                        return Elevation(session_lost=True)
+                    if locked:
+                        return Elevation(locked=True)
                     if _lookup_keys(user) != _lookup_keys(vouched):
-                        if locked:
-                            return Elevation(locked=True)
                         # The account's lookup keys moved after the role test read them (see the
                         # comment above the lookup's call). The session may still be live, and the
                         # token still authenticate; ``session_lost`` is the answer and the row the
@@ -16652,18 +16662,8 @@ class AuthService:
                             "auth.mfa_failed", actor=user.username, client=client, phase=None
                         )
                         return Elevation(session_lost=True)
-                    # With TOTP turned off a lock answers ``locked``, as that re-read did, and the
-                    # lapse is not asked: the account holds no factor to name on a lapse row, and
-                    # main never asked it of one either. With TOTP on, the lapse is still asked of
-                    # a locked account, and ends its session, as a lapse during the wait did ahead
-                    # of the lock, so a lock and a lapse together keep both rows and the ended
-                    # session. A directory account never rejoins: a rename moved its keys.
                     if not user.totp_enabled:
-                        return Elevation(locked=locked)
-                    if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
-                        return Elevation(session_lost=True)
-                    if locked:
-                        return Elevation(locked=True)
+                        return Elevation()
                     break
                 # A local account keeps main's order, ``totp_enabled``, then the lapse, then the
                 # lock. Asked on every pass, so a rejoin lets no queue go before main's checks

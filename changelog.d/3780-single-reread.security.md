@@ -11,9 +11,11 @@
   in-queue read now refuses as `session_lost`, with the same `auth.mfa_failed` row, whenever the
   account's lookup keys (its id, username, OIDC issuer and subject, and directory object id) moved
   after the role test read it and no second-step lock is live; with a live lock it answers `locked`
-  with the locked row, as the dropped read did whenever it found the row. The session is not
-  ended, so its token may still authenticate. Before, such a move refused only when it lost that
-  race; otherwise a rename while the attempt waited carried on in the old name's queue. A session
+  with the locked row, as the dropped read did whenever it found the row. With TOTP on, a lapsed
+  temporary credential still ends the session first and writes `auth.temp_password_expired`.
+  Otherwise the session is not ended, so its token may still authenticate. Before, such a move
+  refused only when it lost that race; otherwise a rename while the attempt waited carried on in
+  the old name's queue. A session
   lost during the lookup is now named with the account's current name, read in the queue, while
   its row is still there; before, it was named with the name read before the lookup.
   Inside the queue, a live second-step lock on a directory account is now asked right after the

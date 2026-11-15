@@ -884,6 +884,48 @@ async def test_a_local_rejoin_refuses_a_lock_read_before_it_lets_the_queue_go(
     assert rows == [LOCKED_REFUSAL_DETAIL]
 
 
+@pytest.mark.parametrize("lapsed", [False, True], ids=["control", "lapsed"])
+async def test_a_key_move_with_a_lapse_ends_the_session(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, lapsed: bool
+) -> None:
+    """BACKLOG #3780 item 2, review of PR 2971. A rename lands in the directory check's role test
+    and the temporary credential has lapsed. Main's dropped re-read found the renamed row, and its
+    in-queue read then ended the lapsed session with ``auth.temp_password_expired``, so the lapse
+    is asked before a key move is refused. RED when: the key move answers ``session_lost`` and
+    leaves the lapsed session live. ``control`` has no lapse: the key move is refused as
+    ``session_lost`` and the session stays live."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_roles_lost = e.service._directory_roles_lost
+    real_lapsed = e.service._credential_lapsed
+    renamed = False
+
+    async def _roles_lost(*args: Any, **kwargs: Any) -> str | None:
+        nonlocal renamed
+        assert await store.set_user_username(
+            e.user_id, "jdoe-renamed", expected_username="jdoe", audits=()
+        )
+        renamed = True
+        return await real_roles_lost(*args, **kwargs)
+
+    def _lapsed_once_renamed(user: Any, now: float) -> bool:
+        return (lapsed and renamed) or real_lapsed(user, now)
+
+    monkeypatch.setattr(e.service, "_directory_roles_lost", _roles_lost)
+    monkeypatch.setattr(e.service, "_credential_lapsed", _lapsed_once_renamed)
+
+    answer = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert answer.ok is False and answer.session_lost is True
+    expired = await store.list_audit(action="auth.temp_password_expired")
+    if lapsed:
+        assert len(expired) == 1
+        assert not await _live_session(store, e.token), "the lapsed session was not ended"
+    else:
+        assert expired == []
+        assert await _live_session(store, e.token)
+        assert await _audited_mfa_failures(store) == [{"reason": "session_lost"}]
+
+
 async def test_a_local_rename_while_queued_rejoins_the_queue_under_the_new_name(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
