@@ -270,6 +270,125 @@ def test_bad_ace_is_reported_ahead_of_a_bad_owner() -> None:
     assert "the owner (" not in reason
 
 
+# ---- Tier 1c: granting ACE forms, shared service identities, servicing trustees (BACKLOG #5622) --
+
+_LOCAL_SERVICE = "S-1-5-19"
+_NETWORK_SERVICE = "S-1-5-20"
+_TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+
+
+@pytest.mark.parametrize(
+    "ace_type",
+    [
+        0x04,  # ACCESS_ALLOWED_COMPOUND_ACE
+        0x05,  # ACCESS_ALLOWED_OBJECT_ACE
+        0x09,  # ACCESS_ALLOWED_CALLBACK_ACE
+        0x0B,  # ACCESS_ALLOWED_CALLBACK_OBJECT_ACE
+    ],
+)
+def test_write_granting_conditional_or_object_ace_refused(ace_type: int) -> None:
+    """An allow entry the policy cannot attribute still grants: it refuses rather than passes.
+
+    The reader parses a trustee only for type 0x00, so these arrive with an empty SID. Skipping them
+    as non-granting would let a callback ACE granting write to anyone pass a clean-looking DACL."""
+    aces = [(_ALLOW, _FULL, _SELF), (ace_type, _MODIFY, "")]
+    reason = _evaluate_config_dacl(_SELF, aces, _SELF, _never_admin)
+    assert reason is not None
+    assert f"type 0x{ace_type:02x}" in reason
+
+
+def test_config_guard_sets_match_the_anchor_path_rule() -> None:
+    """The config guard and the anchor-path rule judge the same Windows ACLs; a SID or ACE type added
+    to one and not the other would quietly loosen whichever was missed."""
+    from messagefoundry.auth import anchor_path
+    from messagefoundry.config import wiring
+
+    assert wiring._WIN_GRANTING_ACE_TYPES == anchor_path._GRANTING_ACE_TYPES
+    assert wiring._WIN_SHARED_SERVICE_SIDS == anchor_path._SHARED_SERVICE_SIDS
+    assert wiring._WIN_TRUSTED_INSTALLER_SID == anchor_path.TRUSTED_INSTALLER_SID
+    assert wiring._WIN_NO_ADMIN_LOOKUP_SIDS == anchor_path._BROAD_SIDS
+
+
+def test_read_only_callback_ace_passes() -> None:
+    # A conditional entry with no write-class bit grants nothing this check cares about.
+    aces = [(_ALLOW, _FULL, _SELF), (0x09, _READ_EXEC, "")]
+    assert _evaluate_config_dacl(_SELF, aces, _SELF, _never_admin) is None
+
+
+@pytest.mark.parametrize("shared", [_LOCAL_SERVICE, _NETWORK_SERVICE])
+def test_shared_service_identity_is_not_self_trusted_as_grantee(shared: str) -> None:
+    """LocalService and NetworkService run many services, so the engine running as one of them does
+    not make a write grant to that SID the engine's alone."""
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, shared)]
+    reason = _evaluate_config_dacl(_SYSTEM, aces, shared, _never_admin)
+    assert reason is not None
+    assert shared in reason
+
+
+@pytest.mark.parametrize("shared", [_LOCAL_SERVICE, _NETWORK_SERVICE])
+def test_shared_service_identity_is_not_self_trusted_as_owner(shared: str) -> None:
+    reason = _evaluate_config_dacl(shared, [(_ALLOW, _READ_EXEC, _USERS)], shared, _never_admin)
+    assert reason is not None
+    assert "so it can rewrite the code this loader executes" in reason
+
+
+def test_trusted_installer_grantee_passes() -> None:
+    # TrustedInstaller is the servicing identity; it can replace any system file already.
+    aces = [(_ALLOW, _FULL, _SELF), (_ALLOW, _FULL, _TRUSTED_INSTALLER)]
+    assert _evaluate_config_dacl(_SELF, aces, _SELF, _never_admin) is None
+
+
+def test_trusted_installer_owner_passes() -> None:
+    aces = [(_ALLOW, _FULL, _TRUSTED_INSTALLER)]
+    assert _evaluate_config_dacl(_TRUSTED_INSTALLER, aces, _SELF, _never_admin) is None
+
+
+def test_domain_admins_grantee_passes_when_a_member_of_administrators() -> None:
+    """Domain Admins holding write on a SYSTEM-owned dir passes once the local Administrators lookup
+    finds it. As a grantee the lookup decides, never the RID arm (that is for owners only)."""
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _FULL, _DOMAIN_ADMINS)]
+    looked_up: list[str] = []
+
+    def _member(sid: str) -> bool:
+        looked_up.append(sid)
+        return sid == _DOMAIN_ADMINS
+
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _member) is None
+    assert looked_up == [_DOMAIN_ADMINS]
+
+
+def test_domain_admins_grantee_refused_when_not_a_member() -> None:
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _FULL, _DOMAIN_ADMINS)]
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _never_admin) is not None
+
+
+def test_grantee_with_unresolvable_membership_refused() -> None:
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _FULL, _DOMAIN_ADMINS)]
+    reason = _evaluate_config_dacl(_SYSTEM, aces, _SELF, _unresolvable)
+    assert reason is not None
+    assert "could not be resolved" in reason
+
+
+@pytest.mark.parametrize(
+    "broad",
+    [
+        _EVERYONE,
+        _AUTH_USERS,
+        _USERS,
+        "S-1-5-2",  # NETWORK
+        "S-1-5-3",  # BATCH
+        "S-1-5-4",  # INTERACTIVE
+        "S-1-5-6",  # SERVICE
+        "S-1-5-113",  # Local account
+        "S-1-5-32-546",  # BUILTIN\\Guests
+    ],
+)
+def test_broad_grantee_refused_even_if_listed_in_administrators(broad: str) -> None:
+    # A well-known group can be added to Administrators; the lookup must not soften a broad grant.
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, broad)]
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _always_admin) is not None
+
+
 @pytest.mark.parametrize(
     "sid",
     [
