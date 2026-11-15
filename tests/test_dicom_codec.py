@@ -240,11 +240,15 @@ def test_person_name_components_splits_pn() -> None:
         pytest.param("^^^^^X=Yamada", ("Yamada", *[""] * 6, "I"), id="text-past-fifth"),
         pytest.param("^^^^^X", (), id="only-past-fifth"),
         pytest.param("Doe^ ^Q", ("Doe", "", "Q"), id="blank-middle"),
-        # A group with only a prefix or suffix is no name, so the next group is used.
+        # A group with only a prefix or suffix is no name: the next group is used, or, with none
+        # left, the result is empty.
         pytest.param(
             "^^^Dr=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="prefix-only-group"
         ),
-        pytest.param("^^^^Jr", (), id="suffix-only-name"),
+        pytest.param("^^^^Jr", (), id="suffix-alone"),
+        # A given or a middle name alone is a name, so its group is chosen.
+        pytest.param("^Madonna=Yamada", ("", "Madonna"), id="given-alone"),
+        pytest.param("^^Q=Yamada", ("", "", "Q"), id="middle-alone"),
         pytest.param("^^^^", (), id="all-empty"),
         pytest.param("== ", (), id="blank-groups"),
     ],
