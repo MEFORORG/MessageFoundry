@@ -298,19 +298,22 @@ _SNIFF_HEAD_BYTES = 384
 _CARRIAGE_SNIFF_CHARS = 4096
 
 
-def _reply_sniff_head(ic: InboundConnection, body: str) -> bytes | None:
-    """The leading bytes of a binary loopback reply for the declared-type sniff, or ``None`` to leave
-    it unsniffed. Carriage is decoded from a head; whitespace inside it is tolerated, and a head that
-    does not decode is left to the codec. A body that is not carriage is the decoded text a capturing
-    transport hands over, sniffed in the inbound's declared charset as an operator resend is."""
+def _reply_sniff_head(ic: InboundConnection, body: str) -> bytes:
+    """The leading bytes of a binary loopback reply for the declared-type sniff. Carriage is decoded
+    from a head, whitespace inside it tolerated. A body that is not carriage is the decoded text a
+    capturing transport hands over, encoded in the inbound's declared charset as an operator resend
+    encodes it. Either fails closed: a head that does not decode, or a charset that cannot encode
+    it, gives ``b""``, which every sniffed type refuses, as :func:`b64_head` intends."""
     if is_marked(body):
         start = len(CARRIAGE_MARKER)
-        head = b64_head(body[start : start + _CARRIAGE_SNIFF_CHARS], _SNIFF_HEAD_BYTES)
-        return head or None
+        return b64_head(body[start : start + _CARRIAGE_SNIFF_CHARS], _SNIFF_HEAD_BYTES)
     try:
         return body[:_SNIFF_HEAD_BYTES].encode(ingress_encoding(ic), "replace")
-    except LookupError:
-        return None  # a codec name load refuses; the codec reports it
+    except (
+        LookupError,
+        UnicodeError,
+    ):  # UnicodeError: ``undefined``, or a codec refusing "replace"
+        return b""
 
 
 def reingress_body_error(ic: InboundConnection, body: str) -> str | None:
@@ -322,20 +325,23 @@ def reingress_body_error(ic: InboundConnection, body: str) -> str | None:
     then the NUL, MLLP frame-byte and second-``MSH`` rules); for a non-HL7 loopback, the declared-type
     sniff of :func:`check_declared_type`, on the head :func:`_reply_sniff_head` gives for a binary
     one. An empty or all-whitespace reply (a ``no_reply`` capture, ADR 0013) has nothing to sniff
-    and is admitted, as before. An HL7 body over twice the peek ceiling is left to ``Peek.parse``,
-    which refuses it as oversize: collapsing line endings at most halves it, and skipping the scans
-    keeps a huge reply off the event loop. The document-marker refusal needs the parsed message, so
-    the re-ingress step runs it after the peek.
+    and is admitted, as before. An HL7 body whose collapsed length is over the ceiling the
+    re-ingress peek applies (the engine default) is left to ``Peek.parse``, which refuses it as
+    oversize, so the scans never run over it. The document-marker refusal needs the parsed message,
+    so the re-ingress step runs it after the peek.
 
     The reason is the guard's own, which carries no byte of the body."""
     blank = not body or body.isspace()
     try:
         if ic.content_type.is_binary:
-            head = None if blank else _reply_sniff_head(ic, body)
-            if head is not None:
-                check_declared_type(ic, head)
+            if not blank:
+                check_declared_type(ic, _reply_sniff_head(ic, body))
             return None
-        if ic.content_type is ContentType.HL7V2 and len(body) > 2 * peek_max_bytes(ic):
+        # Collapsing CRLF to CR is the only change the normalize makes to a body's length.
+        if (
+            ic.content_type is ContentType.HL7V2
+            and len(body) - body.count("\r\n") > DEFAULT_MAX_MESSAGE_BYTES
+        ):
             return None
         decode_ingress(body, ic)
         if ic.content_type is not ContentType.HL7V2 and not blank:

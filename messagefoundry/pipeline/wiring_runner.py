@@ -1414,24 +1414,25 @@ def _peek_for_loopback(
     """Derive ``(control_id, message_type, summary, refusal)`` for a re-ingressed loopback body
     (ADR 0013 Increment 2, Q5) — the re-ingress worker's parsing step, kept in ``pipeline/`` (not the
     store) so the store stays parsing-free, exactly as ``_handle_inbound`` peeks before
-    ``enqueue_ingress``. An HL7V2 loopback runs ``Peek.parse`` (``peek_failed=True`` on ``HL7PeekError``
+    ``enqueue_ingress``. An HL7V2 loopback runs ``Peek.parse`` (a refusal on ``HL7PeekError``
     or a faulting field read → the child is recorded RECEIVED→ERROR, not dropped); any other
     ``content_type`` (x12/text/json) is relayed verbatim as a ``RawMessage`` — no parse,
     ``message_type`` = the content_type value. ``refusal`` is ``None`` when the body is admitted,
     else the recorded reason: :data:`REINGRESS_PEEK_FAILED`, or the document-marker refusal both
-    listeners run on a parsed HL7 body (BACKLOG #5616)."""
+    listeners run on a parsed HL7 body (BACKLOG #5616). That refusal keeps the parsed fields, as the
+    listeners record it, and runs inside the read-fault guard, as theirs does, so a fault in it is
+    a recorded peek failure rather than an error that would re-pend the token at the lane's head."""
     if ic.content_type is ContentType.HL7V2:
         try:
             peek = Peek.parse(body)
             fields = _read_ingress_fields(peek)
+            marker_refused = doc_ref_marker_refusal(peek, body)
         except HL7PeekError:
             return None, None, None, REINGRESS_PEEK_FAILED
         except PEEK_READ_FAULTS as exc:
             _peek_read_fault(ic, exc)
             return None, None, None, REINGRESS_PEEK_FAILED
-        if (marker_refused := doc_ref_marker_refusal(peek, body)) is not None:
-            return None, None, None, marker_refused
-        return fields.control_id, fields.message_type, fields.summary, None
+        return fields.control_id, fields.message_type, fields.summary, marker_refused
     return None, ic.content_type.value, None, None
 
 
@@ -11750,8 +11751,8 @@ class RegistryRunner:
         inbound message (ADR 0013 Increment 2). Strict FIFO per loopback lane: claim the oldest
         ``Stage.RESPONSE`` token, peek the reply body for the loopback's ``content_type``, and hand it
         off **atomically** via :meth:`~messagefoundry.store.base.QueueStore.ingress_handoff` (which
-        produces the re-ingressed message + ingress row, depth-caps it, or errors a non-peekable or
-        oversize body).
+        produces the re-ingressed message + ingress row, depth-caps it, or errors a body the peek,
+        the size ceiling or a listener content guard refuses).
         Mirrors :meth:`_router_worker`'s claim / missing-inbound / backoff supervision. Re-ingress is an
         internal stage with no source of its own (``LoopbackSource`` is inert); under active-passive HA
         the whole graph (and thus this worker) runs on the leader ONLY, so a single node drains it."""
@@ -11851,8 +11852,8 @@ class RegistryRunner:
         if refusal is None:
             control_id, message_type, summary, refusal = _peek_for_loopback(ic, body)
         else:
-            # A refused HL7 body has no message type, as on the listener; the content type stands
-            # in for any other.
+            # An HL7 body a guard refused before the peek has no message type, as on the listener;
+            # the content type stands in for any other.
             hl7 = ic.content_type is ContentType.HL7V2
             control_id, message_type, summary = None, None if hl7 else ic.content_type.value, None
         peek_failed = refusal is not None

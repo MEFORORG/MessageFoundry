@@ -248,8 +248,11 @@ def test_reingress_body_error_reads_the_listener_guards() -> None:
         reingress_body_error(dicom, RawMessage.from_bytes(part10, ContentType.DICOM.value).raw)
         is None
     )
-    # A carriage whose head does not decode is left to the codec.
-    assert reingress_body_error(dicom, "mfb64:v1:@@@not-base64@@@") is None
+    # A carriage whose head does not decode fails closed, as the operator resend refuses it.
+    for corrupt in ("mfb64:v1:@@@not-base64@@@", "mfb64:v1:", "mfb64:v1:QQ"):
+        assert reingress_body_error(dicom, corrupt) == refused, corrupt
+    # An opaque binary loopback has no signature, so nothing is refused there.
+    assert reingress_body_error(_loopback(ContentType.BINARY), "mfb64:v1:@@@") is None
 
 
 async def test_a_refused_hl7_reply_records_no_message_type(store: MessageStore) -> None:
@@ -281,3 +284,9 @@ async def test_a_reply_holding_the_document_marker_is_refused(store: MessageStor
     await _assert_refused_by_a_guard(
         store, ContentType.HL7V2, body, DOC_REF_MARKER_REFUSED_REASON, now=990.0
     )
+    # The refusal keeps the parsed header fields, as a listener records them.
+    from messagefoundry.pipeline.wiring_runner import _peek_for_loopback
+
+    control_id, message_type, _, refusal = _peek_for_loopback(_loopback(ContentType.HL7V2), body)
+    assert refusal == DOC_REF_MARKER_REFUSED_REASON
+    assert control_id is not None and message_type is not None
