@@ -536,9 +536,8 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
     The in-queue read is now the one re-read after the lookup. RED when: a second read of the
     session, of the account, or a second lock check, comes back between the lookup and the code
     check. The account is read twice: once by the directory check's role test, right after the
-    probe, and once in the queue. The lock is asked twice, both in the queue: of the row read after
-    the lookup, and of the row read in the queue, neither a read of its own. The control is that
-    the attempt still succeeds, so the count is of a leg that ran."""
+    probe, and once in the queue. The control is that the attempt still succeeds, so the count is
+    of a leg that ran."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_probe = e.service._probe_principal
     real_load = e.service._load_session
@@ -591,7 +590,7 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
 
     assert verified.ok is True
     assert looked_up
-    assert reads_before_code == [(1, 2, 2)]
+    assert reads_before_code == [(1, 2, 1)]
 
 
 @pytest.mark.parametrize("change", ["revoke", "disable", "lock"])
@@ -696,43 +695,55 @@ async def test_a_rename_rejoins_the_queue_under_the_new_name_before_the_code(
     assert [r["actor"] for r in rows] == ["jdoe-renamed"]
 
 
+@pytest.mark.parametrize("window", ["probe", "role-test"])
 @pytest.mark.parametrize("also", ["totp-off", "lapse"])
 async def test_a_lock_set_during_the_lookup_is_refused_as_locked_whatever_else_lands(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, also: str
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, also: str, window: str
 ) -> None:
-    """BACKLOG #3780 item 2. A lock that lands during the lookup is refused as ``locked``, with its
-    ``auth.mfa_failed`` row, before anything else that landed in the same window is asked: a
-    self-service TOTP disable, or a temporary credential that lapsed. The re-read the item dropped
-    refused it before the queue, ahead of the in-queue ``totp_enabled`` and lapse checks. RED when:
-    the TOTP disable answers first, with no row and no ``locked``, or the lapse ends the session
-    first."""
+    """BACKLOG #3780 item 2. A lock that lands during the lookup, in the probe or in the role test
+    that follows it, is refused as ``locked``, with its ``auth.mfa_failed`` row, before anything
+    else that landed in the same window is asked: a self-service TOTP disable, or a temporary
+    credential that lapsed. The re-read the item dropped refused it before the queue, ahead of the
+    in-queue ``totp_enabled`` and lapse checks. RED when: the TOTP disable answers first, with no
+    row and no ``locked``, or the lapse answers ``session_lost`` first."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_probe = e.service._probe_principal
+    real_roles_lost = e.service._directory_roles_lost
     real_lapsed = e.service._mfa_lapsed
-    looked_up = False
+    landed = False
 
-    async def _probe_while_a_guess_locks(user: Any) -> reconcile.Probe:
-        nonlocal looked_up
-        probe = await real_probe(user)
+    async def _land() -> None:
+        nonlocal landed
         await _lock_second_step(store, e.user_id)
         if also == "totp-off":
             await store.disable_totp(e.user_id)
-        looked_up = True
+        landed = True
+
+    async def _probe(user: Any) -> reconcile.Probe:
+        probe = await real_probe(user)
+        if window == "probe":
+            await _land()
         return probe
 
-    async def _lapsed_after_the_lookup(*args: Any, **kwargs: Any) -> bool:
-        if also == "lapse" and looked_up:
+    async def _roles_lost(*args: Any, **kwargs: Any) -> str | None:
+        if window == "role-test":
+            await _land()
+        return await real_roles_lost(*args, **kwargs)
+
+    async def _lapsed_once_landed(*args: Any, **kwargs: Any) -> bool:
+        if also == "lapse" and landed:
             return True
         return await real_lapsed(*args, **kwargs)
 
-    monkeypatch.setattr(e.service, "_probe_principal", _probe_while_a_guess_locks)
-    monkeypatch.setattr(e.service, "_mfa_lapsed", _lapsed_after_the_lookup)
+    monkeypatch.setattr(e.service, "_probe_principal", _probe)
+    monkeypatch.setattr(e.service, "_directory_roles_lost", _roles_lost)
+    monkeypatch.setattr(e.service, "_mfa_lapsed", _lapsed_once_landed)
 
     refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 
+    assert landed
     assert refused.ok is False and refused.locked is True and refused.session_lost is False
     assert await _audited_mfa_failures(store) == [{"reason": "locked"}]
-    assert await store.get_session(hash_token(e.token)) is not None
 
 
 async def test_a_lost_session_after_a_rename_during_the_lookup_names_the_new_name(

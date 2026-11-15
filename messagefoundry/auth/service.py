@@ -16577,16 +16577,14 @@ class AuthService:
         # still refuses, before any code is checked, a revocation, a disable or a lock the lookup
         # let land. A directory account comes back as the row the directory check's role test read
         # after the lookup, so the queue is keyed, and a lost session named, by the account's name
-        # as it was then, as the dropped re-read did (#2291 class). A lock that row shows landed
-        # during the lookup, and is refused in the queue right after the session read, before the
-        # ``totp_enabled`` and lapse checks, as the dropped re-read refused it before the queue.
+        # as it was then, as the dropped re-read did (#2291 class). A lock is refused in the queue
+        # right after the session read, before the ``totp_enabled`` and lapse checks, as the
+        # dropped re-read refused one that landed during the lookup before the queue.
         vouched = await self._directory_vouches_for_factor(
             token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
         if isinstance(vouched, Elevation):
             return vouched
-        # The helper returns ``user`` itself for a local account, which no lookup preceded.
-        looked_up = vouched is not user
         user = vouched
         async with AsyncExitStack() as queue:
             queued_as = user.username
@@ -16627,16 +16625,16 @@ class AuthService:
                 user = loaded
                 await queue.pop_all().aclose()
                 queued_as = loaded.username
-            # Asked of the row read after the lookup, not of the one just read, so a lock set
-            # while this attempt waited in the queue meets the order below, as on a local account.
-            if looked_up and await self._mfa_lock_refused(vouched, client=client):
+            # The lock first, on the row just read: a lock that landed during the lookup or its
+            # role test is refused as ``locked`` with its row whatever else landed with it, as the
+            # dropped re-read refused it ahead of these checks. A lock that landed during the wait
+            # is refused the same way, on a local account too, rather than after them.
+            if await self._mfa_lock_refused(user, client=client):
                 return Elevation(locked=True)
             if not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
                 return Elevation(session_lost=True)
-            if await self._mfa_lock_refused(user, client=client):
-                return Elevation(locked=True)
             now = time.time()
             # The enrolment this code is checked against: the factor write below lands only while
             # the row still holds it. Every enable stamps ``totp_enrolled_at`` afresh, as
