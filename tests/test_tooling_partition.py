@@ -346,6 +346,15 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # those packages, or an edit to tests/_ast_sites.py; each arrives as an ENGINE, console,
         # toolkit or tests/ diff, and the tooling path gate sees none of them.
         "test_warn_query_credentials_callers.py",
+        # NOT engine source, so this entry widens the list's stated rule, as
+        # test_risky_component_designation.py above does and for the same reason. It pins
+        # security.yml's windows-lock-install job to the hashed runtime locks, and its
+        # test_every_runtime_lock_exists reads requirements.lock, docker/locks/, security/locks/ and
+        # ci/locks/ off disk (BACKLOG #5594). A lock renamed or removed sets `code=true` but NOT
+        # `tooling=true`, and the tooling tier does not run in the merge queue, so listed as tooling
+        # it would run on no pre-merge leg for that change. It spawns no subprocess, so staying on
+        # the engine legs costs them almost nothing.
+        "test_windows_lock_install.py",
     }
 )
 
