@@ -14,6 +14,7 @@ records its answers, and ``tests/test_builtin_hl7_parity.py`` holds this module 
 Data model (a plain built-in structure)::
 
     ParsedMessage = {
+        "_lazy": {index: raw line},  # first, so a deepcopy reads it before segments (_ensure_split)
         "segments": [ {"id": str, "fields": list[str | dict]}, ... ],
         "raw": str | None,           # cached encode; None once dirtied
         "seps": (field, component, repetition, subcomponent, escape),
@@ -122,14 +123,15 @@ class Segment(TypedDict):
 
 
 class ParsedMessage(TypedDict):
-    """The whole parsed message — see the module docstring for the shape."""
+    """The whole parsed message — see the module docstring for the shape. Build it with ``_lazy``
+    as the first key, as :func:`parse` does: :func:`_ensure_split` relies on that order."""
 
-    segments: list[Segment]
-    raw: str | None
-    seps: tuple[str, str, str, str, str]
     # Per-segment raw text awaiting a lazy split (index in ``segments`` → raw line). MSH is never
     # here (parsed eagerly). A segment leaves this map the first time a field path touches it.
     _lazy: dict[int, str]
+    segments: list[Segment]
+    raw: str | None
+    seps: tuple[str, str, str, str, str]
 
 
 # ---------------------------------------------------------------------------

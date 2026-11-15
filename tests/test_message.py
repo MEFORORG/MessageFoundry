@@ -551,6 +551,7 @@ def test_lazy_split_stores_fields_before_dropping_the_raw_line() -> None:
 
     assert seen == ["PID|1||100^^^HOSP^MR||DOE^JANE^Q||19800101|F"]
     assert pid not in tree["_lazy"]
+    tree["raw"] = None  # drop parse's cached text, so the encode is rebuilt from the split fields
     assert clone.encode() == ADT
 
 
@@ -585,4 +586,5 @@ def test_a_split_during_the_copy_on_write_deepcopy_keeps_the_segment() -> None:
     assert pid not in tree["_lazy"]  # the split did run in the middle of the copy
     assert clone["PID-5.1"] == "DOE"
     assert clone.encode() == ADT.replace("19800101|F", "19800101|M")
+    tree["raw"] = None  # rebuild the original from its split fields, not parse's cached text
     assert m.encode() == ADT
