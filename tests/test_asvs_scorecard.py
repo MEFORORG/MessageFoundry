@@ -2526,14 +2526,56 @@ def test_signature_compares_names_not_only_counts() -> None:
     first assertion goes RED, while the default-value pair stays equal either way.
     """
 
-    def sig(src: str) -> tuple[object, ...]:
-        fn = ast.parse(src).body[0]
-        assert isinstance(fn, ast.FunctionDef)
-        return _signature(fn.args)
+    assert _sig("def f(path): ...") != _sig("def f(p): ...")
+    assert _sig("def f(a, *, b): ...") != _sig("def f(a, b): ...")
+    assert _sig("def f(a, timeout=1): ...") == _sig("def f(a, timeout=999): ...")
 
-    assert sig("def f(path): ...") != sig("def f(p): ...")
-    assert sig("def f(a, *, b): ...") != sig("def f(a, b): ...")
-    assert sig("def f(a, timeout=1): ...") == sig("def f(a, timeout=999): ...")
+
+def _sig(src: str) -> tuple[object, ...]:
+    fn = ast.parse(src).body[0]
+    assert isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+    return _signature(fn)
+
+
+def test_signature_tells_async_from_sync() -> None:
+    """Swapping ``async def`` for ``def`` (or back) keeps every parameter and still breaks every call
+    site: an awaiting caller gets a non-awaitable, a plain caller gets a coroutine it never runs. Either
+    way the observable reddens for the swap, not for the reintroduction.
+
+    Falsified by dropping the async flag from `_signature`: the pair compares EQUAL. BACKLOG #5590.
+    """
+    assert _sig("async def f(a): ...") != _sig("def f(a): ...")
+    assert _sig("async def f(a): ...") == _sig("async def f(a): return 1")
+
+
+def test_signature_tells_which_keyword_only_parameter_has_the_default() -> None:
+    """Moving a keyword-only default from one parameter to another keeps the COUNT and the names, and
+    makes a call that omitted the formerly-defaulted one raise TypeError.
+
+    Falsified by comparing keyword-only defaults by count again: the first pair compares EQUAL.
+    BACKLOG #5590.
+    """
+    assert _sig("def f(*, a=1, b): ...") != _sig("def f(*, a, b=1): ...")
+    assert _sig("def f(*, a, b=1): ...") == _sig("def f(*, a, b=2): ...")
+
+
+def test_prove_absences_refuses_an_async_swap(tmp_path: Path) -> None:
+    """End to end: a mutation that redefines the symbol as ``async def`` with the same parameters makes
+    the observable red because `scan` now returns a coroutine, and was counted as a proof.
+
+    Falsified by dropping the async flag from `_signature`: `proved_absences` becomes 1. BACKLOG #5590.
+    """
+    _module(tmp_path, "scanner.py", _SCANNER)
+    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    claim = _live_claim(
+        'async def scan(p):\n    return "clean"', "scanner.py", "test_scanner.py::test_clean"
+    )
+    findings = prove_absences([claim], tmp_path)
+    assert not findings.ok
+    assert any("PROVE-ERROR" in p and "different signature" in p for p in findings.problems), (
+        findings.problems
+    )
+    assert findings.proved_absences == 0
 
 
 def test_prove_absences_runs_one_baseline_per_observable_and_one_tree_copy(
