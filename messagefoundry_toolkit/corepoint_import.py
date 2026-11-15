@@ -827,10 +827,11 @@ def parse_roles(data: str) -> tuple[RoleToken, ...]:
 def _unread_markup(data: str, roles: tuple[RoleToken, ...]) -> bool:
     """Whether :func:`parse_roles` read no span in ``data`` and :func:`strip_markup` changes it.
 
-    Such a statement names no handle anyone can read, so it must not take the flat reading, which
-    has no handle gate and no write gate. THE one test, asked by the render's write and send arms
-    and by the handle scan alike, so the three cannot disagree on it. ADR 0086 §2(b″), first gap,
-    states the rule and what follows from it (BACKLOG #5556)."""
+    Such a statement names no handle the role layer can read, so it must not take the flat reading
+    (ADR 0086 §2(b″), the gap on flat-reading writes, says what that reading skips). THE one test,
+    asked by the render's write and send arms and by the handle scan alike, so the three cannot
+    disagree on it. ADR 0086 §2(b″), first gap, states the rule and what follows from it (BACKLOG
+    #5556)."""
     return not roles and strip_markup(data) != data.strip()
 
 
@@ -945,17 +946,17 @@ def _message_handles(action_list: Element) -> tuple[frozenset[str], frozenset[st
     ``subject`` is ``held`` when the scan reads no send (it skips a markup-free one), the handle the
     live sends it reads deliver when every one of them delivers that same handle and it is held, and
     empty otherwise. Two held handles are two trees in Corepoint, and folding both onto one ``msg``
-    would put a write meant for one into the other's send. An empty subject means :func:`_map_roles` maps no path-bearing
-    statement, so each one it reads degrades to a TODO — the honest output, because a cross-message
-    write rendered as ``msg.set`` silently mutates the wrong message. A write that takes the flat
-    reading is not gated by the subject (ADR 0086 §2(b″)). On the step 1 path, a role-parsed
-    ``MsgSend`` on a ``<Line>`` of anything outside ``held`` is refused by :func:`_send_refusal`
-    (BACKLOG #313).
+    would put a write meant for one into the other's send. An empty subject means
+    :func:`_map_roles` maps no path-bearing statement, so each one it reads degrades to a TODO — the
+    honest output, because a cross-message write rendered as ``msg.set`` silently mutates the wrong
+    message. A write that takes the flat reading is not gated by the subject (ADR 0086 §2(b″)). On
+    the step 1 path, a role-parsed ``MsgSend`` on a ``<Line>`` of anything outside ``held`` is
+    refused by :func:`_send_refusal` (BACKLOG #313).
 
-    A ``<Line>`` in markup the role layer does not read (:func:`_unread_markup`) names no handle, so
-    its send delivers ``""``, as a role-parsed send of no handle does, and its ``MsgTreeCopy`` may
-    have overwritten any tree, so a list holding one holds nothing (BACKLOG #5556). The render
-    refuses that send with :data:`_UNREAD_MARKUP_SEND_REFUSAL`.
+    A ``<Line>`` in markup the role layer does not read (:func:`_unread_markup`) names no handle the
+    scan can read, so its send delivers ``""``, as a role-parsed send of no handle does, and its
+    ``MsgTreeCopy`` may have overwritten any tree, so a list holding one holds nothing (BACKLOG
+    #5556). The render refuses that send with :data:`_UNREAD_MARKUP_SEND_REFUSAL`.
 
     The scan skips ``@Disabled`` statements exactly where :func:`_parse_statement` does, and reads each
     verb and kind through the same helpers. It is **flow-insensitive**: it does not see statement order

@@ -217,8 +217,7 @@ At least these gaps remain:
   no known handle and a `MsgTreeCopy` as holding nothing.
 - A field write that takes the flat reading checks no handle: the flat reading keeps only a path's
   leaf, so `ItemClear %OUT/PID-19`, read flat, writes `msg`, even in a list that delivers two
-  handles. A flat write to `MSH-2` or to `OBX-5` also maps onto `msg`, where a role-parsed write to
-  either is left unmapped.
+  handles. A flat write to `MSH-2` or to `OBX-5` also maps onto `msg`.
 - The handle scan does not see statement order or branches. A send that runs before its clone is
   made, or a clone made on one branch only, still counts as `msg`.
 
