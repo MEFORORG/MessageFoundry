@@ -239,6 +239,8 @@ async def test_oidc_start_post_answers_with_a_navigating_page_not_a_303(
         r = await c.post("/ui/oidc/start", follow_redirects=False)
     assert_idp_hop(r, HOSTILE_IDP_URL)
     assert "mf_oidc_flow=flow-hop" in r.headers.get("set-cookie", "")
+    # No session yet, so no watchdog: its first probe would race the hop to the login page.
+    assert "data-mf-session-watchdog" not in r.text
 
 
 async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) -> None:

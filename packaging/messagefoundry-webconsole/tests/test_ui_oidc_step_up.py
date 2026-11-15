@@ -292,6 +292,7 @@ async def test_the_step_up_start_answers_with_a_navigating_page_not_a_303(
         r = await _start_step_up(c)
     assert_idp_hop(r, HOSTILE_IDP_URL)
     assert "mf_oidc_flow=flow-hop" in r.headers.get("set-cookie", "")
+    assert 'action="/ui/logout"' in r.text  # a live session, so its sign-out stays (ASVS 7.4.4)
 
 
 async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(
@@ -686,7 +687,7 @@ async def test_a_retry_after_an_abandoned_idp_prompt_still_continues(
         await _federated_sign_in(service, c, monkeypatch)
         issue_continuation(c, _UNLOCK)
         abandoned = await _start_unlock_step_up(c)
-        assert abandoned.status_code == 200
+        assert idp_url(abandoned)  # a flow was staged, not a refusal page
         retry = await _start_unlock_step_up(c)
 
         landed = await _callback(c, idp_url(retry))

@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 import pytest
 from starlette.datastructures import Headers
+from starlette.responses import RedirectResponse
 from starlette.types import Message, Receive, Scope, Send
 
 from messagefoundry.api import create_app
@@ -75,19 +76,23 @@ def idp_url(resp: httpx.Response) -> str:
     return url
 
 
-#: An authorization URL with every character the hop page must escape, standing in for the one the
-#: engine builds. The start legs' old 303 carried exactly this string as its Location.
-HOSTILE_IDP_URL = "https://idp.example/authorize?client_id=c&state=a\"b<c>'d&x=1"
+#: An authorization URL standing in for the one the engine builds, with characters the old 303's
+#: Location percent-quoted (a double quote, angle brackets, a backslash) and characters it left
+#: alone that the hop's markup must still escape (an ampersand, a single quote).
+HOSTILE_IDP_URL = "https://idp.example/authorize?client_id=c&state=a\"b<c>'d&p=e\\f&x=1"
 
 _NONCE_IN_CSP = re.compile(r"'nonce-([A-Za-z0-9_-]+)'")
 
 
 def assert_idp_hop(resp: httpx.Response, url: str) -> None:
-    """``resp`` is a start leg's navigating page to exactly ``url``, escaped where it sits in the
-    markup, under the console's own /ui CSP, unchanged: ``build_ui_csp`` where a nonce is bound,
-    else the static ``UI_CSP``. Both carry ``form-action 'self'`` and name no IdP origin."""
-    assert idp_url(resp) == url
-    assert resp.text.count(html.escape(url, quote=True)) == 2, resp.text  # refresh + fallback link
+    """``resp`` is a start leg's navigating page to the very target the old 303 sent for ``url``
+    (Starlette's ``RedirectResponse`` Location), escaped where it sits in the markup, under the
+    console's own /ui CSP, unchanged: ``build_ui_csp`` where a nonce is bound, else the static
+    ``UI_CSP``. Both carry ``form-action 'self'`` and name no IdP origin."""
+    old_location = RedirectResponse(url, status_code=303).headers["location"]
+    assert idp_url(resp) == old_location
+    escaped = html.escape(old_location, quote=True)
+    assert resp.text.count(escaped) == 2, resp.text  # the refresh and the fallback link
     policies = resp.headers.get_list("content-security-policy")
     assert len(policies) == 1, policies
     nonce = _NONCE_IN_CSP.search(policies[0])

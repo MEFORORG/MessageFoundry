@@ -50,7 +50,7 @@ The callback picks its limiter from the flow its cookie names (BACKLOG #3374): s
 from __future__ import annotations
 
 import logging
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, quote
 
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -250,11 +250,19 @@ def _fail(request: Request, code: str, *, keep_flow: bool = False) -> Response:
     return resp
 
 
-def _idp_hop(request: Request, auth: AuthService, flow_id: str, authorization_url: str) -> Response:
+#: The characters Starlette's ``RedirectResponse`` leaves unquoted in a Location. The hop quotes its
+#: target the same way, so it navigates to exactly what the start legs' old 303 sent.
+_LOCATION_SAFE = ":/%#?=@[]!$&'()*+,;"
+
+
+def _idp_hop(
+    request: Request, auth: AuthService, flow_id: str, authorization_url: str, *, signed_in: bool
+) -> Response:
     """A start leg's answer once its flow is staged: the flow cookie, on a 200 page that navigates
-    to the IdP. Never a 303: both start legs are form POSTs, and the /ui CSP's
+    to the IdP. Never a 303: the start legs are form POSTs, and the /ui CSP's
     ``form-action 'self'`` blocks a redirect to the IdP's origin (see :func:`pages.idp_handoff`)."""
-    resp = HTMLResponse(pages.idp_handoff(authorization_url), status_code=200)
+    target = quote(authorization_url, safe=_LOCATION_SAFE)
+    resp = HTMLResponse(pages.idp_handoff(target, signed_in=signed_in), status_code=200)
     set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
     return resp
 
@@ -398,7 +406,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except FlowError:
             await auth.audit_oidc_reject("start_failed", client=client)
             return RedirectResponse("/ui/login?e=oidc_failed", status_code=303)
-        return _idp_hop(request, auth, flow_id, authorization_url)
+        return _idp_hop(request, auth, flow_id, authorization_url, signed_in=False)
 
     @app.post("/ui/reauth/oidc")
     @public_route("the federated re-authentication a step-up gate sends the browser to")
@@ -497,7 +505,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # mints one grant.
         if action.unlock:
             hold_claim_for_flow(flow_id, claim)
-        return _idp_hop(request, auth, flow_id, authorization_url)
+        return _idp_hop(request, auth, flow_id, authorization_url, signed_in=True)
 
     @app.get("/ui/oidc/callback")
     @public_route("the federated sign-in return; a session does not exist yet")

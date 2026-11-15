@@ -4,9 +4,10 @@
 re-auth, and the L4b self-service account pages (change password, TOTP MFA lifecycle).
 
 The account pages carry the normal chrome. The UNAUTHENTICATED entry pages (sign-in, the Windows-SSO
-challenge) are bare — ``nav=Markup("")``. Every page that is reached WITH a live session but drops the
-full nav for focus/confinement (step-up re-auth, reauth-continue, the forced must-change-password
-page, passkey enrolment, the federated landing hop) renders ``nav=minimal_nav()`` instead: the
+challenge, and the IdP hop on the federated sign-in leg) are bare — ``nav=Markup("")``. Every page
+that is reached WITH a live session but drops the full nav for focus/confinement (step-up re-auth,
+reauth-continue, the forced must-change-password page, passkey enrolment, the federated landing hop,
+the IdP hop on the step-up leg) renders ``nav=minimal_nav()`` instead: the
 wordmark plus the same one-click POST Sign-out form, so an authenticated page never leaves the
 operator without a way out (ASVS 7.4.4). Every dynamic value is placed through the escaping element
 builders in :mod:`.._html`. Secrets are handled once: a password is only ever an
@@ -213,28 +214,35 @@ def _meta_refresh(target: str) -> Markup:
     return el("meta", **{"http-equiv": "refresh", "content": f"0;url={target}"})
 
 
-def idp_handoff(authorization_url: str) -> Markup:
-    """The hop from a federated START leg to the IdP: ``POST /ui/oidc/start`` and
-    ``POST /ui/reauth/oidc`` both answer with it.
+def idp_handoff(authorization_url: str, *, signed_in: bool) -> Markup:
+    """The hop from a federated START leg to the IdP. ``POST /ui/oidc/start`` and
+    ``POST /ui/reauth/oidc`` answer with it, and so does ``GET /ui/oidc/start`` when it skips its
+    interstitial and runs the sign-in POST leg itself.
 
     Returned as **200 HTML with a meta refresh**, deliberately NOT a 303, for a reason unlike
-    :func:`oidc_landing`'s. Both legs are form POSTs, and the ``/ui`` CSP carries
+    :func:`oidc_landing`'s. The two POST legs are form submissions, and the ``/ui`` CSP carries
     ``form-action 'self'``. Chromium checks ``form-action`` again on each redirect that follows a
     form submission, so a 303 to the IdP's origin is blocked and the browser never leaves the page
     (measured in headless Edge 157 against the real ``POST /ui/oidc/start``). A meta refresh is a
     navigation from this document, not a form submission, so ``form-action`` does not govern it,
-    and the CSP needs no IdP origin.
+    and the CSP needs no IdP origin. The GET that runs the POST leg gets the same page: a 303
+    would work there, but one leg with one answer is simpler to hold.
 
-    **Bare chrome, on purpose.** :func:`.._html.minimal_nav` carries the session watchdog, whose
-    first probe sends a signed-out browser to the login page. On the sign-in leg there is no
-    session yet, so that probe would race this page's own navigation to the IdP. The page lives
-    for no time at all, so it offers no sign-out control.
+    ``signed_in`` picks the chrome. On the step-up leg the browser holds a live session, so the
+    page carries :func:`.._html.minimal_nav` and its sign-out control (ASVS 7.4.4). On the sign-in
+    leg it is bare: ``minimal_nav`` brings the session watchdog, whose first probe sends a browser
+    with no session to the login page, racing this page's own navigation to the IdP.
 
     ``authorization_url`` comes from the engine's flow state, built from configuration, never from
     the request.
     """
     body = _hop_card("Continuing to your organization's sign-in provider.", authorization_url)
-    return page("Signing in", body, nav=Markup(""), head_extra=_meta_refresh(authorization_url))
+    return page(
+        "Signing in",
+        body,
+        nav=minimal_nav() if signed_in else Markup(""),
+        head_extra=_meta_refresh(authorization_url),
+    )
 
 
 def leaving_site(

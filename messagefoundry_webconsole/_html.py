@@ -157,9 +157,9 @@ def page(
     ``script-src 'self'`` CSP would block, and no canary that same policy would ALLOW (which would read
     as "CSP not enforced" on a perfectly conforming browser).
 
-    ``head_extra`` appends markup to the ``<head>`` and is ``None`` for every existing caller, so the
-    rendered document is byte-identical unless a caller opts in. It exists for the federated-login
-    hops (ADR 0142), the landing hop and the start legs' hop to the IdP, which each need a
+    ``head_extra`` appends markup to the ``<head>``. It defaults to ``None``, which leaves the
+    rendered document byte-identical, and a caller opts in. It exists for the federated-login hops
+    (ADR 0142), the landing hop and the start legs' hop to the IdP, which each need a
     ``<meta http-equiv="refresh">``: a pragma directive is only
     conforming inside ``<head>``, and relying on browsers' tolerance of one in ``<body>`` would make a
     security-critical redirect depend on undefined behaviour.
@@ -484,7 +484,8 @@ def _default_nav(active: str) -> Markup:
     # left and this block flush right (heart sits directly left of Sign out, alerts left of the heart).
     right = el("div", _nav_status_icons(), _logout_form(), class_="navright")
     # ``data-mf-session-watchdog`` (14.3.1) rides the <nav> element deliberately: a nav is rendered
-    # ONLY on an authenticated page (the two unauthenticated entry pages pass nav=Markup("")), so the
+    # ONLY on an authenticated page (at least the two unauthenticated entry pages, and the IdP hop on
+    # the sign-in leg, pass nav=Markup("")), so the
     # hook is present exactly where a live session's rendered PHI needs discarding when that session
     # ends — with no per-render authentication plumbing to keep in sync. minimal_nav carries it too.
     return el(

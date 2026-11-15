@@ -51,9 +51,10 @@ _SERVICE_LOGGER = "messagefoundry.auth.service"
 #: The pages/*.py builders allowed to suppress the nav entirely: both are reached WITHOUT a session.
 UNAUTHENTICATED_BARE_BUILDERS = frozenset({"login", "sso_challenge"})
 
-#: The one TRANSIT page allowed to suppress the nav: the federated start legs' hop to the IdP. It
-#: navigates away at once, and ``minimal_nav()`` would bring the session watchdog, whose first probe
-#: sends a browser with no session (the sign-in start) to the login page, racing the hop itself.
+#: The one TRANSIT page that picks its nav per leg: the federated start legs' hop to the IdP. On the
+#: step-up leg it renders ``minimal_nav()``. On the sign-in leg it is bare, because ``minimal_nav()``
+#: would bring the session watchdog, whose first probe sends a browser with no session to the login
+#: page, racing the hop itself. ``test_the_idp_hop_signs_out_only_with_a_session`` pins both.
 TRANSIT_BARE_BUILDERS = frozenset({"idp_handoff"})
 
 _PAGES_DIR = Path(messagefoundry_webconsole.__file__).parent / "pages"
@@ -122,13 +123,19 @@ def test_unauthenticated_pages_render_no_sign_out() -> None:
     assert LOGOUT_FORM not in pages.sso_challenge()
 
 
-def test_the_idp_hop_carries_no_session_watchdog() -> None:
-    """The start legs' hop to the IdP navigates at once. With the watchdog's hook on it, a browser
-    with no session yet would be sent to the login page by the first probe, racing the hop."""
-    hop = pages.idp_handoff("https://idp.example/authorize?state=s")
-    assert "data-mf-session-watchdog" not in hop
-    assert LOGOUT_FORM not in hop
-    assert 'http-equiv="refresh"' in hop
+def test_the_idp_hop_signs_out_only_with_a_session() -> None:
+    """The start legs' hop to the IdP. On the sign-in leg no session exists yet, and the watchdog's
+    first probe would send the browser to the login page, racing the hop, so it is bare. On the
+    step-up leg the session is live, so it keeps the sign-out control and the watchdog."""
+    url = "https://idp.example/authorize?state=s"
+    sign_in = pages.idp_handoff(url, signed_in=False)
+    assert "data-mf-session-watchdog" not in sign_in
+    assert LOGOUT_FORM not in sign_in
+    step_up = pages.idp_handoff(url, signed_in=True)
+    assert "data-mf-session-watchdog" in step_up
+    assert LOGOUT_FORM in step_up
+    for hop in (sign_in, step_up):
+        assert 'http-equiv="refresh"' in hop
 
 
 # --- builder enumeration: a NEW bare authenticated page fails here --------------------------------
