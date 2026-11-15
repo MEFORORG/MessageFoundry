@@ -108,8 +108,10 @@ function unlinkWithRetries(file: string, retries: number): void {
  *   swap after the listing makes only the later lstats and unlinks, the retry waits included, and
  *   the rmdir act there. Either way regular files there named as case files can be unlinked, and the
  *   directory there removed once it is empty.
- * - If `dir` is replaced by another plain directory at any time before the listing or an unlink,
- *   the steps after the replacement act on that directory instead.
+ * - If `dir` is replaced by another plain directory at any time before the rmdir, after the step 1
+ *   lstat and after the last unlink included, the steps after the replacement act on that directory
+ *   instead. An empty plain directory placed there after the last unlink is removed by the rmdir,
+ *   and sweepStaleCaseDirs counts it as a directory removed.
  * - If `dir` itself is swapped for a link after the step 1 lstat, the rest goes through the link. A
  *   swap before the listing lists the target's entries; a swap before an lstat or unlink, the retry
  *   waits included, acts on the listed names in the target. Either way regular files named as case
@@ -183,7 +185,9 @@ export function removeCaseDir(dir: string): void {
  *
  * At least these stay until a sweep that reaches them can remove them: a directory left by a process
  * that ended before the run's `finally` ran, such as a crash, or a window close or reload while the
- * dry-run is pending (deactivate removes nothing), and a case file deleteCaseDir could not unlink. A
+ * dry-run is pending (deactivate removes nothing); a directory whose dry-run never returns, since
+ * the dry-run has no timeout and the run's `finally` does not run while it is pending; and a case
+ * file deleteCaseDir could not unlink. A
  * directory holding an entry deleteCaseDir leaves stays on every sweep, as above.
  *
  * Open limit, at least this one, besides deleteCaseDir's: the gates are read from one lstat, and
