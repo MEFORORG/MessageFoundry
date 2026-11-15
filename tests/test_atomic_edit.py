@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import stat
 import sys
 import textwrap
@@ -553,6 +554,26 @@ def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
     assert path.read_bytes() == b"x = 1\n"
 
 
+@pytest.mark.parametrize(
+    ("owner", "editor", "editor_writes", "expected"),
+    [
+        ("S-1-5-80-1", "S-1-5-21-9", False, "D:P(A;;FA;;;S-1-5-80-1)(A;;FR;;;S-1-5-21-9)"),
+        ("S-1-5-80-1", "S-1-5-21-9", True, "D:P(A;;FA;;;S-1-5-80-1)(A;;FA;;;S-1-5-21-9)"),
+        (None, "S-1-5-21-9", False, "D:P(A;;FA;;;S-1-5-21-9)"),
+        ("S-1-5-21-9", "S-1-5-21-9", False, "D:P(A;;FA;;;S-1-5-21-9)"),
+        ("S-1-5-80-1", None, False, "D:P(A;;FA;;;S-1-5-80-1)"),
+    ],
+    ids=["foreign-owner", "candidate", "own-account", "editor-is-owner", "no-editor"],
+)
+def test_the_owner_and_editor_list(
+    owner: str | None, editor: str | None, editor_writes: bool, expected: str
+) -> None:
+    # Pure string building, so every case runs on every platform.
+    assert (
+        atomic_edit._owner_and_editor_list(owner, editor, editor_writes=editor_writes) == expected
+    )
+
+
 @windows_only
 @pytest.mark.parametrize(
     "dacl",
@@ -578,7 +599,11 @@ def test_the_owner_only_check_fails_on_anything_else(tmp_path: Path, dacl: str) 
         path, dacl.format(me=me), protected=dacl.startswith("D:P")
     )
     assert result.failure is None and result.dacl_status == 0, result
-    with pytest.raises(AssertionError):
+    # The refusal must be about the list it read, not a failed read: both of the check's own
+    # asserts on a list it read carry that list as their message.
+    sddl = store_mod._read_dacl_sddl(path, owner=True)
+    assert sddl is not None
+    with pytest.raises(AssertionError, match=re.escape(sddl)):
         assert_owner_only(path, me)
     result = store_mod._set_security_from_sddl(path, f"D:P(A;;FA;;;{me})", protected=True)
     assert result.failure is None and result.dacl_status == 0, result
