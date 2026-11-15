@@ -1155,6 +1155,7 @@ def _run_shardcert(argv: list[str]) -> int:
 
     from harness.load.shardcert import (
         InboundBandTooNarrow,
+        StoreResetFailed,
         parse_rate_ladder,
         run_shardcert,
         run_shardcert_ladder,
@@ -1208,6 +1209,11 @@ def _run_shardcert(argv: list[str]) -> int:
     except InboundBandTooNarrow as exc:
         # ARTIFACT 5, under --strict-inbound-bands: the fleet would have measured the INGRESS pool while the
         # operator was sweeping the OUTBOUND one. Exit 2 (setup), never 1 (a bench result).
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 2
+    except StoreResetFailed as exc:
+        # BACKLOG #5576: the store could not be emptied, so nothing measured would be clean. Setup, not a
+        # bench result.
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
@@ -1447,7 +1453,11 @@ def _run_shardcert_engine(argv: list[str]) -> int:
         return 2
 
     from harness.load.coord import FileDropCoord
-    from harness.load.shardcert import InboundBandTooNarrow, run_shardcert_engine
+    from harness.load.shardcert import (
+        InboundBandTooNarrow,
+        StoreResetFailed,
+        run_shardcert_engine,
+    )
 
     coord = _coord_from_args(args)
     assert isinstance(coord, FileDropCoord)
@@ -1475,7 +1485,7 @@ def _run_shardcert_engine(argv: list[str]) -> int:
                 strict_bands=args.strict_inbound_bands,
             )
         )
-    except InboundBandTooNarrow as exc:
+    except (InboundBandTooNarrow, StoreResetFailed) as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
@@ -1998,7 +2008,7 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         return 2
 
     from harness.load.coord import FileDropCoord
-    from harness.load.shardcert import InboundBandTooNarrow, parse_rate_ladder
+    from harness.load.shardcert import InboundBandTooNarrow, StoreResetFailed, parse_rate_ladder
     from harness.load.shardcert_ladder import run_engine_ladder
 
     try:
@@ -2066,7 +2076,7 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
                 strict_bands=args.strict_inbound_bands,
             )
         )
-    except InboundBandTooNarrow as exc:
+    except (InboundBandTooNarrow, StoreResetFailed) as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
