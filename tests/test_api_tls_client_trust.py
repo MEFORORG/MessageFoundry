@@ -245,17 +245,28 @@ def test_the_chain_check_admits_a_client_whose_chain_nobody_revoked(two_tier: _T
     _handshake(_client(two_tier), ctx)
 
 
+def _crl_checked_server(
+    cert: Path, key: Path, ca_file: Path, crl: Path, *, chain: bool = False
+) -> ssl.SSLContext:
+    """A server context that requires a client certificate and checks it against ``crl``, built
+    by hand rather than by the listener, so a test can show what OpenSSL does with that CRL."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(cafile=ca_file)
+    harden_crl_check(ctx, str(crl), record_held_copy=False, chain=chain)
+    return ctx
+
+
 @pytest.mark.usefixtures("clean_anchor_checks")
 def test_control_the_leaf_check_alone_admits_the_revoked_intermediates_client(
     two_tier: _TwoTier,
 ) -> None:
     """The instrument's control: the same CRL file under the leaf flag, as the listener loaded it
     before the fix, admits the client, so the CRL above really does revoke something."""
-    leaf_only = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    leaf_only.load_cert_chain(two_tier.server_cert, two_tier.server_key)
-    leaf_only.verify_mode = ssl.CERT_REQUIRED
-    leaf_only.load_verify_locations(cadata=two_tier.root_file.read_text("ascii"))
-    harden_crl_check(leaf_only, str(two_tier.revokes_intermediate), record_held_copy=False)
+    leaf_only = _crl_checked_server(
+        two_tier.server_cert, two_tier.server_key, two_tier.root_file, two_tier.revokes_intermediate
+    )
     assert not leaf_only.verify_flags & (ssl.VERIFY_CRL_CHECK_CHAIN & ~ssl.VERIFY_CRL_CHECK_LEAF)
     _handshake(_client(two_tier), leaf_only)
 
@@ -337,6 +348,137 @@ def test_a_loaded_ca_with_no_crl_of_its_own_refuses_the_build(
     # The control: with the root's CRL added, the same CA file builds and admits the client.
     crl_file.write_bytes(two_tier.revokes_nothing.read_bytes())
     _handshake(_client(two_tier), build_api_ssl_context(settings))
+
+
+@dataclass(frozen=True)
+class _Rollover:
+    """One CA name, ``CN=Client Root``, under two keys, with a client leaf under the new key and
+    a server certificate under the old one. Every CRL here is minted on demand."""
+
+    d: Path
+    old_key: ec.EllipticCurvePrivateKey
+    new_key: ec.EllipticCurvePrivateKey
+    old_root: Path
+    new_root: Path
+    server_cert: Path
+    server_key: Path
+    client_bundle: Path
+    client_key: Path
+
+    def crl(self, name: str, *crls: bytes) -> Path:
+        path = self.d / name
+        path.write_bytes(b"".join(crls))
+        return path
+
+    def settings(self, ca_files: list[Path], crl: Path) -> ApiSettings:
+        ca_file = self.d / "client-ca.pem"
+        ca_file.write_bytes(b"".join(p.read_bytes() for p in ca_files))
+        return ApiSettings(
+            tls_cert_file=str(self.server_cert),
+            tls_key_file=str(self.server_key),
+            tls_client_ca_file=str(ca_file),
+            tls_client_crl_file=str(crl),
+        )
+
+    def client(self) -> ssl.SSLContext:
+        """TLS 1.2, as :func:`_client`, so the server's verdict lands inside the handshake."""
+        ctx = ssl.create_default_context(cadata=self.old_root.read_text("ascii"))
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(self.client_bundle, self.client_key)
+        return ctx
+
+
+@pytest.fixture
+def rollover(tmp_path: Path) -> _Rollover:
+    old_key, new_key, leaf_key, server_key = (
+        ec.generate_private_key(ec.SECP256R1()) for _ in range(4)
+    )
+    files = {
+        "old-root.pem": _pem(_cert("Client Root", old_key, "Client Root", old_key, ca=True)),
+        "new-root.pem": _pem(_cert("Client Root", new_key, "Client Root", new_key, ca=True)),
+        "server.pem": _pem(_cert("server", server_key, "Client Root", old_key, ca=False)),
+        "server-key.pem": _key_pem(server_key),
+        "client.pem": _pem(_cert("svc", leaf_key, "Client Root", new_key, ca=False)),
+        "client-key.pem": _key_pem(leaf_key),
+    }
+    for name, data in files.items():
+        (tmp_path / name).write_bytes(data)
+    return _Rollover(
+        d=tmp_path,
+        old_key=old_key,
+        new_key=new_key,
+        old_root=tmp_path / "old-root.pem",
+        new_root=tmp_path / "new-root.pem",
+        server_cert=tmp_path / "server.pem",
+        server_key=tmp_path / "server-key.pem",
+        client_bundle=tmp_path / "client.pem",
+        client_key=tmp_path / "client-key.pem",
+    )
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_crl_whose_issuer_differs_from_its_ca_only_in_spacing_builds_and_admits(
+    rollover: _Rollover,
+) -> None:
+    """Red before the fix: the check matched the CRL to its CA by issuer name, compared with white
+    space exact, so a CRL from ``CN=Client Root `` refused the start, while OpenSSL drops that
+    space, takes the CRL as the CA's own, and admits the client. The CRL is the CA's by its key."""
+    crl = rollover.crl("spaced.pem", _crl("Client Root ", rollover.new_key, None))
+    ctx = build_api_ssl_context(rollover.settings([rollover.new_root], crl))
+    _handshake(rollover.client(), ctx)
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_same_name_rollover_with_only_the_old_keys_crl_refuses_the_build(
+    rollover: _Rollover,
+) -> None:
+    """Red before the fix: the old key's CRL carries the name both CAs share, so it counted for
+    both and the start passed, while every client under the new key is refused at the handshake.
+    The control: with the new key's CRL added, the same CA file builds and admits that client."""
+    old_crl = _crl("Client Root", rollover.old_key, None)
+    old_only = rollover.crl("old-only.pem", old_crl)
+    settings = rollover.settings([rollover.old_root, rollover.new_root], old_only)
+    with pytest.raises(
+        ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Client Root'"
+    ) as err:
+        build_api_ssl_context(settings)
+    # It names the new key's CA alone, by serial number, since the two share a name.
+    serials = {
+        root: f"{x509.load_pem_x509_certificate(root.read_bytes()).serial_number:#x}"
+        for root in (rollover.old_root, rollover.new_root)
+    }
+    assert f"(serial number {serials[rollover.new_root]})" in str(err.value)
+    assert serials[rollover.old_root] not in str(err.value)
+    # The handshake the refusal speaks for: the old key's CRL alone refuses the new key's client.
+    by_hand = _crl_checked_server(
+        rollover.server_cert,
+        rollover.server_key,
+        Path(str(settings.tls_client_ca_file)),
+        old_only,
+        chain=True,
+    )
+    with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):
+        _handshake(rollover.client(), by_hand)
+    both = rollover.crl("both.pem", old_crl, _crl("Client Root", rollover.new_key, None))
+    _handshake(
+        rollover.client(),
+        build_api_ssl_context(settings.model_copy(update={"tls_client_crl_file": str(both)})),
+    )
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_control_a_loaded_ca_with_no_crl_at_all_still_refuses_the_build(
+    rollover: _Rollover,
+) -> None:
+    """The control for the two above, green before the fix and after it: matching by key still
+    refuses a loaded CA that signed no CRL in the file, here one of another name beside the new
+    key's CA and its CRL."""
+    other_key = ec.generate_private_key(ec.SECP256R1())
+    other = rollover.d / "other-ca.pem"
+    other.write_bytes(_pem(_cert("Other CA", other_key, "Other CA", other_key, ca=True)))
+    crl = rollover.crl("new-only.pem", _crl("Client Root", rollover.new_key, None))
+    with pytest.raises(ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Other CA'"):
+        build_api_ssl_context(rollover.settings([rollover.new_root, other], crl))
 
 
 def test_a_crl_that_is_there_but_unreadable_refuses_naming_its_setting(

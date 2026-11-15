@@ -1215,27 +1215,51 @@ def crl_pem_blocks(pem: bytes) -> list[bytes]:
     return list(_crl_blocks(pem))
 
 
-def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[str]:
-    """The subject, in RFC 4514 form, of each CA in ``ca_ders`` that signed no CRL in ``crl_pem``
-    (vault BACKLOG #5627). Under a whole-chain CRL check OpenSSL needs a loaded CA's own CRL for
-    every certificate it issued, a leaf or an intermediate a client sends, so without it every
-    client under that CA is refused. Names are matched the way OpenSSL matches them
-    (:func:`_issuer_name_key`). Raises ``ValueError`` naming which file did not parse."""
+def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[str, int]]:
+    """Each CA in ``ca_ders`` that signed no CRL in ``crl_pem``, as its subject in RFC 4514 form
+    and its certificate's serial number (vault BACKLOG #5627). Under a whole-chain
+    CRL check OpenSSL needs a loaded CA's own CRL for every certificate it issued, a leaf or an
+    intermediate a client sends, so without it every client under that CA is refused.
+
+    **A CRL is matched to a CA by key, never by name** (:func:`_signed_by`). By name, a CRL whose
+    issuer differed from the CA's subject only in white space refused the start, though OpenSSL
+    takes it for that CA's; and in a rollover that keeps the CA's name under a new key, the old
+    key's CRL counted for both CAs, so the start passed and every client under the new key was
+    refused. Raises ``ValueError`` naming which file did not parse."""
     try:
-        signers = {
-            _issuer_name_key(x509.load_pem_x509_crl(block).issuer) for block in _crl_blocks(crl_pem)
-        }
+        crls = [
+            (crl, _crl_extensions(crl).akid)
+            for crl in map(x509.load_pem_x509_crl, _crl_blocks(crl_pem))
+        ]
     except _UNREADABLE_CA as exc:
         raise ValueError(f"a CRL block does not parse: {exc}") from exc
-    missing: list[str] = []
+    missing: list[tuple[str, int]] = []
     for der in ca_ders:
         try:
-            ca = x509.load_der_x509_certificate(der)
-            if _issuer_name_key(ca.subject) not in signers:
-                missing.append(ca.subject.rfc4514_string())
+            ca = _listed_ca(der)
+            subject = ca.cert.subject.rfc4514_string()
         except _UNREADABLE_CA as exc:
             raise ValueError(f"a loaded client CA does not parse: {exc}") from exc
+        if not any(_signed_by(crl, akid, ca) for crl, akid in crls):
+            missing.append((subject, ca.serial))
     return missing
+
+
+def _signed_by(crl: x509.CertificateRevocationList, akid: _CrlAkid | None, ca: _ListedCa) -> bool:
+    """Whether ``ca`` signed ``crl``, judged as :func:`_signature_state` judges a CA it named,
+    without its issuer-name test: the CA fits the CRL's Authority Key Identifier ``akid``
+    (:func:`_akid_fit`), and its key verifies the CRL. A signature the engine cannot check counts
+    only when the CRL names the CA's key by key identifier, the case a start already loads with a
+    warning (``uncheckable``); by itself it proves nothing, since a key of another kind than the
+    signature cannot check it either."""
+    try:
+        names_key = _akid_fit(akid, ca)
+    except _UNREADABLE_CA:
+        return False
+    if names_key is None:
+        return False
+    verified = _verifies(crl, ca.cert)
+    return verified is True or (verified is None and names_key)
 
 
 def _crl_blocks(pem: bytes) -> Iterator[bytes]:
