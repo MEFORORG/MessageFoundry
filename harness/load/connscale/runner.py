@@ -380,6 +380,8 @@ async def run_connscale(
                                 break
                             records.append(record)
                             step += 1
+    if not records:
+        notes.append("NO STEP WAS RECORDED: the sweep measured nothing, so the run fails")
     slos = _evaluate_slos(profile, records)
     comparison: ClaimModeComparison | None = build_comparison(
         records, profile.claim_modes, missing_detail=missing_detail
@@ -2540,10 +2542,12 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
     if slo.zero_loss:
         # `all()` over nothing is True, so a sweep that kept no record would read zero-loss PASS;
         # this function is shared with the batch-box aggregate, so the guard is here (BACKLOG #5432).
-        all_ok = bool(records) and all(r.no_loss.ok for r in records)
         # An empty list says so, rather than reading as a message loss.
-        zero_loss_seen: bool | str = all_ok if records else "no step was recorded"
-        out.append(SloCheck("zero_loss", True, zero_loss_seen, all_ok))
+        if not records:
+            out.append(SloCheck("zero_loss", True, "no step was recorded", False))
+        else:
+            all_ok = all(r.no_loss.ok for r in records)
+            out.append(SloCheck("zero_loss", True, all_ok, all_ok))
     if profile.intake_audit:
         # BACKLOG #1292, and DELIBERATELY NOT folded into zero_loss: this is a per-MESSAGE check and
         # zero_loss is a per-COUNT one, so they can disagree, and each disagreement is informative.

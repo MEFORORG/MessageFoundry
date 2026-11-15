@@ -106,6 +106,9 @@ def test_estate_reconcile_sees_the_stranded_rows_through_the_sample() -> None:
     )
     assert not result.ok
     assert result.backlog == 36
+    # The control: the same estate run, drained and delivered, passes.
+    c = Counters(sent=36, acked=36, sink_received=36)
+    assert estate_reconcile(c, _BASE, _sample(read=36, written=36), unconfirmed_budget=2).ok
 
 
 # --- #5433: the connscale reconcile ---------------------------------------------------------------
@@ -215,3 +218,4 @@ async def test_a_sweep_that_recorded_nothing_does_not_pass(monkeypatch: pytest.M
     assert report.records == []
     assert all(c.ok for c in report.slos)  # the control: no SLO fails it
     assert not report.result_ok
+    assert any("NO STEP WAS RECORDED" in n for n in report.notes), report.notes
