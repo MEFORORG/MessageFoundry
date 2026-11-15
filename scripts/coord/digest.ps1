@@ -275,20 +275,21 @@ $md.Add('')
 
 $md.Add('## Calibration, per seat and class')
 $md.Add('')
-$md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day. A row's acted and reversed counts also hold the reversed decisions logged under another name of its roster seat, which the gate charges to it (reversals only, #5604), so one reversal can show in several rows.")
+$md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day. Each name keeps its own samples, but a breach under any name of its roster seat closes every name of it, and a row's acted and reversed counts also hold the reversed decisions logged under another name of its seat, as the gate reads them (owner ruling 2026-11-15, option c), so one reversal can show in several rows.")
 $md.Add('')
 $md.Add('| Seat | Class | Rated | Disagree | Blind status | Acted decisions, 14 days | Reversed | Reversal rate |')
 $md.Add('|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
-# Kept by "seat|class", so the gate-state table below reads each seat's Class B row from here.
-# A row is the seat as logged, and a roster alias's reversals reach its rate, as decision.ps1 -Gate
-# reads them (reversals only, #5604), so this table agrees with what the gate answers.
+# Kept by "name|class", so the gate-state table below reads each name's Class B row from here. A row
+# is one name, trimmed and lower-cased as the gate pools its samples, and Get-DecisionCalibration
+# applies the seat's breaches and reversals to it, as decision.ps1 -Gate does (owner ruling
+# 2026-11-15, option c), so this table agrees with what the gate answers.
 $calibration = @{}
 $byClass = @{}
 foreach ($g in @($decisions | Group-Object { [string]$_.class })) { $byClass[$g.Name] = $g.Group }
-foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-Object Name)) {
+foreach ($g in @($decisions | Group-Object { "$(ConvertTo-DecisionSeatLabel ([string]$_.seat))|$($_.class)" } | Sort-Object Name)) {
     # Read from a record, not split from the name: a seat holding `|` splits the name wrongly.
-    $seat = [string]$g.Group[0].seat
+    $seat = ConvertTo-DecisionSeatLabel ([string]$g.Group[0].seat)
     $class = [string]$g.Group[0].class
     $c = Get-DecisionCalibration -Decisions $byClass[$class] -Seat $seat -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
     $calibration[$g.Name] = $c
@@ -323,7 +324,7 @@ if ($dayEnd -gt $now) {
 $md.Add('')
 $md.Add('| Seat | Seat reversal budget | Class B calibrated |')
 $md.Add('|---|---|---|')
-foreach ($s in @($decisions | ForEach-Object { [string]$_.seat } | Where-Object { $_ } | Sort-Object -Unique)) {
+foreach ($s in @($decisions | ForEach-Object { ConvertTo-DecisionSeatLabel ([string]$_.seat) } | Where-Object { $_ } | Sort-Object -Unique)) {
     $cal = $calibration["$s|B"]
     $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if ($cal -and $cal.Calibrated) { 'yes' } else { 'no' }) |")
 }

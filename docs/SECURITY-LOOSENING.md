@@ -51,16 +51,15 @@ credential-shaped under a neutral header name, over plain `http` off this machin
 of this section. This section is the one statement of that rule; other pages link here.
 
 A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
-or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
-or starts the service, with two exceptions. SFTP: the host key is known only once the server
+or when an SSH host key is unknown. The engine refuses each case below before the credential is
+sent, at a point that depends on the hop. SFTP, for example: the host key is known only once the server
 answers, so that refusal comes at connect, before the password is sent. The AI broker: the engine
 builds it for each `POST /ai/chat`, so that request is refused and answers `503`, and the refusal
 names `[ai].endpoint`. **No lever in this guide lifts a refusal in
 the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
 `tls_hop_attested`, `cleartext_accepted` and a loopback host, with one exception: on the plain
 `http` row a loopback host still carries a credential, since that hop never leaves this machine.
-Each refusal names the connection, or
-the `[auth]` setting for the AD bind, and offers only settings that can fix it. A verify-off refusal
+Each refusal offers only settings that can fix it. A verify-off refusal
 names a header off the allowlist apart from any credential. Where such headers are all it lists, it
 also offers removing them. The engine then judges the hop as one with no credential, under its own
 levers. `Email` and `Direct`
@@ -79,6 +78,7 @@ pointed at one of those levers.
 | `[auth]` AD binds | `ad_server` is a plain `ldap://` address, or a bare host (vault BACKLOG #3533) | use an `ldaps://` address; pin a private CA with `ad_tls_ca_cert_file` |
 | `[alerts]` SMTP relay login (`email_username`) | `email_use_tls = false` or `email_tls_verify = false`, refused at load (vault BACKLOG #3533) | turn both on; pin the relay's CA with `email_tls_ca_file`; or remove the login |
 | AI broker (`[ai].endpoint`) | the endpoint is plain `http` | use an `https` endpoint |
+| The store login (`[store]`, SQL Server and PostgreSQL) | `trust_server_certificate = true` or `encrypt = false` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2) | trust the server's certificate, or pin it with `[store].ssl_root_cert` |
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
@@ -116,9 +116,10 @@ engine has not verified, when the lever named beside each is set:
   [credential-shaped](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine) under
   an allowlisted header name, such as an opaque token in `X-Request-ID`, on a `verify_tls = false`
   hop. The allowlist reads names, and the value test knows only the shapes that definition lists;
-- the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
-  `encrypt = false`.
+  `encrypt = false`, when the connection declares `tls_hop_attested` with its reason. Without that
+  declaration the hop is refused at every posture, whatever `MEFOR_ALLOW_INSECURE_TLS` says (owner
+  ruling 2026-11-14, vault BACKLOG #3533 item 2).
 
 **The forward-proxy login is judged by different owner rulings.** A `proxy_user` login rides the
 leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
@@ -701,13 +702,12 @@ is refused, so an opt-out does nothing and is not reported.
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
   (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) are **honoured** again, only where the
-  code knows this posture. A plain `ldap://` AD bind is not: it is refused at every posture, and
-  the opt-in that this dial used to release, `[auth].ad_allow_insecure_ldap`, was removed (vault
-  BACKLOG #3533). A check that reads no posture refuses the escape whatever the dial says
-  (vault BACKLOG #2354): at least the CLI commands that open the store without one. That includes
-  `support-bundle` and `verify`, and at `warn` the commands BACKLOG #2532 covers and
-  `admin-revoke-sessions`, which pass the instance posture only at `enforce` (see *Which callers
-  know the posture* below).
+  code knows this posture and only in the cells each escape reaches. What `MEFOR_ALLOW_INSECURE_TLS`
+  opens, and what it never opens, the store hop among them, is stated once in
+  [DEPLOYMENT.md](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch). A plain `ldap://` AD
+  bind is not: it is refused at every posture, and the opt-in that this dial used to release,
+  `[auth].ad_allow_insecure_ldap`, was removed (vault BACKLOG #3533). A check that reads no posture
+  refuses the escape whatever the dial says (vault BACKLOG #2354).
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
@@ -1007,8 +1007,12 @@ count is above `0` (vault BACKLOG #2613).
 > ([ADR 0077](adr/0077-action-bound-step-up.md)).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
   once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
-  With the switch off, those routes accept the session-wide step-up window instead. A sign-in can
-  open that window, so a session taken over inside it can bind an authenticator, inject a message
+  With the switch off, those routes accept the session-wide step-up window instead. At least a
+  sign-in, a TOTP or recovery code on any session but an `oidc` one, and a passkey assertion that
+  completes a pending factor with the user-verification flag, on any session but an `oidc` one,
+  can open that window; that flag is
+  the authenticator's own report ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
+  2026-11-14 amendment). So a session taken over inside it can bind an authenticator, inject a message
   or export bodies in bulk with no fresh proof.
 - **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
   while a client that cannot send the bound proof is updated.
@@ -2599,7 +2603,20 @@ count is above `0` (vault BACKLOG #2613).
   key file ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)), and each
   other secret-class setting, whose way in is the secrets directory that `MEFOR_SECRETS_DIRECTORY`
   names, one restricted file per setting
-  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). They also
+  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). Every
+  `MEFOR_VALUE_*` variable in those lists is refused too, an empty one and a host name as well as
+  a password, since the engine cannot tell which `env()` value is a secret (owner ruling
+  2026-11-14, vault BACKLOG #8212). The refusal never spells one, since the name was read from
+  the registry and may hold a value typed in the wrong place. It counts them: the names are
+  de-duplicated without regard to case, and each is counted once, under the first registry value
+  that sets it, so a name a later value also sets is not counted there. It sends each to the
+  secrets directory, or a value that is not a secret and is the same for every instance to the
+  active environment's value file. A `MEFOR_VALUE_*` variable a `[secrets].provider = "env"`
+  reference names is refused too, and the secrets directory does not supply it, since that
+  provider reads the environment only; the refusal says to drop the reference and put the
+  credential in the secrets directory under the setting it stands for, or else to use
+  `[secrets].provider = "vault"`, which applies engine-wide. It says to delete an empty entry, or
+  the bare name `MEFOR_VALUE_`, rather than move it. They also
   refuse a store key in their own environment when they found their service but could not read
   its lists, since the key most likely came from there; another secret in their own environment is
   not refused then.
@@ -2608,8 +2625,9 @@ count is above `0` (vault BACKLOG #2613).
   `create_managed_app`, refuses on the same finding: the factory raises as it is built. The entry
   is named, with the refusal's finding and remedy, only where the refusal would fire
   (`messagefoundry/serviceenv.py`): the engine found its service, the way the bullet *How the
-  engine finds its own service* below says, and either an engine secret is in that service's lists
-  or the lists could not be read and a store key is in the engine's own environment. A
+  engine finds its own service* below says, and either an engine secret or a `MEFOR_VALUE_*`
+  variable is in that service's lists, or the lists could not be read and a store key is in the
+  engine's own environment. A
   console-script launcher such as `uvicorn.exe` or `hypercorn.exe` between NSSM and the
   interpreter is neither a Python interpreter nor `messagefoundry.exe`, so the engine does not
   find its service there and this entry is not named. The reading is taken once per process, and
@@ -2641,11 +2659,17 @@ count is above `0` (vault BACKLOG #2613).
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
   line says so. The reading is taken once per process: as `serve` or `supervise` starts, or at
   the first reading an app built without them takes.
-- **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
-  list or the service's own `Environment` value, and from the machine-wide environment. Keep the
+- **How to clear them:** remove each variable the entry names or counts from the registry value
+  it names, NSSM's list or the service's own `Environment` value, and from the machine-wide
+  environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
-  and a secret a connection reads through `env()`, whose name only your config knows.
+  a variable named by a `[secrets].provider = "env"` reference, whose name only your config
+  knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable or a secret
+  other than a store key that reaches the engine from the machine-wide environment, which is
+  neither refused nor named. A `MEFOR_VALUE_*` variable in the service's own lists is covered,
+  as *What is refused* says, whatever reads it: an `env()` value or a `[secrets].provider = "env"`
+  reference.
 
 ---
 

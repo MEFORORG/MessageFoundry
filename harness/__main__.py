@@ -14,8 +14,9 @@
                                                 mutations of generated HL7 through the MLLP driver,
                                                 checking health, ACK-implies-stored, reply shape and no
                                                 5xx after each batch. Exits 0 (held) / 1 (an invariant
-                                                broke; the seed and a replay file are printed) / 2
-                                                (setup). ``--fuzz-replay FILE`` resends a kept case.
+                                                broke, or the run checked nothing; see
+                                                harness/fuzz/cli.py) / 2 (setup). ``--fuzz-replay
+                                                FILE`` resends a kept case.
 ``python -m harness --list-profiles`` → list the built-in load profiles.
 ``python -m harness --load NAME``     → run a load profile headless against a running engine and exit
                                                 0 (SLOs met) / 1 (SLO violation, incl. zero_loss when
@@ -287,8 +288,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--fuzz-out",
-        help="fuzz: directory a failing case's exact bytes are written to (default: a "
-        "messagefoundry-harness-fuzz directory under the system temp directory)",
+        help="fuzz: directory a failing case's exact bytes are written to (default: a fresh "
+        "messagefoundry-harness-fuzz-* directory under the system temp directory)",
     )
     parser.add_argument(
         "--fuzz-replay",
@@ -1155,6 +1156,7 @@ def _run_shardcert(argv: list[str]) -> int:
 
     from harness.load.shardcert import (
         InboundBandTooNarrow,
+        StoreResetFailed,
         parse_rate_ladder,
         run_shardcert,
         run_shardcert_ladder,
@@ -1208,6 +1210,11 @@ def _run_shardcert(argv: list[str]) -> int:
     except InboundBandTooNarrow as exc:
         # ARTIFACT 5, under --strict-inbound-bands: the fleet would have measured the INGRESS pool while the
         # operator was sweeping the OUTBOUND one. Exit 2 (setup), never 1 (a bench result).
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 2
+    except StoreResetFailed as exc:
+        # BACKLOG #5576: the store could not be emptied, so nothing measured would be clean. Setup, not a
+        # bench result.
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
@@ -1447,7 +1454,11 @@ def _run_shardcert_engine(argv: list[str]) -> int:
         return 2
 
     from harness.load.coord import FileDropCoord
-    from harness.load.shardcert import InboundBandTooNarrow, run_shardcert_engine
+    from harness.load.shardcert import (
+        InboundBandTooNarrow,
+        StoreResetFailed,
+        run_shardcert_engine,
+    )
 
     coord = _coord_from_args(args)
     assert isinstance(coord, FileDropCoord)
@@ -1475,7 +1486,7 @@ def _run_shardcert_engine(argv: list[str]) -> int:
                 strict_bands=args.strict_inbound_bands,
             )
         )
-    except InboundBandTooNarrow as exc:
+    except (InboundBandTooNarrow, StoreResetFailed) as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
@@ -1998,7 +2009,7 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         return 2
 
     from harness.load.coord import FileDropCoord
-    from harness.load.shardcert import InboundBandTooNarrow, parse_rate_ladder
+    from harness.load.shardcert import InboundBandTooNarrow, StoreResetFailed, parse_rate_ladder
     from harness.load.shardcert_ladder import run_engine_ladder
 
     try:
@@ -2066,7 +2077,7 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
                 strict_bands=args.strict_inbound_bands,
             )
         )
-    except InboundBandTooNarrow as exc:
+    except (InboundBandTooNarrow, StoreResetFailed) as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

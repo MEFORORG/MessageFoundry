@@ -193,10 +193,12 @@ Facts the labels leave out:
   under a new tag. Run by hand on a draft held for any other reason, such as a failed build job
   or a refused approval, the same command publishes a release with an asset missing or a package
   not on PyPI.
-- **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
-  run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
-  passed. To clear it, re-run the failed job on that commit, then re-run the release. A check
-  still running is waited for. A check the server requires that never ran on the commit also
+- **The provenance gate.** The tagged commit must be on `main`, and for each required check, the
+  latest run of every workflow and trigger that ran it on that commit must have passed. A red run
+  after the merge blocks the tag even if the merge-queue run passed, and a green from another
+  workflow or trigger does not clear it. To clear it, re-run the failed jobs of the workflow run the
+  refusal names, or run that workflow on the same trigger again, then re-run the release. GitHub
+  re-runs a workflow run only within 30 days of it. A check still running is waited for. A check the server requires that never ran on the commit also
   blocks it; tag a newer commit that ran it.
 
 ## What we publish, per release

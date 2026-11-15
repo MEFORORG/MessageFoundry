@@ -197,11 +197,13 @@ from messagefoundry.store.row_seal import (
     SESSION_KIND,
     USER_KIND,
     AnyRowSealer,
+    ResealOutcome,
     RowSealer,
     RowSealError,
     RowSealKeyRetiredError,
     SealPager,
     TransitSealUnavailableError,
+    classify_unrotated,
     require_seal_for_write,
     revoke_seal_refusals,
     row_sealer_for_cipher,
@@ -2283,10 +2285,48 @@ def reauth_stamp(
     return apply
 
 
-def mfa_stamp(now: float) -> Callable[[SessionRecord], SessionRecord]:
-    """The change ``mark_session_mfa_verified`` makes to a session row (WP-14)."""
-    when = float(now)
-    return lambda s: replace(s, mfa_verified_at=when)
+@dataclass(frozen=True)
+class PendingFactorAnchor:
+    """What a factor that completes a PENDING session also moves (vault BACKLOG #2964 item 14): the
+    session's address to ``client`` (``None`` keeps the stored one) and its step-up window, which
+    opens when ``open_window`` is true and is cleared when it is false, whether or not the address
+    moved. :func:`mfa_stamp` applies it only to a row that has not met its factor."""
+
+    client: str | None
+    open_window: bool
+
+
+class _MfaStamp:
+    """The callable :func:`mfa_stamp` returns. ``anchored`` says whether its last application
+    applied the anchor; it is decided afresh on every call, so a callable applied twice cannot
+    carry an earlier answer."""
+
+    def __init__(self, when: float, anchor: PendingFactorAnchor | None) -> None:
+        self._when = when
+        self._anchor = anchor
+        self.anchored = False
+
+    def __call__(self, s: SessionRecord) -> SessionRecord:
+        anchor = self._anchor if s.mfa_verified_at is None else None
+        self.anchored = anchor is not None
+        if anchor is None:
+            return replace(s, mfa_verified_at=self._when)
+        return replace(
+            s,
+            mfa_verified_at=self._when,
+            client=s.client if anchor.client is None else anchor.client,
+            reauth_at=self._when if anchor.open_window else None,
+        )
+
+
+def mfa_stamp(now: float, anchor: PendingFactorAnchor | None = None) -> _MfaStamp:
+    """The change ``mark_session_mfa_verified`` makes to a session row (WP-14).
+
+    It always stamps ``mfa_verified_at``. With an ``anchor``, and only when the row it is applied to
+    has not met its factor, it also applies the anchor (:class:`PendingFactorAnchor`). The session
+    write helper applies it to the row it read inside its own transaction, so the decision is made
+    on the row the write replaces, never on an earlier read."""
+    return _MfaStamp(float(now), anchor)
 
 
 # The session-cap predicates, in the `?` dialect SQLite and SQL Server share (BACKLOG #1900). Each
@@ -4916,6 +4956,67 @@ def report_refused_role_holder() -> None:
     log.warning(
         "a holder of a deleted custom role failed its integrity seal; its role row was removed"
         " and nothing was re-sealed (BACKLOG #2592)"
+    )
+
+
+#: The sealed columns ``rotate-key``'s re-seal passes move to the active key, as ``(table, column,
+#: filter)``, read back after the passes (vault BACKLOG #5635). Approvals are the open ones alone,
+#: as ``count_unsealed_approvals`` counts them: a decided request releases nothing, so a seal on
+#: one must not hold a rotation open. Constants, never input, so :func:`unrotated_seal_queries`
+#: formats them into SQL.
+RESEALED_SEAL_COLUMNS: Final = (
+    ("users", "authz_seal", ""),
+    ("roles", "seal", ""),
+    ("pending_approvals", "seal", " AND status IN ('pending', 'executing', 'interrupted')"),
+    ("authority_set_seal", "seal", ""),
+)
+
+
+def unheld_seal_refusal(outcome: ResealOutcome, *, before_writes: bool) -> CipherError:
+    """The refusal ``reencrypt_to_active`` raises when a user, role, open approval or directory-map
+    seal names a key this run does not hold (vault BACKLOG #5635). Going on would re-encrypt such a
+    user's TOTP secret, which the user's seal covers, and leave the record verifying under no key.
+    A ``CipherError``, as a cell no supplied key opens is, so ``rotate-key`` aborts with exit 1,
+    rolls no audit range, writes no stamp and leaves its rotation record open.
+
+    ``before_writes`` says which check fired. The pre-flight read runs before any re-seal or cell
+    pass writes. The passes never write over a seal under a key the run does not hold, so with
+    nothing else writing it sees every such seal. The check after the passes reads the tables it
+    checks once. The reads and the passes are separate transactions, so neither read is atomic
+    against a writer running alongside, such as an engine left running. A seal such a writer
+    commits during the run may be missed, or counted refused, rather than stopping the run. The
+    text names only tables and non-secret seal key ids."""
+    done = (
+        "Nothing was written by this pass: the check ran before any re-seal or re-encryption."
+        if before_writes
+        else "The re-seal passes had already committed re-seals and TOTP re-encryptions under the "
+        "active key, so keep that key; no other cell was re-encrypted. A seal appearing after "
+        "the passes means something else wrote to the store during this run: stop it first."
+    )
+    return CipherError(
+        f"{outcome.unheld} user, role, open approval or directory-map record(s) in "
+        f"{', '.join(outcome.unheld_tables)} name a seal key this run does not hold (seal key "
+        f"id(s) {', '.join(outcome.unheld_key_ids)}; each such seal starts mfseal:v1:<id>:), so "
+        f"they were not re-sealed. {done} The causes include at least a prior "
+        "key that was not supplied, a key that is lost, and a seal written outside the store. "
+        "Supply the prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run; where no key "
+        "you hold opens the record, recreate or remove it, then re-run"
+    )
+
+
+def unrotated_seal_queries(placeholder: str, *, collate: str = "") -> tuple[tuple[str, str], ...]:
+    """``(table, SELECT)`` for each of :data:`RESEALED_SEAL_COLUMNS`: its seals that are not blank
+    and do not name the active key, whose ``LIKE`` pattern the one ``placeholder`` takes. Each
+    backend runs these after its re-seal passes and hands the rows to ``classify_unrotated``.
+    ``collate`` is SQL Server's binary collation. The filter only saves work, and does not
+    mirror each pass's own: ``classify_unrotated`` decides what counts."""
+    return tuple(
+        (
+            table,
+            f"SELECT {column} AS seal FROM {table} WHERE {column} <> ''"
+            f" AND {column}{collate} NOT LIKE {placeholder}{where}",
+        )
+        for table, column, where in RESEALED_SEAL_COLUMNS
     )
 
 
@@ -11120,6 +11221,8 @@ class MessageStore:
     # check_reference_backend_supported).
     supports_reference_sets = True
     backend = StoreBackend.SQLITE
+    # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
+    _reseal_outcome: ResealOutcome = ResealOutcome()
 
     def __init__(
         self,
@@ -12242,6 +12345,7 @@ class MessageStore:
         supplied via ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED``) — it never silently drops PHI. Returns the
         number of values rewritten."""
         cipher = self._cipher
+        self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
             # and the comment named only the harmless one. IdentityCipher means NO key is
@@ -12273,9 +12377,19 @@ class MessageStore:
         # re-sealed under the active key in one write (rotation_reseal), so the loop below finds those
         # secrets already under the active key. The loop then rotates the rest, which are accounts
         # whose record has no seal or fails it and is refused anyway.
+        # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
+        # under a key this run does not hold leaves the store as this method found it.
+        preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if preflight.unheld:
+            self._reseal_outcome = preflight
+            raise unheld_seal_refusal(preflight, before_writes=True)
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
+        # Vault BACKLOG #5635: what the passes left under another key, for the command to read.
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
+            raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
@@ -19150,6 +19264,25 @@ class MessageStore:
             await self._write_user(user_id, lambda r: r.changed(cred_digest=digest))
         return count
 
+    def reseal_outcome(self) -> ResealOutcome:
+        """What the last :meth:`reencrypt_to_active` left sealed under a key other than the active
+        one (vault BACKLOG #5635); empty before one has run."""
+        return self._reseal_outcome
+
+    async def _unrotated_seals(self) -> list[tuple[str, object]]:
+        """``(table, seal)`` for every seal :func:`unrotated_seal_queries` selects, read after the
+        re-seal passes (vault BACKLOG #5635)."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return []
+        active = f"{SEAL_PREFIX}{sealer.key_id}:%"
+        seals: list[tuple[str, object]] = []
+        async with self._read() as db:
+            for table, sql in unrotated_seal_queries("?"):
+                cur = await db.execute(sql, (active,))
+                seals.extend((table, r[0]) for r in await cur.fetchall())
+        return seals
+
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key (BACKLOG #2592), for ``rotate-key``.
 
@@ -20749,13 +20882,22 @@ class MessageStore:
             await self._write_session(token_hash, stamp)
             await self._commit()
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        """Stamp a session's second-factor as satisfied (WP-14): after a TOTP/recovery verify, or at
-        issuance for an MFA-delegated AD/Kerberos login."""
-        stamp = mfa_stamp(time.time() if now is None else now)
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        """Stamp a session's second-factor as satisfied (WP-14): at least after a TOTP/recovery
+        verify, a factor enrolment confirm, a passkey assertion (the one caller that passes an
+        ``anchor``), or at issuance for a sign-in that owes no second factor. See
+        :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the answer."""
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with _writer_txn(self._db, self._lock):
-            await self._write_session(token_hash, stamp)
+            written = await self._write_session(token_hash, stamp)
             await self._commit()
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None

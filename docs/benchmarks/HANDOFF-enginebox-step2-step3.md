@@ -245,6 +245,8 @@ $env:MEFOR_ALLOW_INSECURE_TLS
 
 Also confirm `MEFOR_ALLOW_INSECURE_TLS`: **shardcert injects it into its own subprocesses**, but `stage_residency.py` does not. If the store hop runs with `trust_server_certificate=true` / `encrypt=false`, the script dies with `ValueError: SQL Server TLS is weakened … set MEFOR_ALLOW_INSECURE_TLS=1`. **VERIFY ON THE BOX** and export it in your shell if so.
 
+> CHANGED 2026-11-14 (vault BACKLOG #3533 item 2, owner ruling): the paragraph above no longer works. The engine now refuses a store login over `trust_server_certificate=true` / `encrypt=false` at every posture, and `MEFOR_ALLOW_INSECURE_TLS` does not lift that, in `serve`, in shardcert's subprocesses or in `stage_residency.py`. Exporting it changes nothing. Give the store a certificate the engine box trusts, or pin the server's own certificate with `MEFOR_STORE_SSL_ROOT_CERT` (`Encrypt=strict`; CI measures that pin against SQL Server 2025 on Linux, and SQL Server 2022 on Linux refused it, with error 17821, under every TLS configuration CI tried), and keep `MEFOR_STORE_ENCRYPT=true` and `MEFOR_STORE_TRUST_SERVER_CERTIFICATE=false`. What the escape still means: [the escape hatch](../DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch).
+
 ### 3.5 🚨 ENGINE box — THE STALE-ENV SWEEP (run this on EVERY arm)
 
 **The harness merges your launching shell's environment as the BASE of the child env** — `node_env = {**os.environ, **store_env, **shape_env, **escapes}` (`harness/load/shardcert.py:1559`; single-box twin at `:700`). **So ANY stale `MEFOR_PIPELINE_*` export silently reconfigures the engine in every arm of both runs, invisibly — it appears in no harness output and in no report JSON.** The immediately preceding session (P0) exported exactly such vars (`MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS=false` was its A/B knob). A leftover in a wrapper script or a machine-level env var makes every number in both runs a measurement of an unknown configuration.
@@ -378,7 +380,7 @@ New-Item -ItemType Directory -Force <OUT_ENGINE> | Out-Null
 **ENGINE box, SAME shell, SAME cwd, SAME `MEFOR_STORE_*` env as the ladder:**
 ```powershell
 $env:PYTHONUTF8 = "1"
-$env:MEFOR_ALLOW_INSECURE_TLS = "1"       # only if the store hop is TLS-weakened — see §3.4
+$env:MEFOR_ALLOW_INSECURE_TLS = "1"       # CHANGED 2026-11-14: no longer lifts a weakened store hop; see the dated note in §3.4
 New-Item -ItemType Directory -Force <OUT_ENGINE> | Out-Null     # ⬅️ MANDATORY — see below
 
 .\.venv\Scripts\python.exe scripts\bench\stage_residency.py --json <OUT_ENGINE>\s2-residency.json `

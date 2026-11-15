@@ -183,7 +183,7 @@ def test_each_refusal_is_typed_and_still_a_value_error(tmp_path: Path) -> None:
     bad_crl = _pg().model_copy(update={"ssl_crl_file": str(crl)})
     for refuse in (
         lambda: _build_ssl(_pg(trust_server_certificate=True), posture=enforcing),
-        lambda: connection_string(_ss(trust_server_certificate=True), posture=enforcing),
+        lambda: connection_string(_ss(trust_server_certificate=True)),
         lambda: check_pinned_certificate(_ss(ssl_root_cert=pin), posture=enforcing),
         lambda: _build_ssl(gone, posture=enforcing),
         # Any refusal the context builder makes is typed at the open, a CRL that cannot be judged

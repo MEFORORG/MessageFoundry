@@ -62,16 +62,15 @@ _T = TypeVar("_T")
 def _conn() -> dict[str, Any]:
     """Connector settings for the CI mssql service container (reuses the store job's ``MEFOR_STORE_*``).
 
-    ``trust_server_certificate`` is on for the container's self-signed cert; the connector's TLS guard
-    permits that MITM-able combination only because the job also sets ``MEFOR_ALLOW_INSECURE_TLS`` — the
-    trusted-network dev/test escape this exact scenario exists for."""
+    Verification stays on: the CI job serves a certificate it generated and added to the runner's
+    trust store. ``trust_server_certificate`` is refused at every posture, whatever
+    ``MEFOR_ALLOW_INSECURE_TLS`` says (vault BACKLOG #3533 item 2)."""
     return dict(  # noqa: C408
         server=os.environ.get("MEFOR_STORE_SERVER", "localhost"),
         port=int(os.environ.get("MEFOR_STORE_PORT", "1433")),
         database=os.environ.get("MEFOR_STORE_DATABASE", "MessageFoundry"),
         username=os.environ.get("MEFOR_STORE_USERNAME", "sa"),
         password=os.environ.get("MEFOR_STORE_PASSWORD", ""),
-        trust_server_certificate=True,
     )
 
 

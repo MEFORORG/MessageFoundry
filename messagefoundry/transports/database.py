@@ -95,13 +95,10 @@ from messagefoundry.config.models import (
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     EgressSettings,
-    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import (
     HOP_ATTESTATION_LEVER,
-    HopPosture,
     InsecureHopRefused,
-    current_hop_posture,
     hop_name_prefix,
 )
 from messagefoundry.config.wiring import _is_text_codec
@@ -110,11 +107,13 @@ from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
 from messagefoundry.odbc_call_gate import (
     CallGate,
+    UngatedConnectionError,
     call_gate,
+    close_one_shot,
     drop_handle,
-    install_call_gate,
     raw_cursor,
     report_once,
+    require_call_gate,
 )
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
@@ -195,57 +194,49 @@ _NO_NEXTSET_STATES = frozenset({"IM001", "HYC00", "HY007"})
 _CLIENT_FETCH_STATES = frozenset({"07006"})
 
 
-def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
-    """Whether a weakened (verify-off) customer-DB TLS posture may be used, routed through the ONE
-    shared hop authority (#200, ADR 0092).
+def _weakened_tls_permitted(*, attested: bool) -> bool:
+    """Whether a weakened (verify-off) customer-DB TLS posture may be used (#200, ADR 0092).
 
-    A per-connection ``tls_hop_attested`` ALLOWs it (the operator affirms the hop is secure by other
-    means — a proxy-terminated / trusted-segment DB link). Otherwise this stays a **STRICT verify-off
-    cell** (decision 5): refused unless the global ``MEFOR_ALLOW_INSECURE_TLS`` escape applies, and
-    that escape works only at ``[security].enforcement = warn`` (decision 2), so it can never relax
-    an enforcing hop.
-
-    The escape question is the shared :func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`,
-    so this cell and every other weakened-TLS cell answer it in one place. ``posture`` is the
-    construction-time posture; the send-time tripwire passes the one its connector captured, because
-    a delivery worker runs outside the scope that stamped it. ``None`` fails closed (vault BACKLOG
-    #2354). CORRECTED: an unstamped call used to fall back to the unclamped escape, on the premise
-    that the enforced gate had already vetted the real posture; callers the gate never reaches made
-    that false."""
-    return attested or weakened_tls_escape_permitted(posture)
+    Only a per-connection ``tls_hop_attested`` ALLOWs it (the operator affirms the hop is secure by
+    other means: a proxy-terminated or trusted-segment DB link). Otherwise this is a **STRICT
+    verify-off cell** (decision 5), refused at every posture. The connection's login would cross the
+    hop, so ``MEFOR_ALLOW_INSECURE_TLS`` does not permit it, even on an instance at
+    ``[security].enforcement = warn`` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2). It used
+    to take a posture, and the escape on such an instance let the login cross."""
+    return attested
 
 
 def _audit_attested_weakened_tls(cell: str, *, connection: str | None = None) -> None:
-    """Loud-log a per-connection attestation that suppresses a would-be **production-PHI** weakened-TLS
-    refusal (#200 decision 3 — attestation is AUDITED when it crosses a prod-PHI hop). No-op on a
-    non-prod / non-PHI / unstamped posture (nothing was suppressed there)."""
-    posture = current_hop_posture()
-    if posture is not None and posture.enforcing:
-        logger.warning(
-            "%s%s: weakened TLS permitted by per-connection tls_hop_attested on a production-PHI "
-            "instance (operator attests the hop is secure by other means)",
-            hop_name_prefix(connection),
-            cell,
-        )
+    """Loud-log a per-connection attestation that suppresses a weakened-TLS refusal (#200 decision 3 —
+    attestation is AUDITED when it crosses a hop that would otherwise be refused).
+
+    It logs at every posture, because the refusal it suppresses holds at every posture: without the
+    attestation :func:`_weakened_tls_permitted` refuses the hop even at ``[security].enforcement =
+    warn`` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2). It used to log only while
+    enforcing, when ``MEFOR_ALLOW_INSECURE_TLS`` could permit the hop at ``warn`` instead."""
+    logger.warning(
+        "%s%s: weakened TLS permitted by per-connection tls_hop_attested (operator attests the hop is "
+        "secure by other means)",
+        hop_name_prefix(connection),
+        cell,
+    )
 
 
 def _assert_send_hop(
     *,
     weakened: bool,
     attested: bool,
-    posture: HopPosture | None,
     connection: str | None = None,
 ) -> None:
     """Zero-I/O byte-crossing re-assertion (#200 decision 4): before a payload crosses a weakened-TLS
-    DB hop, re-confirm the posture-keyed authority still permits it. Raises :class:`InsecureHopRefused`
-    (a ``ValueError``) otherwise — a fail-closed tripwire behind the construction-time gate. No-op for
-    a non-weakened (verifying-TLS) hop. ``posture`` is the one the connector captured when it was
-    built."""
-    if weakened and not _weakened_tls_permitted(attested=attested, posture=posture):
+    DB hop, re-confirm :func:`_weakened_tls_permitted` still permits it. Raises
+    :class:`InsecureHopRefused` (a ``ValueError``) otherwise — a fail-closed tripwire behind the
+    construction-time gate. No-op for a non-weakened (verifying-TLS) hop."""
+    if weakened and not _weakened_tls_permitted(attested=attested):
         raise InsecureHopRefused(
             f"{hop_name_prefix(connection)}DATABASE destination: refusing to put a payload on a "
             "weakened-TLS database hop "
-            "(posture-keyed refusal, #200)"
+            "(#200)"
         )
 
 
@@ -263,10 +254,9 @@ def _build_dsn(
     BACKLOG #4873).
 
     Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
-    ``ServerCertificate`` pin. A weakened TLS posture is **refused** via the shared posture-keyed
-    authority (:func:`_weakened_tls_permitted`, #200) — a STRICT verify-off cell that stays refused
-    for staging AND prod PHI, with the global escape clamped so it can never relax a production hop;
-    ``attested`` (the per-connection ``tls_hop_attested``) is the surgical, audited per-hop opt-in.
+    ``ServerCertificate`` pin. A weakened TLS posture is **refused** (:func:`_weakened_tls_permitted`,
+    #200) at every posture, even with ``MEFOR_ALLOW_INSECURE_TLS`` set at
+    ``[security].enforcement = warn`` (vault BACKLOG #3533 item 2); ``attested`` (the per-connection ``tls_hop_attested``) is the surgical, audited per-hop opt-in.
 
     ``read_only`` (the db_lookup pool and, since BACKLOG #2617, the ``DatabaseRef`` sync set it;
     destination/source omit it, keeping their DSN byte-identical) appends ``ApplicationIntent=ReadOnly``
@@ -286,18 +276,15 @@ def _build_dsn(
         raise ValueError(f"{where}DATABASE {refusal}")
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
-    if (trust or not encrypt) and not _weakened_tls_permitted(
-        attested=attested, posture=current_hop_posture()
-    ):
+    if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
         raise ValueError(
             f"{where}DATABASE connection TLS is weakened "
             "(trust_server_certificate=true or encrypt=false), "
-            "which is MITM-able. Use a trusted server certificate with encrypt=true; set "
-            f"{HOP_ATTESTATION_LEVER} on the connection if the hop is "
-            "secure by other means (a proxy-terminated or isolated segment; reported as a loosening); "
-            f"or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn to "
-            "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "
-            "the default, or with no posture)."
+            "which is MITM-able, and the connection's login would cross it. Use a trusted server "
+            f"certificate with encrypt=true, or set {HOP_ATTESTATION_LEVER} on the connection if the "
+            "hop is secure by other means (a proxy-terminated or isolated segment; reported as a "
+            f"loosening). {INSECURE_TLS_ESCAPE_ENV}=1 does not permit it, even on an instance at "
+            "[security].enforcement = warn."
         )
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
@@ -2054,7 +2041,7 @@ def _warn_generic_tls_unenforced(
     params: Mapping[str, Any], *, family: str, connection: str | None = None
 ) -> None:
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
-    path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
+    path **cannot introspect the driver's TLS posture**, so the weakened-TLS refusal
     (#200 / ADR 0092) does not apply and :func:`_build_connection` reports the hop as non-weakened. That
     is a deliberate operator-owned-TLS model.
 
@@ -2117,7 +2104,7 @@ def _warn_generic_tls_unenforced(
 # construction.
 #
 # SCOPE IS DELIBERATE: the generic dialect only, and only when the classifier returns a reason. The SQL
-# Server preset keeps its own posture-keyed weakened-TLS refusal (:func:`_build_dsn`) — moving that arm
+# Server preset keeps its own weakened-TLS refusal (:func:`_build_dsn`) — moving that arm
 # onto this gradient would ADD the loopback and ``cleartext_accepted`` relaxations to a path that
 # refuses today, which is a loosening.
 
@@ -2136,7 +2123,7 @@ def generic_cleartext_hop_guard(
     nothing on this arm to gate (BACKLOG #1178).
 
     ``None`` covers two different situations. A non-``generic`` dialect is not this arm at all — the SQL
-    Server preset keeps its own posture-keyed weakened-TLS refusal in :func:`_build_dsn`. A generic
+    Server preset keeps its own weakened-TLS refusal in :func:`_build_dsn`. A generic
     connection returns ``None`` when :func:`generic_odbc_tls_unenforced` does, because it found no reason to think the hop crosses in plaintext; the
     engine still cannot VERIFY an arbitrary driver's keyword, and that residual is unchanged and
     written down above :data:`_ODBC_NO_TLS_VALUES`.
@@ -3227,8 +3214,9 @@ class _AutocommitPool:
     async def _acquire_confirmed(self) -> Any:
         conn = await self._pool.acquire()
         # BACKLOG #2394: here, not only in _acquire, because a DatabaseRef sync borrows through
-        # acquire_pooled, and because the set below goes through the gate.
-        install_call_gate(conn)
+        # acquire_pooled, and because the set below goes through the gate. One the gate cannot
+        # wrap is refused before that set, its first call.
+        await _require_gate_or_discard(self._pool, conn)
         if conn in self._confirmed:  # False, not an error, for an object with no weak reference
             return conn
         try:
@@ -3349,15 +3337,75 @@ async def _acquire(pool: Any, timeout: float) -> Any:
     hung/exhausted pool surfaces as a retryable failure instead of an unbounded await.
 
     The connection comes back with the call gate installed (BACKLOG #2394), so a cancelled call
-    cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded."""
+    cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded. A
+    real aioodbc connection the gate cannot wrap is refused and discarded instead, before any call
+    runs on it (:func:`_require_gate_or_discard`)."""
     try:
         conn = await asyncio.wait_for(pool.acquire(), timeout)
     except TimeoutError as exc:
         raise DeliveryError(
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
-    install_call_gate(conn)
+    await _require_gate_or_discard(pool, conn)
     return conn
+
+
+async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
+    """Gate a connection just borrowed from ``pool``, or refuse it (BACKLOG #2394).
+
+    Call it before the first pyodbc call on ``conn``, with no await between the borrow and it. A
+    real aioodbc connection the call gate cannot wrap
+    (:func:`~messagefoundry.odbc_call_gate.require_call_gate`) has no safe cancellation exit, so
+    it is closed here, while no call runs on it.
+    :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` then propagates, and each caller
+    classifies it as it does any other failure to borrow. A stand-in the gate cannot wrap is not
+    refused, as ``require_call_gate`` leaves it alone.
+
+    **Its handle is dropped before any await**, so the pool never lends it again, and given back
+    closed at once. The close of that handle runs on a worker thread, and the refusal does not wait
+    for it, as the store's refusal does not: nothing runs on the connection, so the close can race
+    nothing, and the borrow is not held behind a busy executor or a slow disconnect. Where the
+    executor is already shut down, at loop teardown, no thread can take the close, and the handle
+    is freed as this refusal unwinds, on the event loop thread.
+
+    **A connection with no ``_conn``** (an aioodbc that renamed it, as it renamed ``_execute``) has
+    no handle to drop, so it is closed through its own ``close()``
+    (:func:`~messagefoundry.odbc_call_gate.close_one_shot`), and goes back to ``pool`` only once
+    that close has returned, through :func:`_return_when_settled` when a cancellation lands
+    meanwhile. So the pool can neither lend it nor close it again while that close runs. On this
+    path the borrow does wait for the close, and nothing bounds that wait. A close that failed
+    leaves it open: it goes back open, and the next borrow refuses and closes it again."""
+    try:
+        require_call_gate(conn)
+    except UngatedConnectionError:
+        raw = drop_handle(conn)  # first, and await-free: the pool never lends it again
+        if raw is not None:
+            try:
+                asyncio.get_running_loop().run_in_executor(None, _close_refused, raw)
+            except RuntimeError as exc:  # the executor is shut down; see the docstring
+                logger.debug("DATABASE: refused connection not closed, executor shut down: %s", exc)
+        else:
+            closing = asyncio.ensure_future(close_one_shot(conn, None))
+            # The loop holds a task only weakly; keep this one alive until it ends, since on a
+            # cancellation only _return_when_settled's callback is left waiting on it.
+            _DETACHED_SETTLES.add(closing)
+            closing.add_done_callback(_DETACHED_SETTLES.discard)
+            try:
+                await asyncio.shield(closing)
+            except BaseException:
+                _return_when_settled(pool, conn, closing, "a refused connection's close")
+                raise
+        await _return_to_pool(pool, conn)
+        raise
+
+
+def _close_refused(raw: Any) -> None:
+    """On a worker thread: close the driver connection of a borrow the call gate refused. No call
+    ever ran on it, so no transaction can be open. Never raises."""
+    try:
+        raw.close()
+    except Exception as exc:  # noqa: BLE001 - every driver fault; nobody is left to raise to
+        logger.warning("DATABASE: closing a refused connection failed: %s", _safe_db_error(exc))
 
 
 async def _close_cursor(cur: Any) -> None:
@@ -3415,20 +3463,21 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     alone is handed to that call, so the connection goes back only once it has returned, and the
     gate closes the cursor it made as it returns. A cancellation that lands after a call was handed
     to the connection's executor but before that call entered the gate leaves a call that never
-    runs (:class:`~messagefoundry.odbc_call_gate.CallGate`), so no close races it. A connection
-    with no gate (one :func:`~messagefoundry.odbc_call_gate.install_call_gate` could not wrap,
-    which it logs at ERROR, or a test double) has nothing to hand a close to, so a cancellation
-    drops its handle and closes nothing: the pool gets it back closed, and pyodbc frees the cursor
-    and then the connection once nothing uses them, since its cursor holds the connection.
+    runs (:class:`~messagefoundry.odbc_call_gate.CallGate`), so no close races it. A real aioodbc
+    connection the gate cannot wrap does not reach here through this module's borrows, which refuse
+    and discard it before its first call (:func:`_require_gate_or_discard`); a connection taken
+    from a plain aioodbc pool some other way, such as ``acquire_pooled`` on a pool that is not an
+    :class:`_AutocommitPool`, is not checked. A connection with no gate, a test double or one that
+    came that other way, has nothing to hand a close to, so a cancellation drops its handle
+    and closes nothing: the pool gets it back closed, and its unclosed handles are freed where
+    their last reference drops, rather than under the call.
 
     **What this does not cover, at least.** A cursor with no raw pyodbc cursor (a test double, or
     an aioodbc that renamed ``_impl``, which :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs
     once) is closed through its own ``close()`` as a task, and a teardown cancel of that task keeps
-    the connection out of the pool (:func:`_return_when_settled`). An ungated connection's
-    unclosed handles are freed where their last reference drops, which can be the event loop, for
-    one through the cancelled call's own result: that free rolls back and disconnects there, the
-    trade for not freeing them under the call. Its session ends only then. A cancellation that lands after a ``cursor()`` call returned on its
-    thread, but before the loop delivered the result, leaves that cursor for the collector.
+    the connection out of the pool (:func:`_return_when_settled`). A cancellation that lands after
+    a ``cursor()`` call returned on its thread, but before the loop delivered the result, leaves
+    that cursor for the collector.
 
     **``discard`` closes the connection instead of returning it open (BACKLOG #5010).** A caller
     whose own rollback failed passes it, since the transaction may still be open on a live session
@@ -3826,8 +3875,6 @@ class DatabaseDestination(DestinationConnector):
         # send-time byte-crossing re-assertion below.
         self._hop_attested = config.tls_hop_attested
         self._connection_name = config.name
-        # The posture this connector was built under, for the send-time tripwire (vault BACKLOG #2354).
-        self._hop_posture = current_hop_posture()
         self._dsn, self._weakened_tls = _build_connection(
             s, attested=self._hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
@@ -3900,15 +3947,14 @@ class DatabaseDestination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
-        # #200 decision 4: zero-I/O byte-crossing re-assertion of the posture-keyed hop decision, so a
-        # payload never crosses a weakened-TLS DB hop the shared authority would refuse. Defense-in-depth
-        # BEHIND the construction-time _build_dsn gate (which already refused a prod-PHI weakened hop),
+        # #200 decision 4: zero-I/O byte-crossing re-assertion of the hop decision, so a
+        # payload never crosses a weakened-TLS DB hop _weakened_tls_permitted would refuse. Defense-in-depth
+        # BEHIND the construction-time _build_dsn gate (which already refused an unattested weakened hop),
         # catching a reload / build that reached send() around it. Fixed DSN target → this only ever
         # fires as a tripwire.
         _assert_send_hop(
             weakened=self._weakened_tls,
             attested=self._hop_attested,
-            posture=self._hop_posture,
             connection=self._connection_name,
         )
         # BACKLOG #1178: the generic dialect's twin of the line above. That tripwire is keyed on
@@ -4224,7 +4270,7 @@ class DatabaseSource(SourceConnector):
         if refusal is not None:
             raise ValueError(refusal)
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
-        # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
+        # verify-off refusal as the destination (a read still crosses the wire).
         self._dsn, _ = _build_connection(
             s,
             attested=config.tls_hop_attested,

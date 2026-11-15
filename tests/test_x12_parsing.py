@@ -609,6 +609,34 @@ def test_check_integrity_reports_a_trailer_a_new_header_opens_over(
     assert check_integrity(raw) == expected
 
 
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param(
+            "SE*2*0001~", "SE*2*0001~SE*2*0009~", ["SE02 '0009' has no ST"], id="orphan-se"
+        ),
+        pytest.param("GE*1*1~", "GE*1*1~GE*0*9~", ["GE02 '9' has no GS"], id="orphan-ge"),
+        pytest.param(
+            "GE*1*1~",
+            "GE*1*1~ST*270*0002~SE*2*0002~",
+            ["ST02 '0002' is outside a GS"],
+            id="set-outside-group",
+        ),
+    ],
+)
+def test_check_integrity_reports_a_trailer_or_set_with_no_enclosing_header(
+    old: str, new: str, expected: list[str]
+) -> None:
+    # An orphan SE or GE, or a set outside any group, tied out clean (BACKLOG #5808). The edit is a
+    # whole-segment insert, so the rest of the envelope still ties out and the one problem is the
+    # one this case plants.
+    good = interchange()
+    assert check_integrity(good) == []
+    raw = good.replace(old, new, 1)
+    assert raw != good
+    assert check_integrity(raw) == expected
+
+
 class _CountingStr(str):
     """A ``str`` that totals how far its ``find`` calls scan, and how much its slices read."""
 

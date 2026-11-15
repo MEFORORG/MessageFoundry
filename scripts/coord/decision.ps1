@@ -341,8 +341,14 @@ function Invoke-DecisionGate {
                 return (New-GateAnswer 'REVIEW' $why)
             }
         }
-        if (-not $Seat) {
+        if (-not (ConvertTo-DecisionSeat $Seat)) {
             $why.Add('no seat was given or found in the seat registry, so its calibration and its reversal budget cannot be read')
+            return (New-GateAnswer 'REVIEW' $why)
+        }
+        if ($null -eq (Get-DecisionSeatAliases)) {
+            # Without the roster an alias cannot be joined to its seat, so the seat's history may be
+            # read in part (BACKLOG #5597).
+            $why.Add("the seat roster docs/roles/seats.json could not be read, so $Seat's aliases cannot be joined to its calibration and reversal budget")
             return (New-GateAnswer 'REVIEW' $why)
         }
         if ($Offline) {
@@ -375,7 +381,9 @@ function Invoke-DecisionGate {
         $closed = $false
 
         # Calibration reads the window alone, so it is the digest's whatever else was read for joins.
-        # -Seat applies the reversals-only alias ruling (#5604); Get-DecisionCalibration says how.
+        # Every seat's Class B pool, and -Seat as asked: Get-DecisionCalibration joins the seat's names
+        # by roster name, never by raw string (BACKLOG #5597), keeps the samples that name's own, and
+        # applies a breach or a reversal under any name of the seat (owner ruling 2026-11-15, option c).
         $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Seat $Seat -Decisions @($all | Where-Object {
                 $_.kind -eq 'decision' -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
             })
@@ -455,8 +463,9 @@ if ($Flush) {
 if ($List) {
     try { $Day = Resolve-DecisionDay $Day } catch { [Console]::Error.WriteLine("decision.ps1: $($_.Exception.Message)"); exit 2 }
     $res = Read-DecisionLog -Repo $Repo -CoordRoot $coord -Days (Get-DecisionDayRange $Day $Days)
+    $canon = ConvertTo-DecisionSeat $Seat
     $rows = @($res.Records | Where-Object {
-            (-not $Seat -or [string]$_.seat -eq $Seat) -and (-not $Item -or [string]$_.item -eq $Item)
+            (-not $Seat -or (ConvertTo-DecisionSeat ([string]$_.seat)) -eq $canon) -and (-not $Item -or [string]$_.item -eq $Item)
         })
     if ($Json) {
         Write-Output (ConvertTo-Json -InputObject $rows -Depth 8)
@@ -471,6 +480,10 @@ if ($List) {
     }
     if (-not $res.Complete) {
         foreach ($e in $res.Errors) { [Console]::Error.WriteLine("decision.ps1: INCOMPLETE, the log was not fully read: $e") }
+        exit 4
+    }
+    if ($Seat -and $null -eq (Get-DecisionSeatAliases)) {
+        [Console]::Error.WriteLine("decision.ps1: INCOMPLETE, the seat roster docs/roles/seats.json could not be read, so records under an alias of '$Seat' were not matched.")
         exit 4
     }
     exit 0

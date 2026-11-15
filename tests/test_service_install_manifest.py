@@ -1457,6 +1457,404 @@ def test_residue_outside_the_well_known_set_is_reported_not_hidden(tmp_path: Pat
     )
 
 
+# --- the -LockConfigDir lockdown is READ BACK too (BACKLOG #5562) ----------------------------------
+# Set-SecureConfigAcl had the shape Set-SecureDataDirAcl had before #1699: `/inheritance:r /grant:r`
+# on the directory alone. An EXPLICIT broad ACE on the directory survived it, and so did every child
+# file or folder whose own DACL carried an explicit grant or had inheritance turned off -- while the
+# installer printed "Config : locked to ...". The runtime guard (SEC-003) vets the directory and each
+# *.py, so the likely outcome is a service that refuses to start under a line saying it was locked.
+#
+# Only an elevated token may make Administrators an owner, so an unelevated run reads back an owner
+# problem for every item; _config_lockdown keeps those apart for the owner arm.
+
+_CONFIG_ACL_FNS = [
+    "Set-SecureConfigAcl",
+    "Get-WellKnownBroadSids",
+    "Get-BroadAclResidue",
+    "Get-ReparsePointAncestor",
+    "Reset-ConfigTreeAcl",
+]
+
+
+def _config_lockdown(tmp_path: Path, prepare: str = "", account: str = "$me") -> dict:
+    """Run Set-SecureConfigAcl on a real config tree and read every DACL in it back.
+
+    The tree is ``config\\mod.py`` and ``config\\sub\\inner.py``, with a folder ``outside`` beside
+    it that a junction planted in the tree may point at. ``prepare`` runs first, with ``$cfg``,
+    ``$outside`` and ``$me`` set. The before-reads are the controls.
+    """
+    assert _SCRIPT is not None
+    parent = tmp_path / f"cfg-{uuid.uuid4().hex[:8]}"
+    cfg = parent / "config"
+    outside = parent / "outside"
+    (cfg / "sub").mkdir(parents=True)
+    outside.mkdir()
+    (cfg / "mod.py").write_text("X = 1\n", encoding="utf-8")
+    (cfg / "sub" / "inner.py").write_text("Y = 2\n", encoding="utf-8")
+    (outside / "target.py").write_text("Z = 3\n", encoding="utf-8")
+    (outside / "shared.py").write_text("W = 4\n", encoding="utf-8")
+    body = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $parent = {_psq(str(parent))}
+  $cfg = {_psq(str(cfg))}
+  $outside = {_psq(str(outside))}
+  $paths = [ordered]@{{
+    cfg = $cfg; mod = (Join-Path $cfg 'mod.py'); sub = (Join-Path $cfg 'sub')
+    inner = (Join-Path $cfg 'sub\inner.py'); target = (Join-Path $outside 'target.py')
+    shared = (Join-Path $outside 'shared.py')
+  }}
+  function Read-Sids([string]$p) {{
+    @((Get-Acl -LiteralPath $p).Access | ForEach-Object {{
+      try {{ $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }}
+      catch {{ "$($_.IdentityReference)" }} }})
+  }}
+  function Read-Tree {{
+    $o = [ordered]@{{}}
+    foreach ($k in $paths.Keys) {{ $o[$k] = @(Read-Sids $paths[$k]) }}
+    $o['modProtected'] = (Get-Acl -LiteralPath $paths.mod).AreAccessRulesProtected
+    $o['cfgProtected'] = (Get-Acl -LiteralPath $cfg).AreAccessRulesProtected
+    $o['targetOwner'] = (Get-Acl -LiteralPath $paths.target).GetOwner(
+      [Security.Principal.SecurityIdentifier]).Value
+    $o
+  }}
+  try {{
+{prepare}
+    $before = Read-Tree
+    $warnings = @()
+    $problems = @()
+    $emitted = & {{ Set-SecureConfigAcl -Path $cfg -Account {account} }} 3>&1
+    foreach ($o in @($emitted)) {{
+      if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
+      else {{ $problems += "$o" }}
+    }}
+    $after = Read-Tree
+    [pscustomobject]@{{
+      before = $before; after = $after; problems = @($problems); warnings = @($warnings)
+      listing = (& icacls $cfg /T | Out-String); meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+      elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+    }} | ConvertTo-Json -Depth 5 -Compress
+  }} finally {{
+    # Put the tree back in reach so pytest can delete it, however the block above ended. The
+    # junction is deleted as a link once the folder holding it is writable again, and before any
+    # child is touched: nothing below may walk through it.
+    foreach ($p in @($parent, $cfg, $outside)) {{
+      & icacls $p /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+    }}
+    $link = Join-Path $cfg 'linked'
+    if (Test-Path -LiteralPath $link) {{ (Get-Item -LiteralPath $link -Force).Delete() }}
+    foreach ($p in @($paths.mod, $paths.sub, $paths.inner, $paths.target)) {{
+      & icacls $p /inheritance:e /grant "${{me}}:F" | Out-Null
+    }}
+  }}
+"""
+    out: dict = json.loads(
+        _ok(_extract(_SCRIPT, _CONFIG_ACL_FNS, body), tmp_path).strip().splitlines()[-1]
+    )
+    problems = [p for p in (out.get("problems") or []) if p]
+    # Only an elevated token may make Administrators the owner, so an unelevated run reads back an
+    # owner problem for every item. Those are kept apart, and the owner arm below judges them.
+    out["ownerProblems"] = [p for p in problems if "is owned by" in p]
+    out["problems"] = [p for p in problems if "is owned by" not in p]
+    out["warnings"] = [w for w in (out.get("warnings") or []) if w]
+    return out
+
+
+@_windows_only
+def test_an_explicit_broad_ace_on_the_config_dir_is_stripped(tmp_path: Path) -> None:
+    """The #1699 shape on the config dir: an EXPLICIT BUILTIN\\Users Modify survives
+    ``/inheritance:r /grant:r`` and reaches every module below it."""
+    got = _config_lockdown(
+        tmp_path, "    & icacls $cfg /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null"
+    )
+    assert "S-1-5-32-545" in got["before"]["cfg"], (
+        f"CONTROL FAILED: the explicit Users ACE was not planted:\n{got['listing']}"
+    )
+    assert "S-1-5-32-545" in got["before"]["mod"], "CONTROL FAILED: mod.py did not inherit it"
+    for key in ("cfg", "mod", "sub", "inner"):
+        assert "S-1-5-32-545" not in got["after"][key], (
+            f"BUILTIN\\Users still holds access to {key} after Set-SecureConfigAcl:\n{got['listing']}"
+        )
+    assert got["problems"] == [], (
+        f"a removed ACE must not be reported as residue: {got['problems']}"
+    )
+
+
+@_windows_only
+def test_a_child_with_its_own_dacl_is_reset_to_inherit_the_lockdown(tmp_path: Path) -> None:
+    """A module with inheritance turned off and its own grant, and a folder with an explicit grant
+    its files inherit. ``/inheritance:r`` on the directory touches neither, and the guard vets each
+    *.py, so the service would refuse to start under a line saying the config was locked."""
+    prepare = r"""
+    & icacls $paths.mod /inheritance:r /grant:r "${me}:F" '*S-1-5-11:M' | Out-Null
+    & icacls $paths.sub /grant '*S-1-5-11:(OI)(CI)M' | Out-Null
+"""
+    got = _config_lockdown(tmp_path, prepare)
+    assert got["before"]["modProtected"] is True, "CONTROL FAILED: mod.py still inherits"
+    assert "S-1-5-11" in got["before"]["mod"], "CONTROL FAILED: mod.py has no own grant"
+    assert "S-1-5-11" in got["before"]["inner"], "CONTROL FAILED: inner.py did not inherit"
+    for key in ("mod", "sub", "inner"):
+        assert "S-1-5-11" not in got["after"][key], (
+            f"Authenticated Users still holds access to {key}:\n{got['listing']}"
+        )
+    assert got["after"]["modProtected"] is False, (
+        f"mod.py still has inheritance turned off, so the lockdown never reaches it:\n{got['listing']}"
+    )
+    assert "S-1-5-32-544" in got["after"]["mod"] and "S-1-5-18" in got["after"]["mod"], (
+        f"mod.py did not inherit the lockdown's grants:\n{got['listing']}"
+    )
+    assert got["problems"] == [], (
+        f"a reset child must not be reported as residue: {got['problems']}"
+    )
+
+
+@_windows_only
+def test_config_residue_outside_the_removal_set_is_returned(tmp_path: Path) -> None:
+    """What the named removals miss is READ BACK and returned, so the installer does not print the
+    lockdown line over it. Power Users stands in for any account outside the well-known set."""
+    got = _config_lockdown(
+        tmp_path, "    & icacls $cfg /grant '*S-1-5-32-547:(OI)(CI)RX' | Out-Null"
+    )
+    assert "S-1-5-32-547" in got["before"]["cfg"], "CONTROL FAILED: Power Users was not planted"
+    assert any("Power Users" in p or "S-1-5-32-547" in p for p in got["problems"]), (
+        "a principal outside the removal set survived and nothing returned it -- the installer "
+        f"would print the lockdown line over it: {got['problems']}\n{got['listing']}"
+    )
+
+
+@_windows_only
+def test_a_junction_in_the_config_dir_is_not_followed_and_is_named(tmp_path: Path) -> None:
+    """icacls /T walks through a junction (measured: ``icacls <dir>\\* /reset /T`` reset a file in
+    the junction's target, with /L or without), so the reset walks the tree itself and stops at a
+    link. A link it did not reset is named, because the lockdown did not reach what it points at.
+
+    The owner step walks the same way: ``/setowner /T`` follows a junction too. Unelevated, no
+    owner can be set either way, so only an elevated run (CI) witnesses the owner arm.
+
+    A HARD LINK shares one DACL among all its names, so resetting ``config\\shared.py`` would
+    rewrite ``outside\\shared.py`` too. It is named and left alone."""
+    prepare = r"""
+    & icacls $paths.target /grant '*S-1-5-32-547:R' | Out-Null
+    & icacls $paths.shared /grant '*S-1-5-32-547:R' | Out-Null
+    cmd /c mklink /J (Join-Path $cfg 'linked') $outside | Out-Null
+    cmd /c mklink /H (Join-Path $cfg 'shared.py') $paths.shared | Out-Null
+"""
+    got = _config_lockdown(tmp_path, prepare)
+    assert "S-1-5-32-547" in got["before"]["target"], "CONTROL FAILED: the target has no grant"
+    assert "S-1-5-32-547" in got["before"]["shared"], "CONTROL FAILED: the shared file has no grant"
+    assert "S-1-5-32-547" in got["after"]["target"], (
+        "the reset followed the junction and rewrote a file OUTSIDE the config dir"
+    )
+    assert got["after"]["targetOwner"] == got["before"]["targetOwner"], (
+        "the owner step followed the junction and re-owned a file OUTSIDE the config dir"
+    )
+    assert "S-1-5-32-547" in got["after"]["shared"], (
+        "the reset went through a hard link and rewrote the DACL of a file OUTSIDE the config dir"
+    )
+    assert any("linked" in p for p in got["problems"]), (
+        f"the junction must be named as not reset: {got['problems']}"
+    )
+    assert any("shared.py" in p and "hard link" in p for p in got["problems"]), (
+        f"the hard link must be named as not reset: {got['problems']}"
+    )
+
+
+def test_the_walk_changes_a_link_itself_never_its_target() -> None:
+    """Without ``/L`` icacls follows a link and re-owns and resets its target, which may lie
+    outside the config dir. A link the checks before the per-item calls miss would reach them, so
+    every icacls call in the per-item loop must carry ``/L``, wherever in its arguments; on a file
+    that is not a link, ``/L`` changes nothing (measured)."""
+    m = re.search(r"(?ms)^function Reset-ConfigTreeAcl \{.*?^\}", _script_text())
+    assert m is not None, "Reset-ConfigTreeAcl is missing from install-service.ps1"
+    loop = re.search(r"(?ms)foreach \(\$child in \$children\) \{.*?^        \}", m.group(0))
+    assert loop is not None, "the per-item loop of Reset-ConfigTreeAcl was not found"
+    # An invocation starts a statement; a message that only mentions icacls does not.
+    call = re.compile(r"""(?i)^\s*(?:&\s*)?["']?icacls(?:\.exe)?["']?\s""")
+    calls = [ln for ln in loop.group(0).splitlines() if call.search(ln)]
+    verbs = {v for c in calls for v in ("/setowner", "/reset") if v in c.split()}
+    assert verbs == {"/setowner", "/reset"}, (
+        f"CONTROL FAILED: the per-item /setowner and /reset calls were not found: {calls}"
+    )
+    for c in calls:
+        assert "/L" in c.split(), (
+            f"a per-item icacls call lacks /L, so it acts on a link's target: {c}"
+        )
+
+
+@_windows_only
+def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Path) -> None:
+    """A file link whose own DACL hides its link type passes ``$isLink``, so the walk fails closed on
+    any file reparse point whose type reads empty: it skips the item and names it. A named problem
+    withholds the installer's "Config : locked" line. Creating a symbolic link needs the privilege
+    an unelevated account has only in Developer Mode, so the test skips without it.
+
+    THE HARNESS STARTS WITH THE BACKUP AND RESTORE PRIVILEGES OFF. Either one lets reading LinkType
+    pass the deny entry; ``_privileges_disabled`` says why. Both hosted Windows legs failed the
+    control while the restore privilege was on (run 43668208722). A control that still fails fails
+    the test, and its message names what whoami reads in the harness."""
+    from tests.test_worktree_remove_in_use import _privileges_disabled
+
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(tmp_path)
+    except OSError as e:
+        pytest.skip(f"SKIP (nothing run): this account cannot create a symbolic link ({e})")
+    probe.unlink()
+    prepare = r"""
+    & icacls $paths.target /grant '*S-1-5-32-547:R' | Out-Null
+    $hidden = Join-Path $cfg 'hidden.py'
+    New-Item -ItemType SymbolicLink -Path $hidden -Target $paths.target | Out-Null
+    # Denying SYNCHRONIZE empties LinkType (measured on pwsh 7.6).
+    & icacls $hidden /L /deny "${me}:(S)" | Out-Null
+    if ("$((Get-Item -LiteralPath $hidden -Force).LinkType)") {
+      # By full path: under Git Bash, as on the CI legs, a bare whoami is MSYS's, which has no /priv.
+      $whoami = Join-Path $env:SystemRoot 'System32\whoami.exe'
+      $held = @(& $whoami /priv | Select-String 'SeBackupPrivilege|SeRestorePrivilege') -join '; '
+      if (-not $held) { $held = 'neither listed' }
+      throw ("CONTROL FAILED: the deny entry did not hide the link's type (privileges this " +
+        "test switched off: $wereOn; whoami /priv here: $held)")
+    }
+"""
+    with _privileges_disabled() as were_on:
+        got = _config_lockdown(tmp_path, f"    $wereOn = {were_on}\n" + prepare)
+    assert "S-1-5-32-547" in got["before"]["target"], "CONTROL FAILED: the target has no grant"
+    assert "S-1-5-32-547" in got["after"]["target"], (
+        "the reset followed a link whose type it could not read and rewrote a file OUTSIDE the "
+        "config dir"
+    )
+    assert got["after"]["targetOwner"] == got["before"]["targetOwner"], (
+        "the owner step followed a link whose type it could not read and re-owned a file OUTSIDE "
+        "the config dir"
+    )
+    assert any("hidden.py" in p and "link type could not be read" in p for p in got["problems"]), (
+        "a link whose type could not be read was not named, so the installer would print the "
+        f"locked line over it: {got['problems']}"
+    )
+    decided = re.search(
+        r"(?s)if \(\$ConfigLockProblems\) \{.*?Write-Warning.*?\} else \{.*?Config : locked",
+        _script_text(),
+    )
+    assert decided is not None, (
+        "the installer no longer withholds the 'Config : locked' line when the lockdown returns a "
+        "problem"
+    )
+
+
+@_windows_only
+def test_every_owner_in_the_config_tree_is_read_back(tmp_path: Path) -> None:
+    """The guard refuses a dir or *.py whose owner it cannot trust, so an owner the lockdown could
+    not set is returned, not left under the lockdown line. Unelevated, nothing can be made
+    Administrators-owned, so every item must come back; elevated, none."""
+    got = _config_lockdown(tmp_path)
+    named = " ".join(got["ownerProblems"])
+    if got["elevated"]:
+        assert got["ownerProblems"] == [], got["ownerProblems"]
+    else:
+        for part in ("config'", "mod.py", "sub'", "inner.py"):
+            assert part in named, f"an owner left unset was not returned for {part}: {named}"
+
+
+@_windows_only
+def test_a_root_that_could_not_be_locked_leaves_the_tree_alone(tmp_path: Path) -> None:
+    """The walk resets each child to inherit from the root, so after a failed root lock it would
+    WIDEN a child that was tighter than the root. An account icacls cannot resolve fails the
+    root grant; the owner-only module below must keep its own DACL."""
+    prepare = r"""
+    & icacls $cfg /grant '*S-1-5-32-547:(OI)(CI)M' | Out-Null
+    & icacls $paths.mod /inheritance:r /grant:r "${me}:F" | Out-Null
+"""
+    got = _config_lockdown(tmp_path, prepare, account="'NoSuchAccount-b234x'")
+    assert got["before"]["modProtected"] is True, "CONTROL FAILED: mod.py still inherits"
+    assert any("could not be locked" in p for p in got["problems"]), got["problems"]
+    assert got["after"]["modProtected"] is True, (
+        f"the walk ran over a root that was not locked and widened mod.py:\n{got['listing']}"
+    )
+    assert "S-1-5-32-547" not in got["after"]["mod"], got["listing"]
+
+
+@_windows_only
+def test_a_root_still_granting_another_account_leaves_the_tree_alone(tmp_path: Path) -> None:
+    """The root grant succeeded, but an entry outside the removal set survived on it. Resetting a
+    child to inherit would then pass that entry to a child that was tighter than the root."""
+    prepare = r"""
+    & icacls $cfg /grant '*S-1-5-32-547:(OI)(CI)M' | Out-Null
+    & icacls $paths.mod /inheritance:r /grant:r "${me}:F" | Out-Null
+"""
+    got = _config_lockdown(tmp_path, prepare)
+    assert got["before"]["modProtected"] is True, "CONTROL FAILED: mod.py still inherits"
+    assert any("S-1-5-32-547" in p or "Power Users" in p for p in got["problems"]), got["problems"]
+    assert any("nothing below" in p for p in got["problems"]), got["problems"]
+    assert got["after"]["modProtected"] is True, (
+        f"the walk reset mod.py under a root that still grants Power Users:\n{got['listing']}"
+    )
+    assert "S-1-5-32-547" not in got["after"]["mod"], got["listing"]
+
+
+@_windows_only
+def test_a_dot_backslash_account_locks_like_its_full_name(tmp_path: Path) -> None:
+    """icacls does not take '.\\name', which Set-ServiceAccount accepts, so the account is spelled
+    with this host's name first; otherwise -LockConfigDir could never finish for it."""
+    got = _config_lockdown(tmp_path, account="('.\\' + $me.Split('\\')[-1])")
+    assert got["problems"] == [], got["problems"]
+    assert got["meSid"] in got["after"]["cfg"], f"the account got no grant:\n{got['listing']}"
+
+
+@_windows_only
+def test_a_deny_entry_on_the_config_dir_is_returned(tmp_path: Path) -> None:
+    """A deny entry survives /remove:g, which removes grants only, and is passed down by the reset;
+    one against the run-as account stops the service reading its config under a clean line."""
+    got = _config_lockdown(
+        tmp_path, "    & icacls $cfg /deny '*S-1-5-32-547:(OI)(CI)(W)' | Out-Null"
+    )
+    assert any("deny" in p for p in got["problems"]), got["problems"]
+
+
+@_windows_only
+def test_a_write_grant_for_the_run_as_account_below_the_config_is_named(tmp_path: Path) -> None:
+    """The reset drops the run-as account's own explicit Modify on a child folder to the read it
+    inherits. The read-back allows that account, so without a warning a File connection writing
+    there would fail at run time with nothing said at install."""
+    got = _config_lockdown(tmp_path, '    & icacls $paths.sub /grant "${me}:(OI)(CI)M" | Out-Null')
+    assert any("write away" in w and "sub'" in w for w in got["warnings"]), got["warnings"]
+    assert got["problems"] == [], got["problems"]
+
+
+@_windows_only
+def test_a_clean_config_lockdown_returns_nothing_and_keeps_what_the_service_needs(
+    tmp_path: Path,
+) -> None:
+    """POSITIVE CONTROL. Every arm above passes on a function that strips everything, or that
+    returns a problem for every tree."""
+    got = _config_lockdown(tmp_path)
+    assert got["problems"] == [], f"a clean tree must read back clean: {got['problems']}"
+    assert got["warnings"] == [], f"a clean tree must warn of nothing: {got['warnings']}"
+    assert got["after"]["cfgProtected"] is True, "the config dir must not inherit from its parent"
+    for key in ("cfg", "mod", "sub", "inner"):
+        sids = got["after"][key]
+        assert "S-1-5-18" in sids and "S-1-5-32-544" in sids, (
+            f"SYSTEM or Administrators lost access to {key}:\n{got['listing']}"
+        )
+        assert got["meSid"] in sids, f"the run-as account lost read on {key}:\n{got['listing']}"
+
+
+def test_the_config_lockdown_line_is_printed_only_after_a_clean_read_back() -> None:
+    """CALL-SITE guard. The function's read-back says nothing if the installer still prints
+    "Config : locked to ..." whatever it returned."""
+    text = _script_text()
+    collect = text.index(
+        "$ConfigLockProblems += @(Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount)"
+    )
+    gate = text.index("if ($ConfigLockProblems) {", collect)
+    clean = text.index("} else {", gate)
+    line = text.index('Write-Host "  Config : locked to $cfgGrantees', clean)
+    refused = text[gate:clean]
+    assert "Write-Warning" in refused and "$ConfigLockProblems" in refused, (
+        "the residue branch must warn and name what it found"
+    )
+    assert "locked to" not in refused, "the residue branch must not claim the lockdown"
+    assert collect < gate < clean < line
+
+
 def test_the_installer_still_calls_the_lockdown_on_the_data_dir(tmp_path: Path) -> None:
     """CALL-SITE guard, and the literal complaint of BACKLOG #1699: deleting the call left every
     test green. The behavioural arms above run the FUNCTION and say nothing about whether the
@@ -2407,31 +2805,83 @@ _ACE_FN = "Remove-AccountAce"
 _OTHER_SID = "S-1-5-80-400"  # a STRING PREFIX of S-1-5-80-4001, deliberately
 
 
-def _logon_right_arms(tmp_path: Path, *, holders: list[str], sid: str) -> dict:
-    """Run Remove-ServiceLogonRight against a stubbed secedit whose policy holds ``holders``."""
+_WORKDIR_FN = "New-SeceditWorkDirectory"
+
+
+def _workdir_seam(parent: Path) -> str:
+    """Point New-SeceditWorkDirectory at ``parent``, owned by the test's own account.
+
+    On Windows the REAL helper runs, wrapped so it makes the folder under ``parent`` and owns it
+    as this unelevated account rather than as Administrators, which only an elevated token may
+    name as an owner. Elsewhere there are no Windows ACLs to set, so a plain folder stands in.
+    """
+    if sys.platform.startswith("win"):
+        return rf"""
+  $script:RealWorkDir = ${{function:{_WORKDIR_FN}}}
+  $script:WorkOwner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  function {_WORKDIR_FN} {{ & $script:RealWorkDir -Parent {_psq(str(parent))} -OwnerSid $script:WorkOwner }}
+"""
+    return rf"""
+  function {_WORKDIR_FN} {{
+    $d = Join-Path {_psq(str(parent))} ([guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $d | Out-Null
+    $d
+  }}
+"""
+
+
+def _logon_right_arms(
+    tmp_path: Path, *, holders: list[str], sid: str, workdir: str | None = None
+) -> dict:
+    """Run Remove-ServiceLogonRight against a stubbed secedit whose policy holds ``holders``.
+
+    ``workdir`` replaces the New-SeceditWorkDirectory seam; by default it is the real helper on
+    Windows. At the configure call the stub reads the folder the policy file sits in, so the
+    arms can say who could have changed that file before secedit imported it.
+    """
     assert _UNINSTALL is not None
+    parent = tmp_path / "secedit-parent"
+    parent.mkdir(exist_ok=True)
     inf = ["[Unicode]", "Unicode=yes", "[Privilege Rights]"]
     if holders:
         inf.append("SeServiceLogonRight = " + ",".join(holders))
     inf.append("[Version]")
     inf_ps = "@(" + ", ".join(_psq(line) for line in inf) + ")"
     body = rf"""
-  # $env:TEMP is where the function writes its policy export; on a Linux runner it is unset and
-  # Join-Path would throw before a single assertion ran.
+  # The old code wrote its export here; set so a regression to it lands in the test's own folder.
   $env:TEMP = {_psq(str(tmp_path))}
+{_workdir_seam(parent) if workdir is None else workdir}
   $script:Configured = ''
   $script:ConfigureCalls = 0
   $script:ExportCalls = 0
+  $script:Cfg = ''
+  $script:Db = ''
+  $script:Folder = $null
   function secedit {{
     $a = @($args)
+    $i = [array]::IndexOf($a, '/cfg')
+    $script:Cfg = $a[$i + 1]
     if ($a -contains '/export') {{
       $script:ExportCalls++
-      $i = [array]::IndexOf($a, '/cfg')
-      Set-Content -Path $a[$i + 1] -Value {inf_ps} -Encoding Unicode
+      Set-Content -LiteralPath $script:Cfg -Value {inf_ps} -Encoding Unicode
     }} elseif ($a -contains '/configure') {{
       $script:ConfigureCalls++
-      $i = [array]::IndexOf($a, '/cfg')
-      $script:Configured = ((Get-Content $a[$i + 1]) -join ' | ')
+      $script:Configured = ((Get-Content -LiteralPath $script:Cfg) -join ' | ')
+      $script:Db = $a[[array]::IndexOf($a, '/db') + 1]
+      $dir = Split-Path -Parent $script:Cfg
+      if ($IsWindows -or $env:OS -eq 'Windows_NT') {{
+        $acl = Get-Acl -LiteralPath $dir
+        $script:Folder = [ordered]@{{
+          path = $dir
+          owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+          protected = $acl.AreAccessRulesProtected
+          reparse = [bool]((Get-Item -LiteralPath $dir -Force).Attributes -band
+            [System.IO.FileAttributes]::ReparsePoint)
+          sids = @($acl.Access | Where-Object {{ $_.AccessControlType -eq 'Allow' }} |
+            ForEach-Object {{ $_.IdentityReference.Translate(
+              [Security.Principal.SecurityIdentifier]).Value }})
+        }}
+      }}
     }}
     $global:LASTEXITCODE = 0
   }}
@@ -2446,11 +2896,16 @@ def _logon_right_arms(tmp_path: Path, *, holders: list[str], sid: str) -> dict:
   [pscustomobject]@{{
     result = [bool]$result; outputs = $outputs; warnings = @($warnings)
     exportCalls = $script:ExportCalls; configureCalls = $script:ConfigureCalls
-    configured = $script:Configured
+    configured = $script:Configured; cfg = $script:Cfg; db = $script:Db; folder = $script:Folder
+    left = @(Get-ChildItem -LiteralPath {_psq(str(parent))} -Force | ForEach-Object {{ $_.Name }})
+    me = $(if ($IsWindows -or $env:OS -eq 'Windows_NT') {{
+      [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }} else {{ '' }})
   }} | ConvertTo-Json -Depth 4 -Compress
 """
     parsed: dict = json.loads(
-        _ok(_extract(_UNINSTALL, [_SECEDIT_FN], body), tmp_path).strip().splitlines()[-1]
+        _ok(_extract(_UNINSTALL, [_SECEDIT_FN, _WORKDIR_FN], body), tmp_path)
+        .strip()
+        .splitlines()[-1]
     )
     parsed["warnings"] = [w for w in (parsed.get("warnings") or []) if w]
     return parsed
@@ -2511,6 +2966,252 @@ def test_a_right_the_account_does_not_hold_is_a_no_op(tmp_path: Path) -> None:
     got = _logon_right_arms(tmp_path, holders=["*S-1-5-32-544"], sid="S-1-5-80-4001")
     assert got["result"] is False, "reporting a removal that did not happen is the #1704 shape"
     assert got["configureCalls"] == 0, "the policy must not be rewritten when nothing changes"
+
+
+# --- the secedit files live in a folder only administrators can change (BACKLOG #5563) -------------
+# The export and the database sat at $env:TEMP\mefor-secedit-remove-<PID>.inf/.sdb. The uninstaller
+# runs elevated, but the user's TEMP belongs to the user, so a same-user process at medium integrity
+# could plant or rewrite the .inf between the export and `secedit /configure` and so change a
+# machine-wide user right. A folder of its own in that TEMP is not enough either: holding
+# FILE_DELETE_CHILD on the TEMP, that process can rename the folder away and put its own in its place.
+
+
+@_windows_only
+def test_the_secedit_files_sit_in_a_fresh_folder_only_administrators_can_change(
+    tmp_path: Path,
+) -> None:
+    got = _logon_right_arms(
+        tmp_path, holders=["*S-1-5-80-4001", "*S-1-5-32-544"], sid="S-1-5-80-4001"
+    )
+    assert got["configureCalls"] == 1 and got["result"] is True, got["warnings"]
+    folder = got["folder"]
+    temp = str(tmp_path)
+    assert folder["path"].rstrip("\\").lower() != temp.lower(), (
+        f"the policy file is written straight into the user's TEMP: {got['cfg']}"
+    )
+    assert re.search(r"[0-9a-f]{32}", Path(folder["path"]).name), (
+        f"the work folder's name is predictable: {folder['path']}"
+    )
+    assert Path(got["db"]).parent == Path(got["cfg"]).parent, (
+        f"the database must sit in the same private folder: {got['db']}"
+    )
+    assert folder["protected"] is True, "the work folder inherits entries from the folder above"
+    assert folder["reparse"] is False, "the work folder is a junction or a link"
+    # The test's own account stands in for Administrators as the owner (see _workdir_seam).
+    assert folder["owner"] == got["me"], f"the work folder has another owner: {folder['owner']}"
+    extra = set(folder["sids"]) - {"S-1-5-18", "S-1-5-32-544", got["me"]}
+    assert not extra, f"the work folder grants access to {sorted(extra)}"
+    assert got["left"] == [], f"the work folder was not removed afterwards: {got['left']}"
+
+
+@_windows_only
+def test_the_work_folder_is_refused_under_a_parent_others_can_delete_in(tmp_path: Path) -> None:
+    """A parent folder that lets another account delete its children lets that account rename the
+    private folder away and substitute its own, so the helper refuses it."""
+    assert _UNINSTALL is not None
+    parent = tmp_path / "open-parent"
+    parent.mkdir()
+    body = rf"""
+  $parent = {_psq(str(parent))}
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+  # F, not M: Modify holds no FILE_DELETE_CHILD, and that is the right that renames a child.
+  & icacls $parent /grant '*S-1-5-32-545:(OI)(CI)F' | Out-Null
+  $made = $null
+  $refusal = ''
+  try {{ $made = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value }}
+  catch {{ $refusal = $_.Exception.Message }}
+  $clean = $null
+  & icacls $parent /remove:g '*S-1-5-32-545' | Out-Null
+  try {{ $clean = {_WORKDIR_FN} -Parent $parent -OwnerSid $me.User.Value }} catch {{ $clean = "ERR $_" }}
+  [pscustomobject]@{{ made = $made; refusal = $refusal; clean = $clean
+    left = @(Get-ChildItem -LiteralPath $parent -Force | ForEach-Object {{ $_.Name }}) }} |
+    ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_UNINSTALL, [_WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
+    )
+    assert got["made"] is None, f"a folder was made under an open parent: {got['made']}"
+    assert "S-1-5-32-545" in got["refusal"] or "Users" in got["refusal"], got["refusal"]
+    # POSITIVE CONTROL: the same parent without the grant is accepted.
+    assert got["clean"] and not str(got["clean"]).startswith("ERR"), got["clean"]
+    assert got["left"] == [Path(got["clean"]).name], (
+        f"the refused attempt left a folder behind: {got['left']}"
+    )
+
+
+def test_a_work_folder_that_cannot_be_made_runs_no_secedit(tmp_path: Path) -> None:
+    """When the private folder cannot be made, nothing is exported or imported, and the operator is
+    told the right was not removed rather than left believing it was."""
+    seam = f"""
+  function {_WORKDIR_FN} {{ throw 'planted refusal' }}
+"""
+    got = _logon_right_arms(
+        tmp_path, holders=["*S-1-5-80-4001", "*S-1-5-32-544"], sid="S-1-5-80-4001", workdir=seam
+    )
+    assert got["exportCalls"] == 0 and got["configureCalls"] == 0
+    assert got["result"] is False
+    assert any("planted refusal" in w and "NOT removed" in w for w in got["warnings"]), got[
+        "warnings"
+    ]
+
+
+def test_the_secedit_folder_defaults_to_the_windows_temp_not_the_users(tmp_path: Path) -> None:
+    """STATIC. The default parent is %SystemRoot%\\Temp, where a user may make a folder but may not
+    delete or rename one an administrator made; the user's TEMP lets its owner do both. Unelevated,
+    the tests cannot make a folder there, so this reads the source."""
+    assert _UNINSTALL is not None
+    body = f"""
+  $out = [ordered]@{{}}
+  foreach ($n in @('{_SECEDIT_FN}', '{_WORKDIR_FN}')) {{
+    $fn = $ast.Find({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $args[0].Name -eq $n }}, $true)
+    $out[$n] = $fn.Body.Extent.Text
+  }}
+  [pscustomobject]$out | ConvertTo-Json -Compress
+"""
+    got = json.loads(_ok(_extract(_UNINSTALL, [], body), tmp_path).strip().splitlines()[-1])
+    remove = got[_SECEDIT_FN]
+    helper = got[_WORKDIR_FN]
+    code = "\n".join(
+        line
+        for line in re.sub(r"<#.*?#>", "", remove, flags=re.S).splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "$env:TEMP" not in code and "GetTempPath" not in code, (
+        "Remove-ServiceLogonRight still builds a path in the user's TEMP"
+    )
+    assert re.search(rf"\b{_WORKDIR_FN}\b", code), (
+        "Remove-ServiceLogonRight does not call the helper"
+    )
+    assert re.search(r'Join-Path \(\[Environment\]::GetFolderPath\("Windows"\)\) "Temp"', helper), (
+        "the helper's default parent must be the Windows folder's Temp, asked of the system"
+    )
+    helper_code = "\n".join(
+        line
+        for line in re.sub(r"<#.*?#>", "", helper, flags=re.S).splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "$env:SystemRoot" not in helper_code and "$env:windir" not in helper_code.lower(), (
+        "the user can set SystemRoot and windir for their own processes, so neither may name the "
+        "trusted parent"
+    )
+
+
+def test_both_scripts_carry_the_same_secedit_folder_helper(tmp_path: Path) -> None:
+    """The installer and the uninstaller share no file, so each carries New-SeceditWorkDirectory.
+    A fix to one copy that never reaches the other would reopen #5563 on one side, silently."""
+    assert _SCRIPT is not None and _UNINSTALL is not None
+    body = f"""
+  $out = @()
+  foreach ($src in @({_psq(str(_SCRIPT))}, {_psq(str(_UNINSTALL))})) {{
+    $tree = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
+    $fns = @($tree.FindAll({{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+      $args[0].Name -eq '{_WORKDIR_FN}' }}, $true))
+    $out += ,@($fns | ForEach-Object {{ $_.Extent.Text }})
+  }}
+  ConvertTo-Json -InputObject $out -Depth 3 -Compress
+"""
+    got = json.loads(_ok(_extract(_SCRIPT, [], body), tmp_path).strip().splitlines()[-1])
+    install, uninstall = got
+    assert len(install) == 1 and len(uninstall) == 1, (
+        f"each script must define {_WORKDIR_FN} once: {len(install)}, {len(uninstall)}"
+    )
+
+    def norm(text: str) -> str:
+        return text.replace("\r\n", "\n")
+
+    assert norm(install[0]) == norm(uninstall[0]), (
+        f"the two copies of {_WORKDIR_FN} differ; change both, byte for byte"
+    )
+
+
+_GRANT_FN = "Set-ServiceLogonRight"
+
+
+def _grant_arms(tmp_path: Path, *, workdir: str | None = None) -> dict:
+    """Run install-service.ps1's Set-ServiceLogonRight against a stubbed secedit, the account
+    being this test's own, and read the folder the policy file sits in at the configure call."""
+    assert _SCRIPT is not None
+    parent = tmp_path / "secedit-parent"
+    parent.mkdir(exist_ok=True)
+    inf = ["[Unicode]", "Unicode=yes", "[Privilege Rights]", "SeServiceLogonRight = *S-1-5-32-544"]
+    inf_ps = "@(" + ", ".join(_psq(line) for line in inf) + ")"
+    body = rf"""
+  $env:TEMP = {_psq(str(tmp_path))}
+{_workdir_seam(parent) if workdir is None else workdir}
+  $script:Calls = 0
+  $script:Cfg = ''
+  $script:Configured = ''
+  $script:Folder = $null
+  function secedit {{
+    $a = @($args)
+    $script:Calls++
+    $script:Cfg = $a[[array]::IndexOf($a, '/cfg') + 1]
+    if ($a -contains '/export') {{
+      Set-Content -LiteralPath $script:Cfg -Value {inf_ps} -Encoding Unicode
+    }} else {{
+      $script:Configured = ((Get-Content -LiteralPath $script:Cfg) -join ' | ')
+      $dir = Split-Path -Parent $script:Cfg
+      $acl = Get-Acl -LiteralPath $dir
+      $script:Folder = [ordered]@{{
+        path = $dir
+        owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        protected = $acl.AreAccessRulesProtected
+        sids = @($acl.Access | Where-Object {{ $_.AccessControlType -eq 'Allow' }} |
+          ForEach-Object {{ $_.IdentityReference.Translate(
+            [Security.Principal.SecurityIdentifier]).Value }})
+      }}
+    }}
+    $global:LASTEXITCODE = 0
+  }}
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $warnings = @()
+  $emitted = & {{ {_GRANT_FN} -Account $me.Name }} 3>&1 6>$null
+  foreach ($o in @($emitted)) {{
+    if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
+  }}
+  [pscustomobject]@{{
+    calls = $script:Calls; cfg = $script:Cfg; configured = $script:Configured
+    folder = $script:Folder; warnings = @($warnings); me = $me.User.Value
+    left = @(Get-ChildItem -LiteralPath {_psq(str(parent))} -Force | ForEach-Object {{ $_.Name }})
+  }} | ConvertTo-Json -Depth 4 -Compress
+"""
+    parsed: dict = json.loads(
+        _ok(_extract(_SCRIPT, [_GRANT_FN, _WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
+    )
+    parsed["warnings"] = [w for w in (parsed.get("warnings") or []) if w]
+    return parsed
+
+
+@_windows_only
+def test_the_installer_grants_the_logon_right_from_a_private_folder(tmp_path: Path) -> None:
+    """The grant direction of #5563, and the larger one: `secedit /configure` applies every user
+    right in the file, so a rewritten .inf could hand any right to any account."""
+    got = _grant_arms(tmp_path)
+    assert got["calls"] == 2, got["warnings"]
+    assert f"*{got['me']}" in got["configured"], "the account's SID was not added to the policy"
+    folder = got["folder"]
+    assert Path(folder["path"]).parent == tmp_path / "secedit-parent", (
+        f"the policy file is not in a folder of its own under the trusted parent: {got['cfg']}"
+    )
+    assert re.search(r"[0-9a-f]{32}", Path(folder["path"]).name), folder["path"]
+    assert folder["protected"] is True, "the work folder inherits entries from the folder above"
+    assert folder["owner"] == got["me"], f"the work folder has another owner: {folder['owner']}"
+    extra = set(folder["sids"]) - {"S-1-5-18", "S-1-5-32-544", got["me"]}
+    assert not extra, f"the work folder grants access to {sorted(extra)}"
+    assert got["left"] == [], f"the work folder was not removed afterwards: {got['left']}"
+
+
+@_windows_only
+def test_the_installer_runs_no_secedit_without_a_private_folder(tmp_path: Path) -> None:
+    seam = f"""
+  function {_WORKDIR_FN} {{ throw 'planted refusal' }}
+"""
+    got = _grant_arms(tmp_path, workdir=seam)
+    assert got["calls"] == 0, "secedit ran although the private folder could not be made"
+    assert any("planted refusal" in w and "NOT granted" in w for w in got["warnings"]), got[
+        "warnings"
+    ]
 
 
 def test_the_ace_switch_issues_the_reverse_icacls_call(tmp_path: Path) -> None:

@@ -671,8 +671,9 @@ def _mllp_ssl_context(
     verify the peer's cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
     and optionally present ``tls_cert_file`` for mTLS. ``tls_verify=False`` (outbound) is MITM-able and
     refused unless ``weakened_tls_escape_permitted_here()``: ``MEFOR_ALLOW_INSECURE_TLS`` set on an
-    instance at ``[security].enforcement = warn``, as for the SQL Server store's weakened TLS. A hop
-    it lets through logs a loud warning.
+    instance at ``[security].enforcement = warn``. (The store's weakened TLS is no longer like this:
+    it refuses at every posture, vault BACKLOG #3533 item 2.) A hop it lets through logs a loud
+    warning.
 
     ``trust_anchor_policy`` (#190, ADR 0093, OUTBOUND verify path only) supplies the instance ``[tls]``
     internal-CA fallback: when the connection names no ``tls_ca_file`` of its own, an internal hop
@@ -3319,7 +3320,7 @@ class MLLPSource(SourceConnector):
                         # per-connection task die silently or leak detail. Log redacted; drop the conn.
                         # A HANDLER fault no longer lands here: the inner arm above answers it
                         # (BACKLOG #1619). What still does includes a reply the listener's
-                        # encoding cannot carry.
+                        # encoding cannot carry and cannot replace characters in (BACKLOG #5799).
                         peer = writer.get_extra_info("peername")
                         logger.error(
                             "MLLP connection from %s failed unexpectedly: %s", peer, safe_exc(exc)

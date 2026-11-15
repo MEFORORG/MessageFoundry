@@ -64,15 +64,14 @@ _EGRESS = EgressSettings(deny_by_default=False)
 
 def _conn(**over: Any) -> dict[str, Any]:
     """Connector settings for the CI mssql container, from the store job's ``MEFOR_STORE_*``.
-    ``trust_server_certificate`` is permitted only because the job also sets
-    ``MEFOR_ALLOW_INSECURE_TLS``."""
+    Verification stays on: the job serves a certificate it generated and added to the runner's
+    trust store (vault BACKLOG #3533 item 2)."""
     settings: dict[str, Any] = {
         "server": os.environ.get("MEFOR_STORE_SERVER", "localhost"),
         "port": int(os.environ.get("MEFOR_STORE_PORT", "1433")),
         "database": os.environ.get("MEFOR_STORE_DATABASE", "MessageFoundry"),
         "username": os.environ.get("MEFOR_STORE_USERNAME", "sa"),
         "password": os.environ.get("MEFOR_STORE_PASSWORD", ""),
-        "trust_server_certificate": True,
     }
     settings.update(over)
     return settings

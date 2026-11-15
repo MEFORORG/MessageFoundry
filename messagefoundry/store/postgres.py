@@ -83,7 +83,6 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StorePrivilegeStatus,
     StoreSettings,
-    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import (
     HopPosture,
@@ -196,8 +195,10 @@ from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     USER_KIND,
     AnyRowSealer,
+    ResealOutcome,
     RowSealError,
     SealPager,
+    classify_unrotated,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -280,6 +281,7 @@ from messagefoundry.store.store import (
     OutboxStatus,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -408,6 +410,8 @@ from messagefoundry.store.store import (
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    unheld_seal_refusal,
+    unrotated_seal_queries,
     user_disabled_change,
     user_insert_params,
     user_reseal_params,
@@ -1718,54 +1722,35 @@ _PG_AD_MAP_SQL: Final[Mapping[str, AdMapSql]] = MappingProxyType(
 )
 
 
-def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) -> Any:
+def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) -> ssl.SSLContext:
     """Build the asyncpg ``ssl`` arg from the store settings, mirroring the SQL Server backend's
     refuse-weakened-TLS logic (ASVS 12.3.2).
 
-    A weakened posture (``trust_server_certificate=true`` or ``encrypt=false``) is MITM-able, so it
-    **refuses** unless the explicit ``MEFOR_ALLOW_INSECURE_TLS`` dev escape is set on an instance at
-    ``[security].enforcement = warn`` — it can't be silently turned on in production. Returns the ``ssl`` value to pass to ``asyncpg.create_pool``:
-    ``False`` (no TLS) only under the escape with ``encrypt=false``; an SSLContext that skips cert
-    verification under the escape with ``trust_server_certificate=true``; otherwise a verifying
-    SSLContext the engine builds, against the pinned CA or the system trust store.
+    A weakened posture (``trust_server_certificate=true`` or ``encrypt=false``) is MITM-able, and the
+    store login would cross it, so it is **refused** whatever ``posture`` says, even with
+    ``MEFOR_ALLOW_INSECURE_TLS`` set on an instance at ``[security].enforcement = warn`` (owner
+    ruling 2026-11-14, vault BACKLOG #3533 item 2). The SQL
+    Server twin is ``store.sqlserver.connection_string``. Otherwise this returns the verifying
+    SSLContext the engine builds, against the pinned CA or the system trust store, for
+    ``asyncpg.create_pool``.
 
-    #200 (ADR 0092 decision 2): the engine<->store hop routes the escape through the ONE clamp
-    (:func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`) so ``MEFOR_ALLOW_INSECURE_TLS``
-    works only at ``[security].enforcement = warn`` and can NEVER relax an **enforcing** store hop
-    (the SQL Server twin above is keyed identically). It
-    stays a STRICT verify-off cell (no gradient) and keeps NO second escape. ``posture`` (threaded from
-    ``open_store``) ``None`` reads the ambient posture, and with none the escape is NOT permitted
-    (vault BACKLOG #2354). CORRECTED: this read *"``None`` leaves the escape unclamped"*."""
+    ``posture`` (threaded from ``open_store``) is read only by the revocation guard below; ``None``
+    reads the ambient posture (vault BACKLOG #2354)."""
     if posture is None:
         posture = current_hop_posture()
-    if (
-        settings.trust_server_certificate or not settings.encrypt
-    ) and not weakened_tls_escape_permitted(posture):
+    if settings.trust_server_certificate or not settings.encrypt:
         raise StoreTlsRefused(
             "Postgres TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
-            f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
-            "instance at [security].enforcement = warn to allow it for a trusted-network dev/test "
-            "bind (the escape has no effect while enforcing, the default, or with no posture)."
+            "MITM-able, and the store login would cross it. Use a trusted server certificate, or "
+            "name its CA with [store].ssl_root_cert. Nothing permits a weakened store hop, not "
+            f"even {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn."
         )
-    if not settings.encrypt:
-        return False  # escape set (checked above) — plaintext connection, dev/test only
-    if settings.trust_server_certificate:
-        # escape set (checked above) — encrypt but skip server-cert verification (trusted-net dev).
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        # Verification is off but the store hop is still encrypted, so the suite list still decides
-        # whether recorded PHI traffic survives a future key compromise (ASVS 12.1.2).
-        narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
-        harden_cipher_suites(ctx, connector="Postgres store (TLS verification disabled)")
-        return ctx
     # #201 (ADR 0078 amendment): the engine->store hop below VERIFIES the peer cert (a pinned CA or the
     # system trust store) but asyncpg rides stdlib ssl, which does NO OCSP/CRL revocation — a
     # revoked-but-unexpired store cert would still be accepted. Refuse an off-loopback production-PHI
     # verifying store hop unless revocation is really checked on it. Byte-identical when the posture is
     # unstamped / non-prod / loopback / CRL-checked; composes with (never loosens) the weakened-TLS
-    # refusal above (that fires first on the verify-off / cleartext path, and the two gates key on
-    # disjoint conditions so one hop is never refused twice).
+    # refusal above, which fires first.
     # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
     ctx = _verifying_context_at_open(settings)
@@ -2083,6 +2068,8 @@ class PostgresStore:
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
     backend = StoreBackend.POSTGRES
+    # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
+    _reseal_outcome: ResealOutcome = ResealOutcome()
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
     #: columns (error/last_error/detail), and summary/metadata (MRN + patient name) added in EF-3.
@@ -2299,13 +2286,10 @@ class PostgresStore:
         if settings.db_schema:
             # Resolve unqualified table names against the configured schema (it must already exist).
             server_settings["search_path"] = settings.db_schema
-        # The refusals run here, once, at pool open. On a VERIFYING hop the `connect` hook then builds
-        # a fresh context for every connection, so the context `ssl=` carries is never handshaken on;
-        # it stays for the verify-off and plaintext escapes, where no hook is installed (BACKLOG #300).
+        # The refusals run here, once, at pool open. The `connect` hook then builds a fresh context
+        # for every connection, so the context `ssl=` carries is never handshaken on (BACKLOG #300).
+        # Every hop it opens verifies: a weakened one is refused with no escape (vault BACKLOG #3533).
         ssl_arg = _build_ssl(settings, posture=posture)
-        # Read off what _build_ssl returned rather than re-deciding from the settings, so the hook
-        # cannot drift onto a verify-off hop or off a verifying one.
-        verifying = isinstance(ssl_arg, ssl.SSLContext) and ssl_arg.verify_mode is ssl.CERT_REQUIRED
         return await asyncpg.create_pool(
             host=settings.server,
             port=settings.port,
@@ -2314,7 +2298,7 @@ class PostgresStore:
             password=settings.password,
             ssl=ssl_arg,
             # `connect=` needs asyncpg 0.30+, which is why pyproject's floor is 0.30.
-            connect=_per_connection_ssl_connect(settings, asyncpg) if verifying else None,
+            connect=_per_connection_ssl_connect(settings, asyncpg),
             min_size=1,
             max_size=max(1, max_size),
             timeout=settings.connect_timeout,  # connection-acquire/connect timeout (seconds)
@@ -3893,6 +3877,7 @@ class PostgresStore:
         retired-key values; skips values already under the active key (idempotent) and NULL/blank
         ones. A value no configured key can decrypt raises before any UPDATE (PHI is never dropped).
         Returns the number of values rewritten. Ported, not stubbed — Postgres supports rotation."""
+        self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
@@ -3921,9 +3906,19 @@ class PostgresStore:
         # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
+        # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
+        # under a key this run does not hold leaves the store as this method found it.
+        preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if preflight.unheld:
+            self._reseal_outcome = preflight
+            raise unheld_seal_refusal(preflight, before_writes=True)
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
+        # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
+            raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             if is_row_tagged(table, column):
@@ -10049,6 +10044,22 @@ class PostgresStore:
         2)."""
         await conn.fetchval("SELECT 1 FROM users WHERE id=$1 FOR UPDATE", user_id)
 
+    def reseal_outcome(self) -> ResealOutcome:
+        """store.py's ``MessageStore.reseal_outcome`` states the contract (vault BACKLOG #5635)."""
+        return self._reseal_outcome
+
+    async def _unrotated_seals(self) -> list[tuple[str, object]]:
+        """store.py's ``MessageStore._unrotated_seals`` states the contract (vault BACKLOG #5635)."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return []
+        active = f"{SEAL_PREFIX}{sealer.key_id}:%"
+        seals: list[tuple[str, object]] = []
+        for table, sql in unrotated_seal_queries("$1"):
+            rows = await self._fetchall(sql, active)
+            seals.extend((table, r["seal"]) for r in rows)
+        return seals
+
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
         store.py's ``MessageStore.reseal_user_records`` states the contract."""
@@ -11427,10 +11438,17 @@ class PostgresStore:
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await self._write_session(conn, token_hash, stamp)
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        stamp = mfa_stamp(time.time() if now is None else now)
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            await self._write_session(conn, token_hash, stamp)
+            written = await self._write_session(conn, token_hash, stamp)
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None

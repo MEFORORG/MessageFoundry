@@ -12513,9 +12513,11 @@ def create_managed_app(
         # BACKLOG #2193: the alerts test send builds an EmailTransport per request, and its SMTP
         # login takes the revocation guard a live alert takes, so it reads this same posture.
         app.state.alert_hop_posture = _hop_posture
-        # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
-        # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
-        # never relax a production-PHI store hop. None (no [ai]) fails closed (vault BACKLOG #2354).
+        # #200 (ADR 0092): thread the derived instance posture to the store open, for the checks that
+        # read one (the SQL Server pin's anchor checks, the PostgreSQL revocation guard). The weakened-
+        # TLS refusal reads none: it refuses at every posture (vault BACKLOG #3533 item 2). With None
+        # (no [ai]) and no ambient stamp, the pin's anchor checks enforce (vault BACKLOG #2354), but the PostgreSQL
+        # revocation guard does not run: it no-ops on an unstamped posture (see open_store).
         # create=True (BACKLOG #1780): serve's first run is the ordinary way a SQLite store comes to exist.
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this

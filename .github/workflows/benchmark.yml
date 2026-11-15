@@ -177,10 +177,43 @@ jobs:
       MEFOR_STORE_USERNAME: postgres
       MEFOR_STORE_PASSWORD: mefor
       MEFOR_STORE_POOL_SIZE: "40"  # track the shipped default (ADR 0062: 5 -> 40)
-      MEFOR_STORE_ENCRYPT: "false"  # plaintext to the container; the TLS-hardening guard needs the escape
-      MEFOR_ALLOW_INSECURE_TLS: "1"
+      # Verified TLS: the container serves a certificate the runner's trust store holds (the step
+      # below that makes it). Nothing permits a weakened store hop (vault BACKLOG #3533 item 2).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The same certificate as ci.yml's postgres-store step of the same name, which says why.
+      - name: Serve TLS from the Postgres container with a generated certificate
+        timeout-minutes: 5
+        env:
+          PG: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/pg-tls"
+          bash scripts/ci/db-tls-cert.sh "$dir"
+          docker cp "$dir/server.pem" "$PG:/var/lib/postgresql/server.pem"
+          docker cp "$dir/server.key" "$PG:/var/lib/postgresql/server.key"
+          docker exec -u 0 "$PG" chown postgres:postgres /var/lib/postgresql/server.pem /var/lib/postgresql/server.key
+          docker exec -u 0 "$PG" chmod 600 /var/lib/postgresql/server.key
+          docker exec "$PG" psql -U postgres -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.pem'" \
+            -c "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key'" \
+            -c "ALTER SYSTEM SET ssl = on" \
+            -c "SELECT pg_reload_conf()"
+          sudo cp "$dir/server.pem" /usr/local/share/ca-certificates/mefor-ci-postgres.crt
+          sudo update-ca-certificates
+          out=""
+          for i in $(seq 1 15); do
+            if out="$(timeout 10 openssl s_client -starttls postgres -connect localhost:5432 \
+              -servername localhost -verify_return_error -verify_hostname localhost </dev/null 2>&1)"; then
+              grep -m1 "Verify return code" <<<"$out"
+              exit 0
+            fi
+            echo "waiting for Postgres to serve the generated certificate ($i)"; sleep 2
+          done
+          echo "$out"
+          docker logs --tail 80 "$PG" 2>&1
+          echo "::error::Postgres did not serve a certificate the runner verifies within 30 s of the reload"
+          exit 1
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -235,11 +268,9 @@ jobs:
           # enforcing leg must satisfy only warns, so it configures no [alerts] channel.
           MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
-          # THE ENFORCEMENT DIAL, and why this leg needs it. The store hop to the Postgres container is
-          # weakened TLS (job env above). Under the shipped `enforce`, the MEFOR_ALLOW_INSECURE_TLS
-          # escape is clamped inert (ADR 0092 decision 2), so serve refuses at store open. `warn` honors
-          # the escape and still reports every gate. ci.yml's `load test (smoke, sqlserver)` leg carries
-          # the full reasoning, including why no narrower fix exists for a `services:` container.
+          # THE ENFORCEMENT DIAL. This leg is at `warn` because it configures no [alerts] channel (the
+          # sign-in comment above), not for TLS: the store hop is verified now. ci.yml's `load test
+          # (smoke, sqlserver)` leg says why `warn` stays.
           MEFOR_SECURITY_ENFORCEMENT: "warn"
           # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
@@ -261,8 +292,6 @@ jobs:
           # default relative "messagefoundry.db" and the minted pair lands in the working directory,
           # $GITHUB_WORKSPACE (measured on ci.yml's sqlserver load leg, run 33511381948). serve derives
           # the pair's directory from [store].path whatever the backend, so this holds for Postgres as well.
-          # MEFOR_ALLOW_INSECURE_TLS in the job env is the engine's escape for the hop it DIALS to the
-          # database. It has no reach over this hop, which is a client reaching the engine's API.
           cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
           key="$GITHUB_WORKSPACE/api-generated-key.pem"
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"
@@ -353,8 +382,11 @@ jobs:
       MEFOR_STORE_USERNAME: sa
       MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
       MEFOR_STORE_POOL_SIZE: "40"  # track the shipped default (ADR 0062: 5 -> 40)
-      MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
-      MEFOR_ALLOW_INSECURE_TLS: "1"
+      # No MEFOR_STORE_SSL_ROOT_CERT: this job's image is SQL Server 2022, so the store verifies the
+      # certificate the container serves through the runner's trust store (Encrypt=yes,
+      # TrustServerCertificate=no), as ci.yml's `store_tls: trust-store` legs do; the matrix there
+      # says why (owner ruling 2026-11-15). The step that makes the certificate adds it to that
+      # store. Nothing permits a weakened store hop (vault BACKLOG #3533 item 2).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python
@@ -410,6 +442,48 @@ jobs:
           done
           "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
+      # The same certificate as ci.yml's sqlserver-store step of the same name, which says why, added
+      # to the runner's trust store, which is how this job's store verifies it.
+      - name: Serve TLS from the SQL Server container with a generated certificate
+        timeout-minutes: 5
+        env:
+          MSSQL: ${{ job.services.mssql.id }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mssql-tls"
+          bash scripts/ci/db-tls-cert.sh "$dir"
+          if docker exec "$MSSQL" test -e /var/opt/mssql/mssql.conf; then
+            docker exec "$MSSQL" cat /var/opt/mssql/mssql.conf
+            echo "::error::the SQL Server image now ships an mssql.conf; merge the [network] TLS lines into it rather than replace it"
+            exit 1
+          fi
+          printf '%s\n' '[network]' \
+            'tlscert = /var/opt/mssql/tls/server.pem' 'tlskey = /var/opt/mssql/tls/server.key' \
+            > "$dir/mssql.conf"
+          docker exec -u 0 "$MSSQL" mkdir -p /var/opt/mssql/tls
+          docker cp "$dir/server.pem" "$MSSQL:/var/opt/mssql/tls/server.pem"
+          docker cp "$dir/server.key" "$MSSQL:/var/opt/mssql/tls/server.key"
+          docker cp "$dir/mssql.conf" "$MSSQL:/var/opt/mssql/mssql.conf"
+          uid="$(docker exec "$MSSQL" id -u)"
+          echo "the image runs as uid ${uid}"
+          docker exec -u 0 "$MSSQL" chown -R "${uid}:0" /var/opt/mssql/tls /var/opt/mssql/mssql.conf
+          docker exec -u 0 "$MSSQL" chmod 500 /var/opt/mssql/tls
+          docker exec -u 0 "$MSSQL" chmod 400 /var/opt/mssql/tls/server.key
+          docker exec -u 0 "$MSSQL" chmod 444 /var/opt/mssql/tls/server.pem
+          docker exec -u 0 "$MSSQL" chmod 644 /var/opt/mssql/mssql.conf
+          docker restart "$MSSQL"
+          sudo cp "$dir/server.pem" /usr/local/share/ca-certificates/mefor-ci-mssql.crt
+          sudo update-ca-certificates
+          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+          for i in $(seq 1 60); do
+            if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server is up again"; exit 0
+            fi
+            echo "waiting for SQL Server after the restart ($i)"; sleep 2
+          done
+          docker logs --tail 80 "$MSSQL" 2>&1
+          echo "::error::SQL Server did not come back within 120 s of the restart that loads the generated certificate"
+          exit 1
       - name: Install project (dev + sqlserver)
         run: |
           python -m pip install --upgrade pip
@@ -438,11 +512,9 @@ jobs:
           # enforcing leg must satisfy only warns, so it configures no [alerts] channel.
           MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
-          # THE ENFORCEMENT DIAL, and why this leg needs it. The store hop to the SQL Server container is
-          # weakened TLS (job env above). Under the shipped `enforce`, the MEFOR_ALLOW_INSECURE_TLS
-          # escape is clamped inert (ADR 0092 decision 2), so serve refuses at store open. `warn` honors
-          # the escape and still reports every gate. ci.yml's `load test (smoke, sqlserver)` leg carries
-          # the full reasoning, including why no narrower fix exists for a `services:` container.
+          # THE ENFORCEMENT DIAL. This leg is at `warn` because it configures no [alerts] channel (the
+          # sign-in comment above), not for TLS: the store hop is verified now. ci.yml's `load test
+          # (smoke, sqlserver)` leg says why `warn` stays.
           MEFOR_SECURITY_ENFORCEMENT: "warn"
           # The PHI posture's gates, provisioned as in the sqlite leg; the key is minted below.
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
@@ -464,8 +536,6 @@ jobs:
           # default relative "messagefoundry.db" and the minted pair lands in the working directory,
           # $GITHUB_WORKSPACE (measured on ci.yml's sqlserver load leg, run 33511381948). serve derives
           # the pair's directory from [store].path whatever the backend, so this holds for SQL Server as well.
-          # MEFOR_ALLOW_INSECURE_TLS in the job env is the engine's escape for the hop it DIALS to the
-          # database. It has no reach over this hop, which is a client reaching the engine's API.
           cert="$GITHUB_WORKSPACE/api-generated-cert.pem"
           key="$GITHUB_WORKSPACE/api-generated-key.pem"
           export MEFOR_HARNESS_TLS_CERT_FILE="$cert"

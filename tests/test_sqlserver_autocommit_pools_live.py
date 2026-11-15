@@ -36,8 +36,8 @@ The DatabaseRef pool is built as ``pipeline/reference_sync.py`` ``_load_database
 rather than through that function, which runs its statement and closes the pool itself, so it leaves
 no borrowed connection whose session this file could read.
 
-**Gated**: skipped unless ``MEFOR_TEST_SQLSERVER`` is set (plus ``MEFOR_STORE_*``). The weakened TLS
-the CI container needs is attested per hop in the child, since a child inherits no hop posture. The
+**Gated**: skipped unless ``MEFOR_TEST_SQLSERVER`` is set (plus ``MEFOR_STORE_*``). TLS is verified:
+the CI leg's runner trusts the certificate its container serves (vault BACKLOG #3533 item 2). The
 scratch table is uuid-named and not dropped (ephemeral container), as the other live files do.
 Synthetic data only.
 """
@@ -62,7 +62,6 @@ pytestmark = pytest.mark.skipif(
 _REPO = Path(__file__).resolve().parent.parent
 _RESULT_MARK = "MF2148-RESULT "
 _ENGINE_POOLS = ("poll_mark", "db_lookup", "reference_sync")
-_ATTESTED_REASON = "CI SQL Server container with a self-signed certificate"
 #: Exit codes of a native crash (SIGSEGV, SIGABRT), which scripts/ci/retry-native-crash.sh retries.
 _NATIVE_CRASH = frozenset({-11, -6, 139, 134})
 _DB_TIMEOUT = 60.0
@@ -80,9 +79,6 @@ def _conn(kind: str) -> dict[str, Any]:
         "database": os.environ.get("MEFOR_STORE_DATABASE", "MessageFoundry"),
         "username": os.environ.get("MEFOR_STORE_USERNAME", "sa"),
         "password": os.environ.get("MEFOR_STORE_PASSWORD", ""),
-        "trust_server_certificate": True,
-        "tls_hop_attested": True,
-        "tls_hop_attested_reason": _ATTESTED_REASON,
         "app_name": f"mf2148-{kind}",
     }
 
@@ -120,7 +116,7 @@ async def _committed(table: str, key: str, login_timeout: int) -> str:
 
     from messagefoundry.transports.database import _build_dsn
 
-    dsn = _build_dsn(_conn("verify"), attested=True)
+    dsn = _build_dsn(_conn("verify"))
     conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=login_timeout)
     try:
         cur = await conn.cursor()
@@ -156,9 +152,7 @@ async def _measure(kind: str, table: str, mode: str) -> dict[str, Any]:
             Source(
                 name="IB_MF2148",
                 type=ConnectorType.DATABASE,
-                tls_hop_attested=True,
-                tls_hop_attested_reason=_ATTESTED_REASON,
-                settings={k: v for k, v in settings.items() if not k.startswith("tls_hop_attested")}
+                settings=settings
                 | {
                     "poll_statement": f"SELECT k, v FROM [{table}] WHERE v IS NULL",
                     "mark_statement": f"UPDATE [{table}] SET v = 1 WHERE k = :k",
@@ -179,7 +173,7 @@ async def _measure(kind: str, table: str, mode: str) -> dict[str, Any]:
 
         close = executor.aclose
     elif kind == "reference_sync":
-        dsn = database._build_dsn(dict(settings), read_only=True, attested=True)
+        dsn = database._build_dsn(dict(settings), read_only=True)
         holder: list[Any] = []
 
         async def open_pool() -> Any:
@@ -191,7 +185,7 @@ async def _measure(kind: str, table: str, mode: str) -> dict[str, Any]:
         async def close() -> None:
             await database._close_pool_bounded(holder[0], "DATABASE reference source")
     else:  # the mechanism's control: aioodbc's own autocommit=True pool, not wrapped
-        dsn = database._build_dsn(dict(settings), attested=True)
+        dsn = database._build_dsn(dict(settings))
         holder = []
 
         async def open_pool() -> Any:
@@ -249,7 +243,7 @@ async def _measure_all(mode: str) -> dict[str, Any]:
     settings = _conn("setup")
     table = scratch_name("mf2148")
     conn = await aioodbc.connect(
-        dsn=database._build_dsn(settings, attested=True),
+        dsn=database._build_dsn(settings),
         autocommit=True,
         timeout=database._login_timeout(settings, "BACKLOG #2148 setup"),
     )

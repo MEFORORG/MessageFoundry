@@ -36,7 +36,8 @@ $script:DecisionTitlePrefix = 'decision-log '
 
 # Read at load time: inside a function $PSScriptRoot would name the caller's script.
 $script:DecisionHere = $PSScriptRoot
-# Resolve-DecisionSeat reads the roster once, on first use.
+# Get-DecisionSeatAliases's cache: the map, $false once the roster failed, or $null before the first
+# read. Set here so a StrictMode caller can read it before the first load.
 $script:DecisionSeatAliases = $null
 
 # The spool's retry (Invoke-DecisionSpoolIo) is coord-root.ps1's.
@@ -595,6 +596,30 @@ function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
     return [string]$Record.outcome
 }
 
+function Get-DecisionBlindState($Decisions, [hashtable]$Ratings) {
+    # One history's owner-rating state, verdicts oldest first. A breach is any trailing 60 holding
+    # more than 3 disagreements; after the latest one, 60 newer ratings must pass before it heals.
+    # A history shorter than 60 is its own trailing 60, so 4 disagreements in 10 ratings are a
+    # breach too: that changes nothing for a history of 60 or more, whose first full window holds
+    # every shorter one, but it lets a short history of another name of the seat close this one.
+    $verdicts = @($Decisions | Where-Object { $Ratings.ContainsKey([string]$_.id) } |
+            Sort-Object { [string]$Ratings[[string]$_.id].id } | ForEach-Object { [string]$Ratings[[string]$_.id].rating -eq 'disagree' })
+    $n = $verdicts.Count
+    $lastBreach = -1
+    # A running count of the disagreements in the trailing 60 ending at $i.
+    $dis = 0
+    for ($i = 0; $i -lt $n; $i++) {
+        if ($verdicts[$i]) { $dis++ }
+        if ($i -ge 60 -and $verdicts[$i - 60]) { $dis-- }
+        if ($dis -gt 3) { $lastBreach = $i }
+    }
+    $since = $n - 1 - $lastBreach
+    return [pscustomobject]@{
+        N = $n; Rated = [Math]::Min($n, 60); Disagree = $dis; Since = $since
+        Breached = ($lastBreach -ge 0 -and $since -lt 60)
+    }
+}
+
 function Get-DecisionCalibration {
     <#
       One seat and class's calibration, plan section 4.2: the owner's disagreement on the trailing 60
@@ -603,40 +628,53 @@ function Get-DecisionCalibration {
       percent). Calibrated means both hold. The digest's calibration table prints this, and the gate
       reads Calibrated.
 
-      -Decisions is one class's pool for every seat, and the samples are the decisions logged
-      under -Seat as given. -Seat is mandatory, so no caller can pool every seat by leaving it out. A roster alias of it is the same seat for REVERSALS ONLY (owner
-      ruling 2026-11-15, BACKLOG #5604): its reversed decisions are charged to this rate, and nothing
-      else of its is read. Its ratings never count toward the 60 samples and its unreversed decisions
-      never dilute the rate, because either would let a name with no record of its own borrow its
-      seat's calibration. The gate and the digest both call this, so they apply the ruling alike.
+      -Decisions is one class's pool for every seat. -Seat is mandatory, so no caller can pool every
+      seat by leaving it out. A roster alias and its seat (docs/roles/seats.json) are one seat, read
+      under owner ruling 2026-11-15, option c (BACKLOG #5604, #5597):
+      - The SAMPLES are the name's own: the decisions logged under -Seat's spelling, trimmed and
+        lower-cased, and never under another name of its seat. Borrowing them would let a name with
+        no record of its own inherit its seat's calibration.
+      - A live BREACH in any history of the seat -- its roster name's, any alias's, or all its names'
+        read together -- applies to every name of it, so an alias escapes nothing.
+      - REVERSALS are charged across the names: another name's reversed decisions in -RecentDays
+        count in this rate, while its unreversed ones never dilute it.
+      The gate and the digest both call this, so they apply the ruling alike.
     #>
     param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays,
         [Parameter(Mandatory)][AllowEmptyString()][string]$Seat)
-    $aliasDecisions = @(Get-DecisionAliasDecisions $Decisions $Seat)
-    $Decisions = @($Decisions | Where-Object { [string]$_.seat -eq $Seat })
-    # Verdicts oldest first. A breach is any trailing 60 holding more than 3 disagreements; after
-    # the latest one, 60 newer ratings must pass before the class is calibrated again.
-    $verdicts = @($Decisions | Where-Object { $Ratings.ContainsKey([string]$_.id) } |
-            Sort-Object { [string]$Ratings[[string]$_.id].id } | ForEach-Object { [string]$Ratings[[string]$_.id].rating -eq 'disagree' })
-    $n = $verdicts.Count
-    $lastBreach = -1
-    for ($i = 59; $i -lt $n; $i++) {
-        if (@($verdicts[($i - 59)..$i] | Where-Object { $_ }).Count -gt 3) { $lastBreach = $i }
+    $label = ConvertTo-DecisionSeatLabel $Seat
+    $canon = ConvertTo-DecisionSeat $Seat
+    $family = @($Decisions | Where-Object { (ConvertTo-DecisionSeat ([string]$_.seat)) -eq $canon })
+    $own = @()
+    $otherNames = [System.Collections.Generic.List[object]]::new()
+    foreach ($g in @($family | Group-Object { ConvertTo-DecisionSeatLabel ([string]$_.seat) } | Sort-Object Name)) {
+        if ($g.Name -eq $label) { $own = @($g.Group) } else { $otherNames.Add($g) }
     }
-    $rated = [Math]::Min($n, 60)
-    $dis = if ($n) { @($verdicts[($n - $rated)..($n - 1)] | Where-Object { $_ }).Count } else { 0 }
-    $since = $n - 1 - $lastBreach
+    $others = @($otherNames | ForEach-Object { $_.Group })
+    $st = Get-DecisionBlindState $own $Ratings
     $blindOk = $false
-    $blind = if ($n -lt 60) { "review path, $n/60 samples" }
-    elseif ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
+    $blind = if ($st.N -lt 60) { "review path, $($st.N)/60 samples" }
+    elseif ($st.Breached) { "BREACH: review path, $($st.Since)/60 fresh samples" }
     else { $blindOk = $true; 'calibrated' }
+    # The seat's other histories: each other name alone, then every name together, which also
+    # catches disagreements split across names so that no one name holds more than 3.
+    $breachedIn = [System.Collections.Generic.List[string]]::new()
+    foreach ($g in $otherNames) {
+        if ((Get-DecisionBlindState $g.Group $Ratings).Breached) { $breachedIn.Add($g.Name) }
+    }
+    if ($others.Count -and (Get-DecisionBlindState $family $Ratings).Breached) { $breachedIn.Add("all of $canon's names together") }
+    if ($breachedIn.Count) {
+        $seatBreach = "BREACH in seat $canon's history ($($breachedIn -join ', ')): review path"
+        $blind = if ($blindOk) { $seatBreach } else { "$blind; $seatBreach" }
+        $blindOk = $false
+    }
     # A decision the gate answered HALT for was deferred, not acted on, so it does not dilute the
     # rate -- unless it was reversed anyway, which is still a reversal. BACKLOG #5604.
-    $recent = @($Decisions | Where-Object {
+    $recent = @($own | Where-Object {
             $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) -and
             ([string]$_.gate -ne 'HALT' -or (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed')
         })
-    $recent += @($aliasDecisions | Where-Object {
+    $recent += @($others | Where-Object {
             $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) -and (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed'
         })
     $revd = @($recent | Where-Object { (Get-DecisionOutcome $_ $Outcomes) -eq 'reversed' }).Count
@@ -646,7 +684,7 @@ function Get-DecisionCalibration {
     $pct = ($revRate * 100).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + '%'
     $rateText = if ($recent.Count) { $pct + $(if ($breach) { ' BREACH' } else { '' }) } else { 'n/a' }
     return [pscustomobject]@{
-        Rated = $rated; Disagree = $dis; Blind = $blind; Recent = $recent.Count; Reversed = $revd
+        Rated = $st.Rated; Disagree = $st.Disagree; Blind = $blind; Recent = $recent.Count; Reversed = $revd
         RateText = $rateText; Calibrated = ($blindOk -and -not $breach)
     }
 }
@@ -710,9 +748,8 @@ function Get-DecisionBudget {
     $Limit = 3
     if ($Seat) {
         $Limit = 2
-        # A roster alias is the same seat, on either side, so its reversals are charged to it.
-        $own = Resolve-DecisionSeat $Seat
-        $Reversals = @($Reversals | Where-Object { $null -eq $_.Seat -or (Resolve-DecisionSeat $_.Seat) -eq $own })
+        $canon = ConvertTo-DecisionSeat $Seat
+        $Reversals = @($Reversals | Where-Object { $null -eq $_.Seat -or (ConvertTo-DecisionSeat $_.Seat) -eq $canon })
     }
     $day = [TimeSpan]::FromHours(24)
     # A reversal that could still close the scope at $Now happened in the last 24 hours, and the 24
@@ -780,43 +817,51 @@ function Get-DecisionRecentUnsampledB {
         })
 }
 
-function Resolve-DecisionSeat([string]$Seat) {
-    # A seat name folded to its roster seat (docs/roles/seats.json aliases), trimmed and lower-case.
-    # A name the roster does not map, or a roster that cannot be read, stays as given: the budget and
-    # the rate then read the bare name, as they did before aliases were folded, never a guess.
-    if (-not $Seat) { return '' }
-    $s = $Seat.Trim().ToLowerInvariant()
-    if ($null -eq $script:DecisionSeatAliases) {
-        $script:DecisionSeatAliases = @{}
-        try {
-            $roster = Join-Path (Split-Path -Parent (Split-Path -Parent $script:DecisionHere)) 'docs/roles/seats.json'
-            foreach ($p in ([System.IO.File]::ReadAllText($roster) | ConvertFrom-Json -ErrorAction Stop).aliases.PSObject.Properties) {
-                if ($p.Name -notlike '_*') { $script:DecisionSeatAliases[$p.Name.ToLowerInvariant()] = [string]$p.Value }
-            }
-        } catch {
-            $script:DecisionSeatAliases = @{}
-        }
+function Get-DecisionSeatAliases {
+    # docs/roles/seats.json's alias map, lower-cased label -> lower-cased seat, read once. $null when
+    # the roster cannot be read: every label then stands for itself, trimmed and lower-cased, and the
+    # gate goes to review rather than read a seat's history in part.
+    if ($script:DecisionSeatAliases -is [hashtable]) { return $script:DecisionSeatAliases }
+    if ($script:DecisionSeatAliases -eq $false) { return $null }
+    $map = @{}
+    try {
+        $roster = Join-Path (Split-Path -Parent (Split-Path -Parent $script:DecisionHere)) 'docs/roles/seats.json'
+        $doc = Read-CoordText $roster | ConvertFrom-Json -ErrorAction Stop
+        $aliases = Get-DecisionJsonValue $doc 'aliases'
+        if ($aliases -isnot [System.Management.Automation.PSCustomObject]) { throw "$roster holds no aliases map" }
+        foreach ($p in $aliases.PSObject.Properties) { $map[(ConvertTo-DecisionSeatLabel $p.Name)] = ConvertTo-DecisionSeatLabel ([string]$p.Value) }
+    } catch {
+        $script:DecisionSeatAliases = $false
+        return $null
     }
-    if ($script:DecisionSeatAliases.ContainsKey($s)) { return [string]$script:DecisionSeatAliases[$s] }
+    $script:DecisionSeatAliases = $map
+    return $map
+}
+
+function ConvertTo-DecisionSeatLabel([string]$Seat) {
+    # One spelling's name, trimmed and lower-cased with no alias collapsed: the name a calibration
+    # sample pool is kept under (owner ruling 2026-11-15, option c), so padding or case starts no
+    # fresh pool, while `mgr` and `manager` stay two pools.
+    if (-not $Seat) { return '' }
+    return $Seat.Trim().ToLowerInvariant()
+}
+
+function ConvertTo-DecisionSeat([string]$Seat) {
+    # One seat's one name: trimmed, lower-cased, and an alias collapsed onto the seat it spells
+    # (docs/roles/seats.json). Every seat comparison here goes through this, so a padded or aliased
+    # spelling cannot escape a seat's reversal budget or calibration breach (BACKLOG #5597). Only the
+    # calibration SAMPLES are kept per name, by ConvertTo-DecisionSeatLabel.
+    $s = ConvertTo-DecisionSeatLabel $Seat
+    if (-not $s) { return '' }
+    $map = Get-DecisionSeatAliases
+    if ($map -and $map.ContainsKey($s)) { return [string]$map[$s] }
     return $s
 }
 
-function Get-DecisionAliasDecisions($Decisions, [string]$Seat) {
-    # The decisions of -Seat's roster seat logged under any OTHER of its names: for -Seat `mgr`,
-    # those logged as `manager` or another alias of it. Get-DecisionCalibration reads only their
-    # reversals; the calibration pool itself stays the decisions logged under -Seat as given.
-    $canon = Resolve-DecisionSeat $Seat
-    if (-not $canon) { return @() }
-    return @($Decisions | Where-Object {
-            [string]$_.seat -ne $Seat -and (Resolve-DecisionSeat ([string]$_.seat)) -eq $canon
-        })
-}
-
 function Test-DecisionLanderSeat([string]$Seat) {
-    # The Lander, or a roster alias of it (docs/roles/seats.json). An unreadable roster is no
-    # exemption: this only ever relaxes the cost rung, so a fault must not grant it, and
-    # Resolve-DecisionSeat then leaves an alias unmapped.
-    return ((Resolve-DecisionSeat $Seat) -eq 'lander')
+    # The Lander, or a roster alias of it. An unreadable roster is no exemption for an alias: this
+    # only ever relaxes the cost rung, so a fault must not grant it.
+    return ((ConvertTo-DecisionSeat $Seat) -eq 'lander')
 }
 
 function Get-DecisionJsonValue($Object, [string]$Name) {

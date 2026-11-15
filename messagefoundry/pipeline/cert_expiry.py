@@ -250,7 +250,7 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
       file once, so the row watches the file, not the copy the signer holds."""
     certs: list[MonitoredCert] = []
     store, pin = settings.store, settings.store.ssl_root_cert
-    # Only where the store sends it: an escaped weakened posture sends no pin.
+    # Only where the store would send it: a weakened posture sends no pin (and refuses at open).
     sends_pin = store.encrypt and not store.trust_server_certificate
     if store.backend is StoreBackend.SQLSERVER and sends_pin and isinstance(pin, str) and pin:
         certs.append(MonitoredCert("store.ssl_root_cert", pin))

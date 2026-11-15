@@ -38,7 +38,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -210,6 +210,7 @@ from messagefoundry.store.store import (
     LockoutIncrement,
     PasskeyCounts,
     PasskeyRowMalformed,
+    PendingFactorAnchor,
     RevokeResult,
     RoleRow,
     SessionRecord,
@@ -1193,6 +1194,11 @@ IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 #: its ceremony back.
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
+#: The ``outcome`` a ``directory_unconfirmed`` row carries when the directory check's answer is
+#: neither a string nor the vouched account row (BACKLOG #3780 item 2). A string answer is written
+#: as given.
+_UNKNOWN_DIRECTORY_ANSWER = "unknown_answer"
+
 #: The ``auth.reauth`` reason for a directory step-up re-bind sent with an empty password (BACKLOG
 #: #2434). The directory is never asked and nothing is charged; the caller sees a refused password.
 EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a credential
@@ -1461,9 +1467,9 @@ class Elevation:
       body, cookie), or it has just made the session it elevated unreachable.
     * not ``ok``, ``session_lost`` False -- the proof was wrong (bad password, bad code, bad
       assertion). Nothing rotated, and the token the caller presented still authenticates.
-    * not ``ok``, ``session_lost`` True -- the session is gone, so the caller must sign in again.
-      Either the proof was GOOD but the session was revoked or expired underneath the ceremony, or
-      (password re-auth only, BACKLOG #1138) the session is revoked because it spent its re-proof
+    * not ``ok``, ``session_lost`` True -- the caller must sign in again. Either the proof was
+      GOOD but the session was revoked or expired underneath the ceremony, or (password re-auth
+      only, BACKLOG #1138) the session is revoked because it spent its re-proof
       budget, in which case the proof was wrong or never checked; or (any ceremony, BACKLOG #2298)
       the session was ended because its temporary password lapsed, with the proof checked or not,
       as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
@@ -1474,7 +1480,11 @@ class Elevation:
       back (vault BACKLOG #3113, #3025; THE RETRY comment in
       :meth:`AuthService.confirm_mfa_enrollment`). Or (the TOTP and
       passkey legs, BACKLOG #3068) the session or its account went while the leg waited on the
-      directory lookup, the account queue or the proof check, with the proof checked or not. Fails
+      directory lookup, the account queue or the proof check, with the proof checked or not. Or
+      (:meth:`AuthService.verify_mfa`, a directory account, BACKLOG #3780) the account's lookup keys
+      moved after the directory check read the row, with the proof unchecked: then the session
+      may still be live and the presented token may still authenticate, as when the read this
+      replaced lost its race with such a move. Fails
       CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather
       than re-prompting on a session that is gone or unreachable. For a password re-auth, the
       ``auth.reauth`` row's ``session_revoked`` says which cause applied.
@@ -6436,7 +6446,7 @@ class AuthService:
             return False
         # A bad signature writes no row here (see _check_password_and_passkey); the clone signal
         # and a refused stored key do, deferred with the other refused rows.
-        new_count = await self._verify_passkey_signature(
+        verified = await self._verify_passkey_signature(
             user,
             cred,
             response_json=parsed,
@@ -6447,10 +6457,13 @@ class AuthService:
             write=later,
             audit_bad_signature=False,
         )
-        if new_count is None:
+        if verified is None:
             return False
         answer = await self._store.update_webauthn_sign_count(
-            cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
+            cred.credential_id_hash,
+            expected=cred.sign_count,
+            new=verified.new_sign_count,
+            used_at=now,
         )
         if answer != "moved":
             missed, suspect = answer, cred
@@ -6474,9 +6487,9 @@ class AuthService:
         client: str | None,
         write: Callable[[Callable[[], Awaitable[None]]], Awaitable[None]],
         audit_bad_signature: bool,
-    ) -> int | None:
-        """Verify an assertion's signature against stored passkey ``cred``: the new sign count, or
-        ``None`` when it is refused. The one copy of the refusal handling both passkey legs share,
+    ) -> webauthn.AssertionResult | None:
+        """Verify an assertion's signature against stored passkey ``cred``: the new sign count and
+        UV flag, or ``None`` when it is refused. The one copy of the refusal handling both passkey legs share,
         :meth:`finish_webauthn_assertion` and the combined passkey sign-in. ``write`` runs each audit
         row: at once on the second-factor leg, deferred into the failure pad on the sign-in.
 
@@ -8472,9 +8485,9 @@ class AuthService:
                 # ticket or a federated redirect is an AMBIENT proof, and seeding would let the
                 # engine's own login stamp satisfy `has_recent_step_up` for the whole
                 # `step_up_max_age_seconds` window with no directory interaction. So the first
-                # window-gated action demands a real step-up: a directory re-bind or an engine TOTP
-                # or recovery code at the MFA gate for a `kerberos` session, since `verify_mfa`
-                # stamps the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
+                # window-gated action demands a real step-up: a directory re-bind, or an engine TOTP
+                # or recovery code at the MFA gate, or a user-verified passkey that completes a
+                # pending factor, for a `kerberos` session, since those stamp the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
                 # #296, #2142).
                 #
                 # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
@@ -12192,8 +12205,9 @@ class AuthService:
           started before the rotation can never be finished, which is a dead end, not a retry.
         * ``_new_ip_seen`` — the WP-L3-13 dedupe. Only the audit row and notice depend on it, never
           the step-up. A re-verification drops the entry before it rotates (BACKLOG #2159), so a
-          strand costs something on a rotation WITHOUT one, such as a passkey assertion or an
-          enrolment confirm: every address already reported would be audited and notified again.
+          strand costs something on a rotation WITHOUT one, such as an enrolment confirm or a
+          passkey assertion that moved no anchor (an ``oidc`` session, or one that had already
+          met its factor): every address already reported would be audited and notified again.
         * ``_reproof_session_failures`` — the BACKLOG #1138 per-session re-proof budget. Stranded,
           any rotation would hand the session a fresh budget of guesses.
 
@@ -12222,9 +12236,10 @@ class AuthService:
 
         **Ordering is the whole control** (see each call site): every store stamp for this elevation
         must already have been written against the OLD hash before this runs, because the re-key
-        carries those columns forward, and every session stamp UPDATE is rowcount-blind (which
-        session writes report what they changed is :meth:`AuthStore.rotate_session`'s docstring to
-        say) — a stamp issued *after* the rotation silently writes nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
+        carries those columns forward, and a session stamp UPDATE against a dead hash raises
+        nothing (which session writes report what they changed is
+        :meth:`AuthStore.rotate_session`'s docstring to say) — a stamp issued *after* the rotation
+        silently writes nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
 
         A rotation the store refused is ``None`` here too (BACKLOG #3023); see
         :meth:`_rotate_session_hash`.
@@ -12808,6 +12823,31 @@ class AuthService:
         if user is None or user.disabled:
             return None
         return await self._build_identity(user)
+
+    async def session_shows_signed_in(self, token: str | None) -> bool:
+        """Whether a page that may be served with or without a session shows this browser as
+        signed in: Sign-out and the session watchdog. A DISPLAY decision, never an authorization.
+
+        It refuses, ends and reports a session as :meth:`identity_for_token` does, with one
+        exception: a session whose owner's temporary credential has lapsed reads ``False`` and is
+        left as it is, so the sign-in callback's supersession ends it and records the lapse
+        (BACKLOG #3749). Unlike that method, this one never refreshes a session's idle clock.
+        """
+        if not token:
+            return False
+        session = await self._load_session(hash_token(token))
+        if session is None:
+            return False
+        now = time.time()
+        if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
+            await self._store.revoke_session(session.token_hash, now=now)
+            return False
+        user = await self._load_user(session.user_id)
+        if user is not None and (refusal := self._gate_refusal(session, user, now)) is not None:
+            if refusal != "credential":
+                await self._session_seal_failed(session.token_hash)
+            return False
+        return user is not None and not user.disabled
 
     async def _load_session(self, token_hash: str) -> SessionRecord | None:
         """The session ``token_hash`` names, or ``None`` (BACKLOG #2592). The ONLY reader of
@@ -15432,7 +15472,10 @@ class AuthService:
 
         A LOCAL login that owes no second factor is the first verification. No directory login is:
         Kerberos and OIDC sessions are born with no window (BACKLOG #1144 step 5). A Kerberos session
-        opens one by a step-up or a code at the MFA gate, an OIDC session only by the IdP step-up
+        opens one by at least a step-up, a TOTP or recovery code, or a user-verified passkey that
+        completes its pending factor (a passkey never renews a window once the factor is met), an
+        OIDC
+        session only by the IdP step-up
         (BACKLOG #2142)."""
         if not token:
             return False
@@ -15479,8 +15522,10 @@ class AuthService:
         """Start the new-address dedupe over for a session that just re-anchored, so an address
         reported before the re-anchor is reported again (BACKLOG #2159).
 
-        Every leg that calls ``mark_session_reauthed`` calls this straight after it, before it
-        rotates the token; tests/test_admin_new_ip.py pins the pairing. Keying the reset on the
+        Every leg that re-anchors calls this straight after the write, before it rotates the
+        token: each leg that calls ``mark_session_reauthed``, and :meth:`finish_webauthn_assertion`
+        when ``mark_session_mfa_verified(anchor=...)`` reports it applied the anchor;
+        tests/test_admin_new_ip.py pins the pairing. Keying the reset on the
         re-anchor rather than on ``reauth_at`` keeps it free of the wall clock, which can step
         back."""
         self._new_ip_seen.pop(token_hash, None)
@@ -15560,9 +15605,12 @@ class AuthService:
           OIDC one minted while ``oidc_require_mfa_claim`` is off. Such a sign-in writes nothing
           here, and the factor leg below writes for it;
         * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``),
-          once the session has rotated, whether it finishes a sign-in or a step-up. Only
-          ``verify_mfa`` also moves the session's anchor (see :meth:`_same_host`), and not on an
-          OIDC session, whose anchor moves only at the IdP (BACKLOG #2142);
+          once the session has rotated, whether it finishes a sign-in or a step-up. A code also
+          moves the session's anchor on every success (see :meth:`_same_host`), and a passkey only
+          when it completes a factor the session had not yet met; neither on an OIDC session, whose
+          anchor moves only at the IdP (BACKLOG #2142). So after a passkey on a session that had
+          already met its factor, this record can hold an address the anchor has not moved to. The
+          passkey opens the step-up window only with the UV flag;
         * a factor enrolment confirmed, first or later (``confirm_mfa_enrollment``,
           ``finish_webauthn_registration``); a first one is how a first sign-in under
           ``require_mfa`` finishes. Those callers pass the account as ``enrolment``, and an address
@@ -15757,8 +15805,19 @@ class AuthService:
         carrying ``cap_reached`` for the first address past that, because this runs on every
         sensitive request (BACKLOG #2159). The step-up
         dependencies treat ``True`` as "force a fresh step-up"; a successful re-verify (``POST
-        /me/reauth`` **or** ``/auth/mfa-verify``) re-anchors the session to the new address (see
-        :meth:`reauth` / :meth:`verify_mfa`), so the signal clears and the caller proceeds. An
+        /me/reauth`` or ``/auth/mfa-verify``) on any session but an ``oidc`` one re-anchors the
+        session to the new address and stamps the step-up window (see :meth:`reauth` /
+        :meth:`verify_mfa`), so the signal clears and the caller proceeds. A passkey assertion that
+        completes a factor the session had not yet met (:meth:`finish_webauthn_assertion`), on any
+        session but an ``oidc`` one, re-anchors it too, so the signal clears, but it stamps
+        the window only when the authenticator reported user verification and otherwise shuts it,
+        so after an assertion without that flag a window-gated step-up still forces a step-up. As
+        after a code that completes the same pending factor, an action-bound grant the session
+        minted before it is not cleared, so an action gate can pass on that grant from the new
+        address, and this signal no longer fires there for the PHI reads and paced writes either:
+        the passkey matches the code on both and is stricter on the window (measured by
+        tests/test_webauthn.py, ADR 0068's 2026-11-14 amendment). An assertion
+        on a session that had already met its factor neither re-anchors nor stamps. An
         ``oidc`` session, which :meth:`reauth` refuses, can re-anchor through the IdP step-up
         (:meth:`complete_oidc_step_up`). It is
         **step-up-forcing only** — it never changes an RBAC allow or deny, and a ``True`` is cleared
@@ -16721,7 +16780,9 @@ class AuthService:
         **The directory lookup runs BEFORE the queue, never inside it.** It is a network round
         trip, and one slow lookup held in the queue would stall every attempt queued on that
         account. It only adds a refusal and counts nothing, so running it concurrently cannot let a
-        burst past the lock: the check that bounds the burst is the one inside the queue.
+        burst past the lock: the check that bounds the burst is the one inside the queue. That
+        in-queue read is also the one re-read after the lookup; the comment above the lookup's
+        call states the rule (BACKLOG #3780 item 2).
 
         The TOTP code is judged at the moment the request ARRIVED, not when it leaves the queue
         (``arrived``). Otherwise a caller who knows only the username could queue padded failures
@@ -16780,38 +16841,120 @@ class AuthService:
         # or recovery code and charges nothing to the lockout: the caller did not guess wrong, the
         # directory could not vouch for the account. This only ADDS a refusal; a confirmed
         # directory account meets the same lock and lockout feed. A local account is not asked.
-        current = await self._directory_vouches_for_factor(
-            token, user, event="auth.mfa_failed", client=client, report_lock=True
+        # BACKLOG #3780 item 2, THE ONE STATEMENT OF THIS RULE: no holder re-read follows the
+        # lookup here, because the in-queue re-read below is that read. Only the queue's
+        # acquisition awaits between the two, and nothing is spent before the in-queue read, so it
+        # still refuses, before any code is checked, a revocation, a disable or a lock the lookup
+        # let land. A directory account comes back as the row the directory check's role test read
+        # after the lookup, so the queue is keyed by the account's name as it was then; the
+        # dropped re-read keyed it by the name it read itself, a moment later. A session lost
+        # during the lookup is named by the in-queue read, with the account's current name while
+        # its row is still there (#2291 class); the dropped re-read named it with the name read
+        # before the lookup.
+        #
+        # The dropped re-read also answered ``session_lost`` when its account read came back empty
+        # because a delete, rename, rebind or re-key raced the seal check's second read
+        # (``_verified``). That race needs the row gone, which the in-queue read sees too, or its
+        # lookup keys moved after the role test read it. So for a directory account the in-queue
+        # read refuses the same way, with the same ``session_lost`` reason, whenever the keys
+        # moved and no check before it refused. An attempt the dropped re-read refused for the
+        # race is still refused, unless the move was put back before the queue read. Wider than
+        # main, which refused only when the race was lost. A local account was never re-read
+        # after a lookup, so neither this refusal nor the lock-first order below applies to it.
+        # Both only add or reorder refusals.
+        directory = _is_directory_account(user)
+        vouched = await self._directory_vouches_for_factor(
+            token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
-        if isinstance(current, Elevation):
-            return current
-        user = current
-        async with self._account_credential_lock(user.username):
-            # Read the session, the account and its lock again. The queue may have been a wait, so
-            # what was read before it may be stale: a session revoked meanwhile would still spend
-            # its code, and a lock set by the attempt ahead in the queue would go unseen. A session
-            # or account gone answers ``session_lost``, as the re-reads before and after this one
-            # do (BACKLOG #3068): the token no longer authenticates. Audited with the row
-            # :meth:`_factor_holder_current` writes (BACKLOG #3780), under the account's name as it
-            # is now when the row is still there (#2291 class). The account is read even when the
-            # session is gone, so a rename that came with the revocation names the row too.
-            session = await self._load_session(hash_token(token))
-            loaded = await self._load_user(user.id if session is None else session.user_id)
-            if session is None or loaded is None or loaded.disabled:
-                await self._audit_session_lost(
-                    "auth.mfa_failed",
-                    actor=(loaded or user).username,
-                    client=client,
-                    phase=None,
-                )
-                return Elevation(session_lost=True)
-            user = loaded
-            if not user.totp_enabled:
-                return Elevation()
-            if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
-                return Elevation(session_lost=True)
-            if await self._mfa_lock_refused(user, client=client):
-                return Elevation(locked=True)
+        if isinstance(vouched, Elevation):
+            return vouched
+        user = vouched
+        async with AsyncExitStack() as queue:
+            joined = [user.username]
+            for may_rejoin in (True, False):
+                # In key order, so two attempts that each hold two queues take them in one order
+                # and cannot wait on each other.
+                for name in sorted(joined, key=_credential_lock_key):
+                    await queue.enter_async_context(self._account_credential_lock(name))
+                # Read the session, the account and its lock again. The queue may have been a wait,
+                # and for a directory account the lookup came before it, so what was read before
+                # may be stale: a session revoked meanwhile would still spend its code, and a lock
+                # set by the attempt ahead in the queue would go unseen. A session or account gone,
+                # or an account disabled, answers ``session_lost``, as the re-reads after this one
+                # do (BACKLOG #3068). Audited with the row :meth:`_factor_holder_current`
+                # writes (BACKLOG #3780), under the account's name as it is now when the row is
+                # still there (#2291 class). The account is read even when the session is gone, so
+                # a rename that came with the revocation names the row too.
+                session = await self._load_session(hash_token(token))
+                loaded = await self._load_user(user.id if session is None else session.user_id)
+                if session is None or loaded is None or loaded.disabled:
+                    await self._audit_session_lost(
+                        "auth.mfa_failed",
+                        actor=(loaded or user).username,
+                        client=client,
+                        phase=None,
+                    )
+                    return Elevation(session_lost=True)
+                user = loaded
+                if directory:
+                    # The dropped re-read's order: the lock is asked first, on the row just read,
+                    # and its row written, so a lock that landed during the lookup or its role test
+                    # is audited as ``locked`` whatever else landed with it. With TOTP on, the lapse
+                    # is asked next, of a locked account and of one whose keys moved too, and ends
+                    # its session, as a lapse during the wait did ahead of the lock and of a rename;
+                    # so a lock and a lapse together keep both rows and the ended session. With TOTP
+                    # turned off the lapse is not asked: the account holds no factor to name on a
+                    # lapse row, and main never asked it of one either. Then a lock answers
+                    # ``locked``, with moved keys too, as that re-read did when its read found the
+                    # row. A directory account never rejoins: a rename moved its keys.
+                    locked = await self._mfa_lock_refused(user, client=client)
+                    if user.totp_enabled and await self._mfa_lapsed(
+                        token, user, client=client, factor_checked=False
+                    ):
+                        return Elevation(session_lost=True)
+                    if locked:
+                        return Elevation(locked=True)
+                    if _lookup_keys(user) != _lookup_keys(vouched):
+                        # The account's lookup keys moved after the role test read them (see the
+                        # comment above the lookup's call). The session may still be live, and the
+                        # token still authenticate; ``session_lost`` is the answer and the row the
+                        # dropped re-read gave when such a move raced its read.
+                        await self._audit_session_lost(
+                            "auth.mfa_failed", actor=user.username, client=client, phase=None
+                        )
+                        return Elevation(session_lost=True)
+                    if not user.totp_enabled:
+                        return Elevation()
+                    break
+                # A local account keeps main's order, ``totp_enabled``, then the lapse, then the
+                # lock. Asked on every pass, so a rejoin lets no queue go before main's checks
+                # have run on the row this pass read, and asks them again after its wait.
+                if not user.totp_enabled:
+                    return Elevation()
+                if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
+                    return Elevation(session_lost=True)
+                if await self._mfa_lock_refused(user, client=client):
+                    return Elevation(locked=True)
+                if not may_rejoin or _credential_lock_key(user.username) in {
+                    _credential_lock_key(name) for name in joined
+                }:
+                    break
+                # A rename landed after the queue was keyed, so the queue held is one that attempts
+                # reading the new name do not join, and a burst split across the two can get one
+                # code check past the lockout (BACKLOG #1943). Only a local account gets here. The
+                # attempt lets every queue it holds go, then takes the first name's queue and the
+                # new name's again, in key order, and the reads and checks above run again after
+                # that wait. While it waits it holds neither, so attempts queued behind it on the
+                # first name may run first. ONCE: a further rename carries on in the queues then
+                # held, as a rename during the code check below does. Both windows stay open while
+                # the queue is keyed by name. ``user`` is carried forward, so a refusal after the
+                # rejoin names the account as last read.
+                await queue.pop_all().aclose()
+                joined.append(user.username)
+            else:
+                # Unreachable: the last pass breaks or returns. Guarded so an edit to the loop can
+                # never let the code check below run without the account's queue held (#1943).
+                raise RuntimeError("verify_mfa left its queue loop without holding the queue")
             now = time.time()
             # The enrolment this code is checked against: the factor write below lands only while
             # the row still holds it. Every enable stamps ``totp_enrolled_at`` afresh, as
@@ -17236,11 +17379,20 @@ class AuthService:
         client: str | None,
         report_lock: bool,
         phase: str | None = None,
+        reread: bool = True,
     ) -> Elevation | VerifiedUser:
         """The directory check a leg runs before it marks a DIRECTORY account's factor met, with
         the re-read that must follow the lookup. Returns the refusal to hand back, or the account
         to carry on with: ``user`` itself for a local account, which is never asked and costs no
         read, or the row read afresh after a confirmed lookup.
+
+        **Except under ``reread=False``,** which skips that re-read. For a directory account it
+        returns the row :meth:`_directory_step_up_refusal`'s role test read after the lookup, so
+        its name and lock are as they were then; for a local account, ``user`` itself. Either way
+        the session was not read again and the lock not checked, so nothing below about the
+        re-read then holds, and the caller must read the session and check the lock itself before
+        it checks a proof. At least :meth:`verify_mfa` passes it; the comment at its call says why
+        (BACKLOG #3780 item 2).
 
         The one copy of a block :meth:`verify_mfa` (BACKLOG #2023) and
         :meth:`finish_webauthn_assertion` (BACKLOG #2239) each used to spell out (BACKLOG #3068).
@@ -17258,25 +17410,34 @@ class AuthService:
         the account it loaded through :meth:`_load_user`. No session object is needed, because the
         re-read loads the session from the token; :meth:`confirm_mfa_enrollment` holds no session.
         Each passes its own failure ``event`` (``auth.mfa_failed`` on the TOTP legs,
-        ``auth.webauthn_failed`` on the passkey legs). ``report_lock`` sets ``locked`` on a lock
-        refusal; :meth:`verify_mfa` and the two enrolment legs report it (BACKLOG #3810 finding 4),
-        and :meth:`finish_webauthn_assertion` does not. ``phase``, which the enrolment legs pass as
+        ``auth.webauthn_failed`` on the passkey legs). ``report_lock`` sets ``locked`` on the
+        re-read's lock refusal; :meth:`verify_mfa` and the two enrolment legs pass it (BACKLOG #3810
+        finding 4), and :meth:`finish_webauthn_assertion` does not. Under :meth:`verify_mfa`'s
+        ``reread=False`` no re-read runs, so no lock is refused here and the flag does nothing.
+        ``phase``, which the enrolment legs pass as
         ``enroll`` as their own wrong-proof rows carry it, is added to the ``directory_unconfirmed``
         and ``session_lost`` rows. It is not added to the lock row, whose detail is the shared
         constant an exclusion matches exactly (#1131). Call it before anything the refusal must not
         spend (a TOTP step, recovery codes, a stored credential, a sign count; a challenge already
         taken is put back), and after the cheap local refusals, so a caller already refused costs
-        no lookup. Note that the re-read refuses
-        a second-step-locked account."""
+        no lookup. Note that the re-read, where it runs, refuses a second-step-locked account; under
+        ``reread=False`` nothing here does."""
         if not _is_directory_account(user):
             return user
-        refusal = await self._directory_step_up_refusal(user)
-        if refusal is not None:
-            detail = {"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}
+        answer = await self._directory_step_up_refusal(user)
+        # A positive test: only the vouched row carries on, so an answer of any other type, a
+        # refusal shape this does not know included, refuses (fails closed).
+        if not isinstance(answer, VerifiedUser):
+            # A string answer is written as given; an answer that is not a string gets one fixed
+            # slug.
+            outcome = answer if isinstance(answer, str) else _UNKNOWN_DIRECTORY_ANSWER
+            detail = {"reason": DIRECTORY_UNCONFIRMED, "outcome": outcome}
             if phase is not None:
                 detail["phase"] = phase
             await self._audit(event, actor=user.username, detail=_json(detail), client=client)
-            return Elevation(directory_refusal=_directory_refusal(refusal))
+            return Elevation(directory_refusal=_directory_refusal(outcome))
+        if not reread:
+            return answer
         return await self._factor_holder_current(
             token,
             actor=user.username,
@@ -17301,9 +17462,11 @@ class AuthService:
 
         For a check that must land just before a factor is written, after awaits in which a
         revocation, a disable or a lock could have landed (BACKLOG #3068).
-        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, both second-
-        factor legs run it again right before ``mark_session_mfa_verified``, and :meth:`verify_mfa`
-        runs it on a matched code whose spend failed, before it decides the charge. A session
+        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, for every caller
+        but :meth:`verify_mfa`, whose in-queue read takes its place (BACKLOG #3780 item 2). Both
+        second-factor legs run it right before ``mark_session_mfa_verified``. And
+        :meth:`verify_mfa` runs it on a matched code whose spend failed, before it decides the
+        charge. A session
         revoked or gone, or an account disabled or gone, returns ``session_lost``: the token no longer
         authenticates, so the caller must not report a wrong proof. It is audited as ``event``
         with ``reason=session_lost``, filed under ``actor`` (the account name the caller last
@@ -17321,13 +17484,15 @@ class AuthService:
             return Elevation(locked=report_lock)
         return user
 
-    async def _directory_step_up_refusal(self, user: UserRecord) -> str | None:
+    async def _directory_step_up_refusal(self, user: UserRecord) -> str | VerifiedUser:
         """Why the directory cannot vouch for directory account ``user`` before :meth:`verify_mfa`
         renews its step-up window (BACKLOG #2023) or :meth:`finish_webauthn_assertion` marks its
         factor met (BACKLOG #2239), or before :meth:`confirm_mfa_enrollment` or
-        :meth:`finish_webauthn_registration` marks it met on a first enrolment (BACKLOG #3061), or
-        ``None`` when it can. All four reach it through :meth:`_directory_vouches_for_factor`, which
-        calls it only for an AD row; a local account is never asked.
+        :meth:`finish_webauthn_registration` marks it met on a first enrolment (BACKLOG #3061), or,
+        when it can, the account row the role test below read after the probe (BACKLOG #3780 item
+        2). That row is an account read only, not a re-read of the session or a check of the lock.
+        All four reach it through :meth:`_directory_vouches_for_factor`, which calls it only for an
+        AD row; a local account is never asked.
 
         Without this, an account disabled in the directory kept renewing its window with a good code
         until the reconciliation pass revoked its sessions. The engine row's ``disabled`` flag is
@@ -17361,7 +17526,8 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return ACCOUNT_REFUSED
-        return await self._directory_roles_lost(fresh, answer.groups)
+        lost = await self._directory_roles_lost(fresh, answer.groups)
+        return fresh if lost is None else lost
 
     async def _directory_roles_lost(self, user: VerifiedUser, groups: Iterable[str]) -> str | None:
         """Why the stored authority of directory account ``user`` exceeds what ``groups`` grant,
@@ -18570,10 +18736,13 @@ class AuthService:
         origin: str,
     ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
-        factor satisfied and re-key the session (ASVS 7.2.4) — **`mfa_verified` ONLY** (ADR 0068
-        decision 1: ``reauth_at`` + the WP-L3-13 client re-anchor come from the password leg of
-        ``POST /ui/reauth``, never from the assertion — the loop-class defense). Returns a
-        not-``ok`` :class:`Elevation` (never raises) for any invalid input, always audited.
+        factor satisfied and re-key the session (ASVS 7.2.4). The same factor write, when the row it
+        reads in its own transaction has not met its factor, also re-anchors the session to the WP-L3-13 client as
+        :meth:`verify_mfa` does and stamps ``reauth_at`` only when the authenticator reported user
+        verification, clearing it otherwise. A session that had already met its factor when that
+        write ran, and any ``oidc`` session, is neither re-anchored nor stamped (vault BACKLOG #2964
+        item 14, owner rulings 2026-11-14, ADR 0068 amendment of that date). Returns a not-``ok``
+        :class:`Elevation` (never raises) for any invalid input, always audited.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
         what keeps the 7.2.4 claim honest rather than TOTP-shaped. **Deliberate divergence from :meth:`verify_mfa`** (recorded in ADR
@@ -18644,7 +18813,7 @@ class AuthService:
         # amendment) is audited with its own slug, so an admin can see why a passkey-only user is
         # stuck; py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 §4).
         # The caller gets the same refusal for each. _verify_passkey_signature holds all three.
-        new_count = await self._verify_passkey_signature(
+        verified = await self._verify_passkey_signature(
             user,
             cred,
             response_json=response_json,
@@ -18655,7 +18824,7 @@ class AuthService:
             write=_write_now,
             audit_bad_signature=True,
         )
-        if new_count is None:
+        if verified is None:
             return Elevation()
         # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account must
         # still be in the directory first, as verify_mfa asks (#2023). Without this an account
@@ -18676,7 +18845,10 @@ class AuthService:
         user = current
         now = time.time()
         answer = await self._store.update_webauthn_sign_count(
-            cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
+            cred.credential_id_hash,
+            expected=cred.sign_count,
+            new=verified.new_sign_count,
+            used_at=now,
         )
         if answer != "moved":
             # Every compare-and-set miss is a clone signal (ADR 0068 decision 4), whatever follows:
@@ -18737,10 +18909,24 @@ class AuthService:
         async with self._stamp_to_rotation(
             ceremony="webauthn_assert", actor=user.username, client=client
         ) as window:
+            # Vault BACKLOG #2964 item 14: the anchor rides the factor write, and the store applies
+            # it only to a row that has not met its factor (AuthStore.mark_session_mfa_verified).
+            # None on an oidc session, whose anchor moves only at the IdP (BACKLOG #2142); the
+            # mechanism is written at mint and never changes, so the entry read decides it.
+            anchor = (
+                None
+                if session.auth_mechanism == SessionMechanism.OIDC.value
+                else PendingFactorAnchor(client=client, open_window=verified.user_verified)
+            )
+            anchored = False
             async with self._sealed_stamp(hash_token(token)) as stamp:
-                await self._store.mark_session_mfa_verified(hash_token(token))
+                anchored = await self._store.mark_session_mfa_verified(
+                    hash_token(token), anchor=anchor
+                )
             if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
                 return Elevation(session_lost=True)
+            if anchored:
+                self._restart_new_ip_dedupe(hash_token(token))
             # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
             # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
             # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,

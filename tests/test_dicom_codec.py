@@ -219,8 +219,72 @@ def test_hl7_map_builds_oru_segments_with_escaping_round_trip() -> None:
 
 def test_person_name_components_splits_pn() -> None:
     assert hl7_map.person_name_components("Doe^Jane^Q") == ("Doe", "Jane", "Q")
-    assert hl7_map.person_name_components("Alpha=Beta") == ("Alpha",)  # alphabetic group only
+    # The alphabetic group names someone, so it is used and the alternate is not.
+    assert hl7_map.person_name_components("Alpha=Beta") == ("Alpha",)
     assert hl7_map.person_name_components(None) == ()
+
+
+@pytest.mark.parametrize(
+    ("pn", "xpn"),
+    [
+        # DICOM Family^Given^Middle^Prefix^Suffix; XPN Family^Given^Middle^Suffix^Prefix.
+        pytest.param("Doe^Jane^Q^Dr^Jr", ("Doe", "Jane", "Q", "Jr", "Dr"), id="prefix-and-suffix"),
+        pytest.param("Doe^Jane^^Dr", ("Doe", "Jane", "", "", "Dr"), id="prefix-only"),
+        pytest.param("Doe^Jane^^^Jr", ("Doe", "Jane", "", "Jr"), id="suffix-only"),
+        # A sixth component on is malformed, and would land in the coded XPN-6 onward.
+        pytest.param("Doe^Jane^Q^Dr^Jr^PhD^L", ("Doe", "Jane", "Q", "Jr", "Dr"), id="too-long"),
+        # A blank alphabetic group falls through to an alternate group, which XPN-8 names.
+        pytest.param("=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="ideographic-only"),
+        pytest.param("^ =Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="blank-alphabetic"),
+        pytest.param("^^=^=Yamada", ("Yamada", *[""] * 6, "P"), id="phonetic-only"),
+        # Text only past the fifth component is no name: fall through, or come back empty.
+        pytest.param("^^^^^X=Yamada", ("Yamada", *[""] * 6, "I"), id="text-past-fifth"),
+        pytest.param("^^^^^X", (), id="only-past-fifth"),
+        pytest.param("Doe^ ^Q", ("Doe", "", "Q"), id="blank-middle"),
+        # A group with only a prefix or suffix is no name: the alternates are checked as below, or,
+        # with no name anywhere, the result is empty.
+        pytest.param(
+            "^^^Dr=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="prefix-only-group"
+        ),
+        pytest.param("^^^^Jr", (), id="suffix-alone"),
+        # Project choice: any family, given or middle name in the alphabetic group wins, since that
+        # group is the most likely to stay ASCII.
+        pytest.param("^Testgiven=Yamada^Taro", ("", "Testgiven"), id="alphabetic-given-wins"),
+        pytest.param(
+            "^Testgiven^Testmiddle=^^^^=Testfamily",
+            ("", "Testgiven", "Testmiddle"),
+            id="alphabetic-given-middle-wins",
+        ),
+        pytest.param("^^Q=Yamada^Taro", ("", "", "Q"), id="alphabetic-middle-wins"),
+        pytest.param("^A=^B", ("", "A"), id="alphabetic-before-alternate"),
+        pytest.param("^Testgiven=^^^Dr", ("", "Testgiven"), id="given-alone"),
+        # With no name in the alphabetic group: the ideographic, then the phonetic group with a
+        # family name, then the ideographic, then the phonetic group with a given or middle name.
+        pytest.param("=Yamada=Yamada2", ("Yamada", *[""] * 6, "I"), id="ideographic-family-first"),
+        pytest.param(
+            "=^Testgiven=Testfamily", ("Testfamily", *[""] * 6, "P"), id="alternate-family-first"
+        ),
+        pytest.param("=^A=^B", ("", "A", *[""] * 5, "I"), id="first-alternate-given"),
+        pytest.param("^^^Dr=^^Q", ("", "", "Q", *[""] * 4, "I"), id="middle-alone"),
+        pytest.param("^^^^", (), id="all-empty"),
+        pytest.param("== ", (), id="blank-groups"),
+    ],
+)
+def test_person_name_components_maps_pn_onto_xpn(pn: str, xpn: tuple[str, ...]) -> None:
+    # BACKLOG #5804: the prefix and suffix landed in each other's XPN slot, and an empty
+    # alphabetic group returned ("",) and dropped the ideographic name.
+    assert hl7_map.person_name_components(pn) == xpn
+
+
+def test_pid_from_dataset_writes_an_ideographic_only_name() -> None:
+    raw = make_sr_part10(patient_name="=Yamada^Taro")
+    ds = DicomDataset.parse(RawMessage.from_bytes(raw, "dicom"))
+    assert ds.patient_name == "=Yamada^Taro"
+    msg = Message.parse("MSH|^~\\&|MEFOR|FAC|PSCRIBE|DEST|20260620101500||ORU^R01|ID1|P|2.5.1")
+    msg.add_segment(hl7_map.pid_from_dataset(ds))
+    assert msg.field("PID-5.1") == "Yamada"
+    assert msg.field("PID-5.2") == "Taro"
+    assert msg.field("PID-5.8") == "I"  # name representation code: ideographic
 
 
 def test_obx_builder_strips_crlf_injection() -> None:

@@ -77,7 +77,7 @@ from messagefoundry.store.privilege import (
     probe_failure,
     sqlite_not_applicable,
 )
-from messagefoundry.store.row_seal import AnyRowSealer
+from messagefoundry.store.row_seal import AnyRowSealer, ResealOutcome
 from messagefoundry.store.store import (
     ANY_CLAIM_OWNER,
     OPEN_STORE_PIN,
@@ -116,6 +116,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     PinCheck,
     ReingressOriginMissing,
     ReingressOutcome,
@@ -1687,6 +1688,13 @@ class QueueStore(StoreLifecycle, Protocol):
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
+
+    def reseal_outcome(self) -> ResealOutcome:
+        """What the last :meth:`reencrypt_to_active` left sealed under a key other than the active
+        one: the user, role, approval and directory-map seals its re-seal passes did not move
+        (vault BACKLOG #5635). A side result, so ``reencrypt_to_active`` keeps its count; empty
+        before one has run, and always empty on a store with no in-process seal key."""
+        ...
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:
@@ -3368,8 +3376,10 @@ class AuthStore(Protocol):
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
         is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This and
         :meth:`supersede_session`, which returns the row it revoked, are the single-session UPDATEs
-        that report what they changed: every other one is deliberately blind (a write against a dead
-        hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
+        that report what they changed, with one narrower exception:
+        :meth:`mark_session_mfa_verified` answers only whether it landed AND applied a pending-factor
+        anchor, so its False does not tell a dead hash from a stamp that applied none. Every other
+        one is deliberately blind (a write against a dead hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
         so it must be able to fail closed if the session died underneath it.
 
         **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG
@@ -3402,8 +3412,31 @@ class AuthStore(Protocol):
         ...
 
     async def mark_session_mfa_verified(
-        self, token_hash: str, *, now: float | None = None
-    ) -> None: ...
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        """Stamp the session's second factor as met (``mfa_verified_at``), always.
+
+        ``anchor`` (vault BACKLOG #2964 item 14) is applied only when the row this write reads has
+        not met its factor. The decision is made inside the write's own transaction, on the row the
+        write reads. PostgreSQL and SQL Server hold a row lock from that read to the write, and
+        SQLite's writer lock orders this process's writers, so a factor another request met first
+        leaves this a plain factor stamp. On SQLite a commit by another process between the read
+        and the write makes the write raise rather than replace anything, which the passkey leg
+        answers by ending the session (fail closed). When
+        applied, the anchor moves the session's address to ``anchor.client`` (``None`` keeps it)
+        and opens the step-up window (``reauth_at``) when ``anchor.open_window`` is true. When
+        ``open_window`` is false it CLEARS ``reauth_at``, whether or not the address moved. The
+        default ``None`` applies no anchor, which is the behaviour every other caller has.
+
+        Returns ``True`` only when the write landed and applied the anchor, so a caller restarts
+        its new-address bookkeeping only for a session an anchor was applied to (with
+        ``anchor.client`` ``None`` that is True with the address unchanged); ``False`` for a write
+        that applied none, a session gone or revoked, or a write that lost its seal compare."""
+        ...
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
@@ -4739,12 +4772,14 @@ async def open_store(
     live cipher and threaded into every backend, so no caller has to handle key material.
 
     ``posture`` (#200, ADR 0092) is the deriving instance's :class:`HopPosture`, threaded into the
-    server-DB backends so the engine<->store weakened-TLS refusal (``connection_string`` / ``_build_ssl``)
-    clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on an enforcing hop (decision 2). ``None`` reads
-    the ambient posture, and with none the escape is NOT permitted (vault BACKLOG #2354). CORRECTED:
-    this read *"``None`` ... leaves it unclamped, byte-identical to pre-#200"*. So a CLI command that
-    opens a weakened store needs an instance at ``[security].enforcement = warn`` AND a posture; the
-    commands that pass none refuse a weakened store whatever the dial says.
+    server-DB backends for the checks that read one, at least the SQL Server pin's anchor checks and
+    the PostgreSQL revocation guard. ``None`` reads the ambient posture. With none, the SQL Server pin's
+    anchor checks take the enforcing branch (vault BACKLOG #2354), but the PostgreSQL revocation
+    guard does NOT run: it is a no-op on an unstamped posture, so a caller that opens a PostgreSQL
+    store with no posture crosses its hop with no revocation check. The engine<->store weakened-TLS refusal
+    (``connection_string`` / ``_build_ssl``) reads no posture: a weakened store hop is refused at
+    every posture, even with ``MEFOR_ALLOW_INSECURE_TLS`` set on an instance at
+    ``[security].enforcement = warn`` (vault BACKLOG #3533 item 2).
 
     ``keyless_chain_refusal`` (BACKLOG #1916) is the at-rest opt-out's verdict for this caller: the
     setting that refuses running keyless, or ``None`` when the audited opt-out applies. A service

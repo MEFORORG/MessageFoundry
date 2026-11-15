@@ -28,6 +28,8 @@ from messagefoundry.framing import (
     FramePayloadError,
     codec_for,
 )
+from messagefoundry.parsing._builtin_hl7 import _extract_separators
+from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.parsing.split import _sends_more_than_one_message
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
@@ -64,6 +66,10 @@ FRAMING_CODE = "framing"
 #: reply: an unusable name fails every message alike, and each one already has its ERROR row.
 #: Bounded by the configured inbounds, since the key is a connection name.
 _reply_fallback_logged: set[str] = set()
+
+#: The listeners whose reply-character replacement has been logged, once per connection for the
+#: same reason (BACKLOG #5799): a narrow charset meets the same characters on every message.
+_reply_replacement_logged: set[str] = set()
 
 
 def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:
@@ -149,15 +155,25 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     For the same reason a reply whose charset NAME is unusable is sent in ``utf-8`` instead: a name
     that names no text codec, or one that refuses every conversion, would otherwise leave the ``AE``
     the runner built for exactly that misconfiguration unsent (BACKLOG #2431). A usable charset that
-    cannot hold one reply's characters still raises, which the listener's last-resort arm owns.
-    Usable is decided by probing the NAME, as ``decode_body`` decides it: a usable codec such as
-    ``idna`` can raise a bare ``UnicodeError`` for one reply, which still raises here.
-    ``connection`` names the listener in the warning the fallback logs, once per connection. The
-    charset setting itself is not logged, since it is configuration that may hold anything."""
+    cannot hold one reply's characters is not that misconfiguration, so the reply is not moved to
+    ``utf-8``: it stays in the declared charset, and each character the charset cannot hold becomes
+    the codec's replacement character, for the same reason a frame byte becomes a space (BACKLOG
+    #5799). Before, that reply raised to the listener's last-resort arm, which closed the connection
+    unanswered, so the sender resent a message already stored. A codec that cannot replace, such as
+    ``idna``, or an ``MSH``-led reply whose own delimiters include the replacement ``?``
+    (:func:`_encode_replacing`), still raises, with a fixed ``UnicodeError`` that chains nothing,
+    since the strict encode's error holds the whole reply. Usable is decided by probing the NAME, as ``decode_body``
+    decides it: a usable codec can also raise a bare ``UnicodeError`` for one reply, which still
+    raises here. ``connection`` names the listener in the warning each fallback logs, once per
+    connection for each, since a narrow charset meets the same characters message after message.
+    The charset setting and the reply are never logged: the setting is configuration that may hold
+    anything, and the reply echoes the message."""
+    unencodable = False
     try:
         body = reply.encode(encoding)
     except UnicodeEncodeError:
-        raise
+        # Decided here and encoded below, so nothing raised later chains this error's `object`.
+        unencodable = True
     except (LookupError, UnicodeError):
         if _is_text_codec(encoding):
             raise
@@ -169,9 +185,82 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
                 connection,
             )
         body = reply.encode("utf-8")
+    if unencodable:
+        body = _encode_replacing(reply, encoding, connection)
     if codec.start in body or codec.end in body:
         logger.warning(
             "reply held a frame start or end byte; each was replaced by a space before framing"
         )
     # The replacement is the leaf's rule, shared with the test harness's ACK writers.
     return codec.frame(codec.neutralise(body))
+
+
+def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
+    """``reply`` in ``encoding`` with each character the charset cannot hold replaced, for
+    :func:`frame_reply`. A codec that refuses the ``replace`` handler raises a fixed
+    ``UnicodeError``, outside the handler, so neither error's text or ``object`` rides the chain.
+    The warning names the connection, never the reply or the setting.
+
+    The ``replace`` handler writes ``?`` on encode. An ``MSH``-led reply declares its own
+    delimiters in MSH-1 and MSH-2, and HL7 lets a sender pick ``?`` as one, so where it is a
+    delimiter or the segment terminator a replaced data character would become structure (ADR
+    0206). That reply is refused with the same fixed error instead. So is one with a delimiter the
+    charset cannot hold: the delimiter itself would become ``?`` beside replaced data characters,
+    and both would read as one delimiter. A reply not led by ``MSH`` has no declared delimiters to
+    collide with."""
+    delimiters = _reply_delimiters(reply)
+    if _REPLACEMENT in delimiters or not all(_encodes(d, encoding) for d in delimiters):
+        raise UnicodeError(
+            "the reply holds characters its charset cannot encode, and the replacement would "
+            "collide with one of its own delimiters"
+        )
+    # Leading noise the charset cannot hold, such as a BOM, would be replaced too, and a reply led by
+    # "?MSH" is no reply any parser reads. Refused like the collisions above. Read only.
+    lead = reply[: len(reply) - len(reply.lstrip(_LEADING_WS_STR))]
+    if not _encodes(lead, encoding):
+        raise UnicodeError(
+            "the reply holds characters its charset cannot encode, including in the noise before "
+            "its first segment"
+        )
+    body: bytes | None
+    try:
+        body = reply.encode(encoding, errors="replace")
+    except (LookupError, UnicodeError):
+        body = None
+    if body is None:
+        raise UnicodeError("the reply holds characters its charset can neither encode nor replace")
+    if connection not in _reply_replacement_logged:
+        _reply_replacement_logged.add(connection)
+        logger.warning(
+            "inbound %r: a reply held characters its charset cannot encode; each was replaced "
+            "before framing (logged once per connection)",
+            connection,
+        )
+    return body
+
+
+#: What Python's ``replace`` error handler writes in place of a character on encode.
+_REPLACEMENT = "?"
+
+
+def _encodes(delimiter: str, encoding: str) -> bool:
+    """Whether one delimiter character survives a strict encode, so ``replace`` leaves it alone."""
+    try:
+        delimiter.encode(encoding)
+    except (LookupError, UnicodeError):
+        return False
+    return True
+
+
+def _reply_delimiters(reply: str) -> frozenset[str]:
+    """The delimiters an ``MSH``-led ``reply`` declares, read as the parser reads them, plus the
+    segment terminator; empty for any other reply. Read only: nothing here changes the reply.
+
+    Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
+    leading noise (``sniff._LEADING_WS_STR``) skips them. The first line is measured, not the whole
+    reply, so a first line of ``MSH`` alone has no field separator to read and declares nothing,
+    rather than indexing past its end."""
+    line = reply.lstrip(_LEADING_WS_STR).partition("\r")[0]
+    if not line.startswith("MSH") or len(line) < 4:
+        return frozenset()
+    return frozenset((*_extract_separators(line), "\r"))

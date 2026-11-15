@@ -2,17 +2,22 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Unit tests for the acceptance harness framework — JUnit aggregation, runner mapping, reporting.
 
-These never nest pytest: the suite-execution seam is injected (a fake ``pytest_runner``), so the
-deterministic aggregation/mapping/report logic is exercised in isolation.
+The aggregation/mapping/report logic is driven through an injected fake ``pytest_runner``, and
+``default_pytest_runner`` through a faked ``subprocess.run``. One test runs a real pytest child on a
+small suite, because only a real run shows what pytest's JUnit actually carries.
 """
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
-from harness.acceptance.matrix import MATRIX, Status
+import pytest
+
+from harness.acceptance.matrix import MATRIX, ONCE, PER_DB, Coverage, MatrixRow, Status
 from harness.acceptance.report import (
     exit_code,
     render_console,
@@ -20,9 +25,12 @@ from harness.acceptance.report import (
     render_markdown,
 )
 from harness.acceptance.runner import (
+    PytestRun,
     RowResult,
     _aggregate,
     _parse_junit_by_file,
+    _pytest_row_result,
+    default_pytest_runner,
     run_matrix,
 )
 from messagefoundry.terminal_text import escape_for_markdown_cell
@@ -43,14 +51,15 @@ _JUNIT = """<?xml version="1.0" encoding="utf-8"?>
 def test_parse_junit_aggregates_per_file(tmp_path: Path) -> None:
     junit = tmp_path / "junit.xml"
     junit.write_text(_JUNIT, encoding="utf-8")
-    status = _parse_junit_by_file(junit)
+    status, unattributed = _parse_junit_by_file(junit)
+    assert unattributed == []
     assert status["tests/test_a.py"] is Status.PASS  # one pass + one skip -> PASS
     assert status["tests/test_b.py"] is Status.FAIL
     assert status["tests/test_c.py"] is Status.SKIP  # all skipped
 
 
 def test_parse_junit_missing_file_is_empty(tmp_path: Path) -> None:
-    assert _parse_junit_by_file(tmp_path / "nope.xml") == {}
+    assert _parse_junit_by_file(tmp_path / "nope.xml") == ({}, [])
 
 
 def test_aggregate_precedence() -> None:
@@ -62,7 +71,14 @@ def test_aggregate_precedence() -> None:
     assert _aggregate([]) is None
 
 
-def _fake_runner(node_ids: Sequence[str]) -> dict[str, Status]:
+def test_aggregate_per_db_ranks_skip_above_pass() -> None:
+    assert _aggregate([Status.PASS, Status.SKIP, Status.SKIP], per_db=True) is Status.SKIP
+    assert _aggregate([Status.PASS, Status.PASS], per_db=True) is Status.PASS
+    assert _aggregate([Status.SKIP, Status.ERROR], per_db=True) is Status.ERROR
+    assert _aggregate([Status.SKIP, Status.FAIL], per_db=True) is Status.FAIL
+
+
+def _fake_runner(node_ids: Sequence[str]) -> PytestRun:
     mapping = {
         "tests/test_store_backend.py": Status.PASS,
         "tests/test_sqlserver_store.py": Status.SKIP,
@@ -74,15 +90,188 @@ def _fake_runner(node_ids: Sequence[str]) -> dict[str, Status]:
         "tests/test_task_resilience.py": Status.PASS,
         "tests/test_connection_resilience.py": Status.PASS,
     }
-    return {k: v for k, v in mapping.items() if k in set(node_ids)}
+    return PytestRun({k: v for k, v in mapping.items() if k in set(node_ids)})
 
 
 def test_run_matrix_maps_pytest_rows() -> None:
     results = {r.row.id: r for r in run_matrix(include_sections=["B"], pytest_runner=_fake_runner)}
-    assert results["B1"].status is Status.PASS  # PASS + SKIP + SKIP -> PASS
+    # B1 is Per-DB: SQLite passing while both server-DB suites skip leaves it unverified, not PASS.
+    assert results["B1"].status is Status.SKIP
     assert results["B4"].status is Status.ERROR  # keyprovider not collected -> ERROR
     assert results["B5"].status is Status.PASS
     assert results["B6"].status is Status.PASS
+
+
+def _fake_pytest(
+    monkeypatch: pytest.MonkeyPatch, junit_text: str, code: pytest.ExitCode
+) -> dict[str, Any]:
+    """Stand in for the pytest subprocess: write ``junit_text`` where ``--junitxml`` points.
+
+    Returns a dict that receives the keyword arguments the runner passed to ``subprocess.run``.
+    """
+    seen: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        target = next(a for a in cmd if a.startswith("--junitxml=")).split("=", 1)[1]
+        Path(target).write_text(junit_text, encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, int(code))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return seen
+
+
+_PASSING = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" tests="1">
+  <testcase classname="tests.test_a" name="test_one" file="tests/test_a.py" time="0.1"/>
+</testsuite></testsuites>
+"""
+
+
+def _passing_plus(case: str) -> str:
+    """``_PASSING`` with one more ``<testcase>`` element appended to its suite."""
+    return _PASSING.replace("</testsuite>", f"  {case}\n</testsuite>")
+
+
+def test_default_runner_flags_a_failure_with_no_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    fileless = '<testcase classname="" name="tests.conftest"><error message="boom"/></testcase>'
+    _fake_pytest(monkeypatch, _passing_plus(fileless), pytest.ExitCode.TESTS_FAILED)
+    run = default_pytest_runner(["tests/test_a.py"])
+    assert run.by_file == {"tests/test_a.py": Status.PASS}
+    assert "outside the row files" in run.run_error and "tests.conftest" in run.run_error
+
+
+def test_default_runner_flags_a_failure_in_a_file_no_row_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    junit = _passing_plus(
+        '<testcase name="t" file="tests/helper.py"><failure message="x"/></testcase>'
+    )
+    _fake_pytest(monkeypatch, junit, pytest.ExitCode.TESTS_FAILED)
+    assert "tests/helper.py" in default_pytest_runner(["tests/test_a.py"]).run_error
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        pytest.ExitCode.INTERRUPTED,
+        pytest.ExitCode.INTERNAL_ERROR,
+        pytest.ExitCode.USAGE_ERROR,
+        pytest.ExitCode.NO_TESTS_COLLECTED,
+    ],
+)
+def test_default_runner_flags_a_broken_run_exit(
+    monkeypatch: pytest.MonkeyPatch, code: pytest.ExitCode
+) -> None:
+    _fake_pytest(monkeypatch, _PASSING, code)
+    assert default_pytest_runner(["tests/test_a.py"]).run_error == f"pytest exited {int(code)}"
+
+
+def test_collection_error_in_a_row_file_reads_error_not_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broken = '<testcase classname="" name="tests.test_b" file="tests/test_b.py">'
+    broken += '<error message="collection failure">ImportError</error></testcase>'
+    _fake_pytest(monkeypatch, _passing_plus(broken), pytest.ExitCode.TESTS_FAILED)
+    run = default_pytest_runner(["tests/test_a.py", "tests/test_b.py"])
+    assert run == PytestRun({"tests/test_a.py": Status.PASS, "tests/test_b.py": Status.ERROR})
+
+
+def test_broken_run_exit_leads_the_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    fileless = '<testcase classname="" name="internal"><error message="x"/></testcase>'
+    _fake_pytest(monkeypatch, _passing_plus(fileless), pytest.ExitCode.INTERNAL_ERROR)
+    assert default_pytest_runner(["tests/test_a.py"]).run_error == "pytest exited 3"
+
+
+def test_default_runner_flags_exit_1_that_no_row_file_explains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_pytest(monkeypatch, _PASSING, pytest.ExitCode.TESTS_FAILED)
+    assert "no row file recorded a failure" in default_pytest_runner(["tests/test_a.py"]).run_error
+
+
+def test_default_runner_accepts_exit_1_a_row_file_explains(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_pytest(monkeypatch, _JUNIT, pytest.ExitCode.TESTS_FAILED)
+    run = default_pytest_runner(["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"])
+    assert run.run_error == ""
+    assert run.by_file["tests/test_b.py"] is Status.FAIL
+
+
+def test_default_runner_clean_exit_has_no_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_pytest(monkeypatch, _PASSING, pytest.ExitCode.OK)
+    assert default_pytest_runner(["tests/test_a.py"]) == PytestRun({"tests/test_a.py": Status.PASS})
+
+
+def test_default_runner_drops_pytest_addopts_from_the_child_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An inherited partial deselect (``-k``/``-m``) would drop a failing test and keep its passing
+    # siblings, so the row would read PASS.
+    seen = _fake_pytest(monkeypatch, _PASSING, pytest.ExitCode.OK)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-k 'not test_failing'")
+    monkeypatch.setenv("MEFOR_TEST_SENTINEL", "kept")  # the scrub must not drop the rest of the env
+    default_pytest_runner(["tests/test_a.py"])
+    env = seen["env"]
+    assert "PYTEST_ADDOPTS" not in env
+    assert env["MEFOR_TEST_SENTINEL"] == "kept"
+
+
+def test_default_runner_reports_truncated_junit_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_pytest(monkeypatch, _PASSING[:80], pytest.ExitCode.TESTS_FAILED)
+    run = default_pytest_runner(["tests/test_a.py"])
+    assert run.by_file == {}
+    assert run.run_error.startswith("unreadable JUnit XML")
+
+
+def test_run_error_turns_every_pytest_row_to_error_but_keeps_fail() -> None:
+    def broken(node_ids: Sequence[str]) -> PytestRun:
+        statuses = dict.fromkeys(node_ids, Status.PASS)
+        statuses["tests/test_audit_offbox_tee.py"] = Status.FAIL
+        return PytestRun(statuses, "pytest exited 3")
+
+    results = {r.row.id: r for r in run_matrix(include_sections=["B"], pytest_runner=broken)}
+    assert results["B1"].status is Status.ERROR
+    assert "run error: pytest exited 3" in results["B1"].detail
+    assert results["B5"].status is Status.FAIL  # a real failure is not downgraded to ERROR
+
+
+def test_per_db_row_passes_only_when_every_backend_suite_passed() -> None:
+    def all_pass(node_ids: Sequence[str]) -> PytestRun:
+        return PytestRun(dict.fromkeys(node_ids, Status.PASS))
+
+    results = {r.row.id: r for r in run_matrix(include_sections=["B"], pytest_runner=all_pass)}
+    assert results["B1"].status is Status.PASS
+
+
+def test_once_row_still_passes_with_a_skipped_suite() -> None:
+    once = MatrixRow("Z1", "Z", "t", ONCE, Coverage.PYTEST, ("tests/a.py", "tests/b.py"))
+    mixed = PytestRun({"tests/a.py": Status.PASS, "tests/b.py": Status.SKIP})
+    assert _pytest_row_result(once, mixed).status is Status.PASS
+    per_db = replace(once, per_db=PER_DB)
+    assert _pytest_row_result(per_db, mixed).status is Status.SKIP
+
+
+def test_default_runner_flags_a_report_that_attributes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The xunit2 shape: a clean exit whose testcases carry no ``file``.
+    xunit2 = _PASSING.replace(' file="tests/test_a.py"', "")
+    _fake_pytest(monkeypatch, xunit2, pytest.ExitCode.OK)
+    assert "attributed no testcase" in default_pytest_runner(["tests/test_a.py"]).run_error
+
+
+def test_default_runner_attributes_a_real_pytest_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The runner must shield the child from this: inherited, it would deselect everything, the child
+    # would exit 5, and run_error would be set.
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-k nothing_matches")
+    # One real child run: the hand-written JUnit above carries ``file=``, which pytest's default
+    # JUnit family omits, so only a real run proves the argv lets results reach their rows.
+    ref = "tests/test_win2025_acceptance.py"
+    run = default_pytest_runner([ref])
+    assert run.run_error == ""
+    assert ref in run.by_file  # attributed; its own verdict is that suite's business
 
 
 def test_run_matrix_no_pytest_skips_pytest_rows() -> None:
@@ -187,8 +376,6 @@ def test_exit_code() -> None:
 
 
 def test_xlsx_write_back(tmp_path: Path) -> None:
-    import pytest
-
     openpyxl = pytest.importorskip("openpyxl")  # not a project dep — only run where it's available
     from harness.acceptance.report import write_xlsx_status
 

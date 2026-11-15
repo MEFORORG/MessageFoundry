@@ -250,7 +250,8 @@ two are session-wide and automatic: `_allow_insecure_config_source_in_tests` and
 `_warn_posture_for_the_server_db_legs`. The database runs open a store under the posture the
 second one sets. The file holds ten automatic fixtures and some import-time setup, at least a
 port-base variable that `test_multishard_smoke.py` reads. Two is a floor, not the list. Step 3
-must read the whole file against the moving tests.
+must read the whole file against the moving tests. *(Note 2026-11-14, vault BACKLOG #3533 item 2:
+`_warn_posture_for_the_server_db_legs` was removed.)*
 
 **Class 2, by name.** Each is an engine test today. Each has a part that is really a harness test.
 

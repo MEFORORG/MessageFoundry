@@ -188,11 +188,12 @@ that function's docstring carries the argument, and `tests/test_cli_ai_policy.py
 ## IDE gating behavior
 
 The IDE assistant ([ide/src/chat.ts](../ide/src/chat.ts)) resolves the policy **before** every
-request: it first calls `GET /ai/policy` (authoritative, and cached on success); on any error it falls
-back to that cached authoritative policy, then to the local `messagefoundry ai-policy` CLI; if none of
-those can positively confirm a policy it uses a fail-closed built-in default (`mode: unverified`),
-which **disables** assistance rather than re-enabling BYO — a central *off* must not be bypassable by
-taking the engine offline (SEC-022).
+request. It first calls `GET /ai/policy`, which is authoritative and is cached per engine on
+success. On any error it falls back to that engine's cached authoritative policy. Next comes the
+local `messagefoundry ai-policy` CLI, but only for the default engine target, and only while the IDE
+has never held any engine's answer. If none of those can confirm a policy, it uses a fail-closed
+built-in default (`mode: unverified`). That default **disables** assistance rather than re-enabling
+BYO, so a central *off* cannot be bypassed by taking the engine offline (SEC-022).
 
 The cached policy is stamped with when the engine gave it. Offline, a cached answer that **disables**
 assistance stands however old it is. A cached answer that **enables** it stands for 12 hours, the
@@ -234,9 +235,19 @@ idle clock and make the engine's 30-minute idle timeout unreachable (CWE-613).
 authoritative `assist_permitted: false` the IDE has already observed is **retained** over a later
 `null`, so under BYO that combination resolves to **Disabled**. The rule is deliberately one-way — a
 cached `true` is *not* sticky, since fabricating a permit from stale state is the fail-open direction
-— and any evaluable `true`/`false` replaces the cached value outright, so signing in is the escape
-hatch. Anything that is not the literal `true`/`false`, **including a response that omits the field**,
-counts as "not evaluated" and never as a permit.
+— and any evaluable `true`/`false` replaces that engine's cached value outright, so signing in is
+the escape hatch for that engine. Anything that is not the literal `true`/`false`, **including a
+response that omits the field**, counts as "not evaluated" and never as a permit.
+
+**A deny reaches other engines (BACKLOG #5564).** The IDE also records each central *off* and each
+`ai:assist` deny with the engine that issued it. When the target is unreachable, every recorded deny
+applies, even where the target's own cached answer would enable assistance. When the target is
+reachable, its own `mode` stands, so a recorded *off* does not override it. A recorded `ai:assist`
+deny still applies to its answer when that answer cannot evaluate the permission. Only the issuing
+engine's evaluated `true`, or for an *off* its answer in a mode that enables, clears the deny. A
+deny the IDE cached before it kept answers per engine names no issuer, so any engine's such answer
+clears it. Signing in to another engine does not clear a deny that engine did not issue, and the
+extension has no reset.
 
 `messagefoundry.showAiPolicy` (command **"MessageFoundry: Show AI Policy"**) displays the current
 resolved policy in the IDE.

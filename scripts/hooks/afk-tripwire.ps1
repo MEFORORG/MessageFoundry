@@ -38,6 +38,12 @@
     `bash -c`, `pwsh -Command` and `cmd /c` is read as a command of its own, and `pwsh -File <x>`
     reads <x> as the program.
 
+    It reads the text twice: with no escapes, as it always did, and with the escapes of the shell
+    that runs it (bash's backslash for the Bash tool and `bash -c`, PowerShell's backtick and doubled
+    quote for the PowerShell tool and `pwsh -Command`; both when the tool is unknown). It records an
+    act either reading sees. A reading that ignored `\"` closed the span there, so the span's real
+    closing quote opened another, and a later act read as quoted text.
+
     WHAT IT DOES NOT SEE (SAIDS section 9: a rule is not a control until something enforces it).
     A script file that runs one of these acts, an alias or variable that spells the command, git
     plumbing that deletes or moves a ref (`update-ref -d`, `branch -D`), and every non-shell tool.
@@ -66,8 +72,17 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Split-TripwireSegments([string]$Text) {
-    <# Segments of tokens; a token is @{ T = text; Q = any part of it was quoted }. #>
+function Split-TripwireSegments([string]$Text, [string]$Dialect = 'literal') {
+    <#
+      Segments of tokens; a token is @{ T = text; Q = any part of it was quoted or escaped }.
+
+      $Dialect is how an escape reads. 'literal' honours none, so a quoted span closes at the next
+      same quote. 'bash' honours a backslash: outside quotes, before `"`, `\`, `$` or a backtick
+      inside double quotes, and anywhere inside $'...'. 'pwsh' honours a backtick, outside quotes and
+      inside double quotes, and a doubled quote inside either kind. Find-Tripwires reads the text
+      literally and in its shell's dialect, and keeps every hit: a reading that took an escaped quote
+      for a close read the command after it as quoted text.
+    #>
     $segs = [System.Collections.Generic.List[object]]::new()
     $toks = [System.Collections.Generic.List[object]]::new()
     $cur = [System.Text.StringBuilder]::new()
@@ -91,17 +106,45 @@ function Split-TripwireSegments([string]$Text) {
     while ($i -lt $n) {
         $ch = $Text[$i]
         if ($ch -eq "'" -or $ch -eq '"') {
-            $close = $Text.IndexOf($ch, $i + 1)
-            if ($close -lt 0) { $close = $n }
-            $null = $cur.Append($Text, $i + 1, [Math]::Max(0, $close - $i - 1))
+            # bash's $'...' takes backslash escapes, as a plain '...' does not.
+            $ansi = $Dialect -eq 'bash' -and $ch -eq "'" -and $i -gt 0 -and $Text[$i - 1] -eq '$'
+            $j = $i + 1
+            if ($Dialect -eq 'literal') {
+                $j = $Text.IndexOf($ch, $j)
+                if ($j -lt 0) { $j = $n }
+                $null = $cur.Append($Text, $i + 1, $j - $i - 1)
+            }
+            while ($j -lt $n -and $Dialect -ne 'literal') {
+                $c = $Text[$j]
+                $escape = $false
+                if ($j + 1 -lt $n) {
+                    $next = $Text[$j + 1]
+                    if ($Dialect -eq 'pwsh') { $escape = ($c -eq $ch -and $next -eq $ch) -or ($ch -eq '"' -and $c -eq '`') }
+                    elseif ($Dialect -eq 'bash') { $escape = $c -eq '\' -and ($ansi -or ($ch -eq '"' -and '"\$`'.Contains($next))) }
+                }
+                if ($escape) { $null = $cur.Append($Text[$j + 1]); $j += 2; continue }
+                if ($c -eq $ch) { break }
+                $null = $cur.Append($c)
+                $j++
+            }
             $quoted = $true; $inTok = $true
-            $i = $close + 1
+            $i = $j + 1
             continue
         }
         # A line continuation, bash's or PowerShell's, joins two lines into one command; with CRLF
         # line ends it is three characters.
-        if (($ch -eq '\' -or $ch -eq '`') -and $i + 1 -lt $n -and ($Text[$i + 1] -eq "`n" -or $Text[$i + 1] -eq "`r")) {
+        # Each shell's own character only: PowerShell runs the line after `D:\x\` as a new command.
+        $joins = if ($Dialect -eq 'bash') { $ch -eq '\' } elseif ($Dialect -eq 'pwsh') { $ch -eq '`' } else { $ch -eq '\' -or $ch -eq '`' }
+        if ($joins -and $i + 1 -lt $n -and ($Text[$i + 1] -eq "`n" -or $Text[$i + 1] -eq "`r")) {
             $i += $(if ($Text[$i + 1] -eq "`r" -and $i + 2 -lt $n -and $Text[$i + 2] -eq "`n") { 3 } else { 2 })
+            continue
+        }
+        # An escaped character outside quotes is the character itself, quoted: bash hands git
+        # `--force` for `\--force`, and a `\"` opens no span.
+        if ($i + 1 -lt $n -and (($Dialect -eq 'bash' -and $ch -eq '\') -or ($Dialect -eq 'pwsh' -and $ch -eq '`'))) {
+            $null = $cur.Append($Text[$i + 1])
+            $quoted = $true; $inTok = $true
+            $i += 2
             continue
         }
         # A comment runs to the end of its line, and a flag named in it is a mention.
@@ -217,7 +260,7 @@ function Find-GitTripwires($Argv, $Hits) {
     }
 }
 
-function Find-Tripwires([string]$Command, [int]$Depth, $Hits) {
+function Find-Tripwires([string]$Command, [int]$Depth, $Hits, [string]$Shell = '') {
     if ($Depth -gt 2 -or -not $Command) { return }
     # Heredoc bodies and here-strings are file content or messages, not commands. The delimiter may
     # be quoted or backslash-escaped, and may hold dots and dashes (`<<"END-OF-MSG"`, `<<\EOF`).
@@ -228,7 +271,25 @@ function Find-Tripwires([string]$Command, [int]$Depth, $Hits) {
     $text = [regex]::Replace($text, '(?s)@''\r?\n.*?\r?\n''@', "''")
     $text = [regex]::Replace($text, '(?s)@"\r?\n.*?\r?\n"@', "''")
     $skip = @('sudo', 'command', 'exec', 'time', 'nohup', 'env', 'do', 'then', 'else', 'if', 'while', 'until', '!', '.', 'elif')
-    foreach ($seg in (Split-TripwireSegments $text)) {
+    # The literal reading, as before, and the reading of the shell that runs the text: $Shell is the
+    # tool's (Bash or PowerShell) or the one a `-c` names; unknown reads both. An act either reading
+    # sees is recorded. Reading the other shell's escapes too would shift every later span in text
+    # that merely holds its escape character (a path ending `\` under PowerShell) and record acts
+    # that are only mentioned. A reading whose escape character the text lacks would only repeat the
+    # literal one, so it is skipped. Either character counts for either shell, because the literal
+    # reading joins a line ending in either, and each shell joins only on its own. A doubled quote
+    # alone changes content, never where spans end.
+    $dialects = @('literal')
+    if ($text.Contains('\') -or $text.Contains('`')) {
+        if ($Shell -in @('bash', '')) { $dialects += 'bash' }
+        if ($Shell -in @('pwsh', '')) { $dialects += 'pwsh' }
+    }
+    $scannedBodies = [System.Collections.Generic.HashSet[string]]::new()
+    $segments = [System.Collections.Generic.List[object]]::new()
+    foreach ($dialect in $dialects) {
+        foreach ($s in (Split-TripwireSegments $text $dialect)) { $segments.Add($s) }
+    }
+    foreach ($seg in $segments) {
         if (@($seg | Where-Object { -not $_.Q -and $_.T -match '^-AllowOrphanedAllocations(:\$?true)?$' }).Count) {
             $Hits.Add('-AllowOrphanedAllocations')
         }
@@ -251,7 +312,9 @@ function Find-Tripwires([string]$Command, [int]$Depth, $Hits) {
                 else { $t -cmatch '^-[a-z]*c$' }
                 if ($isCmd) {
                     $body = (@($argv | Select-Object -Skip ($a + 1) | ForEach-Object { $_.T }) -join ' ')
-                    Find-Tripwires $body ($Depth + 1) $Hits
+                    $inner = if ($prog -in @('pwsh', 'powershell')) { 'pwsh' } elseif ($prog -eq 'cmd') { 'cmd' } else { 'bash' }
+                    # Two readings often give one body; read it once.
+                    if ($scannedBodies.Add("$inner|$body")) { Find-Tripwires $body ($Depth + 1) $Hits $inner }
                     break
                 }
                 if ($prog -in @('pwsh', 'powershell') -and $t -match '^-(f|fi|fil|file)$' -and $a + 1 -lt $argv.Count) {
@@ -282,7 +345,10 @@ try {
     # Every hit needs one of these words, so most shell calls stop here without being tokenised.
     if ([string]$cmdProp.Value -notmatch '\bgit\b|remove\.ps1|claim\.ps1|AllowOrphanedAllocations|MEFOR_AFK_KILL|SKIP=') { exit 0 }
     $hits = [System.Collections.Generic.List[string]]::new()
-    Find-Tripwires ([string]$cmdProp.Value) 0 $hits
+    $toolProp = $j.PSObject.Properties['tool_name']
+    $toolName = if ($toolProp) { [string]$toolProp.Value } else { '' }
+    $shell = if ($toolName -eq 'Bash') { 'bash' } elseif ($toolName -eq 'PowerShell') { 'pwsh' } else { '' }
+    Find-Tripwires ([string]$cmdProp.Value) 0 $hits $shell
     if (-not $hits.Count) { exit 0 }
     $what = (@($hits | Select-Object -Unique) -join ', ')
 
@@ -294,8 +360,7 @@ try {
         try {
             # The record names the acts, never the command text, which can carry a secret.
             $decision = Join-Path (Split-Path -Parent $PSScriptRoot) 'coord/decision.ps1'
-            $toolProp = $j.PSObject.Properties['tool_name']
-            $tool = if ($toolProp) { [string]$toolProp.Value } else { 'shell' }
+            $tool = if ($toolProp) { $toolName } else { 'shell' }
             $out = @(& $decision -Log -Kind tripwire -Class C -Session $sid -NoPost -Note "$tool command carried: $what" 2>$null)
             $id = @($out | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^LOGGED (\S+)' } | ForEach-Object { $Matches[1] })
             $logged = if ($id) { "Recorded as tripwire $($id[0]) in the decision log." } else { 'Not recorded: decision.ps1 wrote no record.' }
