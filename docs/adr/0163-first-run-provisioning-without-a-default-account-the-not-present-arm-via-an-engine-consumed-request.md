@@ -267,7 +267,8 @@ see its *What it widens* and *Left open*.
 - **Optional follow-up, not built:** an inheritable audit SACL on the data directory, set by
   `install-service.ps1`, would restore a record of administrator reads where "Audit File System" is on.
 - **Pre-existing follow-up, not built:** restore staging in `messagefoundry/pipeline/dr_backup.py` (the
-  `TemporaryDirectory` with prefix `mefor-restore-` under `dest_store_path.parent`) still calls
+  `mefor-restore-` directory beside the destination, made by `_open_staging` since BACKLOG #5617
+  rather than a `TemporaryDirectory`) still calls
   `_secure_file`, which grants the operator's user SID but removes only INHERITED entries. That leaves
   `archive.tar`, and `extracted_store.db` until it is placed, with the operator plus any entry the
   file carries explicitly -- and the hosted runners showed Python 3.13+ temp-directory entries arriving

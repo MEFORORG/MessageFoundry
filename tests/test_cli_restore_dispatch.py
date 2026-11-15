@@ -804,11 +804,16 @@ def test_discard_partial_restore_removes_only_the_recorded_paths(tmp_path) -> No
 def _restore_staging_that_cannot_be_removed(mp: pytest.MonkeyPatch) -> None:
     """Make every removal of a RESTORE staging directory fail, as a scanner holding a file open in it
     does on Windows, with the retry schedule cut to nothing. The backup that builds the fixture
-    archive stages under ``mefor-backup-`` and is not touched."""
+    archive stages under ``mefor-backup-`` and is not touched.
+
+    The refused removal takes the lock file and marker first, as ``rmtree`` does on NTFS where the
+    dot-names list first, so a leftover the sweep can still find proves the teardown re-marked it."""
     real_remove = dr_backup._remove_tree
 
     def refuse(path: Path) -> bool:
         if path.name.startswith("mefor-restore-"):
+            for name in (".lock", ".lock-held"):
+                (path / name).unlink(missing_ok=True)
             return False
         return real_remove(path)
 
@@ -1554,14 +1559,16 @@ def test_a_refusal_survives_a_real_held_open_staging_file(tmp_path, capsys, monk
     shutil.rmtree(leftover)
 
 
-def test_a_restore_staging_leftover_holds_no_plaintext_and_is_swept(
+def test_a_restore_staging_leftover_has_its_archive_emptied_and_is_swept(
     tmp_path, key_b64, capsys
 ) -> None:
     # BACKLOG #5617. The restore staged the decrypted archive and the extracted store in a
     # `TemporaryDirectory`, outside the lock-and-sweep the backup and verify stage under. When its
     # teardown failed, the whole decrypted archive stayed on the destination volume at full size,
     # and no later run would ever remove it. It now stages like a verify: a failed teardown empties
-    # what it can, keeps the directory marked, and the next run's sweep removes it.
+    # what it can, keeps the directory marked, and the next run's sweep removes it. The exit 1
+    # below rests on the hard-link placement, which tmp_path's volume supports: the linked store is
+    # the file the teardown reports.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored" / "msg.db"
     with pytest.MonkeyPatch.context() as mp:
@@ -1578,10 +1585,13 @@ def test_a_restore_staging_leftover_holds_no_plaintext_and_is_swept(
     assert (leftovers[0] / "archive.tar").stat().st_size == 0
     # The restore is whole: the store opens and carries its row.
     assert asyncio.run(_read_back(dest, key_b64)) == (1, _RAW_BODY)
-    # Marked for the sweep, and swept by the next restore that stages beside it.
+    # Re-marked for the sweep after the refused removal took its marks, and swept by the next
+    # restore that stages beside it, here through a relative --to.
     assert (leftovers[0] / ".lock").exists() and (leftovers[0] / ".lock-held").exists()
-    second = tmp_path / "restored" / "again.db"
-    assert main(["restore", archive, "--to", str(second), "--service-config", toml]) == 0
+    with pytest.MonkeyPatch.context() as mp:
+        mp.chdir(tmp_path)
+        argv = ["restore", archive, "--to", "restored/again.db", "--service-config", toml]
+        assert main(argv) == 0
     capsys.readouterr()
     _no_staging_left(dest.parent)
     # The sweep removed a name, never the placed store's bytes.
@@ -1619,9 +1629,40 @@ def test_a_refusal_names_a_staging_leftover_that_still_holds_plaintext(tmp_path,
     err = _refusal(capsys)
     assert err.startswith("error: restore failed (age_undated): Nothing was written"), err
     assert "Separately, the plaintext staging directory" in err and "archive.tar" in err, err
+    # The leftover sentence ends before the CLI's own age remedy starts.
+    assert "open. Choose a newer archive" in err, err
     (leftover,) = tmp_path.glob("mefor-restore-*")
     assert leftover.name in err and "Traceback" not in err, err
     shutil.rmtree(leftover)
+
+
+def test_a_refusal_behind_an_os_error_on_its_way_out_is_the_one_reported(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    # A refusal raised inside the decrypt's `with` block can meet an OSError as it leaves it, such
+    # as the archive's close-time flush on a full volume. The refusal is the one reported.
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    monkeypatch.setattr(dr_backup, "_MAX_RESTORE_PLAINTEXT_BYTES", 1)
+    real_open = open
+
+    class FlushFails(io.FileIO):
+        def close(self) -> None:
+            super().close()
+            raise OSError(28, "No space left on device")
+
+    def opener(path, mode="r", *args, **kwargs):
+        if mode == "wb" and Path(path).name == "archive.tar":
+            return FlushFails(path, "wb")
+        return real_open(path, mode, *args, **kwargs)
+
+    # Shadowed in the module alone, so nothing else's `open` changes.
+    monkeypatch.setattr(dr_backup, "open", opener, raising=False)
+    assert main([*_config_only_argv(str(tar), toml, tmp_path / "cfg"), "--allow-old-archive"]) == 1
+    err = _refusal(capsys)
+    assert "restore failed (verify)" in err and "staging cap" in err, err
+    assert "No space left" not in err, err
+    _no_staging_left(tmp_path)
 
 
 def test_restore_refuses_a_staging_directory_that_is_not_owner_only(tmp_path, capsys) -> None:
@@ -1634,7 +1675,8 @@ def test_restore_refuses_a_staging_directory_that_is_not_owner_only(tmp_path, ca
         mp.setattr(dr_backup, "_staging_is_private", lambda path: False)
         assert main(argv) == 1
     err = _refusal(capsys)
-    assert "restore failed (destination)" in err and "not owner-only" in err, err
+    assert "restore failed (destination)" in err and "did not come out owner-only" in err, err
+    assert "[backup].destination" not in err, err
     _no_staging_left(tmp_path)
     assert not (tmp_path / "cfg").exists()
     # The control: the same command stages and restores.

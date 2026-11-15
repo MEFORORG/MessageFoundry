@@ -4530,18 +4530,20 @@ def _restore_blocking(
     destination is removed on any exception after the store is placed, so a failed restore leaves the
     destination as it found it and the operator can simply run the command again — rather than meeting
     the never-overwrite refusal on the retry and having to delete a PHI-bearing file by hand. The
-    cleanup runs AFTER the staging directory is gone and removes only the paths this restore recorded
-    writing (:func:`_discard_partial_restore`), so it cannot reach the staging directory or anything
-    else that shares the destination's parent.
+    cleanup runs AFTER the staging directory's teardown and removes only the paths this restore
+    recorded writing (:func:`_discard_partial_restore`), so it cannot reach the staging directory, or
+    a leftover of it the teardown could not remove, or anything else that shares the destination's
+    parent.
 
     **A restore that is whole is never rolled back, whatever happens after it.** The one thing that
-    runs after the config bundle lands is the staging directory's own removal, and it can fail: on
-    Windows an antivirus scanner or the indexer holding the just-written store open makes that
-    ``rmtree`` raise ``PermissionError``. That is a leftover to report, not a restore to undo --
-    undoing it would delete a placed, verified store to answer a directory that could not be
-    deleted, and leave the operator with no store, no bundle, and the plaintext staging directory
-    still on disk. It raises ``BackupError("cleanup", ...)`` naming the directory instead, with the
-    store and bundle intact.
+    runs after the config bundle lands is the staging directory's own teardown (:meth:`_Staging.release`,
+    BACKLOG #5617), and its removal can fail: on Windows an antivirus scanner or the indexer holding
+    the just-written store open. The teardown then empties what it can in place and leaves the
+    directory marked for the next sweep. That is a leftover, not a restore to undo -- undoing it would
+    delete a placed, verified store to answer a directory that could not be deleted. Where a file in
+    it could not be emptied, as the extracted store hard-linked to the placed one cannot be, it raises
+    ``BackupError("cleanup", ...)`` naming the directory, with the store and bundle intact; where
+    every file was emptied, it returns the result and the teardown logs the empty leftover.
 
     **``dest_store_path`` is ``None`` only for a CONFIG-ONLY archive's bundle (vault BACKLOG #5233).**
     A server-DB store's archive carries no store, so ``--to`` has nothing to name, and the refusal that
@@ -4608,7 +4610,11 @@ def _restore_blocking(
 
     # The config-only route stages in the RESOLVED parent: an unresolved `.` (or `""`) is its own
     # parent, which would stage the decrypted archive inside the bundle's own directory.
-    staging_parent = anchor.parent if dest_store_path is not None else anchor.resolve().parent
+    # Absolute on the store route too: the sweep below tells this run's own directory, which
+    # `mkdtemp` names absolutely, from a dead run's by comparing the paths it lists under this root.
+    staging_parent = (
+        anchor.absolute().parent if dest_store_path is not None else anchor.resolve().parent
+    )
     if dest_store_path is None and staging_parent == anchor.resolve():
         raise BackupError(
             "destination",
@@ -4666,7 +4672,14 @@ def _restore_blocking(
         try:
             work = _open_staging(staging_parent, _RESTORE_STAGING_PREFIX, secure=True)
         except StagingNotPrivateError as exc:
-            raise BackupError("destination", safe_exc(exc)) from exc
+            # Its own words, not `_open_staging`'s: that text names the backup's and verify's
+            # settings, none of which moves a restore's staging directory.
+            raise BackupError(
+                "destination",
+                f"the restore's staging directory in {staging_parent} did not come out owner-only, "
+                "so nothing was decrypted there. Choose a --to or --config-to on a volume that "
+                "keeps a directory's mode or ACL",
+            ) from exc
         except OSError as exc:
             # The staging directory itself could not be made (an unwritable parent, say), so
             # nothing was decrypted or written: a refusal line, not a traceback.
@@ -4904,16 +4917,23 @@ def _restore_blocking(
             leftover = work.release()
             refusal: BaseException = exc
             if isinstance(exc, OSError):
-                # No refusal behind it: the OSError is the failure itself, such as a full volume
-                # mid-decrypt. A refusal line rather than a traceback, on both routes; the
+                # A refusal already leaving a `with` block, found in the chain: an OSError raised on
+                # its way out (a close-time flush on a full volume) would otherwise replace it.
+                # With no refusal behind it the OSError is the failure itself, such as a full
+                # volume mid-decrypt: a refusal line rather than a traceback, on both routes; the
                 # `finally` still rolls back what was published.
-                refusal = BackupError("restore", f"the restore failed: {safe_exc(exc)}")
+                refusal = _refusal_in_flight(exc) or BackupError(
+                    "restore", f"the restore failed: {safe_exc(exc)}"
+                )
             if leftover is not None:
                 if isinstance(refusal, BackupError):
-                    refusal = BackupError(
-                        refusal.kind,
-                        join_before_checks(str(refusal).rstrip("."), ". Separately, ", leftover),
+                    joined = join_before_checks(
+                        str(refusal).rstrip("."), ". Separately, ", leftover
                     )
+                    if not _split_checks(joined)[1]:
+                        # A sentence the CLI can append its own remedy to, such as the age hint.
+                        joined = f"{joined.rstrip('.')}."
+                    refusal = BackupError(refusal.kind, joined)
                 else:
                     exc.add_note(leftover)
             if refusal is exc:
@@ -4974,6 +4994,18 @@ def _staging_refusal(parent: Path, anchor: Path, exc: OSError) -> str:
         f"The restore stages the decrypted archive there, beside {anchor}, so that directory must "
         "exist or be creatable, and be writable. Nothing was decrypted"
     )
+
+
+def _refusal_in_flight(exc: BaseException) -> BackupError | None:
+    """The first :class:`BackupError` in ``exc``'s ``__context__`` chain, or ``None``."""
+    seen: set[int] = set()
+    link = exc.__context__
+    while link is not None and id(link) not in seen:
+        if isinstance(link, BackupError):
+            return link
+        seen.add(id(link))
+        link = link.__context__
+    return None
 
 
 def _missing_dirs(*paths: Path | None) -> list[Path]:
