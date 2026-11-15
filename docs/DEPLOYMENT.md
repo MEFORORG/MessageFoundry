@@ -833,9 +833,10 @@ engine will not always refuse them for you:
 
 **Deployment requirement:** run these on **loopback only**, or behind a **TLS-terminating proxy / on a
 trusted, isolated network segment**. If PHI flows over one of them off-host without that protection, it
-is exposed in cleartext. A Direct outbound connection with `use_tls = false` is the exception to the
-loopback route: a loopback host does not admit it, so under `enforce` keep `use_tls = true`, the
-default. It runs only on an instance at `warn` with the escape set, and the same advice holds there. A non-loopback raw-TCP/X12 **bind** is refused at startup (`check_tcp_tls_exposure`,
+is exposed in cleartext. A Direct outbound connection with `use_tls = false` is the exception: no
+network arrangement admits it under `enforce`, loopback included, so keep `use_tls = true`, the
+default. It runs only on an instance at `warn` with the escape set, and there it still belongs on
+loopback, behind a TLS-terminating proxy or on a trusted, isolated segment. A non-loopback raw-TCP/X12 **bind** is refused at startup (`check_tcp_tls_exposure`,
 PR #558) — but because these connectors have no TLS to enable, the gate's only passes are a loopback bind
 or OS-level firewall/segmentation (`serve --allow-insecure-bind` is clamped inert on the default
 enforcing-PHI posture); choosing one (and keeping PHI off the cleartext wire) is the **operator
@@ -849,10 +850,11 @@ decision 4; TLS support for them is BACKLOG #311).
 
 ## The `MEFOR_ALLOW_INSECURE_TLS` escape hatch
 
-Several connectors **fail closed** on a weakened-TLS or cleartext configuration unless the
-environment variable `MEFOR_ALLOW_INSECURE_TLS` is set on an instance at
-`[security].enforcement = warn`. It exists for **dev / trusted-lab** use only. At `enforce`, the
-default, it has no effect.
+Several connectors **fail closed** on a weakened-TLS or cleartext configuration. The environment
+variable `MEFOR_ALLOW_INSECURE_TLS`, set on an instance at `[security].enforcement = warn`, is one way
+past many of them. It exists for **dev / trusted-lab** use only, and at `enforce`, the default, it
+has no effect. Some of the same cells also open for a per-connection `tls_hop_attested` or a loopback
+host, at any posture; the entries below and the connector references say which.
 
 The escape does not release a credential to a peer the engine has not verified, except on the hops
 that rule does not reach yet. The rule and those hops are stated once in
@@ -930,7 +932,7 @@ CORRECTED 2026-11-14: this read *"mostly clamped"*.
 
 **Never set `MEFOR_ALLOW_INSECURE_TLS` in production.** It is inert at `enforce`, the default, but it
 is a latent switch: move the instance to `warn` and the settings in the first list become permitted
-with it. CORRECTED 2026-11-14: this read that it *"turns the remaining fail-closed verification checks
+with it, and the SFTP entry takes effect with no other setting. CORRECTED 2026-11-14: this read that it *"turns the remaining fail-closed verification checks
 into best-effort"*.
 
 **It is not the only way to weaken TLS, so do not audit for it alone.** Three further families of lever

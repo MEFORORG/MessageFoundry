@@ -3115,7 +3115,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | `port` | int / `env()` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`). |
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
 | `username` | str / `env()` / None | `None` | SMTP `AUTH` user — put the secret in `env()`. |
-| `password` | str / `env()` / None | `None` | SMTP `AUTH` password — `env()` only. AUTH is sent **over TLS only**; a cleartext-credential config is refused. |
+| `password` | str / `env()` / None | `None` | SMTP `AUTH` password — `env()` only. AUTH is sent **over verified TLS only**: a login with `use_tls`, `tls_verify` or `tls_check_hostname` off is refused, whatever escape or declaration is set. |
 | `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated. **First, an opt-in**, and at least these pass it: this connection's `cleartext_accepted = true` with its mandatory `cleartext_reason` (per-hop, audited — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted), and prefer it); its [`tls_hop_attested`](#attesting-a-hop-secure-tls_hop_attested), for a hop secured by other means; or `MEFOR_ALLOW_INSECURE_TLS`, which is process-global and has no effect at `[security].enforcement = enforce`, the default ([the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what else it reaches). A loopback host does not pass it. **Then** the hop goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback ALLOWs, an attested hop ALLOWs, a `cleartext_accepted` hop **WARNs + audits** (never a silent allow), a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
 | `timeout_seconds` | float | `30.0` | |
 | `encoding` | str | `"utf-8"` | The body's charset. A body that cannot be encoded in it is a permanent `encoding` refusal. It dead-letters on the first attempt and is never retried. The error names the charset, never the content. |
@@ -4190,8 +4190,10 @@ has no hop to declare; inbound binds are governed by the four exposed-gates and
 declaration (ADR 0153 decision 2 is Destination-only). On `Ftp()` the declaration reaches
 the **anonymous** plain-ftp hop only: a *credentialed* plain-ftp connection is refused outright, because
 the credential itself would cross in the clear. And **`Direct()` is deliberately absent from the list —
-the declaration does not reach it at all.** Its `use_tls=false` cell consults the raw
-`MEFOR_ALLOW_INSECURE_TLS` escape rather than this authority, so setting `cleartext_accepted` on a
+the declaration does not reach it at all.** Its `use_tls=false` cell consults the
+`MEFOR_ALLOW_INSECURE_TLS` escape, read through the clamp so it works only at
+`[security].enforcement = warn`, rather than this authority (corrected 2026-11-14: this read *"the
+raw"* escape, stale since #323), so setting `cleartext_accepted` on a
 Direct outbound is accepted at load and then never consulted; see the
 [`Direct(...)` `use_tls` row](#direct-project--direct-smime-over-smtp-outbound-send-adr-0085).
 
