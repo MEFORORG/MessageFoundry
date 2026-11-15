@@ -708,28 +708,29 @@ Manager's watch reached the cloud session 29 seconds after its question.
   Builder in its own session, started from a chip or spawned, opens its own PR. Korus
   `roles/MANAGER.md` holds the rest, in *When to cut a pull request* and *A Builder in its own
   session opens its own pull request*.
-- **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge on GitHub is branch
-  protection and the required contexts, nothing else; the holds below are the Lander's own. **The
-  Lander checks for PROOF THAT CODE REVIEW RAN on the change (owner ruling 2026-09-29, in
+- **The merge is the Lander's, and NO LABEL BLOCKS IT.** What blocks a merge on GitHub includes
+  branch protection and the required contexts, and no label; the holds below are the Lander's own.
+  **The Lander checks for PROOF THAT CODE REVIEW RAN on the change (owner ruling 2026-09-29, in
   session).** Proof is a code-review tag on the PR, such as the Builder's QA line under the `qa`
   label, or other evidence that code review ran against this change. Without it, the Lander sends
   the change to code review. The proof must cover the change being merged, so a conflict resolution
   the Lander wrote itself needs its own review. The Lander reads what the review found. **The Lander
-  may merge when none of the open findings changes behaviour or weakens a control, once it has named
-  each open finding on the PR.** The owner's ruling of 2026-10-12, in session, approved the
-  condition that none changes behaviour or weakens a control, as part of the Lander's proposal *"Let
-  me merge when the open findings are filed as rows and none changes behaviour or weakens a
-  control"*. The naming step, and the order the ledger ruling R2 paragraph below states, replace the
-  proposal's filing-first step. A finding that changes behaviour or weakens a control still goes to
-  the owner for a ruling. **CORRECTED 2026-10-12:** that sentence read *"a finding that names a
-  defect the merge would ship goes back to the owner for a ruling."* **CORRECTED 2026-11-15:** the
-  bold sentence read *"The Lander may merge when the open findings are filed as rows and none
-  changes behaviour or weakens a control (owner ruling 2026-10-12, in session)."* The 2026-10-12
-  ruling does not let the Lander skip the review proof, or choose between two authors' deliberate
-  changes. Nor does it let the Lander decline a finding that names a defect the merge would ship.
-  Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the earlier rule,
-  this ruling is the newer one. The full text and the owner's words are in
-  [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
+  may merge when none of the open findings changes behaviour or weakens a control, or the owner has
+  ruled that each one that does may merge, once it has named each open finding on the PR.** The
+  owner's ruling of 2026-10-12, in session, approved the condition that none changes behaviour or
+  weakens a control, as part of the Lander's proposal *"Let me merge when the open findings are
+  filed as rows and none changes behaviour or weakens a control"*. The naming step, and the order
+  the ledger ruling R2 paragraph below states, replace the proposal's filing-first step. A finding
+  that changes behaviour or weakens a control still goes to the owner for a ruling. **CORRECTED
+  2026-10-12:** that sentence read *"a finding that names a defect the merge would ship goes back to
+  the owner for a ruling."* **CORRECTED 2026-11-15:** the bold sentence read *"The Lander may merge
+  when the open findings are filed as rows and none changes behaviour or weakens a control (owner
+  ruling 2026-10-12, in session)."* The 2026-10-12 ruling does not let the Lander skip the review
+  proof, or choose between two authors' deliberate changes. Nor does it let the Lander decline a
+  finding that names a defect the merge would ship. Korus `roles/LANDER.md` *4a-quinquies* holds the
+  rest. Where korus still carries a rule this bullet replaced, this bullet is the newer text. The
+  full text and the owner's words are in [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved
+  in wave 3*.
   **A delegated decision counts as that ruling (owner ruling 2026-10-22).** In the owner's words:
   *"when I answer a specific question with /driver or /empower, that delegates that question to the
   seat that asked it, including questions the empower rules reserve to me. The seat decides after
@@ -743,9 +744,10 @@ Manager's watch reached the cloud session 29 seconds after its question.
   statement in a security or assurance record about what a control does, a score or an anchor:
   that weakens a control, so it goes to the owner under the 2026-10-12 ruling, and the PR waits
   for that ruling. A finding the Lander cannot classify goes to the owner (decision
-  d20261029T165623191-578690). Korus `roles/LANDER.md` *4a-quinquies* sends more to the owner:
-  false program output, and a false control claim in any comment, docstring or doc (the Lander's
-  reading, decision d20261110T205706609-38b347).
+  d20261029T165623191-578690). Korus `roles/LANDER.md` *4a-quinquies*
+  sends more to the owner, and governs where the two differ: false program output, and a false
+  control claim in any comment, docstring or doc (the Lander's reading, decision
+  d20261110T205706609-38b347).
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed, and the Lander reads it as setting when.** A merged PR files at most one row, holding
   its open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
@@ -756,20 +758,21 @@ Manager's watch reached the cloud session 29 seconds after its question.
   governing the order of filing and merging. The order is: the Lander names each open finding on the
   PR, one line each, with its filed row or "queued for filing", naming its subject and pasting no
   row text; it merges; it files the queued ones in the next ledger pass, under the sweep in korus
-  `roles/LANDER.md`, *An item left in a PR comment is yours to carry*. **Filing never holds the
-  merge. A finding that goes to the owner holds the merge until the owner rules.** That last rule,
-  under R2, is the owner's ruling of 2026-11-15, in the Repair Manager's chat. Asked *"Under ledger
-  ruling R2's 'the merge never waits on an open finding', does a finding sent to you for a ruling
-  still hold the merge until you rule?"*, the owner answered *"owner findings still hold the
-  merge"*. The Lander decided the order under the owner's delegation of 2026-11-11; the decision's
-  record gives the question as *"does CLAUDE.md s5 file-before-merge or R2 merge-first govern?"* and
-  the owner's answer as *"/driver"*. The authority for this text is the owner confirmation in the
-  Repair Manager's chat, 2026-11-15: *"Confirmed: fix all 11 findings on korus PR 270 and whatever
-  engine PR 2891 leaves open, including the edits to engine CLAUDE.md section 5 and korus
-  roles/LANDER.md, so both repos state one merge order. R5 does not block this pair."* **CORRECTED
-  2026-11-15:** this paragraph read *"changes how the findings are filed, and nothing else in this
-  bullet"* and *"The merge permission, and what goes to the owner, are unchanged."* What goes to the
-  owner is still unchanged; the filing condition and the order changed.
+  `roles/LANDER.md`, *An item left in a PR comment is yours to carry*. **Filing an open finding
+  never holds the merge. A finding that goes to the owner holds the merge until the owner rules.**
+  That last rule is not R2's text. It is the owner's ruling of 2026-11-15, in the Repair Manager's
+  chat. Asked *"Under ledger ruling R2's 'the merge never waits on an open finding', does a finding
+  sent to you for a ruling still hold the merge until you rule?"*, the owner answered *"owner
+  findings still hold the merge"*. The Lander decided the order under the owner's delegation of
+  2026-11-11; the decision's record gives the question as *"does CLAUDE.md s5 file-before-merge or
+  R2 merge-first govern?"* and the owner's answer as *"/driver"*. The authority for this text is the
+  owner confirmation in the Repair Manager's chat, 2026-11-15: *"Confirmed: fix all 11 findings on
+  korus PR 270 and whatever engine PR 2891 leaves open, including the edits to engine CLAUDE.md
+  section 5 and korus roles/LANDER.md, so both repos state one merge order. R5 does not block this
+  pair."* **CORRECTED 2026-11-15:** this paragraph read *"changes how the findings are filed, and
+  nothing else in this bullet"* and *"The merge permission, and what goes to the owner, are
+  unchanged."* This change left what goes to the owner as it was; the filing condition and the order
+  changed.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
