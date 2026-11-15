@@ -27,6 +27,9 @@ from pathlib import Path
 
 import pytest
 
+#: pytest's param type, read from an instance rather than imported from pytest's private modules.
+ParameterSet = type(pytest.param(None))
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCANNER_PATH = _REPO_ROOT / "scripts" / "security" / "scan_forbidden.py"
 
@@ -1745,20 +1748,21 @@ def test_a_body_origin_main_caught_is_still_caught(sf, body: str) -> None:
     assert set(main_hits) <= set(sf.scan_pr_body(body)), body
 
 
-def _harvested_pr_bodies(cap: int) -> list[str]:
-    """Every string a PR-body fixture in this module holds: the module-level lists and every
-    parametrize value. A string over the baseline cap is left out: the property is stated under it,
-    and the oracle is quadratic on the long timing shapes."""
+def _harvested_pr_bodies() -> list[str]:
+    """Every string a fixture in this module holds: the ``_PR_*`` lists and every parametrize value.
+    Some are not PR bodies (flags, encodings), which only widens the corpus; the test's control counts
+    the bodies the oracle fires on. The long timing shapes are left out, as the oracle is quadratic
+    on them; the baseline's cut on such a shape is pinned by its own test."""
     found: list[str] = []
 
     def take(value: object) -> None:
-        if isinstance(value, str):
+        if isinstance(value, ParameterSet):  # a tuple, so it must be read before the tuple branch
+            take(value.values)
+        elif isinstance(value, str):
             found.append(value)
         elif isinstance(value, (list, tuple)):
             for v in value:
                 take(v)
-        elif hasattr(value, "values") and hasattr(value, "marks"):  # a pytest.param
-            take(value.values)
 
     for name, value in list(globals().items()):
         if name.startswith("_PR_"):
@@ -1766,7 +1770,7 @@ def _harvested_pr_bodies(cap: int) -> list[str]:
         for mark in getattr(value, "pytestmark", []):
             if mark.name == "parametrize":
                 take(list(mark.args[1]))
-    return [s for s in dict.fromkeys(found) if len(s) <= cap]
+    return [s for s in dict.fromkeys(found) if len(s) <= 10_000]
 
 
 def _generated_pr_bodies(count: int = 600) -> list[str]:
@@ -1821,15 +1825,48 @@ def _generated_pr_bodies(count: int = 600) -> list[str]:
 def test_the_scan_reports_at_least_every_hit_origin_main_reported(sf) -> None:
     """The structural property: the baseline is one pass of the union, so this holds by construction,
     and the test pins it against an oracle the scanner does not share."""
-    harvested = _harvested_pr_bodies(sf._PR_BASE_CAP)
-    assert len(harvested) > 100, "control: the harvest must find the fixtures, or it proves nothing"
-    fired = 0
-    for body in harvested + _generated_pr_bodies():
+    harvested = set(_harvested_pr_bodies())
+    fired_harvested = fired_generated = 0
+    for body in [*harvested, *_generated_pr_bodies()]:
         main_hits = set(_main_scan_pr_body(sf, body))
-        fired += bool(main_hits)
+        if main_hits:
+            if body in harvested:
+                fired_harvested += 1
+            else:
+                fired_generated += 1
         missed = main_hits - set(sf.scan_pr_body(body))
         assert not missed, (body, sorted(missed))
-    assert fired > 100, "control: the oracle must fire on much of the corpus"
+    # Controls: the oracle fires on many fixtures and many generated bodies, or this proves nothing.
+    assert fired_harvested > 100 and fired_generated > 100, (fired_harvested, fired_generated)
+
+
+_PROSE = "This paragraph explains the change in plain words and names no requirement at all. "
+
+
+@pytest.mark.parametrize("body", _MAIN_CAUGHT_BRANCH_MISSED)
+@pytest.mark.parametrize("layout", ["one-line", "wrapped"])
+def test_a_main_caught_shape_past_the_cap_is_still_caught(sf, body: str, layout: str) -> None:
+    """Round 5: a blanket cut at 2000 characters lost main's reading of every long paragraph. Only an
+    adversarial run is cut now, so ordinary prose before the shape keeps main's reading of it."""
+    filler = _PROSE * 30
+    if layout == "wrapped":
+        filler = "\n".join(_PROSE.strip() for _ in range(30)) + "\n"
+    long_body = filler + body
+    assert len(long_body) > sf._PR_BASE_CAP
+    main_hits = _main_scan_pr_body(sf, long_body)
+    assert main_hits, "control: origin/main's reading must catch this shape"
+    assert set(main_hits) <= set(sf.scan_pr_body(long_body)), layout
+
+
+def test_the_baseline_cut_falls_only_on_an_adversarial_run_and_never_mid_word(sf) -> None:
+    prose = _PROSE * 300
+    assert sf._pr_base_bounded(prose, sf._pr_base_split_cost) == prose
+    adversarial = "a" + " " * 30_000 + "ASVS 16.9.97 is metadata-driven"
+    cut = sf._pr_base_bounded(adversarial, sf._pr_base_split_cost)
+    assert len(cut) <= sf._PR_BASE_CAP
+    brackets = ("word " * 500) + "[" * 20_000
+    cut = sf._pr_base_bounded(brackets, sf._pr_base_link_cost)
+    assert len(cut) <= sf._PR_BASE_CAP and cut.endswith("word"), cut[-10:]
 
 
 def test_the_union_is_deduplicated_and_sorted_by_line_then_kind(sf) -> None:
