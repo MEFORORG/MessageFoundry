@@ -88,19 +88,20 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
     """Split a DICOM ``PatientName`` (a ``^``-delimited PN — ``Family^Given^Middle^Prefix^Suffix``,
     with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components.
 
-    Uses the first group with a non-blank family, given or middle name, so an ideographic-only name
-    is not lost and a group holding only a prefix or suffix is passed over, and ``()`` when no group
-    has one. A blank (spaces-only) component is written empty. A name taken from the ideographic or
-    phonetic group carries ``I`` or ``P`` in ``XPN-8`` (name representation code), which tells a
-    receiver that reads ``XPN-8`` which group it is. It does not make the text decode. This helper
-    sets no character set, and with ``MSH-18`` empty the message declares ASCII. For any non-ASCII
-    name, from any group, the Handler that builds ``MSH`` must declare the set in ``MSH-18``, and
-    the outbound connection's ``encoding``, which encodes the bytes sent, must agree with it.
-    ``XPN`` puts the suffix before the prefix
-    (``Family^Given^Middle^Suffix^Prefix``), so the DICOM prefix and suffix swap places. A PN has
-    five components; anything past the fifth is malformed and dropped rather than written into
-    ``XPN-6`` onward, which are coded fields. Trailing blank components are dropped too
-    (BACKLOG #5804)."""
+    Uses the first group with a non-blank family name. Only when no group has one does it use the
+    first group with a non-blank given or middle name, so an ideographic-only name is not lost, a
+    given name alone does not hide a later family name, and a group holding only a prefix or
+    suffix is passed over. It returns ``()`` when no group has any of the three. A blank
+    (spaces-only) component is written empty. A name taken from the ideographic or phonetic group
+    carries ``I`` or ``P`` in ``XPN-8`` (name representation code), which tells a receiver that
+    reads ``XPN-8`` which group it is. It does not make the text decode. This helper sets no
+    character set, and with ``MSH-18`` empty the message declares ASCII. For any non-ASCII name,
+    from any group, the Handler that builds ``MSH`` must declare the set in ``MSH-18``, and the
+    outbound connection's ``encoding``, which encodes the bytes sent, must agree with it. ``XPN``
+    puts the suffix before the prefix (``Family^Given^Middle^Suffix^Prefix``), so the DICOM prefix
+    and suffix swap places. A PN has five components; anything past the fifth is malformed and
+    dropped rather than written into ``XPN-6`` onward, which are coded fields. Trailing blank
+    components are dropped too (BACKLOG #5804)."""
     if not patient_name:
         return ()
     # Alphabetic, ideographic, phonetic; each cut to its five components, a blank one made empty.
@@ -108,8 +109,10 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
         [part if part.strip() else "" for part in (group.split("^") + [""] * 5)[:5]]
         for group in patient_name.split("=")[:3]
     ]
-    # Choose on family, given and middle: a prefix or suffix alone is no name.
-    group_index = next((i for i, parts in enumerate(candidates) if any(parts[:3])), None)
+    # A family name first; failing that, a given or middle name. A prefix or suffix is no name.
+    group_index = next((i for i, parts in enumerate(candidates) if parts[0]), None)
+    if group_index is None:
+        group_index = next((i for i, parts in enumerate(candidates) if any(parts[1:3])), None)
     if group_index is None:
         return ()
     parts = candidates[group_index]

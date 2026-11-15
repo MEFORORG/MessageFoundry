@@ -246,9 +246,13 @@ def test_person_name_components_splits_pn() -> None:
             "^^^Dr=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="prefix-only-group"
         ),
         pytest.param("^^^^Jr", (), id="suffix-alone"),
-        # A given or a middle name alone is a name, so its group is chosen.
-        pytest.param("^Madonna=Yamada", ("", "Madonna"), id="given-alone"),
-        pytest.param("^^Q=Yamada", ("", "", "Q"), id="middle-alone"),
+        # A family name in a later group beats a given name alone in an earlier one.
+        pytest.param(
+            "^Testgiven=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="family-beats-given"
+        ),
+        # With no family name anywhere, the first group with a given or middle name is chosen.
+        pytest.param("^Testgiven=^^^Dr", ("", "Testgiven"), id="given-alone"),
+        pytest.param("^^^Dr=^^Q", ("", "", "Q", *[""] * 4, "I"), id="middle-alone"),
         pytest.param("^^^^", (), id="all-empty"),
         pytest.param("== ", (), id="blank-groups"),
     ],
