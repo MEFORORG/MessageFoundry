@@ -84,15 +84,22 @@ def rec(kind: str = "decision", at: datetime | None = None, **fields: Any) -> di
 
 
 def _rated(
-    seat: str, days: int, disagree: tuple[int, ...] = (), count: int = 60
+    seat: str,
+    days: int,
+    disagree: tuple[int, ...] = (),
+    count: int = 60,
+    start: int = 0,
+    stride: int = 1,
 ) -> list[dict[str, Any]]:
     """``count`` Class B decisions by ``seat``, ``days`` old, each rated, the ``disagree`` indexes
-    (oldest first) rated disagree and the rest agree."""
-    decided = [rec(at=ago(days=days, minutes=i), seat=seat, item="calib") for i in range(count)]
+    (oldest first) rated disagree and the rest agree. Rating ``i`` falls in minute slot
+    ``start + stride * i``, so two calls with stride 2 and starts 0 and 1 interleave their ratings."""
+    slots = [start + stride * i for i in range(count)]
+    decided = [rec(at=ago(days=days, minutes=m), seat=seat, item="calib") for m in slots]
     rated = [
         rec(
             "rating",
-            at=ago(days=days, minutes=-1 - i),
+            at=ago(days=days, minutes=-1 - slots[i]),
             seat="owner",
             ref=d["id"],
             rating="disagree" if i in disagree else "agree",
@@ -1114,6 +1121,52 @@ def test_an_aliass_clean_samples_do_not_heal_its_seats_breach(sb: Sandbox) -> No
     code, doc = gate(sb, seat="manager1")
     assert code == REVIEW, why(doc)
     assert "BREACH in seat manager's history (manager)" in why(doc), why(doc)
+
+
+# THE BAR FOR OPTION C IS MAIN'S POOLED READING (BACKLOG #5604): every history the seat-pooled
+# calibration this ruling replaced answers REVIEW for must still be REVIEW. Each REVIEW history below
+# was run through origin/main's decision.ps1 and _decisionlog.ps1 at 73d9236f3b as well, which
+# answered REVIEW for it, and each NO-REVIEW control likewise answered NO-REVIEW there: option c may
+# be stricter than that reading, never looser, and it does not lock a seat on one name's short
+# history that the pooled reading passes.
+
+
+def test_a_breach_under_a_name_that_drops_below_60_still_closes_its_alias(sb: Sandbox) -> None:
+    """The manager's 60 ratings end in 4 disagreements, but its oldest decision has left the 60-day
+    window, so it holds 59 there and its own history is no longer a breach. Read with `mgr`'s 60
+    clean ratings before them, the seat's pooled history still is, so `mgr` stays closed."""
+    gone = rec(at=ago(days=61), seat="manager", item="calib")
+    gone_rating = rec("rating", at=ago(days=19), seat="owner", ref=gone["id"], rating="agree")
+    manager = _rated("manager", 19, disagree=(55, 56, 57, 58), count=59)
+    seed_vault(sb, calibrated("builder") + _rated("mgr", 20) + [gone, gone_rating] + manager)
+    code, doc = gate(sb, seat="mgr")
+    msg = why(doc)
+    assert code == REVIEW, msg
+    assert "BREACH in seat manager's history (all of manager's names together)" in msg, msg
+    assert gate(sb, seat="builder")[0] == NO_REVIEW, "a breach closed a seat it does not belong to"
+
+
+@pytest.mark.parametrize(
+    ("disagree", "expected"),
+    [((55, 56, 57, 58), REVIEW), ((0, 20, 40, 58), NO_REVIEW)],
+    ids=["inside-one-pooled-60", "spread-past-every-pooled-60"],
+)
+def test_disagreements_under_a_short_name_interleaved_with_an_alias(
+    sb: Sandbox, disagree: tuple[int, ...], expected: int
+) -> None:
+    """Four disagreements under `manager`, which holds fewer than 60 ratings, interleaved one for one
+    with `mgr`'s 60. Inside one trailing 60 of the seat's pooled order they are a breach, so `mgr`
+    is closed. Spread so that no pooled 60 holds more than 3, the pooled reading passes them and so
+    does option c: a short history's disagreements alone close no seat."""
+    seed_vault(
+        sb,
+        _rated("manager", 19, disagree, count=59, stride=2)
+        + _rated("mgr", 19, count=60, start=1, stride=2),
+    )
+    code, doc = gate(sb, seat="mgr")
+    assert code == expected, why(doc)
+    if expected == REVIEW:
+        assert "BREACH in seat manager's history (all of manager's names together)" in why(doc)
 
 
 def test_a_reversal_logged_under_a_seat_alias_is_charged_to_the_seat(sb: Sandbox) -> None:
