@@ -1408,8 +1408,9 @@ keyword for strict encryption (*documentation*). The decision rests on a private
 BACKLOG #3009, and its contents are not repeated here. Four consequences follow, and they are
 decisions too:
 
-1. **No silent fall back.** Strict encryption is TDS 8.0, which SQL Server 2022 and later speak, and
-   2022 is the engine's supported floor. A server that cannot speak it refuses the connection. The
+1. **No silent fall back.** Strict encryption is TDS 8.0. A server that cannot speak it refuses the
+   connection. *(Note 2026-11-15: this said SQL Server 2022 and later speak it; SQL Server 2022 on
+   Linux refused the strict pinned login in CI, so the claim is cut.)* The
    engine never retries with `Encrypt=yes`, because that is the shape that left the pin unenforced.
 2. **The escaped dev posture is unchanged.** Where `trust_server_certificate` or `encrypt = false`
    is escaped, the string carries no pin and no `strict`, so strict cannot quietly turn

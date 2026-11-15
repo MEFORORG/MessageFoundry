@@ -4772,12 +4772,14 @@ async def open_store(
     live cipher and threaded into every backend, so no caller has to handle key material.
 
     ``posture`` (#200, ADR 0092) is the deriving instance's :class:`HopPosture`, threaded into the
-    server-DB backends so the engine<->store weakened-TLS refusal (``connection_string`` / ``_build_ssl``)
-    clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on an enforcing hop (decision 2). ``None`` reads
-    the ambient posture, and with none the escape is NOT permitted (vault BACKLOG #2354). CORRECTED:
-    this read *"``None`` ... leaves it unclamped, byte-identical to pre-#200"*. So a CLI command that
-    opens a weakened store needs an instance at ``[security].enforcement = warn`` AND a posture; the
-    commands that pass none refuse a weakened store whatever the dial says.
+    server-DB backends for the checks that read one, at least the SQL Server pin's anchor checks and
+    the PostgreSQL revocation guard. ``None`` reads the ambient posture. With none, the SQL Server pin's
+    anchor checks take the enforcing branch (vault BACKLOG #2354), but the PostgreSQL revocation
+    guard does NOT run: it is a no-op on an unstamped posture, so a caller that opens a PostgreSQL
+    store with no posture crosses its hop with no revocation check. The engine<->store weakened-TLS refusal
+    (``connection_string`` / ``_build_ssl``) reads no posture: a weakened store hop is refused at
+    every posture, even with ``MEFOR_ALLOW_INSECURE_TLS`` set on an instance at
+    ``[security].enforcement = warn`` (vault BACKLOG #3533 item 2).
 
     ``keyless_chain_refusal`` (BACKLOG #1916) is the at-rest opt-out's verdict for this caller: the
     setting that refuses running keyless, or ``None`` when the audited opt-out applies. A service

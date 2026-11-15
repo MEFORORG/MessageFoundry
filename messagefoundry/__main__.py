@@ -9439,7 +9439,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     store_slot = _ProvisionStore()
     # The instance hop posture, as `serve` derives it: the auth build takes it, and both store opens
-    # below pass it, so a server store hop is clamped and guarded as `serve` opens it (#200, #201).
+    # below pass it, as `serve` passes it to its own store open (#200, #201).
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
 
     async def administrator_exists() -> tuple[bool, str | None]:
@@ -9691,8 +9691,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # A store key that could not be resolved (the comment above `key_unresolved`). Or the
         # store hop, refused at the open as `serve` refuses it now that the posture is passed: a
-        # server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`
-        # (#5000). Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
+        # server store off-box with no revocation check at `enforce`, or a weakened-TLS store hop
+        # at any posture (#5000, vault BACKLOG #3533 item 2). Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
         # store's live schema falls short of this build's DDL batch: the open rolled the batch back
         # and wrote no marker, and the text lists the differences and the remedy, then says what
         # the open may have changed before it (#5067). Exit 2: could not start, never the
@@ -13735,13 +13735,13 @@ def _command_hop_posture(settings: ServiceSettings) -> HopPosture | None:
     guard, which does nothing with none, refuses an unrevoked off-box hop as ``serve`` does.
 
     At ``warn`` it is ``None``, as these commands passed before. At least these read ``None`` as
-    enforcing: the Vault hops, and the weakened-TLS check and the SQL Server pin's anchor checks,
-    which read the ambient posture for ``None`` and find none stamped on any CLI path. So a weakened
-    store stays refused with ``MEFOR_ALLOW_INSECURE_TLS`` set, an escape ``serve`` honours only at
-    ``[security].enforcement = warn``, and an unattested off-box Vault stays
-    refused, and a SQL Server pin keeps its enforcing anchor checks. Passing the ``warn`` posture
-    would relax each of them, and no command may loosen (Manager decision 2026-10-31, under the
-    owner's delegation of 2026-10-22). The revocation guard then does nothing, so each command calls
+    enforcing: the Vault hops, and the SQL Server pin's anchor checks, which read the ambient
+    posture for ``None`` and find none stamped on any CLI path. So an unattested off-box Vault
+    stays refused, and a SQL Server pin keeps its enforcing anchor checks. Passing the ``warn``
+    posture would relax each of them, and no command may loosen (Manager decision 2026-10-31, under
+    the owner's delegation of 2026-10-22). A weakened store is refused whatever posture is passed,
+    even with ``MEFOR_ALLOW_INSECURE_TLS`` set on an instance at ``[security].enforcement = warn``
+    (vault BACKLOG #3533 item 2). The revocation guard then does nothing, so each command calls
     :func:`_warn_on_an_unrevoked_store_hop` before its open, which says when that logs. Imported here, not at module
     level, so the CLI's import cost stays where it is."""
     from messagefoundry.config.settings import hop_posture_from_ai

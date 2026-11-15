@@ -55,7 +55,6 @@ from messagefoundry.auth.anchor_path import PathVerdict
 from messagefoundry.config import secretprovider_vault, tls_policy, tls_probe
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import (
-    INSECURE_TLS_ESCAPE_ENV,
     AuthSettings,
     EgressSettings,
     StoreBackend,
@@ -445,18 +444,6 @@ def test_postgres_pinned_ca_context_asserts(every_suite_looks_weak: None, tmp_pa
     # The control: the unwrapped builder fails on this arm's own assertion.
     with pytest.raises(ValueError, match=r"Postgres store \(pinned CA\)"):
         postgres._verifying_context(settings)
-
-
-def test_postgres_trust_server_certificate_context_asserts(
-    escape_at_warn: None, every_suite_looks_weak: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``_build_ssl``, ``trust_server_certificate`` arm — reachable only behind the dev escape, still
-    encrypted, so still asserted."""
-
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    settings = _pg_settings(trust_server_certificate=True)
-    with pytest.raises(ValueError, match="Postgres store"):
-        postgres._build_ssl(settings)
 
 
 def test_postgres_default_arm_context_asserts(every_suite_looks_weak: None) -> None:

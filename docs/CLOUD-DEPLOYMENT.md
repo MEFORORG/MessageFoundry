@@ -91,7 +91,9 @@ is verified against [`config/settings.py`](../messagefoundry/config/settings.py)
 connection is TLS-verified out of the box. Give the managed Postgres a **CA-trusted** server cert (the
 provider's default RDS/Cloud SQL/Azure CA chains to a public root, or pin a private CA by file via
 `[store].ssl_root_cert` — a Postgres CA-bundle, see [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5). **Do not
-set `MEFOR_ALLOW_INSECURE_TLS`** in a real deployment — it disables TLS verification across every transport.
+set `MEFOR_ALLOW_INSECURE_TLS`** in a real deployment. It never reaches this store hop, which refuses
+`[store].trust_server_certificate = true` or `[store].encrypt = false` at every posture;
+[the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what it means.
 
 ### 2.2 Lease timings vs. failover speed
 
@@ -114,8 +116,7 @@ mechanism against a SQL Server store with **Always On Availability Groups** for 
   has no ODBC.
 - Trust the DB CA via the host **machine trust store** (the CA-chain path, recommended for rotation), or
   pin the server cert by file with `[store].ssl_root_cert` (ODBC Driver **18.1+** `ServerCertificate`, a
-  leaf pin — rotate in lockstep). The engine sends the pin with `Encrypt=strict`, which needs SQL Server
-  2022 or later. It matches one exact certificate, so on an AG every replica must present that same
+  leaf pin — rotate in lockstep). The engine sends the pin with `Encrypt=strict`. It matches one exact certificate, so on an AG every replica must present that same
   certificate, or a failover refuses every store connection. See [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5.
 - Everything else (the leader lease, graph gating, the LB recipe below) is identical — both backends run
   the same active-passive coordinator.

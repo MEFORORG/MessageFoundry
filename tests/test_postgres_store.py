@@ -4,9 +4,10 @@
 
 **Gated**: skipped unless ``MEFOR_TEST_POSTGRES`` is set (plus ``MEFOR_STORE_*`` connection env),
 so it's a no-op locally and in normal CI. A CI Postgres service-container job sets the env and runs it
-for real. Requires the ``postgres`` extra (``asyncpg``). For the loopback dev Postgres
-(``encrypt=false``) also set ``MEFOR_ALLOW_INSECURE_TLS=1`` (``scripts/dev/postgres.ps1`` exports it),
-or the fixture errors on the bind-guard rather than skipping.
+for real. Requires the ``postgres`` extra (``asyncpg``). The server must speak verified TLS: a
+store hop with ``encrypt=false`` or ``trust_server_certificate=true`` is refused at every posture,
+whatever ``MEFOR_ALLOW_INSECURE_TLS`` says (vault BACKLOG #3533 item 2), so the fixture errors on
+that refusal rather than skipping.
 
 Beyond the SQL Server parity tests, this also exercises the **staged pipeline** Postgres supports
 (ingress → routed → outbound, finalize PROCESSED; the ROUTED→FILTERED collapse), reference snapshots,
@@ -6105,7 +6106,6 @@ import time
 from pathlib import Path
 
 from messagefoundry.config.settings import load_settings
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.postgres import PostgresStore
 
 
@@ -6129,7 +6129,7 @@ def rendezvous(latch_dir, tag, peers, timeout=60.0):
 async def main() -> None:
     tag, rows, latch_dir, peers = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
     store = await PostgresStore.open(
-        load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
+        load_settings(environ=os.environ).store
     )
     try:
         rendezvous(latch_dir, tag, peers)

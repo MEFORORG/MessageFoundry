@@ -232,11 +232,18 @@ def test_build_dsn_weak_tls_refused_without_escape(monkeypatch: pytest.MonkeyPat
         _build_dsn({"server": "s", "database": "d", "encrypt": False})
 
 
-def test_build_dsn_weak_tls_allowed_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The escape needs a known non-enforcing posture (vault BACKLOG #2354).
+def test_build_dsn_weak_tls_refused_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The escape on a known non-enforcing posture used to permit this; it no longer reaches the hop
+    # (vault BACKLOG #3533 item 2). The attestation is the one way across.
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with (
+        active_hop_posture(HopPosture(enforcing=False)),
+        pytest.raises(ValueError, match="weakened"),
+    ):
+        _build_dsn({"server": "s", "database": "d", "encrypt": False})
     with active_hop_posture(HopPosture(enforcing=False)):
-        assert "Encrypt=no" in _build_dsn({"server": "s", "database": "d", "encrypt": False})
+        weak = {"server": "s", "database": "d", "encrypt": False}
+        assert "Encrypt=no" in _build_dsn(weak, attested=True)
 
 
 def test_build_dsn_bad_auth() -> None:

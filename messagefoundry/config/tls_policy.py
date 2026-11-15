@@ -2107,8 +2107,8 @@ class InsecureHopRefused(ValueError):
 
 class StoreTlsRefused(InsecureHopRefused):
     """The store open refused the engine-to-store hop's own TLS settings (BACKLOG #5000). At
-    least: a weakened hop (``trust_server_certificate`` on or ``encrypt`` off) the escape does not
-    cover, on either server backend; a SQL Server ``[store].ssl_root_cert`` pin the engine must not
+    least: a weakened hop (``trust_server_certificate`` on or ``encrypt`` off) on either server
+    backend, which nothing permits (vault BACKLOG #3533 item 2); a SQL Server ``[store].ssl_root_cert`` pin the engine must not
     send, its trust-anchor checks included; and a ``ValueError`` the PostgreSQL store's TLS context
     builder raises at the open, such as an unreadable pin file or a CRL file that cannot be judged.
     Raised before the store dials. The PostgreSQL pool's per-connection rebuild does not raise it.

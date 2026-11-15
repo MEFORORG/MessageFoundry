@@ -353,11 +353,11 @@ async def test_runner_refuses_prod_phi_weakened_db_lookup_even_with_escape(
         runner._build_lookup_executor()
 
 
-async def test_runner_allows_synthetic_weakened_db_lookup_with_escape(
+async def test_runner_refuses_synthetic_weakened_db_lookup_with_escape(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Byte-identical for a synthetic instance: with the escape set, a weakened-TLS lookup still builds —
-    # the clamp only closes the production-PHI case, never a dev lane.
+    # A non-enforcing (synthetic) instance with the escape set used to build a weakened-TLS lookup.
+    # The lookup's login would cross that hop, so it is refused there too (vault BACKLOG #3533 item 2).
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
     runner = RegistryRunner(
         _db_registry(),
@@ -366,7 +366,8 @@ async def test_runner_allows_synthetic_weakened_db_lookup_with_escape(
         hop_posture=SYNTHETIC,
         egress=EgressSettings(deny_by_default=False),
     )
-    assert runner._build_lookup_executor() is not None
+    with pytest.raises(ValueError, match="weakened"):
+        runner._build_lookup_executor()
 
 
 # =====================================================================================

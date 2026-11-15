@@ -85,8 +85,9 @@ Start the same `serve` command on each host/process — e.g.:
 python -P -X disable-remote-debug -m messagefoundry serve --service-config messagefoundry.toml --config ./config
 ```
 
-(For a local DEV Postgres, `scripts/dev/postgres.ps1` sets the `MEFOR_STORE_*` connection env and
-`MEFOR_ALLOW_INSECURE_TLS=1` for a loopback, no-TLS database — DEV convenience only.)
+(For a local DEV Postgres, `scripts/dev/postgres.ps1` sets the `MEFOR_STORE_*` connection env. The
+database must serve TLS the engine can verify, since nothing permits a weakened store hop; its
+`-RootCert` names the CA to pin.)
 
 ## What each node does
 

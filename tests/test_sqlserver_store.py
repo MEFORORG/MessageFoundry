@@ -231,7 +231,6 @@ async def test_store_fixture_closes_the_pool_when_setup_fails(
 _CANCEL_CHILD = r"""
 import asyncio, os, sys
 from messagefoundry.config.settings import load_settings
-from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.sqlserver import SqlServerStore, _call_gate
 
 RESOURCE, ROUNDS = sys.argv[1], int(sys.argv[2])
@@ -269,7 +268,7 @@ def check(ok, message):
 
 async def main() -> None:
     store = await SqlServerStore.open(
-        load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
+        load_settings(environ=os.environ).store
     )
     quarantined = []
     real_release_dirty = store._release_dirty
@@ -7574,11 +7573,10 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
 
     Every string braces the password with :func:`~messagefoundry.odbc_dsn.odbc_brace`. The generic
     builder's (:func:`_build_odbc_dsn`, whose password goes through :func:`_odbc_password` for the
-    ``msodbc`` family) names the host alone, so it reaches the default port; it has
-    ``TrustServerCertificate=yes`` appended, which its ``odbc_params`` allowlist does not take and
-    the container's self-signed certificate needs. The SQL Server preset's (:func:`_build_dsn`)
-    sets that keyword here, and the store's (:func:`connection_string`) takes it from the leg's
-    settings; where the two strings match byte for byte one login covers both. They go through
+    ``msodbc`` family) names the host alone, so it reaches the default port; every string
+    verifies the server's certificate, which the leg's runner trusts (vault BACKLOG #3533 item 2).
+    The store's (:func:`connection_string`) takes its TLS from the leg's settings; where two strings
+    match byte for byte one login covers both. They go through
     aioodbc and pyodbc.
 
     A driver that ended a braced value at its first ``}`` or its first ``};``, or did not turn
@@ -7638,18 +7636,15 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
             await conn.close()
         return (None if row is None else str(row[0])), ""
 
-    generic = (
-        _build_odbc_dsn(
-            {
-                "odbc_driver": "ODBC Driver 18 for SQL Server",
-                "server": base.server or "localhost",
-                "database": "master",
-                "username": login,
-                "password": password,
-                "odbc_params": {"Encrypt": "yes"},
-            }
-        )
-        + "TrustServerCertificate=yes;"
+    generic = _build_odbc_dsn(
+        {
+            "odbc_driver": "ODBC Driver 18 for SQL Server",
+            "server": base.server or "localhost",
+            "database": "master",
+            "username": login,
+            "password": password,
+            "odbc_params": {"Encrypt": "yes"},
+        }
     )
     preset = _build_dsn(
         {
@@ -7658,7 +7653,7 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
             "database": "master",
             "username": login,
             "password": password,
-            "trust_server_certificate": True,
+            # Verifying: CI trusts the server's generated certificate (vault BACKLOG #3533 item 2).
         }
     )
     store = connection_string(

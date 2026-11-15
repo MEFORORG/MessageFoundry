@@ -3073,11 +3073,12 @@ class RegistryRunner:
         for name, spec in self.registry.lookups.items():
             refuse_unresolved_hop_flags(spec.settings, f"database lookup {name!r}")
             resolved[name] = resolve_env_settings(spec.settings, self._env_values)
-        # #200 (ADR 0092): stamp the derived posture around the live executor build so the DSN's
-        # weakened-TLS refusal (_build_dsn → _weakened_tls_permitted) keys on THIS instance's posture,
-        # applying the production-PHI clamp. engine.start()/reload build the executor here WITHOUT going
-        # through build_check_registry's active_hop_posture scope, so an unstamped build would fall back
-        # to the UNCLAMPED escape at query time and let a prod-PHI weakened-TLS live read cross.
+        # #200 (ADR 0092): stamp the derived posture around the live executor build. engine.start()/
+        # reload build the executor here WITHOUT going through build_check_registry's
+        # active_hop_posture scope. Since vault BACKLOG #3533 item 2 nothing this build reaches reads
+        # a posture: the executor calls _build_dsn, the SQL Server preset, never the generic dialect's
+        # cleartext guard, and _build_dsn's weakened-TLS refusal and attestation audit line read none.
+        # The stamp is therefore inert; whether to remove it is left open rather than decided here.
         with active_hop_posture(self._hop_posture):
             return DatabaseLookupExecutor(resolved, egress=self._egress)
 
@@ -5762,9 +5763,8 @@ class RegistryRunner:
         # than the built Source (stream_threshold_bytes is a wiring field, not a transport setting), and
         # it WARNS where its neighbours refuse. See the function for why a refusal is not available here.
         warn_unbudgeted_streaming_inbound(ic, budget=self._stream_inflight_budget)
-        # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
-        # weakened-TLS refusal on it), matching the exposure-check posture threading above. Off the
-        # event loop (engine PR 2815, hold F2).
+        # #200 (ADR 0092): stamp the posture for the source build too, matching the exposure-check
+        # posture threading above. Off the event loop (engine PR 2815, hold F2).
         source = await _build_off_loop(
             self._hop_posture,
             functools.partial(build_source, source_cfg, egress=self._egress),
