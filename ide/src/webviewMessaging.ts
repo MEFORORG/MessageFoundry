@@ -181,6 +181,38 @@ export function postToWebview(
 }
 
 /**
+ * The render a page's request names: the channel token the page put in it, under
+ * {@link CHANNEL_FIELD}, or undefined when it names none. The page sends its own token because the
+ * one current when the host handles the request may already belong to a newer render (BACKLOG
+ * #5565). It authenticates nothing: it only addresses the reply.
+ */
+export function requestToken(message: unknown): string | undefined {
+  if (message === null || typeof message !== "object") {
+    return undefined;
+  }
+  const token = (message as Record<string, unknown>)[CHANNEL_FIELD];
+  return typeof token === "string" ? token : undefined;
+}
+
+/**
+ * {@link postToWebview} for a reply computed across an `await`: it posts only while the render that
+ * asked, named by {@link requestToken}, is still the one showing. postToWebview stamps whatever
+ * token is current, so without this a reply that outlived a re-render, or a request handled only
+ * after one, reached the NEW document as though addressed to it (BACKLOG #5565: a connection
+ * editor's field rebuild for connection A drawn over connection B). Returns undefined when dropped.
+ */
+export function postToSameRender(
+  webview: WebviewTarget,
+  askedToken: string | undefined,
+  message: Record<string, unknown>,
+): PromiseLike<boolean> | undefined {
+  if (askedToken === undefined || openTokens.get(webview) !== askedToken) {
+    return undefined;
+  }
+  return postToWebview(webview, message);
+}
+
+/**
  * JSON for interpolation into an inline `<script>`, with `<` escaped so no value can close the tag.
  *
  * The panel scripts (`*Webview.ts`) embed their seed data with it too. The token is base64url and

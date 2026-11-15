@@ -21,6 +21,7 @@ import {
   type WizardState,
 } from "../../connectionWizardModel";
 import type { ConnObj } from "../../connectionMerge";
+import { startServiceConfigValue } from "../../engineControlModel";
 
 // Pure new-connection wizard model (#221e) — the answer→ConnObj mapping, per-step validators, and the
 // upsert argv, exercised vscode-free (the QuickInput orchestration itself is Extension-Host-only).
@@ -274,11 +275,15 @@ suite("connectionServiceConfig — which settings file a connection edit names",
     assert.strictEqual(connectionServiceConfig("env/prod.toml", false), undefined);
   });
 
-  test("a blank setting is passed as it is, as the alert and security editors pass it", () => {
-    // The CLI refuses an empty or blank --service-config, so the edit is refused rather than
-    // checked against the fallback file.
-    assert.strictEqual(connectionServiceConfig("", true), "");
-    assert.strictEqual(connectionServiceConfig("   ", true), "   ");
+  test("a blank setting counts as unset, as Start reads it, so one setting names one file", () => {
+    // Clearing the Settings box stores "", which VS Code still reports as set. Start leaves the
+    // flag off for it; a connection edit passing --service-config "" resolved the same setting to
+    // a different file (BACKLOG #5566).
+    for (const blank of ["", "   ", "\t"]) {
+      assert.strictEqual(connectionServiceConfig(blank, true), undefined, JSON.stringify(blank));
+    }
+    // One helper decides for both paths, so they cannot drift apart again.
+    assert.strictEqual(startServiceConfigValue, connectionServiceConfig);
   });
 
   test("settingIsSet reads a user or workspace value, never the default or a folder value", () => {

@@ -403,6 +403,7 @@ const connection: Receiver = {
         routers: ["route_adt"],
         transports: ["mllp", "file"],
         fieldGroups: buildForm(SCHEMA, "mllp", "inbound", {}),
+        fieldGroupsFor: { transport: "mllp", direction: "inbound" },
         siblings: undefined,
         clone: undefined,
       }),

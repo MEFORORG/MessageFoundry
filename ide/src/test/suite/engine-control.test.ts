@@ -19,7 +19,10 @@ import {
   preflightArgs,
   runDirHasEngine,
   runStartPlan,
+  SERVE_DEFAULT_SERVICE_CONFIG,
+  serveCommandHint,
   serveCommandLine,
+  startServiceConfigValue,
   validateProvisionEmail,
   type AdminDetails,
   type AdminProbeResult,
@@ -600,5 +603,189 @@ suite("engine control — statusBar.ts serves only through the Start plan (Wave 
 
   test("no password is ever put on a command line", () => {
     assert.ok(!/--password/.test(code), "statusBar.ts must not pass a password flag");
+  });
+});
+
+// BACKLOG #5566. The Start fork guard judged a store present from the configured service TOML, but
+// serve, the admin probe and provision-admin ran without --service-config. So with a non-default
+// `messagefoundry.serviceConfig`, the guard passed and serve opened no service TOML and created a
+// new default store. All four now carry the one value the guard judges.
+suite("engine control — Start runs against the service TOML the fork guard judged (BACKLOG #5566)", () => {
+  const SC = "deploy/prod/messagefoundry.toml";
+
+  test("serve, the probe, provision-admin and the copied command all carry --service-config", () => {
+    const flag = `--service-config=${SC}`;
+    assert.ok(buildServeInvocation({ python: "p", configDir: "c", serviceConfig: SC }).args.includes(flag));
+    assert.ok(buildAdminProbeInvocation({ python: "p", serviceConfig: SC }).args.includes(flag));
+    assert.ok(
+      buildProvisionInvocation({ python: "p", serviceConfig: SC, username: "a", email: "a@b.test" }).args.includes(
+        flag,
+      ),
+    );
+    assert.ok(serveCommandLine("c", SC).endsWith(` ${flag}`));
+  });
+
+  test("a path that starts with a dash stays a value, and one with a space stays one argument", () => {
+    const serve = buildServeInvocation({ python: "p", configDir: "c", serviceConfig: "-odd.toml" }).args;
+    assert.ok(serve.includes("--service-config=-odd.toml"));
+    assert.ok(serveCommandLine("c", "my dir/x.toml").endsWith('"--service-config=my dir/x.toml"'));
+  });
+
+  test("left at its default, no flag is added: serve reads the same default file itself", () => {
+    for (const args of [
+      buildServeInvocation({ python: "p", configDir: "c" }).args,
+      buildAdminProbeInvocation({ python: "p" }).args,
+      buildProvisionInvocation({ python: "p", username: "a", email: "a@b.test" }).args,
+    ]) {
+      assert.ok(!args.some((a) => a.startsWith("--service-config")), args.join(" "));
+    }
+  });
+
+  const src = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "statusBar.ts"), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
+
+  test("statusBar.ts hands every invocation the value the guard judges, read once per Start", () => {
+    const calls = [
+      /buildServeInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
+      /buildAdminProbeInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
+      /buildProvisionInvocation\(\{[^}]*serviceConfig:\s*serviceConfigArg/,
+      /serveCommandLine\(configDir\(\),\s*startServiceConfig\(\)\)/,
+    ];
+    for (const call of calls) {
+      assert.ok(call.test(code), `not handed the service config: ${call}`);
+    }
+    // The control: the call the file carried before the fix must fail its predicate.
+    assert.ok(!calls[0].test("buildServeInvocation({ python, configDir: configDir() })"));
+    // One read in launchEngine feeds the guard and all three effects of the Start plan.
+    const launch = /private async launchEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    assert.ok(launch, "launchEngine moved — re-point this scan before trusting it");
+    assert.strictEqual((launch[0].match(/startServiceConfig\(\)/g) ?? []).length, 1, "read it once");
+    for (const use of [
+      /this\.controlContextFor\(serviceConfigArg\)\.hasStore/,
+      /this\.probeAdmin\(python, ws, serviceConfigArg\)/,
+      /this\.provisionInTerminal\(python, ws, admin, serviceConfigArg\)/,
+      /this\.serveEngine\(python, ws, serviceConfigArg\)/,
+    ]) {
+      assert.ok(use.test(launch[0]), `launchEngine does not pass the one value: ${use}`);
+    }
+    assert.ok(
+      /path\.resolve\(ws,\s*serviceConfigArg\s*\?\?\s*SERVE_DEFAULT_SERVICE_CONFIG\)/.test(code),
+      "the fork guard must judge the file the invocations name",
+    );
+    // A set value naming no file is refused before the guard, since serve would refuse it anyway.
+    assert.ok(
+      /const refusal = serviceConfigRefusal\(ws, serviceConfigArg\);\s*if \(refusal !== undefined\) \{[\s\S]*?return;/.test(
+        launch[0],
+      ),
+      "a set service config that names no file must stop Start",
+    );
+    assert.ok(
+      /function serviceConfigRefusal\([^)]*\)[^{]*\{\s*if \(serviceConfigArg === undefined \|\| isFile\(path\.resolve\(ws, serviceConfigArg\)\)\) \{\s*return undefined;/.test(
+        code,
+      ),
+      "the refusal must be exactly: set, and not a file",
+    );
+  });
+
+  test("Restart refuses a service config that names no file BEFORE it stops the engine", () => {
+    const restart = /async restartEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    assert.ok(restart, "restartEngine moved — re-point this scan before trusting it");
+    const body = restart[0];
+    const refused = body.search(/if \(refusal !== undefined\) \{\s*notify\(refusal\);\s*return;/);
+    const stops = body.search(/term\.dispose\(\)/);
+    assert.ok(refused >= 0, "restartEngine must check the service config");
+    assert.ok(stops > refused, "the check must come before the running engine is stopped");
+    assert.ok(/serviceConfigRefusal\(ws, startServiceConfig\(\)\)/.test(body));
+  });
+
+  test("Restart refuses a remote target and an untrusted workspace before it stats the service config", () => {
+    // Why: the comment at the top of restartEngine. restart-trust.test.ts drives the behaviour.
+    const gatedFirst = (body: string): string | undefined => {
+      const local = body.search(/if \(!isLocalEngine\(url\)\) \{\s*notify\([^;]*\);\s*return;/);
+      const trusted = body.search(
+        /if \(!vscode\.workspace\.isTrusted\) \{\s*notify\("trust this workspace to let the IDE run the engine\."\);\s*return;/,
+      );
+      const stat = body.search(/serviceConfigRefusal\(/);
+      if (local < 0 || trusted < 0 || stat < 0) {
+        return `a check is missing (local ${local}, trusted ${trusted}, stat ${stat})`;
+      }
+      if (stat < local || stat < trusted) {
+        return "serviceConfigRefusal runs before a refusal";
+      }
+      const before = body.slice(0, Math.max(local, trusted));
+      return /\bfs\.|Sync\(|isFile\(|pythonPath\(|startServiceConfig\(|dbFilesIn\(|controlContext/.test(before)
+        ? "a filesystem read runs before the refusals"
+        : undefined;
+    };
+    const restart = /async restartEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    assert.ok(restart, "restartEngine moved — re-point this scan before trusting it");
+    assert.strictEqual(gatedFirst(restart[0]), undefined);
+    // Control: the order this method had before the fix, where Restart statted first.
+    const unfixed =
+      "async restartEngine() {\n const ws = workspaceDir();\n" +
+      " const refusal = ws === undefined ? undefined : serviceConfigRefusal(ws, startServiceConfig());\n" +
+      " const url = this.currentUrl();\n" +
+      ' if (!isLocalEngine(url)) {\n notify(`${url} is remote`);\n return;\n }\n' +
+      ' if (!vscode.workspace.isTrusted) {\n notify("trust this workspace to let the IDE run the engine.");\n return;\n }\n';
+    assert.strictEqual(gatedFirst(unfixed), "serviceConfigRefusal runs before a refusal");
+    // Control: both refusals ahead of the config check, but a read of the interpreter's path first.
+    const readFirst =
+      "async restartEngine() {\n const python = pythonPath();\n const url = this.currentUrl();\n" +
+      ' if (!isLocalEngine(url)) {\n notify(`${url} is remote`);\n return;\n }\n' +
+      ' if (!vscode.workspace.isTrusted) {\n notify("trust this workspace to let the IDE run the engine.");\n return;\n }\n' +
+      " const refusal = serviceConfigRefusal(ws, startServiceConfig());\n";
+    assert.strictEqual(gatedFirst(readFirst), "a filesystem read runs before the refusals");
+    // Start's launchEngine carries the same two messages, so the two refusals read alike.
+    const launch = /private async launchEngine\(\)[\s\S]*?\r?\n {2}\}\r?\n/.exec(code);
+    assert.ok(launch, "launchEngine moved — re-point this scan before trusting it");
+    for (const message of [
+      "is a remote engine — the IDE can only start a local (loopback) engine.`",
+      '"trust this workspace to let the IDE run the engine."',
+    ]) {
+      assert.ok(launch[0].includes(message) && restart[0].includes(message), message);
+    }
+  });
+
+  test("the unreachable-engine hint names the --service-config Start adds", () => {
+    const hint = serveCommandHint();
+    assert.ok(hint.includes(serveCommandLine("<configDir>")));
+    assert.ok(hint.includes("--service-config=<file>"), hint);
+    const client = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "engineClient.ts"), "utf8");
+    assert.ok(/serveCommandHint\(\)/.test(client), "engineClient's hint must use serveCommandHint");
+    assert.ok(!/serveCommandLine\(/.test(client), "engineClient must not name the bare command");
+  });
+
+  test("a blank messagefoundry.serviceConfig counts as unset: no flag, no refusal", () => {
+    // Clearing the Settings box stores "", which VS Code still reports as set.
+    for (const blank of ["", "   ", "\t"]) {
+      assert.strictEqual(startServiceConfigValue(blank, true), undefined, JSON.stringify(blank));
+    }
+    assert.strictEqual(startServiceConfigValue("messagefoundry.toml", false), undefined, "unset");
+    assert.strictEqual(startServiceConfigValue("deploy/prod.toml", true), "deploy/prod.toml");
+    // A hand-edited non-string is not a blank the user cleared; it is still refused as it was.
+    assert.strictEqual(startServiceConfigValue(42, true), "");
+    assert.ok(
+      /function startServiceConfig\(\)[^{]*\{\s*return startServiceConfigValue\(serviceConfig\(\),\s*serviceConfigIsSet\(\)\);/.test(
+        code,
+      ),
+      "Start must read the setting through startServiceConfigValue",
+    );
+  });
+
+  test("with no flag, the fork guard judges the file serve reads by default, so Create new engine still runs", () => {
+    assert.strictEqual(SERVE_DEFAULT_SERVICE_CONFIG, "messagefoundry.toml");
+    assert.ok(
+      /path\.resolve\(ws,\s*serviceConfigArg\s*\?\?\s*SERVE_DEFAULT_SERVICE_CONFIG\)/.test(code),
+      "a blank setting must not make the guard judge the workspace directory",
+    );
+    // A blank setting, with no default TOML and no store, is no engine: the guard offers to create one.
+    assert.strictEqual(runDirHasEngine({ serviceTomlExists: false, dbFiles: [] }), false);
+  });
+
+  test("a change to messagefoundry.serviceConfig re-plans the hover's actions", () => {
+    assert.ok(
+      /affectsConfiguration\("messagefoundry\.serviceConfig"\)\)\s*\{\s*bar\.repaint\(\);/.test(code),
+      "the status bar must react to a service config change",
+    );
   });
 });
