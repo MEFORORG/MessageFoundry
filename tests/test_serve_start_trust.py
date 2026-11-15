@@ -655,8 +655,8 @@ def test_a_file_only_the_open_or_only_the_walk_reaches_refuses(
 def test_an_open_and_a_walk_that_disagree_on_presence_refuse(
     reached_by: str, refusal: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The same disagreement on every host, with the walk replaced: POSIX has no layout that makes
-    the walk and the open disagree."""
+    """The same disagreement on every host, with the walk replaced, because the junction layout
+    above is Windows-only."""
     import messagefoundry.config.wiring as wiring
 
     values = tmp_path / "dev.toml"
@@ -665,8 +665,10 @@ def test_an_open_and_a_walk_that_disagree_on_presence_refuse(
     if reached_by == "open":
         values.write_text("", encoding="utf-8")
     _file_and_folder([values])  # control: the real walk agrees with the open
-    walk_end = None if reached_by == "open" else other
-    monkeypatch.setattr(wiring, "_link_chain", lambda _path: ([tmp_path], walk_end))
+    walk_end: list[Path | None] = [values if reached_by == "open" else None]
+    monkeypatch.setattr(wiring, "_link_chain", lambda _path: ([tmp_path], walk_end[0]))
+    _file_and_folder([values])  # control: a replaced walk that agrees with the open passes
+    walk_end[0] = None if reached_by == "open" else other
     with pytest.raises(WiringError, match=refusal):
         _file_and_folder([values])
 

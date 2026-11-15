@@ -10856,8 +10856,10 @@ def assert_trusted_start_paths(
 
     A path that cannot be stat'ed, for any reason but nothing being there, or whose link chain
     cannot be walked, is refused with ``WiringError`` naming it, and the escape does not downgrade
-    that: nothing about it was vetted (vault BACKLOG #6654 item 2). A file or folder that is not
-    there is not checked, because nothing reads it.
+    that: nothing about it was vetted (vault BACKLOG #6654 item 2). So is a path whose open and
+    walk disagree, where one reaches an object and the other none, or ``os.path.samefile`` says
+    they reach two: the walk vetted another route than the open takes. A file or folder that both
+    find not there is not checked, because nothing reads it.
 
     **Not checked**, at least: the folders above each file's own folder and above each folder
     holding a link, a ``subst`` drive's own folder, and a file named in the settings that the start

@@ -3,8 +3,9 @@
   vetted the file and its folder, and a reload also vetted the folder of each link along a chain of
   file links from the value file. Now each check vets the real folder holding each link, a folder
   link anywhere in the path included, each link itself on Windows, and the real file and folder
-  the links lead to, or the folder a dangling link leads into, except some relative links reached
-  through a junction on Windows (`docs/SECURITY.md`). Where only one of the walk and the open
+  the links lead to, or the folder a dangling link leads into, except where a relative link
+  reached through a junction on Windows sends the open along another route than the walk
+  (`docs/SECURITY.md`). Where only one of the walk and the open
   reaches anything, or `os.path.samefile` says they reach two different ones, the check
   refuses the path. A reload vets the engine's own
   value file before it reads the config directory, so one in its `environments/` folder is vetted

@@ -2836,8 +2836,9 @@ folder, the real folder holding each link an open of it follows, a folder link a
 path included, each such link itself on Windows, and the real file and folder the links lead to
 (`_link_chain` in
 [`config/wiring.py`](../messagefoundry/config/wiring.py), vault BACKLOG #6654 item 5), except
-some relative links reached through a junction, as below. Where a
-link leads to a file that is not there, the folder it would be created in is vetted. A start vets
+where a relative link reached through a junction sends the open along another route than the
+walk, as below. Where a
+link leads to a file that is not there, the folder the walk finds it would be created in is vetted. A start vets
 the file and the links it follows the same way when the engine is built, before its first load
 reads the directory; where the value file is not there and no link leads to it, that check does
 not vet its folder. The walk models how the open resolves each link, but on Windows
@@ -2845,8 +2846,9 @@ a relative link reached through a junction resolves its `..` against the path th
 junction, not the real folder the walk reached. So the check also stats the value file through
 the open's own resolution and refuses it where that and the walk disagree: one reaches something
 and the other reaches nothing, or `os.path.samefile` says they reach two different ones.
-Where both reach the same file by different links, it passes, and a link only the open followed,
-with the folder holding it, can go unvetted. A
+Where both reach the same file by different routes, or neither reaches anything, it passes, and
+the route only the open takes can go unvetted: the links on it, the folders holding them, and the
+folder the open would create a missing file in. A
 folder holding a link is judged by the rule the file's own folder is, so a link that sits directly
 in `C:\` or `C:\ProgramData`, as Windows ships them, is refused. The file or folder vetted, or a
 name along the links it follows, that cannot be stat'ed, for any reason but nothing being there,
