@@ -102,11 +102,14 @@ function unlinkWithRetries(file: string, retries: number): void {
  * Open limits, at least these. `dir` is checked once, by the lstat of step 1, and each entry once, by
  * its lstat in step 2. A directory above `dir` is never checked. The listing, every lstat and
  * unlink, and the rmdir all go by path.
- * - If a directory above `dir` is swapped for a link at any time after `dir` was made, every step,
- *   step 1 included, acts on the same names inside the link's target: regular files there named as
- *   case files can be unlinked, and the directory there removed once it is empty.
- * - If `dir` is replaced by another plain directory before the step 1 lstat, the steps act on that
- *   directory instead.
+ * - If a directory above `dir` is swapped for a link, the steps after the swap act on the same
+ *   names inside the link's target. A swap before the step 1 lstat makes every step act there; a
+ *   swap after the step 1 lstat and before the listing makes the listing and the rest act there; a
+ *   swap after the listing makes only the later lstats and unlinks, the retry waits included, and
+ *   the rmdir act there. Either way regular files there named as case files can be unlinked, and the
+ *   directory there removed once it is empty.
+ * - If `dir` is replaced by another plain directory at any time before the listing or an unlink,
+ *   the steps after the replacement act on that directory instead.
  * - If `dir` itself is swapped for a link after the step 1 lstat, the rest goes through the link. A
  *   swap before the listing lists the target's entries; a swap before an lstat or unlink, the retry
  *   waits included, acts on the listed names in the target. Either way regular files named as case

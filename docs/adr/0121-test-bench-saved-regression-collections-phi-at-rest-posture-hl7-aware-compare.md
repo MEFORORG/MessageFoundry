@@ -113,9 +113,13 @@ disk. What must not break in its place: a run tries to delete its directory, in 
 before the error is rethrown when a case file fails to write; a sweep tries to delete old run
 directories when a Test Bench panel is created and before a collection run writes its own
 directory; and the delete never recurses, never follows a link that is an entry in the run
-directory, and unlinks only regular files named as case files in that directory. The only
-exception allowed is a race in which another process swaps the run directory, an entry in it, or
-a directory above it, after the run made it or the sweep listed it. The races known to remain,
+directory, and unlinks only regular files named as case files in that directory. The exceptions
+allowed are of at least two kinds. One is a run whose `finally` does not run or never completes, at
+least because the process ends before it (a crash, or a window close or reload while the dry-run
+is pending) or because the dry-run never returns (it runs with `timeoutMs` 0, no timeout); the
+`sweepStaleCaseDirs` docblock lists these. The other is a race in which another process swaps the
+run directory, an entry in it, or a directory above it, after the run made it or the sweep listed
+it. The races known to remain,
 what the delete removes, and what stays are recorded in the `deleteCaseDir` and
 `sweepStaleCaseDirs` docblocks in `ide/src/collectionCaseFiles.ts`.
 
