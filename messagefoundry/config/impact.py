@@ -2,8 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Rename / delete PRE-FLIGHT over a loaded :class:`Registry` (#152 impact analysis, CLI surface).
 
-:mod:`messagefoundry.config.reachability` stays **pure** (it computes the reverse-reference index from
-``co_consts`` with no I/O); this module is its I/O twin — it turns that index into the concrete source
+:mod:`messagefoundry.config.reachability` computes the reverse-reference index (from ``co_consts``, with
+source reads only to tell same-named tables apart) and writes nothing; this module is its I/O twin — it turns that index into the concrete source
 edits needed to rename a registered object and rewrite every referent, and applies them to disk.
 
 Two authoring surfaces are covered:
@@ -17,9 +17,11 @@ Two authoring surfaces are covered:
   ``name`` definition) is edited as **text** (no TOML round-trip, so hand-authored formatting/comments
   survive byte-for-byte outside the one edited value).
 
-The rewrite is **span-scoped**: only literals inside a referrer function's source span (or the object's
-own definition statement) are touched, so an unrelated data literal that merely happens to equal the
-old name — living in a different function — is left alone.
+The rewrite is **site-scoped**: only literals at a referrer's sites (its own body, a handler's ``accepts=``
+predicate, a module-level statement binding a name it reads, and, for a table rename, the accessor call
+in a config helper it reaches) or in the object's own definition statement are touched, so an unrelated
+data literal that merely happens to equal the old name — living in a different function — is left alone
+(BACKLOG #5620).
 
 ``plan_rename`` is a pure computation (it reads files but writes nothing); ``apply_rename`` performs the
 writes, preserving each file's exact bytes outside the replaced spans (newline style and the original
@@ -36,12 +38,19 @@ import tokenize
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import FunctionType
 
+from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 from messagefoundry.config.reachability import (
     Reference,
     ReferenceIndex,
+    SourceCache,
     build_reference_index,
+    captured_values,
+    reached_functions,
+    source_lines,
+    table_kinds,
 )
 from messagefoundry.config.wiring import Registry, WiringError, config_py_files
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
@@ -67,6 +76,9 @@ RENAMEABLE_KINDS = frozenset(
 #: it, and its definition literal is rewritten like any other code-first declaration (see
 #: :data:`_DECLARATION_FACTORIES`).
 _FILE_BACKED_KINDS = frozenset({"code_set"})
+
+#: The registry table kinds, which may share a name with one another (a code set and a reference).
+_TABLE_KINDS = frozenset({"code_set", "reference", "lookup", "fhir_lookup"})
 
 #: Code-first declaration factories whose first positional arg is the object's name literal. These specs
 #: carry no ``source_file``/``source_line`` (unlike inbound/outbound), so their definition statement is
@@ -203,42 +215,67 @@ def plan_rename(
             f"registered {target_kind}"
         )
 
-    index = build_reference_index(registry)
-    # file -> the line spans within it we may rewrite (definition + referrers).
-    py_spans: dict[str, list[_Span]] = {}
+    sources = SourceCache()
+    index = build_reference_index(registry, sources)
+    # file -> the line spans of the object's own definition, every literal in which is rewritten.
+    def_spans: dict[str, list[_Span]] = {}
     # (toml-path, key) pairs whose value == old must be rewritten (router binding / name definition).
     toml_targets: set[tuple[str, str]] = set()
 
-    def add_py_span(file: str | None, span: _Span | None) -> None:
+    def add_def_span(file: str | None, span: _Span | None) -> None:
         if file is None or span is None:
             return
         resolved = _under_config_dir(config_dir, file)
         if resolved is not None:
-            py_spans.setdefault(resolved, []).append(span)
+            def_spans.setdefault(resolved, []).append(span)
 
     # The object's own definition (so the name is actually changed, not only its referents).
-    _add_definition_span(registry, config_dir, target_kind, old, add_py_span, toml_targets)
+    _add_definition_span(registry, config_dir, target_kind, old, add_def_span, toml_targets)
 
-    # Every referent edge: rewrite the literal in the referrer's source (or its toml binding). Keep each
-    # py referrer's (resolved-file, span) so a referrer we could not rewrite is surfaced, not dropped.
-    referrer_spans: list[tuple[Reference, str, _Span]] = []
+    # Every referent edge: rewrite the literal at each site the referrer reads it from (or its toml
+    # binding). Keep each py referrer's sites, so a referrer we could not rewrite is surfaced, not
+    # dropped -- including one whose source, or one of whose captured values, could not be located.
+    referrers: list[tuple[Reference, list[_Site], bool]] = []
     for ref in index.referrers(target_kind, old):
-        loc = _add_referrer_span(registry, target_kind, ref, add_py_span, toml_targets)
-        if loc is not None:
-            resolved = _under_config_dir(config_dir, loc[0])
-            if resolved is not None:
-                referrer_spans.append((ref, resolved, loc[1]))
+        found = _referrer_sites(registry, ref, old, target_kind, sources, toml_targets)
+        if found is None:
+            continue
+        sites, complete = found
+        in_dir = [
+            _Site(resolved, site.span, site.allowed)
+            for site in sites
+            if (resolved := _under_config_dir(config_dir, site.file)) is not None
+        ]
+        referrers.append((ref, in_dir, complete and len(in_dir) == len(sites)))
 
+    # A table name another table kind also holds (a code set and a reference both called "x"): a
+    # referrer's own body may read either, so only a literal passed to this kind's accessor is ours.
+    shared_kind = (
+        target_kind
+        if target_kind in _TABLE_KINDS and len(table_kinds(registry).get(old, [])) > 1
+        else None
+    )
+    ref_sites = [site for _ref, sites, _complete in referrers for site in sites]
     edits: list[LiteralEdit] = []
-    for file, spans in py_spans.items():
-        edits.extend(_py_literal_edits(file, old, new, spans))
+    files = set(def_spans) | {site.file for site in ref_sites}
+    for file in sorted(files):
+        file_def = def_spans.get(file, [])
+        file_sites = [site for site in ref_sites if site.file == file]
+        spans = file_def + [site.span for site in file_sites]
+        kinds = sources.occurrences(file, old)
+        for edit in _py_literal_edits(file, old, new, spans):
+            pos = (edit.start_line, edit.start_col)
+            if _in_any_span(edit.start_line, file_def) or any(
+                site.rewrites(pos, kinds, shared_kind) for site in file_sites
+            ):
+                edits.append(edit)
     for toml_path, key in toml_targets:
         edits.extend(_toml_value_edits(toml_path, key, old, new))
 
     # Deterministic, de-duplicated (a literal reachable from two overlapping spans appears once).
     unique = {(e.file, e.start_line, e.start_col): e for e in edits}
     ordered = sorted(unique.values(), key=lambda e: (e.file, e.start_line, e.start_col))
-    unresolved = _unresolved_referrers(referrer_spans, ordered)
+    unresolved = _unresolved_referrers(referrers, ordered, old, sources, shared_kind)
     return RenamePlan(
         target_kind=target_kind, old=old, new=new, edits=tuple(ordered), unresolved=unresolved
     )
@@ -258,7 +295,9 @@ def apply_rename(plan: RenamePlan) -> list[LiteralEdit]:
     for file, file_edits in by_file.items():
         raw = Path(file).read_bytes()
         text = raw.decode("utf-8")
-        lines = text.splitlines(keepends=True)
+        # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline read,
+        # which breaks on exactly those, so an edit's line is the line it names here too.
+        lines = source_lines(text)
         # Bottom-to-top, right-to-left: a multi-line edit changes the line count below it, so applying
         # in descending (start_line, start_col) keeps every not-yet-applied edit's indices valid.
         for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
@@ -312,42 +351,231 @@ def _add_definition_span(
         add_py_span(file, span)
 
 
-def _add_referrer_span(
-    registry: Registry,
-    target_kind: str,
-    ref: Reference,
-    add_py_span: object,
-    toml_targets: set[tuple[str, str]],
-) -> tuple[str, _Span] | None:
-    """Scope one referent edge: a router/handler body naming ``old`` (rewrite in its function span), or
-    an inbound's ``router="old"`` binding (its definition statement, or its ``connections.toml`` line).
+@dataclass(frozen=True)
+class _Site:
+    """One place a referrer reads the old name from: a line span in one file.
 
-    Returns the referrer's ``(source_file, span)`` when it maps to a ``.py`` span (so the caller can
-    later check whether an edit actually landed in it), or ``None`` for a TOML binding / an unlocatable
-    referrer."""
-    assert callable(add_py_span)
+    ``allowed`` is ``None`` for a site whose every literal equal to the old name is a referent (the
+    referrer's own body, an inbound's statement, a non-table binding such as ``TARGET = "OB_X"``). A
+    site the referrer only reaches (a helper, a module-level binding) for a table rename names its
+    referent positions instead: the literals passed to that table kind's accessor, or a bare
+    ``NAME = "old"`` value, so an unrelated equal literal there (a dict key, a label) is left alone."""
+
+    file: str
+    span: _Span
+    allowed: frozenset[tuple[int, int]] | None
+
+    def rewrites(
+        self,
+        pos: tuple[int, int],
+        kinds: Mapping[tuple[int, int], str | None],
+        shared_kind: str | None,
+    ) -> bool:
+        """Whether the literal at ``pos`` is one of this site's referents."""
+        if self.allowed is not None:
+            return pos in self.allowed
+        if not self.span.start <= pos[0] <= self.span.end:
+            return False
+        return shared_kind is None or kinds.get(pos) == shared_kind
+
+    def occurrences(
+        self, kinds: Mapping[tuple[int, int], str | None], shared_kind: str | None
+    ) -> set[tuple[str, int, int]]:
+        """Every referent position at this site that a complete rename must edit. With
+        ``shared_kind`` set, a literal passed to another table kind's accessor belongs to that table
+        and is not counted; any other literal is, since it may read either."""
+        if self.allowed is not None:
+            return {(self.file, line, col) for line, col in self.allowed}
+        return {
+            (self.file, line, col)
+            for (line, col), kind in kinds.items()
+            if self.span.start <= line <= self.span.end
+            and not (shared_kind is not None and kind is not None and kind != shared_kind)
+        }
+
+
+def _referrer_sites(
+    registry: Registry,
+    ref: Reference,
+    old: str,
+    target_kind: str,
+    sources: SourceCache,
+    toml_targets: set[tuple[str, str]],
+) -> tuple[list[_Site], bool] | None:
+    """The ``.py`` sites one referent edge reads ``old`` from, and whether every value the referrer
+    captures holding ``old`` was located; ``None`` for a ``connections.toml`` router binding
+    (recorded in ``toml_targets`` instead).
+
+    A router/handler's sites are its own body and, for a handler, its ``accepts=`` predicate's; for a
+    table rename, the config-authored helpers either reaches; and each module-level statement that
+    binds a global or module attribute one of them reads and holds ``old`` (``TARGET = "OB_X"``,
+    ``DIET = code_set("diets")``), in its own module or a config module it reads through (BACKLOG
+    #5620). An inbound's site is its definition statement. A referrer with no sites, or one that
+    captures ``old`` through a binding no site holds (``from _consts import TARGET``, a closure), is
+    reported unresolved by the caller."""
+    table_kind = target_kind if target_kind in _TABLE_KINDS else None
     if ref.referrer_kind in ("router", "handler"):
         table = registry.routers if ref.referrer_kind == "router" else registry.handlers
         fn = table.get(ref.referrer)
-        if fn is not None:
-            file, span = _fn_span(fn)
-            add_py_span(file, span)
-            if file is not None and span is not None:
-                return file, span
-        return None
+        if fn is None:
+            return [], False
+        roots: list[object] = [fn]
+        if ref.referrer_kind == "handler" and ref.referrer in registry.handler_accepts:
+            roots.append(registry.handler_accepts[ref.referrer])
+        sites: list[_Site] = []
+        # A referrer whose own function cannot be read is unresolved. A predicate that is not a plain
+        # function (a partial, a callable instance) is not: the index cannot read it either, so no
+        # edge came from it.
+        complete = bool(reached_functions(fn))
+        for root in roots:
+            for depth, func in enumerate(reached_functions(root)):
+                file, span = _fn_span(func)
+                if file is None or span is None:
+                    complete = complete and depth > 0
+                elif depth == 0 or table_kind is None:
+                    sites.append(_Site(file, span, None))
+                else:
+                    allowed = _accessor_positions(sources, file, span, old, table_kind)
+                    allowed |= _default_positions(sources, func, file, span, old)
+                    sites.append(_Site(file, span, frozenset(allowed)))
+                bound_sites, located = _module_binding_sites(func, old, table_kind, sources)
+                sites.extend(bound_sites)
+                complete = complete and located
+        return sites, complete
     if ref.referrer_kind == "inbound":
         conn = registry.inbound.get(ref.referrer)
         if conn is None:
-            return None
+            return [], False
         if conn.source_line is not None and conn.source_file:
             span = _statement_span(conn.source_file, conn.source_line)
-            add_py_span(conn.source_file, span)
-            if span is not None:
-                return conn.source_file, span
-        elif conn.source_file and _is_connections_toml(conn.source_file):
+            return (
+                ([_Site(conn.source_file, span, None)], True) if span is not None else ([], False)
+            )
+        if conn.source_file and _is_connections_toml(conn.source_file):
             # The referent edge is the router binding; rewrite only the `router = "..."` value.
             toml_targets.add((conn.source_file, "router"))
+            return None
+        return [], False
     return None
+
+
+def _accessor_positions(
+    sources: SourceCache, file: str, span: _Span, old: str, table_kind: str
+) -> set[tuple[int, int]]:
+    """The positions in ``span`` where ``old`` is passed to ``table_kind``'s accessor."""
+    return {
+        pos
+        for pos, kind in sources.occurrences(file, old).items()
+        if kind == table_kind and span.start <= pos[0] <= span.end
+    }
+
+
+def _default_positions(
+    sources: SourceCache, func: FunctionType, file: str, span: _Span, old: str
+) -> set[tuple[int, int]]:
+    """The positions of ``old`` written as a default argument in ``func``'s own signature
+    (``def _lookup(code, table="diets")``), which the function reads as a captured value."""
+    parsed = sources.parse(file)
+    if parsed is None:
+        return set()
+    out: set[tuple[int, int]] = set()
+    for node in ast.walk(parsed[0]):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if not span.start <= node.lineno <= span.end:
+            continue
+        if not isinstance(node, ast.Lambda) and node.name != func.__name__:
+            continue
+        defaults = [*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)]
+        out |= {
+            sources.position(file, c)
+            for d in defaults
+            for c in ast.walk(d)
+            if isinstance(c, ast.Constant) and c.value == old
+        }
+    return out
+
+
+def _module_binding_sites(
+    func: FunctionType, old: str, table_kind: str | None, sources: SourceCache
+) -> tuple[list[_Site], bool]:
+    """The module-level statements that bind a name ``func`` reads and hold ``old`` -- a global in
+    ``func``'s own module, or an attribute of a config module it reads (``_consts.TARGET``) in that
+    module -- and whether every such captured value whose value is ``old`` (or a code set named
+    ``old``) is bound by a statement this plan can rewrite.
+
+    A default argument is written in ``func``'s own signature, so it is located by the function's
+    site, never here. A closure's binding lives in an enclosing function, and an imported name's in
+    another module, so neither is ever located: such a referrer is unresolved."""
+    names_by_file: dict[str, set[str]] = {}
+    required: set[tuple[str | None, str]] = set()
+    for captured in captured_values(func, func.__module__):
+        if captured.source == "default":
+            continue
+        own_file = func.__code__.co_filename
+        file = own_file if captured.source == "global" else captured.module_file
+        if file is not None and captured.source != "closure":
+            names_by_file.setdefault(file, set()).add(captured.name)
+        value = captured.value
+        if (isinstance(value, str) and value == old) or (
+            isinstance(value, CodeSet) and value.name == old and table_kind == "code_set"
+        ):
+            required.add((file if captured.source != "closure" else None, captured.name))
+    sites: list[_Site] = []
+    bound: set[tuple[str | None, str]] = set()
+    for file in sorted(names_by_file):
+        for stmt, stmt_names in _module_bindings(sources, file, names_by_file[file]):
+            span = _Span(stmt.lineno, stmt.end_lineno or stmt.lineno)
+            if table_kind is None:
+                allowed: set[tuple[int, int]] | None = None
+                found = any(span.start <= p[0] <= span.end for p in sources.occurrences(file, old))
+            else:
+                allowed = _accessor_positions(sources, file, span, old, table_kind)
+                value = stmt.value
+                if isinstance(value, ast.Constant) and value.value == old:
+                    allowed.add(sources.position(file, value))
+                found = bool(allowed)
+            if not found:
+                # A statement holding old only where this plan will not rewrite it does not locate
+                # the binding: A, B = "diets", "x" stays a capture of the old name.
+                continue
+            bound |= {(file, name) for name in stmt_names}
+            sites.append(_Site(file, span, frozenset(allowed) if allowed is not None else None))
+    return sites, required <= bound
+
+
+def _module_bindings(
+    sources: SourceCache, file: str, names: set[str]
+) -> list[tuple[ast.Assign | ast.AnnAssign | ast.AugAssign, set[str]]]:
+    """``file``'s module-scope assignments that bind one of ``names``, with the names each binds.
+    Module scope includes the bodies of top-level ``if``/``try``/``with``/``for``/``while``
+    statements, but never a ``def`` or ``class`` body."""
+    parsed = sources.parse(file)
+    if parsed is None:
+        return []
+    out: list[tuple[ast.Assign | ast.AnnAssign | ast.AugAssign, set[str]]] = []
+    stack: list[ast.stmt] = list(parsed[0].body)
+    while stack:
+        stmt = stack.pop()
+        if isinstance(stmt, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+            stack.extend(stmt.body)
+            stack.extend(getattr(stmt, "orelse", []))
+            continue
+        if isinstance(stmt, (ast.Try, ast.TryStar)):
+            stack.extend(stmt.body + stmt.orelse + stmt.finalbody)
+            for handler in stmt.handlers:
+                stack.extend(handler.body)
+            continue
+        if isinstance(stmt, ast.Assign):
+            targets: list[ast.expr] = list(stmt.targets)
+        elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+            targets = [stmt.target]
+        else:
+            continue
+        stmt_names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)} & names
+        if stmt_names:
+            out.append((stmt, stmt_names))
+    return out
 
 
 def _fn_span(fn: object) -> tuple[str | None, _Span | None]:
@@ -362,11 +590,12 @@ def _fn_span(fn: object) -> tuple[str | None, _Span | None]:
     if code is None:
         return None, None
     try:
-        source_lines, start = inspect.getsourcelines(target)
-    except (OSError, TypeError):
+        fn_lines, start = inspect.getsourcelines(target)
+    except (OSError, TypeError, SyntaxError, tokenize.TokenError):
+        # A file that changed since it loaded (an editor mid-save) cannot be located either.
         return None, None
     file = str(code.co_filename)
-    return file, _Span(start, start + len(source_lines) - 1)
+    return file, _Span(start, start + len(fn_lines) - 1)
 
 
 def _statement_span(file: str, start_line: int) -> _Span | None:
@@ -440,17 +669,27 @@ def _call_name(func: ast.expr) -> str | None:
 
 
 def _unresolved_referrers(
-    referrer_spans: list[tuple[Reference, str, _Span]], edits: list[LiteralEdit]
+    referrers: list[tuple[Reference, list[_Site], bool]],
+    edits: list[LiteralEdit],
+    old: str,
+    sources: SourceCache,
+    shared_kind: str | None,
 ) -> tuple[Reference, ...]:
-    """The referrers whose ``.py`` span carries no rewrite — a real referent the tokenizer safely refused
-    to touch (a folded adjacent-string concat / no-interpolation f-string / dynamic name). Reported so a
-    ``--apply`` that renames the definition doesn't silently leave a dangling referent behind."""
+    """The referrers that would still read ``old`` after the edits — a real referent the tokenizer
+    safely refused to touch (a folded adjacent-string concat / no-interpolation f-string), or a name
+    the planner cannot see at any of the referrer's sites (a dynamic name, an imported constant, a
+    closure). Reported so a ``--apply`` that renames the definition doesn't silently leave a
+    dangling referent.
+
+    Coverage is per occurrence, not per span: every referent position at every site must carry an
+    edit (BACKLOG #5620), so one rewritten literal no longer vouches for a second one beside it."""
+    edited = {(e.file, e.start_line, e.start_col) for e in edits}
     out: list[Reference] = []
-    for ref, file, span in referrer_spans:
-        covered = any(
-            edit.file == file and span.start <= edit.start_line <= span.end for edit in edits
-        )
-        if not covered:
+    for ref, sites, complete in referrers:
+        occurrences: set[tuple[str, int, int]] = set()
+        for site in sites:
+            occurrences |= site.occurrences(sources.occurrences(site.file, old), shared_kind)
+        if not complete or not occurrences or not occurrences <= edited:
             out.append(ref)
     return tuple(out)
 
@@ -573,7 +812,10 @@ def _toml_value_edits(toml_path: str, key: str, old: str, new: str) -> list[Lite
         + r"(?P=q))"
     )
     edits: list[LiteralEdit] = []
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    # Number lines exactly as apply_rename splits them: a TOML string may hold U+2028 or U+0085, and a
+    # split on those would shift every later edit's line.
+    for lineno, line in enumerate(source_lines(text), start=1):
+        line = line.rstrip("\r\n")
         m = pattern.match(line)
         if m is None:
             continue
@@ -627,7 +869,8 @@ def _apply_one(lines: list[str], edit: LiteralEdit) -> bool:
     if region[inner_start:inner_end] != edit.old_literal:
         return False
     new_region = region[:inner_start] + edit.new_literal + region[inner_end:]
-    lines[lo : hi + 1] = new_region.splitlines(keepends=True)
+    # Re-split as apply_rename split the file, so an earlier edit on line ``lo`` still indexes its line.
+    lines[lo : hi + 1] = source_lines(new_region)
     return True
 
 

@@ -20,6 +20,8 @@ import pytest
 from messagefoundry.config import codeset_edit
 from messagefoundry.config.code_sets import load_code_set
 from messagefoundry.config.impact import (
+    LiteralEdit,
+    RenamePlan,
     apply_rename,
     delete_impact,
     plan_rename,
@@ -291,6 +293,55 @@ def test_rename_router_rewrites_binding_and_definition_and_connections_toml(
     # The def statement's NAME token (def r_shared) is not a string literal — never rewritten.
     assert "def r_shared(msg):" in mod
     load_config(config_dir)
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u0085"])
+def test_rename_router_toml_binding_survives_a_unicode_line_separator_in_an_earlier_value(
+    tmp_path: Path, separator: str
+) -> None:
+    # str.splitlines breaks a line on U+2028 / U+0085, but apply_rename splits as tokenize does (\n,
+    # \r\n, \r only). A connections.toml edit numbered by str.splitlines lands one line too low, so the
+    # router binding below the value is skipped and dangles after the rename.
+    original = (
+        "[[outbound]]\n"
+        'name = "OB_FILE"\n'
+        'transport = "file"\n'
+        "  [outbound.settings]\n"
+        f'  directory = "out{separator}dir"\n'
+        "\n" + _ROUTER_TOML
+    )
+    config_dir = _write_config(tmp_path, {"mod.py": _ROUTER_MOD, "connections.toml": original})
+    registry = load_config(config_dir)
+
+    plan = plan_rename(registry, config_dir, "router", "r_shared", "r_flow")
+    applied = apply_rename(plan)
+
+    assert len(applied) == len(plan.edits) == 3
+    raw = (config_dir / "connections.toml").read_bytes().decode("utf-8")
+    # The binding is rewritten and nothing else in the file moved.
+    assert raw == original.replace('router = "r_shared"', 'router = "r_flow"')
+    assert load_config(config_dir).inbound["IB_DATA"].router == "r_flow"
+
+
+def test_apply_rename_multi_line_edit_keeps_an_earlier_edit_on_its_line_after_u2028(
+    tmp_path: Path,
+) -> None:
+    # A multi-line (backslash-continued) literal is re-split after it is rewritten. Re-split with
+    # str.splitlines, a U+2028 earlier on its first line breaks that line in two, so an earlier edit on
+    # the same line no longer finds its literal at its column and is silently skipped.
+    path = tmp_path / "m.py"
+    first = 's = "\u2028"; t = "AA"; u = "BB\\\n'
+    path.write_text(first + 'BB"\n', encoding="utf-8", newline="")
+    aa = first.index('"AA"')
+    bb = first.index('"BB')
+    edits = (
+        LiteralEdit(str(path), 1, aa, 1, aa + 4, '"AA"', '"CC"'),
+        LiteralEdit(str(path), 1, bb, 2, 3, '"BB\\\nBB"', '"DD"'),
+    )
+    applied = apply_rename(RenamePlan("outbound", "x", "y", edits=edits))
+
+    assert len(applied) == 2
+    assert path.read_bytes().decode("utf-8") == 's = "\u2028"; t = "CC"; u = "DD"\n'
 
 
 def test_fstring_bytes_and_adjacent_concat_are_never_rewritten(tmp_path: Path) -> None:
@@ -672,3 +723,615 @@ def test_codeset_remove_still_surfaces_referrers_with_no_connection_declared(
     result = codeset_edit.remove_code_set(config_dir, "diets", validate=_validate_code_set)
 
     assert result["referrers"] == [{"referrer_kind": "handler", "referrer": "h_cs"}]
+
+
+# --- BACKLOG #5620 / #5621: referent sites outside the referrer's own body ------
+
+# One handler reaching three tables three ways: a module-top capture (DIETS), a helper it calls
+# (_label), and a module-level accepts predicate (_only_known). None of the three names appears in
+# the handler's own body.
+_HELPERS_CODESET_MOD = (
+    "from messagefoundry import MLLP, Send, code_set, handler, inbound, outbound, router\n"
+    "\n"
+    'inbound("IB_HS", MLLP(port=2791), router="r_hs")\n'
+    'outbound("OB_HS", MLLP(host="127.0.0.1", port=6900))\n'
+    "\n"
+    'DIETS = code_set("diets")\n'
+    "\n"
+    "\n"
+    "def _label(code):\n"
+    '    return code_set("meals_table").get(code)\n'
+    "\n"
+    "\n"
+    "def _only_known(msg):\n"
+    '    return "A" in code_set("allow_list")\n'
+    "\n"
+    "\n"
+    '@router("r_hs")\n'
+    "def r_hs(msg):\n"
+    '    return ["h_hs"]\n'
+    "\n"
+    "\n"
+    '@handler("h_hs", accepts=_only_known)\n'
+    "def h_hs(msg):\n"
+    '    first = DIETS.get("A")\n'
+    '    second = _label("A")\n'
+    '    return Send("OB_HS", msg)\n'
+)
+
+
+def _write_helpers_codeset_config(tmp_path: Path) -> Path:
+    config_dir = _write_config(tmp_path, {"mod.py": _HELPERS_CODESET_MOD})
+    codesets = config_dir / "codesets"
+    codesets.mkdir()
+    for name in ("diets", "meals_table", "allow_list"):
+        (codesets / f"{name}.csv").write_text("code,value\nA,Apple\n", encoding="utf-8", newline="")
+    return config_dir
+
+
+@pytest.mark.parametrize("table", ["diets", "meals_table", "allow_list"])
+def test_table_read_at_module_top_in_a_helper_or_a_predicate_is_a_live_referrer(
+    tmp_path: Path, table: str
+) -> None:
+    """A table captured at module top level, read in a helper the handler calls, or read in a
+    module-level accepts predicate is load-bearing; the removal pre-flight must name the handler and
+    dead-config must not list the table (BACKLOG #5621)."""
+    config_dir = _write_helpers_codeset_config(tmp_path)
+    registry = load_config(config_dir)
+    index = build_reference_index(registry)
+    assert delete_impact(index, "code_set", table) == [
+        Reference("handler", "h_hs", "code_set", table)
+    ]
+    assert ("code_set", table) not in index.unreferenced(registry)
+
+
+@pytest.mark.parametrize("table", ["diets", "meals_table", "allow_list"])
+def test_rename_rewrites_module_top_helper_and_predicate_table_reads(
+    tmp_path: Path, table: str
+) -> None:
+    """BACKLOG #5620: the rename planner rewrites the referent where it is written, not only inside
+    the handler's own body, and the renamed graph still loads."""
+    config_dir = _write_helpers_codeset_config(tmp_path)
+    result = codeset_edit.rename_code_set(config_dir, table, "renamed", validate=_validate_code_set)
+    assert result["referents_rewritten"] == 1
+    assert "referents_unresolved" not in result
+    mod = (config_dir / "mod.py").read_text(encoding="utf-8")
+    assert f'code_set("{table}")' not in mod
+    assert 'code_set("renamed")' in mod
+    load_config(config_dir)
+
+
+_MODULE_CONSTANT_TARGET_MOD = (
+    "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
+    "\n"
+    'inbound("IB_MC", MLLP(port=2793), router="r_mc")\n'
+    'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6910))\n'
+    "\n"
+    'TARGET = "OB_OLD"\n'
+    "\n"
+    "\n"
+    '@router("r_mc")\n'
+    "def r_mc(msg):\n"
+    '    return ["h_mc"]\n'
+    "\n"
+    "\n"
+    '@handler("h_mc")\n'
+    "def h_mc(msg):\n"
+    "    return Send(TARGET, msg)\n"
+)
+
+
+_SIBLING_HELPERS_MOD = (
+    "import _shared\n"
+    "from _shared import label\n"
+    "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
+    "\n"
+    'inbound("IB_SH", MLLP(port=2799), router="r_sh")\n'
+    'outbound("OB_SH", MLLP(host="127.0.0.1", port=6940))\n'
+    "\n"
+    "\n"
+    '@router("r_sh")\n'
+    "def r_sh(msg):\n"
+    '    return ["h_sh"]\n'
+    "\n"
+    "\n"
+    '@handler("h_sh")\n'
+    "def h_sh(msg):\n"
+    '    value = label("A")\n'
+    '    other = _shared.kinds("A")\n'
+    '    return Send("OB_SH", msg)\n'
+)
+
+_SIBLING_HELPERS = (
+    "from messagefoundry import code_set\n"
+    "\n"
+    'KINDS = code_set("kinds")\n'
+    "\n"
+    "\n"
+    "def label(code):\n"
+    '    return code_set("diets").get(code)\n'
+    "\n"
+    "\n"
+    "def kinds(code):\n"
+    "    return KINDS.get(code)\n"
+)
+
+
+@pytest.mark.parametrize("table", ["diets", "kinds"])
+def test_table_reads_in_a_sibling_helper_module_are_referent_sites(
+    tmp_path: Path, table: str
+) -> None:
+    """BACKLOG #5620/#5621: a table read in a ``_``-prefixed helper module, reached by a ``from``
+    import or through the module (``_shared.kinds``), is a referent of the handler and rewrites."""
+    config_dir = _write_config(
+        tmp_path, {"mod.py": _SIBLING_HELPERS_MOD, "_shared.py": _SIBLING_HELPERS}
+    )
+    codesets = config_dir / "codesets"
+    codesets.mkdir()
+    for name in ("diets", "kinds"):
+        (codesets / f"{name}.csv").write_text("code,value\nA,Apple\n", encoding="utf-8", newline="")
+    registry = load_config(config_dir)
+    index = build_reference_index(registry)
+    assert delete_impact(index, "code_set", table) == [
+        Reference("handler", "h_sh", "code_set", table)
+    ]
+
+    result = codeset_edit.rename_code_set(config_dir, table, "renamed", validate=_validate_code_set)
+    assert result["referents_rewritten"] == 1
+    assert "referents_unresolved" not in result
+    assert 'code_set("renamed")' in (config_dir / "_shared.py").read_text(encoding="utf-8")
+    load_config(config_dir)
+
+
+def test_rename_rewrites_a_module_level_target_constant(tmp_path: Path) -> None:
+    """BACKLOG #5620: ``Send(TARGET)`` with ``TARGET = "OB_OLD"`` at module scope is a referent; the
+    planner rewrites the constant, so the applied rename leaves a config that loads."""
+    config_dir = _write_config(tmp_path, {"mod.py": _MODULE_CONSTANT_TARGET_MOD})
+    registry = load_config(config_dir)
+    plan = plan_rename(registry, config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    text = (config_dir / "mod.py").read_text(encoding="utf-8")
+    assert 'TARGET = "OB_NEW"' in text
+    assert '"OB_OLD"' not in text
+    load_config(config_dir)
+
+
+# The body carries one rewritable referent and one the tokenizer refuses to split.
+_PARTIAL_EDIT_MOD = (
+    "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
+    "\n"
+    'inbound("IB_PE", MLLP(port=2795), router="r_pe")\n'
+    'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6920))\n'
+    "\n"
+    "\n"
+    '@router("r_pe")\n'
+    "def r_pe(msg):\n"
+    '    return ["h_pe"]\n'
+    "\n"
+    "\n"
+    '@handler("h_pe")\n'
+    "def h_pe(msg):\n"
+    "    if msg is None:\n"
+    '        return Send("OB_" "OLD", msg)\n'
+    '    return Send("OB_OLD", msg)\n'
+)
+
+
+def test_unresolved_report_is_per_site_not_any_edit_in_the_body(tmp_path: Path) -> None:
+    """BACKLOG #5620: one rewritten literal in the body must not mark a second, unrewritable referent
+    in the same body as covered."""
+    config_dir = _write_config(tmp_path, {"mod.py": _PARTIAL_EDIT_MOD})
+    registry = load_config(config_dir)
+    plan = plan_rename(registry, config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == (Reference("handler", "h_pe", "outbound", "OB_OLD"),)
+
+
+# A code set and a Reference declaration that share one name, each read by its own handler.
+_SAME_NAME_TABLES_MOD = (
+    "from messagefoundry import FileRef, MLLP, Reference, Send, code_set, handler, inbound, "
+    "outbound, reference, router\n"
+    "\n"
+    'inbound("IB_SN", MLLP(port=2797), router="r_sn")\n'
+    'outbound("OB_SN", MLLP(host="127.0.0.1", port=6930))\n'
+    'Reference("shared", source=FileRef(path="shared.csv"))\n'
+    "\n"
+    "\n"
+    '@router("r_sn")\n'
+    "def r_sn(msg):\n"
+    '    return ["h_code", "h_ref"]\n'
+    "\n"
+    "\n"
+    '@handler("h_code")\n'
+    "def h_code(msg):\n"
+    '    label = code_set("shared").get("A")\n'
+    '    return Send("OB_SN", msg)\n'
+    "\n"
+    "\n"
+    '@handler("h_ref")\n'
+    "def h_ref(msg):\n"
+    '    npi = reference("shared").get("x")\n'
+    '    return Send("OB_SN", msg)\n'
+)
+
+
+def _write_same_name_config(tmp_path: Path) -> Path:
+    config_dir = _write_config(tmp_path, {"mod.py": _SAME_NAME_TABLES_MOD})
+    codesets = config_dir / "codesets"
+    codesets.mkdir()
+    (codesets / "shared.csv").write_text("code,value\nA,Apple\n", encoding="utf-8", newline="")
+    return config_dir
+
+
+def test_same_named_code_set_and_reference_keep_their_own_kinds(tmp_path: Path) -> None:
+    """BACKLOG #5621: a code set and a reference that share a name are two objects; each keeps its
+    own referrer, and neither reads as dead."""
+    config_dir = _write_same_name_config(tmp_path)
+    registry = load_config(config_dir)
+    index = build_reference_index(registry)
+    assert delete_impact(index, "code_set", "shared") == [
+        Reference("handler", "h_code", "code_set", "shared")
+    ]
+    assert delete_impact(index, "reference", "shared") == [
+        Reference("handler", "h_ref", "reference", "shared")
+    ]
+    assert index.unreferenced(registry) == []
+
+
+def test_renaming_one_of_two_same_named_tables_leaves_the_other_alone(tmp_path: Path) -> None:
+    """BACKLOG #5621: renaming the code set rewrites its own read and leaves the reference's."""
+    config_dir = _write_same_name_config(tmp_path)
+    result = codeset_edit.rename_code_set(
+        config_dir, "shared", "renamed", validate=_validate_code_set
+    )
+    assert result["referents_rewritten"] == 1
+    assert "referents_unresolved" not in result
+    mod = (config_dir / "mod.py").read_text(encoding="utf-8")
+    assert 'code_set("renamed")' in mod
+    assert 'reference("shared")' in mod
+    assert 'Reference("shared"' in mod
+
+
+def _codeset_dir(tmp_path: Path, files: dict[str, str], *tables: str) -> Path:
+    config_dir = _write_config(tmp_path, files)
+    codesets = config_dir / "codesets"
+    codesets.mkdir()
+    for name in tables:
+        (codesets / f"{name}.csv").write_text("code,value\nA,Apple\n", encoding="utf-8", newline="")
+    return config_dir
+
+
+_PREAMBLE = (
+    "from messagefoundry import FileRef, MLLP, Reference, Send, code_set, handler, "
+    "inbound, outbound, reference, router\n"
+    "\n"
+    'inbound("IB_Q", MLLP(port=2801), router="r_q")\n'
+    'outbound("OB_Q", MLLP(host="127.0.0.1", port=6950))\n'
+    "\n"
+    "\n"
+    '@router("r_q")\n'
+    "def r_q(msg):\n"
+    '    return ["h_q"]\n'
+    "\n"
+    "\n"
+)
+
+
+def test_an_accessor_inside_an_fstring_replacement_field_is_a_referent(tmp_path: Path) -> None:
+    """A code set and a reference share a name; the code set is read once plainly and once inside
+    an f-string's replacement field. The rename rewrites both reads, and the reference read inside an
+    f-string elsewhere keeps the reference live."""
+    body = _PREAMBLE + (
+        'Reference("shared", source=FileRef(path="shared.csv"))\n'
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = code_set("shared").get("A")\n'
+        "    b = f\"{code_set('shared').get('A')}\"\n"
+        "    c = f\"{reference('shared').get('x')}\"\n"
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "shared")
+    registry = load_config(config_dir)
+    index = build_reference_index(registry)
+    assert delete_impact(index, "reference", "shared") == [
+        Reference("handler", "h_q", "reference", "shared")
+    ]
+    plan = plan_rename(registry, config_dir, "code_set", "shared", "renamed")
+    assert plan.unresolved == ()
+    assert len(plan.edits) == 2
+
+
+def test_a_bound_method_predicate_still_counts_its_table(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        "class _Gate:\n"
+        "    def ok(self, msg):\n"
+        '        return "A" in code_set("allow_list")\n'
+        "\n"
+        "\n"
+        "_GATE = _Gate()\n"
+        "\n"
+        "\n"
+        '@handler("h_q", accepts=_GATE.ok)\n'
+        "def h_q(msg):\n"
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "allow_list")
+    registry = load_config(config_dir)
+    index = build_reference_index(registry)
+    assert delete_impact(index, "code_set", "allow_list") == [
+        Reference("handler", "h_q", "code_set", "allow_list")
+    ]
+
+
+def test_a_capture_inside_a_module_level_try_is_rewritten(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        "try:\n"
+        '    DIETS = code_set("diets")\n'
+        "except ValueError:\n"
+        "    DIETS = {}\n"
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = DIETS.get("A")\n'
+        '    b = code_set("diets").get("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    result = codeset_edit.rename_code_set(
+        config_dir, "diets", "renamed", validate=_validate_code_set
+    )
+    assert result["referents_rewritten"] == 2
+    assert "referents_unresolved" not in result
+    assert 'code_set("diets")' not in (config_dir / "mod.py").read_text(encoding="utf-8")
+
+
+def test_a_capture_imported_by_name_from_a_helper_is_reported_unresolved(tmp_path: Path) -> None:
+    """``from _shared import KINDS`` hides where the code set is captured, so the planner cannot
+    rewrite it. One plain read beside it must not make the referrer read as covered."""
+    body = (
+        "from _shared import KINDS\n"
+        + _PREAMBLE
+        + (
+            '@handler("h_q")\n'
+            "def h_q(msg):\n"
+            '    a = KINDS.get("A")\n'
+            '    b = code_set("kinds").get("A")\n'
+            '    return Send("OB_Q", msg)\n'
+        )
+    )
+    helper = 'from messagefoundry import code_set\n\nKINDS = code_set("kinds")\n'
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body, "_shared.py": helper}, "kinds")
+    registry = load_config(config_dir)
+    plan = plan_rename(registry, config_dir, "code_set", "kinds", "renamed")
+    assert plan.unresolved == (Reference("handler", "h_q", "code_set", "kinds"),)
+
+
+def test_a_helper_literal_that_is_not_a_table_read_is_left_alone(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        'LABELS = {"diets": "Diet orders"}\n'
+        "\n"
+        "\n"
+        "def _label(k):\n"
+        '    if k == "diets":\n'
+        '        return LABELS["diets"]\n'
+        '    return code_set("diets").get(k)\n'
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = _label("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    result = codeset_edit.rename_code_set(
+        config_dir, "diets", "renamed", validate=_validate_code_set
+    )
+    assert result["referents_rewritten"] == 1
+    text = (config_dir / "mod.py").read_text(encoding="utf-8")
+    assert 'LABELS = {"diets": "Diet orders"}' in text
+    assert 'if k == "diets":' in text
+    assert 'code_set("renamed").get(k)' in text
+
+
+def test_a_method_call_is_not_read_as_a_module_function(tmp_path: Path) -> None:
+    """``code_set("units").get(...)`` calls the CodeSet's ``get``; a module function named ``get``
+    that reads another table is not a helper of the handler."""
+    body = _PREAMBLE + (
+        "def get(code):\n"
+        '    return code_set("diets").get(code)\n'
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = code_set("units").get("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets", "units")
+    index = build_reference_index(load_config(config_dir))
+    assert delete_impact(index, "code_set", "diets") == []
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [
+        ('DIET_TABLE = "diets"\n', "def h_q(msg):\n    a = code_set(DIET_TABLE)\n"),
+        ("", 'def h_q(msg, cs=code_set("diets")):\n    a = cs.get("A")\n'),
+    ],
+)
+def test_a_name_constant_or_a_default_argument_is_a_live_table_read(
+    tmp_path: Path, capture: tuple[str, str]
+) -> None:
+    module_top, handler_def = capture
+    body = (
+        _PREAMBLE
+        + module_top
+        + '\n\n@handler("h_q")\n'
+        + handler_def
+        + '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    registry = load_config(config_dir)
+    assert delete_impact(build_reference_index(registry), "code_set", "diets") == [
+        Reference("handler", "h_q", "code_set", "diets")
+    ]
+    result = codeset_edit.rename_code_set(
+        config_dir, "diets", "renamed", validate=_validate_code_set
+    )
+    assert result["referents_rewritten"] == 1
+    assert "referents_unresolved" not in result
+    load_config(config_dir)
+
+
+def test_a_binding_the_plan_cannot_rewrite_leaves_the_referrer_unresolved(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        'A, B = "diets", "x"\n'
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        "    a = code_set(A)\n"
+        '    b = code_set("diets").get("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "renamed")
+    assert plan.unresolved == (Reference("handler", "h_q", "code_set", "diets"),)
+
+
+def test_a_helper_default_naming_the_table_is_rewritten(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        'def _lookup(code, table="diets"):\n'
+        "    return code_set(table).get(code)\n"
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        'def h_q(msg, *, cs=code_set("diets")):\n'
+        '    a = _lookup("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    result = codeset_edit.rename_code_set(
+        config_dir, "diets", "renamed", validate=_validate_code_set
+    )
+    assert result["referents_rewritten"] == 2
+    assert "referents_unresolved" not in result
+    load_config(config_dir)
+
+
+def test_a_send_in_a_helper_is_rewritten_with_the_handlers_own(tmp_path: Path) -> None:
+    body = (
+        "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
+        "\n"
+        'inbound("IB_HF", MLLP(port=2803), router="r_hf")\n'
+        'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6960))\n'
+        "\n"
+        "\n"
+        "def _fallback(msg):\n"
+        '    return Send("OB_OLD", msg)\n'
+        "\n"
+        "\n"
+        '@router("r_hf")\n'
+        "def r_hf(msg):\n"
+        '    return ["h_hf"]\n'
+        "\n"
+        "\n"
+        '@handler("h_hf")\n'
+        "def h_hf(msg):\n"
+        "    if msg is None:\n"
+        "        return [_fallback(msg)]\n"
+        '    return Send("OB_OLD", msg)\n'
+    )
+    config_dir = _write_config(tmp_path, {"mod.py": body})
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"OB_OLD"' not in (config_dir / "mod.py").read_text(encoding="utf-8")
+
+
+def test_a_callable_with_a_raising_getattr_does_not_break_the_index(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        "import functools\n"
+        "\n"
+        "\n"
+        "class _Lazy:\n"
+        "    def __call__(self, x):\n"
+        "        return x\n"
+        "\n"
+        "    def __getattr__(self, name):\n"
+        '        raise RuntimeError("not initialised")\n'
+        "\n"
+        "\n"
+        "LAZY = _Lazy()\n"
+        "\n"
+        "\n"
+        "def _gate(flag, msg):\n"
+        "    return flag\n"
+        "\n"
+        "\n"
+        '@handler("h_q", accepts=functools.partial(_gate, True))\n'
+        "def h_q(msg):\n"
+        "    LAZY(1)\n"
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _write_config(tmp_path, {"mod.py": body})
+    registry = load_config(config_dir)
+    build_reference_index(registry)
+    plan = plan_rename(registry, config_dir, "outbound", "OB_Q", "OB_R")
+    assert plan.unresolved == ()
+
+
+@pytest.mark.parametrize("decorator", ["@_Trace", "@functools.cache"])
+def test_a_handler_behind_a_non_function_wrapper_keeps_its_table(
+    tmp_path: Path, decorator: str
+) -> None:
+    """A class-based decorator that calls functools.update_wrapper, or functools.cache, wraps the
+    handler in an object that is not a function. Its __wrapped__ is followed, as inspect.unwrap did,
+    so the table it reads is not reported dead, and the rename still rewrites the read."""
+    body = (
+        "import functools\n"
+        + _PREAMBLE
+        + (
+            "class _Trace:\n"
+            "    def __init__(self, fn):\n"
+            "        functools.update_wrapper(self, fn)\n"
+            "        self._fn = fn\n"
+            "\n"
+            "    def __call__(self, msg):\n"
+            "        return self._fn(msg)\n"
+            "\n"
+            "\n"
+            '@handler("h_q")\n'
+            f"{decorator}\n"
+            "def h_q(msg):\n"
+            '    a = code_set("diets").get("A")\n'
+            '    return Send("OB_Q", msg)\n'
+        )
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    registry = load_config(config_dir)
+    index = build_reference_index(registry)
+    assert delete_impact(index, "code_set", "diets") == [
+        Reference("handler", "h_q", "code_set", "diets")
+    ]
+    assert ("code_set", "diets") not in index.unreferenced(registry)
+    plan = plan_rename(registry, config_dir, "code_set", "diets", "renamed")
+    assert plan.unresolved == ()
+    assert len(plan.edits) == 1
+
+
+def test_a_form_feed_line_does_not_shift_the_rename(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        "\x0c\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = 1; b = code_set("diets").get("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    registry = load_config(config_dir)
+    plan = plan_rename(registry, config_dir, "code_set", "diets", "renamed")
+    assert plan.unresolved == ()
+    assert len(plan.edits) == 1
