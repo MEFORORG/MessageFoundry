@@ -241,22 +241,23 @@ async def _account(
     total, the cipher's figure is only this process's own spend, so a key another process or an
     earlier run had already taken to the ceiling would keep encrypting. That failure is re-raised
     instead of being logged, and the cipher refuses to encrypt until a later pass hydrates it.
-    ``strict`` raises the same way on a cipher hydrated before: a store open passes it, because the
-    cipher's figure may come from another store handle and only this store's row is the key's total
-    here. Otherwise a failed add on a hydrated cipher is logged and retried: its figure then carries
-    the key's lifetime total, so the ceiling still holds against it.
+    ``strict`` re-raises too on a cipher hydrated before, so the store open that passes it fails:
+    the cipher's figure may come from another store handle and only this store's row is the key's
+    total here. That cipher stays hydrated, so it is not refused; the open is. Otherwise a failed add
+    on a hydrated cipher is logged and retried: its figure then carries the key's lifetime total, so
+    the ceiling still holds against it.
 
     The failure is re-raised AS ITSELF. A store that is locked, busy or unreachable raises its
     driver's error, and a caller that reads :class:`~messagefoundry.store.crypto.CipherError` as a
-    key refusal must not send an operator to the key for it; a ``CipherError`` stays one."""
+    key refusal must not send an operator to the key for it; a ``CipherError`` stays one. The note
+    added names the pass, once, since an add may raise one stored exception on every retry."""
     try:
         await _add_then_grant(bound, add, need, floor=floor)
     except Exception as exc:
         if strict or not bound.invocation_bound_hydrated:
-            exc.add_note(
-                f"the AES-GCM invocation bound could not read its persisted total while {what}; "
-                "nothing is encrypted under this data key until a pass reads it"
-            )
+            note = f"the AES-GCM invocation bound could not read its persisted total while {what}"
+            if note not in getattr(exc, "__notes__", ()):
+                exc.add_note(note)
             raise
         log.warning(
             "could not reach the AES-GCM invocation bound for the active key while %s; the "

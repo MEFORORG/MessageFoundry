@@ -197,6 +197,26 @@ async def test_a_locked_store_on_a_strict_pass_raises_the_store_error_not_a_key_
     with pytest.raises(sqlite3.OperationalError) as caught:
         await checkpoint_invocations(cipher, _busy, strict=True)
     assert caught.value is error
+    # The note names the pass, and claims no refusal: this cipher was hydrated before, so it is
+    # still able to encrypt, and a note saying otherwise would send an operator the wrong way.
+    notes = caught.value.__notes__
+    assert len(notes) == 1 and "invocation bound" in notes[0] and "checkpointing" in notes[0]
+    assert "nothing is encrypted" not in notes[0]
+    cipher.encrypt("x")
+
+
+async def test_a_reraised_store_error_is_noted_once_however_often_the_pass_retries() -> None:
+    """An add may raise one stored exception on every failed pass; its notes must not pile up."""
+    cipher = _cipher()
+    error = _locked()
+
+    async def _busy(_key_id: str, _count: int) -> int:
+        raise error
+
+    for _ in range(3):
+        with pytest.raises(sqlite3.OperationalError):
+            await checkpoint_invocations(cipher, _busy)
+    assert len(error.__notes__) == 1
 
 
 async def test_a_locked_store_on_a_first_hydration_raises_the_store_error_and_fails_closed() -> (
