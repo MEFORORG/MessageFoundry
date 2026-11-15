@@ -525,19 +525,33 @@ def _resolve_reexport(name: str, reexports: dict[str, list[str]]) -> set[str]:
     return reached
 
 
-def _chain_ends(qualified: str, reexports: dict[str, list[str]]) -> set[str]:
-    """The ends of a qualified callee's re-export chain: the names it reaches that link nowhere. A
-    name with a link is not an end, so a ``def verify`` its module also binds by an import is not
-    one; a cycle, a self-link or an over-long chain has none. Used only to decide when the method
-    rule may be skipped, where too few ends keeps the rule and so errs toward reporting."""
-    return {n for n in _resolve_reexport(qualified, reexports) if not reexports.get(n)}
+def _lands_on(
+    qualified: str, reexports: dict[str, list[str]], known_functions: set[str], depth: int = 0
+) -> bool:
+    """Whether EVERY branch of a qualified callee's re-export chain ends on a first-party
+    module-level function. Used only to decide when the method rule may be skipped, so any doubt
+    keeps the rule: a branch that loops (a cycle or a self-link) or passes the depth cap counts as
+    NOT first-party, and so does a name with a link, such as a ``def verify`` its module also binds
+    by an import, whose own def is not one of its branches."""
+    return _all_branches_first_party(qualified, reexports, known_functions, (), depth)
 
 
-def _lands_on(qualified: str, reexports: dict[str, list[str]], known_functions: set[str]) -> bool:
-    """Whether EVERY end of a qualified callee's re-export chain is a first-party module-level
-    function (:func:`_chain_ends`)."""
-    ends = _chain_ends(qualified, reexports)
-    return bool(ends) and ends <= known_functions
+def _all_branches_first_party(
+    name: str,
+    reexports: dict[str, list[str]],
+    known_functions: set[str],
+    path: tuple[str, ...],
+    depth: int,
+) -> bool:
+    links = reexports.get(name)
+    if not links:
+        return name in known_functions
+    if name in path or depth >= 8:
+        return False
+    return all(
+        _all_branches_first_party(t, reexports, known_functions, (*path, name), depth + 1)
+        for t in links
+    )
 
 
 def _canonical_algorithm(name: str) -> str | None:

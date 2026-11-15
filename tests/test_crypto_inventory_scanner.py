@@ -1439,6 +1439,12 @@ def test_a_reused_provider_name_does_not_hide_the_provider_call() -> None:
             id="form-feed-in-a-string",
         ),
         pytest.param("// c\rconst n = Math.random();\n", id="lone-cr-ends-a-line-comment"),
+        # Discriminating: the per-line view skips the /*-led second line, and an unfolded lexer
+        # blanks the whole comment, so only the folding finds the call.
+        pytest.param(
+            "// c\u2028/* x */ const n = Math.random();\n", id="u2028-then-comment-led-code"
+        ),
+        pytest.param("// c\r/* x */ const n = Math.random();\n", id="cr-then-comment-led-code"),
         pytest.param("// c\u2028const n = Math.random();\n", id="u2028-ends-a-line-comment"),
         pytest.param("// c\u2029const n = Math.random();\n", id="u2029-ends-a-line-comment"),
     ],
@@ -1587,3 +1593,39 @@ def test_a_provider_def_its_module_also_imports_is_still_followed() -> None:
     assert "tls_context:via messagefoundry.a" in found.get("messagefoundry/x.py", frozenset()), (
         found
     )
+
+
+@pytest.mark.parametrize("loop", ["cycle", "self-link"])
+def test_a_binding_that_never_ends_first_party_keeps_the_method_rule(loop: str) -> None:
+    # b.verify is bound to a first-party def AND, by a function-local import, to a chain that never
+    # ends: a cycle between d and e, or a self-link. Only every branch ending first-party may skip
+    # the method rule; origin/main reports the .verify() here, and so must this.
+    ops = _gate().crypto_operations
+    nl = chr(10)
+    if loop == "cycle":
+        far = {
+            "messagefoundry/d.py": "from messagefoundry.e import verify" + nl,
+            "messagefoundry/e.py": "from messagefoundry.d import verify" + nl,
+        }
+    else:
+        far = {"messagefoundry/d.py": "from messagefoundry.d import verify" + nl}
+    sources = {
+        **far,
+        "messagefoundry/c.py": nl.join(["def verify(x):", "    return x", ""]),
+        "messagefoundry/b.py": nl.join(
+            [
+                "from messagefoundry.c import verify",
+                "",
+                "",
+                "def other():",
+                "    from messagefoundry.d import verify",
+                "    return verify",
+                "",
+            ]
+        ),
+        "messagefoundry/x.py": nl.join(
+            ["from messagefoundry import b", "", "", "def go(s):", "    b.verify(s)", ""]
+        ),
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert "sign_verify:.verify()" in found.get("messagefoundry/x.py", frozenset()), found
