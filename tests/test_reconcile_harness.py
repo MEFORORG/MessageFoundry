@@ -114,20 +114,6 @@ def test_alternate_separators_are_honored() -> None:
     assert sep.field == "#" and sep.component == "@"
 
 
-def test_difference_describe_is_readable() -> None:
-    d = Difference("PID", 1, 5, "DOE^JOHN", "DOE^JANE", "field")
-    assert "PID[1]-5" in d.describe() and "field" in d.describe()
-
-
-def test_normalize_blanks_in_place_returns_canonical() -> None:
-    canon = normalize(BASE)
-    msh = canon[0]
-    # MSH-7 and MSH-10 blanked by default; the row holds MSH-1, so each sits at its field number.
-    assert msh[7] == "" and msh[10] == ""
-    # MSH-9 (type) preserved.
-    assert msh[9] == "ADT^A01"
-
-
 def test_a_different_declared_field_separator_is_a_difference() -> None:
     """BACKLOG #5425: MSH-1 is the field separator itself, so splitting each side on its own separator
     lost it, and two messages that differed only there normalized to equal rows. It is a real output
@@ -145,3 +131,17 @@ def test_a_different_declared_field_separator_is_a_difference() -> None:
     assert normalize(BASE) != normalize(alt)
     # The rows now index every segment by its HL7 field number, MSH included.
     assert normalize(BASE)[0][1:3] == ["|", "^~\\&"]
+
+
+def test_difference_describe_is_readable() -> None:
+    d = Difference("PID", 1, 5, "DOE^JOHN", "DOE^JANE", "field")
+    assert "PID[1]-5" in d.describe() and "field" in d.describe()
+
+
+def test_normalize_blanks_in_place_returns_canonical() -> None:
+    canon = normalize(BASE)
+    msh = canon[0]
+    # MSH-7 and MSH-10 blanked by default; the row holds MSH-1, so each sits at its field number.
+    assert msh[7] == "" and msh[10] == ""
+    # MSH-9 (type) preserved.
+    assert msh[9] == "ADT^A01"
