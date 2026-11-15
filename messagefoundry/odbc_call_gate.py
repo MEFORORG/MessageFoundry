@@ -13,7 +13,7 @@ without one importing the other.
 
 The SQL Server store installs it on every pooled connection, every claim holder and its open-time
 probe connections, through :func:`require_call_gate`, which refuses a real one it cannot wrap. The
-DATABASE connector installs it on every pooled connection it borrows, and
+DATABASE connector installs it the same way on every pooled connection it borrows, and
 hands a cursor close to a running call with :meth:`CallGate.run_after_running_call`. The detach that quarantines a cancelled pooled connection stays in the store,
 because it is the pool's rule, not the gate's. The exits of an unpooled one-shot connection,
 :func:`close_one_shot` and :func:`abandon_one_shot`, live here: they need no pool, so a transport

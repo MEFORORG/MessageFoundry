@@ -862,6 +862,9 @@ or compression library:
   type its extension names. Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.
+- `parsing/dicom/_deps.py` imports `zlib` only to name `zlib.error` in the tuple of parse errors
+  that the DICOM parsers turn into a `DicomError` (BACKLOG #5803). It calls nothing in `zlib`,
+  decompresses nothing and opens no archive, so it has nothing to bound.
 - `pipeline/dr_backup.py` reads a disaster-recovery backup, which is a tar archive, on
   `messagefoundry restore` and `restore-verify`. `_extract_member` never uses a member's stored name
   as a path: it streams the store member into one fixed file name. The reader accepts only an
