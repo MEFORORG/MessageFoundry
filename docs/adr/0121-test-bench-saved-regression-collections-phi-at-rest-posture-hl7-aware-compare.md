@@ -76,9 +76,12 @@ of volatile fields (MSH-7, MSH-10).**
   against its stored `expected` via `compareMessages`, and **deletes the temp directory in a
   `finally`**. A hard crash can still leave the directory behind; *Consequences* says what removes
   it (amended 2026-11-14, BACKLOG #5415). *Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):* the
-  `finally` removes the case files, then the directory if it is empty. A case file that cannot be
-  unlinked, or any entry not named as a case file, stays, so the delete never follows a link out of
-  the directory. Pass/fail is shown per case;
+  `finally` removes the case files, then the directory if it is empty. At least a case file that
+  cannot be unlinked, an entry named as a case file that is not a regular file, or any entry not
+  named as a case file, stays. The delete never recurses and unlinks only regular files named as
+  case files, so a link inside the directory is not followed; the open limit in `deleteCaseDir`'s
+  docblock records the race that remains, a directory swapped for a link after its lstat. Pass/fail
+  is shown per case;
   a click on a case shows its expected-vs-actual differences (see *Reveal on click*).
 - **A case must also end where it did (amended 2026-11-14, BACKLOG #5416).** An errored Router or
   Handler delivers nothing, so the delivery compare alone passed a case that expects no delivery. A
@@ -103,9 +106,12 @@ of volatile fields (MSH-7, MSH-10).**
 temp materialization is always cleaned up; the compare never hardcodes `|^~\&` (reads MSH); the
 existing Load / before-after / Coverage-Profiling panes and the `--show-phi` posture are untouched.
 
-**Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):** the case files are removed, then the
-directory if it is empty. A case file that cannot be unlinked, or any entry not named as a case
-file, stays, so the delete never follows a link out of the directory.
+**Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):** This supersedes "always cleaned up" in the
+sentence above. The case files are removed, then the directory if it is empty. At least a case file
+that cannot be unlinked, an entry named as a case file that is not a regular file, or any entry not
+named as a case file, stays. The delete never recurses and unlinks only regular files named as case
+files, so a link inside the directory is not followed; the open limit in `deleteCaseDir`'s docblock
+records the race that remains, a directory swapped for a link after its lstat.
 
 ## Acceptance Criteria
 
@@ -156,10 +162,15 @@ deleted when the Test Bench next opens or next runs a collection, once it is ove
 not before, so a run in another window survives; on POSIX only a directory this user owns is
 deleted. Until then it stays on disk, with no bound if the Test Bench is not used again.
 *Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):* the run's `finally` and this sweep each
-remove a directory's case files, then the directory if it is empty, so "always cleaned" and
-"deleted" above now mean that. A case file that cannot be unlinked, or any entry not named as a case
-file, stays, so the delete never follows a link out of the directory; a directory holding an entry
-not named as a case file stays after every later sweep too. The dry-run is handed the directory, not one path per case, so a large
+remove a directory's case files, then the directory if it is empty. Superseded 2026-11-15: a hard
+crash is not the only way a case file is left. At least a case file that cannot be unlinked also
+stays, and its directory stays with any entry not removed. At least a case file that cannot be
+unlinked, an entry named as a case file that is not a regular file, or any entry not named as a case
+file, stays. The delete never recurses and unlinks only regular files named as case files, so a
+link inside the directory is not followed; the open limit in `deleteCaseDir`'s docblock records the
+race that remains, a directory swapped for a link after its lstat. A directory holding at least an
+entry named as a case file that is not a regular file, or any entry not named as a case file, stays
+after every later sweep too. The dry-run is handed the directory, not one path per case, so a large
 collection no longer grows the command line (`ide/src/collectionCaseFiles.ts`). The volatile policy is a fixed default;
 a feed with other volatile fields (e.g. a bespoke timestamp segment) may show a false regression until
 a future per-collection override lands.
@@ -209,7 +220,8 @@ message files. A command to delete every saved collection, including stranded on
 **What it does not change.** Case bodies are still PHI when an author saves real messages, so the
 synthetic-case steer and the in-UI notice stay. The rerun still materializes inputs to a temp
 directory and deletes it in `finally`. *Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):* it
-removes the case files, then the directory if it is empty, as *Must not break* records.
+removes the case files, then the directory if it is empty, as the 2026-11-15 amendment beneath
+*Must not break*, which supersedes its "always cleaned up", records.
 
 ## Amendment 2026-10-20 -- the SecretStorage key carries a scheme version (BACKLOG #3426)
 
