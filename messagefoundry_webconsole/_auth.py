@@ -295,15 +295,18 @@ def _login_redirect(note: str = "", *, cookie_presented: bool) -> HTTPException:
     Carries :data:`CLEAR_SITE_DATA_HEADER` on the REDIRECT ITSELF (ASVS 14.3.1) whenever the request
     presented a session cookie. Every SERVER-driven session termination lands here — idle timeout,
     absolute timeout, revoke ("sign out everywhere else"), admin disable, AD-reconcile revoke — and
-    each of those arrives with the dead cookie, so those are exactly the paths the residual names.
-    Attaching it to the 303 rather than only to the landing page means the header cannot depend on
-    which login URL the browser is sent to, or on the client watchdog having run at all (with
-    JavaScript blocked it never does).
+    the browser's next same-site request after one presents the dead cookie, so those are the paths
+    the residual names. Attaching it to the 303 rather than only to the landing page means the
+    header cannot depend on which login URL the browser is sent to, or on the client watchdog having
+    run at all (with JavaScript blocked it never does).
 
-    A request with NO session cookie never had a session here, so it ends nothing, and the redirect
-    omits the header: otherwise a first visit to ``/ui`` would ask the browser to clear its cache
-    for the origin on an ordinary unauthenticated landing, a cost with no session behind it to
-    protect. ``cookie_presented`` has no default, so each caller decides rather than inheriting one.
+    A request with NO session cookie gets no header: a first visit to ``/ui`` would otherwise ask
+    the browser to clear its cache for the origin on an ordinary unauthenticated landing. **That
+    includes a cross-site navigation after a termination**, such as a link followed from a mail
+    client: the cookie is ``SameSite=Strict``, so the browser withholds it, and neither this 303 nor
+    the login render it reaches sends the header. Such a landing keeps the other 14.3.1 controls:
+    the server-side revoke, ``Cache-Control: no-store`` on every /ui page, and the watchdog's
+    blanking. ``cookie_presented`` has no default, so each caller decides rather than inheriting one.
     """
     location = "/ui/login" + (f"?e={note}" if note else "")
     headers = {"Location": location}
@@ -312,10 +315,20 @@ def _login_redirect(note: str = "", *, cookie_presented: bool) -> HTTPException:
     return HTTPException(status.HTTP_303_SEE_OTHER, headers=headers)
 
 
-def login_redirect_response(note: str = "expired") -> RedirectResponse:
+def login_redirect_response(
+    note: str = "expired", *, cookie_presented: bool = True
+) -> RedirectResponse:
     """The RESPONSE form of :func:`_login_redirect`, for a ROUTE that discovers the session is gone
     (rather than a dependency, which raises). Same 14.3.1 header, same default outcome code, so the
-    two paths cannot drift apart."""
+    two paths cannot drift apart.
+
+    ``cookie_presented=False`` is for a route a browser can open with no session cookie, such as a
+    bookmarked page: it gets the plain sign-in page, with no outcome code and no header, as
+    :func:`_login_redirect` gives the gate's first visit. The code is dropped with the header
+    because the login render sends the header for an ``expired`` code by itself. The default keeps
+    both for the routes that reach here only after a session existed."""
+    if not cookie_presented:
+        return RedirectResponse("/ui/login", status_code=303)
     resp = RedirectResponse("/ui/login" + (f"?e={note}" if note else ""), status_code=303)
     resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
     return resp
@@ -524,13 +537,13 @@ def require_ui(
 
     async def dependency(request: Request) -> Identity:
         auth = get_auth(request)
-        if auth is None:
-            # The browser UI always needs a real session — no allow_no_auth shortcut here. Counted
-            # from the raw lines rather than read through session_token, so this redirect is not
-            # turned into a 400 by a repeated cookie; with no auth no cookie can authenticate, so
-            # one presented is a dead one, as the login render's stale-cookie check also reads it.
-            raise _login_redirect(cookie_presented=session_cookie_copies(request) > 0)
+        # Read before the no-auth branch, so both branches judge "a cookie was presented" by the
+        # same test the login render's stale-cookie check uses.
         token = session_token(request)
+        if auth is None:
+            # The browser UI always needs a real session — no allow_no_auth shortcut here. With no
+            # auth no cookie can authenticate, so one presented is a dead one.
+            raise _login_redirect(cookie_presented=bool(token))
         identity = await auth.identity_for_token(token, activity=activity)
         if identity is None:
             # A cookie that no longer authenticates IS a post-termination landing (idle/absolute

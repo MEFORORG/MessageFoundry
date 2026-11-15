@@ -334,6 +334,25 @@ async def test_a_presented_dead_session_cookie_gets_clear_site_data_on_the_redir
         assert gone.headers["clear-site-data"] == '"cache"'
 
 
+async def test_the_hand_gated_pages_send_clear_site_data_only_for_a_presented_cookie(
+    engine: Engine,
+) -> None:
+    """The second-factor and re-auth pages check the session by hand and redirect through
+    ``login_redirect_response``. A bookmark can open either with no cookie, which is a first visit:
+    plain sign-in page, no code, no header. A dead cookie still gets both."""
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        for path in ("/ui/mfa", "/ui/reauth?next=/ui"):
+            first = await c.get(path, follow_redirects=False)
+            assert first.status_code == 303, path
+            assert first.headers["location"] == "/ui/login", path
+            assert "clear-site-data" not in {k.lower() for k in first.headers}, path
+            dead = await c.get(path, headers=_DEAD_COOKIE, follow_redirects=False)
+            assert dead.status_code == 303, path
+            assert dead.headers["location"] == "/ui/login?e=expired", path
+            assert dead.headers["clear-site-data"] == '"cache"', path
+
+
 async def test_sign_out_always_sends_clear_site_data(engine: Engine) -> None:
     """Sign-out is a termination whatever the request carries: no cookie, a dead one, or a live
     session (the last is :func:`test_logout_emits_clear_site_data_cache_only`). The condition on
