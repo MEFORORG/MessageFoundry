@@ -34,6 +34,7 @@ true, so the day someone widens it, a test has to be edited deliberately.
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import os
 import re
 import shutil
@@ -390,6 +391,209 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
     text = _WORKFLOW.read_text(encoding="utf-8")
     assert "steps.denylist" not in text, "dangling reference to the removed deny-list step"
     assert not any(s.get("id") == "denylist" for s in steps), "the deny-list step is still present"
+
+
+# THE SUBSTRING CHECKS ABOVE CANNOT SEE THE OPERATORS BETWEEN THE GUARDS (BACKLOG #5605). Swap one
+# `&&` for `||`, drop the dev-only scoping of a minor bump, or move a parenthesis, and every substring
+# is still present. So the merge condition is EVALUATED, over every combination of the outputs it
+# reads, and compared with the policy stated once in `_merge_policy`. The evaluator covers only the
+# expression subset GitHub documents and this workflow uses; anything else fails the parse, so a
+# condition rewritten in another form has to extend it here rather than pass unread.
+
+_EXPR_TOKEN = re.compile(
+    r"\s*(?:(?P<op>==|!=|&&|\|\||[()!])|'(?P<str>(?:[^']|'')*)'|(?P<ref>[A-Za-z_][\w.\-]*))"
+)
+
+
+def _tokenize_expression(text: str) -> list[tuple[str, str]]:
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    text = text.strip()
+    while pos < len(text):
+        m = _EXPR_TOKEN.match(text, pos)
+        assert m and m.end() > pos, f"unparsed expression text at {text[pos:]!r}"
+        pos = m.end()
+        if m.group("op"):
+            tokens.append(("op", m.group("op")))
+        elif m.group("str") is not None:
+            tokens.append(("str", m.group("str").replace("''", "'")))
+        else:
+            ref = m.group("ref")
+            assert ref not in {"true", "false", "null"}, f"unsupported literal {ref!r}"
+            tokens.append(("ref", ref))
+    return tokens
+
+
+def _evaluate_expression(text: str, context: dict[str, str]) -> bool:
+    """Evaluate an Actions ``if:`` as GitHub does for this subset: ``==``/``!=`` compare strings
+    case-insensitively, ``&&``/``||``/``!`` coerce to truthiness, and an output that is not set (its
+    step was skipped) reads as the empty string, which is falsy."""
+    tokens = _tokenize_expression(text)
+    at = 0
+
+    def peek() -> tuple[str, str] | None:
+        return tokens[at] if at < len(tokens) else None
+
+    def take(expected: str | None = None) -> tuple[str, str]:
+        nonlocal at
+        tok = peek()
+        assert tok is not None, f"expression ended early: {text!r}"
+        if expected is not None:
+            assert tok == ("op", expected), f"expected {expected!r}, got {tok!r} in {text!r}"
+        at += 1
+        return tok
+
+    def primary() -> str | bool:
+        tok = take()
+        if tok == ("op", "("):
+            value = disjunction()
+            take(")")
+            return value
+        if tok == ("op", "!"):
+            return not bool(primary())
+        if tok[0] == "str":
+            return tok[1]
+        if tok[0] == "ref":
+            return context.get(tok[1], "")
+        raise AssertionError(f"unexpected token {tok!r} in {text!r}")
+
+    def comparison() -> str | bool:
+        left = primary()
+        tok = peek()
+        if tok in (("op", "=="), ("op", "!=")):
+            take()
+            right = primary()
+            assert isinstance(left, str) and isinstance(right, str), f"non-string compare: {text!r}"
+            equal = left.casefold() == right.casefold()
+            return equal if tok[1] == "==" else not equal
+        return left
+
+    def conjunction() -> str | bool:
+        value = comparison()
+        while peek() == ("op", "&&"):
+            take()
+            right = comparison()
+            value = bool(value) and bool(right)
+        return value
+
+    def disjunction() -> str | bool:
+        value = conjunction()
+        while peek() == ("op", "||"):
+            take()
+            right = conjunction()
+            value = bool(value) or bool(right)
+        return value
+
+    result = disjunction()
+    assert at == len(tokens), f"trailing tokens {tokens[at:]!r} in {text!r}"
+    return bool(result)
+
+
+_TRI = ("true", "false", "")
+
+
+def _merge_policy(c: dict[str, str]) -> bool:
+    """The merge policy, stated once: on the allow-set; a security-track PR also needs a confirmed
+    advisory AND an aged release; any patch, or a minor bump of a DEVELOPMENT dependency only."""
+    on_allow_set = c["steps.allowset.outputs.eligible"] == "true"
+    security_ok = c["steps.ghsa.outputs.security_track"] != "true" or (
+        c["steps.ghsa.outputs.advisory_ok"] == "true" and c["steps.age.outputs.age_ok"] == "true"
+    )
+    update = c["steps.meta.outputs.update-type"]
+    in_scope = update == "version-update:semver-patch" or (
+        update == "version-update:semver-minor"
+        and c["steps.meta.outputs.dependency-type"] == "direct:development"
+    )
+    return on_allow_set and security_ok and in_scope
+
+
+def _merge_contexts() -> list[dict[str, str]]:
+    axes = {
+        "steps.allowset.outputs.eligible": _TRI,
+        "steps.ghsa.outputs.security_track": _TRI,
+        "steps.ghsa.outputs.advisory_ok": _TRI,
+        "steps.age.outputs.age_ok": _TRI,
+        "steps.meta.outputs.update-type": (
+            "version-update:semver-patch",
+            "version-update:semver-minor",
+            "version-update:semver-major",
+            "",
+        ),
+        "steps.meta.outputs.dependency-type": ("direct:development", "direct:production", ""),
+    }
+    return [dict(zip(axes, combo, strict=True)) for combo in itertools.product(*axes.values())]
+
+
+def _merge_step() -> dict:
+    merges = [s for s in _steps() if "gh pr merge" in str(s.get("run", ""))]
+    assert len(merges) == 1, f"expected exactly one gh pr merge step, found {len(merges)}"
+    return merges[0]
+
+
+def test_the_merge_condition_evaluates_to_the_policy_over_every_input() -> None:
+    cond = str(_merge_step().get("if", ""))
+    assert cond, "the merge step has no if:, so it merges every Dependabot PR"
+    wrong = [c for c in _merge_contexts() if _evaluate_expression(cond, c) != _merge_policy(c)]
+    assert not wrong, (
+        f"the merge condition disagrees with the policy on {len(wrong)} input combinations; "
+        f"first: {wrong[0]} (condition says {_evaluate_expression(cond, wrong[0])})"
+    )
+
+
+def test_the_expression_evaluator_can_tell_a_loosened_condition_apart() -> None:
+    """The instrument check for the test above: each loosening the row names must disagree."""
+    cond = str(_merge_step().get("if", ""))
+    loosened = {
+        "operator swapped": cond.replace(
+            "steps.allowset.outputs.eligible == 'true' &&",
+            "steps.allowset.outputs.eligible == 'true' ||",
+            1,
+        ),
+        # `>-` keeps the newline before a more-indented line, so match any whitespace.
+        "dev-only minor scoping dropped": re.sub(
+            r"\s*&&\s*steps\.meta\.outputs\.dependency-type == 'direct:development'",
+            "",
+            cond,
+            count=1,
+        ),
+        "equality inverted": cond.replace("advisory_ok == 'true'", "advisory_ok != 'true'", 1),
+    }
+    contexts = _merge_contexts()
+    for label, variant in loosened.items():
+        assert variant != cond, f"the {label} mutation no longer applies to the condition text"
+        assert any(_evaluate_expression(variant, c) != _merge_policy(c) for c in contexts), (
+            f"the evaluator could not tell the {label} condition from the policy"
+        )
+
+
+def test_the_job_runs_only_for_dependabot_authored_prs() -> None:
+    job = _load()["jobs"]["auto-merge"]
+    cond = str(job.get("if", ""))
+    assert cond, "the auto-merge job has no if:, so it runs for every pull request"
+    for login, expected in (("dependabot[bot]", True), ("someone", False), ("", False)):
+        got = _evaluate_expression(cond, {"github.event.pull_request.user.login": login})
+        assert got is expected, f"job if: {cond!r} gives {got} for author {login!r}"
+
+
+def test_the_merge_step_squashes_the_triggering_pr_and_nothing_else() -> None:
+    merge = _merge_step()
+    assert str(merge["run"]).strip() == 'gh pr merge --auto --squash "$PR_URL"', merge["run"]
+    env = merge.get("env") or {}
+    assert env == {
+        "PR_URL": "${{ github.event.pull_request.html_url }}",
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+    }, env
+
+
+def test_the_workflow_token_permissions_are_exactly_the_three_it_needs() -> None:
+    doc = _load()
+    assert doc.get("permissions") == {
+        "contents": "write",
+        "pull-requests": "write",
+        "security-events": "read",
+    }, doc.get("permissions")
+    job = doc["jobs"]["auto-merge"]
+    assert "permissions" not in job, "a job-level permissions: block overrides the pinned set"
 
 
 def test_new_steps_take_every_input_through_env_not_interpolation() -> None:
