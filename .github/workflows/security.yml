@@ -731,6 +731,58 @@ jobs:
           path: sbom-python-windows.cdx.json
           if-no-files-found: ignore
 
+  windows-lock-install:
+    name: windows-lock-install (hashed runtime locks install as win_amd64 wheels)
+    # BACKLOG #5594. Windows is the only supported v1 platform, and before this job nothing that runs
+    # on a pull request installed a hashed lock there: the pip-audit job's DEP-1 install is Linux, the
+    # Windows test legs in ci.yml install against the HASHLESS constraints.lock, and `sbom-windows` is
+    # schedule-only. So a Windows-only pin with no cp314 win_amd64 wheel, or a wrong Windows hash, would
+    # merge unnoticed and fail first on a deploying site.
+    #
+    # WHY A WINDOWS RUNNER AND NOT `pip --platform win_amd64` ON LINUX. `--platform` changes which wheel
+    # TAGS pip accepts; it does not change how environment MARKERS evaluate, which still read the host.
+    # On Linux every `sys_platform == 'win32'` pin (at least sspilib and colorama) is skipped as not
+    # applicable, which is exactly the class this job exists to cover. Only a real win32 interpreter
+    # evaluates those markers the way a deploying site does.
+    #
+    # A REAL INSTALL, not `--dry-run`, so a wheel that downloads and hashes clean but will not install
+    # is caught too. Each lock goes into a freshly cleared venv, so one lock cannot satisfy another's
+    # pin. Measured 2026-11-14 on Windows 11 with CPython 3.14: all four locks resolve under these
+    # flags, and zeroing sspilib's hashes in a copy of the core lock fails the install with a hash
+    # mismatch.
+    #
+    # NOT A REQUIRED CONTEXT. It hard-fails and reports on every pull request and merge-group run, so
+    # a red is visible on the PR; whether branch protection reads it is the owner's call, recorded in
+    # `.github/required-contexts.txt`. tests/test_security_posture.py files it as pending promotion.
+    runs-on: windows-latest
+    # Four hash-locked installs, the largest carrying PySide6. Sized like `sbom-windows`.
+    timeout-minutes: 20
+    env:
+      PIP_ONLY_BINARY: ":all:"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No job token on disk: see the pip-audit job's checkout (vault BACKLOG #3861).
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: ci/python-version
+      - name: Install each hashed runtime lock as win_amd64 wheels
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The venv is built --without-pip and driven by the runner's pip, as the sbom-windows job
+          # does, so no unpinned pip is seeded into it. --require-hashes resolves nothing: every
+          # artifact and its hash comes from the lock.
+          python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
+          python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r requirements.lock
+          python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
+          python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r docker/locks/requirements-core.lock
+          python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
+          python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r docker/locks/requirements-sqlserver.lock
+          python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
+          python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r security/locks/requirements-harness.lock
+
   trivy:
     name: trivy (container image vulnerabilities)
     runs-on: ubuntu-latest

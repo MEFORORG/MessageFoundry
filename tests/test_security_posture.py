@@ -186,7 +186,11 @@ _SUPERSEDED_SECURITY_JOBS = frozenset(
 # `test_required_jobs_declare_no_skippable_job_level_if`, all of which are live on them. The guard
 # that cannot go vacuous is `test_every_security_job_is_classified`: it asserts SET EQUALITY over
 # every job in the workflow, so emptying this bucket is only legal if each name landed in another.
-_PENDING_PROMOTION_SECURITY_JOBS: frozenset[str] = frozenset()
+#
+# NO LONGER EMPTY: `windows-lock-install` (BACKLOG #5594) is filed here. It hard-fails on every pull
+# request and is not yet required; whether branch protection reads it is the owner's call. Filing it
+# here makes the three `pending_promotion` tests live on it.
+_PENDING_PROMOTION_SECURITY_JOBS: frozenset[str] = frozenset({"windows-lock-install"})
 
 #: Every job this module grades, whatever its posture. `test_every_security_job_is_classified`
 #: asserts this is SET-EQUAL to the workflow's real job keys, which is what lets other rules build on

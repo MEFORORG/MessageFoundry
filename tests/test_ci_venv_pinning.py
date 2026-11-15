@@ -136,6 +136,8 @@ LOCK_ONLY_VENVS = (
     # SBOM scan venv that is not listed here.
     ("release.yml", "$RUNNER_TEMP/sbomenv"),
     ("security.yml", "$RUNNER_TEMP/sbomenv"),
+    # The Windows hashed-lock install check (BACKLOG #5594).
+    ("security.yml", "$RUNNER_TEMP/winlockcheck"),
 )
 
 #: The runners the engine SBOM is built on, one step per runner in each of `release.yml` and
