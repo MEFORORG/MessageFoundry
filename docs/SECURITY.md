@@ -5495,11 +5495,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   alert nor the audit row says which case it is, so an operator cannot tell it from tampering.
   The count the every-account revoke reports leaves out each session it missed: on SQL Server, a
   session of an account its list read did not return, rotated while it ran. The bind's and the
-  unbind's are read from the driver's row count, so where a session-wide
-  `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
-  until the session is presented or listed, the store still holds it as live. BACKLOG #4974,
-  which closed the rotation miss as the opening of this bullet states, did not change the -1
-  count. A bind ends sessions only: an engine factor already enrolled on the account stays.
+  unbind's are counted from an `OUTPUT` rowset on SQL Server since BACKLOG #5625, so a
+  session-wide `SET NOCOUNT ON` leaked onto the connection no longer turns them into -1
+  (BACKLOG #2283). And until the session is presented or listed, the store still holds it as
+  live. A bind ends sessions only: an engine factor already enrolled on the account stays.
 - **A bind and a user delete take one lock order on both server stores** (BACKLOG #2738). A
   bind, an unbind and a whole-account revoke lock the account's row and then its sessions, and
   on SQL Server so does a session rotation (BACKLOG #4974). Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
@@ -7513,7 +7512,8 @@ In their place, every refused sign-in on an existing, enabled local account writ
 `auth.login_failed` row with reason `bad_credentials` (plus `combined: true` for a combined sign-in),
 whether a wrong credential or a live lock refused it. Two refusals keep their own rows: an unknown or
 disabled name (`reason: unknown_or_disabled`, also written for an account deleted before the
-sign-in's session was written, BACKLOG #2733), and a right password on an expired temporary
+sign-in's session was written, BACKLOG #2733; a directory sign-in whose row is gone at its session
+insert writes `reason: account_deleted`, BACKLOG #5624), and a right password on an expired temporary
 credential (`auth.temp_password_expired`). That action also records a session ended because its
 temporary credential lapsed, with at least these `at` values: `"session"` with no sign-in attempt
 behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on the same browser,

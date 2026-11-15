@@ -2642,7 +2642,12 @@ _SCHEMA: list[str] = [
         -- read-then-write atomic. 256 is this file's dominant width (55 uses); the composite
         -- key is then 2 x 256 x 2 bytes = 1024, inside the 1700-byte nonclustered limit.
         -- NVARCHAR(450), the other precedent here, would be 1800 across two columns and fail.
-        oidc_issuer NVARCHAR(256) NULL, oidc_subject NVARCHAR(256) NULL,
+        -- BACKLOG #5613: BIN2, so the pair and that index compare case- and accent-exactly, as
+        -- SQLite and Postgres do. Under a case-insensitive default two OIDC subjects differing only in case
+        -- were one key: the second could neither be bound nor sign in. state.[key] says what BIN2
+        -- leaves alone (trailing spaces); the bind refuses a subject with surrounding space.
+        oidc_issuer NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL,
+        oidc_subject NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL,
         -- BACKLOG #1471: the directory's IMMUTABLE id for this account (normalised AD objectGUID).
         -- SIZED rather than MAX for this file's ordinary reason (256 is its dominant width), though
         -- nothing here needs it as an index key: the column carries NO uniqueness constraint, so the
@@ -2687,9 +2692,9 @@ _SCHEMA: list[str] = [
     # Federated (issuer, sub) identity keying (BACKLOG #1015): COL_LENGTH-gated ADD on a pre-existing
     # users table. NULL on existing rows = "not yet federated" (username stays the sole key). Idempotent.
     """IF COL_LENGTH('users','oidc_issuer') IS NULL
-        ALTER TABLE users ADD oidc_issuer NVARCHAR(256) NULL""",
+        ALTER TABLE users ADD oidc_issuer NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL""",
     """IF COL_LENGTH('users','oidc_subject') IS NULL
-        ALTER TABLE users ADD oidc_subject NVARCHAR(256) NULL""",
+        ALTER TABLE users ADD oidc_subject NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL""",
     # Directory-immutable identity binding (BACKLOG #1471): COL_LENGTH-gated ADD on a pre-existing
     # users table. NULL on existing rows = "no directory binding", and such a row is REFUSED rather
     # than adopted by an AD login presenting an objectGUID -- not byte-identical to before, and that
@@ -2743,9 +2748,9 @@ _SCHEMA: list[str] = [
     #
     # MUST RUN BEFORE the index. _SCHEMA is applied in order, so position here is load-bearing.
     """IF COL_LENGTH('users','oidc_issuer') = -1
-        ALTER TABLE users ALTER COLUMN oidc_issuer NVARCHAR(256) NULL""",
+        ALTER TABLE users ALTER COLUMN oidc_issuer NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL""",
     """IF COL_LENGTH('users','oidc_subject') = -1
-        ALTER TABLE users ALTER COLUMN oidc_subject NVARCHAR(256) NULL""",
+        ALTER TABLE users ALTER COLUMN oidc_subject NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NULL""",
     # The atomicity the application guard cannot provide: auth/service.py reads the current holder and
     # writes the binding in two separate awaits, so two concurrent FIRST logins for one subject can
     # both observe "no holder" and both bind. FILTERED so unfederated rows coexist -- and on SQL Server
@@ -15133,9 +15138,10 @@ class SqlServerStore:
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
         # BACKLOG #1471. The AD login's identification read, keyed on the directory's immutable id
-        # rather than the recyclable sAMAccountName. NOTE, as with get_user_by_federated_subject
-        # below, that the comparison is the DATABASE's and this column carries no explicit COLLATE:
-        # under a case-insensitive server default two ids differing only in case would match here.
+        # rather than the recyclable sAMAccountName. NOTE that the comparison is the DATABASE's and
+        # this column carries no explicit COLLATE, unlike the pair get_user_by_federated_subject
+        # below reads, which is BIN2 since BACKLOG #5613. Under a case-insensitive server default
+        # two ids differing only in case would match here.
         # The normaliser in auth/ldap.py emits ONE case, so that divergence is not reachable through
         # the login path -- it is recorded because the byte-exact comparison SQLite and Postgres
         # perform is the property a reader would assume.
@@ -15144,11 +15150,8 @@ class SqlServerStore:
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
-        # issuer. NOTE the comparison is the DATABASE's, and these columns carry no explicit COLLATE:
-        # under a case-insensitive server default two subjects differing only in case would match
-        # here, which is SAFE for this predicate (it can only refuse MORE) but is the opposite of the
-        # byte-exact comparison SQLite and Postgres perform. The BIN2 remedy this file applies to
-        # `reference_sets.[key]` is the fix if that divergence ever needs closing.
+        # issuer. Case-exact through the columns' BIN2 collation (BACKLOG #5613); the base
+        # protocol's docstring says what that leaves (trailing spaces).
         d = await self._fetchone(
             f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
         )
@@ -16298,16 +16301,15 @@ class SqlServerStore:
                     # Nothing written, so nothing is revoked. The rollback frees the connection.
                     await conn.rollback()
                     return None
-                await cur.execute(
-                    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
-                    (now, user_id),
-                )
-                revoked = cur.rowcount
+                # Counted from OUTPUT, never cursor.rowcount, which a session-wide SET NOCOUNT ON
+                # reports as -1 (BACKLOG #5625): the count is audited and returned to the caller.
+                await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+                revoked = len(await cur.fetchall())
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return int(revoked) if revoked is not None else 0
+        return revoked
 
     async def clear_user_federated_subject(
         self,
@@ -16375,11 +16377,9 @@ class SqlServerStore:
                         webauthn_enrolled=webauthn_enrolled,
                     )
                 await self._write_user(cur, user_id, lambda r: federated_unbind(r, now))
-                await cur.execute(
-                    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
-                    (now, user_id),
-                )
-                count = cur.rowcount
+                # From OUTPUT, as set_user_federated_subject counts it (BACKLOG #5625).
+                await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+                count = len(await cur.fetchall())
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -16388,7 +16388,7 @@ class SqlServerStore:
             username=username,
             issuer=issuer,
             subject=subject,
-            sessions_revoked=int(count) if count is not None else 0,
+            sessions_revoked=count,
             totp_enrolled=totp_enrolled,
             webauthn_enrolled=webauthn_enrolled,
         )
@@ -16543,6 +16543,7 @@ class SqlServerStore:
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
+        mfa_verified: bool = False,
     ) -> bool:
         now = time.time() if now is None else now
         # BACKLOG #1474 and #2592. UPDLOCK/ROWLOCK, not a plain read: the lock is the guard. Either a
@@ -16590,6 +16591,7 @@ class SqlServerStore:
                     seed_reauth=seed_reauth,
                     auth_mechanism=auth_mechanism,
                     idp_auth_time=idp_auth_time,
+                    mfa_verified=mfa_verified,
                     user_epoch=int(rows[0][2]),
                     # BACKLOG #5091: its own statement, after the row lock, for the reason
                     # postgres.py's create_session gives; revoke_all_sessions says why it cannot

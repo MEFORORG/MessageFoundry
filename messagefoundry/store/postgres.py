@@ -1582,7 +1582,7 @@ _PG_SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
     " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
     " user_epoch, global_epoch, seal)"
-    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,NULL,$8,$9,$10,$11,$12)"
+    " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,$10,$11,$12,$13)"
 )
 _PG_SESSION_RESEAL: Final = (
     "UPDATE sessions SET token_hash=$1, user_id=$2, created_at=$3, expires_at=$4, revoked_at=$5,"
@@ -11305,6 +11305,7 @@ class PostgresStore:
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
+        mfa_verified: bool = False,
     ) -> bool:
         now = time.time() if now is None else now
         # BACKLOG #1474 and #2592. FOR UPDATE, not a plain read: the row lock is the guard. Either a
@@ -11348,6 +11349,7 @@ class PostgresStore:
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
+                mfa_verified=mfa_verified,
                 user_epoch=int(row["session_epoch"]),
                 # BACKLOG #5091: its own statement, after the row lock, so a sign-in that waited
                 # behind a revoke reads that revoke's global epoch beside its account epoch. A

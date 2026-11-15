@@ -1439,7 +1439,7 @@ _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
     " revoked_at, client, reauth_at, mfa_verified_at, auth_mechanism, idp_auth_time,"
     " user_epoch, global_epoch, seal)"
-    " VALUES (?,?,?,?,?,NULL,?,?,NULL,?,?,?,?,?)"
+    " VALUES (?,?,?,?,?,NULL,?,?,?,?,?,?,?,?)"
 )
 
 # BACKLOG #2592: the one statement that rewrites a session's sealed columns, used only by the store's
@@ -1520,6 +1520,7 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
         record.last_used_at,
         record.client,
         record.reauth_at,
+        record.mfa_verified_at,
         record.auth_mechanism,
         record.idp_auth_time,
         record.user_epoch,
@@ -2236,13 +2237,17 @@ def new_session_record(
     idp_auth_time: float | None,
     user_epoch: int,
     global_epoch: int,
+    mfa_verified: bool = False,
 ) -> SessionRecord:
     """The row ``create_session`` writes, with every float as the backend will read it back, so the
     seal made over it verifies after the round trip (BACKLOG #2592).
 
     ``reauth_at = now`` seeds the step-up window from sign-in (ASVS 7.5.3). ``seed_reauth=False``
     (an MFA-pending session, WP-14) leaves it NULL, so enrolment or step-up needs an explicit
-    password re-proof: a stolen pre-MFA token cannot ride the sign-in's step-up freshness."""
+    password re-proof: a stolen pre-MFA token cannot ride the sign-in's step-up freshness.
+
+    ``mfa_verified`` stamps ``mfa_verified_at = now`` in the row itself (BACKLOG #5624), so a
+    sign-in that owes no factor needs no second write that could miss a revoked row."""
     now = float(now)
     return SessionRecord(
         token_hash=token_hash,
@@ -2253,7 +2258,7 @@ def new_session_record(
         revoked_at=None,
         client=client,
         reauth_at=now if seed_reauth else None,
-        mfa_verified_at=None,
+        mfa_verified_at=now if mfa_verified else None,
         auth_mechanism=auth_mechanism,
         idp_auth_time=_opt_float(idp_auth_time),
         user_epoch=int(user_epoch),
@@ -20795,6 +20800,7 @@ class MessageStore:
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
+        mfa_verified: bool = False,
     ) -> bool:
         now = time.time() if now is None else now
         # _writer_txn, not a short writer: the account's row is read first in the same transaction
@@ -20826,6 +20832,7 @@ class MessageStore:
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
+                mfa_verified=mfa_verified,
                 user_epoch=int(row["session_epoch"]),
                 global_epoch=global_epoch_or_refuse(row["global_epoch"]),
             )
@@ -20919,10 +20926,12 @@ class MessageStore:
         now: float | None = None,
         anchor: PendingFactorAnchor | None = None,
     ) -> bool:
-        """Stamp a session's second-factor as satisfied (WP-14): at least after a TOTP/recovery
-        verify, a factor enrolment confirm, a passkey assertion (the one caller that passes an
-        ``anchor``), or at issuance for a sign-in that owes no second factor. See
-        :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the answer."""
+        """Stamp a session's second-factor as satisfied (WP-14), after a factor ceremony: at least a
+        TOTP/recovery verify, a factor enrolment confirm, or a passkey assertion, which passes an
+        ``anchor`` on any session but an OIDC one. Session issuance does not call this;
+        :meth:`AuthStore.create_session` says how its ``mfa_verified`` stamps the row in the INSERT
+        (BACKLOG #5624). See :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the
+        answer."""
         stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with _writer_txn(self._db, self._lock):
             written = await self._write_session(token_hash, stamp)
