@@ -1193,6 +1193,11 @@ IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 #: its ceremony back.
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
+#: The ``outcome`` a ``directory_unconfirmed`` row carries when the directory check's answer is
+#: neither a known refusal reason nor the vouched account row (BACKLOG #3780 item 2): it fails closed
+#: under this fixed slug rather than under the unknown value's own text.
+_UNKNOWN_DIRECTORY_ANSWER = "unknown_answer"
+
 #: The ``auth.reauth`` reason for a directory step-up re-bind sent with an empty password (BACKLOG
 #: #2434). The directory is never asked and nothing is charged; the caller sees a refused password.
 EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a credential
@@ -16576,12 +16581,22 @@ class AuthService:
         # acquisition awaits between the two, and nothing is spent before the in-queue read, so it
         # still refuses, before any code is checked, a revocation, a disable or a lock the lookup
         # let land. A directory account comes back as the row the directory check's role test read
-        # after the lookup, so the queue is keyed by the account's name as it was then, as the
-        # dropped re-read keyed it. A session lost during the lookup is named by the in-queue
-        # read, with the account's current name while its row is still there (#2291 class); the
-        # dropped re-read named it with the name read before the lookup. The lock is asked in the
-        # queue right after the session read, before the ``totp_enabled`` and lapse checks (see
-        # below).
+        # after the lookup, so the queue is keyed by the account's name as it was then; the
+        # dropped re-read keyed it by the name it read itself, a moment later. A session lost
+        # during the lookup is named by the in-queue read, with the account's current name while
+        # its row is still there (#2291 class); the dropped re-read named it with the name read
+        # before the lookup.
+        #
+        # The dropped re-read also answered ``session_lost`` when its account read came back empty
+        # because a delete, rename, rebind or re-key raced the seal check's second read
+        # (``_verified``). That race needs the row gone, which the in-queue read sees too, or its
+        # lookup keys moved after the role test read it. So for a directory account the in-queue
+        # read refuses the same way, with the same ``session_lost`` reason, whenever the keys
+        # moved: an attempt the dropped re-read refused for the race is still refused, unless the
+        # move was put back before the queue read. Wider than main, which refused only when the
+        # race was lost. A local account was never re-read after a lookup, so neither this refusal
+        # nor the lock-first order below applies to it.
+        directory = _is_directory_account(user)
         vouched = await self._directory_vouches_for_factor(
             token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
@@ -16603,7 +16618,12 @@ class AuthService:
                 # a rename that came with the revocation names the row too.
                 session = await self._load_session(hash_token(token))
                 loaded = await self._load_user(user.id if session is None else session.user_id)
-                if session is None or loaded is None or loaded.disabled:
+                if (
+                    session is None
+                    or loaded is None
+                    or loaded.disabled
+                    or (directory and _lookup_keys(loaded) != _lookup_keys(vouched))
+                ):
                     await self._audit_session_lost(
                         "auth.mfa_failed",
                         actor=(loaded or user).username,
@@ -16616,14 +16636,15 @@ class AuthService:
                 ):
                     user = loaded
                     break
-                # A directory rename landed after the queue was keyed, so the queue held is one
-                # that attempts reading the new name do not join, and a burst split across the two
-                # can get one code check past the lockout (BACKLOG #1943). Leave it and queue under
-                # the name the row holds now; the reads above run again after that wait. ONCE: a
-                # second rename carries on in the queue then held, as a rename during the code
-                # check below does. Both windows stay open while the queue is keyed by name; the
-                # read this replaces, which ran before the queue, covered neither.
-                # Carried forward, so a refusal after the rejoin names the account as last read.
+                # A rename landed after the queue was keyed, so the queue held is one that attempts
+                # reading the new name do not join, and a burst split across the two can get one
+                # code check past the lockout (BACKLOG #1943). Only a local account gets here: a
+                # directory account whose keys moved was refused above. Leave the queue and join
+                # the one under the name the row holds now; the reads above run again after that
+                # wait. ONCE: a second rename carries on in the queue then held, as a rename during
+                # the code check below does. Both windows stay open while the queue is keyed by
+                # name. Carried forward, so a refusal after the rejoin names the account as last
+                # read.
                 user = loaded
                 await queue.pop_all().aclose()
                 queued_as = loaded.username
@@ -16631,18 +16652,21 @@ class AuthService:
                 # Unreachable: the last pass breaks or returns. Guarded so an edit to the loop can
                 # never let the code check below run without the account's queue held (#1943).
                 raise RuntimeError("verify_mfa left its queue loop without holding the queue")
-            # The lock is asked first, on the row just read, and its row written: a lock that
-            # landed during the lookup or its role test is audited as ``locked`` whatever else
-            # landed with it, as the dropped re-read audited it ahead of these checks. The lapse
-            # is still asked of a locked account, and ends its session, as a lapse during the
-            # wait did ahead of the lock. So a lock and a lapse together keep both rows and the
-            # ended session; a lock alone answers ``locked``, before ``totp_enabled``.
-            locked = await self._mfa_lock_refused(user, client=client)
-            if not locked and not user.totp_enabled:
-                return Elevation()
+            # For a directory account the lock is asked first, on the row just read, and its row
+            # written: a lock that landed during the lookup or its role test is audited as
+            # ``locked`` whatever else landed with it, as the dropped re-read audited it ahead of
+            # these checks. With TOTP turned off it answers ``locked`` there, as that re-read did,
+            # and the lapse is not asked: the account holds no factor to name on a lapse row, and
+            # main never asked it of one either. With TOTP on, the lapse is still asked of a locked
+            # account, and ends its session, as a lapse during the wait did ahead of the lock, so a
+            # lock and a lapse together keep both rows and the ended session. A local account keeps
+            # main's order, ``totp_enabled``, then the lapse, then the lock.
+            locked = directory and await self._mfa_lock_refused(user, client=client)
+            if not user.totp_enabled:
+                return Elevation(locked=locked)
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
                 return Elevation(session_lost=True)
-            if locked:
+            if locked or (not directory and await self._mfa_lock_refused(user, client=client)):
                 return Elevation(locked=True)
             now = time.time()
             # The enrolment this code is checked against: the factor write below lands only while
@@ -17099,23 +17123,27 @@ class AuthService:
         the account it loaded through :meth:`_load_user`. No session object is needed, because the
         re-read loads the session from the token; :meth:`confirm_mfa_enrollment` holds no session.
         Each passes its own failure ``event`` (``auth.mfa_failed`` on the TOTP legs,
-        ``auth.webauthn_failed`` on the passkey legs). ``report_lock`` sets ``locked`` on a lock
-        refusal; :meth:`verify_mfa` and the two enrolment legs report it (BACKLOG #3810 finding 4),
-        and :meth:`finish_webauthn_assertion` does not. ``phase``, which the enrolment legs pass as
+        ``auth.webauthn_failed`` on the passkey legs). ``report_lock`` sets ``locked`` on the
+        re-read's lock refusal; :meth:`verify_mfa` and the two enrolment legs pass it (BACKLOG #3810
+        finding 4), and :meth:`finish_webauthn_assertion` does not. Under :meth:`verify_mfa`'s
+        ``reread=False`` no re-read runs, so no lock is refused here and the flag does nothing.
+        ``phase``, which the enrolment legs pass as
         ``enroll`` as their own wrong-proof rows carry it, is added to the ``directory_unconfirmed``
         and ``session_lost`` rows. It is not added to the lock row, whose detail is the shared
         constant an exclusion matches exactly (#1131). Call it before anything the refusal must not
         spend (a TOTP step, recovery codes, a stored credential, a sign count; a challenge already
         taken is put back), and after the cheap local refusals, so a caller already refused costs
-        no lookup. Note that the re-read refuses
-        a second-step-locked account."""
+        no lookup. Note that the re-read, where it runs, refuses a second-step-locked account; under
+        ``reread=False`` nothing here does."""
         if not _is_directory_account(user):
             return user
         answer = await self._directory_step_up_refusal(user)
         # A positive test: only the vouched row carries on, so an answer of any other type, a
         # refusal shape this does not know included, refuses (fails closed).
         if not isinstance(answer, VerifiedUser):
-            outcome = str(answer)
+            # A known refusal names itself; any other shape gets one fixed slug, so the audit row
+            # never carries a value's own text.
+            outcome = answer if isinstance(answer, str) else _UNKNOWN_DIRECTORY_ANSWER
             detail = {"reason": DIRECTORY_UNCONFIRMED, "outcome": outcome}
             if phase is not None:
                 detail["phase"] = phase
