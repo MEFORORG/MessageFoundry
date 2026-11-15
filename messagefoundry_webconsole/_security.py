@@ -301,9 +301,11 @@ def _is_ui_fetch_scope(path: str) -> bool:
 
 
 #: A cross-site request that is a SAFE TOP-LEVEL NAVIGATION is allowed -- an intranet link into the
-#: console is one, and so is the OIDC callback, where the IdP's redirect back is cross-site BY
-#: CONSTRUCTION. METHOD is part of safe: a cross-site navigation carrying a POST is a CSRF form
-#: submission, and no supported flow makes one.
+#: console is one, and so is the OIDC callback, where the IdP's redirect back is cross-site UNLESS
+#: the IdP is on the console's own site, such as a sibling subdomain. That return is same-site, and
+#: :func:`_is_safe_top_level_navigation` then demands ``Sec-Fetch-User: ?1`` of it
+#: (``docs/BROWSER-SUPPORT.md``, federated sign-in). METHOD is part of safe: a cross-site navigation
+#: carrying a POST is a CSRF form submission, and no supported flow makes one.
 _SAFE_NAVIGATION_METHODS = frozenset({"GET", "HEAD"})
 
 

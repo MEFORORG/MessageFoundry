@@ -211,7 +211,7 @@ than its browser's floor, so none has a row.
 ### Federated sign-in and form-action
 
 BCD also records, under `form-action`, that Chrome, Edge and Safari apply it to the redirect that
-follows a form submission, and that Firefox does not. So the two console forms that lead to the
+follows a form submission, and that Firefox does not. So at least the two console forms that lead to the
 identity provider, the "leaving this site" page's form (`POST /ui/oidc/start`) and the step-up form
 (`POST /ui/reauth/oidc`), are not answered with a redirect there. Each is answered with a page that
 navigates to the identity provider by meta refresh, with a Continue link as the fallback, and so is

@@ -911,8 +911,11 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
     the ``window.<Feature>`` detects and the session-cookie attributes. Each directive of the two
     policies needs a row or a place in the section's list of other directives, and the in-page
     referrer tag and the two passkey registration options each need a row. So a header, detect or
-    directive the console starts using reds here until the table names it, and a row for any of
-    those cannot be deleted to lift a floor. The request headers the server reads are held to the
+    directive the console starts using reds here until the table names it, and a row for a header,
+    detect, cookie attribute, referrer tag or passkey option cannot be deleted to lift a floor. A
+    directive's row CAN be: moving the directive into the list of other directives keeps this green,
+    because the test cannot tell that move from a directive that needs no row, so a reviewer checks
+    such a move against the dataset. The request headers the server reads are held to the
     same table by ``test_browser_support_doc.py``, which derives them.
 
     Names are matched against each row's lead, its first backticked token, rather than by substring,
@@ -943,6 +946,7 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
     section = " ".join(re.split(r"^## ", section, maxsplit=1, flags=re.MULTILINE)[0].split())
     assert _OTHER_DIRECTIVES_LEAD in section, _OTHER_DIRECTIVES_LEAD
     listed = section.split(_OTHER_DIRECTIVES_LEAD, 1)[1].split(". ", 1)[0]
+    assert directives, directives
     unnamed = sorted(d for d in directives if d not in leads and f"`{d}`" not in listed)
     assert not unnamed, f"no version row and no place in the list of other directives: {unnamed}"
     # The referrer tag and the two passkey options are read from source text. Each read asserts
