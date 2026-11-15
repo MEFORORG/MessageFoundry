@@ -8109,11 +8109,11 @@ Those keep the old bytes until they are built again, and a reload writes a `chan
 `restart_required` row for them. A changed syslog CA takes effect only at a restart.
 
 **The SQL Server `[store].ssl_root_cert` pin is checked at the next start or reload too, but its
-change check cannot vouch for its own hop.** Its
-baseline is read from, and its rows are written to, the store that pin secures, so a swapped pin
-that lets another server answer the hop can keep its own `changed` row out of the real store.
-Item 11 of the [trust anchors module](../messagefoundry/auth/trust_anchors.py) says when, and
-which checks still refuse.
+change check cannot vouch for its own hop.** Its baseline is read from, and its rows are written
+to, the store that pin secures, so a swapped pin that lets another server answer the hop can keep
+its own `changed` row out of the real store. Item 11 of the
+[trust anchors module](../messagefoundry/auth/trust_anchors.py) says when, which checks still
+refuse, and that a refused reload leaves the store reading the swapped file until a restart.
 
 **What a reload's `restart_required` list covers (BACKLOG #3015).** An empty list in the reload
 response says that no settings anchor with a recorded load changed in the engine process that
