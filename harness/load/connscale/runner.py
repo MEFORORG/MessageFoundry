@@ -2067,6 +2067,7 @@ def _reconcile(
     # COUNTS: one duplicated outbound row, or one row carried over from before the baseline, cancels
     # one lost message. Only a per-message audit separates them.
     write_short = read - written
+    # The whole pipeline, not the outbound stage alone: see EngineSample.backlog (BACKLOG #5433).
     drained = backlog == 0
     # The three reload guards. Each is a SIGNATURE, not a fraction of the offered volume, and none
     # applies to a step that offered nothing at all (`sent == 0`, e.g. a zero-rate lane).
@@ -2535,7 +2536,9 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
     out: list[SloCheck] = []
     slo = profile.slo
     if slo.zero_loss:
-        all_ok = all(r.no_loss.ok for r in records)
+        # `all()` over nothing is True, so a sweep that kept no record would read zero-loss PASS;
+        # this function is shared with the batch-box aggregate, so the guard is here (BACKLOG #5432).
+        all_ok = bool(records) and all(r.no_loss.ok for r in records)
         out.append(SloCheck("zero_loss", True, all_ok, all_ok))
     if profile.intake_audit:
         # BACKLOG #1292, and DELIBERATELY NOT folded into zero_loss: this is a per-MESSAGE check and
@@ -2567,10 +2570,11 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
             SloCheck("intake_audit", "no accept-ACKed message absent", observed, not suspect)
         )
     if slo.max_drain_seconds is not None:
-        worst = max(
-            (r.drain_seconds for r in records if r.drain_seconds is not None),
-            default=None,
-        )
+        # A timed-out drain (None) POISONS the worst case, as in the batchbox and compare copies:
+        # dropping it let any sibling that drained in time mask the step that never did (BACKLOG
+        # #5434).
+        drains = [r.drain_seconds for r in records]
+        worst = None if not drains or None in drains else max(d for d in drains if d is not None)
         ok = worst is not None and worst <= slo.max_drain_seconds
         out.append(
             SloCheck(

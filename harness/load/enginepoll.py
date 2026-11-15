@@ -206,8 +206,21 @@ class EngineSample:
     poller_renewals: int = 0  # sessions the poller signed in again after the engine ended one
 
     @property
-    def backlog(self) -> int:
+    def outbound_backlog(self) -> int:
+        """Outbound ``pending + inflight`` alone: the delivery queue, blind to ingress and routed."""
         return self.pending + self.inflight
+
+    @property
+    def backlog(self) -> int:
+        """Undrained rows in ANY stage -- what every no-loss reconcile's drained term reads.
+
+        It was :attr:`outbound_backlog` alone (BACKLOG #5435), so a router or transform that stalled
+        left every accepted message in ingress or routed with this reading 0, and a reconcile run on
+        a timed-out drain passed. ``in_pipeline`` already counts the outbound rows, so the two are
+        not summed; they come from separate store reads, so the larger one is the fail-closed read.
+        An older engine without ``in_pipeline`` reads 0 there and keeps the outbound reading.
+        """
+        return max(self.outbound_backlog, self.in_pipeline)
 
 
 @dataclass(frozen=True)
