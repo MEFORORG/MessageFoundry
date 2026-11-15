@@ -99,7 +99,8 @@ of volatile fields (MSH-7, MSH-10).**
   state.
 
 **Must not break:** no new engine/CLI surface; no PHI to a repo file, `globalState`, or a log; the
-temp materialization is always cleaned up; the compare never hardcodes `|^~\&` (reads MSH); the
+run deletes its temp materialization's case files, then the directory if it is then empty, and at
+least a case file that cannot be unlinked, or any entry not named as a case file, stays; the compare never hardcodes `|^~\&` (reads MSH); the
 existing Load / before-after / Coverage-Profiling panes and the `--show-phi` posture are untouched.
 
 ## Acceptance Criteria

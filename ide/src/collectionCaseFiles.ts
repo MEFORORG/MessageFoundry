@@ -8,13 +8,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-/** Every run's directory starts with this, which is how a later run finds one a crash left behind. */
+/** Every run's directory starts with this, which is how a later run finds one left behind. */
 export const CASE_DIR_PREFIX = "mefor-testbench-";
 
 /**
  * How old a run's directory must be before a later run deletes it as left behind. A run deletes its
- * own directory when it ends, so only a crash leaves one; the margin keeps a sweep from deleting the
- * directory of a run still going in another window.
+ * case files when it ends, then its directory if it is then empty, so at least a crash, a case file
+ * that cannot be unlinked, or an entry not named as a case file leaves one; the margin keeps a sweep
+ * from deleting the directory of a run still going in another window.
  */
 export const STALE_CASE_DIR_MS = 60 * 60 * 1000;
 
@@ -117,7 +118,7 @@ export function removeCaseDir(dir: string): void {
 }
 
 /**
- * Delete the run directories under `base` that a crashed run left behind: a real directory (never a
+ * Delete the run directories under `base` that a run left behind: a real directory (never a
  * symlink) named with CASE_DIR_PREFIX, last modified more than `maxAgeMs` before `now`, and, on POSIX,
  * owned by this process's user. The OS temp directory is shared there, so the prefix alone does not
  * say who made an entry. On Windows the default TEMP is per-user. Each is deleted as removeCaseDir
