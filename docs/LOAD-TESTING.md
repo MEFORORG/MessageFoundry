@@ -251,6 +251,11 @@ tracking. `--baseline run.json --tolerance 0.1` flags regressions (throughput be
 This is **fan-out-agnostic** (it never assumes 1:1), so it holds for any fan-out factor. At-least-once
 re-deliveries are reported as a derived count (`sink_received − engine_written`).
 
+A run that cannot prove itself clean reads **`no-loss: INCONCLUSIVE`** and fails `zero_loss` without
+the LOSS label (BACKLOG #5574). At least these do it: nothing sent, nothing delivered, a drain that
+timed out, rows still in the ingress or routed stages, engine metrics unavailable, and engine
+counters that went backwards or an engine that restarted mid-run. A proven shortfall stays LOSS.
+
 ### Exit codes
 
 | Code | Meaning |

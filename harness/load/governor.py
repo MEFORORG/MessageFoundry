@@ -6,8 +6,9 @@ Two loop models share one connection pool, differing only in *when* the next sen
 
 * **open** — a rate-scheduled producer. It accumulates the integral of the phase's rate curve as
   send credit (not a per-message ``sleep(1/rate)``, so jitter doesn't drift, and a ramp offers what
-  its curve integrates to) and, at high rates, emits the whole batch due since the last tick. If the pool can't accept a send (engine lagging), it's counted as
-  *deferred* rather than dropped silently — that's how ``offered ≫ achieved`` becomes visible.
+  its curve integrates to) and, at high rates, emits the whole batch due since the last tick. If
+  the pool can't accept a send (engine lagging), it's counted as *deferred* rather than dropped
+  silently — that's how ``offered ≫ achieved`` becomes visible.
 * **closed** — holds exactly ``concurrency`` messages in flight via a semaphore released on each
   ACK/timeout. The achieved rate is whatever the engine drains, so it measures *max sustainable
   throughput* without a local backlog inflating the number.
@@ -28,6 +29,9 @@ _MAX_TICK_SLEEP = 0.05
 # Floor on an open-loop tick: without it, float rounding can leave the credit a hair under 1.0 and
 # ask for a sleep of ~1e-15 s again and again. A send due sooner than this rides the next batch.
 _MIN_TICK_SLEEP = 0.001
+# Credit within this of a whole send counts as that send, so float rounding of an integral that is
+# exactly a whole number (0 -> 1000 msg/s over 10 s is 5000) cannot leave the last send unoffered.
+_CREDIT_EPSILON = 1e-6
 _ACQUIRE_POLL = 0.1
 
 
@@ -80,15 +84,15 @@ class RateGovernor:
             credit += (last_rate + rate) / 2.0 * (t - last_t)
             last_t, last_rate = t, rate
             emitted = 0
-            while credit >= 1.0 and emitted < _BATCH_CAP:
+            while credit >= 1.0 - _CREDIT_EPSILON and emitted < _BATCH_CAP:
                 self._emit_one(sampler)
                 credit -= 1.0
                 emitted += 1
-            if credit >= 1.0:
+            if credit >= 1.0 - _CREDIT_EPSILON:
                 # Still behind after the batch cap: the GENERATOR could not even schedule the sends this
                 # tick (it never reached a pool, so no engine ever saw them). This is the genuinely
                 # RIG-side deferral — the one a DRIVE SHORTFALL verdict may honestly rest on.
-                behind = int(credit)
+                behind = int(credit + _CREDIT_EPSILON)
                 self._counters.deferred += behind
                 self._counters.deferred_schedule += behind
                 credit -= behind
@@ -99,7 +103,9 @@ class RateGovernor:
                 continue
             # Sleep until the next send is due at the current rate; a rising rate is picked up on
             # the next tick, which `_MAX_TICK_SLEEP` keeps short.
-            await asyncio.sleep(max(_MIN_TICK_SLEEP, min((1.0 - credit) / rate, _MAX_TICK_SLEEP)))
+            await asyncio.sleep(
+                max(_MIN_TICK_SLEEP, min(max(0.0, 1.0 - credit) / rate, _MAX_TICK_SLEEP))
+            )
 
     async def _run_closed(self, phase: Phase, mix: TypeMix, stop: asyncio.Event) -> None:
         sampler = self._corpus.sampler(mix)

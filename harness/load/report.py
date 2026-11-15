@@ -656,29 +656,38 @@ def _reconcile(
             -1,
             0,
             "engine metrics unavailable — cannot verify no-loss",
+            inconclusive=True,
         )
     read = final.read - base.read
     written = final.written - base.written
     backlog = final.backlog
-    # A restarted engine's cumulative counters begin again from zero, so final - baseline is no
-    # longer a run total: it can go negative (read as a huge intake "loss") or, once the counters
-    # regrow past the baseline, look plausible while undercounting. Either way no verdict rests on
-    # it (BACKLOG #5574). Read the whole sample run from the baseline on, not only its two ends, so
-    # a reset hidden by regrowth is still seen. At least this misses a restart of one shard of a
-    # cluster whose summed counters and max uptime both kept rising.
+    # A restarted engine's counters begin again from zero, and a stats reset or a purge of counted
+    # rows also lowers them, so final - baseline is no longer a run total: it can go negative (read
+    # as a huge intake "loss") or, once the counters regrow past the baseline, look plausible while
+    # undercounting. No intake or delivery verdict rests on it (BACKLOG #5574). The whole sample run
+    # is read, not only its two ends, so a reset hidden by regrowth is still seen. At least this
+    # misses a restart of one shard of a cluster whose summed counters and max uptime kept rising.
+    # The dead-ACK-path signature reads no engine counter, so it still proves a loss here.
     reset = _counter_reset(poller)
     if reset is not None:
+        dead = sent > 0 and counters.acked + counters.nak == 0
+        detail = (
+            f"engine counters went backwards or the engine restarted ({reset}) — an engine "
+            f"restart, a stats reset or a purge of counted rows; the read/written deltas cannot "
+            f"be reconciled against this run's sends"
+        )
+        if dead:
+            detail = f"{sent} sent and the sender saw no reply at all — a dead ACK path; {detail}"
         return NoLoss(
             False,
             sent,
-            read,
-            written,
+            max(0, read),
+            max(0, written),
             sink_received,
             backlog,
             0,
-            f"engine counters went backwards ({reset}) — the engine restarted mid-run, so its "
-            f"cumulative read/written totals cannot be reconciled against this run's sends",
-            inconclusive=True,
+            detail,
+            inconclusive=not dead,
         )
     at_least_once = max(0, sink_received - written)
     # Only a SHORTFALL is loss; an excess is benign. Intake: read < sent means the engine never
@@ -759,8 +768,10 @@ def _reconcile(
     # (harness/load/enginepoll.py) stops polling on `read >= sent - timeouts` AND
     # `sink_received >= written` AND an empty pipeline — which is `read_ok` AND `deliver_ok` AND
     # `drained`, the same three arms rearranged. So ON A RUN WHOSE SAMPLER SETTLED, all three hold
-    # by construction and `ok` is decided by `ack_path_dead` alone; the three only carry information
-    # on a run that exhausted `drain_timeout_s` without settling.
+    # by construction and, among the LOSS arms, `ok` is decided by `ack_path_dead` alone; the three
+    # only carry information on a run that exhausted `drain_timeout_s` without settling. The
+    # INCONCLUSIVE reasons further down (nothing sent, nothing delivered, a timed-out drain, a
+    # counter reset; BACKLOG #5574) are independent of the sampler and can fail a settled run too.
     #
     # The coupling is not new — the sampler has always stopped on the reconcile's own condition, and
     # `read_short` has always been that condition. WHAT IS NEW is that the retired floor was the one
@@ -829,7 +840,7 @@ def _reconcile(
     unproven: list[str] = []
     if sent == 0:
         unproven.append("nothing was sent — the run measured nothing")
-    elif sink_received == 0:
+    elif sink_received == 0 and written <= 0:
         unproven.append(
             f"nothing was delivered (sink_received 0, engine_written {written}) — "
             f"no delivery to reconcile"
@@ -852,12 +863,10 @@ def _reconcile(
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
-    if outbound_backlog:
-        parts.append(f"backlog {outbound_backlog} not drained")
-    if final.in_pipeline:
+    if not drained:
         parts.append(
-            f"in_pipeline {final.in_pipeline} rows not done in some stage (ingress, routed or "
-            f"outbound) — not drained"
+            f"backlog {outbound_backlog} outbound, in_pipeline {final.in_pipeline} not done in "
+            f"any stage (ingress, routed or outbound) — not drained"
         )
     parts.extend(unproven)
     if heavily_stranded:
@@ -900,26 +909,22 @@ def _reconcile(
 
 
 def _counter_reset(poller: EnginePoller) -> str | None:
-    """Name the first backwards step of a cumulative counter (``read``, ``written``) or of
-    ``uptime_s`` between consecutive samples from the baseline to the final one, or None.
+    """Name the first step between consecutive samples (the baseline is the first, the final the
+    last) where ``read`` or ``written`` went backwards, or where the engine's uptime is shorter than
+    the harness's own monotonic time since the previous sample -- it started after that sample.
 
-    Samples before the baseline (calibration, preflight) are not part of the run and are skipped;
-    if the baseline is not found by identity, only the two ends are compared."""
-    base, final = poller.baseline, poller.final
-    if base is None or final is None:
-        return None
-    samples = poller.samples
-    start = next((i for i, s in enumerate(samples) if s is base), None)
-    run = samples[start:] if start is not None else [base]
-    if run[-1] is not final:
-        run.append(final)
-    for prev, cur in pairwise(run):
+    Uptime is compared to the elapsed gap rather than to the previous uptime because the engine
+    derives uptime from the wall clock, so a small clock step back is not a restart."""
+    for prev, cur in pairwise(poller.samples):
         if cur.read < prev.read:
             return f"read {prev.read} -> {cur.read}"
         if cur.written < prev.written:
             return f"written {prev.written} -> {cur.written}"
-        if cur.uptime_s < prev.uptime_s:
-            return f"uptime_s {prev.uptime_s} -> {cur.uptime_s}"
+        if cur.uptime_s < cur.elapsed_s - prev.elapsed_s:
+            return (
+                f"uptime {cur.uptime_s:.1f}s is shorter than the "
+                f"{cur.elapsed_s - prev.elapsed_s:.1f}s since the previous sample"
+            )
     return None
 
 

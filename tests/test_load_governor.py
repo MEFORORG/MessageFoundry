@@ -90,8 +90,10 @@ def _ramp(rate_start: float, rate_end: float, duration: float = 10.0) -> Phase:
     )
 
 
-def _within(actual: int, expected: float, frac: float = 0.02) -> bool:
-    return abs(actual - expected) <= max(2.0, expected * frac)
+def _within(actual: int, expected: float) -> bool:
+    # The fake clock makes the count exact up to the trapezoid rule's rounding at a tick that
+    # straddles a curve's kink, so one send of slack, not a percentage.
+    return abs(actual - expected) <= 1
 
 
 def test_constant_rate_offers_rate_times_duration(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -134,7 +136,7 @@ def test_a_zero_rate_stretch_does_not_burst_on_the_way_back_up(
     # its deadline at 2 s through the zero stretch and fired ~200 sends in the first tick after 4 s.
     phase = _VPhase(name="v", kind="ramp", loop="open", duration_s=6.0, rate_start=100.0)
     gov = _run(phase, monkeypatch)
-    assert _within(len(gov.emitted), 400, frac=0.03), len(gov.emitted)
+    assert _within(len(gov.emitted), 400), len(gov.emitted)
     in_gap = [t for t in gov.emitted if 2.06 <= t < 4.0]
     assert not in_gap, in_gap[:5]
     # No single instant carries more than a tick's worth of sends at 100 msg/s.
