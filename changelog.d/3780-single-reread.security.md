@@ -32,10 +32,10 @@
   A change reversed between the lookup and the queue read no longer refuses the attempt where the
   dropped read refused it: at least a lock or a disable, a rename, rebind or re-key put back, and a
   record that failed its seal and was repaired. A reversal is at least an administrator's or the
-  directory's act, the lock's own expiry, or a directory sign-in by Kerberos or OIDC that owes no
-  further factor, which clears the second-step lock and which the account's holder can make. The
-  re-reads after the code check are unchanged. A local account's in-queue read now runs its TOTP,
-  lapse and lock checks before the attempt leaves its queue on a rename. A rename of a local
-  account that lands while the attempt waits in the queue makes it, once, let its queue go, then
-  take the queue of the name it first joined and the queue of the new name together, and read and
-  check again. While it waits for them it holds neither. (`BACKLOG #3780`)
+  directory's act, the lock's own expiry, or the account holder's own passkey, Kerberos or OIDC
+  success clearing the second-step lock while the attempt waited. The re-reads after the code
+  check are unchanged. A local account's in-queue read now runs its TOTP, lapse and lock checks
+  before the attempt leaves its queue on a rename. A rename of a local account that lands while the
+  attempt waits in the queue makes it, once, let its queue go, then take the queue of the name it
+  first joined and the queue of the new name together, and read and check again. While it waits
+  for them it holds neither. (`BACKLOG #3780`)

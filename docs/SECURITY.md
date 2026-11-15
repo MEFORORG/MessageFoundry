@@ -6754,11 +6754,11 @@ feeds the **second-step** counter, and a combined sign-in feeds one or the other
 
 So the sign-in lock refuses **no** second-factor leg: a session holder has already passed the step it
 guards. The IdP step-up feeds no counter either. The second-step checks in `verify_mfa` and
-`finish_webauthn_assertion` never filtered on `auth_provider`. Each leg has one provider branch,
+`finish_webauthn_assertion` never filtered on `auth_provider`. Their provider branches, at least
 the directory check of BACKLOG #2023 on the code leg and of BACKLOG #2239 on the passkey leg (see
-[step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). Each runs after
-the second-step lock check and adds a refusal for a directory account; neither exempts any account
-from the second-step lock. Since BACKLOG #1638 a
+[step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)), only add or
+reorder refusals for a directory account; none exempts any account from the second-step lock.
+Since BACKLOG #1638 a
 Kerberos or OIDC sign-in refuses a mirror row under either lock before it completes. WebAuthn
 assertion failures deliberately do not **feed** a counter (signatures are not guessable secrets, and a flaky authenticator
 must not lock an account) — **but an account under the second-step lock IS refused at the assertion leg

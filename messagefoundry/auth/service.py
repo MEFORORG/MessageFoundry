@@ -1194,8 +1194,8 @@ IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
 #: The ``outcome`` a ``directory_unconfirmed`` row carries when the directory check's answer is
-#: neither a known refusal reason nor the vouched account row (BACKLOG #3780 item 2): it fails closed
-#: under this fixed slug rather than under the unknown value's own text.
+#: neither a string nor the vouched account row (BACKLOG #3780 item 2). A string answer is written
+#: as given.
 _UNKNOWN_DIRECTORY_ANSWER = "unknown_answer"
 
 #: The ``auth.reauth`` reason for a directory step-up re-bind sent with an empty password (BACKLOG
@@ -1466,9 +1466,9 @@ class Elevation:
       body, cookie), or it has just made the session it elevated unreachable.
     * not ``ok``, ``session_lost`` False -- the proof was wrong (bad password, bad code, bad
       assertion). Nothing rotated, and the token the caller presented still authenticates.
-    * not ``ok``, ``session_lost`` True -- the session is gone, or in the one case named last its
-      account's keys moved, so the caller must sign in again. Either the proof was GOOD but the session was revoked or expired underneath the ceremony, or
-      (password re-auth only, BACKLOG #1138) the session is revoked because it spent its re-proof
+    * not ``ok``, ``session_lost`` True -- the caller must sign in again. Either the proof was
+      GOOD but the session was revoked or expired underneath the ceremony, or (password re-auth
+      only, BACKLOG #1138) the session is revoked because it spent its re-proof
       budget, in which case the proof was wrong or never checked; or (any ceremony, BACKLOG #2298)
       the session was ended because its temporary password lapsed, with the proof checked or not,
       as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
@@ -16596,11 +16596,11 @@ class AuthService:
         # (``_verified``). That race needs the row gone, which the in-queue read sees too, or its
         # lookup keys moved after the role test read it. So for a directory account the in-queue
         # read refuses the same way, with the same ``session_lost`` reason, whenever the keys
-        # moved and no lock is live; a live lock answers ``locked``, as the dropped re-read did
-        # whenever its read found the row. An attempt the dropped re-read refused for the race is
-        # still refused, unless the move was put back before the queue read. Wider than main,
-        # which refused only when the race was lost. A local account was never re-read after a lookup, so neither this refusal
-        # nor the lock-first order below applies to it. Both only add or reorder refusals.
+        # moved and no check before it refused. An attempt the dropped re-read refused for the
+        # race is still refused, unless the move was put back before the queue read. Wider than
+        # main, which refused only when the race was lost. A local account was never re-read
+        # after a lookup, so neither this refusal nor the lock-first order below applies to it.
+        # Both only add or reorder refusals.
         directory = _is_directory_account(user)
         vouched = await self._directory_vouches_for_factor(
             token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
@@ -17167,8 +17167,8 @@ class AuthService:
         # A positive test: only the vouched row carries on, so an answer of any other type, a
         # refusal shape this does not know included, refuses (fails closed).
         if not isinstance(answer, VerifiedUser):
-            # A known refusal names itself; any other shape gets one fixed slug, so the audit row
-            # never carries a value's own text.
+            # A string answer is written as given; an answer that is not a string gets one fixed
+            # slug.
             outcome = answer if isinstance(answer, str) else _UNKNOWN_DIRECTORY_ANSWER
             detail = {"reason": DIRECTORY_UNCONFIRMED, "outcome": outcome}
             if phase is not None:

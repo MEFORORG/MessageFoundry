@@ -930,9 +930,11 @@ async def test_a_local_rename_while_queued_rejoins_the_queue_under_the_new_name(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #3780 item 2. A local account's rename while the attempt waits is caught by the
-    in-queue re-read: a name that keys a different queue from the one held sends the attempt to the
-    new one before the code is checked, still holding the first. RED when: the code is checked
-    without the new name's queue, which attempts reading the new name join (BACKLOG #1943)."""
+    in-queue re-read: a name that keys a different queue from the one held makes the attempt, once,
+    let its queue go, then take the queue of the name it first joined and the queue of the new name
+    together, and read and check again; while it waits for them it holds neither. RED when: the
+    code is checked without the new name's queue, which attempts reading the new name join
+    (BACKLOG #1943)."""
     a = await _enrolled_local_session(store)
     real_lock = a.service._account_credential_lock
     real_verify = a.service._verify_second_factor
@@ -1298,14 +1300,15 @@ async def test_a_second_rename_carries_on_in_the_queue_held(
     assert [r["actor"] for r in rows] == [names[2]]
 
 
-async def test_a_rename_put_back_while_rejoining_still_holds_the_first_queue(
+async def test_a_rename_put_back_while_rejoining_holds_the_first_queue_at_the_check(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #3780 item 2, review of PR 2971. A local account renamed while its attempt waits,
     then renamed back before the rejoin's read: the account's name keys the queue the attempt first
-    joined, which main held throughout. RED when: the rejoin lets that queue go, so the code check
-    runs beside attempts that read the name put back and queue on it (BACKLOG #1943), where main
-    did not."""
+    joined, which main held at its code check. The rejoin lets its queue go, then takes the queue
+    of the name it first joined and the queue of the new name together; while it waits for them it
+    holds neither. RED when: the code is checked without the first name's queue, so it runs beside
+    attempts that read the name put back and queue on it (BACKLOG #1943), where main's did not."""
     a = await _enrolled_local_session(store)
     real_lock = a.service._account_credential_lock
     real_verify = a.service._verify_second_factor
