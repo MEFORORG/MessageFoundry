@@ -1466,8 +1466,8 @@ class Elevation:
       body, cookie), or it has just made the session it elevated unreachable.
     * not ``ok``, ``session_lost`` False -- the proof was wrong (bad password, bad code, bad
       assertion). Nothing rotated, and the token the caller presented still authenticates.
-    * not ``ok``, ``session_lost`` True -- the session is gone, so the caller must sign in again.
-      Either the proof was GOOD but the session was revoked or expired underneath the ceremony, or
+    * not ``ok``, ``session_lost`` True -- the session is gone, or in the one case named last its
+      account's keys moved, so the caller must sign in again. Either the proof was GOOD but the session was revoked or expired underneath the ceremony, or
       (password re-auth only, BACKLOG #1138) the session is revoked because it spent its re-proof
       budget, in which case the proof was wrong or never checked; or (any ceremony, BACKLOG #2298)
       the session was ended because its temporary password lapsed, with the proof checked or not,
@@ -1479,7 +1479,11 @@ class Elevation:
       back (vault BACKLOG #3113, #3025; THE RETRY comment in
       :meth:`AuthService.confirm_mfa_enrollment`). Or (the TOTP and
       passkey legs, BACKLOG #3068) the session or its account went while the leg waited on the
-      directory lookup, the account queue or the proof check, with the proof checked or not. Fails
+      directory lookup, the account queue or the proof check, with the proof checked or not. Or
+      (:meth:`AuthService.verify_mfa`, a directory account, BACKLOG #3780) the account's lookup keys
+      moved after the directory check read the row, with the proof unchecked: then the session
+      may still be live and the presented token may still authenticate, as when the read this
+      replaced lost its race with such a move. Fails
       CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather
       than re-prompting on a session that is gone or unreachable. For a password re-auth, the
       ``auth.reauth`` row's ``session_revoked`` says which cause applied.
@@ -16592,9 +16596,10 @@ class AuthService:
         # (``_verified``). That race needs the row gone, which the in-queue read sees too, or its
         # lookup keys moved after the role test read it. So for a directory account the in-queue
         # read refuses the same way, with the same ``session_lost`` reason, whenever the keys
-        # moved: an attempt the dropped re-read refused for the race is still refused, unless the
-        # move was put back before the queue read. Wider than main, which refused only when the
-        # race was lost. A local account was never re-read after a lookup, so neither this refusal
+        # moved and no lock is live; a live lock answers ``locked``, as the dropped re-read did
+        # whenever its read found the row. An attempt the dropped re-read refused for the race is
+        # still refused, unless the move was put back before the queue read. Wider than main,
+        # which refused only when the race was lost. A local account was never re-read after a lookup, so neither this refusal
         # nor the lock-first order below applies to it. Both only add or reorder refusals.
         directory = _is_directory_account(user)
         vouched = await self._directory_vouches_for_factor(
@@ -16613,20 +16618,15 @@ class AuthService:
                 # Read the session, the account and its lock again. The queue may have been a wait,
                 # and for a directory account the lookup came before it, so what was read before
                 # may be stale: a session revoked meanwhile would still spend its code, and a lock
-                # set by the attempt ahead in the queue would go unseen. A session or account gone
-                # answers ``session_lost``, as the re-reads after this one do (BACKLOG #3068): the
-                # token no longer authenticates. Audited with the row :meth:`_factor_holder_current`
+                # set by the attempt ahead in the queue would go unseen. A session or account gone,
+                # or an account disabled, answers ``session_lost``, as the re-reads after this one
+                # do (BACKLOG #3068). Audited with the row :meth:`_factor_holder_current`
                 # writes (BACKLOG #3780), under the account's name as it is now when the row is
                 # still there (#2291 class). The account is read even when the session is gone, so
                 # a rename that came with the revocation names the row too.
                 session = await self._load_session(hash_token(token))
                 loaded = await self._load_user(user.id if session is None else session.user_id)
-                if (
-                    session is None
-                    or loaded is None
-                    or loaded.disabled
-                    or (directory and _lookup_keys(loaded) != _lookup_keys(vouched))
-                ):
+                if session is None or loaded is None or loaded.disabled:
                     await self._audit_session_lost(
                         "auth.mfa_failed",
                         actor=(loaded or user).username,
@@ -16634,44 +16634,66 @@ class AuthService:
                         phase=None,
                     )
                     return Elevation(session_lost=True)
-                if not may_rejoin or _credential_lock_key(loaded.username) in {
+                user = loaded
+                if directory:
+                    # The dropped re-read's order: the lock is asked first, on the row just read,
+                    # and its row written, so a lock that landed during the lookup or its role test
+                    # is audited as ``locked`` whatever else landed with it. A lock with moved keys
+                    # answers ``locked``, as that re-read did when its read found the row.
+                    locked = await self._mfa_lock_refused(user, client=client)
+                    if _lookup_keys(user) != _lookup_keys(vouched):
+                        if locked:
+                            return Elevation(locked=True)
+                        # The account's lookup keys moved after the role test read them (see the
+                        # comment above the lookup's call). The session may still be live, and the
+                        # token still authenticate; ``session_lost`` is the answer and the row the
+                        # dropped re-read gave when such a move raced its read.
+                        await self._audit_session_lost(
+                            "auth.mfa_failed", actor=user.username, client=client, phase=None
+                        )
+                        return Elevation(session_lost=True)
+                    # With TOTP turned off a lock answers ``locked``, as that re-read did, and the
+                    # lapse is not asked: the account holds no factor to name on a lapse row, and
+                    # main never asked it of one either. With TOTP on, the lapse is still asked of
+                    # a locked account, and ends its session, as a lapse during the wait did ahead
+                    # of the lock, so a lock and a lapse together keep both rows and the ended
+                    # session. A directory account never rejoins: a rename moved its keys.
+                    if not user.totp_enabled:
+                        return Elevation(locked=locked)
+                    if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
+                        return Elevation(session_lost=True)
+                    if locked:
+                        return Elevation(locked=True)
+                    break
+                # A local account keeps main's order, ``totp_enabled``, then the lapse, then the
+                # lock. Asked on every pass, so a rejoin lets no queue go before main's checks
+                # have run on the row this pass read, and asks them again after its wait.
+                if not user.totp_enabled:
+                    return Elevation()
+                if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
+                    return Elevation(session_lost=True)
+                if await self._mfa_lock_refused(user, client=client):
+                    return Elevation(locked=True)
+                if not may_rejoin or _credential_lock_key(user.username) in {
                     _credential_lock_key(name) for name in joined
                 }:
-                    user = loaded
                     break
                 # A rename landed after the queue was keyed, so the queue held is one that attempts
                 # reading the new name do not join, and a burst split across the two can get one
-                # code check past the lockout (BACKLOG #1943). Only a local account gets here: a
-                # directory account whose keys moved was refused above. Let go, then hold the
-                # first queue AND the one under the name the row holds now; the reads above run
-                # again after that wait. The first queue stays held, so a rename put back while
-                # the attempt waits still meets the attempts queued on that name. ONCE: a further
-                # rename carries on in the queues then held, as a rename during the code check
-                # below does. Both windows stay open while the queue is keyed by name. Carried
-                # forward, so a refusal after the rejoin names the account as last read.
-                user = loaded
+                # code check past the lockout (BACKLOG #1943). Only a local account gets here. The
+                # attempt lets every queue it holds go, then takes the first name's queue and the
+                # new name's again, in key order, and the reads and checks above run again after
+                # that wait. While it waits it holds neither, so attempts queued behind it on the
+                # first name may run first. ONCE: a further rename carries on in the queues then
+                # held, as a rename during the code check below does. Both windows stay open while
+                # the queue is keyed by name. ``user`` is carried forward, so a refusal after the
+                # rejoin names the account as last read.
                 await queue.pop_all().aclose()
-                joined.append(loaded.username)
+                joined.append(user.username)
             else:
                 # Unreachable: the last pass breaks or returns. Guarded so an edit to the loop can
                 # never let the code check below run without the account's queue held (#1943).
                 raise RuntimeError("verify_mfa left its queue loop without holding the queue")
-            # For a directory account the lock is asked first, on the row just read, and its row
-            # written: a lock that landed during the lookup or its role test is audited as
-            # ``locked`` whatever else landed with it, as the dropped re-read audited it ahead of
-            # these checks. With TOTP turned off it answers ``locked`` there, as that re-read did,
-            # and the lapse is not asked: the account holds no factor to name on a lapse row, and
-            # main never asked it of one either. With TOTP on, the lapse is still asked of a locked
-            # account, and ends its session, as a lapse during the wait did ahead of the lock, so a
-            # lock and a lapse together keep both rows and the ended session. A local account keeps
-            # main's order, ``totp_enabled``, then the lapse, then the lock.
-            locked = directory and await self._mfa_lock_refused(user, client=client)
-            if not user.totp_enabled:
-                return Elevation(locked=locked)
-            if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
-                return Elevation(session_lost=True)
-            if locked or (not directory and await self._mfa_lock_refused(user, client=client)):
-                return Elevation(locked=True)
             now = time.time()
             # The enrolment this code is checked against: the factor write below lands only while
             # the row still holds it. Every enable stamps ``totp_enrolled_at`` afresh, as

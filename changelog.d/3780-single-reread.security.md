@@ -10,10 +10,12 @@
   rebind or re-key racing the seal check's second read could cause. So for a directory account the
   in-queue read now refuses as `session_lost`, with the same `auth.mfa_failed` row, whenever the
   account's lookup keys (its id, username, OIDC issuer and subject, and directory object id) moved
-  after the role test read it. Before, such a move refused only when it lost that race; otherwise a
-  rename while the attempt waited carried on in the old name's queue. A session lost during the
-  lookup is now named with the account's current name, read in the queue, while its row is still
-  there; before, it was named with the name read before the lookup.
+  after the role test read it and no second-step lock is live; with a live lock it answers `locked`
+  with the locked row, as the dropped read did whenever it found the row. The session is not
+  ended, so its token may still authenticate. Before, such a move refused only when it lost that
+  race; otherwise a rename while the attempt waited carried on in the old name's queue. A session
+  lost during the lookup is now named with the account's current name, read in the queue, while
+  its row is still there; before, it was named with the name read before the lookup.
   Inside the queue, a live second-step lock on a directory account is now asked right after the
   session read, and writes its `auth.mfa_failed` locked row before the TOTP and lapse checks. For a
   lock that lands during the lookup, the attempt used to answer `locked` and leave the session live,
@@ -27,11 +29,11 @@
   keeps its order: TOTP, then the lapse, then the lock.
   A change reversed between the lookup and the queue read no longer refuses the attempt where the
   dropped read refused it: at least a lock or a disable, a rename, rebind or re-key put back, and a
-  record that failed its seal and was repaired. No guess, counter or audit bound is lost, because an
-  attempt that was refused in that window could be resent after the reversal and admitted,
-  whoever made it. A reversal is at least an administrator's or the directory's act, the lock's
-  own expiry, or a directory sign-in by Kerberos or OIDC that owes no further factor, which clears
-  the second-step lock and which the account's holder can make. The re-reads after the code check
-  are unchanged. A rename of a local account that lands while the attempt waits in the queue
-  sends it, once, to the queue of the account's new name as well, still holding the queue it
-  joined first, where it reads again. (`BACKLOG #3780`)
+  record that failed its seal and was repaired. A reversal is at least an administrator's or the
+  directory's act, the lock's own expiry, or a directory sign-in by Kerberos or OIDC that owes no
+  further factor, which clears the second-step lock and which the account's holder can make. The
+  re-reads after the code check are unchanged. A local account's in-queue read now runs its TOTP,
+  lapse and lock checks before the attempt leaves its queue on a rename. A rename of a local
+  account that lands while the attempt waits in the queue makes it, once, let its queue go, then
+  take the queue of the name it first joined and the queue of the new name together, and read and
+  check again. While it waits for them it holds neither. (`BACKLOG #3780`)

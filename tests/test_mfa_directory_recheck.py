@@ -33,6 +33,7 @@ from _totp_clock import fresh_totp, pin_totp_clock
 from messagefoundry.api import create_app
 from messagefoundry.auth import reconcile, totp
 from messagefoundry.auth import service as service_module
+from messagefoundry.auth.audit_visibility import LOCKED_REFUSAL_DETAIL
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
     AdPrincipal,
@@ -780,6 +781,107 @@ async def test_a_directory_account_renamed_after_the_role_test_is_refused_as_a_l
     assert await store.list_audit(action="auth.mfa_verified") == []
     user = await store.get_user(e.user_id)
     assert user is not None and user.second_step_failed_attempts == 0
+
+
+@pytest.mark.parametrize("lands", ["nothing", "rename", "lock-and-rename"])
+async def test_a_lock_and_a_key_move_during_the_lookup_answer_locked(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, lands: str
+) -> None:
+    """BACKLOG #3780 item 2, review of PR 2971. A lock and a rename both land in the directory
+    check's role test. Main's dropped re-read found the renamed row, asked its lock and answered
+    ``locked`` with the shared locked detail, so the in-queue read asks the lock before it refuses
+    a key move. RED when: the key move answers ``session_lost`` and the locked row is never
+    written. ``nothing`` and ``rename`` are the controls: nothing landing checks the code once, and
+    a rename alone is refused as ``session_lost``."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_roles_lost = e.service._directory_roles_lost
+    real_verify = e.service._verify_second_factor
+    checks = 0
+
+    async def _roles_lost(*args: Any, **kwargs: Any) -> str | None:
+        if lands == "lock-and-rename":
+            await _lock_second_step(store, e.user_id)
+        if lands != "nothing":
+            assert await store.set_user_username(
+                e.user_id, "jdoe-renamed", expected_username="jdoe", audits=()
+            )
+        return await real_roles_lost(*args, **kwargs)
+
+    async def _counted(*args: Any, **kwargs: Any) -> bool:
+        nonlocal checks
+        checks += 1
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(e.service, "_directory_roles_lost", _roles_lost)
+    monkeypatch.setattr(e.service, "_verify_second_factor", _counted)
+
+    answer = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    if lands == "nothing":
+        assert answer.ok is True
+        assert checks == 1, "the counter did not see the code check"
+        return
+    assert answer.ok is False and checks == 0
+    rows = [(r["actor"], r["detail"]) for r in await store.list_audit(action="auth.mfa_failed")]
+    if lands == "rename":
+        assert answer.session_lost is True and answer.locked is False
+        assert rows == [("jdoe-renamed", json.dumps({"reason": "session_lost"}, sort_keys=True))]
+    else:
+        assert answer.locked is True and answer.session_lost is False
+        assert rows == [("jdoe-renamed", LOCKED_REFUSAL_DETAIL)]
+
+
+@pytest.mark.parametrize("lock", [False, True], ids=["control", "lock-cleared-in-the-wait"])
+async def test_a_local_rejoin_refuses_a_lock_read_before_it_lets_the_queue_go(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, lock: bool
+) -> None:
+    """BACKLOG #3780 item 2, review of PR 2971. A local account is renamed and second-step locked
+    while its attempt waits; the lock is cleared while the attempt waits to rejoin. Main's one
+    in-queue read found the lock and answered ``locked``, so the first pass asks the lock before it
+    lets the queue go. RED when: the lock is asked only after the rejoin, so the code is checked
+    and the session elevated. ``control`` renames without a lock: the attempt rejoins and the code
+    is checked once."""
+    a = await _enrolled_local_session(store)
+    real_lock = a.service._account_credential_lock
+    real_verify = a.service._verify_second_factor
+    renamed = f"{a.username}-renamed"
+    calls = 0
+    checks = 0
+
+    @asynccontextmanager
+    async def _queue(username: str) -> AsyncIterator[None]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert await store.set_user_username(
+                a.user_id, renamed, expected_username=a.username, audits=()
+            )
+            if lock:
+                await _lock_second_step(store, a.user_id)
+        elif calls == 2 and lock:
+            await store.record_login_success(a.user_id)  # clears the second-step lock
+        async with real_lock(username):
+            yield
+
+    async def _counted(*args: Any, **kwargs: Any) -> bool:
+        nonlocal checks
+        checks += 1
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(a.service, "_account_credential_lock", _queue)
+    monkeypatch.setattr(a.service, "_verify_second_factor", _counted)
+
+    answer = await a.service.verify_mfa(a.token, a.code)
+
+    if not lock:
+        assert answer.ok is True
+        assert calls == 3 and checks == 1
+        return
+    assert answer.ok is False and answer.locked is True
+    assert checks == 0, "the code was checked"
+    assert calls == 1, "the attempt let its queue go before refusing the lock"
+    rows = [r["detail"] for r in await store.list_audit(action="auth.mfa_failed")]
+    assert rows == [LOCKED_REFUSAL_DETAIL]
 
 
 async def test_a_local_rename_while_queued_rejoins_the_queue_under_the_new_name(
