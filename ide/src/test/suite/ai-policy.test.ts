@@ -398,7 +398,10 @@ suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
     await resolveAiPolicy(ctx, engineIo(A, wire({ mode: "off" })));
     const io = offlineWithCli(true);
     const p = await resolveAiPolicy(ctx, io);
-    assert.strictEqual(p.mode, "unverified", "a cached off must not be bypassed by changing the setting");
+    // A's "off" is in the deny carrier, and an unreachable target applies any carried deny, so the
+    // answer is that "off" itself, which is stricter than the bare "unverified" an uncached target gets.
+    assert.strictEqual(p.mode, "off", "a cached off must not be bypassed by changing the setting");
+    assert.strictEqual(assistantState(p).enabled, false, "assistance stays disabled");
     assert.strictEqual(io.cliAsked(), false, "the CLI is not consulted for a configured target");
   });
 
