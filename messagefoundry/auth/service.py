@@ -210,6 +210,7 @@ from messagefoundry.store.store import (
     LockoutIncrement,
     PasskeyCounts,
     PasskeyRowMalformed,
+    PendingFactorAnchor,
     RevokeResult,
     RoleRow,
     SessionRecord,
@@ -11854,8 +11855,8 @@ class AuthService:
         * ``_new_ip_seen`` — the WP-L3-13 dedupe. Only the audit row and notice depend on it, never
           the step-up. A re-verification drops the entry before it rotates (BACKLOG #2159), so a
           strand costs something on a rotation WITHOUT one, such as an enrolment confirm or a
-          passkey assertion on an ``oidc`` session: every address already reported would be
-          audited and notified again.
+          passkey assertion that moved no anchor (an ``oidc`` session, or one that had already
+          met its factor): every address already reported would be audited and notified again.
         * ``_reproof_session_failures`` — the BACKLOG #1138 per-session re-proof budget. Stranded,
           any rotation would hand the session a fresh budget of guesses.
 
@@ -15014,7 +15015,8 @@ class AuthService:
 
         A LOCAL login that owes no second factor is the first verification. No directory login is:
         Kerberos and OIDC sessions are born with no window (BACKLOG #1144 step 5). A Kerberos session
-        opens one by a step-up, a code at the MFA gate or a user-verified passkey there, an OIDC
+        opens one by a step-up, a code at the MFA gate, or a user-verified passkey that completes
+        its pending factor there (a passkey never renews a window once the factor is met), an OIDC
         session only by the IdP step-up
         (BACKLOG #2142)."""
         if not token:
@@ -15062,8 +15064,10 @@ class AuthService:
         """Start the new-address dedupe over for a session that just re-anchored, so an address
         reported before the re-anchor is reported again (BACKLOG #2159).
 
-        Every leg that calls ``mark_session_reauthed`` calls this straight after it, before it
-        rotates the token; tests/test_admin_new_ip.py pins the pairing. Keying the reset on the
+        Every leg that re-anchors calls this straight after the write, before it rotates the
+        token: each leg that calls ``mark_session_reauthed``, and :meth:`finish_webauthn_assertion`
+        when ``mark_session_mfa_verified(anchor=...)`` reports it applied the anchor;
+        tests/test_admin_new_ip.py pins the pairing. Keying the reset on the
         re-anchor rather than on ``reauth_at`` keeps it free of the wall clock, which can step
         back."""
         self._new_ip_seen.pop(token_hash, None)
@@ -15143,10 +15147,12 @@ class AuthService:
           OIDC one minted while ``oidc_require_mfa_claim`` is off. Such a sign-in writes nothing
           here, and the factor leg below writes for it;
         * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``),
-          once the session has rotated, whether it finishes a sign-in or a step-up. Both also move
-          the session's anchor (see :meth:`_same_host`), but not on an OIDC session, whose anchor
-          moves only at the IdP (BACKLOG #2142). The passkey opens the step-up window only with
-          the UV flag;
+          once the session has rotated, whether it finishes a sign-in or a step-up. A code also
+          moves the session's anchor on every success (see :meth:`_same_host`), and a passkey only
+          when it completes a factor the session had not yet met; neither on an OIDC session, whose
+          anchor moves only at the IdP (BACKLOG #2142). So after a passkey on a session that had
+          already met its factor, this record can hold an address the anchor has not moved to. The
+          passkey opens the step-up window only with the UV flag;
         * a factor enrolment confirmed, first or later (``confirm_mfa_enrollment``,
           ``finish_webauthn_registration``); a first one is how a first sign-in under
           ``require_mfa`` finishes. Those callers pass the account as ``enrolment``, and an address
@@ -18158,11 +18164,12 @@ class AuthService:
         origin: str,
     ) -> Elevation:
         """Verify an assertion for the caller's session; on success mark the session's second
-        factor satisfied, re-anchor it to the WP-L3-13 client as :meth:`verify_mfa` does, stamp
-        ``reauth_at`` only when the authenticator reported user verification and clear it otherwise
-        (not on an ``oidc`` session either way, and not on a session that had already met its
-        factor, which neither re-anchors nor stamps; vault BACKLOG #2964 item 14, owner rulings
-        2026-11-14, ADR 0068 Amendments of that date) and re-key the session (ASVS 7.2.4). Returns a not-``ok``
+        factor satisfied and re-key the session (ASVS 7.2.4). The same factor write, when the row it
+        locks has not met its factor, also re-anchors the session to the WP-L3-13 client as
+        :meth:`verify_mfa` does and stamps ``reauth_at`` only when the authenticator reported user
+        verification, clearing it otherwise. A session that had already met its factor when that
+        write ran, and any ``oidc`` session, is neither re-anchored nor stamped (vault BACKLOG #2964
+        item 14, owner rulings 2026-11-14, ADR 0068 amendment of that date). Returns a not-``ok``
         :class:`Elevation` (never raises) for any invalid input, always audited.
 
         For a passkey-only account this is the ONLY leg of ``POST /ui/mfa``, so the rotation here is
@@ -18330,33 +18337,24 @@ class AuthService:
         async with self._stamp_to_rotation(
             ceremony="webauthn_assert", actor=user.username, client=client
         ) as window:
+            # Vault BACKLOG #2964 item 14: the anchor rides the factor write, and the store applies
+            # it only to a row that has not met its factor (AuthStore.mark_session_mfa_verified).
+            # None on an oidc session, whose anchor moves only at the IdP (BACKLOG #2142); the
+            # mechanism is written at mint and never changes, so the entry read decides it.
+            anchor = (
+                None
+                if session.auth_mechanism == SessionMechanism.OIDC.value
+                else PendingFactorAnchor(client=client, open_window=verified.user_verified)
+            )
+            anchored = False
             async with self._sealed_stamp(hash_token(token)) as stamp:
-                await self._store.mark_session_mfa_verified(hash_token(token))
+                anchored = await self._store.mark_session_mfa_verified(
+                    hash_token(token), anchor=anchor
+                )
             if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
                 return Elevation(session_lost=True)
-            # Vault BACKLOG #2964 item 14 (owner rulings 2026-11-14, "Assertion only" and "Stamp
-            # only if UV"): re-anchor the session to the address that proved the passkey, as
-            # verify_mfa does after a good code, so the two address signals agree. The step-up
-            # window opens only when the signed authenticator data carried the UV flag; without it
-            # the same write shuts any open window, so none follows the anchor. Not on an oidc
-            # session, whose anchor moves only at the IdP (BACKLOG #2142);
-            # tests/test_docs_security_pathways.py pins the branch.
-            # Only when this assertion completes a factor the session had not met. The console
-            # stages an assertion for a session that already met it too (the POST /ui/mfa
-            # re-render), and there a passkey proves nothing the session lacked, so it neither
-            # opens the window nor moves the anchor. Read from the session row loaded at entry:
-            # every leg that meets a factor on an existing session also re-keys it, so a factor
-            # met by another request since that read leaves this token naming no row. Kept as
-            # its own `if`: the docs pin wants the stamp under a bare auth_mechanism comparison.
-            if session.mfa_verified_at is None:  # noqa: SIM102
-                if session.auth_mechanism != SessionMechanism.OIDC.value:
-                    async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
-                        await self._store.mark_session_reauthed(
-                            hash_token(token), client=client, stamp_window=verified.user_verified
-                        )
-                    if reauth_stamp.refused:  # BACKLOG #2592: as above, the session has ended
-                        return Elevation(session_lost=True)
-                    self._restart_new_ip_dedupe(hash_token(token))
+            if anchored:
+                self._restart_new_ip_dedupe(hash_token(token))
             # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
             # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
             # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,

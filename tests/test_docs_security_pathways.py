@@ -971,6 +971,45 @@ def _called(node: ast.AST, name: str) -> bool:
     )
 
 
+def _anchored_factor_writes(node: ast.AST) -> list[ast.Call]:
+    """The ``mark_session_mfa_verified`` calls under ``node`` that pass an ``anchor=`` keyword,
+    which is how the passkey leg re-anchors and stamps (vault BACKLOG #2964 item 14)."""
+    return [
+        c
+        for c in call_sites(node, "mark_session_mfa_verified")
+        if any(k.arg == "anchor" for k in c.keywords)
+    ]
+
+
+def _anchor_is_none_on_oidc(leg: ast.AST) -> bool:
+    """Whether ``leg`` binds ``anchor`` only to ``None if <x>.auth_mechanism == ...OIDC.value else
+    ...``, so an oidc session's factor write applies no anchor and opens no window (BACKLOG #2142).
+    """
+    bound = [
+        n.value
+        for n in ast.walk(leg)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "anchor" for t in n.targets)
+    ]
+    return bool(bound) and all(
+        isinstance(v, ast.IfExp)
+        and isinstance(v.body, ast.Constant)
+        and v.body.value is None
+        and isinstance(v.test, ast.Compare)
+        and isinstance(v.test.left, ast.Attribute)
+        and v.test.left.attr == "auth_mechanism"
+        and all(isinstance(op, ast.Eq) for op in v.test.ops)
+        and all(
+            isinstance(c, ast.Attribute)
+            and c.attr == "value"
+            and isinstance(c.value, ast.Attribute)
+            and c.value.attr == "OIDC"
+            for c in v.test.comparators
+        )
+        for v in bound
+    )
+
+
 def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     """ASVS 6.1.3 was held at partial a third time (BACKLOG #1133) on passages older than both fixes.
 
@@ -983,7 +1022,8 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     2. A browser SSO or OIDC session's first sensitive action does not always force a step-up.
        ``verify_mfa`` stamps ``reauth_at``, and neither code route asks whether the session already
        met its factor, so a TOTP or recovery code opens a fresh window at any time. Since vault
-       BACKLOG #2964 item 14 a passkey assertion with the UV flag stamps one too.
+       BACKLOG #2964 item 14 a passkey assertion with the UV flag that completes a pending factor
+       stamps one too.
     3. Console routes charge the per-actor ceremony budget, ``POST /ui/mfa`` among them. There were
        four when this pass ran; BACKLOG #296 added ``POST /ui/reauth/oidc`` for five, and the doc's
        count is now derived from the route list below rather than written into this test.
@@ -1026,9 +1066,11 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     assert _called(verify, "mark_session_reauthed"), (
         "verify_mfa no longer stamps reauth_at; the step-up paragraph says a TOTP opens a window."
     )
-    assert _called(assertion, "mark_session_reauthed"), (
-        "a passkey assertion no longer stamps reauth_at; the step-up paragraph says it does, as a "
-        "code does (vault BACKLOG #2964 item 14)."
+    # Vault BACKLOG #2964 item 14: the passkey stamps reauth_at through its factor write's anchor,
+    # in one write, never through a second mark_session_reauthed.
+    assert _anchored_factor_writes(assertion) and not _called(assertion, "mark_session_reauthed"), (
+        "a passkey assertion no longer stamps reauth_at through its factor write's anchor; the "
+        "step-up paragraph says a user-verified passkey that completes a pending factor does."
     )
     assert not _called(verify, "mfa_satisfied") and not any(
         isinstance(n, ast.Attribute) and n.attr == "mfa_verified_at" for n in ast.walk(verify)
@@ -1041,9 +1083,16 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         if isinstance(n, ast.AsyncFunctionDef) and n.name == "mfa_verify"
     )
     for label, handler in (("POST /ui/mfa", routes["POST /ui/mfa"]), ("JSON", json_verify)):
-        assert _called(handler, "verify_mfa") and not _called(handler, "mfa_satisfied"), (
-            f"the {label} MFA route now checks whether the session already met its factor; the "
-            "doc says a TOTP refreshes the step-up window at any time."
+        # Vault BACKLOG #2964 item 14: POST /ui/mfa may ask, but only AFTER verify_mfa has run, to
+        # send a satisfied session's refused code to /ui instead of re-rendering the gate. A code
+        # is still never refused for a met factor.
+        verify_lines = [c.lineno for c in call_sites(handler, "verify_mfa")]
+        asked_lines = [c.lineno for c in call_sites(handler, "mfa_satisfied")]
+        assert verify_lines and (
+            not asked_lines if label == "JSON" else all(a > min(verify_lines) for a in asked_lines)
+        ), (
+            f"the {label} MFA route now checks whether the session already met its factor before "
+            "the code; the doc says a TOTP refreshes the step-up window at any time."
         )
 
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
@@ -1121,37 +1170,31 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     # BACKLOG #2142: verify_mfa stamps only under a branch on the session's mechanism, refuses a
     # satisfied oidc session's code through one helper (so the "asks nothing" pin above still holds
     # for every other session), and the paragraph says both.
-    # Vault BACKLOG #2964 item 14: the passkey assertion stamps under the same branch.
-    for name, leg in (("verify_mfa", verify), ("finish_webauthn_assertion", assertion)):
-        # The stamp sits in the body of an `auth_mechanism != ...` test, never under its else.
-        guarded = [
-            n
-            for n in ast.walk(leg)
-            if isinstance(n, ast.If)
-            and isinstance(n.test, ast.Compare)
-            and isinstance(n.test.left, ast.Attribute)
-            and n.test.left.attr == "auth_mechanism"
-            and all(isinstance(op, ast.NotEq) for op in n.test.ops)
-            and all(
-                isinstance(c, ast.Attribute)
-                and c.attr == "value"
-                and isinstance(c.value, ast.Attribute)
-                and c.value.attr == "OIDC"
-                for c in n.test.comparators
-            )
-            and any(_called(stmt, "mark_session_reauthed") for stmt in n.body)
-        ]
-        unguarded = [
-            stmt
-            for stmt in ast.walk(leg)
-            if isinstance(stmt, ast.Expr)
-            and _called(stmt, "mark_session_reauthed")
-            and not any(stmt in ast.walk(g) for g in guarded)
-        ]
-        assert guarded and not unguarded, (
-            f"{name} stamps reauth_at outside its auth_mechanism branch; the doc says an oidc "
-            "session's factor opens no window."
+    guarded = [
+        n
+        for n in ast.walk(verify)
+        if isinstance(n, ast.If)
+        and any(
+            isinstance(a, ast.Attribute) and a.attr == "auth_mechanism" for a in ast.walk(n.test)
         )
+        and any(_called(stmt, "mark_session_reauthed") for stmt in n.body)
+    ]
+    unguarded = [
+        stmt
+        for stmt in ast.walk(verify)
+        if isinstance(stmt, ast.Expr)
+        and _called(stmt, "mark_session_reauthed")
+        and not any(stmt in ast.walk(g) for g in guarded)
+    ]
+    assert guarded and not unguarded, (
+        "verify_mfa stamps reauth_at outside its auth_mechanism branch; the doc says an oidc code "
+        "opens no window."
+    )
+    # Vault BACKLOG #2964 item 14: the passkey's factor write carries no anchor on an oidc session.
+    assert _anchor_is_none_on_oidc(assertion), (
+        "finish_webauthn_assertion no longer passes anchor=None on an oidc session; the doc says "
+        "a passkey on an oidc session opens no window."
+    )
     assert _called(verify, "_code_owes_nothing_to_oidc_session"), (
         "verify_mfa no longer refuses a satisfied oidc session's code; the doc says it does."
     )
@@ -1945,13 +1988,14 @@ def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -
         "6.8.4 fallback says no directory sign-in opens the step-up window."
     )
     # The AD re-bind and the IdP step-up stamp the window and never mark the second factor; the
-    # TOTP leg and, since vault BACKLOG #2964 item 14, the passkey do both (the passkey's window
-    # only with the UV flag).
+    # TOTP leg does both, and since vault BACKLOG #2964 item 14 the passkey does both in its one
+    # factor write, through its anchor (the window only with the UV flag).
     for func in (AuthService.reauth, AuthService.complete_oidc_step_up):
         assert _calls_method(func, "mark_session_reauthed"), func.__name__
         assert not _calls_method(func, "mark_session_mfa_verified"), func.__name__
     assert _calls_method(AuthService.finish_webauthn_assertion, "mark_session_mfa_verified")
-    assert _calls_method(AuthService.finish_webauthn_assertion, "mark_session_reauthed")
+    assert not _calls_method(AuthService.finish_webauthn_assertion, "mark_session_reauthed")
+    assert _anchored_factor_writes(_service_func("finish_webauthn_assertion"))
     assert _calls_method(AuthService.verify_mfa, "mark_session_mfa_verified")
     assert _calls_method(AuthService.verify_mfa, "mark_session_reauthed")
     # The passkey is not relied on for user verification: asked for at PREFERRED, never required.

@@ -2259,13 +2259,12 @@ def new_session_record(
 
 
 def reauth_stamp(
-    now: float, client: str | None, idp_auth_time: float | None, *, stamp_window: bool = True
+    now: float, client: str | None, idp_auth_time: float | None
 ) -> Callable[[SessionRecord], SessionRecord]:
     """The change ``mark_session_reauthed`` makes to a session row, for the session write helper.
 
-    ``reauth_at`` becomes ``now``, unless ``stamp_window`` is false, which clears it, so a window
-    opened at the old anchor never follows the session to a new one (vault BACKLOG #2964 item 14).
-    A ``client`` re-anchors the session's address; ``None`` keeps the stored one (WP-L3-13). ``idp_auth_time`` only ever moves FORWARD (BACKLOG #2143), so two
+    ``reauth_at`` becomes ``now``. A ``client`` re-anchors the session's address; ``None`` keeps the
+    stored one (WP-L3-13). ``idp_auth_time`` only ever moves FORWARD (BACKLOG #2143), so two
     step-ups landing out of order cannot leave the older value behind for a replay to pass."""
     when = float(now)
     idp = _opt_float(idp_auth_time)
@@ -2276,7 +2275,7 @@ def reauth_stamp(
             forward = idp
         return replace(
             s,
-            reauth_at=when if stamp_window else None,
+            reauth_at=when,
             client=s.client if client is None else client,
             idp_auth_time=forward,
         )
@@ -2284,10 +2283,48 @@ def reauth_stamp(
     return apply
 
 
-def mfa_stamp(now: float) -> Callable[[SessionRecord], SessionRecord]:
-    """The change ``mark_session_mfa_verified`` makes to a session row (WP-14)."""
-    when = float(now)
-    return lambda s: replace(s, mfa_verified_at=when)
+@dataclass(frozen=True)
+class PendingFactorAnchor:
+    """What a factor that completes a PENDING session also moves (vault BACKLOG #2964 item 14): the
+    session's address to ``client`` (``None`` keeps the stored one) and its step-up window, which
+    opens when ``open_window`` is true and is cleared when it is false, whether or not the address
+    moved. :func:`mfa_stamp` applies it only to a row that has not met its factor."""
+
+    client: str | None
+    open_window: bool
+
+
+class _MfaStamp:
+    """The callable :func:`mfa_stamp` returns. ``anchored`` says whether its last application
+    applied the anchor; it is decided afresh on every call, so a callable applied twice cannot
+    carry an earlier answer."""
+
+    def __init__(self, when: float, anchor: PendingFactorAnchor | None) -> None:
+        self._when = when
+        self._anchor = anchor
+        self.anchored = False
+
+    def __call__(self, s: SessionRecord) -> SessionRecord:
+        anchor = self._anchor
+        self.anchored = anchor is not None and s.mfa_verified_at is None
+        if not self.anchored or anchor is None:  # the second test only narrows the type
+            return replace(s, mfa_verified_at=self._when)
+        return replace(
+            s,
+            mfa_verified_at=self._when,
+            client=s.client if anchor.client is None else anchor.client,
+            reauth_at=self._when if anchor.open_window else None,
+        )
+
+
+def mfa_stamp(now: float, anchor: PendingFactorAnchor | None = None) -> _MfaStamp:
+    """The change ``mark_session_mfa_verified`` makes to a session row (WP-14).
+
+    It always stamps ``mfa_verified_at``. With an ``anchor``, and only when the row it is applied to
+    has not met its factor, it also applies the anchor (:class:`PendingFactorAnchor`). The session
+    write helper applies it to the row it read inside its own transaction, so the decision is made
+    on the row the write replaces, never on an earlier read."""
+    return _MfaStamp(float(now), anchor)
 
 
 # The session-cap predicates, in the `?` dialect SQLite and SQL Server share (BACKLOG #1900). Each
@@ -20666,22 +20703,27 @@ class MessageStore:
         now: float | None = None,
         client: str | None = None,
         idp_auth_time: float | None = None,
-        stamp_window: bool = True,
     ) -> None:
-        stamp = reauth_stamp(
-            time.time() if now is None else now, client, idp_auth_time, stamp_window=stamp_window
-        )
+        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
         async with _writer_txn(self._db, self._lock):
             await self._write_session(token_hash, stamp)
             await self._commit()
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
         """Stamp a session's second-factor as satisfied (WP-14): after a TOTP/recovery verify, or at
-        issuance for an MFA-delegated AD/Kerberos login."""
-        stamp = mfa_stamp(time.time() if now is None else now)
+        issuance for an MFA-delegated AD/Kerberos login. See
+        :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the answer."""
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with _writer_txn(self._db, self._lock):
-            await self._write_session(token_hash, stamp)
+            written = await self._write_session(token_hash, stamp)
             await self._commit()
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None

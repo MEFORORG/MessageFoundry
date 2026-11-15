@@ -66,6 +66,7 @@ from messagefoundry.logging_setup import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
+from tests._ast_sites import call_sites
 from tests._bound_proof import prove
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
@@ -647,9 +648,12 @@ async def test_one_epoch_audits_at_most_the_per_session_cap() -> None:
 
 
 def test_every_reanchor_restarts_the_dedupe() -> None:
-    """Each function that re-anchors a session (``mark_session_reauthed``) also restarts the
-    new-address dedupe. A new re-verification leg that forgot would leave addresses reported
-    before it suppressed after it, which is the gap BACKLOG #2159 closed."""
+    """Each function that re-anchors a session also restarts the new-address dedupe. A new
+    re-verification leg that forgot would leave addresses reported before it suppressed after it,
+    which is the gap BACKLOG #2159 closed. A leg re-anchors when it calls
+    ``mark_session_reauthed``, or when it calls ``mark_session_mfa_verified`` with an ``anchor=``
+    (vault BACKLOG #2964 item 14, the passkey assertion), so that leg is named below and cannot
+    drop out of the set unseen."""
     source = Path(inspect.getfile(AuthService)).read_text(encoding="utf-8")
     tree = ast.parse(source)
     anchoring: dict[str, set[str]] = {}
@@ -660,9 +664,14 @@ def test_every_reanchor_restarts_the_dedupe() -> None:
                 for n in ast.walk(node)
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
             }
-            if "mark_session_reauthed" in called:
+            anchored_factor = any(
+                any(k.arg == "anchor" for k in c.keywords)
+                for c in call_sites(node, "mark_session_mfa_verified")
+            )
+            if "mark_session_reauthed" in called or anchored_factor:
                 anchoring[node.name] = called
     assert len(anchoring) >= 3, sorted(anchoring)  # control: the probe finds the known legs
+    assert "finish_webauthn_assertion" in anchoring, sorted(anchoring)
     missing = sorted(
         name for name, called in anchoring.items() if "_restart_new_ip_dedupe" not in called
     )

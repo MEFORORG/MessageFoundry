@@ -1886,6 +1886,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # BACKLOG #2142: an oidc session that already met its factor owes no code, as the GET
             # says for any satisfied session. Nothing rotated, so the cookie is still live.
             return RedirectResponse("/ui", status_code=303)
+        if await auth.mfa_satisfied(token):
+            # A session that already met its factor owes this page nothing, as the GET says, so
+            # its refused code lands on /ui rather than on a gate re-rendered for it. verify_mfa
+            # has already audited and charged the code. The re-render below is pending-only.
+            return RedirectResponse("/ui", status_code=303)
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
         # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
@@ -2175,9 +2180,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # (the sanctioned /ui carve — the cookie stays confined to /ui deps; bearer_token()
     # is untouched) that verifies an assertion, marks the session's factor and, when that
     # completes a pending factor, re-anchors it as a TOTP code does, stamping the window only
-    # with the UV flag (vault BACKLOG #2964 item 14; not an oidc session). A session that had
-    # already met its factor, which the POST /ui/mfa re-render can stage an assertion for, is
-    # neither re-anchored nor stamped. An action-bound grant still comes only from the
+    # with the UV flag (vault BACKLOG #2964 item 14; not an oidc session). An assertion that
+    # arrives for a session that already met its factor (two tabs share the challenge, which
+    # moves with the session's re-key) marks it and re-keys, and moves no anchor and no window.
+    # An action-bound grant still comes only from the
     # POST /ui/reauth password leg (ADR 0077).
     # NOT registered as a continuation (body-carrying JSON — part of the
     # step-up mechanism itself). MFA-pending sessions pass (the assertion IS the proof);

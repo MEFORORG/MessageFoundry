@@ -116,6 +116,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     PinCheck,
     ReingressOriginMissing,
     ReingressOutcome,
@@ -3377,12 +3378,8 @@ class AuthStore(Protocol):
         now: float | None = None,
         client: str | None = None,
         idp_auth_time: float | None = None,
-        stamp_window: bool = True,
     ) -> None:
-        """Refresh the session's step-up freshness (``reauth_at``), unless ``stamp_window`` is false,
-        which clears it in the same write and re-anchors only: a passkey assertion without the UV
-        flag (vault BACKLOG #2964 item 14, owner ruling 2026-11-14), so no open window follows the
-        anchor to a new address. When ``client`` is given, also
+        """Refresh the session's step-up freshness (``reauth_at``). When ``client`` is given, also
         re-anchor the session's last-verified client address to it (the new-client-IP risk signal in
         WP-L3-13 uses this so a re-verify from a roamed address clears the forced step-up); a ``None``
         ``client`` leaves the stored address unchanged.
@@ -3395,8 +3392,26 @@ class AuthStore(Protocol):
         ...
 
     async def mark_session_mfa_verified(
-        self, token_hash: str, *, now: float | None = None
-    ) -> None: ...
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        """Stamp the session's second factor as met (``mfa_verified_at``), always.
+
+        ``anchor`` (vault BACKLOG #2964 item 14) is applied only when the row this write reads has
+        not met its factor: the decision is made inside the write, on the row it locks and
+        replaces, so a factor another request met first leaves this a plain factor stamp. When
+        applied, the anchor moves the session's address to ``anchor.client`` (``None`` keeps it)
+        and opens the step-up window (``reauth_at``) when ``anchor.open_window`` is true. When
+        ``open_window`` is false it CLEARS ``reauth_at``, whether or not the address moved. The
+        default ``None`` applies no anchor, which is the behaviour every other caller has.
+
+        Returns ``True`` only when the write landed and applied the anchor, so a caller restarts
+        its new-address bookkeeping only for a session whose anchor moved; ``False`` for a write
+        that applied none, a session gone or revoked, or a write that lost its seal compare."""
+        ...
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 

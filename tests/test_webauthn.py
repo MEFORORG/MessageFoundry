@@ -233,8 +233,10 @@ async def test_fresh_session_is_mfa_pending_until_assertion() -> None:
 @pytest.mark.parametrize("uv", [True, False])
 async def test_assertion_stamps_the_factor_and_re_anchors(uv: bool) -> None:
     """Vault BACKLOG #2964 item 14 (owner rulings 2026-11-14, "Assertion only" and "Stamp only if
-    UV"): every verified assertion marks the factor and re-anchors the session; ``reauth_at`` is
-    stamped only when the signed authenticator data carries the UV flag."""
+    UV"): a verified assertion that completes a pending factor marks the factor and re-anchors the
+    session; ``reauth_at`` is stamped only when the signed authenticator data carries the UV flag,
+    and cleared without it. The window is seeded open first, so the non-UV case proves the clear
+    rather than a value that was never set."""
     from messagefoundry.auth.tokens import hash_token
 
     store = await MessageStore.open(":memory:")
@@ -248,6 +250,10 @@ async def test_assertion_stamps_the_factor_and_re_anchors(uv: bool) -> None:
         assert fresh is not None
         before = await store.get_session(hash_token(fresh))
         assert before is not None and before.reauth_at is None  # MFA-pending: no seeded step-up
+        seeded = time.time() - 60
+        await store.mark_session_reauthed(hash_token(fresh), now=seeded)
+        before = await store.get_session(hash_token(fresh))
+        assert before is not None and before.reauth_at == seeded and before.mfa_verified_at is None
         options = await service.begin_webauthn_assertion(fresh, rp_id=RP)
         assert options is not None
         challenge = base64url_to_bytes(json.loads(options)["challenge"])
@@ -263,7 +269,10 @@ async def test_assertion_stamps_the_factor_and_re_anchors(uv: bool) -> None:
         after = await store.get_session(hash_token(elevation.token))
         assert after is not None
         assert after.mfa_verified_at is not None
-        assert (after.reauth_at is not None) is uv
+        if uv:
+            assert after.reauth_at is not None and after.reauth_at > seeded
+        else:
+            assert after.reauth_at is None
         assert after.client == "10.4.4.2"
     finally:
         await store.close()
@@ -1449,12 +1458,75 @@ async def test_a_non_uv_assertion_shuts_an_open_window_as_it_re_anchors() -> Non
 
 
 @pytest.mark.parametrize("uv", [True, False])
-async def test_an_assertion_on_a_session_that_met_its_factor_opens_nothing(uv: bool) -> None:
-    """Vault BACKLOG #2964 item 14: the ``POST /ui/mfa`` re-render stages an assertion for a session
-    that has already met its factor, since it passes ``satisfied=False`` to the passkey leg. A
-    passkey there proves nothing the session lacked, so it neither opens the step-up window, with
-    or without UV, nor moves the anchor. RED when: ``finish_webauthn_assertion``
-    re-anchors and stamps on every session, which opens the window from a third address."""
+async def test_an_assertion_on_a_session_that_met_its_factor_moves_nothing(
+    monkeypatch: pytest.MonkeyPatch, uv: bool
+) -> None:
+    """Vault BACKLOG #2964 item 14, two tabs: a passkey ceremony staged while the session was
+    pending survives a TOTP code from another tab (the challenge moves with the re-key), and its
+    assertion then reaches a session that has met its factor. It marks the factor and re-keys, and
+    moves neither the anchor nor the window the code stamped, with UV or without. RED when: the
+    passkey leg re-anchors and stamps a session that has met its factor (the anchor moves to the
+    third address, and with UV the window is stamped again; without UV it is cleared)."""
+    from messagefoundry.auth import totp
+    from messagefoundry.auth.tokens import hash_token
+    from tests._totp_clock import pin_totp_clock
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        enroll = await service.begin_mfa_enrollment(identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t0), token=token
+        )
+        assert confirmed.ok and confirmed.token is not None
+        auth, _ = await _enroll(service, identity, confirmed.token)
+        out = await service.login(ADMIN_USERNAME, password, client="10.6.6.1")
+        assert out.ok and out.mfa_required and out.token is not None
+        # Tab one stages the passkey while the session is pending.
+        options = await service.begin_webauthn_assertion(out.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        # Tab two meets the factor with a code from a second address: anchored there, window open.
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        code = await service.verify_mfa(
+            out.token, totp.totp(enroll.secret, now=t1), client="10.6.6.2"
+        )
+        assert code.ok and code.token is not None
+        met = await store.get_session(hash_token(code.token))
+        assert met is not None and met.client == "10.6.6.2" and met.reauth_at is not None
+        # Tab one's assertion lands on the satisfied session, from a third address.
+        again = await service.finish_webauthn_assertion(
+            code.token,
+            auth.get_response(challenge, user_verified=uv),
+            client="10.6.6.3",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert again.ok and again.token is not None and again.token != code.token
+        row = await store.get_session(hash_token(again.token))
+        assert row is not None
+        assert (row.client, row.reauth_at) == ("10.6.6.2", met.reauth_at)
+        assert await service.flag_new_client_ip(again.token, "10.6.6.3", path="/ui/x")
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("interleave", [True, False])
+async def test_a_factor_met_during_the_assertion_is_not_re_anchored(
+    monkeypatch: pytest.MonkeyPatch, interleave: bool
+) -> None:
+    """Vault BACKLOG #2964 item 14, review finding R6: the decision to re-anchor is made inside the
+    factor write, on the row it locks, never on the session row the leg loaded first. Here another
+    write meets the session's factor after that load (inside the sign-count write, which runs
+    between them), so the passkey's own write must be a plain factor stamp: the anchor, the window
+    and the new-address dedupe all stay as they were. ``interleave=False`` is the control: the same
+    flow with no interleaved stamp moves the anchor, stamps the window and restarts the dedupe. RED
+    on the guard this replaced, which decided from the first load and re-anchored the factor-met
+    row."""
     from messagefoundry.auth.tokens import hash_token
 
     store = await MessageStore.open(":memory:")
@@ -1462,39 +1534,42 @@ async def test_an_assertion_on_a_session_that_met_its_factor_opens_nothing(uv: b
         service = await _service(store)
         identity, token, password = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
-        out = await service.login(ADMIN_USERNAME, password, client="10.6.6.1")
+        out = await service.login(ADMIN_USERNAME, password, client="198.51.100.1")
         assert out.ok and out.mfa_required and out.token is not None
-        # A presence-only tap meets the factor from a second address: anchored there, no window.
+        pending = hash_token(out.token)
+        seeded = time.time() - 60
+        await store.mark_session_reauthed(pending, now=seeded, client="198.51.100.1")
+        # An address reported before the assertion: a dedupe restart reports it again after.
+        assert await service.flag_new_client_ip(out.token, "203.0.113.5", path="/ui/x")
         options = await service.begin_webauthn_assertion(out.token, rp_id=RP)
         assert options is not None
         challenge = base64url_to_bytes(json.loads(options)["challenge"])
-        met = await service.finish_webauthn_assertion(
+
+        real_count = store.update_webauthn_sign_count
+
+        async def count_after_a_factor_stamp(*args: Any, **kwargs: Any) -> Any:
+            await store.mark_session_mfa_verified(pending)  # another leg met the factor
+            return await real_count(*args, **kwargs)
+
+        if interleave:
+            monkeypatch.setattr(store, "update_webauthn_sign_count", count_after_a_factor_stamp)
+        elevation = await service.finish_webauthn_assertion(
             out.token,
-            auth.get_response(challenge, user_verified=False),
-            client="10.6.6.2",
+            auth.get_response(challenge, user_verified=True),
+            client="192.0.2.9",
             rp_id=RP,
             origin=ORIGIN,
         )
-        assert met.ok and met.token is not None
-        assert await service.mfa_satisfied(met.token) is True
-        assert await _session_after(service, met.token) == ("10.6.6.2", False)
-        # What the re-render stages for that satisfied session, answered from a third address.
-        options = await service.begin_webauthn_assertion(met.token, rp_id=RP)
-        assert options is not None
-        challenge = base64url_to_bytes(json.loads(options)["challenge"])
-        again = await service.finish_webauthn_assertion(
-            met.token,
-            auth.get_response(challenge, user_verified=uv),
-            client="10.6.6.3",
-            rp_id=RP,
-            origin=ORIGIN,
-        )
-        assert again.ok and again.token is not None
-        row = await store.get_session(hash_token(again.token))
-        assert row is not None
-        assert (row.client, row.reauth_at) == ("10.6.6.2", None)
-        assert await service.has_recent_step_up(again.token) is False
-        assert await service.flag_new_client_ip(again.token, "10.6.6.3", path="/ui/x")
+        assert elevation.ok and elevation.token is not None
+        row = await store.get_session(hash_token(elevation.token))
+        assert row is not None and row.mfa_verified_at is not None
+        if interleave:
+            assert (row.client, row.reauth_at) == ("198.51.100.1", seeded)
+            assert not await _reaudited(service, elevation.token, "203.0.113.5")
+        else:
+            assert row.client == "192.0.2.9"
+            assert row.reauth_at is not None and row.reauth_at > seeded
+            assert await _reaudited(service, elevation.token, "203.0.113.5")
     finally:
         await store.close()
 

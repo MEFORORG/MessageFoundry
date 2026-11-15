@@ -753,74 +753,65 @@ decisions of this ADR change; the rest stand.
 on 2026-09-28 under the owner's "No, fix it" ruling; it is not itself an owner ruling. This
 amendment records the build (BACKLOG #3373).
 
-## Amendment (2026-11-14) -- a passkey assertion re-anchors the session (vault BACKLOG #2964 item 14)
+## Amendment (2026-11-14) -- a passkey that completes a pending factor re-anchors the session, and opens the window only with UV (vault BACKLOG #2964 item 14)
 
 Decision 1 said the assertion stamps `mfa_verified_at` only, and that `reauth_at` and the WP-L3-13
-re-anchor come from the password leg of `POST /ui/reauth`. That no longer holds.
-`finish_webauthn_assertion` now calls `mark_session_reauthed(client)` after a verified assertion,
-as `verify_mfa` does after a good code, and not on an `oidc` session (BACKLOG #2142). So the
-session's anchor and the account's known-address record agree after a passkey, and the assertion
-opens the step-up window, as a code does. An action-bound grant (ADR 0077) still comes only from the
-password, directory or IdP leg. Enrolment, TOTP confirm and passkey registration alike, still does
-not re-anchor: ADR 0197 Amendment A lets a holder of the password alone enrol.
+re-anchor come from the password leg of `POST /ui/reauth`. That no longer holds for every
+assertion.
 
-**A premise this leaves open.** Decision 1 justified `user_verification=PREFERRED` with "the
-knowledge factor is the password that accompanies every step-up", and *Options considered* item 1
-said a passkey-alone step-up forces the UV-policy question. A window-gated route (not an
-action-bound one) now passes after a passkey alone, so that premise no longer holds there. A TOTP
-code already had the same reach. Whether to require user verification is not decided here.
-Where `[auth].require_action_step_up` is off, every action-bound route falls back to the window, so
-there a passkey alone also passes factor binding and removal, which before this needed the password.
+A verified assertion still marks the session's second factor through `mark_session_mfa_verified`.
+`finish_webauthn_assertion` now passes that write an anchor (`PendingFactorAnchor`: the request's
+client address, and whether the signed authenticator data carried the UV flag). The store applies
+the anchor only when the session row that write reads, inside its own transaction, has not met its
+factor, so the decision is made on the row the write replaces. When it applies:
 
-**Who decided.** The owner, 2026-11-14, answering "#2964 item 14 ... Which do you want?" with
-"Assertion only".
+- the session's address anchor moves to the client that proved the passkey, as `verify_mfa` does
+  after a good code, so the anchor and the account's known-address record agree, and the
+  new-address dedupe restarts;
+- with UV, `reauth_at` is stamped, so the assertion opens the step-up window;
+- without UV, `reauth_at` is cleared, whether or not the address moved, so a window opened earlier
+  (for example by a password step-up on the pending session) never follows the anchor to a new
+  address. A pending session that stepped up with the password from the same address loses that
+  window; this is accepted as the fail-closed answer.
 
-## Amendment (2026-11-14, second) -- the window opens only on a user-verified assertion (vault BACKLOG #2964 item 14)
+No anchor is passed on an `oidc` session, whose window and anchor move only at the IdP (BACKLOG
+#2142). An assertion that reaches a session that has already met its factor, for example one
+staged while the session was pending and answered after another tab met the factor (the challenge
+moves with the session's re-key), marks the factor, clears the failure counter and re-keys the
+session, and moves no anchor and no window. So, unlike a TOTP code, a passkey never renews a window
+once the factor is met. `POST /ui/mfa` no longer re-renders the gate for a session that has
+already met its factor: a refused code there lands on `/ui`, as the page's GET does.
 
-This narrows the amendment above. Every verified assertion at the MFA gate still marks the factor,
-re-anchors the session to its address and restarts the new-address dedupe. The step-up window
-(`reauth_at`) opens only when the signed authenticator data carries the UV flag: `verify_assertion`
-returns py_webauthn's `user_verified` beside the sign count, and `finish_webauthn_assertion` passes
-it to `mark_session_reauthed(stamp_window=...)`, which without it re-anchors and leaves `reauth_at`
-as it was. `verify_mfa` is unchanged. `user_verification` stays PREFERRED, so a PIN-less key still
-meets the factor, but alone it opens no window; the password leg of `POST /ui/reauth` still does.
-The premise in the amendment above, that a passkey alone passes a window-gated route, now holds only
-for a user-verified assertion.
+Unchanged: enrolment, TOTP confirm and passkey registration alike, does not re-anchor, since ADR
+0197 Amendment A lets a holder of the password alone enrol. The combined password-and-passkey
+sign-in stamps the window as before, whatever the UV flag, because the password is present in the
+same request. `user_verification` stays PREFERRED, so a PIN-less key still meets the factor but
+alone opens no window. An action-bound grant (ADR 0077) still comes only from the password,
+directory or IdP leg.
 
-AC-2 above is superseded: a verified assertion stamps `mfa_verified_at` and the client re-anchor,
-and `reauth_at` only with UV, never on an `oidc` session. Its verifying test is now
-`tests/test_webauthn.py::test_assertion_stamps_the_factor_and_re_anchors`.
+**A premise this leaves open.** Decision 1 justified PREFERRED with "the knowledge factor is the
+password that accompanies every step-up", and *Options considered* item 1 said a passkey-alone
+step-up forces the UV-policy question. A window-gated route now passes after a user-verified
+passkey alone. The UV flag is the authenticator's own report in its signed authenticator data;
+under `attestation=none` the engine does not verify which authenticator made it, so it is not a
+factor the engine checked. A TOTP code already had the same reach. Where
+`[auth].require_action_step_up` is off, every action-bound route falls back to the window, so there
+a user-verified passkey alone also passes factor binding and removal.
 
-**Who decided.** The owner, 2026-11-14, answering "How should a passkey assertion stamp the
-window?" with "Stamp only if UV".
+AC-2 above is superseded: a verified assertion stamps `mfa_verified_at`, and, when it completes a
+pending factor, the client re-anchor and `reauth_at` only with UV, never on an `oidc` session. Its
+verifying test is now `tests/test_webauthn.py::test_assertion_stamps_the_factor_and_re_anchors`,
+renamed from `test_assertion_stamps_mfa_only_never_reauth`.
 
-## Amendment (2026-11-14, third) -- a non-UV assertion shuts the window (vault BACKLOG #2964 item 14)
+**Who decided.**
 
-This corrects the amendment above, which said a non-UV assertion "leaves `reauth_at` as it was".
-That let a window opened at the old address follow the anchor to a new one. A verified assertion
-without the UV flag now clears `reauth_at` in the same sealed write that re-anchors
-(`mark_session_reauthed(stamp_window=False)`), so the window is shut after it whatever it was
-before. A user-verified assertion still stamps it.
-
-**Who decided.** The Manager, 2026-11-14, reading the owner's "Stamp only if UV" as "without UV,
-the window is shut", as the strictly safer option, under the owner's standing instruction of
-2026-10-22.
-
-AC-2's named test, `tests/test_webauthn.py::test_assertion_stamps_mfa_only_never_reauth`, was
-renamed to `tests/test_webauthn.py::test_assertion_stamps_the_factor_and_re_anchors`.
-
-## Amendment (2026-11-14, fourth) -- only an assertion that completes a pending factor re-anchors or stamps (vault BACKLOG #2964 item 14)
-
-This narrows the three amendments above. The console stages an assertion for a session that has
-already met its factor too: the `POST /ui/mfa` re-render after a refused code does. On such a
-session a passkey proves nothing the session lacked, so `finish_webauthn_assertion` now re-anchors
-and stamps (or, without UV, shuts) the window only when the session had not met its factor when the
-assertion began (`mfa_verified_at` unset on the session row it read). An assertion on a session that
-already met it still marks the factor, clears the failure counter and re-keys the session, but it
-moves no anchor and leaves `reauth_at` as it was. So "every verified assertion at the MFA gate"
-in the second amendment reads "every verified assertion that completes a pending factor".
-A TOTP code is unchanged: on any session but an `oidc` one, `verify_mfa` renews the window at any
-time.
-
-**Who decided.** The Manager, 2026-11-14, from the branch's review, within the owner's "Assertion
-only" and "Stamp only if UV".
+- The owner, 2026-11-14, answering "#2964 item 14 ... Which do you want?" with "Assertion only":
+  the assertion re-anchors, and the enrolment legs do not.
+- The owner, 2026-11-14, answering "How should a passkey assertion stamp the window?" with "Stamp
+  only if UV".
+- The owner, 2026-11-14, answering "does 'Stamp only if UV' also reach the combined
+  password-plus-passkey sign-in?" with "No, passkey-only".
+- The Manager, 2026-11-14, reading "Stamp only if UV" as "without UV, the window is shut", the
+  strictly safer option, under the owner's standing instruction of 2026-10-22.
+- The Manager, 2026-11-14, from the branch's review: the re-anchor and the stamp apply only to an
+  assertion that completes a pending factor, decided inside the factor write.

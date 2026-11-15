@@ -280,6 +280,7 @@ from messagefoundry.store.store import (
     OutboxStatus,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -11387,18 +11388,22 @@ class PostgresStore:
         now: float | None = None,
         client: str | None = None,
         idp_auth_time: float | None = None,
-        stamp_window: bool = True,
     ) -> None:
-        stamp = reauth_stamp(
-            time.time() if now is None else now, client, idp_auth_time, stamp_window=stamp_window
-        )
+        stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await self._write_session(conn, token_hash, stamp)
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        stamp = mfa_stamp(time.time() if now is None else now)
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            await self._write_session(conn, token_hash, stamp)
+            written = await self._write_session(conn, token_hash, stamp)
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None

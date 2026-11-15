@@ -1245,13 +1245,15 @@ async def test_a_code_completes_a_pending_oidc_factor_but_opens_no_window(
         await store.close()
 
 
+@pytest.mark.parametrize("uv", [True, False])
 async def test_a_passkey_completes_a_pending_oidc_factor_but_opens_no_window(
-    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, uv: bool
 ) -> None:
-    """RED when: ``finish_webauthn_assertion`` stamps ``reauth_at`` or re-anchors an OIDC session.
+    """RED when: ``finish_webauthn_assertion`` stamps, clears or re-anchors an OIDC session.
 
     Vault BACKLOG #2964 item 14 made the passkey re-anchor as a code does, and kept BACKLOG #2142's
-    exclusion: on an OIDC session the window and the anchor move only at the IdP."""
+    exclusion: on an OIDC session the window and the anchor move only at the IdP. The window is
+    seeded first, so the non-UV case shows it is left as it was rather than cleared."""
     pytest.importorskip("webauthn")
     from webauthn.helpers import base64url_to_bytes
 
@@ -1289,14 +1291,16 @@ async def test_a_passkey_completes_a_pending_oidc_factor_but_opens_no_window(
         assert registered.ok, registered
         pending = await _oidc_session(service, monkeypatch, rsa_key, client="10.0.0.1")
         assert not await service.mfa_satisfied(pending)
+        seeded = time.time() - 60
+        await store.mark_session_reauthed(hash_token(pending), now=seeded)
         options = await service.begin_webauthn_assertion(pending, rp_id=rp)
         assert options is not None
 
         verified = await service.finish_webauthn_assertion(
             pending,
-            # UV set, so only the oidc branch can keep the window shut.
+            # With UV, only the oidc branch can keep the window as it was.
             auth.get_response(
-                base64url_to_bytes(json.loads(options)["challenge"]), user_verified=True
+                base64url_to_bytes(json.loads(options)["challenge"]), user_verified=uv
             ),
             client="10.0.0.9",
             rp_id=rp,
@@ -1307,7 +1311,7 @@ async def test_a_passkey_completes_a_pending_oidc_factor_but_opens_no_window(
         assert await service.mfa_satisfied(verified.token)
         session = await store.get_session(hash_token(verified.token))
         assert session is not None and session.auth_mechanism == SessionMechanism.OIDC.value
-        assert session.reauth_at is None, "a passkey opened an OIDC session's step-up window"
+        assert session.reauth_at == seeded, "a passkey moved an OIDC session's step-up window"
         assert session.client == "10.0.0.1", "a passkey re-anchored an OIDC session"
         assert await service.flag_new_client_ip(verified.token, "10.0.0.9", path=NEXT)
     finally:

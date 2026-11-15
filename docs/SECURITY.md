@@ -4068,8 +4068,11 @@ own claim in its signed data; see the strength table's passkey row), on any sess
 one; the combined password-and-passkey sign-in stamps it as before, because the password is present (vault
 BACKLOG #2964 item 14, owner rulings 2026-11-14; see
 [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). An
-assertion on a session that had already met its factor, which the `POST /ui/mfa` re-render can
-stage, neither re-anchors nor stamps. An
+assertion on a session that had already met its factor, for example one staged while it was pending
+and answered after another tab met the factor, neither re-anchors nor stamps. The store decides that
+inside the factor write, from the session row it locks (`mark_session_mfa_verified` with an
+anchor). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
+`/ui`, as the page's GET does, and stages no assertion. An
 action-bound grant still comes only from the credential leg: the password leg of `POST /ui/reauth`,
 or for an `oidc` session the IdP leg, which shows no password field. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **re-proof-only
 step-up**, with no MFA gate: the password or directory re-bind, or the IdP leg for an `oidc`
@@ -4949,7 +4952,8 @@ The honest limits of that model, one sentence each:
     session state, so a new leg that forgets the call records nothing.
   - A step-up does extra store reads before it writes: the account, and whether it owes a factor.
   - A factor enrolment records the address without moving the session's anchor, and so does a
-    passkey or a code at the MFA gate on a session the OIDC sign-in minted. Until a password or
+    passkey or a code at the MFA gate on a session the OIDC sign-in minted, and a passkey on a
+    session that had already met its factor. Until a password or
     IdP step-up moves it, the record and the new-client-IP signal can disagree about that address.
 - An administrator's password reset or MFA reset deletes every address in the account's
   known-address record (vault BACKLOG #2946, owner ruling 2026-10-16). So the next sign-in from any

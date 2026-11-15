@@ -672,13 +672,14 @@ async def test_verify_mfa_succeeds_when_no_stamp_is_refused(
     assert await service.mfa_satisfied(run.out.token) is True
 
 
-@pytest.mark.parametrize("tamper", ["mark_session_reauthed", None])
-async def test_a_passkey_ends_the_session_when_the_reauth_stamp_is_refused(
+@pytest.mark.parametrize("tamper", ["mark_session_mfa_verified", None])
+async def test_a_passkey_ends_the_session_when_its_anchored_factor_stamp_is_refused(
     keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch, tamper: str | None
 ) -> None:
-    """Vault BACKLOG #2964 item 14 gave the passkey leg verify_mfa's reauth stamp, and its refusal:
-    a session whose seal fails at that stamp is ended, with no success recorded (BACKLOG #2592).
-    ``None`` is the control: the same flow and spies, no row changed, and the leg succeeds."""
+    """Vault BACKLOG #2964 item 14: the passkey leg re-anchors in its one factor write, so that
+    write's seal refusal ends the session, with no success recorded and no second session write
+    (BACKLOG #2592). ``None`` is the control: the same flow and spies, no row changed, and the leg
+    succeeds with that one write."""
     pytest.importorskip("webauthn")
     from webauthn.helpers import base64url_to_bytes
 
@@ -731,13 +732,13 @@ async def test_a_passkey_ends_the_session_when_the_reauth_stamp_is_refused(
     added = {a: len(await store.list_audit(action=a)) - counts[a] for a in counted}
     if tamper is None:
         assert elevation.ok and elevation.token is not None
-        assert calls == list(_WATCHED)
+        assert calls == ["mark_session_mfa_verified", "record_login_success"]
         assert added == {"auth.webauthn_verified": 1, AUTHORITY_SEAL_FAILED_ACTION: 0}
         return
     assert elevation.session_lost and not elevation.ok and elevation.token is None
     row = await store.get_session(hash_token(pending))
     assert row is not None and row.revoked_at is not None
-    assert calls == ["mark_session_mfa_verified", "mark_session_reauthed"]
+    assert calls == ["mark_session_mfa_verified"]
     assert added == {"auth.webauthn_verified": 0, AUTHORITY_SEAL_FAILED_ACTION: 1}
     assert len(alerts) == 1
 
