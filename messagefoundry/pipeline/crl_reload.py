@@ -898,24 +898,29 @@ def _load(
                     FIX,
                 )
                 continue
+            if anchors not in signatures:
+                signatures[anchors] = crl_signature_finding(pem, anchors)
+            unsigned = signatures[anchors]
+            # In a start's order: a proven bad signature, then the own-CRL rule, then a signature
+            # short of proof. A start refuses the first two, so each is a file to fix, and the
+            # third would send the operator to a restart the own-CRL rule then refuses.
+            if unsigned is not None and unsigned.state == "bad":
+                refusals.add(f"{label}: {unsigned.why}", BAD_SIGNATURE)
+                continue
             if context_checks_chain_revocation(ctx):
                 # Vault BACKLOG #5627: the rule a start applies to a hop checking the whole chain,
                 # so a CRL OpenSSL may judge a CA's clients by, and that CA did not sign, never
-                # loads live. A start refuses the file too, so it is a file to fix. Before the
-                # signature check, whose finding ends this context's checks with a remedy that
-                # can send the operator to a restart the start then refuses.
+                # loads live.
                 if anchors not in unowned:
                     try:
                         missing = cas_without_own_crl(anchors, pem)
                         unowned[anchors] = own_crl_refusal(missing) if missing else None
                     except ValueError as exc:  # a start refuses the same file, naming it
-                        unowned[anchors] = str(exc)
+                        unowned[anchors] = f"it could not be checked against the hop's CAs: {exc}"
                 if (unowned_why := unowned[anchors]) is not None:
                     refusals.add(f"{label}: {unowned_why}", FIX)
                     continue
-            if anchors not in signatures:
-                signatures[anchors] = crl_signature_finding(pem, anchors)
-            if (unsigned := signatures[anchors]) is not None:
+            if unsigned is not None:
                 refusals.add(f"{label}: {unsigned.why}", _SIGNATURE_REMEDY[unsigned.state])
                 continue
             if held_back is not None:

@@ -2407,9 +2407,9 @@ Each CRL in the file is judged on its own, as for an expired CRL. So a badly sig
 the file even beside a newer, good CRL from the same issuer. OpenSSL would use the newer one, and
 such a file was measured to pass its handshakes. Remove the bad copy.
 
-Anything short of that proof loads, and the engine logs one WARNING for the file, on every hop but
-the API listener, which refuses more (the paragraph after this list says what). At least these
-three cases warn:
+Anything short of that proof passes this check, and the engine logs one WARNING for the file. The
+file then loads unless another rule refuses it; on the API listener one such rule refuses some of
+these cases after that WARNING (the paragraph after this list says which). At least these three cases warn:
 
 - The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly but for
   the case of ASCII letters, which it folds as OpenSSL does (vault BACKLOG #3543), and then the

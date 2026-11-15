@@ -667,6 +667,64 @@ def test_a_ca_whose_subject_key_identifier_cannot_be_read_has_no_crl_of_its_own(
     assert pki_module._signed_by(keyed, akid, read) is True  # the control
     unread = pki_module._ListedCa(read.name, _Unread(), read.serial)  # type: ignore[arg-type]
     assert pki_module._signed_by(keyed, akid, unread) is False
+    # Red before the second fix: a serial the CRL's AKID names that is not this CA's rules the CA
+    # out, as OpenSSL's match does, before its unreadable identifier is read.
+    other = x509.load_pem_x509_crl(
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(_name("Client Root"))
+        .last_update(_NOW - _DAY)
+        .next_update(_NOW + 30 * _DAY)
+        .add_extension(
+            x509.AuthorityKeyIdentifier(
+                key_identifier=akid.key_identifier,
+                authority_cert_issuer=[x509.DirectoryName(_name("Client Root"))],
+                authority_cert_serial_number=read.serial + 1,
+            ),
+            False,
+        )
+        .sign(rollover.new_key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.PEM)
+    )
+    other_akid = pki_module._crl_extensions(other).akid
+    assert pki_module._signed_by(other, other_akid, unread) is None
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_reload_reports_a_proven_bad_signature_as_a_start_does(rollover: _Rollover) -> None:
+    """Red before the fix: with the own-CRL rule checked first, a forged CRL naming the old key
+    was reported as a CA without its own CRL, telling the operator to add a CRL that is already
+    there, while a start reports the proven bad signature. The reload follows the start's order."""
+    crl = rollover.crl(
+        "held.pem",
+        _crl("Client Root", rollover.old_key, None, age=2 * _DAY),
+        _crl("Client Root", rollover.new_key, None, age=2 * _DAY),
+    )
+    ctx = build_api_ssl_context(rollover.settings([rollover.old_root, rollover.new_root], crl))
+    forged = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(_name("Client Root"))
+        .last_update(_NOW - _DAY / 4)
+        .next_update(_NOW + 30 * _DAY)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(rollover.old_key.public_key()),
+            False,
+        )
+        .sign(ec.generate_private_key(ec.SECP256R1()), hashes.SHA256())
+        .public_bytes(serialization.Encoding.PEM)
+    )
+    crl.write_bytes(
+        _crl("Client Root", rollover.old_key, None, age=_DAY / 2)
+        + _crl("Client Root", rollover.new_key, None, age=_DAY / 2)
+        + forged
+    )
+    gc.collect()
+    (outcome,) = [o for o in crl_reload.reload_replaced_crls() if Path(o.path) == crl.resolve()]
+    assert outcome.refusal is not None
+    assert outcome.refusal.remedy == crl_reload.BAD_SIGNATURE, outcome.refusal
+    assert outcome.reloaded == 0
+    _handshake(rollover.client(), ctx)  # the copy it holds still admits the client
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        build_api_ssl_context(rollover.settings([rollover.old_root, rollover.new_root], crl))
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")

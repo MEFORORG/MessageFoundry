@@ -602,7 +602,8 @@ _UNREAD_EXTENSIONS = (x509.UnsupportedGeneralNameType, CryptographyDeprecationWa
 #: :func:`_signature_state` reads a CRL whose own extensions raise one of these as ``unlisted``.
 #: :class:`IssuerIndex` also refuses a file holding a CA that raises one, and its ``issuer_of``
 #: names no issuer for a client LEAF that raises one, so narrowing this tuple reaches both (BACKLOG
-#: #4948).
+#: #4948). So does :func:`_signed_by`, which reads a CA whose authority key identifier match
+#: raises one as not having signed that CRL, failing closed (vault BACKLOG #5627).
 _UNREADABLE_CA = (ValueError, x509.InvalidVersion, *_UNREAD_EXTENSIONS)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
@@ -1082,14 +1083,23 @@ def _akid_fit(akid: _CrlAkid | None, listed: _ListedCa) -> bool | None:
     AKID or no key identifier fits, and so does a CA with no Subject Key Identifier, but none of
     those names the key.
 
-    **A CA whose extensions do not read raises** ``ValueError``, or another of
-    :data:`_UNREADABLE_CA`, rather than reading as ruled out: OpenSSL skips the key identifier
-    check where it reads no identifier, so the CRL may still be one it judges that CA's peers by.
-    :func:`_signature_state` reads such a CA as fitting nothing, as it read ``None`` before, and
-    :func:`_signed_by` reads it as having no CRL of its own (vault BACKLOG #5627)."""
+    **A CA whose extensions do not read, where the AKID needs them, raises** ``ValueError``, or
+    another of :data:`_UNREADABLE_CA`, rather than reading as ruled out: OpenSSL skips the key
+    identifier check where it reads no identifier, so the CRL may still be one it judges that
+    CA's peers by. The serial number and the issuer name are matched first, so a CRL they rule
+    the CA out of never reads its extensions. :func:`_signature_state` reads such a CA as not
+    fitting that CRL, as it read ``None`` before, and :func:`_signed_by` as not having signed it
+    (vault BACKLOG #5627)."""
     if akid is None:
         return False
     ca = listed.cert
+    if akid.serial is not None and akid.serial != listed.serial:
+        return None
+    # By the name test the issuer match uses, since OpenSSL compares this name by the same
+    # canonical form. OpenSSL reads only the first directory name here; any one counts here,
+    # as it did before vault BACKLOG #3543.
+    if akid.issuers and _issuer_name_key(ca.issuer) not in akid.issuers:
+        return None
     names_key = False
     if akid.key_identifier is not None:
         try:
@@ -1102,13 +1112,7 @@ def _akid_fit(akid: _CrlAkid | None, listed: _ListedCa) -> bool | None:
             if ski != akid.key_identifier:
                 return None
             names_key = True
-    if akid.serial is not None and akid.serial != listed.serial:
-        return None
-    # By the name test the issuer match uses, since OpenSSL compares this name by the same
-    # canonical form. OpenSSL reads only the first directory name here; any one counts here,
-    # as it did before vault BACKLOG #3543.
-    fits = not akid.issuers or _issuer_name_key(ca.issuer) in akid.issuers
-    return names_key if fits else None
+    return names_key
 
 
 def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
@@ -1283,8 +1287,9 @@ def own_crl_refusal(missing: Iterable[tuple[str, int]]) -> str:
         "subject key identifier fits every CRL whose authority key identifier names a key alone, "
         "so beside another CA of its name it stays refused until that CA's CRLs also name their "
         "signer's issuer and serial number, or it is reissued with a subject key identifier. A "
-        "CA whose certificate the engine cannot read well enough to match a CRL's authority key "
-        "identifier against is refused whatever CRLs the file holds: reissue it"
+        "CRL under a CA's name also counts as not its own where the engine cannot read the CA's "
+        "certificate well enough to match that CRL's authority key identifier against it: "
+        "reissue such a CA"
     )
 
 
