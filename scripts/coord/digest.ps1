@@ -277,12 +277,14 @@ $md.Add('## Calibration, per seat and class')
 $md.Add('')
 $md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day.")
 $md.Add('')
-$md.Add('| Seat | Class | Rated | Disagree | Blind status | Decisions, 14 days | Reversed | Reversal rate |')
+$md.Add('| Seat | Class | Rated | Disagree | Blind status | Acted decisions, 14 days | Reversed | Reversal rate |')
 $md.Add('|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
 # Kept by "seat|class", so the gate-state table below reads each seat's Class B row from here.
+# The seat is folded through the roster, as decision.ps1 -Gate folds it, so an alias's decisions
+# land in its seat's row and this table agrees with what the gate answers.
 $calibration = @{}
-foreach ($g in @($decisions | Group-Object { "$($_.seat)|$($_.class)" } | Sort-Object Name)) {
+foreach ($g in @($decisions | Group-Object { "$(Resolve-DecisionSeat ([string]$_.seat))|$($_.class)" } | Sort-Object Name)) {
     $seat, $class = $g.Name -split '\|', 2
     $c = Get-DecisionCalibration -Decisions $g.Group -Ratings $ratings -Outcomes $outcomes -RecentDays $recent
     $calibration[$g.Name] = $c
@@ -317,7 +319,7 @@ if ($dayEnd -gt $now) {
 $md.Add('')
 $md.Add('| Seat | Seat reversal budget | Class B calibrated |')
 $md.Add('|---|---|---|')
-foreach ($s in @($decisions | ForEach-Object { [string]$_.seat } | Where-Object { $_ } | Sort-Object -Unique)) {
+foreach ($s in @($decisions | ForEach-Object { Resolve-DecisionSeat ([string]$_.seat) } | Where-Object { $_ } | Sort-Object -Unique)) {
     $cal = $calibration["$s|B"]
     $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if ($cal -and $cal.Calibrated) { 'yes' } else { 'no' }) |")
 }

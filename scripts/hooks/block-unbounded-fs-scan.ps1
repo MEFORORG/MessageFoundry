@@ -87,8 +87,27 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # quotes, opens or closes nothing, so a toggle shifted every later span by one and blanked the
 # separator and the walk after it. And `$'...'` takes backslash escapes, so `$'\''` is one quote
 # character rather than the end of a span. Unclosed contexts at the end simply stop.
-function Hide-QuotedSpans([string]$Text) {
+#
+# BASH ONLY. The PowerShell tool is screened too, and there the backtick is the escape and a
+# backslash is literal, so `"done`n"` and `"D:\dir\"` would read as a substitution and an escaped
+# quote and blank the command after them. -Plain keeps the toggle that read both correctly.
+function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
+    if ($Plain) {
+        $sb = [System.Text.StringBuilder]::new($Text.Length)
+        $quote = $null
+        foreach ($ch in $Text.ToCharArray()) {
+            if ($null -ne $quote) {
+                if ($ch -ceq $quote) { $quote = $null; [void]$sb.Append($ch) }
+                elseif ($ch -ceq "`n") { [void]$sb.Append($ch) }
+                else { [void]$sb.Append(' ') }
+                continue
+            }
+            if ($ch -ceq '"' -or $ch -ceq "'") { $quote = $ch }
+            [void]$sb.Append($ch)
+        }
+        return $sb.ToString()
+    }
     $sb = [System.Text.StringBuilder]::new($Text.Length)
     # The context stack: top (unquoted), dq, sq, ansi ($'...'), sub ($( inside double quotes, with
     # its open-paren depth) and bt (a backtick substitution inside double quotes). Only top, sub and
@@ -115,7 +134,8 @@ function Hide-QuotedSpans([string]$Text) {
             $n++; continue
         }
         if ($kind -ceq 'dq') {
-            # A backslash survives inside double quotes unless it guards one of " $ ` \ or a newline.
+            # A backslash is consumed inside double quotes when it guards one of " $ ` \. Before a
+            # newline it is blanked alone, so the newline stays where Hide-HeredocBodies counts it.
             if ($ch -ceq '\' -and $null -ne $next -and '"$`\'.IndexOf($next) -ge 0) {
                 [void]$sb.Append('  '); $n += 2; continue
             }
@@ -150,7 +170,7 @@ function Hide-QuotedSpans([string]$Text) {
             $n += 2; continue
         }
         [void]$sb.Append($ch)
-        $prevDollar = ($ch -ceq '$')
+        $prevDollar = ($ch -ceq '$') -and -not $prevDollar
         $n++
     }
     return $sb.ToString()
@@ -254,7 +274,7 @@ try {
 
     # The blanked view says where a command starts and what program it is; the raw view, at the
     # same offsets, gives its operands. Quotes are masked before heredocs, for the reason above.
-    $scan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
+    $scan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain:([string]$j.tool_name -cne 'Bash'))
 
     # Split into simple commands. `(`, `)` and the backtick are separators too, or `$(find /proc)`,
     # a backtick substitution and a `( find /proc )` subshell were each allowed.

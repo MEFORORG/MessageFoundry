@@ -1389,6 +1389,7 @@ def _context_checks(dispatcher: Path, g: dict[str, Path]) -> list[str]:
     return failed
 
 
+@pytest.mark.timeout(300)
 def test_guard_context_is_passed_through_joined_and_a_failure_still_shows(
     tmp_path: Path,
 ) -> None:
@@ -1418,6 +1419,7 @@ _NOTICE_ADD = "if ($ShellGuardFailed) {\n        $ShellGuardContexts.Add("
         ("failure notice dropped", _NOTICE_ADD, "if ($false) {\n        $ShellGuardContexts.Add("),
     ],
 )
+@pytest.mark.timeout(300)
 def test_each_context_mistake_is_caught(tmp_path: Path, label: str, old: str, new: str) -> None:
     """The control for the test above: a dispatcher carrying each mistake fails at least one check."""
     mutated = _dispatcher_copy(tmp_path / "dispatch_mutated.ps1", (old, new))

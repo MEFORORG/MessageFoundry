@@ -624,6 +624,8 @@ QUOTED_SUBSTITUTION_DENY = [
     # The other side of the same rule: an ESCAPED dollar starts no `$'...'`, so the single quotes
     # after it are plain ones, in which a backslash escapes nothing.
     pytest.param(r"echo \$'\'; find /proc", id="escaped-dollar-before-plain-single-quotes"),
+    # `$$` is the PID, so the quote after it is a plain one, not a `$'...'`.
+    pytest.param(r"echo $$'\'; find /proc", id="pid-before-plain-single-quotes"),
 ]
 
 
@@ -650,6 +652,20 @@ def test_quoted_prose_naming_a_walk_is_still_allowed(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
+# THE POWERSHELL TOOL KEEPS THE PLAIN QUOTE TOGGLE. Its escape is the backtick and a backslash is
+# literal, so reading these as bash would open a substitution or an escape that never closes and
+# blank the walk after it. Each was denied before the bash masker and must stay denied.
+POWERSHELL_QUOTE_DENY = [
+    pytest.param('Write-Host "done`n"; grep -r x /proc', id="backtick-escape-in-a-string"),
+    pytest.param('Get-ChildItem "D:\\Code\\"; grep -r x /proc', id="trailing-backslash-path"),
+]
+
+
+@pytest.mark.parametrize("command", POWERSHELL_QUOTE_DENY)
+def test_a_powershell_string_does_not_hide_the_walk_after_it(command: str) -> None:
+    assert_denied(run_guard(bash(command, tool="PowerShell")))
+
+
 # ============================================ the corpora must not quietly shrink
 
 
@@ -674,8 +690,9 @@ EXPECTED_ROW_COUNTS = {
     "OPTION_GRAMMAR_DENY": 12,
     "PRUNE_INERT_DENY": 9,
     "FOLDING_ALLOW": 20,
-    "QUOTED_SUBSTITUTION_DENY": 9,
+    "QUOTED_SUBSTITUTION_DENY": 10,
     "QUOTED_PROSE_ALLOW": 6,
+    "POWERSHELL_QUOTE_DENY": 2,
 }
 
 
