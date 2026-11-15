@@ -788,80 +788,21 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       going past a file it cannot set (an open editor, an antivirus scan) instead of stopping at the
       first one and leaving the rest on the old owner — check its summary line for skipped files.
       Setting the owner does **not** grant anyone access — pair it with the DACL recipes above.
-  - **A LocalService or NetworkService engine account could not also be the account that runs the
-    config editors.** The engine and the web console never run an editor. An editor runs from the
-    CLI as whoever starts it, and the VS Code extension shells the `connection`, `codeset`, `alert`
-    and `security` commands as the user VS Code runs as. So this case needs an editor deliberately
-    started as the engine's account, for example from a scheduled task. At least `connection
-    upsert` and `remove`, `codeset upsert`, `alert add` and `remove`, and `security set` write
-    through `atomic_edit.replace_validated`. It makes its candidate in the edited file's folder, so
-    the account an editor runs as needs write on that folder, and the file it leaves is owned by
-    that account. Each editor also takes a lock (`atomic_edit.edit_lock`) on a `.mefor-edit.lock`
-    file, which it creates when the file is absent and never removes. The lock file sits beside
-    the edited file, except for code sets, whose lock file sits in the config directory, above
-    `codesets`. The config guard does not check the lock file. When the editor's account is
-    LocalService (`S-1-5-19`) or NetworkService (`S-1-5-20`), the guard refuses the folder the
-    editor wrote into and the file it left, because other services share that SID (ADR 0036
-    Amendment E). Before that amendment, self-trust passed both. A config load checks the config
-    directory first and `codesets` with its tables last, and stops at the first path it refuses:
-    at start, or in the engine log on a `/config/reload`, whose caller gets only `422 invalid
-    configuration`. For each path the guard reports the first entry it refuses outright, ahead of
-    the owner, so the messages below appear only where no other entry on that path is refused
-    first. Where another account owns the path and an entry grants the shared account write, the
-    message has this shape:
-    ```text
-    refusing to load config from writable-by-others path D:\hl7\config: the account the engine runs as (S-1-5-19) has write access, but other services share that identity, so it is not trusted as the engine's own; see docs/SERVICE.md for required permissions
-    ```
-    Where the shared account owns the path, its own entry passes and the owner check refuses the
-    path instead, with the reason `the owner (S-1-5-19) is the account the engine runs as, but
-    other services share that identity, so it can rewrite the code this loader executes`.
-    - Where its account can create the lock file and its candidate in the config directory and
-      read `connections.toml`, the `connection` editor validates an edit by loading the directory,
-      so it refuses the edit with the config directory's refusal before it replaces
-      `connections.toml`. By then it has already created the lock file, if that was absent.
-      Otherwise the file system refuses the edit first.
-    - A `codeset upsert` does not run this check. It creates an absent `codesets` folder, then
-      takes its lock, creating an absent lock file. Both are created in the config directory, so
-      where either is absent and the editor's account cannot create it there, the upsert is
-      refused at that step, having written nothing, or only the `codesets` folder when the lock
-      file was the step refused. Otherwise it writes the table where its account can replace a
-      file in `codesets`; where it cannot, it is refused there, leaving any `codesets` folder or
-      lock file it created. The next load refuses the first path it reaches that the shared
-      account can write or owns; of the paths the upsert touched, the config directory comes
-      first, then `codesets`, then the table. Once no folder entry grants the shared account write,
-      the section's `/setowner ... /T /C` gives every path an administrator owner, but a table the
-      editor wrote is still refused: with the message above naming the table where `_secure_file`
-      granted that table to the shared account (below), and otherwise as one whose owner and DACL
-      could not be read.
-    - The `alert` and `security` editors write the settings file, which `serve` vets at start
-      ahead of its folder. The next start prints a refusal of that file, such as `error: refusing
-      to start from writable-by-others path <settings file>: ` followed by the owner reason above,
-      and, once that file is fixed, a refusal of its folder.
-
-    The refusal is deliberate, and it stays (owner ruling 2026-11-15). The remedy is an engine
-    account that is its own: the installer's default per-service virtual account, or a dedicated
-    local account or gMSA passed with `-ServiceAccount`. *Restrict the service token* above
-    records that no run has exercised a named account, and that the installer's read-back refuses
-    the `HOST\user` spelling today (BACKLOG #3938). Keep the config folders read-only to that
-    account, as `-LockConfigDir` sets them. The lockdown removes inherited entries but replaces
-    explicit ones only for SYSTEM, Administrators and the run-as account, so remove an explicit
-    grant to the shared account from each folder too, for example `icacls "D:\hl7\config"
-    /remove:g *S-1-5-19`. Nor does the lockdown replace the protected access list
-    `store._secure_file` gives each file an editor writes, at least a code-set table, the settings
-    file and `connections.toml`. That list grants full control to SYSTEM, Administrators, OWNER
-    RIGHTS and the account `store._current_user` names, which it reads from environment
-    variables, not the process token. Where that last grant fails, `_secure_file` logs a warning
-    and the file keeps the other three, which its folder's grants do not reach either. So the new
-    engine account cannot read a file still under that list: a load refuses such a code-set table
-    or `connections.toml` as one whose owner and DACL could not be read (Win32 error 5), and
-    `serve` cannot open such a settings file and stops with `error:` before its start check. Once
-    an administrator owns such a file, run `icacls "<file>" /reset`, which drops the list and has
-    the file inherit its folder's grants. The lockdown's owner step, run at install time with
-    `/C`, made an administrator the owner of what each folder it locks then held, less any file
-    `/C` skipped. For a file written since, one it skipped, or one in a folder it did not lock,
-    run `icacls "<file>" /setowner "*S-1-5-32-544"` first. The same `_secure_file` step means an
-    editor run under any other account would leave the edited file with no grant to the engine's
-    account, so the engine's inherited read would be gone. That gap is not settled here.
+  - **An engine run as LocalService or NetworkService earns no self-trust**
+    ([ADR 0036](adr/0036-windows-config-source-trust.md) Amendment E). Other services share
+    LocalService (`S-1-5-19`) and NetworkService (`S-1-5-20`), so the guard does not treat either
+    as the engine's own account. On a site that ran the engine as one of them, the guard would
+    refuse, at load or at `serve` start, each path it checks that the shared account owns or that
+    an entry lets it write. That includes a file a config editor writes as that account.
+    The refusal is the guard's own message, and it is one of two kinds: a write grant to the
+    shared account, or the shared account as owner. It is deliberate and stays: the owner ruled on
+    2026-11-15 to keep it fail-closed. The remedy:
+    - **Run the engine under an account that is its own:** the installer's default per-service
+      virtual account, or a dedicated local account or gMSA passed with `-ServiceAccount`, with the
+      caveat [Restrict the service token](#restrict-the-service-token) records for a named account.
+    - **Do not run the config editors as the engine's shared account,** whether from the CLI or
+      through the VS Code extension: `connection`, `codeset`, `alert` and `security`.
+    - **Keep the config folders read-only to the engine account,** as `-LockConfigDir` sets them.
   - On **POSIX** hosts the loader **refuses** to load from a group/world-writable directory or module
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable

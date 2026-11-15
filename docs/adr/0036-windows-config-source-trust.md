@@ -73,7 +73,7 @@ could drop/rewrite a config module that executes as the service account on the n
    **Consequence kept fail-closed (owner ruling 2026-11-15, in a batch 482 Manager session).** The
    LocalService and NetworkService rule also changes what the config editors' output earns when
    they run as such an engine's own account. The owner ruled to keep that fail-closed rather than
-   relax the rule. What fails, the messages and the remedy are in
+   relax the rule. The rule's effect and the remedy are in
    [`docs/SERVICE.md`](../SERVICE.md), *Lock down the config directory (CONFIG-2)*.
 
    **Amended 2026-09-18 (BACKLOG #1647): the owner is vetted, not trusted unconditionally.** As
