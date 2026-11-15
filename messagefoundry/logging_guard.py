@@ -228,10 +228,13 @@ class LogWriteGuard:
         ``unwritable`` its window lapses only after a full window passes with no roll at all, not a
         window after its first roll. So a sink still needing a roll every few seconds keeps its
         streak past the bound: the roll is counted and its rolled-aside path recorded, the stage-2
-        cause stays on ``/status``, and nothing pages. A roll after a quiet window is a fresh heal
-        and moves it to ``rolled`` as above. So is a roll that heals a sink stage 2 declared dead,
-        unless that sink had already passed the bound within a window of its last roll: then it is
+        cause stays on ``/status``, and nothing pages. A stage-2 failure counts as a roll for that
+        window, so a sink that keeps failing outright is never quiet. A roll after a quiet window is
+        a fresh heal and moves it to ``rolled`` as above. So is a roll that heals a sink stage 2
+        declared dead, unless the streak, counting that healing roll, passes the bound: then it is
         still flapping and stays latched, failing closed until a quiet window or :meth:`revalidate`.
+        While the sink is down its window also restarts at each roll, keeping the streak, so the
+        roll after a heal is never measured from a window that began before the sink went down.
 
         **PRECONDITION: ``reason`` and ``rolled_aside`` arrive ALREADY SCRUBBED** (BACKLOG #1591).
         Build them with :func:`_safe_reason` and :func:`_escape_only`, as
@@ -248,7 +251,13 @@ class LogWriteGuard:
             already_down = previous is not None and previous.state == "unwritable"
             now = time.monotonic()
             first_at, streak, last_at = self._roll_flap.get(sink, (now, 0, now))
-            if now - (last_at if already_down else first_at) > _ROLL_FLAP_WINDOW_SECONDS:
+            if already_down:
+                # Restarting at ``now`` while keeping the streak can only trip the bound sooner than
+                # main's window from the first roll, never later.
+                if now - last_at > _ROLL_FLAP_WINDOW_SECONDS:
+                    streak = 0
+                first_at = now
+            elif now - first_at > _ROLL_FLAP_WINDOW_SECONDS:
                 first_at, streak = now, 0
             streak += 1
             self._roll_flap[sink] = (first_at, streak, now)
@@ -263,8 +272,10 @@ class LogWriteGuard:
                 else reason
             )
             if flapping and previous is not None and already_down:
-                # Latched: keep the stage-2 cause the operator was paged with on ``/status``.
+                # Latched: keep the stage-2 cause the operator was paged with on ``/status``, and the
+                # last broken file when this roll had none to move aside.
                 last_event, last_event_at = previous.last_event, previous.last_event_at
+                rolled_aside = rolled_aside or previous.rolled_aside
             else:
                 last_event, last_event_at = verdict, _utc_now()
             self._sinks[sink] = LogSinkStatus(
@@ -311,6 +322,10 @@ class LogWriteGuard:
                 rolled_aside=previous.rolled_aside if previous else None,
             )
             all_down = all(s.state == "unwritable" for s in self._sinks.values())
+            # A stage-2 failure keeps the flap window from reading quiet (see record_rollover).
+            now = time.monotonic()
+            first_at, streak, _last_at = self._roll_flap.get(sink, (now, 0, now))
+            self._roll_flap[sink] = (first_at, streak, now)
         if already_down:
             # Latched: one page per break, not one per dropped record. Without this a broken disk
             # turns every subsequent log line into an alert AND a stderr line, and the storm buries

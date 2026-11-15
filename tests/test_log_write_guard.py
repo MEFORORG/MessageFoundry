@@ -276,6 +276,85 @@ def test_a_sink_that_keeps_flapping_across_windows_stays_unwritable_and_pages_on
     assert guard.status()[0].state == "healthy"
 
 
+def _guard_on(
+    clock: _FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> tuple[LogWriteGuard, list[LogSinkEvent]]:
+    monkeypatch.setattr("messagefoundry.logging_guard.time", clock)
+    events: list[LogSinkEvent] = []
+    guard = LogWriteGuard()
+    guard.register("file")
+    guard.set_escalation(events.append)
+    return guard, events
+
+
+def _at(clock: _FakeClock, t: float) -> None:
+    clock.now = 1000.0 + t
+
+
+def test_a_heal_of_a_dead_sink_does_not_leave_the_flap_window_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812, review finding 1. Rolls at 0, 10, 20 and 30 s, a stage-2 failure at 35 s, then
+    # six rolls 65 to 115 s: six rolls in 50 s is a flap, and main's window catches it at 115 s.
+    # NEGATIVE CONTROL: at 8de4d951d the heal at 65 s kept the window's start at 0 s, so the roll at
+    # 75 s measured from it, reset the streak, and the sink ended ``rolled`` with no stop asked for.
+    clock = _FakeClock()
+    guard, events = _guard_on(clock, monkeypatch)
+    for t in (0, 10, 20, 30):
+        _at(clock, t)
+        guard.record_rollover("file", reason="lock", rolled_aside=None)
+    _at(clock, 35)
+    guard.record_unwritable("file", reason="the replacement failed too")
+    for t in (65, 75, 85, 95, 105, 115):
+        _at(clock, t)
+        guard.record_rollover("file", reason="lock", rolled_aside=None)
+
+    assert guard.status()[0].state == "unwritable"
+    assert guard.can_log() is False
+    assert events[-1].stage == "unwritable" and events[-1].stop_requested is True
+
+
+def test_continuous_stage2_failure_is_not_a_quiet_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # BACKLOG #5812, review finding 2. A flap-latched sink then fails outright on every record for
+    # 90 s; the one roll that succeeds after that is still the same break, not a fresh heal after a
+    # quiet window. NEGATIVE CONTROL: at 8de4d951d (and on main) only successful rolls counted, so
+    # the 90 s of failures read as quiet and the roll moved the sink to ``rolled``.
+    clock = _FakeClock()
+    guard, events = _guard_on(clock, monkeypatch)
+    for t in range(_MAX_ROLLS_PER_WINDOW + 1):
+        _at(clock, t)
+        guard.record_rollover("file", reason="lock", rolled_aside=None)
+    assert guard.status()[0].state == "unwritable"
+    paged = len(events)
+    for t in range(10, 100):
+        _at(clock, t)
+        guard.record_unwritable("file", reason="the replacement failed too")
+    _at(clock, 101)
+    guard.record_rollover("file", reason="lock", rolled_aside=None)
+
+    assert guard.status()[0].state == "unwritable"
+    assert guard.can_log() is False
+    assert len(events) == paged
+
+
+def test_a_latched_roll_with_no_file_to_move_keeps_the_last_broken_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812, review finding 6. A latched roll that moved nothing aside (the file was deleted)
+    # must not erase the pointer to the broken file the operator was paged about.
+    clock = _FakeClock()
+    guard, _events = _guard_on(clock, monkeypatch)
+    for t in range(_MAX_ROLLS_PER_WINDOW + 1):
+        _at(clock, t)
+        guard.record_rollover("file", reason="lock", rolled_aside=f"/x/app.log.broken-{t}")
+    _at(clock, 7)
+    guard.record_rollover("file", reason="lock", rolled_aside=None)
+
+    status = guard.status()[0]
+    assert status.state == "unwritable"
+    assert status.rolled_aside == f"/x/app.log.broken-{_MAX_ROLLS_PER_WINDOW}"
+
+
 def test_a_roll_after_a_quiet_window_is_a_fresh_heal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
