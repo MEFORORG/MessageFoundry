@@ -186,8 +186,17 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     ``enforce`` a pin the store refuses stops the start with no row.
     **Not covered**, as in item 9: the driver reads the file by path at each connect, so the
     checked bytes are not the loaded bytes, and the spec carries ``loads_verified_bytes=False``
-    and no fingerprint pin. A changed file is used by the next connect and audited by the next
-    reload, which writes ``changed`` and no ``restart_required``.
+    and no fingerprint pin. A changed file is used by the next connect. The next start or reload
+    compares it with the last audited fingerprint, and writes ``changed`` and no
+    ``restart_required``.
+
+    **The pin's audit rides the hop the pin protects.** The baseline that compare reads
+    (:func:`_last_fingerprint`), and every row this check writes (:func:`_record`), go through
+    the store this hop reaches. A swapped pin that lets another server answer the hop lets that
+    server answer them too: it can return the new fingerprint, so no ``changed`` row is written,
+    or take the row, so the real store records nothing. So the change audit is only as good as
+    the hop it is meant to catch. The ACL, path and readability refusals are judged on the file,
+    not on the store, so they still refuse; only their rows travel the hop.
 
     **A reload runs the anchor checks and none of the store's content checks.** It checks the
     ACL, the path and a change (items 1, 3 and 4; the spec has no pin), and refuses a file it
