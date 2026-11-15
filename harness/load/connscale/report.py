@@ -50,7 +50,9 @@ if TYPE_CHECKING:
 EXIT_OK = 0
 EXIT_SLO_VIOLATION = 1
 
-SCHEMA_VERSION = 2  # 1 -> 2: no_loss.inconclusive (BACKLOG #5574)
+# Still 1 after `no_loss.inconclusive` was added (BACKLOG #5574): the key is additive, and 2 is the
+# readings payload's version, which `connscale_harvest` tells apart from this one by number.
+SCHEMA_VERSION = 1
 
 #: Which rate window the readings payload's rates were computed over (BACKLOG #1420). The window is
 #: defined once, in `harness.load.connscale.runner._empty_claim_rates`. This value names the one that

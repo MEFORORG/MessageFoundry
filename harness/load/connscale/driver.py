@@ -15,8 +15,7 @@ mean rate without the scheduling overhead.
 
 Connections open in **batches** (``connect_batch``) with a short inter-batch pause to avoid a connect
 thundering-herd polluting the steady-state measurement. Stop is cooperative and graced, as
-:meth:`~harness.load.sender.ConnectionPool.stop` is: each connection writes what is already queued,
-then waits out the grace for replies, and cancels nothing (see :meth:`ConnScaleDriver.stop`).
+:meth:`~harness.load.sender.ConnectionPool.stop` is (see :meth:`ConnScaleDriver.stop`).
 """
 
 from __future__ import annotations
@@ -272,8 +271,9 @@ class ConnScaleDriver:
             await asyncio.sleep(_RECONNECT_POLL)
 
     async def stop(self, grace: float) -> None:
-        """Stop every connection, as ``ConnectionPool.stop`` does. Each one writes the sends already
-        queued on it, then waits up to ``grace`` for outstanding replies; a send still unanswered
-        when its connection closes is counted in ``timeouts`` (unconfirmed), never as sent-and-lost.
-        Nothing is cancelled."""
+        """Stop every connection, as ``ConnectionPool.stop`` does. Each one stops taking sends, its
+        writer drains what is queued while the socket stays up, it waits up to ``grace`` for
+        outstanding replies, and then cancels its reader; a send still unanswered at that close is
+        counted in ``timeouts`` (unconfirmed). A socket the engine closes first ends that
+        connection's writer early, so what it still had queued is not written."""
         await asyncio.gather(*(conn.stop(grace) for conn in self._conns))

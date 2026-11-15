@@ -1419,3 +1419,54 @@ def test_inconclusive_reaches_the_json_and_the_console() -> None:
     assert estate_report._noloss_cell(est) == "INCONCL"
     assert estate_report._noloss_cell(replace(est, inconclusive=False)) == "FAIL"
     assert estate_report._noloss_cell(replace(est, ok=True, inconclusive=False)) == "ok"
+
+
+def test_rig_reconciles_a_client_counter_loss_stays_loss_across_a_counter_reset() -> None:
+    # The stranding budget reads only client counters, so a reset that voids the engine deltas does
+    # not void it: 36 of 36 sends unanswered is a systemic no-ACK fault either way. The control is
+    # the same reset with every send answered, which is INCONCLUSIVE.
+    base = _sample(read=100, written=100)
+    final = _sample(read=30, written=30)
+    flood = Counters(sent=36, acked=0, timeouts=36)
+    for result in (
+        connscale_reconcile(flood, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
+        estate_reconcile(flood, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
+    ):
+        assert not result.ok and not result.inconclusive, result.detail
+        assert "systemic no-ACK fault" in result.detail
+        assert "restarted mid-run" in result.detail
+    control = connscale_reconcile(
+        _RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET
+    )
+    assert not control.ok and control.inconclusive, control.detail
+
+
+def test_connscale_reconcile_a_reload_guard_stays_loss_across_a_counter_reset() -> None:
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=18)
+    reload = _reload(30, sent=30, acked=0, timeouts=30, not_reconnected=4)
+    result = connscale_reconcile(
+        c,
+        _sample(read=100, written=100),
+        _sample(read=18, written=18),
+        unconfirmed_budget=12,
+        reload=reload,
+        counter_reset=_RESET,
+    )
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "4 connection(s) never came back" in result.detail
+
+
+def test_batchbox_aggregate_a_band_that_could_not_read_the_engine_is_inconclusive() -> None:
+    # connscale `_reconcile` writes the stand-ins 0 / 0 / -1 when the engine metrics are missing.
+    # Read as readings they would say every message was lost.
+    blind = _band(engine_read=0, engine_written=0, backlog=-1)
+    rec = bb.aggregate_cell_record(_cell(), [blind])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "could not read the engine metrics" in rec.no_loss.detail
+    assert "lost" not in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_escapes_a_band_reset_text_to_one_line() -> None:
+    rec = bb.aggregate_cell_record(_cell(), [_band(counter_reset="engine went\nRESULT ok")])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "\n" not in rec.no_loss.detail

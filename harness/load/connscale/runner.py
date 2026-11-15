@@ -1793,6 +1793,10 @@ def _build_record(
     # currently gives them only a number they cannot act on.
     if not no_loss.ok and post.verdict != intake_audit.VERDICT_NOT_RUN:
         no_loss = replace(no_loss, detail=f"{no_loss.detail}; {post.summary()}")
+        # The per-message audit can PROVE what the counts could only leave open: an accept-ACKed
+        # message absent from the store is a loss, so the step is not INCONCLUSIVE (BACKLOG #5574).
+        if post.verdict == intake_audit.VERDICT_INVARIANT_SUSPECT:
+            no_loss = replace(no_loss, inconclusive=False)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
 
     # Wall #1: executor saturation (None when the shim isn't installed → all-None samples).
@@ -2033,20 +2037,14 @@ def _reconcile(
     # The whole pipeline, not the outbound queue alone: a stalled router or transform leaves every
     # accepted message in ingress or routed with the outbound reading at 0 (BACKLOG #5574).
     backlog = max(final.pending + final.inflight, final.in_pipeline)
-    # A restart, a stats reset or a purge makes final - baseline no run total, so no intake or
-    # delivery arm may rest on it; the load copy's reasoning is the source of record.
-    if counter_reset is not None:
-        return NoLoss(
-            False,
-            sent,
-            max(0, read),
-            max(0, written),
-            sink_received,
-            backlog,
-            f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
-            f"sends, and the drain and delivery arms were not judged",
-            inconclusive=True,
-        )
+    # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
+    # the engine deltas may rest on it; the load copy's reasoning is the source of record. The arms
+    # that read only client counters (the stranding budget and the reload guards) still prove a loss
+    # across it, as the load copy keeps its dead-ACK-path signature. A negative delta is not
+    # published.
+    engine_judged = counter_reset is None
+    if not engine_judged:
+        read, written = max(0, read), max(0, written)
     # A `timeouts`-counted message (in-flight at a connection close with no ACK seen — a mid-run reset
     # or the stop-grace expiring) is UNCONFIRMED, not lost: `sent` was counted at write-buffer time, so
     # the frame may never have left the closed socket. Requiring `read >= sent` false-fails exactly when
@@ -2137,20 +2135,17 @@ def _reconcile(
     # ingress or routed reads exactly like a dead-letter, so an undrained step is INCONCLUSIVE on
     # it rather than LOSS (BACKLOG #5574).
     write_lost = write_short > 0 and drained
-    lost = (
-        read_short > 0
-        or floor_short > 0
-        or deliver_short > 0
-        or write_lost
-        or over_budget
-        or not_back
-        or no_sends
-        or no_reply
-    )
+    engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0 or write_lost
+    lost = (engine_judged and engine_lost) or over_budget or not_back or no_sends or no_reply
     # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
     # undelivering step satisfies trivially.
     unproven: list[str] = []
+    if counter_reset is not None:
+        unproven.append(
+            f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
+            f"sends, so the intake, delivery and drain arms were not judged"
+        )
     if sent == 0:
         unproven.append("nothing was sent — the step measured nothing")
     elif sink_received == 0 and written <= 0:
@@ -2162,11 +2157,13 @@ def _reconcile(
         unproven.append("the drain timed out — the final counts are an unsettled snapshot")
     ok = not lost and drained and not unproven
     parts: list[str] = []
-    if read_short > 0:
+    if not engine_judged:
+        pass  # the engine-delta arms were not judged; `unproven` says why
+    elif read_short > 0:
         parts.append(
             f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
         )
-    if floor_short > 0:
+    if engine_judged and floor_short > 0:
         of_what = (
             f"the {population} send(s) the reload probe did not strand"
             if stranded
@@ -2176,11 +2173,13 @@ def _reconcile(
             f"engine_read {read} < intake floor {population // 2} (half of {of_what}) — "
             f"the unconfirmed-send excusal cannot lower this floor"
         )
-    if deliver_short > 0:
+    if engine_judged and deliver_short > 0:
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
-    if write_short > 0 and not drained:
+    if not engine_judged:
+        pass
+    elif write_short > 0 and not drained:
         parts.append(
             f"engine_written {written} < engine_read {read} with rows still in the pipeline — "
             f"not judged as a loss until it drains"
@@ -2193,8 +2192,8 @@ def _reconcile(
         )
         parts.append(
             f"engine_written {written} < engine_read {read} ({write_short} read but never "
-            f"delivered; causes include a dead-letter, a worker refusal, a rejection recorded "
-            f"before its NAK, and a message still in an earlier stage{naked})"
+            f"delivered; causes include a dead-letter, a worker refusal, and a rejection "
+            f"recorded before its NAK{naked})"
         )
     if not drained:
         parts.append(

@@ -369,3 +369,23 @@ def test_trials_aggregate_to_the_mean_rate_bug_5429() -> None:
     assert cmp.rows[0].candidate is not None
     assert cmp.rows[0].candidate.achieved_read_per_s == 400.0
     assert cmp.rows[0].candidate.sent == 2000
+
+
+def test_an_inconclusive_baseline_is_no_resilience_win_and_fails_the_row() -> None:
+    # BACKLOG #5574: a per_lane arm that cleared nothing is neither a breach nor a measurement, so
+    # it cannot make the row pass on the resilience basis, which skips the throughput guard. The
+    # control is the same baseline as a proven breach, which still reads as a resilience win.
+    from dataclasses import replace as _replace
+
+    breached = _record(
+        claim_mode="per_lane", count=10, achieved_read=0.0, idle_poll=1.0, no_loss_ok=False
+    )
+    pooled = _record(claim_mode="pooled", count=10, achieved_read=100.0, idle_poll=0.0)
+    cmp = build_comparison([breached, pooled], ("per_lane", "pooled"))
+    assert cmp is not None and len(cmp.rows) == 1
+    assert cmp.rows[0].resilience_win and cmp.rows[0].ok
+    unsure = _replace(breached, no_loss=_replace(breached.no_loss, inconclusive=True))
+    cmp = build_comparison([unsure, pooled], ("per_lane", "pooled"))
+    assert cmp is not None and len(cmp.rows) == 1
+    assert not cmp.rows[0].resilience_win
+    assert not cmp.rows[0].ok

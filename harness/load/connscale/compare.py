@@ -78,6 +78,9 @@ class _ArmMetrics:
     # --- loss reconcile (the AUTHORITATIVE signal; from the independent sink counter, NOT the
     # /stats achieved-rate poller that zeroes under overload — see the report's reading caveat). ---
     no_loss_ok: bool
+    #: The arm's reconcile could not clear it and proved no loss either (BACKLOG #5574). It is not
+    #: a breach, so it can never make a resilience win, and a baseline in this state fails the row.
+    no_loss_inconclusive: bool
     sent: int
     sink_received: int
     backlog: int
@@ -124,6 +127,10 @@ class _ArmMetrics:
             fd_count_peak=_max_or_none([r.fd_count_peak for r in recs]),
             working_set_peak_bytes=_max_or_none([r.working_set_peak_bytes for r in recs]),
             no_loss_ok=not losses,
+            # Inconclusive only when no trial PROVED a loss: one proven loss is a breach, whatever
+            # the other trials could not clear (BACKLOG #5574).
+            no_loss_inconclusive=bool(losses)
+            and all(r.no_loss.inconclusive for r in recs if not r.no_loss.ok),
             sent=sum(r.no_loss.sent for r in recs),
             sink_received=sum(r.no_loss.sink_received for r in recs),
             backlog=max(r.no_loss.backlog for r in recs),
@@ -162,6 +169,7 @@ class ComparisonRow:
         return (
             not self.pooled_missing
             and not self.baseline.no_loss_ok
+            and not self.baseline.no_loss_inconclusive
             and not self.candidate_lost
             and self.candidate is not None
             and self.candidate.drain_completed
@@ -178,6 +186,10 @@ class ComparisonRow:
             return False
         # A pooled arm whose drain timed out in any trial left rows stranded (BACKLOG #5429).
         if self.candidate is not None and not self.candidate.drain_completed:
+            return False
+        # A baseline that cleared nothing is no breach and no measurement: the row cannot pass on
+        # the resilience basis, nor on a throughput delta it never made sound (BACKLOG #5574).
+        if self.baseline.no_loss_inconclusive:
             return False
         if self.collapse_verdict == COLLAPSE_FAIL:
             return False

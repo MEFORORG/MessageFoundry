@@ -140,7 +140,7 @@ def test_json_curve_schema_keyed_by_count() -> None:
     rep = _report(recs, [SloCheck("zero_loss", True, True, True)], backend="postgres")
     body = json.loads(rep.to_json())
     assert body["kind"] == "connscale"
-    assert body["schema_version"] == 2
+    assert body["schema_version"] == 1
     assert [r["count"] for r in body["records"]] == [50, 100]
     # Every record carries the 6 walls.
     r0 = body["records"][0]

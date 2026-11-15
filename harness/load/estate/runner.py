@@ -513,20 +513,13 @@ def _reconcile(
     # The whole pipeline, not the outbound queue alone: a stalled router or transform leaves every
     # accepted message in ingress or routed with the outbound reading at 0 (BACKLOG #5574).
     backlog = max(final.pending + final.inflight, final.in_pipeline)
-    # A restart, a stats reset or a purge makes final - baseline no run total, so no intake or
-    # delivery arm may rest on it; the load copy's reasoning is the source of record.
-    if counter_reset is not None:
-        return NoLoss(
-            False,
-            sent,
-            max(0, read),
-            max(0, written),
-            sink_received,
-            backlog,
-            f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
-            f"sends, and the drain and delivery arms were not judged",
-            inconclusive=True,
-        )
+    # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
+    # the engine deltas may rest on it; the load copy's reasoning is the source of record. The
+    # stranding budget reads only client counters, so it still proves a loss across it. A negative
+    # delta is not published.
+    engine_judged = counter_reset is None
+    if not engine_judged:
+        read, written = max(0, read), max(0, written)
     # An unconfirmed send (in-flight at a connection close, no ACK seen) is bounded-excused; past the
     # budget it is a systemic no-ACK fault. The bound is a FRACTION of the run (at most three quarters), floored
     # by the connection count — NOT "~one per connection", a model this sender breaks because
@@ -550,11 +543,17 @@ def _reconcile(
     floor_short = sent // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    lost = read_short > 0 or floor_short > 0 or deliver_short > 0 or over_budget
+    engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0
+    lost = (engine_judged and engine_lost) or over_budget
     # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
     # undelivering step satisfies trivially.
     unproven: list[str] = []
+    if counter_reset is not None:
+        unproven.append(
+            f"{counter_reset} — the read/written deltas cannot be reconciled against this step's "
+            f"sends, so the intake, delivery and drain arms were not judged"
+        )
     if sent == 0:
         unproven.append("nothing was sent — the step measured nothing")
     elif sink_received == 0 and written <= 0:
@@ -566,16 +565,16 @@ def _reconcile(
         unproven.append("the drain timed out — the final counts are an unsettled snapshot")
     ok = not lost and drained and not unproven
     parts: list[str] = []
-    if read_short > 0:
+    if engine_judged and read_short > 0:
         parts.append(
             f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
         )
-    if floor_short > 0:
+    if engine_judged and floor_short > 0:
         parts.append(
             f"engine_read {read} < intake floor {sent // 2} (half of {sent} sent) — "
             f"the unconfirmed-send excusal cannot lower this floor"
         )
-    if deliver_short > 0:
+    if engine_judged and deliver_short > 0:
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )

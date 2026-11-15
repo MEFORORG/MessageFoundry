@@ -65,6 +65,7 @@ from harness.load.connscale.runner import (
 )
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import EngineNode, FailoverError, _await_port
+from messagefoundry.terminal_text import escape_for_terminal
 
 _HEALTH_TIMEOUT = 30.0
 _PORTS_READY_TIMEOUT = 60.0
@@ -479,14 +480,18 @@ def aggregate_cell_record(
         unproven.append("a band's drain timed out — the final counts are an unsettled snapshot")
     # A band whose engine counters reset mid-cell makes every engine delta in it no run total, so
     # neither arm above may rest on it. A band report that does not say is refused, never read as
-    # "no reset": a missing field must not clear a cell.
+    # "no reset": a missing field must not clear a cell. A band that could not read the engine at
+    # all reports the stand-ins 0/0/-1 (connscale `_reconcile`), which are not readings either.
+    # The reset text comes out of another process's report file, so it is escaped to one line.
     resets: list[str] = []
     for r in proc_reports:
         nl = r.get("no_loss", {})
         if "counter_reset" not in nl:
             resets.append("a band report does not say whether the engine counters reset")
         elif nl["counter_reset"] is not None:
-            resets.append(str(nl["counter_reset"]))
+            resets.append(escape_for_terminal(str(nl["counter_reset"]), single_line=True))
+        if int(nl.get("backlog", 0) or 0) < 0:
+            resets.append("a band could not read the engine metrics")
     if resets:
         lost = False
         unproven.append(
