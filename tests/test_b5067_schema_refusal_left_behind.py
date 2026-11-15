@@ -217,6 +217,26 @@ def test_provision_admin_key_refusal_at_the_write_open_names_the_entry(
     assert "Traceback" not in out, out
 
 
+def test_provision_admin_invocation_bound_store_error_at_the_write_open_names_the_entry(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The open's strict invocation-bound pass re-raises a store error as itself (BACKLOG #5608),
+    where it once arrived as a ``CipherError``. It carries the bound's note, so it takes the same
+    exit 2 and keeps the advice about the shown key's entry (#5067), not the floor's exit 1.
+
+    Mutation: drop the ``_InvocationBoundOpenRefused`` raise; the exit is then 1."""
+    from messagefoundry.store.gcm_bound import INVOCATION_BOUND_NOTE
+
+    refusal = TimeoutError("lock request on synthetic_table timed out")
+    refusal.add_note(INVOCATION_BOUND_NOTE)
+    _refused_at_the_write(monkeypatch, "sqlserver", refusal)
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert "synthetic_table" in out, out
+    assert "nothing was written" in out, out
+    assert _UNUSED_ENTRY in out, out
+    assert "Traceback" not in out, out
+
+
 def test_provision_admin_names_no_entry_once_the_write_has_started(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

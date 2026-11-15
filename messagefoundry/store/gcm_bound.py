@@ -85,6 +85,7 @@ from messagefoundry.store.crypto import (
 
 __all__ = [
     "GCM_RESERVE_BLOCK",
+    "INVOCATION_BOUND_NOTE",
     "bind_store_salt",
     "bounded_cipher",
     "checkpoint_invocations",
@@ -97,6 +98,11 @@ log = logging.getLogger(__name__)
 
 #: Public alias of the reserve block size (tests + the runner read it; the cipher owns the value).
 GCM_RESERVE_BLOCK = _GCM_RESERVE_BLOCK
+
+#: The note a failed add carries when a pass re-raises it (:func:`_account`): a store open's strict
+#: pass, or any pass before the cipher has read its row. A CLI open arm tests for it to report the
+#: failure as "could not start", as it reports a key refusal, rather than as a late store error.
+INVOCATION_BOUND_NOTE = "raised while the AES-GCM invocation bound read its persisted total"
 
 #: ``(key_id, count) -> new cumulative total``. Each backend supplies its own atomic upsert-add. ``count``
 #: is normally positive (a reservation); a settlement may pass a NEGATIVE count to refund an unspent
@@ -249,15 +255,15 @@ async def _account(
 
     The failure is re-raised AS ITSELF. A store that is locked, busy or unreachable raises its
     driver's error, and a caller that reads :class:`~messagefoundry.store.crypto.CipherError` as a
-    key refusal must not send an operator to the key for it; a ``CipherError`` stays one. The note
-    added names the pass, once, since an add may raise one stored exception on every retry."""
+    key refusal must not send an operator to the key for it; a ``CipherError`` stays one. It
+    carries :data:`INVOCATION_BOUND_NOTE`, once, since an add may raise one stored exception on
+    every retry; a caller tests for the note to tell this failure from any other at the open."""
     try:
         await _add_then_grant(bound, add, need, floor=floor)
     except Exception as exc:
         if strict or not bound.invocation_bound_hydrated:
-            note = f"the AES-GCM invocation bound could not read its persisted total while {what}"
-            if note not in getattr(exc, "__notes__", ()):
-                exc.add_note(note)
+            if INVOCATION_BOUND_NOTE not in getattr(exc, "__notes__", ()):
+                exc.add_note(INVOCATION_BOUND_NOTE)
             raise
         log.warning(
             "could not reach the AES-GCM invocation bound for the active key while %s; the "

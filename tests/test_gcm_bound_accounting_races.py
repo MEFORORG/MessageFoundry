@@ -33,7 +33,11 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
-from messagefoundry.store.gcm_bound import checkpoint_invocations, reserve_invocations_ahead
+from messagefoundry.store.gcm_bound import (
+    INVOCATION_BOUND_NOTE,
+    checkpoint_invocations,
+    reserve_invocations_ahead,
+)
 from messagefoundry.store.store import MessageStore
 
 
@@ -199,9 +203,8 @@ async def test_a_locked_store_on_a_strict_pass_raises_the_store_error_not_a_key_
     assert caught.value is error
     # The note names the pass, and claims no refusal: this cipher was hydrated before, so it is
     # still able to encrypt, and a note saying otherwise would send an operator the wrong way.
-    notes = caught.value.__notes__
-    assert len(notes) == 1 and "invocation bound" in notes[0] and "checkpointing" in notes[0]
-    assert "nothing is encrypted" not in notes[0]
+    assert caught.value.__notes__ == [INVOCATION_BOUND_NOTE]
+    assert "nothing is encrypted" not in INVOCATION_BOUND_NOTE
     cipher.encrypt("x")
 
 
@@ -216,7 +219,9 @@ async def test_a_reraised_store_error_is_noted_once_however_often_the_pass_retri
     for _ in range(3):
         with pytest.raises(sqlite3.OperationalError):
             await checkpoint_invocations(cipher, _busy)
-    assert len(error.__notes__) == 1
+    with pytest.raises(sqlite3.OperationalError):  # another pass, the same note
+        await reserve_invocations_ahead(cipher, _busy, 5)
+    assert error.__notes__ == [INVOCATION_BOUND_NOTE]
 
 
 async def test_a_locked_store_on_a_first_hydration_raises_the_store_error_and_fails_closed() -> (

@@ -9165,6 +9165,26 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     return left
 
 
+def _raised_by_the_invocation_bound(exc: BaseException) -> bool:
+    """Whether ``exc`` is a store error the AES-GCM invocation bound's pass re-raised at the open.
+
+    That pass re-raises a failed add as itself (BACKLOG #5608), where it once raised a
+    ``CipherError``, so an open arm that reported the ``CipherError`` as "could not start" tests
+    for the note to report this the same way."""
+    from messagefoundry.store.gcm_bound import INVOCATION_BOUND_NOTE
+
+    return INVOCATION_BOUND_NOTE in getattr(exc, "__notes__", ())
+
+
+class _InvocationBoundOpenRefused(Exception):
+    """``provision-admin``'s carrier for an open refused by the invocation bound's pass, so one
+    outer arm can report it as the ``CipherError`` arm does. ``failure`` is the store's error."""
+
+    def __init__(self, failure: Exception) -> None:
+        super().__init__()
+        self.failure = failure
+
+
 def _provision_open_refusal(
     exc: BaseException, store: StoreSettings, *, kept: Path | None = None
 ) -> str:
@@ -9835,6 +9855,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 kept_key = _discard_minted_custody(
                     minted.path, settings.store, exc, service_account=args.service_account
                 )
+            if isinstance(exc, Exception) and _raised_by_the_invocation_bound(exc):
+                raise _InvocationBoundOpenRefused(exc) from exc  # BACKLOG #5608
             if not isinstance(exc, StoreCreateBatchFailedBeforeKeyUse):
                 raise
             # The key is dealt with (PR 2804 hold 17); the batch's own error is what the operator
@@ -10031,6 +10053,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
             raise
         text = after_the_key(
             codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept_key)
+        )
+        _emit_error(text, as_json=args.json)
+        return 2
+    except _InvocationBoundOpenRefused as refused:
+        # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
+        # arrived as the `CipherError` above: raised at the open, before the write, so the same
+        # exit 2 and the same advice about the shown key's entry (#5067).
+        failure = refused.failure
+        text = after_the_key(
+            codec_safe_str(failure),
+            _provision_open_refusal(failure, settings.store, kept=kept_key),
         )
         _emit_error(text, as_json=args.json)
         return 2
@@ -10276,6 +10309,14 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # open. So does a keyed open that meets a row it cannot read or that is not JSON once
             # decrypted (BACKLOG #2308). Nothing has been read or written. Through
             # `codec_safe_str`, as the sibling commands print it (BACKLOG #2532).
+            from messagefoundry.redaction import codec_safe_str
+
+            return ("open-refused", wanted, codec_safe_str(exc))
+        except Exception as exc:
+            # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
+            # arrived as the `CipherError` above: the same "could not start". Any other propagates.
+            if not _raised_by_the_invocation_bound(exc):
+                raise
             from messagefoundry.redaction import codec_safe_str
 
             return ("open-refused", wanted, codec_safe_str(exc))

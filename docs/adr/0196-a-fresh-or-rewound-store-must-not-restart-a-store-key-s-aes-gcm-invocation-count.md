@@ -88,8 +88,12 @@ build does not assume they are covered:
 - **A failing counter write falls back quietly, once the count has been read.** After a pass
   has read the key's persisted total, `checkpoint_invocations` and `reserve_invocations_ahead`
   log a warning and fall back to the in-process count when the add fails. If `cipher_meta` writes
-  keep failing, each restart restarts from a stale row. Before that first read, and on a store
-  open's first pass, a failed add raises and the cipher refuses to encrypt (BACKLOG #5608).
+  keep failing, each restart restarts from a stale row. Two cases raise instead (BACKLOG #5608).
+  Before that first read, a failed add raises, and the cipher refuses to encrypt until a later
+  pass reads the row. On a store open's first pass, a failed add raises and the open fails, but
+  a cipher that had already read a row, through another store handle, is not refused: it keeps
+  encrypting for that handle. Either way the add's own error is raised, a store that is locked or
+  unreachable included, carrying `INVOCATION_BOUND_NOTE`; it is not a `CipherError`.
 - **The full restore-verify opens a scratch copy under the live key.** Both
   `[backup].full_restore_verify` and the CLI `restore-verify --full` reach `_full_open_check`, which
   opens the snapshot through the real store. Anything that open seals is charged only to the
