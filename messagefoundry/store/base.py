@@ -77,7 +77,7 @@ from messagefoundry.store.privilege import (
     probe_failure,
     sqlite_not_applicable,
 )
-from messagefoundry.store.row_seal import AnyRowSealer
+from messagefoundry.store.row_seal import AnyRowSealer, ResealOutcome
 from messagefoundry.store.store import (
     ANY_CLAIM_OWNER,
     OPEN_STORE_PIN,
@@ -1687,6 +1687,13 @@ class QueueStore(StoreLifecycle, Protocol):
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
+
+    def reseal_outcome(self) -> ResealOutcome:
+        """What the last :meth:`reencrypt_to_active` left sealed under a key other than the active
+        one: the user, role, approval and directory-map seals its re-seal passes did not move
+        (vault BACKLOG #5635). A side result, so ``reencrypt_to_active`` keeps its count; empty
+        before one has run, and always empty on a store with no in-process seal key."""
+        ...
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:

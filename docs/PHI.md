@@ -740,7 +740,18 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    changed key while the rotation record names it or cannot be read (BACKLOG
    #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before either data pass
    (the store open can already have written under the key) and closes it only when a run completes,
-   so a run killed or failed after that point leaves it open. When a start finds that the key in
+   so a run killed or failed after that point leaves it open. **A sealed record under a key the run
+   was not given stops it (vault BACKLOG #5635).** When a user, role, open approval or directory-map
+   seal names a key the run does not hold, a pre-flight read finds it before any re-seal or cell
+   pass writes, and the store pass aborts having written nothing, naming the tables and the seal
+   key ids; the command exits 1 with nothing rolled or stamped. Neither that read nor the check
+   after the re-seal passes, which reads the tables it checks once, is atomic against a writer
+   running alongside. A seal such a writer commits during the run may be missed, or counted with
+   the refused records, rather than stopping the run, or it may stop the run after the re-seal
+   passes have committed under the active key, which you must then keep. So stop the engine
+   before rotating, and before dropping the prior key.
+   Supply that key and re-run, or remove a record no key you hold opens. A seal that fails under a
+   key the run holds, or is malformed, does not stop it; the run notes it. When a start finds that the key in
    use differs from its stamp, or has none, and the record names that key or cannot be read, `serve`
    logs a WARNING and reads the key's age from the prior date, or from the date the record opened
    where there is none. On a key that matches its stamp it says nothing about the record. Under

@@ -392,10 +392,12 @@ def test_only_writer_txn_and_the_read_snapshot_open_a_transaction() -> None:
     # callers each pass one of the module's `_WEBAUTHN_*` constants: an INSERT or a DELETE, never a
     # transaction verb. The fifth is `newest_keyed_audit_row`'s read-only `fetch` (vault BACKLOG
     # #3750 item 33), which runs only the SELECTs `read_newest_keyed_audit_row` passes it, on a
-    # `_read()` connection. If you added one, confirm it carries no transaction verb and then move
-    # this number.
-    assert scan.unreadable == 5, (
-        f"{scan.unreadable} SQL arguments could not be read as text, expected 5. A new one is a new "
+    # `_read()` connection. The sixth is `_unrotated_seals` (vault BACKLOG #5635), which runs only
+    # the SELECTs `unrotated_seal_queries` builds from `RESEALED_SEAL_COLUMNS`, on a `_read()`
+    # connection. If you added one, confirm it carries no transaction verb and then move this
+    # number.
+    assert scan.unreadable == 6, (
+        f"{scan.unreadable} SQL arguments could not be read as text, expected 6. A new one is a new "
         f"blind spot in this guard: check it carries no transaction verb before moving the number."
     )
 

@@ -11537,6 +11537,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.row_seal import ResealOutcome
     from messagefoundry.store.store import audit_roll_refused_for_good
     from messagefoundry.uploads import ResealResult, UploadStore
 
@@ -11658,7 +11659,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    async def run() -> tuple[int, ResealResult, tuple[bool, str], bool]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str], bool, ResealOutcome]:
         import datetime
 
         from messagefoundry.pipeline.secret_rotation import (
@@ -11683,6 +11684,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
             if isinstance(store, SecretRotationMetaStore) and key_id:
                 record_named = await open_rotation_record(store, key_id, today)
             count = await store.reencrypt_to_active()
+            # Vault BACKLOG #5635: what the store pass left under a key it holds and could not
+            # re-seal, for the note below. A record under a key it does not hold aborted the pass.
+            seals = store.reseal_outcome()
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
             # had no rotation of any kind — a rotation re-sealed every database cell and left every
             # uploaded file under the retired key, so the operator's next step (dropping that key)
@@ -11762,7 +11766,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # way out only then: a run with the key already stamped opens no record, and a
             # refusal a re-run or a restored key clears has its own remedy in the roll's error.
             way_out = record_named and not rolled[0] and audit_roll_refused_for_good(rolled[1])
-            return count, uploads, rolled, way_out
+            return count, uploads, rolled, way_out, seals
         finally:
             await store.close()
 
@@ -11776,7 +11780,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         *_key_unresolved(),
     )
     try:
-        count, uploads, (rolled_ok, rolled_msg), name_way_out = run_guarded(run())
+        count, uploads, (rolled_ok, rolled_msg), name_way_out, seals = run_guarded(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -11788,7 +11792,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # record stays open. That is safe precisely because both passes skip what is already under
         # the active key: a re-run with the key supplied goes on from here, and nothing rolls back.
         # One case no key finishes: a row whose tag verified but which is not UTF-8, or not JSON at
-        # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308).
+        # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308). The store
+        # pass also refuses here, from a pre-flight read before any of its writes, when a user, role,
+        # open approval or directory-map seal names a key this run does not hold (#5635): going on
+        # would re-encrypt such a user's TOTP secret, which its seal covers, and strand the record
+        # under every key. Its message names the tables and seal key ids.
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
     except could_not_start as exc:
@@ -11884,6 +11892,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "This run did not stamp the key's rotation date, and no serve start does while the "
             "rotation stands open, though one that came before this run may have.",
             file=sys.stderr,
+        )
+    if seals.refused:
+        # Vault BACKLOG #5635: a seal that fails under a key this run holds, or is malformed, is
+        # left as it is. No key re-seals it, so it must not fail the run, or every later run would
+        # fail on it too (the BACKLOG #3181 precedent). Said here, not only logged.
+        print(
+            f"note: {seals.refused} user, role, open approval or directory-map record(s) were left "
+            "as they are: their seal fails under a key this run holds, or is malformed. The "
+            "causes include at least a change made outside the store and, if an engine was still "
+            "running, a write it made during this run. A record changed outside the store is "
+            "refused on every read and no key re-seals it, so it does not hold this rotation open; "
+            "recreate or remove it. The log names each kind."
         )
     if not rolled_ok:
         # The data is rotated but the audit chain is not settled: its current range is still under
