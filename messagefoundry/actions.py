@@ -320,8 +320,11 @@ def date_diff_field(
     A whole-field path reads the field's **first component**, so a composite ``TS`` such as
     ``20260101120000^S`` (HL7 v2.3's time plus degree of precision) reads as its time; when that
     component is empty the whole field is read, as :meth:`Message.age` does, so ``^D`` or
-    ``~20270101`` raises as an unparseable timestamp. A field holding a second repetition raises
-    :class:`ValueError` whichever way it is addressed: a timestamp field holds one value.
+    ``~20270101`` raises as an unparseable timestamp. A whole field raises :class:`ValueError` when
+    it holds more than one repetition, or anything in component 2 but the degree-of-precision code
+    of its own time (``20260101120000^D`` and a range ``20260101^20260201`` both raise), and a
+    component path raises when the field has a second repetition: a timestamp field holds one
+    value.
 
     Every ``±HHMM`` offset present is validated. ``"years"`` counts on each stamp's own stated date,
     as an age does (a birthday is a local date), offsets or not. ``"days"``, ``"hours"`` and
@@ -350,10 +353,10 @@ def date_diff_field(
     end_raw = _timestamp_value(msg, end_path)
     if not start_raw or not end_raw:
         return
-    _refuse_repetition(msg, start_path)
-    _refuse_repetition(msg, end_path)
     start_dt, start_prec, start_off = parse_hl7_timestamp(start_raw)
     end_dt, end_prec, end_off = parse_hl7_timestamp(end_raw)
+    _check_ts_field(msg, start_path, start_prec)
+    _check_ts_field(msg, end_path, end_prec)
     start_shift = None if start_off is None else _offset_shift(start_off)
     end_shift = None if end_off is None else _offset_shift(end_off)
     both_dates = start_prec not in _TIME_PRECISIONS and end_prec not in _TIME_PRECISIONS
@@ -410,12 +413,42 @@ def _timestamp_value(msg: Message, path: str) -> str | None:
     return msg.field(f"{path}.1") or msg.field(path)
 
 
-def _refuse_repetition(msg: Message, path: str) -> None:
-    """Raise when the field ``path`` addresses holds a second repetition, rather than silently
-    reading the first: a timestamp field holds one value."""
-    seg, fld, _comp, _sub = parse_path(path)
-    if msg.field(f"{seg}-{fld}", repetition=2) is not None:
-        raise ValueError(f"date_diff_field: {seg}-{fld} repeats; a timestamp field holds one value")
+#: HL7 v2.3 ``TS`` degree-of-precision codes (component 2), as :func:`parse_hl7_timestamp`'s tokens.
+_DEGREE_OF_PRECISION = {
+    "Y": "year",
+    "L": "month",
+    "D": "day",
+    "H": "hour",
+    "M": "minute",
+    "S": "second",
+}
+
+
+def _check_ts_field(msg: Message, path: str, precision: str) -> None:
+    """Raise unless the field ``path`` addresses holds one timestamp, rather than silently reading a
+    part of it. A whole field may hold only one repetition (main refused any repetition separator
+    there, as unparseable), and only its time plus, in component 2, the degree-of-precision code
+    of that time's own precision: a range (``start^end``) or a code that disagrees with the stamp
+    (``20260101120000^D``) raises. A component path is refused when the field has a second
+    repetition."""
+    seg, fld, comp, _sub = parse_path(path)
+    field = f"{seg}-{fld}"
+    repeats = (
+        len(msg.repetitions(field)) > 1
+        if comp is None
+        else msg.field(field, repetition=2) is not None
+    )
+    if repeats:
+        raise ValueError(f"date_diff_field: {field} repeats; a timestamp field holds one value")
+    if comp is None:
+        degree = msg.field(f"{path}.2")
+        if msg.field(f"{path}.3") is not None or (
+            degree is not None and _DEGREE_OF_PRECISION.get(degree) != precision
+        ):
+            raise ValueError(
+                f"date_diff_field: {path} holds more than a timestamp and the degree of precision "
+                "of its time"
+            )
 
 
 def copy_segment(

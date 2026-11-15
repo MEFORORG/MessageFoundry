@@ -667,6 +667,39 @@ def test_date_diff_field_a_ts_field_with_an_empty_first_value_raises(start: str)
     assert m["ZTS-3"] is None
 
 
+@pytest.mark.parametrize(
+    ("start", "end", "unit"),
+    [
+        ("20260101^20260201", "20260104", "days"),  # a range, not a timestamp
+        ("20260101120000^D", "20260101180000", "hours"),  # day precision on a time of day
+        ("20260101^S", "20260104", "days"),  # second precision on a date
+        ("20260101^D^X", "20260104", "days"),  # a third component
+        ("20260101~~20270101", "20260104", "days"),  # a later repetition after an empty one
+    ],
+)
+def test_date_diff_field_a_whole_field_holding_more_than_one_timestamp_raises(
+    start: str, end: str, unit: Literal["days", "hours"]
+) -> None:
+    # BACKLOG #5822, review round 4. Main refused each of these whole fields as unparseable; reading
+    # component 1 must not turn them into a silent number. NEGATIVE CONTROL: at 375a4aa8e the first,
+    # second and last wrote 3, 6 and 3.
+    m = _two_stamps(start, end)
+    with pytest.raises(ValueError):
+        date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit=unit)
+    assert m["ZTS-3"] is None
+
+
+def test_date_diff_field_a_component_path_keeps_mains_reading() -> None:
+    # Main read a component path from the first repetition: an empty one is a no-op, and a later
+    # repetition after an empty second one is not looked at. Both stay as main had them.
+    m = _two_stamps("~20270101", "20260104")
+    date_diff_field(m, "ZTS-1.1", "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] is None
+    m = _two_stamps("20260101~~20270101", "20260104")
+    date_diff_field(m, "ZTS-1.1", "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] == "3"
+
+
 @pytest.mark.parametrize("path", ["ZTS-1", "ZTS-1.1"])
 def test_date_diff_field_refuses_a_repeating_ts_field(path: str) -> None:
     # A timestamp field holds one value, so a second repetition raises however it is addressed.
