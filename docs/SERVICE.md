@@ -759,8 +759,10 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   - **The OWNER is checked too, and this arm REFUSES rather than warning.** An owner holds
     `WRITE_DAC` implicitly, so it can rewrite the DACL and the executed `.py` whatever the ACEs
     currently say — a clean DACL owned by a low-privilege account is not evidence of anything. The
-    owner passes when it is **the account the engine runs as**, a **well-known administrator SID**
-    (SYSTEM, `BUILTIN\Administrators`, or a domain SID ending in RID 500/512/518/519), or a
+    owner passes when it is **the account the engine runs as** (never LocalService or
+    NetworkService, which other services share), a **well-known administrator SID**
+    (SYSTEM, `BUILTIN\Administrators`, TrustedInstaller, or a domain SID ending in RID
+    500/512/518/519), or a
     **resolved direct member of the local Administrators group**. Anything else is refused, **and so
     is a membership lookup that cannot be completed**, the same as a DACL read that cannot finish
     (ADR 0036 Decision 3 as amended).

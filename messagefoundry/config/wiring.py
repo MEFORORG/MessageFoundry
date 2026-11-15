@@ -9898,18 +9898,9 @@ _WIN_GRANTING_ACE_TYPES = frozenset({0x00, 0x04, 0x05, 0x09, 0x0B})
 # make that SID the engine's alone: self-trust skips them, as a grantee and as an owner.
 _WIN_SHARED_SERVICE_SIDS = frozenset({"S-1-5-19", "S-1-5-20"})
 
-# Broad groups for which the Administrators membership lookup is never consulted. A well-known group
-# can be added to Administrators, and a write grant to one must still refuse; the lookup decides only
-# for a named account or group. The first five are refused outright as broad (_WIN_REJECTED_SIDS).
-_WIN_NO_ADMIN_LOOKUP_SIDS = _WIN_REJECTED_SIDS | frozenset(
-    {
-        "S-1-5-2",  # NT AUTHORITY\NETWORK
-        "S-1-5-3",  # NT AUTHORITY\BATCH
-        "S-1-5-6",  # NT AUTHORITY\SERVICE
-        "S-1-5-113",  # NT AUTHORITY\Local account
-        "S-1-5-32-546",  # BUILTIN\Guests
-    }
-)
+# ACE_HEADER.AceFlags bit for an entry that only propagates to children and grants nothing on the
+# object it sits on.
+_WIN_INHERIT_ONLY_ACE = 0x08
 
 
 def _is_well_known_admin_sid(sid: str) -> bool:
@@ -9943,6 +9934,21 @@ def _is_well_known_admin_sid(sid: str) -> bool:
     return int(rid_text) in _WIN_ADMIN_RIDS
 
 
+def _is_domain_admin_group_sid(sid: str) -> bool:
+    """Whether ``sid`` is a Domain, Schema or Enterprise Admins group SID by its form alone.
+
+    These are the only domain-relative grantees the DACL pass trusts, and only once the local
+    Administrators lookup resolves them (BACKLOG #5622). A group, not an account: UAC marks these
+    groups deny-only in an unelevated token, so a write grant to one is usable only by an elevated
+    administrator, who could take ownership anyway. A grant to an administrator's own user SID (RID
+    500 included) works from the unelevated session and stays refused."""
+    return (
+        _is_well_known_admin_sid(sid)
+        and sid not in _WIN_ADMIN_SIDS
+        and int(sid.rsplit("-", 1)[1]) != 500
+    )
+
+
 def _evaluate_config_dacl(
     owner_sid: str,
     aces: Sequence[tuple[int, int, str]],
@@ -9952,11 +9958,13 @@ def _evaluate_config_dacl(
     """Pure DACL + owner policy: return a refusal reason, or ``None`` if the source is trusted.
 
     ``aces`` is ``(ace_type, access_mask, trustee_sid)`` tuples as strings (``ConvertSidToStringSidW``
-    form). A source is refused when any **ALLOWED** ACE grants a **write-class** right to a principal
-    that is neither the file owner, nor the current process user, nor a trusted admin/SYSTEM SID,
-    nor a resolved direct member of Administrators — and unconditionally when a broad/low-privilege
-    SID (Everyone/Authenticated Users/Users/…) holds such a right. Any other granting entry type
-    (callback, object, compound) carrying a write-class right refuses too, because its trustee or
+    form), with an empty trustee for every type but 0x00. A source is refused when any **ALLOWED**
+    ACE grants a **write-class** right to a principal that is neither the file owner, nor the current
+    process user, nor a trusted admin/SYSTEM/TrustedInstaller SID, nor a Domain/Schema/Enterprise
+    Admins group that resolves as a direct member of Administrators
+    (:func:`_is_domain_admin_group_sid`) — and unconditionally when a broad/low-privilege SID
+    (Everyone/Authenticated Users/Users/…) holds such a right. Any other granting entry type
+    (compound, object, callback) carrying a write-class right refuses too, because its trustee or
     condition cannot be judged here. A LocalService or NetworkService process user is not
     self-trusted: other services share that SID (BACKLOG #5622).
 
@@ -9971,7 +9979,9 @@ def _evaluate_config_dacl(
     raised through :func:`_refuse_unsafe_config_source`, which says where that escape is honoured.
 
     Order matters, and it is not cosmetic: the ACEs are evaluated first so an observed insecure ACE is
-    reported as itself instead of being masked by the owner verdict. A ``self_sid`` of ``None`` (the
+    reported as itself instead of being masked by the owner verdict, and the scan runs past an entry
+    it cannot judge, so a definite insecure entry later in the list is reported ahead of it. A
+    ``self_sid`` of ``None`` (the
     process token could not be read) **skips** the owner comparison here, because there is nothing to
     compare an owner against. This function does not refuse on it; the caller does.
     :func:`_enforce_windows_paths` refuses an unreadable token before any path is evaluated
@@ -9986,31 +9996,42 @@ def _evaluate_config_dacl(
     trusted.add(owner_sid)
     if engine_sid is not None:
         trusted.add(engine_sid)
+    unsure: str | None = None  # the first entry that cannot be judged, reported if none is worse
     for ace_type, access_mask, trustee_sid in aces:
         if ace_type not in _WIN_GRANTING_ACE_TYPES:
             continue  # DENY ACEs never grant a right
         if not access_mask & _WIN_WRITE_MASK:
             continue  # read/execute-only ACE (e.g. Users:RX on a repo checkout) is fine
         if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
-            return (
-                f"a conditional or object access entry (type 0x{ace_type:02x}) grants write access, "
-                "and this check cannot tell whom it applies to"
+            unsure = unsure or (
+                f"a compound, object or callback access entry (type 0x{ace_type:02x}) grants write "
+                "access, and this check cannot tell whom it applies to"
             )
+            continue
         if trustee_sid in _WIN_REJECTED_SIDS:
             return f"a broad/low-privilege principal ({trustee_sid}) has write access"
         if trustee_sid in trusted:
             continue
-        # A direct member of Administrators can take ownership anyway, so its grant adds nothing. The
-        # lookup decides for a grantee, never the RID arm, whose foreign-authority limit ADR 0036
-        # Amendment A accepted for owners only.
-        member = False if trustee_sid in _WIN_NO_ADMIN_LOOKUP_SIDS else owner_in_admins(trustee_sid)
-        if member is None:
+        if trustee_sid == self_sid:
             return (
-                f"a non-owner principal ({trustee_sid}) has write access, and its Administrators "
-                f"membership could not be resolved"
+                f"the account the engine runs as ({trustee_sid}) has write access, but other "
+                "services share that identity, so it is not trusted as the engine's own"
             )
-        if not member:
-            return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
+        # The RID arm alone would trust an admin group of any domain (ADR 0036 Amendment A accepted
+        # that for owners only), so a grantee must also resolve as a member of Administrators here.
+        if _is_domain_admin_group_sid(trustee_sid):
+            member = owner_in_admins(trustee_sid)
+            if member is True:
+                continue
+            if member is None:
+                unsure = unsure or (
+                    f"an administrators group ({trustee_sid}) has write access, and its "
+                    "Administrators membership could not be resolved"
+                )
+                continue
+        return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
+    if unsure is not None:
+        return unsure
     if self_sid is None or owner_sid == engine_sid or _is_well_known_admin_sid(owner_sid):
         return None
     owner_is_admin = owner_in_admins(owner_sid)
@@ -10018,6 +10039,11 @@ def _evaluate_config_dacl(
         return (
             f"the owner ({owner_sid}) is not the account the engine runs as, and its Administrators "
             f"membership could not be resolved"
+        )
+    if not owner_is_admin and owner_sid == self_sid:
+        return (
+            f"the owner ({owner_sid}) is the account the engine runs as, but other services share "
+            f"that identity, so it can rewrite the code this loader executes"
         )
     if not owner_is_admin:
         return (
@@ -10404,7 +10430,8 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
         member SID and a short read alike, with no way to tell which."""
         _logger.warning(
             "config-source trust guard could not resolve local Administrators membership (%s); an "
-            "owner that is neither the run-as account nor a well-known admin SID will be REFUSED "
+            "owner that is neither the run-as account nor a well-known admin SID, or an admins "
+            "group holding write, will be REFUSED "
             "(see docs/SERVICE.md for the required config-dir ownership)",
             why,
         )
@@ -10542,8 +10569,12 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                 # is read for all of them: the policy refuses a callback or object entry granting a
                 # write-class right, and recording it as 0 would hide that (BACKLOG #5622).
                 allowed = ctypes.cast(ace_ptr, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
+                mask = int(allowed.Mask)
                 trustee = ""  # parsed for type 0x00 only
-                if header.AceType == _WIN_ACCESS_ALLOWED_ACE_TYPE:
+                if header.AceType != _WIN_ACCESS_ALLOWED_ACE_TYPE:
+                    if header.AceFlags & _WIN_INHERIT_ONLY_ACE:
+                        mask = 0  # grants nothing on this object; each child is read itself
+                else:
                     # The trustee SID begins at the SidStart field offset within the ACE structure.
                     sid_offset = _ACCESS_ALLOWED_ACE.SidStart.offset
                     sid_ptr = ace_ptr.value + sid_offset if ace_ptr.value is not None else 0
@@ -10551,7 +10582,7 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
                     if parsed is None:
                         return _WinPathSecurity(owner_sid=owner_sid, aces=None)
                     trustee = parsed
-                aces.append((header.AceType, int(allowed.Mask), trustee))
+                aces.append((header.AceType, mask, trustee))
             return _WinPathSecurity(owner_sid=owner_sid, aces=tuple(aces))
         finally:
             if sd_ptr:

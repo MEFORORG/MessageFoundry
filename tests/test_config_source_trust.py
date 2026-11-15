@@ -306,7 +306,6 @@ def test_config_guard_sets_match_the_anchor_path_rule() -> None:
     assert wiring._WIN_GRANTING_ACE_TYPES == anchor_path._GRANTING_ACE_TYPES
     assert wiring._WIN_SHARED_SERVICE_SIDS == anchor_path._SHARED_SERVICE_SIDS
     assert wiring._WIN_TRUSTED_INSTALLER_SID == anchor_path.TRUSTED_INSTALLER_SID
-    assert wiring._WIN_NO_ADMIN_LOOKUP_SIDS == anchor_path._BROAD_SIDS
 
 
 def test_read_only_callback_ace_passes() -> None:
@@ -330,6 +329,21 @@ def test_shared_service_identity_is_not_self_trusted_as_owner(shared: str) -> No
     reason = _evaluate_config_dacl(shared, [(_ALLOW, _READ_EXEC, _USERS)], shared, _never_admin)
     assert reason is not None
     assert "so it can rewrite the code this loader executes" in reason
+    assert "other services share that identity" in reason
+
+
+@pytest.mark.parametrize("shared", [_LOCAL_SERVICE, _NETWORK_SERVICE])
+def test_shared_service_grantee_refusal_names_the_shared_identity(shared: str) -> None:
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, shared)]
+    reason = _evaluate_config_dacl(_SYSTEM, aces, shared, _never_admin)
+    assert reason is not None
+    assert "other services share that identity" in reason
+
+
+def test_shared_service_sid_still_trusted_when_it_is_not_the_engine() -> None:
+    # Only SELF-trust is withdrawn: the owner arm and the rest of the rule are unchanged for others.
+    aces = [(_ALLOW, _FULL, _SELF), (_ALLOW, _READ_EXEC, _LOCAL_SERVICE)]
+    assert _evaluate_config_dacl(_SELF, aces, _SELF, _never_admin) is None
 
 
 def test_trusted_installer_grantee_passes() -> None:
@@ -367,6 +381,54 @@ def test_grantee_with_unresolvable_membership_refused() -> None:
     reason = _evaluate_config_dacl(_SYSTEM, aces, _SELF, _unresolvable)
     assert reason is not None
     assert "could not be resolved" in reason
+
+
+@pytest.mark.parametrize(
+    "grantee",
+    [
+        _FOREIGN,  # an ordinary account, even one listed in Administrators: usable unelevated
+        "S-1-5-21-1-2-3-500",  # the built-in Administrator ACCOUNT, not a group
+        "S-1-5-14",  # REMOTE INTERACTIVE LOGON: a well-known group outside the broad set
+        "S-1-2-0",  # LOCAL
+        "S-1-5-15",  # This Organization
+    ],
+)
+def test_only_admin_groups_earn_grantee_trust_from_the_lookup(grantee: str) -> None:
+    """The lookup widens grantee trust for Domain/Schema/Enterprise Admins GROUPS only. A write grant
+    to an administrator's own user SID works from its unelevated session, so a "member of
+    Administrators" answer for it, or for any other well-known group, must not pass."""
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _MODIFY, grantee)]
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _always_admin) is not None
+
+
+@pytest.mark.parametrize("rid", ["518", "519"])
+def test_schema_and_enterprise_admins_grantee_pass_when_resolved(rid: str) -> None:
+    sid = f"S-1-5-21-1-2-3-{rid}"
+    aces = [(_ALLOW, _FULL, _SYSTEM), (_ALLOW, _FULL, sid)]
+    assert _evaluate_config_dacl(_SYSTEM, aces, _SELF, _always_admin) is None
+
+
+@pytest.mark.parametrize(
+    "unjudged",
+    [
+        [(0x09, _MODIFY, "")],
+        [(_ALLOW, _MODIFY, _DOMAIN_ADMINS)],  # with an unresolvable lookup
+    ],
+)
+def test_definite_bad_ace_reported_ahead_of_an_unjudged_one(
+    unjudged: list[tuple[int, int, str]],
+) -> None:
+    # The scan runs past an entry it cannot judge, so the Everyone grant after it is what is named.
+    aces = [*unjudged, (_ALLOW, _MODIFY, _EVERYONE)]
+    reason = _evaluate_config_dacl(_SYSTEM, aces, _SELF, _unresolvable)
+    assert reason is not None
+    assert _EVERYONE in reason
+
+
+def test_unjudged_ace_reported_ahead_of_a_bad_owner() -> None:
+    reason = _evaluate_config_dacl(_OWNER, [(0x09, _MODIFY, "")], _SELF, _never_admin)
+    assert reason is not None
+    assert "type 0x09" in reason
 
 
 @pytest.mark.parametrize(
@@ -843,6 +905,58 @@ def test_world_writable_config_dir_warns_with_escape_windows(
         registry = load_config(tmp_path)
     assert "o" in registry.outbound  # loaded despite the broad-write ACE
     assert any("dev/test override" in r.message for r in caplog.records)
+
+
+def _set_dacl_sddl(path: Path, sddl: str) -> None:
+    """Replace ``path``'s DACL with the one ``sddl`` describes (a conditional ACE cannot be written
+    with icacls)."""
+    import ctypes
+    from ctypes import wintypes
+
+    if sys.platform != "win32":  # also what narrows the ctypes names below for mypy
+        raise RuntimeError("a DACL is set through Win32; this host is not Windows")
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    sd = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        ctypes.c_wchar_p(sddl), 1, ctypes.byref(sd), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        set_file_security = advapi32.SetFileSecurityW
+        set_file_security.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+        set_file_security.restype = wintypes.BOOL
+        if not set_file_security(str(path), 0x4, sd):  # DACL_SECURITY_INFORMATION
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.LocalFree(sd)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="real NTFS DACL read needs Windows")
+def test_reader_records_the_mask_of_a_callback_ace_windows(tmp_path: Path) -> None:
+    """BACKLOG #5622: the reader used to record every non-0x00 entry with a zero mask, so the policy
+    could not see a callback entry granting write. Through the real reader, a write-granting
+    callback ACE now reaches the policy with its mask, and an inherit-only one with none."""
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    target = tmp_path / "cfg.py"
+    target.write_text("", encoding="utf-8")
+    _set_dacl_sddl(target, "D:P(A;;FA;;;SY)(XA;;FA;;;WD;(Member_of {SID(BA)}))")
+    sec = _win32_config_source_probes().read_path(target)
+    assert sec.aces is not None
+    callback = [ace for ace in sec.aces if ace[0] == 0x09]
+    assert len(callback) == 1
+    assert callback[0][1] & 0x10000000 or callback[0][1] & 0x2  # write-class bits survive
+    assert sec.owner_sid is not None
+    assert _evaluate_config_dacl(sec.owner_sid, sec.aces, sec.owner_sid, _never_admin) is not None
+
+    folder = tmp_path / "sub"
+    folder.mkdir()
+    _set_dacl_sddl(folder, "D:P(A;OICI;FA;;;SY)(XA;OICIIO;FA;;;WD;(Member_of {SID(BA)}))")
+    sec = _win32_config_source_probes().read_path(folder)
+    assert sec.aces is not None
+    assert [ace[1] for ace in sec.aces if ace[0] == 0x09] == [0]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="real NTFS DACL check needs Windows")
