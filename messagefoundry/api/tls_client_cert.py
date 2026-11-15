@@ -53,9 +53,7 @@ __all__ = [
 ]
 
 #: One parsed ``[api].trusted_proxies`` entry, as uvicorn matches a socket peer against it.
-TrustedProxy = (
-    ipaddress.IPv4Address | ipaddress.IPv6Address | ipaddress.IPv4Network | ipaddress.IPv6Network
-)
+TrustedProxy = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 # Private ASGI ``scope['state']`` key under which the shim stashes the verified peer cert. The leading
 # underscore + package prefix keeps it clear of any application state and un-guessable as a spoof target
@@ -147,10 +145,11 @@ def parse_trusted_proxies(entries: Sequence[str]) -> tuple[TrustedProxy, ...]:
     Read through :func:`~messagefoundry.config.settings.uvicorn_trusted_hosts`, the list ``serve``
     hands uvicorn, so a peer this shim treats as a proxy is exactly one uvicorn takes
     ``X-Forwarded-For`` from, in either IPv4 spelling. Every entry must already have loaded."""
-    from messagefoundry.config.settings import uvicorn_trusted_hosts
+    from messagefoundry.config.settings import _parse_trusted_proxy, uvicorn_trusted_hosts
 
+    # One reader of the list (BACKLOG #3042); a bare address becomes its one-address network.
     return tuple(
-        ipaddress.ip_network(entry) if "/" in entry else ipaddress.ip_address(entry)
+        ipaddress.ip_network(_parse_trusted_proxy(entry))
         for entry in uvicorn_trusted_hosts(entries)
     )
 
@@ -170,13 +169,7 @@ def peer_is_trusted_proxy(
         address = ipaddress.ip_address(host)
     except (TypeError, IndexError, ValueError):
         return True
-    for proxy in proxies:
-        if isinstance(proxy, ipaddress.IPv4Network | ipaddress.IPv6Network):
-            if address in proxy:
-                return True
-        elif address == proxy:
-            return True
-    return False
+    return any(address in proxy for proxy in proxies)
 
 
 def enriched_app_state(

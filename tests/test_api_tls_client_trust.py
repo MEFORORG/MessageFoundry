@@ -393,8 +393,8 @@ def test_serve_must_name_the_proxies_when_it_builds_the_shim() -> None:
 
 def test_trusted_proxies_parse_to_both_ipv4_spellings() -> None:
     proxies = parse_trusted_proxies(["10.0.0.5"])
-    assert ipaddress.ip_address("10.0.0.5") in proxies
-    assert ipaddress.ip_address("::ffff:10.0.0.5") in proxies
+    assert ipaddress.ip_network("10.0.0.5/32") in proxies
+    assert ipaddress.ip_network("::ffff:10.0.0.5/128") in proxies
 
 
 # --- #5628: clientAuth extended key usage ---------------------------------------------------------------
@@ -474,4 +474,4 @@ def test_the_remembered_answers_are_bounded(monkeypatch: pytest.MonkeyPatch) -> 
     index = IssuerIndex(_pem(ca[0]).decode("ascii"))
     for _ in range(5):
         index.issuer_of(_leaf_der(ca, [ExtendedKeyUsageOID.CLIENT_AUTH]))
-    assert len(index._answers) == 2
+    assert index._answers.cache_info().currsize == 2

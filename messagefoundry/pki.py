@@ -16,13 +16,13 @@ Pure and side-effect-free (no engine state, I/O, or DB): it takes/returns bytes 
 from __future__ import annotations
 
 import datetime
+import functools
 import ipaddress
 import logging
 import os
 import ssl
 import string
-import threading
-from collections import Counter, OrderedDict
+from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -1696,9 +1696,8 @@ class IssuerIndex:
         # unmatched_keys does not call it a CA.
         self._pinned_subjects: set[str] = set()
         # BACKLOG #5628: issuer_of's answers, keyed by the leaf and whether clientAuth was asked
-        # for. A lock, because a listener may ask from a worker thread as well as the loop.
-        self._answers: OrderedDict[tuple[bytes, bool], str] = OrderedDict()
-        self._answers_lock = threading.Lock()
+        # for. lru_cache is bounded and safe to call from a worker thread as well as the loop.
+        self._answers = functools.lru_cache(maxsize=ISSUER_CACHE_SIZE)(self._issuer_of)
         read: list[tuple[x509.Certificate, str, bytes, bytes, int]] = []
         blocks = _pem_certificate_blocks(cadata.encode("ascii", "replace"))
         for position, block in enumerate(blocks, start=1):
@@ -1744,21 +1743,10 @@ class IssuerIndex:
         at all, so without this a certificate issued for any purpose would map to a principal.
 
         Each answer is remembered for :data:`ISSUER_CACHE_SIZE` leaves (BACKLOG #5628)."""
-        key = (leaf_der, require_client_auth)
-        with self._answers_lock:
-            answer = self._answers.get(key)
-            if answer is not None:
-                self._answers.move_to_end(key)
-                return answer
-        answer = self._issuer_of(leaf_der, require_client_auth=require_client_auth)
-        with self._answers_lock:
-            self._answers[key] = answer
-            self._answers.move_to_end(key)
-            while len(self._answers) > ISSUER_CACHE_SIZE:
-                self._answers.popitem(last=False)
+        answer: str = self._answers(leaf_der, require_client_auth)
         return answer
 
-    def _issuer_of(self, leaf_der: bytes, *, require_client_auth: bool) -> str:
+    def _issuer_of(self, leaf_der: bytes, require_client_auth: bool) -> str:
         try:
             leaf = x509.load_der_x509_certificate(leaf_der)
             if require_client_auth and not _names_client_auth(leaf):
