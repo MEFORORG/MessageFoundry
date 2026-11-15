@@ -730,6 +730,8 @@ async def _no_ack_fault_step(
         _engine_sample(0),
         _engine_sample(engine.read),
         unconfirmed_budget=1,
+        drain_seconds=1.0,
+        counter_reset=None,
         reload=account,
     )
     ages = [(driver.request_ns - ns) / 1e9 for ns in driver.strand_ns]
@@ -898,6 +900,8 @@ async def _post_reload_step(
         _engine_sample(0),
         _engine_sample(engine.read),
         unconfirmed_budget=1,
+        drain_seconds=1.0,
+        counter_reset=None,
         reload=account,
     )
 

@@ -102,13 +102,25 @@ def test_estate_reconcile_sees_the_stranded_rows_through_the_sample() -> None:
     # The estate copy is not edited here: it reads `final.backlog`, so the sample carries the fix.
     c = Counters(sent=36, acked=36, sink_received=0)
     result = estate_reconcile(
-        c, _BASE, _sample(read=36, written=0, in_pipeline=36), unconfirmed_budget=2
+        c,
+        _BASE,
+        _sample(read=36, written=0, in_pipeline=36),
+        unconfirmed_budget=2,
+        drain_seconds=1.0,
+        counter_reset=None,
     )
     assert not result.ok
     assert result.backlog == 36
     # The control: the same estate run, drained and delivered, passes.
     c = Counters(sent=36, acked=36, sink_received=36)
-    assert estate_reconcile(c, _BASE, _sample(read=36, written=36), unconfirmed_budget=2).ok
+    assert estate_reconcile(
+        c,
+        _BASE,
+        _sample(read=36, written=36),
+        unconfirmed_budget=2,
+        drain_seconds=1.0,
+        counter_reset=None,
+    ).ok
 
 
 # --- #5433: the connscale reconcile ---------------------------------------------------------------
@@ -120,7 +132,12 @@ def test_connscale_reconcile_fails_rows_left_upstream_when_the_counts_cancel() -
     # Drained used to be the outbound backlog alone, so this passed.
     c = Counters(sent=36, acked=36, sink_received=36)
     result = connscale_reconcile(
-        c, _BASE, _sample(read=36, written=36, in_pipeline=5), unconfirmed_budget=2
+        c,
+        _BASE,
+        _sample(read=36, written=36, in_pipeline=5),
+        unconfirmed_budget=2,
+        drain_seconds=1.0,
+        counter_reset=None,
     )
     assert not result.ok
     assert "backlog 5 not drained" in result.detail
@@ -129,7 +146,12 @@ def test_connscale_reconcile_fails_rows_left_upstream_when_the_counts_cancel() -
 def test_connscale_reconcile_fails_a_stalled_router() -> None:
     c = Counters(sent=36, acked=36, sink_received=0)
     result = connscale_reconcile(
-        c, _BASE, _sample(read=36, written=0, in_pipeline=36), unconfirmed_budget=2
+        c,
+        _BASE,
+        _sample(read=36, written=0, in_pipeline=36),
+        unconfirmed_budget=2,
+        drain_seconds=1.0,
+        counter_reset=None,
     )
     assert not result.ok
     assert "backlog 36 not drained" in result.detail
@@ -137,7 +159,14 @@ def test_connscale_reconcile_fails_a_stalled_router() -> None:
 
 def test_connscale_reconcile_still_passes_a_drained_run() -> None:
     c = Counters(sent=36, acked=36, sink_received=36)
-    assert connscale_reconcile(c, _BASE, _sample(read=36, written=36), unconfirmed_budget=2).ok
+    assert connscale_reconcile(
+        c,
+        _BASE,
+        _sample(read=36, written=36),
+        unconfirmed_budget=2,
+        drain_seconds=1.0,
+        counter_reset=None,
+    ).ok
 
 
 # --- #5432 and #5434: the connscale SLOs ----------------------------------------------------------

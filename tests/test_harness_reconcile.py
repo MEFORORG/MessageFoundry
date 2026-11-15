@@ -77,10 +77,15 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 
-from harness.load.connscale.runner import _reconcile as connscale_reconcile
-from harness.load.connscale.runner import _ReloadAccount
+import pytest
+
+from harness.load.connscale import batchbox as bb
+from harness.load.connscale import report as connscale_report
+from harness.load.connscale.runner import ConnScaleError, _ReloadAccount
+from harness.load.connscale.runner import _reconcile as _connscale_reconcile
 from harness.load.enginepoll import EnginePoller, EngineSample
-from harness.load.estate.runner import _reconcile as estate_reconcile
+from harness.load.estate import report as estate_report
+from harness.load.estate.runner import _reconcile as _estate_reconcile
 from harness.load.metrics import Counters, Histogram
 from harness.load.profile import Phase, Slo
 from harness.load.report import (
@@ -113,6 +118,52 @@ def _sample(*, read: int, written: int, pending: int = 0, inflight: int = 0) -> 
 
 
 _BASE = _sample(read=0, written=0)
+
+
+# The rig copies take the drain outcome and the counter-reset reading as REQUIRED keywords, so a
+# production caller cannot clear a step by forgetting one (BACKLOG #5574). These wrappers supply a
+# settled drain and no reset, which is what every case below that predates #5574 assumed; the
+# #5574 cases at the end of the module pass both explicitly.
+def connscale_reconcile(
+    c: Counters,
+    base: EngineSample | None,
+    final: EngineSample | None,
+    *,
+    unconfirmed_budget: int,
+    reload: _ReloadAccount | None = None,
+    drain_seconds: float | None = 1.0,
+    counter_reset: str | None = None,
+) -> connscale_report.NoLoss:
+    return _connscale_reconcile(
+        c,
+        base,
+        final,
+        unconfirmed_budget=unconfirmed_budget,
+        drain_seconds=drain_seconds,
+        counter_reset=counter_reset,
+        reload=reload,
+    )
+
+
+def estate_reconcile(
+    c: Counters,
+    base: EngineSample | None,
+    final: EngineSample | None,
+    *,
+    unconfirmed_budget: int,
+    drain_seconds: float | None = 1.0,
+    counter_reset: str | None = None,
+) -> estate_report.NoLoss:
+    return _estate_reconcile(
+        c,
+        base,
+        final,
+        unconfirmed_budget=unconfirmed_budget,
+        drain_seconds=drain_seconds,
+        counter_reset=counter_reset,
+    )
+
+
 _BUDGET = 2  # a tiny run's connection count
 
 # connscale-smoke's real shape at the N=100 cell: a fixed_aggregate step offering 35 msg/s for 3s is
@@ -415,12 +466,14 @@ def test_connscale_reload_that_left_a_listener_down_fails_though_the_counts_pass
 
 def test_connscale_reload_guards_leave_a_step_that_offered_nothing_alone() -> None:
     # A zero-rate lane sends nothing before or after the reload. There is no intake to measure, so
-    # the reload guards do not fail it; the old reconcile passed it too.
+    # the reload guards do not fail it. The step is still not zero-loss: it measured nothing, so it
+    # is INCONCLUSIVE on that ground alone (BACKLOG #5574), and no reload guard text appears.
     reload = _reload(0, sent=0, acked=0, timeouts=0)
     result = connscale_reconcile(
         Counters(), _BASE, _sample(read=0, written=0), unconfirmed_budget=12, reload=reload
     )
-    assert result.ok, result.detail
+    assert not result.ok and result.inconclusive, result.detail
+    assert result.detail == "nothing was sent — the step measured nothing"
 
 
 def test_connscale_reconcile_a_reload_that_stranded_nothing_changes_nothing() -> None:
@@ -486,12 +539,16 @@ def test_connscale_reconcile_the_2026_09_21_reds_were_the_stranding_budget() -> 
         assert result.ok == (stranded >= 3), (stranded, result.detail)
 
 
-def test_connscale_reconcile_empty_run_clears_the_floor_trivially() -> None:
+def test_connscale_reconcile_empty_run_is_inconclusive_not_a_floor_failure() -> None:
     # sent == 0 makes the floor 0, so a run that sent nothing is not failed BY the floor (it has
-    # nothing to read). Guards against a `sent // 2` -> `max(1, ...)` style edit failing empty runs.
-    assert connscale_reconcile(
+    # nothing to read), and is not called a loss. It used to PASS; it measured nothing, so it is
+    # INCONCLUSIVE instead (BACKLOG #5574) and the detail names only that reason.
+    result = connscale_reconcile(
         Counters(), _BASE, _sample(read=0, written=0), unconfirmed_budget=_SMOKE_BUDGET
-    ).ok
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "intake floor" not in result.detail
+    assert "nothing was sent" in result.detail
 
 
 # --- load runner _reconcile ----------------------------------------------------------------------
@@ -1118,6 +1175,17 @@ def test_load_reconcile_metrics_unavailable_is_inconclusive() -> None:
     assert not result.ok and result.inconclusive, result.detail
 
 
+def test_load_reconcile_a_dead_ack_path_stays_loss_without_engine_metrics() -> None:
+    # The dead-ACK-path signature reads no engine counter, as across a reset; the rig copies keep
+    # their client-counter arms when blind too (BACKLOG #5574).
+    poller = cast(EnginePoller, SimpleNamespace(baseline=None, final=None, samples=[]))
+    dead = Counters(sent=90, acked=0, timeouts=90)
+    result = load_reconcile(dead, poller, 1.0, tolerance=0, unconfirmed_budget=4)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "dead ACK path" in result.detail
+    assert "engine metrics unavailable" in result.detail
+
+
 def test_load_reconcile_a_proven_delivery_loss_is_not_called_nothing_delivered() -> None:
     c = Counters(sent=90, acked=90, sink_received=0)
     result = load_reconcile(
@@ -1136,3 +1204,546 @@ def test_load_reconcile_a_real_loss_is_labelled_loss_not_inconclusive() -> None:
     assert not result.ok and not result.inconclusive, result.detail
     assert "lost 1 on intake" in result.detail
     assert "drain timed out" in result.detail
+
+
+# --- BACKLOG #5574: the rig copies return INCONCLUSIVE, not PASS --------------------------------
+#
+# The same shapes the load copy above pins, on the connscale reconcile (which multishard and the
+# connscale-remote band also call), the estate reconcile, and the batch-box cell aggregate. Each
+# case pairs with the clean control first, so a reconcile that went red on everything would fail
+# the control rather than pass the case.
+
+_RIG_CLEAN = Counters(sent=36, acked=36, sink_received=36)
+_RIG_FINAL = _sample(read=36, written=36)
+_RESET = (
+    "the engine restarted mid-run (uptime 1.0s is shorter than the 2.0s since the previous sample)"
+)
+
+
+def test_rig_reconciles_clean_control_for_the_inconclusive_cases() -> None:
+    for result in (
+        connscale_reconcile(_RIG_CLEAN, _BASE, _RIG_FINAL, unconfirmed_budget=_BUDGET),
+        estate_reconcile(_RIG_CLEAN, _BASE, _RIG_FINAL, unconfirmed_budget=_BUDGET),
+    ):
+        assert result.ok and not result.inconclusive, result.detail
+
+
+def test_rig_reconciles_a_timed_out_drain_is_not_zero_loss() -> None:
+    for result in (
+        connscale_reconcile(
+            _RIG_CLEAN, _BASE, _RIG_FINAL, unconfirmed_budget=_BUDGET, drain_seconds=None
+        ),
+        estate_reconcile(
+            _RIG_CLEAN, _BASE, _RIG_FINAL, unconfirmed_budget=_BUDGET, drain_seconds=None
+        ),
+    ):
+        assert not result.ok and result.inconclusive, result.detail
+        assert "drain timed out" in result.detail
+
+
+def test_rig_reconciles_rows_still_in_ingress_or_routed_are_not_zero_loss() -> None:
+    # Outbound pending + inflight is 0 while 5 rows sit upstream of it: a stalled router or
+    # transform. Read from the explicit fields, so this holds whatever `EngineSample.backlog` means.
+    staged = _staged(read=36, written=36, in_pipeline=5)
+    for result in (
+        connscale_reconcile(_RIG_CLEAN, _BASE, staged, unconfirmed_budget=_BUDGET),
+        estate_reconcile(_RIG_CLEAN, _BASE, staged, unconfirmed_budget=_BUDGET),
+    ):
+        assert not result.ok and result.inconclusive, result.detail
+        assert "in_pipeline 5" in result.detail
+        assert result.backlog == 5
+
+
+def test_connscale_reconcile_read_but_unwritten_rows_still_in_the_pipeline_are_not_loss() -> None:
+    # 6 messages read and still in ingress or routed: `written < read` here is not yet a loss, so
+    # the step is INCONCLUSIVE until it drains. Drained, the same gap is a LOSS (the control).
+    c = Counters(sent=36, acked=36, sink_received=30)
+    undrained = connscale_reconcile(
+        c, _BASE, _staged(read=36, written=30, in_pipeline=6), unconfirmed_budget=_BUDGET
+    )
+    assert not undrained.ok and undrained.inconclusive, undrained.detail
+    assert "not judged as a loss until it drains" in undrained.detail
+    drained = connscale_reconcile(
+        c, _BASE, _sample(read=36, written=30), unconfirmed_budget=_BUDGET
+    )
+    assert not drained.ok and not drained.inconclusive, drained.detail
+    assert "6 read but never delivered" in drained.detail
+
+
+def test_rig_reconciles_nothing_delivered_is_not_zero_loss() -> None:
+    # One send, stranded at teardown: the excusal and the floor (0) both clear it, nothing was
+    # written and nothing arrived, so every loss arm holds. It used to PASS.
+    c = Counters(sent=1, acked=0, timeouts=1)
+    final = _sample(read=0, written=0)
+    for result in (
+        connscale_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET),
+        estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET),
+    ):
+        assert not result.ok and result.inconclusive, result.detail
+        assert "nothing was delivered" in result.detail
+
+
+def test_estate_reconcile_a_run_that_sent_nothing_is_inconclusive() -> None:
+    result = estate_reconcile(Counters(), _BASE, _BASE, unconfirmed_budget=_BUDGET)
+    assert not result.ok and result.inconclusive, result.detail
+    assert "nothing was sent" in result.detail
+
+
+def test_rig_reconciles_a_counter_reset_is_inconclusive_not_loss() -> None:
+    # The engine counters went backwards: `read` is 30 - 100. The old code called that a loss on
+    # intake; with the reset named, no loss arm is judged and no negative delta is published.
+    base = _sample(read=100, written=100)
+    final = _sample(read=30, written=30)
+    for result in (
+        connscale_reconcile(
+            _RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET
+        ),
+        estate_reconcile(_RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
+    ):
+        assert not result.ok and result.inconclusive, result.detail
+        assert "restarted mid-run" in result.detail
+        assert "lost" not in result.detail
+        assert result.engine_read == 0
+
+
+def test_rig_reconciles_metrics_unavailable_is_inconclusive() -> None:
+    for result in (
+        connscale_reconcile(_RIG_CLEAN, None, None, unconfirmed_budget=_BUDGET),
+        estate_reconcile(_RIG_CLEAN, None, None, unconfirmed_budget=_BUDGET),
+    ):
+        assert not result.ok and result.inconclusive, result.detail
+
+
+def test_rig_reconciles_a_real_loss_stays_loss_beside_an_inconclusive_reason() -> None:
+    final = _sample(read=35, written=35)
+    c = Counters(sent=36, acked=36, sink_received=35)
+    for result in (
+        connscale_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET, drain_seconds=None),
+        estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET, drain_seconds=None),
+    ):
+        assert not result.ok and not result.inconclusive, result.detail
+        assert "lost 1 on intake" in result.detail
+        assert "drain timed out" in result.detail
+
+
+def test_rig_reconciles_take_the_drain_and_reset_readings_with_no_default() -> None:
+    # A production caller that forgot either reading would otherwise clear a step by omission.
+    import inspect
+
+    for fn in (_connscale_reconcile, _estate_reconcile):
+        params = inspect.signature(fn).parameters
+        for name in ("drain_seconds", "counter_reset"):
+            assert params[name].default is inspect.Parameter.empty, (fn.__module__, name)
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, (fn.__module__, name)
+
+
+def _band(**no_loss: object) -> dict[str, object]:
+    """A connscale-remote band report with a clean, drained cell's numbers."""
+    nl: dict[str, object] = {
+        "ok": True,
+        "sent": 10,
+        "engine_read": 10,
+        "engine_written": 10,
+        "sink_received": 10,
+        "backlog": 0,
+        "detail": "",
+        "counter_reset": None,
+        "stranding": {"unconfirmed": 0, "budget": 8, "over_budget": False},
+    }
+    nl.update(no_loss)
+    return {
+        "traffic": {"sent": 10, "acked": 10, "nak": 0, "deferred": 0, "timeouts": 0},
+        "no_loss": nl,
+        "throughput": {
+            "achieved_aggregate_rate": 5.0,
+            "delivered_aggregate_rate": 5.0,
+            "in_pipeline_peak": 0,
+            "drain_seconds": 0.5,
+        },
+        "offered_aggregate_rate": 10.0,
+    }
+
+
+def _cell() -> bb.BatchCell:
+    return bb.BatchCell(
+        sweep_mode="fixed_aggregate",
+        count=8,
+        claim_mode="pooled",
+        fuse_mode=False,
+        batch_mode=False,
+        trial=0,
+    )
+
+
+def test_batchbox_aggregate_clean_control() -> None:
+    rec = bb.aggregate_cell_record(_cell(), [_band()])
+    assert rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+
+
+def test_batchbox_aggregate_nothing_sent_is_refused_and_nothing_delivered_is_inconclusive() -> None:
+    # A fleet that sent nothing is refused outright (BACKLOG #5431); the driver turns the refusal
+    # into a failed cell record, which `_failed_cell_record` labels INCONCLUSIVE.
+    empty = _band(sent=0, engine_read=0, engine_written=0, sink_received=0)
+    empty["traffic"] = {"sent": 0, "acked": 0, "nak": 0, "deferred": 0, "timeouts": 0}
+    with pytest.raises(ConnScaleError, match="sent nothing"):
+        bb.aggregate_cell_record(_cell(), [empty])
+    undelivered = _band(engine_read=10, engine_written=0, sink_received=0)
+    rec = bb.aggregate_cell_record(_cell(), [undelivered])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "nothing was delivered" in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_undrained_backlog_is_inconclusive_not_loss() -> None:
+    rec = bb.aggregate_cell_record(_cell(), [_band(backlog=4)])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "backlog 4 not drained" in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_a_band_counter_reset_is_inconclusive() -> None:
+    # The band's engine deltas would read as an intake loss; the named reset withholds that verdict.
+    rec = bb.aggregate_cell_record(_cell(), [_band(engine_read=3, counter_reset=_RESET)])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "restarted mid-run" in rec.no_loss.detail
+    assert "lost" not in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_a_band_silent_on_counter_reset_cannot_clear_the_cell() -> None:
+    band = _band()
+    no_loss = band["no_loss"]
+    assert isinstance(no_loss, dict)
+    del no_loss["counter_reset"]
+    rec = bb.aggregate_cell_record(_cell(), [band])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "does not say whether the engine counters reset" in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_a_real_loss_stays_loss() -> None:
+    rec = bb.aggregate_cell_record(_cell(), [_band(sink_received=7)])
+    assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "lost 3" in rec.no_loss.detail
+
+
+def test_inconclusive_reaches_the_json_and_the_console() -> None:
+    # The verdict is useless if a reader of the artifact or the log cannot tell it from a loss.
+    rec = bb.aggregate_cell_record(_cell(), [_band(backlog=4)])
+    payload = rec.to_json_dict()
+    no_loss = payload["no_loss"]
+    assert isinstance(no_loss, dict)
+    assert no_loss["inconclusive"] is True
+    est = estate_report.NoLoss(False, 1, 0, 0, 0, 0, "why", inconclusive=True)
+    assert estate_report._noloss_cell(est) == "INCONCL"
+    assert estate_report._noloss_cell(replace(est, inconclusive=False)) == "FAIL"
+    assert estate_report._noloss_cell(replace(est, ok=True, inconclusive=False)) == "ok"
+
+
+def test_rig_reconciles_a_client_counter_loss_stays_loss_across_a_counter_reset() -> None:
+    # The stranding budget reads only client counters, so a reset that voids the engine deltas does
+    # not void it: 36 of 36 sends unanswered is a systemic no-ACK fault either way. The control is
+    # the same reset with every send answered, which is INCONCLUSIVE.
+    base = _sample(read=100, written=100)
+    final = _sample(read=30, written=30)
+    flood = Counters(sent=36, acked=0, timeouts=36)
+    for result in (
+        connscale_reconcile(flood, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
+        estate_reconcile(flood, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
+    ):
+        assert not result.ok and not result.inconclusive, result.detail
+        assert "systemic no-ACK fault" in result.detail
+        assert "restarted mid-run" in result.detail
+    control = connscale_reconcile(
+        _RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET
+    )
+    assert not control.ok and control.inconclusive, control.detail
+
+
+def test_connscale_reconcile_a_reload_guard_stays_loss_across_a_counter_reset() -> None:
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=18)
+    reload = _reload(30, sent=30, acked=0, timeouts=30, not_reconnected=4)
+    result = connscale_reconcile(
+        c,
+        _sample(read=100, written=100),
+        _sample(read=18, written=18),
+        unconfirmed_budget=12,
+        reload=reload,
+        counter_reset=_RESET,
+    )
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "4 connection(s) never came back" in result.detail
+
+
+def test_rig_reconciles_a_client_counter_loss_stays_loss_without_engine_metrics() -> None:
+    # Missing engine metrics used to return INCONCLUSIVE before any arm ran, so a systemic no-ACK
+    # fault the client counters prove on their own was reported as unproven. The control is the
+    # same missing metrics with every send answered, which stays INCONCLUSIVE.
+    flood = Counters(sent=36, acked=0, timeouts=36)
+    for result in (
+        connscale_reconcile(flood, None, None, unconfirmed_budget=_BUDGET),
+        estate_reconcile(flood, None, None, unconfirmed_budget=_BUDGET),
+    ):
+        assert not result.ok and not result.inconclusive, result.detail
+        assert "systemic no-ACK fault" in result.detail
+        assert "engine metrics unavailable" in result.detail
+        assert (result.engine_read, result.engine_written, result.backlog) == (0, 0, -1)
+        assert "not drained" not in result.detail
+    for control in (
+        connscale_reconcile(_RIG_CLEAN, None, None, unconfirmed_budget=_BUDGET),
+        estate_reconcile(_RIG_CLEAN, None, None, unconfirmed_budget=_BUDGET),
+    ):
+        assert not control.ok and control.inconclusive, control.detail
+
+
+def test_connscale_reconcile_a_reload_guard_stays_loss_without_engine_metrics() -> None:
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=18)
+    reload = _reload(30, sent=30, acked=0, timeouts=30, not_reconnected=4)
+    result = connscale_reconcile(c, None, None, unconfirmed_budget=12, reload=reload)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "4 connection(s) never came back" in result.detail
+
+
+def test_rig_reconciles_do_not_read_unconfirmed_sends_off_a_reset_intake() -> None:
+    # Under a reset `read` is clamped, so "not observed at intake" would be read off a stand-in.
+    # The note is qualified instead. The control, with no reset and the same counts, keeps the
+    # plain note, because there the read is a run total.
+    c = Counters(sent=36, acked=33, timeouts=3, sink_received=33)
+    base = _sample(read=100, written=100)
+    final = _sample(read=33, written=33)
+    for result in (
+        connscale_reconcile(c, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
+        estate_reconcile(c, base, final, unconfirmed_budget=_BUDGET, counter_reset=_RESET),
+    ):
+        assert result.inconclusive, result.detail
+        assert "not observed at intake" not in result.detail
+        assert "whether they reached the engine is unknown" in result.detail
+    for control in (
+        connscale_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET),
+        estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET),
+    ):
+        assert "3 unconfirmed send(s)" in control.detail
+        assert "not observed at intake" in control.detail
+
+
+def test_batchbox_aggregate_a_band_that_could_not_read_the_engine_is_inconclusive() -> None:
+    # connscale `_reconcile` writes the stand-ins 0 / 0 / -1 when the engine metrics are missing.
+    # Read as readings they would say every message was lost.
+    blind = _band(engine_read=0, engine_written=0, backlog=-1)
+    rec = bb.aggregate_cell_record(_cell(), [blind])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "could not read the engine metrics" in rec.no_loss.detail
+    assert "lost" not in rec.no_loss.detail
+
+
+def _pair(**over: object) -> dict[str, object]:
+    """One band of a two-band fleet: each band reads the SAME engine, so its engine totals cover
+    both bands' 20 sends."""
+    return _band(**{"engine_read": 20, "engine_written": 20, **over})
+
+
+def test_batchbox_aggregate_two_band_clean_control() -> None:
+    rec = bb.aggregate_cell_record(_cell(), [_pair(), _pair()])
+    assert rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+
+
+def test_batchbox_aggregate_one_band_reset_does_not_hide_a_delivery_loss_another_proves() -> None:
+    # Band B read the engine cleanly: it wrote 20, and the union sink got 17. Band A's reset used to
+    # withhold every arm, so the cell was INCONCLUSIVE. The control is the same reset with nothing
+    # short, which stays INCONCLUSIVE.
+    rec = bb.aggregate_cell_record(
+        _cell(),
+        [_pair(counter_reset=_RESET, sink_received=7, engine_written=25), _pair()],
+    )
+    assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "lost 3" in rec.no_loss.detail
+    # The published total is the one the verdict rests on, so the artifact reproduces "lost 3".
+    assert rec.no_loss.engine_written == 20
+    assert "restarted mid-run" in rec.no_loss.detail
+    control = bb.aggregate_cell_record(_cell(), [_pair(counter_reset=_RESET), _pair()])
+    assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
+    assert "lost" not in control.no_loss.detail
+
+
+def test_batchbox_aggregate_a_reset_leaves_the_intake_arm_unjudged_on_every_band() -> None:
+    # Band B saw no reset, but a reset A saw spans B's deltas too and lowers its read: an intake
+    # shortfall read off B is no proof, so it is not judged.
+    rec = bb.aggregate_cell_record(
+        _cell(),
+        [_pair(counter_reset=_RESET, engine_read=12), _pair(engine_read=12)],
+    )
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "the intake arm was not judged" in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_one_blind_band_does_not_hide_an_intake_loss_another_proves() -> None:
+    rec = bb.aggregate_cell_record(
+        _cell(),
+        [_pair(engine_read=0, engine_written=0, backlog=-1), _pair(engine_read=15)],
+    )
+    assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "engine_read 15 < aggregate sent 20 (lost 5)" in rec.no_loss.detail
+    assert "1 band(s) could not read the engine metrics" in rec.no_loss.detail
+    # The control: the same blind band beside a clean one cannot clear, and proves nothing.
+    control = bb.aggregate_cell_record(
+        _cell(), [_pair(engine_read=0, engine_written=0, backlog=-1), _pair()]
+    )
+    assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
+
+
+def test_batchbox_aggregate_keeps_a_band_loss_proven_on_client_counters_alone() -> None:
+    # The band saw a reset, so its reconcile judged only its client-counter arms, and those proved a
+    # loss. The cell used to demote it to INCONCLUSIVE. The band publishes no stranding arm (a
+    # producer other than connscale-remote, whose client-only loss is that arm), so the band's own
+    # verdict is what the cell keeps, and its loss needs no unjudged stranding arm named beside it.
+    # The control is the same reset with an INCONCLUSIVE band verdict, which proves nothing.
+    flood = _pair(counter_reset=_RESET, ok=False, inconclusive=False)
+    flood_no_loss = flood["no_loss"]
+    assert isinstance(flood_no_loss, dict)
+    del flood_no_loss["stranding"]
+    rec = bb.aggregate_cell_record(_cell(), [flood, _pair()])
+    assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "proved a loss on client counters alone" in rec.no_loss.detail
+    assert "do not say whether their sends broke" not in rec.no_loss.detail
+    unsure = _pair(counter_reset=_RESET, ok=False, inconclusive=True)
+    control = bb.aggregate_cell_record(_cell(), [unsure, _pair()])
+    assert not control.no_loss.ok and control.no_loss.inconclusive, control.no_loss.detail
+    # A band that judged its engine arms is not counted: its delivery arm compares one band's sink
+    # with the engine-wide written, so its own LOSS can be an artifact of the split.
+    judged = _pair(ok=False, inconclusive=False)
+    assert bb.aggregate_cell_record(_cell(), [judged, _pair()]).no_loss.ok
+
+
+def _remote_band(timeouts: int, *, counter_reset: str | None = None) -> dict[str, object]:
+    """One band of a two-band fleet as connscale-remote would write it: 10 sends on 4 connections,
+    ``timeouts`` of them unconfirmed, the engine reading both bands' 20 sends cleanly. The band's
+    own `_reconcile` and its published stranding arm come from the producer's code, so the
+    aggregate is tested against what a band really says, not a hand-set verdict."""
+    from harness.load.connscale.remote import ConnScaleRemoteReport
+    from harness.load.connscale.runner import _excusal
+
+    c = Counters(sent=10, acked=10 - timeouts, timeouts=timeouts, sink_received=10)
+    no_loss = _connscale_reconcile(
+        c,
+        _sample(read=0, written=0),
+        _sample(read=20, written=20),
+        unconfirmed_budget=4,
+        drain_seconds=0.5,
+        counter_reset=counter_reset,
+    )
+    report = ConnScaleRemoteReport(
+        engine_bands=1,
+        count_per_band=4,
+        per_conn_rate=1.0,
+        offered_aggregate_rate=4.0,
+        engine_index_base=3,
+        sink_host="127.0.0.1",
+        sink_ports=(40000,),
+        hold_start_iso="2026-09-30T00:00:00Z",
+        drain_complete_iso="2026-09-30T00:00:05Z",
+        achieved_aggregate_rate=4.0,
+        delivered_aggregate_rate=4.0,
+        sent=c.sent,
+        acked=c.acked,
+        nak=0,
+        deferred=0,
+        timeouts=c.timeouts,
+        no_loss=no_loss,
+        in_pipeline_peak=0,
+        drain_seconds=0.5,
+        counter_reset=counter_reset,
+        stranding=_excusal(c, unconfirmed_budget=4),
+    )
+    return report.to_json_dict()
+
+
+def test_batchbox_aggregate_keeps_a_stranding_loss_whether_or_not_the_band_read_the_engine() -> (
+    None
+):
+    # A band's stranding arm reads only its own sends and timeouts, so no other band corrects it.
+    # The cell used to keep that loss only where the band's engine arms went unjudged: the flood
+    # beside a reset failed the cell, and the same flood beside a clean engine read passed it.
+    # Budget here: max(4 connections, 3 * 10 // 4 = 7) = 7, so 8 timeouts is over it.
+    needle = "band at engine index 3: 8 unconfirmed sends exceed its stranding budget (7)"
+    for flood in (_remote_band(8), _remote_band(8, counter_reset=_RESET)):
+        # The band's own verdict agrees with what it published: the arm is the same arithmetic.
+        no_loss = flood["no_loss"]
+        assert isinstance(no_loss, dict)
+        assert no_loss["ok"] is False and no_loss["inconclusive"] is False, no_loss["detail"]
+        assert "systemic no-ACK fault" in str(no_loss["detail"])
+        rec = bb.aggregate_cell_record(_cell(), [flood, _pair()])
+        assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+        assert needle in rec.no_loss.detail
+        # Counted once: the band's own LOSS verdict under a reset is this same stranding.
+        assert "proved a loss on client counters alone" not in rec.no_loss.detail
+    # The control: 7 timeouts is within the same budget, so a clean engine read clears the cell.
+    within = _remote_band(7)
+    rec = bb.aggregate_cell_record(_cell(), [within, _pair()])
+    assert rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+
+
+def test_batchbox_aggregate_does_not_clear_a_stranding_arm_a_band_does_not_publish() -> None:
+    # A band report that does not say whether it broke the stranding budget cannot clear the arm,
+    # whether the field is absent, not a boolean, or without the numbers it rests on. The control is
+    # the same band saying False with numbers that agree.
+    # A verdict its own numbers contradict is malformed too: 9 > 7 is over budget, whatever it says.
+    for stranding in (
+        None,
+        {"unconfirmed": 0, "budget": 8},
+        {"unconfirmed": 0, "budget": 8, "over_budget": "false"},
+        {"over_budget": False},
+        {"unconfirmed": 9, "budget": 7, "over_budget": False},
+    ):
+        band = _pair()
+        no_loss = band["no_loss"]
+        assert isinstance(no_loss, dict)
+        if stranding is None:
+            del no_loss["stranding"]
+        else:
+            no_loss["stranding"] = stranding
+        rec = bb.aggregate_cell_record(_cell(), [band, _pair()])
+        assert not rec.no_loss.ok and rec.no_loss.inconclusive, (stranding, rec.no_loss.detail)
+        assert "1 band report(s) do not say whether their sends broke" in rec.no_loss.detail
+    assert bb.aggregate_cell_record(_cell(), [_pair(), _pair()]).no_loss.ok
+
+
+def test_batchbox_aggregate_reports_every_band_reason_not_only_the_first() -> None:
+    other = "engine counters went backwards (read 9 -> 1, written 9 -> 1): a stats reset"
+    silent = _pair()
+    no_loss = silent["no_loss"]
+    assert isinstance(no_loss, dict)
+    del no_loss["counter_reset"]
+    rec = bb.aggregate_cell_record(
+        _cell(), [_pair(counter_reset=_RESET), _pair(counter_reset=other), silent]
+    )
+    assert rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "restarted mid-run" in rec.no_loss.detail
+    assert "a stats reset" in rec.no_loss.detail
+    assert "does not say whether the engine counters reset" in rec.no_loss.detail
+    assert "no band read the engine cleanly" in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_escapes_a_band_reset_text_to_one_line() -> None:
+    rec = bb.aggregate_cell_record(_cell(), [_band(counter_reset="engine went\nRESULT ok")])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "\n" not in rec.no_loss.detail
+
+
+def test_batchbox_aggregate_a_blind_band_is_not_called_undrained() -> None:
+    rec = bb.aggregate_cell_record(_cell(), [_band(engine_read=0, engine_written=0, backlog=-1)])
+    assert rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "not drained" not in rec.no_loss.detail
+
+
+def test_rig_reconciles_a_reset_does_not_claim_the_drain_arm_went_unjudged() -> None:
+    # The pipeline gauges are not deltas, so a reset leaves the drain arm judged; the reason text
+    # must not say otherwise beside a "not drained" clause.
+    staged = _staged(read=30, written=30, in_pipeline=4)
+    base = _sample(read=100, written=100)
+    for result in (
+        connscale_reconcile(
+            _RIG_CLEAN, base, staged, unconfirmed_budget=_BUDGET, counter_reset=_RESET
+        ),
+        estate_reconcile(
+            _RIG_CLEAN, base, staged, unconfirmed_budget=_BUDGET, counter_reset=_RESET
+        ),
+    ):
+        assert result.inconclusive, result.detail
+        assert "not drained" in result.detail
+        assert "drain arms were not judged" not in result.detail

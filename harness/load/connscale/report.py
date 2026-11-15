@@ -50,6 +50,8 @@ if TYPE_CHECKING:
 EXIT_OK = 0
 EXIT_SLO_VIOLATION = 1
 
+# Still 1 after `no_loss.inconclusive` was added (BACKLOG #5574): the key is additive, and 2 is the
+# readings payload's version, which `connscale_harvest` tells apart from this one by number.
 SCHEMA_VERSION = 1
 
 #: Which rate window the readings payload's rates were computed over (BACKLOG #1420). The window is
@@ -126,6 +128,10 @@ class NoLoss:
     sink_received: int
     backlog: int
     detail: str
+    #: ``ok`` is False and nothing proved a loss: the step cannot clear itself (BACKLOG #5574), as
+    #: in ``harness.load.report.NoLoss``. ``detail`` holds the reasons. It still fails zero_loss.
+    #: Defaulted, so a constructor that names no verdict reads as a loss rather than a pass.
+    inconclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -449,6 +455,7 @@ class ConnScaleRecord:
                 "sink_received": self.no_loss.sink_received,
                 "backlog": self.no_loss.backlog,
                 "detail": self.no_loss.detail,
+                "inconclusive": self.no_loss.inconclusive,
             },
             "wall1_executor": {
                 "queue_depth_peak": self.executor_queue_depth_peak,
@@ -1478,6 +1485,11 @@ class ConnScaleReport:
         # A `no_loss` shortfall renders as a bare count in the table above, which is exactly the
         # unattributable failure this exists to replace -- so the verdict goes on the console beside
         # it, not only in the JSON artifact.
+        # BACKLOG #5574: a step that could not clear itself says why, beside the table, so a failed
+        # zero_loss SLO is not read as a message loss nobody can find.
+        for r in self.records:
+            if r.no_loss.inconclusive:
+                lines.append(f"no-loss INCONCLUSIVE: {r.step_label} -- {r.no_loss.detail}")
         for r in self.records:
             for audit in (r.intake_audit_live, r.intake_audit):
                 if audit.verdict in (VERDICT_INTAKE_COMPLETE, VERDICT_NOT_RUN):

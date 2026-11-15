@@ -250,6 +250,10 @@ async def _probe(rate: float, duration_s: float, pool_size: int) -> int:
                 await node.stop()
     c, nl = report.counters, report.no_loss
     pct = (c.timeouts / c.sent * 100.0) if c.sent else 0.0
+    # The reconcile's three outcomes, not its bare `ok`: a False there is either a proven LOSS or a
+    # run that could not clear itself (INCONCLUSIVE, BACKLOG #5574), and a reader of the row must
+    # be able to tell which without the detail.
+    verdict = "OK" if nl.ok else "INCONCLUSIVE" if nl.inconclusive else "LOSS"
     # NO derived per-second figure is printed. `engine_read / wall` looks like a service rate and is
     # not one: `wall` includes the stop grace, the drain and the settle-poll, so it lands at ~25/s
     # whether the run offered 60/s or 600/s. Report what was measured -- offered, ingested, stranded
@@ -257,9 +261,16 @@ async def _probe(rate: float, duration_s: float, pool_size: int) -> int:
     print(
         f"RESULT rate={rate:g} sent={c.sent} acked={c.acked} stranded={c.timeouts} "
         f"pct={pct:.1f} read={nl.engine_read} written={nl.engine_written} "
-        f"sink={nl.sink_received} backlog={nl.backlog} ok={nl.ok} wall={wall:.2f}",
+        f"sink={nl.sink_received} backlog={nl.backlog} ok={nl.ok} no_loss={verdict} "
+        f"wall={wall:.2f}",
         flush=True,
     )
+    if not nl.ok:
+        # Why, on stderr and on ONE escaped line, beside the RESULT row rather than in it: the
+        # workflow parses every stdout line starting RESULT, and a detail of its own must never be
+        # able to forge one (the same reason `_setup_failed` escapes).
+        shown = escape_for_terminal(nl.detail, single_line=True)
+        print(f"ingress probe: no-loss {verdict}: {shown}", file=sys.stderr, flush=True)
     # Deliberately exit 0 even on a reconcile failure: this is a MEASUREMENT, not a gate. A machine
     # too slow to keep up is the finding, not an error, and a non-zero exit here would turn runner
     # weather into a red workflow.
