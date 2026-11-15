@@ -787,8 +787,8 @@ async def test_a_local_rename_while_queued_rejoins_the_queue_under_the_new_name(
 ) -> None:
     """BACKLOG #3780 item 2. A local account's rename while the attempt waits is caught by the
     in-queue re-read: a name that keys a different queue from the one held sends the attempt to the
-    new one before the code is checked. RED when: the code is checked while holding the old name's
-    queue, which attempts reading the new name do not join (BACKLOG #1943)."""
+    new one before the code is checked, still holding the first. RED when: the code is checked
+    without the new name's queue, which attempts reading the new name join (BACKLOG #1943)."""
     a = await _enrolled_local_session(store)
     real_lock = a.service._account_credential_lock
     real_verify = a.service._verify_second_factor
@@ -816,8 +816,10 @@ async def test_a_local_rename_while_queued_rejoins_the_queue_under_the_new_name(
     verified = await a.service.verify_mfa(a.token, a.code)
 
     assert verified.ok is True
-    assert queued_as == [a.username, renamed]  # queued under the old name, rejoined once
-    assert held_at_check == [{service_module._credential_lock_key(renamed)}]
+    # Queued under the old name, then both queues in key order, once.
+    assert queued_as == [a.username, a.username, renamed]
+    key = service_module._credential_lock_key
+    assert held_at_check == [{key(a.username), key(renamed)}]
     assert a.service._credential_locks == {}
     rows = await store.list_audit(action="auth.mfa_verified")
     assert [r["actor"] for r in rows] == [renamed]
@@ -1099,7 +1101,7 @@ async def test_an_account_deleted_after_the_rejoin_is_audited_under_its_last_rea
             assert await store.set_user_username(
                 a.user_id, renamed, expected_username=a.username, audits=()
             )
-        else:
+        elif len(queued_as) == 2:
             await store.delete_user(a.user_id)
         async with real_lock(username):
             yield
@@ -1109,7 +1111,7 @@ async def test_an_account_deleted_after_the_rejoin_is_audited_under_its_last_rea
     refused = await a.service.verify_mfa(a.token, a.code)
 
     assert refused.ok is False and refused.session_lost is True
-    assert queued_as == [a.username, renamed]
+    assert queued_as == [a.username, a.username, renamed]
     rows = await store.list_audit(action="auth.mfa_failed")
     lost = [
         r for r in rows if r["detail"] and json.loads(r["detail"]) == {"reason": "session_lost"}
@@ -1123,7 +1125,7 @@ async def test_a_second_rename_carries_on_in_the_queue_held(
     """BACKLOG #3780 item 2. The rejoin runs once, so a name that keeps moving cannot keep an
     attempt cycling through queues. RED when: the rejoin is unbounded (the attempt queues a third
     time) or a second rename refuses the attempt. A second rename of a local account carries on in
-    the queue then held, as one during the code check does; the success is still filed under the
+    the queues then held, as one during the code check does; the success is still filed under the
     name written last."""
     a = await _enrolled_local_session(store)
     real_lock = a.service._account_credential_lock
@@ -1146,10 +1148,55 @@ async def test_a_second_rename_carries_on_in_the_queue_held(
     verified = await a.service.verify_mfa(a.token, a.code)
 
     assert verified.ok is True
-    assert queued_as == names[:2]
+    assert queued_as == [names[0], names[0], names[1]]
     assert a.service._credential_locks == {}
     rows = await store.list_audit(action="auth.mfa_verified")
     assert [r["actor"] for r in rows] == [names[2]]
+
+
+async def test_a_rename_put_back_while_rejoining_still_holds_the_first_queue(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 2, review of PR 2971. A local account renamed while its attempt waits,
+    then renamed back before the rejoin's read: the account's name keys the queue the attempt first
+    joined, which main held throughout. RED when: the rejoin lets that queue go, so the code check
+    runs beside attempts that read the name put back and queue on it (BACKLOG #1943), where main
+    did not."""
+    a = await _enrolled_local_session(store)
+    real_lock = a.service._account_credential_lock
+    real_verify = a.service._verify_second_factor
+    renamed = f"{a.username}-renamed"
+    calls = 0
+    held_at_check: list[set[str]] = []
+
+    @asynccontextmanager
+    async def _queue(username: str) -> AsyncIterator[None]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert await store.set_user_username(
+                a.user_id, renamed, expected_username=a.username, audits=()
+            )
+        elif calls == 2:
+            assert await store.set_user_username(
+                a.user_id, a.username, expected_username=renamed, audits=()
+            )
+        async with real_lock(username):
+            yield
+
+    async def _verify(*args: Any, **kwargs: Any) -> bool:
+        held_at_check.append(set(a.service._credential_locks))
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(a.service, "_account_credential_lock", _queue)
+    monkeypatch.setattr(a.service, "_verify_second_factor", _verify)
+
+    verified = await a.service.verify_mfa(a.token, a.code)
+
+    assert verified.ok is True
+    assert len(held_at_check) == 1
+    assert service_module._credential_lock_key(a.username) in held_at_check[0]
+    assert a.service._credential_locks == {}
 
 
 @pytest.mark.parametrize(

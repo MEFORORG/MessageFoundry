@@ -580,9 +580,13 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     begin legs still read no provider, and the finish legs read none themselves.
     """
 
-    # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
-    # call, so verify_mfa reads no provider itself and the helper reads it exactly once (through
-    # _is_directory_account since BACKLOG #3780; _provider_reads counts either form).
+    # Since BACKLOG #3068 the directory check lives in the shared helper both second-factor legs
+    # call, and the helper reads the provider exactly once (through _is_directory_account since
+    # BACKLOG #3780; _provider_reads counts either form). Since BACKLOG #3780 item 2 verify_mfa reads
+    # it once itself, re-derived against the rows: for a directory account its in-queue read stands
+    # in for the holder re-read the helper no longer runs for it, so it adds a refusal (lookup keys
+    # moved since the role test) and asks the lock before TOTP and the lapse. Both only add or
+    # reorder refusals; nothing is exempted, and the lockout feed below is pinned as before.
     def _tree(func: object) -> ast.AST:
         return ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
 
@@ -592,7 +596,7 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     verify_tree = _tree(AuthService.verify_mfa)
     helper_tree = _tree(AuthService._directory_vouches_for_factor)
     assert (
-        _provider_reads(verify_tree) == 0
+        _provider_reads(verify_tree) == 1
         and _provider_reads(_tree(AuthService._factor_holder_current)) == 0
         and "_directory_vouches_for_factor" in _attrs(verify_tree)
         and _provider_reads(helper_tree) == 1

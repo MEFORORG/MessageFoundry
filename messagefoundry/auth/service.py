@@ -16595,20 +16595,21 @@ class AuthService:
         # moved: an attempt the dropped re-read refused for the race is still refused, unless the
         # move was put back before the queue read. Wider than main, which refused only when the
         # race was lost. A local account was never re-read after a lookup, so neither this refusal
-        # nor the lock-first order below applies to it. Whether the lookup ran is read off the
-        # helper's answer, which is the very ``user`` passed for a local account and a row read
-        # afresh for a directory one, so the provider branch stays the helper's alone.
+        # nor the lock-first order below applies to it. Both only add or reorder refusals.
+        directory = _is_directory_account(user)
         vouched = await self._directory_vouches_for_factor(
             token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
         if isinstance(vouched, Elevation):
             return vouched
-        directory = vouched is not user
         user = vouched
         async with AsyncExitStack() as queue:
-            queued_as = user.username
+            joined = [user.username]
             for may_rejoin in (True, False):
-                await queue.enter_async_context(self._account_credential_lock(queued_as))
+                # In key order, so two attempts that each hold two queues take them in one order
+                # and cannot wait on each other.
+                for name in sorted(joined, key=_credential_lock_key):
+                    await queue.enter_async_context(self._account_credential_lock(name))
                 # Read the session, the account and its lock again. The queue may have been a wait,
                 # and for a directory account the lookup came before it, so what was read before
                 # may be stale: a session revoked meanwhile would still spend its code, and a lock
@@ -16633,23 +16634,24 @@ class AuthService:
                         phase=None,
                     )
                     return Elevation(session_lost=True)
-                if not may_rejoin or (
-                    _credential_lock_key(loaded.username) == _credential_lock_key(queued_as)
-                ):
+                if not may_rejoin or _credential_lock_key(loaded.username) in {
+                    _credential_lock_key(name) for name in joined
+                }:
                     user = loaded
                     break
                 # A rename landed after the queue was keyed, so the queue held is one that attempts
                 # reading the new name do not join, and a burst split across the two can get one
                 # code check past the lockout (BACKLOG #1943). Only a local account gets here: a
-                # directory account whose keys moved was refused above. Leave the queue and join
-                # the one under the name the row holds now; the reads above run again after that
-                # wait. ONCE: a second rename carries on in the queue then held, as a rename during
-                # the code check below does. Both windows stay open while the queue is keyed by
-                # name. Carried forward, so a refusal after the rejoin names the account as last
-                # read.
+                # directory account whose keys moved was refused above. Let go, then hold the
+                # first queue AND the one under the name the row holds now; the reads above run
+                # again after that wait. The first queue stays held, so a rename put back while
+                # the attempt waits still meets the attempts queued on that name. ONCE: a further
+                # rename carries on in the queues then held, as a rename during the code check
+                # below does. Both windows stay open while the queue is keyed by name. Carried
+                # forward, so a refusal after the rejoin names the account as last read.
                 user = loaded
                 await queue.pop_all().aclose()
-                queued_as = loaded.username
+                joined.append(loaded.username)
             else:
                 # Unreachable: the last pass breaks or returns. Guarded so an edit to the loop can
                 # never let the code check below run without the account's queue held (#1943).
@@ -17103,9 +17105,7 @@ class AuthService:
 
         **Except under ``reread=False``,** which skips that re-read. For a directory account it
         returns the row :meth:`_directory_step_up_refusal`'s role test read after the lookup, so
-        its name and lock are as they were then, and never the ``user`` object passed in; for a
-        local account, that very object, which :meth:`verify_mfa` reads to tell whether the lookup
-        ran. Either way
+        its name and lock are as they were then; for a local account, ``user`` itself. Either way
         the session was not read again and the lock not checked, so nothing below about the
         re-read then holds, and the caller must read the session and check the lock itself before
         it checks a proof. At least :meth:`verify_mfa` passes it; the comment at its call says why

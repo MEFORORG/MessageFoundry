@@ -28,8 +28,10 @@
   A change reversed between the lookup and the queue read no longer refuses the attempt where the
   dropped read refused it: at least a lock or a disable, a rename, rebind or re-key put back, and a
   record that failed its seal and was repaired. No guess, counter or audit bound is lost, because an
-  attempt that was refused in that window could be resent after the reversal and admitted. A
-  reversal is an administrator's or the directory's act, or the lock's own expiry, never the
-  caller's act. The re-reads after the code check are unchanged. A rename of a local account that
-  lands while the attempt waits in the queue sends it, once, to the queue of the account's new
-  name, where it reads again. (`BACKLOG #3780`)
+  attempt that was refused in that window could be resent after the reversal and admitted,
+  whoever made it. A reversal is at least an administrator's or the directory's act, the lock's
+  own expiry, or a directory sign-in by Kerberos or OIDC that owes no further factor, which clears
+  the second-step lock and which the account's holder can make. The re-reads after the code check
+  are unchanged. A rename of a local account that lands while the attempt waits in the queue
+  sends it, once, to the queue of the account's new name as well, still holding the queue it
+  joined first, where it reads again. (`BACKLOG #3780`)
