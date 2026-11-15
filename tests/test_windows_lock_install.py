@@ -114,5 +114,6 @@ def test_the_lock_list_matches_the_dep1_runtime_exports() -> None:
 
 def test_every_runtime_lock_exists() -> None:
     """Non-vacuity: a renamed lock would leave the job installing a path that is not there."""
+    assert _RUNTIME_LOCKS, f"{_JOB}'s lock list is empty; this check walks nothing"
     missing = [lock for lock in _RUNTIME_LOCKS if not (_REPO / lock).is_file()]
     assert not missing, f"runtime lock(s) named by {_JOB} are missing: {missing}"

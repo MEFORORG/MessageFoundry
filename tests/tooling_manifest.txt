@@ -44,6 +44,7 @@ tests/test_asvs_verifier_vault_contract.py
 tests/test_bash_probe_path.py
 tests/test_bash_resolver.py
 tests/test_blanket_stage_guard.py
+tests/test_branch_leak_scan_range.py
 tests/test_check_dependency_floors.py
 tests/test_ci_docs_only_detector.py
 tests/test_ci_engine_step_excludes_webconsole.py
@@ -222,6 +223,7 @@ tests/test_api_burn_guard.py
 tests/test_webconsole_engine_floor.py
 tests/test_wheel_license_files.py
 tests/test_wiki_write_prompt_hook.py
+tests/test_windows_lock_install.py
 tests/test_workflow_concurrency_keys.py
 tests/test_workflow_local_action_check.py
 tests/test_workflow_pipefail_screen.py
