@@ -372,3 +372,38 @@ restored rather than superseded.
 change at the graft boundary rather than at its commit. The instrument here was a content comparison
 between `46b3a4437b7d64053851a0787911f861e3127fdb` and `main` at `1aa2d6a1b`, which establishes *that*
 these moved and not *when*.
+
+## Amendment B (2026-11-14) — section 1: the stage-1 bound gains a latch (BACKLOG #5812)
+
+**Section 1 above is unedited, and its bound still holds.** Past 5 rolls in 60 seconds, counted from
+the first roll of the window, the sink is declared unwritable, and every roll past that bound still
+pages and asks for the stop, exactly as before this amendment. Amendment A's statement that section 1
+describes the shipped module exactly stops being true here: section 1 does not describe the latch
+below.
+
+**What was wrong.** On every roll past the bound, `record_rollover` wrote the sink's state as `rolled`
+and only then escalated, so the stage-2 latch read the state it had just overwritten. And the bound's
+window restarts a minute after its first roll, so a sink still rolling every few seconds flipped back
+to `rolled`, and `can_log()` read True with no probe, until the bound tripped again.
+
+**The latch, as built in [`logging_guard.py`](../../messagefoundry/logging_guard.py).**
+
+- The prior state and the streak are read, and the verdict written, in one hold of the guard's lock.
+- A sink the bound declared unwritable stays unwritable on a later roll that the bound alone would
+  call a heal, while that roll comes within 60 seconds of the sink's last roll or stage-2 failure.
+  That roll pages nothing. It is counted, its rolled-aside path is recorded (the previous one is kept
+  when it moved nothing aside), and the stage-2 cause stays on `GET /status`.
+- A stage-2 failure refreshes that 60-second clock, so a sink failing outright never reads as quiet.
+  A stage-2 failure on a sink the latch alone holds pages, as it would have on the `rolled` sink the
+  bound alone left.
+- The first roll after 60 seconds with no roll and no stage-2 failure moves the sink to `rolled` and
+  pages, as section 1 says. A latched sink that heals and never rolls again stays unwritable until
+  the operator recovery's `revalidate()` writes a record to it.
+- A sink stage 2 declared dead is not latched by this. Its healing roll moves it to `rolled` unless
+  the bound itself says it is flapping.
+
+**The verdict is the bound's OR the latch**, so the latch never reads a sink writable, pages, or asks
+for a stop less often than the bound alone. That property was checked by running this guard beside
+the one before this amendment, under a fake clock, over random sequences of rolls, stage-2 failures
+and recoveries on one and on two sinks; the comparison found violations in earlier drafts of this
+change and none in this one. `tests/test_log_write_guard.py` pins the cases it found.
