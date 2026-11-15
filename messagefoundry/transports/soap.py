@@ -32,15 +32,16 @@ retry), with the one OAuth2 exception at the end of this paragraph. A **Sender/C
 Code, and where that yields none, from the Fault's first faultcode or a Value ahead of it
 (``_fault_code`` says how). An unrecognized fault is treated as permanent. With no fault, the HTTP
 status decides: 2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter; a connection/timeout
-error retries. With a bearer provider configured (OAuth2 client credentials or SMART), an HTTP 401
-drops the cached bearer and retries, as the REST and FHIR connectors do, unless its body is a
-WS-Security fault a fresh bearer cannot fix, which stays permanent: any such fault on a connection
-whose transport stamps a UsernameToken (``ws_security`` with ``ws_username``), and a MessageExpired
-fault on any connection. Elsewhere a 401 FailedAuthentication or InvalidSecurityToken retries once
-with a fresh bearer; if the connection's next answer from the endpoint is again such a 401, it is
-permanent. A UsernameToken a Handler writes into its own envelope is not seen, so on an ordered (FIFO)
-lane a wrong one is resent once per message (BACKLOG #5798). Fault bodies are **not** echoed into errors/logs (they may
-carry PHI) — only the SOAP fault role + HTTP status are.
+error retries. With OAuth2 client credentials configured, an HTTP 401 drops the cached bearer and
+retries, as the REST and FHIR connectors do, unless its body is a WS-Security fault. Such a fault
+stays permanent where a fresh bearer cannot fix it: on a connection whose transport stamps a
+UsernameToken (``ws_security`` with ``ws_username``), and wherever it is MessageExpired. Elsewhere
+the first 401 FailedAuthentication or InvalidSecurityToken retries with a fresh bearer, and the next
+one is a credential fault (ADR 0095), which under the default ``credential_fault_policy`` stops the
+lane and keeps the queue: the credential at fault is one the engine cannot see, at least a
+UsernameToken a Handler writes into its own envelope or a client certificate. Only a 2xx or a 401 that is not a WS-Security fault ends that run; a 5xx,
+a 407, any other status or no answer leaves it open (BACKLOG #5798). Fault bodies are **not**
+echoed into errors/logs (they may carry PHI) — only the SOAP fault role + HTTP status are.
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** (minting a fresh ``<wsa:MessageID>``
 in WS-\* mode — correct WS-\* retry semantics). The service operation **must be idempotent** and its
@@ -644,10 +645,10 @@ class SoapDestination(DestinationConnector):
             transport="SOAP destination",
         )
         self._ws_mode: bool = self.ws_addressing or self.ws_security
-        # BACKLOG #5798: whether the last answer from the endpoint was an OAuth2 401 WS-Security
-        # fault that was retried with a fresh bearer, so the same fault next time is permanent.
-        # Per connection, not per message: it is read and reset by the next answer, whatever message
-        # that answer is for.
+        # BACKLOG #5798: set when a 401 WS-Security fault was retried with a fresh bearer, so the
+        # next one stops the lane. Only a 2xx or a 401 that is not a WS-Security fault clears it; a
+        # 5xx, a 407, another status or no answer at all leaves it set. Per connection, not per
+        # message: it is read by the next such answer, whatever message that answer is for.
         self._wssecurity_401_retried = False
 
         # Non-deterministic generators — instance attributes so tests can inject a fixed clock / UUID /
@@ -1297,8 +1298,8 @@ class SoapDestination(DestinationConnector):
             raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                # BACKLOG #5798: a 2xx is an answer from the endpoint other than a WS-Security 401,
-                # so it ends that run. First, so a 2xx whose read below raises still ends it.
+                # BACKLOG #5798: a 2xx ends a WS-Security 401 run. First, so a 2xx whose read below
+                # raises still ends it.
                 self._wssecurity_401_retried = False
                 # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
                 # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
@@ -1340,39 +1341,37 @@ class SoapDestination(DestinationConnector):
             # 2xx). This is a transport-level fault — raised for BOTH capturing and non-capturing.
             failure = _classify_soap(exc.code, body)
             if self._token_provider is not None and exc.code == 401:
-                # BACKLOG #5798, as in the REST and FHIR twins: the cached OAuth2 bearer may have been
+                # BACKLOG #5798, as in the REST and FHIR twins: the cached bearer may have been
                 # revoked or expired between mint and use. Drop it and retry with a fresh one
                 # (transient); classifying the 401 permanent dead-lettered the message and left the
-                # bad token cached for every later send. A 403 stays permanent below, as there.
-                # A WS-Security fault stays the permanent failure it was where a fresh bearer cannot
-                # fix it: on a connection that sends a UsernameToken, which the fault may name
-                # (retrying would resend a wrong password for the whole budget), and wherever it is
-                # MessageExpired, which names the envelope's Timestamp. Otherwise, with no
-                # UsernameToken sent, FailedAuthentication or InvalidSecurityToken most likely names
-                # the bearer, so it retries ONCE with a fresh one. The engine cannot see every
-                # credential an envelope or a connection carries (a Handler's own UsernameToken
-                # filled from body_secrets, a client certificate), so if the connection's next answer
-                # from the endpoint is again a WS-Security 401, it is permanent, as before #5798: a
-                # wrong credential is resent at most once. Secret-safe: the redacted URL only.
+                # bad token cached for every later send. A 403 stays permanent below, as there. The
+                # module docstring's fault mapping states the WS-Security limits; this arm is the
+                # code of them. Secret-safe: the redacted URL only.
                 self._token_provider.invalidate()
-                wssecurity = isinstance(failure, NegativeAckError) and failure.code == "wssecurity"
-                if wssecurity and not (
-                    (self.ws_security and bool(self.ws_username))
-                    or _names_expired_timestamp(body)
-                    or self._wssecurity_401_retried
+                refreshing = (
+                    f"SOAP {_redact_url(self.url)} returned HTTP 401; refreshing OAuth2 token"
+                )
+                if not (isinstance(failure, NegativeAckError) and failure.code == "wssecurity"):
+                    # An answer that is not a WS-Security fault ends a WS-Security 401 run.
+                    self._wssecurity_401_retried = False
+                    raise DeliveryError(refreshing) from exc
+                if not (
+                    (self.ws_security and bool(self.ws_username)) or _names_expired_timestamp(body)
                 ):
-                    self._wssecurity_401_retried = True
-                    raise DeliveryError(
-                        f"SOAP {_redact_url(self.url)} returned HTTP 401; refreshing OAuth2 token"
+                    if not self._wssecurity_401_retried:
+                        self._wssecurity_401_retried = True
+                        raise DeliveryError(refreshing) from exc
+                    # The fresh bearer did not help, so the fault names a credential the engine
+                    # cannot see; every queued row would fail alike. A credential fault stops the
+                    # lane and keeps the queue (ADR 0095), so no further login is spent. The flag
+                    # stays set, so a resumed lane meets the same stop on the same fault.
+                    raise NegativeAckError(
+                        f"SOAP {_redact_url(self.url)} WS-Security fault (HTTP 401) again after a "
+                        "fresh bearer",
+                        code="wssecurity",
+                        permanent=True,
+                        credential_fault=True,
                     ) from exc
-                self._wssecurity_401_retried = False
-                if not wssecurity:
-                    raise DeliveryError(
-                        f"SOAP {_redact_url(self.url)} returned HTTP 401; refreshing OAuth2 token"
-                    ) from exc
-            else:
-                # Any other answer from the endpoint ends a WS-Security 401 run.
-                self._wssecurity_401_retried = False
             raise (failure or DeliveryError(f"SOAP endpoint answered HTTP {exc.code}")) from exc
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc

@@ -732,7 +732,7 @@ def test_frame_reply_refuses_leading_noise_the_charset_cannot_hold() -> None:
     """Round-four review of #5799: with ordinary delimiters, a BOM-led reply was replaced into
     "?MSH|...", which no parser reads as an ACK. Mutation: drop the leading-noise check in
     _encode_replacing. Red: the call returns that reply."""
-    reply = "﻿MSH|^~" + BS + "&|R|RF" + CR + "MSA|AA|CTRL1|中" + CR
+    reply = "\ufeffMSH|^~" + BS + "&|R|RF" + CR + "MSA|AA|CTRL1|\u4e2d" + CR
     with pytest.raises(UnicodeError, match="noise before its first segment") as ei:
         frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BOM_LEAD")
     assert ei.value.__cause__ is None and ei.value.__context__ is None

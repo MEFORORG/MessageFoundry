@@ -432,27 +432,25 @@ async def test_an_oauth2_only_401_with_a_ws_security_fault_still_retries(
 
 
 @pytest.mark.parametrize("body", [_WSSE_401, _INVALID_TOKEN_401], ids=["failed-auth", "invalid"])
-async def test_a_ws_security_401_after_its_bearer_retry_is_permanent(body: bytes) -> None:
+async def test_a_ws_security_401_after_its_bearer_retry_is_a_credential_fault(body: bytes) -> None:
     """Manager repair pass: the engine cannot see every credential an envelope or a connection
-    carries (a Handler's own UsernameToken from body_secrets, a client certificate), so a wrong one
-    is resent at most once. The first WS-Security 401 retries with a fresh bearer; the same answer
-    next time is permanent, as before #5798. Mutation: never set the retried flag. Red: the second
-    send raises a transient DeliveryError and the wrong credential goes out for the whole budget."""
+    carries (a Handler's own UsernameToken from body_secrets, a client certificate). The first
+    WS-Security 401 retries with a fresh bearer; the next is a credential fault, so the lane stops
+    rather than spend a failed login on every queued row. The run stays open after it, so a resumed
+    lane stops again on the same fault. Mutation: never set the retried flag. Red: the second send
+    raises a transient DeliveryError and the wrong credential goes out for the whole budget."""
     dest, provider = _oauth2_dest()
     dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
     with pytest.raises(DeliveryError) as first:
         await dest.send("<op/>")
     assert not isinstance(first.value, NegativeAckError)
-    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
-    with pytest.raises(NegativeAckError) as second:
-        await dest.send("<op/>")
-    assert second.value.permanent is True and second.value.code == "wssecurity"
-    assert provider.invalidations == 2
-    # The run is over, so a later WS-Security 401 gets its one retry again.
-    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
-    with pytest.raises(DeliveryError) as third:
-        await dest.send("<op/>")
-    assert not isinstance(third.value, NegativeAckError)
+    for _ in range(2):
+        dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+        with pytest.raises(NegativeAckError) as again:
+            await dest.send("<op/>")
+        assert again.value.permanent is True and again.value.credential_fault is True
+        assert again.value.code == "wssecurity"
+    assert provider.invalidations == 3
 
 
 class _ResetDuringRead(_Resp):
@@ -469,27 +467,32 @@ def _between(kind: str) -> _Opener:
         return _Opener(resp=_ResetDuringRead(200))
     if kind == "plain-401":
         return _Opener(exc=_http_error(401, b""))
-    if kind == "500":
-        return _Opener(exc=_http_error(500, b""))
-    assert kind == "unreachable"
-    return _Opener(exc=urllib.error.URLError("refused"))
+    if kind in ("500", "502", "407"):
+        return _Opener(exc=_http_error(int(kind), b""))
+    if kind == "unreachable":
+        return _Opener(exc=urllib.error.URLError("refused"))
+    if kind == "reset":
+        return _Opener(exc=ConnectionResetError("reset"))
+    assert kind == "malformed"
+    return _Opener(exc=http.client.BadStatusLine("garbage"))
 
 
 async def _ws_security_401_then(dest: SoapDestination, kind: str) -> None:
     dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
-    with pytest.raises(DeliveryError):
+    with pytest.raises(DeliveryError) as first:
         await dest.send("<op/>")
+    assert not isinstance(first.value, NegativeAckError)  # the run is open
     dest._opener = _between(kind)  # type: ignore[assignment]
     with contextlib.suppress(DeliveryError):
         await dest.send("<op/>")
     dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
 
 
-@pytest.mark.parametrize("kind", ["2xx", "2xx-read-fails", "plain-401", "500"])
-async def test_control_another_answer_between_ends_the_ws_security_401_run(kind: str) -> None:
-    """Any answer from the endpoint other than a WS-Security 401 ends the run, so the next
-    WS-Security 401 gets its retry. Mutations: delete the reset in the 401 arm's `else:` (red:
-    "500"), or move the 2xx reset after the body read (red: "2xx-read-fails")."""
+@pytest.mark.parametrize("kind", ["2xx", "2xx-read-fails", "plain-401"])
+async def test_control_a_2xx_or_a_plain_401_between_ends_the_ws_security_401_run(kind: str) -> None:
+    """Only a 2xx or a 401 that is not a WS-Security fault ends the run, so the next WS-Security
+    401 gets its retry again. Mutations: move the 2xx reset after the body read (red:
+    "2xx-read-fails"), or drop the reset on a plain 401 (red: "plain-401")."""
     dest, _ = _oauth2_dest()
     await _ws_security_401_then(dest, kind)
     with pytest.raises(DeliveryError) as ei:
@@ -497,15 +500,19 @@ async def test_control_another_answer_between_ends_the_ws_security_401_run(kind:
     assert not isinstance(ei.value, NegativeAckError)
 
 
-async def test_no_answer_between_does_not_end_the_ws_security_401_run() -> None:
-    """A connection failure is no answer from the endpoint, so the run goes on and the next
-    WS-Security 401 is the second in a row: permanent. Mutation: reset the flag in the URLError
-    arm. Red: the second WS-Security 401 is retried again."""
+@pytest.mark.parametrize("kind", ["500", "502", "407", "unreachable", "reset", "malformed"])
+async def test_another_status_or_no_answer_between_leaves_the_ws_security_401_run_open(
+    kind: str,
+) -> None:
+    """A 5xx, a 407 (at least these can come from a gateway or proxy rather than the endpoint),
+    or no answer at all leaves the run open, so the next WS-Security 401 is the second in a row:
+    a credential fault. Mutation: reset the flag in the 401 arm for any other status, or in a
+    transport-failure arm. Red: the second WS-Security 401 is retried again."""
     dest, _ = _oauth2_dest()
-    await _ws_security_401_then(dest, "unreachable")
+    await _ws_security_401_then(dest, kind)
     with pytest.raises(NegativeAckError) as ei:
         await dest.send("<op/>")
-    assert ei.value.permanent is True and ei.value.code == "wssecurity"
+    assert ei.value.permanent is True and ei.value.credential_fault is True
 
 
 _EXPIRED_401 = b"<soap:Fault><faultcode>wsse:MessageExpired</faultcode></soap:Fault>"

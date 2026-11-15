@@ -322,10 +322,11 @@ WS-Security fault codes — `wsse:FailedAuthentication`, `wsse:InvalidSecurityTo
 or an expired timestamp **won't fix on a retry**, so it must **dead-letter** rather than loop the FIFO
 lane forever — consistent with the existing "unrecognized fault → permanent" stance
 (`_classify_soap`, [`soap.py`](../../messagefoundry/transports/soap.py)). *(Amended 2026-11-14,
-BACKLOG #5798: `_classify_soap` still maps these codes to permanent, but on an HTTP `401` with a
-bearer provider and no transport-stamped `UsernameToken`, `_post` raises a `FailedAuthentication`
-or `InvalidSecurityToken` as retryable once, so the delivery is retried with a fresh bearer. The `soap.py` module docstring and
-[CONNECTIONS.md](../CONNECTIONS.md) state the full rule.)* Fault bodies are still **not**
+BACKLOG #5798: `_classify_soap` still maps these codes to permanent, but `_post` treats some of them
+differently on an HTTP `401` with an OAuth2 bearer: at least a first `FailedAuthentication` or
+`InvalidSecurityToken` with no transport-stamped `UsernameToken` is retried with a fresh bearer.
+The `soap.py` module docstring states the rule, and [CONNECTIONS.md](../CONNECTIONS.md) states it
+for operators.)* Fault bodies are still **not**
 echoed into errors/logs (they may carry PHI; the [`soap.py`](../../messagefoundry/transports/soap.py)
 module docstring).
 
