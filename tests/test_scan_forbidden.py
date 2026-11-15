@@ -1347,6 +1347,7 @@ def _superset_bodies() -> dict[str, str]:
             "reviewer-wrapped-verdict": (
                 f"{_REQ}, _which_ stays {_PARTIAL}, and\n{_REQ_B} stays {_PARTIAL}."
             ),
+            "reviewer-quote-marker-line": f"{_HEAD}| a | b | c |\n>\n{_ROW}",
             "reviewer-escaped-pipe": (
                 f"| Note | Version | ASVS | Result |\n|---|---|---|---|\n"
                 f"| x \\| y | {_REQ} | z | {_PASS.title()} (12 messages) |"
