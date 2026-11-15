@@ -177,6 +177,7 @@ def _token_re(helpers: list[str]) -> re.Pattern[str]:
 _CONTINUES = "?:.+-*%|&=<>,(["
 _POSTFIX = ("++", "--")
 _SAME_LINE_BRACE_RE = re.compile(r"[ \t]*\{")
+_EXTENDS_BEFORE_RE = re.compile(r"(?<![\w$.])extends\s*$")
 _META_NAME_RE = re.compile(r"name\s*:\s*['\"]([^'\"]+)['\"]")
 
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
@@ -292,28 +293,39 @@ class _Ctx:
 # --------------------------------------------------------------------------------------------
 
 
-def _is_regex_position(prev: str) -> bool:
+def _is_regex_position(prev: str, src: str = "", prev_at: int = -1) -> bool:
     """Decide whether a `/` opens a regex literal or divides.
 
     The standard heuristic: a `/` following a VALUE (identifier, literal, closing bracket) is
-    division; anywhere else it opens a regex. Imperfect at the margins -- `return /x/` is right,
+    division; anywhere else it opens a regex. A postfix ``++``/``--`` ending at ``prev_at`` in
+    ``src`` is a value too: ``i++ / 2`` divides, and read as a regex it swallowed the rest of its
+    line, a template's closing backtick included. Imperfect at the margins -- `return /x/` is right,
     a keyword like `typeof` ending in a letter reads as a value -- so `_mask` additionally refuses
     any "regex" that does not close on its own line, which keeps a misread from desynchronising
     the rest of the scan.
     """
+    if prev in ("+", "-") and _ends_postfix(src, prev_at):
+        return False
     return prev == "" or not (prev.isalnum() or prev in "_$)]}")
 
 
-def _ends_postfix(src: str, i: int, floor: int = 0) -> bool:
-    """Whether the code before ``i`` ends in a postfix ``++``/``--``, whitespace skipped.
+def _ends_postfix(text: str, at: int) -> bool:
+    """Whether the code character at ``at`` ends a postfix ``++``/``--``.
 
-    One character of ``prev`` cannot tell ``i++ / 2``, which divides, from ``a + /x/``; read as a
-    regex, the division swallowed the rest of its line, a template's closing backtick included.
+    Only a run of exactly two after a value: ``a+++/x/`` lexes as ``a++ + /x/`` and ``1 + ++`` is a
+    prefix operator, and both still expect an operand.
     """
-    k = i - 1
-    while k >= floor and src[k].isspace():
+    c = text[at] if 0 <= at < len(text) else ""
+    if c not in ("+", "-"):
+        return False
+    k = at
+    while k >= 0 and text[k] == c:
         k -= 1
-    return k - 1 >= floor and src[k - 1 : k + 1] in _POSTFIX
+    if at - k != 2:
+        return False
+    while k >= 0 and text[k] in " \t":
+        k -= 1
+    return k >= 0 and (text[k].isalnum() or text[k] in "_$)]")
 
 
 @dataclass
@@ -378,7 +390,7 @@ def _interp_end(src: str, start: int) -> int:
     """
     n = len(src)
     depth = 0
-    prev = ""
+    prev, prev_at = "", -1
     j = start
     while j < n:
         c = src[j]
@@ -399,13 +411,13 @@ def _interp_end(src: str, start: int) -> int:
         if c == "`":
             j, prev = _template_end(src, j), "x"
             continue
-        if c == "/" and _is_regex_position(prev) and not _ends_postfix(src, j, start):
+        if c == "/" and _is_regex_position(prev, src, prev_at):
             closed = _regex_close(src, j)
             if closed != -1:
                 j, prev = closed + 1, "x"
                 continue
         if not c.isspace():
-            prev = c
+            prev, prev_at = c, j
         if c == "{":  # an object or block inside the interpolation
             depth += 1
         elif c == "}":
@@ -426,7 +438,7 @@ def _mask(src: str, notes: _MaskNotes | None = None) -> str:
     out = list(src)
     n = len(src)
     i = 0
-    prev = ""
+    prev, prev_at = "", -1
     notes = notes if notes is not None else _MaskNotes()
 
     def blank(start: int, stop: int, comment: bool = False) -> None:
@@ -478,7 +490,7 @@ def _mask(src: str, notes: _MaskNotes | None = None) -> str:
             i, prev = end, "x"
             continue
 
-        if c == "/" and _is_regex_position(prev) and not _ends_postfix(src, i):
+        if c == "/" and _is_regex_position(prev, src, prev_at):
             closed = _regex_close(src, i)
             if closed != -1:
                 blank(i, closed + 1)
@@ -487,7 +499,7 @@ def _mask(src: str, notes: _MaskNotes | None = None) -> str:
             # Did not close on its line: treat as division and keep the scan in sync.
 
         if not c.isspace():
-            prev = c
+            prev, prev_at = c, i
         i += 1
 
     return "".join(out)
@@ -698,15 +710,18 @@ def _expr_end(ctx: _Ctx, i: int) -> int:
         elif depth == 0 and c in ";,":
             return j
         elif depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
-            # A postfix `++`/`--` ends its line's expression, and one that starts the next line
-            # is a prefix operator after an inserted semicolon: neither continues.
+            # A `++`/`--` starting the next line is a prefix operator after an inserted semicolon.
+            # A postfix result ending this line cannot be called, indexed or dotted, so ASI splits
+            # there unless the next line opens with a binary operator.
             tail = raw[i:j].rstrip()
             nxt = _NONSPACE_RE.search(raw, j)
-            if (tail[-1] not in _CONTINUES or tail.endswith(_POSTFIX)) and (
-                nxt is None
-                or nxt.group() not in _CONTINUES
-                or raw.startswith(_POSTFIX, nxt.start())
-            ):
+            if nxt is None:
+                return j
+            anew = nxt.group() not in _CONTINUES or raw.startswith(_POSTFIX, nxt.start())
+            if _ends_postfix(raw, i + len(tail) - 1):
+                if anew or nxt.group() in "([.":
+                    return j
+            elif tail[-1] not in _CONTINUES and anew:
                 return j
     return len(masked)
 
@@ -990,7 +1005,7 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
             continue
         # `{ review(r) {...} }` or `get review() {` defines a method of the same name: a function
         # value, not a call.
-        method_head = bool(helper) and _is_method_head(ctx, m.end() - 1)
+        method_head = bool(helper) and _is_method_head(ctx, m.start(), m.end() - 1)
         if method_head:
             ctx.def_names.add(m.start())
         elif helper or hook:
@@ -1022,11 +1037,14 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
     return total
 
 
-def _is_method_head(ctx: _Ctx, open_idx: int) -> bool:
+def _is_method_head(ctx: _Ctx, name_start: int, open_idx: int) -> bool:
     """Whether ``name(...)`` at ``open_idx`` is a method head: a ``{`` follows on the same line.
 
     Same line only: a call followed by a bare block on the next line must still price the call.
+    ``class A extends mixin(B) {`` calls ``mixin`` even though a brace follows.
     """
+    if _EXTENDS_BEFORE_RE.search(ctx.masked, max(0, name_start - 32), name_start):
+        return False
     close = _match_bracket(ctx.masked, open_idx)
     return close != -1 and _SAME_LINE_BRACE_RE.match(ctx.code, close + 1) is not None
 

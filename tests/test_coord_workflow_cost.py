@@ -555,6 +555,50 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
             1,
         ),
         (
+            "a regex after a line comment ending in dashes",
+            "const CODE_SPAN =\n  // ----------------\n  /`([^`]+)`/g\nconst R = [1, 2, 3]\n"
+            "await parallel(R.map(r => () => agent(r)))\n",
+            3,
+        ),
+        (
+            "a regex after a line comment ending in C++",
+            "const x = [ // C, C++\n /'/g, await agent(1) ]\n",
+            1,
+        ),
+        (
+            "a block comment between a postfix decrement and a division",
+            "const s = `${ a-- /* c */ / b }`; const q = c / d\nawait agent(1)\n",
+            1,
+        ),
+        (
+            "an unspaced regex after a postfix increment and a plus",
+            "const y = a+++/`/.source\nconst R = [1, 2, 3]\n"
+            "await parallel(R.map(r => () => agent(r)))\n",
+            3,
+        ),
+        (
+            "a postfix helper followed by a line starting with a bracket",
+            "let n = 0\nconst nextId = () => n++\n[1, 2, 3].forEach(x => agent(x))\n"
+            "nextId()\nnextId()\n",
+            3,
+        ),
+        (
+            "a postfix increment then a binary plus continues the line",
+            "let n = 0\nconst g = () => n+++\nagent(1)\ng()\ng()\n",
+            2,
+        ),
+        (
+            "a trailing prefix increment continues the line",
+            "const g = (o) => 1 + ++\no[agent(1)]\ng(o)\ng(o)\n",
+            2,
+        ),
+        (
+            "a helper called in a class heritage clause",
+            "function mixin(B) { agent(1); return B }\nmixin(Object)\n"
+            "class A extends mixin(Object) {\n  run() { return 1 }\n}\n",
+            2,
+        ),
+        (
             "an unclosed regex class at the end of an interpolation",
             "await agent(1)\nconst s = `${ /[abc",
             1,
