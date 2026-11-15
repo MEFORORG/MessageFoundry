@@ -50,6 +50,7 @@ from tests._keyed_reopen_contract import (
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._keyless_blank_contract import keyed_cipher
+from tests._passthrough_marker_scope_contract import CASES as PT_MARKER_SCOPE_CASES
 from tests._reingress_refused_body_contract import CASES as REINGRESS_REFUSED_BODY_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
@@ -3206,6 +3207,13 @@ async def test_reingress_peek_failed_errors_child_and_skips_ingress(store) -> No
 async def test_reingress_refused_body_contract(store, case) -> None:
     """Vault BACKLOG #4796: a refused loopback re-ingress is charged to the refused-body allowance,
     the same contract the SQLite suite runs: past it only the head is stored, inside it the whole."""
+    await case(store)
+
+
+@pytest.mark.parametrize("case", PT_MARKER_SCOPE_CASES)
+async def test_passthrough_marker_scope_contract(store, case) -> None:
+    """BACKLOG #5614: a pass-through marker is scoped to its parent's channel, the same contract the
+    SQLite suite runs, so a dead one is listed under the parent's channel, not the pass-through's."""
     await case(store)
 
 

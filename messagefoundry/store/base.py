@@ -2001,7 +2001,11 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def connection_metrics(
         self, *, since: float, now: float | None = None, rate_window: float = 60.0
-    ) -> ConnectionMetrics: ...
+    ) -> ConnectionMetrics:
+        """Per-channel inbound and per-(channel_id, destination_name) outbound aggregates for the
+        connections dashboard. A pass-through marker is not a delivery, so it is in no destination's
+        aggregate (BACKLOG #5614)."""
+        ...
 
     async def delivery_latency_histogram(
         self, *, buckets: Sequence[float], now: float | None = None
@@ -2009,7 +2013,8 @@ class QueueStore(StoreLifecycle, Protocol):
         """Per-(channel_id, destination_name) delivery-latency histogram over outbound rows that
         reached status='done'. Latency = updated_at - created_at (seconds), clamped to >= 0 (clock-
         skew guard). bucket_counts are CUMULATIVE (Prometheus le semantics). Read-only; runs off the
-        event loop."""
+        event loop. A pass-through marker is not a delivery and is excluded, as it is from
+        :meth:`connection_metrics`' destinations (BACKLOG #5614)."""
         ...
 
 

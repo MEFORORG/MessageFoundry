@@ -1225,17 +1225,25 @@ def _insert_queue_ingress_params(
 
 
 def _insert_marker_params(
-    row_id: str, parent_id: str, pt_name: str, enc_body: str, status: str, now: float
+    row_id: str,
+    parent_id: str,
+    channel_id: str,
+    pt_name: str,
+    enc_body: str,
+    status: str,
+    now: float,
 ) -> tuple[Any, ...]:
-    # The PT parent-marker row: an ALREADY-TERMINAL outbound-shaped row (lane = the PT inbound name),
-    # never claimed. Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the marker stamp in
-    # ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when the child was
-    # produced, DEAD on a depth-cap breach) rather than PENDING.
+    # The PT parent-marker row: an ALREADY-TERMINAL outbound-shaped row (its lane, destination_name,
+    # is the PT inbound name), never claimed. ``channel_id`` is the parent's inbound, as on every
+    # outbound row the handoff writes, so a dead marker is scoped to the parent's channel in the
+    # dead-letter view (#5614). Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the
+    # marker stamp in ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when
+    # the child was produced, DEAD on a depth-cap breach) rather than PENDING.
     return (
         row_id,
         parent_id,
         Stage.OUTBOUND.value,
-        pt_name,
+        channel_id,
         pt_name,
         PASSTHROUGH_MARKER_HANDLER,
         enc_body,
@@ -7186,12 +7194,18 @@ class SqlServerStore:
         return True
 
     async def _insert_passthrough_marker_mssql(
-        self, cur: Any, parent_id: str, pt_name: str, produced: bool, now: float
+        self,
+        cur: Any,
+        parent_id: str,
+        channel_id: str,
+        pt_name: str,
+        produced: bool,
+        now: float,
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
         SQL Server twin of :meth:`MessageStore._insert_passthrough_marker`. A single ``stage='outbound'``
-        row keyed by the PT inbound name, inserted already-terminal: ``done`` when the child was produced
+        row sent to the PT inbound name, inserted already-terminal: ``done`` when the child was produced
         (→ parent finalizes ``PROCESSED``), or ``dead`` when the depth cap was breached (→ parent
         finalizes ``ERROR``). Never claimed (no delivery worker for a PT name; claims take ``pending``
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
@@ -7203,6 +7217,7 @@ class SqlServerStore:
             _insert_marker_params(
                 marker_id,
                 parent_id,
+                channel_id,
                 pt_name,
                 self._cipher.encrypt(
                     "",
@@ -7210,7 +7225,7 @@ class SqlServerStore:
                         row_id=marker_id,
                         message_id=parent_id,
                         stage=Stage.OUTBOUND.value,
-                        channel_id=pt_name,
+                        channel_id=channel_id,
                         destination_name=pt_name,
                         handler_name=PASSTHROUGH_MARKER_HANDLER,
                         body_ref=None,
@@ -7226,7 +7241,13 @@ class SqlServerStore:
             await self._event(cur, parent_id, "dead", pt_name, "passthrough depth cap", now)
 
     def _insert_passthrough_marker_mssql_sync(
-        self, cur: Any, parent_id: str, pt_name: str, produced: bool, now: float
+        self,
+        cur: Any,
+        parent_id: str,
+        channel_id: str,
+        pt_name: str,
+        produced: bool,
+        now: float,
     ) -> None:
         """Synchronous twin of :meth:`_insert_passthrough_marker_mssql` (ADR 0071 B5)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
@@ -7236,6 +7257,7 @@ class SqlServerStore:
             _insert_marker_params(
                 marker_id,
                 parent_id,
+                channel_id,
                 pt_name,
                 self._cipher.encrypt(
                     "",
@@ -7243,7 +7265,7 @@ class SqlServerStore:
                         row_id=marker_id,
                         message_id=parent_id,
                         stage=Stage.OUTBOUND.value,
-                        channel_id=pt_name,
+                        channel_id=channel_id,
                         destination_name=pt_name,
                         handler_name=PASSTHROUGH_MARKER_HANDLER,
                         body_ref=None,
@@ -7660,7 +7682,7 @@ class SqlServerStore:
         ``Send``\\ s whose target is an internal **pass-through (PT) inbound**. For each, this produces —
         **in this same transaction** — a new INGRESS-stage child message on the PT channel (a content-
         addressed id; ``RECEIVED`` per count-and-log; correlated to the parent), plus a single already-
-        terminal outbound marker row on *this* (parent) message keyed by the PT inbound name, so the
+        terminal outbound marker row on *this* (parent) message sent to the PT inbound name, so the
         parent finalizes ``PROCESSED`` (delivered into the PT) rather than collapsing to ``FILTERED``. A
         ``correlation_depth`` breach drops the child and dead-letters the parent's marker (``ERROR``).
         Byte-identical to the pre-feature path when ``pt_deliveries`` is empty. Mirrors
@@ -7759,7 +7781,7 @@ class SqlServerStore:
                             inherits,
                         )
                         await self._insert_passthrough_marker_mssql(
-                            cur, message_id, pt_name, produced, now
+                            cur, message_id, channel_id, pt_name, produced, now
                         )
                     # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                     await self._inherit_attachments(cur, message_id, inherits)
@@ -7970,7 +7992,7 @@ class SqlServerStore:
                         inherits,
                     )
                     self._insert_passthrough_marker_mssql_sync(
-                        cur, message_id, pt_name, produced, now
+                        cur, message_id, channel_id, pt_name, produced, now
                     )
                 # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                 self._inherit_attachments_sync(cur, message_id, inherits)
@@ -17213,6 +17235,7 @@ class SqlServerStore:
         for cid, (read, errored) in counts.items():
             inbound[cid] = InboundMetrics(read=int(read), errored=int(errored or 0), last_at=None)
 
+        # A pass-through marker is not a delivery, so it is no edge either (BACKLOG #5614).
         dest_rows = await self._fetchall(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN (?,?) THEN 1 ELSE 0 END) AS queue_depth,"
@@ -17221,7 +17244,7 @@ class SqlServerStore:
             " MIN(CASE WHEN status=? THEN created_at END) AS oldest_pending_at,"
             " SUM(CASE WHEN status=? AND updated_at>=? THEN 1 ELSE 0 END) AS recent_done,"
             " MAX(CASE WHEN status=? THEN updated_at END) AS last_done_at"
-            " FROM queue WHERE stage=? GROUP BY channel_id, destination_name",
+            f" FROM queue WHERE stage=? AND {_NOT_PT_MARKER} GROUP BY channel_id, destination_name",
             (
                 OutboxStatus.PENDING.value,
                 OutboxStatus.INFLIGHT.value,
@@ -17268,7 +17291,7 @@ class SqlServerStore:
             "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
             " AS sum_seconds,"
             " COUNT(*) AS cnt"
-            " FROM queue WHERE stage=? AND status=?"
+            f" FROM queue WHERE stage=? AND status=? AND {_NOT_PT_MARKER}"  # BACKLOG #5614
             " GROUP BY channel_id, destination_name"
             " ORDER BY channel_id, destination_name"
         )

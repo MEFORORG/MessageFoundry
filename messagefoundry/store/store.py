@@ -14218,7 +14218,7 @@ class MessageStore:
         produces — **in this same transaction** — a new, independent INGRESS-stage child message on the
         PT channel (a content-addressed id; ``RECEIVED`` per count-and-log; correlated to this message),
         which the PT inbound's own router worker then re-routes. The Send-into-PT also stamps a single
-        **already-``done`` outbound marker row** on *this* (parent) message keyed by the PT inbound name,
+        **already-``done`` outbound marker row** on *this* (parent) message sent to the PT inbound name,
         so the parent finalizes ``PROCESSED`` (the Send was delivered — into the PT) and never collapses
         to ``FILTERED``. Atomicity makes "child produced" and "routed row consumed" one durable fact, so a
         crash/re-run is an idempotent no-op (the content-addressed child id + the guarded routed-row
@@ -14290,12 +14290,14 @@ class MessageStore:
                         now,
                         inherits,
                     )
-                    # The parent's disposition for this Send: a marker outbound row keyed by the PT
+                    # The parent's disposition for this Send: a marker outbound row sent to the PT
                     # inbound, already terminal (DONE = delivered into the PT, or DEAD = depth-cap
                     # breach → parent ERROR). It is never claimed (no delivery worker for a PT name;
                     # claims take PENDING rows only), so it is inert; it exists solely so the
                     # finalizer counts the Send as delivered/errored rather than collapsing FILTERED.
-                    await self._insert_passthrough_marker(message_id, pt_name, produced, now)
+                    await self._insert_passthrough_marker(
+                        message_id, channel_id, pt_name, produced, now
+                    )
                 # Every child's documents in one pass, after the children exist (BACKLOG #5099).
                 await self._inherit_attachments(message_id, inherits)
             # JSON-encode + apply each declared state write in the SAME transaction as the outbound
@@ -15469,11 +15471,11 @@ class MessageStore:
         return True
 
     async def _insert_passthrough_marker(
-        self, parent_id: str, pt_name: str, produced: bool, now: float
+        self, parent_id: str, channel_id: str, pt_name: str, produced: bool, now: float
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
-        A single ``stage='outbound'`` row keyed by the PT inbound name, inserted already-terminal: ``done``
+        A single ``stage='outbound'`` row sent to the PT inbound name, inserted already-terminal: ``done``
         when the child was produced (the Send was *delivered* into the PT → the parent finalizes
         ``PROCESSED``, not ``FILTERED``), or ``dead`` when the depth cap was breached (→ the parent
         finalizes ``ERROR``). It is **never claimed** — there is no delivery worker for a PT inbound name,
@@ -15483,7 +15485,11 @@ class MessageStore:
         ``dead`` event mirrors a normal outbound's so the hop is visible in the per-message timeline.
 
         ``handler_name`` carries :data:`PASSTHROUGH_MARKER_HANDLER`, which is how replay, dead-letter
-        replay, resend and the attachment clean-up tell this row from real outbound work (#1580)."""
+        replay, resend and the attachment clean-up tell this row from real outbound work (#1580).
+
+        ``channel_id`` is the parent's inbound, as on every outbound row the handoff writes, and only
+        ``destination_name`` names the PT inbound. So a dead marker is listed and counted in the
+        dead-letter view under the parent's channel scope, never the PT channel's (BACKLOG #5614)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
@@ -15498,7 +15504,7 @@ class MessageStore:
                 marker_id,
                 parent_id,
                 Stage.OUTBOUND.value,
-                pt_name,
+                channel_id,
                 pt_name,
                 PASSTHROUGH_MARKER_HANDLER,
                 self._cipher.encrypt(
@@ -15507,7 +15513,7 @@ class MessageStore:
                         row_id=marker_id,
                         message_id=parent_id,
                         stage=Stage.OUTBOUND.value,
-                        channel_id=pt_name,
+                        channel_id=channel_id,
                         destination_name=pt_name,
                         handler_name=PASSTHROUGH_MARKER_HANDLER,
                         body_ref=None,
@@ -22111,6 +22117,7 @@ class MessageStore:
 
         # Reads every outbound row the store holds (BACKLOG #1726, left open): no queue index carries
         # updated_at or the (channel, destination) pair, so no rewrite over the existing indexes helps.
+        # A pass-through marker is not a delivery, so it is no edge either (BACKLOG #5614).
         cur = await db.execute(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN (?,?) THEN 1 ELSE 0 END) AS queue_depth,"
@@ -22119,7 +22126,7 @@ class MessageStore:
             " MIN(CASE WHEN status=? THEN created_at END) AS oldest_pending_at,"
             " SUM(CASE WHEN status=? AND updated_at>=? THEN 1 ELSE 0 END) AS recent_done,"
             " MAX(CASE WHEN status=? THEN updated_at END) AS last_done_at"
-            " FROM queue WHERE stage=? GROUP BY channel_id, destination_name",
+            f" FROM queue WHERE stage=? AND {_NOT_PT_MARKER} GROUP BY channel_id, destination_name",
             (
                 OutboxStatus.PENDING.value,
                 OutboxStatus.INFLIGHT.value,
@@ -22167,7 +22174,7 @@ class MessageStore:
             "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
             " AS sum_seconds,"
             " COUNT(*) AS cnt"
-            " FROM queue WHERE stage=? AND status=?"
+            f" FROM queue WHERE stage=? AND status=? AND {_NOT_PT_MARKER}"  # BACKLOG #5614
             " GROUP BY channel_id, destination_name"
             " ORDER BY channel_id, destination_name"
         )

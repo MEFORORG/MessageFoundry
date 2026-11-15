@@ -189,6 +189,7 @@ from messagefoundry.pipeline.ingress_guards import (
     doc_ref_marker_refusal,
     ingress_encoding,
     peek_max_bytes,
+    reingress_body_error,
     reingress_size_error,
     streaming_over_threshold,
     strict_validate_timeout,
@@ -1407,26 +1408,65 @@ def _peek_read_fault(ic: InboundConnection, exc: Exception) -> str:
     return f"parse error: peek read failed ({type(exc).__name__})"
 
 
+def _unstorable_reply(body: str) -> str | None:
+    """Why ``body`` cannot be written as strict UTF-8, or ``None`` when it can (BACKLOG #5616): it
+    holds a lone surrogate, which no charset decode yields. At least the SQLite store and every
+    keyed store's cipher write text that way, and the re-ingress handoff writes the reply as a
+    child's raw. The reason names a position and never the character (``safe_exc``). The trial
+    encode is a C-speed pass, skipped for an ASCII body, and nothing is raised from the handler."""
+    if body.isascii():
+        return None
+    try:
+        body.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        return safe_exc(exc)
+    return None
+
+
+def _guard_loopback_body(ic: InboundConnection, body: str) -> str | None:
+    """:func:`reingress_body_error` inside the read-fault guard :func:`_peek_for_loopback` runs the
+    peek in (BACKLOG #5616): a guard that raises one of :data:`PEEK_READ_FAULTS` instead of its own
+    refusal is a recorded refusal, so the reply is an ERROR child and the lane drains. Outside this
+    guard such a fault escaped the re-ingress step, and the worker's fault arm re-pended the token at
+    the lane's head on every pass. Another exception type still takes the fault arm, as it does from
+    the peek. Only the exception TYPE is logged or recorded, as :func:`_peek_read_fault` does."""
+    try:
+        return reingress_body_error(ic, body)
+    except PEEK_READ_FAULTS as exc:
+        log.warning(
+            "loopback %r: a content guard on a re-ingressed reply raised %s; recording ERROR",
+            ic.name,
+            type(exc).__name__,
+        )
+        return f"ingress guard error: content check failed ({type(exc).__name__})"
+
+
 def _peek_for_loopback(
     ic: InboundConnection, body: str
-) -> tuple[str | None, str | None, str | None, bool]:
-    """Derive ``(control_id, message_type, summary, peek_failed)`` for a re-ingressed loopback body
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Derive ``(control_id, message_type, summary, refusal)`` for a re-ingressed loopback body
     (ADR 0013 Increment 2, Q5) — the re-ingress worker's parsing step, kept in ``pipeline/`` (not the
     store) so the store stays parsing-free, exactly as ``_handle_inbound`` peeks before
-    ``enqueue_ingress``. An HL7V2 loopback runs ``Peek.parse`` (``peek_failed=True`` on ``HL7PeekError``
+    ``enqueue_ingress``. An HL7V2 loopback runs ``Peek.parse`` (a refusal on ``HL7PeekError``
     or a faulting field read → the child is recorded RECEIVED→ERROR, not dropped); any other
     ``content_type`` (x12/text/json) is relayed verbatim as a ``RawMessage`` — no parse,
-    ``message_type`` = the content_type value."""
+    ``message_type`` = the content_type value. ``refusal`` is ``None`` when the body is admitted,
+    else the recorded reason: :data:`REINGRESS_PEEK_FAILED`, or the document-marker refusal both
+    listeners run on a parsed HL7 body (BACKLOG #5616). That refusal keeps the parsed fields, as the
+    listeners record it, and runs inside the read-fault guard, as theirs does, so a fault in it is
+    a recorded peek failure rather than an error that would re-pend the token at the lane's head."""
     if ic.content_type is ContentType.HL7V2:
         try:
-            fields = _read_ingress_fields(Peek.parse(body))
+            peek = Peek.parse(body)
+            fields = _read_ingress_fields(peek)
+            marker_refused = doc_ref_marker_refusal(peek, body)
         except HL7PeekError:
-            return None, None, None, True
+            return None, None, None, REINGRESS_PEEK_FAILED
         except PEEK_READ_FAULTS as exc:
             _peek_read_fault(ic, exc)
-            return None, None, None, True
-        return fields.control_id, fields.message_type, fields.summary, False
-    return None, ic.content_type.value, None, False
+            return None, None, None, REINGRESS_PEEK_FAILED
+        return fields.control_id, fields.message_type, fields.summary, marker_refused
+    return None, ic.content_type.value, None, None
 
 
 @dataclass
@@ -11744,8 +11784,8 @@ class RegistryRunner:
         inbound message (ADR 0013 Increment 2). Strict FIFO per loopback lane: claim the oldest
         ``Stage.RESPONSE`` token, peek the reply body for the loopback's ``content_type``, and hand it
         off **atomically** via :meth:`~messagefoundry.store.base.QueueStore.ingress_handoff` (which
-        produces the re-ingressed message + ingress row, depth-caps it, or errors a non-peekable or
-        oversize body).
+        produces the re-ingressed message + ingress row, depth-caps it, or errors a body the peek,
+        the size ceiling or a listener content guard refuses).
         Mirrors :meth:`_router_worker`'s claim / missing-inbound / backoff supervision. Re-ingress is an
         internal stage with no source of its own (``LoopbackSource`` is inert); under active-passive HA
         the whole graph (and thus this worker) runs on the leader ONLY, so a single node drains it."""
@@ -11835,16 +11875,40 @@ class RegistryRunner:
                 item.id, f"undecryptable re-ingress reply: {safe_exc(exc)}"
             )
             return _ItemOutcome.PROCESSED, None
+        unstorable = _unstorable_reply(body)
+        if unstorable is not None:
+            # BACKLOG #5616: a reply holding a lone surrogate. The guards' head sniff raised on one in
+            # the first characters of a text reply, and a refused child holds the reply (or its
+            # head) as its raw, which the handoff then fails to write. Either fault re-pended the
+            # token at the head of this FIFO lane on every pass. Checked before the size ceiling for
+            # that reason: an oversize refusal stores the head. Dead-letter the token instead, as
+            # the undecryptable arm above does; it keeps its reference for a replay, and the origin
+            # finalizes as that arm leaves it.
+            log.warning(
+                "response worker %r: reply body of %s cannot be stored (%s); dead-lettering",
+                name,
+                item.id,
+                unstorable,
+            )
+            await self.store.dead_letter_now(item.id, f"unstorable re-ingress reply: {unstorable}")
+            return _ItemOutcome.PROCESSED, None
         # BACKLOG #1914: the engine ceiling the listeners enforce (SEC-017), checked before the peek so
         # an oversize non-HL7 body is recorded ERROR with the listener's wording and never routed. An
         # HL7 body meets the same ceiling inside Peek.parse.
-        oversize = reingress_size_error(ic, body)
-        if oversize is None:
-            control_id, message_type, summary, peek_failed = _peek_for_loopback(ic, body)
+        # BACKLOG #5616: then at least the listener's content guards, which a loopback never ran
+        # (reingress_body_error and _peek_for_loopback list them). A refusal takes the peek_failed
+        # path below, so the reply is still recorded as an ERROR child, never dropped or routed.
+        refusal = reingress_size_error(ic, body) or _guard_loopback_body(ic, body)
+        if refusal is None:
+            control_id, message_type, summary, refusal = _peek_for_loopback(ic, body)
         else:
-            control_id, message_type, summary, peek_failed = None, ic.content_type.value, None, True
+            # An HL7 body a guard refused before the peek has no message type, as on the listener;
+            # the content type stands in for any other.
+            hl7 = ic.content_type is ContentType.HL7V2
+            control_id, message_type, summary = None, None if hl7 else ic.content_type.value, None
+        peek_failed = refusal is not None
         refused = None
-        if peek_failed:
+        if refusal is not None:
             # Vault BACKLOG #4796: the refused reply is charged to the loopback's refused-body
             # allowance, as a listener's refusal is. The charge is never refunded. At least a handoff
             # that stores no child (a depth-capped token, an origin that fails its row tag, or a
@@ -11857,7 +11921,7 @@ class RegistryRunner:
                 name,
                 body,
                 ic.content_type.value,
-                oversize or REINGRESS_PEEK_FAILED,
+                refusal,
                 cipher=self.store.cipher(),
             )
         produced = await self.store.ingress_handoff(

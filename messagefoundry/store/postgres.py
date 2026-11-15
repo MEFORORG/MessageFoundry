@@ -4509,12 +4509,18 @@ class PostgresStore:
         return True
 
     async def _insert_passthrough_marker_pg(
-        self, conn: Any, parent_id: str, pt_name: str, produced: bool, now: float
+        self,
+        conn: Any,
+        parent_id: str,
+        channel_id: str,
+        pt_name: str,
+        produced: bool,
+        now: float,
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
         Postgres twin of :meth:`MessageStore._insert_passthrough_marker`. A single ``stage='outbound'``
-        row keyed by the PT inbound name, inserted already-terminal: ``done`` when the child was produced
+        row sent to the PT inbound name, inserted already-terminal: ``done`` when the child was produced
         (→ parent finalizes ``PROCESSED``), or ``dead`` when the depth cap was breached (→ parent
         finalizes ``ERROR``). Never claimed (no delivery worker for a PT name; claims take ``pending``
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
@@ -4531,7 +4537,7 @@ class PostgresStore:
             marker_id,
             parent_id,
             Stage.OUTBOUND.value,
-            pt_name,
+            channel_id,
             pt_name,
             PASSTHROUGH_MARKER_HANDLER,  # the stamp replay keys on (BACKLOG #1580)
             self._cipher.encrypt(
@@ -4540,7 +4546,7 @@ class PostgresStore:
                     row_id=marker_id,
                     message_id=parent_id,
                     stage=Stage.OUTBOUND.value,
-                    channel_id=pt_name,
+                    channel_id=channel_id,
                     destination_name=pt_name,
                     handler_name=PASSTHROUGH_MARKER_HANDLER,
                     body_ref=None,
@@ -4865,7 +4871,7 @@ class PostgresStore:
         ``Send``\\ s whose target is an internal **pass-through (PT) inbound** (not an outbound). For
         each, this produces — **in this same transaction** — a new INGRESS-stage child message on the
         PT channel (a content-addressed id; ``RECEIVED`` per count-and-log; correlated to the parent),
-        plus a single already-terminal outbound marker row on *this* (parent) message keyed by the PT
+        plus a single already-terminal outbound marker row on *this* (parent) message sent to the PT
         inbound name, so the parent finalizes ``PROCESSED`` (the Send was delivered into the PT) rather
         than collapsing to ``FILTERED``. A ``correlation_depth`` breach drops the child and dead-letters
         the parent's marker (``ERROR``). Byte-identical to the pre-feature path when ``pt_deliveries`` is
@@ -4931,7 +4937,7 @@ class PostgresStore:
                             inherits,
                         )
                         await self._insert_passthrough_marker_pg(
-                            conn, message_id, pt_name, produced, now
+                            conn, message_id, channel_id, pt_name, produced, now
                         )
                     # Every child's documents in one pass, in content-address order (BACKLOG #5099).
                     await self._inherit_attachments(conn, message_id, inherits)
@@ -12157,6 +12163,7 @@ class PostgresStore:
         for cid, (read, errored) in counts.items():
             inbound[cid] = InboundMetrics(read=int(read), errored=int(errored or 0), last_at=None)
 
+        # A pass-through marker is not a delivery, so it is no edge either (BACKLOG #5614).
         dest_rows = await self._fetchall(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN ($1,$2) THEN 1 ELSE 0 END) AS queue_depth,"
@@ -12165,7 +12172,7 @@ class PostgresStore:
             " MIN(CASE WHEN status=$7 THEN created_at END) AS oldest_pending_at,"
             " SUM(CASE WHEN status=$8 AND updated_at>=$9 THEN 1 ELSE 0 END) AS recent_done,"
             " MAX(CASE WHEN status=$10 THEN updated_at END) AS last_done_at"
-            " FROM queue WHERE stage=$11 GROUP BY channel_id, destination_name",
+            f" FROM queue WHERE stage=$11 AND {_NOT_PT_MARKER} GROUP BY channel_id, destination_name",
             OutboxStatus.PENDING.value,
             OutboxStatus.INFLIGHT.value,
             OutboxStatus.DONE.value,
@@ -12212,7 +12219,8 @@ class PostgresStore:
             "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
             " AS sum_seconds,"
             " COUNT(*) AS cnt"
-            f" FROM queue WHERE stage=${n + 1} AND status=${n + 2}"
+            # A pass-through marker is not a delivery (BACKLOG #5614).
+            f" FROM queue WHERE stage=${n + 1} AND status=${n + 2} AND {_NOT_PT_MARKER}"
             " GROUP BY channel_id, destination_name"
             " ORDER BY channel_id, destination_name"
         )
