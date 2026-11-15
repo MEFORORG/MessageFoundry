@@ -361,7 +361,8 @@ class UiFetchMetadataMiddleware:
     NAVIGATIONS, which those callers never see.
 
     **A CROSS-SITE TOP-LEVEL NAVIGATION IS LEGITIMATE AND MUST PASS.** An intranet link into the
-    console is one; so is the OIDC callback. Without reading ``Sec-Fetch-Mode`` as well, every real
+    console is one; so is the OIDC callback when the IdP is on another site (a same-site IdP's return
+    falls under the same-site half below). Without reading ``Sec-Fetch-Mode`` as well, every real
     SSO login would 403 while every hermetic test still passed.
 
     **ABSENT IS ALLOWED, AND THAT IS THE LOAD-BEARING HALF.** ``Sec-Fetch-Site`` is browser-populated:
@@ -398,7 +399,7 @@ class UiFetchMetadataMiddleware:
     * ``SameSite=Strict`` strips the session cookie from every CROSS-site request, so a cross-site
       navigation reaches us with no authority and the carve-out costs nothing. It is also the half
       that must stay open -- an intranet link is one, and so is the IdP's redirect back to the OIDC
-      callback.
+      callback when the IdP is on another site.
     * It does NOT strip the cookie from a SAME-site request. "Site" ignores the port, so on the
       shipped loopback default ``http://127.0.0.1:9999`` is same-site to the console: a page there can
       script ``window.open`` at a /ui URL and the operator's cookie rides along. ``Sec-Fetch-User``
