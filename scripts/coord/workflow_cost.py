@@ -112,6 +112,11 @@ _FUNCTION_EXPR_RE = re.compile(r"(?:async\s+)?function\b\s*\*?\s*(?:[A-Za-z_$][\
 _ASYNC_RE = re.compile(r"async\b\s*")
 _NONSPACE_RE = re.compile(r"\S")
 _EXPORT_DEFAULT_RE = re.compile(r"(?<![\w$.])export\s+default\s+(?:async\s+)?$")
+# The same entry point written as an arrow, read up to its `=>`: the runtime calls it too.
+_ENTRY_ARROW_RE = re.compile(
+    r"(?:(?<![\w$.])export\s+default|(?<![\w$.])module\.exports\s*=)\s*(?:async\s+)?"
+    r"(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*$"
+)
 # `for (x of R)`, and `pipeline(R, ...)`, whose first argument is only ever iterated.
 _READ_PREFIX_RE = re.compile(r"(?:(?<![\w$.])(?:of|in)|(?<![\w$.])pipeline\s*\()\s*$")
 _CHANGES_RE = re.compile(r"\s*(?:" + _ASSIGN + r"|\+\+|--)")
@@ -306,6 +311,23 @@ class _MaskNotes:
     held_newlines: set[int] = field(default_factory=set)  # newlines inside a blanked span
 
 
+def _regex_close(src: str, start: int) -> int:
+    """Index of the `/` closing a regex literal opened at ``start``, or -1 if none on its line."""
+    n = len(src)
+    j = start + 1
+    while j < n and src[j] != "\n":
+        if src[j] == "\\":
+            j += 2
+            continue
+        if src[j] == "[":
+            while j < n and src[j] != "]" and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+        if src[j] == "/":
+            return j
+        j += 1
+    return -1
+
+
 def _template_end(src: str, start: int, interps: list[tuple[int, int]] | None = None) -> int:
     """Index just past the template literal whose opening backtick is at ``start``.
 
@@ -333,21 +355,41 @@ def _template_end(src: str, start: int, interps: list[tuple[int, int]] | None = 
 
 
 def _interp_end(src: str, start: int) -> int:
-    """Index of the ``}`` closing an interpolation whose body starts at ``start``, or ``len(src)``."""
+    """Index of the ``}`` closing an interpolation whose body starts at ``start``, or ``len(src)``.
+
+    The body is code, so it is lexed as ``_mask`` lexes code: a quote or brace inside a comment,
+    a string, a nested template or a regex literal is text and moves neither the scan nor the depth.
+    """
     n = len(src)
     depth = 0
+    prev = ""
     j = start
     while j < n:
         c = src[j]
+        if c == "/" and j + 1 < n and src[j + 1] == "/":
+            end = src.find("\n", j)
+            j = n if end == -1 else end
+            continue
+        if c == "/" and j + 1 < n and src[j + 1] == "*":
+            end = src.find("*/", j + 2)
+            j = n if end == -1 else end + 2
+            continue
         if c in "'\"":
             j += 1
             while j < n and src[j] != c and src[j] != "\n":
                 j += 2 if src[j] == "\\" else 1
-            j += 1
+            j, prev = j + 1, "x"
             continue
         if c == "`":
-            j = _template_end(src, j)
+            j, prev = _template_end(src, j), "x"
             continue
+        if c == "/" and _is_regex_position(prev):
+            closed = _regex_close(src, j)
+            if closed != -1:
+                j, prev = closed + 1, "x"
+                continue
+        if not c.isspace():
+            prev = c
         if c == "{":  # an object or block inside the interpolation
             depth += 1
         elif c == "}":
@@ -421,19 +463,7 @@ def _mask(src: str, notes: _MaskNotes | None = None) -> str:
             continue
 
         if c == "/" and _is_regex_position(prev):
-            j = i + 1
-            closed = -1
-            while j < n and src[j] != "\n":
-                if src[j] == "\\":
-                    j += 2
-                    continue
-                if src[j] == "[":
-                    while j < n and src[j] != "]" and src[j] != "\n":
-                        j += 2 if src[j] == "\\" else 1
-                if src[j] == "/":
-                    closed = j
-                    break
-                j += 1
+            closed = _regex_close(src, i)
             if closed != -1:
                 blank(i, closed + 1)
                 i, prev = closed + 1, "x"
@@ -984,6 +1014,8 @@ def _function_value_end(ctx: _Ctx, m: re.Match[str]) -> int:
     ``invoked`` set, because the construct itself calls it.
     """
     if m.group("arrow"):
+        if _ENTRY_ARROW_RE.search(ctx.code, max(0, m.start() - 200), m.start()):
+            return m.end()  # the module's entry point: the runtime calls it
         end = _arrow_body(ctx, m.end())[1]
         return m.end() if _invoked_in_place(ctx, end) else end
     if m.group("fn"):

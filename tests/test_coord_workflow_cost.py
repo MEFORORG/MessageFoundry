@@ -491,6 +491,14 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
             "const fmt = x => x + 1\nconst show = r => fmt(r)\nlog([1].map(show))\nawait agent(1)\n",
             1,
         ),
+        (
+            "an entry point written as an export default arrow",
+            "export default async () => {\n  const R = [1, 2, 3]\n"
+            "  await parallel(R.map(r => () => agent(r)))\n}\n",
+            3,
+        ),
+        ("an export default expression arrow", "export default () => agent(1)\n", 1),
+        ("a module.exports arrow", "module.exports = async (args) => { await agent(1) }\n", 1),
     ],
 )
 def test_shapes_the_helper_rules_must_not_misread(
@@ -510,6 +518,10 @@ def test_shapes_the_helper_rules_must_not_misread(
         ("an escaped quote before a brace", "${x ? '\\'{' : ''}"),
         ("a nested template holding a brace", "${x ? `{` : ''}"),
         ("a nested template with its own interpolation", "${x ? `a${'{'}b` : ''}"),
+        ("a quote inside a regex", '${JSON.stringify(x).replace(/"/g, "\'")}'),
+        ("an escaped brace inside a regex", "${s.replace(/\\{\\{/g, '')}"),
+        ("a brace in a regex class", "${s.replace(/[{]/g, '')}"),
+        ("a brace in a block comment", "${x /* { */}"),
     ],
 )
 def test_a_brace_inside_a_string_in_an_interpolation_does_not_mask_the_rest(
