@@ -170,6 +170,9 @@ that other account. Limb C of cell 6.8.1 under owner ruling R7.
   request is a separate control change, not part of this key change.
   *Superseded by Amendment 3, which also corrects this bullet: the pass never refreshed the flag for
   a certificate-only account, so the gap had no end rather than ending at the next pass.*
+  *Corrected 2026-11-14: the pass never writes the `disabled` flag for any account, so the flag is
+  not "as fresh as" the pass for any of them. The pass ends a directory account's live sessions,
+  and a certificate caller holds none.*
 
 ## Amendment 3 (2026-10-06): a directory account is asked about on every request (BACKLOG #2316)
 
@@ -178,6 +181,11 @@ reconciliation pass". That was false for this path. The reconciler probes only d
 that hold a live session, and a certificate caller holds none. So a certificate-only account was
 never probed, and its row's `disabled` flag and roles were never refreshed. A directory-side disable
 or group removal never reached the certificate path at all.
+
+*Corrected 2026-11-14: the reconciler never writes the `disabled` flag, for a probed account or any
+other. For a probed directory account it ends the live sessions after repeated absent, disabled or
+undetermined answers, and writes the roles only from an answer that reads the account present. A
+certificate-only account got neither, which is the gap above.*
 
 **Decision.**
 
