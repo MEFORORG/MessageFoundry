@@ -436,7 +436,9 @@ def test_leak_check_clean_and_dirty(
         synthetic_site_prefix + "0088"
     )  # a synthetic site code — no real prefix in this scanned file
     hits = leak_check(f"note mentioning ACMECORP and {site}")
-    assert any("acmecorp" in h.lower() for h in hits)  # estate token named
+    assert "estate token" in hits
+    # Reasons only: the estate token is never echoed into a reason that is raised and logged.
+    assert not any("acmecorp" in h.lower() for h in hits)
     assert any("site-code" in h.lower() for h in hits)  # field-anchored site-code pattern caught
 
 
@@ -451,7 +453,8 @@ def test_anonymize_checked_fails_closed_and_is_phi_safe(monkeypatch: pytest.Monk
     with pytest.raises(LeakError) as exc:
         anonymize_checked(dirty, salt=_SALT)
     message = str(exc.value)
-    assert "acmecorp" in message.lower()  # names the token category
+    assert "estate token" in message  # names the token category
+    assert "acmecorp" not in message.lower()  # but never the token itself (BACKLOG #5584)
     assert "DOE" not in message and "999" not in message  # never echoes the body
 
 

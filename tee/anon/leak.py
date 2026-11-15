@@ -133,21 +133,16 @@ def _ipv4_allow_list() -> re.Pattern[str] | None:
 
 
 def scan_text(text: str, *, include_estate: bool = False) -> list[str]:
-    """Forbidden-token **reasons** in ``text`` (no matched text) — vendored twin of
-    ``scan_forbidden.scan_text``. The site code is checked field-anchored by :func:`leak_check`, not
-    here (see the engine docstring)."""
-    reasons: list[str] = []
-    for pat, reason in forbidden_names():
-        if pat.search(text):
-            reasons.append(reason)
-    for m in _IPV4.finditer(text):
-        if not _ALLOWED_IP.match(m.group(0)):
-            reasons.append("routable IP address")
-            break
-    if include_estate:
-        lowered = text.lower()
-        reasons.extend(f"estate token ({token})" for token in estate_tokens() if token in lowered)
-    return reasons
+    """Forbidden-token **reasons** in ``text`` (no matched text), from
+    ``scan_forbidden.scan_text`` itself. The site code is checked field-anchored by :func:`leak_check`, not
+    here (see the engine docstring). With the guard loaded this IS the guard's scan, so the two cannot
+    drift (BACKLOG #5584); without it the name and estate tables are empty and only the IP check runs."""
+    if _GUARD is not None:
+        guarded: list[str] = _GUARD.scan_text(text, include_estate=include_estate)  # type: ignore[attr-defined]
+        return guarded
+    if any(not _ALLOWED_IP.match(m.group(0)) for m in _IPV4.finditer(text)):
+        return ["routable IP address"]
+    return []
 
 
 # --- structural PHI-shape detection over UNMAPPED fields (BACKLOG #331) ----------------------------
