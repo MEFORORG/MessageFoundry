@@ -31,6 +31,7 @@ from harness.scenarios._core import (
     _verify_sink,
     control_id_of,
 )
+from harness.sinks.file import UNSAFE_NAME
 
 
 @dataclass(frozen=True)
@@ -91,10 +92,11 @@ def verify_written(
     published directly inside the outbox."""
     problems: list[str] = []
     for record in records:
-        where = record.meta.get("relpath", "?")
-        if record.meta.get("symlink") == "true" or record.meta.get("refused") == NOT_REGULAR:
-            # Unread, so it carries no control id; a link, FIFO or device in the outbox is a
-            # problem whatever it names.
+        where = record.meta.get("relpath", record.meta.get("name", "?"))
+        refused = record.meta.get("refused")
+        if record.meta.get("symlink") == "true" or refused in (NOT_REGULAR, UNSAFE_NAME):
+            # Unread, so it carries no control id; a link, FIFO or device in the outbox, or a name
+            # the sink refused to join, is a problem whatever it names.
             problems.append(f"a link or other non-file entry appeared in the outbox ({where})")
             continue
         cid = control_id_of(record.payload)

@@ -73,10 +73,14 @@ def _unsafe_listed_name(name: str) -> bool:
     """Whether a name read back from a listing must not be joined onto its folder.
 
     On every platform: an empty name, ``.``, ``..``, or one holding a path separator or a NUL. On
-    Windows also: one holding a colon, which pathlib reads as a drive (``C:`` joins to the folder's
-    own drive, ``D:x`` to another drive) or which names an alternate data stream, and one
-    :func:`ntpath.isreserved` reports, which covers at least a trailing dot or space (Windows strips
-    it, so ``...`` reads as the folder itself) and a device name such as ``nul`` or ``NUL.txt``."""
+    Windows also: one holding a colon, which pathlib reads as a drive, so the join no longer names
+    the listed entry (``C:`` or ``D:x`` joins to the folder or to a path on that drive, depending on
+    which drive the folder is on) or which names an alternate data stream; and one
+    :func:`ntpath.isreserved` reports. That covers at least a trailing dot or space (Windows strips
+    it, so ``...`` reads as the folder itself) and ``nul``, which names the NUL device. It also
+    refuses ``NUL.txt`` because ``ntpath.isreserved`` reports it, and it over-refuses at least
+    ``COM1.hl7``, ``con.txt`` and ``aux.hl7``, which modern Windows treats as ordinary files: they
+    are recorded refused and unread, the fail-closed side."""
     if name in ("", ".", ".."):
         return True
     separators = {"/", "\\"} if _WINDOWS else {os.sep, os.altsep or os.sep}

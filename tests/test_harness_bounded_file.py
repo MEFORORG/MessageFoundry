@@ -330,7 +330,8 @@ def test_a_symlink_swapped_in_after_the_lstat_is_not_regular(
 
 
 _BAD_NAMES = ("", ".", "..", "a/b", "a\0b", "a\\b", "x.", "x ")
-#: Refused by Windows rules only: a drive or stream colon, and reserved device names.
+#: Refused by Windows rules only: a colon, and names `ntpath.isreserved` reports (`nul` is
+#: the NUL device; `NUL.txt` is refused only because `isreserved` reports it).
 _WINDOWS_BAD_NAMES = ("C:", "D:x", "a:b", "nul", "NUL.txt")
 
 
@@ -340,8 +341,8 @@ def test_the_file_sink_refuses_an_unsafe_listed_name_before_joining_it(
 ) -> None:
     """Each listed name passes ``_unsafe_listed_name`` before it is joined onto its folder. A name a
     real listing should never yield (empty, ``.``, ``..``, a separator, a NUL) or, by Windows rules,
-    one holding a colon or that Windows reserves (a trailing dot or space, a device name), which
-    would join to another drive, another entry or a device, is recorded
+    one holding a colon or that ``ntpath.isreserved`` reports (a trailing dot or space, ``nul``,
+    ``NUL.txt``), is recorded
     unread and refused, once, and never joined, entered or read. The names are mocked into the
     listing, since no filesystem here can create them."""
     from harness.sinks import file as file_sink
@@ -361,7 +362,8 @@ def test_the_file_sink_refuses_an_unsafe_listed_name_before_joining_it(
             with real(self.folder) as listing:
                 names = [entry.name for entry in listing]
             if Path(self.folder) == tmp_path:
-                # Never by POSIX rules on a Windows host, where `C:` would loop the walk.
+                # Never by POSIX rules on a Windows host, where `C:` would join to the folder
+                # or a path on that drive, depending on the folder's drive.
                 names += _BAD_NAMES + (_WINDOWS_BAD_NAMES if windows else ())
             return [_Entry(n) for n in names]
 

@@ -36,6 +36,7 @@ from harness.endpoints import Endpoints
 from harness.scenarios import SCENARIOS, run_scenario
 from harness.scenarios.remotefile import RemoteFileScenario, verify_written
 from harness.sinks import Record
+from harness.sinks import file as file_sink
 from harness.sinks._sftp_server import (
     _REFUSED_CHARS,
     INBOX,
@@ -558,3 +559,9 @@ def test_verify_written_catches_changed_bytes_and_a_misplaced_file() -> None:
     assert not result.ok and "non-file entry appeared in the outbox (L.hl7)" in result.detail
     fifo = Record(b"", {"relpath": "F.hl7", "inside": "true", "refused": NOT_REGULAR})
     assert not verify_written(scenario, [good, fifo], sent, "p").ok
+    # A listed name the sink refused before the join is unread too, so it fails the same way.
+    unsafe = Record(
+        b"", {"name": "nul", "folder": ".", "inside": "false", "refused": file_sink.UNSAFE_NAME}
+    )
+    result = verify_written(scenario, [good, unsafe], sent, "p")
+    assert not result.ok and "non-file entry appeared in the outbox (nul)" in result.detail
