@@ -177,13 +177,13 @@ def _token_re(helpers: list[str]) -> re.Pattern[str]:
 # bound to something computed from the literal rather than the literal.
 _CONTINUES = "?:.+-*%|&=<>,(["
 _POSTFIX = ("++", "--")
-# A line ending in one of these awaits an operand, so the expression goes on to the next line.
-_OPERATOR_TAIL = _CONTINUES + "/^!~"
 # A line opening with a binary operator continues the line before: no `;` is inserted ahead of one.
 # A bare `!` and a `++`/`--` open a new statement instead.
 _LEADS_ON_RE = re.compile("[" + re.escape(_CONTINUES + "/^") + r"]|!==?|(?:in|instanceof)(?![\w$])")
 # A code character after which an operand is expected: what follows it continues the expression.
 _EXPECTS_OPERAND = "(,=:?[&|!+-*/%<>~^"
+# A line ending in one of these awaits an operand, so the expression goes on to the next line.
+_OPERATOR_TAIL = _EXPECTS_OPERAND + "."
 # Keywords an operand follows, so a `++`/`--` after one is a prefix operator and not a postfix.
 _OPERAND_WORDS = frozenset(
     ["in", "instanceof", "typeof", "void", "delete", "new", "await", "yield"]
@@ -348,7 +348,13 @@ def _ends_postfix(text: str, at: int) -> bool:
         return False
     word, start = _word_ending_at(text, k)
     # `o.typeof++` increments a property that happens to share a keyword's name.
-    return word not in _OPERAND_WORDS or text[start - 1 : start] == "."
+    return word not in _OPERAND_WORDS or _is_property(text, start)
+
+
+def _is_property(text: str, start: int) -> bool:
+    """Whether the word starting at ``start`` follows a member dot, so it names a property."""
+    k = _prev_code(text, start)
+    return k >= 0 and text[k] == "." and text[k - 1 : k] != "."  # `...typeof x` spreads
 
 
 def _word_ending_at(text: str, k: int) -> tuple[str, int]:
@@ -765,7 +771,7 @@ def _line_continues(ctx: _Ctx, last: int, nxt: int) -> bool:
         return True
     # `typeof`/`in` await an operand too.
     word, start = _word_ending_at(raw, last)
-    if word in _LINE_OPERAND_WORDS and raw[start - 1 : start] != ".":
+    if word in _LINE_OPERAND_WORDS and not _is_property(raw, start):
         return True
     return leads
 
@@ -1111,7 +1117,19 @@ def _is_method_head(ctx: _Ctx, name_start: int, open_idx: int) -> bool:
             break
     if kind == "object":
         return k >= 0 and code[k] in "{,"
-    return k < 0 or code[k] not in _EXPECTS_OPERAND  # not inside a field's initializer
+    # Not in a field's initializer, and not a class expression's heritage held in one.
+    word, _ = _word_ending_at(code, k)
+    return not _awaits_operand(ctx, k) and word != "extends"
+
+
+def _awaits_operand(ctx: _Ctx, k: int) -> bool:
+    """Whether the code character at ``k`` is an operator still waiting for its operand.
+
+    Not a regex literal's closing ``/``, which the mask blanked, and not a postfix ``++``/``--``:
+    both end a value.
+    """
+    c = ctx.code[k]
+    return c in _EXPECTS_OPERAND and ctx.masked[k] == c and not _ends_postfix(ctx.code, k)
 
 
 def _prev_code(code: str, i: int) -> int:
@@ -1136,13 +1154,16 @@ def _enclosing_open(masked: str, i: int) -> int:
     return -1
 
 
-def _after_conditional(masked: str, colon: int) -> bool:
+def _after_conditional(ctx: _Ctx, colon: int) -> bool:
     """Whether the ``:`` at ``colon`` closes a conditional's ``?`` branch in the same statement.
 
-    Walks back over balanced brackets to the enclosing bracket or a ``;``. ``?.`` and ``??`` are
-    not a conditional's ``?``.
+    Walks back over balanced brackets to the enclosing bracket, a ``;``, or a line break where
+    ``_line_continues`` says a ``;`` is inserted, so an earlier statement's conditional does not
+    claim a later ``case`` or label. Each ``:`` passed on the way pairs with the next ``?``, so
+    ``case a ? 1 : 2:`` closes the ``case``. ``?.`` and ``??`` are not a conditional's ``?``.
     """
-    depth = 0
+    masked, code = ctx.masked, ctx.code
+    depth = pending = 0
     for k in range(colon - 1, -1, -1):
         c = masked[k]
         if c in _CLOSERS:
@@ -1153,10 +1174,18 @@ def _after_conditional(masked: str, colon: int) -> bool:
             depth -= 1
         elif depth == 0 and c == ";":
             return False
+        elif depth == 0 and c == "\n" and k not in ctx.held_newlines:
+            last, nxt = _prev_code(code, k), _NONSPACE_RE.search(code, k)
+            if last >= 0 and nxt is not None and not _line_continues(ctx, last, nxt.start()):
+                return False
+        elif depth == 0 and c == ":":
+            pending += 1
         elif depth == 0 and c == "?":
-            nxt, before = masked[k + 1 : k + 2], masked[k - 1 : k] if k else ""
-            if nxt not in ("?", ".") and before != "?":
-                return True
+            after, before = masked[k + 1 : k + 2], masked[k - 1 : k] if k else ""
+            if after not in ("?", ".") and before != "?":
+                if not pending:
+                    return True
+                pending -= 1
     return False
 
 
@@ -1184,7 +1213,7 @@ def _brace_kind(ctx: _Ctx, brace: int) -> str:
         word, start = _word_ending_at(code, k)
         if not word:
             break
-        if word == "class" and code[start - 1 : start] != ".":
+        if word == "class" and not _is_property(code, start):
             return "class"
         if word in _HEAD_STOP:
             break
@@ -1197,7 +1226,7 @@ def _brace_kind(ctx: _Ctx, brace: int) -> str:
         return "block"
     if c == ":":
         outer = _enclosing_open(masked, k)
-        if (outer != -1 and masked[outer] != "{") or _after_conditional(masked, k):
+        if (outer != -1 and masked[outer] != "{") or _after_conditional(ctx, k):
             return "object"  # a conditional's branch
         if outer == -1:
             return "block"  # a label
@@ -1206,7 +1235,9 @@ def _brace_kind(ctx: _Ctx, brace: int) -> str:
     word, _ = _word_ending_at(code, k)
     if word:
         return "object" if word in _EXPRESSION_WORDS else "block"
-    return "object"
+    # After an operator or a spread's dots an operand is due; after any other value, a `;` is
+    # inserted ahead of the `{` and it opens a block.
+    return "object" if c == "." or _awaits_operand(ctx, k) else "block"
 
 
 def _invoked_in_place(ctx: _Ctx, body_end: int) -> bool:

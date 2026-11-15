@@ -626,7 +626,11 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
         ("a value continued by a division", "const g = () => k\n / agent(1)\ng()\ng()\n", 2),
         ("a value continued by in", "const g = (o) => k\n in o[agent(1)]\ng(o)\ng(o)\n", 2),
         ("a line opening with a bare !", "const g = () => k\n!agent(1)\ng()\ng()\n", 1),
-        ("a line opening with a word starting in", "const g = () => k\ninner(agent(1))\ng()\n", 1),
+        (
+            "a line opening with a word starting in",
+            "const g = () => k\ninner(agent(1))\ng()\ng()\n",
+            1,
+        ),
         (
             "a division ending the line before ++",
             "const g = () => a /\n++n + agent(1)\ng()\ng()\n",
@@ -710,6 +714,83 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
             "a call then a bare block in a block",
             "function review(r) { return agent(r) }\nif (x) {\n  review(1)\n  {\n"
             "    log(2)\n  }\n}\n",
+            1,
+        ),
+        (
+            "a helper in the heritage of a class held in a class field",
+            "function review(r) { return agent(r) }\nawait review(0)\nclass Outer {\n"
+            "  Inner = class extends review(Object) {}\n}\n",
+            2,
+        ),
+        (
+            "a call then a bare block in a block after an array",
+            "function review(r) { return agent(r) }\nawait review(0)\nlet q = [1, 2]\n{\n"
+            "  review(1)\n  {\n    log(2)\n  }\n}\n",
+            2,
+        ),
+        (
+            "a call then a bare block in a block after a regex",
+            "function review(r) { return agent(r) }\nawait review(0)\nlet q = /a/\n{\n"
+            "  review(1)\n  {\n    log(2)\n  }\n}\n",
+            2,
+        ),
+        (
+            "a call then a bare block in a block after a postfix increment",
+            "function review(r) { return agent(r) }\nawait review(0)\nn++\n{\n"
+            "  review(1)\n  {\n    log(2)\n  }\n}\n",
+            2,
+        ),
+        (
+            "a case clause after a conditional in an earlier clause",
+            "function review(r) { return agent(r) }\nawait review(0)\nswitch (x) {\n"
+            "  case 1:\n    y = a ? b : c\n    break\n  case 2: {\n    review(1)\n    {\n"
+            "      log(2)\n    }\n  }\n}\n",
+            2,
+        ),
+        (
+            "a label after a conditional statement",
+            "function review(r) { return agent(r) }\nawait review(0)\nconst v = a ? b : c\n"
+            "outer: {\n  review(1)\n  {\n    log(2)\n  }\n}\n",
+            2,
+        ),
+        (
+            "a case label holding a conditional",
+            "function review(r) { return agent(r) }\nawait review(0)\nswitch (x) {\n"
+            "  case a ? 1 : 2: {\n    review(1)\n    {\n      log(2)\n    }\n  }\n}\n",
+            2,
+        ),
+        (
+            "an Allman object method in a nested conditional",
+            "function review(r) { return agent(r) }\nconst api = c ? d ? 1 : 2 : {\n  review(r)\n"
+            "  {\n    return 1\n  }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "an Allman object method in a multi-line conditional",
+            "function review(r) { return agent(r) }\nconst api = c\n  ? 1\n  : {\n  review(r)\n"
+            "  {\n    return 1\n  }\n}\nawait review(1)\n",
+            1,
+        ),
+        (
+            "a class method after a regex field",
+            "function review(r) { return agent(r) }\nawait review(0)\nclass A {\n"
+            "  pat = /a+/\n  review(r) { return 1 }\n}\n",
+            1,
+        ),
+        (
+            "a class method after a postfix field",
+            "function review(r) { return agent(r) }\nawait review(0)\nclass A {\n"
+            "  n = k++\n  review(r) { return 1 }\n}\n",
+            1,
+        ),
+        (
+            "a postfix property named like a keyword, spaced from its dot",
+            "const g = () => o. typeof++\n agent(1)\ng()\ng()\n",
+            1,
+        ),
+        (
+            "a property named in, spaced from its dot, ending the line",
+            "const g = () => o. in\n!agent(1)\ng()\ng()\n",
             1,
         ),
         (
