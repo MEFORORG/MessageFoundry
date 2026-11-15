@@ -30,10 +30,12 @@ nothing -- it reports what its argument costs.
 **A NAMED HELPER COSTS WHERE IT IS CALLED, NOT WHERE IT IS WRITTEN** (BACKLOG #5602). The body of
 ``function review(r) {...}`` or ``const review = r => ...`` is skipped by the linear scan and priced
 at each ``review(...)`` call, so a fan over the helper multiplies it. A helper defined twice or
-reassigned, a recursive call, and a helper passed as a value are unpriced terms. **An array's
-literal length is its width only while nothing can change it** (BACKLOG #5601): a spread element, a
-``push``, an index or ``.length`` assignment, a reassignment, or a second declaration of the name
-makes the fan over it an unpriced term.
+reassigned, a recursive call, and a helper passed as a value are unpriced terms. Any other function
+value -- an object property, a wrapped arrow, a method -- is skipped unless a fan, ``parallel()`` or
+``pipeline()`` invokes it, so its agents fall to the residue. **An array's literal length is its
+width only while nothing can change it** (BACKLOG #5601): a spread element, a second declaration, or
+any use of the name other than a provable read (an allowlist, not a list of mutators) makes the fan
+over it an unpriced term.
 
 **WHAT THIS IS NOT.** It is not the 90-percent Workflow gate, which lives in another repository and
 answers a different question -- *is the pool low enough for MY launch* -- correctly, per launcher.
@@ -105,10 +107,66 @@ _ASSIGN = r"(?:\*\*|\?\?|\|\||&&|>>>|>>|<<|[-+*/%&|^])?=(?![=>])"
 # Ending in a declaration keyword: the name that follows is being DECLARED, not assigned.
 _DECLARED_BEFORE_RE = re.compile(r"(?<![\w$.])(?:const|let|var|function\s*\*?)\s*$")
 _FUNCTION_DECL_RE = re.compile(r"(?<![\w$.])function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(")
-_BINDING_RE = re.compile(r"(?<![\w$.])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=(?![=>])\s*")
+_BINDING_RE = re.compile(r"(?<![\w$.])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=(?![=>])")
 _FUNCTION_EXPR_RE = re.compile(r"(?:async\s+)?function\b\s*\*?\s*(?:[A-Za-z_$][\w$]*)?\s*\(")
 _ASYNC_RE = re.compile(r"async\b\s*")
 _NONSPACE_RE = re.compile(r"\S")
+# `for (x of R)`, and `pipeline(R, ...)`, whose first argument is only ever iterated.
+_READ_PREFIX_RE = re.compile(r"(?:(?<![\w$.])(?:of|in)|(?<![\w$.])pipeline\s*\()\s*$")
+_CHANGES_RE = re.compile(r"\s*(?:" + _ASSIGN + r"|\+\+|--)")
+# Methods that read an array and cannot change its length. Any other use of the name -- passing
+# it to a function, aliasing it, a mutating method -- may change it (BACKLOG #5601), so the
+# literal's count stops being a width. An allowlist, because a list of mutators is never complete.
+_READS = frozenset(
+    [
+        "map",
+        "flatMap",
+        "forEach",
+        "filter",
+        "slice",
+        "join",
+        "includes",
+        "indexOf",
+        "lastIndexOf",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "some",
+        "every",
+        "reduce",
+        "reduceRight",
+        "concat",
+        "at",
+        "entries",
+        "keys",
+        "values",
+        "flat",
+        "toSorted",
+        "toReversed",
+        "toSpliced",
+        "with",
+        "toString",
+    ]
+)
+_KEYWORDS = frozenset(
+    ["if", "for", "while", "switch", "catch", "with", "return", "typeof", "await", "yield", "new"]
+)
+# Function values. Where nothing visible invokes them, their agents are left to the residue.
+_TAIL_PATTERN = (
+    r"|(?P<arrow>=>)"
+    r"|(?<![\w$.])(?P<fn>function)\b"
+    r"|(?<![\w$.])(?P<method>[A-Za-z_$][\w$]*)\s*\("
+)
+
+
+def _token_re(helpers: list[str]) -> re.Pattern[str]:
+    names = "|".join(re.escape(n) for n in sorted(helpers, key=len, reverse=True)) or "(?!)"
+    return re.compile(
+        _TOKEN_PATTERN + r"|(?<![\w$.])(?P<helper>" + names + r")\s*\(" + _TAIL_PATTERN
+    )
+
+
 # A line ending, or the next line starting, with one of these continues an expression-bodied arrow.
 _CONTINUES = "?:.+-*/%|&=<>,(["
 _META_NAME_RE = re.compile(r"name\s*:\s*['\"]([^'\"]+)['\"]")
@@ -183,7 +241,6 @@ class Cost:
 class _Helper:
     """A named function whose body costs nothing where it is written, only where it is called."""
 
-    name: str
     def_at: int  # offset of the name in its definition, which is not a reference
     body_start: int
     body_end: int
@@ -203,9 +260,8 @@ class _Ctx:
     def_names: set[int] = field(default_factory=set)
     helper_cache: dict[str, Cost] = field(default_factory=dict)
     helper_stack: list[str] = field(default_factory=list)
-    token_re: re.Pattern[str] = field(
-        default_factory=lambda: re.compile(_TOKEN_PATTERN + r"|(?P<helper>(?!))")
-    )
+    token_re: re.Pattern[str] = field(default_factory=lambda: _token_re([]))
+    interps: list[tuple[int, int]] = field(default_factory=list)
     # Offsets of every `agent` token, and every helper call, the pricer actually attributed to a
     # site. `_residue` reports the rest, so an unrecognised construct cannot contribute zero in
     # silence.
@@ -236,11 +292,12 @@ def _is_regex_position(prev: str) -> bool:
     return prev == "" or not (prev.isalnum() or prev in "_$)]}")
 
 
-def _mask(src: str) -> str:
+def _mask(src: str, interps: list[tuple[int, int]] | None = None) -> str:
     """Blank out comments, strings, template literals and regexes, PRESERVING length and newlines.
 
     Positions and line numbers in the masked text therefore address the original file exactly, so
-    findings can be reported against real line numbers without a second mapping.
+    findings can be reported against real line numbers without a second mapping. ``interps``, when
+    given, collects the span of every top-level ``${...}`` so the residue can still look inside.
     """
     out = list(src)
     n = len(src)
@@ -289,16 +346,21 @@ def _mask(src: str) -> str:
             # re-entering code mode mid-string, which desynchronises far more often than it helps.
             j = i + 1
             depth = 0
+            interp_start = 0
             while j < n:
                 if src[j] == "\\":
                     j += 2
                     continue
                 if src[j] == "$" and j + 1 < n and src[j + 1] == "{":
+                    if not depth:
+                        interp_start = j + 2
                     depth += 1
                     j += 2
                     continue
                 if src[j] == "}" and depth:
                     depth -= 1
+                    if not depth and interps is not None:
+                        interps.append((interp_start, j))
                     j += 1
                     continue
                 if src[j] == "`" and depth == 0:
@@ -402,22 +464,47 @@ def _declaration_count(ctx: _Ctx, name: str) -> int:
     return sum(1 for m in _word_re(name).finditer(ctx.masked) if _is_declared_at(ctx, m.start()))
 
 
-def _first_assignment(ctx: _Ctx, name: str, mutators: bool) -> int | None:
-    """Offset of the first line that can change what ``name`` holds, or None.
-
-    Its own declaration is not one. ``mutators`` adds the in-place array methods that change a
-    length, and index or ``.length`` assignment -- the shapes that make a literal's count a guess.
-    """
-    alts = [_ASSIGN]
-    if mutators:
-        alts += [
-            r"\.\s*(?:push|unshift|splice|pop|shift)\s*\(",
-            r"\.\s*length\s*" + _ASSIGN,
-            r"\[[^\]]*\]\s*" + _ASSIGN,
-        ]
-    pattern = re.compile(r"(?<![\w$.])" + re.escape(name) + r"\s*(?:" + "|".join(alts) + ")")
+def _first_assignment(ctx: _Ctx, name: str) -> int | None:
+    """Offset of the first assignment to ``name`` other than its declaration, or None."""
+    pattern = re.compile(r"(?<![\w$.])" + re.escape(name) + r"\s*" + _ASSIGN)
     for m in pattern.finditer(ctx.masked):
         if not _is_declared_at(ctx, m.start()):
+            return m.start()
+    return None
+
+
+def _is_read(ctx: _Ctx, i: int, end: int) -> bool:
+    """Whether the reference to an array name in ``[i, end)`` provably leaves its length alone."""
+    masked = ctx.masked
+    before = masked[max(0, i - 24) : i]
+    if before.rstrip().endswith("...") or _READ_PREFIX_RE.search(before):
+        return True
+    j = _skip_space(masked, end)
+    if masked.startswith("=>", j):  # a parameter of the same name: another binding
+        return True
+    if masked.startswith("?.", j):
+        j += 2
+    elif masked.startswith(".", j):
+        j += 1
+    elif masked.startswith("[", j):
+        close = _match_bracket(masked, j)
+        return close != -1 and not _CHANGES_RE.match(masked, close + 1)
+    else:
+        return False
+    method = _IDENT_RE.match(masked, _skip_space(masked, j))
+    if method is None:
+        return False
+    if method.group() == "length":
+        return not _CHANGES_RE.match(masked, method.end())
+    return method.group() in _READS and not masked.startswith(
+        ".", _skip_space(masked, method.end())
+    )
+
+
+def _first_unsafe_use(ctx: _Ctx, name: str) -> int | None:
+    """Offset of the first reference to ``name`` that is not a provable read, or None."""
+    for m in _word_re(name).finditer(ctx.masked):
+        if not _is_declared_at(ctx, m.start()) and not _is_read(ctx, m.start(), m.end()):
             return m.start()
     return None
 
@@ -452,21 +539,30 @@ def _collect_array_widths(ctx: _Ctx) -> tuple[dict[str, int], dict[str, str]]:
         if _declaration_count(ctx, name) > 1:
             unstable[name] = "is declared more than once in this file"
             continue
-        changed = _first_assignment(ctx, name, mutators=True)
+        changed = _first_unsafe_use(ctx, name)
         if changed is not None:
-            unstable[name] = f"is changed after its declaration, at line {ctx.line_of(changed)}"
+            unstable[name] = (
+                f"is used at line {ctx.line_of(changed)} in a way that may change its length"
+            )
     return {k: v for k, v in widths.items() if k not in unstable}, unstable
 
 
-def _skip_space(masked: str, i: int) -> int:
-    while i < len(masked) and masked[i].isspace():
+def _skip_space(text: str, i: int) -> int:
+    """First index at or after ``i`` that is not whitespace in ``text``.
+
+    Called with the RAW text wherever the question is "is there code here": the mask blanks a
+    string, template or regex to spaces, so skipping masked space would step over a literal body
+    and bind the next line of code to it.
+    """
+    while i < len(text) and text[i].isspace():
         i += 1
     return i
 
 
-def _expr_end(masked: str, i: int) -> int:
+def _expr_end(ctx: _Ctx, i: int) -> int:
     """End of an expression-bodied arrow starting at ``i``: a top-level ``;``/``,``/closer, or a
     line break that neither the line before nor the line after continues."""
+    masked, raw = ctx.masked, ctx.raw
     depth = 0
     for j in range(i, len(masked)):
         c = masked[j]
@@ -478,32 +574,48 @@ def _expr_end(masked: str, i: int) -> int:
             depth -= 1
         elif depth == 0 and c in ";,":
             return j
-        elif depth == 0 and c == "\n" and masked[i:j].strip():
-            nxt = _NONSPACE_RE.search(masked, j)
-            if masked[i:j].rstrip()[-1] not in _CONTINUES and (
+        elif depth == 0 and c == "\n" and raw[i:j].strip():
+            nxt = _NONSPACE_RE.search(raw, j)
+            if raw[i:j].rstrip()[-1] not in _CONTINUES and (
                 nxt is None or nxt.group() not in _CONTINUES
             ):
                 return j
     return len(masked)
 
 
-def _function_body(masked: str, open_paren: int) -> tuple[int, int] | None:
+def _function_body(ctx: _Ctx, open_paren: int) -> tuple[int, int] | None:
     """The block body of ``function NAME(params) {...}`` given its parameter ``(``."""
-    close = _match_bracket(masked, open_paren)
+    close = _match_bracket(ctx.masked, open_paren)
     if close == -1:
         return None
-    brace = _skip_space(masked, close + 1)
-    if brace >= len(masked) or masked[brace] != "{":
+    return _block_body(ctx, close + 1)
+
+
+def _block_body(ctx: _Ctx, i: int) -> tuple[int, int] | None:
+    """The inside of the ``{...}`` block starting at the first code at or after ``i``."""
+    brace = _skip_space(ctx.raw, i)
+    if brace >= len(ctx.masked) or ctx.masked[brace] != "{":
         return None
-    end = _match_bracket(masked, brace)
+    end = _match_bracket(ctx.masked, brace)
     return None if end == -1 else (brace + 1, end)
 
 
-def _bound_function_body(masked: str, i: int) -> tuple[int, int] | None:
+def _arrow_body(ctx: _Ctx, after_arrow: int) -> tuple[int, int]:
+    """The body of an arrow whose ``=>`` ends at ``after_arrow``: a block, or an expression."""
+    block = _block_body(ctx, after_arrow)
+    if block is not None:
+        return block
+    body = _skip_space(ctx.raw, after_arrow)
+    return body, _expr_end(ctx, body)
+
+
+def _bound_function_body(ctx: _Ctx, i: int) -> tuple[int, int] | None:
     """The body of the function expression or arrow starting at ``i``, if one starts there."""
+    masked = ctx.masked
+    i = _skip_space(ctx.raw, i)
     fn = _FUNCTION_EXPR_RE.match(masked, i)
     if fn:
-        return _function_body(masked, fn.end() - 1)
+        return _function_body(ctx, fn.end() - 1)
     asynk = _ASYNC_RE.match(masked, i)
     if asynk and not masked.startswith("=>", asynk.end()):  # `async => x` names a parameter
         i = asynk.end()
@@ -511,19 +623,39 @@ def _bound_function_body(masked: str, i: int) -> tuple[int, int] | None:
         close = _match_bracket(masked, i)
         if close == -1:
             return None
-        arrow = _skip_space(masked, close + 1)
+        arrow = _skip_space(ctx.raw, close + 1)
     else:
         ident = _IDENT_RE.match(masked, i)
         if not ident:
             return None
-        arrow = _skip_space(masked, ident.end())
+        arrow = _skip_space(ctx.raw, ident.end())
     if not masked.startswith("=>", arrow):
         return None
-    body = _skip_space(masked, arrow + 2)
-    if body < len(masked) and masked[body] == "{":
-        end = _match_bracket(masked, body)
-        return None if end == -1 else (body + 1, end)
-    return body, _expr_end(masked, body)
+    return _arrow_body(ctx, arrow + 2)
+
+
+def _is_statement_start(ctx: _Ctx, i: int) -> bool:
+    """Whether ``function`` at ``i`` begins a declaration rather than an expression in place.
+
+    ``R.map(function review(r) {...})`` names a function it never calls by name; registering it
+    as a helper would skip its body and price the fan at zero.
+    """
+    raw = ctx.raw
+    k = i - 1
+    while True:
+        newline = False
+        while k >= 0 and raw[k].isspace():
+            newline = newline or raw[k] == "\n"
+            k -= 1
+        if k < 0:
+            return True
+        w = k
+        while w >= 0 and (raw[w].isalnum() or raw[w] in "_$"):
+            w -= 1
+        if raw[w + 1 : k + 1] in ("async", "export", "default"):
+            k = w
+            continue
+        return raw[k] in ";{}" or (newline and raw[k] not in "(,=:?[&|!+-*/%<>~^")
 
 
 def _collect_helpers(ctx: _Ctx) -> None:
@@ -537,13 +669,13 @@ def _collect_helpers(ctx: _Ctx) -> None:
     found: dict[str, list[_Helper]] = {}
     bodies: list[tuple[int, int]] = []
     for m in _FUNCTION_DECL_RE.finditer(ctx.masked):
-        span = _function_body(ctx.masked, m.end() - 1)
+        span = _function_body(ctx, m.end() - 1) if _is_statement_start(ctx, m.start()) else None
         if span:
-            found.setdefault(m.group(1), []).append(_Helper(m.group(1), m.start(1), *span))
+            found.setdefault(m.group(1), []).append(_Helper(m.start(1), *span))
     for m in _BINDING_RE.finditer(ctx.masked):
-        span = _bound_function_body(ctx.masked, m.end())
+        span = _bound_function_body(ctx, m.end())
         if span:
-            found.setdefault(m.group(1), []).append(_Helper(m.group(1), m.start(1), *span))
+            found.setdefault(m.group(1), []).append(_Helper(m.start(1), *span))
 
     for name, defs in found.items():
         if name in _HOOKS:
@@ -554,14 +686,12 @@ def _collect_helpers(ctx: _Ctx) -> None:
         double_named = len(defs) - len(spans)
         if len(spans) > 1 or _declaration_count(ctx, name) - double_named > 1:
             ctx.ambiguous[name] = "is defined more than once in this file"
-        elif (at := _first_assignment(ctx, name, mutators=False)) is not None:
+        elif (at := _first_assignment(ctx, name)) is not None:
             ctx.ambiguous[name] = f"is reassigned at line {ctx.line_of(at)}"
         ctx.helpers[name] = defs[0]
         bodies.extend(spans)
     ctx.bodies = tuple(bodies)
-    if ctx.helpers:
-        names = "|".join(re.escape(n) for n in sorted(ctx.helpers, key=len, reverse=True))
-        ctx.token_re = re.compile(_TOKEN_PATTERN + r"|(?<![\w$.])(?P<helper>" + names + r")\s*\(")
+    ctx.token_re = _token_re(list(ctx.helpers))
 
 
 # --------------------------------------------------------------------------------------------
@@ -584,9 +714,10 @@ def _width_of(ctx: _Ctx, start: int, end: int) -> tuple[int | None, str]:
     if ctx.masked[lead] == "[":
         close = _match_bracket(ctx.masked, lead)
         if close != -1 and not ctx.masked[close + 1 : end].strip():
-            if _has_spread(ctx, _split_top_level(ctx, lead + 1, close)):
+            parts = _split_top_level(ctx, lead + 1, close)
+            if _has_spread(ctx, parts):
                 return None, "inline array built by spread"
-            return len(_split_top_level(ctx, lead + 1, close)), "inline array"
+            return len(parts), "inline array"
 
     m = _ARRAY_FROM_RE.match(seg)
     if m:
@@ -694,12 +825,13 @@ def _loop_head(ctx: _Ctx, after_kw: int) -> tuple[tuple[int, int] | None, int, i
     return subject, i, stop, stop
 
 
-def _price(ctx: _Ctx, start: int, end: int) -> Cost:
+def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
     """Price every agent-starting construct in ``[start, end)``.
 
     Nested constructs are consumed by the recursion, so nothing is counted twice: a ``.map()``
     inside a ``parallel()`` is priced once, by the ``.map()``, and ``parallel()`` merely reports
-    what its argument costs.
+    what its argument costs. ``invoked`` says the construct owning this region calls the function
+    values written in it -- a fan callback, a ``parallel()`` thunk, a ``pipeline()`` stage.
     """
     total = Cost()
     pos = start
@@ -744,9 +876,35 @@ def _price(ctx: _Ctx, start: int, end: int) -> Cost:
             pos = _resume_after_call(ctx, m.end() - 1, end)
             continue
 
+        if m.group("arrow") or m.group("fn") or m.group("method"):
+            pos = m.end() if invoked else max(m.end(), _function_value_end(ctx, m))
+            continue
+
         total = total + _price_loop(ctx, m)
         pos = _loop_head(ctx, m.end())[3]
     return total
+
+
+def _function_value_end(ctx: _Ctx, m: re.Match[str]) -> int:
+    """Where the scan resumes past a function value nothing in view invokes (BACKLOG #5602).
+
+    An ``agent()`` inside ``{ review: r => agent(r) }``, ``once(r => agent(r))`` or a method used
+    to be counted once where it was written and marked attributed, so a fan calling it read as
+    exact. Skipping the body leaves those agents to the residue, which names them; a named helper
+    is priced at its calls instead, and a fan callback or ``parallel()`` argument is scanned with
+    ``invoked`` set, because the construct itself calls it.
+    """
+    if m.group("arrow"):
+        return _arrow_body(ctx, m.end())[1]
+    if m.group("fn"):
+        fn = _FUNCTION_EXPR_RE.match(ctx.masked, m.start())
+        span = _function_body(ctx, fn.end() - 1) if fn else None
+        return span[1] if span else m.end()
+    if m.group("method") in _KEYWORDS:
+        return m.end()
+    close = _match_bracket(ctx.masked, m.end() - 1)
+    span = _block_body(ctx, close + 1) if close != -1 else None  # `review(r) { ... }`
+    return span[1] if span else m.end()
 
 
 def _resume_after_call(ctx: _Ctx, open_idx: int, end: int) -> int:
@@ -814,7 +972,7 @@ def _price_fan_call(ctx: _Ctx, m: re.Match[str], region_start: int, region_end: 
         why = "length" if spec else "length is not a literal"
         body = args[1] if len(args) > 1 else (open_idx + 1, close)
 
-    return _fan_cost(line, width, why, _price(ctx, body[0], body[1]), label)
+    return _fan_cost(line, width, why, _price(ctx, body[0], body[1], invoked=True), label)
 
 
 def _price_loop(ctx: _Ctx, m: re.Match[str]) -> Cost:
@@ -870,7 +1028,7 @@ def _price_hook(ctx: _Ctx, hook: str, name_start: int, open_idx: int, close: int
         # No multiplier of its own. Its argument is either a `.map()` (priced by _price_map) or a
         # literal list of thunks (priced element by element by the ordinary scan), so parallel()
         # simply reports what its argument costs. Multiplying here as well would double-count.
-        return _price(ctx, open_idx + 1, close)
+        return _price(ctx, open_idx + 1, close, invoked=True)
 
     if hook == "pipeline":
         return _price_pipeline(ctx, name_start, open_idx, close)
@@ -898,7 +1056,7 @@ def _price_pipeline(ctx: _Ctx, name_start: int, open_idx: int, close: int) -> Co
     width, why = _width_of(ctx, args[0][0], args[0][1])
     per_item = Cost()
     for lo, hi in args[1:]:
-        per_item = per_item + _price(ctx, lo, hi)
+        per_item = per_item + _price(ctx, lo, hi, invoked=True)
     label = f"pipeline(...) x {len(args) - 1} stages"
     return _fan_cost(ctx.line_of(name_start), width, why, per_item, label)
 
@@ -940,17 +1098,27 @@ def _residue(ctx: _Ctx) -> tuple[Unknown, ...]:
     happened to enumerate. ``ROWS.map(agent)`` passes the hook as a VALUE and matches no call
     pattern at all; this is what catches it, and ``ROWS.map(review)`` over a helper likewise.
     """
-    starters = "|".join(re.escape(n) for n in ("agent", "workflow", *ctx.helpers))
-    starts_agents = re.compile(r"(?<![\w$.])(?:" + starters + r")(?![\w$])")
-    words = [_AGENT_WORD_RE]
-    words += [
-        _word_re(name)
-        for name, h in ctx.helpers.items()
-        if starts_agents.search(ctx.masked, h.body_start, h.body_end)
-    ]
-    hits = sorted((m for word in words for m in word.finditer(ctx.masked)), key=lambda m: m.start())
+    # The helpers that can reach an agent, through any chain of helpers. A helper that starts
+    # nothing may be passed around freely; flagging it would bury the terms that matter.
+    reach = {"agent", "workflow"}
+    while True:
+        starts = re.compile(r"(?<![\w$.])(?:" + "|".join(map(re.escape, reach)) + r")(?![\w$])")
+        grown = {
+            n
+            for n, h in ctx.helpers.items()
+            if n not in reach and starts.search(ctx.masked, h.body_start, h.body_end)
+        }
+        if not grown:
+            break
+        reach |= grown
+    words = [_AGENT_WORD_RE] + [_word_re(n) for n in reach - {"agent", "workflow"}]
+    hits = [m for word in words for m in word.finditer(ctx.masked)]
+    # The mask blanks a template literal whole, so a call inside `${...}` is invisible to every
+    # pricer. Read the raw text there; an `agent` in a string inside one reads as a false hit,
+    # which costs a floor label rather than a silent under-count.
+    hits += [m for lo, hi in ctx.interps for m in starts.finditer(ctx.raw, lo, hi)]
     out: list[Unknown] = []
-    for m in hits:
+    for m in sorted(hits, key=lambda m: m.start()):
         if m.start() in ctx.attributed or m.start() in ctx.def_names:
             continue
         line_end = ctx.raw.find("\n", m.start())
@@ -988,7 +1156,8 @@ def workflow_name(source: str) -> str | None:
 
 def price_script(source: str) -> Cost:
     """Price one workflow script. The returned cost is EXACT only when ``.exact`` is true."""
-    ctx = _Ctx(raw=source, masked=_mask(source))
+    interps: list[tuple[int, int]] = []
+    ctx = _Ctx(raw=source, masked=_mask(source, interps), interps=interps)
     ctx.widths, ctx.unstable = _collect_array_widths(ctx)
     _collect_helpers(ctx)
     cost = _price(ctx, 0, len(ctx.masked))

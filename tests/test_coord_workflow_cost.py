@@ -350,12 +350,13 @@ def test_a_literal_whose_length_can_change_is_not_an_exact_width(
 
 
 def test_a_literal_nothing_changes_keeps_its_exact_width(mod: ModuleType) -> None:
-    """The negative control for #5601: reads, comparisons and arrows over the name stay exact."""
+    """The negative control for #5601: provable reads of the name keep the width exact."""
     script = (
         "const R = [1, 2, 3]\n"
-        "if (R.length == 3 && R !== other) { log(R[0]) }\n"
-        "const f = R => R\n"
-        "await parallel(R.map(r => () => agent(r)))\n"
+        "if (R.length == 3) { log(R[0], R?.join(', '), [...R]) }\n"
+        "for (const x of R) { log(x) }\n"
+        "const f = R => 1\n"
+        "await parallel(R.filter(Boolean) && R.map(r => () => agent(r)))\n"
     )
     cost = mod.price_script(script)
     assert cost.agents == 3
@@ -417,6 +418,86 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
     cost = mod.price_script(script)
     assert cost.agents == 6
     assert cost.exact
+
+
+@pytest.mark.parametrize(
+    ("label", "script", "agents"),
+    [
+        (
+            "a prompt-builder arrow whose body is a template",
+            "const prompt = r => `Review ${r}`\nconst R = [1, 2, 3]\n"
+            "await parallel(R.map(r => () => agent(prompt(r))))\nawait agent('one more')\n",
+            4,
+        ),
+        (
+            "a string constant just before a helper",
+            "const SYSTEM = `You review rows.`\n"
+            "async function review(r) { return agent(SYSTEM + r) }\n"
+            "const R = [1, 2, 3]\nawait parallel(R.map(r => () => review(r)))\n",
+            3,
+        ),
+        (
+            "a named function expression used in place",
+            "const R = [1, 2, 3]\nawait Promise.all(R.map(function review(r) { return agent(r) }))\n",
+            3,
+        ),
+        (
+            "a helper that starts nothing, passed as a value",
+            "const fmt = x => x + 1\nconst show = r => fmt(r)\nlog([1].map(show))\nawait agent(1)\n",
+            1,
+        ),
+    ],
+)
+def test_shapes_the_helper_rules_must_not_misread(
+    mod: ModuleType, label: str, script: str, agents: int
+) -> None:
+    """Regressions from review: the mask blanks literals, so body-finding reads the RAW text."""
+    cost = mod.price_script(script)
+    assert (cost.agents, cost.exact) == (agents, True), label
+
+
+@pytest.mark.parametrize(
+    ("label", "script"),
+    [
+        (
+            "an object property",
+            "const R = [1, 2, 3]\nconst h = { review: r => agent(r) }\n"
+            "await parallel(R.map(r => () => h.review(r)))\n",
+        ),
+        (
+            "a wrapped arrow",
+            "const R = [1, 2, 3]\nconst review = once(r => agent(r))\n"
+            "await parallel(R.map(r => () => review(r)))\n",
+        ),
+        (
+            "a method",
+            "const R = [1, 2, 3]\nclass X { review(r) { return agent(r) } }\n"
+            "await parallel(R.map(r => () => x.review(r)))\n",
+        ),
+        (
+            "a helper called inside a template interpolation",
+            "async function review(r) { return agent(r) }\nawait review(0)\n"
+            "const s = `${await review(1)} ${await review(2)}`\n",
+        ),
+        (
+            "an array filled through push.apply",
+            "const R = []\nR.push.apply(R, found)\nawait parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "an array filled through an alias",
+            "const R = []\nconst T = R\nT.push(1)\nawait parallel(R.map(r => () => agent(r)))\n",
+        ),
+        (
+            "an array handed to a function",
+            "const R = []\nfill(R)\nawait parallel(R.map(r => () => agent(r)))\n",
+        ),
+    ],
+)
+def test_a_function_value_or_array_this_read_cannot_trace_is_a_floor(
+    mod: ModuleType, label: str, script: str
+) -> None:
+    """Regressions from review: each of these priced exact and too low before the fix."""
+    assert not mod.price_script(script).exact, label
 
 
 def test_a_helper_that_is_never_called_is_reported_not_priced(mod: ModuleType) -> None:
@@ -563,7 +644,7 @@ def test_breaking_the_width_multiplication_collapses_the_example_to_the_naive_co
 def test_breaking_the_array_element_count_is_caught(mod: ModuleType) -> None:
     """The other half of the arithmetic: the width itself must come from the literal's length."""
     mutant = _mutate(
-        r'return len\(_split_top_level\(ctx, lead \+ 1, close\)\), "inline array"',
+        r'return len\(parts\), "inline array"',
         'return 1, "inline array"',
         "coord_workflow_cost_mutant2",
     )
@@ -598,7 +679,11 @@ def test_dropping_the_unstable_width_check_is_caught(mod: ModuleType) -> None:
 
 
 def test_dropping_helper_resolution_is_caught(mod: ModuleType) -> None:
-    """BACKLOG #5602's guard, mutation-proved: without it a six-wide helper fan prices at one."""
+    """BACKLOG #5602's count, mutation-proved: without call-site pricing the six agents are lost.
+
+    The function-value skip still leaves the body to the residue, so the mutant reads as a floor
+    rather than as exact; what it loses is the number, which is what resolution exists to give.
+    """
     mutant = _mutate(r"    _collect_helpers\(ctx\)\n", "", "cwc_mutant5")
     script = (
         "const R = [1, 2, 3, 4, 5, 6]\n"
@@ -606,8 +691,30 @@ def test_dropping_helper_resolution_is_caught(mod: ModuleType) -> None:
         "await parallel(R.map(r => () => review(r)))\n"
     )
     priced = mutant.price_script(script)
+    assert (priced.agents, priced.exact) == (0, False)
+    real = mod.price_script(script)
+    assert (real.agents, real.exact) == (6, True)
+
+
+def test_dropping_the_function_value_skip_is_caught(mod: ModuleType) -> None:
+    """BACKLOG #5602's residue guarantee, mutation-proved, for a function no helper rule names.
+
+    Without the skip an agent inside an object property is counted once where it is written and
+    marked attributed, so the six-wide fan that calls it reads as one agent, exact.
+    """
+    mutant = _mutate(
+        r"pos = m\.end\(\) if invoked else max\(m\.end\(\), _function_value_end\(ctx, m\)\)",
+        "pos = m.end()",
+        "cwc_mutant6",
+    )
+    script = (
+        "const R = [1, 2, 3, 4, 5, 6]\n"
+        "const h = { review: r => agent(r) }\n"
+        "await parallel(R.map(r => () => h.review(r)))\n"
+    )
+    priced = mutant.price_script(script)
     assert (priced.agents, priced.exact) == (1, True), "the mutant must reproduce the defect"
-    assert mod.price_script(script).agents == 6
+    assert not mod.price_script(script).exact
 
 
 # ------------------------------------------------------------------------------------------------
