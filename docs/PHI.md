@@ -736,8 +736,11 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    seal names a key the run does not hold, a pre-flight read finds it before any re-seal or cell
    pass writes, and the store pass aborts having written nothing, naming the tables and the seal
    key ids; the command exits 1 with nothing rolled or stamped. The read is not atomic against a
-   writer running alongside, so a seal such a writer makes during the run is refused after the
-   re-seal passes have committed, and that refusal says so; stop the engine first.
+   writer running alongside. The check after the re-seal passes catches only a seal such a writer
+   makes under a key the run does not hold, and that refusal says so. A seal it makes under a
+   retired key the run holds, as an engine still on the prior key would, is counted with the
+   refused records below and does not stop the run, so stop the engine before rotating and before
+   dropping the prior key.
    Supply that key and re-run, or remove a record no key you hold opens. A seal that fails under a
    key the run holds, or is malformed, does not stop it; the run notes it. When a start finds that the key in
    use differs from its stamp, or has none, and the record names that key or cannot be read, `serve`
