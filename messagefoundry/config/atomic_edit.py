@@ -30,7 +30,10 @@ its ownership is given back where Windows lets this account do that (it needs th
 enabled, which an elevated administrator holds but does not enable; otherwise the editor owns it, and
 a later edit by that editor makes the owner-only rewrite). An edit by the file's own account, or by an elevated administrator of a
 file Administrators owns, makes the owner-only rewrite: on Windows the one entry it leaves grants
-the editing account, not SYSTEM, Administrators or another reader.
+the editing account, not SYSTEM, Administrators or another reader. That holds only when this
+process's account can be read from its token and the list can be written. When the token cannot be
+read, no list is written, the edit logs it, and the file keeps what its staging directory gave it.
+When only the write fails, the ``store._secure_file`` fallback can leave more entries than one.
 A config file that is itself a link is refused rather than replaced: the rename would put a detached
 regular file where the link was and leave its target unedited.
 
@@ -423,7 +426,8 @@ def replace_validated(
     _fsync_dir(path.parent)
     if live.windows_owner is not None and _restrict_to_owner_and_editor(path, live.windows_owner):
         return
-    if sys.platform == "win32" and _restrict_to_editor(path):
+    # A failed hand-back still keeps the live owner's grant, as the candidate's list did.
+    if sys.platform == "win32" and _restrict_to_editor(path, owner=live.windows_owner):
         return
     _secure_file(path)
 
@@ -541,7 +545,8 @@ def _foreign_windows_owner(path: Path) -> str | None:
     """The SID of the account that owns ``path`` when that is not this process's account, else
     ``None``. ``None`` too when the owner, the token or the token's groups cannot be read, and for
     an owner many accounts hold, such as Users; the edit then makes the owner-only rewrite, which
-    grants the editing account alone.
+    grants the editing account alone where the token can be read (the module docstring says what
+    happens where it cannot).
 
     Administrators as the owner is this account's own when its token holds Administrators enabled:
     that is the default owner of an elevated administrator's files on Windows Server, and such a

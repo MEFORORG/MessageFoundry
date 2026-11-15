@@ -452,6 +452,31 @@ def test_a_file_another_account_owns_stays_that_accounts_on_windows(
 
 
 @windows_only
+def test_a_failed_hand_back_keeps_the_foreign_owners_grant_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When the owner-and-editor write after the rename fails, the fallback list must still name the
+    # account that owns the file, or that account could no longer read it (vault BACKLOG #5619).
+    import messagefoundry.restricted_file as restricted_mod
+    import messagefoundry.store.store as store_mod
+
+    path = tmp_path / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    owner = _real_owner(path)
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _EDITOR_SID)
+    monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
+    monkeypatch.setattr(atomic_edit, "_restrict_to_owner_and_editor", lambda _path, _owner: False)
+    secured: list[Path] = []
+    monkeypatch.setattr(atomic_edit, "_secure_file", secured.append)
+
+    atomic_edit.replace_validated(path, b"x = 1\n", _noop)
+
+    assert secured == []
+    assert [sid for *_, sid in protected_entries(path)[2]] == [owner, _EDITOR_SID]
+    assert path.read_bytes() == b"x = 1\n"
+
+
+@windows_only
 def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
