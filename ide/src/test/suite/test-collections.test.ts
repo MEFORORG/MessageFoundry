@@ -178,6 +178,38 @@ suite("testCollections.judgeCollectionRun — summaries carry no values", () => 
   });
 });
 
+// BACKLOG #5416: a case that expects no delivery must not pass when its rerun errored, because an
+// errored Router or Handler also delivers nothing, so the delivery compare alone reads it as a match.
+suite("testCollections.judgeCollectionRun — an errored rerun fails the case", () => {
+  const filtered = { name: "filtered", input: hl7(MSH("20200101010101", "C1"), "PID|1||A"), expected: [] };
+
+  test("control: an empty expectation with a clean, empty rerun passes", () => {
+    const run = judgeCollectionRun([filtered], [{ disposition: "filtered", error: null, deliveries: [] }]);
+    assert.strictEqual(run.summaries[0].pass, true);
+    assert.strictEqual(run.passed, 1);
+  });
+
+  test("a recorded Router or Handler error fails it", () => {
+    const run = judgeCollectionRun(
+      [filtered],
+      [{ disposition: "error", error: "router/handler error: boom", deliveries: [] }],
+    );
+    assert.strictEqual(run.summaries[0].pass, false);
+    assert.strictEqual(run.passed, 0);
+    assert.strictEqual(run.details[0].error, "router/handler error: boom");
+  });
+
+  test("an error disposition fails it even with no error text", () => {
+    const run = judgeCollectionRun([filtered], [{ disposition: "error", error: null, deliveries: [] }]);
+    assert.strictEqual(run.summaries[0].pass, false);
+  });
+
+  test("error text fails it whatever the disposition says", () => {
+    const run = judgeCollectionRun([filtered], [{ disposition: "filtered", error: "boom", deliveries: [] }]);
+    assert.strictEqual(run.summaries[0].pass, false);
+  });
+});
+
 // The host half of ADR 0121 "Reveal on click": which detail, if any, a caseDetail request gets.
 suite("testCollections.pickCaseDetail — the host answers only a request for a held case", () => {
   const details = [

@@ -218,7 +218,9 @@ export interface CollectionRunResult {
  * Judge every case of a collection against its rerun, and split each result in two: summaries, which
  * carry no `before`/`after` value and no error text, and details, which carry both (ADR 0121, "Reveal
  * on click"). `reruns[i]` is case `i`'s rerun, or `undefined` when the dry-run produced no row for it,
- * which fails the case.
+ * which fails the case. A rerun that recorded an error, or an `error` disposition, also fails it
+ * (BACKLOG #5416): an errored Router or Handler delivers nothing, so the delivery compare alone would
+ * pass a case that expects no delivery.
  */
 export function judgeCollectionRun(
   cases: readonly TestCase[],
@@ -230,9 +232,10 @@ export function judgeCollectionRun(
   cases.forEach((c, i) => {
     const rerun = reruns[i];
     const cmp = compareCase(c.expected, rerun ? rerun.deliveries : [], ignore);
+    const clean = rerun !== undefined && rerun.error === null && rerun.disposition.toLowerCase() !== "error";
     summaries.push({
       name: c.name,
-      pass: rerun ? cmp.pass : false,
+      pass: clean && cmp.pass,
       disposition: rerun?.disposition ?? "NO RESULT",
     });
     details.push({
