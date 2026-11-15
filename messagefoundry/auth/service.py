@@ -38,7 +38,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -16510,7 +16510,9 @@ class AuthService:
         **The directory lookup runs BEFORE the queue, never inside it.** It is a network round
         trip, and one slow lookup held in the queue would stall every attempt queued on that
         account. It only adds a refusal and counts nothing, so running it concurrently cannot let a
-        burst past the lock: the check that bounds the burst is the one inside the queue.
+        burst past the lock: the check that bounds the burst is the one inside the queue. That
+        in-queue read is also the one re-read after the lookup; the comment above the lookup's
+        call states the rule (BACKLOG #3780 item 2).
 
         The TOTP code is judged at the moment the request ARRIVED, not when it leaves the queue
         (``arrived``). Otherwise a caller who knows only the username could queue padded failures
@@ -16569,32 +16571,58 @@ class AuthService:
         # or recovery code and charges nothing to the lockout: the caller did not guess wrong, the
         # directory could not vouch for the account. This only ADDS a refusal; a confirmed
         # directory account meets the same lock and lockout feed. A local account is not asked.
-        current = await self._directory_vouches_for_factor(
-            token, user, event="auth.mfa_failed", client=client, report_lock=True
+        # BACKLOG #3780 item 2, THE ONE STATEMENT OF THIS RULE: no re-read follows the lookup here,
+        # because the in-queue re-read below is that read. Only the queue's acquisition awaits
+        # between the two, and nothing is spent before the in-queue read, so it still refuses,
+        # before any code is checked, a revocation, a disable or a lock the lookup let land. Only
+        # the lock refusal moves: it now comes after the in-queue ``totp_enabled`` and lapse
+        # checks, as it already did for a local account. The dropped read also supplied the queue's
+        # key, so a rename during the lookup was queued under the new name; the in-queue read now
+        # rejoins the queue under the new name instead, once (see below).
+        vouched = await self._directory_vouches_for_factor(
+            token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
-        if isinstance(current, Elevation):
-            return current
-        user = current
-        async with self._account_credential_lock(user.username):
-            # Read the session, the account and its lock again. The queue may have been a wait, so
-            # what was read before it may be stale: a session revoked meanwhile would still spend
-            # its code, and a lock set by the attempt ahead in the queue would go unseen. A session
-            # or account gone answers ``session_lost``, as the re-reads before and after this one
-            # do (BACKLOG #3068): the token no longer authenticates. Audited with the row
-            # :meth:`_factor_holder_current` writes (BACKLOG #3780), under the account's name as it
-            # is now when the row is still there (#2291 class). The account is read even when the
-            # session is gone, so a rename that came with the revocation names the row too.
-            session = await self._load_session(hash_token(token))
-            loaded = await self._load_user(user.id if session is None else session.user_id)
-            if session is None or loaded is None or loaded.disabled:
-                await self._audit_session_lost(
-                    "auth.mfa_failed",
-                    actor=(loaded or user).username,
-                    client=client,
-                    phase=None,
-                )
-                return Elevation(session_lost=True)
-            user = loaded
+        if isinstance(vouched, Elevation):
+            return vouched
+        async with AsyncExitStack() as queue:
+            queued_as = user.username
+            for may_rejoin in (True, False):
+                await queue.enter_async_context(self._account_credential_lock(queued_as))
+                # Read the session, the account and its lock again. The queue may have been a wait,
+                # and for a directory account the lookup came before it, so what was read before
+                # may be stale: a session revoked meanwhile would still spend its code, and a lock
+                # set by the attempt ahead in the queue would go unseen. A session or account gone
+                # answers ``session_lost``, as the re-reads after this one do (BACKLOG #3068): the
+                # token no longer authenticates. Audited with the row :meth:`_factor_holder_current`
+                # writes (BACKLOG #3780), under the account's name as it is now when the row is
+                # still there (#2291 class). The account is read even when the session is gone, so
+                # a rename that came with the revocation names the row too.
+                session = await self._load_session(hash_token(token))
+                loaded = await self._load_user(user.id if session is None else session.user_id)
+                if session is None or loaded is None or loaded.disabled:
+                    await self._audit_session_lost(
+                        "auth.mfa_failed",
+                        actor=(loaded or user).username,
+                        client=client,
+                        phase=None,
+                    )
+                    return Elevation(session_lost=True)
+                if not may_rejoin or (
+                    _credential_lock_key(loaded.username) == _credential_lock_key(queued_as)
+                ):
+                    user = loaded
+                    break
+                # A directory rename landed after the queue was keyed, so the queue held is one
+                # that attempts reading the new name do not join, and a burst split across the two
+                # can get one code check past the lockout (BACKLOG #1943). Leave it and queue under
+                # the name the row holds now; the reads above run again after that wait. ONCE: a
+                # second rename carries on in the queue then held, as a rename during the code
+                # check below does. Both windows stay open while the queue is keyed by name; the
+                # read this replaces, which ran before the queue, covered neither.
+                # Carried forward, so a refusal after the rejoin names the account as last read.
+                user = loaded
+                await queue.pop_all().aclose()
+                queued_as = loaded.username
             if not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
@@ -17025,11 +17053,17 @@ class AuthService:
         client: str | None,
         report_lock: bool,
         phase: str | None = None,
+        reread: bool = True,
     ) -> Elevation | VerifiedUser:
         """The directory check a leg runs before it marks a DIRECTORY account's factor met, with
         the re-read that must follow the lookup. Returns the refusal to hand back, or the account
         to carry on with: ``user`` itself for a local account, which is never asked and costs no
         read, or the row read afresh after a confirmed lookup.
+
+        **Except under ``reread=False``,** which skips that re-read and returns ``user`` itself, as
+        read BEFORE the lookup: nothing below about the re-read then holds, and the caller must
+        not use the returned row as fresh. Only :meth:`verify_mfa` passes it; the comment at its
+        call says why (BACKLOG #3780 item 2).
 
         The one copy of a block :meth:`verify_mfa` (BACKLOG #2023) and
         :meth:`finish_webauthn_assertion` (BACKLOG #2239) each used to spell out (BACKLOG #3068).
@@ -17066,6 +17100,8 @@ class AuthService:
                 detail["phase"] = phase
             await self._audit(event, actor=user.username, detail=_json(detail), client=client)
             return Elevation(directory_refusal=_directory_refusal(refusal))
+        if not reread:
+            return user
         return await self._factor_holder_current(
             token,
             actor=user.username,
