@@ -73,6 +73,7 @@ counters so the split cannot be mistaken for drift.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 
@@ -496,9 +497,16 @@ def test_connscale_reconcile_empty_run_clears_the_floor_trivially() -> None:
 # --- load runner _reconcile ----------------------------------------------------------------------
 
 
-def _poller(final: EngineSample) -> EnginePoller:
-    # A stub with just the two attributes _reconcile reads; cast once so call sites stay clean.
-    return cast(EnginePoller, SimpleNamespace(baseline=_BASE, final=final))
+def _poller(
+    final: EngineSample,
+    *,
+    samples: list[EngineSample] | None = None,
+    baseline: EngineSample | None = None,
+) -> EnginePoller:
+    # A stub with just the attributes _reconcile reads; cast once so call sites stay clean.
+    seq = [_BASE, final] if samples is None else samples
+    base = seq[0] if baseline is None else baseline
+    return cast(EnginePoller, SimpleNamespace(baseline=base, final=seq[-1], samples=seq))
 
 
 def test_load_reconcile_clean_run_is_exact() -> None:
@@ -728,14 +736,18 @@ def test_load_reconcile_a_total_blackout_is_caught() -> None:
     assert "dead ACK path" in result.detail
 
 
-def test_load_reconcile_a_run_that_sent_nothing_is_not_a_dead_ack_path() -> None:
+def test_load_reconcile_a_run_that_sent_nothing_is_inconclusive_not_a_dead_ack_path() -> None:
     # The other side of the `sent > 0` guard: a run that offered nothing has no reply to be missing,
-    # so it must not be failed for having none. Pins the guard against a `read >= 0`-style edit.
+    # so it is not reported as a dead ACK path. Nor is it zero loss: it measured nothing, so it is
+    # INCONCLUSIVE (BACKLOG #5574), which fails `ok` without the LOSS label.
     c = Counters(sent=0, acked=0, timeouts=0, sink_received=0)
     result = load_reconcile(
         c, _poller(_sample(read=0, written=0)), 1.0, tolerance=0, unconfirmed_budget=4
     )
-    assert result.ok, result.detail
+    assert not result.ok, result.detail
+    assert result.inconclusive
+    assert "dead ACK path" not in result.detail
+    assert "nothing was sent" in result.detail
 
 
 def test_load_reconcile_an_all_nak_run_is_not_a_dead_ack_path() -> None:
@@ -743,12 +755,14 @@ def test_load_reconcile_an_all_nak_run_is_not_a_dead_ack_path() -> None:
     # has a working ACK path and must not be reported as a dead one. (The run fails elsewhere — a
     # NAK rate SLO, and `max_nak_rate` deliberately has no sample floor — but not here, and not with
     # this detail.) Pins the `acked + nak == 0` form against a `counters.acked == 0` simplification.
+    # It delivered nothing, so it is INCONCLUSIVE rather than zero loss (BACKLOG #5574).
     c = Counters(sent=90, acked=0, nak=90, sink_received=0)
     result = load_reconcile(
         c, _poller(_sample(read=90, written=0)), 1.0, tolerance=0, unconfirmed_budget=4
     )
-    assert result.ok, result.detail
     assert "dead ACK path" not in result.detail
+    assert not result.ok and result.inconclusive, result.detail
+    assert "nothing was delivered" in result.detail
 
 
 def test_load_reconcile_merge_queue_ejection_counters_now_reconcile_clean() -> None:
@@ -952,3 +966,116 @@ def test_error_rate_slo_enforced_at_volume() -> None:
     checks = [c for c in slos if c.name.endswith("max_error_rate")]
     assert len(checks) == 1
     assert not checks[0].ok
+
+
+# --- load runner _reconcile: INCONCLUSIVE cases (BACKLOG #5574) ---------------------------------
+#
+# Each case below used to read as zero loss. None of them proves a loss either, so each is
+# INCONCLUSIVE: `ok` is False and `inconclusive` is True, so the zero_loss SLO fails and the render
+# says INCONCLUSIVE rather than LOSS. The clean control is the first test.
+
+
+def _staged(
+    *, read: int, written: int, in_pipeline: int = 0, uptime_s: float = 1.0
+) -> EngineSample:
+    return replace(_sample(read=read, written=written), in_pipeline=in_pipeline, uptime_s=uptime_s)
+
+
+_CLEAN = Counters(sent=90, acked=90, sink_received=90)
+
+
+def test_load_reconcile_clean_control_for_the_inconclusive_cases() -> None:
+    result = load_reconcile(
+        _CLEAN, _poller(_sample(read=90, written=90)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert result.ok and not result.inconclusive, result.detail
+
+
+def test_load_reconcile_rows_still_in_ingress_or_routed_are_not_zero_loss() -> None:
+    # The outbound backlog (pending + inflight) is 0, but 5 rows still sit in the ingress or routed
+    # stages. Read from the explicit fields, so this holds whether `EngineSample.backlog` means the
+    # outbound backlog or the whole pipeline.
+    result = load_reconcile(
+        _CLEAN,
+        _poller(_staged(read=90, written=90, in_pipeline=5)),
+        1.0,
+        tolerance=0,
+        unconfirmed_budget=4,
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "in_pipeline 5" in result.detail
+
+
+def test_load_reconcile_a_timed_out_drain_is_not_zero_loss() -> None:
+    # `drain_seconds is None` is the drain timing out; the final counts are a snapshot of a pipeline
+    # that never settled, so they cannot clear the run.
+    result = load_reconcile(
+        _CLEAN, _poller(_sample(read=90, written=90)), None, tolerance=0, unconfirmed_budget=4
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "drain timed out" in result.detail
+
+
+def test_load_reconcile_nothing_delivered_is_not_zero_loss() -> None:
+    c = Counters(sent=90, acked=90, sink_received=0)
+    result = load_reconcile(
+        c, _poller(_sample(read=90, written=0)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "nothing was delivered" in result.detail
+
+
+def test_load_reconcile_a_counter_reset_mid_run_is_inconclusive_not_loss() -> None:
+    # An external engine restarted mid-run: its cumulative counters began again from zero, so the
+    # final-minus-baseline deltas are meaningless. The old code read `read = 30 - 100 = -70` and
+    # called it "lost 160 on intake" -- a LOSS verdict resting on a negative counter delta.
+    base = _staged(read=100, written=100, uptime_s=500.0)
+    final = _staged(read=30, written=30, uptime_s=20.0)
+    c = Counters(sent=90, acked=90, sink_received=90)
+    result = load_reconcile(
+        c, _poller(final, samples=[base, final]), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "restarted" in result.detail
+    assert "lost" not in result.detail
+
+
+def test_load_reconcile_a_reset_hidden_by_regrowth_is_still_caught() -> None:
+    # The restart happened early enough that the counters grew back PAST the baseline by the final
+    # sample, so final - baseline looks sane. The reset shows only in the sample sequence: uptime
+    # and `read` both went backwards between two intermediate samples.
+    base = _staged(read=10, written=10, uptime_s=100.0)
+    before = _staged(read=50, written=50, uptime_s=105.0)
+    after = _staged(read=2, written=2, uptime_s=1.0)
+    final = _staged(read=100, written=100, uptime_s=10.0)
+    c = Counters(sent=90, acked=90, sink_received=90)
+    result = load_reconcile(
+        c,
+        _poller(final, samples=[base, before, after, final]),
+        1.0,
+        tolerance=0,
+        unconfirmed_budget=4,
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "restarted" in result.detail
+
+
+def test_load_reconcile_samples_before_the_baseline_are_not_read_as_a_reset() -> None:
+    # The poller's sample list may hold pre-baseline samples (calibration, preflight). Only the
+    # stretch from the baseline on is the run, so an older, higher reading does not count.
+    early = _staged(read=500, written=500, uptime_s=900.0)
+    base = _staged(read=0, written=0, uptime_s=1.0)
+    final = _staged(read=90, written=90, uptime_s=5.0)
+    poller = _poller(final, samples=[early, base, final], baseline=base)
+    result = load_reconcile(_CLEAN, poller, 1.0, tolerance=0, unconfirmed_budget=4)
+    assert result.ok, result.detail
+
+
+def test_load_reconcile_a_real_loss_is_labelled_loss_not_inconclusive() -> None:
+    # The LOSS label is kept for a proven shortfall, even when an inconclusive reason rides along.
+    result = load_reconcile(
+        _CLEAN, _poller(_sample(read=89, written=90)), None, tolerance=0, unconfirmed_budget=4
+    )
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "lost 1 on intake" in result.detail
+    assert "drain timed out" in result.detail

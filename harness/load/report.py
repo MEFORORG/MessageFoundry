@@ -15,16 +15,18 @@ import csv
 import io
 import json
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 from harness._spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from harness.load.enginepoll import EnginePoller
 from harness.load.metrics import Counters, Histogram, LatencySummary
 from harness.load.profile import LoadProfile, Phase, Slo
 
-SCHEMA_VERSION = 5  # 1→2: committed_txns + txn_per_message_measured; 2→3: body_copies +
+SCHEMA_VERSION = 6  # 1→2: committed_txns + txn_per_message_measured; 2→3: body_copies +
 # copies_per_message (the #207 sizing proxy — a COPY COUNT, never a byte figure; ADR 0141);
 # 3 to 4: totals.refused_sends (sends the harness refused to frame, ADR 0205 rule 1);
-# 4 to 5: the poller's own cost and txn_per_message_poller_removed (vault BACKLOG #2794)
+# 4 to 5: the poller's own cost and txn_per_message_poller_removed (vault BACKLOG #2794);
+# 5 to 6: no_loss.inconclusive (BACKLOG #5574)
 
 # Exit codes (shared with the CLI).
 EXIT_OK = 0
@@ -81,6 +83,10 @@ class NoLoss:
     #: `no-loss: OK` the normal shape of a contended CI log. Defaulted, so every existing positional
     #: construction is unchanged.
     heavily_stranded: bool = False
+    #: ``ok`` is False and nothing proved a loss: the run cannot clear itself (BACKLOG #5574) --
+    #: nothing sent or delivered, a timed-out drain, rows still in a stage, or an engine whose
+    #: cumulative counters reset mid-run. Rendered INCONCLUSIVE, not LOSS; it still fails zero_loss.
+    inconclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +261,7 @@ class RunReport:
             },
             "no_loss": {
                 "ok": self.no_loss.ok,
+                "inconclusive": self.no_loss.inconclusive,
                 "sent": self.no_loss.sent,
                 "engine_read": self.no_loss.engine_read,
                 "engine_written": self.no_loss.engine_written,
@@ -380,8 +387,9 @@ class RunReport:
             f"copies/msg ({e.db_backend or '?'}; NOT bytes): {copies} (body_copies={e.body_copies})"
         )
         nl = self.no_loss
+        verdict = "OK" if nl.ok else "INCONCLUSIVE" if nl.inconclusive else "LOSS"
         lines.append(
-            f"no-loss: {'OK' if nl.ok else 'LOSS'} — sent={nl.sent} engine_read={nl.engine_read} "
+            f"no-loss: {verdict} — sent={nl.sent} engine_read={nl.engine_read} "
             f"engine_written={nl.engine_written} sink_received={nl.sink_received} "
             f"backlog={nl.backlog} at_least_once={nl.at_least_once_redeliveries}"
         )
@@ -652,6 +660,26 @@ def _reconcile(
     read = final.read - base.read
     written = final.written - base.written
     backlog = final.backlog
+    # A restarted engine's cumulative counters begin again from zero, so final - baseline is no
+    # longer a run total: it can go negative (read as a huge intake "loss") or, once the counters
+    # regrow past the baseline, look plausible while undercounting. Either way no verdict rests on
+    # it (BACKLOG #5574). Read the whole sample run from the baseline on, not only its two ends, so
+    # a reset hidden by regrowth is still seen. At least this misses a restart of one shard of a
+    # cluster whose summed counters and max uptime both kept rising.
+    reset = _counter_reset(poller)
+    if reset is not None:
+        return NoLoss(
+            False,
+            sent,
+            read,
+            written,
+            sink_received,
+            backlog,
+            0,
+            f"engine counters went backwards ({reset}) — the engine restarted mid-run, so its "
+            f"cumulative read/written totals cannot be reconciled against this run's sends",
+            inconclusive=True,
+        )
     at_least_once = max(0, sink_received - written)
     # Only a SHORTFALL is loss; an excess is benign. Intake: read < sent means the engine never
     # received some messages we sent. Delivery: sink_received < written means a delivery the engine
@@ -789,8 +817,26 @@ def _reconcile(
     deliver_short = written - sink_received
     read_ok = read_short <= tolerance
     deliver_ok = deliver_short <= tolerance
-    drained = backlog == 0
-    ok = read_ok and deliver_ok and drained and not ack_path_dead
+    # Read the explicit fields rather than `backlog`, whose meaning (outbound only, or the whole
+    # pipeline) is not this function's to assume: drained needs BOTH no outbound row pending or
+    # inflight AND no not-done row in any stage, ingress and routed included (BACKLOG #5574).
+    outbound_backlog = final.pending + final.inflight
+    drained = outbound_backlog == 0 and final.in_pipeline == 0
+    lost = not read_ok or not deliver_ok or ack_path_dead
+    # Reasons the run cannot CLEAR itself even though no arm proved a loss (BACKLOG #5574). Each
+    # used to read as zero loss: the arms above are all inequalities that an empty, unsettled or
+    # undelivering run satisfies trivially.
+    unproven: list[str] = []
+    if sent == 0:
+        unproven.append("nothing was sent — the run measured nothing")
+    elif sink_received == 0:
+        unproven.append(
+            f"nothing was delivered (sink_received 0, engine_written {written}) — "
+            f"no delivery to reconcile"
+        )
+    if drain_seconds is None:
+        unproven.append("the drain timed out — the final counts are an unsettled snapshot")
+    ok = not lost and drained and not unproven
     parts: list[str] = []
     if not read_ok:
         parts.append(
@@ -806,8 +852,14 @@ def _reconcile(
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
-    if not drained:
-        parts.append(f"backlog {backlog} not drained")
+    if outbound_backlog:
+        parts.append(f"backlog {outbound_backlog} not drained")
+    if final.in_pipeline:
+        parts.append(
+            f"in_pipeline {final.in_pipeline} rows not done in some stage (ingress, routed or "
+            f"outbound) — not drained"
+        )
+    parts.extend(unproven)
     if heavily_stranded:
         # A NOTE, not a verdict: this no longer decides `ok`. It says the run is poorly confirmed —
         # most of what it offered was never replied to — which makes it a weak MEASUREMENT even
@@ -834,8 +886,41 @@ def _reconcile(
         )
     detail = "; ".join(parts) if parts else _NO_LOSS_ALL_CLEAR
     return NoLoss(
-        ok, sent, read, written, sink_received, backlog, at_least_once, detail, heavily_stranded
+        ok,
+        sent,
+        read,
+        written,
+        sink_received,
+        backlog,
+        at_least_once,
+        detail,
+        heavily_stranded,
+        inconclusive=not ok and not lost,
     )
+
+
+def _counter_reset(poller: EnginePoller) -> str | None:
+    """Name the first backwards step of a cumulative counter (``read``, ``written``) or of
+    ``uptime_s`` between consecutive samples from the baseline to the final one, or None.
+
+    Samples before the baseline (calibration, preflight) are not part of the run and are skipped;
+    if the baseline is not found by identity, only the two ends are compared."""
+    base, final = poller.baseline, poller.final
+    if base is None or final is None:
+        return None
+    samples = poller.samples
+    start = next((i for i, s in enumerate(samples) if s is base), None)
+    run = samples[start:] if start is not None else [base]
+    if run[-1] is not final:
+        run.append(final)
+    for prev, cur in pairwise(run):
+        if cur.read < prev.read:
+            return f"read {prev.read} -> {cur.read}"
+        if cur.written < prev.written:
+            return f"written {prev.written} -> {cur.written}"
+        if cur.uptime_s < prev.uptime_s:
+            return f"uptime_s {prev.uptime_s} -> {cur.uptime_s}"
+    return None
 
 
 def _engine_summary(
@@ -993,7 +1078,11 @@ def compare_to_baseline(
         if b_p99 > 0 and c_p99 > b_p99 * (1.0 + tolerance):
             out.append(f"{name}: e2e p99 regressed {c_p99:.1f} > {b_p99:.1f} ms")
     if _loss_ok(baseline) and not _loss_ok(current):
-        out.append("no-loss regressed: baseline had no loss, current run lost messages")
+        nl = current.get("no_loss")
+        if isinstance(nl, dict) and nl.get("inconclusive"):
+            out.append("no-loss regressed: baseline had no loss, current run is inconclusive")
+        else:
+            out.append("no-loss regressed: baseline had no loss, current run lost messages")
     return out
 
 
