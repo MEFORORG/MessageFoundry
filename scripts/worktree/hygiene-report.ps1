@@ -64,10 +64,10 @@
         -IdleHours, and without prune-merged.ps1's floor. Get-PrivateGitActivity reads the mtimes of
         index, HEAD, ORIG_HEAD, FETCH_HEAD, COMMIT_EDITMSG and MERGE_MSG in the admin dir the .git
         file names, and the timestamp in the last line of logs/HEAD, with no fallback to that file's
-        mtime when the line does not parse. It is NOT prune-merged.ps1's reading: WHEN NOTHING CAN BE
-        READ (no .git file, an unreadable one, no admin files and no parseable reflog line) and the
-        commit date is unknown too, it adds no reason and LETS THE TREE THROUGH, where prune-merged.ps1
-        holds a tree whose activity is unknown. Nor does it read the working tree (its top level and
+        mtime when the line does not parse. It is NOT prune-merged.ps1's reading: WHENEVER
+        Get-PrivateGitActivity returns nothing, only the commit date can hold the tree, so a tree whose
+        commit date is not inside -IdleHours is proposed, where prune-merged.ps1 holds a tree whose
+        activity is unknown. Nor does it read the working tree (its top level and
         test, lint and type-check caches), which prune-merged.ps1 and the nightly removal also hold a
         tree on, so a tree a session ran pytest or mypy in without git can still be proposed here;
       * `git status --porcelain --untracked-files=normal` is empty. An untracked `.venv` alone goes to
@@ -283,12 +283,19 @@ function Get-PrivateGitActivity([string]$Worktree) {
     $gitdir = $Matches[1].Trim()
     if (-not [System.IO.Path]::IsPathRooted($gitdir)) { $gitdir = Join-Path $Worktree $gitdir }
     $newest = $null
-    foreach ($name in @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')) {
-        $f = Join-Path $gitdir $name
-        if (Test-Path -LiteralPath $f -PathType Leaf) {
-            $t = [DateTimeOffset](Get-Item -LiteralPath $f).LastWriteTimeUtc
-            if (-not $newest -or $t -gt $newest) { $newest = $t }
+    # A file a git command deletes between Test-Path and Get-Item returns nothing rather than ending
+    # the report under its 'Stop' preference, as worktree-gates.ps1 Get-WorktreeActivity does.
+    try {
+        foreach ($name in @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')) {
+            $f = Join-Path $gitdir $name
+            if (Test-Path -LiteralPath $f -PathType Leaf) {
+                $t = [DateTimeOffset](Get-Item -LiteralPath $f -ErrorAction Stop).LastWriteTimeUtc
+                if (-not $newest -or $t -gt $newest) { $newest = $t }
+            }
         }
+    }
+    catch [System.Management.Automation.SessionStateException], [System.IO.IOException], [System.UnauthorizedAccessException] {
+        return $null
     }
     $reflog = Join-Path $gitdir 'logs/HEAD'
     if (Test-Path -LiteralPath $reflog -PathType Leaf) {

@@ -1317,12 +1317,29 @@ def test_the_working_tree_reading_refuses_an_unset_cache_list(tmp_path: Path) ->
     assert proc.stdout.strip() == "True|True", (proc.stdout, proc.stderr)
 
 
-def test_a_git_file_vanishing_mid_read_is_an_unknown_reading_not_a_crash(tmp_path: Path) -> None:
-    """BACKLOG #5603. A git command can delete ORIG_HEAD or MERGE_MSG between Get-WorktreeActivity's
-    Test-Path and its Get-Item. Under the callers' $ErrorActionPreference = 'Stop' that used to end
-    prune-merged mid -Apply loop with no receipt; it is an unknown reading now, which vetoes.
+#: What a stood-in Get-Item throws: a file a git command deleted after Test-Path saw it, and a drive
+#: that went away between the two.
+_GET_ITEM_FAILURES = {
+    "vanished-file": "[System.Management.Automation.ItemNotFoundException]::new('stub: deleted')",
+    "dropped-drive": "[System.Management.Automation.DriveNotFoundException]::new('stub: no drive')",
+}
 
-    The first call, before Get-Item is stood in for, is the control: the same tree reads a date."""
+#: Loads hygiene-report.ps1's Get-PrivateGitActivity alone, lifted from the script by its AST: the
+#: script runs a whole report when it is dot-sourced.
+_LIFT_PRIVATE_GIT_ACTIVITY = (
+    "$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:T_SCRIPT, [ref]$null, "
+    "[ref]$null); $fn = $ast.Find({ param($n) $n -is "
+    "[System.Management.Automation.Language.FunctionDefinitionAst] -and "
+    "$n.Name -eq 'Get-PrivateGitActivity' }, $true); . ([scriptblock]::Create($fn.Extent.Text)); "
+)
+
+
+def _read_with_get_item_failing(
+    tmp_path: Path, script: Path, load: str, call: str, throw: str
+) -> str:
+    """Run ``call`` on a linked worktree under $ErrorActionPreference = 'Stop', once as the control
+    and once with Get-Item throwing ``throw``. Prints ``<control read a value>|<second read>``, where
+    the second is True for an unknown reading and ``threw: ...`` when the throw escaped."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
@@ -1338,13 +1355,13 @@ def test_a_git_file_vanishing_mid_read_is_an_unknown_reading_not_a_crash(tmp_pat
         "-m",
         "seed",
     )
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", "-b", "linked", str(linked))
     command = (
-        "$ErrorActionPreference = 'Stop'; "
-        f". '{SCRIPT.parent / 'worktree-gates.ps1'}'; "
-        "$a = Get-WorktreeActivity -Path $env:T_REPO; "
-        "function global:Get-Item { throw [System.Management.Automation.ItemNotFoundException]::new("
-        "'stub: the file was deleted after Test-Path saw it') }; "
-        "try { $b = Get-WorktreeActivity -Path $env:T_REPO; $r = ($null -eq $b) } "
+        f"$ErrorActionPreference = 'Stop'; {load}"
+        f"$a = {call}; "
+        f"function global:Get-Item {{ throw {throw} }}; "
+        f"try {{ $b = {call}; $r = ($null -eq $b) }} "
         'catch { $r = "threw: $($_.Exception.Message)" }; '
         "'{0}|{1}' -f ($null -ne $a), $r"
     )
@@ -1353,11 +1370,47 @@ def test_a_git_file_vanishing_mid_read_is_an_unknown_reading_not_a_crash(tmp_pat
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, "T_REPO": str(repo)},
+        env={**os.environ, "T_TREE": str(linked), "T_SCRIPT": str(script)},
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == "True|True", (proc.stdout, proc.stderr)
+    return proc.stdout.strip()
+
+
+@pytest.mark.parametrize("failure", sorted(_GET_ITEM_FAILURES))
+def test_a_failed_git_file_read_is_an_unknown_reading_not_a_crash(
+    tmp_path: Path, failure: str
+) -> None:
+    """BACKLOG #5603. A git command can delete ORIG_HEAD or MERGE_MSG between Get-WorktreeActivity's
+    Test-Path and its Get-Item. Under the callers' $ErrorActionPreference = 'Stop' that used to end
+    prune-merged mid -Apply loop with no receipt; it is an unknown reading now, which vetoes.
+
+    The first call, before Get-Item is stood in for, is the control: the same tree reads a date."""
+    out = _read_with_get_item_failing(
+        tmp_path,
+        SCRIPT.parent / "worktree-gates.ps1",
+        ". $env:T_SCRIPT; ",
+        "Get-WorktreeActivity -Path $env:T_TREE",
+        _GET_ITEM_FAILURES[failure],
+    )
+    assert out == "True|True", out
+
+
+@pytest.mark.parametrize("failure", sorted(_GET_ITEM_FAILURES))
+def test_hygiene_reports_private_git_read_survives_a_failed_git_file_read(
+    tmp_path: Path, failure: str
+) -> None:
+    """BACKLOG #5603. hygiene-report.ps1's twin reader runs under the report's 'Stop' preference, so a
+    file deleted between its Test-Path and its Get-Item ended the whole report. It returns nothing
+    now, as the shared reader does. The first call is the control."""
+    out = _read_with_get_item_failing(
+        tmp_path,
+        SCRIPT.parent / "hygiene-report.ps1",
+        _LIFT_PRIVATE_GIT_ACTIVITY,
+        "Get-PrivateGitActivity $env:T_TREE",
+        _GET_ITEM_FAILURES[failure],
+    )
+    assert out == "True|True", out
 
 
 def test_a_cache_too_big_to_date_holds_the_tree(fx: Fixture, sleeper: int) -> None:

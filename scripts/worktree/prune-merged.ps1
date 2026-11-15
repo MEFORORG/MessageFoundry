@@ -130,7 +130,7 @@
     a FAILED fetch (merge decisions then rest on stale refs), a gh PR probe that errored, and every
     -Name-confirmed worktree. -Name is the one worth spelling out: it is -IdleHours 0 scoped to one
     tree, and since signal 1 has been measured vetoing 0 of 4 real siblings, `-Apply -Name <slug>` can
-    leave a candidate with no working occupancy signal at all. It stays available because there are
+    leave a candidate with only signal 2's unknown-reading veto. It stays available because there are
     legitimate uses, but it is never silent -- an operator who believes they are fenced when they are
     not is worse off than one who knows they aren't.
 
@@ -311,8 +311,9 @@ param(
     # THE COST IS FEWER REMOVALS, WHICH IS THE CHEAP DIRECTION. A false SKIP is a minor annoyance and
     # a false PRUNE destroys a session, so widening the veto trades nothing this script values.
     #
-    # 0 turns signal 2 OFF and the run says so in red -- and so does anything under the 12h floor,
-    # because only the literal 0 used to be declared: `-IdleHours 0.5`, typed for "half an hour",
+    # 0 lifts a recent signal 2 reading (an unknown one still vetoes) and the run says so in red --
+    # and so does anything under the 12h floor, because only the literal 0 used to be declared:
+    # `-IdleHours 0.5`, typed for "half an hour",
     # released every worktree on this repo and printed no warning at all.
     [double]$IdleHours = 72,
     # Liveness fence tolerance, passed through to the shared fence.
@@ -704,7 +705,7 @@ function Get-Decision {
     }
     elseif (-not $activityVeto) {
         $activityAge = [math]::Round(((Get-Date) - $activity).TotalHours, 2)
-        $notes += "activity veto OFF (-IdleHours 0); this worktree was touched $activityAge h ago"
+        $notes += "recent-activity veto lifted (-IdleHours 0); this worktree was touched $activityAge h ago"
     }
     else {
         $activityAge = [math]::Round(((Get-Date) - $activity).TotalHours, 2)
