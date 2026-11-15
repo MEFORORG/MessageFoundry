@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+import types
 from typing import Any
 
 import httpx
@@ -191,15 +192,16 @@ async def test_a_must_change_account_may_register_a_passkey_as_its_first_factor(
         assert r.status_code == 200 and "data-mf-webauthn-create" in r.text
 
 
-async def _counted_service(engine: Engine, budget: int) -> AuthService:
-    """A service whose sign-in limiter (control 2) admits ``budget`` attempts in all, whatever the
-    address, so a test reads what a request cost by spending the rest."""
+async def _counted_service(engine: Engine, budget: int, *, per_ip: int = 1000) -> AuthService:
+    """A service whose sign-in limiter (control 2) admits ``budget`` attempts in all, and ``per_ip``
+    from any one address, so a test reads what a request cost by spending the rest."""
     service = AuthService(
         engine.store,
         AuthSettings(
             mfa_verify_min_elapsed_seconds=0,
-            login_rate_limit_per_ip=1000,
+            login_rate_limit_per_ip=per_ip,
             login_rate_limit_global=budget,
+            login_rate_limit_window_seconds=60.0,
             admin_write_min_interval_seconds=0,
         ),
     )
@@ -208,9 +210,10 @@ async def _counted_service(engine: Engine, budget: int) -> AuthService:
 
 
 def _left(service: AuthService) -> int:
-    """Spend what is left of the sign-in budget, and say how much that was."""
+    """Spend what is left of the sign-in budget, and say how much that was. Each attempt comes
+    from an address of its own, so a per-address budget never stops the count short."""
     n = 0
-    while service.allow_login_attempt("probe") and n < 100:
+    while service.allow_login_attempt(f"probe-{n}") and n < 100:
         n += 1
     return n
 
@@ -272,52 +275,56 @@ async def test_a_staged_challenge_is_popped_by_the_sign_in_post_even_without_an_
     assert len(service._preauth_challenges) == 0
 
 
+@pytest.mark.parametrize("assertion", [None, "{}"], ids=["password-only", "with-assertion"])
 async def test_a_begin_leg_from_one_address_pays_for_the_sign_in_post_from_another(
-    engine: Engine,
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, assertion: str | None
 ) -> None:
-    """BACKLOG #3937 step 28: pins what ships. The begin leg charges control 2 under ITS address,
-    and ``POST /ui/login`` renews that hit without asking the POST's address, so a POST from B
-    carrying a handle A's begin leg staged, a password-only POST included, draws nothing from B's
-    per-address budget. A's hit stays counted, under A, and in the global budget. The begin leg had
-    already charged A and the global budget, as a POST from A would have, so an attacker holding
-    both addresses gains no attempt. A third party holding the handle cookie would spend A's hit
-    instead of its own. Whether the skip should require the two addresses to match is the
-    ledger row's decision; this test changes nothing either way.
+    """BACKLOG #3937 step 28: pins the SHIPPED behaviour, whose change is that row's open decision.
+    The begin leg charges control 2 under ITS address, and ``POST /ui/login`` renews that hit
+    without asking the POST's address, so a POST from B carrying a handle A's begin leg staged,
+    with or without an assertion, draws nothing from B's per-address budget. A's hit is moved to
+    the POST's moment, under A, and counts once in the global budget. The begin leg had already
+    charged A and the global budget, as a POST from A would have, so an attacker holding both
+    addresses gains no attempt; a third party holding the handle cookie would spend A's hit instead
+    of its own. If that decision requires the two addresses to match, this test is inverted with
+    it, not kept green.
 
-    RED when: the POST's skip of control 2 asks the POST's address, so B's budget is spent."""
-    service = AuthService(
-        engine.store,
-        AuthSettings(
-            mfa_verify_min_elapsed_seconds=0,
-            login_rate_limit_per_ip=1,
-            login_rate_limit_global=100,
-            admin_write_min_interval_seconds=0,
-        ),
+    RED when: the skip asks the POST's address (B's budget is spent); the renewal frees A's hit or
+    leaves it at the begin leg's moment (a later window finds A free); or the renewal leaves A's
+    hit out of the global budget, or counts it twice."""
+    clock = [1_000.0]
+    # The limiter module's own clock only, so no step can age out of the window under load.
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", types.SimpleNamespace(monotonic=lambda: clock[0])
     )
-    await service.initialize()
+    service = await _counted_service(engine, budget=5, per_ip=1)
+    # One app and two peers on it, so both browsers reach the one service and its limiter.
     app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
 
     def browser(address: str) -> httpx.AsyncClient:
         transport = httpx.ASGITransport(app=app, client=(address, 51234))
         return httpx.AsyncClient(transport=transport, base_url="http://t")
 
+    login = {"username": "nobody", "password": PW}
+    first = login if assertion is None else {**login, "passkey_assertion": assertion}
     async with browser("192.0.2.10") as a, browser("192.0.2.20") as b:
         begun = await a.post("/ui/login/passkey", headers=SAME_ORIGIN)
         assert begun.status_code == 200
-        handle = a.cookies.get(_COOKIE)
-        assert handle
-        b.cookies.set(_COOKIE, handle)
-        login = {"username": "nobody", "password": PW}
-        paid = await b.post("/ui/login", data=login)
+        b.cookies.update(a.cookies)  # the handle cookie, as the begin leg set it
+        assert b.cookies.get(_COOKIE)
+        clock[0] += 59
+        paid = await b.post("/ui/login", data=first)
         assert paid.status_code == 303 and paid.headers["location"] == "/ui/login?e=bad"
-        b.cookies.clear()
+        assert b.cookies.get(_COOKIE) is None, "the refusal did not clear the handle cookie"
         # B's one unit is still there: this POST spends it, and the next is refused.
         charged = await b.post("/ui/login", data=login)
-        assert charged.status_code == 303, "the paid POST drew on B's own budget"
+        assert charged.status_code == 303, "the shipped cross-address skip now charges B"
         refused = await b.post("/ui/login", data=login)
         assert refused.status_code == 429, "control 2 did not count B's own POST"
-    # A's begin-leg hit was moved, not released.
-    assert not service.allow_login_attempt("192.0.2.10"), "the renewal freed A's budget"
+    clock[0] += 2  # A's begin-leg stamp (t=0) has aged out; the hit the POST moved (t=59) has not
+    assert not service.allow_login_attempt("192.0.2.10"), "the renewal did not move A's hit"
+    # Global: A's one moved hit and B's charged POST; a refused attempt is not counted.
+    assert _left(service) == 3, "the renewal did not count A's hit once in the global budget"
 
 
 async def test_a_passkey_row_that_does_not_parse_is_the_uniform_refusal_on_ui_login(

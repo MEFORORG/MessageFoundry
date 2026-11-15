@@ -4167,7 +4167,10 @@ before it charges the sign-in limiter. Where the begin leg's hit is still in the
 MOVES that hit to now instead of charging a second one, so the sign-in is counted from the moment
 it is spent and a begin leg's budget cannot be spent in a later window. A challenge outlives the
 window (120 seconds against 60 by default); one whose hit has aged out is charged afresh, and so is
-a forged, expired or absent handle, which finds nothing. The path
+a forged, expired or absent handle, which finds nothing. The moved hit stays under the begin leg's
+client address, and the sign-in POST's own address is not asked, so a POST from another address
+that carries the handle draws nothing from that address's budget (whether the two must match is
+BACKLOG #3937 step 28's open decision). The path
 runs only when the account row read before any verify holds a discoverable passkey under the
 request's `rp_id`, and the sign-in lock does not refuse it, as it does not refuse option E's
 combined sign-in. The assertion must come from one of the named account's own passkeys under that
