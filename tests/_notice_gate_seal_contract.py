@@ -67,6 +67,7 @@ async def assert_notice_gate_reads_sealed_rows(store: Any, raw: RawSql) -> None:
     """Drive the gate over sealed and tampered records on ``store``'s backend. ``store`` must be
     keyed and hold no account on entry."""
     assert store.row_sealer() is not None, "the contract needs a store opened with a store key"
+    assert not await store.list_users(), "the contract needs a store that holds no account"
     alerts: list[str] = []
     service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
     await service.initialize()
@@ -79,7 +80,8 @@ async def assert_notice_gate_reads_sealed_rows(store: Any, raw: RawSql) -> None:
     refused = await _refuses(store, service, "a raw notify_email must not satisfy the gate")
     assert any("gate-addr" in a for a in alerts)  # the failing record was reported
     # The record still exists, so the refusal says one was left out rather than only "none exists".
-    assert "1 account record(s) failed their integrity check" in refused
+    assert "1 account record(s) could not be verified against their integrity seal" in refused
+    assert "whose record passes its integrity seal" in refused
     await store.delete_user("gate-addr")
     # Control: the same address through the store satisfies it.
     await _account(store, "gate-addr-ok", [admin])

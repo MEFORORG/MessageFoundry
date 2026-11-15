@@ -548,7 +548,7 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
-from messagefoundry.store.row_seal import probe_row_sealer_at_start
+from messagefoundry.store.row_seal import TransitSealUnavailableError, probe_row_sealer_at_start
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -11580,17 +11580,30 @@ async def _assert_security_notice_is_deliverable(
     so on a keyed store a ``notify_email``, a ``disabled`` flag or a ``user_roles`` row written
     outside the store would have passed this gate on an Administrator no seal covers. On a keyed
     store every field the gate weighs -- the address, the flag and the role rows -- now comes from a
-    record that passed its seal; one that fails is reported by the service, does not count, and is
-    named in the refusal, so the operator is not sent to ``provision-admin`` over an account that
-    exists. A keyless store has no seal, so there the rows are taken as read. One pass answers both
-    halves, from one snapshot. A Vault transit Outage raises out of the start, which is the
-    fail-closed answer: the gate cannot be settled without it.
+    record that passed its seal. One that fails, or that Vault transit cannot verify, is reported
+    by the service and does not count, and the refusal says how many were left out, so it does not
+    read as a store with no account at all. A keyless store has no seal, so there the rows are
+    taken as read. One pass answers both halves, from one snapshot. A Vault transit Outage leaves
+    the question unsettled: under ``enforce`` with the gate on it refuses, and otherwise it is one
+    WARNING, as the dials promise.
     """
     alerts = alerts_settings or AlertsSettings()
     # The two preconditions of the deliverability question. Either one false skips the refusal: the
     # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
     gated = auth_settings.notify_security_events and alerts.security_notifications_required
-    listed = await auth.list_checked_users()
+    enforcement = (security_settings or SecuritySettings()).enforcement
+    try:
+        listed = await auth.list_checked_users()
+    except TransitSealUnavailableError as exc:
+        detail = (
+            "the accounts could not be checked against their integrity seal because Vault transit "
+            "did not answer, so whether any security notice reaches an Administrator is unsettled. "
+            "Restore Vault transit and start again"
+        )
+        if gated and enforcement is SecurityEnforcement.ENFORCE:
+            raise RuntimeError(f"refusing to start a PHI instance: {detail}") from exc
+        _log.warning("the security-notice gate could not run: %s", detail)
+        return
     failed = sum(1 for entry in listed if entry.user is None)
     admins = [
         u
@@ -11600,12 +11613,12 @@ async def _assert_security_notice_is_deliverable(
     administrator_exists = bool(admins)
     if administrator_exists and (not gated or any(u.notify_email for u in admins)):
         return
-    # A record that fails its seal still exists, so the refusal must not read as a store with no
-    # account at all: it says how many were left out, which the seal-failure report names.
+    # A record left out still exists, so the refusal must not read as a store with no account at
+    # all: it says how many were left out, and the service's seal report names each one and why.
     left_out = (
-        f" {failed} account record(s) failed their integrity check and were not counted; the"
-        " integrity alert and audit row name each one, and an Administrator among them must be"
-        " resolved before this check can count it"
+        f" {failed} account record(s) could not be verified against their integrity seal and were"
+        " not counted; the seal-failure warning names each one and its cause. If an Administrator"
+        " is among them, resolve that record before creating another"
         if failed
         else ""
     )
@@ -11615,7 +11628,8 @@ async def _assert_security_notice_is_deliverable(
         # file, and is left as it is.
         where = str(Path(store.path).resolve()) if Path(store.path).is_file() else store.path
         detail = (
-            "no enabled Administrator exists in this store, so no enabled account holds the role "
+            f"no enabled Administrator{' whose record passes its integrity seal' if failed else ''} "
+            "exists in this store, so no enabled account holds the role "
             "that manages users and roles, and every out-of-band security notice about the most "
             "privileged accounts would reach nobody. The engine creates no account on its own. "
             f"{_PROVISION_ADMIN_HINT.format(store=where)}.{left_out}"
@@ -11636,7 +11650,6 @@ async def _assert_security_notice_is_deliverable(
             "pull-only /me/security-events feed in writing via "
             f"[alerts].security_notifications_required=false.{left_out}"
         )
-    enforcement = (security_settings or SecuritySettings()).enforcement
     if enforcement is SecurityEnforcement.ENFORCE:
         raise RuntimeError(f"refusing to start a PHI instance: {detail}")
     _log.warning("PHI instance with no deliverable security-notice recipient: %s", detail)
@@ -13182,9 +13195,10 @@ def create_managed_app(
                     security_notifier.start()
                 # BACKLOG #2131: before engine.start() for #1923's reason. On a first run no
                 # enabled Administrator exists yet, and the gate's refusal must stop startup before
-                # any connection starts rather than after. Both touch only the store: initialize()
-                # seeds the built-in roles and the gate reads the users through the service's
-                # checked list, which can write a seal-failure audit row and raise its alert. A refusal here also comes
+                # any connection starts rather than after. initialize() seeds the built-in roles;
+                # the gate reads the users through the service's checked list, which on a keyed
+                # store verifies each seal (a Vault transit call each under vault_transit) and can
+                # write a seal-failure audit row and raise its alert. A refusal here also comes
                 # before the start's opt-in audit-chain walk, so that walk cannot alert on such a
                 # start. Vault BACKLOG #3145 item 2 is declined: the walk runs inside engine.start(),
                 # and moving it ahead of this gate reorders the start whose failure paging

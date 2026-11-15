@@ -35,6 +35,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import TransitSealUnavailableError
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
 from tests._notice_gate_seal_contract import assert_notice_gate_reads_sealed_rows
@@ -247,6 +248,39 @@ async def test_the_contract_fails_when_no_seal_is_checked(
     monkeypatch.setattr(service_module, "user_seal_ok_async", _holds)
     with pytest.raises(pytest.fail.Exception):
         await _gate_contract(tmp_path / "unchecked.db")
+
+
+@pytest.mark.parametrize(
+    ("security", "alerts", "refuses"),
+    [
+        (_ENFORCE, AlertsSettings(security_notifications_required=True), True),
+        (_WARN, AlertsSettings(security_notifications_required=True), False),
+        (_ENFORCE, AlertsSettings(security_notifications_required=False), False),
+    ],
+)
+async def test_a_transit_outage_refuses_only_where_the_gate_enforces(
+    monkeypatch: pytest.MonkeyPatch,
+    security: SecuritySettings,
+    alerts: AlertsSettings,
+    refuses: bool,
+) -> None:
+    # BACKLOG #5629: the checked read can meet a Vault transit Outage. It leaves the question
+    # unsettled, so it refuses under enforce with the gate on, and is only a warning where the
+    # dials promise no more than one.
+    async def _outage(self: AuthService) -> None:
+        raise TransitSealUnavailableError("transit did not answer")
+
+    store = await _store_with_admin(email="ops@example.test")
+    try:
+        monkeypatch.setattr(AuthService, "list_checked_users", _outage)
+        if refuses:
+            with pytest.raises(RuntimeError) as exc:
+                await _call(store, security=security, alerts=alerts)
+            assert "Vault transit did not answer" in str(exc.value)
+        else:
+            await _call(store, security=security, alerts=alerts)  # must not raise
+    finally:
+        await store.close()
 
 
 def _phi_app(tmp_path: Path, *, security: SecuritySettings) -> FastAPI:
