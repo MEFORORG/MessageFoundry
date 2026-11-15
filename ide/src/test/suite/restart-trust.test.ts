@@ -3,12 +3,11 @@
 // Restart refuses a remote target and an untrusted workspace before it touches the filesystem
 // (BACKLOG #5566, PR 2966 hold).
 //
-// Restart checks `messagefoundry.serviceConfig` names a file before it stops the running engine, and
-// that check stats `path.resolve(workspace, <setting>)`. In an untrusted workspace the setting can come
-// from the repository's own `.vscode/settings.json`, and on Windows a UNC value makes that stat open
-// SMB, with NTLM, to a host the repository chose. So Restart carries Start's two refusals first.
+// Why the order matters is stated once, at the top of `restartEngine` in statusBar.ts.
 //
-// This drives the real `restartEngine` against a stubbed `vscode` and spied sync `fs` calls. It runs
+// This drives the real `restartEngine` against a stubbed `vscode` and spied sync `fs` calls. The spies
+// are installed only for Restart's synchronous part, which runs every check before its first await;
+// an async `fs` call is not spied, and nor is a sync one outside SPIED below. It runs
 // node-side only, as its siblings do: the Extension Host opens no folder and cannot shut workspace
 // trust (live-debug.test.ts records the same), so no untrusted workspace with the setting can exist
 // there. Each refusal is paired with a trusted control that DOES stat the configured path, so a
@@ -27,6 +26,7 @@ const UNC_SETTING = "\\\\attacker.invalid\\share\\messagefoundry.toml";
 const LOOPBACK = "https://127.0.0.1:8765";
 const REMOTE = "https://prod.example.com:8765";
 const TRUST_REFUSAL = "MessageFoundry: trust this workspace to let the IDE run the engine.";
+const REMOTE_REFUSAL = `MessageFoundry: ${REMOTE} is a remote engine — the IDE can only start a local (loopback) engine.`;
 
 let stubWorkspace: string | undefined;
 let stubTrusted = true;
@@ -139,7 +139,8 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     closeListeners.clear();
   });
 
-  /** The sync `fs` entry points a check could reach a path through; `existsSync` answers false. */
+  /** At least the sync `fs` entry points a check could reach a path through; `existsSync` answers
+   *  false. Not every one: a call through another is not recorded. */
   const SPIED = [
     "statSync",
     "lstatSync",
@@ -186,13 +187,17 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
         throw Object.assign(new Error(`ENOENT: stubbed ${name} '${String(p)}'`), { code: "ENOENT" });
       };
     }
+    let pending: Promise<void>;
     try {
-      await statusBar.EngineStatusBar.prototype.restartEngine.call(owner as never);
+      // Every check runs before Restart's first await, so the spies come off once this call returns,
+      // before the stop's wait and delay hand the event loop to anything else in the process.
+      pending = statusBar.EngineStatusBar.prototype.restartEngine.call(owner as never);
     } finally {
       for (const [name, original] of originals) {
         FS_MODULE[name] = original;
       }
     }
+    await pending;
     return { statted, stopped, started };
   }
 
@@ -211,9 +216,7 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     const run = await restart(REMOTE);
 
     assert.deepStrictEqual(run.statted, [], "Restart touched the filesystem before its target check");
-    assert.deepStrictEqual(notices, [
-      `MessageFoundry: ${REMOTE} is a remote engine — the IDE can only start a local (loopback) engine.`,
-    ]);
+    assert.deepStrictEqual(notices, [REMOTE_REFUSAL]);
     assert.strictEqual(run.stopped, false);
     assert.strictEqual(run.started, false);
   });
@@ -230,17 +233,16 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
 
   // With the setting unset there is no service config refusal, so only the two refusals stand
   // between a running engine and its stop: a Restart that got past them would act as Stop.
-  for (const [what, url, trusted] of [
-    ["an untrusted workspace", LOOPBACK, false],
-    ["a remote target", REMOTE, true],
+  for (const [what, url, trusted, notice] of [
+    ["an untrusted workspace", LOOPBACK, false, TRUST_REFUSAL],
+    ["a remote target", REMOTE, true, REMOTE_REFUSAL],
   ] as const) {
     test(`${what}, setting unset: Restart refuses and does not stop the engine`, async () => {
       stubSetting = undefined;
       stubTrusted = trusted;
       const run = await restart(url);
 
-      assert.deepStrictEqual(run.statted, []);
-      assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+      assert.deepStrictEqual(notices, [notice]);
       assert.strictEqual(run.stopped, false, "a refused Restart must not stop the engine");
       assert.strictEqual(run.started, false);
     });

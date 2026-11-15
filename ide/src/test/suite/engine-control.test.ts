@@ -699,8 +699,7 @@ suite("engine control — Start runs against the service TOML the fork guard jud
   });
 
   test("Restart refuses a remote target and an untrusted workspace before it stats the service config", () => {
-    // The service config check stats a path the workspace's own settings name, so in an untrusted
-    // workspace the repository picks it; a UNC value would open SMB to a host it names.
+    // Why: the comment at the top of restartEngine. restart-trust.test.ts drives the behaviour.
     const gatedFirst = (body: string): string | undefined => {
       const local = body.search(/if \(!isLocalEngine\(url\)\) \{\s*notify\([^;]*\);\s*return;/);
       const trusted = body.search(
