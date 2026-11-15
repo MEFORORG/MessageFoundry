@@ -643,18 +643,20 @@ async def _misses(service: AuthService, count: int, client: str | None) -> None:
         assert await service.logout(token, client=client, proven_at=None) == "nothing_to_revoke"
 
 
-async def _own_miss_rows(store: MessageStore) -> list[object]:
+async def _own_miss_rows(store: MessageStore, *, limit: int = _MISS_ROWS) -> list[object]:
     """The client address of each ``nothing_to_revoke`` row a miss wrote for itself, newest first."""
     return [
         client
-        for _, client, detail in await logout_entries(store, limit=_MISS_ROWS)
+        for _, client, detail in await logout_entries(store, limit=limit)
         if detail.get("outcome") == "nothing_to_revoke"
     ]
 
 
-async def _counted(store: MessageStore) -> list[tuple[object, object, object]]:
+async def _counted(
+    store: MessageStore, *, limit: int = _MISS_ROWS
+) -> list[tuple[object, object, object]]:
     """Each count row, oldest first, as its actor, client address and ``count``."""
-    entries = await logout_entries(store, limit=_MISS_ROWS)
+    entries = await logout_entries(store, limit=limit)
     return [
         (actor, client, detail.get("count"))
         for actor, client, detail in reversed(entries)
@@ -731,6 +733,57 @@ async def test_a_flood_from_many_sources_stops_at_the_aggregate_and_is_counted(
     counts = [n for _, _, n in await _counted(store)]
     assert counts == [1, 2], "the misses past the bound were not all counted"
     assert (await _own_miss_rows(store))[0] == "192.0.2.81", "a new window wrote no row"
+
+
+async def _flood(service: AuthService) -> int:
+    """Caller-less misses from more sources than the aggregate admits, each past its share, then
+    from callers with no address, all in one window. Returns how many misses were sent."""
+    sources = _LOGOUT_MISS_ROWS_ALL // _LOGOUT_MISS_ROWS_PER_SOURCE + 5
+    for n in range(sources):
+        await _misses(service, 2 * _LOGOUT_MISS_ROWS_PER_SOURCE, f"2001:db8::{n:x}")
+    await _misses(service, 2 * _LOGOUT_MISS_ROWS_PER_SOURCE, None)
+    return (sources + 1) * 2 * _LOGOUT_MISS_ROWS_PER_SOURCE
+
+
+async def test_every_miss_of_a_flood_is_written_or_counted_and_the_bound_is_what_holds_it(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    miss_clock: list[float],
+) -> None:
+    """BACKLOG #3749 item 6, carried on #4735 step 1: the bound on the ``auth.logout`` rows that
+    sign-outs naming no caller and ending nothing can append, as ``/ui/logout``'s are, with a
+    control. RED when: a flood in one window writes more of its own rows than the aggregate, or a
+    miss is neither its own row nor in a count row once the next window's first miss has written
+    the count. The NEGATIVE CONTROL runs the same flood with the bound lifted, on a store of its
+    own, and reads one row per miss through the same reader, so the reader can see a flood the
+    bound does not hold, and the first assertion fails on code without the bound."""
+    unbounded_store = await MessageStore.open(tmp_path / "unbounded.db")
+    try:
+        unbounded = await _service(unbounded_store)
+        monkeypatch.setattr(unbounded, "_admit_logout_miss_row", lambda client: True)
+        sent = await _flood(unbounded)
+        assert len(await _own_miss_rows(unbounded_store, limit=2 * sent)) == sent
+        assert await _counted(unbounded_store, limit=2 * sent) == []
+    finally:
+        await unbounded_store.close()
+
+    service = await _service(store)
+    sent = await _flood(service)
+    assert sent > _LOGOUT_MISS_ROWS_ALL, "the flood must pass the aggregate to test it"
+    assert len(await _own_miss_rows(store, limit=2 * sent)) == _LOGOUT_MISS_ROWS_ALL
+    # The count row is written on the leading edge only, so the misses after the first one past
+    # the bound wait for the next window's first miss, which also writes its own row.
+    miss_clock[0] += _LOGOUT_MISS_ROW_WINDOW_SECONDS + 1
+    await _misses(service, 1, "192.0.2.99")
+    sent += 1
+    own = await _own_miss_rows(store, limit=2 * sent)
+    counts = await _counted(store, limit=2 * sent)
+    assert own[0] == "192.0.2.99"
+    assert [(actor, client) for actor, client, _ in counts] == [(None, None), (None, None)]
+    tallies = [n for _, _, n in counts if isinstance(n, int)]
+    assert len(tallies) == len(counts) and tallies[0] == 1, "the first miss past it was not counted"
+    assert len(own) + sum(tallies) == sent, "a miss went unrecorded"
 
 
 async def test_a_cancelled_count_row_keeps_its_count_for_the_next_one(
