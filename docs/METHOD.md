@@ -1121,7 +1121,7 @@ fleet, so never take them*.
   *"Merge, file rows (Recommended)"* on engine PRs 2675 and 2676, and *"Merge both, file rows"* on
   engine PRs 2691 and 2671. `CLAUDE.md` section 5 cites the signed text, under R5.
 
-  **CORRECTED 2026-11-11, added after the move.** The paragraph above paraphrases R2's signed
+  **CORRECTED 2026-11-15, added after the move.** The paragraph above paraphrases R2's signed
   *"in its mechanics only"* as *"filing mechanics only"*. Decision d20261111T061703900-432f31,
   decided by the Lander under the owner's delegation of 2026-11-11, reads R2's signed text as
   governing the order of filing and merging. So the Lander's proposal quoted under 2026-10-12,
