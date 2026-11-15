@@ -10,10 +10,12 @@
 // Every switch defaults to the SECURE position; when the operator moves one to its insecure value, or a
 // session limit above its default, the form shows a plain-language loosening warning in place (CISA
 // "make deviations from safe defaults obvious"). A change takes effect on the next engine restart (the TOML is read at startup).
+import * as fs from "node:fs";
 import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { FIELDS, securityEditorScript } from "./securityEditorWebview";
+import { saveUpdatesProblem, securityConfigTarget, securitySetArgs, securityShowArgs } from "./securityEditorModel";
 
 interface ShowResult {
   values: Record<string, unknown>;
@@ -53,9 +55,15 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
     context.subscriptions,
   );
   current.webview.onDidReceiveMessage(
-    async (m: { command?: string; updates?: Record<string, unknown> }) => {
-      if (m?.command === "save" && m.updates) {
-        await save(m.updates, current);
+    async (m: { command?: string; updates?: unknown }) => {
+      if (m?.command === "save") {
+        // Checked here as well as in the webview: this is what reaches the file (BACKLOG #5411).
+        const problem = saveUpdatesProblem(m.updates, FIELDS);
+        if (problem !== null) {
+          postToWebview(current.webview, { command: "error", message: `Not saved: ${problem}.` });
+          return;
+        }
+        await save(m.updates as Record<string, unknown>, current);
       } else if (m?.command === "cancel") {
         current.dispose();
       }
@@ -65,17 +73,29 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
   await refresh(current);
 }
 
+/** The service-settings file to read and write, which must be inside the workspace folder
+ *  (BACKLOG #5411), or undefined after the refusal is posted to the webview. */
+function configPath(ws: string, current: vscode.WebviewPanel): string | undefined {
+  const target = securityConfigTarget(ws, serviceConfig(), fs.realpathSync.native);
+  if (!target.ok) {
+    postToWebview(current.webview, { command: "error", message: `${target.problem}. Nothing was read or written.` });
+    return undefined;
+  }
+  return target.path;
+}
+
 /** Re-read `security show` and push the current state (values + defaults + loosenings) to the webview. */
 async function refresh(current: vscode.WebviewPanel): Promise<void> {
   const ws = workspaceDir();
   if (!ws) {
     return;
   }
+  const file = configPath(ws, current);
+  if (file === undefined) {
+    return;
+  }
   try {
-    const state = await runJson<ShowResult>(
-      ["security", "show", "--service-config", serviceConfig()],
-      ws,
-    );
+    const state = await runJson<ShowResult>(securityShowArgs(file), ws);
     postToWebview(current.webview, { command: "state", state });
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
@@ -92,11 +112,12 @@ async function save(
   if (!ws) {
     return;
   }
+  const file = configPath(ws, current);
+  if (file === undefined) {
+    return;
+  }
   try {
-    await runJson(
-      ["security", "set", "--service-config", serviceConfig(), "--data", JSON.stringify(updates)],
-      ws,
-    );
+    await runJson(securitySetArgs(file, updates), ws);
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
     return;
