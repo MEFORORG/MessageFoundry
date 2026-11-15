@@ -81,8 +81,8 @@ def main(
         # once the campaign runs is recorded in the result, never raised, so it still exits 1.
         return fail_setup(str(exc))
     if not result.ok:
-        # A vacuous run broke no invariant, so it kept no file and has nothing to replay.
-        if result.failures and not replay_files:
+        # A vacuous run kept no file, so it has nothing to replay.
+        if any(f.replay for f in result.failures) and not replay_files:
             where = f"--fuzz-driver {driver}" + (f" --fuzz-endpoint {endpoint}" if endpoint else "")
             print(f"replay with: python -m harness --fuzz-replay FILE {where} (seed {seed})")
         return EXIT_INVARIANT

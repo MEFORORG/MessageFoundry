@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from harness.fuzz.invariants import (
-    ACK_CODES,
     ApiFault,
     check_health,
     check_stored,
@@ -91,23 +90,21 @@ class CampaignResult:
     #: per-message store invariant never ran, which proves nothing.
     stored_checked: int = 0
     failures: list[Failure] = field(default_factory=list)
-    #: What a result must have checked to pass: a stored row for a campaign, an acknowledgement for
-    #: a replay, which is one kept case and often a NAKed one.
+    #: What a result must have checked to pass: a stored row for a campaign; for a replay, only a
+    #: case judged, since a kept case is often one the engine NAKs or owes no reply at all.
     require_stored: bool = True
 
     @property
     def vacuous(self) -> str:
         """Why nothing the pass rests on was checked (BACKLOG #5419), or empty when something
-        was: no stored row was matched to a positive ACK, or, for a replay, no acknowledgement came
-        back at all."""
-        if self.require_stored:
-            if self.stored_checked == 0:
-                return (
-                    "no positive acknowledgement was matched to a stored row, so the "
-                    "per-message store invariant never ran"
-                )
-        elif not any(self.replies[code] for code in ACK_CODES):
-            return "no acknowledgement came back, so no reply was judged"
+        was. :meth:`_Session.finish` records a non-empty one as a :class:`Failure`."""
+        if self.cases == 0:
+            return "no case was sent, so no invariant was checked"
+        if self.require_stored and self.stored_checked == 0:
+            return (
+                "no positive acknowledgement was matched to a stored row, so the per-message "
+                "store invariant never ran"
+            )
         return ""
 
     @property
@@ -172,8 +169,7 @@ def replay(
                 control_id=None if payload is None else control_id_of(payload),
             )
         )
-    session = _Session(client, transport, config, emit, keep_replays=False)
-    session.result.require_stored = False
+    session = _Session(client, transport, config, emit, replaying=True)
     session.batch(cases, None)
     return session.finish()
 
@@ -186,14 +182,15 @@ class _Session:
         config: FuzzConfig,
         emit: Emit,
         *,
-        keep_replays: bool = True,
+        replaying: bool = False,
     ) -> None:
         self.client = client
         self.transport = transport
         self.config = config
         self.emit = emit
-        self.keep_replays = keep_replays
-        self.result = CampaignResult(seed=config.seed)
+        # A replay's cases are files already, and it is judged by the replay rule (vacuous).
+        self.keep_replays = not replaying
+        self.result = CampaignResult(seed=config.seed, require_stored=not replaying)
         self.out_dir: Path | None = None
         self.started = time.monotonic()
         try:
@@ -273,7 +270,7 @@ class _Session:
                         f"engine's ACK for that frame echoes {shown(owed)}"
                     )
                 continue
-            stored = self._stored_as(ack.control_id, case.control_id, before)
+            stored = self._stored_as(ack.control_id, control_id_of(payload), before)
             if stored is None:
                 continue  # an unqueryable control id: the batch's store count covers it
             problem = check_stored(self.client, *stored, self.config.settle)
@@ -281,6 +278,9 @@ class _Session:
                 problems.append(problem)
             else:
                 self.result.stored_checked += 1
+                # The next positive ACK for this id, a second frame of the case or a later case
+                # of the batch, owes a row of its own rather than reusing this one.
+                before[stored[0]] = stored[1] + 1
         return len(verdict.acks), problems
 
     @staticmethod
@@ -357,6 +357,9 @@ class _Session:
             f"stored_checked={r.stored_checked} elapsed={elapsed:.1f}s"
         )
         if r.vacuous and not r.failures:
+            # Recorded as a failure, with no case and no file, so every reader of the result
+            # sees why it did not pass.
+            r.failures.append(Failure(r.vacuous, None, ()))
             self.emit(
                 f"FAIL seed={r.seed} reason={r.vacuous}; a run that checked nothing is not a pass"
             )

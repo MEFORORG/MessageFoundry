@@ -30,8 +30,8 @@ so an exchange must carry exactly one acknowledgement per complete frame sent (c
 decoder), then a clean close; an incomplete frame owes nothing, so a case whose framing a mutation
 broke may end in silence. An inbound configured with ``ack_mode = "none"`` never answers and is not
 a target for the MLLP transport. A timeout, a reset, a refused connection, a reply cut off
-mid-frame, bytes outside a reply frame or a reply that is not an acknowledgement breaks the reply
-invariant. Any API call answering 5xx breaks the API invariant, and ``/health`` must answer ``ok``.
+mid-frame, bytes outside a reply frame, a frame whose trailer is not exactly FS CR (BACKLOG
+#5421) or a reply that is not an acknowledgement breaks the reply invariant. Any API call answering 5xx breaks the API invariant, and ``/health`` must answer ``ok``.
 
 Nothing here quotes a message or reply body: problems name codes, counts and control ids.
 """

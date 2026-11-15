@@ -533,8 +533,10 @@ def test_a_campaign_that_checked_no_stored_row_is_not_a_pass(tmp_path: Path) -> 
     config = FuzzConfig(out_dir=tmp_path / "out", settle=0.0, seed=3, iterations=30)
     lines: list[str] = []
     result = run(cast(EngineClient, _FakeClient(naks)), naks, config, emit=lines.append)
-    assert not result.failures and result.stored_checked == 0 and result.replies["AR"] > 0
+    assert result.stored_checked == 0 and result.replies["AR"] > 0
     assert result.vacuous and not result.ok
+    # Recorded as the one failure, with no case and no file, so a reader of failures sees why.
+    assert [(f.reason, f.case, f.replay) for f in result.failures] == [(result.vacuous, None, ())]
     assert any(line.startswith("FAIL seed=3 ") for line in lines)
     assert not any(line.startswith("PASS") for line in lines)
     # Control: the same campaign against an engine that accepts is a pass that checked rows.
@@ -555,9 +557,9 @@ def test_the_cli_exits_one_on_a_vacuous_campaign(
     assert "never ran" in out and "replay with:" not in out
 
 
-def test_a_replay_needs_an_acknowledgement_not_a_stored_row(tmp_path: Path) -> None:
-    """A replay is one kept case, often a NAKed one, so it is judged by its reply; silence that
-    checked nothing is still not a pass."""
+def test_a_replay_is_judged_by_its_reply_not_a_stored_row(tmp_path: Path) -> None:
+    """A replay is one kept case, often one the engine NAKs or owes no reply, so the reply rule is
+    its check: a NAKed case, and a frameless one closed in silence, both pass."""
     kept = tmp_path / "fuzz-seed3-iter0.mllp.bin"
     kept.write_bytes(_first(3, "none").data)
     transport = _NakTransport()
@@ -566,11 +568,41 @@ def test_a_replay_needs_an_acknowledgement_not_a_stored_row(tmp_path: Path) -> N
     result = replay(cast(EngineClient, client), transport, [kept], config, emit=lambda _: None)
     assert result.ok and result.stored_checked == 0
     silent = _SilentTransport()
-    kept.write_bytes(b"\x0bMSH|^~\\&|A")  # no complete frame: nothing is owed and nothing checked
+    kept.write_bytes(b"\x0bMSH|^~\\&|A")  # no complete frame: the clean close is all it owes
     result = replay(
         cast(EngineClient, _FakeClient(silent)), silent, [kept], config, emit=lambda _: None
     )
-    assert not result.failures and result.vacuous and not result.ok
+    assert result.ok and not result.vacuous
+
+
+class _OneRowClient(_FakeClient):
+    """Keeps one row per control id however many frames carried it: an engine that ACKed both
+    frames of a doubled case but stored only one."""
+
+    def list_messages(self, *, control_id: str | None = None, limit: int = 50) -> MessageList:
+        listing = super().list_messages(control_id=control_id, limit=limit)
+        if control_id is None or listing.total < 2:
+            return listing
+        return MessageList(total=1, limit=limit, offset=0, messages=listing.messages[:1])
+
+
+def test_each_positive_ack_of_a_doubled_case_owes_its_own_row(tmp_path: Path) -> None:
+    """Both AAs of a frame.double case were checked against the one pre-send count, so the first
+    frame's row satisfied the second ACK too (code review of BACKLOG #5420)."""
+    case = next(make_case(3, i) for i in range(500) if make_case(3, i).mutation == "frame.double")
+    kept = tmp_path / f"fuzz-seed3-iter{case.iteration}.mllp.bin"
+    kept.write_bytes(case.data)
+    transport = _EchoTransport()
+    config = FuzzConfig(out_dir=tmp_path / "out", settle=0.0, seed=3)
+    one_row = cast(EngineClient, _OneRowClient(transport))
+    result = replay(one_row, transport, [kept], config, emit=lambda _: None)
+    assert not result.ok
+    assert "is not in the store (1 row(s), 1 before the send)" in result.failures[0].reason
+    # Control: a store that keeps both rows passes, with both ACKs checked.
+    transport = _EchoTransport()
+    both = cast(EngineClient, _FakeClient(transport))
+    result = replay(both, transport, [kept], config, emit=lambda _: None)
+    assert result.ok and result.stored_checked == 2
 
 
 class _BlankEchoTransport(_EchoTransport):
