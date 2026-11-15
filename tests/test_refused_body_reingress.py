@@ -11,6 +11,7 @@ Synthetic bodies only; no real PHI.
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -196,8 +197,8 @@ def test_a_held_text_head_keeps_a_lone_surrogate() -> None:
 
 
 async def test_a_reply_holding_a_nul_is_refused_on_reingress(store: MessageStore) -> None:
-    """BACKLOG #5616: a NUL inside a captured HL7 reply is refused, as a listener refuses one. Here and
-    not in the shared contract, because a keyless server store cannot capture a NUL to begin with."""
+    """BACKLOG #5616: a NUL inside a captured HL7 reply is refused, as a listener refuses one. Here
+    and not in the shared contract, because a keyless server store cannot capture a NUL at all."""
     from messagefoundry.pipeline.ingress_guards import NUL_REJECTED_REASON
     from tests._reingress_refused_body_contract import REPLY, _assert_refused_by_a_guard
 
@@ -212,23 +213,71 @@ def _loopback(content_type: ContentType) -> Any:
 
 
 def test_reingress_body_error_reads_the_listener_guards() -> None:
-    """BACKLOG #5616: what ``reingress_body_error`` admits and refuses, beside the contract cases."""
-    from messagefoundry.pipeline.ingress_guards import reingress_body_error
+    """BACKLOG #5616: what ``reingress_body_error`` admits and refuses, beside the contract."""
+    from messagefoundry.pipeline.ingress_guards import (
+        MULTIPLE_MESSAGES_REJECTED_REASON,
+        reingress_body_error,
+    )
 
     hl7 = _loopback(ContentType.HL7V2)
     reply = "MSH|^~\\&|P|||||20260101||ACK^A01|R1|P|2.5.1\rMSA|AA|X1\r"
     assert reingress_body_error(hl7, reply) is None
     # A whole MLLP frame around the reply is tolerated, as the listener tolerates it (ADR 0205).
     assert reingress_body_error(hl7, "\x0b" + reply + "\x1c\r") is None
+    # Two messages are refused whatever the line endings, as the listener normalizes them first.
+    for eol in ("\r", "\n", "\r\n"):
+        two = (reply + reply.replace("R1", "R2")).replace("\r", eol)
+        assert reingress_body_error(hl7, two) == MULTIPLE_MESSAGES_REJECTED_REASON, repr(eol)
+    # An empty or blank reply (a no_reply capture, ADR 0013) has nothing to sniff and is admitted.
+    for ct in (ContentType.JSON, ContentType.FHIR, ContentType.XML, ContentType.X12):
+        for blank in ("", " \r\n"):
+            assert reingress_body_error(_loopback(ct), blank) is None, (ct, blank)
+    assert reingress_body_error(_loopback(ContentType.DICOM), "") is None
     dicom = _loopback(ContentType.DICOM)
     not_dicom = RawMessage.from_bytes(b"%PDF-1.7 synthetic" * 60, ContentType.DICOM.value).raw
     refused = reingress_body_error(dicom, not_dicom)
     assert refused is not None and "'dicom'" in refused
-    # Longer than the decoded sniff prefix, so only its head is decoded.
+    # Line-wrapped carriage is still sniffed: whitespace in its head is tolerated.
+    wrapped = "mfb64:v1:" + base64.encodebytes(b"%PDF-1.7 synthetic" * 60).decode()
+    assert reingress_body_error(dicom, wrapped) == refused
+    # Decoded text a capturing transport hands a binary loopback is sniffed too.
+    assert reingress_body_error(dicom, "<html>error</html>") == refused
+    # Longer than the decoded sniff head, so only its head is decoded.
     part10 = b"\x00" * 128 + b"DICM" + b"\x02\x00" * 600
     assert (
         reingress_body_error(dicom, RawMessage.from_bytes(part10, ContentType.DICOM.value).raw)
         is None
     )
-    # A carriage that does not decode is left to the codec, as the size rule leaves it.
+    # A carriage whose head does not decode is left to the codec.
     assert reingress_body_error(dicom, "mfb64:v1:@@@not-base64@@@") is None
+
+
+async def test_a_refused_hl7_reply_records_no_message_type(store: MessageStore) -> None:
+    """BACKLOG #5616: a guard-refused HL7 reply has no message type, as a listener's refusal does,
+    not the content type ``hl7v2``."""
+    from messagefoundry.pipeline.ingress_guards import FRAME_BYTE_REJECTED_REASON
+    from tests._reingress_refused_body_contract import (
+        REPLY,
+        _allowance,
+        _reingress,
+        _runner,
+    )
+
+    body = REPLY.replace("MSA|AA|RB1", "MSA|AA|RB1\x1c\rNTE|1||SYNTH")
+    child = await _reingress(store, _runner(store, _allowance(10_000)), body, now=950.0)
+    assert child["error"] == FRAME_BYTE_REJECTED_REASON
+    assert child["message_type"] is None
+
+
+async def test_a_reply_holding_the_document_marker_is_refused(store: MessageStore) -> None:
+    """BACKLOG #5616: the document-marker refusal both listeners run on a parsed HL7 body also
+    refuses a re-ingressed reply, which would otherwise dead-letter on every outbound."""
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+    from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
+    from tests._reingress_refused_body_contract import _assert_refused_by_a_guard
+    from tests.test_sender_document_handle import _copy_in_nte_component
+
+    body = _copy_in_nte_component("|", "^~\\/", DOC_REF_MARKER + "x")
+    await _assert_refused_by_a_guard(
+        store, ContentType.HL7V2, body, DOC_REF_MARKER_REFUSED_REASON, now=990.0
+    )

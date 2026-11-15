@@ -4524,7 +4524,7 @@ class PostgresStore:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
         Postgres twin of :meth:`MessageStore._insert_passthrough_marker`. A single ``stage='outbound'``
-        row keyed by the PT inbound name, inserted already-terminal: ``done`` when the child was produced
+        row sent to the PT inbound name, inserted already-terminal: ``done`` when the child was produced
         (→ parent finalizes ``PROCESSED``), or ``dead`` when the depth cap was breached (→ parent
         finalizes ``ERROR``). Never claimed (no delivery worker for a PT name; claims take ``pending``
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
@@ -4875,7 +4875,7 @@ class PostgresStore:
         ``Send``\\ s whose target is an internal **pass-through (PT) inbound** (not an outbound). For
         each, this produces — **in this same transaction** — a new INGRESS-stage child message on the
         PT channel (a content-addressed id; ``RECEIVED`` per count-and-log; correlated to the parent),
-        plus a single already-terminal outbound marker row on *this* (parent) message keyed by the PT
+        plus a single already-terminal outbound marker row on *this* (parent) message sent to the PT
         inbound name, so the parent finalizes ``PROCESSED`` (the Send was delivered into the PT) rather
         than collapsing to ``FILTERED``. A ``correlation_depth`` breach drops the child and dead-letters
         the parent's marker (``ERROR``). Byte-identical to the pre-feature path when ``pt_deliveries`` is

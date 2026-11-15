@@ -1233,8 +1233,8 @@ def _insert_marker_params(
     # is the PT inbound name), never claimed. ``channel_id`` is the parent's inbound, as on every
     # outbound row the handoff writes, so a dead marker is scoped to the parent's channel in the
     # dead-letter view (#5614). Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the
-    # marker stamp in ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when the child was
-    # produced, DEAD on a depth-cap breach) rather than PENDING.
+    # marker stamp in ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when
+    # the child was produced, DEAD on a depth-cap breach) rather than PENDING.
     return (
         row_id,
         parent_id,
@@ -7211,7 +7211,7 @@ class SqlServerStore:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
         SQL Server twin of :meth:`MessageStore._insert_passthrough_marker`. A single ``stage='outbound'``
-        row keyed by the PT inbound name, inserted already-terminal: ``done`` when the child was produced
+        row sent to the PT inbound name, inserted already-terminal: ``done`` when the child was produced
         (→ parent finalizes ``PROCESSED``), or ``dead`` when the depth cap was breached (→ parent
         finalizes ``ERROR``). Never claimed (no delivery worker for a PT name; claims take ``pending``
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
@@ -7688,7 +7688,7 @@ class SqlServerStore:
         ``Send``\\ s whose target is an internal **pass-through (PT) inbound**. For each, this produces —
         **in this same transaction** — a new INGRESS-stage child message on the PT channel (a content-
         addressed id; ``RECEIVED`` per count-and-log; correlated to the parent), plus a single already-
-        terminal outbound marker row on *this* (parent) message keyed by the PT inbound name, so the
+        terminal outbound marker row on *this* (parent) message sent to the PT inbound name, so the
         parent finalizes ``PROCESSED`` (delivered into the PT) rather than collapsing to ``FILTERED``. A
         ``correlation_depth`` breach drops the child and dead-letters the parent's marker (``ERROR``).
         Byte-identical to the pre-feature path when ``pt_deliveries`` is empty. Mirrors

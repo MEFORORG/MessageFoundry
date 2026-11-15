@@ -14101,7 +14101,7 @@ class MessageStore:
         produces — **in this same transaction** — a new, independent INGRESS-stage child message on the
         PT channel (a content-addressed id; ``RECEIVED`` per count-and-log; correlated to this message),
         which the PT inbound's own router worker then re-routes. The Send-into-PT also stamps a single
-        **already-``done`` outbound marker row** on *this* (parent) message keyed by the PT inbound name,
+        **already-``done`` outbound marker row** on *this* (parent) message sent to the PT inbound name,
         so the parent finalizes ``PROCESSED`` (the Send was delivered — into the PT) and never collapses
         to ``FILTERED``. Atomicity makes "child produced" and "routed row consumed" one durable fact, so a
         crash/re-run is an idempotent no-op (the content-addressed child id + the guarded routed-row
@@ -14173,7 +14173,7 @@ class MessageStore:
                         now,
                         inherits,
                     )
-                    # The parent's disposition for this Send: a marker outbound row keyed by the PT
+                    # The parent's disposition for this Send: a marker outbound row sent to the PT
                     # inbound, already terminal (DONE = delivered into the PT, or DEAD = depth-cap
                     # breach → parent ERROR). It is never claimed (no delivery worker for a PT name;
                     # claims take PENDING rows only), so it is inert; it exists solely so the
@@ -15358,7 +15358,7 @@ class MessageStore:
     ) -> None:
         """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
 
-        A single ``stage='outbound'`` row keyed by the PT inbound name, inserted already-terminal: ``done``
+        A single ``stage='outbound'`` row sent to the PT inbound name, inserted already-terminal: ``done``
         when the child was produced (the Send was *delivered* into the PT → the parent finalizes
         ``PROCESSED``, not ``FILTERED``), or ``dead`` when the depth cap was breached (→ the parent
         finalizes ``ERROR``). It is **never claimed** — there is no delivery worker for a PT inbound name,

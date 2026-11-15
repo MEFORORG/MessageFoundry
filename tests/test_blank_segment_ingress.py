@@ -39,6 +39,7 @@ from messagefoundry.parsing.peek import Peek, normalize
 from messagefoundry.parsing.summary import summarize
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.store.store import REINGRESS_PEEK_FAILED
 from messagefoundry.transports.mllp import (
     _HANDLER_FAILURE_NAK_TEXT,
     CR,
@@ -304,9 +305,14 @@ def test_a_faulting_peek_read_marks_a_loopback_peek_failed(
     runner: tuple[RegistryRunner, InboundConnection], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, ic = runner
-    assert wiring_runner._peek_for_loopback(ic, _SHAPES["control"])[3] is False  # control
+    assert wiring_runner._peek_for_loopback(ic, _SHAPES["control"])[3] is None  # control
     _faulting_control_id(monkeypatch)
-    assert wiring_runner._peek_for_loopback(ic, _SHAPES["control"]) == (None, None, None, True)
+    assert wiring_runner._peek_for_loopback(ic, _SHAPES["control"]) == (
+        None,
+        None,
+        None,
+        REINGRESS_PEEK_FAILED,
+    )
 
 
 def test_build_ack_degrades_to_defaults_when_a_peek_read_faults(

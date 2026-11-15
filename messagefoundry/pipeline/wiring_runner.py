@@ -1410,24 +1410,29 @@ def _peek_read_fault(ic: InboundConnection, exc: Exception) -> str:
 
 def _peek_for_loopback(
     ic: InboundConnection, body: str
-) -> tuple[str | None, str | None, str | None, bool]:
-    """Derive ``(control_id, message_type, summary, peek_failed)`` for a re-ingressed loopback body
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Derive ``(control_id, message_type, summary, refusal)`` for a re-ingressed loopback body
     (ADR 0013 Increment 2, Q5) — the re-ingress worker's parsing step, kept in ``pipeline/`` (not the
     store) so the store stays parsing-free, exactly as ``_handle_inbound`` peeks before
     ``enqueue_ingress``. An HL7V2 loopback runs ``Peek.parse`` (``peek_failed=True`` on ``HL7PeekError``
     or a faulting field read → the child is recorded RECEIVED→ERROR, not dropped); any other
     ``content_type`` (x12/text/json) is relayed verbatim as a ``RawMessage`` — no parse,
-    ``message_type`` = the content_type value."""
+    ``message_type`` = the content_type value. ``refusal`` is ``None`` when the body is admitted,
+    else the recorded reason: :data:`REINGRESS_PEEK_FAILED`, or the document-marker refusal both
+    listeners run on a parsed HL7 body (BACKLOG #5616)."""
     if ic.content_type is ContentType.HL7V2:
         try:
-            fields = _read_ingress_fields(Peek.parse(body))
+            peek = Peek.parse(body)
+            fields = _read_ingress_fields(peek)
         except HL7PeekError:
-            return None, None, None, True
+            return None, None, None, REINGRESS_PEEK_FAILED
         except PEEK_READ_FAULTS as exc:
             _peek_read_fault(ic, exc)
-            return None, None, None, True
-        return fields.control_id, fields.message_type, fields.summary, False
-    return None, ic.content_type.value, None, False
+            return None, None, None, REINGRESS_PEEK_FAILED
+        if (marker_refused := doc_ref_marker_refusal(peek, body)) is not None:
+            return None, None, None, marker_refused
+        return fields.control_id, fields.message_type, fields.summary, None
+    return None, ic.content_type.value, None, None
 
 
 @dataclass
@@ -11839,16 +11844,20 @@ class RegistryRunner:
         # BACKLOG #1914: the engine ceiling the listeners enforce (SEC-017), checked before the peek so
         # an oversize non-HL7 body is recorded ERROR with the listener's wording and never routed. An
         # HL7 body meets the same ceiling inside Peek.parse.
-        # BACKLOG #5616: then the listener's content guards (NUL, MLLP frame byte, a second MSH, the
-        # declared-type sniff), which a loopback never ran. A refusal takes the peek_failed path below,
-        # so the reply is still recorded as an ERROR child, never dropped and never routed.
+        # BACKLOG #5616: then at least the listener's content guards, which a loopback never ran
+        # (reingress_body_error and _peek_for_loopback list them). A refusal takes the peek_failed
+        # path below, so the reply is still recorded as an ERROR child, never dropped or routed.
         refusal = reingress_size_error(ic, body) or reingress_body_error(ic, body)
         if refusal is None:
-            control_id, message_type, summary, peek_failed = _peek_for_loopback(ic, body)
+            control_id, message_type, summary, refusal = _peek_for_loopback(ic, body)
         else:
-            control_id, message_type, summary, peek_failed = None, ic.content_type.value, None, True
+            # A refused HL7 body has no message type, as on the listener; the content type stands
+            # in for any other.
+            hl7 = ic.content_type is ContentType.HL7V2
+            control_id, message_type, summary = None, None if hl7 else ic.content_type.value, None
+        peek_failed = refusal is not None
         refused = None
-        if peek_failed:
+        if refusal is not None:
             # Vault BACKLOG #4796: the refused reply is charged to the loopback's refused-body
             # allowance, as a listener's refusal is. The charge is never refunded. At least a handoff
             # that stores no child (a depth-capped token, an origin that fails its row tag, or a
@@ -11861,7 +11870,7 @@ class RegistryRunner:
                 name,
                 body,
                 ic.content_type.value,
-                refusal or REINGRESS_PEEK_FAILED,
+                refusal,
                 cipher=self.store.cipher(),
             )
         produced = await self.store.ingress_handoff(

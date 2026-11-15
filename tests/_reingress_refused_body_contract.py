@@ -3,8 +3,8 @@
 """Cross-backend contract: a refused loopback re-ingress is bounded by the refused-body allowance
 (vault BACKLOG #4796).
 
-A captured reply that fails its peek, size or content check on re-ingress is recorded as an ``ERROR`` child of
-its origin. Before #4796 every backend's ``ingress_handoff`` stored that child's body whole, outside
+A captured reply that fails its peek, size or content check on re-ingress is recorded as an
+``ERROR`` child of its origin. Before #4796 every backend's ``ingress_handoff`` stored that child's body whole, outside
 the per-inbound allowance a listener's refusal is charged to, so a partner answering with refused
 replies could grow the store unmetered on a first deployment. These cases drive the real re-ingress
 step (``RegistryRunner._process_response_item``) over each backend and read the child it records.
@@ -202,6 +202,15 @@ async def assert_a_reply_holding_two_messages_is_refused(store: Any) -> None:
     await _assert_refused_by_a_guard(
         store, ContentType.HL7V2, body, MULTIPLE_MESSAGES_REJECTED_REASON, now=600.0
     )
+    # CRLF line endings, as an HTTP partner may send: the listener collapses them first, so the
+    # second MSH is still found.
+    await _assert_refused_by_a_guard(
+        store,
+        ContentType.HL7V2,
+        body.replace("RSP", "CRL").replace("\r", "\r\n"),
+        MULTIPLE_MESSAGES_REJECTED_REASON,
+        now=650.0,
+    )
 
 
 async def assert_a_reply_of_the_wrong_type_is_refused(store: Any) -> None:
@@ -225,6 +234,15 @@ async def assert_a_reply_of_the_declared_type_is_admitted(store: Any) -> None:
     assert METADATA_KEY not in child["meta"]
 
 
+async def assert_an_empty_reply_is_admitted(store: Any) -> None:
+    """An empty reply (a ``no_reply`` capture, ADR 0013) on a JSON loopback has nothing to sniff, so
+    it is routed as before #5616, not refused."""
+    runner = _runner(store, _allowance(0), ContentType.JSON)
+    child = await _reingress(store, runner, "", now=850.0)
+    assert child["status"] == MessageStatus.RECEIVED.value
+    assert METADATA_KEY not in child["meta"]
+
+
 #: Every case, for ``pytest.mark.parametrize``. Each takes ``(store,)``.
 CASES = [
     pytest.param(assert_a_refused_reply_flood_stores_heads_past_the_allowance, id="flood"),
@@ -234,4 +252,5 @@ CASES = [
     pytest.param(assert_a_reply_holding_two_messages_is_refused, id="two-messages"),
     pytest.param(assert_a_reply_of_the_wrong_type_is_refused, id="wrong-type"),
     pytest.param(assert_a_reply_of_the_declared_type_is_admitted, id="declared-type"),
+    pytest.param(assert_an_empty_reply_is_admitted, id="empty-reply"),
 ]

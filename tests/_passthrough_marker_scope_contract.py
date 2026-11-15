@@ -3,8 +3,8 @@
 """Cross-backend contract: a pass-through marker is scoped to its PARENT's channel (BACKLOG #5614).
 
 A Send into a pass-through inbound stamps an already-terminal outbound marker row on the parent.
-Before #5614 every backend wrote the pass-through inbound's name into that row's ``channel_id``, so a
-dead marker (a depth-cap breach) was listed and counted in the dead-letter view under the
+Before #5614 every backend wrote the pass-through inbound's name into that row's ``channel_id``, so
+a dead marker (a depth-cap breach) was listed and counted in the dead-letter view under the
 pass-through channel's RBAC scope. A user scoped to that channel would have seen the parent's
 metadata and summary, and the parent channel's user would not have seen its own dead letter. Every
 other outbound row the handoff writes carries the parent's inbound, and so does the marker now.
