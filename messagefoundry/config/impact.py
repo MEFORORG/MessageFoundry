@@ -48,8 +48,6 @@ from messagefoundry.config.reachability import (
     SourceCache,
     build_reference_index,
     captured_values,
-    code_names,
-    config_module_files,
     reached_functions,
     table_kinds,
 )
@@ -424,21 +422,21 @@ def _referrer_sites(
         if ref.referrer_kind == "handler" and ref.referrer in registry.handler_accepts:
             roots.append(registry.handler_accepts[ref.referrer])
         sites: list[_Site] = []
-        complete = True
+        # A referrer whose own function cannot be read is unresolved. A predicate that is not a plain
+        # function (a partial, a callable instance) is not: the index cannot read it either, so no
+        # edge came from it.
+        complete = bool(reached_functions(fn))
         for root in roots:
-            funcs = reached_functions(root)
-            if not funcs:
-                complete = False
-            for depth, func in enumerate(funcs):
+            for depth, func in enumerate(reached_functions(root)):
                 file, span = _fn_span(func)
                 if file is None or span is None:
                     complete = complete and depth > 0
-                elif depth == 0:
+                elif depth == 0 or table_kind is None:
                     sites.append(_Site(file, span, None))
-                elif table_kind is not None:
-                    sites.append(
-                        _Site(file, span, _accessor_positions(sources, file, span, old, table_kind))
-                    )
+                else:
+                    allowed = _accessor_positions(sources, file, span, old, table_kind)
+                    allowed |= _default_positions(sources, func, file, span, old)
+                    sites.append(_Site(file, span, frozenset(allowed)))
                 bound_sites, located = _module_binding_sites(func, old, table_kind, sources)
                 sites.extend(bound_sites)
                 complete = complete and located
@@ -462,53 +460,87 @@ def _referrer_sites(
 
 def _accessor_positions(
     sources: SourceCache, file: str, span: _Span, old: str, table_kind: str
-) -> frozenset[tuple[int, int]]:
+) -> set[tuple[int, int]]:
     """The positions in ``span`` where ``old`` is passed to ``table_kind``'s accessor."""
-    return frozenset(
+    return {
         pos
         for pos, kind in sources.occurrences(file, old).items()
         if kind == table_kind and span.start <= pos[0] <= span.end
-    )
+    }
+
+
+def _default_positions(
+    sources: SourceCache, func: FunctionType, file: str, span: _Span, old: str
+) -> set[tuple[int, int]]:
+    """The positions of ``old`` written as a default argument in ``func``'s own signature
+    (``def _lookup(code, table="diets")``), which the function reads as a captured value."""
+    parsed = sources.parse(file)
+    if parsed is None:
+        return set()
+    out: set[tuple[int, int]] = set()
+    for node in ast.walk(parsed[0]):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if not span.start <= node.lineno <= span.end:
+            continue
+        if not isinstance(node, ast.Lambda) and node.name != func.__name__:
+            continue
+        defaults = [*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)]
+        out |= {
+            sources.position(file, c)
+            for d in defaults
+            for c in ast.walk(d)
+            if isinstance(c, ast.Constant) and c.value == old
+        }
+    return out
 
 
 def _module_binding_sites(
     func: FunctionType, old: str, table_kind: str | None, sources: SourceCache
 ) -> tuple[list[_Site], bool]:
-    """The module-level statements that bind a name ``func`` reads and hold ``old``, in ``func``'s own
-    module and in any config module it reads an attribute of (``_consts.TARGET``); and whether every
-    global or module attribute ``func`` reads whose value is ``old`` (or a code set named ``old``) is
-    bound by one of them."""
-    global_names, attr_names = code_names(func.__code__)
-    names = global_names | attr_names
-    captured = {
-        name
-        for name, value in captured_values(func, func.__module__)
-        if name
-        and (
-            (isinstance(value, str) and value == old)
-            or (isinstance(value, CodeSet) and value.name == old and table_kind == "code_set")
-        )
-    }
+    """The module-level statements that bind a name ``func`` reads and hold ``old`` -- a global in
+    ``func``'s own module, or an attribute of a config module it reads (``_consts.TARGET``) in that
+    module -- and whether every such captured value whose value is ``old`` (or a code set named
+    ``old``) is bound by a statement this plan can rewrite.
+
+    A default argument is written in ``func``'s own signature, so it is located by the function's
+    site, never here. A closure's binding lives in an enclosing function, and an imported name's in
+    another module, so neither is ever located: such a referrer is unresolved."""
+    names_by_file: dict[str, set[str]] = {}
+    required: set[tuple[str | None, str]] = set()
+    for captured in captured_values(func, func.__module__):
+        if captured.source == "default":
+            continue
+        own_file = func.__code__.co_filename
+        file = own_file if captured.source == "global" else captured.module_file
+        if file is not None and captured.source != "closure":
+            names_by_file.setdefault(file, set()).add(captured.name)
+        value = captured.value
+        if (isinstance(value, str) and value == old) or (
+            isinstance(value, CodeSet) and value.name == old and table_kind == "code_set"
+        ):
+            required.add((file if captured.source != "closure" else None, captured.name))
     sites: list[_Site] = []
-    bound: set[str] = set()
-    for file in sorted(config_module_files(func)):
-        for stmt, stmt_names in _module_bindings(sources, file, names):
+    bound: set[tuple[str | None, str]] = set()
+    for file in sorted(names_by_file):
+        for stmt, stmt_names in _module_bindings(sources, file, names_by_file[file]):
             span = _Span(stmt.lineno, stmt.end_lineno or stmt.lineno)
-            positions = {
-                pos for pos in sources.occurrences(file, old) if span.start <= pos[0] <= span.end
-            }
-            if not positions:
-                continue
-            bound |= stmt_names
             if table_kind is None:
-                sites.append(_Site(file, span, None))
+                allowed: set[tuple[int, int]] | None = None
+                found = any(span.start <= p[0] <= span.end for p in sources.occurrences(file, old))
+            else:
+                allowed = _accessor_positions(sources, file, span, old, table_kind)
+                value = stmt.value
+                if isinstance(value, ast.Constant) and value.value == old:
+                    allowed.add(sources.position(file, value))
+                found = bool(allowed)
+            if not found:
+                # A statement holding old only where this plan will not rewrite it does not locate
+                # the binding: A, B = "diets", "x" stays a capture of the old name.
                 continue
-            allowed = set(_accessor_positions(sources, file, span, old, table_kind))
-            value = stmt.value
-            if isinstance(value, ast.Constant) and value.value == old:
-                allowed.add(sources.position(file, value))
-            sites.append(_Site(file, span, frozenset(allowed)))
-    return sites, captured <= bound
+            bound |= {(file, name) for name in stmt_names}
+            sites.append(_Site(file, span, frozenset(allowed) if allowed is not None else None))
+    return sites, required <= bound
 
 
 def _module_bindings(
@@ -558,7 +590,8 @@ def _fn_span(fn: object) -> tuple[str | None, _Span | None]:
         return None, None
     try:
         source_lines, start = inspect.getsourcelines(target)
-    except (OSError, TypeError):
+    except (OSError, TypeError, SyntaxError, tokenize.TokenError):
+        # A file that changed since it loaded (an editor mid-save) cannot be located either.
         return None, None
     file = str(code.co_filename)
     return file, _Span(start, start + len(source_lines) - 1)

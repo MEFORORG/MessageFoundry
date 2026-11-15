@@ -46,9 +46,9 @@ __all__ = [
     "ReferenceIndex",
     "SourceCache",
     "build_reference_index",
+    "Captured",
     "captured_values",
     "code_names",
-    "config_module_files",
     "reached_functions",
     "table_kinds",
 ]
@@ -77,42 +77,58 @@ def _string_consts(code: CodeType) -> set[str]:
     return out
 
 
-def code_names(code: CodeType) -> tuple[set[str], set[str]]:
-    """The global names and the attribute names a code object loads, recursing into nested code.
+def code_names(code: CodeType) -> tuple[set[str], set[tuple[str, str]]]:
+    """The global names a code object loads, and the ``(global, attribute)`` pairs it loads as
+    ``global.attribute`` (``_consts.TARGET``), recursing into nested code.
 
-    Read from the bytecode rather than ``co_names``, which mixes the two: a method call such as
-    ``cs.translate(x)`` must not be read as a reference to a module function called ``translate``."""
+    Read from the bytecode rather than ``co_names``, which mixes globals with every attribute name: a
+    method call such as ``cs.get(x)`` must not be read as a reference to a module function ``get``."""
     global_names: set[str] = set()
-    attr_names: set[str] = set()
+    module_attrs: set[tuple[str, str]] = set()
+    previous: dis.Instruction | None = None
     for ins in dis.get_instructions(code):
         if ins.opname in _GLOBAL_LOADS and isinstance(ins.argval, str):
             global_names.add(ins.argval)
-        elif ins.opname in _ATTR_LOADS and isinstance(ins.argval, str):
-            attr_names.add(ins.argval)
+        elif (
+            ins.opname in _ATTR_LOADS
+            and isinstance(ins.argval, str)
+            and previous is not None
+            and previous.opname in _GLOBAL_LOADS
+            and isinstance(previous.argval, str)
+        ):
+            module_attrs.add((previous.argval, ins.argval))
+        previous = ins
     for const in code.co_consts:
         if isinstance(const, CodeType):
             inner_globals, inner_attrs = code_names(const)
             global_names |= inner_globals
-            attr_names |= inner_attrs
-    return global_names, attr_names
+            module_attrs |= inner_attrs
+    return global_names, module_attrs
 
 
 _GLOBAL_LOADS = frozenset({"LOAD_GLOBAL", "LOAD_NAME"})
-_ATTR_LOADS = frozenset({"LOAD_ATTR", "LOAD_METHOD", "LOAD_SUPER_ATTR"})
+_ATTR_LOADS = frozenset({"LOAD_ATTR", "LOAD_METHOD"})
 
 
 def _function_of(obj: object) -> FunctionType | None:
-    """The plain function behind ``obj``: decorators unwrapped, a bound method's ``__func__``, or
-    ``None`` for anything else (a callable instance, a builtin)."""
-    if not callable(obj):
+    """The plain function behind ``obj``: a bound method's ``__func__``, then any ``functools.wraps``
+    chain followed through ``__dict__``, or ``None`` for anything else (a callable instance, a
+    builtin, a ``partial``). No attribute lookup runs on a non-function, so a captured object's own
+    ``__getattr__`` never runs."""
+    if isinstance(obj, MethodType):
+        obj = obj.__func__
+    if not isinstance(obj, FunctionType):
         return None
-    try:
-        target = inspect.unwrap(obj)
-    except ValueError:  # a __wrapped__ chain that loops
-        return None
-    if isinstance(target, MethodType):
-        target = target.__func__
-    return target if isinstance(target, FunctionType) else None
+    seen: set[int] = set()
+    while id(obj) not in seen:
+        seen.add(id(obj))
+        wrapped = obj.__dict__.get("__wrapped__")
+        if isinstance(wrapped, MethodType):
+            wrapped = wrapped.__func__
+        if not isinstance(wrapped, FunctionType):
+            break
+        obj = wrapped
+    return obj
 
 
 def _is_config_module(name: object, root_module: str) -> bool:
@@ -128,27 +144,50 @@ def _cell_value(cell: CellType) -> object:
         return None
 
 
-def captured_values(func: FunctionType, root_module: str) -> list[tuple[str, object]]:
-    """The ``(name, value)`` pairs ``func`` can read without computing them: the globals it loads,
-    the attributes it loads off a config module, its closure cells and its default arguments.
+@dataclass(frozen=True)
+class Captured:
+    """One value a function reads without computing it, and where it reads it from.
+
+    ``source`` is ``"global"`` (bound in ``func``'s own module), ``"attribute"`` (``module_file``'s
+    module-level ``name``), ``"closure"`` (a free variable of an enclosing function) or
+    ``"default"`` (a default argument, written in ``func``'s own signature)."""
+
+    source: str
+    name: str
+    value: object
+    module_file: str | None = None
+
+
+def captured_values(func: FunctionType, root_module: str) -> list[Captured]:
+    """What ``func`` can read without computing it: the globals it loads, the attributes it loads
+    off a config module, its closure cells and its default arguments.
 
     A module attribute is read from the module's ``__dict__``, so a module ``__getattr__`` never runs."""
-    global_names, attr_names = code_names(func.__code__)
-    pairs: list[tuple[str, object]] = [(n, func.__globals__.get(n)) for n in sorted(global_names)]
-    pairs += [
-        (n, module.__dict__.get(n))
-        for _name, module in list(pairs)
-        if isinstance(module, ModuleType) and _is_config_module(module.__name__, root_module)
-        for n in sorted(attr_names)
-        if n in module.__dict__
-    ]
-    pairs += [
-        (name, _cell_value(cell))
+    global_names, module_attrs = code_names(func.__code__)
+    out = [Captured("global", n, func.__globals__.get(n)) for n in sorted(global_names)]
+    for module_name, attr in sorted(module_attrs):
+        module = func.__globals__.get(module_name)
+        if not isinstance(module, ModuleType) or not _is_config_module(
+            module.__name__, root_module
+        ):
+            continue
+        module_file = module.__dict__.get("__file__")
+        if attr in module.__dict__:
+            out.append(
+                Captured(
+                    "attribute",
+                    attr,
+                    module.__dict__[attr],
+                    module_file if isinstance(module_file, str) else None,
+                )
+            )
+    out += [
+        Captured("closure", name, _cell_value(cell))
         for name, cell in zip(func.__code__.co_freevars, func.__closure__ or (), strict=False)
     ]
-    pairs += [("", value) for value in func.__defaults__ or ()]
-    pairs += [(name, value) for name, value in (func.__kwdefaults__ or {}).items()]
-    return pairs
+    out += [Captured("default", "", value) for value in func.__defaults__ or ()]
+    out += [Captured("default", name, value) for name, value in (func.__kwdefaults__ or {}).items()]
+    return out
 
 
 def _reached(fn: object) -> Iterator[FunctionType | CodeSet | str]:
@@ -170,7 +209,8 @@ def _reached(fn: object) -> Iterator[FunctionType | CodeSet | str]:
             continue
         seen.add(id(func))
         yield func
-        for _name, value in captured_values(func, root_module):
+        for captured in captured_values(func, root_module):
+            value = captured.value
             if isinstance(value, CodeSet):
                 key = "code_set:" + value.name
                 if key not in seen_values:
@@ -190,19 +230,6 @@ def reached_functions(fn: object) -> list[FunctionType]:
     """``fn`` (unwrapped) and every config-authored helper function it reaches through its globals,
     closure cells, defaults and imported config modules, transitively. A non-function yields ``[]``."""
     return [f for f in _reached(fn) if isinstance(f, FunctionType)]
-
-
-def config_module_files(func: FunctionType) -> set[str]:
-    """``func``'s own source file and the file of every config module it reads an attribute of
-    (``_consts.TARGET``) -- the files whose module-level bindings ``func`` can read."""
-    files = {func.__code__.co_filename}
-    for name in code_names(func.__code__)[0]:
-        value = func.__globals__.get(name)
-        if isinstance(value, ModuleType) and _is_config_module(value.__name__, func.__module__):
-            module_file = value.__dict__.get("__file__")
-            if isinstance(module_file, str):
-                files.add(module_file)
-    return files
 
 
 def table_kinds(registry: Registry) -> dict[str, list[str]]:
@@ -231,7 +258,8 @@ class SourceCache:
         """``file``'s module tree and its lines, or ``None`` when unreadable or unparseable."""
         if file not in self._parsed:
             try:
-                text = Path(file).read_text(encoding="utf-8")
+                # utf-8-sig: a BOM-encoded module (common from Windows editors) parses too.
+                text = Path(file).read_text(encoding="utf-8-sig")
                 # Lines split as the parser and the tokenizer count them (\n, \r\n, \r only), not as
                 # str.splitlines does, which also breaks on a form feed or U+2028.
                 lines = io.StringIO(text, newline="").readlines()
@@ -290,6 +318,13 @@ class SourceCache:
                         parents[id(part)] = node
                         stack.append(part)
                 continue
+            if isinstance(node, ast.TemplateStr):
+                # A t-string's value is a Template, never a str, so only its interpolations count.
+                for part in node.values:
+                    if isinstance(part, ast.Interpolation):
+                        parents[id(part)] = node
+                        stack.append(part)
+                continue
             if isinstance(node, ast.Constant) and node.value == value:
                 parent = parents.get(id(node))
                 kind = None
@@ -310,8 +345,13 @@ def _source_kinds(func: FunctionType, literal: str, sources: SourceCache) -> set
     a list, a helper's argument), so the caller falls back to every kind the name could be."""
     try:
         lines, start = inspect.getsourcelines(func)
-    except (OSError, TypeError, SyntaxError, tokenize.TokenError):
+    except (OSError, TypeError, SyntaxError, tokenize.TokenError) as exc:
         # A helper whose file changed since it loaded: fall back to every kind the name could be.
+        _log.debug(
+            "reference analysis could not read the source of %s: %s",
+            func.__qualname__,
+            type(exc).__name__,
+        )
         return None
     end = start + len(lines) - 1
     kinds: set[str | None] = {

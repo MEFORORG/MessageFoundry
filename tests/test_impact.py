@@ -1134,6 +1134,104 @@ def test_a_name_constant_or_a_default_argument_is_a_live_table_read(
     load_config(config_dir)
 
 
+def test_a_binding_the_plan_cannot_rewrite_leaves_the_referrer_unresolved(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        'A, B = "diets", "x"\n'
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        "    a = code_set(A)\n"
+        '    b = code_set("diets").get("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "renamed")
+    assert plan.unresolved == (Reference("handler", "h_q", "code_set", "diets"),)
+
+
+def test_a_helper_default_naming_the_table_is_rewritten(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        'def _lookup(code, table="diets"):\n'
+        "    return code_set(table).get(code)\n"
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        'def h_q(msg, *, cs=code_set("diets")):\n'
+        '    a = _lookup("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    result = codeset_edit.rename_code_set(
+        config_dir, "diets", "renamed", validate=_validate_code_set
+    )
+    assert result["referents_rewritten"] == 2
+    assert "referents_unresolved" not in result
+    load_config(config_dir)
+
+
+def test_a_send_in_a_helper_is_rewritten_with_the_handlers_own(tmp_path: Path) -> None:
+    body = (
+        "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
+        "\n"
+        'inbound("IB_HF", MLLP(port=2803), router="r_hf")\n'
+        'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6960))\n'
+        "\n"
+        "\n"
+        "def _fallback(msg):\n"
+        '    return Send("OB_OLD", msg)\n'
+        "\n"
+        "\n"
+        '@router("r_hf")\n'
+        "def r_hf(msg):\n"
+        '    return ["h_hf"]\n'
+        "\n"
+        "\n"
+        '@handler("h_hf")\n'
+        "def h_hf(msg):\n"
+        "    if msg is None:\n"
+        "        return [_fallback(msg)]\n"
+        '    return Send("OB_OLD", msg)\n'
+    )
+    config_dir = _write_config(tmp_path, {"mod.py": body})
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"OB_OLD"' not in (config_dir / "mod.py").read_text(encoding="utf-8")
+
+
+def test_a_callable_with_a_raising_getattr_does_not_break_the_index(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        "import functools\n"
+        "\n"
+        "\n"
+        "class _Lazy:\n"
+        "    def __call__(self, x):\n"
+        "        return x\n"
+        "\n"
+        "    def __getattr__(self, name):\n"
+        '        raise RuntimeError("not initialised")\n'
+        "\n"
+        "\n"
+        "LAZY = _Lazy()\n"
+        "\n"
+        "\n"
+        "def _gate(flag, msg):\n"
+        "    return flag\n"
+        "\n"
+        "\n"
+        '@handler("h_q", accepts=functools.partial(_gate, True))\n'
+        "def h_q(msg):\n"
+        "    LAZY(1)\n"
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _write_config(tmp_path, {"mod.py": body})
+    registry = load_config(config_dir)
+    build_reference_index(registry)
+    plan = plan_rename(registry, config_dir, "outbound", "OB_Q", "OB_R")
+    assert plan.unresolved == ()
+
+
 def test_a_form_feed_line_does_not_shift_the_rename(tmp_path: Path) -> None:
     body = _PREAMBLE + (
         "\x0c\n"
