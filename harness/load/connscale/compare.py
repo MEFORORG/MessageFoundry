@@ -81,6 +81,12 @@ class _ArmMetrics:
     #: The arm's reconcile could not clear it and proved no loss either (BACKLOG #5574). It is not
     #: a breach, so it can never make a resilience win, and a baseline in this state fails the row.
     no_loss_inconclusive: bool
+    #: How many trials could not clear zero-loss and proved no loss, whatever the others did. A
+    #: baseline with any fails its row (BACKLOG #5574): the fold must be monotone, so a proven breach
+    #: in another trial cannot turn an INCONCLUSIVE trial's fail into a resilience win, which it did
+    #: when the row read ``no_loss_inconclusive`` alone ([LOSS, INCONCLUSIVE] passed as a win while
+    #: [OK, INCONCLUSIVE] failed).
+    inconclusive_trials: int
     sent: int
     sink_received: int
     backlog: int
@@ -131,6 +137,7 @@ class _ArmMetrics:
             # the other trials could not clear (BACKLOG #5574).
             no_loss_inconclusive=bool(losses)
             and all(r.no_loss.inconclusive for r in recs if not r.no_loss.ok),
+            inconclusive_trials=sum(1 for r in recs if not r.no_loss.ok and r.no_loss.inconclusive),
             sent=sum(r.no_loss.sent for r in recs),
             sink_received=sum(r.no_loss.sink_received for r in recs),
             backlog=max(r.no_loss.backlog for r in recs),
@@ -169,7 +176,7 @@ class ComparisonRow:
         return (
             not self.pooled_missing
             and not self.baseline.no_loss_ok
-            and not self.baseline.no_loss_inconclusive
+            and not self.baseline.inconclusive_trials
             and not self.candidate_lost
             and self.candidate is not None
             and self.candidate.drain_completed
@@ -187,9 +194,10 @@ class ComparisonRow:
         # A pooled arm whose drain timed out in any trial left rows stranded (BACKLOG #5429).
         if self.candidate is not None and not self.candidate.drain_completed:
             return False
-        # A baseline that cleared nothing is no breach and no measurement: the row cannot pass on
-        # the resilience basis, nor on a throughput delta it never made sound (BACKLOG #5574).
-        if self.baseline.no_loss_inconclusive:
+        # A baseline trial that cleared nothing is no breach and no measurement: the row cannot pass
+        # on the resilience basis, nor on a throughput delta it never made sound, whatever the other
+        # trials proved (BACKLOG #5574).
+        if self.baseline.inconclusive_trials:
             return False
         if self.collapse_verdict == COLLAPSE_FAIL:
             return False
@@ -234,7 +242,9 @@ class ClaimModeComparison:
     def baseline_zero_loss_breaches(self) -> int:
         """Counts where per_lane breached the at-least-once reconcile (context for the resilience
         story; it also marks those counts' throughput comparison unsound)."""
-        # An INCONCLUSIVE baseline is not a breach (BACKLOG #5574); it fails its row instead.
+        # A breach is a trial that PROVED a loss. A baseline none of whose trials did is not one
+        # (BACKLOG #5574); it fails its row instead. A row with a proven trial and an INCONCLUSIVE
+        # one is counted here and in `baseline_inconclusive` both, and fails.
         return sum(
             1
             for row in self.rows
@@ -243,9 +253,9 @@ class ClaimModeComparison:
 
     @property
     def baseline_inconclusive(self) -> int:
-        """Counts whose per_lane arm could not clear zero-loss and proved no loss (BACKLOG #5574).
-        Each fails its row, so the summary names them beside the breaches it does not count."""
-        return sum(1 for row in self.rows if row.baseline.no_loss_inconclusive)
+        """Counts with a per_lane trial that could not clear zero-loss and proved no loss (BACKLOG
+        #5574), whatever its other trials proved. Each fails its row, so the summary names them."""
+        return sum(1 for row in self.rows if row.baseline.inconclusive_trials)
 
     @property
     def resilience_wins(self) -> int:
@@ -562,6 +572,8 @@ def _row_json(row: ComparisonRow) -> dict[str, object]:
             "pooled_zero_loss": (None if row.candidate is None else row.candidate.no_loss_ok),
             # A False above is a proven breach or an INCONCLUSIVE arm; this says which (BACKLOG #5574).
             "per_lane_zero_loss_inconclusive": row.baseline.no_loss_inconclusive,
+            # Any of these fails the row, even beside a trial that proved a breach.
+            "per_lane_inconclusive_trials": row.baseline.inconclusive_trials,
             "pooled_zero_loss_inconclusive": (
                 None if row.candidate is None else row.candidate.no_loss_inconclusive
             ),
@@ -633,10 +645,11 @@ def _loss_label(row: ComparisonRow) -> str:
         return f"CANDIDATE LOST -- pooled breached zero-loss ({detail})"
     if row.candidate is not None and not row.candidate.drain_completed:
         return "CANDIDATE UNDRAINED -- a pooled trial's drain timed out (rows stranded)"
-    if row.baseline.no_loss_inconclusive:
+    if row.baseline.inconclusive_trials:
         return (
-            f"BASELINE INCONCLUSIVE -- per_lane could not clear zero-loss, so the row has no "
-            f"sound basis ({row.baseline.no_loss_detail})"
+            f"BASELINE INCONCLUSIVE -- {row.baseline.inconclusive_trials} of "
+            f"{row.baseline.trials} per_lane trial(s) could not clear zero-loss and proved no "
+            f"loss, so the row has no sound basis ({row.baseline.no_loss_detail})"
         )
     if row.resilience_win:
         return "RESILIENCE -- per_lane breached zero-loss, pooled held (throughput delta not sound)"
@@ -778,6 +791,12 @@ class _FuseArm:
     # final ``no_loss.backlog`` is one reading after the drain wait; drain completion is the signal that
     # the whole pipeline emptied within the timeout, so it is the gate.) ---
     drain_seconds_worst: float | None
+    #: Of the trials with no drain time, how many sent traffic (``await_drain`` timed out over a real
+    #: run) and how many sent nothing (a cell that never ran or whose drive failed carries the same
+    #: None drain). The drain guard's reason names which (BACKLOG #5574); the gate reads only
+    #: ``drain_seconds_worst``.
+    drain_timeouts: int
+    drainless_unsent: int
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
     #: The arm did not hold zero-loss and no trial PROVED a loss: every failing trial's reconcile was
@@ -824,6 +843,10 @@ class _FuseArm:
             mean_written_per_s=statistics.fmean(writtens) if writtens else 0.0,
             in_pipeline_peak=max((r.in_pipeline_peak for r in recs), default=0),
             drain_seconds_worst=drain_seconds_worst,
+            drain_timeouts=sum(1 for r in recs if r.drain_seconds is None and r.no_loss.sent > 0),
+            drainless_unsent=sum(
+                1 for r in recs if r.drain_seconds is None and r.no_loss.sent <= 0
+            ),
             delivered_offered=statistics.fmean(ratios) if ratios else None,
             zero_loss_ok=all(r.no_loss.ok for r in recs) and bool(recs),
             zero_loss_inconclusive=(
@@ -1332,19 +1355,23 @@ def _fuse_verdict(
     if candidate_lost and not cand.zero_loss_inconclusive:
         return FUSE_NO_GO, "B1 breached zero-loss -- fusion must never drop a message (hard guard)"
     if not in_pipeline_ok:
-        if not cand.drain_completed and candidate_lost and cand.zero_loss_inconclusive:
-            # A failed or never-run cell carries the same None drain as a timed-out one, and its
-            # INCONCLUSIVE reconcile cannot say which; stalled rows are not asserted (BACKLOG #5574).
-            return FUSE_NO_GO, (
-                "B1 pipeline did not fully drain: a B1 trial's drain timed out or the trial never "
-                "ran (its reconcile was INCONCLUSIVE; its detail says which) -- no ceiling lift is "
-                "measured"
-            )
-        if not cand.drain_completed:
+        # A failed or never-run cell carries the same None drain as a timed-out one. What it sent
+        # tells them apart: a trial that sent nothing stranded nothing, so no stall is asserted for
+        # it, and a timed-out drain over real traffic keeps its specific reason (BACKLOG #5574).
+        unsent = (
+            f"{cand.drainless_unsent} B1 trial(s) sent nothing and have no drain time (the cell "
+            f"never ran or its drive failed; the reconcile detail says which)"
+        )
+        if not cand.drain_completed and cand.drain_timeouts:
+            also = f"; {unsent}" if cand.drainless_unsent else ""
             return FUSE_NO_GO, (
                 "B1 pipeline did not fully drain (await_drain timed out -- the whole-pipeline in_pipeline "
                 "gauge never reached 0, rows stranded in ingress/routed/outbound) -- the higher intake "
-                "rides a backlog, not a real ceiling lift"
+                f"rides a backlog, not a real ceiling lift{also}"
+            )
+        if not cand.drain_completed:
+            return FUSE_NO_GO, (
+                f"B1 pipeline did not fully drain: {unsent} -- no ceiling lift is measured"
             )
         return FUSE_NO_GO, (
             f"B1 drain time grew (B1 {_fmt(cand.drain_seconds_worst)}s > B0 "

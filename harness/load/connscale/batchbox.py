@@ -60,11 +60,13 @@ from harness.load.connscale.runner import (
     ConnScaleError,
     _await_node_healthy,
     _evaluate_slos,
+    _excusal,
     _node_env,
     _reset_server_store,
 )
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import EngineNode, FailoverError, _await_port
+from harness.load.metrics import Counters
 from messagefoundry.terminal_text import escape_for_terminal
 
 _HEALTH_TIMEOUT = 30.0
@@ -372,6 +374,45 @@ def build_remote_argv(
 # --- the driver-side per-cell aggregation (pure) -----------------------------
 
 
+def _report_count(value: object) -> int | None:
+    """A non-negative integer count read off a band report, or None for anything else."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _band_stranding(report: Mapping[str, Any]) -> tuple[bool | None, str]:
+    """Whether one band's own sends broke the stranding budget its ``_reconcile`` judged them by.
+
+    ``(True, why)`` over budget, ``(False, "")`` within it, ``(None, "")`` when the report does not
+    carry what the budget reads (BACKLOG #5574): a missing field must not clear the arm. The budget's
+    connection term is a FLOOR (``max(connections, three quarters of the sends)``), so a report
+    without its connection count still decides every band whose timeouts sit within the three
+    quarters; only one past it needs the count it lacks.
+    """
+    traffic = report.get("traffic", {})
+    sent = _report_count(traffic.get("sent"))
+    timeouts = _report_count(traffic.get("timeouts"))
+    if sent is None or timeouts is None:
+        return None, ""
+    bands = _report_count(report.get("engine_bands"))
+    per_band = _report_count(report.get("count_per_band"))
+    connections = None if bands is None or per_band is None else bands * per_band
+    ex = _excusal(
+        Counters(sent=sent, timeouts=timeouts),
+        unconfirmed_budget=0 if connections is None else connections,
+    )
+    if not ex.over_budget:
+        return False, ""
+    if connections is None:
+        return None, ""
+    return True, (
+        f"a band's {ex.unconfirmed} unconfirmed sends exceed its stranding budget ({ex.budget} = "
+        f"max({connections} connections, three quarters of its {sent} sends)) — systemic no-ACK "
+        f"fault, judged on that band's client counters alone"
+    )
+
+
 def aggregate_cell_record(
     cell: BatchCell,
     proc_reports: list[dict[str, Any]],
@@ -476,7 +517,21 @@ def aggregate_cell_record(
     # verdict rather than demote it to INCONCLUSIVE (BACKLOG #5574). A band that judged its engine
     # arms is not counted: its delivery arm compares one band's sink with the engine-wide written.
     client_lost = 0
+    # The stranding budget, judged again here on EVERY band's own client counters, whatever its
+    # engine arms did (BACKLOG #5574). It reads only that band's sends and timeouts, so no other band
+    # can correct it, and a band over budget is a loss the cell keeps. Taking it off the band's
+    # verdict alone would keep it only where the engine arms went unjudged: the same flood beside a
+    # clean engine read would pass the cell, and beside a reset would fail it. `_excusal` is the one
+    # definition the band's `_reconcile` used, with the budget it was given (engine_bands x
+    # count_per_band; a remote band runs no reload probe, so nothing is excused as reload stranding).
+    stranding: list[str] = []
+    stranding_unjudged = 0
     for r in proc_reports:
+        over_budget, why = _band_stranding(r)
+        if over_budget is None:
+            stranding_unjudged += 1
+        elif over_budget:
+            stranding.append(why)
         nl = r.get("no_loss", {})
         engine_unjudged = False
         if "counter_reset" not in nl:
@@ -489,7 +544,13 @@ def aggregate_cell_record(
         if int(nl.get("backlog", 0) or 0) < 0:
             blind += 1
             engine_unjudged = True
-        if engine_unjudged and nl.get("ok") is False and nl.get("inconclusive") is False:
+        # A band already counted over the stranding budget is not counted twice.
+        if (
+            engine_unjudged
+            and not over_budget
+            and nl.get("ok") is False
+            and nl.get("inconclusive") is False
+        ):
             client_lost += 1
     # Every band reads the SAME engine, so one band's readings are the engine totals and a proven
     # loss needs only the bands that read it cleanly (BACKLOG #5574): one band's reset or blindness
@@ -508,7 +569,7 @@ def aggregate_cell_record(
     # A negative backlog is the metrics-unavailable stand-in, refused below as no reading; only a
     # positive one is rows left in the pipeline.
     drained = backlog <= 0
-    lost = read_short > 0 or deliver_short > 0 or client_lost > 0
+    lost = read_short > 0 or deliver_short > 0 or bool(stranding) or client_lost > 0
     # Reasons the cell cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: both arms above are inequalities an empty, unsettled or
     # undelivering cell satisfies trivially.
@@ -538,6 +599,12 @@ def aggregate_cell_record(
             else "the loss arms were not judged (no band read the engine cleanly)"
         )
         unproven.append(f"{blind} band(s) could not read the engine metrics — {unjudged}")
+    if stranding_unjudged:
+        unproven.append(
+            f"{stranding_unjudged} band report(s) do not carry what the stranding budget reads "
+            f"(traffic sent and timeouts, engine_bands, count_per_band) — their stranding arm was "
+            f"not judged"
+        )
     no_loss_ok = not lost and drained and not unproven
     parts: list[str] = []
     if read_short > 0:
@@ -547,6 +614,7 @@ def aggregate_cell_record(
             f"union sink_received {agg_sink_received} < engine_written {judged_written} "
             f"(lost {deliver_short})"
         )
+    parts.extend(stranding)
     if client_lost:
         parts.append(
             f"{client_lost} band(s) proved a loss on client counters alone (their engine arms "

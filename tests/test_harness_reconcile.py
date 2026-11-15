@@ -1603,6 +1603,62 @@ def test_batchbox_aggregate_keeps_a_band_loss_proven_on_client_counters_alone() 
     assert bb.aggregate_cell_record(_cell(), [judged, _pair()]).no_loss.ok
 
 
+def _flood(timeouts: int, *, connections: bool = True, **over: object) -> dict[str, object]:
+    """A band of a two-band fleet with ``timeouts`` of its 10 sends unconfirmed, on 4 connections."""
+    band = _pair(**over)
+    band["traffic"] = {
+        "sent": 10,
+        "acked": 10 - timeouts,
+        "nak": 0,
+        "deferred": 0,
+        "timeouts": timeouts,
+    }
+    if connections:
+        band["engine_bands"], band["count_per_band"] = 1, 4
+    return band
+
+
+def test_batchbox_aggregate_keeps_a_stranding_loss_whether_or_not_the_band_read_the_engine() -> (
+    None
+):
+    # A band's stranding budget reads only its own sends and timeouts, so no other band corrects it.
+    # The cell used to keep that loss only where the band's engine arms went unjudged: the flood
+    # beside a reset failed the cell, and the same flood beside a clean engine read passed it.
+    # Budget here: max(4 connections, 3 * 10 // 4 = 7) = 7, so 8 timeouts is over it.
+    needle = "exceed its stranding budget (7 = max(4 connections, three quarters of its 10 sends))"
+    for flood in (
+        _flood(8, ok=False, inconclusive=False),
+        _flood(8, ok=False, inconclusive=False, counter_reset=_RESET),
+    ):
+        rec = bb.aggregate_cell_record(_cell(), [flood, _pair()])
+        assert not rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+        assert needle in rec.no_loss.detail
+        # Counted once: the band's own LOSS verdict under a reset is this same stranding.
+        assert "proved a loss on client counters alone" not in rec.no_loss.detail
+    # The control: 7 timeouts is within the same budget, so a clean engine read clears the cell.
+    rec = bb.aggregate_cell_record(_cell(), [_flood(7), _pair()])
+    assert rec.no_loss.ok and not rec.no_loss.inconclusive, rec.no_loss.detail
+
+
+def test_batchbox_aggregate_does_not_clear_a_stranding_arm_it_cannot_read() -> None:
+    # Past three quarters of the sends, the budget turns on the connection count, so a band report
+    # without it cannot clear the arm. Within three quarters the count cannot matter (it is a
+    # floor), so the arm is still judged; that is the control.
+    rec = bb.aggregate_cell_record(_cell(), [_flood(8, connections=False), _pair()])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "1 band report(s) do not carry what the stranding budget reads" in rec.no_loss.detail
+    rec = bb.aggregate_cell_record(_cell(), [_flood(7, connections=False), _pair()])
+    assert rec.no_loss.ok, rec.no_loss.detail
+    # A band report without its timeouts reads nothing, whatever it sent.
+    silent = _pair()
+    traffic = silent["traffic"]
+    assert isinstance(traffic, dict)
+    del traffic["timeouts"]
+    rec = bb.aggregate_cell_record(_cell(), [silent, _pair()])
+    assert not rec.no_loss.ok and rec.no_loss.inconclusive, rec.no_loss.detail
+    assert "do not carry what the stranding budget reads" in rec.no_loss.detail
+
+
 def test_batchbox_aggregate_reports_every_band_reason_not_only_the_first() -> None:
     other = "engine counters went backwards (read 9 -> 1, written 9 -> 1): a stats reset"
     silent = _pair()

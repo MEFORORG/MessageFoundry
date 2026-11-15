@@ -400,6 +400,45 @@ def test_an_inconclusive_baseline_is_no_resilience_win_and_fails_the_row() -> No
     assert "baseline_inconclusive=1" in cmp.render_table()
 
 
+def test_a_baseline_inconclusive_trial_fails_the_row_whatever_the_other_trials_proved() -> None:
+    # BACKLOG #5574: the fold must be monotone. A baseline of [LOSS, INCONCLUSIVE] used to pass as
+    # a resilience win while [OK, INCONCLUSIVE] failed, so a proven breach in one trial lifted the
+    # INCONCLUSIVE trial's fail. Both fail now. The control is [LOSS, LOSS], the "per_lane drowns"
+    # case, which stays a resilience win.
+    from dataclasses import replace as _replace
+
+    from harness.load.connscale.compare import _loss_label
+
+    breached = _record(
+        claim_mode="per_lane", count=10, achieved_read=0.0, idle_poll=1.0, no_loss_ok=False
+    )
+    clean = _record(claim_mode="per_lane", count=10, achieved_read=100.0, idle_poll=1.0)
+    unsure = _replace(breached, no_loss=_replace(breached.no_loss, inconclusive=True), trial=1)
+    pooled = [
+        _replace(
+            _record(claim_mode="pooled", count=10, achieved_read=100.0, idle_poll=0.0), trial=t
+        )
+        for t in (0, 1)
+    ]
+    for first in (breached, clean):
+        cmp = build_comparison([first, unsure, *pooled], ("per_lane", "pooled"))
+        assert cmp is not None and len(cmp.rows) == 1
+        (row,) = cmp.rows
+        assert row.baseline.trials == 2 and row.baseline.inconclusive_trials == 1
+        assert not row.resilience_win and not row.ok and not cmp.ok, first.no_loss.detail
+        assert _loss_label(row).startswith("BASELINE INCONCLUSIVE -- 1 of 2 per_lane trial(s)")
+        assert cmp.baseline_inconclusive == 1
+        loss = cmp.to_json_dict()["rows"][0]["loss"]  # type: ignore[index]
+        assert loss["per_lane_inconclusive_trials"] == 1
+    # A proven breach still counts as one beside the INCONCLUSIVE trial; it just cannot pass.
+    cmp = build_comparison([breached, unsure, *pooled], ("per_lane", "pooled"))
+    assert cmp is not None and cmp.baseline_zero_loss_breaches == 1
+    drowned = _replace(breached, trial=1)
+    cmp = build_comparison([breached, drowned, *pooled], ("per_lane", "pooled"))
+    assert cmp is not None and len(cmp.rows) == 1
+    assert cmp.rows[0].resilience_win and cmp.rows[0].ok and cmp.ok
+
+
 def test_an_inconclusive_arm_is_labelled_inconclusive_not_a_breach() -> None:
     from dataclasses import replace as _replace
 
