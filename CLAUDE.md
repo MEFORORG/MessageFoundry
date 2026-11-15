@@ -715,13 +715,13 @@ Manager's watch reached the cloud session 29 seconds after its question.
   change. Without it, the Lander sends the change to code review. The proof must cover the change
   being merged, so a conflict resolution the Lander wrote itself needs its own review. The Lander
   reads what the review found. **The Lander may merge when none of the open findings changes
-  behaviour or weakens a control.** That condition is the owner's ruling of 2026-10-12, in
-  session, approving the Lander's proposal *"Let me merge when the open findings are filed as rows
-  and none changes behaviour or weakens a control"*. The proposal also put the filing first; the
-  ledger ruling R2 paragraph below now states the order, and the naming step that comes before the
-  merge. **CORRECTED 2026-11-15:** the bold
-  sentence read *"The Lander may merge when the open findings are filed as rows and none changes
-  behaviour or weakens a control (owner ruling 2026-10-12, in session)."* A finding that changes
+  behaviour or weakens a control, once it has named each open finding on the PR.** The owner's
+  ruling of 2026-10-12, in session, approved the first condition as part of the Lander's proposal
+  *"Let me merge when the open findings are filed as rows and none changes behaviour or weakens a
+  control"*. The naming step, and the order the ledger ruling R2 paragraph below states, replace
+  the proposal's filing-first step. **CORRECTED 2026-11-15:** the bold sentence read *"The Lander
+  may merge when the open findings are filed as rows and none changes behaviour or weakens a
+  control (owner ruling 2026-10-12, in session)."* A finding that changes
   behaviour or weakens a control still goes to the owner for a ruling. **CORRECTED 2026-10-12:**
   this read *"a finding that names a defect the merge would ship goes back to the owner for a
   ruling."* The
@@ -756,9 +756,9 @@ Manager's watch reached the cloud session 29 seconds after its question.
   filing". In a public repository the line names the subject and pastes no row text. The Lander
   files the queued ones in the next ledger pass, under the sweep in korus `roles/LANDER.md`, *An
   item left in a PR comment is yours to carry*. A finding that goes to the owner still holds the
-  merge until the owner rules: the permission above still requires that none changes behaviour or
-  weakens a control, and R2's item 4 keeps a false security-record statement going to the owner.
-  That reading is this text's; neither R2 nor the decision's record states it. The Lander decided
+  merge until the owner rules, as the sentences above say. R2 amends the 2026-10-12 ruling in its
+  mechanics only, and its item 4 names one of that ruling's owner routes as unchanged, so its
+  *"never waits"* covers the findings that ruling lets the Lander merge past. The Lander decided
   the order under the owner's delegation of 2026-11-11; the decision's record gives the question as
   *"does CLAUDE.md s5 file-before-merge or R2 merge-first govern?"* and the owner's answer as
   *"/driver"*. The authority for this text is the owner confirmation in the Repair Manager's chat,
