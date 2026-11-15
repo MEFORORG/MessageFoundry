@@ -28,11 +28,15 @@ same-named tables apart)."""
 from __future__ import annotations
 
 import ast
+import dis
 import inspect
+import io
+import logging
+import tokenize
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from types import CellType, CodeType, FunctionType, ModuleType
+from types import CellType, CodeType, FunctionType, MethodType, ModuleType
 
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.wiring import _CONFIG_MODULE_PREFIX, Registry
@@ -42,11 +46,14 @@ __all__ = [
     "ReferenceIndex",
     "SourceCache",
     "build_reference_index",
+    "captured_values",
+    "code_names",
     "config_module_files",
-    "loaded_names",
     "reached_functions",
     "table_kinds",
 ]
+
+_log = logging.getLogger(__name__)
 
 #: The run-time call each table kind is read through, keyed by the simple name the call resolves to
 #: (``code_set(...)`` and ``mod.code_set(...)`` alike). Its first positional argument is the table name.
@@ -70,20 +77,42 @@ def _string_consts(code: CodeType) -> set[str]:
     return out
 
 
-def loaded_names(code: CodeType) -> set[str]:
-    """Every global or attribute name a code object loads, recursing into nested code."""
-    out = set(code.co_names)
+def code_names(code: CodeType) -> tuple[set[str], set[str]]:
+    """The global names and the attribute names a code object loads, recursing into nested code.
+
+    Read from the bytecode rather than ``co_names``, which mixes the two: a method call such as
+    ``cs.translate(x)`` must not be read as a reference to a module function called ``translate``."""
+    global_names: set[str] = set()
+    attr_names: set[str] = set()
+    for ins in dis.get_instructions(code):
+        if ins.opname in _GLOBAL_LOADS and isinstance(ins.argval, str):
+            global_names.add(ins.argval)
+        elif ins.opname in _ATTR_LOADS and isinstance(ins.argval, str):
+            attr_names.add(ins.argval)
     for const in code.co_consts:
         if isinstance(const, CodeType):
-            out |= loaded_names(const)
-    return out
+            inner_globals, inner_attrs = code_names(const)
+            global_names |= inner_globals
+            attr_names |= inner_attrs
+    return global_names, attr_names
 
 
-def _code_of(fn: object) -> CodeType | None:
-    """The ``__code__`` of a registered Router/Handler (unwrapping decorators), or ``None`` for a
-    callable with no analyzable code object (e.g. a callable instance) — which is then skipped."""
-    target = inspect.unwrap(fn) if callable(fn) else fn
-    return getattr(target, "__code__", None)
+_GLOBAL_LOADS = frozenset({"LOAD_GLOBAL", "LOAD_NAME"})
+_ATTR_LOADS = frozenset({"LOAD_ATTR", "LOAD_METHOD", "LOAD_SUPER_ATTR"})
+
+
+def _function_of(obj: object) -> FunctionType | None:
+    """The plain function behind ``obj``: decorators unwrapped, a bound method's ``__func__``, or
+    ``None`` for anything else (a callable instance, a builtin)."""
+    if not callable(obj):
+        return None
+    try:
+        target = inspect.unwrap(obj)
+    except ValueError:  # a __wrapped__ chain that loops
+        return None
+    if isinstance(target, MethodType):
+        target = target.__func__
+    return target if isinstance(target, FunctionType) else None
 
 
 def _is_config_module(name: object, root_module: str) -> bool:
@@ -99,17 +128,41 @@ def _cell_value(cell: CellType) -> object:
         return None
 
 
-def _reached(fn: object) -> Iterator[FunctionType | CodeSet]:
-    """The root function, then every config-authored helper function it reaches through its globals,
-    closure cells and imported config modules (transitively), and every ``CodeSet`` those hold.
+def captured_values(func: FunctionType, root_module: str) -> list[tuple[str, object]]:
+    """The ``(name, value)`` pairs ``func`` can read without computing them: the globals it loads,
+    the attributes it loads off a config module, its closure cells and its default arguments.
+
+    A module attribute is read from the module's ``__dict__``, so a module ``__getattr__`` never runs."""
+    global_names, attr_names = code_names(func.__code__)
+    pairs: list[tuple[str, object]] = [(n, func.__globals__.get(n)) for n in sorted(global_names)]
+    pairs += [
+        (n, module.__dict__.get(n))
+        for _name, module in list(pairs)
+        if isinstance(module, ModuleType) and _is_config_module(module.__name__, root_module)
+        for n in sorted(attr_names)
+        if n in module.__dict__
+    ]
+    pairs += [
+        (name, _cell_value(cell))
+        for name, cell in zip(func.__code__.co_freevars, func.__closure__ or (), strict=False)
+    ]
+    pairs += [("", value) for value in func.__defaults__ or ()]
+    pairs += [(name, value) for name, value in (func.__kwdefaults__ or {}).items()]
+    return pairs
+
+
+def _reached(fn: object) -> Iterator[FunctionType | CodeSet | str]:
+    """The root function, then every config-authored helper function it reaches through what it can
+    read (:func:`captured_values`), transitively, and every ``CodeSet`` or ``str`` those hold.
 
     Helpers outside config code (the ``messagefoundry`` package, the standard library) are not
     followed: their constants are not the author's table names."""
-    root = inspect.unwrap(fn) if callable(fn) else fn
-    if not isinstance(root, FunctionType):
+    root = _function_of(fn)
+    if root is None:
         return
     root_module = root.__module__
     seen: set[int] = set()
+    seen_values: set[str] = set()
     stack: list[FunctionType] = [root]
     while stack:
         func = stack.pop()
@@ -117,31 +170,25 @@ def _reached(fn: object) -> Iterator[FunctionType | CodeSet]:
             continue
         seen.add(id(func))
         yield func
-        names = loaded_names(func.__code__)
-        values: list[object] = [func.__globals__.get(n) for n in names]
-        values += [_cell_value(cell) for cell in func.__closure__ or ()]
-        values += [
-            getattr(value, n, None)
-            for value in list(values)
-            if isinstance(value, ModuleType) and _is_config_module(value.__name__, root_module)
-            for n in names
-        ]
-        for value in values:
+        for _name, value in captured_values(func, root_module):
             if isinstance(value, CodeSet):
-                if id(value) not in seen:
-                    seen.add(id(value))
+                key = "code_set:" + value.name
+                if key not in seen_values:
+                    seen_values.add(key)
                     yield value
-            elif callable(value):
-                target = inspect.unwrap(value)
-                if isinstance(target, FunctionType) and _is_config_module(
-                    target.__module__, root_module
-                ):
+            elif isinstance(value, str):
+                if "str:" + value not in seen_values:
+                    seen_values.add("str:" + value)
+                    yield value
+            else:
+                target = _function_of(value)
+                if target is not None and _is_config_module(target.__module__, root_module):
                     stack.append(target)
 
 
 def reached_functions(fn: object) -> list[FunctionType]:
     """``fn`` (unwrapped) and every config-authored helper function it reaches through its globals,
-    closure cells and imported config modules, transitively. A non-function callable yields ``[]``."""
+    closure cells, defaults and imported config modules, transitively. A non-function yields ``[]``."""
     return [f for f in _reached(fn) if isinstance(f, FunctionType)]
 
 
@@ -149,10 +196,10 @@ def config_module_files(func: FunctionType) -> set[str]:
     """``func``'s own source file and the file of every config module it reads an attribute of
     (``_consts.TARGET``) -- the files whose module-level bindings ``func`` can read."""
     files = {func.__code__.co_filename}
-    for name in loaded_names(func.__code__):
+    for name in code_names(func.__code__)[0]:
         value = func.__globals__.get(name)
         if isinstance(value, ModuleType) and _is_config_module(value.__name__, func.__module__):
-            module_file = getattr(value, "__file__", None)
+            module_file = value.__dict__.get("__file__")
             if isinstance(module_file, str):
                 files.add(module_file)
     return files
@@ -173,18 +220,6 @@ def table_kinds(registry: Registry) -> dict[str, list[str]]:
     return out
 
 
-def _accessor_kind(node: ast.Constant, parents: dict[int, ast.AST]) -> str | None:
-    """The table kind whose accessor call takes ``node`` as its first positional argument
-    (``code_set("x")`` -> ``"code_set"``), or ``None`` when ``node`` sits anywhere else."""
-    from messagefoundry.config.graph import _called_name
-
-    parent = parents.get(id(node))
-    if not isinstance(parent, ast.Call) or not parent.args or parent.args[0] is not node:
-        return None
-    name = _called_name(parent)
-    return _TABLE_ACCESSORS.get(name) if name is not None else None
-
-
 class SourceCache:
     """Parsed config sources by file name, for one index build or rename plan."""
 
@@ -197,11 +232,24 @@ class SourceCache:
         if file not in self._parsed:
             try:
                 text = Path(file).read_text(encoding="utf-8")
-                self._parsed[file] = (ast.parse(text), text.splitlines(keepends=True))
-            except (OSError, SyntaxError, ValueError, MemoryError, RecursionError):
+                # Lines split as the parser and the tokenizer count them (\n, \r\n, \r only), not as
+                # str.splitlines does, which also breaks on a form feed or U+2028.
+                lines = io.StringIO(text, newline="").readlines()
+                self._parsed[file] = (ast.parse(text), lines)
+            except (OSError, SyntaxError, ValueError, MemoryError, RecursionError) as exc:
                 # MemoryError and RecursionError are the parser's width and depth walls (BACKLOG #1858).
+                _log.debug("reference analysis could not parse %s: %s", file, type(exc).__name__)
                 self._parsed[file] = None
         return self._parsed[file]
+
+    def position(self, file: str, node: ast.expr) -> tuple[int, int]:
+        """``node``'s ``(line, char col)``: ast counts the column in UTF-8 bytes, while tokenize, and
+        so every rename edit, counts characters."""
+        parsed = self.parse(file)
+        lines = parsed[1] if parsed is not None else []
+        line_text = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
+        prefix = line_text.encode("utf-8")[: node.col_offset]
+        return node.lineno, len(prefix.decode("utf-8", errors="replace"))
 
     def occurrences(self, file: str, value: str) -> dict[tuple[int, int], str | None]:
         """Each place ``file`` spells the string ``value``, as ``(line, char col)`` -> the table kind
@@ -220,7 +268,9 @@ class SourceCache:
         parsed = self.parse(file)
         if parsed is None:
             return {}
-        tree, lines = parsed
+        from messagefoundry.config.graph import _called_name
+
+        tree = parsed[0]
         parents: dict[int, ast.AST] = {}
         out: dict[tuple[int, int], str | None] = {}
         stack: list[ast.AST] = [tree]
@@ -228,26 +278,29 @@ class SourceCache:
             node = stack.pop()
             kind: str | None
             if isinstance(node, ast.JoinedStr):
-                # Never descend: a fragment of an f-string is not the string's value.
                 parts = node.values
-                if not all(isinstance(v, ast.Constant) for v in parts):
+                if all(isinstance(v, ast.Constant) for v in parts):
+                    if "".join(str(v.value) for v in parts if isinstance(v, ast.Constant)) == value:
+                        out[self.position(file, node)] = None
                     continue
-                if "".join(str(v.value) for v in parts if isinstance(v, ast.Constant)) != value:
-                    continue
-                kind = None
-            elif isinstance(node, ast.Constant) and node.value == value:
-                kind = _accessor_kind(node, parents)
-            else:
-                for child in ast.iter_child_nodes(node):
-                    parents[id(child)] = node
-                    stack.append(child)
+                # A constant piece of an interpolating f-string is not the string's value, but an
+                # expression inside a replacement field (f"{code_set('x')}") is ordinary code.
+                for part in parts:
+                    if isinstance(part, ast.FormattedValue):
+                        parents[id(part)] = node
+                        stack.append(part)
                 continue
-            line_text = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
-            # ast columns are UTF-8 byte offsets; tokenize (and so every rename edit) counts characters.
-            col = len(
-                line_text.encode("utf-8")[: node.col_offset].decode("utf-8", errors="replace")
-            )
-            out[(node.lineno, col)] = kind
+            if isinstance(node, ast.Constant) and node.value == value:
+                parent = parents.get(id(node))
+                kind = None
+                if isinstance(parent, ast.Call) and parent.args and parent.args[0] is node:
+                    called = _called_name(parent)
+                    kind = _TABLE_ACCESSORS.get(called) if called is not None else None
+                out[self.position(file, node)] = kind
+                continue
+            for child in ast.iter_child_nodes(node):
+                parents[id(child)] = node
+                stack.append(child)
         return out
 
 
@@ -257,7 +310,8 @@ def _source_kinds(func: FunctionType, literal: str, sources: SourceCache) -> set
     a list, a helper's argument), so the caller falls back to every kind the name could be."""
     try:
         lines, start = inspect.getsourcelines(func)
-    except (OSError, TypeError):
+    except (OSError, TypeError, SyntaxError, tokenize.TokenError):
+        # A helper whose file changed since it loaded: fall back to every kind the name could be.
         return None
     end = start + len(lines) - 1
     kinds: set[str | None] = {
@@ -317,11 +371,12 @@ class ReferenceIndex:
         return sorted(obj for obj in registered if obj not in reachable)
 
 
-def build_reference_index(registry: Registry) -> ReferenceIndex:
+def build_reference_index(registry: Registry, sources: SourceCache | None = None) -> ReferenceIndex:
     """Build the reverse-reference index from the authoritative static wiring graph (ADR 0091 D1 —
     the inbound/router/handler/outbound edges, AST-first with the ``co_consts`` heuristic as a
     fallback tier) plus the ``code_set()``/``reference()``/lookup-table edges this module reads from
-    each referrer's reached functions (see the module docstring)."""
+    each referrer's reached functions (see the module docstring). ``sources`` lets a caller that parses
+    the same files afterwards share one parse."""
     from messagefoundry.config.graph import build_wiring_graph
 
     kinds_by_name = table_kinds(registry)
@@ -343,7 +398,7 @@ def build_reference_index(registry: Registry) -> ReferenceIndex:
         *(("handler", n, fn) for n, fn in registry.handlers.items()),
         *(("handler", n, pred) for n, pred in registry.handler_accepts.items()),
     ]
-    sources = SourceCache()
+    sources = sources if sources is not None else SourceCache()
     # Helpers shared by many referrers are read once: targets are cached per reached object.
     targets_of: dict[int, list[tuple[str, str]]] = {}
     seen: set[Reference] = set(edges)
@@ -360,14 +415,17 @@ def build_reference_index(registry: Registry) -> ReferenceIndex:
 
 
 def _table_targets(
-    reached: FunctionType | CodeSet,
+    reached: FunctionType | CodeSet | str,
     kinds_by_name: dict[str, list[str]],
     sources: SourceCache,
 ) -> list[tuple[str, str]]:
-    """The ``(kind, name)`` tables one reached function names as literals, or the code set a captured
-    ``CodeSet`` global is. A literal several kinds share is narrowed by the accessor it is passed to;
+    """The ``(kind, name)`` tables one reached function names as literals, the code set a captured
+    ``CodeSet`` is, or the tables a captured ``str`` names. A literal several kinds share is narrowed by the accessor it is passed to;
     when that cannot be read, every kind holding the name counts, so a live table is never reported
     dead (a safe over-report)."""
+    if isinstance(reached, str):
+        # A global the referrer reads that holds a table name (DIET_TABLE = "diets"; code_set(DIET_TABLE)).
+        return [(k, reached) for k in kinds_by_name.get(reached, ())]
     if isinstance(reached, CodeSet):
         return (
             [("code_set", reached.name)]

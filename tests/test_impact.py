@@ -934,7 +934,216 @@ def test_renaming_one_of_two_same_named_tables_leaves_the_other_alone(tmp_path: 
         config_dir, "shared", "renamed", validate=_validate_code_set
     )
     assert result["referents_rewritten"] == 1
+    assert "referents_unresolved" not in result
     mod = (config_dir / "mod.py").read_text(encoding="utf-8")
     assert 'code_set("renamed")' in mod
     assert 'reference("shared")' in mod
     assert 'Reference("shared"' in mod
+
+
+def _codeset_dir(tmp_path: Path, files: dict[str, str], *tables: str) -> Path:
+    config_dir = _write_config(tmp_path, files)
+    codesets = config_dir / "codesets"
+    codesets.mkdir()
+    for name in tables:
+        (codesets / f"{name}.csv").write_text("code,value\nA,Apple\n", encoding="utf-8", newline="")
+    return config_dir
+
+
+_PREAMBLE = (
+    "from messagefoundry import FileRef, MLLP, Reference, Send, code_set, handler, "
+    "inbound, outbound, reference, router\n"
+    "\n"
+    'inbound("IB_Q", MLLP(port=2801), router="r_q")\n'
+    'outbound("OB_Q", MLLP(host="127.0.0.1", port=6950))\n'
+    "\n"
+    "\n"
+    '@router("r_q")\n'
+    "def r_q(msg):\n"
+    '    return ["h_q"]\n'
+    "\n"
+    "\n"
+)
+
+
+def test_an_accessor_inside_an_fstring_replacement_field_is_a_referent(tmp_path: Path) -> None:
+    """A code set and a reference share a name; the code set is read once plainly and once inside
+    an f-string's replacement field. The rename rewrites both reads, and the reference read inside an
+    f-string elsewhere keeps the reference live."""
+    body = _PREAMBLE + (
+        'Reference("shared", source=FileRef(path="shared.csv"))\n'
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = code_set("shared").get("A")\n'
+        "    b = f\"{code_set('shared').get('A')}\"\n"
+        "    c = f\"{reference('shared').get('x')}\"\n"
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "shared")
+    registry = load_config(config_dir)
+    index = build_reference_index(registry)
+    assert delete_impact(index, "reference", "shared") == [
+        Reference("handler", "h_q", "reference", "shared")
+    ]
+    plan = plan_rename(registry, config_dir, "code_set", "shared", "renamed")
+    assert plan.unresolved == ()
+    assert len(plan.edits) == 2
+
+
+def test_a_bound_method_predicate_still_counts_its_table(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        "class _Gate:\n"
+        "    def ok(self, msg):\n"
+        '        return "A" in code_set("allow_list")\n'
+        "\n"
+        "\n"
+        "_GATE = _Gate()\n"
+        "\n"
+        "\n"
+        '@handler("h_q", accepts=_GATE.ok)\n'
+        "def h_q(msg):\n"
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "allow_list")
+    registry = load_config(config_dir)
+    index = build_reference_index(registry)
+    assert delete_impact(index, "code_set", "allow_list") == [
+        Reference("handler", "h_q", "code_set", "allow_list")
+    ]
+
+
+def test_a_capture_inside_a_module_level_try_is_rewritten(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        "try:\n"
+        '    DIETS = code_set("diets")\n'
+        "except ValueError:\n"
+        "    DIETS = {}\n"
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = DIETS.get("A")\n'
+        '    b = code_set("diets").get("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    result = codeset_edit.rename_code_set(
+        config_dir, "diets", "renamed", validate=_validate_code_set
+    )
+    assert result["referents_rewritten"] == 2
+    assert "referents_unresolved" not in result
+    assert 'code_set("diets")' not in (config_dir / "mod.py").read_text(encoding="utf-8")
+
+
+def test_a_capture_imported_by_name_from_a_helper_is_reported_unresolved(tmp_path: Path) -> None:
+    """``from _shared import KINDS`` hides where the code set is captured, so the planner cannot
+    rewrite it. One plain read beside it must not make the referrer read as covered."""
+    body = (
+        "from _shared import KINDS\n"
+        + _PREAMBLE
+        + (
+            '@handler("h_q")\n'
+            "def h_q(msg):\n"
+            '    a = KINDS.get("A")\n'
+            '    b = code_set("kinds").get("A")\n'
+            '    return Send("OB_Q", msg)\n'
+        )
+    )
+    helper = 'from messagefoundry import code_set\n\nKINDS = code_set("kinds")\n'
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body, "_shared.py": helper}, "kinds")
+    registry = load_config(config_dir)
+    plan = plan_rename(registry, config_dir, "code_set", "kinds", "renamed")
+    assert plan.unresolved == (Reference("handler", "h_q", "code_set", "kinds"),)
+
+
+def test_a_helper_literal_that_is_not_a_table_read_is_left_alone(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        'LABELS = {"diets": "Diet orders"}\n'
+        "\n"
+        "\n"
+        "def _label(k):\n"
+        '    if k == "diets":\n'
+        '        return LABELS["diets"]\n'
+        '    return code_set("diets").get(k)\n'
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = _label("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    result = codeset_edit.rename_code_set(
+        config_dir, "diets", "renamed", validate=_validate_code_set
+    )
+    assert result["referents_rewritten"] == 1
+    text = (config_dir / "mod.py").read_text(encoding="utf-8")
+    assert 'LABELS = {"diets": "Diet orders"}' in text
+    assert 'if k == "diets":' in text
+    assert 'code_set("renamed").get(k)' in text
+
+
+def test_a_method_call_is_not_read_as_a_module_function(tmp_path: Path) -> None:
+    """``code_set("units").get(...)`` calls the CodeSet's ``get``; a module function named ``get``
+    that reads another table is not a helper of the handler."""
+    body = _PREAMBLE + (
+        "def get(code):\n"
+        '    return code_set("diets").get(code)\n'
+        "\n"
+        "\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = code_set("units").get("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets", "units")
+    index = build_reference_index(load_config(config_dir))
+    assert delete_impact(index, "code_set", "diets") == []
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [
+        ('DIET_TABLE = "diets"\n', "def h_q(msg):\n    a = code_set(DIET_TABLE)\n"),
+        ("", 'def h_q(msg, cs=code_set("diets")):\n    a = cs.get("A")\n'),
+    ],
+)
+def test_a_name_constant_or_a_default_argument_is_a_live_table_read(
+    tmp_path: Path, capture: tuple[str, str]
+) -> None:
+    module_top, handler_def = capture
+    body = (
+        _PREAMBLE
+        + module_top
+        + '\n\n@handler("h_q")\n'
+        + handler_def
+        + '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    registry = load_config(config_dir)
+    assert delete_impact(build_reference_index(registry), "code_set", "diets") == [
+        Reference("handler", "h_q", "code_set", "diets")
+    ]
+    result = codeset_edit.rename_code_set(
+        config_dir, "diets", "renamed", validate=_validate_code_set
+    )
+    assert result["referents_rewritten"] == 1
+    assert "referents_unresolved" not in result
+    load_config(config_dir)
+
+
+def test_a_form_feed_line_does_not_shift_the_rename(tmp_path: Path) -> None:
+    body = _PREAMBLE + (
+        "\x0c\n"
+        '@handler("h_q")\n'
+        "def h_q(msg):\n"
+        '    a = 1; b = code_set("diets").get("A")\n'
+        '    return Send("OB_Q", msg)\n'
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    registry = load_config(config_dir)
+    plan = plan_rename(registry, config_dir, "code_set", "diets", "renamed")
+    assert plan.unresolved == ()
+    assert len(plan.edits) == 1
