@@ -179,7 +179,9 @@ def _keyed_open_steps(monkeypatch: pytest.MonkeyPatch, settles: list[bool]) -> N
     async def _noop(*_args: object, **_kwargs: object) -> Any:
         return None
 
-    async def _checkpoint(self: PostgresStore, *, settle: bool = False) -> None:
+    async def _checkpoint(
+        self: PostgresStore, *, settle: bool = False, strict: bool = False
+    ) -> None:
         settles.append(settle)
 
     monkeypatch.setattr(PostgresStore, "_ensure_schema", _noop)

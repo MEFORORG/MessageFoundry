@@ -209,7 +209,9 @@ def _keyed_open_steps(monkeypatch: pytest.MonkeyPatch, settles: list[bool]) -> N
     async def _noop(*_args: object, **_kwargs: object) -> Any:
         return None
 
-    async def _checkpoint(self: SqlServerStore, *, settle: bool = False) -> None:
+    async def _checkpoint(
+        self: SqlServerStore, *, settle: bool = False, strict: bool = False
+    ) -> None:
         settles.append(settle)
 
     monkeypatch.setattr(SqlServerStore, "_ensure_schema", _noop)

@@ -177,11 +177,11 @@ from messagefoundry.store.queue_tag import (
     QUEUE_TAG_SELECT,
     QueueTagError,
     alert_queue_tag_failure,
-    is_tag_failure,
     open_queue_cell,
     queue_payload_aad,
     queue_row_aad,
     report_queue_tag_failure,
+    reseal_unless_tag_failure,
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -4289,8 +4289,9 @@ class SqlServerStore:
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
                 # itself a large burst. A no-op when the cipher carries no bound (keyless /
-                # `vault_transit`).
-                await store.checkpoint_cipher_invocations()
+                # `vault_transit`). Strict, so the open reads THIS store's row rather than trusting a
+                # figure another handle left in the cipher (BACKLOG #5608).
+                await store.checkpoint_cipher_invocations(strict=True)
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
             if store._row_sealer is not None:
@@ -10084,12 +10085,11 @@ class SqlServerStore:
             after = rows[-1]["id"]
             updates: list[tuple[str, str]] = []
             for r in rows:
-                try:
-                    updates.append((self._reencrypt_value(r["v"], aad_of(r)), r["id"]))
-                except CipherError:
-                    if not is_tag_failure(self._cipher, r["v"]):
-                        raise
+                resealed = reseal_unless_tag_failure(self._cipher, r["v"], aad_of(r))
+                if resealed is None:
                     skipped += 1
+                else:
+                    updates.append((resealed, r["id"]))
             if updates:
                 async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:
@@ -10145,8 +10145,9 @@ class SqlServerStore:
 
     def _reencrypt_value(self, stored: str, aad: bytes) -> str:
         """Decrypt (keyring — any key) then re-encrypt under the active key, rebinding the SAME cell AAD
-        (ASVS 11.3.3) — the single seam every rotation loop funnels through so none can pair a mismatched
-        decrypt/encrypt AAD. Mirrors MessageStore._reencrypt_value."""
+        (ASVS 11.3.3) — the seam every untagged rotation loop funnels through so none can pair a
+        mismatched decrypt/encrypt AAD; the tagged loops use ``reseal_unless_tag_failure``, the same
+        pair (BACKLOG #5610). Mirrors MessageStore._reencrypt_value."""
         return self._cipher.encrypt(self._cipher.decrypt(stored, aad=aad), aad=aad)
 
     async def _reencrypt_identity_composite(
@@ -14175,10 +14176,12 @@ class SqlServerStore:
         )
         return int(row["n"]) if row is not None else 0
 
-    async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
+    async def checkpoint_cipher_invocations(
+        self, *, settle: bool = False, strict: bool = False
+    ) -> int | None:
         """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
         return await checkpoint_invocations(
-            self._cipher, self.add_cipher_invocations, settle=settle
+            self._cipher, self.add_cipher_invocations, settle=settle, strict=strict
         )
 
     async def audit_anchor(self) -> tuple[int, str]:

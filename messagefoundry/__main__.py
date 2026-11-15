@@ -9145,7 +9145,6 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     switch them back. So for that refusal it says the batch was rolled back and, there, that those
     options may already have changed: sentences, the last with no full stop, so a caller can end
     it."""
-    from messagefoundry.config.settings import SchemaManagement, StoreBackend
     from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 
     if not any(isinstance(e, ServerSchemaMismatchError) for e in (exc, exc.__cause__)):
@@ -9154,16 +9153,141 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
         "The open rolled its schema batch back and wrote no schema marker, and this command wrote "
         "no row"
     )
-    if (
-        store.backend is StoreBackend.SQLSERVER
-        and store.resolved_schema_management() is SchemaManagement.AUTO
-    ):
+    if _open_switches_snapshot_options(store):
         left += (
             ". Under [store].schema_management = auto the open may already have switched the "
             "database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options on, before "
             "that batch; the refusal does not switch them back"
         )
     return left
+
+
+def _open_switches_snapshot_options(store: StoreSettings) -> bool:
+    """Whether a writable open of ``store`` switches the database's snapshot options on, as
+    :func:`_open_refusal_left_behind` describes."""
+    from messagefoundry.config.settings import StoreBackend
+
+    return store.backend is StoreBackend.SQLSERVER and _open_runs_schema_ddl(store)
+
+
+def _open_runs_schema_ddl(store: StoreSettings) -> bool:
+    """Whether a writable open of ``store`` runs schema DDL itself: ``[store].schema_management``
+    resolves to ``auto``, as it always does on SQLite. Under ``external`` the open only verifies
+    the schema (#305)."""
+    from messagefoundry.config.settings import SchemaManagement
+
+    return store.resolved_schema_management() is SchemaManagement.AUTO
+
+
+def _kept_key_sentence(kept: Path) -> str:
+    """``provision-admin``'s words for the store key a failed create kept (PR 2804 fourteenth
+    hold), with no full stop."""
+    return (
+        "No Administrator was provisioned, and the store key minted for it is kept at "
+        f"{kept} (see the warning on stderr)"
+    )
+
+
+def _raised_by_the_invocation_bound(exc: BaseException) -> bool:
+    """Whether ``exc`` is a store error the AES-GCM invocation bound's pass re-raised at the open.
+
+    That pass re-raises a failed add as itself (BACKLOG #5608), where it once raised a
+    ``CipherError``, so an open arm that reported the ``CipherError`` as "could not start" tests
+    for the note to report this the same way."""
+    from messagefoundry.store.gcm_bound import INVOCATION_BOUND_NOTE
+
+    return INVOCATION_BOUND_NOTE in getattr(exc, "__notes__", ())
+
+
+def _invocation_bound_open_errors() -> tuple[type[Exception], ...]:
+    """What a store error the invocation bound's pass re-raised at the open can be, at least: the
+    driver and connection errors (:func:`~messagefoundry.store.base.store_open_errors`), the
+    engine's own ``RuntimeError`` refusals, and ``ValueError``, which aiosqlite raises for a closed
+    connection. Built on each call, as ``store_driver_errors`` is, never cached; a command builds
+    it once, before its event loop runs, since naming a server driver imports it. Each of its open
+    arms catches this set, by where it arose, and hands it to :func:`_raise_if_bound_refused`."""
+    from messagefoundry.store.base import store_open_errors
+
+    return (RuntimeError, ValueError, *store_open_errors())
+
+
+def _raise_if_bound_refused(exc: BaseException, errors: tuple[type[Exception], ...]) -> None:
+    """Raise :class:`_InvocationBoundOpenRefused` from ``exc`` when it is a store error the AES-GCM
+    invocation bound's pass re-raised at the open (BACKLOG #5608): one of ``errors``
+    (:func:`_invocation_bound_open_errors`), carrying the bound's note, and no defect. A defect
+    (``AUDIT_WRITE_DEFECTS``) is left to reach the dispatch floor as one, as every other open arm
+    leaves it. Otherwise return, and the caller re-raises ``exc``."""
+    from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
+
+    if (
+        isinstance(exc, errors)
+        and not isinstance(exc, AUDIT_WRITE_DEFECTS)
+        and _raised_by_the_invocation_bound(exc)
+    ):
+        raise _InvocationBoundOpenRefused(exc) from exc
+
+
+def _invocation_bound_left_behind(store: StoreSettings) -> str:
+    """What an open the invocation bound's pass failed left behind (BACKLOG #5608): sentences, the
+    last with no full stop, as :func:`_open_refusal_left_behind` returns them.
+
+    The strict pass runs late in a writable open: after the schema step, the store pin's read and
+    the salt bind, which commits a salt row on a store that had none. Under ``auto`` the schema
+    step runs DDL (:func:`_open_runs_schema_ddl`), and on SQL Server the open first switches the
+    snapshot options on (:func:`_open_switches_snapshot_options`). It runs before the open appends
+    its audit genesis row, and the command writes no account or audit row until its open returns.
+    So the text says no account or audit row was written, and never that nothing was: the open's
+    own steps may have written, and a minting ``provision-admin`` run wrote its key file before
+    the open, which its caller names."""
+    changed = ["the store's salt record"]
+    if _open_runs_schema_ddl(store):
+        changed.insert(0, "the schema, which the open creates or migrates")
+    if _open_switches_snapshot_options(store):
+        changed.append(
+            "the database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options, which "
+            "under [store].schema_management = auto the open switches on and does not switch back"
+        )
+    listed = changed[0] if len(changed) == 1 else f"{', '.join(changed[:-1])} and {changed[-1]}"
+    return (
+        "The open stopped where the AES-GCM invocation bound reads the key's persisted total. No "
+        "account or audit row was written, but the steps the open runs before that read may "
+        f"already have changed the database: at least {listed}"
+    )
+
+
+class _InvocationBoundOpenRefused(Exception):
+    """The carrier for an open refused by the invocation bound's pass, so one outer arm can report
+    it as could not start. ``failure`` is the store's error, also its one argument, so a copy or an
+    unpickle rebuilds it whole, as for ``StoreCreateBatchFailedBeforeKeyUse``."""
+
+    def __init__(self, failure: Exception) -> None:
+        super().__init__(failure)
+        self.failure = failure
+
+
+def _invocation_bound_refusal(
+    failure: Exception, store: StoreSettings, *, refusing: str = ""
+) -> str:
+    """The text for an open the invocation bound's pass failed (BACKLOG #5608): the store it names
+    (:func:`_store_label`), the store's error as :func:`_transit_store_error_text` renders it, so
+    a server's text, which can quote a stored value, shows as its class and SQLSTATE while an
+    engine refusal keeps its remedy, then ``refusing``, then what the open left behind
+    (:func:`_invocation_bound_left_behind`), with no full stop."""
+    # The class stands in for an engine refusal raised with no text, so the line names a cause.
+    rendered = _sentence(_transit_store_error_text(failure) or type(failure).__name__)
+    return (
+        f"cannot open the store at {_store_label(store)}: {rendered} "
+        f"{refusing}{_invocation_bound_left_behind(store)}"
+    )
+
+
+def _invocation_bound_provision_refusal(
+    failure: Exception, store: StoreSettings, *, kept: Path | None = None
+) -> str:
+    """``provision-admin``'s :func:`_invocation_bound_refusal`. ``kept`` is the store key a failed
+    create kept, as for :func:`_provision_open_refusal`."""
+    text = _invocation_bound_refusal(failure, store, refusing="Refusing to provision. ")
+    return text if kept is None else f"{text}. {_kept_key_sentence(kept)}"
 
 
 def _provision_open_refusal(
@@ -9178,10 +9302,7 @@ def _provision_open_refusal(
 
     left = _open_refusal_left_behind(exc, store)
     if kept is not None:
-        held = (
-            "No Administrator was provisioned, and the store key minted for it is kept at "
-            f"{kept} (see the warning on stderr)"
-        )
+        held = _kept_key_sentence(kept)
         tail = (
             f"Refusing to provision. {held}"
             if left is None
@@ -9441,6 +9562,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # The instance hop posture, as `serve` derives it: the auth build takes it, and both store opens
     # below pass it, as `serve` passes it to its own store open (#200, #201).
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    # Built here, off the event loop, since naming a server driver imports it. Both opens below
+    # catch it to find a store error the invocation bound's pass re-raised (BACKLOG #5608).
+    bound_open_errors = _invocation_bound_open_errors()
 
     async def administrator_exists() -> tuple[bool, str | None]:
         """``(absent, refusal)``: whether no store exists yet, and what the service refuses."""
@@ -9460,6 +9584,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         except StoreNotFoundError:
             return True, None
+        except bound_open_errors as exc:
+            # An existing store's open runs the bound's strict pass too (BACKLOG #5608): could
+            # not start, as at the write's open below. Any other error propagates as before.
+            _raise_if_bound_refused(exc, bound_open_errors)
+            raise
         store_slot.current = store
         try:
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
@@ -9685,6 +9814,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # Through codec_safe_str, as every open refusal this command prints (#2532, #5067).
         _emit_error(f"{_sentence(codec_safe_str(exc))} Nothing was written", as_json=args.json)
         return 2
+    except _InvocationBoundOpenRefused as refused:
+        # The pre-check's open failed at the invocation bound's strict pass (BACKLOG #5608),
+        # before the prompt, so no key was shown: could not start, as at the write's open.
+        _emit_error(
+            _invocation_bound_provision_refusal(refused.failure, settings.store),
+            as_json=args.json,
+        )
+        return 2
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
         return 2
@@ -9836,6 +9973,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 kept_key = _discard_minted_custody(
                     minted.path, settings.store, exc, service_account=args.service_account
                 )
+            _raise_if_bound_refused(exc, bound_open_errors)  # BACKLOG #5608
             if not isinstance(exc, StoreCreateBatchFailedBeforeKeyUse):
                 raise
             # The key is dealt with (PR 2804 hold 17); the batch's own error is what the operator
@@ -10032,6 +10170,18 @@ def _provision_admin(args: argparse.Namespace) -> int:
             raise
         text = after_the_key(
             codec_safe_str(exc), _provision_open_refusal(exc, settings.store, kept=kept_key)
+        )
+        _emit_error(text, as_json=args.json)
+        return 2
+    except _InvocationBoundOpenRefused as refused:
+        # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
+        # arrived as the `CipherError` above: raised at the open, before the write, so the same
+        # exit 2 and the same advice about the shown key's entry (#5067). The open had already
+        # run steps that may write, so the text says what it left rather than "nothing".
+        failure = refused.failure
+        text = after_the_key(
+            _transit_store_error_text(failure),
+            _invocation_bound_provision_refusal(failure, settings.store, kept=kept_key),
         )
         _emit_error(text, as_json=args.json)
         return 2
@@ -10255,6 +10405,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         RowSealError,
         *store_driver_errors(),
     )
+    # Built here, off the event loop, as the set above is: the open's catch for a store error the
+    # invocation bound's pass re-raised (BACKLOG #5608).
+    bound_open_errors = _invocation_bound_open_errors()
 
     async def run() -> tuple[str, str, str]:
         """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
@@ -10280,6 +10433,12 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             from messagefoundry.redaction import codec_safe_str
 
             return ("open-refused", wanted, codec_safe_str(exc))
+        except bound_open_errors as exc:
+            # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
+            # arrived as the `CipherError` above: could not start, reported below. Any other
+            # error propagates as before.
+            _raise_if_bound_refused(exc, bound_open_errors)
+            raise
         try:
             user = await store.get_user_by_username(wanted)
             if user is None:
@@ -10344,6 +10503,12 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         _UnauditableWrite,
     ) as exc:
         _emit_error(str(exc), as_json=args.json)
+        return 2
+    except _InvocationBoundOpenRefused as bound:
+        # Could not start, exit 2, under the store's name, as a SQLite error from this open was
+        # reported before BACKLOG #5608 tagged it. The open had already run steps that may write,
+        # so the text says what it left rather than "nothing was written".
+        _emit_error(_invocation_bound_refusal(bound.failure, settings.store), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
