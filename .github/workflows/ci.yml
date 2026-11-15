@@ -3607,7 +3607,6 @@ jobs:
         timeout-minutes: 5
         env:
           MSSQL: ${{ job.services.mssql.id }}
-          LABEL: ${{ matrix.label }}
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/mssql-tls"
@@ -3618,15 +3617,9 @@ jobs:
             echo "::error::the SQL Server image now ships an mssql.conf; merge the [network] TLS lines into it rather than replace it"
             exit 1
           fi
-          # SQL Server 2022 on Linux allows TLS 1.0-1.2 by default, and under them it refuses the
-          # strict (TDS 8.0) login with error 17821 (run 43704495127). So 2022 also allows TLS 1.3;
-          # 1.2 stays for the Encrypt=yes login. The list is space-separated: the server read
-          # '1.2,1.3' as one version and refused every login (run 43706665689).
-          protocols=()
-          if [ "$LABEL" = 2022 ]; then protocols=('tlsprotocols = 1.2 1.3'); fi
           printf '%s\n' '[network]' \
             'tlscert = /var/opt/mssql/tls/server.pem' 'tlskey = /var/opt/mssql/tls/server.key' \
-            "${protocols[@]}" > "$dir/mssql.conf"
+            > "$dir/mssql.conf"
           docker exec -u 0 "$MSSQL" mkdir -p /var/opt/mssql/tls
           docker cp "$dir/server.pem" "$MSSQL:/var/opt/mssql/tls/server.pem"
           docker cp "$dir/server.key" "$MSSQL:/var/opt/mssql/tls/server.key"
@@ -3639,16 +3632,12 @@ jobs:
           docker exec -u 0 "$MSSQL" chmod 400 /var/opt/mssql/tls/server.key
           docker exec -u 0 "$MSSQL" chmod 444 /var/opt/mssql/tls/server.pem
           docker exec -u 0 "$MSSQL" chmod 644 /var/opt/mssql/mssql.conf
-          since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           docker restart "$MSSQL"
           sudo cp "$dir/server.pem" /usr/local/share/ca-certificates/mefor-ci-mssql.crt
           sudo update-ca-certificates
-          # Wait on the server's own ready line, not on a login: the check below makes both
-          # logins and names whichever one this configuration refuses.
+          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
           for i in $(seq 1 60); do
-            docker logs --since "$since" "$MSSQL" > "$dir/restart.log" 2>&1
-            if grep -q 'ready for client connections' "$dir/restart.log"; then
-              grep 'TLS protocol versions' "$dir/restart.log" | cut -c1-120 || true
+            if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
               echo "SQL Server is up again"; exit 0
             fi
             echo "waiting for SQL Server after the restart ($i)"; sleep 2
@@ -4955,7 +4944,6 @@ jobs:
         timeout-minutes: 5
         env:
           MSSQL: ${{ job.services.mssql.id }}
-          LABEL: ${{ matrix.label }}
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/mssql-tls"
@@ -4965,12 +4953,9 @@ jobs:
             echo "::error::the SQL Server image now ships an mssql.conf; merge the [network] TLS lines into it rather than replace it"
             exit 1
           fi
-          # 2022 also allows TLS 1.3 for the strict pinned login; sqlserver-store's step says why.
-          protocols=()
-          if [ "$LABEL" = 2022 ]; then protocols=('tlsprotocols = 1.2 1.3'); fi
           printf '%s\n' '[network]' \
             'tlscert = /var/opt/mssql/tls/server.pem' 'tlskey = /var/opt/mssql/tls/server.key' \
-            "${protocols[@]}" > "$dir/mssql.conf"
+            > "$dir/mssql.conf"
           docker exec -u 0 "$MSSQL" mkdir -p /var/opt/mssql/tls
           docker cp "$dir/server.pem" "$MSSQL:/var/opt/mssql/tls/server.pem"
           docker cp "$dir/server.key" "$MSSQL:/var/opt/mssql/tls/server.key"
