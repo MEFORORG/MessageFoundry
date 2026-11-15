@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from harness.drivers import Injection
 from harness.drivers.mllp import MLLPDriver
 from harness.endpoints import Endpoints
-from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, frame
+from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, frame_neutralised
 
 REPLY = "reply"
 CLOSED = "closed"
@@ -122,14 +122,15 @@ def _read_replies(sock: socket.socket) -> Exchange:
         return Exchange(RESET, tuple(replies), str(exc))
     if decoder.in_frame:
         return Exchange(MALFORMED, tuple(replies), "the engine closed inside a reply frame")
-    if received != b"".join(frame(r) for r in replies):
+    if received != b"".join(frame_neutralised(r) for r in replies):
         # The decoder discards bytes outside a frame and closes one on the end block alone, so a
         # byte count would pass a wrong trailer, or one frame short its CR beside one with two.
-        # Compared byte for byte: an engine that writes anything but whole SB..FS CR frames is
-        # answering in something other than MLLP.
+        # Compared byte for byte with what a conforming engine writes: each reply framed as its
+        # listeners frame one (ADR 0205 rule 1), a frame byte in the payload neutralised. So a reply
+        # carrying a start byte as data fails too, where the bare frame() would have matched it.
         detail = (
             f"the {len(received)} reply byte(s) are not exactly {len(replies)} SB..FS CR "
-            "frame(s): bytes outside an MLLP frame, or a wrong trailer"
+            "frame(s): bytes outside an MLLP frame, a wrong trailer, or a frame byte in a reply"
         )
         return Exchange(MALFORMED, tuple(replies), detail)
     return Exchange(REPLY if replies else CLOSED, tuple(replies))

@@ -704,8 +704,10 @@ _ACK_BODY = b"MSH|^~\\&|E|F\rMSA|AA|1\r"
         b"\x0b" + _ACK_BODY + b"\x1c\x1c",  # a second end block as the trailer
         # One frame short its CR, the next carrying two: the byte counts balance.
         b"\x0b" + _ACK_BODY + b"\x1c" + frame(_ACK_BODY) + b"\r",
+        # A start byte left in the reply's MSA-2: the engine's listeners neutralise it.
+        frame(_ACK_BODY.replace(b"|1\r", b"|1\x0b\r")),
     ],
-    ids=["lf-trailer", "fs-trailer", "compensating"],
+    ids=["lf-trailer", "fs-trailer", "compensating", "unneutralised-start-byte"],
 )
 def test_a_reply_with_a_wrong_trailer_is_not_a_clean_reply(sent: bytes) -> None:
     """BACKLOG #5421: the reply bytes were checked by count, so a wrong trailer byte, or one frame
