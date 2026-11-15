@@ -9195,13 +9195,15 @@ def _raised_by_the_invocation_bound(exc: BaseException) -> bool:
 
 def _invocation_bound_open_errors() -> tuple[type[Exception], ...]:
     """What a store error the invocation bound's pass re-raised at the open can be, at least: the
-    driver and connection errors (:func:`~messagefoundry.store.base.store_open_errors`), the
-    engine's own ``RuntimeError`` refusals, and ``ValueError``, which aiosqlite raises for a closed
-    connection. Built on each call, as ``store_driver_errors`` is, never cached. An open arm catches
-    this set, by where it arose, and passes on all but the bound's (BACKLOG #5608)."""
+    driver and connection errors (:func:`~messagefoundry.store.base.store_open_errors`),
+    ``sqlite3.Error``, the root beneath which ``sqlite3.InterfaceError`` sits, the engine's own
+    ``RuntimeError`` refusals, and ``ValueError``, which aiosqlite raises for a closed connection.
+    Built on each call, as ``store_driver_errors`` is, never cached; a command builds it once,
+    before its event loop runs, since naming a server driver imports it. Each of its open arms
+    catches this set, by where it arose, and passes on all but the bound's (BACKLOG #5608)."""
     from messagefoundry.store.base import store_open_errors
 
-    return (RuntimeError, ValueError, *store_open_errors())
+    return (RuntimeError, ValueError, sqlite3.Error, *store_open_errors())
 
 
 def _invocation_bound_left_behind(store: StoreSettings) -> str:
@@ -9211,9 +9213,10 @@ def _invocation_bound_left_behind(store: StoreSettings) -> str:
     The strict pass runs late in a writable open: after the schema step, the store pin's read and
     the salt bind, which commits a salt row on a store that had none, and on SQL Server under
     ``[store].schema_management = auto`` after the open switched the database's snapshot options
-    on. It runs before the open appends its audit genesis row, and the command writes nothing
-    until its open returns. So the text says no account or audit row was written, and never that
-    nothing was."""
+    on. It runs before the open appends its audit genesis row, and the command writes no account
+    or audit row until its open returns. So the text says no account or audit row was written, and
+    never that nothing was: the open's own steps may have written, and a minting
+    ``provision-admin`` run wrote its key file before the open, which its caller names."""
     left = (
         "The open stopped where the AES-GCM invocation bound reads the key's persisted total. No "
         "account or audit row was written, but the steps the open runs before that read may "
@@ -9242,12 +9245,15 @@ class _InvocationBoundOpenRefused(Exception):
 def _invocation_bound_refusal(
     failure: Exception, store: StoreSettings, *, refusing: str = ""
 ) -> str:
-    """The text for an open the invocation bound's pass failed (BACKLOG #5608): the store's error
-    as :func:`_store_error_text` renders it, so a server's text, which can quote a stored value,
-    shows as its class and SQLSTATE, then ``refusing``, then what the open left behind
+    """The text for an open the invocation bound's pass failed (BACKLOG #5608): the store it names
+    (:func:`_store_label`), the store's error as :func:`_transit_store_error_text` renders it, so
+    a server's text, which can quote a stored value, shows as its class and SQLSTATE while an
+    engine refusal keeps its remedy, then ``refusing``, then what the open left behind
     (:func:`_invocation_bound_left_behind`), with no full stop."""
+    rendered = _sentence(_transit_store_error_text(failure))
     return (
-        f"{_sentence(_store_error_text(failure))} {refusing}{_invocation_bound_left_behind(store)}"
+        f"cannot open the store at {_store_label(store)}: {rendered} "
+        f"{refusing}{_invocation_bound_left_behind(store)}"
     )
 
 
@@ -9532,6 +9538,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # The instance hop posture, as `serve` derives it: the auth build takes it, and both store opens
     # below pass it, so a server store hop is clamped and guarded as `serve` opens it (#200, #201).
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+    # Built here, off the event loop, since naming a server driver imports it. Both opens below
+    # catch it to find a store error the invocation bound's pass re-raised (BACKLOG #5608).
+    bound_open_errors = _invocation_bound_open_errors()
 
     async def administrator_exists() -> tuple[bool, str | None]:
         """``(absent, refusal)``: whether no store exists yet, and what the service refuses."""
@@ -9551,7 +9560,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         except StoreNotFoundError:
             return True, None
-        except _invocation_bound_open_errors() as exc:
+        except bound_open_errors as exc:
             # An existing store's open runs the bound's strict pass too (BACKLOG #5608): could
             # not start, as at the write's open below. Any other error propagates as before.
             if not _raised_by_the_invocation_bound(exc):
@@ -9941,7 +9950,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 kept_key = _discard_minted_custody(
                     minted.path, settings.store, exc, service_account=args.service_account
                 )
-            if isinstance(exc, Exception) and _raised_by_the_invocation_bound(exc):
+            if isinstance(exc, bound_open_errors) and _raised_by_the_invocation_bound(exc):
                 raise _InvocationBoundOpenRefused(exc) from exc  # BACKLOG #5608
             if not isinstance(exc, StoreCreateBatchFailedBeforeKeyUse):
                 raise
@@ -10149,7 +10158,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # run steps that may write, so the text says what it left rather than "nothing".
         failure = refused.failure
         text = after_the_key(
-            _store_error_text(failure),
+            _transit_store_error_text(failure),
             _invocation_bound_provision_refusal(failure, settings.store, kept=kept_key),
         )
         _emit_error(text, as_json=args.json)
@@ -10374,6 +10383,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         RowSealError,
         *store_driver_errors(),
     )
+    # Built here, off the event loop, as the set above is: the open's catch for a store error the
+    # invocation bound's pass re-raised (BACKLOG #5608).
+    bound_open_errors = _invocation_bound_open_errors()
 
     async def run() -> tuple[str, str, str]:
         """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
@@ -10399,7 +10411,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             from messagefoundry.redaction import codec_safe_str
 
             return ("open-refused", wanted, codec_safe_str(exc))
-        except _invocation_bound_open_errors() as exc:
+        except bound_open_errors as exc:
             # A store error the open's invocation-bound pass re-raised (BACKLOG #5608), which once
             # arrived as the `CipherError` above: could not start, reported below. Any other
             # error propagates as before.
@@ -10475,13 +10487,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         # Could not start, exit 2, under the store's name, as a SQLite error from this open was
         # reported before BACKLOG #5608 tagged it. The open had already run steps that may write,
         # so the text says what it left rather than "nothing was written".
-        failure = bound.failure
-        return _emit_store_open_error(
-            failure,
-            _store_label(settings.store),
-            as_json=args.json,
-            text=_invocation_bound_refusal(failure, settings.store),
-        )
+        _emit_error(_invocation_bound_refusal(bound.failure, settings.store), as_json=args.json)
+        return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "open-refused":

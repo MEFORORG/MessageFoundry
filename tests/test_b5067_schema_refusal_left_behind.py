@@ -260,6 +260,7 @@ def test_provision_admin_invocation_bound_store_error_at_the_pre_check_is_could_
     monkeypatch.setattr(base, "open_store", refusing)
     out = _run(_provision(_settings(shell, backend, management)), capsys)
     assert "Refusing to provision" in out, out
+    assert "cannot open the store at 127.0.0.1/mefor" in out, out
     _assert_bound_left_behind(out, names_the_setting=_STORES[backend, management])
     assert _UNUSED_ENTRY not in out, "no key was shown before the pre-check"
 
@@ -286,11 +287,9 @@ def test_a_server_driver_error_at_the_bound_shows_its_class_and_sqlstate_not_its
     from messagefoundry.store import base
     from messagefoundry.store.gcm_bound import INVOCATION_BOUND_NOTE
 
-    driver_error = type("PostgresError", (Exception,), {})
-    asyncpg = types.ModuleType("asyncpg")
-    for name in ("PostgresError", "InterfaceError", "InternalClientError"):
-        setattr(asyncpg, name, driver_error)
-    monkeypatch.setitem(sys.modules, "asyncpg", asyncpg)
+    # The renderer reads a ``sqlstate`` attribute on any error, so no stand-in driver module is
+    # installed: one would linger in the auth service's cached catch sets after this test.
+    driver_error = type("PostgresError", (OSError,), {})
 
     async def refusing(*_args: object, **_kwargs: object) -> object:
         exc = driver_error("lock timeout on a row quoting synthetic-value-9")
