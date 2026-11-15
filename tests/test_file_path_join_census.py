@@ -1090,15 +1090,14 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/securityEditorModel.ts": Site(
         5,
-        GUARDED,
-        "The security editor's settings path, from the operator's setting; the rules it must meet "
-        "are in the securityConfigTarget docblock. Two sites in reachesRoot splice a link target "
-        "read from disk, which a repository can hold, onto the rest of the path, and pass the "
-        "result to lstat, readlink and realpath; on Windows those open handles and can contact SMB "
-        "for a UNC target. resolveLinks joins a resolved prefix to the missing tail; when the "
-        "setting reaches the workspace folder, its output, realTarget, is the path the CLI opens, "
-        "and the guard refuses the setting unless realTarget is inside that folder (BACKLOG #5411).",
-        "ide/src/securityEditorModel.ts::!inside(realRoot, realTarget)",
+        OPERATOR,
+        "The security editor builds its settings path from the workspace folder, the operator's "
+        "setting, and link targets and resolved prefixes read from the workspace, which a "
+        "repository can hold; no part is checked before its join. The two reachesRoot hop paths "
+        "go to lstat, readlink and realpath before any containment check. On Windows the SMB "
+        "contact a link to a UNC path can cause comes from realpath(at) and resolveLinks following "
+        "it, not from a join. The containment refusal runs after every join and decides only which "
+        "path the CLI is given. The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
     ),
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
     "ide/src/statusBar.ts": Site(4, OPERATOR, _IDE_WORKSPACE),
