@@ -16595,13 +16595,15 @@ class AuthService:
         # moved: an attempt the dropped re-read refused for the race is still refused, unless the
         # move was put back before the queue read. Wider than main, which refused only when the
         # race was lost. A local account was never re-read after a lookup, so neither this refusal
-        # nor the lock-first order below applies to it.
-        directory = _is_directory_account(user)
+        # nor the lock-first order below applies to it. Whether the lookup ran is read off the
+        # helper's answer, which is the very ``user`` passed for a local account and a row read
+        # afresh for a directory one, so the provider branch stays the helper's alone.
         vouched = await self._directory_vouches_for_factor(
             token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
         if isinstance(vouched, Elevation):
             return vouched
+        directory = vouched is not user
         user = vouched
         async with AsyncExitStack() as queue:
             queued_as = user.username
@@ -17101,7 +17103,9 @@ class AuthService:
 
         **Except under ``reread=False``,** which skips that re-read. For a directory account it
         returns the row :meth:`_directory_step_up_refusal`'s role test read after the lookup, so
-        its name and lock are as they were then; for a local account, ``user`` itself. Either way
+        its name and lock are as they were then, and never the ``user`` object passed in; for a
+        local account, that very object, which :meth:`verify_mfa` reads to tell whether the lookup
+        ran. Either way
         the session was not read again and the lock not checked, so nothing below about the
         re-read then holds, and the caller must read the session and check the lock itself before
         it checks a proof. At least :meth:`verify_mfa` passes it; the comment at its call says why
