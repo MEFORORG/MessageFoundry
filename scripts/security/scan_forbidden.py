@@ -580,6 +580,8 @@ _PR_CELL_VERDICT = re.compile(
 #: "never fails" and "never passing" describe a component, not a verdict: the CI verbs after "never"
 #: bind only a marked row. "never met" and "never partial" are verdict states and still bind.
 _PR_NEVER = re.compile(rf"(?i){_PR_NB}never{_PR_NA}")
+#: A verdict state later in a cell than its "never" and CI verb, which makes the cell a verdict again.
+_PR_CELL_STATE_AFTER = re.compile(rf"(?i){_PR_NB}{_PR_VERDICT_STATE}")
 #: The cell openings that state a verdict whatever follows: "unchanged" and a record verb.
 _PR_CELL_RECORD_PREFIX = re.compile(rf"(?i)(?:unchanged|{_PR_STRONG_VERB}){_PR_NA}")
 #: A cell that OPENS with a verdict and goes on: "unchanged, partial. No build reaches it."
@@ -778,25 +780,32 @@ PR_BODY_REASONS = {
 _PrUnits = list[tuple[list[tuple[int, int]], str, bool]]
 
 
-def _pr_lines(body: str) -> tuple[list[str], list[int], list[int]]:
+def _pr_lines(body: str) -> tuple[list[str], list[int], list[int], set[int]]:
     """The body's one line model: its lines as str.splitlines reads them, so a hit reports the line
-    number main reported, and the numbers of its blank lines as GFM counts them, in two lists.
+    number main reported; the numbers of its blank lines as GFM counts them, in two lists; and the
+    numbers of the lines that open a GFM line with a quote marker GFM reads as one.
 
     A blank line is a whole GFM line (between "\\n", "\\r\\n" or "\\r") holding only spaces and tabs.
-    A quote blank is one that opens with a quote marker GFM reads as one (_PR_QUOTE_OPEN) and holds
-    only quote markers besides, a blank line inside a quote; it ends only a quoted table
-    (_pr_table_starts). A ">" then a no-break space is a quoted line with
-    content, neither. A separator only str.splitlines reads (a form feed, U+2028) ends a line here
-    but never makes a blank one: the line it ends, or the empty line it opens, lies inside a GFM line
-    with content, so it ends no table (step 9)."""
+    A quote blank is a whole GFM line that opens with a quote marker (_PR_QUOTE_OPEN) and holds only
+    quote markers besides, a blank line inside a quote; it ends only a quoted table
+    (_pr_table_starts). A ">" then a no-break space is a quoted line with content, neither. A
+    separator only str.splitlines reads (a form feed, U+2028) ends a line here but never makes a
+    blank or quoted one: the line it ends, or the line it opens, lies inside a GFM line, so it ends
+    no table (step 9), and a ">" after it is content, not a quote marker."""
     lines: list[str] = []
     blanks: list[int] = []
     quote_blanks: list[int] = []
+    quoted: set[int] = set()
 
-    def classify(line: str) -> None:
+    def classify(line: str, gfm_end: bool) -> None:
+        opens_quote = _PR_QUOTE_OPEN.match(line) is not None
+        if opens_quote:
+            quoted.add(len(lines))
+        if not gfm_end:
+            return
         if not line.strip(" \t"):
             blanks.append(len(lines))
-        elif _PR_QUOTE_OPEN.match(line) and not _PR_QUOTE_BLANK.sub("", line).strip(" \t"):
+        elif opens_quote and not _PR_QUOTE_BLANK.sub("", line).strip(" \t"):
             quote_blanks.append(len(lines))
 
     start = 0
@@ -805,16 +814,16 @@ def _pr_lines(body: str) -> tuple[list[str], list[int], list[int]]:
     for end in _PR_LINE_END.finditer(body):
         lines.append(body[start : end.start()])
         gfm_end = end.group() in _PR_GFM_LINE_ENDS
-        if whole and gfm_end:
-            classify(lines[-1])
+        if whole:
+            classify(lines[-1], gfm_end)
         whole = gfm_end
         start = end.end()
     # A final line ending opens no line, as str.splitlines reads it.
     if start < len(body):
         lines.append(body[start:])
         if whole:
-            classify(lines[-1])
-    return lines, blanks, quote_blanks
+            classify(lines[-1], gfm_end=True)
+    return lines, blanks, quote_blanks, quoted
 
 
 def _pr_units(lines: list[str], delete_invisible: bool) -> _PrUnits:
@@ -988,6 +997,8 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
             and hit.group("verdict").lower() in _PR_CI_VERDICTS
             # Anywhere before the verdict: "never fails", and "has never been failing" too.
             and _PR_NEVER.search(hit.string, hit.start(), hit.start("verdict")) is not None
+            # A cell that goes on to a verdict state ("is never failing; partial") states a verdict.
+            and _PR_CELL_STATE_AFTER.search(hit.string, hit.end()) is None
         )
 
     def is_verdict(cell: str) -> bool:
@@ -1014,15 +1025,16 @@ def _pr_is_delimiter(row: str) -> bool:
 
 
 def _pr_table_starts(
-    units: _PrUnits, lines: list[str], blanks: list[int], quote_blanks: list[int]
+    units: _PrUnits, blanks: list[int], quote_blanks: list[int], quoted: set[int]
 ) -> list[bool]:
     """For each unit, whether it starts a run of rows: it is a row, and the unit above is not a row or
     a blank line (only spaces and tabs, as GFM reads one) lies between them. A line holding only a
     no-break space emits no unit either, but GFM does not count it blank, so it ends no table.
 
     A quote blank (only quote markers) between two rows ends the run only inside a quoted table:
-    every row since the last unit that is not a row, through the row below the quote blank, opens
-    with a quote marker GFM reads as one (at most three spaces before it, _PR_QUOTE_OPEN). Blank
+    every row since the last unit that is not a row, through the row below the quote blank, opens a
+    GFM line with a quote marker GFM reads as one (at most three spaces before it, _PR_QUOTE_OPEN;
+    the line numbers in ``quoted``). A ">" after a form feed or U+2028 is content, not one. Blank
     lines emit no unit, so that span reaches across them to a header above a blank line. Anywhere
     else, a lone ">" between rows does not end the run, as main read no blank line at all."""
 
@@ -1035,10 +1047,7 @@ def _pr_table_starts(
     for index, (marks, _, is_row) in enumerate(units):
         above = units[index - 1] if index else None
         line = marks[0][1]
-        if not is_row:
-            block_quoted = True
-        else:
-            block_quoted = block_quoted and _PR_QUOTE_OPEN.match(lines[line - 1]) is not None
+        block_quoted = not is_row or (block_quoted and line in quoted)
         starts.append(
             is_row
             and (
@@ -1181,10 +1190,10 @@ def scan_pr_body(body: str) -> list[str]:
     restate a verdict on the same line report it once, rather than storming.
     """
     found: set[tuple[int, int]] = set()
-    lines, blanks, quote_blanks = _pr_lines(body)
+    lines, blanks, quote_blanks, quoted = _pr_lines(body)
     units = _pr_units(lines, delete_invisible=False)
     # Both readings share the units' kinds and lines, so they share where each run of rows starts.
-    starts = _pr_table_starts(units, lines, blanks, quote_blanks)
+    starts = _pr_table_starts(units, blanks, quote_blanks, quoted)
     asvs = _pr_table_columns(units, starts)
     loose = _pr_loose_columns(units, starts)
     for unit, unit_asvs, unit_loose in zip(units, asvs, loose, strict=True):

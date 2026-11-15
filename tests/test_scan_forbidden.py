@@ -1248,6 +1248,27 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
         )
         for lead in ("    ", "\t")
     ),
+    # Review round-25a1cb2995's losses, each flagged by main. A ">" after a separator only
+    # str.splitlines ends a line at lies inside a GFM line, so it is content, not a quote marker, and
+    # the table is not a quoted one, whether the separator leads the row below or the header.
+    *(
+        (
+            "9",
+            "verdict",
+            f"> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n>\n{chr(code)}> {_ROW}",
+        )
+        for code in (0x0C, 0x85, 0x2028)
+    ),
+    *(
+        (
+            "9",
+            "verdict",
+            f"Intro{chr(code)}> {_HEAD.replace(chr(10), chr(10) + '> ')}| a | b | c |\n>\n> {_ROW}",
+        )
+        for code in (0x0C, 0x85, 0x2028)
+    ),
+    # A cell whose "never" and CI verb go on to a verdict state states a verdict (step 10's boundary).
+    ("10", "verdict", f"| {_REQ_B} | x | is never failing; {_PARTIAL} |"),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
