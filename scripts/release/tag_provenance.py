@@ -18,42 +18,40 @@ reviewed commit. This script asks two questions before anything is built:
    nothing in it proves nothing.
 
    A context passes only when EVERY latest report of it passes; which reports are latest is a
-   question of what supersedes what (BACKLOG #5591):
+   question of what supersedes what (BACKLOG #5591). The highest id in each LINEAGE is latest:
 
-   * A commit status is superseded by a later status of the same context, since GitHub itself
-     judges a context on its newest status.
-   * A check run is superseded by a later run of the same name in the SAME check suite. That is
-     what re-running a GitHub Actions job makes: new runs, with higher ids, in the workflow run's
-     own suite (measured 2026-11-14 on run 43659597734, attempt 2: suite 118209571176 held the
-     failed and the passing ``CI gate`` runs). Runs of one name in DIFFERENT suites are independent
-     reports, for example main's push run and a dispatched run of one workflow, or two apps posting
-     one name, and GitHub orders nothing between them. So each suite's latest run must pass, and a
-     green in one suite never hides a red or a still-running run in another.
-   * The exception is a suite whose workflow ran on an event in :data:`POOLED_EVENTS`. Those
-     events, such as a comment on a pull request, run against the default branch's tip on behalf of
-     something else, so each one adds a suite to main's tip without testing it: every
-     ``issue_comment`` run of the CLA workflow adds a ``cla`` suite there (measured 2026-11-14). Held
-     one suite apiece, a single red comment run could never be superseded, and anyone who can
-     comment could block releasing main's tip for good. Those suites are pooled into one lineage
-     per context, judged on its latest run as every suite was before #5591, so the pooling never
-     passes a commit the earlier rule refused.
-   * A run whose suite the API did not name is its own lineage, so nothing supersedes it; the
-     refusal names it, and an unknown event is held per suite, never pooled.
+   * A commit status's lineage is its context, since GitHub itself judges a context on its newest
+     status.
+   * An Actions check run's lineage is its name, its workflow and the event that ran it. A re-run
+     of a job adds new, higher-id runs to the same suite (measured 2026-11-14 on run 43659597734,
+     attempt 2: suite 118209571176 held the failed and the passing ``CI gate`` runs), so a passing
+     re-run supersedes the failed attempt. A later run of the same workflow on the same event, such
+     as the next nightly or a second dispatch, supersedes an earlier one too: it repeats the same
+     test of the same commit. Runs of one name from different workflows or different events are
+     independent reports, for example the merge-queue run, main's push run and a dispatched run of
+     one workflow, and GitHub orders nothing between them, so the latest of each must pass and a
+     green in one never hides a red or a still-running run in another. Every comment on a pull
+     request adds a ``cla`` suite to main's tip on ``issue_comment`` (measured 2026-11-14); those
+     share one lineage, so a later comment run supersedes a red one rather than block the tip.
+   * A check run whose suite no workflow run names, such as another app's or a deleted run's, is
+     its suite's own lineage; one with no suite id is its own, so nothing supersedes it.
 
-   Every run is read (``filter=all``), because the endpoint's default ``latest`` filter returns only
-   the newest runs, which hides an earlier attempt from the rule that has to judge it. Ids are
-   compared only within a kind, since the two kinds number their ids separately. A check run
-   passes on the conclusions branch protection accepts: ``success``, ``neutral`` or ``skipped``. A
-   commit status passes on ``success``. A context with no report at all refuses.
+   The newest run of a context is the latest in its lineage, so this never passes a commit the
+   earlier one-latest-run-per-context rule refused. Every run is read (``filter=all``), because the
+   endpoint's default ``latest`` filter returns only the newest runs, which hides an earlier
+   attempt from the rule that has to judge it. Ids are compared only within a kind, since the two
+   kinds number their ids separately. A check run passes on the conclusions branch protection
+   accepts: ``success``, ``neutral`` or ``skipped``. A commit status passes on ``success``. A
+   context with no report at all refuses.
 
    **A red latest run blocks the tag** even when the merge-queue run passed. That covers main's own
-   push run, the nightly run and a dispatched run on the same commit. A release gate fails closed.
-   The remedy is to re-run the failed jobs of THAT workflow run ("Re-run failed jobs"), then re-run
-   the release; a fresh dispatch starts a new suite and leaves the red one standing. GitHub re-runs
-   a workflow run only within 30 days of it, so past that the remedy is to tag a newer commit.
-   (Manager ruling under the owner's driver rule, 2026-10-03; the owner may overturn it.) A required
-   check still RUNNING is waited for, up to ``--wait-seconds``, so a tag pushed right after a merge
-   is judged on the finished run, but a red that waiting cannot fix refuses at once.
+   push run, the nightly run and a dispatched run on the same commit, and a release gate fails
+   closed. (Manager ruling under the owner's driver rule, 2026-10-03, which the owner may overturn;
+   the lineage rule above is BACKLOG #5591's.) The remedy is to re-run the failed jobs of that
+   workflow run, or to run the same workflow on the same event again, then re-run the release; the
+   refusal names the run, suite and event. GitHub re-runs a workflow run only within 30 days of it.
+   A required check still RUNNING is waited for, up to ``--wait-seconds``, so a tag pushed right
+   after a merge is judged on the finished run, but a red in another lineage refuses at once.
 
    A context the server requires now that never reported on the commit also refuses, even when it
    was added after the commit merged. Nothing tells "added later" apart from "skipped by a bypass",
@@ -95,12 +93,6 @@ ON_MAIN = frozenset({"behind", "identical"})
 #: Check-run conclusions branch protection treats as passing.
 PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 
-#: Workflow events that run against the default branch's tip on behalf of a comment, a pull
-#: request or another run, so their suites land on main's tip without testing it. This repository's
-#: required contexts come from workflows triggered on at least these. A suite on any other event, or
-#: on none, is judged on its own.
-POOLED_EVENTS = frozenset({"issue_comment", "pull_request_target", "workflow_run"})
-
 
 @dataclass(frozen=True)
 class Report:
@@ -119,19 +111,21 @@ class Report:
     suite: int | None = None
     #: The event of the workflow run that owns the suite; empty for a status or a non-Actions suite.
     event: str = ""
+    #: The id of that workflow run's workflow; empty wherever ``event`` is.
+    workflow: str = ""
 
     def lineage(self) -> tuple[str, str, str]:
         """What a later report must share to supersede this one.
 
-        A status is superseded by a later status of its context. A check run is superseded only by a
-        later run in its own check suite, or, for a suite on a :data:`POOLED_EVENTS` event, by a
-        later run in any such suite. A run with no suite id is superseded by nothing, because its
-        lineage names the run itself.
+        A status is superseded by a later status of its context. An Actions check run is superseded
+        by a later run of its workflow on its event; any other check run only by a later run in its
+        own suite. A run with no suite id is superseded by nothing, because its lineage names the
+        run itself.
         """
         if self.kind == "status":
             return (self.context, self.kind, "")
-        if self.event in POOLED_EVENTS:
-            return (self.context, self.kind, "pooled")
+        if self.workflow and self.event:
+            return (self.context, self.kind, f"workflow:{self.workflow}:{self.event}")
         if self.suite is None:
             return (self.context, self.kind, f"run:{self.id}")
         return (self.context, self.kind, f"suite:{self.suite}")
@@ -213,10 +207,11 @@ def reports_from(
 ) -> list[Report]:
     """Reports out of the slurped ``check-runs``, ``statuses`` and ``actions/runs`` pages.
 
-    The workflow runs give each Actions suite its event; a suite no run names gets none.
+    The workflow runs give each Actions suite its workflow and event; a suite no run names gets
+    neither.
     """
-    events = {
-        int(run["check_suite_id"]): str(run.get("event") or "")
+    owners = {
+        int(run["check_suite_id"]): (str(run.get("workflow_id") or ""), str(run.get("event") or ""))
         for page in run_pages
         for run in page.get("workflow_runs") or []
         if run.get("check_suite_id") is not None
@@ -229,7 +224,8 @@ def reports_from(
             state=str(run["status"]),
             conclusion=str(run.get("conclusion") or ""),
             suite=(suite := _suite_id(run)),
-            event=events.get(suite, "") if suite is not None else "",
+            workflow=owners.get(suite, ("", ""))[0] if suite is not None else "",
+            event=owners.get(suite, ("", ""))[1] if suite is not None else "",
         )
         for page in check_pages
         for run in page.get("check_runs") or []
@@ -346,9 +342,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "::error::the release is refused (vault BACKLOG #2631). Tag a commit that is on "
             f"{args.branch} and passed every required check. A failed check run counts against "
-            "the commit until the workflow run that holds it re-runs its failed jobs and they "
-            "pass; a fresh dispatch does not clear it, and past 30 days tag a newer commit. A "
-            "check still running counts until it ends. Then re-run the release."
+            "the commit until the workflow run named above re-runs its failed jobs, or the same "
+            "workflow runs again on the same event, and passes. A check still running counts "
+            "until it ends. Then re-run the release."
         )
         return 1
     print(f"the tagged commit is on {args.branch} and passed all {len(required)} required contexts")

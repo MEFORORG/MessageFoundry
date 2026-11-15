@@ -166,7 +166,7 @@ jobs:
   # or on a merge whose checks went red, would build, sign and publish like a tag on a reviewed
   # commit. scripts/release/tag_provenance.py holds the rule and says where its promise ends.
   #
-  # Its own job, so the read scopes it needs (checks, statuses) never sit in a job that signs or
+  # Its own job, so the read scopes it needs (checks, statuses, actions) never sit in a job that signs or
   # publishes. Every job that builds a release artifact `needs:` it. It RUNS on a dispatch too, with
   # its one step skipped, because a skipped job would skip every job that needs it and so end the
   # dry-run. On a dispatch the dry-run therefore builds from a commit nobody vouched for, which is

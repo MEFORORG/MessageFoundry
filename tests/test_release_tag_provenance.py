@@ -297,8 +297,12 @@ def _run(id_: int, suite: int | None, status: str, conclusion: str | None = None
     return run
 
 
-def _runs(*runs: dict[str, Any], events: dict[int, str] | None = None) -> list[Report]:
-    workflow_runs = [{"check_suite_id": k, "event": v} for k, v in (events or {}).items()]
+def _runs(*runs: dict[str, Any], owners: dict[int, tuple[str, str]] | None = None) -> list[Report]:
+    """Reports from check runs, with ``owners`` mapping a suite id to its (workflow id, event)."""
+    workflow_runs = [
+        {"check_suite_id": suite, "workflow_id": workflow, "event": event}
+        for suite, (workflow, event) in (owners or {}).items()
+    ]
     return reports_from([{"check_runs": list(runs)}], [], [{"workflow_runs": workflow_runs}])
 
 
@@ -317,9 +321,28 @@ def _runs(*runs: dict[str, Any], events: dict[int, str] | None = None) -> list[R
 def test_a_green_in_another_suite_does_not_hide_a_red_or_running_run(
     runs: tuple[dict[str, Any], ...],
 ) -> None:
-    """BACKLOG #5591: only a later run of the SAME suite supersedes an earlier one."""
+    """BACKLOG #5591: with no workflow run naming them, only the SAME suite supersedes."""
     problems = verdict("behind", ["CI gate"], _runs(*runs))
     assert len(problems) == 1 and "did not pass" in problems[0], problems
+
+
+@pytest.mark.parametrize(
+    "owners",
+    [
+        {100: ("1", "merge_group"), 200: ("1", "push")},
+        {100: ("1", "push"), 200: ("2", "push")},
+    ],
+    ids=["same-workflow-other-event", "same-event-other-workflow"],
+)
+def test_a_green_from_another_workflow_or_event_does_not_hide_a_red(
+    owners: dict[int, tuple[str, str]],
+) -> None:
+    """BACKLOG #5591: the merge-queue run and main's push run are independent reports."""
+    reports = _runs(
+        _run(10, 100, "completed", "failure"), _run(11, 200, "completed", "success"), owners=owners
+    )
+    problems = verdict("behind", ["CI gate"], reports)
+    assert len(problems) == 1 and "run 10, suite 100" in problems[0], problems
 
 
 def test_unfinished_sees_a_run_still_going_in_another_suite() -> None:
@@ -338,41 +361,37 @@ def test_a_rerun_in_the_same_suite_supersedes_the_failed_attempt() -> None:
     assert tp.unfinished(["CI gate"], reports) == []
 
 
-def test_comment_driven_suites_pool_so_a_later_comment_run_supersedes_a_red_one() -> None:
-    """Each issue_comment run adds a suite to main's tip without testing it. Held per suite, one red
-    comment run would block releasing the tip for good; pooled, a later one supersedes it, as every
-    suite was judged before #5591. The validating suite (merge_group) is still held on its own."""
-    events = {100: "merge_group", 300: "issue_comment", 400: "pull_request_target"}
-    red_comment = [_run(10, 100, "completed", "success"), _run(11, 300, "completed", "failure")]
-    problems = verdict("behind", ["CI gate"], _runs(*red_comment, events=events))
-    assert len(problems) == 1 and "event issue_comment" in problems[0], problems
-    healed = _runs(*red_comment, _run(12, 400, "completed", "success"), events=events)
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch", "issue_comment"])
+def test_a_later_run_of_the_same_workflow_on_the_same_event_supersedes(event: str) -> None:
+    """The next nightly, a second dispatch, or a later comment run repeats the same test, so a red
+    one does not block the commit for good. A cancelled run counts as red until then."""
+    owners = {100: ("1", "merge_group"), 300: ("2", event), 400: ("2", event)}
+    first = [_run(10, 100, "completed", "success"), _run(11, 300, "completed", "cancelled")]
+    problems = verdict("behind", ["CI gate"], _runs(*first, owners=owners))
+    assert len(problems) == 1 and f"event {event}" in problems[0], problems
+    healed = _runs(*first, _run(12, 400, "completed", "success"), owners=owners)
     assert verdict("behind", ["CI gate"], healed) == []
-    # A pooled green never hides a red in a validating suite.
-    red_merge = _runs(
-        _run(10, 100, "completed", "failure"), _run(12, 300, "completed", "success"), events=events
-    )
-    assert len(verdict("behind", ["CI gate"], red_merge)) == 1
 
 
-def test_pooling_never_passes_what_the_pre_5591_rule_refused() -> None:
-    """The newest run of a context, whatever its suite, is a latest report under both rules."""
-    events = {100: "push", 300: "issue_comment"}
-    for last in ("push", "comment"):
-        suite = 100 if last == "push" else 300
+def test_the_lineage_rule_never_passes_what_the_pre_5591_rule_refused() -> None:
+    """The newest run of a context, whatever its lineage, is a latest report under both rules."""
+    owners = {100: ("1", "push"), 300: ("2", "issue_comment"), 500: ("3", "other")}
+    for suite in (100, 300, 500, 900):
         reports = _runs(
             _run(10, 100, "completed", "success"),
             _run(11, 300, "completed", "success"),
             _run(12, suite, "completed", "failure"),
-            events=events,
+            owners=owners,
         )
-        assert verdict("behind", ["CI gate"], reports), last
+        assert verdict("behind", ["CI gate"], reports), suite
 
 
 def test_a_failure_names_its_run_suite_and_event() -> None:
     """The remedy is re-running THAT workflow run, so the refusal must say which one it is."""
     problems = verdict(
-        "behind", ["CI gate"], _runs(_run(10, 100, "completed", "failure"), events={100: "push"})
+        "behind",
+        ["CI gate"],
+        _runs(_run(10, 100, "completed", "failure"), owners={100: ("1", "push")}),
     )
     assert "run 10, suite 100, event push" in problems[0], problems
 
