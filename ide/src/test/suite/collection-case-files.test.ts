@@ -3,6 +3,7 @@
 // BACKLOG #5415: the files a collection run writes for `dryrun`. Every body here is synthetic.
 
 import * as assert from "assert";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -186,4 +187,94 @@ suite("collectionCaseFiles: a run directory is deleted without recursing (BACKLO
       assert.deepStrictEqual(fs.readdirSync(dir), [caseFileName(9999)]);
     });
   }
+});
+
+/** `p` as a `\\?\Volume{GUID}\` path, or undefined when mountvol prints no volume GUID for its drive. */
+function volumeGuidPath(p: string): string | undefined {
+  const real = fs.realpathSync.native(p);
+  const out = spawnSync("mountvol", [real.slice(0, 2), "/L"], { encoding: "utf8" });
+  const guid = (out.stdout ?? "").trim();
+  return /^\\\\\?\\Volume\{[0-9a-fA-F-]+\}\\$/.test(guid) ? guid + real.slice(3) : undefined;
+}
+
+/** A junction from `link` to `target`. Made by mklink, since Node rewrites a `\\?\Volume` target. */
+function volumeJunction(link: string, target: string): void {
+  const r = spawnSync("cmd", ["/c", "mklink", "/J", link, target], { encoding: "utf8" });
+  assert.strictEqual(r.status, 0, `mklink /J failed: ${r.stdout}${r.stderr}`);
+}
+
+// The junction deleteCaseDir's step 1 describes: it lstats as a plain directory, so only the
+// real-path check can refuse it. Every target lives outside `base`.
+suite("collectionCaseFiles: a volume-GUID junction is refused (Windows, BACKLOG #5415)", () => {
+  let base = "";
+  let outside = "";
+  let target = "";
+  setup(function () {
+    if (POSIX) {
+      this.skip(); // junctions are Windows-only
+    }
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "mefor-casefiles-test-"));
+    outside = fs.mkdtempSync(path.join(os.tmpdir(), "mefor-casefiles-outside-"));
+    fs.writeFileSync(path.join(outside, caseFileName(0)), BODY);
+    target = volumeGuidPath(outside) ?? "";
+    if (target === "") {
+      this.skip(); // mountvol printed no volume GUID for the temp drive
+    }
+  });
+  teardown(() => {
+    if (base === "") {
+      return; // skipped on POSIX before anything was made
+    }
+    try {
+      unlinkLinks(base);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+      base = outside = "";
+    }
+  });
+
+  const outsideIntact = (): void =>
+    assert.deepStrictEqual(fs.readdirSync(outside), [caseFileName(0)], "a file outside base was deleted");
+
+  test("the sweep refuses a planted run directory that is one, and does not count it", () => {
+    const planted = path.join(base, `${CASE_DIR_PREFIX}planted`);
+    volumeJunction(planted, target);
+    const stale = materializeCases([BODY], base); // THE CONTROL: a real stale run directory goes
+    assert.strictEqual(sweepStaleCaseDirs(base, Date.now() + 10 * STALE_CASE_DIR_MS), 1);
+    outsideIntact();
+    assert.ok(fs.existsSync(planted), "the planted junction was removed");
+    assert.ok(!fs.existsSync(stale), "the real stale run directory was not removed");
+  });
+
+  test("removeCaseDir refuses a run directory that is one", () => {
+    const dir = path.join(base, `${CASE_DIR_PREFIX}swapped`);
+    volumeJunction(dir, target);
+    removeCaseDir(dir);
+    outsideIntact();
+    assert.ok(fs.existsSync(dir), "the junction was removed");
+  });
+
+  const deleters: [string, (dir: string) => void][] = [
+    ["removeCaseDir", removeCaseDir],
+    ["sweepStaleCaseDirs", (dir) => void sweepStaleCaseDirs(path.dirname(dir), Date.now() + 10 * STALE_CASE_DIR_MS)],
+  ];
+  for (const [how, remove] of deleters) {
+    test(`${how}: an entry named like a case file that is one is left, and the case files around it go`, () => {
+      const dir = materializeCases([BODY, BODY], base);
+      volumeJunction(path.join(dir, caseFileName(9999)), target);
+      remove(dir);
+      outsideIntact();
+      assert.deepStrictEqual(fs.readdirSync(dir), [caseFileName(9999)]);
+    });
+  }
+
+  test("unlinkLinks removes one without entering it, so a recursive delete after it stays inside", () => {
+    const tree = fs.mkdtempSync(path.join(base, "tree-"));
+    volumeJunction(path.join(tree, "linked"), target);
+    unlinkLinks(tree);
+    fs.rmSync(tree, { recursive: true, force: true });
+    outsideIntact();
+    assert.ok(!fs.existsSync(tree));
+  });
 });
