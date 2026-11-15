@@ -66,8 +66,9 @@ def _normalize(path: str) -> str:
 def _parse_junit_by_file(junit_path: Path) -> tuple[dict[str, Status], list[str]]:
     """Aggregate a pytest JUnit XML into one :class:`Status` per source file.
 
-    Also returns the names of failing testcases that carry no ``file`` attribute (a collection or
-    conftest error), which no row can own. Raises :class:`ElementTree.ParseError` on truncated XML.
+    Also returns the names of failing testcases that carry no ``file`` attribute (a
+    collection error in a file outside the repo root, say), which no row can own. Raises
+    :class:`ElementTree.ParseError` on truncated XML and :class:`OSError` on an unreadable file.
     """
     if not junit_path.is_file():
         return {}, []
@@ -111,13 +112,16 @@ def _judge_run(
         k for k, s in by_file.items() if s is Status.FAIL and k not in requested
     )
     if outside:
-        return f"pytest reported failures outside the row files: {', '.join(outside[:3])}"
+        more = f" (+{len(outside) - 3} more)" if len(outside) > 3 else ""
+        return f"pytest reported failures outside the row files: {', '.join(outside[:3])}{more}"
     if returncode not in (0, _PYTEST_TESTS_FAILED):
         return f"pytest exited {returncode}"
     if returncode == _PYTEST_TESTS_FAILED and not any(
         by_file.get(k) is Status.FAIL for k in requested
     ):
         return f"pytest exited {returncode} but no row file recorded a failure"
+    if node_ids and not requested & by_file.keys():
+        return "pytest's JUnit attributed no testcase to any requested file"
     return ""
 
 
@@ -140,6 +144,10 @@ def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -
             "pytest",
             *node_ids,
             f"--junitxml={junit}",
+            # xunit1 is the JUnit family that writes each testcase's ``file``; pytest's default
+            # (xunit2) omits it, and without it no result can be attributed to a row.
+            "-o",
+            "junit_family=xunit1",
             "-p",
             "no:cacheprovider",
             "-q",
@@ -155,7 +163,7 @@ def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -
             return PytestRun({}, f"pytest timed out after {timeout:g}s")
         try:
             by_file, unattributed = _parse_junit_by_file(junit)
-        except ElementTree.ParseError as exc:
+        except (ElementTree.ParseError, OSError) as exc:
             return PytestRun({}, f"unreadable JUnit XML ({exc})")
         return PytestRun(by_file, _judge_run(node_ids, proc.returncode, by_file, unattributed))
 

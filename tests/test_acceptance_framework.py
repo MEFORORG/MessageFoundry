@@ -2,8 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Unit tests for the acceptance harness framework — JUnit aggregation, runner mapping, reporting.
 
-These never nest pytest: the suite-execution seam is injected (a fake ``pytest_runner``), so the
-deterministic aggregation/mapping/report logic is exercised in isolation.
+The aggregation/mapping/report logic is driven through an injected fake ``pytest_runner``, and
+``default_pytest_runner`` through a faked ``subprocess.run``. One test runs a real pytest child on a
+small suite, because only a real run shows what pytest's JUnit actually carries.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from harness.acceptance.matrix import MATRIX, Coverage, Status
+from harness.acceptance.matrix import MATRIX, ONCE, PER_DB, Coverage, MatrixRow, Status
 from harness.acceptance.report import (
     exit_code,
     render_console,
@@ -207,10 +208,29 @@ def test_per_db_row_passes_only_when_every_backend_suite_passed() -> None:
 
 
 def test_once_row_still_passes_with_a_skipped_suite() -> None:
-    once = next(r for r in MATRIX if not r.is_per_db and r.coverage is Coverage.PYTEST)
-    first, *rest = once.refs
-    mixed = PytestRun({first: Status.PASS, **dict.fromkeys(rest, Status.SKIP)})
+    once = MatrixRow("Z1", "Z", "t", ONCE, Coverage.PYTEST, ("tests/a.py", "tests/b.py"))
+    mixed = PytestRun({"tests/a.py": Status.PASS, "tests/b.py": Status.SKIP})
     assert _pytest_row_result(once, mixed).status is Status.PASS
+    per_db = replace(once, per_db=PER_DB)
+    assert _pytest_row_result(per_db, mixed).status is Status.SKIP
+
+
+def test_default_runner_flags_a_report_that_attributes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The xunit2 shape: a clean exit whose testcases carry no ``file``.
+    xunit2 = _PASSING.replace(' file="tests/test_a.py"', "")
+    _fake_pytest(monkeypatch, xunit2, pytest.ExitCode.OK)
+    assert "attributed no testcase" in default_pytest_runner(["tests/test_a.py"]).run_error
+
+
+def test_default_runner_attributes_a_real_pytest_run() -> None:
+    # One real child run: the hand-written JUnit above carries ``file=``, which pytest's default
+    # JUnit family omits, so only a real run proves the argv lets results reach their rows.
+    ref = "tests/test_win2025_acceptance.py"
+    run = default_pytest_runner([ref])
+    assert run.run_error == ""
+    assert ref in run.by_file  # attributed; its own verdict is that suite's business
 
 
 def test_run_matrix_no_pytest_skips_pytest_rows() -> None:
