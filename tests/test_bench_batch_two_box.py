@@ -856,6 +856,98 @@ async def test_batch_driver_crashed_band_fails_cell_not_absent(
     assert report.exit_code != 0
 
 
+async def _drive_against_stub_engine(
+    monkeypatch: pytest.MonkeyPatch, first_ready: dict[str, Any]
+) -> tuple[Any, list[Any], dict[str, Any] | None]:
+    """Run the driver half against a stand-in engine box whose FIRST cell posts ``first_ready`` and
+    every other cell a well-formed READY. Returns the report, the cells and the first cell's DONE."""
+    import asyncio
+
+    _install_driver_fakes(monkeypatch)
+    profile = _profile()
+    with tempfile.TemporaryDirectory() as tmp:
+        coord = FileDropCoord(tmp, run_id="batch_ab")
+        cells = bb.iter_batch_cells(profile, claim_mode="pooled")
+
+        async def stub_engine() -> None:
+            for i, cell in enumerate(cells):
+                cc = coord.for_run(f"batch_ab.{cell.cell_id}")
+                well_formed = {
+                    "cell_id": cell.cell_id,
+                    "batch_mode": cell.batch_mode,
+                    "sweep_mode": cell.sweep_mode,
+                    "count": cell.count,
+                    "trial": cell.trial,
+                    "inbound_base": 20000,
+                    "api_port": 9000,
+                    "sink_base": 40000,
+                    "sink_procs": 6,
+                    "hold_seconds": profile.hold_seconds,
+                    "drain_timeout_s": profile.drain_timeout_s,
+                    "aggregate_rate": 24.0,
+                }
+                cc.post(BATCH_CELL_READY, first_ready if i == 0 else well_formed)
+                await cc.await_message(BATCH_CELL_DONE, timeout=10.0, interval=0.02)
+
+        driver_task = asyncio.create_task(
+            bb.run_batch_driver(
+                profile=profile,
+                claim_mode="pooled",
+                engine_host="10.0.0.5",
+                coord=coord,
+                sink_host="0.0.0.0",
+                report_dir=Path(tmp) / "reports",
+                cell_timeout=10.0,
+            )
+        )
+        _, report = await asyncio.gather(stub_engine(), driver_task)
+        first_done = coord.for_run(f"batch_ab.{cells[0].cell_id}").read(BATCH_CELL_DONE)
+    return report, cells, first_done
+
+
+async def test_a_cell_whose_engine_failed_to_start_is_a_failed_record_bug_5428(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # One B0 trial's engine never started; the other five cells run clean with a +50% lift. Dropping
+    # that cell from the records used to let the run read GO and exit 0.
+    report, cells, first_done = await _drive_against_stub_engine(
+        monkeypatch, {"cell_id": "ignored", "error": "engine did not start: boom"}
+    )
+    assert len(report.records) == len(cells)
+    failed = report.records[0]
+    assert failed.no_loss.ok is False
+    assert "engine error: engine did not start: boom" in failed.no_loss.detail
+    assert failed.batch_handoff_statements == cells[0].batch_mode
+    assert first_done == {"cell_id": cells[0].cell_id, "skipped": True}
+    assert not report.result_ok
+    assert report.exit_code != 0
+
+
+async def test_a_malformed_ready_fails_its_cell_and_still_posts_done_bug_5428(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No inbound_base, and a count that is not a number: int(ready[...]) raises KeyError or TypeError,
+    # which used to end the driver without posting DONE, stranding the engine box on its wait.
+    report, cells, first_done = await _drive_against_stub_engine(
+        monkeypatch, {"cell_id": "x", "count": None, "api_port": 9000}
+    )
+    assert len(report.records) == len(cells)
+    assert report.records[0].no_loss.ok is False
+    assert first_done is not None
+    assert first_done["cell_id"] == cells[0].cell_id
+    assert "error" in first_done
+    assert report.exit_code != 0
+
+
+async def test_the_driver_report_names_the_engine_over_https_bug_5428(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _, _ = await _drive_against_stub_engine(
+        monkeypatch, {"cell_id": "ignored", "error": "engine did not start: boom"}
+    )
+    assert report.engine_url.startswith("https://10.0.0.5")
+
+
 # --------------------------------------------------------------------------------------------------
 # BACKLOG #2012 -- the two-box outputs name their rate window, and it is not the sweep's
 # --------------------------------------------------------------------------------------------------

@@ -954,9 +954,13 @@ async def run_batch_driver(
         cell_coord = coord.for_run(f"{coord.run_id}.{cell.cell_id}")
         ready = await cell_coord.await_message(BATCH_CELL_READY, timeout=cell_timeout)
         if ready.get("error"):
-            # The engine could not start this cell — record the miss (build_batch_comparison surfaces a
-            # missing arm) and release the engine so the matrix stays in lockstep.
-            notes.append(f"CELL {cell.cell_id} skipped: engine error: {ready['error']}")
+            # The engine could not start this cell. Record it as an explicit failed cell, not only a
+            # note (BACKLOG #5428): a dropped record could leave the zero-loss SLO and the B0/B1 verdict
+            # reading GO over a cell that never ran, and a missing B0 arm drops the cell from that
+            # verdict. Then release the engine so the matrix stays in lockstep.
+            detail = f"engine error: {ready['error']}"
+            notes.append(f"CELL {cell.cell_id} skipped: {detail}")
+            records.append(_failed_cell_record(cell, detail))
             cell_coord.post(BATCH_CELL_DONE, {"cell_id": cell.cell_id, "skipped": True})
             continue
         try:
@@ -981,9 +985,10 @@ async def run_batch_driver(
                     "rate_window": record.rate_window,
                 },
             )
-        except (ConnScaleError, OSError, ValueError) as exc:
+        except (ConnScaleError, OSError, ValueError, KeyError, TypeError) as exc:
             # A cell whose fleet couldn't be driven or aggregated (a crashed band, an empty/short fleet,
-            # a null engine gauge) is recorded as an EXPLICIT failed/loss cell so it surfaces in the
+            # a null engine gauge, or a READY payload missing a field or holding a wrong type, which
+            # ``_drive_cell_fleet`` reads with ``int(ready[...])`` -- BACKLOG #5428) is recorded as an EXPLICIT failed/loss cell so it surfaces in the
             # zero-loss SLO + the B0/B1 verdict — never a silent gap in the matrix (mirrors the connscale
             # runner failing a step rather than dropping it).
             notes.append(f"CELL {cell.cell_id} drive failed: {exc}")
@@ -999,7 +1004,8 @@ async def run_batch_driver(
     )
     return ConnScaleReport(
         profile=profile.name,
-        engine_url=f"http://{engine_host} (per-cell API ports)",
+        # The engine always serves TLS (ADR 0172), and build_remote_argv dials it over https.
+        engine_url=f"https://{engine_host} (per-cell API ports)",
         db_backend=profile.store_backend,
         shim_installed=False,
         records=records,
