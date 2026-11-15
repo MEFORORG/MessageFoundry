@@ -603,6 +603,74 @@ def test_a_relative_link_behind_a_junction_that_opens_another_file_refuses(tmp_p
         _file_and_folder([tmp_path / "a" / "b" / "f.toml"])
 
 
+def _junction_decoy_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """``a\\b`` a junction to ``real\\c``, holding ``f.toml``, a link to ``..\\x\\g.toml``: the walk
+    reads it as ``real\\x\\g.toml`` and the open as ``a\\x\\g.toml`` (measured). Both folders are
+    made, neither file. Returns the path opened, the walk's file and the open's file."""
+    import _winapi
+
+    winapi: Any = _winapi  # typeshed declares CreateJunction for win32 only
+    real_c = tmp_path / "real" / "c"
+    real_c.mkdir(parents=True)
+    (tmp_path / "real" / "x").mkdir()
+    (tmp_path / "a" / "x").mkdir(parents=True)
+    winapi.CreateJunction(str(real_c), str(tmp_path / "a" / "b"))
+    _link(real_c / "f.toml", Path("..") / "x" / "g.toml")
+    return (
+        tmp_path / "a" / "b" / "f.toml",
+        tmp_path / "real" / "x" / "g.toml",
+        tmp_path / "a" / "x" / "g.toml",
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a junction is a Windows link")
+@pytest.mark.parametrize(
+    ("reached_by", "refusal"),
+    [
+        ("open", "the open reaches an object where the walk reaches none"),
+        ("walk", "the walk reaches an object where the open reaches none"),
+    ],
+)
+def test_a_file_only_the_open_or_only_the_walk_reaches_refuses(
+    reached_by: str, refusal: str, tmp_path: Path
+) -> None:
+    """The kernel check above ran only where the walk found a file: where the open read a file the
+    walk found nowhere, the folder it was read from went unvetted, and where the walk found a file
+    the open did not, the folder the open would create one in went unvetted (lander hold on
+    fba252d79f, cases a and b)."""
+    opened, walked, decoy = _junction_decoy_layout(tmp_path)
+    _file_and_folder([opened])  # control: neither reaches a file, so they agree
+    (decoy if reached_by == "open" else walked).write_text("", encoding="utf-8")
+    with pytest.raises(WiringError, match=refusal):
+        _file_and_folder([opened])
+
+
+@pytest.mark.parametrize(
+    ("reached_by", "refusal"),
+    [
+        ("open", "the open reaches an object where the walk reaches none"),
+        ("walk", "the walk reaches an object where the open reaches none"),
+    ],
+)
+def test_an_open_and_a_walk_that_disagree_on_presence_refuse(
+    reached_by: str, refusal: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same disagreement on every host, with the walk replaced: POSIX has no layout that makes
+    the walk and the open disagree."""
+    import messagefoundry.config.wiring as wiring
+
+    values = tmp_path / "dev.toml"
+    other = tmp_path / "other.toml"
+    other.write_text("", encoding="utf-8")
+    if reached_by == "open":
+        values.write_text("", encoding="utf-8")
+    _file_and_folder([values])  # control: the real walk agrees with the open
+    walk_end = None if reached_by == "open" else other
+    monkeypatch.setattr(wiring, "_link_chain", lambda _path: ([tmp_path], walk_end))
+    with pytest.raises(WiringError, match=refusal):
+        _file_and_folder([values])
+
+
 def test_a_link_into_a_file_where_a_folder_belongs_vets_that_file_s_folder(tmp_path: Path) -> None:
     """A link whose target runs through a regular file reads nothing (ENOTDIR), but whoever can
     write the folder holding that file can replace it with a folder holding the target."""

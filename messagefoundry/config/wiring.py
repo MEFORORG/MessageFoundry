@@ -10697,20 +10697,19 @@ def _enforce_posix_paths(
 # answer to "who can write this path" for config and for start, on each platform.
 
 
-def _stat_is(path: Path, *, folder: bool) -> bool:
-    """Whether ``path`` is a folder, or with ``folder`` false a regular file, following links.
+def _stat_mode(path: Path) -> int | None:
+    """The mode of what an open of ``path`` reaches, following links.
 
-    ``False`` where no object can be opened by that path (:func:`is_missing_directory`), so nothing
+    ``None`` where no object can be opened by that path (:func:`is_missing_directory`), so nothing
     there is read. Any other stat error raises: ``Path.is_dir`` and ``Path.is_file`` answer
     ``False`` for it too, and the start check then vetted nothing there (vault BACKLOG #6654 items
     2 and 17)."""
     try:
-        mode = path.stat().st_mode
+        return path.stat().st_mode
     except OSError as exc:
         if is_missing_directory(exc):
-            return False
+            return None
         raise
-    return stat.S_ISDIR(mode) if folder else stat.S_ISREG(mode)
 
 
 def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
@@ -10877,7 +10876,8 @@ def _file_and_folder(
     :func:`_link_chain` names for it. A file or folder that is not there adds what its link chain
     names, if a link leads to it, and nothing otherwise; so does a path holding a NUL, which no
     open accepts, logged as skipped. Raises ``WiringError``, its message starting with ``lead``,
-    for a path that cannot be stat'ed or walked."""
+    for a path that cannot be stat'ed or walked, and for one whose open and walk disagree: one
+    reaches an object and the other reaches none, or they reach two objects."""
     paths: list[Path] = []
     for path, folder in [*((f, False) for f in files), *((f, True) for f in folders)]:
         if "\0" in os.fspath(path):
@@ -10887,12 +10887,22 @@ def _file_and_folder(
             )
             continue
         try:
-            present = _stat_is(path, folder=folder)
+            mode = _stat_mode(path)
+            present = mode is not None and (stat.S_ISDIR if folder else stat.S_ISREG)(mode)
             chain, end = _link_chain(path)
-            if present and end is not None and not os.path.samefile(path, end):
-                # The kernel's own answer, against the walk's. On Windows a relative link reached
-                # through a junction resolves its ``..`` against the path through the junction,
-                # not the folder the walk reached (measured), so the walk vetted another file.
+            # The kernel's own answer, against the walk's. On Windows a relative link reached
+            # through a junction resolves its ``..`` against the path through the junction, not
+            # the folder the walk reached (measured), so the walk vetted another file, or found
+            # nothing where the open reads one, or the reverse.
+            if mode is not None and end is None:
+                raise OSError(
+                    errno.EINVAL, "the open reaches an object where the walk reaches none"
+                )
+            if mode is None and end is not None:
+                raise OSError(
+                    errno.EINVAL, "the walk reaches an object where the open reaches none"
+                )
+            if end is not None and not os.path.samefile(path, end):
                 raise OSError(errno.EINVAL, "the open reaches another object than the walk")
         except (OSError, ValueError) as exc:
             # ValueError: a link target holding a NUL, which lstat refuses.
