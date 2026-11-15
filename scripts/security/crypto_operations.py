@@ -218,11 +218,16 @@ NOT_OPERATIONS: dict[str, str] = {
 METHOD_RULES: dict[str, str] = {
     "encrypt": "cipher",
     "decrypt": "cipher",
+    # Vault BACKLOG #6706: a BatchCipher opens or seals several values per call.
+    "encrypt_many": "cipher",
+    "decrypt_many": "cipher",
     "encrypt_data": "cipher",  # hvac Vault Transit
     "decrypt_data": "cipher",  # hvac Vault Transit
     "rewrap_data": "cipher",  # hvac Vault Transit
     "sign": "sign_verify",
     "verify": "sign_verify",
+    # ADR 0217: the row sealers' awaitable verify, served by the local and Transit sealers.
+    "verify_async": "sign_verify",
     "sign_data": "sign_verify",  # hvac Vault Transit
     "verify_signed_data": "sign_verify",  # hvac Vault Transit
     "generate_hmac": "mac",  # hvac Vault Transit

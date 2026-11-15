@@ -77,13 +77,19 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    an inbound ``Ftp`` poller. Each takes the checks of items 1 to 4 under the label
    ``outbound:<name>``, ``fhir_lookup:<name>`` or ``inbound:<name>``, on the inbound dial. A pin
    mismatch always refuses, and an exposed or unjudged CA refuses at ``enforce``. **When** a
-   refusal lands follows ADR 0031, as amended on 2026-10-06:
+   refusal lands follows ADR 0031, as amended on 2026-10-06, and for a ``FhirLookup`` on
+   2026-11-11:
 
    * An outbound or an ``Ftp`` poller is checked when its lane is built, at start and at an
      operator start (:func:`make_lane_anchor_check`). A refusal fails that lane only, with the
      audit row, and the rest of the graph comes up.
-   * A ``FhirLookup`` has no lane of its own, so the registry preflight checks it and refuses
-     the start or the reload (:func:`make_registry_anchor_preflight`).
+   * A ``FhirLookup`` is checked as the runner builds the lookup executor at start, through the
+     same lane check under its own label (vault BACKLOG #3582). An engine started with no graph
+     takes its first one by reload. That load checks each lookup CA before its build check,
+     which leaves out one the check refused, so that one is isolated as at a start. A refusal fails that lookup only,
+     with the audit row, as a lookup that fails to build is isolated (vault BACKLOG #3008): it is
+     recorded failed and alerted, every Handler call to it fails closed, and the rest of the graph
+     comes up. Nothing is dialled for it.
    * Before a reload quiesces, the runner checks each lane the reload builds or keeps running, and
      a refusal refuses the whole reload. It does not read an idle lane: one not deployed, an
      ``auto_start=False`` lane not running, one below a DR threshold, a poller outside its
@@ -91,6 +97,14 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
      last kind failed. A config change or an operator start builds it, and checks it then.
      Only these checks skip an idle lane. A reload's build check still builds every deployed
      connector, and those that read the file as they are built refuse one they cannot load.
+   * A reload builds every ``FhirLookup`` again, so before its build check the runner checks
+     each one the new graph declares, idle or not, and a refusal refuses the whole reload. A DR
+     activation checks them inside its bounded preflight instead, and its reload checks them
+     again only if another reload changed the graph in between. Its build still loads each
+     lookup's file, with no bound, as a lane's build loads its own. In a reload, a check the
+     store stopped refuses only once no lookup or lane CA is refused, and ahead of a
+     build-check failure (BACKLOG #3091). In a
+     DR activation's preflight it refuses there, as the preflight's other checks do.
 
    **Not covered: the checked bytes are not the loaded bytes here.** These hops build their
    context from the path, with ``cafile=``, after the check. So a file swapped between the check
@@ -1988,16 +2002,24 @@ _CONNECTION_ANCHOR_KEYS = (
 
 
 def lane_anchor_spec(direction: str, name: str, settings: Mapping[str, Any]) -> AnchorSpec | None:
-    """The dialling CA of one outbound lane, or of one inbound ``Ftp`` poller, or ``None``.
+    """The dialling CA of one outbound lane, of one inbound ``Ftp`` poller, or of one
+    ``FhirLookup``, or ``None``.
 
-    ``direction`` is ``"outbound"`` or ``"inbound"``; ``settings`` are resolved. One place names
-    both, so the lane check and the reload preflight write rows under the same label. An inbound
-    poller dials out over FTPS and reads its CA by path, as an outbound does. It has no ``tls``
-    key, so :func:`connection_anchor_spec` never takes it. The caller passes only an ``Ftp``
-    poller or a ``DatabasePoll`` as ``"inbound"``.
+    ``direction`` is ``"outbound"``, ``"inbound"`` or ``"fhir_lookup"``; ``settings`` are
+    resolved. One place names them all, so the lane check and the reload preflight write rows
+    under the same label. An inbound poller dials out over FTPS and reads its CA by path, as an
+    outbound does. It has no ``tls`` key, so :func:`connection_anchor_spec` never takes it. The
+    caller passes only an ``Ftp`` poller or a ``DatabasePoll`` as ``"inbound"``. A
+    ``FhirLookup`` is not a lane, but the runner checks its CA as it builds the lookup, in the
+    same isolation (module item 9), so it takes the lane check under its own label
+    (vault BACKLOG #3582).
 
     A generic DATABASE lane's CA is its ``odbc_params`` ``sslca`` (:func:`database_ca_anchor_spec`,
     module item 12), under the same label. It takes no ``tls_ca_file``, so a lane has one CA."""
+    if direction == "fhir_lookup":
+        return outbound_anchor_spec(
+            name, settings, kind="fhir lookup", label=fhir_lookup_record_name(name)
+        )
     if direction == "inbound":
         kind, label = "inbound connection", inbound_record_name(name)
         spec = outbound_anchor_spec(name, settings, kind=kind, label=label)
@@ -2016,9 +2038,10 @@ def registry_anchor_specs(
     DATABASE outbound or ``DatabasePoll`` takes its ``odbc_params`` ``sslca`` there (module item
     12). A ``DatabaseLookup`` has no generic dialect, so it has no such CA.
 
-    ``lanes=False`` leaves out the outbound, ``Ftp`` poller and ``DatabasePoll`` CAs, which the start checks lane by
-    lane instead (module item 9). A connection whose anchor settings do not resolve is skipped:
-    its own build refuses it, and that error names the missing value."""
+    ``lanes=False`` leaves out the outbound, ``Ftp`` poller, ``DatabasePoll`` and ``FhirLookup``
+    CAs, which the runner checks one by one instead, as it builds each (module item 9). A
+    connection whose anchor settings do not resolve is skipped: its own build refuses it, and that
+    error names the missing value."""
     from messagefoundry.config.wiring import WiringError, resolve_env_settings
 
     def resolved(settings: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -2043,10 +2066,9 @@ def registry_anchor_specs(
                 st = resolved(ic.spec.settings)
                 if st is not None and (spec := lane_anchor_spec("inbound", ic.name, st)):
                     specs.append(spec)
-    for fl in registry.fhir_lookups.values():
-        if (st := resolved(fl.settings)) is not None:
-            label = fhir_lookup_record_name(fl.name)
-            if spec := outbound_anchor_spec(fl.name, st, kind="fhir lookup", label=label):
+        for fl in registry.fhir_lookups.values():
+            st = resolved(fl.settings)
+            if st is not None and (spec := lane_anchor_spec("fhir_lookup", fl.name, st)):
                 specs.append(spec)
     return specs
 
@@ -2659,10 +2681,11 @@ def make_registry_anchor_preflight(store: Store, *, enforcing: bool) -> Registry
     route answers with 422 and the first load with a refused start. Dormant when no connection names
     a CA it checks.
 
-    It checks the inbound listener CAs and the ``FhirLookup`` CAs. It leaves out the lane CAs, of
-    the outbounds and the ``Ftp`` pollers: the runner checks those for each lane it builds, at
-    start and before a reload (module item 9). ``lanes=True`` adds them, for a caller that wants
-    the whole graph checked at once, such as a test of the checks themselves."""
+    It checks the inbound listener CAs. It leaves out the lane CAs, of the outbounds, the ``Ftp``
+    pollers and the ``DatabasePoll`` inbounds, and the ``FhirLookup`` CAs: the runner checks
+    those one by one as it builds each, at start, and before a reload (module item 9).
+    ``lanes=True`` adds them, for a caller that wants the whole graph checked at once, such as a
+    test of the checks themselves."""
 
     async def preflight(
         registry: Registry, env_values: Mapping[str, Any], *, lanes: bool = False

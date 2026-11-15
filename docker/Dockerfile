@@ -47,16 +47,32 @@
 # sha256:a66d3a463d0be3cc537c269b0d3418746dda512417a975559a0eaa8a6406baaf carried it in all three.
 # No other platform under either index was inspected.
 #
-# NOT INSPECTED: the index engine PR 2778 (Dependabot, 2026-11-04) moves the pin to,
-# sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527. The Lander's review of
-# that PR recorded on 2026-11-04, in its hold comment: the tag python:3.14-slim-bookworm unchanged,
-# 516b51cb the official image for that tag that day, built from the same docker-library revision,
-# with Python 3.14.10 and the same 69 Debian packages at the same versions on linux/amd64,
-# ca-certificates 20250419~deb12u2 among them. That record holds no CA-bundle reading, and a Debian
-# package list cannot show the two pip-vendored certifi bundles at all. A later digest the pin
-# moves to is inspected by nothing: tests/test_container_build_pins.py refuses only the known-bad
+# Any digest on the FROM line that no INSPECTED paragraph above names is uninspected, whatever the
+# paragraphs below say: each records the pin one PR set, and the FROM line can move to a digest none
+# of them names. Nothing checks this: tests/test_container_build_pins.py refuses only the known-bad
 # digests, so check this block against the FROM line when it moves.
-FROM python:3.14-slim-bookworm@sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527 AS python-base
+#
+# NOT INSPECTED, THE PIN ENGINE PR 2778 SET: the index
+# sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527, set by that PR
+# (Dependabot, opened 2026-11-04). The Lander's review of that PR recorded on 2026-11-04, in its
+# hold comment (issuecomment-6629228552): the tag python:3.14-slim-bookworm unchanged, 516b51cb
+# the official image for that tag that day, built from the same docker-library revision, with
+# Python 3.14.10 and the same 69 Debian packages at the same versions on linux/amd64,
+# ca-certificates 20250419~deb12u2 among them. That record holds no CA-bundle reading, and a
+# Debian package list cannot show the two pip-vendored certifi bundles at all. It is a record of
+# 516b51cb only.
+#
+# NOT INSPECTED, THE PIN ENGINE PR 2943 SET: the index
+# sha256:3fe1a0b6c2d6b2ebb572906cdabeca75aeb558c0c17db5ffefbcf8094871c32b, set by that PR
+# (Dependabot, opened 2026-11-14). Neither this header nor that PR's hold comment records a
+# CA-bundle reading or a package comparison of this digest, on any platform, so neither says which
+# CA roots any of its bundles trusts, the three bundles named above or any other. The 516b51cb
+# package list does not carry over to it. The Lander's hold comment on that PR
+# (issuecomment-6872517695, 2026-11-14) recorded that 3fe1a0b6 is the digest Docker Hub served for
+# the unchanged tag that day, with Python 3.14.10, and that its Debian base moved from 2026-10-27 to
+# 2026-11-04. Its "supply chain checks out" covers which digest the tag served and that the bump
+# changes one line, not what the image trusts.
+FROM python:3.14-slim-bookworm@sha256:3fe1a0b6c2d6b2ebb572906cdabeca75aeb558c0c17db5ffefbcf8094871c32b AS python-base
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------
 FROM python-base AS builder-base

@@ -53,9 +53,9 @@ from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
 from messagefoundry.transports.egress import (
-    _http_egress_allowed,
     check_egress_allowed,
     check_fhir_lookup_allowed,
+    http_egress_allowed,
 )
 from messagefoundry.transports.fhir import FhirDestination, FhirLookupExecutor
 from messagefoundry.transports.http_auth import HttpAuthError, OAuth2ClientCredentialsProvider
@@ -537,7 +537,7 @@ def test_the_webhook_screen_leaves_an_ordinary_hook_alone() -> None:
 # build-check (``check``, reload, connection upsert), test-connection, start and resume. So the
 # construction refusal above never got the chance. Two leaks sat in front of it:
 #
-# * ``_http_egress_allowed`` read ``urlsplit(url).port``, which raises ``Port could not be cast to
+# * ``http_egress_allowed`` read ``urlsplit(url).port``, which raises ``Port could not be cast to
 #   integer value as '<head>'`` for the ``slash_in_pw`` shape once an allow entry pins a port and names
 #   the parsed host. ``redact()`` does not match that text.
 # * every arm echoed ``urlsplit(url).hostname`` in its refusal, and for ``encoded_at`` that hostname
@@ -551,10 +551,10 @@ _EGRESS_HOSTS = ["endpoint.example.invalid", "svc:443"]
 
 
 def test_the_http_egress_match_never_raises_on_a_port_that_is_not_a_number() -> None:
-    assert _http_egress_allowed(_USERINFO_SHAPES["slash_in_pw"], _EGRESS_HOSTS) is False
+    assert http_egress_allowed(_USERINFO_SHAPES["slash_in_pw"], _EGRESS_HOSTS) is False
     # The control half: an ordinary URL still matches, with or without a pinned port.
-    assert _http_egress_allowed("https://endpoint.example.invalid/x", _EGRESS_HOSTS) is True
-    assert _http_egress_allowed("https://svc:443/x", _EGRESS_HOSTS) is True
+    assert http_egress_allowed("https://endpoint.example.invalid/x", _EGRESS_HOSTS) is True
+    assert http_egress_allowed("https://svc:443/x", _EGRESS_HOSTS) is True
 
 
 @pytest.mark.parametrize("shape", sorted(_USERINFO_SHAPES))

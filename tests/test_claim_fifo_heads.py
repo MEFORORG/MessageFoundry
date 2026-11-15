@@ -508,6 +508,26 @@ async def test_list_fifo_lanes_pagination_and_stage_scoping(store: Any) -> None:
     assert [lane for lane, _ in out_lanes] == ["OB_L1"]
 
 
+async def test_case_variant_lanes_are_listed_and_claimed_apart(store: Any) -> None:
+    """BACKLOG #5721: two lanes whose names differ only in case are two lanes to discovery and to
+    the claim, on every backend. SQLite and Postgres compare exactly; the SQL Server case is what
+    this pins, since a case-insensitive database collation would fold the two (CI's SQL Server leg
+    runs the image's default, case-insensitive, collation). The walk order is each backend's own,
+    so the pages are compared with the full listing rather than with a fixed order."""
+    lanes = ["IB_CASE", "ib_case"]
+    ids = {lane: await _seed_ingress(store, lane, [100.0 + i]) for i, lane in enumerate(lanes)}
+    listed = await store.list_fifo_lanes(Stage.INGRESS.value)
+    assert sorted(listed) == [("IB_CASE", 100.0), ("ib_case", 101.0)]
+    walked: list[tuple[str, float]] = []
+    after: str | None = None
+    while page := await store.list_fifo_lanes(Stage.INGRESS.value, limit=1, after=after):
+        walked.extend(page)
+        after = page[-1][0]
+    assert walked == listed, "the after cursor must step from one case variant to the other"
+    res = await _claim_heads(store, Stage.INGRESS.value, lanes, now=200.0)
+    assert {lane: [r.message_id for r in rows] for lane, rows in res.by_lane.items()} == ids
+
+
 async def test_list_fifo_lanes_excludes_fully_claimed_lane(store: Any) -> None:
     """A lane with no PENDING rows left (all inflight) disappears from discovery."""
     await _seed_ingress(store, "IB_LC", [100.0])

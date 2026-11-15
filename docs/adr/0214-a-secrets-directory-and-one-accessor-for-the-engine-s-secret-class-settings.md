@@ -153,6 +153,40 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 ## Amendments
 
+- **2026-11-13, on Windows the folder just above the directory is read (vault BACKLOG #5656,
+  #5657).** On Windows, `_windows_surroundings_problem` in `messagefoundry/restricted_file.py`
+  reads the owner and access list of `full.parent`, the folder just above the directory in its
+  path as written, and refuses the directory when a broad group or an application package
+  may delete a file in that folder, change its access list or take it over, or when that
+  folder's owner is such a group or cannot be read. The check also judges some junctions and links
+  on the path; the code is the record of which. It is not a complete check of the directory's
+  surroundings, and the risk above that says *"Nor are the folders above the directory
+  checked"* is only partly closed. A file in the directory is not walked again; the directory's
+  own check is its walk.
+
+  Known not to be judged, at least:
+  - by that holder read, a broad group's `DELETE` on the folder: `_HOLDER_REPLACE_MASK` does not
+    include `DELETE`;
+  - anything around a directory at a drive root, such as `S:\`: the function returns `None` when
+    `full.parent == full`.
+- **2026-11-13, a link is refused on every platform (vault BACKLOG #5636).** Decision 3's "a link
+  on Windows" now reads "a link": `broad_access_problem` reads the named path without following a
+  link on POSIX too, so a secrets directory, or a file in it, that is itself a link is refused
+  there as well. A Kubernetes Secret volume serves each file as a link, so it cannot be this
+  directory. On POSIX the same check also refuses a directory or file another account owns, and
+  one held in a directory that another account owns or that a group or other may write without
+  the sticky bit; `docs/CONFIGURATION.md` states the rule.
+- **2026-11-11, half of slice B built: the NSSM reading refuses every secret-class name.** A
+  name from `DIRECTORY_SETTING_NAMES` in the service's own environment lists now refuses `serve`
+  and `supervise`, under every enforcement setting, as a store key there already did, and the
+  refusal names this directory as the way in. The `service_environment_secret` loosening is
+  removed; an app built without either command, such as one built with `create_app(engine)`,
+  names what they refuse as `secret_in_service_environment` where it finds its service. The
+  other half, refusing such a
+  secret found in the environment elsewhere, is not built: one reaching the engine from the
+  machine-wide environment, or from its own environment when the service's lists could not be
+  read, is neither refused nor named, since only a store key's names are read there (vault
+  BACKLOG #2595).
 - **2026-11-05, slice D built.** `[store].key_provider` no longer accepts the four external names
   ADR 0019 declared and nobody built, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`; each is now
   refused as an unknown name. Question 12 of the maintainer-internal decisions index answered yes

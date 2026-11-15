@@ -268,7 +268,8 @@ async def test_a_heartbeat_cancelled_in_flight_unwinds_within_the_release_bound(
     MUTATION ARM, measured: send the statement through the pool's own ``execute`` (as before #2523)
     and the task is still running after stop() returns, because the release waits for ever."""
     # A clamp long enough that stop()'s cancel lands well inside it on a loaded runner. If the
-    # coordinator's own deadline fired first, the loop would move on to a claim before stop() ran.
+    # coordinator's own deadline fired first, the side pass would move on to its refresh before
+    # stop() ran.
     renew = 1.0
     server.hang.add(_HEARTBEAT_SQL)
     a, pool = _pg(server, renew=renew, fence=_GUARD)
@@ -276,19 +277,22 @@ async def test_a_heartbeat_cancelled_in_flight_unwinds_within_the_release_bound(
     await asyncio.wait_for(server.hung.wait(), _GUARD)
     heartbeat = a._heartbeat_task
     assert heartbeat is not None
+    hung_at = len(server.sent)
 
     elapsed, _ = await _timed(a.stop())
 
     assert elapsed < _STOP_BOUND + _SLACK
     # stop() did not wait for it (its own bound is shorter), but the task finishes within the
-    # release's timeout.
+    # release's timeout: the loop waits for the side pass it cancelled (BACKLOG #5710).
     await asyncio.wait({heartbeat}, timeout=renew + _SLACK)
     assert heartbeat.done(), "the cancelled heartbeat is still waiting on its connection's release"
-    # And it finished CANCELLED. The stand-in's release raises TimeoutError over the cancel, as
-    # asyncpg's does; without _call_within restoring the cancel, the loop logs that as a failed
-    # heartbeat and goes on to send a claim after stop() had cancelled it.
-    assert heartbeat.cancelled(), "the cancel was swallowed by the release's TimeoutError"
-    assert server.row.owner is None, "the cancelled loop went on to claim the lease"
+    # No assertion on how the loop task ended: it ends cancelled whatever the side pass did, since
+    # its finally only waits for that pass. The stand-in's release raises TimeoutError over the
+    # cancel, as asyncpg's does; without _call_within restoring the cancel, the side pass logs that
+    # as a failed heartbeat and goes on to send its refresh after stop() had cancelled it, which the
+    # statement check catches (BACKLOG #5710). The loop waited for the pass, so anything it sent is
+    # already recorded.
+    assert _only_stop_writes(server.sent[hung_at:]), "the cancel was swallowed: another statement"
     assert renew in pool.release_timeouts
     assert None not in pool.acquire_timeouts, "a statement borrowed with no timeout"
     assert None not in pool.release_timeouts, "a statement released with no timeout"
@@ -302,8 +306,10 @@ async def test_a_cancel_survives_a_release_that_raises_over_it(server: _Server) 
     The clamp is set long on purpose, so the coordinator's own deadline cannot fire first and turn
     the hung heartbeat into an ordinary timeout before stop() cancels it.
 
-    MUTATION ARM, measured: drop the restore in ``_call_within`` and the loop logs a failed heartbeat,
-    then sends a claim and takes the lease after stop() had cancelled it."""
+    MUTATION ARM, measured: drop the restore in ``_call_within`` and the side pass logs a failed
+    heartbeat, then sends its refresh after stop() had cancelled it. Before BACKLOG #5710 the claim
+    followed the heartbeat, so the arm sent a claim; now the claim runs first and the refresh
+    follows."""
     server.hang.add(_HEARTBEAT_SQL)
     a, pool = _pg(server, renew=_GUARD, fence=_GUARD)
     pool.release_fails = True
@@ -311,11 +317,20 @@ async def test_a_cancel_survives_a_release_that_raises_over_it(server: _Server) 
     await asyncio.wait_for(server.hung.wait(), _GUARD)
     heartbeat = a._heartbeat_task
     assert heartbeat is not None
+    hung_at = len(server.sent)
 
     await _timed(a.stop())
 
-    assert heartbeat.done() and heartbeat.cancelled(), "the cancel was swallowed"
-    assert server.row.owner is None, "the cancelled loop went on to claim the lease"
+    # Done means the loop's finally waited out its side pass, so everything that pass sent is
+    # recorded. How the task ended says nothing: it ends cancelled whatever the pass did, so the
+    # statement check is the guard.
+    assert heartbeat.done()
+    assert _only_stop_writes(server.sent[hung_at:]), "the cancel was swallowed: another statement"
+
+
+def _only_stop_writes(sent: list[str]) -> bool:
+    """Whether every statement in ``sent`` is one of stop()'s own two writes."""
+    return all(_RELEASE_SQL in sql or _TOMBSTONE_SQL in sql for sql in sent)
 
 
 @pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
@@ -450,9 +465,11 @@ async def test_a_lock_timeout_is_still_the_answer_when_the_tick_outlasts_the_fen
 
     with pytest.raises(StepdownLockTimeout):
         await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
-    server.answer.set()  # the server answers at last, and the tick renews
+    server.answer.set()  # the server answers at last, and the tick's renew lands
     await _timed(tick)
-    assert a.is_leader() is True
+    # The renew returned past the fence, so the tick fences rather than keep the node leader on a
+    # baseline already older than the fence (BACKLOG #5711). Before that it read True here.
+    assert a.is_leader() is False
 
 
 # --- the paused tick's owner read (BACKLOG #2540) ----------------------------------------------

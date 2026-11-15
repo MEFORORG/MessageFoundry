@@ -27,6 +27,8 @@ All state is bounded by the run's sent count (a failover run is a short burst, n
 
 from __future__ import annotations
 
+from collections.abc import Callable, Collection
+
 
 class LeadershipTracker:
     """Continuous "active leaders ∈ {0,1}" SLO (H6). The Jepsen-style single-leader invariant: across a
@@ -149,6 +151,30 @@ class FailoverTracker:
     def acked_not_delivered(self) -> int:
         """Acknowledged messages that never reached the sink — the headline loss number (must be 0)."""
         return len(self._acked - self._delivered)
+
+    def acked_copies_missing(
+        self,
+        expected: Callable[[int], Collection[int]],
+        destination_of: Callable[[str], int | None],
+    ) -> int:
+        """Copies of acknowledged messages that never arrived: for each ACKed seq, the EXPECTED
+        destinations (``expected(seq)``) it did not arrive at, summed. Must be 0. A copy's
+        destination is read from the lane label :meth:`on_delivery` was given (MSH-6 in the
+        shardcert) by ``destination_of``; it is the label, not the port the copy reached.
+
+        Exact per message and per destination, where a count of all deliveries is not: a
+        re-delivery on a lane the seq already reached adds nothing, a copy under a destination the
+        seq was never routed to is not one of its copies, and copies of another message (a
+        duplicate, or a send whose ACK this side never saw) cannot stand in for a lost one."""
+        arrived: dict[int, set[int]] = {}
+        for lane, seen in self._lane_seen.items():
+            dest = destination_of(lane)
+            if dest is None:
+                continue
+            for seq in seen:
+                arrived.setdefault(seq, set()).add(dest)
+        empty: set[int] = set()
+        return sum(len(set(expected(seq)) - arrived.get(seq, empty)) for seq in self._acked)
 
     @property
     def acked_all_delivered(self) -> bool:

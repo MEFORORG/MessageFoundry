@@ -25,8 +25,9 @@ the readers of those settings go through. The design is ADR 0214.
   may sit here, and the listing passes over them: the ``host`` key provider reads them itself
   (:mod:`messagefoundry.store.custody_host`, vault BACKLOG #3411), checking each as a key file.
 
-**What this slice does not do**, at least: refuse a secret found in the environment (the NSSM
-reading in :mod:`messagefoundry.serviceenv` still names a non-key secret and does not refuse it);
+**What this slice does not do**, at least: refuse a secret found in the environment (slice B
+later made the NSSM reading in :mod:`messagefoundry.serviceenv` refuse one in the service's own
+lists, where it could read them);
 create the directory (the Windows service installer does, slice C, and names it to the service);
 wrap a file with DPAPI (a plain file restricted by
 its access list is the control, and whether a Windows file is also wrapped waits on a spike); and
@@ -58,6 +59,7 @@ __all__ = [
     "VALUE_PREFIX",
     "SecretsDirectory",
     "SecretsDirectoryError",
+    "is_value_name",
     "open_secrets_directory",
     "secret_setting",
     "secret_settings",
@@ -110,8 +112,11 @@ MAX_FILE_BYTES: Final = 64 * 1024
 
 #: The remedy every access refusal ends with.
 _REMEDY: Final = (
-    "Restrict it to SYSTEM, Administrators and the account the engine runs as (POSIX: the "
-    "engine's own account, mode 0700 for the directory and 0600 for a file)"
+    "Restrict it to SYSTEM, Administrators and the account the engine runs as, as real files and "
+    "directories rather than links, with no junction or link above them that another account can change (Windows: "
+    "in a folder no broad group may delete a file in or change the access list of; POSIX: the "
+    "engine's own account, mode 0700 for the directory and 0600 for a file, in a folder that "
+    "account or root owns and only it may write, or that has the sticky bit)"
 )
 
 
@@ -136,7 +141,7 @@ _VALUE_NAME = re.compile(r"MEFOR_VALUE_[A-Za-z0-9_]+")
 _FILE_NAME = re.compile(r"[A-Za-z0-9_]+")
 
 
-def _is_value_name(key: str) -> bool:
+def is_value_name(key: str) -> bool:
     """Whether ``key`` names an ``env()`` value."""
     return _VALUE_NAME.fullmatch(key) is not None
 
@@ -150,10 +155,12 @@ _CUSTODY_KEYS: Final = frozenset(_name_key(name) for name in CUSTODY_FILE_NAMES)
 def _check(path: Path, what: str, *, directory: bool = False) -> None:
     """Refuse ``path`` when a known broad group can reach it: the rule key files get. For the
     directory, a broad right to delete a file inside it is refused too, since deleting a file sends
-    its setting back to the environment."""
+    its setting back to the environment. The directory's own check walks the folders above it; a
+    file's does not walk them again, because the directory that holds it is the one just judged
+    (on POSIX that directory's owner and mode are still read for each file)."""
     from messagefoundry.restricted_file import broad_access_problem
 
-    problem = broad_access_problem(path, directory=directory)
+    problem = broad_access_problem(path, directory=directory, holder_judged=not directory)
     if problem is not None:
         raise SecretsDirectoryError(f"{what} is not restricted: {problem}. {_REMEDY}")
 
@@ -175,8 +182,8 @@ _REMOVED: Final = "was removed after the directory was listed; start again"
 
 
 def _not_a_regular_file(path: Path) -> str | None:
-    """Why ``path`` is not a regular file to read, or ``None`` when it is. This follows a link, so on
-    Windows it runs only after the access check has refused one."""
+    """Why ``path`` is not a regular file to read, or ``None`` when it is. This follows a link, so it
+    runs only after the access check has refused one."""
     try:
         mode = path.stat().st_mode
     except FileNotFoundError:
@@ -221,7 +228,7 @@ class SecretsDirectory:
 
         ``name`` must be one of :data:`DIRECTORY_SETTING_NAMES` or start with :data:`VALUE_PREFIX`.
         Raises :class:`SecretsDirectoryError` for a file that cannot be used."""
-        if name not in DIRECTORY_SETTING_NAMES and not _is_value_name(name):
+        if name not in DIRECTORY_SETTING_NAMES and not is_value_name(name):
             raise ValueError(f"{name} is not a setting the secrets directory supplies")
         on_disk = self.names.get(_name_key(name))
         if on_disk is None:
@@ -234,7 +241,7 @@ class SecretsDirectory:
         return {
             on_disk: self._read_file(on_disk)
             for key, on_disk in sorted(self.names.items())
-            if _is_value_name(key)
+            if is_value_name(key)
         }
 
     def _read_file(self, on_disk: str) -> str:
@@ -247,12 +254,11 @@ class SecretsDirectory:
         # does not follow a link, so it may run before the access check.
         if not os.path.lexists(path):
             raise SecretsDirectoryError(f"{what} {_REMOVED}")
-        # The access check before anything that follows a link: on Windows it refuses a link
-        # without following it, and following one would open whatever it names as the engine's
-        # account, a UNC share included. A link swapped in after this check is still followed by
-        # the stat and the open below; reading through one handle opened without following would
-        # close that, and is not done here. On POSIX the access check itself follows a link and
-        # judges the file behind it, so this order changes nothing there.
+        # The access check before anything that follows a link: it refuses a link without
+        # following it, on every platform, and following one would open whatever it names as the
+        # engine's account, a UNC share included. A link swapped in after this check is still
+        # followed by the stat and the open below; reading through one handle opened without
+        # following would close that, and is not done here.
         _check(path, what)
         # A FIFO or a device named for a setting would block the read for good.
         problem = _not_a_regular_file(path)
@@ -282,8 +288,8 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
 
     ``environ`` defaults to this process's environment. Raises :class:`SecretsDirectoryError` when
     the directory is named and cannot be used: at least a relative path, a path that is not a
-    directory, a link on Windows, a directory a known broad group can read or change, or a file in
-    it whose name is not a setting the directory supplies."""
+    directory, a link, a directory a known broad group can read or change, or a file in it whose
+    name is not a setting the directory supplies."""
     environ = os.environ if environ is None else environ
     raw = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
     if not raw:
@@ -304,7 +310,7 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
     # The directory first: a group that can add a file to it can supply a setting, whatever the
     # access list of the file it adds.
     _check(path, what, directory=True)
-    if not path.is_dir():  # at least a link to something else, on POSIX
+    if not path.is_dir():  # what the access check passed is not a directory after all
         raise SecretsDirectoryError(unusable)
     try:
         entries = sorted(os.listdir(path))
@@ -330,7 +336,7 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
                 "directory: keep it in a DPAPI-protected key file ([store].encryption_key_file, "
                 "made with `messagefoundry protect-key`) and remove that file"
             )
-        if key in _ALLOWED_KEYS or _is_value_name(key):
+        if key in _ALLOWED_KEYS or is_value_name(key):
             # env() keys are matched lower-cased, so two files that differ only in case would
             # supply one value with no way to tell which.
             twin = folded.setdefault(key.lower(), entry)

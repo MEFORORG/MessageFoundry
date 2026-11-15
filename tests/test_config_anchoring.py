@@ -22,6 +22,7 @@ from messagefoundry.config.anchor import (
     resolve_project_root,
 )
 from messagefoundry.config.wiring import load_config
+from tests.test_audit_keyless_chain_flagged import _AT_REST_ENV
 
 # A graph that references env() (an outbound host) — the AC-3 precondition.
 _ENV_GRAPH = """
@@ -612,3 +613,242 @@ def test_without_a_root_the_build_check_still_falls_back_to_the_cwd(
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
 # retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
 pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
+
+
+# --- BACKLOG #5926 / #5927: the offline store commands anchor [store].path the way serve does ------
+#
+# Each command below loads the service settings and then tests or opens [store].path. Run from a
+# directory that is not the root, a relative path must name the store serve would open, under
+# [environments].base_dir, and not one beside the working directory. At least these commands; the
+# list is the ones this change covers, not a census of every command that reads the store.
+
+_OFFLINE_AT_REST_ENV = (
+    *_AT_REST_ENV,
+    "MEFOR_STORE_PATH",
+    "MEFOR_STORE_BACKEND",
+    "MEFOR_ENVIRONMENTS_BASE_DIR",
+)
+
+
+@pytest.fixture
+def away_from_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """A root holding nothing yet, a service config naming it as base_dir with a relative
+    [store].path, and a working directory that is somewhere else. Returns (root, service config)."""
+    for name in _OFFLINE_AT_REST_ENV:
+        monkeypatch.delenv(name, raising=False)
+    root = tmp_path / "repo"
+    root.mkdir()
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text(
+        f'[environments]\nbase_dir = "{root.as_posix()}"\n\n[store]\npath = "mf.db"\n',
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "wd"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    return root, svc
+
+
+def test_anchored_store_path_follows_the_root(tmp_path: Path) -> None:
+    from messagefoundry.config.anchor import anchored_store_path
+
+    root = tmp_path / "repo"
+    assert anchored_store_path("mf.db", root, cwd=tmp_path / "wd") == str(root / "mf.db")
+
+
+def test_anchored_store_path_keeps_an_absolute_path(tmp_path: Path) -> None:
+    from messagefoundry.config.anchor import anchored_store_path
+
+    abs_db = str((tmp_path / "fastvol" / "store.db").resolve())
+    assert anchored_store_path(abs_db, tmp_path / "repo", cwd=tmp_path) == abs_db
+
+
+def test_anchored_store_path_with_no_root_is_unchanged(tmp_path: Path) -> None:
+    from messagefoundry.config.anchor import anchored_store_path
+
+    assert anchored_store_path("mf.db", None, cwd=tmp_path) == "mf.db"
+
+
+def test_the_in_memory_sentinel_is_never_joined_under_the_root(tmp_path: Path) -> None:
+    from messagefoundry.config.anchor import anchored_store_path
+
+    # Joined, `:memory:` would become a durable file (an NTFS stream on Windows). The guard sits in
+    # anchor_under_root, so serve's and supervise's pre-load --db join keeps it too.
+    root = tmp_path / "repo"
+    assert anchored_store_path(":memory:", root, cwd=tmp_path) == ":memory:"
+    assert anchor_under_root(":memory:", root, cwd=tmp_path) == ":memory:"
+
+
+def test_anchored_store_path_keeps_a_drive_relative_path_under_the_root(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The same AC-8 rule anchor_under_root applies to every other member: warn, stay under root.
+    from messagefoundry.config.anchor import anchored_store_path
+
+    root = tmp_path / "repo"
+    anchored = anchored_store_path("/data/mf.db", root, cwd=tmp_path)
+    if Path("/data/mf.db").is_absolute():  # POSIX: a leading slash is absolute and stays put
+        assert anchored == "/data/mf.db"
+    else:
+        assert anchored == str(root / "data" / "mf.db")
+        assert "drive-relative" in caplog.text
+
+
+def test_anchor_settings_store_path_tolerates_no_settings(tmp_path: Path) -> None:
+    from messagefoundry.config.anchor import anchor_settings_store_path
+
+    anchor_settings_store_path(None, cwd=tmp_path)  # support-bundle's unloaded case: no raise
+
+
+def _names(output: str, path: Path) -> bool:
+    # A repr or a JSON string doubles a Windows backslash; undo that before the substring test.
+    return str(path) in output.replace("\\\\", "\\")
+
+
+@pytest.mark.parametrize(
+    ("argv", "via_db", "code"),
+    [
+        pytest.param(["admin-unlock", "--username", "site-admin"], False, 2, id="admin-unlock"),
+        pytest.param(["audit-verify"], False, 2, id="audit-verify"),
+        pytest.param(["audit-anchor"], False, 2, id="audit-anchor"),
+        pytest.param(["rotate-key"], False, 2, id="rotate-key"),
+        pytest.param(["backup", "--destination", "BACKUP_DIR"], False, 2, id="backup"),
+        pytest.param(["cipher-audit"], False, 2, id="cipher-audit"),
+        # A SQLite store has no server principal to probe, so this one reports and exits 0.
+        pytest.param(["check-privileges"], False, 0, id="check-privileges"),
+        # A relative --db merges into [store].path before the anchor, so two commands suffice to
+        # pin that it is anchored too: one through the shared host gate, one with its own guards.
+        pytest.param(["admin-unlock", "--username", "site-admin"], True, 2, id="admin-unlock-db"),
+        pytest.param(["rotate-key"], True, 2, id="rotate-key-db"),
+    ],
+)
+def test_offline_store_command_names_the_store_under_the_root(
+    away_from_root: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    via_db: bool,
+    code: int,
+) -> None:
+    """With no store yet, every one of these refuses or reports naming the path it tested. That
+    path must be the root's, for a file-set relative [store].path and for a relative --db alike
+    (ADR 0050 AC-1: a relative --db follows the root), and no store may appear in the working
+    directory."""
+    from messagefoundry.store.crypto import generate_key
+
+    root, svc = away_from_root
+    if argv[0] == "rotate-key":  # it refuses for a missing key before it reaches the store check
+        monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    argv = [str(root.parent / "bk") if a == "BACKUP_DIR" else a for a in argv]
+    argv = [*argv, "--service-config", str(svc)]
+    if via_db:
+        argv += ["--db", "mf.db"]
+    rc = main(argv)
+    out = capsys.readouterr()
+    assert rc == code, out.out + out.err
+    assert _names(out.out + out.err, root / "mf.db"), out.out + out.err
+    assert not (Path.cwd() / "mf.db").exists()
+
+
+def test_cert_inventory_reports_the_generated_pair_beside_the_anchored_store(
+    away_from_root: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    root, svc = away_from_root
+    assert main(["cert", "inventory", "--service-config", str(svc), "--json"]) == 0
+    api_tls = json.loads(capsys.readouterr().out)["api_tls"]
+    assert api_tls["source"] == "generated"
+    assert Path(api_tls["cert"]).parent == root
+
+
+def test_provision_admin_creates_the_store_under_the_root(
+    away_from_root: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_provision_first_administrator import _PASSWORD, _tty
+
+    root, svc = away_from_root
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI", "true")
+    monkeypatch.setenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT", "true")
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--service-config",
+            str(svc),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert (root / "mf.db").exists()
+    assert not (Path.cwd() / "mf.db").exists()
+
+
+def test_restore_verify_hands_the_anchored_store_settings_on(
+    away_from_root: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import messagefoundry.pipeline.dr_backup as dr_backup
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    root, svc = away_from_root
+    archive = root.parent / "a.mfbak"
+    archive.write_bytes(b"not an archive")
+    seen: list[str] = []
+
+    async def _spy(_archive: str, *, store_settings: object, full: bool) -> object:
+        seen.append(store_settings.path)  # type: ignore[attr-defined]
+        # A refusal the command already handles, as "could not start", so the run stops here.
+        raise KeyProviderError("stop after the capture")
+
+    monkeypatch.setattr(dr_backup, "run_restore_verify", _spy)
+    assert main(["restore-verify", str(archive), "--service-config", str(svc), "--full"]) == 2
+    assert seen == [str(root / "mf.db")]
+
+
+def test_support_bundle_reads_the_anchored_store(
+    away_from_root: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import messagefoundry.support as support_mod
+
+    root, svc = away_from_root
+    seen: list[str] = []
+
+    def _spy(_out: str, *, settings: object, **_kw: object) -> object:
+        seen.append(settings.store.path)  # type: ignore[attr-defined]
+        raise OSError("stop after the capture")
+
+    monkeypatch.setattr(support_mod, "build_bundle", _spy)
+    assert main(["support-bundle", "--service-config", str(svc), "--out", "b.zip"]) == 2
+    assert seen == [str(root / "mf.db")]
+
+
+def test_restore_resolves_keys_beside_the_anchored_store(
+    away_from_root: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import messagefoundry.pipeline.dr_backup as dr_backup
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    root, svc = away_from_root
+    seen: list[str] = []
+
+    async def _spy(_archive: str, *, store_settings: object, **_kw: object) -> object:
+        seen.append(store_settings.path)  # type: ignore[attr-defined]
+        raise KeyProviderError("stop after the capture")
+
+    monkeypatch.setattr(dr_backup, "run_restore", _spy)
+    main(["restore", "a.mfbak", "--to", "new.db", "--service-config", str(svc)])
+    assert seen == [str(root / "mf.db")]
+
+
+def test_verify_checks_the_anchored_store(away_from_root: tuple[Path, Path]) -> None:
+    from messagefoundry.verify.runner import _load_settings, _writable_dir
+
+    root, svc = away_from_root
+    settings, error = _load_settings(str(svc))
+    assert error is None and settings is not None
+    assert settings.store.path == str(root / "mf.db")
+    assert _writable_dir(settings) == root.resolve()

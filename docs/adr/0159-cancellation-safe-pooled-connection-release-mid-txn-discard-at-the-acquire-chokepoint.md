@@ -652,7 +652,7 @@ the next reader does not re-derive the wrong precedent from the same comment.
   once nothing uses them, since a pyodbc cursor holds its connection. That free rolls back and
   disconnects wherever the last reference drops, which can be the event loop, for one through the
   cancelled call's own result; that is the trade for not freeing them under the call. Its session
-  ends only then. The SQL Server store's claim holder now leaves through the one-shot exits the
+  ends only then (**for a real connection, SUPERSEDED by the 2026-11-14 note below**). The SQL Server store's claim holder now leaves through the one-shot exits the
   open-time probes use: a cancelled open and the discard after a cancelled claim hand the
   connection and cursor to the gate with no await, and an ordinary discard waits on a close a
   second cancellation cannot cut short. A cancelled claim still waits for its statement in
@@ -660,9 +660,35 @@ the next reader does not re-derive the wrong precedent from the same comment.
   runs before the discard. **Still open, at least:** a cancellation that lands after a `cursor()` call returned on its thread but before the
   loop delivered the result leaves that cursor for the collector; and the store's pooled
   quarantine, its `_cursor` helper and the one-shot exits still close an ungated connection beside a
-  running call. Under the `aioodbc==0.5.0` pin (BACKLOG #5005) no real connection is ungated.
+  running call (**SUPERSEDED for the SQL Server store by the 2026-11-11 note below**). Under the `aioodbc==0.5.0` pin (BACKLOG #5005) no real connection is ungated.
   Pinned offline by `tests/test_backlog2394_cancel_exits.py` and
   `tests/test_backlog2394_database_gate.py`.
+
+  **NOTE 2026-11-11 (BACKLOG #2394 step 2): the SQL Server store's ungated residual above is
+  closed by refusal.** The store's pooled borrow, its claim connection and its two open-time
+  connections each run `require_call_gate` before the store makes its first pyodbc call on the
+  connection, and discard a real
+  aioodbc connection the gate cannot wrap while nothing runs on it. So a real connection that
+  enters the store through those four sites reaches its exits, the quarantine and `_cursor`
+  included, gated. That holds only while they are the store's only ways in that run a call (the
+  pool warm-up borrows and releases with no call). A source pin catches at least a new
+  `aioodbc.connect` in a function that does not require the gate, and a pooled borrow outside
+  `_borrow`; it does not check that the gate comes before the first call. The DATABASE
+  connector's ungated borrow is unchanged (**SUPERSEDED by the 2026-11-14 note below**). Pinned
+  offline by `tests/test_backlog2394_store_refuses_ungated.py`.
+
+  **NOTE 2026-11-14 (BACKLOG #2394 step 1): the DATABASE connector's ungated residual is closed by
+  refusal too.** Its two borrow sites, `_acquire` and the autocommit pool's `_acquire_confirmed`,
+  run `require_call_gate` before the connector makes its first pyodbc call on the connection. A
+  real aioodbc connection the gate cannot wrap is closed there while nothing runs on it, and the
+  borrow fails. Its handle is dropped first, so the pool gets it back closed and never lends it
+  again; on an aioodbc that also renamed `_conn` there is no handle to drop, so it goes back only
+  once its own close has returned, and open if that close failed. So the cancelled DATABASE borrow on a connection
+  with no gate, which the 2026-11-05 note says drops its handle and closes nothing, is now reached
+  only by a stand-in, not by a real connection that entered through those two sites. That holds
+  only while they are the connector's only ways in; the source pin in
+  `tests/test_backlog2394_database_refuses_ungated.py`, which also pins the refusal offline, says
+  what it catches and what it does not.
 
 ## Acceptance Criteria
 

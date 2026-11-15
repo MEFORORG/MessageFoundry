@@ -200,8 +200,9 @@ def test_a_nested_repository_still_refuses_name_under_discard_even_with_force(ri
 
 def test_a_flagged_file_refuses_name_under_discard(rig: Rig) -> None:
     """The snapshot's temporary index carries no flags, so a sparse checkout's skip-worktree files
-    would be parked as deletions. -Name does not refuse a flagged file without -Discard; with it,
-    it does, and the plain run is the control."""
+    would be parked as deletions. -Name refuses a flagged file without -Force too (BACKLOG #5648),
+    but under -Discard it refuses whatever -Force says; the -Force run without -Discard is the
+    control."""
     wt = _sibling(rig, "sparse")
     (wt / "seed.txt").write_text("hidden local edit\n", encoding="utf-8")
     _git(wt, "update-index", "--skip-worktree", "seed.txt")
@@ -212,7 +213,12 @@ def test_a_flagged_file_refuses_name_under_discard(rig: Rig) -> None:
     assert "flagged seed.txt" in _out(proc) and "skip-worktree" in _out(proc), _out(proc)
     assert wt.exists() and _attic(rig) == []
 
-    proc = rig.run("-Name", "sparse")
+    proc = rig.run("-Name", "sparse", "-Discard", "-Force")
+    assert proc.returncode != 0, _out(proc)
+    assert "-Discard cannot park a tree with files flagged" in _out(proc), _out(proc)
+    assert wt.exists() and _attic(rig) == []
+
+    proc = rig.run("-Name", "sparse", "-Force")
     assert proc.returncode == 0, _out(proc)
 
 

@@ -76,8 +76,8 @@
 # compared as Actions compares (ignoring case), and refuses while it is 'true' and the upload did
 # not run. That last read covers at least a variable set after the build job read it, whether by
 # a re-run of failed jobs reusing the build job's output or while the upload waited for its
-# approval, and an environment copy that differs; re-running the build job, which re-runs the jobs
-# after it, reads it afresh. Unset, the upload step is skipped and the release still goes public.
+# approval, and an environment copy that differs. docs/SUPPLY-CHAIN.md, *The draft*, says what to
+# do on a refusal. Unset, the upload step is skipped and the release still goes public.
 #
 # THE HAND-OVER. Each build job records the digests once its last gate has passed, and its last
 # step uploads the files. Neither step has an `if:`, so any earlier failure skips both. In `release`
@@ -88,7 +88,8 @@
 # exercises the upload half; no dispatch runs a publish job, so the download and the check first run
 # on a real tag. A tag keeps the files 30 days from the end of the build job, a dispatch 1 day. The
 # harness publishes from `publish-pypi`, under the engine's one approval (owner ruling 2026-10-16), so
-# that approval must land inside the 30 days, or a re-run of every job rebuilds the files.
+# that approval must land inside the 30 days. Every re-run remedy in this file holds only inside
+# GitHub's re-run window; docs/SUPPLY-CHAIN.md, *The draft*, gives it.
 #
 # PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
 # tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
@@ -165,7 +166,7 @@ jobs:
   # or on a merge whose checks went red, would build, sign and publish like a tag on a reviewed
   # commit. scripts/release/tag_provenance.py holds the rule and says where its promise ends.
   #
-  # Its own job, so the read scopes it needs (checks, statuses) never sit in a job that signs or
+  # Its own job, so the read scopes it needs (checks, statuses, actions) never sit in a job that signs or
   # publishes. Every job that builds a release artifact `needs:` it. It RUNS on a dispatch too, with
   # its one step skipped, because a skipped job would skip every job that needs it and so end the
   # dry-run. On a dispatch the dry-run therefore builds from a commit nobody vouched for, which is
@@ -180,6 +181,7 @@ jobs:
       contents: read   # the compare and branch endpoints, and the checkout
       checks: read     # the check runs on the tagged commit
       statuses: read   # the commit statuses on the tagged commit
+      actions: read    # the workflow runs on the tagged commit, which give each check suite its event
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1850,8 +1852,10 @@ jobs:
       # release) would fail with "release not found" on every console tag, killing the job, and with it
       # publish-pypi-webconsole, which needs it — i.e. the PyPI name could never be claimed.
       #
-      # A DRAFT, LIKE THE ENGINE'S, UNTIL THE WHEEL IS ON PYPI; publish-github-release-webconsole
-      # says the rest (vault BACKLOG #2975).
+      # A DRAFT, LIKE THE ENGINE'S, UNTIL publish-github-release-webconsole PUBLISHES IT, which it
+      # does only after publish-pypi-webconsole has succeeded, and that job uploads the wheel only
+      # with PUBLISH_WEBCONSOLE set; publish-github-release-webconsole's comment says the rest
+      # (vault BACKLOG #2975).
       #
       # The re-run arm is equally load-bearing: v0.3.1 showed a bare `gh release create` turns a single
       # PyPI failure into a permanent retry deadlock (every re-run dies here and SKIPS the publish, so a
@@ -1994,7 +1998,8 @@ jobs:
           verbose: true
           print-hash: true
 
-  # PUBLISH THE CONSOLE'S GITHUB RELEASE ONCE ITS WHEEL IS ON PYPI (vault BACKLOG #2975). Before this
+  # PUBLISH THE CONSOLE'S GITHUB RELEASE ONLY AFTER ITS UPLOAD JOB HAS SUCCEEDED (vault BACKLOG #2975),
+  # with the wheel on PyPI when PUBLISH_WEBCONSOLE is set and with no upload when it is not. Before this
   # job, release-webconsole published its release in the call that made it, so the release was public
   # before the `pypi` approval was even asked for, and a refused approval left a public release with
   # no PyPI upload. Now the release is a draft, and this job takes it public after
@@ -2012,6 +2017,7 @@ jobs:
       contents: write   # gh release edit (take the console release out of draft)
     steps:
       # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
+      # The error's text points to docs/SUPPLY-CHAIN.md, *The draft*, which also says what to do.
       - name: Publish the draft console GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2027,7 +2033,7 @@ jobs:
           if [ "$is_draft" = "true" ]; then
             # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
             if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
-              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). Either it was set after $BUILD_JOB read it (a re-run of failed jobs reuses that reading, as does a set made while the upload waited for its approval): re-run the $BUILD_JOB job, which re-runs the jobs after it. Or the pypi environment holds its own copy of $GATE_NAME: remove it. Or unset $GATE_NAME. The release stays a draft."
+              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). The release stays a draft. At least two causes can fire, alone or together. (1) The pypi environment holds its own copy of $GATE_NAME, with a value that is not true in any letter case: look at that environment's variables in the repository settings to see whether it does now, though a copy removed since this run cannot be seen there. (2) $BUILD_JOB read $GATE_NAME before it was set, or the upload read it while it was unset and it was set again before this job ran: treat this as possible whenever this refusal fires; the remedies below clear it either way, so it need not be told apart. To finish the release with the upload, remove any copy from the pypi environment, then re-run the $BUILD_JOB job, which re-runs the jobs after it, the upload's pypi approval included, and reads $GATE_NAME afresh in each, so it clears both; while $GATE_NAME still reads true, a 'Re-run failed jobs' reuses the upload outcome this message names and is refused again. To finish it without the upload, while no other release run that reads $GATE_NAME is queued, waiting or in progress, and none can start before the restore below, note whether this repository holds $GATE_NAME and its value, remove any copy from the pypi environment, give the repository variable $GATE_NAME a value that is not true in any letter case, such as false, which overrides any organization copy for this repository only, and re-run this job; once that re-run has finished, whatever its result, and before the next release, restore the repository variable $GATE_NAME to the value you noted, deleting it if this repository had none, or that release skips its upload too and still goes public. Do not edit or delete an organization copy, which other repositories may read. GitHub allows a re-run only within 30 days of a run's first attempt; past that, docs/SUPPLY-CHAIN.md, The draft, names the routes left."
               exit 1
             fi
             gh release edit "$tag" --draft=false
@@ -2448,9 +2454,10 @@ jobs:
   # refuses to publish while PUBLISH_HARNESS is 'true' and the harness upload did not run.
   #
   # If `release-harness` or `publish-pypi` fails, this job is skipped and the release stays a draft.
-  # Re-running the failed jobs finishes the release, unless PUBLISH_HARNESS was set after
-  # `release-harness` read it: then this job refuses, and its error names the job to re-run. A
-  # draft is never published with an asset missing.
+  # Re-running the failed jobs finishes the release, unless this job's refusal fires: then
+  # docs/SUPPLY-CHAIN.md, *The draft*, says what to do. A
+  # draft is never published with an asset missing. The refusal comes after `publish-pypi`, so on
+  # that path the toolkit and the engine are already on PyPI while the release stays a draft.
   publish-github-release:
     # The event-and-ref pair sits on the job, so a dispatch never schedules it at all.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -2462,6 +2469,7 @@ jobs:
       contents: write   # gh release edit (take the release out of draft)
     steps:
       # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
+      # The error's text points to docs/SUPPLY-CHAIN.md, *The draft*, which also says what to do.
       - name: Publish the draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2477,7 +2485,7 @@ jobs:
           if [ "$is_draft" = "true" ]; then
             # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
             if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
-              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). Either it was set after $BUILD_JOB read it (a re-run of failed jobs reuses that reading, as does a set made while the upload waited for its approval): re-run the $BUILD_JOB job, which re-runs the jobs after it. Or the pypi environment holds its own copy of $GATE_NAME: remove it. Or unset $GATE_NAME. The release stays a draft."
+              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). The release stays a draft. At least two causes can fire, alone or together. (1) The pypi environment holds its own copy of $GATE_NAME, with a value that is not true in any letter case: look at that environment's variables in the repository settings to see whether it does now, though a copy removed since this run cannot be seen there. (2) $BUILD_JOB read $GATE_NAME before it was set, or the upload read it while it was unset and it was set again before this job ran: treat this as possible whenever this refusal fires; the remedies below clear it either way, so it need not be told apart. To finish the release with the upload, remove any copy from the pypi environment, then re-run the $BUILD_JOB job, which re-runs the jobs after it, the upload's pypi approval included, and reads $GATE_NAME afresh in each, so it clears both; while $GATE_NAME still reads true, a 'Re-run failed jobs' reuses the upload outcome this message names and is refused again. To finish it without the upload, while no other release run that reads $GATE_NAME is queued, waiting or in progress, and none can start before the restore below, note whether this repository holds $GATE_NAME and its value, remove any copy from the pypi environment, give the repository variable $GATE_NAME a value that is not true in any letter case, such as false, which overrides any organization copy for this repository only, and re-run this job; once that re-run has finished, whatever its result, and before the next release, restore the repository variable $GATE_NAME to the value you noted, deleting it if this repository had none, or that release skips its upload too and still goes public. Do not edit or delete an organization copy, which other repositories may read. GitHub allows a re-run only within 30 days of a run's first attempt; past that, docs/SUPPLY-CHAIN.md, The draft, names the routes left."
               exit 1
             fi
             gh release edit "$tag" --draft=false

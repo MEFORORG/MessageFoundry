@@ -282,10 +282,16 @@ async def test_start_inbound_does_not_register_on_bind_failure(
     reg = _inbound_registry("utf-8")
     runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     monkeypatch.setattr(wr, "build_source", lambda cfg, *, egress: _BoomSource())
-    with pytest.raises(OSError):
-        await runner.start_inbound("mllp_in")
-    assert not runner.inbound_running("mllp_in")
-    assert "mllp_in" not in runner._sources
+    # The door refuses a runner that is not running (BACKLOG #5702), so the graph comes up first;
+    # start() isolates the same bind failure, and the operator's retry is what is under test.
+    await runner.start()
+    try:
+        with pytest.raises(OSError):
+            await runner.start_inbound("mllp_in")
+        assert not runner.inbound_running("mllp_in")
+        assert "mllp_in" not in runner._sources
+    finally:
+        await runner.stop()
 
 
 async def test_start_isolates_inbound_bind_failure_and_recovers(
@@ -357,13 +363,20 @@ async def test_per_connection_ops_take_reload_lock(store: MessageStore) -> None:
     # M-10: public per-connection ops serialize against reload()/stop() via _reload_lock.
     reg = _inbound_registry("utf-8")
     runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
-    await runner._reload_lock.acquire()
-    task = asyncio.ensure_future(runner.start_inbound("mllp_in"))
-    await asyncio.sleep(0.05)
-    assert not task.done()  # blocked on the lock held above
-    runner._reload_lock.release()
-    await asyncio.wait_for(task, timeout=2.0)
+    # A running graph with the inbound unbound: the door refuses a runner that is not running
+    # (BACKLOG #5702), and the lock is what is under test.
+    await runner.start()
     try:
+        await runner.stop_inbound("mllp_in")
+        assert not runner.inbound_running("mllp_in")
+        await runner._reload_lock.acquire()
+        try:
+            task = asyncio.ensure_future(runner.start_inbound("mllp_in"))
+            await asyncio.sleep(0.05)
+            assert not task.done()  # blocked on the lock held above
+        finally:
+            runner._reload_lock.release()
+        await asyncio.wait_for(task, timeout=2.0)
         assert runner.inbound_running("mllp_in")
     finally:
         await runner.stop()

@@ -203,7 +203,7 @@ async def test_a_listed_account_deleted_mid_read_is_left_out(keyed: tuple[Engine
     async def list_then_delete() -> list[object]:
         rows = await original()
         await engine.store.remove_unless_last_admin(
-            victim, AdminRemoval.DELETE, admin_role_id=Role.ADMINISTRATOR.value
+            victim, AdminRemoval.DELETE, admin_role_id=Role.ADMINISTRATOR.value, audits=()
         )
         return list(rows)
 
@@ -275,7 +275,7 @@ def _rekey_every_read(
         rekeyed_reads.append(read)
         if read == delete_on_read:
             await store.remove_unless_last_admin(
-                user_id, AdminRemoval.DELETE, admin_role_id=Role.ADMINISTRATOR.value
+                user_id, AdminRemoval.DELETE, admin_role_id=Role.ADMINISTRATOR.value, audits=()
             )
         return dataclasses.replace(
             row, username=f"{row.username}-{read}", oidc_subject=f"flipped-{read}"

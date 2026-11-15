@@ -22,6 +22,8 @@ import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
+from messagefoundry.store.store import no_audit_row
+
 ISSUER = "https://idp.example/tenant"
 #: The subject the first account starts bound to, and the one a re-bind must be free to replace.
 FIRST_SUB = "S-1-unbind-first"
@@ -268,6 +270,12 @@ async def _assert_session_binding_guard_contract(store: Any) -> None:
     #    so the refusals above came from the guard and not from anything else about the row.
     assert await _guarded_session(store, "g-unguarded", None) is True
 
+    # 6. BACKLOG #2733. With no guard either, an account that is gone is refused, not handed to the
+    #    INSERT's foreign-key error: a sign-in that lost a race with the account's delete.
+    assert (
+        await _guarded_session(store, "g-unguarded-nobody", None, user="fed-guard-nobody") is False
+    )
+
 
 #: A second account for the bind's sweep, so "every session of THAT account" has a control.
 GUARD_BYSTANDER = "fed-guard-bystander"
@@ -425,8 +433,9 @@ async def _hold_then_race(
     with its locks; start ``second``; require that ``second`` really waits on ``first``'s server
     session; then release ``first`` and return both results, ``first``'s first.
 
-    ``attr`` names a write helper called ``(handle, key, change)``: ``_write_user`` or
-    ``_write_session``. Only the first call for ``key`` pauses. With ``pause_before``, the pause
+    ``attr`` names a helper called ``(handle, key, ...)``: ``_write_user``, ``_write_session``, or
+    SQL Server's ``_delete_user_rows``. Only the first call for ``key`` pauses. With
+    ``pause_before``, the pause
     comes inside that call instead, just before the handle runs the first statement starting with
     that text, so ``first`` holds what the helper's locked read took and has written nothing yet.
     The race is hooked, not timed: without the probe a pass could come from a ``second`` that never
@@ -457,12 +466,12 @@ async def _hold_then_race(
                 await _hold(self._handle)
             return await self._handle.execute(sql, *args)
 
-    async def _paused_write(handle: Any, written_key: str, change: Any) -> Any:
+    async def _paused_write(handle: Any, written_key: str, *rest: Any) -> Any:
         if written_key != key or holder:
-            return await real_write(handle, written_key, change)
+            return await real_write(handle, written_key, *rest)
         if pause_before is not None:
-            return await real_write(_PausingHandle(handle), written_key, change)
-        written = await real_write(handle, written_key, change)
+            return await real_write(_PausingHandle(handle), written_key, *rest)
+        written = await real_write(handle, written_key, *rest)
         await _hold(handle)
         return written
 
@@ -520,7 +529,7 @@ async def _sweep_by_unbind(store: Any, account: str) -> int:
 
 
 async def _sweep_by_revoke(store: Any, account: str) -> int:
-    return int((await store.revoke_user_sessions(account, now=3.0)).count)
+    return int((await store.revoke_user_sessions(account, now=3.0, audit=no_audit_row)).count)
 
 
 async def _sweep_every_account(store: Any, account: str) -> int:

@@ -5,9 +5,9 @@
 // or ship keys. PHI boundary: we only ever attach code + the config graph (names) — never message
 // bodies / patient data — regardless of the chosen model.
 import * as vscode from "vscode";
-import { assistantState, resolveAiPolicy } from "./aiPolicy";
+import { DEFAULT_AI_POLICY_IO, aiPolicyEngineUrl, assistantState, resolveAiPolicy } from "./aiPolicy";
 import { withAuth } from "./auth";
-import { aiContextCharLimit, engineUrl } from "./cli";
+import { aiContextCharLimit } from "./cli";
 import { postJson } from "./engineClient";
 import { GraphProvider } from "./graphTree";
 
@@ -109,7 +109,10 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
   const handler: vscode.ChatRequestHandler = async (request, _chatContext, stream, token) => {
     // Honor the centrally-governed AI policy before touching any model: a "off" / unsupported-managed /
     // unpermitted policy disables assistance entirely (see aiPolicy.assistantState).
-    const policy = await resolveAiPolicy(context);
+    // One read of the target (BACKLOG #5564): the policy is read from this engine, and an
+    // engine-brokered request below goes to this same engine, whatever the settings say meanwhile.
+    const engine = aiPolicyEngineUrl();
+    const policy = await resolveAiPolicy(context, { ...DEFAULT_AI_POLICY_IO, url: () => engine });
     const state = assistantState(policy);
     if (!state.enabled) {
       stream.markdown(state.message ?? "AI assistance is unavailable under your MessageFoundry policy.");
@@ -153,7 +156,8 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
     // code) — never message bodies / PHI — regardless of mode; the server re-resolves the policy and is
     // the sole enforcement point. MVP is non-streaming: render the whole reply at once.
     if (policy.mode === "managed_endpoint") {
-      const url = engineUrl();
+      // The engine whose policy said managed_endpoint (BACKLOG #5564), not a different one.
+      const url = engine;
       try {
         const res = await withAuth(context, url, (token) =>
           postJson<AiChatReply>(

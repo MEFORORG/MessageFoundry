@@ -118,7 +118,9 @@ async def _existing_directory_account(engine: Engine, *roles: Role) -> None:
         password_generated=False,
         audits=(),
     )
-    await engine.store.set_user_roles(user_id, [r.value for r in roles], assigned_by="ad-sync")
+    await engine.store.set_user_roles(
+        user_id, [r.value for r in roles], assigned_by="ad-sync", audits=()
+    )
 
 
 def _client(engine: Engine, service: AuthService, sink: _Sink) -> httpx.AsyncClient:

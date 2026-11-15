@@ -13,7 +13,7 @@ import {
   type AiPolicyIo,
   type AiPolicyWire,
 } from "../../aiPolicy";
-import { CACHED_PERMIT_MAX_AGE_MS, type CachedAiPolicy } from "../../aiPolicyModel";
+import { CACHED_PERMIT_MAX_AGE_MS, aiPolicyCacheKey, type CachedAiPolicy } from "../../aiPolicyModel";
 import { peekToken } from "../../auth";
 
 // SEC-022 regression. The offline AI-policy resolution must FAIL CLOSED: when the engine is
@@ -83,24 +83,39 @@ suite("pickOfflinePolicy (SEC-022)", () => {
 // Extension-Host leg); the pure merge rule they depend on is asserted node-side on every leg in
 // ai-policy-model.test.ts. That split is deliberate — see R4 in the plan.
 
-/** A fake globalState that records what was written, so a guard cannot pass by not writing. */
+/** The cache key fakeIo's default engine is cached under (BACKLOG #5564: the cache is per engine). */
+const LOOPBACK_KEY = aiPolicyCacheKey("http://127.0.0.1:8765");
+
+/** A fake globalState that records what was written, so a guard cannot pass by not writing. `seed`
+ *  is the policy cached for fakeIo's default engine; `stored` and `updates` read that engine's entry. */
 function fakeCtx(seed?: AiPolicy): {
   ctx: vscode.ExtensionContext;
   stored: () => AiPolicy | undefined;
   updates: () => number;
 } {
-  let value = seed;
+  const store = new Map<string, unknown>();
+  if (seed !== undefined) {
+    store.set(LOOPBACK_KEY, seed);
+  }
   let updates = 0;
   const ctx = {
     globalState: {
-      get: (_key: string): AiPolicy | undefined => value,
-      update: async (_key: string, v: AiPolicy): Promise<void> => {
-        value = v;
-        updates++;
+      get: (key: string): unknown => store.get(key),
+      keys: (): readonly string[] => [...store.keys()],
+      // As VS Code's Memento does, an undefined value deletes the key, so keys() no longer lists it.
+      update: async (key: string, v: unknown): Promise<void> => {
+        if (v === undefined) {
+          store.delete(key);
+        } else {
+          store.set(key, v);
+        }
+        if (key === LOOPBACK_KEY) {
+          updates++;
+        }
       },
     },
   } as unknown as vscode.ExtensionContext;
-  return { ctx, stored: () => value, updates: () => updates };
+  return { ctx, stored: () => store.get(LOOPBACK_KEY) as AiPolicy | undefined, updates: () => updates };
 }
 
 function wire(w: Partial<AiPolicyWire>): AiPolicyWire {
@@ -298,5 +313,137 @@ suite("resolveAiPolicy — the cached permit's age bound (BACKLOG #1154)", () =>
     const stale = await resolveAiPolicy(f.ctx, io);
     assert.strictEqual(stale.mode, "unverified", "an expired permit must not fall to the CLI's byo");
     assert.strictEqual(assistantState(stale).enabled, false);
+  });
+});
+
+// BACKLOG #5564 — the cache is keyed by the engine that answered. This fake honours the key, unlike
+// fakeCtx above, so a cache shared across engines is visible.
+suite("resolveAiPolicy — the cache is per engine (BACKLOG #5564)", () => {
+  const A = "http://127.0.0.1:8765";
+  const B = "http://127.0.0.1:9876";
+
+  function keyedCtx(): vscode.ExtensionContext {
+    const store = new Map<string, unknown>();
+    return {
+      globalState: {
+        get: (key: string): unknown => store.get(key),
+        keys: (): readonly string[] => [...store.keys()],
+        update: async (key: string, v: unknown): Promise<void> => {
+          if (v === undefined) {
+            store.delete(key);
+          } else {
+            store.set(key, v);
+          }
+        },
+      },
+    } as unknown as vscode.ExtensionContext;
+  }
+
+  /** The engine at `url` answers `answer`, or is unreachable when `answer` is undefined. */
+  function engineIo(url: string, answer: AiPolicyWire | undefined): AiPolicyIo {
+    return {
+      url: () => url,
+      readToken: async () => "tok-abc",
+      getPolicy: async () => {
+        if (answer === undefined) {
+          throw new Error("engine unreachable");
+        }
+        return answer;
+      },
+      getCliPolicy: async () => {
+        throw new Error("no CLI here");
+      },
+    };
+  }
+
+  test("T17: a permit cached from engine A does not enable assistance against unreachable engine B", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: true })));
+    const offlineB = await resolveAiPolicy(ctx, engineIo(B, undefined));
+    assert.strictEqual(offlineB.mode, "unverified", "B has no cache of its own, so it fails closed");
+    assert.strictEqual(assistantState(offlineB).enabled, false);
+  });
+
+  test("T18: engine A's permit does not overwrite engine B's cached deny", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(B, wire({ mode: "off" })));
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: true })));
+    const offlineB = await resolveAiPolicy(ctx, engineIo(B, undefined));
+    assert.strictEqual(offlineB.mode, "off", "B's central off survives A answering");
+  });
+
+  test("T19: one engine keeps its own cache — A's deny still answers for A offline", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: false })));
+    const offlineA = await resolveAiPolicy(ctx, engineIo(`${A}/`, undefined));
+    assert.strictEqual(offlineA.assistPermitted, false, "the same engine, spelled with a slash, is one key");
+  });
+
+  /** Engine B is unreachable with no cache; the local CLI would say byo. */
+  function offlineWithCli(configured: boolean): AiPolicyIo & { cliAsked: () => boolean } {
+    let asked = false;
+    return {
+      ...engineIo(B, undefined),
+      getCliPolicy: async () => {
+        asked = true;
+        return wire({ mode: "byo" });
+      },
+      targetConfigured: () => configured,
+      cliAsked: () => asked,
+    };
+  }
+
+  test("T20: a configured target with no cache, in an IDE that has never held an answer, fails closed, not to the CLI's byo", async () => {
+    // A fresh store, so neither a carried deny nor an earlier engine answer decides the result:
+    // only the configured target keeps the CLI out.
+    const io = offlineWithCli(true);
+    const p = await resolveAiPolicy(keyedCtx(), io);
+    assert.strictEqual(p.mode, "unverified", "a configured target fell to the local CLI");
+    assert.strictEqual(io.cliAsked(), false, "the CLI is not consulted for a configured target");
+    assert.strictEqual(assistantState(p).enabled, false, "assistance stays disabled");
+  });
+
+  test("T20b: engine A's carried off applies to an unreachable configured target with no cache", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ mode: "off" })));
+    const io = offlineWithCli(true);
+    const p = await resolveAiPolicy(ctx, io);
+    // A's "off" is in the deny carrier, and an unreachable target applies any carried deny.
+    assert.strictEqual(p.mode, "off", "a cached off must not be bypassed by changing the setting");
+    assert.strictEqual(io.cliAsked(), false, "the CLI is not consulted once an engine has answered");
+  });
+
+  test("T22: the default target with no cache still falls to the CLI, as before", async () => {
+    const io = offlineWithCli(false);
+    const p = await resolveAiPolicy(keyedCtx(), io);
+    assert.strictEqual(p.mode, "byo");
+    assert.strictEqual(io.cliAsked(), true);
+  });
+
+  test("T22b: once any engine has answered, the default target with no cache does not fall to the CLI", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: true })));
+    const io = offlineWithCli(false);
+    const p = await resolveAiPolicy(ctx, io);
+    assert.strictEqual(p.mode, "unverified", "the local CLI answered after an engine had");
+    assert.strictEqual(io.cliAsked(), false, "the CLI is not consulted once an engine has answered");
+  });
+
+  test("T23: a central off survives clearing the engine setting back to the default target", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ mode: "off" })));
+    const p = await resolveAiPolicy(ctx, offlineWithCli(false));
+    assert.strictEqual(p.mode, "off", "the local CLI's byo outranked the central off");
+  });
+
+  test("T24: an alias URL inherits the deny, and only the issuing engine's grant clears it", async () => {
+    const ctx = keyedCtx();
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: false })));
+    const alias = await resolveAiPolicy(ctx, engineIo("http://localhost:8765", wire({})));
+    assert.strictEqual(assistantState(alias).enabled, false, "a tokenless read at the alias cleared the deny");
+    await resolveAiPolicy(ctx, engineIo(B, wire({ assist_permitted: true })));
+    assert.strictEqual(assistantState(await resolveAiPolicy(ctx, offlineWithCli(false))).enabled, false);
+    await resolveAiPolicy(ctx, engineIo(A, wire({ assist_permitted: true })));
+    assert.strictEqual(assistantState(await resolveAiPolicy(ctx, offlineWithCli(false))).enabled, true);
   });
 });

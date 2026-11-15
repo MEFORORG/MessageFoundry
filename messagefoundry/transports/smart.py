@@ -81,7 +81,6 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     hop_declarations_from_settings,
     http_family_trust_anchor,
-    is_refused_proxy_digest_tunnel,
     refuse_cleartext_credential_hop,
     refuse_unrevoked_verified_hop,
     refuse_url_credentials,
@@ -145,9 +144,10 @@ def request_token(
     A failure names ``endpoint`` and a status, reason or error class, never the request or the reply
     body, because the body carries the bearer token. A request that cannot be encoded for the wire
     still raises its own ``ValueError``, as it did before BACKLOG #2054. ``connector`` names the hop
-    in a refusal of the reply body, and holds no URL (BACKLOG #2060). A web proxy's Digest challenge
-    the engine will not answer raises the subclass ``rest.auth_challenge_refused`` builds, a
-    permanent configuration fault (BACKLOG #2989), on an ``http`` or an ``https`` token endpoint."""
+    in a refusal of the reply body, and holds no URL (BACKLOG #2060). A Digest refusal raised by the
+    opener's proxy Digest handler becomes the permanent configuration fault
+    ``rest.auth_challenge_refused`` builds (BACKLOG #2989); no built provider's hop reaches that
+    handler, since a Digest proxy in front of an https token endpoint is refused at build."""
     body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint, connector=connector)
     return _parse_token_reply(body, endpoint=endpoint)
 
@@ -172,21 +172,17 @@ def _read_token_reply(
     except urllib.error.HTTPError as exc:
         raise DeliveryError(f"{endpoint} returned HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
-        if is_refused_proxy_digest_tunnel(opener, exc):
-            # BACKLOG #2989: an https:// token endpoint's Digest proxy 407 arrives here, not in
-            # the HttpAuthError arm below; the predicate says why no retry can clear it.
-            raise auth_challenge_refused(endpoint) from exc
         raise DeliveryError(f"{endpoint} unreachable: {exc.reason}") from exc
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{endpoint} failed: {exc}") from exc
     except HttpAuthError as exc:
-        # BACKLOG #1171: this opener carries the web proxy's Digest handler, which refuses a 407 it will
-        # not answer (a hash other than SHA-256, or a challenge it cannot parse) with an HttpAuthError.
-        # That is a ValueError, and it escaped this function's DeliveryError contract. Fixed text: the
-        # refusal names the peer's own algorithm token, which stays on the cause only.
-        # BACKLOG #2989: the same classification the delivery hop gives this refusal. A plain
-        # DeliveryError here retried a refusal that no retry can clear. Only an http:// token
-        # endpoint reaches this arm; the https:// one's 407 is the URLError arm above.
+        # BACKLOG #1171, #2989: the proxy Digest handler's refusal, classified as the delivery hop
+        # classifies it. No built configuration reaches this arm now: an http:// token endpoint must
+        # be loopback and is dialled direct, and an https:// one meets the proxy only on a CONNECT,
+        # where no Digest handler runs; _open_token_hop refuses a Digest proxy there at build (ADR
+        # 0095 B.1). Kept so a refusal that did arrive would still be this fault rather than escape
+        # the DeliveryError contract as a ValueError. Fixed text: the peer's algorithm token stays
+        # on the cause only.
         raise auth_challenge_refused(endpoint) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as
@@ -328,9 +324,10 @@ class _TokenEndpointProvider(abc.ABC):
         proxy: ProxyConfig | None,
         ech_sidecar: str | None,
         trust_anchor: TrustAnchor,
+        connection: str | None,
     ) -> None:
-        """Build the token hop's opener, refuse it if it verifies with no revocation check, and set
-        up the empty cache."""
+        """Build the token hop's opener, refuse it if an https token request would meet a web proxy
+        set up for Digest or if it verifies with no revocation check, and set up the empty cache."""
         self.token_url = token_url
         self.expiry_skew_seconds = max(0.0, expiry_skew_seconds)
         self.timeout_seconds = timeout_seconds
@@ -338,6 +335,26 @@ class _TokenEndpointProvider(abc.ABC):
         # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener and
         # no Proxy-Authorization (byte-identical).
         token_proxy = proxy.for_host(token_url) if proxy else None
+        # BACKLOG #2989 item 11: an https token request reaches its web proxy only as a CONNECT, and
+        # urllib raises the proxy's 407 there before the Digest handler sees it, so the Digest
+        # setup could never answer a challenge on this hop (ADR 0095 B.1). Keyed on the proxy
+        # resolved for the TOKEN host, so a token host the proxy bypasses builds. With an ECH
+        # sidecar the POST is re-addressed to the loopback sidecar, which is dialled direct, so the
+        # proxy never meets it. The data hop refuses Digest for an https destination in
+        # rest.proxy_auth_handler_from_settings.
+        if (
+            scheme == "https"
+            and ech_sidecar is None
+            and token_proxy is not None
+            and token_proxy.answers_digest
+        ):
+            raise self._ERROR(
+                f"{hop_name_prefix(connection)}{self._LABEL} token endpoint is https and its web "
+                "proxy is set up for Digest (proxy_auth_type='digest'); a 407 from the proxy "
+                "arrives on the CONNECT, where Digest cannot answer it. ADR 0095 B.1 gives the "
+                "remedies, and the cost of proxy_auth_type='basic', which sends the password on "
+                "the CONNECT in recoverable form"
+            )
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
         # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
@@ -434,10 +451,9 @@ class _TokenEndpointProvider(abc.ABC):
     def access_token(self) -> str:
         """A valid bearer token — cached until it nears expiry, otherwise freshly acquired. Blocking
         (a token ``POST``); the connector calls it inside its off-loop ``send()`` worker. Raises
-        :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails,
-        except for a web proxy's refused Digest challenge, which raises the permanent configuration
-        fault :func:`~messagefoundry.transports.rest.auth_challenge_refused` builds (BACKLOG #2989).
-        """
+        :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails, or
+        the permanent configuration fault :func:`request_token` names for a refused Digest
+        challenge."""
         with self._lock:
             if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
                 return self._cached_token
@@ -547,6 +563,7 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             proxy=proxy,
             ech_sidecar=ech_sidecar,
             trust_anchor=trust_anchor,
+            connection=connection,
         )
 
     def _assertion_claims(self) -> dict[str, object]:

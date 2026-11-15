@@ -28,6 +28,7 @@ from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthServic
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     PASSKEY_DIGEST_EXCLUDED,
     USER_SEAL_EXCLUDED,
@@ -84,6 +85,11 @@ async def _user(store: MessageStore, user_id: str) -> None:
     )
 
 
+async def _holds(*_: object) -> bool:
+    """A seal check switched off: every row holds."""
+    return True
+
+
 async def test_the_user_seal_contract_holds_on_sqlite(keyed: tuple[MessageStore, Path]) -> None:
     store, path = keyed
     await assert_user_seal_contract(store, _raw_for(path))
@@ -97,7 +103,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, "user_seal_ok", lambda sealer, record: True)
+    monkeypatch.setattr(service_module, "user_seal_ok_async", _holds)
     with pytest.raises(AssertionError):
         await assert_user_seal_contract(store, _raw_for(path))
 
@@ -218,7 +224,7 @@ async def test_a_key_rotation_reseals_every_account_under_the_active_key(tmp_pat
     try:
         await AuthService(store, AuthSettings()).initialize()  # the built-in roles
         await _user(store, "u")
-        await store.set_user_roles("u", [Role.VIEWER.value])
+        await store.set_user_roles("u", [Role.VIEWER.value], audits=())
         await store.set_totp_secret("u", secret="JBSWY3DPEHPK3PXP")
     finally:
         await store.close()
@@ -266,7 +272,7 @@ async def test_the_last_administrator_guard_counts_only_sealed_administrators(
     await AuthService(store, AuthSettings()).initialize()
     for name in ("a", "b"):
         await _user(store, name)
-        await store.set_user_roles(name, [Role.ADMINISTRATOR.value])
+        await store.set_user_roles(name, [Role.ADMINISTRATOR.value], audits=())
 
     async def removable(target: str) -> bool:
         return await store.remove_unless_last_admin(
@@ -274,12 +280,13 @@ async def test_the_last_administrator_guard_counts_only_sealed_administrators(
             AdminRemoval.SET_ROLES,
             admin_role_id=Role.ADMINISTRATOR.value,
             role_ids=[Role.VIEWER.value],
+            audits=(),
         )
 
     await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", "b"))
     assert not await removable("a")  # b is refused, so a is the last usable administrator
     await _user(store, "c")
-    await store.set_user_roles("c", [Role.ADMINISTRATOR.value])
+    await store.set_user_roles("c", [Role.ADMINISTRATOR.value], audits=())
     assert await removable("a")  # control: c is a sealed administrator
 
 
@@ -323,7 +330,7 @@ async def test_a_session_resolves_with_one_role_read(keyed: tuple[MessageStore, 
     service = AuthService(store, AuthSettings())
     await service.initialize()
     await _user(store, "u")
-    await store.set_user_roles("u", [Role.VIEWER.value])
+    await store.set_user_roles("u", [Role.VIEWER.value], audits=())
     token = mint_token()
     await store.create_session(
         token_hash=hash_token(token), user_id="u", expires_at=time.time() + 3600
@@ -641,7 +648,7 @@ async def test_a_record_that_fails_is_not_resealed_by_a_check(
     """``user_seal_ok`` is a pure check: a record whose seal fails stays failing after it."""
     store, _ = keyed
     sealer = store.row_sealer()
-    assert sealer is not None
+    assert isinstance(sealer, RowSealer)  # a local key: the sync check is the one under test
     row = UserRow(**{f.name: _sample(f.type) for f in fields(UserRow)})
     record = UserAuthzRecord(row=row)
     assert not user_seal_ok(sealer, record)

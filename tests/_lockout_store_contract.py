@@ -58,6 +58,16 @@ import pytest
 
 from messagefoundry.auth.service import _opened_totp_state
 from messagefoundry.auth.tokens import credential_id_hash
+from messagefoundry.store.store import AuditAppend
+
+#: The audit row the contract's unlocks append, in the clear's own transaction (BACKLOG #5633).
+_UNLOCK_AUDIT = AuditAppend("auth.admin_unlocked", actor="cli:contract")
+
+
+async def _unlock_rows(store: Any) -> int:
+    """How many unlock rows the contract's actor has in the audit log."""
+    return len(await store.list_audit(limit=500, actor="cli:contract"))
+
 
 #: Discoverable passkeys stored under today's credential-id hash scheme (BACKLOG #3423): only such a
 #: row is a way past the sign-in lock, since only it can sign in.
@@ -136,6 +146,7 @@ async def _assert_lockout_contract(store: Any, *, corrupt_passkeys: PasskeyCorru
     """The behaviour every backend owes ``increment_login_failure`` and the lockout writers.
     ``corrupt_passkeys`` drives the unreadable-passkey arm, which needs raw SQL on each backend."""
     await _assert_an_unreadable_passkey_set_counts_at_the_fixed_length(store, corrupt_passkeys)
+    await _assert_unreadable_passkeys_beside_a_totp(store, corrupt_passkeys)
     await _assert_single_counter_policy(store)
     await _assert_escalation(store)
     await _assert_passkey_escalates_the_sign_in_lock(store)
@@ -330,7 +341,7 @@ async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
             )
             seen.append(locked - (start + THRESHOLD - 1))
             start = locked + 1.0
-        await store.clear_lockout(user_id, reset_cycles=True, now=start)
+        await store.clear_lockout(user_id, audit=_UNLOCK_AUDIT, reset_cycles=True, now=start)
         return seen
 
     await store.create_user(
@@ -483,6 +494,74 @@ async def _assert_an_unreadable_passkey_set_counts_at_the_fixed_length(
         await store.delete_user(user_id)
 
 
+async def _assert_unreadable_passkeys_beside_a_totp(
+    store: Any, corrupt_passkeys: PasskeyCorrupters
+) -> None:
+    """BACKLOG #3948 step 7, on every backend: the conditional writes read the passkey set only
+    where the TOTP on the locked row does not already count, and a set that cannot be read, at
+    fetch or at parse time, counts as no way past rather than raising.
+
+    Beside a usable TOTP, the rotation and the removal of the unreadable passkey land, with no
+    passkey read. ``disable_totp`` takes the TOTP away, so it reads the set, and with only an
+    unreadable passkey left it is refused. Beside a refused TOTP the rotation and the removal fall
+    back to the read, and are refused. RED when: a conditional write reads the set before judging
+    the TOTP (the usable arms raise), or a read failure escapes (the other arms raise)."""
+    from tests._webauthn_store_contract import _cred
+
+    def rotate(user_id: str) -> Awaitable[bool]:
+        return store.set_password(
+            user_id,
+            password_hash="h-chosen",
+            password_generated=False,
+            must_change_password=False,
+            require_way_past=_opened_totp_state,
+        )
+
+    for case, corrupt in corrupt_passkeys.items():
+        for secret in ("JBSWY3DPEHPK3PXP", _REFUSED_A):
+            usable = secret != _REFUSED_A
+            user_id = f"rot-bad-{case}-{'usable' if usable else 'refused'}"
+            pk = credential_id_hash(user_id.encode())
+            await store.create_user(
+                user_id=user_id,
+                username=user_id,
+                auth_provider="local",
+                password_hash="h-issued",
+                now=1.0,
+                password_generated=False,
+                audits=(),
+            )
+            staged = await store.set_totp_secret(user_id, secret=secret, now=2.0)
+            assert await store.enable_totp(
+                user_id, expected_secret_cell=staged, recovery_code_hashes=[], now=2.0
+            )
+            # Discoverable: read cleanly it would be a way past, so a corruption that did not land
+            # lets the disable through and fails the arm.
+            await store.add_webauthn_credential(
+                _cred(user_id, "resident", id_hash=pk, rp_id="t", discoverable=True)
+            )
+            await corrupt(user_id)
+
+            assert await rotate(user_id) is usable, f"{case}: the rotation beside {secret}"
+            user = await store.get_user(user_id)
+            assert user is not None
+            assert user.password_hash == ("h-chosen" if usable else "h-issued"), case
+            if usable:
+                assert not await store.disable_totp(
+                    user_id, now=3.0, require_way_past=_opened_totp_state
+                ), f"{case}: the TOTP went with only an unreadable passkey left"
+                user = await store.get_user(user_id)
+                assert user is not None and user.totp_enabled, case
+            # Every leg runs this keyless: on a keyed store the passkey write checks the set
+            # against its seal before it deletes, so an unreadable set raises there.
+            removed = await store.delete_webauthn_credential(
+                user_id, pk, require_way_past=_opened_totp_state
+            )
+            assert removed is usable, f"{case}: the removal beside {secret}"
+            await store.delete_all_webauthn_credentials(user_id)
+            await store.delete_user(user_id)
+
+
 async def _assert_counters_stay_apart_and_clear(store: Any) -> None:
     """The two counters never write each other's columns, and each writer clears what the ADR says."""
     await store.create_user(
@@ -520,13 +599,33 @@ async def _assert_counters_stay_apart_and_clear(store: Any) -> None:
     assert user is not None and user.password_hash == "h2"
     assert _lockout_columns(user) == before
 
+    # --- BACKLOG #5633: a refused audit append rolls the clear back, on every backend -------------
+    locked = _lockout_columns(user)
+
+    async def refuse_append(*_a: object, **_k: object) -> object:
+        raise RuntimeError("audit append refused (test)")
+
+    store._append_audits = refuse_append  # the store is typed Any here: one patch, three backends
+    try:
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await store.clear_lockout("lock-u2", audit=_UNLOCK_AUDIT, now=step_until - 1.0)
+    finally:
+        del store._append_audits
+    user = await store.get_user("lock-u2")
+    assert user is not None and _lockout_columns(user) == locked, "an unaudited unlock committed"
+    # ... and an unknown account writes nothing and appends no row.
+    unlocks = await _unlock_rows(store)
+    assert not await store.clear_lockout("lock-nobody", audit=_UNLOCK_AUDIT, now=step_until)
+    assert await _unlock_rows(store) == unlocks
+
     # --- AC-9: clear_lockout clears both locks and both counts, and KEEPS both cycle counts --------
-    await store.clear_lockout("lock-u2", now=step_until - 1.0)
+    assert await store.clear_lockout("lock-u2", audit=_UNLOCK_AUDIT, now=step_until - 1.0)
     user = await store.get_user("lock-u2")
     assert user is not None and _lockout_columns(user) == (0, None, 2, 0, None, 2)
     assert user.password_hash == "h2", "an unlock must never touch the credential"
+    assert await _unlock_rows(store) == unlocks + 1, "the unlock committed without its audit row"
     # ... and zeroes them too when the operator says the campaign is over.
-    await store.clear_lockout("lock-u2", reset_cycles=True, now=step_until)
+    await store.clear_lockout("lock-u2", audit=_UNLOCK_AUDIT, reset_cycles=True, now=step_until)
     user = await store.get_user("lock-u2")
     assert user is not None and _lockout_columns(user) == (0, None, 0, 0, None, 0)
 

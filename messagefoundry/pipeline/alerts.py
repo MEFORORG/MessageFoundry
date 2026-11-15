@@ -683,7 +683,11 @@ class AlertSink(Protocol):
         an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). The IdP
         step-up return's audit budget uses ``step_up_return:audit_budget:<action>`` when its
         all-callers backstop stops a row, at most once a window per action (BACKLOG #3965); that
-        row was shed by the budget, not refused by the store. ``action`` is
+        row was shed by the budget, not refused by the store. The directory reconciler uses
+        ``directory-reconciler:<action>`` for a row a completed pass could not write, once per
+        action per pass (BACKLOG #3018 step 2), and a directory sign-in
+        ``directory-sign-in:<action>`` for a role-sync row the store refused twice (BACKLOG
+        #2221). ``action`` is
         the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT
         carried. The ERROR log line written beside this alert carries the row's detail on some paths
         and only the exception on others; docs/SECURITY.md says which. It is raised whether the gate
@@ -726,7 +730,10 @@ class AlertSink(Protocol):
         ``ad_group_map`` with ``name`` = ``ad-group:<group>`` when a group newly maps to the role.
         A directory sign-in whose role sync newly grants the role (vault BACKLOG #2610) raises it
         with ``name`` = ``user:<username>`` and ``via`` = ``directory_sign_in_negotiate``,
-        ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route. A directory
+        ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route; when that
+        role sync holds an error until after its revoke and notice, or the revoke raises, the
+        route has no outcome, and the service raises it with ``via`` = ``directory_sign_in``
+        instead (BACKLOG #2221). A directory
         reconcile pass whose role re-diff newly grants it (vault BACKLOG #3141) raises it with
         ``name`` = ``user:<username>`` and ``via`` = ``directory_reconcile``. The offline
         ``provision-admin`` command raises it on every Administrator it grants (vault BACKLOG #3849
@@ -772,8 +779,9 @@ class AlertSink(Protocol):
         the account enters that state, which leaves it unjudged too; or the directory has stayed
         unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
         (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
-        ``passes`` the page names), raised once per run; or that many of one account's probes running
-        have failed to reach the directory, an outage pass's probes included
+        ``passes`` the page names), raised once per run; or that setting's count of one account's
+        last ``2K - 1`` probes, K being the setting, have failed to reach the directory, an outage
+        pass's probes included
         (``account_unreachable``, BACKLOG #3100, the ``auth.ad_reconcile_unreached`` row), raised
         once as the account enters that state. The type's name predates every case but the first.
         Read ``reason`` before naming the cause.
@@ -1012,7 +1020,9 @@ class AlertSink(Protocol):
         :meth:`leadership_acquired`. Emits **no** notification (a step-down needs no page); it exists so
         durable alert-state (ADR 0044) **auto-resolves** the matching open ``leadership_acquired`` instance
         (the open set then tracks the current leaders). ``node`` is the node id; ``role`` is ``"follower"``;
-        ``reason`` is a PHI-free cause (``"lease taken or expired"`` / ``"self-fenced"`` / ``"released"``).
+        ``reason`` is a PHI-free cause, at least ``"lease taken or expired"`` / ``"self-fenced"`` /
+        ``"released"`` / ``"lease claim returned past the fence timeout"`` (BACKLOG #5711) /
+        ``"heartbeat lapsed"`` (BACKLOG #5710).
         The default :class:`LoggingAlertSink` logs it; a state-less sink treats it as a no-op."""
         ...
 
@@ -1708,6 +1718,25 @@ def authority_seal_alert(
     return _raise
 
 
+def authority_seal_page(sink: AlertSink) -> Callable[[str, str], None]:
+    """A store's seal page hook, armed on its
+    :class:`~messagefoundry.store.row_seal.SealPager` (decision d20261109T200352805-599b24 on ADR
+    0217, item 5): each call, with a subject and a reason, raises ``integrity_drift`` on ``sink``.
+    The store builds the subject, at least ``authority-seal-transit`` for an Outage. The reason
+    names no token or Vault reply. It may name a row by its ref
+    (:func:`~messagefoundry.store.row_seal.seal_row_ref`): a session by 12 characters of its token
+    hash, any other row by its stored id, control characters scrubbed and bounded with a checksum,
+    so a short user id appears whole.
+
+    A sink failure propagates to the pager, whose ``page`` logs it and never raises, so a revoke is
+    unchanged and a capped Unverifiable subject spends no slot on a page no sink took."""
+
+    def _raise(subject: str, reason: str) -> None:
+        sink.integrity_drift(subject, reason=reason, drift_count=1)
+
+    return _raise
+
+
 def no_enabled_administrator_alert(sink: AlertSink) -> Callable[[str, str], None]:
     """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with a
     username and a ``via``, raises :meth:`AlertSink.no_enabled_administrator` keyed
@@ -1757,16 +1786,37 @@ def step_up_return_audit_alert(sink: AlertSink) -> Callable[[str], None]:
 
     Carries the key and the action name only. Never raises: an alert failure must not change what a
     step-up return answers."""
+    return _keyed_audit_write_failed(sink, STEP_UP_RETURN_AUDIT_KEY, "step-up return")
+
+
+def _keyed_audit_write_failed(sink: AlertSink, prefix: str, source: str) -> Callable[[str], None]:
+    """A callable that raises :meth:`AlertSink.audit_write_failed` keyed ``<prefix>:<action>`` for
+    each action it is given, and logs a sink failure at WARNING, naming ``source``, rather than
+    raising it: an alert failure must never break a request."""
 
     def _raise(action: str) -> None:
         try:
-            sink.audit_write_failed(f"{STEP_UP_RETURN_AUDIT_KEY}:{action}", action=action)
+            sink.audit_write_failed(f"{prefix}:{action}", action=action)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning(
-                "the step-up return audit_write_failed alert could not be delivered", exc_info=True
+                "the %s audit_write_failed alert could not be delivered", source, exc_info=True
             )
 
     return _raise
+
+
+#: The prefix of the ``audit_write_failed`` key for a directory sign-in's role-sync row the store
+#: refused in the role write's transaction and on its own too (BACKLOG #2221). The action follows a
+#: colon, as for the other keys of that alert.
+DIRECTORY_SIGN_IN_AUDIT_KEY = "directory-sign-in"
+
+
+def directory_sign_in_audit_alert(sink: AlertSink) -> Callable[[str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with the
+    audit action of a directory sign-in's role-sync row the store refused twice, raises
+    :meth:`AlertSink.audit_write_failed` keyed ``<DIRECTORY_SIGN_IN_AUDIT_KEY>:<action>`` (BACKLOG
+    #2221). Carries the key and the action name only. Never raises."""
+    return _keyed_audit_write_failed(sink, DIRECTORY_SIGN_IN_AUDIT_KEY, "directory sign-in")
 
 
 def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None:

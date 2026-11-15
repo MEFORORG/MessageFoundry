@@ -697,3 +697,40 @@ def test_no_get_or_head_route_declares_a_phi_needle_parameter() -> None:
         "The URL, browser history and the access log are outside the redactor's reach; send it in a "
         f"POST body instead. Offenders: {offenders}"
     )
+
+
+# --- BACKLOG #6700: the API boundary --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [True, "7", 7.5])
+async def test_a_json_bool_or_string_scan_limit_is_refused(enc_engine: Engine, bad: Any) -> None:
+    """A lax int took JSON ``true`` as 1 and ``"7"`` as 7, so make_spec's type rule never saw them.
+    Control: a JSON integer is accepted."""
+    service = await _service(enc_engine)
+    await _add_user(service, "boss", [Role.ADMINISTRATOR.value])
+    async with _client(enc_engine, service) as c:
+        token = await _login(c, "boss")
+        r = await c.post(
+            "/messages/search", headers=_auth(token), json={"content": "JANE", "scan_limit": bad}
+        )
+        assert r.status_code == 422, r.text
+        ok = await c.post(
+            "/messages/search", headers=_auth(token), json={"content": "JANE", "scan_limit": 7}
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["scan_limit"] == 7
+
+
+async def test_a_padded_mrn_needle_still_audits_as_digits(enc_engine: Engine) -> None:
+    """make_spec keeps a needle's spaces, so the audit shape is read from the stripped needle: a
+    pasted `` 9001`` is still an MRN-shaped lookup."""
+    service = await _service(enc_engine)
+    await _add_user(service, "boss", [Role.ADMINISTRATOR.value])
+    async with _client(enc_engine, service) as c:
+        token = await _login(c, "boss")
+        r = await c.post("/messages/search", headers=_auth(token), json={"content": " 9001"})
+        assert r.status_code == 200, r.text
+    rows = await enc_engine.store.list_audit(action="message_search")
+    parsed = json.loads(rows[0]["detail"])
+    assert parsed["needle_shape"] == "digits"
+    assert "9001" not in rows[0]["detail"]

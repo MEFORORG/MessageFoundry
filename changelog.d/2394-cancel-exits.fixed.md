@@ -12,8 +12,8 @@
   connection to the gate without waiting for the running driver call, the discard after a cancelled
   claim no longer waits for the claim statement itself, and a second cancellation during an
   ordinary discard no longer waits for the close. A cancelled claim still waits for its statement
-  in the claim's own shielded lock-timeout reset, which runs before the discard. At least these are
+  in the claim's own shielded lock-timeout reset, which runs before the discard. At least this is
   not covered: a cancellation that lands after a `cursor()` call returned but before its result was
-  delivered, which leaves that cursor for the collector; and the store's pooled connections, its
-  open-time connections and its claim connections, which on a connection the gate could not wrap
-  still close beside a running driver call. (`BACKLOG #2394`, `BACKLOG #2395`)
+  delivered, which leaves that cursor for the collector. The store's own connections the gate could
+  not wrap are refused instead; the entry for that refusal says how. (`BACKLOG #2394`,
+  `BACKLOG #2395`)

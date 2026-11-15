@@ -139,7 +139,9 @@ class _Rig:
             password_generated=False,
             audits=(),
         )
-        await self.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="admin")
+        await self.store.set_user_roles(
+            user_id, [Role.ADMINISTRATOR.value], assigned_by="admin", audits=()
+        )
         if disabled:
             await self.store.set_user_disabled(user_id, disabled=True)
 
@@ -414,14 +416,21 @@ async def test_the_grant_is_judged_on_the_roles_read_at_apply_time_not_the_plans
     real = rig.service._apply_reconcile_revocation
 
     async def a_sign_in_lands_first(
-        revocation: SessionRevocation, *, watermark: _AuditWatermark | None
+        revocation: SessionRevocation,
+        *,
+        watermark: _AuditWatermark | None,
+        maps_held: bool = True,
+        not_attempted: int = 0,
     ) -> _RevocationApplied:
         await rig.store.set_user_roles(
             revocation.user_id,
             [Role.ADMINISTRATOR.value, Role.OPERATOR.value],
             assigned_by="ad-sync",
+            audits=(),
         )
-        return await real(revocation, watermark=watermark)
+        return await real(
+            revocation, watermark=watermark, maps_held=maps_held, not_attempted=not_attempted
+        )
 
     monkeypatch.setattr(rig.service, "_apply_reconcile_revocation", a_sign_in_lands_first)
 

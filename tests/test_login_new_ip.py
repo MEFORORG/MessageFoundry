@@ -1011,8 +1011,8 @@ async def test_a_step_up_from_a_roamed_address_records_it_and_moves_the_anchor()
     """A session minted at one address and used from another steps up there. On an account that
     owes no factor the password is the whole credential, so the step-up proves as much from the new
     address as a sign-in from it would: the address joins the record. ``reauth`` also re-anchors the
-    session, so after a password step-up the two address signals agree. A passkey assertion does
-    not re-anchor, and tests/test_webauthn.py pins that leg."""
+    session, so after a password step-up the two address signals agree. tests/test_webauthn.py
+    pins the passkey assertion, which re-anchors too (vault BACKLOG #2964 item 14)."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, _FakeNotifier())

@@ -1946,6 +1946,33 @@ def test_parse_audit_anchor_refuses_an_empty_head_with_a_nonzero_count() -> None
         parse_audit_anchor("5:")
 
 
+@pytest.mark.parametrize(
+    "head", ["a" * 64, "vault:v1:c3ludGhldGlj"], ids=["hex-digest", "isolated-module-mac"]
+)
+def test_parse_audit_anchor_refuses_a_head_with_a_zero_count(head: str) -> None:
+    """The converse of the pairing above (vault BACKLOG #5987 item 1). A log with rows has a newest
+    seq of 1 or more on every backend, so `0:<head>` is an anchor the store can never emit, and
+    `audit-verify --expected-anchor` would report an intact chain as `truncated or rewritten`."""
+    with pytest.raises(AuditAnchorError) as caught:
+        parse_audit_anchor(f"0:{head}")
+    assert caught.value.reason == (
+        "a zero row count is only producible from an EMPTY log, so it cannot carry a head"
+    )
+    assert parse_audit_anchor(f"1:{head}") == (1, head)  # the control: the head itself is legal
+
+
+@pytest.mark.parametrize(
+    "text", ["-98765:" + "a" * 64, "98765:", "98765:" + "a" * 12, "98765:zz", "0:" + "a" * 64]
+)
+def test_no_anchor_refusal_reason_carries_the_parsed_count(text: str) -> None:
+    """vault BACKLOG #5987: the engine logs `.reason` to the persistent service log, and the count is
+    the mis-pointed file's content, so no reason may carry it. Pinned per refusal that parses one."""
+    with pytest.raises(AuditAnchorError) as caught:
+        parse_audit_anchor(text)
+    assert "98765" not in caught.value.reason
+    assert "a" * 12 not in caught.value.reason
+
+
 def test_anchor_file_reader_refuses_an_oversized_file(tmp_path: Path) -> None:
     """The byte bound is a LOG-DISCLOSURE control: every parse refusal quotes its input back.
 

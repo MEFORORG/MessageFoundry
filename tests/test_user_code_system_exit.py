@@ -154,7 +154,12 @@ def test_the_fused_transform_body_returns_sys_exit_as_a_content_fault(
     runner = _runner(store, handler=_exit)
 
     result = runner._run_fused_transform(
-        "IB", _item(Stage.ROUTED, handler_name="h"), RunContext(), "hl7v2", None
+        "IB",
+        _item(Stage.ROUTED, handler_name="h"),
+        RunContext(),
+        "hl7v2",
+        None,
+        registry=runner.registry,
     )
 
     assert isinstance(result.xform_exc, UserCodeCalledSysExit)

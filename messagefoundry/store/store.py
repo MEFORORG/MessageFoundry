@@ -38,7 +38,6 @@ import asyncio
 import functools
 import hashlib
 import hmac
-import inspect
 import json
 import logging
 import math
@@ -78,6 +77,7 @@ from typing import (
     Protocol,
     Self,
     TypedDict,
+    TypeGuard,
     assert_never,
     cast,
     overload,
@@ -101,7 +101,6 @@ from messagefoundry.config.settings import (
 from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
 from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
-from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
@@ -133,7 +132,10 @@ from messagefoundry.store.crypto import (
     AesGcmCipher,
     AuditKeyVersionRefusedError,
     AuditMacFn,
+    AuditMacMalformedError,
+    AuditMacVerifier,
     AuditScheme,
+    AuditVerifyTimedOutError,
     Cipher,
     CipherError,
     CipherInfo,
@@ -144,6 +146,7 @@ from messagefoundry.store.crypto import (
     cipher_info,
     cipher_meta_key,
     decrypt_json_cell,
+    encrypt_many,
     report_sealed_surface,
     reseal_rotation_fingerprints,
     rotation_fingerprint_cipher,
@@ -151,9 +154,10 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.document_strip import (
+    StripCursor,
     StripResult,
-    cutoff_for,
-    log_unreadable_skips,
+    StripUpdate,
+    run_strip_pass,
 )
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
@@ -192,9 +196,20 @@ from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     SESSION_KIND,
     USER_KIND,
+    AnyRowSealer,
+    ResealOutcome,
     RowSealer,
     RowSealError,
+    RowSealKeyRetiredError,
+    SealPager,
+    TransitSealUnavailableError,
+    classify_unrotated,
+    require_seal_for_write,
+    revoke_seal_refusals,
+    row_sealer_for_cipher,
     seal_bytes,
+    seal_row_ref,
+    transit_seal_refusals,
 )
 from messagefoundry.store.schema_verify import (
     SchemaMismatchError,
@@ -1208,6 +1223,30 @@ class FailOutcome:
     dead_messages: tuple[str, ...] = ()
 
 
+#: The queue statuses no worker-death write may leave (vault BACKLOG #4607 step 6): a row already
+#: resolved keeps its disposition. Every terminal status, so a late death never turns a DONE or a
+#: CANCELLED row DEAD, and never dead-letters a DEAD row twice.
+_RESOLVED_STATUSES: Final = (
+    OutboxStatus.DONE.value,
+    OutboxStatus.DEAD.value,
+    OutboxStatus.CANCELLED.value,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerDeathOutcome:
+    """What one ``record_worker_death`` call did (vault BACKLOG #4607 step 6).
+
+    ``deaths`` is the row's ``worker_deaths`` as this call's own increment left it, read inside the
+    same write, never the value a claim returned. It is 0 when the row was already resolved, so
+    nothing was counted. ``dead`` is True when this call dead-lettered the row at its cap. On
+    Postgres and SQL Server both are reset to the empty outcome when the H1 epoch fence rolled the
+    dead-letter back, increment included (ADR 0157 C3)."""
+
+    deaths: int = 0
+    dead: bool = False
+
+
 class ClaimAbortPhase(StrEnum):
     """WHICH statement of a claim transaction hit the lock timeout (BACKLOG #1270).
 
@@ -1495,19 +1534,693 @@ def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionReco
     return replace(record, seal=seal)
 
 
+async def seal_session_async(sealer: AnyRowSealer | None, record: SessionRecord) -> SessionRecord:
+    """:func:`seal_session`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    seal = "" if sealer is None else await sealer.seal_async(SESSION_KIND, record.seal_fields())
+    return replace(record, seal=seal)
+
+
+async def require_session_seal_for_write(
+    sealer: AnyRowSealer | None, record: SessionRecord
+) -> None:
+    """Refuse a write over ``record`` unless its seal holds under the active key: the write path's
+    form of :func:`session_seal_ok` (ADR 0217 (c) step 1). Raises ``RowSealError(SESSION_KIND)``
+    for a Forged seal, :class:`~messagefoundry.store.row_seal.RowSealUnverifiableError` for an
+    Unverifiable one, :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError` for an
+    Outage, and :class:`~messagefoundry.store.row_seal.RowSealKeyRetiredError` for a genuine seal
+    under a retired key. Every backend's session writer calls :func:`session_writer_seal_check`,
+    whose callers end that last one quietly (ADR 0217, *Build rulings*, ruling 3)."""
+    await require_seal_for_write(
+        sealer, SESSION_KIND, record.seal_fields(), record.seal, subject=""
+    )
+
+
+#: The audit action a Forged authority row writes: ``AUTHORITY_SEAL_FAILED_ACTION`` in
+#: ``auth/service.py``, which the store may not import; a test pins the two equal.
+AUTHORITY_SEAL_FAILED_AUDIT_ACTION: Final = "integrity.authority_seal_failed"
+#: The audit action an Unverifiable authority row writes (ADR 0217, *The four answers*).
+AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION: Final = "integrity.authority_seal_unverifiable"
+
+
+@dataclass(frozen=True, slots=True)
+class _RevokeSealRefusal:
+    """One Forged or Unverifiable answer a revoke went ahead without: the row kind, the WHOLE
+    stored id, and the Transit verdict's two triage integers, 0 for Forged. The whole id keys the
+    subject's digest. No log line carries it, and a page names it by its ref
+    (:func:`~messagefoundry.store.row_seal.seal_row_ref`). The audit row differs by kind: a
+    session's detail names its ref, while a user's detail carries the WHOLE id, as
+    ``AuthService``'s rows of the same actions do."""
+
+    unverifiable: bool
+    kind: str
+    # Out of the repr: for a session this is the whole token hash, which no log line may carry.
+    ident: str = field(repr=False)
+    stored_version: int = 0
+    probe_version: int = 0
+
+
+#: How a held refusal's report reads, by what became of the revoke that held it: committed; failed
+#: before its commit was confirmed; or failed, after which a retry in the same
+#: :func:`deferred_revoke_reports` scope committed.
+_RevokeEnd = Literal["committed", "failed", "retried"]
+
+_REVOKE_END_TEXT: Final[dict[str, str]] = {
+    "committed": "the revoke ended the sessions anyway",
+    "failed": "the revoke then failed before its commit was confirmed; its sessions may not have"
+    " been ended",
+    "retried": "that revoke attempt then failed before its commit was confirmed, and a retry of"
+    " the revoke then committed",
+}
+
+
+def _refusal_key(refusal: _RevokeSealRefusal) -> tuple[object, ...]:
+    """What makes two held refusals one report: the same answer for the same stored row."""
+    return ("refusal", refusal.unverifiable, refusal.kind, refusal.ident)
+
+
+@dataclass
+class RevokeSealOutcome:
+    """What one revoke's sealed writes met (decision d20261109T200352805-599b24 on ADR 0217, items
+    2 and 4). ``tripped`` is set by the first Transit Outage: after it, no account's epoch raise
+    calls Transit (``skipped`` counts them), every session is still marked revoked, and the kept
+    session's re-stamp is not attempted, so it is ended with the rest. A Forged or Unverifiable
+    answer does not trip it, so the accounts after it still call Transit; each is held in
+    ``refusals`` until :meth:`committing` reports it, once the revoke's outcome is known.
+
+    ``pager`` is the store's :class:`~messagefoundry.store.row_seal.SealPager` (item 5); ``None``
+    pages nothing."""
+
+    pager: SealPager | None = None
+    tripped: bool = False
+    skipped: int = 0
+    refusals: list[_RevokeSealRefusal] = field(default_factory=list)
+    outages: list[str] = field(default_factory=list)
+    #: Each refusal's log line, ``(what, class name, key)``, written once the outcome is known.
+    #: ``key`` is :func:`_refusal_key`'s, or ``("outage", what)`` for an Outage.
+    refused_log: list[tuple[str, str, tuple[object, ...]]] = field(default_factory=list)
+
+    @asynccontextmanager
+    async def committing(
+        self, record_audit: Callable[..., Awaitable[object]]
+    ) -> AsyncIterator[None]:
+        """Wrap a revoke's transaction, and report everything the revoke held once its outcome is
+        known, on every exit (decision d20261110T063908944-857965, item 6).
+
+        **On a clean exit** the revoke has committed, and :meth:`report` runs here, so no path
+        between the commit and a separate call can skip it.
+
+        **If the transaction raises**, the report says the revoke failed before its commit was
+        confirmed, rather than that it went ahead, and the exception propagates (decision
+        d20261110T004916856-814db8, Q5, and decision d20261110T042322305-2ffc60): a held Outage is
+        paged, and each held Forged or Unverifiable refusal is logged, audited softly and paged.
+        The text does not claim the revoke rolled back: an error after a commit landed reaches here
+        too. Inside a :func:`deferred_revoke_reports` scope, which a caller that retries a failed
+        revoke opens, the report is held for the scope instead, so a retry that meets the same
+        refusals reports each once (decision d20261110T063908944-857965, item 4). That report never
+        raises, so the transaction's exception is the one the caller sees; it runs to completion
+        through a cancel, and a cancel that lands meanwhile is raised in place of a transaction
+        exception that was not itself a cancel.
+
+        **An exception that is neither an ``Exception`` nor a cancel** (an interpreter exit, a
+        ``GeneratorExit``) may not await, so the log lines and the pages are written at once and
+        the audit rows are not, which an ERROR line records."""
+        try:
+            yield
+        except (Exception, asyncio.CancelledError) as exc:
+            carry = _REVOKE_CARRY.get()
+            if carry is not None and not carry.closed:
+                carry.held.append((self, record_audit))
+                raise
+            cancelled, _failure = await _run_to_completion(
+                functools.partial(self._report, record_audit, end="failed")
+            )
+            if cancelled and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError from exc
+            raise
+        except BaseException as exc:
+            self._report_unawaited(exc, end="failed")
+            raise
+        carry = _REVOKE_CARRY.get()
+        if carry is not None and not carry.closed:
+            carry.covered_by(self)
+        await self.report(record_audit)
+
+    def refused(self, exc: Exception, *, what: str, kind: str, ident: str) -> None:
+        """Take one refusal :func:`revoke_seal_refusals` names, which the revoke goes ahead without.
+        Its log line, which names its class only, is held with it and written once the outcome is
+        known (decision d20261110T042322305-2ffc60), as the skipped-raise count is: "the revoke
+        ended the sessions anyway" is true only after the commit. An Outage trips the outcome and
+        is held too. :meth:`committing` reports everything held, on every exit."""
+        if isinstance(exc, TransitSealUnavailableError):
+            self.tripped = True
+            self.outages.append(what)
+            self.refused_log.append((what, type(exc).__name__, ("outage", what)))
+            return
+        if isinstance(exc, RowSealError):
+            refusal = _RevokeSealRefusal(False, kind, ident)
+        else:
+            refusal = _RevokeSealRefusal(
+                True,
+                kind,
+                ident,
+                getattr(exc, "stored_version", 0),
+                getattr(exc, "probe_version", 0),
+            )
+        self.refusals.append(refusal)
+        self.refused_log.append((what, type(exc).__name__, _refusal_key(refusal)))
+
+    def log_skipped(self) -> None:
+        """Log how many accounts went without their raise because of the Outage, if any, once."""
+        skipped, self.skipped = self.skipped, 0
+        if skipped:
+            log.warning(
+                "a revoke met a Vault transit outage; %d further account epoch raise(s) were "
+                "skipped without calling Transit, and every session is still ended",
+                skipped,
+            )
+
+    async def report(self, record_audit: Callable[..., Awaitable[object]]) -> None:
+        """After the revoke commits, write each held refusal's audit row, softly, and page it
+        (decision d20261109T200352805-599b24, item 4): ``integrity.authority_seal_unverifiable``
+        under the row's capped subject for Unverifiable, ``integrity.authority_seal_failed`` under
+        ``AUTHORITY_SEAL_SUBJECT`` for Forged. :meth:`committing` calls it on a clean exit.
+        ``record_audit`` is the store's own, so the row is never inside the revoke's writer
+        transaction. A failed audit write, a defect included, is logged at ERROR and the page still
+        goes.
+
+        The detail keys match ``AuthService``'s rows of the same actions: a user by its whole id
+        (``user_id``), a session by its 12-character ref (``session``), never a token hash.
+
+        A held Outage is paged here first, after the commit, with its own text (decision
+        d20261110T004916856-814db8, Q5); it writes no audit row, as before.
+
+        **A cancel cannot drop a page.** The revoke has committed, so the loop runs as a task
+        awaited through :func:`asyncio.shield`, and awaited again after each cancel, as
+        ``auth/service.py``'s ``_write_through_cancellation`` runs a refused sign-in's rows; the
+        cancel is re-raised once every row is written and every page sent. A failure of the report
+        itself is logged at ERROR with its class and then re-raised (decision
+        d20261110T063908944-857965, item 5)."""
+        cancelled, failure = await _run_to_completion(
+            functools.partial(self._report, record_audit, end="committed")
+        )
+        if cancelled:
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure
+
+    def _page_outages(self, *, end: _RevokeEnd) -> None:
+        """Page each held Outage once, with text that says what became of the revoke."""
+        outages, self.outages = self.outages, []
+        if self.pager is None:
+            return
+        for what in outages:
+            self.pager.outage(
+                f"{what} met a Vault transit outage; the revoke went ahead without it"
+                if end == "committed"
+                else f"{what} met a Vault transit outage, and {_REVOKE_END_TEXT[end]}"
+            )
+
+    def _log_held(self, *, end: _RevokeEnd) -> None:
+        """Write the held refusals' log lines, and after a commit the skipped-raise count."""
+        refused_log, self.refused_log = self.refused_log, []
+        for what, cls, _key in refused_log:
+            log.warning("%s was refused (%s); %s", what, cls, _REVOKE_END_TEXT[end])
+        if end == "committed":
+            self.log_skipped()
+
+    def _entry(self, refusal: _RevokeSealRefusal, *, end: _RevokeEnd) -> tuple[str, str, str]:
+        """One held refusal's audit action, detail JSON and page reason."""
+        ref = seal_row_ref(refusal.kind, refusal.ident)
+        after = _REVOKE_END_TEXT[end]
+        detail: dict[str, object] = {"kind": refusal.kind, "during": "revoke"}
+        if end != "committed":
+            detail["committed"] = False
+        if end == "retried":
+            detail["retry_committed"] = True
+        if refusal.kind == SESSION_KIND:
+            detail["session"] = ref  # the same form the page names it by
+        else:
+            detail["user_id"] = refusal.ident
+        if refusal.unverifiable:
+            detail["stored_version"] = refusal.stored_version
+            detail["probe_version"] = refusal.probe_version
+            return (
+                AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION,
+                json.dumps(detail, sort_keys=True),
+                f"a {refusal.kind} row's integrity seal could not be verified by Vault transit"
+                f" during a revoke ({refusal.kind} {ref}); {after}",
+            )
+        return (
+            AUTHORITY_SEAL_FAILED_AUDIT_ACTION,
+            json.dumps(detail, sort_keys=True),
+            f"a {refusal.kind} row failed its integrity check during a revoke"
+            f" ({refusal.kind} {ref}); {after}",
+        )
+
+    def _page(self, refusal: _RevokeSealRefusal, reason: str) -> None:
+        if self.pager is None:
+            return
+        if refusal.unverifiable:
+            self.pager.unverifiable(refusal.kind, refusal.ident, reason)
+        else:
+            self.pager.forged(reason)
+
+    async def _report(
+        self, record_audit: Callable[..., Awaitable[object]], *, end: _RevokeEnd
+    ) -> None:
+        """The awaited report, run to completion: the held log lines (and, after a commit, the
+        skipped-raise count), the Outage pages, then each refusal's soft audit row and page."""
+        self._log_held(end=end)
+        self._page_outages(end=end)
+        if not self.refusals:
+            return
+        from messagefoundry.audit_write import write_audit_soft
+
+        refusals, self.refusals = self.refusals, []
+        for refusal in refusals:
+            action, detail, reason = self._entry(refusal, end=end)
+            await write_audit_soft(
+                functools.partial(record_audit, action, detail=detail),
+                log=log,
+                message="the %s audit row for a revoke's refused authority row could not be written",
+                args=(action,),
+                # No defect raises: the report never replaces the revoke's own outcome.
+                errors=(Exception,),
+                defects=(),
+            )
+            self._page(refusal, reason)
+
+    def _report_unawaited(self, cause: BaseException, *, end: _RevokeEnd) -> None:
+        """The report for an exit that may not await (an interpreter exit, a ``GeneratorExit``):
+        the log lines and the pages now, and an ERROR line for the audit rows not written."""
+        self._log_held(end=end)
+        self._page_outages(end=end)
+        refusals, self.refusals = self.refusals, []
+        for refusal in refusals:
+            _action, _detail, reason = self._entry(refusal, end=end)
+            self._page(refusal, reason)
+        if refusals:
+            log.error(
+                "%d audit row(s) for a revoke's refused authority rows were not written: the"
+                " revoke was ended by %s, which cannot wait for a write; each was logged and paged",
+                len(refusals),
+                type(cause).__name__,
+            )
+
+
+@dataclass
+class _RevokeCarry:
+    """The failed revoke attempts one :func:`deferred_revoke_reports` scope holds, with their
+    stores' ``record_audit``. ``committed`` says a later attempt in the scope committed;
+    ``closed`` says the scope has reported, so a late attempt reports for itself."""
+
+    held: list[tuple[RevokeSealOutcome, Callable[..., Awaitable[object]]]] = field(
+        default_factory=list
+    )
+    committed: bool = False
+    closed: bool = False
+
+    def covered_by(self, outcome: RevokeSealOutcome) -> None:
+        """A revoke attempt committed: drop from every held failed attempt what it will report,
+        so each refusal, Outage and log line is reported once, by the attempt that committed."""
+        self.committed = True
+        keys = {_refusal_key(r) for r in outcome.refusals} | {
+            ("outage", w) for w in outcome.outages
+        }
+        for held, _record_audit in self.held:
+            held.refusals = [r for r in held.refusals if _refusal_key(r) not in keys]
+            held.outages = [w for w in held.outages if ("outage", w) not in keys]
+            held.refused_log = [e for e in held.refused_log if e[2] not in keys]
+
+    async def _report(self) -> None:
+        end: _RevokeEnd = "retried" if self.committed else "failed"
+        for held, record_audit in self.held:
+            await held._report(record_audit, end=end)
+
+    async def flush(self) -> tuple[bool, BaseException | None]:
+        """Report every held attempt once, run to completion; never raises."""
+        self.closed = True
+        return await _run_to_completion(self._report)
+
+    def flush_unawaited(self, cause: BaseException) -> None:
+        self.closed = True
+        end: _RevokeEnd = "retried" if self.committed else "failed"
+        for held, _record_audit in self.held:
+            held._report_unawaited(cause, end=end)
+
+
+#: The open :func:`deferred_revoke_reports` scope, if any.
+_REVOKE_CARRY: ContextVar[_RevokeCarry | None] = ContextVar("mefor_revoke_carry", default=None)
+
+
+@asynccontextmanager
+async def deferred_revoke_reports() -> AsyncIterator[None]:
+    """Hold the report of each revoke attempt that fails inside this scope until the scope ends,
+    for a caller that retries a failed revoke (decision d20261110T063908944-857965, item 4).
+
+    A retry that commits reports its own refusals with the committed wording, and this scope drops
+    those from the failed attempts it holds, so a refusal the committing attempt met is audited and
+    paged once and the last page an operator sees for it is accurate. What only failed attempts met
+    is reported when the scope ends, by every held attempt that met it: the held attempts are not
+    deduplicated against each other, so a caller retrying up to
+    ``_POST_COMMIT_REVOKE_ATTEMPTS`` times can report one refusal that many times. Each is reported
+    as having failed, or, when a later attempt committed, as an attempt whose retry committed. The report runs on every exit and never raises out of a failing scope; on a clean
+    exit a failure of the report is re-raised, as :meth:`RevokeSealOutcome.report` does. A nested
+    scope joins the outer one. A revoke that fails after the scope has reported, in a task that
+    inherited it, reports for itself."""
+    if _REVOKE_CARRY.get() is not None:
+        yield
+        return
+    carry = _RevokeCarry()
+    reset = _REVOKE_CARRY.set(carry)
+    try:
+        try:
+            yield
+        except (Exception, asyncio.CancelledError) as exc:
+            cancelled, _failure = await carry.flush()
+            if cancelled and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError from exc
+            raise
+        except BaseException as exc:
+            carry.flush_unawaited(exc)
+            raise
+        cancelled, failure = await carry.flush()
+        if cancelled:
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure
+    finally:
+        _REVOKE_CARRY.reset(reset)
+
+
+async def _run_to_completion(
+    body: Callable[[], Awaitable[None]],
+    *,
+    what: str = "a revoke's seal report",
+    lost: str = "its remaining audit rows and pages were not sent",
+) -> tuple[bool, BaseException | None]:
+    """Run ``body`` as a task awaited through :func:`asyncio.shield`, awaited again after each
+    cancel, so a cancel cannot cut it short. Returns whether a cancel landed meanwhile, and the
+    body's own failure, for the caller to re-raise or not. Never raises. A failure is logged at
+    ERROR with its class, and its traceback at DEBUG only, since a defect's message may carry a
+    row value (CLAUDE.md section 9). A body that ends cancelled is logged too, and returned as a
+    ``CancelledError`` (decision d20261110T063908944-857965, item 5). ``what`` names the body and
+    ``lost`` what its unfinished end leaves undone in those lines; the defaults are the revoke's,
+    so its callers pass neither (BACKLOG #5720)."""
+    task = asyncio.ensure_future(body())
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A cancel of this caller, recorded first, so a cancel landing in the turn the loop
+            # ends is still raised; the body's own cancel is read below instead.
+            if not task.cancelled():
+                cancelled = True
+        except BaseException:  # noqa: BLE001 -- the body's own failure, read from the task below
+            pass
+    if task.cancelled():
+        log.error("%s was cancelled before it finished; %s", what, lost)
+        return cancelled, asyncio.CancelledError()
+    failure = task.exception()
+    if failure is not None:
+        log.error("%s failed (%s); %s", what, type(failure).__name__, lost)
+        log.debug("%s failure", what, exc_info=failure)
+    return cancelled, failure
+
+
+#: How long a failed store open's cleanup may still run once a cancel has landed, before
+#: :func:`cleanup_failed_open` forces the release and stops waiting (BACKLOG #5720, decision
+#: d20261114T002244771-017417). Nothing bounds the cleanup until a cancel lands.
+FAILED_OPEN_CANCEL_BOUND_S = 5.0
+
+# The attribute on an event loop holding the cleanups a cancel stopped waiting for. On the loop,
+# not the module, so the strong reference goes with a closed loop rather than outliving it.
+_ABANDONED_OPEN_CLEANUPS_ATTR = "_mefor_abandoned_open_cleanups"
+
+
+def cancels_at_entry() -> int:
+    """The current task's ``cancelling()`` count, read when a store open starts, so
+    :func:`cleanup_failed_open` counts only a cancel that landed during the open; a cancel the
+    task swallowed earlier is not this open's (BACKLOG #5720, as BACKLOG #5004)."""
+    current = asyncio.current_task()
+    return current.cancelling() if current is not None else 0
+
+
+def _force_failed_open_release(force_release: Callable[[], object]) -> None:
+    """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054)."""
+    try:
+        force_release()
+    except Exception as failure:  # noqa: BLE001 — never mask the open's error
+        log.warning(
+            "forcing the release after a failed store open also failed (%s)",
+            type(failure).__name__,
+        )
+
+
+def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
+    """Retrieve a forced ``stop()``'s outcome so the loop never logs it as never retrieved; a
+    failure there is logged by class (vault BACKLOG #3054)."""
+    if future.cancelled():
+        return
+    failure = future.exception()
+    if failure is not None:
+        log.warning(
+            "stopping a connection after a failed store open failed (%s)", type(failure).__name__
+        )
+
+
+def _stop_unawaited(conn: aiosqlite.Connection) -> None:
+    """``conn.stop()``, with its future's outcome read when it resolves (BACKLOG #5720)."""
+    future = conn.stop()
+    if future is not None:
+        future.add_done_callback(_read_stop_outcome)
+
+
+def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
+    """Keep a strong reference to a cleanup this open stopped waiting for until it finishes, so
+    the loop does not drop it pending (BACKLOG #5720)."""
+    loop = task.get_loop()
+    held: set[asyncio.Future[Any]] | None = getattr(loop, _ABANDONED_OPEN_CLEANUPS_ATTR, None)
+    if held is None:
+        held = set()
+        try:
+            setattr(loop, _ABANDONED_OPEN_CLEANUPS_ATTR, held)
+        except AttributeError:
+            # A loop class that takes no attribute: the references the cleanup's own awaits hold.
+            return
+    held.add(task)
+    task.add_done_callback(held.discard)
+
+
+async def cleanup_failed_open(
+    exc: BaseException,
+    release: Callable[[], Awaitable[None]],
+    force_release: Callable[[], object],
+    *,
+    cancels_before: int,
+) -> None:
+    """Run a failed store open's ``release`` through :func:`_run_to_completion`, so a cancel
+    cannot cut it short and leak what the open built (BACKLOG #5720). ``release`` logs its own
+    failures by class, so none replaces the open's error (vault BACKLOG #3054). Raises a cancel
+    that landed during the open or its cleanup when ``exc`` is an ``Exception``; the caller
+    re-raises ``exc`` otherwise. ``cancels_before`` is :func:`cancels_at_entry`, read when the
+    open started.
+
+    **A cancel still ends a failed open** (decision d20261114T002244771-017417). Nothing bounds the
+    cleanup until a cancel lands; from then it gets at most :data:`FAILED_OPEN_CANCEL_BOUND_S`.
+    The bound starts at once when the open's own end was a cancel, or a cancel this open received
+    under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past
+    the bound, ``force_release`` drops what the open built without waiting, and this stops
+    waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
+    thing a ``GeneratorExit`` runs: a coroutine being closed cannot await, and awaiting would
+    replace the exit with a ``RuntimeError``."""
+    if isinstance(exc, GeneratorExit):
+        _force_failed_open_release(force_release)
+        return
+
+    task = asyncio.ensure_future(
+        _run_to_completion(
+            release,
+            what="a failed store open's cleanup",
+            lost="what the open built may not have been released",
+        )
+    )
+    loop = asyncio.get_running_loop()
+    current = asyncio.current_task()
+    # A cancel this open received, under its own exception or another, has landed already.
+    cancelled = current is not None and current.cancelling() > cancels_before
+    if cancelled or isinstance(exc, asyncio.CancelledError):
+        trigger: str | None = "a cancel"
+    elif not isinstance(exc, Exception):
+        trigger = type(exc).__name__
+    else:
+        trigger = None
+    deadline = None if trigger is None else loop.time() + FAILED_OPEN_CANCEL_BOUND_S
+    while not task.done():
+        remaining = None if deadline is None else deadline - loop.time()
+        if remaining is not None and remaining <= 0:
+            # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
+            _force_failed_open_release(force_release)
+            log.warning(
+                "a failed store open's cleanup did not finish within %s s of %s; what the open"
+                " built was released without waiting for it",
+                FAILED_OPEN_CANCEL_BOUND_S,
+                trigger,
+            )
+            _hold_abandoned_open_cleanup(task)
+            break
+        try:
+            if remaining is None:
+                await asyncio.shield(task)
+            else:
+                await asyncio.wait_for(asyncio.shield(task), remaining)
+        except TimeoutError:
+            continue  # the next pass finds the deadline passed, or the cleanup done
+        except asyncio.CancelledError:
+            # Ours unless only the cleanup task was cancelled: a cancel of this task landing in
+            # the same turn counts too, so it is never dropped (BACKLOG #5720).
+            if not task.cancelled() or (
+                current is not None and current.cancelling() > cancels_before
+            ):
+                cancelled = True
+                if deadline is None:
+                    trigger = "a cancel"
+                    deadline = loop.time() + FAILED_OPEN_CANCEL_BOUND_S
+            if task.cancelled():
+                break
+    if task.done() and (task.cancelled() or task.result()[1] is not None):
+        # The cleanup ended cancelled or failed, so what it should have closed may be open,
+        # the read pool included: drop it without waiting (BACKLOG #5720).
+        _force_failed_open_release(force_release)
+    if cancelled and isinstance(exc, Exception):
+        raise asyncio.CancelledError from exc
+
+
+async def raise_account_epoch(
+    write: Callable[[EpochBump], Awaitable[UserAuthzRecord | None]],
+    outcome: RevokeSealOutcome,
+    user_id: str,
+    lock: Callable[[], Awaitable[object]] | None = None,
+) -> EpochRaise | None:
+    """One account's session epoch raise for a revoke, shared by the three backends'
+    ``_bump_session_epoch``: ``write`` is the backend's ``_write_user`` for ``user_id``. Returns
+    the raise, or ``None`` where none was written. A refusal :func:`revoke_seal_refusals` names goes
+    without the raise (decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2) and is
+    taken by ``outcome``; an Outage trips it, after which no raise is attempted (decision
+    d20261109T200352805-599b24, item 2).
+
+    ``lock`` takes the account row's lock without calling Transit. A tripped revoke still runs it,
+    so it holds every account row it would have written before its session sweep, the lock order a
+    server backend's revoke relies on; SQLite's write lock already covers the whole file."""
+    if outcome.tripped:
+        outcome.skipped += 1
+        if lock is not None:
+            await lock()
+        return None
+    bump = EpochBump()
+    try:
+        return bump.raised(await write(bump))
+    except revoke_seal_refusals() as exc:
+        outcome.refused(exc, what="an account's session epoch raise", kind=USER_KIND, ident=user_id)
+        return None
+
+
+async def write_kept_session(
+    write: Awaitable[SessionRecord | None], outcome: RevokeSealOutcome, token_hash: str
+) -> SessionRecord | None:
+    """Await a revoke's re-stamp of the session it keeps, reading a Transit Unverifiable or Outage
+    answer as declined (``None``), so the caller ends that session as it ends the rest (decisions
+    d20261109T165402853-83b348 and d20261109T165406730-2505f2 on ADR 0217); ``outcome`` takes the
+    refusal. A Forged session still raises ``RowSealError``, as on ``main``. A session sealed under a
+    retired key is declined too, quietly, with an INFO line and no refusal (owner ruling 2026-11-07
+    on ADR 0217): it is genuine, minted before the key changed, and the caller ends it."""
+    try:
+        return await write
+    except RowSealKeyRetiredError:
+        log.info(
+            "the session a revoke keeps was sealed under a retired store key; it is ended with "
+            "the rest"
+        )
+        return None
+    except transit_seal_refusals() as exc:
+        outcome.refused(
+            exc, what="the kept session's re-stamp", kind=SESSION_KIND, ident=token_hash
+        )
+        return None
+
+
+async def session_writer_seal_check(sealer: AnyRowSealer | None, record: SessionRecord) -> None:
+    """:func:`require_session_seal_for_write` as every backend's session writer runs it: every
+    answer raises as that function says, a session under a retired key as
+    :class:`~messagefoundry.store.row_seal.RowSealKeyRetiredError`.
+
+    The write declines a retired-key session and the callers end it quietly (owner ruling
+    2026-11-07 on ADR 0217, built in slice 1b-iv): a revoke's kept-session re-stamp ends it with
+    the rest (:func:`write_kept_session`), and ``AuthService``'s stamp and rotation legs end it as
+    the reader does (``key_changed``). The writer does not end it itself, which would hide the
+    end from those callers: ``revoke_user_sessions`` would miscount its kept session and a stamp
+    leg would record a success for a session just ended."""
+    await require_session_seal_for_write(sealer, record)
+
+
+async def require_role_seal_for_write(sealer: AnyRowSealer | None, row: RoleRow) -> None:
+    """Refuse a write over ``row`` unless its seal holds under a held key: the write path's form
+    of :func:`role_seal_ok` (ADR 0217 (c) step 1), raising as
+    :func:`~messagefoundry.store.row_seal.require_seal_for_write` says."""
+    await require_seal_for_write(sealer, ROLE_KIND, row.seal_fields(), row.seal, subject="")
+
+
 def session_seal_ok(sealer: RowSealer | None, record: SessionRecord) -> bool:
     """Whether ``record`` carries a valid seal. Always True with no sealer: a store that holds no
     key writes and checks no seals. With one, a missing or empty seal fails like a wrong one."""
     return sealer is None or sealer.verify(SESSION_KIND, record.seal_fields(), record.seal)
 
 
-def session_sealed_by_retired_key(sealer: RowSealer | None, record: SessionRecord) -> bool:
+# The awaitable read checks below serve either sealer (ADR 0217 slice 1b). Under the local sealer
+# each answers exactly as its sync twin, where it has one. Under Transit an Unverifiable or
+# Outage answer raises as itself (``TransitSealUnverifiableError``, ``TransitSealUnavailableError``).
+# At least two callers now handle them, under the owner rulings of 2026-11-08: the session loader
+# catches both from ``session_sealed_by_retired_key_async``, and a session rotation catches the
+# Outage. Every other caller still fails closed by raising; what each does is the catch census of
+# slices 2 and 1b-iv.
+
+
+async def session_seal_ok_async(sealer: AnyRowSealer | None, record: SessionRecord) -> bool:
+    """:func:`session_seal_ok`, awaitable, for either sealer."""
+    return sealer is None or await sealer.verify_async(
+        SESSION_KIND, record.seal_fields(), record.seal
+    )
+
+
+async def session_sealed_by_retired_key_async(
+    sealer: AnyRowSealer | None, record: SessionRecord
+) -> bool:
     """Whether ``record`` carries a genuine seal made under a RETIRED store key: a session minted
     before the key changed and not yet ended by ``rotate-key``. It is refused like any other row
     that fails; this only says the refusal is a key change, not an integrity failure."""
-    return sealer is not None and sealer.sealed_by_retired_key(
+    return sealer is not None and await sealer.sealed_by_retired_key_async(
         SESSION_KIND, record.seal_fields(), record.seal
     )
+
+
+async def _held_seal_ok(
+    sealer: AnyRowSealer | None, kind: str, fields: Iterable[tuple[str, object]], stored: str
+) -> bool:
+    """The record read check every ``*_seal_ok_async`` shares: True with no sealer, else whether
+    ``stored`` holds under a held key, a value the encoder cannot read failing like a wrong seal.
+
+    The encoding is tried on its own first, so only the encoder's ``TypeError`` reads as a
+    failed seal; one raised past it, in the pool hand-off or the backend, is a defect and
+    propagates, as :func:`~messagefoundry.store.row_seal.require_seal_for_write` lets it."""
+    if sealer is None:
+        return True
+    parts = tuple(fields)
+    try:
+        seal_bytes(kind, parts)
+    except TypeError:
+        return False
+    return await sealer.verify_held_async(kind, parts, stored)
 
 
 def new_session_record(
@@ -1572,10 +2285,48 @@ def reauth_stamp(
     return apply
 
 
-def mfa_stamp(now: float) -> Callable[[SessionRecord], SessionRecord]:
-    """The change ``mark_session_mfa_verified`` makes to a session row (WP-14)."""
-    when = float(now)
-    return lambda s: replace(s, mfa_verified_at=when)
+@dataclass(frozen=True)
+class PendingFactorAnchor:
+    """What a factor that completes a PENDING session also moves (vault BACKLOG #2964 item 14): the
+    session's address to ``client`` (``None`` keeps the stored one) and its step-up window, which
+    opens when ``open_window`` is true and is cleared when it is false, whether or not the address
+    moved. :func:`mfa_stamp` applies it only to a row that has not met its factor."""
+
+    client: str | None
+    open_window: bool
+
+
+class _MfaStamp:
+    """The callable :func:`mfa_stamp` returns. ``anchored`` says whether its last application
+    applied the anchor; it is decided afresh on every call, so a callable applied twice cannot
+    carry an earlier answer."""
+
+    def __init__(self, when: float, anchor: PendingFactorAnchor | None) -> None:
+        self._when = when
+        self._anchor = anchor
+        self.anchored = False
+
+    def __call__(self, s: SessionRecord) -> SessionRecord:
+        anchor = self._anchor if s.mfa_verified_at is None else None
+        self.anchored = anchor is not None
+        if anchor is None:
+            return replace(s, mfa_verified_at=self._when)
+        return replace(
+            s,
+            mfa_verified_at=self._when,
+            client=s.client if anchor.client is None else anchor.client,
+            reauth_at=self._when if anchor.open_window else None,
+        )
+
+
+def mfa_stamp(now: float, anchor: PendingFactorAnchor | None = None) -> _MfaStamp:
+    """The change ``mark_session_mfa_verified`` makes to a session row (WP-14).
+
+    It always stamps ``mfa_verified_at``. With an ``anchor``, and only when the row it is applied to
+    has not met its factor, it also applies the anchor (:class:`PendingFactorAnchor`). The session
+    write helper applies it to the row it read inside its own transaction, so the decision is made
+    on the row the write replaces, never on an earlier read."""
+    return _MfaStamp(float(now), anchor)
 
 
 # The session-cap predicates, in the `?` dialect SQLite and SQL Server share (BACKLOG #1900). Each
@@ -1972,7 +2723,7 @@ type AdminHolderTest = Callable[[UserRow], bool]
 
 async def admin_guard_counts(
     holders: Iterable[tuple[str, bool]],
-    sealer: RowSealer | None,
+    sealer: AnyRowSealer | None,
     read_record: Callable[[str], Awaitable[UserAuthzRecord | None]],
     counts: AdminHolderTest | None = None,
     *,
@@ -1996,7 +2747,7 @@ async def admin_guard_counts(
             target += 1
             continue
         record = await read_record(holder_id)
-        if record is None or not user_seal_ok(sealer, record):
+        if record is None or not await user_seal_ok_async(sealer, record):
             continue
         if record.row.disabled or role_id not in record.role_ids:
             continue
@@ -2753,17 +3504,50 @@ def session_owes_unproven_factor(
     Fails closed (True) on a missing, revoked, foreign, stale-epoch or unsealed session, and on an
     unsealed account: nothing there can be shown to owe nothing. A missing account is the caller's
     to handle: the insert's foreign key already refuses it (BACKLOG #1807)."""
-    if (
-        session is None
-        or session.revoked_at is not None
-        or session.user_id != record.row.id
-        or not session_epochs_current(
-            session, user_epoch=record.row.session_epoch, global_epoch=global_epoch
-        )
-        or not session_seal_ok(sealer, session)
-        or not user_seal_ok(sealer, record)
+    if not _session_may_bind(session, record, global_epoch=global_epoch):
+        return True
+    if not session_seal_ok(sealer, session) or not user_seal_ok(sealer, record):
+        return True
+    return _factor_unproven(session, record, passkeys)
+
+
+async def session_owes_unproven_factor_async(
+    sealer: AnyRowSealer | None,
+    session: SessionRecord | None,
+    record: UserAuthzRecord,
+    passkeys: Sequence[WebAuthnCredential],
+    *,
+    global_epoch: int,
+) -> bool:
+    """:func:`session_owes_unproven_factor`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    if not _session_may_bind(session, record, global_epoch=global_epoch):
+        return True
+    if not await session_seal_ok_async(sealer, session) or not await user_seal_ok_async(
+        sealer, record
     ):
         return True
+    return _factor_unproven(session, record, passkeys)
+
+
+def _session_may_bind(
+    session: SessionRecord | None, record: UserAuthzRecord, *, global_epoch: int
+) -> TypeGuard[SessionRecord]:
+    """The seal-free half of :func:`session_owes_unproven_factor`'s fail-closed test: a session
+    that exists, is live, belongs to ``record``'s account and carries current epochs."""
+    return (
+        session is not None
+        and session.revoked_at is None
+        and session.user_id == record.row.id
+        and session_epochs_current(
+            session, user_epoch=record.row.session_epoch, global_epoch=global_epoch
+        )
+    )
+
+
+def _factor_unproven(
+    session: SessionRecord, record: UserAuthzRecord, passkeys: Sequence[WebAuthnCredential]
+) -> bool:
+    """Whether the account holds a factor ``session`` has not proven, for a sealed session."""
     if session.mfa_verified_at is not None:
         return False
     return record.row.totp_enabled or record.row.cred_digest != "" or bool(passkeys)
@@ -2776,6 +3560,20 @@ def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRec
     return record.changed(authz_seal=seal)
 
 
+async def seal_user_async(sealer: AnyRowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
+    """:func:`seal_user`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    seal = "" if sealer is None else await sealer.seal_async(USER_KIND, record.seal_fields())
+    return record.changed(authz_seal=seal)
+
+
+async def require_user_seal_for_write(sealer: AnyRowSealer | None, record: UserAuthzRecord) -> None:
+    """Refuse a write over ``record`` unless its seal holds under a held key: the write path's form
+    of :func:`user_seal_ok`, a value the encoder cannot read failing too (ADR 0217 (c) step 1)."""
+    await require_seal_for_write(
+        sealer, USER_KIND, record.seal_fields(), record.row.authz_seal, subject=""
+    )
+
+
 def user_seal_ok(sealer: RowSealer | None, record: UserAuthzRecord) -> bool:
     """Whether ``record`` carries a valid seal under a key this process holds. Always True with no
     sealer: a store that holds no key writes and checks no seals. With one, a missing or empty seal
@@ -2786,6 +3584,11 @@ def user_seal_ok(sealer: RowSealer | None, record: UserAuthzRecord) -> bool:
         return sealer.verify_held(USER_KIND, record.seal_fields(), record.row.authz_seal)
     except TypeError:
         return False
+
+
+async def user_seal_ok_async(sealer: AnyRowSealer | None, record: UserAuthzRecord) -> bool:
+    """:func:`user_seal_ok`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    return await _held_seal_ok(sealer, USER_KIND, record.seal_fields(), record.row.authz_seal)
 
 
 @dataclass(frozen=True)
@@ -3382,8 +4185,8 @@ _SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
 def passkey_cell_undecodable(exc: BaseException) -> bool:
     """Whether ``exc`` is a driver failing to decode a passkey cell while fetching, before any row
     is parsed: pyodbc's ``UnicodeDecodeError``, or sqlite3's ``OperationalError`` told apart only by
-    its message (:func:`escalation_passkeys`). Every reader that counts such a set for nothing
-    asks it."""
+    its message. :func:`passkeys_or_none`, and every other reader that counts such a set for
+    nothing, asks it."""
     if isinstance(exc, UnicodeDecodeError):
         return True
     return isinstance(exc, sqlite3.OperationalError) and str(exc).startswith(_SQLITE_DECODE_FAILURE)
@@ -3420,6 +4223,21 @@ async def escalation_passkeys(
     record = await read_record()
     if record is None or not sets_a_later_sign_in_lock(record.row, threshold, now):
         return None
+    return await passkeys_or_none(
+        read_passkeys, record.row.id, "its sign-in lock keeps its fixed length"
+    )
+
+
+async def passkeys_or_none(
+    read_passkeys: Callable[[], Awaitable[list[WebAuthnCredential]]],
+    user_id: str,
+    outcome: str,
+) -> list[WebAuthnCredential] | None:
+    """The passkey set ``read_passkeys`` reads for ``user_id``, or ``None`` where it cannot be
+    read: a row that does not parse (:class:`PasskeyRowMalformed`), or a cell the driver cannot
+    decode while fetching (:func:`passkey_cell_undecodable`). Logged as a warning naming the
+    account, the failure's class and ``outcome``, what the caller does instead. Any other error is
+    raised."""
     try:
         return await read_passkeys()
     except PasskeyRowMalformed as exc:
@@ -3432,11 +4250,7 @@ async def escalation_passkeys(
             raise
         failure = type(exc).__name__
     # The class name only: a decode error's message and arguments quote the cell.
-    log.warning(
-        "the passkeys of user %s could not be read (%s); its sign-in lock keeps its fixed length",
-        record.row.id,
-        failure,
-    )
+    log.warning("the passkeys of user %s could not be read (%s); %s", user_id, failure, outcome)
     return None
 
 
@@ -3513,6 +4327,33 @@ def removal_keeps_way_past(
     trusted = not sealed or passkey_digest(passkeys) == row.cred_digest
     counts = passkey_counts or passkey_is_way_past
     return trusted and any(counts(c) for c in remaining)
+
+
+async def way_past_passkeys(
+    record: UserAuthzRecord | None,
+    read_passkeys: Callable[[], Awaitable[list[WebAuthnCredential]]],
+    *,
+    totp_counts: TotpCounts | None,
+    drop_totp: bool = False,
+) -> list[WebAuthnCredential]:
+    """The passkey set a conditional write's way-past rule is given (:func:`holds_way_past`,
+    :func:`removal_keeps_way_past`, :func:`totp_removal`), read under the write's lock after
+    ``record``, the account row that lock holds (BACKLOG #3948 step 7).
+
+    Where the write keeps the TOTP (not ``drop_totp``) and ``totp_counts`` counts it on ``record``,
+    the rule passes on the TOTP alone, so no passkey is read for it: a set that cannot be read
+    must not refuse a write the TOTP already allows. A write that reads the set for its own sake
+    still does (the passkey delete re-seals over the new set). A TOTP judged before the lock that no longer counts
+    under it (:meth:`TotpJudgement.moved`) falls back to the read. Where the write removes the TOTP
+    (``drop_totp``) it is the other way round: the passkeys matter only while that TOTP counts
+    (:func:`totp_removal`), so only then are they read. A set that cannot be read
+    (:func:`passkeys_or_none`) is empty here, so it counts as no way past, whatever the seal."""
+    if record is None or bool(_totp_is_way_past(record, totp_counts)) != bool(drop_totp):
+        return []
+    read = await passkeys_or_none(
+        read_passkeys, record.row.id, "it counts as no way past the sign-in lock"
+    )
+    return [] if read is None else read
 
 
 def totp_removal(
@@ -4086,7 +4927,7 @@ def report_unsealed_users(count: int) -> None:
 
 
 def rotation_reseal(
-    sealer: RowSealer, active_prefix: str, reencrypt: Callable[[str, bytes], str]
+    sealer: AnyRowSealer, active_prefix: str, reencrypt: Callable[[str, bytes], str]
 ) -> UserChange:
     """``rotate-key``'s change to one user record (BACKLOG #2592): the TOTP secret re-encrypted under
     the active key when it is not already, and the record re-sealed under the active key. The seal
@@ -4115,6 +4956,67 @@ def report_refused_role_holder() -> None:
     log.warning(
         "a holder of a deleted custom role failed its integrity seal; its role row was removed"
         " and nothing was re-sealed (BACKLOG #2592)"
+    )
+
+
+#: The sealed columns ``rotate-key``'s re-seal passes move to the active key, as ``(table, column,
+#: filter)``, read back after the passes (vault BACKLOG #5635). Approvals are the open ones alone,
+#: as ``count_unsealed_approvals`` counts them: a decided request releases nothing, so a seal on
+#: one must not hold a rotation open. Constants, never input, so :func:`unrotated_seal_queries`
+#: formats them into SQL.
+RESEALED_SEAL_COLUMNS: Final = (
+    ("users", "authz_seal", ""),
+    ("roles", "seal", ""),
+    ("pending_approvals", "seal", " AND status IN ('pending', 'executing', 'interrupted')"),
+    ("authority_set_seal", "seal", ""),
+)
+
+
+def unheld_seal_refusal(outcome: ResealOutcome, *, before_writes: bool) -> CipherError:
+    """The refusal ``reencrypt_to_active`` raises when a user, role, open approval or directory-map
+    seal names a key this run does not hold (vault BACKLOG #5635). Going on would re-encrypt such a
+    user's TOTP secret, which the user's seal covers, and leave the record verifying under no key.
+    A ``CipherError``, as a cell no supplied key opens is, so ``rotate-key`` aborts with exit 1,
+    rolls no audit range, writes no stamp and leaves its rotation record open.
+
+    ``before_writes`` says which check fired. The pre-flight read runs before any re-seal or cell
+    pass writes. The passes never write over a seal under a key the run does not hold, so with
+    nothing else writing it sees every such seal. The check after the passes reads the tables it
+    checks once. The reads and the passes are separate transactions, so neither read is atomic
+    against a writer running alongside, such as an engine left running. A seal such a writer
+    commits during the run may be missed, or counted refused, rather than stopping the run. The
+    text names only tables and non-secret seal key ids."""
+    done = (
+        "Nothing was written by this pass: the check ran before any re-seal or re-encryption."
+        if before_writes
+        else "The re-seal passes had already committed re-seals and TOTP re-encryptions under the "
+        "active key, so keep that key; no other cell was re-encrypted. A seal appearing after "
+        "the passes means something else wrote to the store during this run: stop it first."
+    )
+    return CipherError(
+        f"{outcome.unheld} user, role, open approval or directory-map record(s) in "
+        f"{', '.join(outcome.unheld_tables)} name a seal key this run does not hold (seal key "
+        f"id(s) {', '.join(outcome.unheld_key_ids)}; each such seal starts mfseal:v1:<id>:), so "
+        f"they were not re-sealed. {done} The causes include at least a prior "
+        "key that was not supplied, a key that is lost, and a seal written outside the store. "
+        "Supply the prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED and re-run; where no key "
+        "you hold opens the record, recreate or remove it, then re-run"
+    )
+
+
+def unrotated_seal_queries(placeholder: str, *, collate: str = "") -> tuple[tuple[str, str], ...]:
+    """``(table, SELECT)`` for each of :data:`RESEALED_SEAL_COLUMNS`: its seals that are not blank
+    and do not name the active key, whose ``LIKE`` pattern the one ``placeholder`` takes. Each
+    backend runs these after its re-seal passes and hands the rows to ``classify_unrotated``.
+    ``collate`` is SQL Server's binary collation. The filter only saves work, and does not
+    mirror each pass's own: ``classify_unrotated`` decides what counts."""
+    return tuple(
+        (
+            table,
+            f"SELECT {column} AS seal FROM {table} WHERE {column} <> ''"
+            f" AND {column}{collate} NOT LIKE {placeholder}{where}",
+        )
+        for table, column, where in RESEALED_SEAL_COLUMNS
     )
 
 
@@ -4169,7 +5071,9 @@ class UnknownRoleError(LookupError):
     Raised by each backend's ``_write_user`` for an id the write ADDS whose role was gone when the
     write read the ``roles`` table, so a role deleted after a caller's own check is not granted. A
     delete that commits after that read is refused instead by the ``user_roles`` foreign key, which
-    every backend has, as the driver's integrity error. Either way no record seals the id."""
+    every backend has, as the driver's integrity error. Either way no record seals the id. SQL
+    Server's ``_write_ad_map`` raises it too, through :func:`existing_role_pairs_only` (BACKLOG
+    #5725), where SQLite and Postgres raise their driver's integrity error from the map's key."""
 
     def __init__(self, role_ids: Sequence[str]) -> None:
         self.role_ids = tuple(role_ids)
@@ -4292,6 +5196,12 @@ def seal_role(sealer: RowSealer | None, row: RoleRow) -> RoleRow:
     return replace(row, seal="" if sealer is None else sealer.seal(ROLE_KIND, row.seal_fields()))
 
 
+async def seal_role_async(sealer: AnyRowSealer | None, row: RoleRow) -> RoleRow:
+    """:func:`seal_role`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    seal = "" if sealer is None else await sealer.seal_async(ROLE_KIND, row.seal_fields())
+    return replace(row, seal=seal)
+
+
 def role_seal_ok(sealer: RowSealer | None, row: RoleRow) -> bool:
     """Whether ``row`` carries a valid seal under a key this process holds. Always True with no
     sealer. With one, a missing or empty seal fails like a wrong one."""
@@ -4301,6 +5211,11 @@ def role_seal_ok(sealer: RowSealer | None, row: RoleRow) -> bool:
         return sealer.verify_held(ROLE_KIND, row.seal_fields(), row.seal)
     except TypeError:
         return False
+
+
+async def role_seal_ok_async(sealer: AnyRowSealer | None, row: RoleRow) -> bool:
+    """:func:`role_seal_ok`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    return await _held_seal_ok(sealer, ROLE_KIND, row.seal_fields(), row.seal)
 
 
 def ad_group_keys(groups: Iterable[str]) -> frozenset[str]:
@@ -4315,8 +5230,9 @@ class AdMap:
     ``name`` is the map (:data:`AD_MAPS`). ``pairs`` are sorted ``(ad_group, value)``, the value
     being a role id or a channel; the seal covers them and the name. ``missing`` names mapped role
     ids with no ``roles`` row when the role map was read. It is not sealed: it is read beside the
-    map so a deleted role is never handed out, on SQL Server especially, where the role map has no
-    role foreign key. The channel map's ``missing`` is always empty."""
+    map so a deleted role is never handed out, on SQL Server especially, where the role map's
+    foreign key is ``WITH NOCHECK`` and compares in the database collation, so the read matches a
+    role id exactly (BACKLOG #5725). The channel map's ``missing`` is always empty."""
 
     name: str
     pairs: tuple[tuple[str, str], ...] = ()
@@ -4337,7 +5253,9 @@ class AdMap:
     def from_entries(cls, name: str, entries: Iterable[tuple[str, str]]) -> AdMap:
         """The map an administrator's entries describe, as the map stores them: group names as
         :func:`ad_group_keys` keeps them. A channel is stripped and a blank one dropped; a role id
-        is kept as given, and an unknown one is refused by the roles foreign key."""
+        is kept as given, and an unknown one is refused at the write: by the roles foreign key on
+        SQLite and Postgres, and on SQL Server, whose case-insensitive collation that key cannot
+        rely on, by :func:`existing_role_pairs_only` before the key (BACKLOG #5725)."""
         if name == AD_SCOPE_MAP:
             entries = [(g, v.strip()) for g, v in entries if v.strip()]
         return cls.of(name, ((g.strip().lower(), v) for g, v in entries if g.strip()))
@@ -4389,8 +5307,17 @@ def ad_map_seal_ok(sealer: RowSealer | None, current: AdMap) -> bool:
         return False
 
 
+async def ad_map_seal_ok_async(sealer: AnyRowSealer | None, current: AdMap) -> bool:
+    """:func:`ad_map_seal_ok`, awaitable, for either sealer (ADR 0217 slice 1b). The empty map
+    stays exempt, as on ``main``; ADR 0217's sealed empty map is not built here."""
+    if not current.pairs:
+        return True
+    return await _held_seal_ok(sealer, ADSET_KIND, current.seal_fields(), current.seal)
+
+
 #: A write to one AD map, for a backend's ``_write_ad_map``: a whole replacement map, which keeps
-#: nothing stored and so is never refused, or an edit of the stored map, which is checked first.
+#: nothing stored and so is never refused over the stored map's seal, or an edit of the stored map,
+#: which is checked first. Either is refused for a role id that names no role (BACKLOG #5725).
 AdMapChange = AdMap | Callable[[AdMap], AdMap]
 
 
@@ -4409,10 +5336,68 @@ def ad_map_write(sealer: RowSealer | None, current: AdMap, change: AdMapChange) 
     else:
         changed = change(current)
     seal = "" if sealer is None else sealer.seal(ADSET_KIND, changed.seal_fields())
-    new = replace(changed, seal=seal)
+    return _ad_map_if_changed(current, replace(changed, seal=seal))
+
+
+async def ad_map_write_async(
+    sealer: AnyRowSealer | None, current: AdMap, change: AdMapChange
+) -> AdMap | None:
+    """:func:`ad_map_write`, awaitable, for either sealer (ADR 0217 slice 1b). An edit over a
+    stored map that fails is refused through :func:`require_seal_for_write`, which says with
+    what; the empty map stays exempt, as :func:`ad_map_seal_ok_async` says."""
+    if isinstance(change, AdMap):
+        changed = replace(change, name=current.name)
+    else:
+        if current.pairs:
+            await require_seal_for_write(
+                sealer, ADSET_KIND, current.seal_fields(), current.seal, subject=""
+            )
+        changed = change(current)
+    seal = "" if sealer is None else await sealer.seal_async(ADSET_KIND, changed.seal_fields())
+    return _ad_map_if_changed(current, replace(changed, seal=seal))
+
+
+def _ad_map_if_changed(current: AdMap, new: AdMap) -> AdMap | None:
+    """``new``, or ``None`` when it differs from ``current`` in neither pairs nor seal."""
     if new.pairs == current.pairs and new.seal == current.seal:
         return None
     return new
+
+
+def existing_role_pairs_only(
+    current: AdMap, change: AdMapChange, present: Iterable[str]
+) -> AdMapChange:
+    """``change`` to the role map with every role id that has no ``roles`` row handled, given the
+    ids that have one, compared EXACTLY (BACKLOG #5725). The role map's twin of
+    :func:`existing_roles_only`: a backend whose role foreign key cannot refuse every such id calls
+    it inside its ``_write_ad_map`` transaction, before the write seals anything.
+
+    A whole replacement, an administrator's save, naming any role id not in ``present`` raises
+    :class:`UnknownRoleError`, as the foreign key does on SQLite and Postgres, so neither a deleted
+    role's id nor a case or trailing-space variant of a live one is ever sealed in. An edit raises
+    for a pair it ADDS; a pair ``current`` already held is dropped instead: a row a deleted role, or
+    a write before this check, left behind, which grants nothing, and which an edit such as a role
+    delete or a key rotation's re-seal must not be refused over."""
+    held = frozenset(present)
+
+    def checked(new: AdMap, had: frozenset[tuple[str, str]]) -> AdMap:
+        added = sorted({pair[1] for pair in new.pairs if pair[1] not in held and pair not in had})
+        if added:
+            raise UnknownRoleError(added)
+        kept = tuple(pair for pair in new.pairs if pair[1] in held)
+        if len(kept) == len(new.pairs):
+            return new
+        log.warning(
+            "an AD role map write dropped %d pair(s) whose role id matches no role exactly"
+            " (BACKLOG #5725)",
+            len(new.pairs) - len(kept),
+        )
+        return replace(new, pairs=kept)
+
+    if isinstance(change, AdMap):
+        return checked(change, frozenset())
+    had = frozenset(current.pairs)
+    return lambda m: checked(change(m), had)
 
 
 class AdMapSql(NamedTuple):
@@ -4682,6 +5667,55 @@ def approval_seal_ok(sealer: RowSealer | None, row: ApprovalRow) -> bool:
         return False
 
 
+async def seal_approval_async(sealer: AnyRowSealer | None, row: ApprovalRow) -> ApprovalRow:
+    """:func:`seal_approval`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    seal = "" if sealer is None else await sealer.seal_async(APPROVAL_KIND, row.seal_fields())
+    return replace(row, seal=seal)
+
+
+async def approval_seal_ok_async(sealer: AnyRowSealer | None, row: ApprovalRow) -> bool:
+    """:func:`approval_seal_ok`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    return await _held_seal_ok(sealer, APPROVAL_KIND, row.seal_fields(), row.seal)
+
+
+async def approval_update_async(
+    sealer: AnyRowSealer | None, current: ApprovalRow, new: ApprovalRow
+) -> ApprovalRow:
+    """:func:`approval_update`, awaitable, for either sealer (ADR 0217 slice 1b): ``current`` is
+    refused, when its seal fails, by :func:`require_seal_for_write`, which says with what."""
+    await require_seal_for_write(
+        sealer, APPROVAL_KIND, current.seal_fields(), current.seal, subject=""
+    )
+    return await seal_approval_async(sealer, new)
+
+
+async def first_sealed_approval_async(
+    sealer: AnyRowSealer | None, rows: Iterable[ByName]
+) -> ApprovalRow | None:
+    """:func:`first_sealed_approval`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    failed = 0
+    for found in rows:
+        try:
+            row = ApprovalRow.from_mapping(found)
+        except RowSealError:
+            failed += 1
+            continue
+        if await approval_seal_ok_async(sealer, row):
+            return row
+        failed += 1
+    _report_unjoined_approvals(failed)
+    return None
+
+
+async def approval_fails_seal_async(sealer: AnyRowSealer | None, found: ByName) -> bool:
+    """:func:`approval_fails_seal`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    try:
+        row = ApprovalRow.from_mapping(found)
+    except RowSealError:
+        return True
+    return not await approval_seal_ok_async(sealer, row)
+
+
 def approval_update(
     sealer: RowSealer | None, current: ApprovalRow, new: ApprovalRow
 ) -> ApprovalRow:
@@ -4707,13 +5741,18 @@ def first_sealed_approval(sealer: RowSealer | None, rows: Iterable[ByName]) -> A
         if approval_seal_ok(sealer, row):
             return row
         failed += 1
+    _report_unjoined_approvals(failed)
+    return None
+
+
+def _report_unjoined_approvals(failed: int) -> None:
+    """Log the open repeat matches a join passed over for failing their seal, when there were any."""
     if failed:
         log.warning(
             "%d open dual-control request(s) matching a repeat failed their integrity seal and were"
             " not joined; the request was filed on its own (BACKLOG #2592)",
             failed,
         )
-    return None
 
 
 def approval_fails_seal(sealer: RowSealer | None, found: ByName) -> bool:
@@ -4767,6 +5806,23 @@ def held_approval_tombstone(sealer: RowSealer | None, found: ByName) -> tuple[st
     any other column, which the tombstone never vouched for, does not."""
     if sealer is None:
         return None
+    claim = _tombstone_claim(found)
+    if claim is None:
+        return None
+    fields, seal, approver, decided_at = claim
+    try:
+        held = sealer.verify_held(APPROVAL_TOMBSTONE_KIND, fields, seal)
+    except TypeError:
+        return None
+    return (approver, decided_at) if held else None
+
+
+def _tombstone_claim(
+    found: ByName,
+) -> tuple[tuple[tuple[str, object], ...], str, str, float] | None:
+    """What a ``rejected`` row claims its tombstone covers, with its seal, approver and decision
+    time, or ``None`` for a row that is not ``rejected`` or whose columns are not the types a
+    tombstone carries. The shared half of :func:`held_approval_tombstone` and its async twin."""
     try:
         approval_id, approver = found["id"], found["approver"]
         decided_at, seal = found["decided_at"], found["seal"]
@@ -4779,13 +5835,40 @@ def held_approval_tombstone(sealer: RowSealer | None, found: ByName) -> tuple[st
             or not isinstance(decided_at, int | float)
         ):
             return None
-        fields = approval_tombstone_fields(
-            approval_id, approver=approver, decided_at=float(decided_at)
-        )
-        held = sealer.verify_held(APPROVAL_TOMBSTONE_KIND, fields, seal)
+        when = float(decided_at)
+        fields = approval_tombstone_fields(approval_id, approver=approver, decided_at=when)
     except (IndexError, KeyError, TypeError, ValueError):
         return None
-    return (approver, float(decided_at)) if held else None
+    return fields, seal, approver, when
+
+
+async def approval_tombstone_async(
+    sealer: AnyRowSealer | None, approval_id: str, *, approver: str, decided_at: float
+) -> str:
+    """:func:`approval_tombstone`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    if sealer is None:
+        return ""
+    return await sealer.seal_async(
+        APPROVAL_TOMBSTONE_KIND,
+        approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at),
+    )
+
+
+async def held_approval_tombstone_async(
+    sealer: AnyRowSealer | None, found: ByName
+) -> tuple[str, float] | None:
+    """:func:`held_approval_tombstone`, awaitable, for either sealer (ADR 0217 slice 1b). A
+    Transit Unverifiable or Outage answer raises as itself, as every awaitable read check does."""
+    if sealer is None:
+        return None
+    claim = _tombstone_claim(found)
+    if claim is None:
+        return None
+    fields, seal, approver, decided_at = claim
+    # The claim's fields are two strings, a status and a float, so the encoder cannot refuse them:
+    # no TypeError is caught here, and one from past the encoder propagates as a defect.
+    held = await sealer.verify_held_async(APPROVAL_TOMBSTONE_KIND, fields, seal)
+    return (approver, decided_at) if held else None
 
 
 def report_unsealed_approvals(count: int) -> None:
@@ -4815,6 +5898,33 @@ def report_approval_reseal(resealed: int, refused: int) -> None:
 
 # PHI-at-rest encryption is the store's `_cipher` (messagefoundry.store.crypto): identity when no
 # key is configured, AES-256-GCM when MEFOR_STORE_ENCRYPTION_KEY is set. See STORE-1.
+
+
+def _audit_row_bytes(
+    prev_hash: str,
+    *,
+    seq: int,
+    ts: float,
+    actor: str | None,
+    action: str,
+    channel_id: str | None,
+    detail: str | None,
+    client: str | None,
+) -> bytes:
+    """The bytes :func:`audit_row_hash` MACs for one row: its eight typed fields, encoded. Raises
+    :class:`TypeError` on a value of a type no engine build writes."""
+    return encode_typed_fields(
+        (
+            ("seq", seq),
+            ("prev_hash", prev_hash),
+            ("ts", float(ts) if isinstance(ts, int) and not isinstance(ts, bool) else ts),
+            ("actor", actor),
+            ("action", action),
+            ("channel_id", channel_id),
+            ("detail", detail),
+            ("client", client),
+        )
+    )
 
 
 def audit_row_hash(
@@ -4857,17 +5967,15 @@ def audit_row_hash(
 
     ``ts`` is normalised to ``float``, so an integer timestamp a caller passed hashes as the float the
     column hands back."""
-    data = encode_typed_fields(
-        (
-            ("seq", seq),
-            ("prev_hash", prev_hash),
-            ("ts", float(ts) if isinstance(ts, int) and not isinstance(ts, bool) else ts),
-            ("actor", actor),
-            ("action", action),
-            ("channel_id", channel_id),
-            ("detail", detail),
-            ("client", client),
-        )
+    data = _audit_row_bytes(
+        prev_hash,
+        seq=seq,
+        ts=ts,
+        actor=actor,
+        action=action,
+        channel_id=channel_id,
+        detail=detail,
+        client=client,
     )
     if mac is not None:
         return mac(data)  # computed inside the isolated module (Transit); no in-heap key
@@ -5091,7 +6199,8 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     producible only from an empty log, so ``5:`` is a head the store can never emit and falls under the
     refusal above. Left accepted it parses to ``(5, "")``, which no intact chain can match — so a line
     truncated while being copied, or an anchor file caught half-written, would be reported as
-    ``truncated or rewritten`` on a chain nobody touched.
+    ``truncated or rewritten`` on a chain nobody touched. The converse holds too: a log with rows has
+    a newest seq of 1 or more, so ``0:<head>`` is refused for the same reason.
 
     IT LIVES HERE, BESIDE THE COMPARATORS AND THE PRODUCER, BECAUSE IT NOW HAS TWO CONSUMERS: the
     ``audit-verify`` CLI and the engine's ``[integrity].audit_anchor_file`` startup check (BACKLOG #328).
@@ -5122,6 +6231,14 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
                 text,
             )
         return count, head
+    if count == 0:
+        # The converse of the pairing above: a log with rows has a newest seq of 1 or more, so a head
+        # beside a zero count is one the store can never emit, and a comparator would report it as
+        # `truncated or rewritten` on an intact chain (vault BACKLOG #5987 item 1).
+        raise AuditAnchorError(
+            "a zero row count is only producible from an EMPTY log, so it cannot carry a head",
+            text,
+        )
     refusal, head = _audit_head_shape(head)
     if refusal is not None:
         raise AuditAnchorError(refusal, text)
@@ -5743,13 +6860,17 @@ class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
 
 
 class StoreCreateBatchFailedBeforeKeyUse(Exception):
-    """A minting open's create batch failed before its commit (PR 2804 hold 17). The batch is one
-    transaction on each server backend, and nothing is sealed under the store key before it commits:
-    the first seal follows ``bind_store_salt``, after the batch and the pin check, which only reads.
-    So nothing was sealed under the key, and a minting command may remove the key
-    it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the batch's own error,
-    also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller sees a
-    new class; a failure at or after the commit is never this."""
+    """A minting server open failed before anything was sealed under the store key: its create
+    batch failed before its commit (PR 2804 hold 17), or it failed while building its pool, before
+    the store that holds the cipher existed, with a class only a failed dial raises, at least the
+    hop's TLS settings, a refused address or a refused login (vault BACKLOG #8119 item 2;
+    ``store.base``'s ``_failed_before_connecting`` names them). The batch is one transaction on each server
+    backend, and the first seal follows ``bind_store_salt``, after the batch and after the pin
+    check, which only reads. So nothing was sealed under the key, and a minting command may remove
+    the key it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the open's own
+    error, also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller
+    sees a new class; a failure once the pin check has passed is never this, and any other failure
+    before it, a ``RuntimeError`` or a connection lost mid-open among them, keeps the key."""
 
     def __init__(self, failure: Exception) -> None:
         # The failure itself is the one argument, so a copy or an unpickle rebuilds it whole.
@@ -5762,6 +6883,26 @@ class StoreCreateBatchFailedBeforeKeyUse(Exception):
 #: than a parameter of each backend's open, as the hop posture is held during connector
 #: construction; ``None`` for every open that is not under the ``host`` key provider.
 OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
+
+
+class PinCheck:
+    """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`),
+    the last step before its first write under the store key. Under ``auto`` schema management the
+    open may already have committed its schema, and on SQL Server altered the database's options,
+    before it; neither is under the key. A mutable cell rather than a flag in a context variable,
+    so a pass recorded under a copied context still reaches the open that set it (vault BACKLOG
+    #8119 item 2)."""
+
+    __slots__ = ("passed",)
+
+    def __init__(self) -> None:
+        self.passed = False
+
+
+#: The cell ``store.base.open_store`` sets around a minting open's backend open; ``None`` otherwise.
+OPEN_STORE_PIN_CHECK: ContextVar[PinCheck | None] = ContextVar(
+    "mefor_open_store_pin_check", default=None
+)
 
 
 def minting_open() -> bool:
@@ -5892,6 +7033,8 @@ async def check_open_store_pin(host: AuditRangeHost) -> None:
         return
     refusal = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
     if refusal is None:
+        if (check := OPEN_STORE_PIN_CHECK.get()) is not None:
+            check.passed = True  # the open may write under the key from here on
         return
     refused = StoreChainNeverStarted if refusal.never_started else StoreIdPinRefusedBeforeWrite
     raise refused(f"refusing to open the store: {refusal.text}")
@@ -5918,26 +7061,47 @@ _AUDIT_CHAINED_COLUMNS: Final = ("ts", "actor", "action", "channel_id", "detail"
 
 
 def _audit_row_mac(
-    row: Mapping[str, Any], prev: Any, key: bytes | None, mac: AuditMacFn | None
+    row: Mapping[str, Any],
+    prev: Any,
+    key: bytes | None,
+    mac: AuditMacFn | None,
+    *,
+    in_walk: bool = False,
 ) -> str | None:
     """The hash ``row`` should carry, chained from ``prev``, or ``None`` when a chained column holds a
     value of a type no engine build writes -- which the walk reports as a break rather than raising.
 
-    A MAC provider is pinned to the Transit key version ``row``'s stored hash names
-    (:func:`_version_pinned_mac`), so a row sealed before a key rotation still verifies after it.
-    It may raise :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError`."""
-    if mac is not None:
-        mac = _version_pinned_mac(mac, row["row_hash"])
+    A MAC provider that checks a stored MAC itself
+    (:class:`~messagefoundry.store.crypto.AuditMacVerifier`, Transit's ``verify`` call) is asked
+    whether ``row``'s stored hash is the MAC of the row's bytes: the stored hash is returned when it
+    verifies, and ``None`` when it does not (BACKLOG #2720). No MAC is regenerated, so a row made
+    under an older Transit key version still verifies after the key rotates. That check may raise
+    :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError`.
+
+    A check that timed out on both asks
+    (:class:`~messagefoundry.store.crypto.AuditVerifyTimedOutError`) propagates only for the chain
+    walk (``in_walk``), where the walk could not run; every other caller, the store open among
+    them, reads it as ``None``, a MAC that does not verify, as before BACKLOG #8222."""
+    fields = {column: row[column] for column in _AUDIT_CHAINED_COLUMNS}
     try:
-        return audit_row_hash(
-            prev,
-            seq=row["seq"],
-            **{column: row[column] for column in _AUDIT_CHAINED_COLUMNS},
-            key=key,
-            mac=mac,
-        )
+        # `mac is None` first: the in-heap key path skips the Protocol check, which is not free.
+        if mac is None or not isinstance(mac, AuditMacVerifier):
+            return audit_row_hash(prev, seq=row["seq"], **fields, key=key, mac=mac)
+        data = _audit_row_bytes(prev, seq=row["seq"], **fields)
     except TypeError:
         return None
+    stored = row["row_hash"]
+    # A non-text hash is checked as the empty string, which is never a MAC, so it still costs the
+    # one round trip a malformed MAC does. `is True`: a truthy non-bool answer fails closed.
+    checked = stored if isinstance(stored, str) else ""
+    try:
+        verified = mac.verify(data, checked)
+    except AuditVerifyTimedOutError as exc:
+        if in_walk:
+            raise
+        log.warning("%s; read as a MAC that does not verify", exc)
+        return None
+    return stored if verified is True and checked else None
 
 
 def _audit_digest_line(r: Mapping[str, Any]) -> bytes:
@@ -6085,6 +7249,28 @@ def _audit_tag_ok(epoch: AuditEpoch, secret: tuple[bytes | None, AuditMacFn | No
     return hmac.compare_digest(audit_mac_bytes(epoch.handover), audit_mac_bytes(expected))
 
 
+def _handover_tag_ok(
+    epoch: AuditEpoch, secret: tuple[bytes | None, AuditMacFn | None], seq: object
+) -> bool:
+    """:func:`_audit_tag_ok` for the range row at ``seq`` in the chain walk: a provider reply that
+    is a non-empty string but no well-formed MAC
+    (:class:`~messagefoundry.store.crypto.AuditMacMalformedError`) is logged and read as a tag that
+    does not match, a break at that row (BACKLOG #8222). Any other provider failure propagates.
+    The store open (``settle_audit_ranges``) calls :func:`_audit_tag_ok` itself, so there the same
+    reply still refuses the open; that path is unruled and on the owner's queue. Where the open's
+    check reaches such a row and refuses, no walk runs, so this reading is not seen there."""
+    try:
+        return _audit_tag_ok(epoch, secret)
+    except AuditMacMalformedError as exc:
+        log.warning(
+            "the MAC provider answered the handover tag of the audit key-range row at seq=%s with "
+            "no well-formed MAC; read as a tag that does not match: %s",
+            seq,
+            exc,
+        )
+        return False
+
+
 #: Why a keyed process reports a chain with no genesis row at sequence number 1.
 _AUDIT_NO_GENESIS: Final = (
     "the chain does not open with a genesis row naming its key; a store that holds a key requires "
@@ -6203,10 +7389,21 @@ def verify_audit_rows(
     a Transit round trip, so K walks would cost K times N of them. Keyed on ``seq``, the chain's own
     coordinate, never on the row id, which can skip numbers.
 
-    **Constant-time, full-walk (ASVS 11.2.4)**, as before: every row MAC is compared with
-    :func:`hmac.compare_digest` over :func:`audit_mac_bytes`, the walk always runs to completion, and
-    the first divergent position is reported after it. A structural break is reported at its own
-    position, with the reason."""
+    **Constant-time, full-walk (ASVS 11.2.4)**: a keyless SHA-256 row hash, a row MAC recomputed
+    under an in-heap key, and one from a plain :data:`AuditMacFn` that does not check a stored MAC
+    itself are compared with the stored hash in the engine by :func:`hmac.compare_digest` over
+    :func:`audit_mac_bytes`. A plain provider may compute its MAC outside the engine; the shipped
+    ``vault_transit`` cipher passes an :class:`~messagefoundry.store.crypto.AuditMacVerifier`
+    instead (``TransitCipher.audit_mac_fn``). Under ``vault_transit`` the compare of
+    a row MAC is Transit's own ``verify`` call, made inside Vault (:func:`_audit_row_mac`); the
+    ``compare_digest`` the walk still runs there sets the stored hash beside itself, or beside
+    ``None`` when Transit did not verify it, and decides nothing. A break does not end the walk:
+    it runs on, and the first divergent position is reported after it. A MAC call that raises
+    anything but :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError` ends the walk
+    with that error, so the walk could not run, except that a range row's handover-tag MAC
+    raising :class:`~messagefoundry.store.crypto.AuditMacMalformedError` is a logged break at that
+    row (BACKLOG #8222). A structural break is
+    reported at its own position, with the reason."""
     # The row AT seq 1, not the row that sorts first, which is the rule the open applies too
     # (``load_audit_chain``). A row added below the genesis row must not change what the chain is:
     # with a key in hand it would leave every row's MAC uncompared, and with none it would make a
@@ -6322,7 +7519,7 @@ def verify_audit_rows(
         refused: str | None = None
         if held:
             try:
-                expected = _audit_row_mac(r, prev, key, mac)
+                expected = _audit_row_mac(r, prev, key, mac, in_walk=True)
             except AuditKeyVersionRefusedError as exc:  # a break at this row; the walk goes on
                 expected, refused = None, str(exc)
         else:
@@ -6383,7 +7580,7 @@ def verify_audit_rows(
                 )
             )
         out_secret = _audit_secret_for(outgoing, mac_keys, mac_fn)
-        if out_secret is not None and not _audit_tag_ok(epoch, out_secret):
+        if out_secret is not None and not _handover_tag_ok(epoch, out_secret, pos):
             breaks.append(
                 (
                     pos,
@@ -8196,7 +9393,9 @@ class AuditAppend:
 
     For a record that must not outlive, or be outlived by, the row it describes. Written as a
     second call, a crash between the two kept the change and lost its record. At least these take
-    them: ``create_user`` and ``update_user_profile`` (BACKLOG #2221), the operator mutations
+    them: ``create_user``, ``update_user_profile``, ``set_user_roles`` and
+    ``remove_unless_last_admin`` (BACKLOG #2221), ``revoke_user_sessions`` through an
+    :data:`OperatorAudit` (BACKLOG #3018 step 4), the operator mutations
     through an :data:`OperatorAudit` (BACKLOG #2624), the four operator alert mutations (vault
     BACKLOG #3217), a dual-control request and its transitions (vault BACKLOG #2255), and
     ``replace_totp_enrolment`` (ADR 0171 Amendment B). Each joins the hash chain
@@ -8286,6 +9485,15 @@ row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock
 not read chain state."""
 
 
+def no_audit_row(_result: object) -> None:
+    """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
+
+    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Most of its callers end the sessions
+    as the tail of a change that carries its own row, such as a password reset or a disable, so the
+    revoke has nothing of its own to record."""
+    return None
+
+
 #: The columns every backend reads a ``transit_bound_attestation`` row by (BACKLOG #2337).
 TRANSIT_ATTESTATION_COLUMNS: Final = "key_name, reason, actor, attested_at, audit_seq, audit_hash"
 
@@ -8342,43 +9550,70 @@ def transit_withdrawn_audit(
     return AuditAppend(TRANSIT_BOUND_WITHDRAWN_ACTION, actor=actor, detail=json.dumps(detail))
 
 
-#: Transit's HMAC string names the key version that made it: ``vault:v<N>:<base64>``.
-_TRANSIT_MAC_VERSION: Final = re.compile(r"vault:v([1-9][0-9]{0,9}):")
-
-
-def _version_pinned_mac(mac: AuditMacFn, stored: object) -> AuditMacFn:
-    """``mac`` pinned to the Transit key version ``stored`` was made under, or ``mac`` unchanged
-    when ``stored`` names no version.
-
-    Transit's ``generate_hmac`` uses the key's LATEST version unless told otherwise. So after the
-    operator rotates the key, as the attestation says they will, an unpinned recompute yields
-    ``vault:v2:...`` against a stored ``vault:v1:...`` and the attestation reads as forged. Pinning
-    keeps the check exact: the recompute still runs inside Transit under the stored version's key,
-    so a writer without Transit access still cannot forge a match. A provider whose signature takes
-    no ``key_version`` (a plain ``Callable[[bytes], str]``) is returned unpinned, as before."""
-    match = _TRANSIT_MAC_VERSION.match(stored) if isinstance(stored, str) else None
-    if match is None:
-        return mac
-    try:
-        pinnable = "key_version" in inspect.signature(mac).parameters
-    except (TypeError, ValueError):  # a builtin or C callable with no introspectable signature
-        pinnable = False
-    if not pinnable:
-        return mac
-    version = int(match.group(1))
-    versioned = cast("Callable[..., str]", mac)
-
-    def pinned(data: bytes) -> str:
-        return versioned(data, key_version=version)
-
-    return pinned
-
-
 #: One read for :func:`load_transit_bound_attestation`: ``(sql, params) -> row or None``. ``sql``
 #: carries ``?`` placeholders; the Postgres store rewrites them to ``$n`` before it runs.
 type TransitAttestationFetch = Callable[
     [str, tuple[object, ...]], Awaitable[Mapping[str, Any] | None]
 ]
+
+
+#: How many statements :func:`_exact_audit_row` may issue before it fails closed (BACKLOG #5726).
+#: A variant row needs a write outside the engine or an account whose name differs only in case,
+#: so a lookup that meets this many is refused rather than walked further.
+_EXACT_AUDIT_WALK_STEPS: Final = 64
+
+
+async def _exact_audit_row(
+    fetch: TransitAttestationFetch,
+    columns: str,
+    where: str,
+    params: tuple[object, ...],
+    exact: Callable[[Mapping[str, Any]], bool],
+    *,
+    above: int | None = None,
+    at_most: int | None = None,
+) -> Mapping[str, Any] | None:
+    """The newest ``audit_log`` row numbered above ``above`` and at most ``at_most`` that matches
+    ``where`` EXACTLY, read through ``fetch``.
+
+    BACKLOG #5726: ``where`` compares text in the database collation, which on SQL Server folds
+    case and pads trailing spaces, so ``MAX(seq)`` alone could pick a variant row (another account
+    whose name differs only in case, or a row written outside the engine) and shadow the row the
+    caller wants, refusing genuine evidence. Each row ``where`` finds is therefore checked with
+    ``exact`` in Python, and a variant is stepped past, one indexed lookup each, until an exact
+    row or none is left: one more statement per variant row, each an aggregate over the rows
+    ``where`` matches. The bound moves strictly every step, so the walk ends. On SQLite and
+    Postgres, which compare exactly, the first row is the answer.
+
+    A variant row whose ``seq`` is not an integer is RETURNED, not stepped past or read as none:
+    every caller rechecks the row exactly and refuses it, so a malformed read fails closed, and the
+    supersession check, for which "no row" means "nothing supersedes", never fails open. So is the
+    last variant row once :data:`_EXACT_AUDIT_WALK_STEPS` statements are spent: anyone who can
+    write ``audit_log`` could otherwise make one lookup issue a statement per planted row."""
+    hi = at_most
+    row: Mapping[str, Any] | None = None
+    for _ in range(_EXACT_AUDIT_WALK_STEPS):
+        conds, args = [where], list(params)
+        if above is not None:
+            conds.append("seq > ?")
+            args.append(above)
+        if hi is not None:
+            conds.append("seq <= ?")
+            args.append(hi)
+        row = await fetch(
+            f"SELECT {columns} FROM audit_log WHERE seq ="
+            f" (SELECT MAX(seq) FROM audit_log WHERE {' AND '.join(conds)})",
+            tuple(args),
+        )
+        if row is None or exact(row):
+            return row
+        seq = _strict_int(row["seq"])
+        if seq is None:
+            return row
+        hi = seq - 1
+        if above is not None and hi <= above:
+            return None
+    return row  # the walk's budget is spent on variants: fail closed, as above
 
 
 @dataclass(frozen=True, slots=True)
@@ -8429,11 +9664,11 @@ async def settle_transit_bound_attestation(
     """``read``'s attestation, with ``audit_gap`` set when its audit row's MAC does not verify.
 
     ``None`` when no row is recorded. The check reuses the chain's own pieces: the row MAC
-    (:func:`_audit_row_mac`, under the key of the row's range and the Transit key version its hash
-    names) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC provider
-    runs off the event loop, because it is a blocking Vault call. A Transit refusal of that call,
-    such as a key version a forged hash names that does not exist, reads as a gap, not an error, so
-    a row anyone with DML wrote cannot stop a ``warn`` start."""
+    (:func:`_audit_row_mac`, under the key of the row's range, by Transit's own ``verify`` for a
+    Transit MAC) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC
+    provider runs off the event loop, because it is a blocking Vault call. A Transit refusal of
+    that call, such as a key version a forged hash names that does not exist, reads as a gap, not
+    an error, so a row anyone with DML wrote cannot stop a ``warn`` start."""
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
@@ -8473,12 +9708,18 @@ async def _transit_attestation_audit_gap(
     if audit["action"] != TRANSIT_BOUND_ATTESTED_ACTION:
         return f"audit row {seq} is not an attestation"
     # The newest attest-or-withdraw row must be this one, so a row replayed after a withdraw, or
-    # after a later attestation, does not count.
-    newest = await fetch(
-        "SELECT MAX(seq) AS newest FROM audit_log WHERE action IN (?, ?)",
-        (TRANSIT_BOUND_ATTESTED_ACTION, TRANSIT_BOUND_WITHDRAWN_ACTION),
+    # after a later attestation, does not count. Read as "no such row above it", matched exactly,
+    # so a padded or case-variant action above it does not count either (BACKLOG #5726).
+    marks = (TRANSIT_BOUND_ATTESTED_ACTION, TRANSIT_BOUND_WITHDRAWN_ACTION)
+    later = await _exact_audit_row(
+        fetch,
+        "seq, action",
+        "action IN (?, ?)",
+        marks,
+        lambda r: r["action"] in marks,
+        above=seq,
     )
-    if newest is None or _strict_int(newest["newest"]) != seq:
+    if later is not None:
         return f"a later attest or withdraw audit row supersedes audit row {seq}"
     try:
         detail = json.loads(audit["detail"] or "")
@@ -8523,11 +9764,17 @@ async def _audit_row_mac_check(
         if before is None:
             return f"audit row {seq - 1}, which audit row {seq} chains from, is missing"
         prev = before["row_hash"]
-    # The key of the row's own range: the newest genesis or range row at or below it.
-    opening = await fetch(
-        "SELECT seq, action, detail FROM audit_log WHERE seq ="
-        " (SELECT MAX(seq) FROM audit_log WHERE action = ? AND seq <= ?)",
-        (AUDIT_KEY_EPOCH_ACTION, seq),
+    # The key of the row's own range: the newest genesis or range row at or below it, its action
+    # matched exactly so a variant row cannot shadow it (BACKLOG #5726).
+    opening = await _exact_audit_row(
+        fetch,
+        "seq, action, detail",
+        "action = ?",
+        (AUDIT_KEY_EPOCH_ACTION,),
+        lambda r: r["action"] == AUDIT_KEY_EPOCH_ACTION,
+        # Never below the genesis position: a planted row numbered 0 or less is no range opening.
+        above=0,
+        at_most=seq,
     )
     key_id: str | None = None
     scheme: AuditScheme | None = None
@@ -8603,15 +9850,20 @@ async def read_newest_keyed_audit_row(
     :func:`settle_newest_keyed_audit_row` once the read is released."""
     if active_key_id is None:
         return None
-    audit = await fetch(
-        "SELECT seq, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
-        " WHERE seq = (SELECT MAX(seq) FROM audit_log WHERE action = ? AND actor = ? AND seq > ?)",
-        (action, actor, after_seq),
+    # A padding or case-folding collation must not widen the query, nor let a variant row (an
+    # account whose name differs only in case) shadow the actor's own newer row (BACKLOG #5726).
+    audit = await _exact_audit_row(
+        fetch,
+        "seq, ts, actor, action, channel_id, detail, client, row_hash",
+        "action = ? AND actor = ?",
+        (action, actor),
+        lambda r: r["action"] == action and r["actor"] == actor,
+        above=after_seq,
     )
     if audit is None:
         return None
     seq = _strict_int(audit["seq"])
-    # Matched again here, exactly: a padding or case-folding collation must not widen the query.
+    # Matched again here, exactly, whatever the walk above returned.
     if seq is None or seq <= after_seq or audit["action"] != action or audit["actor"] != actor:
         return None
     found = await _audit_row_mac_check(
@@ -9183,7 +10435,8 @@ CREATE TABLE IF NOT EXISTS queue (
     next_attempt_at  REAL NOT NULL,
     last_error       TEXT,
     created_at       REAL NOT NULL,
-    updated_at       REAL NOT NULL
+    updated_at       REAL NOT NULL,
+    worker_deaths    INTEGER NOT NULL DEFAULT 0  -- passes that killed their worker (#4607 step 6)
 );
 -- Claim hot path (claim_ready), per stage:
 CREATE INDEX IF NOT EXISTS ix_queue_ready ON queue(stage, status, next_attempt_at);
@@ -9968,6 +11221,8 @@ class MessageStore:
     # check_reference_backend_supported).
     supports_reference_sets = True
     backend = StoreBackend.SQLITE
+    # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
+    _reseal_outcome: ResealOutcome = ResealOutcome()
 
     def __init__(
         self,
@@ -10008,9 +11263,11 @@ class MessageStore:
         # BACKLOG #2592: the row sealer, fixed for the handle's life like the cipher. None when the
         # cipher holds no in-process authorization root (keyless), and then no seal is written or
         # checked.
-        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
-        # ADR 0196: set when this store's open failed to bind its salt into the cipher. That cipher
-        # may already count for another store, so close() must not settle its reserve here.
+        self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
+        self._seal_pager = SealPager()
+        # ADR 0196: True from the start of a writable open until it binds this store's salt into
+        # the cipher (BACKLOG #5720). Until then the cipher may count for another store, or for
+        # none, so close() must not settle its reserve here.
         self._cipher_foreign = False
         # BACKLOG #1780: set by open(read_only=True). The handle is `mode=ro`, so it writes nothing
         # at open or at close: no salt, no invocation reserve, no audit genesis row.
@@ -10162,10 +11419,16 @@ class MessageStore:
         """This store's LIVE at-rest cipher — see :meth:`messagefoundry.store.base.Store.cipher`."""
         return self._cipher
 
-    def row_sealer(self) -> RowSealer | None:
+    def row_sealer(self) -> AnyRowSealer | None:
         """This store's row sealer, or ``None`` on a keyless store. See
         :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
         return self._row_sealer
+
+    def seal_pager(self) -> SealPager:
+        """This store's seal page (decision d20261109T200352805-599b24 on ADR 0217, item 5). The
+        engine, the serve lifespan and ``admin-revoke-sessions`` arm it on their alert sink; each
+        disarms only its own registration."""
+        return self._seal_pager
 
     def _decode_row(
         self, row: aiosqlite.Row, table: str, pk: tuple[object, ...], *columns: str
@@ -10217,6 +11480,7 @@ class MessageStore:
         the pipeline, and loading them decrypts every cell, which refuses a legacy plaintext value
         the writable open would have sealed first. ``state_get`` and ``reference_view`` therefore
         read empty there. The audit chain's state is loaded, because the audit reads need it."""
+        cancels_before = cancels_at_entry()  # BACKLOG #5720: only this open's cancels
         sync = synchronous.upper()
         if sync not in ("NORMAL", "FULL"):
             raise ValueError(
@@ -10274,15 +11538,15 @@ class MessageStore:
             )
             store._read_only = read_only
             if not read_only:
+                # Foreign until the bind below holds: close() must not settle a cipher this open
+                # has not bound, a failure before the bind included (BACKLOG #5720).
+                store._cipher_foreign = True
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
-                try:
-                    await bind_store_salt(cipher, store._ensure_store_salt)
-                except BaseException:
-                    store._cipher_foreign = True
-                    raise
+                await bind_store_salt(cipher, store._ensure_store_salt)
+                store._cipher_foreign = False
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -10309,26 +11573,56 @@ class MessageStore:
             if store._group_commit is not None:
                 store._group_commit.start()  # spin the committer coroutine (needs the running loop)
             return store
-        except BaseException:
+        except BaseException as exc:
             # Close the store when one was constructed — it owns the read pool's connections too,
             # each with its own worker thread — then the writer either way. `Connection.close` is
             # idempotent (it returns immediately once the connection is gone), so the second call
             # after a successful `store.close()` is a no-op. Both are best-effort: a failure while
-            # cleaning up must never replace the error the caller needs to see.
-            if store is not None:
+            # cleaning up must never replace the error the caller needs to see, so each is logged
+            # by class (vault BACKLOG #3054). Run to completion, so a cancel cannot cut it short
+            # and leave a non-daemon worker thread behind (BACKLOG #5720).
+            async def _close_writer() -> None:
                 try:
-                    await store.close()
-                except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
-                    log.warning("error closing a partially-opened store", exc_info=True)
-            try:
-                await db.close()
-                # `close` returns before the worker thread it stops has left `threading.enumerate()`
-                # (see :func:`_await_connection_worker_exit`). A failed open is the shortest path
-                # there is — one PRAGMA, then straight out — so the caller most often wins that race
-                # here, and the caller of a raising `open` is entitled to find nothing left behind.
-                await _await_connection_worker_exit(db)
-            except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
-                log.warning("error closing the connection after a failed store open", exc_info=True)
+                    await db.close()
+                    # `close` returns before the worker thread it stops has left
+                    # `threading.enumerate()` (see :func:`_await_connection_worker_exit`). A failed
+                    # open is the shortest path there is — one PRAGMA, then straight out — so the
+                    # caller most often wins that race here, and the caller of a raising `open` is
+                    # entitled to find nothing left behind.
+                    await _await_connection_worker_exit(db)
+                except Exception as failure:  # noqa: BLE001 — never mask the real failure
+                    log.warning(
+                        "error closing the connection after a failed store open (%s)",
+                        type(failure).__name__,
+                    )
+
+            async def _release() -> None:
+                try:
+                    if store is not None:
+                        try:
+                            await store.close()
+                        except Exception as failure:  # noqa: BLE001 — never mask the real failure
+                            log.warning(
+                                "error closing a partially-opened store (%s)",
+                                type(failure).__name__,
+                            )
+                finally:
+                    # Whatever store.close() raised, a cancel included (BACKLOG #5720).
+                    await _close_writer()
+
+            # Read now: close() empties the list, and a forced release must still reach each one.
+            conns = [*(store._read_conns if store is not None else ()), db]
+
+            def _force_release() -> None:
+                # interrupt() aborts a statement the worker is running, so the close stop()
+                # queues behind it is reached; stop() does not await it (BACKLOG #5720).
+                for conn in conns:
+                    raw = getattr(conn, "_connection", None)
+                    if raw is not None:
+                        _force_failed_open_release(raw.interrupt)
+                    _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+
+            await cleanup_failed_open(exc, _release, _force_release, cancels_before=cancels_before)
             raise
 
     @classmethod
@@ -10443,10 +11737,12 @@ class MessageStore:
                 conn = await aiosqlite.connect(uri, uri=True)
             else:
                 conn = await aiosqlite.connect(path)
+            # Tracked before its first PRAGMA, so close() reaches it, and its non-daemon worker
+            # thread, when a PRAGMA fails (BACKLOG #5720).
+            self._read_conns.append(conn)
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA query_only=ON")  # defence in depth: a read conn never writes
             await conn.execute("PRAGMA busy_timeout=5000")
-            self._read_conns.append(conn)
             pool.put_nowait(conn)
         self._read_pool = pool
 
@@ -10976,21 +12272,24 @@ class MessageStore:
                 rows = list(await cur.fetchall())
                 if not rows:
                     break
+                # One batch per page, so a Transit cipher seals it in few requests (BACKLOG #6706).
+                sealed_values = encrypt_many(
+                    self._cipher,
+                    [
+                        (
+                            r["v"],
+                            aad_of(r)
+                            if aad_of is not None
+                            else cell_aad(table, column, *(r[c] for c in aad_cols)),
+                        )
+                        for r in rows
+                    ],
+                )
                 await self._db.executemany(
                     f"UPDATE {table} SET {column}=? WHERE {where_keys}",
                     [
-                        (
-                            self._cipher.encrypt(
-                                r["v"],
-                                aad=(
-                                    aad_of(r)
-                                    if aad_of is not None
-                                    else cell_aad(table, column, *(r[c] for c in aad_cols))
-                                ),
-                            ),
-                            *(r[c] for c in keys),
-                        )
-                        for r in rows
+                        (value, *(r[c] for c in keys))
+                        for value, r in zip(sealed_values, rows, strict=True)
                     ],
                 )
                 sealed += len(rows)
@@ -11046,6 +12345,7 @@ class MessageStore:
         supplied via ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED``) — it never silently drops PHI. Returns the
         number of values rewritten."""
         cipher = self._cipher
+        self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
             # and the comment named only the harmless one. IdentityCipher means NO key is
@@ -11077,9 +12377,19 @@ class MessageStore:
         # re-sealed under the active key in one write (rotation_reseal), so the loop below finds those
         # secrets already under the active key. The loop then rotates the rest, which are accounts
         # whose record has no seal or fails it and is refused anyway.
+        # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
+        # under a key this run does not hold leaves the store as this method found it.
+        preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if preflight.unheld:
+            self._reseal_outcome = preflight
+            raise unheld_seal_refusal(preflight, before_writes=True)
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
+        # Vault BACKLOG #5635: what the passes left under another key, for the command to read.
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
+            raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
@@ -11665,6 +12975,12 @@ class MessageStore:
         # the CREATE TABLE IF NOT EXISTS in _SCHEMA, so a reopened DB gains it without a separate step.
         if "body_ref" not in queue_cols:
             await db.execute("ALTER TABLE queue ADD COLUMN body_ref TEXT")
+        # Vault BACKLOG #4607 step 6: the per-row count of passes that killed their stage worker.
+        # 0 on an existing row is right: no death was counted before the column existed.
+        if "worker_deaths" not in queue_cols:
+            await db.execute(
+                "ALTER TABLE queue ADD COLUMN worker_deaths INTEGER NOT NULL DEFAULT 0"
+            )
         # The body_ref deref index lives here (not _SCHEMA) so it is created only AFTER the column is
         # guaranteed present — on a Step-A queue it'd otherwise reference a not-yet-added column.
         await db.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
@@ -13737,6 +15053,54 @@ class MessageStore:
             return
         await self._run_grouped(_body)
 
+    async def record_worker_death(
+        self, outbox_id: str, cap: int, error: str, now: float | None = None
+    ) -> WorkerDeathOutcome:
+        """Count one death of the worker processing ``outbox_id``, and dead-letter the row once the
+        count reaches ``cap`` (vault BACKLOG #4607 step 6). See the base contract.
+
+        Two statements rather than one ``UPDATE ... RETURNING``, for the reason
+        :meth:`supersede_session` gives; the writer lock makes them one unit."""
+        error = safe_text(error)  # PHI chokepoint (#120)
+        now = time.time() if now is None else now
+
+        async def _body() -> WorkerDeathOutcome:
+            # Not updated_at: the in-flight watch measures a held row's age from its claim.
+            cur = await self._db.execute(
+                "UPDATE queue SET worker_deaths = worker_deaths + 1"
+                " WHERE id=? AND status IN (?, ?)",
+                (outbox_id, OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
+            )
+            if cur.rowcount == 0:
+                raise _AbortMember(WorkerDeathOutcome())
+            cur = await self._db.execute(
+                "SELECT worker_deaths, message_id, destination_name FROM queue WHERE id=?",
+                (outbox_id,),
+            )
+            row = await cur.fetchone()
+            assert row is not None  # the increment matched it, under the writer lock
+            deaths = int(row["worker_deaths"])
+            if deaths < cap:
+                return WorkerDeathOutcome(deaths=deaths)
+            # No status term: the increment matched this row unresolved, under the writer lock.
+            await self._db.execute(
+                "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                " WHERE id=?",
+                (
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                ),
+            )
+            await self._event(row["message_id"], "dead", row["destination_name"], error, now)
+            await self._maybe_finalize_message(row["message_id"], now)
+            return WorkerDeathOutcome(deaths=deaths, dead=True)
+
+        result = await self._run_grouped(_body)
+        return result if isinstance(result, WorkerDeathOutcome) else WorkerDeathOutcome()
+
     async def mark_done(
         self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
     ) -> bool:
@@ -14659,9 +16023,13 @@ class MessageStore:
             # DONE, DEAD or CANCELLED row back in the queue, and a row something else already re-pended
             # still takes this attempt's backoff, event and last_error. A miss is a terminal (or
             # vanished) row; it writes nothing, not even the 'failed' event, and still returns the
-            # retry time. It cannot strand a row, because it declines no INFLIGHT row. The DEAD branch
-            # carries no status term (C2).
+            # retry time. It cannot strand a row, because it declines no INFLIGHT row.
             retrying = status == OutboxStatus.PENDING.value
+            if not retrying and row["status"] in _RESOLVED_STATUSES:
+                # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): the DEAD branch leaves a row
+                # already DONE, DEAD or CANCELLED as it is, so a late worker cannot turn a delivered
+                # row DEAD. Read under the writer lock, so the row cannot move before the UPDATE.
+                raise _AbortMember(None)
             cur = await self._db.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                 " WHERE id=?" + (" AND status IN (?, ?)" if retrying else ""),
@@ -15200,7 +16568,7 @@ class MessageStore:
                     (message_id, OutboxStatus.DONE.value),
                 )
             cur = await self._db.execute(
-                "UPDATE queue SET status=?, attempts=0, next_attempt_at=?,"
+                "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
                 f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})"
                 f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                 (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
@@ -15735,8 +17103,8 @@ class MessageStore:
                 return 0
             # All-or-nothing, matching the SQL Server backend's atomicity.
             upd = await self._db.execute(
-                f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                f" updated_at=? WHERE {clause}",
+                "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
+                f" last_error=NULL, updated_at=? WHERE {clause}",
                 (OutboxStatus.PENDING.value, now, now, *params),
             )
             for message_id in message_ids:
@@ -17078,7 +18446,8 @@ class MessageStore:
         The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned.
 
         The row is sealed as it is inserted (BACKLOG #2592). A repeat joins only an open request
-        whose seal holds: :func:`first_sealed_approval` says why."""
+        whose seal holds: :func:`first_sealed_approval` says why; SQLite runs its awaitable
+        twin."""
         row = new_approval_row(
             approval_id=approval_id,
             operation=operation,
@@ -17105,7 +18474,7 @@ class MessageStore:
                     + " ORDER BY requested_at ASC",
                     match,
                 )
-                joined = first_sealed_approval(self._row_sealer, await found.fetchall())
+                joined = await first_sealed_approval_async(self._row_sealer, await found.fetchall())
                 if joined is None:
                     await self._write_approval(row)
                 else:
@@ -17131,17 +18500,17 @@ class MessageStore:
 
         With no ``current`` it inserts ``new``, sealed; with ``unless_open`` (the four
         :data:`_SQLITE_OPEN_REPEAT` values) only when no open request matches. With ``current``,
-        the row it read, it is a compare-and-set: :func:`approval_update` refuses a ``current``
-        that fails its seal, raising :class:`RowSealError` and writing nothing, and the UPDATE
-        lands only while the row is still in ``current``'s status and carries its seal."""
+        the row it read, it is a compare-and-set: :func:`approval_update_async` refuses a
+        ``current`` that fails its seal, writing nothing, and the UPDATE lands only while the row
+        is still in ``current``'s status and carries its seal."""
         sealer = self._row_sealer
         if current is not None:
             cur = await self._db.execute(
                 _SQLITE_APPROVAL_UPDATE,
-                approval_update(sealer, current, new).update_params(current),
+                (await approval_update_async(sealer, current, new)).update_params(current),
             )
             return cur.rowcount > 0
-        params = seal_approval(sealer, new).write_params()
+        params = (await seal_approval_async(sealer, new)).write_params()
         if unless_open is None:
             await self._db.execute(_SQLITE_APPROVAL_INSERT, params)
             return True
@@ -17199,7 +18568,7 @@ class MessageStore:
         ``interrupted`` the same way, so two resolvers cannot both record an outcome.
 
         The move goes through :meth:`_write_approval` (BACKLOG #2592): a row whose seal fails
-        raises :class:`RowSealError` and nothing is written.
+        is refused as that method says, and nothing is written.
 
         ``audit`` and ``claim_owner``: the Store protocol states the contract (vault BACKLOG #2255,
         BACKLOG #1562)."""
@@ -17249,7 +18618,7 @@ class MessageStore:
                 found is not None
                 and str(found["status"]) == "pending"
                 and found["seal"] == seal_read
-                and approval_fails_seal(self._row_sealer, found)
+                and await approval_fails_seal_async(self._row_sealer, found)
                 and await self._tombstone_approval(
                     approval_id,
                     approver=approver,
@@ -17267,15 +18636,16 @@ class MessageStore:
         self, approval_id: str, *, approver: str, decided_at: float, seal_read: object
     ) -> bool:
         """The one writer of :data:`_SQLITE_APPROVAL_TOMBSTONE` (BACKLOG #3638). Call it inside an
-        open write, on a row :func:`approval_fails_seal` refused, with the seal it read. Writes the
-        tombstone of :func:`approval_tombstone`, never an approval seal, so the row's other columns
-        stay as unverified as they were, and lands only while the row still carries ``seal_read``."""
+        open write, on a row :func:`approval_fails_seal_async` refused, with the seal it read.
+        Writes the tombstone of :func:`approval_tombstone_async`, never an approval seal, so the
+        row's other columns stay as unverified as they were, and lands only while the row still
+        carries ``seal_read``."""
         cur = await self._db.execute(
             _SQLITE_APPROVAL_TOMBSTONE,
             (
                 approver,
                 float(decided_at),
-                approval_tombstone(
+                await approval_tombstone_async(
                     self._row_sealer, approval_id, approver=approver, decided_at=decided_at
                 ),
                 approval_id,
@@ -17359,28 +18729,32 @@ class MessageStore:
     async def _reseal_approval(self, found: aiosqlite.Row) -> bool:
         """One row of :meth:`reseal_approval_records`, read in its write: re-sealed as a request,
         or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
-        :class:`RowSealError` when neither holds, before any statement runs. The tombstone write
-        runs outside the ``except``, so a database fault in it is not chained to the seal miss."""
+        :class:`RowSealError` when neither holds, before any statement runs. The tombstone check
+        and its write run outside the ``except``, so neither a Transit answer nor a database
+        fault in them is chained to the seal miss. Under Transit an Unverifiable row or an Outage
+        raises its own type instead, which the pass's ``RowSealError`` catch does not take, so it
+        stops the pass with the earlier rows committed (census pin, slice 1b-iv)."""
         try:
             current = ApprovalRow.from_mapping(found)
             return await self._write_approval(current, current=current)
-        except RowSealError:
-            tombstone = held_approval_tombstone(self._row_sealer, found)
-            if tombstone is None:
-                raise
+        except RowSealError as exc:
+            refused = exc
+        tombstone = await held_approval_tombstone_async(self._row_sealer, found)
+        if tombstone is None:
+            raise refused
         return await self._reseal_tombstone(str(found["id"]), *tombstone, seal_read=found["seal"])
 
     async def _reseal_tombstone(
         self, approval_id: str, approver: str, decided_at: float, *, seal_read: object
     ) -> bool:
         """The one writer of :data:`_SQLITE_APPROVAL_TOMBSTONE_RESEAL` (BACKLOG #3638). Call it
-        inside an open write, on a row :func:`held_approval_tombstone` passed, with what it returned
-        and the seal it read. Writes :func:`approval_tombstone` under the active key, so the row
-        stays a tombstone and never gains an approval seal."""
+        inside an open write, on a row :func:`held_approval_tombstone_async` passed, with what it
+        returned and the seal it read. Writes :func:`approval_tombstone_async` under the active
+        key, so the row stays a tombstone and never gains an approval seal."""
         cur = await self._db.execute(
             _SQLITE_APPROVAL_TOMBSTONE_RESEAL,
             (
-                approval_tombstone(
+                await approval_tombstone_async(
                     self._row_sealer, approval_id, approver=approver, decided_at=decided_at
                 ),
                 approval_id,
@@ -17697,18 +19071,22 @@ class MessageStore:
         chains cleanly. Pass ``expected_anchor`` (a ``(count, head_hash)`` previously returned by
         :meth:`audit_anchor` and held out-of-band) to also detect that tail-truncation (review low-1).
 
-        **Constant-time, full-walk (ASVS 11.2.4).** Every row MAC is compared with
-        :func:`hmac.compare_digest` over :func:`audit_mac_bytes` (never ``!=``, which short-circuits on
-        the first differing byte and leaks a forged digest's shared-prefix length), and the walk ALWAYS
-        runs to completion — the first divergent row id is recorded and reported *after* the walk, so
+        **Constant-time, full-walk (ASVS 11.2.4).** A keyless row hash, and a row MAC recomputed
+        under an in-heap key or by a plain MAC provider, are compared with the stored hash by
+        :func:`hmac.compare_digest` over :func:`audit_mac_bytes`, as :func:`verify_audit_rows` says
+        (never ``!=``, which short-circuits on the first differing byte and leaks a forged digest's
+        shared-prefix length), and a break does not end the walk (a MAC call that raises can, as
+        :func:`verify_audit_rows` says) — the first divergent row id is recorded and reported
+        *after* the walk, so
         total verify time is a function of the chain LENGTH, not of where a forgery sits. The reported
         message still names that row id: position is disclosed deliberately, in the operator-facing
         result, so an alert stays actionable — what the change removes is the *timing* side channel, not
-        the intentional disclosure. (Under ``vault_transit`` each row MAC is a Transit round trip, so a
-        broken chain now pays the same N round trips a healthy one already pays — accepted: the
-        healthy-verify cost is the bound, and a tamper alarm must not be cheaper to provoke than a
-        clean pass. A row whose key version Transit refuses costs one more, the probe that tells the
-        refusal from an outage, BACKLOG #2337.)"""
+        the intentional disclosure. (Under ``vault_transit`` a broken chain pays the round trips a
+        healthy one already pays — accepted: the healthy-verify cost is the bound, and a tamper
+        alarm must not be cheaper to provoke than a clean pass. The Transit calls a walk makes per
+        row, a failed verify's included, are stated once in ``docs/CONNECTIONS.md`` Table A, the
+        Vault Transit bulk at-rest cipher row. There the compare of a row MAC is Transit's own
+        ``verify``, which Vault makes with Go's constant-time ``hmac.Equal``, BACKLOG #2720.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
@@ -17765,11 +19143,12 @@ class MessageStore:
             directory_object_id=directory_object_id,
             now=now,
         )
+        # Sealed before the writer lock: the seal depends on the record alone, and under a Transit
+        # sealer it is a Vault round trip that ingress would otherwise wait behind.
+        sealed = await seal_user_async(self._row_sealer, record)
         async with _writer_guard(self._db, self._lock):
             # BACKLOG #2592: the whole row, sealed, in one INSERT.
-            await self._db.execute(
-                _USER_INSERT, user_insert_params(seal_user(self._row_sealer, record))
-            )
+            await self._db.execute(_USER_INSERT, user_insert_params(sealed))
             # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
             appended = await self._append_audits(audits, now=now)
             await self._commit()
@@ -17811,15 +19190,16 @@ class MessageStore:
         writes every column with a compare on the seal it read, then rewrites the role rows when they
         changed. Returns the new record, or ``None`` when there is no row, ``change`` declined, or
         the compare lost to a concurrent write; nothing is written then. Raises
-        :class:`RowSealError`, and writes nothing, when the record it read does not verify:
+        :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
+        :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
+        writes nothing, when the record it read does not verify or cannot be checked:
         re-sealing it would turn a change made outside this helper into a sealed record. A change to
         the roles passes :func:`existing_roles_only` first, so it raises :class:`UnknownRoleError`,
         writing nothing, for an added role id with no ``roles`` row."""
         current = await self._read_user_record(user_id)
         if current is None:
             return None
-        if not user_seal_ok(self._row_sealer, current):
-            raise RowSealError(USER_KIND)
+        await require_user_seal_for_write(self._row_sealer, current)
         changed = change(current)
         if changed is None:
             return None
@@ -17828,7 +19208,7 @@ class MessageStore:
             changed = existing_roles_only(
                 current, changed, [str(r["id"]) for r in await cur.fetchall()]
             )
-        updated = seal_user(self._row_sealer, changed)
+        updated = await seal_user_async(self._row_sealer, changed)
         cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
         if cur.rowcount != 1:
             return None
@@ -17842,7 +19222,7 @@ class MessageStore:
         return updated
 
     async def _account_passkeys(self, user_id: str) -> list[WebAuthnCredential]:
-        # Closed on the way out, a failed fetch included: escalation_passkeys survives a cell that
+        # Closed on the way out, a failed fetch included: passkeys_or_none survives a cell that
         # does not decode, and an open statement would hold back a WAL checkpoint until GC.
         async with self._db.execute(
             "SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,)
@@ -17867,8 +19247,7 @@ class MessageStore:
         left to seal, so ``admin_reset_mfa`` can still clear a set that fails."""
         current = await self._read_user_record(user_id)
         if current is not None:
-            if not user_seal_ok(self._row_sealer, current):
-                raise RowSealError(USER_KIND)
+            await require_user_seal_for_write(self._row_sealer, current)
             if (
                 self._row_sealer is not None
                 and not removes_all
@@ -17885,6 +19264,25 @@ class MessageStore:
             await self._write_user(user_id, lambda r: r.changed(cred_digest=digest))
         return count
 
+    def reseal_outcome(self) -> ResealOutcome:
+        """What the last :meth:`reencrypt_to_active` left sealed under a key other than the active
+        one (vault BACKLOG #5635); empty before one has run."""
+        return self._reseal_outcome
+
+    async def _unrotated_seals(self) -> list[tuple[str, object]]:
+        """``(table, seal)`` for every seal :func:`unrotated_seal_queries` selects, read after the
+        re-seal passes (vault BACKLOG #5635)."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return []
+        active = f"{SEAL_PREFIX}{sealer.key_id}:%"
+        seals: list[tuple[str, object]] = []
+        async with self._read() as db:
+            for table, sql in unrotated_seal_queries("?"):
+                cur = await db.execute(sql, (active,))
+                seals.extend((table, r[0]) for r in await cur.fetchall())
+        return seals
+
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key (BACKLOG #2592), for ``rotate-key``.
 
@@ -17895,7 +19293,10 @@ class MessageStore:
         sealer = self._row_sealer
         if sealer is None:
             return 0, 0
-        # A sealer exists only for a cipher that holds its keys in-process, which is AesGcmCipher.
+        # The local sealer exists only for a cipher that holds its keys in-process, AesGcmCipher.
+        # A store whose cipher is a TransitCipher must never reach here: rotate-key is refused
+        # under vault_transit (ADR 0217), and this cast would hide that TransitCipher has no
+        # active_marker_prefix.
         cipher = cast("AesGcmCipher", self._cipher)
         change = rotation_reseal(
             sealer,
@@ -18059,14 +19460,22 @@ class MessageStore:
             else None
         )
         async with _writer_guard(self._db, self._lock):
-            # The passkeys the condition reads are read under the same writer lock as the write.
+            # The passkeys the condition reads are read under the same writer lock as the write,
+            # and only where the record's TOTP does not already count (way_past_passkeys).
+            passkeys: list[WebAuthnCredential] = []
+            if conditional:
+                passkeys = await way_past_passkeys(
+                    await self._read_user_record(user_id),
+                    lambda: self._account_passkeys(user_id),
+                    totp_counts=totp_counts,
+                )
             change = password_change(
                 password_hash=password_hash,
                 password_generated=password_generated,
                 must_change_password=must_change_password,
                 require_way_past=conditional,
                 now=now,
-                passkeys=await self._account_passkeys(user_id) if conditional else (),
+                passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -18317,10 +19726,20 @@ class MessageStore:
             # ``last_totp_step`` too (:func:`totp_disable`): kept, it would refuse the first code of
             # the next secret inside the same 30 seconds -- which the earlier holder of a row being
             # repaired by ``provision-admin`` could use to block the repair.
+            # The TOTP is what goes, so the set is read wherever that TOTP counts, and one that
+            # cannot be read is empty (way_past_passkeys).
+            passkeys: list[WebAuthnCredential] = []
+            if conditional:
+                passkeys = await way_past_passkeys(
+                    await self._read_user_record(user_id),
+                    lambda: self._account_passkeys(user_id),
+                    totp_counts=totp_counts,
+                    drop_totp=True,
+                )
             change = totp_removal(
                 now,
                 require_way_past=conditional,
-                passkeys=await self._account_passkeys(user_id) if conditional else (),
+                passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -18388,7 +19807,7 @@ class MessageStore:
         async with _writer_txn(self._db, self._lock):
             record = await self._read_user_record(cred.user_id)
             # No account: the insert below meets the foreign key, as it always did (BACKLOG #1807).
-            if record is not None and session_owes_unproven_factor(
+            if record is not None and await session_owes_unproven_factor_async(
                 self._row_sealer,
                 await self._read_session_row(for_session),
                 record,
@@ -18465,7 +19884,9 @@ class MessageStore:
                 current = await self._read_user_record(user_id)
                 if current is None or not removal_keeps_way_past(
                     current,
-                    await self._account_passkeys(user_id),
+                    await way_past_passkeys(
+                        current, lambda: self._account_passkeys(user_id), totp_counts=totp_counts
+                    ),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
@@ -18580,10 +20001,12 @@ class MessageStore:
         role_ids: Sequence[str] = (),
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
         ``AuthStore``. The writer lock serializes it against every other writer in this process,
-        which is every writer this file has."""
+        which is every writer this file has. ``audits`` are appended only when the change is
+        applied, before the one commit (BACKLOG #2221)."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             if change.takes_role(admin_role_id, role_ids):
@@ -18607,7 +20030,9 @@ class MessageStore:
                 )
             else:
                 assert_never(change)
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
+        tee_audits(audits, appended, ts=now)
         return True
 
     async def grant_first_admin_unless_admin_exists(
@@ -18701,14 +20126,31 @@ class MessageStore:
             await self._commit()
 
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None:
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """Clear both locks (:func:`lockout_clear`) and append ``audit`` in ONE transaction
+        (BACKLOG #5633), the shape :meth:`replace_totp_enrolment` uses: a refused append rolls the
+        clear back, so an unlock never lands unrecorded. Returns whether a row was written."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
-            await self._write_user(
-                user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
-            )
+        async with _writer_txn(self._db, self._lock):
+            if (
+                await self._write_user(
+                    user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
+                )
+                is None
+            ):
+                # Nothing written, so nothing audited. The commit ends the empty transaction.
+                await self._commit()
+                return False
+            appended = await self._append_audits((audit,), now=now)
             await self._commit()
+        tee_audits((audit,), appended, ts=now)
+        return True
 
     async def record_login_failure(
         self,
@@ -18818,7 +20260,8 @@ class MessageStore:
         repaired (the comment above :data:`ROLE_SEAL_EXCLUDED` says why that copies nothing in). A
         caller that builds ``row`` from a stored one checks it first, as
         :meth:`reseal_role_records` does."""
-        await self._db.execute(_ROLE_UPSERT, seal_role(self._row_sealer, row).write_params())
+        sealed = await seal_role_async(self._row_sealer, row)
+        await self._db.execute(_ROLE_UPSERT, sealed.write_params())
 
     async def list_roles(self) -> list[aiosqlite.Row]:
         async with self._read() as db:
@@ -18990,13 +20433,17 @@ class MessageStore:
         *,
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             await self._write_user(
                 user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
+            # BACKLOG #2221. Before the one commit, so a failed append rolls the roles back.
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
+        tee_audits(audits, appended, ts=now)
 
     async def set_user_roles_if_held(
         self,
@@ -19006,17 +20453,26 @@ class MessageStore:
         expected_role_ids: Iterable[str],
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. Under the one
-        writer lock, so no other write to the row lands between the compare and the write."""
+        writer lock, so no other write to the row lands between the compare and the write.
+        ``audits`` are appended only when it writes, before the one commit (BACKLOG #3018 step 4).
+        """
         now = time.time() if now is None else now
         change = roles_if_held(
             role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
         )
+        appended: list[AppendedAuditRow] = []
         async with _writer_txn(self._db, self._lock):
             written = await self._write_user(user_id, change)
+            if written is not None:
+                appended = await self._append_audits(audits, now=now)
             await self._commit()
-        return written is not None
+        if written is None:
+            return False
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def set_user_channel_scope(
         self,
@@ -19190,8 +20646,8 @@ class MessageStore:
     async def _write_ad_map(self, name: str, change: AdMapChange) -> bool:
         """The one writer of an AD directory map and its seal (BACKLOG #2592). Call it inside an
         open write transaction. Reads the map, applies ``change`` and writes the result, sealed;
-        :func:`ad_map_write` says when it refuses, raising :class:`RowSealError` and writing
-        nothing. Returns whether anything was written."""
+        :func:`ad_map_write_async` says when it refuses, and with what, writing nothing. Returns
+        whether anything was written."""
         # Each statement is named at its call, not looked up; the module constants say why.
         role = _is_role_map(name)
         cur = await self._db.execute("SELECT seal FROM authority_set_seal WHERE name=?", (name,))
@@ -19205,7 +20661,7 @@ class MessageStore:
             [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
             "" if seal_row is None else str(seal_row["seal"] or ""),
         )
-        new = ad_map_write(self._row_sealer, current, change)
+        new = await ad_map_write_async(self._row_sealer, current, change)
         if new is None:
             return False
         if new.pairs != current.pairs:
@@ -19258,7 +20714,11 @@ class MessageStore:
                 if found is None:
                     continue
                 row = RoleRow.from_mapping(found)
-                if not role_seal_ok(sealer, row):
+                # The write path's own refusal (ADR 0217 (c) step 1), as the map half below meets
+                # it through _write_ad_map: a Forged row is counted refused, as on main.
+                try:
+                    await require_role_seal_for_write(sealer, row)
+                except RowSealError:
                     refused += 1
                     continue
                 await self._write_role(row)
@@ -19319,11 +20779,14 @@ class MessageStore:
                 (user_id,),
             )
             row = await cur.fetchone()
-            if require_federated_subject is not None:
-                bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
-                if bound != require_federated_subject:
-                    await self._db.rollback()
-                    return False
+            # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+            # INSERT's foreign-key error.
+            if row is None or (
+                require_federated_subject is not None
+                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            ):
+                await self._db.rollback()
+                return False
             record = new_session_record(
                 token_hash=token_hash,
                 user_id=user_id,
@@ -19333,10 +20796,10 @@ class MessageStore:
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
-                user_epoch=0 if row is None else int(row["session_epoch"]),
-                global_epoch=0 if row is None else global_epoch_or_refuse(row["global_epoch"]),
+                user_epoch=int(row["session_epoch"]),
+                global_epoch=global_epoch_or_refuse(row["global_epoch"]),
             )
-            record = seal_session(self._row_sealer, record)
+            record = await seal_session_async(self._row_sealer, record)
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
             await self._commit()
         return True
@@ -19351,8 +20814,12 @@ class MessageStore:
 
         Reads the unrevoked row, verifies its seal, applies ``change``, seals the result and writes
         every sealed column with a compare on the seal it read. Returns the new row, or ``None`` when
-        there is no unrevoked row or the compare lost to a concurrent write. Raises
-        :class:`RowSealError`, and writes nothing, when the row it read does not verify: re-sealing
+        there is no unrevoked row or the compare lost to a concurrent write. A row sealed under a
+        retired key raises :class:`RowSealKeyRetiredError`, which every caller ends quietly
+        (build ruling 3, slice 1b-iv). Raises
+        :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
+        :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
+        writes nothing, when the row it read does not verify or cannot be checked: re-sealing
         it would turn a change made outside this helper into a sealed row."""
         cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
         row = await cur.fetchone()
@@ -19361,9 +20828,8 @@ class MessageStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        if not session_seal_ok(self._row_sealer, current):
-            raise RowSealError(SESSION_KIND)
-        updated = seal_session(self._row_sealer, change(current))
+        await session_writer_seal_check(self._row_sealer, current)
+        updated = await seal_session_async(self._row_sealer, change(current))
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None
 
@@ -19416,13 +20882,22 @@ class MessageStore:
             await self._write_session(token_hash, stamp)
             await self._commit()
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        """Stamp a session's second-factor as satisfied (WP-14): after a TOTP/recovery verify, or at
-        issuance for an MFA-delegated AD/Kerberos login."""
-        stamp = mfa_stamp(time.time() if now is None else now)
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        """Stamp a session's second-factor as satisfied (WP-14): at least after a TOTP/recovery
+        verify, a factor enrolment confirm, a passkey assertion (the one caller that passes an
+        ``anchor``), or at issuance for a sign-in that owes no second factor. See
+        :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the answer."""
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with _writer_txn(self._db, self._lock):
-            await self._write_session(token_hash, stamp)
+            written = await self._write_session(token_hash, stamp)
             await self._commit()
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None
@@ -19493,7 +20968,12 @@ class MessageStore:
         return ended
 
     async def revoke_user_sessions(
-        self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        except_token_hash: str | None = None,
+        now: float | None = None,
+        audit: OperatorAudit[RevokeResult],
     ) -> RevokeResult:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
         caller's current session — "sign out everywhere else"), which is kept only when it is
@@ -19507,10 +20987,19 @@ class MessageStore:
         missing row (:func:`global_epoch_unmoved`, :class:`KeptSessionRestamp`, BACKLOG #4975);
         otherwise it is ended with the rest and counted (:meth:`_keep_or_end_session`). If its
         own seal does not verify, that raises :class:`RowSealError` and the whole transaction,
-        revokes included, rolls back."""
+        revokes included, rolls back. ``audit``'s row is appended before the one commit, so a
+        failed append rolls the revokes back too (BACKLOG #3018 step 4)."""
+        require_operator_audit(audit, "store.revoke_user_sessions")  # BACKLOG #5069
         now = time.time() if now is None else now
-        async with _writer_txn(self._db, self._lock):
-            raised = await self._bump_session_epoch(user_id)
+        outcome = RevokeSealOutcome(self._seal_pager)
+        # AuditedWrite inside the seal report: the operator row's tee runs as the commit
+        # lands, before the report awaits, so a report that raises cannot cost the tee.
+        async with (
+            outcome.committing(self.record_audit),
+            AuditedWrite(now) as written,
+            _writer_txn(self._db, self._lock),
+        ):
+            raised = await self._bump_session_epoch(user_id, outcome)
             if except_token_hash is None:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             else:
@@ -19524,20 +21013,35 @@ class MessageStore:
             else:
                 unmoved = global_epoch_unmoved(await self._global_session_epoch_value())
                 result = await self._keep_or_end_session(
-                    revoked, except_token_hash, KeptSessionRestamp(user_id, raised, unmoved), now
+                    revoked,
+                    except_token_hash,
+                    KeptSessionRestamp(user_id, raised, unmoved),
+                    now,
+                    outcome,
                 )
+            await self._append_operator_audit(written, audit, result)
             await self._commit()
         return result
 
     async def _keep_or_end_session(
-        self, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+        self,
+        revoked: int,
+        token_hash: str,
+        restamp: KeptSessionRestamp,
+        now: float,
+        outcome: RevokeSealOutcome,
     ) -> RevokeResult:
         """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside the
         revoke's writer transaction (follow-up to BACKLOG #4975). ``revoked`` is the sweep's count;
         an ended kept session is added to it. A declined session left live would be refused at
         its next request anyway, but meanwhile it would hold a slot under the session cap and its
-        refusal would read as a seal failure, so it is ended here, as the sweep ends the rest."""
-        if restamp.kept(await self._write_session(token_hash, restamp)):
+        refusal would read as a seal failure, so it is ended here, as the sweep ends the rest. A
+        Transit refusal of the re-stamp declines it too, so the kept session is ended
+        (:func:`write_kept_session`). After a Transit Outage tripped ``outcome`` the re-stamp is not
+        attempted, and the session is ended (:class:`RevokeSealOutcome`)."""
+        if not outcome.tripped and restamp.kept(
+            await write_kept_session(self._write_session(token_hash, restamp), outcome, token_hash)
+        ):
             return RevokeResult(revoked, kept=True)
         cur = await self._db.execute(
             _END_DECLINED_KEPT_SESSION_SQL, (now, restamp.user_id, token_hash)
@@ -19566,13 +21070,14 @@ class MessageStore:
         """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
         :meth:`AuthStore.revoke_all_sessions`."""
         now = time.time() if now is None else now
-        async with _writer_txn(self._db, self._lock):
-            result = await self._revoke_all_sessions_in_txn(except_token_hash, now)
+        outcome = RevokeSealOutcome(self._seal_pager)
+        async with outcome.committing(self.record_audit), _writer_txn(self._db, self._lock):
+            result = await self._revoke_all_sessions_in_txn(except_token_hash, now, outcome)
             await self._commit()
         return result
 
     async def _revoke_all_sessions_in_txn(
-        self, except_token_hash: str | None, now: float
+        self, except_token_hash: str | None, now: float, outcome: RevokeSealOutcome
     ) -> RevokeResult:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
@@ -19593,7 +21098,8 @@ class MessageStore:
             raise RuntimeError(GLOBAL_SESSION_EPOCH_MISSING)
         cur = await self._db.execute("SELECT id FROM users ORDER BY id")
         raised = {
-            str(row[0]): await self._bump_session_epoch(str(row[0])) for row in await cur.fetchall()
+            str(row[0]): await self._bump_session_epoch(str(row[0]), outcome)
+            for row in await cur.fetchall()
         }
         # Spelled at the call, not built from a constant, so the BEGIN guard in
         # `tests/test_writer_txn_is_the_only_begin.py` can read it.
@@ -19618,6 +21124,7 @@ class MessageStore:
             except_token_hash,
             KeptSessionRestamp(user_id, raised.get(user_id), global_raised),
             now,
+            outcome,
         )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
@@ -19633,7 +21140,8 @@ class MessageStore:
         restored file then queue on the lock, and the second finds the marker gone, rather than
         both reading it and one failing its upgrade from a stale snapshot."""
         now = time.time() if now is None else now
-        async with _writer_txn(self._db, self._lock):
+        outcome = RevokeSealOutcome(self._seal_pager)
+        async with outcome.committing(self.record_audit), _writer_txn(self._db, self._lock):
             await self._db.execute("UPDATE restore_marker SET id = id WHERE id = 1")
             cur = await self._db.execute(
                 "SELECT archive_sha256, archive_created_at, last_audit_at, restored_at,"
@@ -19649,7 +21157,7 @@ class MessageStore:
                 last_audit_at=finite_or_none(row[2]),
                 restored_at=now if (at := finite_or_none(row[3])) is None else at,
                 sessions_revoked=int(row[4] or 0)
-                + (await self._revoke_all_sessions_in_txn(None, now)).count,
+                + (await self._revoke_all_sessions_in_txn(None, now, outcome)).count,
             )
             audit = AuditAppend(
                 action=STORE_RESTORED_ACTION,
@@ -19690,19 +21198,29 @@ class MessageStore:
         row = await cur.fetchone()
         return None if row is None or row[0] is None else int(row[0])
 
-    async def _bump_session_epoch(self, user_id: str) -> EpochRaise | None:
+    async def _bump_session_epoch(
+        self, user_id: str, outcome: RevokeSealOutcome
+    ) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside the caller's writer
         transaction (BACKLOG #2592), and report the raise, or ``None`` where none was written
-        (:meth:`EpochBump.raised`, BACKLOG #4975). An account whose record fails its seal is
-        refused on every read already, so the revoke that called this goes ahead without the
-        raise, and reports none: ending sessions needs no key, and refusing it would keep them
-        live."""
-        bump = EpochBump()
-        try:
-            return bump.raised(await self._write_user(user_id, bump))
-        except RowSealError:
-            log.warning("an account's record failed its integrity seal; its sessions end anyway")
-            return None
+        (:meth:`EpochBump.raised`, BACKLOG #4975). On every refusal :func:`revoke_seal_refusals`
+        names, the revoke that called this goes ahead without the raise and reports none: ending
+        sessions needs no key, and refusing the revoke would keep them live.
+
+        **Residual: an account whose raise went without may later be read as Holds, with its epoch
+        never raised** (SDS-3.7, decision d20261109T200352805-599b24 item 6). Only a Forged
+        record answers the same way on every later read. An Unverifiable answer can change: the
+        Transit sealer caches it only for
+        :data:`~messagefoundry.store.row_seal.TRANSIT_SEAL_CACHE_TTL_SECONDS` and drops it when
+        the probe version moves, and a Transit node that lagged a key rotation answers Holds once
+        it catches up. An Outage can change too: a Holds answer cached within that TTL is served
+        without calling Transit, and a read after Transit recovers is served as usual. In each of
+        those cases the account is read again, its sessions were ended here, and the epoch raise
+        that would stop an older copy of a revoked session row from resolving is missing. Nothing
+        compensates for it until the owed raise is built (ADR 0217 (b))."""
+        return await raise_account_epoch(
+            lambda bump: self._write_user(user_id, bump), outcome, user_id
+        )
 
     async def enforce_session_cap(
         self,
@@ -20038,112 +21556,57 @@ class MessageStore:
 
         ``connection_cutoffs`` (#34/ADR 0027 plumbing reuse) overrides the cutoff per ``channel_id``
         (``float('-inf')`` = keep forever); empty ⇒ a single global cutoff."""
-        now = time.time() if now is None else now
-        content_types = content_types or {}
+        stamp = time.time() if now is None else now
         inflight = (OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value)
-        # Bound the candidate scan with the LOOSEST finite cutoff (the global one OR the largest override
-        # — a keep-forever -inf never widens it). The precise per-connection cutoff is re-checked in
-        # Python per row via cutoff_for, so this SQL bound only narrows the set we materialize+decrypt.
-        finite = [
-            c for c in ([older_than, *(connection_cutoffs or {}).values()]) if c != float("-inf")
-        ]
-        scan_cutoff = max(finite) if finite else float("-inf")
-        rows: list[aiosqlite.Row] = []
-        if finite:  # nothing finite ⇒ everything is keep-forever ⇒ no candidate to scan
+
+        async def fetch(scan_cutoff: float, after: StripCursor, limit: int) -> list[dict[str, Any]]:
+            # BACKLOG #5651: one keyset batch on (received_at, id), so the scan stays on
+            # ix_messages_received, with the cutoff and the in-flight guard on each.
+            page = ""
+            page_params: tuple[Any, ...] = ()
+            if after is not None:
+                # The leading >= is the index seek; the OR resolves ties on received_at by id.
+                page = "AND m.received_at >= ? AND (m.received_at > ? OR m.id > ?) "
+                page_params = (after[0], after[0], after[1])
             async with self._read() as db:
                 cur = await db.execute(
                     "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m "
-                    "WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < ? "
+                    "WHERE m.received_at < ? " + page + "AND m.raw <> '' "
+                    "AND m.documents_pruned IS NULL "
                     "AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id "
-                    "AND q.status IN (?, ?))",
-                    (scan_cutoff, *inflight),
+                    "AND q.status IN (?, ?)) ORDER BY m.received_at, m.id LIMIT ?",
+                    (scan_cutoff, *page_params, *inflight, limit),
                 )
-                rows = list(await cur.fetchall())
-        return await self._apply_document_strips(
-            rows, now, older_than, connection_cutoffs, min_bytes, content_types
-        )
+                return [dict(r) for r in await cur.fetchall()]
 
-    async def _apply_document_strips(
-        self,
-        rows: Sequence[aiosqlite.Row],
-        now: float,
-        older_than: float,
-        connection_cutoffs: Mapping[str, float] | None,
-        min_bytes: int,
-        content_types: Mapping[str, str],
-    ) -> StripResult:
-        """Codec-transform each candidate row and write back the stripped raw + ``documents_pruned``, in
-        one transaction. The per-connection cutoff is re-checked here (cutoff_for) so a row past the loose
-        scan bound but NOT past its own (tighter / keep-forever) cutoff is left intact."""
-        msgs = 0
-        docs = 0
-        reclaimed = 0
-        updates: list[tuple[str, float, str]] = []
-        failures: list[CellTagError] = []
-        unreadable: list[object] = []
-        for row in rows:
-            cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
-            if row["received_at"] >= cutoff:
-                continue  # not past its own (per-connection) window — skip
-            try:
-                raw = open_message_cell(
-                    self._cipher,
-                    "raw",
-                    row["raw"],
-                    message_id=row["id"],
-                    channel_id=row["channel_id"],
-                )
-            except CipherError as exc:
-                # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
-                # must not abort the whole retention pass. The row is left exactly as found; the
-                # message names only the cell and the message id, never the body (BACKLOG #1169).
-                if isinstance(exc, CellTagError):
-                    # BACKLOG #2593: the read already logged and alerted it, once per hour; it is
-                    # audited below. No second WARNING on every pass.
-                    failures.append(exc)
-                    continue
-                log.warning(
-                    "document strip skipped message %s: its body could not be read: %s",
-                    row["id"],
-                    exc,
-                )
-                continue
-            assert raw is not None  # raw is NOT NULL
-            new_raw, n_docs, n_bytes = _strip_documents(
-                raw,
-                pruned_at=now,
-                min_bytes=min_bytes,
-                content_type=content_types.get(row["channel_id"]),
-                on_unreadable=functools.partial(unreadable.append, row["id"]),
-            )
-            if n_docs == 0:
-                continue  # no embedded document in this body — leave it (and its NULL flag) untouched
-            updates.append(
-                (
-                    self._cipher.encrypt(
-                        new_raw,
-                        aad=message_cell_aad(
-                            "raw", message_id=row["id"], channel_id=row["channel_id"]
-                        ),
-                    ),
-                    now,
-                    row["id"],
-                )
-            )
-            msgs += 1
-            docs += n_docs
-            reclaimed += n_bytes
-        # Before the write, so a failed write does not lose the record of the skips.
-        log_unreadable_skips(unreadable)
-        if updates:
+        async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
+            # The compare-and-swap guard, and its limit, are document_strip's: its module docstring
+            # states both. A failure rolls back the whole batch.
+            landed: list[StripUpdate] = []
             async with _writer_txn(self._db, self._lock):
-                await self._db.executemany(
-                    "UPDATE messages SET raw=?, documents_pruned=? WHERE id=?", updates
-                )
+                for u in updates:
+                    cur = await self._db.execute(
+                        "UPDATE messages SET raw=?, documents_pruned=? "
+                        "WHERE id=? AND documents_pruned IS NULL AND raw=? "
+                        "AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = messages.id "
+                        "AND q.status IN (?, ?))",
+                        (u.new_cell, stamp, u.message_id, u.stored, *inflight),
+                    )
+                    if cur.rowcount == 1:
+                        landed.append(u)
                 await self._commit()
-        await report_cell_tag_failures(self, failures)
-        return StripResult(
-            messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
+            return landed
+
+        return await run_strip_pass(
+            self._cipher,
+            fetch=fetch,
+            write=write,
+            report=functools.partial(report_cell_tag_failures, self),
+            now=stamp,
+            older_than=older_than,
+            connection_cutoffs=connection_cutoffs,
+            min_bytes=min_bytes,
+            content_types=content_types or {},
         )
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:

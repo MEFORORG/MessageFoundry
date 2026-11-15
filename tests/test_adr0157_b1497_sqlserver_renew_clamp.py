@@ -717,8 +717,8 @@ async def test_stop_bounds_both_its_writes_at_the_driver_by_its_own_bound() -> N
 
 
 async def test_the_heartbeat_runs_under_the_renew_clamp() -> None:
-    """It runs before the renew in the same tick, so its bound delays the renew (BACKLOG #6472).
-    Before #5064 it ran at [store].command_timeout: this assertion read [30]."""
+    """An unbounded heartbeat would hold the loop's side pass, and stop(), for [store].command_timeout
+    (BACKLOG #6472, #5710). Before #5064 it ran at [store].command_timeout: this assertion read [30]."""
     conn = _Conn()
     coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
     await coord.heartbeat_once()

@@ -239,6 +239,26 @@ this line.**
 
 ### Fixed
 
+- **Edit and resubmit keeps the original's line endings.** A browser submits a textarea's line
+  breaks as CRLF, so a direct send of a CR-terminated HL7 body, or a resend of an LF-only payload,
+  changed its terminators. The editor now carries the original's style in a hidden `eol` field
+  (`cr`, `lf` or `crlf`; the style most breaks use, CR first on a tie, and CR for a one-line HL7
+  body), and the route rewrites the submitted breaks to it before resubmitting. An `eol` outside
+  that set, an empty one included, is refused with the generic "invalid input". A body that starts
+  with a line break keeps it. The seam digest moved because the route's form parser changed, and
+  it now hashes the helper that rewrites the breaks. (BACKLOG #5930)
+
+- **TOTP enrolment no longer drops the first code.** Under the default
+  `[auth].require_action_step_up`, the enroll page showed a code form whose submit the confirm
+  gate refused for want of its own single-use proof, sending the operator to re-auth and losing the
+  code. While no confirm proof is held, the enroll page now shows the secret with a code-less
+  Continue button that takes the operator through that re-auth to the code form first. Enroll and
+  confirm still each take their own proof (ADR 0077), and a refused code still needs a fresh one:
+  the re-rendered page offers the same Continue instead of a form that would drop the next code.
+  The confirm page itself is unchanged. A Continue can be posted while the confirm proof is
+  already held, from another tab or after Back. It now goes to the re-auth and leaves that proof
+  unspent. No code is checked and no failed attempt is recorded. The verify route's gate chain
+  grew by that check, so the engine seam moves. (BACKLOG #5931)
 - **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
   gave that page for any 503 the engine's flag handler raised, relying on a comment that the
   handler had no other. The handler raises no other today, so nothing an operator sees changes; a

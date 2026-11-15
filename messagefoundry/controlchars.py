@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The control-character alphabets, each written once: the C0/DEL test (BACKLOG #1253) and the
+"""The control-character alphabets, each defined here: the C0/DEL test (BACKLOG #1253) and the
 wider log alphabet built on it (vault BACKLOG #2815). Beside them sits :func:`has_lone_surrogate`,
 the other test a mail header value needs, which the C0/DEL test does not cover. The log alphabet
 does cover it, through category ``Cs`` (vault BACKLOG #2842).
@@ -82,6 +82,9 @@ them. This is not a survey of every such site; these two were read under BACKLOG
     leaves out tab, LF and CR, and it has no DEL, which XML allows. That standard fixes the set.
 
 THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this test, import it.
+The one exception is ``tee/controlchars.py``: the tee imports no engine module, so it carries a
+whole-file copy of this module, and ``tests/test_anon_parity.py`` keeps the two byte-identical.
+Edit this file, then copy it there.
 """
 
 from __future__ import annotations

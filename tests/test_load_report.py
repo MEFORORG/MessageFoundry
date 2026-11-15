@@ -182,7 +182,8 @@ def test_json_is_metrics_only_no_phi() -> None:
     )
     text = report.to_json()
     # 4 to 5: engine_side gained the poller's own cost (vault BACKLOG #2794).
-    assert '"schema_version": 5' in text
+    # 5 to 6: no_loss.inconclusive (BACKLOG #5574).
+    assert '"schema_version": 6' in text
     # No raw HL7 / control ids / PHI tokens ever reach the artifact.
     for forbidden in ("MSH|", "PID|", "\r", "MEFOR", "^~"):
         assert forbidden not in text
@@ -372,7 +373,9 @@ def test_engine_poller_parses_sample_from_client() -> None:
     assert sample.read == 100  # only inbound row contributes read
     assert sample.written == 300  # 280 + 20 outbound
     assert sample.out_dead == 3  # errored summed over outbound rows
-    assert sample.backlog == 3 and sample.queue_depth == 3
+    assert sample.outbound_backlog == 3 and sample.queue_depth == 3
+    # The drain reading takes the whole pipeline, the larger of the two (BACKLOG #5435).
+    assert sample.backlog == 4
     assert sample.in_pipeline == 4  # taken straight from /stats, not derived from outbox_by_status
     assert sample.db_size_bytes == 4096
     assert sample.synchronous == "normal"  # B7: the durability mode rides through the sample

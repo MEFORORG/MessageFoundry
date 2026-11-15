@@ -151,7 +151,17 @@ the next `>` after a match to the next `</`, with `str.find`. Which match it rea
 `_FAULT_RE` matched, and when it yields an empty code instead, the `_fault_code` and `_code_text`
 docstrings say. *(Corrected 2026-11-04, for the fault-code sentences: until BACKLOG #2827 made
 the scan linear, the two patterns captured the code text themselves, from the first faultcode anywhere
-in the reply, else the first Value, the Header included, and an empty `<faultcode/>` took the next element's text as its code.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
+in the reply, else the first Value, the Header included, and an empty `<faultcode/>` took the next element's text as its code.)*
+*(Amended 2026-11-13, BACKLOG #5912: those two are not the only fault-code patterns now. At least
+`_CODE_RE` matches the SOAP 1.2 `Code` start tag the same way, except that the name must be followed by
+whitespace, `/` or `>`, so `<Code.x>` does not match, and `_CODE_END_RE` is its close tag. Each of the
+three start-tag patterns is tried at most once, anchored, by the first read: `faultcode` and `Code` at
+the Fault's first child element, `Value` at the Code's first child. Where that read yields no code,
+the fallback searches forward once each for the first `faultcode` and a `Value` ahead of it, the
+search the code ran before #5912, from the Fault start tag `_find_fault` chose to the first plain
+`_FAULT_END_RE` match, stepping over no markup; that Fault can differ from the one the earlier code
+chose. Only a `faultcode` or `Value` match reaches
+`_code_text`; the `_fault_code` docstring says how. The Fault start-tag search, where some Fault start tag on its side lies outside markup, and the Fault and Code close-tag searches that bound the first read, step over a terminated comment, CDATA section or processing instruction whole, with `str.find`, as the first-child search does; `_search_outside_markup` says how. The fallback's own Fault close-tag search does not. This decision is unchanged.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
 `messagefoundry/`. *(Corrected 2026-11-04: that sentence, the "regex-only" premise and the heading's
 "no XML parser" are no longer true of the codebase. The engine imports XML parsers, and
 `tests/test_security_static.py` keeps the allowlist of where. `transports/soap.py` is on it: it imports
@@ -311,7 +321,12 @@ WS-Security fault codes — `wsse:FailedAuthentication`, `wsse:InvalidSecurityTo
 `wsse:MessageExpired` — to **permanent** (`NegativeAckError`, `permanent=True`). A cert/credential reject
 or an expired timestamp **won't fix on a retry**, so it must **dead-letter** rather than loop the FIFO
 lane forever — consistent with the existing "unrecognized fault → permanent" stance
-(`_classify_soap`, [`soap.py`](../../messagefoundry/transports/soap.py)). Fault bodies are still **not**
+(`_classify_soap`, [`soap.py`](../../messagefoundry/transports/soap.py)). *(Amended 2026-11-14,
+BACKLOG #5798: `_classify_soap` still maps these codes to permanent, but `_post` treats some of them
+differently on an HTTP `401` with an OAuth2 bearer: at least a first `FailedAuthentication` or
+`InvalidSecurityToken` with no transport-stamped `UsernameToken` is retried with a fresh bearer.
+The `soap.py` module docstring states the rule, and [CONNECTIONS.md](../CONNECTIONS.md) states it
+for operators.)* Fault bodies are still **not**
 echoed into errors/logs (they may carry PHI; the [`soap.py`](../../messagefoundry/transports/soap.py)
 module docstring).
 

@@ -708,7 +708,8 @@ class StoreSettings(_Section):
         default=False,
         description=(
             "Execute the pooled claim via the two lane-family versioned procs "
-            "(dbo.mefor_claim_fifo_heads_cid_v2/_dst_v2; fixed-arity CALL) instead of the ~3KB ad-hoc "
+            "(mefor_claim_fifo_heads_cid_v2/_dst_v2 in the store's schema; fixed-arity CALL) "
+            "instead of the ~3KB ad-hoc "
             "batch. Fails safe to the batch (loud) whenever the startup gate cannot verify both "
             "deployed bodies against this build — at least: a missing proc, a body matching no form "
             "this build deploys, a definition this principal cannot read (no VIEW DEFINITION, or "
@@ -2547,8 +2548,10 @@ class SandboxSettings(_Section):
     zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
     Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing
     a forbidden-import guard (socket/store/crypto), the resource caps below, and a fail-closed refusal
-    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial routes the message to
-    ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial fails the message's call
+    **post-ACK** (no NAK), never dropping it, and the ``[delivery] internal_error`` policy handles
+    it: ``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound's routing
+    or transform halts.
 
     **What turning it on costs, all of it measured in ADR 0087 (do not re-derive):**
 
@@ -2562,9 +2565,12 @@ class SandboxSettings(_Section):
       sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
       process in-process, not just that one.
     * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
-      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and dead-letters that message
-      post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
-      to finish now dead-letters. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
+      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and fails
+      that message's call post-ACK, for the ``[delivery] internal_error`` policy to handle
+      (``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound's routing
+      or transform halts). A busy-loop can no longer wedge intake, **and** a legitimately slow
+      Handler that used to finish now fails. ``startup_seconds`` and the POSIX ``mem_mb`` arm with
+      it.
     * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
       marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
       per-interface bound. **One message is not one dispatch:** a message routed to one handler with
@@ -2592,8 +2598,10 @@ class SandboxSettings(_Section):
     # POSIX-only memory cap (MiB) inside the child (no-op on Windows). None disables it. On Linux it is
     # HEADROOM above the loaded graph: RLIMIT_DATA at the worker's VmData after load_config, plus this,
     # with MALLOC_ARENA_MAX=2 so thread arenas cannot keep spending it.
-    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it dead-letters and its
-    # worker is recycled (ADR 0087, amendment of 2026-10-11).
+    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it fails, for the
+    # [delivery] internal_error policy to handle (dead-letter under the default continue; under stop
+    # the inbound's routing or transform halts), and its worker is recycled (ADR 0087, amendment
+    # of 2026-10-11).
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
     startup_seconds: float = Field(default=30.0, gt=0)
@@ -2719,12 +2727,15 @@ class LogWriteFailurePolicy(str, Enum):  # noqa: UP042
 
 
 class SyslogProtocol(str, Enum):  # noqa: UP042
-    # RFC 5426; fire-and-forget, never blocks the engine (the default).
+    # RFC 5426; fire-and-forget, never blocks the engine (the default). One unframed record per
+    # datagram.
     UDP = "udp"
-    # RFC 6587; connection-oriented (down-at-startup skipped; runtime stall bounded by a socket
+    # RFC 6587 octet counting (BACKLOG #5924; docs/CONFIGURATION.md forward_protocol states the
+    # framing); connection-oriented (down-at-startup skipped; runtime stall bounded by a socket
     # timeout so a wedged collector can't block the event loop — synchronous send).
     TCP = "tcp"
-    # RFC 5425; syslog over an ssl-wrapped TCP socket (native, no local agent needed — ADR 0080). Same
+    # RFC 5425 octet-counted frames, the same as tcp, over an ssl-wrapped TCP socket (native, no
+    # local agent needed — ADR 0080). Same
     # down-at-startup-skipped + bounded-timeout posture as tcp; the handshake is also bounded so a
     # collector that stalls TLS can't block the event loop. Requires a CA trust anchor unless
     # verification is explicitly disabled (see LoggingSettings.forward_tls_*).
@@ -4309,6 +4320,14 @@ class AuthSettings(_Section):
         cannot see."""
         return self.ad_enabled and self.ad_session_recheck_seconds > 0
 
+    @property
+    def ad_reconcile_unreached_window(self) -> int:
+        """How many of one account's last probes the unreachable-account page weighs (BACKLOG
+        #3100, #3709 closing step 6): ``2K - 1`` for K ``ad_reconcile_outage_passes``, so K
+        failures in it outnumber the answers. Said once here, for the service and the loosening
+        text alike."""
+        return 2 * self.ad_reconcile_outage_passes - 1
+
     @model_validator(mode="after")
     def _refuse_a_dead_breaker_fraction(self) -> AuthSettings:
         """BACKLOG #3085. Refuse a fraction under which the mass-revoke breaker never trips.
@@ -5240,7 +5259,8 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     The one parse ``[egress].allowed_ech_sidecar`` is validated with at load and matched with at
     the gate, which reads the sidecar it dials back through it, so the two cannot read a host or a
     port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
-    host and a port; ``transports.egress.host_port_allowed`` splits at the first. ``None`` for at
+    host and a port. The ``host[:port]`` lists have their own entry parse, in ``transports.egress``
+    (BACKLOG #5915), which differs at least in that a port is optional there. ``None`` for at
     least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
     ``:`` outside brackets, or none inside them; and a host the
     sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
@@ -9145,7 +9165,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       revokes nothing, so the page about a revocation gap arrives later. The load bounds it to 2 to
       100, inside which a larger value is still looser. ``run - 1`` intervals after the first such
       pass is the least delay, not an estimate (each pass's own run adds to it), and the
-      interval's entry says so too.
+      interval's entry says so too. The same value bounds one account the directory keeps failing
+      for, at that many of up to its last ``ad_reconcile_unreached_window`` probes (BACKLOG #3100,
+      #3709). A value other than 3 changes which failure patterns raise that page, and when. It
+      does not simply delay it: a pattern that pages at one value may never page at another.
       ``ad_session_revoke_max`` and ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``,
       which aborts a pass that would revoke more than both, and an aborted pass revokes nothing.
       Below the default a smaller wave of genuine revocations aborts, so that is named, as the 0
@@ -9695,6 +9718,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         # (run - 1) intervals after the first such pass is the least time to the page, never its
         # estimate.
         run = auth.ad_reconcile_outage_passes
+        window = auth.ad_reconcile_unreached_window
         floor = (
             f"at least {run} passes that read it unreachable, no sooner than "
             f"{(run - 1) * interval} s after the first of them"
@@ -9707,8 +9731,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
                     f"{floor}, and the page about one account the directory keeps failing for, "
-                    f"which comes after at least {run} of that account's own probes running "
-                    f"fail, at least {(run - 1) * interval} s after its first such probe",
+                    f"which comes once {run} of up to that account's last {window} probes "
+                    f"fail, at least {(run - 1) * interval} s after its first such probe. The "
+                    "longer interval spaces that account's probes further apart, which changes "
+                    "which failures that vary over time raise that page, and when, and a failure "
+                    "bounded in time can end before it pages at all",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9721,7 +9748,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
-                    "keeps failing for, so that page waits longer too",
+                    f"keeps failing for, at {run} of up to its last {window} probes. A value "
+                    "other than the default changes which failure patterns raise that page, and "
+                    "when. It does not simply delay it: a pattern that pages at one value may "
+                    "never page at another",
                 )
             )
         strikes = auth.ad_session_recheck_strikes
@@ -9744,9 +9774,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"{_auth_default('ad_session_recheck_max_users')}, so a larger estate takes "
                     f"more passes to cover, and {late}. The smaller sample is also the breaker's "
                     "denominator, so a smaller wave of revocations aborts the pass. In an estate "
-                    "larger than the sample each account is probed less often, so the page about "
-                    "one account the directory keeps failing for, which counts that account's "
-                    "probes, comes more passes later too",
+                    "larger than the sample each account is probed less often, which changes "
+                    "which failures that vary over time raise the page about one account the "
+                    "directory keeps failing for, and when, since it counts that account's "
+                    "probes, and a failure bounded in time can end before it pages at all",
                 )
             )
         brake = (
@@ -10332,10 +10363,13 @@ def security_loosenings(
 
     ``service_env`` is the third PROCESS observation (vault BACKLOG #2595, #2601), from
     :func:`messagefoundry.serviceenv.service_env_posture`: whether the engine runs under an NSSM
-    Windows service, which engine secrets that service's registry-held environment list names,
-    and whether a store key reaches it through its environment. A store key in that list refuses
-    the start, so this registry names only what does not refuse. ``None`` has the meaning it has
-    for ``remote_debug``.
+    Windows service, whether its registry-held environment lists could be read, and whether a
+    store key reaches it through its environment. An engine secret or any ``MEFOR_VALUE_*``
+    variable in those lists refuses the
+    start of ``serve`` and ``supervise``, and the build of ``create_app`` and
+    ``create_managed_app``, which never reach this registry then; a caller that reads it with no
+    refusal of its own gets what they refuse as ``secret_in_service_environment``, where the
+    engine finds its service. ``None`` has the meaning it has for ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares

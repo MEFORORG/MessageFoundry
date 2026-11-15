@@ -173,8 +173,9 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
-from messagefoundry.store.row_seal import RowSealError
+from messagefoundry.store.row_seal import RowSealError, TransitSealUnavailableError
 from messagefoundry.store.store import SessionRecord, UserRecord, VerifiedUser
+from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 
 _VALID_ROLE_IDS = {role.value for role in Role}
 
@@ -342,6 +343,16 @@ async def _refuse_if_self(
     raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
 
 
+def _seal_outage_503() -> HTTPException:
+    """The 503 an admin user read answers when Vault transit could not check a record's seal (ADR
+    0217, the Outage row): nothing was read, so retry once Vault answers."""
+    return HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        str(TransitSealUnavailableError()),
+        headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
+    )
+
+
 async def _checked_user(service: AuthService, user_id: str) -> VerifiedUser:
     """The account an admin route reads, its record checked against its seal (BACKLOG #5520), or
     the route's refusal: 404 when no row is there, 423 when the row's record fails its check, with
@@ -352,6 +363,8 @@ async def _checked_user(service: AuthService, user_id: str) -> VerifiedUser:
         user = await service.checked_user(user_id)
     except UserSealRefused as exc:
         raise HTTPException(status.HTTP_423_LOCKED, str(exc)) from exc
+    except TransitSealUnavailableError as exc:
+        raise _seal_outage_503() from exc
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     return user
@@ -362,20 +375,18 @@ async def _refuse_own_channel_scope(
     service: AuthService,
     identity: Identity,
     user_id: str,
-    target: UserRecord | None = None,
 ) -> None:
     """The channel-scope write's self-target refusal (BACKLOG #1149), one definition for both planes.
 
-    The console calls it through the seam before its own form checks (BACKLOG #3393), so a
-    self-target post with a malformed form is still refused and audited, not answered first by a
-    form error. ``set_channel_scope`` runs it again before the write, so the console's call adds
-    the order and takes nothing away."""
+    The console calls it through the seam before its own form checks and its account read
+    (BACKLOG #3393), so a self-target post with a malformed form is still refused and audited, not
+    answered first by a form error. ``set_channel_scope`` runs it again before the write, so the
+    console's call adds the order and takes nothing away."""
     await _refuse_if_self(
         request,
         service,
         identity,
         user_id,
-        target,
         op="channel_scope",
         detail="another administrator must change your own channel scope",
     )
@@ -505,7 +516,7 @@ def _user_summary(
 
 def _console_user_summary(
     user: UserRecord,
-    role_ids: list[str],
+    role_ids: list[str] | None,
     *,
     show_scope: bool,
     credential_expires_at: float | None = None,
@@ -516,7 +527,14 @@ def _console_user_summary(
     discloses, where a withholding default would read a real scope as deny-all and offer to save
     that over it. The seam field is named ``user_summary_scoped`` so the rename moves the seam
     digest: a console from before the keyword refuses to mount, rather than mounting and failing on
-    its user pages (``_ui_seam.py`` history)."""
+    its user pages (``_ui_seam.py`` history).
+
+    ``role_ids`` None takes the role rows a :class:`VerifiedUser`'s seal covered, so the console
+    reads no record attribute for them (BACKLOG #5559); any other record raises TypeError."""
+    if role_ids is None:
+        if not isinstance(user, VerifiedUser):
+            raise TypeError("role_ids=None takes a checked record, whose seal covered its roles")
+        role_ids = list(user.role_ids)
     return _user_summary(
         user,
         role_ids,
@@ -1390,7 +1408,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         summaries: list[UserListEntry] = []
         # BACKLOG #5520: through the service's checked reader, roles included, which the seal
         # covers. An account whose record fails stays listed by id alone (IntegrityFailedUser).
-        for listed in await service.list_checked_users():
+        try:
+            checked = await service.list_checked_users()
+        except TransitSealUnavailableError as exc:
+            raise _seal_outage_503() from exc
+        for listed in checked:
             user = listed.user
             if user is None:
                 summaries.append(IntegrityFailedUser(id=listed.id, integrity_failed=True))
@@ -2615,6 +2637,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     return AdminHandlers(
         list_roles=list_roles,
         list_users=list_users,
+        checked_user=_checked_user,
         list_custom_roles=list_custom_roles,
         create_user=create_user,
         update_user=update_user,

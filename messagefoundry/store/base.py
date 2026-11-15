@@ -77,10 +77,11 @@ from messagefoundry.store.privilege import (
     probe_failure,
     sqlite_not_applicable,
 )
-from messagefoundry.store.row_seal import RowSealer
+from messagefoundry.store.row_seal import AnyRowSealer, ResealOutcome
 from messagefoundry.store.store import (
     ANY_CLAIM_OWNER,
     OPEN_STORE_PIN,
+    OPEN_STORE_PIN_CHECK,
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
     AdminGrant,
@@ -115,6 +116,8 @@ from messagefoundry.store.store import (
     OutboxItem,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
+    PinCheck,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -131,11 +134,14 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    StoreCreateBatchFailedBeforeKeyUse,
     StorePin,
     StreamingAttachmentsUnsupported,
     TotpUsable,
     UserRecord,
     WebAuthnCredential,
+    WorkerDeathOutcome,
+    minting_open,
     note_audit_chain_read,
 )
 
@@ -949,7 +955,42 @@ class QueueStore(StoreLifecycle, Protocol):
         or another writer already re-pended still takes this attempt's backoff, ``failed`` event and
         ``last_error``. A row some other writer already made DONE, DEAD or CANCELLED is left exactly
         as it is, and no ``failed`` event is written. The call still returns the retry time on that
-        miss; an early wake claims nothing. The DEAD branch carries no status term (ADR 0157 C2)."""
+        miss; an early wake claims nothing. The DEAD branch leaves a row already DONE, DEAD or
+        CANCELLED as it is, and returns an empty outcome (ADR 0157 Amendment C, vault BACKLOG #4607
+        step 6). It still dead-letters a PENDING row, which C2's lease-sweep case needs."""
+        ...
+
+    async def record_worker_death(
+        self, outbox_id: str, cap: int, error: str, now: float | None = None
+    ) -> WorkerDeathOutcome:
+        """Count one death of the stage worker that was processing ``outbox_id``, and dead-letter
+        the row once its count reaches ``cap`` (vault BACKLOG #4607 step 6; owner ruling 2026-11-04,
+        "Yes, dead-letter it"). A death is a ``BaseException`` that is not an ``Exception``, ending
+        the worker; the runner decides that, and never counts a cancellation, ``GeneratorExit``,
+        ``KeyboardInterrupt`` or ``SystemExit``, nor a group none of whose members is a death.
+
+        One transaction. It raises the row's ``worker_deaths`` by one only while the row is
+        unresolved, ``inflight`` or ``pending`` (a Postgres lease sweep may have re-pended it before
+        the death), and reads the count that increment left. Nothing else writes that column but a
+        replay, which resets it with ``attempts``: no claim raises it, and no release, reschedule or
+        ``reset_stale_inflight`` lowers it. So a batch tail claimed beside a dying row is never
+        counted, and the count survives a restart. Below ``cap`` that is the whole write: the row
+        stays as a death leaves it, and ``updated_at`` is untouched. At ``cap`` or above the same
+        transaction dead-letters the row as :meth:`dead_letter_now` does, a ``dead`` event
+        written and its message finalized. A row already DONE, DEAD or CANCELLED is never
+        changed: the increment matches only an unresolved row and holds it locked until the
+        commit (ADR 0157 Amendment C). On Postgres and SQL Server that dead-letter takes the
+        fail-open resolve fence (ADR 0157 C1, C2); a fenced rejection rolls the whole transaction
+        back, increment included, and re-pends a row still in flight (C3). The count loses that
+        death and nothing raises it again, though the runner's ERROR line and the fence's WARNING
+        and ``fenced_writes`` count still record it. So a row whose dead-letter is fenced needs
+        more deaths than ``cap`` before a dead-letter lands.
+
+        "Every time" therefore means across passes that each claimed the row anew: after a restart,
+        or a Postgres lease reclaim. A per_lane worker is respawned, but its dying row stays in
+        flight, so it is not re-claimed in the same process unless a lease sweep re-pends it
+        (#4607 steps 1, 2 and 5 are not built). A resolved row is not counted, and the empty
+        :class:`WorkerDeathOutcome` comes back."""
         ...
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
@@ -1648,6 +1689,13 @@ class QueueStore(StoreLifecycle, Protocol):
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
 
+    def reseal_outcome(self) -> ResealOutcome:
+        """What the last :meth:`reencrypt_to_active` left sealed under a key other than the active
+        one: the user, role, approval and directory-map seals its re-seal passes did not move
+        (vault BACKLOG #5635). A side result, so ``reencrypt_to_active`` keeps its count; empty
+        before one has run, and always empty on a store with no in-process seal key."""
+        ...
+
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total.
@@ -1775,7 +1823,11 @@ class QueueStore(StoreLifecycle, Protocol):
         :meth:`purge_message_bodies` (per-connection-or-global cutoff AND not in-flight); ``min_bytes``
         skips a sub-threshold embed; ``content_types`` (channel_id -> declared content_type) labels a
         bare-mfb64 tombstone. Idempotent (an already-tombstoned body is skipped). Returns a
-        :class:`StripResult` (counts + bytes reclaimed; no message content)."""
+        :class:`StripResult` (counts + bytes reclaimed; no message content).
+
+        Every backend runs it through :func:`~messagefoundry.store.document_strip.run_strip_pass`
+        (BACKLOG #5651); its module docstring states the batching and the write-back guard, and
+        what the guard does and does not cover on each backend."""
         ...
 
     async def purge_dead_letters(
@@ -2298,9 +2350,11 @@ class AuditStore(Protocol):
         """True iff the audit log carries at least one ``dr_backup`` row — the #102 server-DB DR-seed
         gate's "restored, not freshly-bootstrapped" signal. A ``dr_backup`` row is written on every
         leader-gated backup SUCCESS (the run that PRODUCES a seed archive), so a server DB restored from
-        an operating primary carries ≥1; a passive DR standby is never the leader and writes none, so a
-        fresh/unrestored DR DB (non-empty only because provisioning, engine startup and operator
-        sign-in wrote to it) has zero. Read-only (a single indexed existence check), all backends.
+        an operating primary carries ≥1, and the engine starts no backup pass on a passive DR
+        standby (vault BACKLOG #5712). A fresh/unrestored DR DB (non-empty only because
+        provisioning, engine startup and operator sign-in wrote to it) can still carry one: what
+        writes it is stated once at ``BackupRunner``'s ``dr_paused``
+        (``messagefoundry.pipeline.dr_backup``). Read-only (a single indexed existence check), all backends.
         NOTE: this proves prior backup history, NOT vintage/completeness of a DBA-managed restore
         (see BACKLOG #102 residuals)."""
         ...
@@ -2760,10 +2814,18 @@ class AuthStore(Protocol):
 
     # The offline administrator unlock's write (ADR 0171 as amended by ADR 0197): clears both locks and
     # both failure counts, and keeps both cycle counts unless ``reset_cycles``. A named method, in
-    # place of the ``record_login_failure`` reuse ADR 0171 shipped with.
+    # place of the ``record_login_failure`` reuse ADR 0171 shipped with. ``audit`` is appended in the
+    # SAME transaction (BACKLOG #5633), so an unlock is never committed unrecorded: a refused append
+    # rolls the clear back. Returns whether a row was written. False writes and audits nothing: no
+    # such account, or a row that changed under the write's compare-and-set.
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None: ...
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool: ...
 
     # The RAW sign-in lockout-state write: it sets exactly the two values it is handed and nothing
     # else. No engine code calls it since ADR 0197 moved ``admin-unlock`` to ``clear_lockout``; tests
@@ -2911,13 +2973,18 @@ class AuthStore(Protocol):
         *,
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Replace the account's roles with ``role_ids``. Raises ``UnknownRoleError``, writing
         nothing, when an id the account does not already hold has no ``roles`` row as the write
         reads it; a role deleted after that read fails the ``user_roles`` foreign key instead, with
         the driver's integrity error. A held id with no row is dropped (BACKLOG #2592,
         ``store.existing_roles_only``). :meth:`remove_unless_last_admin` with ``SET_ROLES`` does
-        the same."""
+        the same.
+
+        ``audits`` commit in the SAME transaction as the role write, as ``create_user``'s do, so a
+        failed append rolls the roles back (BACKLOG #2221). They are appended whenever the call
+        commits, so the caller passes rows only for a change it has decided to record."""
         ...
 
     async def set_user_roles_if_held(
@@ -2928,9 +2995,14 @@ class AuthStore(Protocol):
         expected_role_ids: Iterable[str],
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """:meth:`set_user_roles` as a COMPARE-AND-SET on the roles the caller read, reporting
         whether it wrote (vault BACKLOG #3085).
+
+        ``audits`` are appended only when it writes, in the write's transaction, so a failed append
+        rolls the roles back and a write that finds the roles moved records nothing (BACKLOG #3018
+        step 4).
 
         The directory reconciler decides a role write from a row it read earlier, and another
         writer, such as a second reconciler or a directory sign-in, may have written the roles in
@@ -2952,9 +3024,14 @@ class AuthStore(Protocol):
         role_ids: Sequence[str] = (),
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Apply ``change`` to ``user_id`` unless it would leave no enabled administrator (vault
         BACKLOG #2779).
+
+        **``audits`` are appended only when the change is applied, in its transaction (BACKLOG
+        #2221).** A refusal writes nothing and appends nothing, and an append that fails rolls the
+        change back, so a disable, delete or role change never commits without its row.
 
         One transaction re-reads the enabled accounts holding ``admin_role_id`` and refuses, writing
         nothing and returning ``False``, when ``user_id`` is one of them, no other is, and the
@@ -3189,13 +3266,20 @@ class AuthStore(Protocol):
     async def set_ad_group_scope_map(self, entries: Iterable[tuple[str, str]]) -> None: ...
 
     # --- sessions ------------------------------------------------------------
-    def row_sealer(self) -> RowSealer | None:
+    def row_sealer(self) -> AnyRowSealer | None:
         """The sealer this store writes authority-row integrity seals with, or ``None`` when its
-        cipher holds no in-process key, in which case no seal is written or checked (BACKLOG #2592).
+        cipher is keyless, in which case no seal is written or checked (BACKLOG #2592).
+        ``row_sealer_for_cipher`` returns a
+        :class:`~messagefoundry.store.row_seal.TransitRowSealer` for a ``vault_transit`` cipher
+        (ADR 0217 slice 1b-iii), else the local
+        :class:`~messagefoundry.store.row_seal.RowSealer`.
 
         The store writes the seals: every session write that changes a sealed column goes through
-        one helper per backend, which verifies the row it read before it re-seals it and raises
-        :class:`~messagefoundry.store.row_seal.RowSealError` rather than re-seal a row that fails.
+        one helper per backend, which verifies the row it read before it re-seals it and refuses
+        rather than re-seal a row that fails. On every backend that refusal goes through
+        :func:`~messagefoundry.store.row_seal.require_seal_for_write`, which says what it raises
+        (ADR 0217 slices 1b-i and 1b-ii), the retired-key type included, which its callers end
+        quietly (slice 1b-iv).
         A revoke blanks the seal, which needs no key. :class:`AuthService` checks the seals, in its
         one session loader; the store's readers return rows unchecked."""
         ...
@@ -3227,9 +3311,7 @@ class AuthStore(Protocol):
 
         ``require_federated_subject`` makes the insert CONDITIONAL on the account still carrying
         that verified ``(issuer, sub)``, checked in the same transaction (BACKLOG #1474): the row is
-        written only if the binding is still there, and the call returns ``False`` otherwise. A user
-        id that resolves to no row is a mismatch like any other, so it too returns ``False`` rather
-        than inserting a session against an account that is not there.
+        written only if the binding is still there, and the call returns ``False`` otherwise.
 
         **It closes a race a caller cannot close for itself.** A federated login and an admin unbind
         can overlap, and the unbind revokes the sessions that EXIST when it runs. Without this guard
@@ -3237,13 +3319,18 @@ class AuthStore(Protocol):
         the withdrawn identity keeps a live session. Checking the binding before calling would only
         narrow the window, because the check and the insert would still be two transactions.
 
+        **A ``user_id`` that resolves to no row returns ``False`` on every call**, guarded or not,
+        and writes nothing (BACKLOG #2733): an account deleted after the caller read it is refused
+        here rather than by the INSERT's foreign-key error.
+
         **``(None, None)`` requires an UNBOUND row** (vault BACKLOG #2609). It is the same guard
         read the other way, for the Windows SSO mint: a bound account is refused that sign-in,
         and a bind sweeps the sessions that exist when it runs. So a Windows SSO insert that
         landed after a bind's sweep would leave a session the bind could not see. A row holding
         either half of a pair is not unbound, and the insert is refused.
 
-        Every other caller passes nothing and is byte-identical: no extra read, no extra statement.
+        A caller that passes no guard still has its account read, for the session epoch, and still
+        takes the missing-row refusal above; only the binding comparison is skipped.
         """
         ...
 
@@ -3289,8 +3376,10 @@ class AuthStore(Protocol):
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
         is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This and
         :meth:`supersede_session`, which returns the row it revoked, are the single-session UPDATEs
-        that report what they changed: every other one is deliberately blind (a write against a dead
-        hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
+        that report what they changed, with one narrower exception:
+        :meth:`mark_session_mfa_verified` answers only whether it landed AND applied a pending-factor
+        anchor, so its False does not tell a dead hash from a stamp that applied none. Every other
+        one is deliberately blind (a write against a dead hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
         so it must be able to fail closed if the session died underneath it.
 
         **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG
@@ -3323,8 +3412,31 @@ class AuthStore(Protocol):
         ...
 
     async def mark_session_mfa_verified(
-        self, token_hash: str, *, now: float | None = None
-    ) -> None: ...
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        """Stamp the session's second factor as met (``mfa_verified_at``), always.
+
+        ``anchor`` (vault BACKLOG #2964 item 14) is applied only when the row this write reads has
+        not met its factor. The decision is made inside the write's own transaction, on the row the
+        write reads. PostgreSQL and SQL Server hold a row lock from that read to the write, and
+        SQLite's writer lock orders this process's writers, so a factor another request met first
+        leaves this a plain factor stamp. On SQLite a commit by another process between the read
+        and the write makes the write raise rather than replace anything, which the passkey leg
+        answers by ending the session (fail closed). When
+        applied, the anchor moves the session's address to ``anchor.client`` (``None`` keeps it)
+        and opens the step-up window (``reauth_at``) when ``anchor.open_window`` is true. When
+        ``open_window`` is false it CLEARS ``reauth_at``, whether or not the address moved. The
+        default ``None`` applies no anchor, which is the behaviour every other caller has.
+
+        Returns ``True`` only when the write landed and applied the anchor, so a caller restarts
+        its new-address bookkeeping only for a session an anchor was applied to (with
+        ``anchor.client`` ``None`` that is True with the address unchanged); ``False`` for a write
+        that applied none, a session gone or revoked, or a write that lost its seal compare."""
+        ...
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
@@ -3362,7 +3474,12 @@ class AuthStore(Protocol):
         ...
 
     async def revoke_user_sessions(
-        self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        except_token_hash: str | None = None,
+        now: float | None = None,
+        audit: OperatorAudit[RevokeResult],
     ) -> RevokeResult:
         """Revoke the account's unrevoked sessions, but ``except_token_hash`` when it is given,
         raising the account's session epoch in the same transaction (BACKLOG #2592). Returns how
@@ -3372,7 +3489,12 @@ class AuthStore(Protocol):
         current global epoch, read in that transaction (store.py's ``KeptSessionRestamp``). A
         session of the account it declines to re-stamp it ends in the same transaction and counts,
         and reports ``ended_kept`` (follow-up to BACKLOG #4975). ``kept`` is False with no
-        ``except_token_hash``."""
+        ``except_token_hash``.
+
+        ``audit`` builds the revocation's row from that result, and the row is appended before the
+        one commit, so the sessions end with their record or not at all (BACKLOG #3018 step 4). It
+        is a function, not a row, because the row can carry the count. It returns ``None`` where
+        the caller records the revocation itself (``store.no_audit_row``)."""
         ...
 
     async def count_user_sessions(
@@ -4444,6 +4566,14 @@ def store_call_errors() -> tuple[type[Exception], ...]:
     return (RuntimeError, OSError, ValueError, *store_driver_errors())
 
 
+def sealed_read_errors() -> tuple[type[Exception], ...]:
+    """What a refused read of a sealed record can raise (BACKLOG #5559): :func:`store_call_errors`
+    and ``CipherError``, from a record that cannot be decrypted. The same caveat holds: a caller
+    that must not read a bug as a refusal re-raises
+    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first."""
+    return (*store_call_errors(), CipherError)
+
+
 @cache
 def audit_write_errors() -> tuple[type[Exception], ...]:
     """What a refused audit write raises, at least on the store backends and key modes named here
@@ -4543,6 +4673,56 @@ def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     except OSError:
         pass
     return None
+
+
+#: SQLSTATEs a server driver reports for a connection it could not establish: 08001 (unable to
+#: establish one) and 08004 (the server rejected it). The invalid-authorization class, 28, a
+#: refused login, is matched by its prefix. Each names a failed dial, not that no earlier dial in
+#: the same open succeeded, so :func:`_failed_before_connecting` asks where it was raised too.
+_CONNECT_ONLY_SQLSTATES: Final = frozenset({"08001", "08004"})
+#: The modules whose ``_create_pool`` builds a server store's pool. Each backend's open calls it
+#: once, first among the calls that can reach the database, and hands the cipher to the store only
+#: after it returns.
+_POOL_CREATION_MODULES: Final = frozenset(
+    {"messagefoundry.store.postgres", "messagefoundry.store.sqlserver"}
+)
+
+
+def _raised_creating_the_pool(exc: BaseException) -> bool:
+    """Whether ``exc``'s traceback passes through a server backend's ``_create_pool``, so it was
+    raised before the store that holds the cipher was built. A backend that catches such an error
+    and raises another outside that call answers ``False``, which keeps the key."""
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        if (
+            frame.f_code.co_name == "_create_pool"
+            and frame.f_globals.get("__name__") in _POOL_CREATION_MODULES
+        ):
+            return True
+        tb = tb.tb_next
+    return False
+
+
+def _failed_before_connecting(exc: Exception) -> bool:
+    """Whether a minting server open's ``exc`` proves it wrote nothing under its key (vault BACKLOG
+    #8119 item 2, the Manager's ruling of 2026-11-10): raised while the backend built its pool,
+    before the store that holds the cipher existed (:func:`_raised_creating_the_pool`), AND of a
+    class only a failed dial raises: the hop's own TLS settings refused (``InsecureHopRefused``), a
+    refused or unresolvable address (``ConnectionRefusedError``, ``socket.gaierror``), or a
+    driver's connection or login refusal named by its SQLSTATE (:data:`_CONNECT_ONLY_SQLSTATES`,
+    class 28). Anything else answers ``False``, and the minting command keeps the key: at least
+    any failure after the pool was built, a timeout, a ``RuntimeError``, and a dial failure a
+    backend wraps in another class, such as SQL Server's database-options connection under
+    ``auto``, or asyncio's combined error for several addresses."""
+    import socket
+
+    if not _raised_creating_the_pool(exc):
+        return False
+    if isinstance(exc, (InsecureHopRefused, ConnectionRefusedError, socket.gaierror)):
+        return True
+    state = driver_sqlstate(exc)
+    return state is not None and (state in _CONNECT_ONLY_SQLSTATES or state.startswith("28"))
 
 
 async def open_store(
@@ -4683,6 +4863,12 @@ async def open_store(
     # The pin rides a context variable to the genesis read every backend shares (vault BACKLOG
     # #3411); reset at once, so no later open in this context inherits it.
     pinned = OPEN_STORE_PIN.set(pin)
+    # A minting server open's failure is typed as one that sealed nothing under the minted key, so
+    # the minting command removes it, only where _failed_before_connecting proves it, and only
+    # before the pin check passed; every other failure keeps the key (vault BACKLOG #8119 item 2).
+    # The batch failures a backend typed itself, and the pin refusals, are re-raised as they are.
+    check = PinCheck() if minting_open() and settings.backend is not StoreBackend.SQLITE else None
+    checking = OPEN_STORE_PIN_CHECK.set(check)
     try:
         store = await _open_backend(
             settings,
@@ -4694,7 +4880,12 @@ async def open_store(
             create=create,
             read_only=read_only,
         )
+    except Exception as exc:
+        if check is None or check.passed or not _failed_before_connecting(exc):
+            raise
+        raise StoreCreateBatchFailedBeforeKeyUse(exc) from exc
     finally:
+        OPEN_STORE_PIN_CHECK.reset(checking)
         OPEN_STORE_PIN.reset(pinned)
     if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:
         await _refuse_to_start_a_keyless_chain(

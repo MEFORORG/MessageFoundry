@@ -47,6 +47,7 @@ import shlex
 import subprocess
 import sys
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -163,7 +164,9 @@ _DEFAULT_CONTEXT: dict[str, str] = {
 }
 
 
-def _evaluate(condition: str, results: list[str], context: dict[str, str] | None = None) -> bool:
+def _evaluate(
+    condition: str, results: list[str], context: Mapping[str, object] | None = None
+) -> bool:
     """Evaluate one step's `if` against a synthetic results vector.
 
     EVALUATED, NOT PATTERN-MATCHED, AND THE DIFFERENCE IS LOAD-BEARING. The previous reader pulled
@@ -181,6 +184,11 @@ def _evaluate(condition: str, results: list[str], context: dict[str, str] | None
     need's result (`needs['test-shard2'].result` -> `need_test_shard2`), the `changes` job's `code`
     output, the event name, and `==` / `!=` between those and a quoted literal. A name `context` does
     not supply raises rather than defaulting.
+
+    BACKLOG #5645 widened it again, for the CLA step's `if`: quoted literals are lifted out into
+    names before translating, so the sign text's spaces and period cannot trip the whitelist; the
+    comment body and `github.event.issue.pull_request` are two more names; and the expression is
+    joined onto one line, because a folded YAML scalar can break after a top-level `||`.
     """
     expr = re.sub(
         r"contains\(\s*needs\.\*\.result\s*,\s*'([a-z]+)'\s*\)",
@@ -192,23 +200,60 @@ def _evaluate(condition: str, results: list[str], context: dict[str, str] | None
         lambda m: "need_" + m.group(1).replace("-", "_"),
         expr,
     )
-    expr = expr.replace("needs.changes.outputs.code", "code").replace("github.event_name", "event")
+    literals: dict[str, str] = {}
+
+    def lift(match: re.Match[str]) -> str:
+        name = f"lit_{len(literals)}"
+        literals[name] = match.group(1)
+        return name
+
+    expr = re.sub(r"'([^']*)'", lift, expr)
+    expr = (
+        expr.replace("needs.changes.outputs.code", "code")
+        .replace("github.event.comment.body", "body")
+        .replace("github.event.issue.pull_request", "issue_pr")
+        .replace("github.event_name", "event")
+    )
     expr = expr.replace("&&", " and ").replace("||", " or ")
-    expr = re.sub(r"!(?!=)", " not ", expr)
+    expr = " ".join(re.sub(r"!(?!=)", " not ", expr).split())
     # Whitelist BEFORE evaluating. The input is this repository's own workflow, so this is not a
     # trust boundary -- it is a guard against grading an expression that grew syntax this function
     # does not model.
-    if not re.fullmatch(r"[\s()'a-z0-9_=!]+", expr):
+    # `!a == b` is `(!a) == b` on GitHub and `not (a == b)` in Python, so it raises rather than
+    # being graded with the wrong precedence.
+    if re.search(r"\bnot\s+\w+\s*[=!]=", expr) or not re.fullmatch(r"[\s()a-z0-9_=!]+", expr):
         raise AssertionError(
             f"the roll-up condition uses syntax this reader does not model: {condition!r}. Teach "
             "_evaluate the new form rather than loosening this check -- an unmodelled operator "
             "silently changes what the gate is graded against."
         )
-    names = dict(_DEFAULT_CONTEXT if context is None else context)
+    # GitHub's `==` compares strings ignoring case, so every string is case-folded before Python's
+    # case-sensitive `==` sees it.
+    names = {
+        key: value.casefold() if isinstance(value, str) else value
+        for key, value in {**(_DEFAULT_CONTEXT if context is None else context), **literals}.items()
+    }
     try:
         return bool(eval(expr, {"__builtins__": {}}, {"results": results, **names}))  # noqa: S307
     except NameError as exc:
         raise AssertionError(f"{condition!r} names something its context does not: {exc}") from exc
+
+
+def test_the_evaluator_folds_case_lifts_literals_and_refuses_bang_equals() -> None:
+    """BACKLOG #5645's three additions to `_evaluate`, each pinned directly: GitHub's `==` ignores
+    case; a literal with spaces, capitals and a period survives the whitelist; and `!a == b`, which
+    GitHub reads as `(!a) == b`, raises rather than being graded as `not (a == b)`."""
+    ctx: dict[str, object] = {"event": "Pull_Request", "body": None, "issue_pr": None}
+    assert _evaluate("github.event_name == 'pull_request'", [], ctx)
+    assert _evaluate("github.event_name == 'PULL_REQUEST'", [], ctx)
+    assert not _evaluate("github.event_name != 'pull_request'", [], ctx)
+    ctx["body"] = "I have read it. Yes!"
+    assert _evaluate("github.event.comment.body == 'i HAVE read it. yes!'", [], ctx)
+    for form in ("!github.event_name == 'push'", "!github.event_name != 'push'"):
+        with pytest.raises(AssertionError, match="does not model"):
+            _evaluate(form, [], ctx)
+    # The neighbour that must keep working: `!` on a parenthesised comparison is unambiguous.
+    assert _evaluate("!(github.event_name == 'push')", [], ctx)
 
 
 def _rollup_fires(condition: str, results: list[str]) -> bool:
@@ -1329,6 +1374,152 @@ def test_the_cla_allowlist_is_an_enumeration_and_not_a_glob() -> None:
         "the CLA allowlist emptied; every maintainer push would need a signature"
     )
     assert "*" not in allowlist, f"the CLA allowlist contains a glob: {allowlist!r}"
+
+
+_CLA_SIGN_TEXT = "I have read the CLA and I agree to its terms."
+
+# The form cla.yml shipped before BACKLOG #5645: the comment arm had no event or pull-request test.
+_CLA_CONDITION_BEFORE_5645 = (
+    "(github.event.comment.body == 'recheck' ||\n"
+    f" github.event.comment.body == '{_CLA_SIGN_TEXT}') ||\n"
+    "github.event_name == 'pull_request_target'"
+)
+
+
+def _cla_step_runs(condition: str, event: str, body: str | None, on_pull_request: bool) -> bool:
+    """Evaluate the CLA step's `if` for one synthetic event, through `_evaluate`.
+
+    `body` is None when the event carries no comment. `github.event.issue.pull_request` is an
+    object only on a pull request's comments, and absent on a plain issue's.
+    """
+    issue_pr = {"url": "synthetic"} if on_pull_request else None
+    return _evaluate(condition, [], {"event": event, "body": body, "issue_pr": issue_pr})
+
+
+@functools.cache
+def _cla_step_condition() -> str:
+    steps = jobs_of("cla.yml")["cla"]["steps"]
+    candidates = [s for s in steps if "allowlist" in (s.get("with") or {})]
+    assert len(candidates) == 1, f"expected ONE CLA action step in cla.yml, found {len(candidates)}"
+    return _without_not_cancelled(str(candidates[0]["if"]))
+
+
+_NOT_CANCELLED = "!cancelled() &&"
+
+
+def _without_not_cancelled(condition: str) -> str:
+    """The CLA action's `if:` opens with `!cancelled() &&` so it runs after a pre-check refusal.
+    `_evaluate` models no status function, so the prefix is checked here and the rest graded."""
+    text = condition.strip()
+    assert text.startswith(_NOT_CANCELLED), (
+        "the CLA action's `if:` must open with `!cancelled() &&`; without a status function GitHub "
+        "adds `success()`, and a pre-check refusal would skip the request to sign"
+    )
+    return text[len(_NOT_CANCELLED) :].strip()
+
+
+@pytest.mark.parametrize("body", ["recheck", _CLA_SIGN_TEXT])
+def test_the_cla_step_ignores_a_sign_or_recheck_comment_on_a_plain_issue(body: str) -> None:
+    """BACKLOG #5645. `issue_comment` fires for plain issues too. The step must run on a pull
+    request's comment and must NOT run on the same text posted on a plain issue.
+
+    THE ASYMMETRY: the same evaluator, given the pre-fix condition, reports that it DID run on the
+    plain issue, so a green here is the condition's work and not an evaluator that never fires.
+    """
+    condition = _cla_step_condition()
+    assert not _cla_step_runs(condition, "issue_comment", body, on_pull_request=False), (
+        f"the CLA step runs on a {body!r} comment posted on a plain issue; its comment arm must "
+        "require github.event.issue.pull_request"
+    )
+    assert _cla_step_runs(condition, "issue_comment", body, on_pull_request=True), (
+        f"the CLA step no longer runs on a {body!r} comment on a pull request, so nobody can sign"
+    )
+    assert _cla_step_runs(_CLA_CONDITION_BEFORE_5645, "issue_comment", body, on_pull_request=False)
+
+
+def test_the_cla_step_keeps_its_pull_request_target_arm_and_merge_group_skip() -> None:
+    """The arms the #5645 tightening must not move: the step runs on every `pull_request_target`
+    run, skips on `merge_group` (the accepted residual cla.yml's `on:` note records), and ignores
+    a pull request comment that is neither the sign text nor `recheck`."""
+    condition = _cla_step_condition()
+    assert _cla_step_runs(condition, "pull_request_target", None, on_pull_request=False)
+    assert not _cla_step_runs(condition, "merge_group", None, on_pull_request=False)
+    assert not _cla_step_runs(condition, "issue_comment", "looks good", on_pull_request=True)
+    # GitHub's `==` ignores case, so a shouted recheck on a pull request runs the step too.
+    assert _cla_step_runs(condition, "issue_comment", "RECHECK", on_pull_request=True)
+    assert not _cla_step_runs(condition, "issue_comment", "RECHECK", on_pull_request=False)
+
+
+def _cla_steps() -> tuple[dict[str, Any], dict[str, Any]]:
+    """The pre-check step and the CLA action step, in that order."""
+    steps = jobs_of("cla.yml")["cla"]["steps"]
+    names = [str(s.get("name", "")) for s in steps]
+    pre = [i for i, n in enumerate(names) if n.startswith("CLA pre-check")]
+    act = [i for i, s in enumerate(steps) if "allowlist" in (s.get("with") or {})]
+    assert len(pre) == 1 and len(act) == 1, f"expected one pre-check and one CLA step: {names}"
+    assert pre[0] < act[0], "the CLA pre-check must run before the CLA action"
+    return steps[pre[0]], steps[act[0]]
+
+
+def test_the_cla_pre_check_reads_the_same_allowlist_and_sign_text_as_the_action() -> None:
+    """BACKLOG #5644. Two copies of one list: if CLA_ALLOWLIST drifts from the action's
+    `allowlist:`, the pre-check refuses or passes on a different list from the one the action
+    skips. And the sign text the `if:` matches must be the one the action tells people to post."""
+    pre, act = _cla_steps()
+    assert str(pre["env"]["CLA_ALLOWLIST"]) == str(act["with"]["allowlist"])
+    assert str(pre["env"]["CLA_SIGNATURES_PATH"]) == str(act["with"]["path-to-signatures"])
+    assert str(pre["env"]["CLA_SIGNATURES_BRANCH"]) == str(act["with"]["branch"])
+    assert str(act["with"]["custom-pr-sign-comment"]) == _CLA_SIGN_TEXT
+    # Same events; the action alone adds `!cancelled()`, so it also runs after a refusal.
+    pre_if = " ".join(str(pre["if"]).split())
+    act_if = " ".join(_without_not_cancelled(str(act["if"])).split())
+    assert act_if == f"({pre_if})", "the pre-check must run on exactly the action's events"
+
+
+def test_the_cla_pre_check_step_names_a_script_that_exists() -> None:
+    """A renamed or moved script makes python3 exit 2, which the wrapper fails on; this catches
+    the rename at pull request time instead, before it reaches the default branch."""
+    pre, _ = _cla_steps()
+    paths = re.findall(r"python3\s+(\S+\.py)", str(pre["run"]))
+    assert len(paths) == 1, f"expected one python3 call in the pre-check step: {pre['run']!r}"
+    assert (ROOT / paths[0]).is_file(), f"cla.yml runs {paths[0]}, which does not exist"
+
+
+def test_the_cla_pre_check_fails_open_on_a_fault_only(tmp_path: Path) -> None:
+    """Owner ruling 2026-11-13, "fail-open on fault, fail-closed on a determinate refusal": exit 1
+    with the refusal annotation fails; exit 3, or exit 1 without it, passes with a warning; exit 2
+    (python3 could not open the script) and any other non-zero fail. Run the step's own script with a stub in place of the pre-check,
+    so the wrapper is what is measured. Event data stays in `env:`, never in `run:`."""
+    pre, _ = _cla_steps()
+    script = str(pre["run"])
+    assert "${{" not in script, "event data must reach the pre-check through env:, not run:"
+    call = "python3 scripts/security/cla_precheck.py"
+    assert script.count(call) == 1, f"the step must call the pre-check exactly once: {script!r}"
+    bash = _require_bash(tmp_path)
+    refused = "::error title=CLA pre-check refused::commit x"
+    # (exit code, what the script printed, the step's exit, whether it warned "not enforced").
+    # Exit 1 fails only WITH the refusal annotation; a bare exit 1 (an import-time traceback) is a
+    # fault. 2 is python3's own "cannot open the script", so it must FAIL; 3 is the fault code.
+    cases = (
+        (0, "CLA pre-check: 1 commit(s) read", 0, False),
+        (1, refused, 1, False),
+        (1, "Traceback (most recent call last):", 0, True),
+        (1, "  ::error title=CLA pre-check refused:: not at line start", 0, True),
+        (2, "python3: cannot open file", 2, False),
+        (3, "::warning title=CLA pre-check fault::x", 0, True),
+        (4, "", 4, False),
+    )
+    for code, printed, expect, warned in cases:
+        stub = f"( printf '%s\\n' '{printed}'; exit {code} )"
+        # GitHub runs a bash `run:` with `-e`, so the wrapper must survive it.
+        wrapped = "set -e\n" + script.replace(call, stub)
+        proc = subprocess.run(  # noqa: S603 -- the repository's own workflow script, under test
+            [bash, "-c", wrapped], capture_output=True, check=False, cwd=tmp_path, timeout=60
+        )
+        out = _text(proc)
+        assert proc.returncode == expect, (code, printed, proc.returncode, out)
+        assert ("::warning title=CLA pre-check not enforced::" in out) == warned, (code, out)
+        assert printed in out, "the wrapper must still show the pre-check's own output"
 
 
 # ===================================================================================================

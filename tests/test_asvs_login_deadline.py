@@ -53,6 +53,7 @@ from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import AuditAppend
 from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
@@ -400,7 +401,9 @@ async def test_every_login_failure_branch_answers_at_one_deadline(
     async def unlock_jane(branch: str) -> None:
         # Repetition must not turn `wrong_password` into `locked_account`; see _MIN_ROUNDS.
         if branch == "wrong_password":
-            await service.store.clear_lockout(jane.id)
+            await service.store.clear_lockout(
+                jane.id, audit=AuditAppend("auth.admin_unlocked", actor="test")
+            )
 
     # At the parent commit of BACKLOG #1140 these branches spread 49 ms; _TOLERANCE is 1 ms.
     _assert_one_deadline(

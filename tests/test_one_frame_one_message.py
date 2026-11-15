@@ -3,9 +3,11 @@
 """One outbound frame holds exactly one message (ADR 0205, vault BACKLOG #2557).
 
 Each section pins one rule of the ADR, and the tests marked as an audit probe reproduce that probe
-from the injection audit. Every such test fails on the code before ADR 0205: the payload was framed
-without a look inside it, a leaf write emitted a decoded hex escape raw, and ingress took an HL7 v2
-body with an embedded MLLP start byte. Synthetic data only.
+from the injection audit. Such tests, the controls aside, were measured failing on the code before
+ADR 0205: the payload was framed without a look inside it, a leaf write emitted a decoded hex escape
+raw, and ingress took an HL7 v2 body with an embedded MLLP start byte. The three AC-5 probes were
+rewritten after that measurement and their new bodies were not run against that code; what was
+measured for them instead is in ADR 0205's AC-5 note of 2026-11-13. Synthetic data only.
 
 Control bytes are written as escapes, never literally, so a byte grep of this file finds none.
 """
@@ -21,6 +23,7 @@ from typing import Any
 
 import pytest
 
+import messagefoundry.transports.framing as framing_mod
 from messagefoundry import actions
 from messagefoundry.config.models import (
     ConnectorType,
@@ -205,26 +208,56 @@ async def test_both_tcp_send_paths_refuse_before_any_dial(
 # --- rule 2: a leaf write never emits a raw control character -----------------------------------
 
 
+def _write_back_decoded(msg: Message, src: str, dst: str) -> None:
+    """The AC-5 edits that hand the leaf escaper a decoded control (ADR 0205, AC-5 note of
+    2026-11-13): ``copy_field`` from a component, then a component write of the decoded read back
+    onto ``src`` itself, which rule 2 governs whatever an action's design."""
+    actions.copy_field(msg, src, dst)
+    msg.set(src, msg.field(src) or "")
+
+
 def test_P2_a_hex_escaped_frame_byte_survives_a_component_edit_escaped() -> None:
     msg = Message.parse(MSH + CR + "PID|1||111^^^MRN||doe" + HEX_EB_SB + "x^jane" + CR)
     actions.convert_case(msg, "PID-5.1", "upper")
+    assert _pid5(msg) == "DOE" + HEX_EB_SB + "X^jane"
+    _write_back_decoded(msg, "PID-5.1", "PID-5.3")
     encoded = msg.encode()
     assert SB not in encoded and EB not in encoded
-    assert "DOE" + HEX_EB_SB + "X^jane" in encoded
+    assert _pid5(msg) == "DOE" + HEX_EB_SB + "X^jane^DOE" + HEX_EB_SB + "X"
     # The read side still decodes it, so the round trip is faithful rather than lossy.
-    assert msg.field("PID-5.1") == "DOE" + EB + SB + "X"
+    assert msg.field("PID-5.1") == msg.field("PID-5.3") == "DOE" + EB + SB + "X"
 
 
 def test_P2_a_hex_escaped_nul_does_not_re_enter_raw() -> None:
     msg = Message.parse(MSH + CR + "PID|1||111||doe" + BS + "X00" + BS + "^jane" + CR)
     actions.convert_case(msg, "PID-5.1", "upper")
+    assert _pid5(msg) == "DOE" + BS + "X00" + BS + "^jane"
+    _write_back_decoded(msg, "PID-5.1", "PID-5.3")
     assert NUL not in msg.encode()
+    assert msg.field("PID-5.1") == msg.field("PID-5.3") == "DOE" + NUL
 
 
 def test_P2_control_a_decoded_cr_is_still_refused() -> None:
+    # convert_case edits the wire text and keeps a hex-escaped CR escaped (BACKLOG #5928), so no raw
+    # CR reaches the wire and the value cannot split into a forged segment.
     msg = Message.parse(MSH + CR + "PID|1||111||doe" + BS + "X0D" + BS + "EVN^jane" + CR)
+    actions.convert_case(msg, "PID-5.1", "upper")
+    assert _pid5(msg) == "DOE" + BS + "X0D" + BS + "EVN^jane"
+    assert [line[:3] for line in msg.encode().split(CR) if line] == ["MSH", "PID"]
+    # The control (ADR 0205, AC-6 note): a CR written back as data is still refused and the message
+    # is left unchanged, whether the CR is literal or decoded from the message's own \X0D\.
+    before = msg.encode()
     with pytest.raises(ValueError, match="segment separator"):
-        actions.convert_case(msg, "PID-5.1", "upper")
+        msg.set("PID-5.1", "doe" + CR + "EVN")
+    decoded = msg.field("PID-5.1")
+    assert decoded == "DOE" + CR + "EVN"
+    with pytest.raises(ValueError, match="segment separator"):
+        msg.set("PID-5.1", decoded)
+    with pytest.raises(ValueError, match="segment separator"):
+        actions.copy_field(msg, "PID-5.1", "PID-5.3")
+    with pytest.raises(ValueError, match="segment separator"):
+        actions.replace_literal(msg, "PID-5.1", "DOE", "doe" + CR + "EVN")
+    assert msg.encode() == before
 
 
 def test_P10_mllp_in_edit_mllp_out_is_one_frame() -> None:
@@ -241,6 +274,11 @@ def test_P10_mllp_in_edit_mllp_out_is_one_frame() -> None:
     msg = Message.parse(body)
     actions.convert_case(msg, "PID-18.1", "upper")
     assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(msg.encode()))) == 1
+    _write_back_decoded(msg, "PID-18.1", "PID-19.1")
+    # The first frame check above ran before copy_field. If copy_field raises, the msg.set write and
+    # this second frame check do not run, and the test fails on that exception instead.
+    assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(msg.encode()))) == 1
+    assert msg.field("PID-18.1") == msg.field("PID-19.1") == "LAST" + EB + SB
 
 
 @pytest.mark.parametrize(
@@ -599,8 +637,109 @@ def test_frame_reply_logs_its_utf8_fallback_by_connection_without_the_setting(
 def test_frame_reply_still_raises_when_a_usable_charset_cannot_hold_the_reply() -> None:
     """``idna`` is a usable codec that raises for one reply. That is the reply's fault, so it is not
     sent in utf-8 under an "unusable charset" warning, as ``decode_body`` decides it by the name."""
-    with pytest.raises(UnicodeError):
+    with pytest.raises(UnicodeError) as ei:
         frame_reply(MLLP_CODEC, "a" * 64, "idna", connection="IB_IDNA")
+    # Round-one review of #5799: the strict encode's error holds the whole reply as `object`, so the
+    # refusal is raised outside the handler and chains nothing.
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+@pytest.mark.parametrize("encoding", ["ascii", "latin-1", "cp1252"])
+def test_frame_reply_replaces_what_a_narrow_charset_cannot_hold(
+    encoding: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5799: the listener replies after the commit, so a raise here closed the connection
+    unanswered and the sender resent a message already stored. The reply now stays in its declared
+    charset with each character it cannot hold replaced, and is sent. Mutation: re-raise the
+    UnicodeEncodeError in frame_reply. Red: the call raises."""
+    reply = MSH + CR + "MSA|AA|CTRL1|中文" + CR
+    connection = f"IB_NARROW_{encoding.upper()}"
+    # The warn-once set is module state; a fresh one makes the test independent of run order.
+    monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.framing"):
+        wire = frame_reply(MLLP_CODEC, reply, encoding, connection=connection)
+        # A narrow charset meets the same characters on every message, so a second reply adds no
+        # line, as the utf-8 fallback's warning does not.
+        frame_reply(MLLP_CODEC, reply, encoding, connection=connection)
+    assert _frames(MLLP_CODEC, wire) == [(MSH + CR + "MSA|AA|CTRL1|??" + CR).encode(encoding)]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert connection in warnings[0] and "replaced" in warnings[0]
+    # Neither the reply nor the setting reaches the log, and this is not the utf-8 fallback.
+    assert "CTRL1" not in warnings[0] and encoding not in warnings[0]
+    assert "utf-8" not in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "msh2",
+    ["?~" + BS + "&", "^?" + BS + "&", "^~?&", "^~" + BS + "?"],
+    ids=["comp", "rep", "esc", "sub"],
+)
+def test_frame_reply_refuses_a_replacement_that_is_one_of_the_replys_delimiters(msh2: str) -> None:
+    """BACKLOG #5799, round-two review: HL7 lets a sender pick ``?`` as a delimiter, and the ACK
+    echoes it, so a ``?`` written for an unencodable character would become structure (ADR 0206).
+    Such a reply is refused with the fixed error, chaining nothing. Mutation: drop the delimiter
+    check in _encode_replacing. Red: the call returns a reply with an extra delimiter."""
+    reply = f"MSH|{msh2}|R|RF|S|F|20260101||ACK|CTRL1|P|2.5" + CR + "MSA|AA|CTRL1|中" + CR
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
+        frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_QDELIM")
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+def test_control_a_field_separator_of_question_mark_is_refused_too() -> None:
+    reply = "MSH?^~" + BS + "&?R?RF" + CR + "MSA?AA?CTRL1?中" + CR
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_QDELIM")
+    # And a reply needing no replacement is untouched by the check, delimiters and all.
+    clean = "MSH?^~" + BS + "&?R?RF" + CR
+    assert frame_reply(MLLP_CODEC, clean, "ascii") == MLLP_CODEC.frame(clean.encode("ascii"))
+
+
+def test_frame_reply_refuses_a_delimiter_the_charset_cannot_hold() -> None:
+    """Round-three review of #5799: an unencodable MSH-1 would itself become ``?`` beside a replaced
+    data character, and the two would read as one delimiter. Mutation: drop the encodability test
+    from the delimiter check. Red: the call returns a reply whose fields have shifted."""
+    reply = "MSH\u00a6^~" + BS + "&\u00a6R\u00a6RF" + CR + "MSA\u00a6AA\u00a6CTRL1\u00a6\u4e2d" + CR
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters") as ei:
+        frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_UNENCODABLE_DELIM")
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+    # Control: latin-1 holds the delimiter, so only the data character is replaced and it answers.
+    wire = frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_UNENCODABLE_DELIM")
+    assert wire == MLLP_CODEC.frame(reply.replace("\u4e2d", "?").encode("latin-1"))
+
+
+@pytest.mark.parametrize("head", ["MSH", "MSH\r\n"], ids=["bare-msh", "msh-then-lf"])
+def test_frame_reply_reads_no_delimiters_from_a_header_too_short_to_declare_them(head: str) -> None:
+    """Round-three review of #5799: a first line of ``MSH`` alone raised IndexError out of the
+    delimiter read. It declares no delimiters, so the reply is replaced and answered. Mutation:
+    measure the whole reply rather than its first line. Red: IndexError."""
+    reply = head + "\r" + "MSA|AA|CTRL1|\u4e2d" + CR
+    wire = frame_reply(MLLP_CODEC, reply, "ascii", connection="IB_SHORT_MSH")
+    assert wire == MLLP_CODEC.frame(reply.replace("\u4e2d", "?").encode("ascii"))
+
+
+@pytest.mark.parametrize("lead", ["\ufeff", " \ufeff\r\n"], ids=["bom", "whitespace-and-bom"])
+def test_frame_reply_reads_delimiters_past_a_leading_bom(lead: str) -> None:
+    """Round-three review of #5799: a leading BOM hid the header, so a reply declaring ``?`` was
+    sent with ``?`` written into its data. The BOM and whitespace are skipped as the engine's
+    tolerated leading noise is. Mutation: drop the lstrip. Red: the call returns a reply."""
+    reply = lead + "MSH|?~" + BS + "&|R|RF" + CR + "MSA|AA|CTRL1|\u4e2d" + CR
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BOM")
+
+
+def test_frame_reply_refuses_leading_noise_the_charset_cannot_hold() -> None:
+    """Round-four review of #5799: with ordinary delimiters, a BOM-led reply was replaced into
+    "?MSH|...", which no parser reads as an ACK. Mutation: drop the leading-noise check in
+    _encode_replacing. Red: the call returns that reply."""
+    reply = "\ufeffMSH|^~" + BS + "&|R|RF" + CR + "MSA|AA|CTRL1|\u4e2d" + CR
+    with pytest.raises(UnicodeError, match="noise before its first segment") as ei:
+        frame_reply(MLLP_CODEC, reply, "latin-1", connection="IB_BOM_LEAD")
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+    # Control: encodable leading whitespace stays, and only the data character is replaced.
+    spaced = " MSH|^~" + BS + "&|R|RF" + CR + "MSA|AA|CTRL1|中" + CR
+    wire = frame_reply(MLLP_CODEC, spaced, "latin-1", connection="IB_BOM_LEAD")
+    assert wire == MLLP_CODEC.frame(spaced.replace("中", "?").encode("latin-1"))
 
 
 @pytest.mark.parametrize("declared", [b"latin-1", 8859])
@@ -726,6 +865,8 @@ async def test_the_tcp_listener_sends_one_frame_when_its_reply_holds_its_start_b
 # The shadow single-row case is the "two-messages" row of the shadow test above; the batch cases
 # are in tests/test_outbound_batch.py.
 
+#: TWO with a byte order mark between its first message and its second MSH.
+MARKED = CLEAN + split._BOM + TWO[len(CLEAN) :]
 #: TWO with each line-end shape a Handler may produce, with leading whitespace, and with byte
 #: order marks where two texts read without stripping them would put them.
 TWO_VARIANTS = [
@@ -733,9 +874,12 @@ TWO_VARIANTS = [
     pytest.param(TWO.replace(CR, "\n"), id="lf"),
     pytest.param(TWO.replace(CR, "\r\n"), id="crlf"),
     pytest.param("\r\n" + TWO, id="leading-whitespace"),
-    pytest.param(CLEAN + split._BOM + TWO[len(CLEAN) :], id="byte-order-mark-between"),
+    pytest.param(MARKED, id="byte-order-mark-between"),
+    pytest.param(MARKED.replace(CR, "\n"), id="lf-byte-order-mark-between"),
     pytest.param(split._BOM + TWO, id="byte-order-mark"),
 ]
+#: The whitespace and byte order marks that lead a body, which the delivery reading reads past.
+_LEAD_PAST_BOM = re.compile(r"\A[\s" + split._BOM + r"]*")
 #: A relayed X12 interchange, which a TCP outbound carries opaquely and never reads as HL7.
 X12 = (
     "ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       *260101*1200*^*00501"
@@ -853,8 +997,60 @@ async def test_check_frame_refuses_two_messages_as_a_send_does(
 )
 def test_the_delivery_reading_is_the_ingress_reading_of_an_msh_led_payload(body: str) -> None:
     # The ingress guard reads normalized text; a delivery reads the payload as it will send it.
-    # On the text a receiver reads once it drops each byte order mark, each must find what the
-    # other finds. The ingress guard itself reads no mark: the parser refuses a body one leads.
-    normalized = normalize(body).replace(split._BOM, "").lstrip()
+    # Each must find what the other finds. The ingress guard reads the marks after a line break
+    # itself (BACKLOG #5918), so only the lead's are dropped: the parser refuses a body one leads,
+    # and the delivery reading reads past them.
+    normalized = _LEAD_PAST_BOM.sub("", normalize(body), count=1)
     expected = starts_with_msh(normalized) and split._holds_more_than_one_message(normalized)
     assert split._sends_more_than_one_message(body) is expected
+
+
+# --- BACKLOG #5918: a later MSH that byte order marks lead is a boundary at ingress too ---------
+# Before the fix only the delivery reading looked past a mark after a line break, so the file split
+# and the ingress guard read TWO with a mark before its second MSH as one message: it was ACKed,
+# then dead-lettered at the outbound frame.
+
+#: The second message of TWO, its MSH led by one or two byte order marks.
+MARKED_TWO = [
+    pytest.param(MARKED, id="one-mark"),
+    pytest.param(CLEAN + split._BOM * 2 + TWO[len(CLEAN) :], id="two-marks"),
+    pytest.param(MARKED.replace(CR, "\n"), id="lf-one-mark"),
+]
+
+
+@pytest.mark.parametrize("body", MARKED_TWO)
+def test_the_ingress_guard_refuses_a_second_msh_that_marks_lead(body: str) -> None:
+    with pytest.raises(ingress_guards.IngressMultipleMessagesRejected):
+        ingress_guards.check_decoded(normalize(body), _ic())
+
+
+@pytest.mark.parametrize("body", MARKED_TWO)
+def test_the_file_split_cuts_past_the_marks_before_a_later_msh(body: str) -> None:
+    # Each member must start with MSH, or the parser records the second one as an ERROR: the split
+    # finds what it finds in the same body with no mark.
+    unmarked = split.split_batch(TWO)
+    assert len(unmarked) == 2
+    assert split.split_batch(body) == unmarked
+    raw = body.encode("utf-8")
+    assert split._needs_a_decode(raw, "utf-8") is True
+    assert split.split_batch_bytes(raw, "utf-8") == [m.encode("utf-8") for m in unmarked]
+    # Each member the split hands over passes the ingress guard on its own.
+    for member in unmarked:
+        ingress_guards.check_decoded(member, _ic())
+
+
+def test_a_mark_inside_a_line_or_before_another_segment_is_not_a_boundary() -> None:
+    # Controls: only a line break, then marks, then MSH, is the wider boundary.
+    inside = MSH + CR + "PID|1||111" + split._BOM + "MSH" + CR
+    before_pid = MSH + CR + split._BOM + "PID|1||111" + CR
+    for body in (inside, before_pid):
+        assert split._holds_more_than_one_message(body) is False
+        assert split.split_batch(body) == [body]
+        assert split._needs_a_decode(body.encode("utf-8"), "utf-8") is False
+
+
+def test_a_single_byte_charset_reads_a_utf8_mark_as_three_characters_it_keeps() -> None:
+    # The byte scan matches the mark's bytes under any ASCII-safe charset, but cp1252 decodes them
+    # to three characters that are not a mark, so the file is still one message, as before.
+    raw = MARKED.encode("utf-8")
+    assert split.split_batch_bytes(raw, "cp1252") == [raw]

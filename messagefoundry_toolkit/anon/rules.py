@@ -572,8 +572,8 @@ def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, 
     ``(default rule, last rule on that path)``, in :data:`DEFAULT_RULES` order.
 
     The kinds do not rewrite the same parts of a field, so a retarget can leave part of a real
-    value behind, and the leak-check scans what is left only for a dashed SSN or a punctuated
-    phone (``leak.retarget_residue_hits``). ``id``, ``mrn`` and
+    value behind, and the leak-check scans what is left only for a dashed SSN, a punctuated
+    phone or a routable IPv6 address (``leak.retarget_residue_hits``). ``id``, ``mrn`` and
     ``ssn`` rewrite the first component and keep CX components 3 to 6, 9 and 10: on ``PID-5``
     that leaves the middle name, on ``PID-11`` the city and postal code, on ``PV1-7`` the
     clinician's given name. ``dln`` keeps the second component (BACKLOG #5534). ``date`` keeps the

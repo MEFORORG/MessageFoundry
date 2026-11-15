@@ -89,6 +89,7 @@ from messagefoundry.transports.base import (
     ReplyBodyDropped,
     encode_wire_body,
     float_setting,
+    insecure_hop_refused,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -339,9 +340,6 @@ class HttpAuthError(ValueError):
 #: ``NegativeAckError.code`` of a send refused by :func:`auth_challenge_refused`.
 AUTH_CHALLENGE_REFUSED_CODE = "auth-challenge-refused"
 
-#: ``NegativeAckError.code`` of a send refused by :meth:`InsecureHopGuard.assert_delivery_url`.
-INSECURE_HOP_REFUSED_CODE = "insecure-hop-refused"
-
 #: The FIXED text the destination and ``FhirLookup`` arms report for a wire-time
 #: :class:`HttpAuthError`, after their own hop label. ``HttpAuthError``'s message quotes the peer's
 #: algorithm token and scheme word, so it stays on the cause and never reaches ``queue.last_error``
@@ -363,48 +361,12 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
     and would send an operator looking for a bad header or URL. The fault is the connection's, so
     this is a configuration fault: under the default ``credential_fault_policy`` the delivery
     worker stops the lane and keeps the queue. ADR 0095 Amendment B is the source of record for
-    why a stop was chosen over a retry, and for where that reasoning is weak. The token hop also
-    raises it for the case :func:`is_refused_proxy_digest_tunnel` names (BACKLOG #2989)."""
+    why a stop was chosen over a retry, and for where that reasoning is weak."""
     return NegativeAckError(
         f"{label} {AUTH_CHALLENGE_REFUSED}",
         code=AUTH_CHALLENGE_REFUSED_CODE,
         permanent=True,
         config_fault=True,
-    )
-
-
-#: The text of the bare ``OSError`` ``http.client.HTTPConnection._tunnel`` raises when a web
-#: proxy answers the ``CONNECT`` for an ``https`` target with a 407.
-_TUNNEL_407_PREFIX = "Tunnel connection failed: 407 "
-
-
-def is_refused_proxy_digest_tunnel(
-    opener: urllib.request.OpenerDirector, exc: urllib.error.URLError
-) -> bool:
-    """Whether ``exc`` is a web proxy's 407 to the ``CONNECT`` for an ``https`` target, on an
-    ``opener`` whose proxy is set up for Digest (BACKLOG #2989, ADR 0095 Amendment B.1).
-
-    That is the refusal :func:`auth_challenge_refused` names, met where no handler can raise it.
-    The proxy Digest handler answers only a 407 that reaches it as a status, and ``_tunnel``
-    raises a ``CONNECT`` 407 before any handler runs, as a bare ``OSError`` that ``do_open`` wraps
-    in a ``URLError``. So a retry sends the same unanswered ``CONNECT``. Without a Digest handler
-    on the opener, the 407 stays the plain status Amendment B keeps for a Basic challenge: a
-    refused pre-emptive Basic credential, or a proxy the connection has no credential for.
-
-    Matched on the exact class and the one-argument text ``_tunnel`` builds from the int status,
-    so a socket error, which carries an errno, never matches, and the proxy's bytes can only
-    follow the prefix. ``tests/test_digest_refusal_classification.py`` pins the text on a real
-    socket, so a CPython that rewords it fails that test instead of retrying again unseen."""
-    reason = exc.reason
-    return (
-        type(reason) is OSError
-        and len(reason.args) == 1
-        and isinstance(reason.args[0], str)
-        and reason.args[0].startswith(_TUNNEL_407_PREFIX)
-        and any(
-            isinstance(handler, _ApprovedProxyDigestAuthHandler)
-            for handler in getattr(opener, "handlers", ())
-        )
     )
 
 
@@ -929,20 +891,13 @@ class InsecureHopGuard:
         :class:`InsecureHopRefused`, a ``ValueError``, left the send unclassified, and the delivery
         worker filed it as an internal error. :func:`assert_probe_hop` is the probe's twin.
 
-        A permanent configuration fault, as :func:`auth_challenge_refused` is. The guard keys on the
-        connection's own URL and the posture captured when it was built, so every queued row would
-        meet the same refusal until an operator changes the connection and reloads. Under the
-        default ``credential_fault_policy`` the lane stops and the queue stays. The text names the
-        connection, the cell, the host and the redacted URL, and no message content."""
+        A permanent configuration fault, as :func:`auth_challenge_refused` is; :func:`insecure_hop_refused`
+        says why. The text names the connection, the cell, the host and the redacted URL, and no
+        message content."""
         try:
             self.assert_send_url(url)
         except InsecureHopRefused as exc:
-            raise NegativeAckError(
-                f"{connector} send refused: {exc}",
-                code=INSECURE_HOP_REFUSED_CODE,
-                permanent=True,
-                config_fault=True,
-            ) from exc
+            raise insecure_hop_refused(exc, connector=connector) from exc
 
 
 def assert_probe_hop(guard: InsecureHopGuard | None, url: str, *, connector: str) -> None:
@@ -2258,9 +2213,17 @@ class _HostProxy:
         if not self.credentialed:
             return (self.config._build_proxy_handler(admitted=False),)
         handlers: list[urllib.request.BaseHandler] = [self.config._build_proxy_handler()]
-        if self.config.digest is not None:
-            handlers.append(self.config.digest.build())
+        digest = self.config.digest if self.answers_digest else None
+        if digest is not None:
+            handlers.append(digest.build())
         return tuple(handlers)
+
+    @property
+    def answers_digest(self) -> bool:
+        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener. The
+        token hop's build refusal of a Digest proxy for an https token endpoint reads it, so the two
+        decide from one rule (BACKLOG #2989)."""
+        return self.credentialed and self.config.digest is not None
 
     def auth_headers(self) -> dict[str, str]:
         """The pre-emptive proxy-auth header(s) to add to each request (Basic; empty for Digest/none)."""
@@ -2523,7 +2486,8 @@ def proxy_config_from_settings(
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
     (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
-    target's scheme (for the digest-over-https refusal).
+    target's scheme (for the digest-over-https refusal; a token hop's https endpoint is refused
+    for Digest in ``smart._TokenEndpointProvider._open_token_hop``).
 
     ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
     (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes.

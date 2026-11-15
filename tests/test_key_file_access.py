@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
@@ -59,6 +60,7 @@ from messagefoundry.store.crypto import generate_key
 from tests._harness_engine import free_port
 from tests._phi_gate_provisions import PHI_GATE_PROVISIONS_TOML, setenv_declared_egress
 from tests.test_api_tls import _self_signed, _self_signed_combined
+from tests.test_engine_secrets import _folder_link, _shared_folder
 from tests.test_restricted_file import _broaden
 
 # The two serve gates every enforcing start meets (tests/_phi_gate_provisions.py says why).
@@ -228,6 +230,68 @@ def test_a_key_path_holding_a_nul_is_refused_not_raised() -> None:
     )
     problem = connection_key_file_problem(graph, {"k": "a\x00b.key"})
     assert problem is not None and "could not be examined" in problem
+
+
+def test_the_remedies_are_one_line_and_name_the_posix_causes() -> None:
+    """A refusal is printed and logged as one line, so neither remedy may hold a line break, and
+    each names the link and directory causes the POSIX check refuses (vault BACKLOG #5636), and the
+    junction and folder causes the Windows check refuses (#5657)."""
+    from messagefoundry import engine_secrets
+
+    for remedy in (key_file_access.KEY_FILE_REMEDY, engine_secrets._REMEDY):
+        assert "\n" not in remedy and "\r" not in remedy
+        assert "link" in remedy and "sticky bit" in remedy
+        assert "junction" in remedy and "delete a file in" in remedy
+
+
+_posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="the POSIX arm; the ubuntu-latest leg runs it"
+)
+
+
+@_posix_only
+def test_a_posix_link_to_a_restricted_key_is_refused_dangling_or_not(tmp_path: Path) -> None:
+    """Vault BACKLOG #5636 and #5656. The check judged the file a link names; a dangling link read
+    as a missing file and passed under ``absent_ok``. Both are refused as a link now."""
+    restricted = _key(tmp_path / "restricted.key", broad=False)
+    assert connection_key_file_problem(_soap_graph(restricted), {}) is None  # the control
+    linked = tmp_path / "linked.key"
+    linked.symlink_to(restricted)
+    problem = connection_key_file_problem(_soap_graph(linked), {})
+    assert problem is not None and "it is a link" in problem
+    dangling = tmp_path / "dangling.key"
+    dangling.symlink_to(tmp_path / "nothing-here.key")
+    assert not key_file_access._absent(str(dangling))
+    problem = connection_key_file_problem(_soap_graph(dangling), {})
+    assert problem is not None and "it is a link" in problem
+
+
+@_posix_only
+def test_a_posix_key_in_a_directory_others_may_replace_it_in_is_refused(tmp_path: Path) -> None:
+    """Vault BACKLOG #5656: the check judged the key file alone, not the directory holding it."""
+    holder = tmp_path / "holder"
+    holder.mkdir(mode=0o700)
+    key = _key(holder / "client.key", broad=False)
+    assert connection_key_file_problem(_soap_graph(key), {}) is None  # the control
+    holder.chmod(0o775)
+    problem = connection_key_file_problem(_soap_graph(key), {})
+    assert problem is not None and "the directory that holds it has mode 0775" in problem
+
+
+def test_a_key_beneath_a_junction_or_a_link_others_can_change_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #5656 and #5657: the check judged the key file, and on POSIX the directory a
+    link led to, but never the folders on its path. A link in a folder a broad group may delete
+    entries in is refused. A junction needs no privilege on Windows."""
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)  # owner-only whatever the umask, so the POSIX holder rule passes it
+    key = _key(real / "client.key", broad=False)
+    assert connection_key_file_problem(_soap_graph(key), {}) is None  # the control
+    shared = _shared_folder(tmp_path / "shared")
+    _folder_link(shared / "linked", real)
+    problem = connection_key_file_problem(_soap_graph(shared / "linked" / "client.key"), {})
+    assert problem is not None and "junction or link on its path can be changed" in problem
 
 
 # --- the registry preflight -----------------------------------------------------------------------

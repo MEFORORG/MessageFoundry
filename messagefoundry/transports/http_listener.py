@@ -1302,6 +1302,9 @@ class HttpSource(SourceConnector):
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        #: The writers of connections whose request is fully read, so stop() leaves each to close
+        #: once its answer is written rather than discard that answer (BACKLOG #5715).
+        self._answering: set[asyncio.StreamWriter] = set()
         #: Which loaded client CA signed a peer's leaf. Only ``mtls_subject`` reads it, so no other
         #: mode pays for parsing the trust store. ``None`` there means no client CA was loaded, and
         #: then no certificate names an issuer, so every one is denied. Built after every check
@@ -1583,13 +1586,21 @@ class HttpSource(SourceConnector):
         # Each woken turn resolves `shutting_down` and writes its own 503 + Retry-After through its
         # still-open writer on the way out, inside the same bounded grace the teardown already has.
         # No-op when nothing is armed, so a listener with no reply_from is byte-identical.
-        if self.reply_drain is not None:
-            self.reply_drain("shutting_down")
+        #
         # Close established clients BEFORE awaiting the server (server.wait_closed() hangs on py3.12.1+
         # waiting for in-flight handlers of a peer holding its connection open). A request mid-handler
-        # still finishes its commit (the body is durably stored before the 202, so at-least-once holds).
-        # Then await the connection tasks with a bounded grace and cancel any stragglers (review H-2).
+        # still finishes its commit and writes its answer (the body is durably stored before the 202,
+        # so at-least-once holds). Then await the connection tasks with a bounded grace and cancel any
+        # stragglers (review H-2); a cancelled task closes its own writer.
         try:
+            if self.reply_drain is not None:
+                self.reply_drain("shutting_down")
+            # Waking is not enough on its own (BACKLOG #5715): a woken turn runs only once this
+            # coroutine yields, and closing its writer here first would discard its 503. So a
+            # connection whose request is fully read keeps its writer: its own `_on_client` closes
+            # it once the answer is written, and the grace below bounds that as it bounds the rest.
+            # A connection still reading its request is closed now, as before.
+            #
             # A socket still in its TLS handshake is this listener's own from its accept on
             # (BACKLOG #2479). Where it upgrades TLS itself it is in `_clients` (`_on_tls_accept`),
             # so this loop closes it and its handshake fails rather than completing mid-stop. Under
@@ -1597,7 +1608,8 @@ class HttpSource(SourceConnector):
             # `connect_accepted_socket` close the socket; `_handshake_accepted` aborts one whose
             # handshake had already completed.
             for writer in list(self._clients):
-                writer.close()
+                if writer not in self._answering:
+                    writer.close()
             for handshake in list(self._handshakes):
                 handshake.cancel()
             pending = [task for task in self._client_tasks if not task.done()]
@@ -1608,6 +1620,7 @@ class HttpSource(SourceConnector):
                 if still_running:
                     await asyncio.gather(*still_running, return_exceptions=True)
             self._clients.clear()
+            self._answering.clear()
             self._client_tasks.clear()
             self._handshakes.clear()
             # Report the handshake failures a trailing event still held (vault BACKLOG #3302).
@@ -1959,7 +1972,8 @@ class HttpSource(SourceConnector):
             peer_host, epoch = slot
         else:
             peer_host = _peer_host(writer)
-        # Register before anything else so stop() can always find + close this connection (H-2).
+        # Register before anything else so stop() can always find this connection (H-2): it closes
+        # one still reading and waits on the task of one answering, which closes its own writer.
         # Dropped only as the last step of the finally below, after the close and the `closed`
         # event, so a stop() that begins while this call is still closing waits for it.
         task = asyncio.current_task()
@@ -2061,6 +2075,7 @@ class HttpSource(SourceConnector):
                 if epoch is not None:
                     self._admission.release(peer_host, epoch)
                 self._clients.discard(writer)
+                self._answering.discard(writer)
                 writer.close()
                 try:  # noqa: SIM105
                     # Bound the close (see stop()): an unbounded Proactor writer.wait_closed() would
@@ -2133,7 +2148,9 @@ class HttpSource(SourceConnector):
             # Oversize / malformed / unsupported / unauthenticated — a synchronous 4xx + the ADR 0021
             # §7 pre-ingress connection_event (metadata only — never a body or field value). An
             # intake-auth refusal additionally writes its tamper-evident audit row here; it is a no-op
-            # for every other kind.
+            # for every other kind. Marked answering, as a request read in full is below, so a stop()
+            # during the event or audit write leaves the refusal its writer.
+            self._answering.add(writer)
             reason = _with_forwarded(exc.reason, exc)
             await self._emit_event(exc.kind, peer_host=peer_host, reason=reason)
             await self._audit_intake_refusal(exc, peer_host)
@@ -2144,6 +2161,27 @@ class HttpSource(SourceConnector):
                 ),
             )
             return True
+        # A stop() that ran while the last bytes sat in the reader's buffer closed this writer as
+        # still reading, so no answer could reach the peer: hand nothing on, and the sender resends
+        # a body that was never recorded or answered, as it would after a close one read earlier.
+        # Only a STOPPING listener takes this path. A writer can also be closing because the peer
+        # closed it, a TLS close_notify or a reset right after a complete request; that request was
+        # read in full while the listener serves, so it is committed below as before, and only its
+        # answer is lost (count-and-log, BACKLOG #5715). The connection's `closed` event reads as an
+        # ordinary close, so the WARNING is what records a declined body; a health probe or a 405
+        # would never have been committed, so it logs nothing.
+        if self._admission.stopping and writer.is_closing():
+            if request.method in _BODY_METHODS:
+                logger.warning(
+                    "HTTP source %s: a request read in full as stop() closed its connection was "
+                    "not committed or answered; the sender would resend it (peer=%s)",
+                    self._log_name,
+                    peer_host or "unknown",
+                )
+            return False
+        # Read in full, so stop() leaves this writer open for the answer (BACKLOG #5715). Dropped in
+        # `_on_client`'s finally, beside `_clients`. Nothing awaits between the check above and here.
+        self._answering.add(writer)
 
         # Health probe: GET/HEAD answer a static, non-PHI 200 WITHOUT an ingress row (ADR 0023 D2).
         if request.method in _HEALTH_PROBE_METHODS:
@@ -2220,7 +2258,12 @@ class HttpSource(SourceConnector):
         """
         resolver = self.sync_reply
         assert resolver is not None  # guarded by the caller, as _handler is above
-        reply = await resolver(message_id)
+        # A turn whose commit finished after stop() began would arm a drained rendezvous and answer
+        # `degraded`, a 504 by default, which D5 forbids on a demotion: it answers `shutting_down`.
+        if self._admission.stopping:
+            reply = InboundReply(ReplyOutcome.SHUTTING_DOWN)
+        else:
+            reply = await resolver(message_id)
         status, body, extra = self._reply_to_wire(reply, message_id)
         # No reply-derived bytes reach the log — only the outcome enum, the destination and timings.
         logger.debug(

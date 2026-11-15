@@ -33,6 +33,7 @@ from messagefoundry.store.store import (
     MessageStore,
     RevokeResult,
     SessionRecord,
+    no_audit_row,
     session_seal_ok,
 )
 from tests._admin_account import ADMIN_USERNAME, login_admin
@@ -71,6 +72,11 @@ def _raw_for(path: Path) -> Any:
     return raw
 
 
+async def _holds(*_: object) -> bool:
+    """A seal check switched off: every row holds."""
+    return True
+
+
 async def test_the_session_seal_contract_holds_on_sqlite(
     keyed: tuple[MessageStore, Path],
 ) -> None:
@@ -86,7 +92,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, "session_seal_ok", lambda sealer, record: True)
+    monkeypatch.setattr(service_module, "session_seal_ok_async", _holds)
     with pytest.raises(AssertionError):
         await assert_session_seal_contract(store, _raw_for(path))
 
@@ -302,7 +308,7 @@ async def test_a_kept_session_a_sweep_missed_is_not_reported_kept(
         )
         snapshot = await store.get_session(hash_token(token))
         assert snapshot is not None
-        await store.revoke_user_sessions("u")
+        await store.revoke_user_sessions("u", audit=no_audit_row)
         await raw(
             "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
             (snapshot.seal, hash_token(token)),
@@ -412,7 +418,7 @@ async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
         assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == 1
         assert await last() == {"scope": self_scope, "count": 1}
         monkeypatch.undo()
-        await store.revoke_user_sessions("u")
+        await store.revoke_user_sessions("u", audit=no_audit_row)
 
     # --- the seal failure: the caller's own row fails its seal, so nothing is kept --------------
     for bent in (False, True):  # control first: the same three rows, the seal intact
@@ -427,7 +433,7 @@ async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
         assert await last() == (
             {"scope": "all", "count": 3} if bent else {"scope": "all_but_caller", "count": 2}
         )
-        await store.revoke_user_sessions("u")
+        await store.revoke_user_sessions("u", audit=no_audit_row)
     # Signing out everywhere else ends the caller's sealed-out row too, but apart from its counted
     # sweep, so its count and reply stay the other sessions only; the scope says the caller's ended.
     for bent in (False, True):
@@ -442,7 +448,7 @@ async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
         assert await last() == {"scope": "self_all" if bent else "self_others", "count": 2}
         caller_row = await store.get_session(hash_token(caller))
         assert caller_row is not None and (caller_row.revoked_at is not None) is bent
-        await store.revoke_user_sessions("u")
+        await store.revoke_user_sessions("u", audit=no_audit_row)
 
 
 async def test_a_failed_read_after_the_revoke_cannot_change_the_scope(
@@ -664,6 +670,77 @@ async def test_verify_mfa_succeeds_when_no_stamp_is_refused(
     assert run.alerts == []
     service = AuthService(keyed[0], AuthSettings())
     assert await service.mfa_satisfied(run.out.token) is True
+
+
+@pytest.mark.parametrize("tamper", ["mark_session_mfa_verified", None])
+async def test_a_passkey_ends_the_session_when_its_anchored_factor_stamp_is_refused(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch, tamper: str | None
+) -> None:
+    """Vault BACKLOG #2964 item 14: the passkey leg re-anchors in its one factor write, so that
+    write's seal refusal ends the session, with no success recorded and no second session write
+    (BACKLOG #2592). ``None`` is the control: the same flow and spies, no row changed, and the leg
+    succeeds with that one write."""
+    pytest.importorskip("webauthn")
+    from webauthn.helpers import base64url_to_bytes
+
+    from tests._soft_webauthn import SoftAuthenticator
+
+    store, path = keyed
+    alerts: list[str] = []
+    service = AuthService(
+        store,
+        AuthSettings(require_mfa=False, mfa_verify_min_elapsed_seconds=0),
+        integrity_alert=alerts.append,
+    )
+    identity, token, password = await login_admin(service)
+    auth = SoftAuthenticator(rp_id="t", origin="http://t")
+    staged = json.loads(
+        await service.begin_webauthn_registration(identity, token=token, rp_id="t", rp_name="MF")
+    )
+    registered = await service.finish_webauthn_registration(
+        identity,
+        auth.create_response(base64url_to_bytes(staged["challenge"])),
+        label="k",
+        token=token,
+        rp_id="t",
+        origin="http://t",
+    )
+    assert registered.ok
+    out = await service.login(ADMIN_USERNAME, password)
+    assert out.ok and out.mfa_required and out.token is not None
+    pending = out.token
+    options = await service.begin_webauthn_assertion(pending, rp_id="t")
+    assert options is not None
+    response = auth.get_response(base64url_to_bytes(json.loads(options)["challenge"]))
+
+    async def tamper_row() -> None:
+        await _raw_for(path)(
+            "UPDATE sessions SET client=? WHERE token_hash=?", ("192.0.2.77", hash_token(pending))
+        )
+
+    calls: list[str] = []
+    for name in _WATCHED:
+        before = tamper_row if name == tamper else None
+        monkeypatch.setattr(store, name, _spy(calls, name, getattr(store, name), before))
+    counted = ("auth.webauthn_verified", AUTHORITY_SEAL_FAILED_ACTION)
+    counts = {a: len(await store.list_audit(action=a)) for a in counted}
+
+    elevation = await service.finish_webauthn_assertion(
+        pending, response, client="192.0.2.9", rp_id="t", origin="http://t"
+    )
+
+    added = {a: len(await store.list_audit(action=a)) - counts[a] for a in counted}
+    if tamper is None:
+        assert elevation.ok and elevation.token is not None
+        assert calls == ["mark_session_mfa_verified", "record_login_success"]
+        assert added == {"auth.webauthn_verified": 1, AUTHORITY_SEAL_FAILED_ACTION: 0}
+        return
+    assert elevation.session_lost and not elevation.ok and elevation.token is None
+    row = await store.get_session(hash_token(pending))
+    assert row is not None and row.revoked_at is not None
+    assert calls == ["mark_session_mfa_verified"]
+    assert added == {"auth.webauthn_verified": 0, AUTHORITY_SEAL_FAILED_ACTION: 1}
+    assert len(alerts) == 1
 
 
 # --- static guards --------------------------------------------------------------------------

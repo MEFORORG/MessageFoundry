@@ -305,14 +305,15 @@ Context above names: feed #21's downstream cert should not stop the other 20.
    with one exception.** The runner checks an outbound's CA inside `_start_outbound`'s isolation
    `try`, and an `Ftp` poller's before it binds. A refusal fails that lane only, with the
    `auth.trust_anchor` row, and §2 and §3 apply. The operator start path checks it too:
-   `_ensure_destination_built` for an outbound, and `start_inbound` for a poller. The exception is
-   a **`FhirLookup`**. Its executor is built graph-wide, which §1 leaves to the backstop, so its
-   refused CA still refuses the start.
+   `_ensure_destination_built` for an outbound, and `start_inbound` for a poller. **CORRECTED
+   2026-11-11:** this rule made a `FhirLookup` the exception, and said its refused CA refuses the
+   start. Since the 2026-11-11 amendment below it has no exception: a refused `FhirLookup` CA
+   isolates that lookup.
 2. **At reload, a refused CA refuses the reload, but only on a lane the reload builds or keeps
    running** (Manager decision, 2026-10-06). That keeps §4's fail-fast rule for what the reload
    touches. Before it quiesces, the runner checks each lane it will build or keep running, and
-   the engine's preflight checks each `FhirLookup` and inbound listener CA. The reload does not
-   read an idle lane's CA:
+   each `FhirLookup`, and the engine's preflight checks each inbound listener CA. The reload does
+   not read an idle lane's CA:
    - a lane below the DR threshold, which the reload parks;
    - an `auto_start = false` lane that is not running;
    - an `Ftp` poller outside its schedule window;
@@ -376,6 +377,57 @@ refused, the same as for a refused lane. A failure that no single lookup's build
 graph-wide and still reaches the backstop. The `DatabaseLookup` executor is unchanged and still
 graph-wide.
 
-**Not changed.** Rule 1 of the 2026-10-06 amendment still refuses the start for a refused
-`FhirLookup` CA. That check runs in the engine's registry preflight, before the runner starts, and
-#3008 did not move it.
+**Not changed by #3008.** #3008 left the refused `FhirLookup` CA refusing the start. The
+2026-11-11 amendment below moves it.
+
+## Amendment (2026-11-11, vault BACKLOG #3582 item 1, #3008 closing step 1) — a `FhirLookup` refused by its CA check is isolated too
+
+**Status:** Accepted. Built in the same change. Owner ruling R3 of 2026-10-05 chose "Isolate it
+like a lane", and its option text reads "One misconfigured lookup would not take every feed down
+on a first deployment." That R3 reaches the CA check is the batch 248 Manager's reading, recorded
+on engine PR 2287 and in vault BACKLOG #3582, not the owner's words. Row #3582 carries the
+verdict *build* for this item.
+
+**Context.** Rule 1 of the 2026-10-06 amendment made a `FhirLookup` the one exception to the lane
+degrade, because "Its executor is built graph-wide". #3008 (engine PR 2287) gave the executor
+per-lookup isolation, so that reason no longer held. The CA check stayed in the engine's registry
+preflight, which runs before the runner starts, so one lookup whose `tls_ca_file` failed its pin,
+permission or path check still stopped every feed from starting.
+
+**Decision.** The registry preflight no longer reads a `FhirLookup` CA. At start, the runner
+checks each lookup's CA with the same lane check, under the label `fhir_lookup:<name>`, before it
+builds the executor (`RegistryRunner.check_fhir_lookup_anchors`). A lookup the check fails is not
+built, so nothing is dialled for it, and it is isolated as #3008 isolates a lookup that fails to
+build: recorded failed, named in `/status` as `fhir_lookups_failed`, logged at ERROR and alerted as
+`connection_stopped` under `fhir_lookup:<name>`, and every read on it raises `FhirLookupError`
+before anything is sent. The rest of the graph starts. The record and the alert carry a fixed
+line. The refusal text, which names the file and its SHA-256, goes to the server log and the
+`auth.trust_anchor` rows only, as a lane's does. A check the store stopped isolates the lookup
+too, as it fails a lane at start.
+
+**Not changed.** A pin, permission or path refusal still writes its `auth.trust_anchor` rows and
+still fails closed: the lookup is never built. A reload, a DR activation and a follower
+convergence still refuse whole (rule 2): a reload builds every lookup again, so before its
+build check the runner checks each lookup's CA (`RegistryRunner.refuse_on_fhir_lookup_anchors`),
+and a refusal refuses the reload before anything changes, audited as a trust-anchor refusal. A DR
+activation runs that check inside its preflight instead, which `[dr].takeover_timeout_seconds`
+bounds (vault BACKLOG #3094), and hands the result to its reload, which runs no lookup CA check
+again unless another reload changed the graph in between. The reload still loads each
+lookup's file as it builds the lookup, with no bound, as it loads a lane's. In a reload, a check the store stopped
+refuses only once no lookup or lane CA is refused, and ahead of a build-check failure
+(BACKLOG #3091). In a DR activation's
+preflight it refuses there, as the preflight's other checks do. An engine started with no graph takes
+its first one by reload. That load checks each lookup CA before its build check, which leaves
+out a lookup the check refused, so that lookup is isolated as at a start. Any other lookup
+fault its build check meets still refuses that whole load. On a passive DR standby the lookup's line says that `POST /dr/activate` needs it. A reload with the cause fixed builds the lookup again, and so does a
+restart. Rule 3, the inbound listener CA, is untouched.
+
+**Consequences.** A start with a broken lookup CA comes up with that lookup failed, where before
+it did not come up. The signal changes from a start that fails to an ERROR line, the
+`connection_stopped` alert a lookup that fails to build already sends, and `fhir_lookups_failed`
+in `/status`. A site with no alert sink wired sees only the log line and `/status`. The check
+writes its `auth.trust_anchor` rows through the lane check, so a repeat of the same refusal, or of
+the same clean pass, writes no new rows, as for a lane. The check runs only where the runner is
+given the lane check, as `serve` gives it; an engine built with the registry preflight alone no
+longer checks a lookup CA, as it never checked a lane CA. The tests are in
+`tests/test_outbound_ca_anchors.py`.

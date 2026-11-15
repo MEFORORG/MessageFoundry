@@ -689,7 +689,7 @@ function Save-PinnedNssm {
 
 function Get-WellKnownBroadSids {
     <#
-      The well-known broad principals the data-directory and secrets-directory lockdowns remove, as
+      The well-known broad principals the data, secrets and config directory lockdowns remove, as
       icacls '*SID' arguments. At least these, not all of them: Set-SecureDataDirAcl says why the
       read-back that follows each removal is what catches the rest.
     #>
@@ -808,7 +808,9 @@ function Get-BroadAclResidue {
       An unresolvable identity is reported rather than skipped: a SID nobody can translate is still
       a grant, and dropping it here would turn a residue into a clean result.
     #>
-    param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    param([Parameter(Mandatory)][string]$Path, [string]$Account,
+        # A list the caller has already read, so a tree walk reads each one once.
+        [System.Security.AccessControl.FileSystemSecurity]$Acl)
     $allowed = @("S-1-5-18", "S-1-5-32-544")
     if ($Account) {
         try {
@@ -820,9 +822,14 @@ function Get-BroadAclResidue {
         }
     }
     $found = @()
-    try { $acl = Get-Acl -Path $Path } catch {
-        Write-Warning "Could not read the ACL of '$Path' ($($_.Exception.Message))."
-        return @()
+    # -LiteralPath: with -Path a name holding '[' or ']' is a wildcard pattern, which can match
+    # nothing and return no list at all, and an empty result here reads as a clean one.
+    $acl = $Acl
+    if ($null -eq $acl) {
+        try { $acl = Get-Acl -LiteralPath $Path } catch {
+            Write-Warning "Could not read the ACL of '$Path' ($($_.Exception.Message))."
+            return @()
+        }
     }
     foreach ($rule in $acl.Access) {
         if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
@@ -1178,8 +1185,33 @@ function Set-SecureConfigAcl {
       rights arrive through a nested domain group is refused. Without this step the shipped installer
       could not produce a config dir that loads, and the only remaining cure would be
       MEFOR_ALLOW_INSECURE_CONFIG_SOURCE, which disables the whole control.
+
+      RETURNS WHAT THE READ-BACK FOUND, one string per problem, and nothing when the tree is locked
+      (BACKLOG #5562). `/inheritance:r /grant:r` is not a lockdown on its own, for the reason
+      Set-SecureDataDirAcl gives: an EXPLICIT ACE for a principal it does not name survives it, and so
+      does every child whose own DACL carries a grant or has inheritance turned off. The guard vets
+      the directory and each *.py, so the caller prints the lockdown line only when this returns
+      nothing.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    # Read again here, not only when -Config was judged: the path, or a folder above it, may have
+    # become a junction or link since, and the walk below would then list and change what it points
+    # at. Measured: a single-item icacls call reset a symbolic link's target but not a junction's,
+    # and a `/T` walk went through a junction.
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or -not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        return "'$Path' is no longer a plain folder, so it was not locked"
+    }
+    $above = Get-ReparsePointAncestor -Path $Path
+    if ($above) { return "'$Path' was not locked: $above" }
+    # icacls does not take '.\name'; the host's own name does the same job, as in Get-WriteGrantProblem.
+    if ($Account) { $Account = $Account -replace '^\.\\', "$([Environment]::MachineName)\" }
+    # The owner first, as the walk below does for each item: an owner holds WRITE_DAC, so a root
+    # whose DACL leaves Administrators out can still be locked. Each item below gets its owner in
+    # Reset-ConfigTreeAcl's walk, not through `/setowner /T`, which follows a junction out of the
+    # tree as `/reset /T` does. The guard evaluates each *.py's owner on its own, so the walk sets
+    # and reads back every one, and one it could not set (an open editor, an AV scan) is returned.
+    & icacls $Path /setowner "*S-1-5-32-544" | Out-Null
     # *S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators. Full control, inherited (OI)(CI) by children.
     $grants = @("*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
     # Service account: read+execute only (it loads, never writes, config) - matches the runtime guard,
@@ -1187,22 +1219,178 @@ function Set-SecureConfigAcl {
     if ($Account) { $grants += "${Account}:(OI)(CI)RX" }
     & icacls $Path /inheritance:r /grant:r @grants | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning ("Could not lock down the config dir '$Path' (icacls exit $LASTEXITCODE); a " +
-            "low-privileged principal with write would cause the engine to REFUSE to load it (SEC-003, " +
-            "docs/SERVICE.md). Lock it manually or re-run elevated.")
+        # Stop here. The walk resets each child to inherit from this folder, so running it over a
+        # folder that was not locked would widen a child that was tighter than it.
+        return ("'$Path' could not be locked (icacls exit $LASTEXITCODE), so nothing below it was " +
+            "changed")
     }
-    # /T so the *.py files the guard also vets carry the same owner, not just the directory. /C so one
-    # unsettable file (an open editor, an AV scan) does not abort the walk and leave the rest of the
-    # tree on the old owner - the guard evaluates each *.py individually, so a partial pass refuses on
-    # whichever module was missed, and the directory itself would already look correct.
-    & icacls $Path /setowner "*S-1-5-32-544" /T /C | Out-Null
+    $problems = @()
+    # The explicit broad ACEs the grant above left standing, as Set-SecureDataDirAcl removes them.
+    # Whatever this set misses is named by the read-back below.
+    $broad = Get-WellKnownBroadSids
+    & icacls $Path /remove:g @broad | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning ("Could not set Administrators as the owner of the config dir '$Path' (icacls " +
-            "exit $LASTEXITCODE); the engine vets the OWNER as well as the ACL and would REFUSE to " +
-            "load a dir owned by a non-administrator (SEC-003, docs/SERVICE.md). With /C some files " +
-            "may have been skipped - check which, then run " +
-            "'icacls ""$Path"" /setowner ""*S-1-5-32-544"" /T /C' elevated.")
+        $problems += "the broad entries on '$Path' could not be removed (icacls exit $LASTEXITCODE)"
     }
+    $problems += @(Reset-ConfigTreeAcl -Path $Path -Account $Account)
+    return $problems
+}
+
+function Reset-ConfigTreeAcl {
+    <#
+      Make Administrators the owner of everything below $Path and reset its DACL so it holds only what
+      it inherits from $Path, then read $Path and each item back. Returns one string per problem,
+      nothing when the tree is locked. A problem is at least: $Path still inheriting, lacking
+      $Account's read or carrying a deny entry, an owner other than Administrators or SYSTEM, an
+      entry for anyone but SYSTEM, Administrators and $Account, a DACL that could not be reset or
+      read, a link the listing shows as one, or a file reparse point whose link type cannot be
+      read. An entry a child only inherits is named once, where it comes from.
+
+      THE WALK IS DONE HERE, NOT WITH `icacls /T`. Measured: `icacls <dir>\* /reset /T /C` reset a
+      file in a junction's target outside <dir>, with /L or without. So each item is set on its own,
+      and an item the listing shows as a junction, symbolic link or folder reparse point (a mounted
+      volume) is neither changed nor entered, and is named instead: what it points at was not locked, and the guard may still load
+      a module through it. A queued folder is read again before it is listed, in case it has become
+      one since. A FILE REPARSE POINT WHOSE LINK TYPE READS EMPTY OR CANNOT BE READ is skipped and
+      named too, failing closed: the item's own DACL can hide a symbolic link's type (a deny of
+      SYNCHRONIZE or read on it, measured). That includes a cloud-file placeholder, whose link type
+      reads empty. Every other item
+      is changed with /L, so the change lands on the item itself and is not followed through a link.
+
+      A FILE THE LISTING SHOWS AS HARD-LINKED keeps its own entries and is named. Its other names,
+      perhaps outside $Path, share its DACL, and the entries it inherits still follow $Path, as any
+      change to the folder that holds it would make them. The hard-link check reads LinkType too, so
+      it can miss at least a hard-linked file whose link type does not read; one it does not detect
+      is locked as a file, which changes it under every name it has.
+
+      A WRITE GRANT FOR $Account BELOW $Path IS DROPPED TO READ by the reset, and named in a warning:
+      a folder a connection writes to does not belong in a config dir the guard executes from.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    $accountSid = $null
+    if ($Account) {
+        try {
+            $accountSid = ([Security.Principal.NTAccount]$Account).Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch { }
+    }
+    $rights = [System.Security.AccessControl.FileSystemRights]
+    $writeMask = [int]($rights::WriteData -bor $rights::AppendData -bor $rights::Delete) -bor 0x10000000 -bor 0x40000000
+    $isLink = {
+        param($Entry)
+        ($Entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
+            ($Entry.PSIsContainer -or "$($Entry.LinkType)" -in @("Junction", "SymbolicLink"))
+    }
+    # Fail closed on a file reparse point whose link type reads empty or throws. LinkType opens the
+    # item, and the item's own DACL can refuse that (a deny of SYNCHRONIZE or read on a symbolic
+    # link empties it, measured), which would let a link through $isLink. The ReparsePoint bit comes
+    # from the directory listing and needs no open.
+    $isUnreadReparse = {
+        param($Entry)
+        if ($Entry.PSIsContainer -or -not ($Entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            return $false
+        }
+        $type = $null
+        try { $type = "$($Entry.LinkType)" } catch { return $true }
+        -not $type
+    }
+    $readBack = {
+        param([string]$Item)
+        $acl = $null
+        try { $acl = Get-Acl -LiteralPath $Item -ErrorAction Stop } catch { }
+        if ($null -eq $acl) { return "the DACL of '$Item' could not be read back" }
+        $owner = $null
+        try { $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { }
+        if ($owner -notin @("S-1-5-32-544", "S-1-5-18")) { "'$Item' is owned by $($acl.Owner), not Administrators" }
+        if ($Item -eq $Path) {
+            if (-not $acl.AreAccessRulesProtected) { "'$Item' still inherits entries from the folder above" }
+            $deny = @($acl.Access | Where-Object { $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny })
+            if ($deny) { "'$Item' carries deny entries for: $(($deny | ForEach-Object { "$($_.IdentityReference)" }) -join ', ')" }
+            if ($accountSid) {
+                $read = [System.Security.AccessControl.FileSystemRights]::ReadData
+                $reads = @($acl.Access | Where-Object {
+                        $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                        ([int]$_.FileSystemRights -band [int]$read) -and
+                        $(try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $accountSid }
+                          catch { $false }) })
+                if (-not $reads) { "'$Item' gives '$Account' no read, so the service could not load its config" }
+            }
+        } elseif (-not @($acl.Access | Where-Object { -not $_.IsInherited })) {
+            # Everything here came down from a folder already read back; naming it again on every
+            # file would bury the one place to fix it.
+            return
+        }
+        $residue = @(Get-BroadAclResidue -Path $Item -Account $Account -Acl $acl)
+        if ($residue) { "'$Item' still grants access to: $($residue -join ', ')" }
+    }
+    $problems = @(& $readBack $Path)
+    # Stop before the walk when the root itself is not locked: each child is reset to inherit from
+    # it, so a root that still grants another account access, or still inherits, would pass that
+    # access down to children that were tighter than it.
+    $rootAcl = $null
+    try { $rootAcl = Get-Acl -LiteralPath $Path -ErrorAction Stop } catch { }
+    if ((-not $rootAcl) -or (-not $rootAcl.AreAccessRulesProtected) -or
+            @(Get-BroadAclResidue -Path $Path -Account $Account -Acl $rootAcl).Count -gt 0) {
+        return @($problems) + "nothing below '$Path' was changed, because '$Path' itself is not locked"
+    }
+    $narrowed = @()
+    $pending = New-Object System.Collections.Generic.Queue[string]
+    $pending.Enqueue($Path)
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Dequeue()
+        if ($dir -ne $Path) {
+            $again = Get-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue
+            if (-not $again -or (& $isLink $again)) {
+                $problems += "'$dir' changed while it was being locked, so nothing in it was"
+                continue
+            }
+        }
+        try { $children = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop) } catch {
+            $problems += "the contents of '$dir' could not be listed ($($_.Exception.Message))"
+            continue
+        }
+        foreach ($child in $children) {
+            $item = $child.FullName
+            if (& $isLink $child) {
+                $problems += "'$item' is a junction, a link or a mounted folder, so what it points at was not locked"
+                continue
+            }
+            if (& $isUnreadReparse $child) {
+                $problems += ("'$item' is a reparse point whose link type could not be read, so it was " +
+                    "not changed, and what it may point at was not locked")
+                continue
+            }
+            if ("$($child.LinkType)" -eq "HardLink") {
+                $problems += ("'$item' has a hard link, so its own entries, which every name of it " +
+                    "shares, were not reset")
+                continue
+            }
+            # Owner first: a child whose DACL leaves Administrators out can be reset only by its owner.
+            # /L here and on /reset below, so a link that reaches this point despite the checks above
+            # is changed itself, never followed to a target perhaps outside $Path. On a file that is
+            # not a link, /L changes nothing (measured).
+            & icacls $item /L /setowner "*S-1-5-32-544" | Out-Null
+            if ($accountSid) {
+                $held = @((Get-Acl -LiteralPath $item -ErrorAction SilentlyContinue).Access | Where-Object {
+                        -not $_.IsInherited -and
+                        $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                        ([int]$_.FileSystemRights -band $writeMask) -and
+                        $(try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $accountSid }
+                          catch { $false }) })
+                if ($held) { $narrowed += "'$item'" }
+            }
+            & icacls $item /L /reset | Out-Null
+            if ($LASTEXITCODE -ne 0) { $problems += "the DACL of '$item' could not be reset (icacls exit $LASTEXITCODE)" }
+            $problems += @(& $readBack $item)
+            if ($child.PSIsContainer) { $pending.Enqueue($item) }
+        }
+    }
+    if ($narrowed) {
+        Write-Warning ("-LockConfigDir took write away from '$Account' on " + ($narrowed -join ", ") +
+            ": everything in the config dir now gives it read only. If a connection writes there, " +
+            "move that folder out of the config dir and grant the account Modify on it.")
+    }
+    return $problems
 }
 
 function Get-CrashDumpImageName {
@@ -1375,6 +1563,99 @@ function Test-GmsaInstalled {
     }
 }
 
+function New-SeceditWorkDirectory {
+    <#
+      Make a new folder for the secedit files of Set-ServiceLogonRight (install-service.ps1) or
+      Remove-ServiceLogonRight (uninstall-service.ps1), and return its path. It is made in one step
+      with its final security: owner $OwnerSid, inheritance off, and full control for SYSTEM,
+      Administrators and the owner only. Throws when that cannot be shown. A folder found at the path
+      afterwards is left where it is, because a failed read-back cannot tell this run's folder from
+      one someone made first.
+
+      THE TWO SCRIPTS SHARE NO FILE, so each carries this function, byte for byte, and
+      tests/test_service_install_manifest.py fails when the two copies differ.
+
+      NOT IN THE USER'S TEMP (BACKLOG #5563). Both scripts run elevated, but the user's TEMP
+      belongs to the user, and a process of that user at medium integrity holds FILE_DELETE_CHILD
+      there. With it, the process can rename any folder in it, whatever that folder's own DACL says,
+      and put its own folder in its place with a policy file of its choosing. So the default parent is
+      the Windows folder's Temp. The Windows folder is asked of the system, not read from
+      $env:SystemRoot: the user can set that variable for their own processes.
+
+      WHAT IS CHECKED ON THE PARENT, before anything is made, and nothing more. It must be a folder
+      that is not a reparse point. Its owner must be SYSTEM, Administrators, TrustedInstaller or
+      $OwnerSid. No allow entry that applies to the parent itself may give anyone else
+      delete-child, a DACL change, ownership or GENERIC_ALL; OWNER RIGHTS counts as the owner and
+      CREATOR OWNER is not judged. A parent that fails is refused. DELETE on the parent itself is
+      not checked, and neither is any folder above it.
+
+      $Parent and $OwnerSid are parameters so the unelevated tests can make a folder they own.
+    #>
+    param([string]$Parent, [string]$OwnerSid = "S-1-5-32-544")
+    if (-not $Parent) { $Parent = Join-Path ([Environment]::GetFolderPath("Windows")) "Temp" }
+    # CREATOR OWNER (S-1-3-0) matches no one outside an inherited entry, so it is listed here.
+    $trusted = @(
+        "S-1-5-18", "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",   # TrustedInstaller
+        "S-1-3-0", $OwnerSid)
+    $item = Get-Item -LiteralPath $Parent -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "'$Parent' is not a plain folder"
+    }
+    # Who could rename a folder made here: its owner (WRITE_DAC grants the rest), and anyone the
+    # folder itself gives delete-child, a DACL change, ownership or GENERIC_ALL. Inherit-only entries
+    # apply to what is made inside, which this folder's own DACL replaces. OWNER RIGHTS (S-1-3-4)
+    # names the parent's owner, so the owner arm judges it.
+    $acl = Get-Acl -LiteralPath $Parent -ErrorAction Stop
+    $rights = [System.Security.AccessControl.FileSystemRights]
+    $renameMask = [int]($rights::DeleteSubdirectoriesAndFiles -bor $rights::ChangePermissions -bor
+        $rights::TakeOwnership) -bor 0x10000000
+    $open = @()
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($trusted -notcontains $owner) { $open += "$owner (owner)" } else { $trusted += @("S-1-3-4") }
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        if (([int]$rule.FileSystemRights -band $renameMask) -eq 0) { continue }
+        $sid = "$($rule.IdentityReference)"
+        try { $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { }
+        if ($trusted -notcontains $sid) { $open += "$sid ($($rule.FileSystemRights))" }
+    }
+    if ($open) {
+        throw ("'$Parent' lets another account rename a folder made in it: " +
+            (($open | Select-Object -Unique) -join ', '))
+    }
+    $path = Join-Path $Parent ("mefor-secedit-" + [guid]::NewGuid().ToString("N"))
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetOwner([Security.Principal.SecurityIdentifier]$OwnerSid)
+    $sec.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @("S-1-5-18", "S-1-5-32-544", $OwnerSid) | Select-Object -Unique) {
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.SecurityIdentifier]$sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+                [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    # .NET Framework (Windows PowerShell 5.1) has the overload; .NET (PowerShell 7) moved it to an
+    # extension method. As in install-service.ps1's New-RestrictedDirectory.
+    $overload = [System.IO.Directory].GetMethod('CreateDirectory',
+        [type[]]@([string], [System.Security.AccessControl.DirectorySecurity]))
+    if ($overload) { [void][System.IO.Directory]::CreateDirectory($path, $sec) }
+    else { [System.IO.FileSystemAclExtensions]::Create((New-Object System.IO.DirectoryInfo($path)), $sec) }
+    # CreateDirectory succeeds on a folder already there, so what is there is read back. A folder
+    # someone else made first is left alone, never deleted: it is not this run's.
+    $made = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    $back = Get-Acl -LiteralPath $path -ErrorAction Stop
+    if (($made.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+            $back.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $OwnerSid -or
+            -not $back.AreAccessRulesProtected) {
+        throw "'$path' was there before this run made it, so it is not the private folder asked for"
+    }
+    return $path
+}
+
 function Set-ServiceLogonRight {
     <#
       Grant the SeServiceLogonRight ("Log on as a service") user right to $Account via the LOCAL security
@@ -1383,6 +1664,11 @@ function Set-ServiceLogonRight {
       built-in secedit (no extra module): export USER_RIGHTS, append the account SID to
       SeServiceLogonRight if missing, re-import. Best-effort: resolves the SID, warns and returns on any
       failure, never aborts the install (an operator can grant it via secpol.msc / Group Policy instead).
+
+      THE TWO SECEDIT FILES LIVE IN A FOLDER ONLY ADMINISTRATORS CAN CHANGE (BACKLOG #5563). They sat
+      at fixed names in the user's TEMP, where a process of the same user at medium integrity could
+      rewrite the policy between the export and the import, and the import applies every user right
+      in it, not only this one. New-SeceditWorkDirectory says where the folder goes and why.
     #>
     param([Parameter(Mandatory)][string]$Account)
     try {
@@ -1394,15 +1680,22 @@ function Set-ServiceLogonRight {
             "Policies -> User Rights Assignment) or the service will fail to start with error 1069.")
         return
     }
-    $inf = Join-Path $env:TEMP "mefor-secedit-$PID.inf"
-    $sdb = Join-Path $env:TEMP "mefor-secedit-$PID.sdb"
+    try { $work = New-SeceditWorkDirectory } catch {
+        Write-Warning ("A private folder for the secedit files could not be made ($($_.Exception.Message)), " +
+            "so 'Log on as a service' was NOT granted to '$Account'. Grant SeServiceLogonRight manually " +
+            "(secpol.msc -> Local Policies -> User Rights Assignment) or the service will fail to start " +
+            "with error 1069.")
+        return
+    }
+    $inf = Join-Path $work "grant.inf"
+    $sdb = Join-Path $work "grant.sdb"
     try {
         & secedit /export /areas USER_RIGHTS /cfg $inf | Out-Null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $inf)) {
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $inf)) {
             Write-Warning "secedit export failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."
             return
         }
-        $lines = Get-Content $inf
+        $lines = Get-Content -LiteralPath $inf
         $row = $lines | Where-Object { $_ -match '^\s*SeServiceLogonRight\s*=' }
         if ($row) {
             # Compare against exact SID tokens, not a raw substring: a SID that is a string prefix of an
@@ -1424,7 +1717,7 @@ function Set-ServiceLogonRight {
             # No existing row: inject one under [Privilege Rights].
             $new = $lines -replace '(\[Privilege Rights\])', "`$1`r`nSeServiceLogonRight = *$sid"
         }
-        Set-Content -Path $inf -Value $new -Encoding Unicode
+        Set-Content -LiteralPath $inf -Value $new -Encoding Unicode
         & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-Warning "secedit configure failed (exit $LASTEXITCODE); grant 'Log on as a service' to '$Account' manually."
@@ -1432,7 +1725,7 @@ function Set-ServiceLogonRight {
         }
         Write-Host "  Right  : granted SeServiceLogonRight (Log on as a service) to '$Account'." -ForegroundColor Green
     } finally {
-        Remove-Item $inf, $sdb -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -2883,16 +3176,31 @@ if ($LockConfigDir) {
         if ($problem) { $UnlockedFolders += "'$($folder.Path)' ($problem)" }
         else { $LockPaths += $folder.Path }
     }
-    foreach ($LockPath in $LockPaths) {
-        Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount
+    # Outermost first. The settings file's folder may hold -Config and the value folder, and its lock
+    # resets everything below it to inherit, so each folder inside it is locked after it, not before.
+    $ConfigLockProblems = @()
+    foreach ($LockPath in @($LockPaths | Sort-Object { $_.TrimEnd('\').Length })) {
+        $ConfigLockProblems += @(Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount)
     }
-    if ($LockPaths.Count -gt 1) {
-        Write-Host ("  Start  : " + (($LockPaths | Select-Object -Skip 1 | ForEach-Object { "'$_'" }) -join ", ") +
-            " locked the same way (vault BACKLOG #2626).")
+    if ($ConfigLockProblems) {
+        # Read back, not assumed (BACKLOG #5562): the lockdown line would otherwise sit over a tree the
+        # guard refuses to load.
+        # Unique: a folder inside another lock path is walked by both locks.
+        Write-Warning ("-LockConfigDir did not finish locking the config: " +
+            (@($ConfigLockProblems | Select-Object -Unique) -join "; ") + ". The engine's source-trust " +
+            "guard (SEC-003) refuses to load a config dir or module that an account other than " +
+            "SYSTEM, an administrator or the run-as account can write, or whose owner is neither the " +
+            "run-as account nor an administrator, so the service may refuse to start. Fix those by hand and re-run; see " +
+            "docs/SERVICE.md 'Lock down the config directory (CONFIG-2)'.")
+    } else {
+        if ($LockPaths.Count -gt 1) {
+            Write-Host ("  Start  : " + (($LockPaths | Select-Object -Skip 1 | ForEach-Object { "'$_'" }) -join ", ") +
+                " locked the same way (vault BACKLOG #2626).")
+        }
+        $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
+                       else { "SYSTEM/Administrators (F)" }
+        Write-Host "  Config : locked to $cfgGrantees; inheritance disabled (SEC-003)."
     }
-    $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
-                   else { "SYSTEM/Administrators (F)" }
-    Write-Host "  Config : locked to $cfgGrantees; inheritance disabled (SEC-003)."
 } else {
     if ($ServiceAccount) { Set-ConfigReadAcl -Path $Config -Account $ServiceAccount }
     # Name BOTH refusal criteria. The owner arm (ADR 0036 Amendment A) is independent of the DACL, so

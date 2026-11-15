@@ -562,7 +562,15 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
     ``iter_route_contexts`` reads those contexts. For an API route, ``effective`` is the context;
     for any other route, it is the rebuilt copy FastAPI serves, or the route itself when it was
     registered on ``owner`` directly. The walk takes the PATH and methods from it. An HTTP route's
-    gate comes from the route's own dependencies."""
+    gate comes from the route's own dependencies.
+
+    Each ``Mount`` is walked through, and every mount beneath it, before it is yielded, so a caller
+    that does not descend is refused as one that does (vault BACKLOG #3177). So the walk raises, at
+    least, :func:`_refuse_low_priority_routes`'s refusal for ``owner`` or any of those mounts, and any
+    other error the walk raises for a route beneath a yielded mount, such as a ``ValueError`` for an
+    included route with no rebuilt copy or :class:`MissingFastAPISymbol`. The descent reads
+    ``Mount.routes``, so it reaches neither a ``Host`` nor an app the mount sees only through a
+    middleware wrapper."""
     _refuse_low_priority_routes(owner)
     routes: Sequence[BaseRoute] = owner.routes
     # One entry at a time, so a context with no rebuilt copy is known to be the entry itself only
@@ -593,10 +601,10 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
                     f"with no rebuilt route ({served!r}), so the walk cannot read its path"
                 )
             served = original
-        if isinstance(served, Mount) and not served.routes:
-            # A walk descends only into a mount with routes, which refuses there; a mount holding
-            # nothing but a frontend group has none, so it is refused here.
-            _refuse_low_priority_routes(served)
+        if isinstance(served, Mount):
+            # Walked through only for its refusals; the docstring says what that covers.
+            for _ in _effective_routes(served):
+                pass
         yield original, served
 
 

@@ -24,7 +24,13 @@ from tee.anon import anonymize as tee_anonymize
 from tee.anon import leak as tee_leak
 
 _ROOT = Path(__file__).resolve().parents[1]
-_BYTE_IDENTICAL = ("keying.py", "rules.py", "surrogates.py")
+# (source, vendored copy) pairs the tee carries and must keep byte-identical.
+_BYTE_IDENTICAL = (
+    ("messagefoundry_toolkit/anon/keying.py", "tee/anon/keying.py"),
+    ("messagefoundry_toolkit/anon/rules.py", "tee/anon/rules.py"),
+    ("messagefoundry_toolkit/anon/surrogates.py", "tee/anon/surrogates.py"),
+    ("messagefoundry/controlchars.py", "tee/controlchars.py"),  # BACKLOG #5637
+)
 _SALT = "adversarial-salt-0123456789abcdef"
 
 # A US MMDDYYYY in EVN-6, which a DATE rule maps, next to a repetition that scrubs to empty. Only
@@ -92,12 +98,10 @@ def _load_scan_forbidden() -> object:
 
 
 def test_shared_logic_files_are_byte_identical() -> None:
-    for name in _BYTE_IDENTICAL:
-        engine = (_ROOT / "messagefoundry_toolkit" / "anon" / name).read_bytes()
-        tee = (_ROOT / "tee" / "anon" / name).read_bytes()
-        assert engine == tee, (
-            f"{name} drifted — re-copy messagefoundry_toolkit/anon/{name} to tee/anon/"
-        )
+    for source, copy in _BYTE_IDENTICAL:
+        engine = (_ROOT / source).read_bytes()
+        tee = (_ROOT / copy).read_bytes()
+        assert engine == tee, f"{copy} drifted — re-copy {source} to {copy}"
 
 
 def test_vendored_hl7data_matches_generator_source() -> None:

@@ -151,8 +151,12 @@ class AutoKeyProvider:
 class HostKeyProvider:
     """``host`` — the store key derived from the key custody host blob (vault BACKLOG #3411). It
     converts a handoff as a store open does, since in the service it may be asked first (the upload
-    cipher is built before the store opens). ``posture`` is the caller's, and ``None`` counts as
-    enforcing for the account check.
+    cipher is built before the store opens). So every command that resolves the key outside a
+    store open converts and deletes a handoff too, when run as the account it was written for,
+    read-only ones such as restore-verify included;
+    :func:`~messagefoundry.store.custody_host.load_host_custody` lists the cases (vault BACKLOG
+    #8119 items 5 and 140). ``posture`` is the caller's, and ``None`` counts as enforcing for the
+    account check.
 
     A custody refusal from here reaches a caller of ``resolve_active_key``,
     ``resolve_decrypt_keys`` or ``build_store_cipher`` as a new ``KeyProviderError`` that keeps its
@@ -295,6 +299,18 @@ def _load_external_provider(
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra."
+        ) from exc
+    except ImportError as exc:
+        # Present but broken: a C extension that fails to load, or a name its SDK or the provider
+        # module itself no longer has. resolve_active_key and resolve_decrypt_keys already refuse
+        # any provider error as a KeyProviderError with a fixed text, so this changes nothing
+        # there; it keeps this seam's own contract, KeyProviderError, for a provider module whose
+        # import fails. An ImportError raised later, inside build_provider, is the provider's to
+        # wrap, as keyprovider_vault wraps its lazy hvac import (vault BACKLOG #6709).
+        raise KeyProviderError(
+            f"[store].key_provider={name!r} could not load its provider module or backend (an "
+            f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "
+            f"with the optional {extra!r} extra."
         ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
     provider: KeyProvider = module.build_provider(settings, posture=posture)

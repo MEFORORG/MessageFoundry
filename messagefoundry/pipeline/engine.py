@@ -64,6 +64,7 @@ from messagefoundry.engine_secrets import SecretsDirectoryError
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
+    authority_seal_page,
     cell_tag_failure_forwarder,
     store_cipher_refusal_forwarder,
 )
@@ -100,6 +101,7 @@ from messagefoundry.pipeline.sharding import join_shard_names, owned_destination
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
+    FhirLookupAnchorPass,
     RegistryRunner,
     TeardownReason,
     check_pt_backend_supported,
@@ -109,6 +111,7 @@ from messagefoundry.pipeline.wiring_runner import (
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import Cipher
+from messagefoundry.store.row_seal import probe_row_sealer_at_start
 from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
@@ -289,6 +292,37 @@ class ApprovedConfig:
 
     fingerprint: str | None
     value_file: object = None
+
+
+#: Every way reading a value file fails that an engine refuses as a bad config rather than a
+#: fault, for a reload (:meth:`Engine.reload_detail`, whose comment says why each is here) and a
+#: start (:meth:`Engine.apply_start_env_values`).
+_VALUE_READ_ERRORS = (ValueError, TypeError, RecursionError, OSError)
+
+
+def _vetted_start_values(
+    provider: SnapshotEnvValuesProvider, snapshot: ConfigSnapshot
+) -> Mapping[str, Any] | None:
+    """:meth:`Engine.apply_start_env_values`'s worker-thread body: ``provider``'s values from
+    ``snapshot``, or ``None`` for a value file the snapshot does not cover.
+
+    The start's load read ``environments/`` before any vet. ``from_snapshot`` vets the value file
+    and its folder before it parses those bytes, and the file is then read once more, after that
+    vet: only where it holds the bytes the snapshot read are they applied, so they are the bytes
+    of a file the vet passed, read after it, as the build's own read was (vault BACKLOG #2596).
+    An edit since the load is refused rather than applied unvetted or left unnamed."""
+    read = provider.from_snapshot(snapshot)
+    value_file = provider.value_file
+    if (
+        read is not None
+        and value_file is not None
+        and not snapshot.holds_value_file_now(value_file)
+    ):
+        raise WiringError(
+            f"environment value file {value_file} changed after the start's config load read it, "
+            "so the start applies none of it; start again"
+        )
+    return read
 
 
 def _require_approved(
@@ -571,8 +605,11 @@ class Engine:
         # no preflight. A DR activation runs it too, over the running graph (_dr_preflight).
         self._registry_preflight = registry_preflight
         # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check the runner
-        # awaits for each lane it builds, at start, at an operator start and before a reload. `serve`
-        # passes it; None = no check. Not handed to a dry-run checker, which builds nothing live.
+        # awaits for each lane it builds, at start, at an operator start and before a reload. Since
+        # vault BACKLOG #3582 the runner awaits it for each FhirLookup too, at start, before a
+        # reload and inside a DR activation's bounded preflight. `serve` passes it; None = no
+        # check. Not handed to a dry-run checker, which builds nothing live; a first load's
+        # throwaway checker carries it for its lookup check (_check_runner).
         self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
@@ -696,6 +733,7 @@ class Engine:
         # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
         # #1169); None until start() arms it, and again after stop() disarms it.
         self._cipher_refusal_armed: Any = None
+        self._seal_page_disarm: Callable[[], None] | None = None
         # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — the secret-side twin of
         # cert_monitor. None (embedding/tests) → no reminder task; a no-op when warn_days=0 or nothing is
         # tracked. The tracked-secret set is derived at scan time from [secret_rotation] so a reload is
@@ -803,6 +841,9 @@ class Engine:
         # and back False on POST /dr/release. A runner takes dr_threshold from _dr_run_threshold() when
         # it is built, and _set_dr_active hands a running one the new value on each flip (#3067).
         self._dr_active = bool(self._dr_settings.enabled and self._dr_settings.activate)
+        # Whether an activation's reload has completed, so the run-profile is applied and not only
+        # latched; :meth:`_dr_backup_paused` reads it. A boot latched active needs no reload.
+        self._dr_profile_applied = self._dr_active
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
         # value is refused here, on this engine, not on the box the graph was authored on). The
@@ -1083,6 +1124,13 @@ class Engine:
             return self._dr_settings.priority_threshold
         return None
 
+    def _dr_backup_paused(self) -> bool:
+        """Whether the backup runner must skip its pass (vault BACKLOG #5712; the reason is at
+        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on a
+        passive DR standby, and during an activation until its reload has completed. Applied
+        implies latched, since every flip of the latch to False clears it."""
+        return self._dr_settings.enabled and not self._dr_profile_applied
+
     @property
     def dr_active(self) -> bool:
         """Whether the engine is running under the DR run-profile this boot (#61, ADR 0048)."""
@@ -1150,6 +1198,8 @@ class Engine:
         the next reload does. A release hands the runner the passive standby's threshold, so that
         reload binds no listener (vault BACKLOG #3140)."""
         self._dr_active = active
+        if not active:
+            self._dr_profile_applied = False
         if self._registry_runner is not None:
             self._registry_runner.set_dr_threshold(
                 self._dr_run_threshold(), standby=self._dr_standby_threshold()
@@ -1204,11 +1254,16 @@ class Engine:
         # DR decision is never a cluster-wide config bump.
         close_failures: tuple[tuple[str, str], ...] = ()
         try:
+            lookups: FhirLookupAnchorPass | None = None
             if rr is not None:
-                await self._dr_preflight(rr.registry)
+                lookups = await self._dr_preflight(rr.registry)
             self._set_dr_active(True)
             if rr is not None:
-                close_failures = await rr.reload()
+                # The lookup CA check the preflight ran inside its bound is not run again here
+                # (vault BACKLOG #3094, #3582), unless a reload landed first and changed the graph.
+                # The reload's build check and executor build still load each lookup CA file,
+                # with no bound, as a lane's build loads its own.
+                close_failures = await rr.reload(fhir_lookup_anchors=lookups)
         except BaseException:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
             # so the latch and the runner's threshold go back too. Left set, the next operator
@@ -1242,19 +1297,25 @@ class Engine:
                         "failed too; POST /config/reload closes them"
                     )
             raise
+        # Only now may a backup pass run: the latch flipped before the reload, which can still
+        # fail and roll it back (vault BACKLOG #5712).
+        self._dr_profile_applied = True
         if not close_failures:
             return {}
         failure = _outbound_close_failure(close_failures)
         return {failure.step: failure.detail}
 
-    async def _dr_preflight(self, registry: Registry) -> None:
+    async def _dr_preflight(self, registry: Registry) -> FhirLookupAnchorPass | None:
         """The settings and registry preflights a DR activation runs before its reload, bounded by
-        ``[dr].takeover_timeout_seconds`` (vault BACKLOG #3094, item 3).
+        ``[dr].takeover_timeout_seconds`` (vault BACKLOG #3094, item 3), and the runner's check
+        of each ``FhirLookup`` CA, under the same bound (vault BACKLOG #3582).
 
         They read trust-anchor files, which may sit on a share at the failed site, and they run
         under the coordinator's lock, so with no bound a share that stops answering held every
         later activate and release too. A timeout cancels them and raises ``TimeoutError``, which
-        the caller rolls back like any refusal. The reload that follows is not bounded here.
+        the caller rolls back like any refusal. Returns the lookup check's pass, ``None`` with no
+        runner, which the caller hands to the reload so it runs no lookup CA check again. The reload
+        that follows is not bounded here, and still reads each lane CA it checks with no bound.
         Cancelling it partway rolls back a takeover the VIP has already moved for, and the runner
         gives each lane's first build its own isolation (ADR 0048, the vault BACKLOG #3263
         amendment).
@@ -1272,10 +1333,16 @@ class Engine:
             coord.note_profile_preflight(True)
         timeout = self._dr_settings.takeover_timeout_seconds
         bound = asyncio.timeout(timeout)
+        lookups: FhirLookupAnchorPass | None = None
         try:
             async with bound:
                 await self.preflight_settings()
                 await self.preflight_registry(registry)
+                rr = self._registry_runner
+                if rr is not None:
+                    # Vault BACKLOG #3582: the FhirLookup CAs moved out of the registry preflight
+                    # into the runner, and are read here so they stay under this bound.
+                    lookups = await rr.refuse_on_fhir_lookup_anchors(registry)
         except TimeoutError as exc:
             if not bound.expired():
                 raise  # a TimeoutError from inside the preflight is its own error
@@ -1284,6 +1351,7 @@ class Engine:
             ) from exc
         if coord is not None:
             coord.note_profile_preflight(False)
+        return lookups
 
     async def _dr_config_drift(self) -> dict[str, object]:
         """The provenance fields a DR activation records: the activated graph's digest, and whether
@@ -1474,11 +1542,15 @@ class Engine:
             held += (await self.store.pending_depth(name))[0]
         return held
 
-    def _check_runner(self, registry: Registry) -> RegistryRunner:
+    def _check_runner(
+        self, registry: Registry, *, lane_anchor_check: LaneAnchorCheck | None = None
+    ) -> RegistryRunner:
         """A throwaway runner for a build check of ``registry``, carrying the same bind host,
         egress, posture and env values a real reload would, and never installed or started: a dry
         run checks with it when no runner is live, and the first load checks with it before
-        :meth:`add_registry` installs the runner it starts."""
+        :meth:`add_registry` installs the runner it starts. Only the first load passes
+        ``lane_anchor_check``, for its FhirLookup CA check (vault BACKLOG #3582): that check
+        writes audit rows, which a dry run never does."""
         return RegistryRunner(
             registry,
             self.store,
@@ -1508,6 +1580,7 @@ class Engine:
             simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             coordinator=self._coordinator,
+            lane_anchor_check=lane_anchor_check,
         )
 
     def _refuse_shard_universe_change(self, registry: Registry) -> None:
@@ -1542,7 +1615,17 @@ class Engine:
         # so it runs on a runner that is not installed yet: installed first, a concurrent reload
         # could take it, unstarted, as the live runner in that window. Nothing yields between
         # add_registry below and the start taking the runner's reload lock.
-        await self._check_runner(registry).build_check_off_loop(registry, env_values)
+        checker = self._check_runner(registry, lane_anchor_check=self._lane_anchor_check)
+        # Vault BACKLOG #3582: a lookup its CA check fails is isolated, as at a start, and a CA
+        # the build could not load is met as a trust anchor first. The
+        # build check leaves such a lookup out, and the start below is handed what this check
+        # found, so it isolates the lookup and runs no lookup CA check again.
+        refused = await checker.check_fhir_lookup_anchors(registry, env_values)
+        checked = registry
+        if refused:
+            kept = {n: s for n, s in registry.fhir_lookups.items() if n not in refused}
+            checked = replace(registry, fhir_lookups=kept)
+        await checker.build_check_off_loop(checked, env_values)
         # A stop that began during the check found no runner to stop, so none may start now
         # (engine PR 2815, Lander hold 6698688363 item 4). Nothing yields from here to add_registry.
         if self._stopping:
@@ -1550,8 +1633,9 @@ class Engine:
         previous_env_values, self._env_values = self._env_values, env_values
         try:
             runner = self.add_registry(registry)
-            # That check warned for this graph, so this start does not (vault BACKLOG #2910).
-            await runner.start(warn_query_credentials=False)
+            # That check warned for this graph, so this start does not (vault BACKLOG #2910),
+            # except for a lookup it left out, which the start warns for (vault BACKLOG #3582).
+            await runner.start(warn_query_credentials=False, fhir_lookup_refused=refused)
         except Exception:
             # Don't leave a half-started runner: a later reload would take the "runner exists"
             # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
@@ -1727,8 +1811,14 @@ class Engine:
     # --- reference sets (ADR 0006) -------------------------------------------
 
     def _make_reference_runner(self) -> ReferenceSyncRunner:
-        """Build the reference sync runner; its specs are read **live** from the current registry, so a
-        reload's swapped declarations are picked up without rebuilding it."""
+        """Build the reference sync runner; its specs and its env() values are read **live**, so a
+        reload's swapped declarations, and a value it adds or rotates, are picked up without
+        rebuilding it (vault BACKLOG #5698).
+
+        The values are the engine's applied ones, set only once a reload has committed, never the
+        registry runner's, which hold a reload's values before it can still be refused. A sync
+        during a reload can still pair the specs of one graph with the other graph's values, and
+        fail that set; the sync after the reload corrects it."""
         return ReferenceSyncRunner(
             self.store,
             lambda: (
@@ -1737,7 +1827,7 @@ class Engine:
                 else []
             ),
             self._reference_settings or ReferenceSettings(),
-            env_values=self._env_values,
+            env_values=lambda: self._env_values,
             egress=self._egress_settings,
             alert_sink=self._alert_sink,
             # Track B Step 6: gate materialize-from-source on the leader; every node still converges its
@@ -1998,12 +2088,31 @@ class Engine:
         if callable(tag_setter):
             tag_setter(None)
 
+    def _arm_seal_page(self) -> None:
+        """Arm the store's seal page on the AlertSink, or the logging sink with none configured
+        (decision d20261109T200352805-599b24 on ADR 0217, item 5), so a revoke an engine runs pages
+        whether or not the serve lifespan armed one too. Tolerant of a store without
+        ``seal_pager()`` (a test double). :meth:`_disarm_seal_page` removes only this registration,
+        so the lifespan's own stays armed."""
+        getter = getattr(self.store, "seal_pager", None)
+        pager = getter() if callable(getter) else None
+        if pager is None or self._seal_page_disarm is not None:
+            return
+        sink = self._alert_sink if self._alert_sink is not None else LoggingAlertSink()
+        self._seal_page_disarm = pager.arm(authority_seal_page(sink))
+
+    def _disarm_seal_page(self) -> None:
+        disarm, self._seal_page_disarm = self._seal_page_disarm, None
+        if disarm is not None:
+            disarm()
+
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
         outbounds, then start the wired graph."""
         self.started_at = time.time()
         # Before anything reads the store, so a refusal during recovery alerts too (BACKLOG #1169).
         self._arm_cipher_refusal_alert()
+        self._arm_seal_page()
         # BACKLOG #2337 (owner rulings 2026-10-07): on `vault_transit` the engine counts no AES-GCM
         # invocations, so a recorded, audited operator attestation must name the configured Transit
         # data key. It refuses under enforce and warns otherwise. First, before recovery or any
@@ -2014,6 +2123,12 @@ class Engine:
             self.store.cipher_info().transit_key_name,
             enforcement=self._security_enforcement,
         )
+        # ADR 0217 slice 1b-iii (owner ruling 2026-11-07): a Transit row sealer proves it can hmac
+        # and verify under the audit key. A failed probe refuses the start, failing closed, before
+        # recovery or any listener, on every backend. The managed lifespan probes earlier too,
+        # before its restore and auth service touch an authority row; this one covers an engine
+        # started without that lifespan.
+        await probe_row_sealer_at_start(self.store.row_sealer())
         # All-stages recovery: returns any row a crash left `inflight` — ingress rows mid-route and
         # outbound rows mid-delivery alike — to `pending` so the staged workers re-claim them
         # (staged pipeline, ADR 0001). The handoff/delivery transactions make the re-run idempotent.
@@ -2217,6 +2332,8 @@ class Engine:
                 alert_sink=self._alert_sink,
                 coordinator=self._coordinator,
                 hop_posture=self._hop_posture,
+                # Read at each pass (vault BACKLOG #5712).
+                dr_paused=self._dr_backup_paused,
             )
             self._backup_runner.start()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent
@@ -3098,52 +3215,19 @@ class Engine:
 
         The value file this engine reads (:meth:`_value_file`) is read into the snapshot too,
         wherever ``[environments].base_dir`` puts it, after the same trust check a value read
-        makes, of the file and the folders :meth:`_value_file_folders` names. So a released
+        makes, of the file, its folder and the links an open of it follows
+        (:func:`~messagefoundry.config.wiring.assert_trusted_start_paths`). That check runs
+        before the config directory is read, so a value file in its ``environments/`` folder is
+        vetted before its bytes are read too (vault BACKLOG #6654 item 5). So a released
         reload checks those bytes against its approval's binding (:func:`_require_approved`), and
         the provider parses them rather than the file as it is later. A file that is
-        not there is held as none; one that cannot be read raises ``WiringError`` naming it, so a
+        not there is held as none, unless the trust check refuses it first, as it does where the
+        open finds no file but the walk of its links reaches one; one that cannot be read raises
+        ``WiringError`` naming it, so a
         reload, gated or not, never falls back to reading it from disk for that fault. A config
         directory that cannot be read whole still returns ``None``, as above, and then an ungated
         reload reads the values from disk."""
         return await asyncio.to_thread(self._reload_snapshot_blocking, path, self._value_file())
-
-    @staticmethod
-    def _value_file_folders(value_file: Path) -> list[Path]:
-        """The folders a reload vets before it reads ``value_file``: its own, the folder of every
-        link along a chain of file links from it, and the folder the chain ends in. Each one's
-        writer could re-point the link it holds, or replace the file, between the vet and the read
-        (vault BACKLOG #2596). Walked rather than refused, so a ConfigMap-style chain still reads.
-        A folder above one of these is not vetted, as for the value file itself
-        (:func:`~messagefoundry.config.wiring.assert_trusted_start_paths`). A loop of links stops
-        the walk, and the read then fails and refuses the reload."""
-        folders = [value_file.parent]
-        hop = value_file
-        # Past every platform's own bound on a chain (40 on Linux, 63 on Windows).
-        for _ in range(64):
-            if not os.path.islink(hop):
-                break
-            text = os.readlink(hop)
-            if os.name == "nt":
-                import errno
-
-                from messagefoundry.auth.anchor_path import _strip_win_prefix
-
-                # Windows answers an absolute target in its \\?\ form; the plain form names the
-                # same folder and compares with the others. A device path has no folder to vet.
-                plain = _strip_win_prefix(text)
-                if plain is None:
-                    raise OSError(errno.EINVAL, "a value file link leads to a device path", text)
-                text = plain
-            target = Path(text)
-            # A relative target names a path from the real folder holding the link. Joined as
-            # text to a folder reached through a directory link, Win32 collapses its ``..``
-            # before following that link and names a decoy folder, so each hop's folder is
-            # resolved first.
-            hop = target if target.is_absolute() else Path(os.path.realpath(hop.parent)) / target
-            hop = Path(os.path.realpath(hop.parent)) / hop.name
-            folders.append(hop.parent)
-        folders.append(Path(os.path.realpath(value_file)).parent)
-        return list(dict.fromkeys(folders))
 
     @staticmethod
     def _reload_snapshot_blocking(
@@ -3151,6 +3235,16 @@ class Engine:
     ) -> ConfigSnapshot | None:
         from messagefoundry.config.snapshot import ConfigDirMissing, with_value_file
 
+        if value_file is not None:
+            # Vetted before anything is read, as the config directory is, with the links an open of
+            # it follows (assert_trusted_start_paths): the bytes read here are the ones a reload
+            # applies, in the config directory's environments/ folder too (vault BACKLOG #2596,
+            # #6654 item 5).
+            assert_trusted_start_paths(
+                [value_file],
+                lead="refusing to read environment values from",
+                folders=[value_file.parent],
+            )
         try:
             snapshot = read_trusted_snapshot(path, strict=True)
         except ConfigDirMissing:
@@ -3172,16 +3266,7 @@ class Engine:
             return snapshot
         refusal: str | None = None
         try:
-            # Vetted before it is read, as the config directory is: the bytes read here are the
-            # ones a reload applies (vault BACKLOG #2596, step 4).
-            assert_trusted_start_paths(
-                [value_file],
-                lead="refusing to read environment values from",
-                folders=Engine._value_file_folders(value_file),
-            )
             return with_value_file(snapshot, value_file, strict=True)
-        except WiringError:
-            raise  # the trust check's refusal, which is a ValueError too
         except (OSError, ValueError) as exc:
             # A fault, never absence, which with_value_file holds as no file. Refused rather than
             # read again from disk, where the same fault can read as no file and env() defaults
@@ -3250,8 +3335,15 @@ class Engine:
         digest is of the snapshot that load ran, as a reload's is, so an edit or a file lock after
         the load's read cannot reach it (vault BACKLOG #2944, #3765). Off a snapshot, only a file
         the load does not read, in ``environments/``, can be left out of it, and it holds that
-        folder as the load read it: a start resolves its values earlier, when the engine is built,
-        not from these bytes. The directory is read for the advisory VCS head alone.
+        folder as the load read it. Where the start's own value file sits in that folder and the
+        load read it, the managed app's start parsed its values from those bytes
+        (:meth:`apply_start_env_values`), so the digest names the value-file bytes the start
+        applied; one the load could not read is left out, and the folder's other files are folded
+        and not parsed. A value file anywhere but that folder is parsed as values from no start
+        snapshot, even one inside the config directory under another ``[environments].dir``, so the
+        digest does not name it as the values the start applied; at least one in ``codesets/`` can
+        still be loaded and folded, as a code-set table. The directory is read for the advisory VCS
+        head alone.
 
         A running graph that carries no snapshot gets none of that: the digest is of the directory
         as it is now, so any covered file can be left out and a later edit can reach it. A digest
@@ -3265,6 +3357,71 @@ class Engine:
             self.config_dir, snapshot
         )
         return reason
+
+    async def apply_start_env_values(self, registry: Registry) -> None:
+        """Parse the start's environment values from the snapshot its first load read, as
+        :meth:`reload_detail` does for a reload (vault BACKLOG #2596, step 6).
+
+        The engine read its values from disk when it was built, before any snapshot existed. A value
+        file in the config directory's ``environments/`` folder is in the load's snapshot, which is
+        what the start's ``config_loaded`` digest folds (:meth:`capture_start_provenance`), so those
+        bytes replace that read: an edit between the build and the load is then both applied and
+        named. A value file anywhere but that folder, one inside the config directory under another
+        ``[environments].dir`` included, is parsed as values from no start snapshot, so the values
+        read at the build stand; at least one in ``codesets/`` can still be loaded and folded, as a
+        code-set table. So do they where the load's snapshot could not read the value file, as
+        under an antivirus lock: the digest then leaves the file out, or the folder holding it, and
+        names it as such. A no-op with no snapshot or no
+        :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`; another provider's
+        values stay the build's, a limit docs/SECURITY.md records.
+
+        The load read the folder before anything vetted it, so the provider vets the value file
+        and its folder first, and the start then reads the file again and applies the snapshot's
+        bytes only where that read, after the vet, holds the same bytes
+        (:func:`_vetted_start_values`). The values the start applies are then a vetted file's
+        bytes, as the build's vet-then-read gave them.
+
+        The managed app's start calls it after the load and before :meth:`guard_registry`, so the
+        guard, the preflight and the runner judge and run the values the digest names, and only
+        before the graph is added: a runner holds its own values. Raises ``WiringError`` for at
+        least a value file that cannot be parsed, one created, removed or edited since the load
+        read it, and a vet of the file or its folder that refuses, the folder's even where the
+        value file is absent, but not where the load could not read the value file or list its
+        folder: the snapshot then leaves the value file out
+        (:meth:`ConfigSnapshot.left_out_environment_file`), and the start returns before any vet."""
+        if self._registry_runner is not None:
+            raise RuntimeError("a start's environment values are applied before its graph runs")
+        provider = self._env_values_provider
+        snapshot = registry.config_snapshot
+        if snapshot is None or not isinstance(provider, SnapshotEnvValuesProvider):
+            return
+        value_file = provider.value_file
+        refusal: str | None = None
+        try:
+            if value_file is not None and await asyncio.to_thread(
+                snapshot.left_out_environment_file, value_file
+            ):
+                # A path only, never a value.
+                log.warning(
+                    "environment value file %s could not be read into the start's config "
+                    "snapshot; the start applies the values read when the engine was built",
+                    scrub_log_argument(str(value_file)),
+                )
+                return
+            # None for a value file outside the snapshot, as in the default layout.
+            read = await asyncio.to_thread(_vetted_start_values, provider, snapshot)
+            if read is not None:
+                self._env_values = dict(read)
+        except WiringError:
+            raise
+        except _VALUE_READ_ERRORS as exc:
+            refusal = safe_exc(exc)
+        if refusal is not None:
+            # After the handler, so the caught error rides neither __cause__ nor __context__: a
+            # TOMLDecodeError keeps the whole value file on .doc (BACKLOG #2307).
+            raise WiringError(
+                f"could not read this environment's values from the start's config snapshot: {refusal}"
+            )
 
     def guard_registry(
         self, registry: Registry, env_values: Mapping[str, Any] | None = None
@@ -3469,6 +3626,15 @@ class Engine:
                 # Into a local: the running values change only at the swap (vault BACKLOG #2596).
                 if snapshot is not None and isinstance(provider, SnapshotEnvValuesProvider):
                     read = await asyncio.to_thread(provider.from_snapshot, snapshot)
+                    if read is None and provider.value_file is not None:
+                        # A path only, never a value. The engine reads the provider's value file
+                        # into the snapshot, so this fires only where it could not. A WARNING: the
+                        # release then rests on a second digest, which samples.
+                        log.warning(
+                            "environment value file %s is outside the config snapshot; the reload "
+                            "reads it from disk",
+                            scrub_log_argument(str(provider.value_file)),
+                        )
                 reads_snapshot = read is not None
                 if read is None:  # no snapshot, or one that cannot vouch for the value file
                     read = await asyncio.to_thread(provider)
@@ -3477,7 +3643,7 @@ class Engine:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.
                 raise
-            except (ValueError, TypeError, RecursionError, OSError) as exc:
+            except _VALUE_READ_ERRORS as exc:
                 # The tuple is specific rather than a blanket Exception (section 6), and each entry is
                 # a MEASURED escape, not a guess. ValueError covers tomllib.TOMLDecodeError and
                 # UnicodeDecodeError (the CLI shapes). RecursionError covers a deeply nested value
@@ -4048,6 +4214,7 @@ class Engine:
                 await self._gcm_invocation_runner.stop()
                 self._gcm_invocation_runner = None
             self._disarm_cipher_refusal_alert()
+            self._disarm_seal_page()
             # Deregister cluster membership after the runner has quiesced but before the store closes (the
             # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
             # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.

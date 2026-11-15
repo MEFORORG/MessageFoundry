@@ -9,8 +9,12 @@ the ``messagefoundry check`` structural gate on emitted modules, and the untrust
 from __future__ import annotations
 
 import ast
+import gc
 import json
+import random
 import re
+from collections.abc import Callable
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -19,12 +23,16 @@ from messagefoundry.checks import run_checks
 from messagefoundry.parsing.message import Message
 from messagefoundry_toolkit.corepoint_import import (
     _CONTAINER_KIND_BY_TAG,
+    _ROLE_BY_CLASS,
+    _SPAN_CLOSE,
+    _SPAN_OPEN,
     _STATEMENT_VERBS,
     _UNDERSTOOD,
     _VERB_CONNECTIVES,
     Action,
     Control,
     CorepointImportError,
+    RoleToken,
     Step,
     UnmappedAction,
     _corepoint_path,
@@ -35,6 +43,7 @@ from messagefoundry_toolkit.corepoint_import import (
     _operands_from_roles,
     _role_prose,
     _role_verb,
+    _strip_tags,
     _understood_list,
     generate_module,
     import_corepoint,
@@ -45,6 +54,7 @@ from messagefoundry_toolkit.corepoint_import import (
     strip_markup,
     tokenize_statement,
 )
+from tests._growth import _growth_between
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "corepoint"
@@ -756,8 +766,136 @@ def test_strip_markup_recovers_the_verb() -> None:
     assert strip_markup("   <i></i>  ") == ""
 
 
-def test_markup_stripped_statements_classify_in_the_fixture() -> None:
-    """Every markup-wrapped statement in the fixture reaches the vocabulary through the strip."""
+# The pattern ``strip_markup`` used before #4036, kept here as the reference its output must match.
+_OLD_MARKUP_TAG = re.compile(r"<[^>]+>")
+
+
+def test_the_tag_strip_matches_the_old_regex_on_every_short_string() -> None:
+    """Exhaustive over ``<``, ``>``, a letter and a newline up to length 8: same output as the regex."""
+    for length in range(9):
+        for chars in product("<>a\n", repeat=length):
+            data = "".join(chars)
+            assert _strip_tags(data) == _OLD_MARKUP_TAG.sub("", data), repr(data)
+
+
+# 8x the input: a linear scan grows about 8x per call, the old ones about 64x (#4036). The controls
+# run at the smaller lengths, which keep that separation at a fraction of the quadratic cost.
+_GROWTH_LENGTHS = (2048, 16384)
+_CONTROL_LENGTHS = (512, 4096)
+_MAX_GROWTH = 24.0
+
+
+def _reading(
+    call: Callable[[str], object],
+    unit: str,
+    lengths: tuple[int, int],
+    *,
+    done: Callable[[float], bool],
+) -> float:
+    """A growth reading over ``unit`` runs of ``lengths``, taken again up to three times, with GC off,
+    until ``done`` holds, so one preemption on a loaded runner cannot fake a curve or hide one."""
+    short, long = (unit * n for n in lengths)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(3):
+            growth = _growth_between(call, short, long, rounds=5)
+            if done(growth):
+                break
+    finally:
+        if was_enabled:
+            gc.enable()
+    return growth
+
+
+def _assert_linear_with_control(
+    old: Callable[[str], object], new: Callable[[str], object], unit: str
+) -> None:
+    """The old code runs first as the positive control, so a box that cannot see the difference
+    reds the test instead of passing it."""
+    control = _reading(old, unit, _CONTROL_LENGTHS, done=lambda g: g > _MAX_GROWTH)
+    assert control > _MAX_GROWTH, (
+        f"the old code grew only {control:.1f}x across {_CONTROL_LENGTHS}, under {_MAX_GROWTH}x, "
+        "so this box or probe cannot tell; fix the fixture, do not raise the bar"
+    )
+    growth = _reading(new, unit, _GROWTH_LENGTHS, done=lambda g: g < _MAX_GROWTH)
+    assert growth < _MAX_GROWTH, f"grew {growth:.1f}x across {_GROWTH_LENGTHS} on {unit!r} runs"
+
+
+@pytest.mark.parametrize("unit", ["<", "<a", "<\n"])
+def test_the_markup_strip_is_linear_on_unclosed_tags(unit: str) -> None:
+    """#4036: a run of ``<`` with no closing ``>`` made the regex retry from every ``<``."""
+    _assert_linear_with_control(lambda text: _OLD_MARKUP_TAG.sub("", text), strip_markup, unit)
+
+
+def _old_parse_roles(data: str) -> tuple[RoleToken, ...]:
+    """``parse_roles`` before #4036, which searched for both span kinds on every pass."""
+    tokens: list[RoleToken] = []
+    stack: list[str] = []
+    saw_span = False
+    pos = 0
+
+    def flush(upto: int) -> None:
+        run = strip_markup(data[pos:upto])
+        if run:
+            cls = stack[-1] if stack else ""
+            tokens.append(RoleToken(_ROLE_BY_CLASS.get(cls, "text") if cls else "text", run, cls))
+
+    while pos < len(data):
+        opening = _SPAN_OPEN.search(data, pos)
+        closing = _SPAN_CLOSE.search(data, pos)
+        if opening is None and closing is None:
+            break
+        if closing is None or (opening is not None and opening.start() < closing.start()):
+            assert opening is not None
+            flush(opening.start())
+            stack.append(opening.group(1).lower())
+            saw_span = True
+            pos = opening.end()
+        else:
+            flush(closing.start())
+            if stack:
+                stack.pop()
+            pos = closing.end()
+    if not saw_span:
+        return ()
+    flush(len(data))
+    return tuple(tokens)
+
+
+_ROLE_FRAGMENTS = (
+    "<span class='path'>",
+    '<span class="Keyword">',
+    "<span  class='detail' >",
+    "</span>",
+    "</span >",
+    "x",
+    " to ",
+    "<",
+    ">",
+    "<b>",
+    "&amp;lt;",
+)
+
+
+def test_parse_roles_matches_its_old_scan_on_random_markup() -> None:
+    rng = random.Random(4036)
+    for _ in range(3000):
+        data = "".join(rng.choice(_ROLE_FRAGMENTS) for _ in range(rng.randrange(13)))
+        assert parse_roles(data) == _old_parse_roles(data), repr(data)
+
+
+@pytest.mark.parametrize("unit", ["</span>", "<span class='a'>"])
+def test_parse_roles_is_linear_on_a_run_of_one_span_kind(unit: str) -> None:
+    """#4036: with only one span kind present, the other kind's search scanned to the end on
+    every pass."""
+    _assert_linear_with_control(_old_parse_roles, parse_roles, unit)
+
+
+def test_the_fixtures_flat_writes_reach_the_vocabulary() -> None:
+    """Every flat field write in the fixture reaches the vocabulary. They are written to take the
+    flat reading (ADR 0086 §2(b″), BACKLOG #5556), and the strip itself is pinned by
+    :func:`test_strip_markup_recovers_the_verb`."""
     src = _package_source()
     assert 'copy_field(msg, "PID-5.1", "NK1-2.1")' in src
     assert 'set_field(msg, "MSH-6", "ACME")' in src  # ItemCopy from a literal == set
@@ -801,7 +939,7 @@ def test_unmapped_verb_emits_a_todo_marker_and_is_counted(tmp_path: Path) -> Non
 
     result = import_corepoint(FIXTURES / "acme_adt_package.xml", tmp_path)
     classes = result.channels[0].unmapped_classes
-    # The first action-list's three unmapped verbs, in order, ahead of the role-grammar list's.
+    # The first action-list's unmapped verbs come first, in order.
     assert classes[:3] == ("MsgParse", "EnvLogText", "ItemCustomScript")
     assert result.total_unmapped == len(classes)
 
@@ -1196,15 +1334,20 @@ _WRITE_INPUT = _role_line(
 )
 
 
-def _role_send(handle_class: str, handle: str, dest: str) -> str:
+def _send_markup(handle_class: str, handle: str, dest: str) -> str:
+    """A role-marked ``MsgSend <handle> to connection "<dest>"``, as markup before escaping."""
     literal = _span("literal", '"' + dest + '"')
-    return _role_line(
+    return (
         _span("keyword", "MsgSend")
         + " "
         + _span(handle_class, handle)
         + " to connection "
         + literal
     )
+
+
+def _role_send(handle_class: str, handle: str, dest: str) -> str:
+    return _role_line(_send_markup(handle_class, handle, dest))
 
 
 def _handler_body(src: str) -> str:
@@ -1310,6 +1453,201 @@ def test_a_hostile_handle_name_cannot_escape_the_raise_or_its_comment() -> None:
     long_src = _handler_source(_role_send("other-handle", "%" + "X" * 5000, "OB_ACME"))
     raise_line = next(ln for ln in long_src.splitlines() if "raise NotImplementedError" in ln)
     assert len(raise_line) < 400
+
+
+# --- markup the role layer did not read (BACKLOG #5556) -----------------------------------------
+#
+# A ``<Line>`` whose ``@Data`` is rich text the role layer reads no span in fell back to the flat
+# reading, which has no handle gate and no write gate: a send of another handle rendered as
+# ``Send(dest, msg)``, a write to another handle as a write to ``msg``, and the handle scan skipped
+# both. Now its send is refused, its write is not mapped, and the scan counts both. Which @Data
+# still takes the flat reading is stated once, in ADR 0086 §2(b″). All fixtures synthetic.
+
+
+def _upper(data: str) -> str:
+    """The same markup with its tag and attribute names in upper case, as HTML allows."""
+    return data.replace("<span class=", "<SPAN CLASS=").replace("</span>", "</SPAN>")
+
+
+def _upper_send(handle_class: str, handle: str, dest: str) -> str:
+    return _role_line(_upper(_send_markup(handle_class, handle, dest)))
+
+
+_UPPER_WRITE_OUT = _role_line(
+    _upper(
+        _span("keyword", "ItemClear")
+        + " "
+        + _span("other-handle", "%OUT")
+        + _span("path", "/PID-19")
+    )
+)
+
+
+def test_a_send_in_upper_case_markup_of_another_handle_is_refused() -> None:
+    """Upper-case span markup is span markup: the send of ``%OUT`` is refused, never sent as msg."""
+    body = _handler_body(_handler_source(_upper_send("other-handle", "%OUT", "OB_ACME")))
+    assert "Send(" not in body
+    assert (
+        'raise NotImplementedError("Corepoint import: MsgSend to OB_ACME: MsgSend delivers %OUT'
+        in body
+    )
+
+
+def test_a_write_in_upper_case_markup_to_another_handle_is_not_mapped_onto_msg() -> None:
+    """The write gate applies too: a clear of ``%OUT`` is not a clear of ``msg``."""
+    body = _handler_body(_handler_source(_UPPER_WRITE_OUT))
+    assert "set_field(msg" not in body
+    assert "# TODO: Corepoint ItemClear" in body
+
+
+def test_a_span_spaced_with_a_no_break_space_is_still_read_on_a_block_label() -> None:
+    """Case folding must not narrow the span's whitespace: main read a keyword span spaced with a
+    no-break space, so the label is a statement and the list holds nothing. Read as unread markup
+    instead, the label was prose and the write and the send of ``%ADT`` went live."""
+    label = _role_line("<span class='keyword'>MsgReplace</span> %ADT")
+    label = label.replace("<Line ", "<Block ", 1).replace("/>", ">", 1)
+    block = (
+        f"{label}<List>{_WRITE_INPUT}{_role_send('input-handle', '%ADT', 'OB_A')}</List></Block>"
+    )
+    body = _handler_body(_handler_source(block))
+    assert 'set_field(msg, "MSH-6", "X")' not in body
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+
+
+def test_a_clone_destination_spaced_with_a_no_break_space_still_overwrites_the_input() -> None:
+    """The same whitespace in a clone's destination span: main counted the clone of ``%OUT`` over
+    ``%ADT``, so nothing is held and the send of ``%ADT`` is refused."""
+    clone = _role_line(
+        _span("keyword", "MsgTreeCopy")
+        + " "
+        + _span("other-handle", "%OUT")
+        + _span("path", "/")
+        + " to <span class='input-handle'>%ADT</span>"
+        + _span("path", "/")
+    )
+    body = _handler_body(_handler_source(clone + _role_send("input-handle", "%ADT", "OB_A")))
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+
+
+def test_upper_case_markup_of_the_input_handle_still_maps_and_sends() -> None:
+    """The control arm: the same upper-case markup on the input handle reads as roles, so its write
+    maps and its send stays live."""
+    write = _role_line(
+        _upper(
+            _span("keyword", "ItemCopy")
+            + " "
+            + _span("literal", '"X"')
+            + " to "
+            + _span("input-handle", "%ADT")
+            + _span("path", "/MSH-6")
+        )
+    )
+    body = _handler_body(_handler_source(write + _upper_send("input-handle", "%ADT", "OB_IN")))
+    assert 'set_field(msg, "MSH-6", "X")' in body
+    assert '    sends.append(Send("OB_IN", msg))  # Corepoint MsgSend' in body
+    assert "raise NotImplementedError" not in body
+
+
+# Each a send of ``%OUT`` to ``OB_ACME`` whose ``@Data`` is rich text with no span the role layer
+# reads. As the XML attribute value, so the entity forms are written escaped once more.
+_UNREAD_MARKUP_SENDS = {
+    "entity-quoted-class": (
+        '<Line Data="&lt;span class=&amp;quot;keyword&amp;quot;&gt;MsgSend&lt;/span&gt; %OUT '
+        'to connection &amp;quot;OB_ACME&amp;quot;"/>'
+    ),
+    "attribute-before-class": _role_line(
+        "<span style='x' class='keyword'>MsgSend</span> %OUT to connection \"OB_ACME\""
+    ),
+    "unquoted-class": _role_line('<span class=keyword>MsgSend</span> %OUT to connection "OB_ACME"'),
+    "another-tag": _role_line('<b>MsgSend</b> %OUT to connection "OB_ACME"'),
+    "entities-only": '<Line Data="MsgSend %OUT to connection &amp;quot;OB_ACME&amp;quot;"/>',
+}
+
+
+@pytest.mark.parametrize("line", _UNREAD_MARKUP_SENDS.values(), ids=_UNREAD_MARKUP_SENDS.keys())
+def test_a_send_in_markup_the_role_layer_does_not_read_is_refused(line: str) -> None:
+    body = _handler_body(_handler_source(line))
+    assert "Send(" not in body
+    assert "    sends = []" in body and body.rstrip().endswith("return sends")
+    assert (
+        '    raise NotImplementedError("Corepoint import: MsgSend to OB_ACME: MsgSend is marked up '
+        "in a form this import does not read" in body
+    )
+
+
+def test_a_send_in_unread_markup_raises_when_the_handler_runs(tmp_path: Path) -> None:
+    with pytest.raises(NotImplementedError, match="marked up in a form this import does not read"):
+        _run_handler(tmp_path, _UNREAD_MARKUP_SENDS["another-tag"])
+
+
+def test_a_send_in_unread_markup_is_counted_unmapped(tmp_path: Path) -> None:
+    export = tmp_path / "pkg.xml"
+    export.write_text(_package(_UNREAD_MARKUP_SENDS["another-tag"]), encoding="utf-8")
+    summary = import_corepoint(export, tmp_path / "out").to_json()
+    assert summary["total_mapped"] == 0
+    assert summary["total_unmapped"] == 1
+
+
+# Each a write of ``"X"`` to ``%OUT/PID-5`` in rich text with no span the role layer reads, which
+# the flat reading maps (its twin that strip_markup leaves unchanged does, below).
+_UNREAD_MARKUP_WRITES = {
+    "entity-quoted-class": (
+        '<Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; '
+        '&amp;quot;X&amp;quot; %OUT/PID-5"/>'
+    ),
+    "attribute-before-class": _role_line(
+        "<span style='x' class='keyword'>ItemCopy</span> \"X\" %OUT/PID-5"
+    ),
+    "unquoted-class": _role_line('<span class=keyword>ItemCopy</span> "X" %OUT/PID-5'),
+    "another-tag": _role_line('<b>ItemCopy</b> "X" %OUT/PID-5'),
+    "entities-only": '<Line Data="ItemCopy &amp;quot;X&amp;quot; %OUT/PID-5"/>',
+}
+
+
+@pytest.mark.parametrize("line", _UNREAD_MARKUP_WRITES.values(), ids=_UNREAD_MARKUP_WRITES.keys())
+def test_a_write_in_markup_the_role_layer_does_not_read_is_not_mapped(line: str) -> None:
+    body = _handler_body(_handler_source(line + _role_send("input-handle", "%ADT", "OB_A")))
+    assert "set_field(msg" not in body
+    assert "# TODO: Corepoint ItemCopy — hand-finish (marked up in a form this import" in body
+
+
+def test_a_plain_text_write_still_maps() -> None:
+    """The control arm for the write tests: the same statement, which strip_markup leaves
+    unchanged, takes the flat reading and maps, so the markup alone is what declines it."""
+    body = _handler_body(_handler_source('<Line Data="ItemCopy &quot;X&quot; %OUT/PID-5"/>'))
+    assert 'set_field(msg, "PID-5", "X")' in body
+
+
+def test_a_clone_in_unread_markup_holds_nothing() -> None:
+    """A ``MsgTreeCopy`` in unread markup may overwrite the input, so the role-marked send of the
+    input is refused, as it is when the same clone is role-marked."""
+    clone = _role_line("<b>MsgTreeCopy</b> %OUT/ to %ADT/")
+    body = _handler_body(_handler_source(clone + _role_send("input-handle", "%ADT", "OB_A")))
+    assert "Send(" not in body
+    assert "raise NotImplementedError" in body
+    # The control: without the clone, the same send is live.
+    live = _handler_body(_handler_source(_role_send("input-handle", "%ADT", "OB_A")))
+    assert 'sends.append(Send("OB_A", msg))' in live
+
+
+def test_a_send_in_unread_markup_counts_as_a_delivery_of_no_known_handle() -> None:
+    """The scan agrees with the render: an unread-markup send delivers a tree nobody can name, so
+    the list has no single delivered handle and a role-marked write to the input is not mapped, as
+    with a role-marked send of a ``$variable``."""
+    unread = _role_line('<b>MsgSend</b> %OUT to connection "OB_X"')
+    body = _handler_body(_handler_source(_WRITE_INPUT + unread))
+    assert 'set_field(msg, "MSH-6", "X")' not in body
+    # The control: the write alone maps onto msg.
+    assert 'set_field(msg, "MSH-6", "X")' in _handler_body(_handler_source(_WRITE_INPUT))
+
+
+def test_a_plain_text_send_still_renders_as_before() -> None:
+    """The control arm, and the gap ADR 0086 §2(b″) records: a send that strip_markup leaves
+    unchanged takes the flat reading and still renders as a send of msg."""
+    body = _handler_body(_handler_source('<Line Data="MsgSend %OUT [OB_FLAT]"/>'))
+    assert '    sends.append(Send("OB_FLAT", msg))  # Corepoint MsgSend' in body
 
 
 def _root_copy(
@@ -2466,10 +2804,12 @@ def test_every_statement_is_accounted_for(tmp_path: Path) -> None:
     """Count-and-log: mapped + unmapped + disabled covers the fixture, nothing silently vanishes."""
     result = import_corepoint(FIXTURES / "acme_adt_package.xml", tmp_path)
     summary = result.to_json()
-    # 3 vocabulary calls from the flat list + 3 from the role list + 15 control constructs.
-    assert summary["total_mapped"] == 21
-    # 3 from the flat list + 5 role statements the guards correctly refuse to map.
-    assert summary["total_unmapped"] == 8
+    # 9 vocabulary calls + 8 control constructs (for, break, if, elif, else, try, except, call)
+    # from the flat list, + 3 vocabulary calls from the role list.
+    assert summary["total_mapped"] == 20
+    # 3 unmapped verbs from the flat list + its MsgSend, refused (BACKLOG #5556) + 5 role statements
+    # the guards correctly refuse to map.
+    assert summary["total_unmapped"] == 9
     assert summary["total_disabled"] == 1
     # The whole fixture is accounted for: every source element lands in exactly one bucket.
     assert summary["total_mapped"] + summary["total_unmapped"] + summary["total_disabled"] == 30
@@ -2847,8 +3187,8 @@ def test_cli_imports_the_xml_package(tmp_path: Path, capsys: pytest.CaptureFixtu
     )
     assert code == 0
     summary = json.loads(capsys.readouterr().out)
-    assert summary["total_mapped"] == 21
-    assert summary["total_unmapped"] == 8
+    assert summary["total_mapped"] == 20
+    assert summary["total_unmapped"] == 9
     assert summary["total_disabled"] == 1
     assert (out / "IB_ACME_ADT.py").is_file()
 
@@ -2871,7 +3211,9 @@ def test_hostile_xml_values_cannot_inject_code() -> None:
     # &#10; is a character reference, so it survives XML attribute-value normalization as a real
     # newline — the sharpest available test of both the literal and the comment escape paths.
     src = _handler_source(
-        '<Line Data="ItemCopy &amp;quot;A&#10;import os&amp;quot; %ADT/MSH-6"/>'
+        # strip_markup leaves it unchanged, so the write takes the flat reading and maps, and its
+        # literal is the escape path under test (ADR 0086 §2(b″), BACKLOG #5556).
+        '<Line Data="ItemCopy &quot;A&#10;import os&quot; %ADT/MSH-6"/>'
         '<Line Data="ItemCustomScript %ADT/OBX-5&#10;os.system(&amp;quot;pwned&amp;quot;)"/>'
     )
     assert "\nimport os" not in src

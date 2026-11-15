@@ -27,10 +27,15 @@ decrypt/verify), **MDN** disposition notifications, **DNS CERT / LDAP** certific
 **Fail-loud at construction** (the ``RestDestination``/``EmailDestination`` pattern): a missing
 host/sender/recipient, an unreadable/malformed signing key, cert, recipient cert, or trust anchor, a
 signing key that does not match its cert, a recipient cert whose key is not RSA, key material of a
-type or strength off the floor (``_require_key_strength``), a trial S/MIME build that fails, or a
-cleartext-credential misconfiguration **raises here**, so it fails at ``check``/dry-run/start —
-never as a wire-time surprise. The blocking crypto + SMTP
-exchange runs off the event loop via ``asyncio.to_thread``.
+type or strength off the floor (``_require_key_strength``), a recipient cert the trust check refuses
+(docs/CONNECTIONS.md, *Recipient trust*, lists what it checks), a trial S/MIME build that fails, or a
+cleartext-credential misconfiguration **raises here**, so it fails at ``check``/dry-run/start.
+
+**One certificate property is NOT refused here: the validity window** (BACKLOG #5631). Construction
+only logs a WARNING for a recipient cert or issuing anchor outside it, and each send refuses it,
+expired or not yet valid, as a permanent configuration fault whose code starts
+``direct-cert-validity``. ``DirectDestination._send`` says why. The
+blocking crypto + SMTP exchange runs off the event loop via ``asyncio.to_thread``.
 
 **STARTTLS posture is inherited from EMAIL.** The signed+encrypted S/MIME body already protects PHI at
 rest and in flight, but the SMTP session still carries envelope metadata (and any AUTH credentials), so
@@ -48,14 +53,15 @@ and connector-success — documented and accepted (a duplicate beats a drop), ex
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hmac
 import logging
 import smtplib
 import ssl
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from cryptography import x509
 from cryptography.exceptions import InternalError, InvalidSignature, UnsupportedAlgorithm
@@ -63,6 +69,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers import algorithms
 from cryptography.hazmat.primitives.serialization import pkcs7
+from cryptography.utils import CryptographyDeprecationWarning
+from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.config.settings import (
@@ -286,6 +294,199 @@ def _require_key_strength(key: Any, setting: str) -> None:
     )
 
 
+def _utcnow() -> datetime.datetime:
+    """The clock the certificate validity checks read. A function, so a test can move it."""
+    return datetime.datetime.now(datetime.UTC)
+
+
+#: The ``NegativeAckError.code`` prefix of a send refused on a certificate outside its validity
+#: window. The full code appends the setting and the bound,
+#: ``direct-cert-validity:<setting>:expired`` or ``...:not-yet-valid``, so the delivery
+#: worker's lane-stop log line and alert detail, which carry the code, say which certificate failed.
+CERT_VALIDITY_CODE = "direct-cert-validity"
+
+
+class _WindowProblem(NamedTuple):
+    """A certificate outside its validity window: which setting, which bound, and the refusal
+    text. Names the setting and the bound only, never a subject or a subjectAltName value."""
+
+    setting: str
+    expired: bool  # False: not yet valid
+
+    @property
+    def text(self) -> str:
+        if self.expired:
+            return f"Direct destination '{self.setting}' has expired (its notAfter has passed)"
+        return (
+            f"Direct destination '{self.setting}' is not yet valid (its notBefore is in the future)"
+        )
+
+    @property
+    def code(self) -> str:
+        return (
+            f"{CERT_VALIDITY_CODE}:{self.setting}:{'expired' if self.expired else 'not-yet-valid'}"
+        )
+
+
+def _same_name_and_key(a: x509.Certificate, b: x509.Certificate) -> bool:
+    """Whether ``a`` and ``b`` carry the same subject and the same public key, whatever else
+    differs (serial, validity, extensions). Both keys already loaded for the strength floor."""
+    spki = serialization.PublicFormat.SubjectPublicKeyInfo
+    return a.subject == b.subject and a.public_key().public_bytes(
+        serialization.Encoding.DER, spki
+    ) == b.public_key().public_bytes(serialization.Encoding.DER, spki)
+
+
+def _window_problem(
+    cert: x509.Certificate, setting: str, now: datetime.datetime
+) -> _WindowProblem | None:
+    """Why ``cert`` is outside its validity window at ``now``, or None."""
+    if now < cert.not_valid_before_utc:
+        return _WindowProblem(setting, expired=False)
+    if now > cert.not_valid_after_utc:
+        return _WindowProblem(setting, expired=True)
+    return None
+
+
+def _validity_refusal(
+    recipient: x509.Certificate, anchors: Sequence[x509.Certificate]
+) -> _WindowProblem | None:
+    """Why ``recipient``, or every one of its issuing ``anchors``, is outside its validity window
+    now, or None. Any one issuing anchor in its window will do, so a CA renewed under the same name
+    and key carries on when the bundle's older copy expires; where none is, a not-yet-valid copy
+    is the anchors' answer, because time alone cures it. Between the recipient's answer and the
+    anchors', an expiry wins, because time cannot cure it, so the refusal names the fix an operator
+    needs: a not-yet-valid recipient issued by an expired anchor reports the anchor. An empty ``anchors``, which the trust check
+    never leaves, reads as an expired anchor rather than as none failing."""
+    now = _utcnow()
+    anchor_problem: _WindowProblem | None = _WindowProblem("trust_anchor", True)
+    found: list[_WindowProblem] = []
+    for anchor in anchors:
+        problem = _window_problem(anchor, "trust_anchor", now)
+        if problem is None:
+            anchor_problem = None
+            break
+        found.append(problem)
+    else:
+        if found:
+            anchor_problem = min(found, key=lambda p: p.expired)
+    problems = [p for p in (_window_problem(recipient, "recipient_cert", now), anchor_problem) if p]
+    # max on a bool key keeps the first of equals, so the recipient leads a tie.
+    return max(problems, key=lambda p: p.expired, default=None)
+
+
+#: What reading a certificate's extensions raises, at least, when ``cryptography`` cannot read them
+#: (measured on 50.0.2): ``ValueError`` for a malformed one, and two that are not ``ValueError``
+#: subclasses, ``DuplicateExtension`` and ``UnsupportedGeneralNameType`` (an x400Address, say). Where
+#: warnings are errors, a ``UserWarning`` (a three-letter country in a directory name) or a
+#: ``CryptographyDeprecationWarning`` too, as ``pki._UNREAD_CA_EXTENSIONS`` records for its own
+#: CA reading; this tuple is Direct's, so a change to that private one cannot widen this contract.
+_UNREAD_EXTENSIONS: tuple[type[Exception], ...] = (
+    ValueError,
+    x509.DuplicateExtension,
+    x509.UnsupportedGeneralNameType,
+    UserWarning,
+    CryptographyDeprecationWarning,
+)
+
+
+def _extension[E: x509.ExtensionType](
+    cert: x509.Certificate, kind: type[E], setting: str
+) -> E | None:
+    """The value of ``cert``'s extension of ``kind``, or None when the cert does not carry one. An
+    extension ``cryptography`` cannot read raises ``ValueError`` naming the setting only. That is at
+    least a malformed one, a duplicated one (``DuplicateExtension``) and a general name it does not
+    support (``UnsupportedGeneralNameType``); the last two are not ``ValueError`` subclasses."""
+    try:
+        return cert.extensions.get_extension_for_class(kind).value
+    except x509.ExtensionNotFound:
+        return None
+    except _UNREAD_EXTENSIONS as exc:
+        raise ValueError(
+            f"Direct destination '{setting}' carries an extension that could not be parsed"
+        ) from exc
+
+
+def _anchor_ca_problem(anchor: x509.Certificate) -> str | None:
+    """Why the issuing ``anchor`` may not issue certificates, or None. A self-signed recipient
+    pinned as its own anchor never reaches this: it issues nothing else."""
+    constraints = _extension(anchor, x509.BasicConstraints, "trust_anchor")
+    if constraints is None or not constraints.ca:
+        return (
+            "Direct destination 'trust_anchor' that issues 'recipient_cert' is not a CA "
+            "certificate (basicConstraints does not assert CA=true)"
+        )
+    usage = _extension(anchor, x509.KeyUsage, "trust_anchor")
+    if usage is not None and not usage.key_cert_sign:
+        return (
+            "Direct destination 'trust_anchor' that issues 'recipient_cert' has a keyUsage "
+            "that does not assert keyCertSign"
+        )
+    return None
+
+
+def _recipient_ca_problem(cert: x509.Certificate) -> str | None:
+    """Why ``cert``, issued by another anchor, is a CA certificate rather than a mailbox's, or
+    None. A recipient pinned as its own anchor never reaches this."""
+    constraints = _extension(cert, x509.BasicConstraints, "recipient_cert")
+    if constraints is not None and constraints.ca:
+        return (
+            "Direct destination 'recipient_cert' is a CA certificate (basicConstraints asserts "
+            "CA=true), not an end-entity encryption certificate"
+        )
+    return None
+
+
+def _recipient_usage_problem(cert: x509.Certificate) -> str | None:
+    """Why ``cert`` may not be an S/MIME encryption target, or None. Each extension is checked only
+    when present: a cert carrying neither keyUsage nor extendedKeyUsage is accepted."""
+    usage = _extension(cert, x509.KeyUsage, "recipient_cert")
+    if usage is not None and not usage.key_encipherment:
+        return (
+            "Direct destination 'recipient_cert' has a keyUsage that does not assert "
+            "keyEncipherment, which RSA key transport needs"
+        )
+    extended = _extension(cert, x509.ExtendedKeyUsage, "recipient_cert")
+    # anyExtendedKeyUsage stands for every purpose (RFC 5280, the extended key usage section).
+    allowed = {ExtendedKeyUsageOID.EMAIL_PROTECTION, ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE}
+    if extended is not None and not allowed.intersection(extended):
+        return (
+            "Direct destination 'recipient_cert' has an extendedKeyUsage that lists neither "
+            "emailProtection nor anyExtendedKeyUsage"
+        )
+    return None
+
+
+def _split_address(address: str) -> tuple[str, str]:
+    """``(local part, lower-cased domain)``: the domain compares case-insensitively, the local part
+    exactly, as RFC 5280 section 7.5 compares an rfc822Name."""
+    local, _, domain = address.rpartition("@")
+    return local, domain.lower()
+
+
+def _address_binding_problem(cert: x509.Certificate, recipients: Sequence[str]) -> str | None:
+    """Why ``cert`` does not name every address in ``recipients``, or None. An address is named by
+    an rfc822Name subjectAltName equal to it, or a dNSName equal to its domain (an organisation
+    certificate). The refusal names the address's position among the checked addresses, never an
+    address or a SAN value. One ``recipients`` entry can hold several comma-joined addresses, so
+    that position counts addresses, not entries."""
+    names = _extension(cert, x509.SubjectAlternativeName, "recipient_cert") or (
+        x509.SubjectAlternativeName([])
+    )
+    mailboxes = {_split_address(v) for v in names.get_values_for_type(x509.RFC822Name)}
+    domains = {v.lower() for v in names.get_values_for_type(x509.DNSName)}
+    for position, address in enumerate(recipients, start=1):
+        local, domain = _split_address(address)
+        if (local, domain) in mailboxes or domain in domains:
+            continue
+        return (
+            f"Direct destination 'recipient_cert' does not name recipient address {position} of "
+            f"{len(recipients)} in 'recipients': it carries no subjectAltName rfc822Name equal to that address and "
+            "no dNSName equal to its domain"
+        )
+    return None
+
+
 #: The RSA signature paddings an operator may select for the CMS SignerInfo, by ``signature_padding``
 #: setting value (ASVS 11.3.1, BACKLOG #1168). ``pkcs1v15`` is the default and stays the default: see
 #: :meth:`DirectDestination._select_rsa_padding` for why that is an interoperability finding rather
@@ -401,8 +602,12 @@ class DirectDestination(DestinationConnector):
             )
         _require_key_strength(recipient_key, "recipient_cert")
         # Trust anchor — the CA(s) the recipient cert must chain to. Verified at construction so a cert
-        # from an untrusted issuer is refused before we ever encrypt PHI to it.
-        self._verify_recipient_trusted(_read_file("trust_anchor", s.get("trust_anchor")))
+        # from an untrusted issuer or naming another mailbox is refused before we ever encrypt PHI
+        # to it. Every anchor that issues it is kept for the send-time validity check, which needs
+        # any one of them inside its window; construction only warns on the window.
+        self._recipient_anchors = self._verify_recipient_trusted(
+            _read_file("trust_anchor", s.get("trust_anchor"))
+        )
         self._probe_build()
 
         # STARTTLS-by-default posture, identical to EmailDestination: the S/MIME body already protects
@@ -511,6 +716,27 @@ class DirectDestination(DestinationConnector):
                 connection=config.name,
                 context=self._tls_context,
             ).enforce_construction()
+        # LAST, after every construction refusal has passed, so it never speaks for a connector
+        # that was not built. The validity window warns here and refuses at send (Manager decision,
+        # batch 224): a build refusal would record the lane failed at start (ADR 0031) rather than
+        # stopped with its queue kept. The send-time refusal is what _send describes.
+        window = _validity_refusal(self._recipient_cert, self._recipient_anchors)
+        if window is not None:
+            logger.warning(
+                "Direct %s:%s: %s. %s",
+                self.host,
+                self.port,
+                window.text,
+                "Every send is refused as a permanent configuration fault: under "
+                "credential_fault_policy = stop the lane stops and keeps its queue, under "
+                "dead_letter each message dead-letters. "
+                + (
+                    "Renew the certificate and rebuild the connector (a new path and a reload, "
+                    "or a restart; the connector keeps the certificates it read)"
+                    if window.expired
+                    else "Start the lane again once notBefore has passed"
+                ),
+            )
 
     def _load_private_key(self, value: Any, password: Any) -> Any:
         """Load the sender's signing private key (PEM/DER, optionally passphrase-protected). PHI/secret-
@@ -622,14 +848,17 @@ class DirectDestination(DestinationConnector):
         # None is also the only value an EC key accepts, so one branch covers both key types.
         return None
 
-    def _verify_recipient_trusted(self, anchor_data: bytes) -> None:
-        """Refuse a recipient cert that is not directly issued by (or equal to) an operator-supplied
-        trust anchor, so PHI is never encrypted to a certificate from an untrusted issuer (the reason a
-        trust anchor is a required setting). This is a **one-level** issuance check (the recipient cert
-        chains directly to a supplied anchor, or is a self-signed cert that IS the anchor); full
-        multi-level path building is deferred (ADR 0085) — Direct trust is typically a single issuing CA
-        or a pinned self-signed correspondent cert. A hostname/SAN match is deliberately NOT done: a
-        Direct address is an email, not a TLS SNI."""
+    def _verify_recipient_trusted(self, anchor_data: bytes) -> tuple[x509.Certificate, ...]:
+        """Refuse a recipient cert this connector should not encrypt PHI to, and return every
+        supplied anchor that issued it and may issue certificates. :func:`_validity_refusal`
+        requires one of them inside its validity window at each send; here it only warns.
+
+        The issuance check is **one level**: the recipient cert chains directly to a supplied
+        anchor, or is a self-signed cert that IS the anchor (ADR 0085 defers path building). What
+        is checked on top of issuance (BACKLOG #5631) is listed once, in docs/CONNECTIONS.md,
+        *Recipient trust*; the helpers this calls each say what they refuse. Every refusal names
+        the setting and the property that failed, never a subject or a subjectAltName value
+        (either may identify a patient's provider)."""
         try:
             anchors = x509.load_pem_x509_certificates(anchor_data)
         except ValueError:
@@ -642,24 +871,61 @@ class DirectDestination(DestinationConnector):
         if not anchors:
             raise ValueError("Direct destination 'trust_anchor' contained no certificates")
         # Floored BEFORE the issuance check, so a weak anchor is refused whether or not it happens to
-        # be the one that issues this recipient. The loop below returns on the first match, so
-        # checking inside it would leave a weak sibling anchor unexamined and still trusted.
+        # be the one that issues this recipient. The loop below skips every anchor that does not
+        # issue it, so checking inside it would leave a weak sibling anchor unexamined and trusted.
         for anchor in anchors:
             _require_key_strength(_cert_public_key(anchor, "trust_anchor"), "trust_anchor")
+        issuers: list[x509.Certificate] = []
+        anchor_problem: str | None = None
+        pinned = False
         for anchor in anchors:
             try:
                 # verify_directly_issued_by checks the issuer/subject name match AND that the anchor's
                 # public key signed the recipient cert; a self-signed recipient pinned as its own anchor
                 # verifies against itself. Raises on any mismatch.
                 self._recipient_cert.verify_directly_issued_by(anchor)
-                return
             except (ValueError, TypeError, InvalidSignature):
                 continue  # try the next anchor
-        # PHI-safe: no cert subject in the message (it may identify a patient's provider).
-        raise ValueError(
-            "Direct destination 'recipient_cert' is not issued by any supplied 'trust_anchor'; "
-            "refusing to encrypt PHI to an untrusted certificate"
+            # An issuer that fails the CA check, or whose extensions do not read, does not end the
+            # search: a bundle can hold an old CA beside its successor under the same name and key.
+            # A PINNED correspondent: the anchor is the recipient's own name and key. Compared by
+            # subject and public key, not DER bytes, so a correspondent that renews its self-signed
+            # cert under the same name and key stays pinned while the old copy is the anchor.
+            if _same_name_and_key(anchor, self._recipient_cert):
+                pinned = True
+                issuers.append(anchor)
+                continue
+            try:
+                problem = _anchor_ca_problem(anchor)
+            except ValueError as exc:
+                problem = str(exc)
+            if problem is None:
+                issuers.append(anchor)
+            else:
+                anchor_problem = problem
+        if not issuers:
+            # PHI-safe: no cert subject in the message (it may identify a patient's provider).
+            raise ValueError(
+                (
+                    anchor_problem
+                    or "Direct destination 'recipient_cert' is not issued by any "
+                    "supplied 'trust_anchor'"
+                )
+                + "; refusing to encrypt PHI to an untrusted certificate"
+            )
+        # A pinned self-signed cert may assert CA=true (openssl req -x509 sets it by default); any
+        # other recipient that does is a CA certificate, not a mailbox's end-entity key.
+        problem = (
+            (None if pinned else _recipient_ca_problem(self._recipient_cert))
+            or _recipient_usage_problem(self._recipient_cert)
+            or _address_binding_problem(self._recipient_cert, self.recipients)
         )
+        if problem is not None:
+            raise ValueError(f"{problem}; refusing to encrypt PHI to it")
+        # A pinned correspondent's validity is the recipient cert's alone (Manager decision, batch
+        # 224): the pinned anchor may be the OLD copy of a renewed cert, and its expiry must not
+        # stop a lane whose recipient cert is valid. The recipient stands in as its own anchor.
+        return (self._recipient_cert,) if pinned else tuple(issuers)
 
     def _probe_build(self) -> None:
         """Build one S/MIME message from a fixed synthetic body, so a build fault fails at
@@ -783,6 +1049,25 @@ class DirectDestination(DestinationConnector):
         # The raise sits OUTSIDE the handler on purpose (BACKLOG #1920): `from exc` would chain the
         # build error as `__cause__`, and `from None` would still leave it on `__context__`. Only the
         # type NAME survives the handler. See `encode_wire_body` in transports/base.py.
+        #
+        # Validity first (BACKLOG #5631), before anything is built or dialled.
+        #
+        # Either bound refuses every queued message alike, so both are a permanent CONFIGURATION
+        # fault (Manager decision, batch 224). Not yet valid is cured by time, but as a transient
+        # retry each attempt counted toward the row's attempt cap and dead-lettered rows; stopped,
+        # the lane keeps the queue and an operator starts it again once notBefore has passed. The
+        # code names the setting and the bound. Under the default credential_fault_policy = stop
+        # the delivery worker stops the lane, keeps the queue, and logs one ERROR line and alert
+        # carrying that code, so this arm adds no log line of its own. Under dead_letter the row's
+        # last_error holds the text below.
+        window = _validity_refusal(self._recipient_cert, self._recipient_anchors)
+        if window is not None:
+            raise NegativeAckError(
+                f"Direct {self.host}:{self.port} refused: {window.text}",
+                code=window.code,
+                permanent=True,
+                config_fault=True,
+            )
         msg: EmailMessage | None = None
         failure = ""
         try:
@@ -790,8 +1075,9 @@ class DirectDestination(DestinationConnector):
         except _BUILD_ERRORS as exc:
             failure = type(exc).__name__
         if msg is None:
-            # The worker's permanent path dead-letters without a log line, so say it here. Type name
-            # only, for the same reason as the error text.
+            # A permanent refusal that is not a lane-stopping fault dead-letters. The worker logs
+            # that dead-letter through its throttled refusal log; this line says it was the S/MIME
+            # build. Type name only, for the same reason as the error text.
             logger.warning(
                 "Direct %s:%s: S/MIME build failed (%s); dead-lettering without retry",
                 self.host,
@@ -854,7 +1140,9 @@ class DirectDestination(DestinationConnector):
     def _probe(self) -> None:
         # Reachability/auth only: connect + (STARTTLS) + EHLO + optional login + NOOP, then quit. NO
         # MAIL FROM / DATA, so a connection test never sends a real Direct message (the EMAIL probe
-        # pattern). Crypto material was already validated at construction.
+        # pattern). Crypto material was already validated at construction, except its validity
+        # window, which construction only warns on and this probe does not read: an expired
+        # certificate is reported by the send, as a direct-cert-validity refusal (BACKLOG #5631).
         try:
             with self._connect() as smtp:
                 smtp.ehlo_or_helo_if_needed()

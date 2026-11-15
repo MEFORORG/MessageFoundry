@@ -306,10 +306,12 @@ def _start_sites(sources: Mapping[str, str]) -> dict[str, frozenset[str]]:
 
 
 @functools.cache
-def _non_literal_library_loads(source: str) -> tuple[str, ...]:
-    """Each ``ctypes`` load handed anything but a string literal or ``None``, as
-    ``Loader(<first argument source>)``, so swapping one computed load for another is visible."""
-    loads: list[str] = []
+def _library_load_calls(source: str) -> tuple[tuple[str, ast.expr | None], ...]:
+    """Each ``ctypes`` library load in ``source``, as ``(loader name, first argument)``. The one
+    walk both library-load checks filter, so a loader form added here reaches both."""
+    if "DLL" not in source and "LoadLibrary" not in source:
+        return ()  # every loader name holds one of these; skips the parse for most modules
+    calls: list[tuple[str, ast.expr | None]] = []
     for node in ast.walk(_parse(source)):
         if not isinstance(node, ast.Call):
             continue
@@ -321,15 +323,22 @@ def _non_literal_library_loads(source: str) -> tuple[str, ...]:
             if isinstance(func, ast.Name)
             else None
         )
-        if name is None or not _LIBRARY_LOADER_RE.match(name):
-            continue
-        first = node.args[0] if node.args else None
+        if name is not None and _LIBRARY_LOADER_RE.match(name):
+            calls.append((name, node.args[0] if node.args else None))
+    return tuple(calls)
+
+
+def _non_literal_library_loads(source: str) -> tuple[str, ...]:
+    """Each ``ctypes`` load handed anything but a string literal or ``None``, as
+    ``Loader(<first argument source>)``, so swapping one computed load for another is visible."""
+    return tuple(
+        f"{name}({'' if first is None else ast.unparse(first)})"
+        for name, first in _library_load_calls(source)
         if not (
             isinstance(first, ast.Constant)
             and (first.value is None or isinstance(first.value, str))
-        ):
-            loads.append(f"{name}({'' if first is None else ast.unparse(first)})")
-    return tuple(loads)
+        )
+    )
 
 
 # --- reading the page ----------------------------------------------------------------------------
@@ -482,6 +491,53 @@ def test_every_library_load_names_its_library_with_a_literal() -> None:
     )
     unnamed = _unnamed_computed_loads(_doc_text())
     assert not unnamed, f"reviewed computed loads not named under 'What holds them': {unnamed}"
+
+
+#: The modules that reach the process's own symbols with ``CDLL(None)``, and how many such calls
+#: each makes, so a new call in a listed module is reviewed too. Section 5's "What holds them"
+#: paragraph names each module (vault BACKLOG #6674 item 8).
+_REVIEWED_PROCESS_SYMBOL_LOADS: dict[str, int] = {"restricted_file.py": 1, "store/crypto.py": 2}
+
+
+def _process_symbol_loads(source: str) -> int:
+    """How many ``ctypes`` loads in ``source`` are handed ``None``: ``CDLL(None)`` and its kin, which
+    load no library and reach the symbols already in the process."""
+    return sum(
+        1
+        for _name, first in _library_load_calls(source)
+        if isinstance(first, ast.Constant) and first.value is None
+    )
+
+
+def test_every_process_symbol_load_is_reviewed_and_named() -> None:
+    """``CDLL(None)`` passes the literal-name check above, yet it resolves from the process's global
+    symbol scope, so each site is pinned here and named under "What holds them"."""
+    found = {
+        rel: count
+        for rel, source in _package_sources().items()
+        if (count := _process_symbol_loads(source))
+    }
+    assert found == _REVIEWED_PROCESS_SYMBOL_LOADS, (
+        f"CDLL(None) calls by module changed: {found}. Review each, register it in "
+        "_REVIEWED_PROCESS_SYMBOL_LOADS and name it in docs/DANGEROUS-FUNCTIONALITY.md section 5."
+    )
+    # The package walk must have seen the sites, or the naming check below runs over nothing. Two
+    # modules carry a ``CDLL(None)`` call today; the equality above already pins which.
+    assert len(found) >= 2, f"the package walk found too few CDLL(None) modules: {found}"
+    holds = _section(_doc_text(), 5).partition("**What holds them.**")[2]
+    assert "`CDLL(None)`" in holds
+    unnamed = sorted(
+        rel
+        for rel in found
+        if f"`{rel}`" not in holds and f"`{rel.removesuffix('.py')}." not in holds
+    )
+    assert not unnamed, f"CDLL(None) sites not named under 'What holds them': {unnamed}"
+
+
+def test_the_process_symbol_load_check_fires() -> None:
+    assert _process_symbol_loads("import ctypes\nctypes.CDLL(None, use_errno=True)\n") == 1
+    assert _process_symbol_loads("import ctypes\nctypes.CDLL('libc.so.6')\n") == 0
+    assert _process_symbol_loads("ctypes.WinDLL(None)\nCDLL(None)\n") == 2
 
 
 def _register_gap(live: Mapping[str, object], register: Mapping[str, object]) -> set[str]:

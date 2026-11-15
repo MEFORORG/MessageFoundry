@@ -538,13 +538,11 @@ pure-Python equivalent:
   `consume_handoff_file` opens it with DELETE as well, and once the service has converted it,
   deletes it through that same handle with `kernel32`'s `SetFileInformationByHandle`, POSIX
   semantics first and the classic disposition where the volume has none
-  (`restricted_file.delete_through_handle`), so the file deleted is the file read. Nothing calls
-  these yet. On Linux it opens the file with
-  `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
-  descriptor. It asks for that descriptor's file system through
-  `restricted_file.linux_file_system_type` (`fstatfs64`, or `fstatfs` where the C library has no
-  `fstatfs64`), and refuses any file system not on the allowlist for that kind of file. Any other
-  POSIX host opens none of these files
+  (`restricted_file.delete_through_handle`), so the file deleted is the file read. On Linux it
+  opens the file with `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list
+  from the open descriptor. It asks for that descriptor's file system through
+  `restricted_file.linux_file_system_type` (below), and refuses any file system not on the
+  allowlist for that kind of file. Any other POSIX host opens none of these files
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
@@ -552,7 +550,8 @@ pure-Python equivalent:
   best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705)
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
-  only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and the disaster-recovery takeover hook use it. On Windows it puts
+  only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and
+  the disaster-recovery takeover hook use it. On Windows it puts
   the child in a `kernel32` job object that ends the whole tree. The takeover hook starts
   suspended, so it joins the job before it can start anything, and `ntdll`'s `NtResumeProcess`
   then lets it run (vault BACKLOG #2622). POSIX needs no `ctypes` for this; the child leads its
@@ -562,8 +561,8 @@ pure-Python equivalent:
   link or junction, `GetFileInformationByHandleEx` to refuse a part that is one, and
   `GetFinalPathNameByHandleW` to confirm where the file it opened really is (BACKLOG #2507, #2535).
   It then moves and deletes the file through that handle with `SetFileInformationByHandle`, so the
-  act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
-  with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
+  act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path
+  part with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
   staging fail-safe, which empties the files a failed backup left in its staging directory, calls
   these same helpers on Windows rather than `ctypes` of its own. It holds each directory, opens each
   file as itself, and refuses a link or junction. It confirms that file lies under the staging
@@ -740,6 +739,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Text a remote peer sizes | A reply field, a traceback or an error text, clamped and redacted before it is logged or shown | `redaction.py` |
 | Replies from an engine address | Whatever answers at the address a client is given. It is meant to be the engine, but nothing proves that before the parse. | `apiclient/client.py`, `tray/probe.py`, `verify/smoke.py` |
 | Identity provider replies | The OpenID Connect token response and key set, and an ID token's header and claims | `auth/oidc/flow.py`, `auth/oidc/jwks.py`, `transports/signing.py` |
+| An HTTP 400 on the Transit audit MAC hop | The body of an HTTP 400 answering the audit chain's check of a stored row MAC (Transit `verify`, BACKLOG #2720), from whatever answers on that hop: at least Vault or OpenBao at `MEFOR_STORE_VAULT_ADDR`, or a proxy or firewall in front of it. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. What is read, and which error each outcome raises, is in at least `verify_audit_hmac`, `_refuses_only_version`, `_names_no_version_reason` and `_reply_errors`, which parses the body and holds the size bound it shares with the data-key decrypt (vault BACKLOG #6707). | `store/crypto_transit.py` |
+| An HTTP 400 on the Transit data-key decrypt | The `errors` list of an HTTP 400 answering a decrypt of the store's data key, and the per-value `error` text of a 2xx batch reply (a batch Vault refuses is asked for value by value, and its body is not read), from whatever answers at `MEFOR_STORE_VAULT_ADDR`, a proxy or firewall in front of Vault included. Every entry of that list is read and compared, and the refusal counts as a tag refusal only when every entry is an AEAD authentication failure text. For a single decrypt, that reading decides at least whether the refusal is a cell tag failure or the cipher's plain refusal, and so whether the cell is audited and alerted, its row withheld from a list and its in-flight handoff dead-lettered rather than re-pended. So whatever answers on that hop can dead-letter the messages it is asked about. A batch result's per-value `error` changes only the class of the error the cipher-cell walk records, and so the class name its reason line shows, never containment, audit or alert. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`, so the engine holds a body up to that bound; for a body hvac did not parse, only the JSON parse is skipped past `_REPARSED_BODY_MAX_CHARS`. The read is in at least `_reply_errors`, `_names_aead_failure`, `_is_aead_failure_text` and `TransitCipher._decrypt_batch` (BACKLOG #5650). | `store/crypto_transit.py` |
+| A Transit batch reply | The `batch_results` list answering a batch encrypt or decrypt of the store's data key, from whatever answers at `MEFOR_STORE_VAULT_ADDR`. The strict reply reader refuses a body over `MAX_VAULT_REPLY_BYTES`. A request of more than one value carries at most `BATCH_MAX_ITEMS` values and `BATCH_MAX_CHARS` characters of them (`store/crypto.py`); one larger value goes alone. The reply is checked in at least `_batch_replies`, `TransitCipher._decrypt_batch` and `TransitCipher._encrypt_batch` (vault BACKLOG #6706). | `store/crypto_transit.py` |
 | A passkey response | A browser sends JSON with CBOR (Concise Binary Object Representation) inside. The `webauthn` library, from the optional `[webauthn]` extra, decodes the CBOR. | `auth/webauthn.py`, `messagefoundry_webconsole/routes/account.py` |
 | A Kerberos sign-in token | The token a browser sends for Windows single sign-on, in its `Authorization: Negotiate` header. The API route decodes its base64, as the web console's `routes/sso.py` does, and pyspnego decodes the token. Kerberos sign-in is off unless configured. | `api/auth_routes.py`, `auth/ldap.py` |
 | A TLS client's certificate | The certificate a TLS client presents, read again to find its issuer. The same module also decodes an operator's PKCS #12 file and certificate revocation lists. | `pki.py` |
@@ -827,6 +829,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads your workspace's `.gitignore` and `.gitattributes`, to add the lines they lack | `sourceControl.ts` |
 | It reads files that ship inside the extension: its HL7 schema tables and its snippets | `hl7schema.ts`, `insertElement.ts` |
 | It reads a value you typed into the extension's connection form | `connectionForm.ts` |
+| Its page script reads, as JSON, the text in a connection editor field that is a table or held a table or array. That text is at least the recorded value from your config, what you typed over it, and a choice the schema offered. Text that does not parse is posted trimmed, for the engine's validator to judge. | `connectionEditorWebview.ts` |
 | It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 | It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
@@ -853,11 +856,16 @@ or compression library:
   connector's ceiling, `max_decompressed_bytes`, defaults to 64 MiB; setting it to `0` turns it off.
   A connection with `decompress=` set and that ceiling off logs one warning when it is built.
   Its gzip member cap, `max_decompressed_members`, defaults to 1024 and cannot be turned off.
-  A zip is refused whole for too many members, duplicate or overlapped members, or bytes before or
-  after the archive. Each member's name must be a safe relative path, and its bytes must match the
+  A zip is refused whole for at least too many members, duplicate or overlapped members, bytes
+  before or after the archive, or an entry compressed with any method but STORED or DEFLATED. The
+  ceiling holds as it goes only for those two methods, because stdlib `zipfile` does not bound one
+  read's output for the others (BACKLOG #5535). Each member's name must be a safe relative path, and its bytes must match the
   type its extension names. Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.
+- `parsing/dicom/_deps.py` imports `zlib` only to name `zlib.error` in the tuple of parse errors
+  that the DICOM parsers turn into a `DicomError` (BACKLOG #5803). It calls nothing in `zlib`,
+  decompresses nothing and opens no archive, so it has nothing to bound.
 - `pipeline/dr_backup.py` reads a disaster-recovery backup, which is a tar archive, on
   `messagefoundry restore` and `restore-verify`. `_extract_member` never uses a member's stored name
   as a path: it streams the store member into one fixed file name. The reader accepts only an
@@ -895,11 +903,11 @@ administrator rights. What each one grants or changes:
 
 | Script | What it grants or changes |
 |---|---|
-| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy. Rewrites the permissions and owner of the data directory, and grants read on the config directory. Sets the service's privilege list and its SID type. With `-EngineWheel`, first builds the engine install under `C:\Program Files\MessageFoundry\engine`: it runs the `-BasePython` interpreter and pip as administrator, installing the `requirements.lock` and engine wheel it checks against `-RequirementsLockSha256` and `-EngineWheelSha256`, binary wheels only ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*). |
-| `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
+| `install-service.ps1` | Copies NSSM into `C:\Program Files\MessageFoundry\nssm`, or the administrator-only folder `-NssmDir` names. Registers the engine as a Windows service through NSSM, and sets the account it runs as. An account with no password, such as the default virtual account, gets "Log on as a service" through a `secedit` rewrite of local security policy, made in a new administrator-only folder under the Windows folder's `Temp`. Rewrites the permissions and owner of the data directory, and grants read on the config directory. With `-LockConfigDir`, instead rewrites the permissions and owner of the config directory and the folders it locks with it, and of the files and folders in them (see below). Sets the service's privilege list and its SID type. With `-EngineWheel`, first builds the engine install under `C:\Program Files\MessageFoundry\engine`: it runs the `-BasePython` interpreter and pip as administrator, installing the `requirements.lock` and engine wheel it checks against `-RequirementsLockSha256` and `-EngineWheelSha256`, binary wheels only ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*). |
+| `uninstall-service.ps1` | Removes the service. With `-RemoveLogonRight`, rewrites local security policy with `secedit` again, to take "Log on as a service" back, working in a new administrator-only folder under the Windows folder's `Temp`. With `-RemoveAccountAces`, removes the account's permission entries from the data and config directories. |
 | `install-net-helper.ps1` | Registers `mefor-net-helper` (ADR 0056) as a service running as LocalSystem. It listens on the named pipe `\\.\pipe\mefor-net-helper` and adds or removes one floating IP address by running `netsh`. |
 | `uninstall-net-helper.ps1` | Removes the helper service. With `-ReleaseAddress`, first asks the helper to remove the floating address from this machine. |
-| `import-db-ca.ps1` | Adds a CA certificate to the machine-wide trust store, `Cert:\LocalMachine\Root`. |
+| `import-db-ca.ps1` | Adds the CA certificates in one file to the machine stores `Cert:\LocalMachine\Root` and `Cert:\LocalMachine\CA`. Which CA goes where, and what each store is a trust anchor for, is in [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.2. Refuses the whole file if, at least, any certificate in it is not a CA or carries a private key, or the file holds no self-signed root. With `-WhatIf` it only shows what it would add, and runs without administrator rights. |
 | `measure-store-access.ps1` | A measurement script, in the assessment's operator-run scope. [`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2 puts this folder in by its scope sentence, and names this script in by owner ruling of 2026-10-05. It measures whether the service account and the operator can both open one store; it is not a deployment step. It installs and uninstalls the service, and deletes the `-DataDir` it is given before it starts. Run it only on a disposable host: with its default `-ServiceName`, it would take over and then remove an engine service installed under that name. It also runs `python` from `PATH` while elevated. Unless `-AppExe` names another, it also takes the `messagefoundry` command from `PATH` (`Get-Command messagefoundry`) and runs it while elevated, at least for `gen-key`, which mints the run's store key, and `protect-key`, which writes the service's key file. The `python` probe starts import the engine's own code from whatever install that `python` finds, whatever `-AppExe` says. In the CI job `windows-service-smoke`, whose install step installs the engine editable, both are the checkout's. The installer's check of the engine install ([`SERVICE.md`](SERVICE.md), *Install the engine where only administrators can write*) never covers the `python` starts, and covers `protect-key` only when `-AppExe` names the launcher it checks; `gen-key` runs before the installer does. So whoever could write a folder on `PATH`, or the install those commands load, would run code as administrator and would see the store key. The `protect-key` start is handed that store key in its environment, as `MEFOR_STORE_ENCRYPTION_KEY`, which is cleared after it exits. So are at least the `python` probe starts that screen the password and provision the administrator. Those starts and the probe start that signs in are also handed, as `MEFOR_W0_ADMIN_PASSWORD`, the synthetic administrator password, or for the screen each candidate it tries. Without `-AppExe`, the service itself runs the engine in the installer's default install root, not the `PATH` `messagefoundry`. It runs NSSM only by full path, from the `-NssmDir` it hands the installer, so it runs the copy the installer checked. The CI job `windows-service-smoke`, which runs this script, runs NSSM the same way. |
 
 **The run-as account is the setting to look at hardest.** `install-service.ps1` defaults to a
@@ -923,8 +931,11 @@ Other switches on `install-service.ps1` change more than the service:
 
 - `-LockConfigDir` turns off permission inheritance on the config directory and limits it to
   SYSTEM, Administrators and the service account. It also makes Administrators the owner of the
-  directory and of everything in it. It does the same to the value file's folder, and to the
-  settings file's folder when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
+  directory and of each file and folder in it that it does not skip, and resets each one's
+  permissions to inherit from the directory, discarding the entries it carried itself; nothing
+  records them. [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2) says which items
+  it skips. The switch does the same to the value file's folder, and to the settings file's folder
+  when that holds no other folder ([SERVICE.md](SERVICE.md) says when).
   Without the switch, the script only adds a read grant.
 - `-SuppressCrashDumps` writes machine-wide Windows Error Reporting keys under `HKLM`. They are
   keyed by program name. So they affect every process with that name on the machine, not only the

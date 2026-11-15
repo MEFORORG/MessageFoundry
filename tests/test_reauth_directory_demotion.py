@@ -177,7 +177,7 @@ async def test_the_re_bind_judges_the_roles_read_after_the_bind(
 
     async def bind_then_resync(username: str, password: str, *, object_id: str) -> _DirectoryRebind:
         rebind = await original(username, password, object_id=object_id)
-        await store.set_user_roles(s.identity.user_id, ["viewer"], assigned_by="ad-sync")
+        await store.set_user_roles(s.identity.user_id, ["viewer"], assigned_by="ad-sync", audits=())
         return rebind
 
     monkeypatch.setattr(s.service, "_reauth_ad", bind_then_resync)
@@ -198,7 +198,7 @@ async def test_a_role_map_that_fails_its_seal_is_no_demotion_on_the_re_bind(
     from messagefoundry.auth.service import DIRECTORY_ROLE_MAP_UNSEALED
 
     s = await _signed_in(store, _OPERATORS, _VIEWERS)
-    monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+    monkeypatch.setattr(service_module, "ad_map_seal_ok_async", _map_fails)
 
     refused = await s.service.reauth(s.identity, _GOOD, token=s.token)
 
@@ -314,7 +314,7 @@ async def test_the_scope_test_skips_an_administrator_and_keeps_a_manual_scope(
         [(_OPERATORS, "administrator"), (_VIEWERS, "viewer")], actor="admin"
     )
     assert await judged('["IB_A"]', SCOPE_SOURCE_AD, _VIEWERS, _OPERATORS) is None
-    await store.set_user_roles(user_id, ["administrator"])
+    await store.set_user_roles(user_id, ["administrator"], audits=())
     assert await judged('["IB_A"]', SCOPE_SOURCE_AD, _OPERATORS) is None
 
 
@@ -330,15 +330,17 @@ async def test_a_scope_map_that_fails_its_seal_is_no_demotion(
         DIRECTORY_SCOPE_MAP_UNSEALED,
         DIRECTORY_SCOPE_NARROWED,
     )
-    from messagefoundry.store.store import AD_SCOPE_MAP, ad_map_seal_ok
+    from messagefoundry.store.row_seal import AnyRowSealer
+    from messagefoundry.store.store import AD_SCOPE_MAP, AdMap, ad_map_seal_ok_async
 
     s = await _signed_in(store, _VIEWERS, _SCOPE_AB, scope_map=_SCOPE_MAP)
-    real = ad_map_seal_ok
-    monkeypatch.setattr(
-        service_module,
-        "ad_map_seal_ok",
-        lambda sealer, current: current.name != AD_SCOPE_MAP and real(sealer, current),
-    )
+    real = ad_map_seal_ok_async
+
+    # The service's map seal check is awaitable (ADR 0217 slice 1b); only the scope map fails.
+    async def scope_map_fails(sealer: AnyRowSealer | None, current: AdMap) -> bool:
+        return current.name != AD_SCOPE_MAP and await real(sealer, current)
+
+    monkeypatch.setattr(service_module, "ad_map_seal_ok_async", scope_map_fails)
 
     refused = await s.service.reauth(s.identity, _GOOD, token=s.token)
 
@@ -411,3 +413,8 @@ async def test_the_reauth_route_answers_a_demoted_account_with_the_sign_in_again
         assert "could not confirm" not in r.json()["detail"]
     finally:
         await engine.stop()
+
+
+async def _map_fails(*_: object) -> bool:
+    """The service's map seal check, switched to fail (ADR 0217 slice 1b: it is awaitable now)."""
+    return False

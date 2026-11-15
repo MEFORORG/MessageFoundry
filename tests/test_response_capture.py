@@ -536,6 +536,31 @@ async def test_database_capture_result_set_caps_and_no_result() -> None:
     assert r3.outcome == "no_reply"
 
 
+async def test_database_capture_propagates_a_fetch_driver_error() -> None:
+    """BACKLOG #5714: a fetch error on a statement that DID return rows (``description`` set) is the
+    statement's failure, not "no result set". Red on the old code, which returned ``no_reply`` and
+    so let ``send`` commit the write and record it as delivered."""
+
+    class _FailingFetch(_Cur):
+        async def fetchall(self) -> list[tuple[Any, ...]]:
+            raise Exception("08S01", "[08S01] communication link failure (10054) (SQLFetch)")
+
+    d = _db(True)
+    with pytest.raises(Exception, match="08S01"):
+        await d._capture(_FailingFetch([(1,)], [("id",)]))
+
+
+async def test_database_capture_a_result_the_client_cannot_read_is_unparseable() -> None:
+    """A fetch error with no SQLSTATE (pyodbc's own, message first) is a capture problem."""
+
+    class _Unreadable(_Cur):
+        async def fetchall(self) -> list[tuple[Any, ...]]:
+            raise Exception("ODBC SQL type -155 is not yet supported.", "HY106")
+
+    r = await _db(True)._capture(_Unreadable([(1,)], [("id",)]))
+    assert r.outcome == "unparseable" and r.body == ""
+
+
 async def test_database_capture_unserializable_column_does_not_raise() -> None:
     # A column value _json_default can't encode must NOT propagate (that would roll back an
     # otherwise-successful write) — it degrades to outcome='unparseable' with an empty body.

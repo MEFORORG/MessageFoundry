@@ -176,10 +176,13 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
 - It **exits 3** when the probe sees a grant beyond that set. Under the `external` default the gMSA
   must never hold `db_ddladmin`, `db_owner` or `sysadmin`, and each one it holds is named. So is
   `UPDATE`, `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`,
-  and an `UPDATE` granted on one column, which outranks the table-level `DENY`. Remove it and run the check
-  again.
+  and an `UPDATE` granted on one column, which outranks the table-level `DENY`. So is
+  `VIEW DEFINITION` reaching its default schema or `dbo` by any route, at least a grant on the
+  schema, the database or the server, schema ownership, or a role or group membership. Remove it
+  and run the check again.
 - It **exits 4** when the probe could not read the login at all, for example on a failed connection
-  or a permission read that came back NULL. That is not a clean result.
+  or a permission read that came back NULL, or as a value that is not 0 or 1. That is not a clean
+  result.
 - It exits 1 when the service settings do not load.
 
 It also probes each Vault token the engine uses and the AD bind account, when they are
@@ -227,8 +230,8 @@ Vault and LDAP*.
 > the login that runs `provision-admin`, for example
 > `GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [CORP\some-operator];` when that schema is `dbo`.
 > Under `auth = "integrated"` that login is the Windows account that runs the command, which is
-> not the gMSA unless the command runs as it. The startup probe (§1.3) does not report it as excess,
-> so where that login is the runtime login (`auth = "sql"`), revoke the grant once the mint is done.
+> not the gMSA unless the command runs as it. Where that login is the runtime login (`auth = "sql"`),
+> revoke the grant once the mint is done; §1.3 says when the startup probe reports it as excess.
 >
 > **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
 > builds and upgrades its own schema at open, and the gMSA also needs `db_ddladmin` as a standing
@@ -247,11 +250,17 @@ Vault and LDAP*.
 > calls are the two lane-family claim procs, and only when `[store].fifo_claim_proc = true` — SQL
 > Server only, default `false` ([`CONFIGURATION.md`](CONFIGURATION.md) `[store]`). (`sp_getapplock`,
 > used on every finalize and at schema init, is a **system** procedure `public` can already execute —
-> no grant.) Their *creation* rides the schema batch, so step 4 deploys them. It is
-> permission-guarded and self-no-ops when the provisioning principal cannot take it. If you enable the
+> no grant.) Their *creation* rides the schema batch, so step 4 deploys them, in the provisioning
+> login's default schema, where the batch creates the tables; it needs `CREATE PROCEDURE` and
+> `ALTER` on that schema. It is permission-guarded and self-no-ops when the provisioning principal
+> cannot take it, or when the `queue` table does not resolve to that same schema for it. **The
+> procs live in the store's schema:** the schema of the `queue` table, wherever the batch first
+> created it. A login whose default schema is not that one deploys no procs at all. The startup
+> gate looks for them in the schema of the `queue` table the runtime login resolves, and the claim
+> calls them there. If you enable the
 > flag, grant the runtime login `EXECUTE` and `VIEW DEFINITION` on both procs the engine calls
-> (`dbo.mefor_claim_fifo_heads_cid_v2` and `_dst_v2`). Each new proc version needs its own grant; a
-> grant made on `_v1` does not cover `_v2`. Without
+> (`mefor_claim_fifo_heads_cid_v2` and `_dst_v2`, in the store's schema). Each new proc version
+> needs its own grant; a grant made on `_v1` does not cover `_v2`. Without
 > `VIEW DEFINITION` the startup gate cannot read the bodies it verifies and degrades to the shipped
 > batch.
 
@@ -345,7 +354,10 @@ CREATE SCHEMA mefor AUTHORIZATION mefor;         -- run by a DBA; the role owns 
 > umbrella role (`rds_superuser`, `cloudsqlsuperuser`, `azure_pg_admin`).
 >
 > **No managed identity.** Postgres has no managed-identity auth mode, so `[store].auth` is a static
-> role+password (supply it via `MEFOR_STORE_PASSWORD`, never the file) and
+> role+password (supply it as `MEFOR_STORE_PASSWORD`, never in the settings file; under a Windows
+> service, as the secrets-directory file of that name, never in the service's NSSM list;
+> [`SERVICE.md`](SERVICE.md#start--stop--status) says why, and when `serve` and `supervise`
+> refuse to start with it there) and
 > `[store].require_managed_identity` is unsatisfiable on this backend — see
 > [`CONFIGURATION.md`](CONFIGURATION.md). `[store].require_least_privilege` is the orthogonal control
 > and **does** apply here (§1.3).
@@ -357,7 +369,7 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
 
 | Backend | What the probe reads | On SQLite |
 |---|---|---|
-| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes. Under `schema_management = "external"` (the default) `db_ddladmin` counts as excess, and so does `UPDATE` (on the table or any one column), `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`; under `auto` `db_ddladmin` is prescribed and the audit-table rights are not counted | n/a |
+| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes. Under `schema_management = "external"` (the default) `db_ddladmin` counts as excess, and so do `VIEW DEFINITION` on the login's default schema or on `dbo`, and `UPDATE` (on the table or any one column), `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`; under `auto` `db_ddladmin` is prescribed, and neither the audit-table rights nor `VIEW DEFINITION` is counted | n/a |
 | PostgreSQL | every role the principal may assume and the **attributes** each carries (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), plus database ownership and `CREATE` on the database. Under `external` it also counts `CREATE` on the store's schema, ownership of objects in it, and `UPDATE` (on the table or any one column), `DELETE`, `TRUNCATE` or `TRIGGER` on `audit_log` held by any role it may assume, as excess; under `auto` the first two are prescribed and the audit-table rights are not counted | n/a |
 | SQLite | — | reported **not applicable**: a local file has no server principal; access is the filesystem ACL on the `.db` and its `-wal`/`-shm` sidecars |
 
@@ -524,14 +536,14 @@ validation to succeed, the database's certificate must chain to a CA the host al
 
 | Backend | How the DB CA is trusted | Disable validation? |
 |---|---|---|
-| **PostgreSQL** | **Either** pin the CA by file with `[store].ssl_root_cert = <ca.pem>` (no machine-wide install — see §1), **or** import it into the Windows machine trust store (§5.2). The file pin is the lighter-touch path. | Never. |
-| **SQL Server (ODBC Driver 18)** | **Machine trust store** (`LocalMachine\Root`, §5.2) is the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). **Never pin the self-signed certificate SQL Server generates when it has no trusted or valid one**: the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md) says why, and how to spot it. | Never. |
+| **PostgreSQL** | **Either** pin the CA by file with `[store].ssl_root_cert = <ca.pem>` (no machine-wide install — see §1), **or** import it into the Windows machine stores (§5.2). The file pin is the lighter-touch path. | Never. |
+| **SQL Server (ODBC Driver 18)** | **Machine stores** (the root in `LocalMachine\Root`, any issuing CA in `LocalMachine\CA`, §5.2) are the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`, sent with `Encrypt=strict`, so SQL Server 2022 or later), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). **Never pin the self-signed certificate SQL Server generates when it has no trusted or valid one**: the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md) says why, and how to spot it. | Never. |
 
-### 5.2 Import a private / internal CA into the machine store (`LocalMachine\Root`)
+### 5.2 Import a private / internal CA into the machine stores (`LocalMachine\Root`, `LocalMachine\CA`)
 
-The CA must go into the **machine** store (`Cert:\LocalMachine\Root`), **not** the per-user store
+The CA must go into the **machine** stores (`Cert:\LocalMachine\...`), **not** the per-user stores
 (`Cert:\CurrentUser\Root`): the engine runs as a **service principal** — LocalSystem, a gMSA, or a
-dedicated service account — which only reads the machine store. A per-user import is invisible to the
+dedicated service account — which only reads the machine stores. A per-user import is invisible to the
 service.
 
 From an **elevated (Administrator)** PowerShell, use the helper:
@@ -540,7 +552,26 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 .\scripts\service\import-db-ca.ps1 -CaPath C:\certs\internal-root-ca.crt
 ```
 
-or run the equivalent built-in directly:
+The helper shows every certificate in the file, and refuses the whole file in at least these cases:
+any one is not a CA or carries a private key, the file holds no self-signed root, or a DER value in
+it does not end where its bytes end. The helper's own help lists the rest.
+
+**Where each CA goes.** This paragraph and the helper's own help are the statement of it; other
+documents point here. A self-signed root, whose signature verifies under its own key, goes into
+`LocalMachine\Root`. Any other CA in the file, such as an issuing CA in a `.p7b` chain, or a
+self-issued certificate another key signed, goes into the intermediate store `LocalMachine\CA`.
+That store is **not** a trust anchor for SChannel or ODBC Driver 18 chain building, so the SQL
+Server hop still checks the chain up to the root. It **is** usable as a trust anchor by the
+engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which the PostgreSQL
+system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
+partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
+there without its root. The helper refuses a file unless at least one certificate in it is a
+self-signed root. It does not check that each other CA in the file chains to that root, and with
+`-Confirm` you may still decline the root and accept another CA, so give it the root of the CA you
+mean to trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
+
+The built-ins below check none of that, so use them only for a file holding one self-signed root
+CA you have checked yourself:
 
 ```powershell
 # PowerShell:
@@ -562,16 +593,17 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 **Rotating the CA (root/intermediate):**
 
 1. **Add** the new CA alongside the old one — both trusted at once (the overlap window):
-   - **SQL Server:** import the new CA into `LocalMachine\Root` (§5.2) on every connecting host; the
-     old CA stays imported. Both chains now validate.
+   - **SQL Server:** import the new CA with its root (§5.2) on every connecting host; §5.2 says which
+     store each goes into. The old CA stays imported. Both chains now validate.
    - **PostgreSQL (file pin):** point `[store].ssl_root_cert` at a **multi-root PEM bundle** containing
      **both** the old and new CA certs (concatenate them in one PEM file), then reload. `libpq`
      accepts a server cert that chains to **either** root.
 2. **Roll the DB server certificate** to one issued by the new CA (a DB-administrator action). Because
    both CAs are trusted, connections keep validating across the swap.
 3. **Remove the old CA** once every host trusts the new one and the server cert has rolled:
-   - **SQL Server:** delete the old CA from `LocalMachine\Root` (e.g.
-     `Get-ChildItem Cert:\LocalMachine\Root | Where-Object Thumbprint -eq <old> | Remove-Item`).
+   - **SQL Server:** delete the old CA from whichever machine store holds it, `LocalMachine\Root` for
+     a root or `LocalMachine\CA` for an issuing CA (e.g.
+     `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA | Where-Object Thumbprint -eq <old> | Remove-Item`).
    - **PostgreSQL:** drop the old CA from the PEM bundle and reload.
 
 **Rotating only the server leaf cert** (same CA): no trust-store change is needed — the new leaf still

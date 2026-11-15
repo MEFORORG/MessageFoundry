@@ -7,7 +7,14 @@
   2026-10-20*, which adds a scheme to each range record and supersedes nothing. **Amended
   2026-10-27** (BACKLOG #2720): see *Amendment 2026-10-27*, which records what a Transit key
   rotation does to the chain. It supersedes only the clause, stated twice, that put Transit's key
-  versioning outside this ADR; that the engine sees one Transit range still stands.
+  versioning outside this ADR; that the engine sees one Transit range still stands. **Amended
+  2026-11-11** (BACKLOG #2720): see *Amendment 2026-11-11*, under which the walk checks each Transit
+  row MAC with Transit's verify call. It supersedes the 2026-10-27 amendment's item 2 and its
+  *Why regenerating pinned stands in for Transit's verify call*, and closes that amendment's edge.
+  **Amended 2026-11-13** (BACKLOG #8222): see *Amendment 2026-11-13*, which changes how the
+  2026-11-11 amendment's items 4 and 5 read, in the chain walk only, a timeout on both asks of one
+  row's verify and a malformed reply to
+  a handover tag.
 - **Date:** 2026-09-23
 - **Related:** BACKLOG #1904 (the defect), #1905 (keyless chain after `provision-admin`), #190 (the
   keyed chain and its watermark), [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)
@@ -445,18 +452,36 @@ section 0): this is what the first deployment's first routine rotation would hav
 
 1. **An append names its version.** It calls `generate_hmac` unpinned, so Transit uses its latest
    version, and the string it stores carries that version.
-2. **A check recomputes pinned to the stored version.** `_version_pinned_mac` in `store/store.py`
+2. **A check recomputes pinned to the stored version.** (Superseded 2026-11-11: see *Amendment
+   2026-11-11*. `_version_pinned_mac` is gone.) `_version_pinned_mac` in `store/store.py`
    reads `<N>` from the stored string and calls `TransitCipher.audit_hmac(data, key_version=N)`.
    The chain walk (`_audit_row_mac`), the genesis-row check at open, and the one-row MAC check
    behind the Transit attestation all go through it. The recompute is compared with the stored
    string in constant time (`hmac.compare_digest`).
 3. **A refused version is a break at that row; an outage is not.** A pinned call that Transit
    answers with HTTP 400 for that version alone raises `AuditKeyVersionRefusedError`
-   (`TransitCipher._refuses_only_version`). The walk records a break at that row, naming the
-   version, and goes on. Any other failure, an unreachable Vault among them, is a `CipherError`:
-   the walk could not run, and no tamper alert fires.
+   (`TransitCipher._refuses_only_version`). The test reads the reply, not who wrote it: a pinned
+   call that gets an HTTP 400 that hvac raises as `InvalidRequest`, while a probe under the latest
+   version answers with a string that does not start with `vault:v<pinned>:`, raises it. An empty
+   answer or one naming no version passes too, and a proxy, not Transit, can author the 400
+   (corrected 2026-11-11, BACKLOG #6707). The walk records a break at that row, naming the
+   version, and goes on. A 400 on which hvac raises an exception other than `InvalidRequest`
+   raises neither `AuditKeyVersionRefusedError` nor its subclass `AuditKeyVersionUnverifiedError`
+   (BACKLOG #6707). For example, these exact 400 bodies with the Content-Type exactly
+   `application/json`:
+   `[]`, `null`, `{"errors":[{"message":"x"}]}`, `{"errors":[1]}`, `{"errors":5}` and
+   `{"errors":true}`. On each, hvac 2.4.0 raises `AttributeError` or `TypeError` in place of
+   `InvalidRequest`. A `MemoryError` that hvac raises while it joins a
+   truthy `errors` value, before it raises any `InvalidRequest`, is not read as a refusal either.
+   Each is a plain `CipherError`, so a version planted behind a proxy that wrote such a body would
+   not read as a break. Any other failure, an unreachable Vault among them, is a `CipherError`
+   too. In every such case the walk could not run, and no tamper alert fires. The genesis-row
+   check at open (item 2) catches only `AuditKeyVersionRefusedError`, so there such a
+   `CipherError` can fail the store open.
 
 ### Why regenerating pinned stands in for Transit's verify call
+
+Superseded 2026-11-11: the walk now makes Transit's verify call (*Amendment 2026-11-11*).
 
 #2720 asked for Transit's verify call on the stored string in place of regenerate-and-compare. The
 pinned recompute gives the two properties that call would:
@@ -479,12 +504,11 @@ key's `min_encryption_version` does this, so every row sealed under a lower vers
 as a break, and so would the attestation, with no re-attest hint. That limit is specific to
 regenerating. Vault's Transit API documentation, read on 2026-10-27, says a pinned HMAC generate
 needs a version at or above the key's `min_encryption_version`, and that `min_decryption_version`
-is the floor for verifying an HMAC. No Vault or OpenBao server was run to confirm it. PR 2167
-named Transit's verify call as the fix for this limit; it is not built. Until it is, do not raise
-the audit key's `min_encryption_version` above the oldest version a stored row names: every older
-row would then read as a break in `audit-verify`, and in the startup walk where it is on.
+is the floor for verifying an HMAC. Closed 2026-11-11: the walk verifies instead of regenerating,
+so `min_encryption_version` no longer bears on it (*Amendment 2026-11-11*).
 
-`_refuses_only_version` infers a refused version from Transit's reply; it does not read the key's
+`_refuses_only_version` infers a refused version from the reply, which a proxy can author (item
+3); it does not read the key's
 version range. So a node whose copy of the key lags a rotation can refuse a real, newer version, and
 that row reads as a break too.
 
@@ -494,9 +518,133 @@ All against an in-process fake Transit client with key versions, never a real se
 `tests/test_transit_bound_attestation.py`:
 
 - `test_rotating_the_transit_key_keeps_the_attestation` -- the chain and the attestation verify
-  after the fake key moves from version 1 to version 2, and the recompute was pinned to version 1.
+  after the fake key moves from version 1 to version 2. Since 2026-11-11 it checks that Transit
+  verified at version 1 and no call was pinned.
 - `test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk` and
   `test_a_planted_unheld_key_version_on_the_genesis_row_opens_and_reads_as_a_break` -- a planted
   version is a break at its row.
-- `test_a_transit_outage_on_the_startup_walk_still_could_not_run` and
-  `test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version` -- an outage is not a break.
+- `test_a_verify_failure_whose_fixed_input_probe_fails_on_the_startup_walk_could_not_run` and
+  `test_a_verify_failure_whose_fixed_input_verify_fails_could_not_run` (renamed 2026-11-11) -- a
+  verify failure whose fixed-input check fails too is not a break. An outage
+  `is_vault_unavailable` names is `test_a_service_failure_of_the_verify_call_still_could_not_run`.
+
+## Amendment 2026-11-11 -- the walk checks each Transit row MAC with Transit's verify call
+
+- **Status:** Accepted -- built with the change (BACKLOG #2720, closing step 1).
+- **Supersedes:** the 2026-10-27 amendment's item 2 and its *Why regenerating pinned stands in for
+  Transit's verify call*. It closes that amendment's edge.
+
+### What changes
+
+1. **A stored MAC is checked by Transit, never regenerated.** `TransitCipher.audit_mac_fn` returns
+   an `AuditMacVerifier` (`store/crypto.py`). For one, `_audit_row_mac` in `store/store.py` calls
+   `TransitCipher.verify_audit_hmac(data, stored)`, which makes Transit's `verify` call on the
+   stored string. Transit checks it at the version it names. The chain walk, the genesis-row check
+   at open, the pin check, and the one-row MAC checks behind the Transit attestation and keyed
+   evidence all go through `_audit_row_mac`. An append still calls `generate_hmac` unpinned, and
+   raises `CipherError` on a reply `transit_mac_version` does not accept, so it never writes a
+   malformed MAC (`TransitCipher.audit_hmac`).
+2. **The policy floor that applies is `min_decryption_version`.** Vault's `pathHMACVerify` at
+   commit cbc874e2358f, read on 2026-11-11, refuses a version above the latest (*"invalid HMAC:
+   version is too new"*) or below `min_decryption_version`, and does not read
+   `min_encryption_version`. So raising `min_encryption_version` leaves older rows verifying, and
+   raising `min_decryption_version` above a version a stored row names makes that row a break.
+   No Vault or OpenBao server was run to confirm it.
+3. **A malformed stored MAC is a break with no verify call.** A stored string that
+   `row_seal.transit_mac_version` does not accept reads as not verified, so no malformed value
+   reaches Transit to draw a 400. It still costs one round trip, an unpinned `generate_hmac` whose
+   answer is discarded, so a malformed row is no cheaper to check than a clean one (the ASVS 11.2.4
+   note on `verify_audit_chain`).
+4. **A refusal of the row is a break; an outage could not run.** A 400 on the verify call that
+   `_refuses_only_version` reads as a refused version (2026-10-27 amendment, item 3, where "a
+   pinned call" now reads as this verify call) raises `AuditKeyVersionRefusedError`, or
+   `AuditKeyVersionUnverifiedError` where `_names_no_version_reason` does not read it as Vault's
+   own refusal, and is a break at that row with the alert. An outage `is_vault_unavailable` names
+   raises a plain `CipherError`, and the walk could not run (`_settled_verify_failure`). A failure of the
+   verify call that is neither a refused version nor an outage `is_vault_unavailable` names is
+   checked by `_recheck_refused_row` once the handler has let go of it (BACKLOG #2720): a
+   `generate_hmac` and a verify over fixed input must succeed, and then the row's own verify is
+   asked once more. An answer is read as usual, and a refused version or an outage on the second
+   ask is read as on the first. Any other second failure is a break at that row once the fixed
+   input verifies again, and a `CipherError` when it does not. A planted row past
+   `max_request_size` (HTTP 413) is one such case, and so are the 400 bodies the 2026-10-27
+   amendment's item 3 lists. This item replaces item 3's reading, that every such failure is a
+   `CipherError` and the walk could not run, for each failure it reads as a break; on the genesis
+   row at open, such a break is logged by `settle_audit_ranges` and the store opens. Transit's
+   `valid: false` is a break. A reply with no bool `valid` is a `CipherError`.
+   **[AMENDED 2026-11-13, BACKLOG #8222: in the chain walk only, when both asks fail with an HTTP
+   408 or 504 and the fixed input verifies, the walk could not run, not a break. Everywhere else,
+   the store open's genesis check among them, and every other pair of failures, read as this item
+   says.
+   See *Amendment 2026-11-13*, item 1. The words above are kept as decided.]**
+5. **A range row's handover tag is not moved.** `_audit_tag_ok` still regenerates the tag under
+   the outgoing key and compares it. **[AMENDED 2026-11-13, BACKLOG #8222: a non-empty reply that
+   is no well-formed MAC is now logged and read as a tag that does not match in the walk. The store
+   open still refuses on it; that path is unruled and on the owner's queue. See *Amendment
+   2026-11-13*, item 2.]**
+6. **The in-process key paths are unchanged.** A plain MAC provider, an in-heap key and the keyless
+   mode still recompute and compare in constant time.
+
+### Evidence
+
+In-process fake Transit, never a real server, in `tests/test_transit_bound_attestation.py`. Its
+`_RotatingTransit` models both policy floors as item 2 reads them.
+
+- `test_a_mixed_v1_and_v2_chain_verifies_after_a_rotation`.
+- `test_raising_min_encryption_version_past_v1_leaves_v1_rows_verifying`.
+- `test_raising_min_decryption_version_past_v1_is_a_break_with_the_alert`.
+- `test_a_tampered_row_in_a_mixed_chain_still_breaks` and
+  `test_a_malformed_stored_mac_is_a_break_with_no_verify_call`.
+
+Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
+
+- `test_audit_hmac_refuses_a_reply_its_own_check_would_reject`.
+
+## Amendment 2026-11-13 -- in the walk, a timeout on both asks of a row's verify could not run and a malformed handover reply is a mismatch
+
+- **Status:** Accepted -- built with the change (BACKLOG #8222 items 1 and 5). The owner ruling
+  of 2026-11-13, "Fix forward", on engine PR 2903 (comment 6840783854) ruled that a 504 or 408 on
+  one row's verify reads as could not run. Reading that only when both asks time out is a Manager
+  decision, not the owner's words, and so is applying it to the chain walk only. The ruling does
+  not cover the store-open path, which is unruled and on the owner's queue, so the open reads both
+  items as engine PR 2903 does.
+- **Supersedes:** in the chain walk only, the 2026-11-11 amendment item 4's reading of a persistent
+  408 or 504 as a break, and the could-not-run engine PR 2903 made of a malformed handover reply.
+
+1. **In the walk, a 408 or 504 on both asks of one row's verify could not run.** Under item 4 above, a failure on
+   both asks while the fixed input verified was a break, a persistent 504 among them. hvac raises a
+   408, a 413 and a 504 as one class, `UnexpectedError`, with no status, so the store's Vault client
+   (`keyprovider_vault._build_client`) now records each failed reply's status on hvac's error
+   (`_record_reply_status`), whichever class hvac raised, `TypeError` or `AttributeError` for a
+   JSON body it cannot read among them. When both asks fail with a 408 or 504
+   (`is_vault_timeout_reply`) and the fixed input verifies after the second, `_recheck_refused_row`
+   raises `AuditVerifyTimedOutError` in place of `False`. Only the chain walk
+   (`_audit_row_mac(..., in_walk=True)`) lets it propagate, so the walk could not run and no tamper
+   alert fires. Every other caller of `_audit_row_mac`, the store open's genesis check and the
+   one-row checks among them, logs it and reads it as a MAC that does not verify, as item 4 says.
+   Every other pair of failures, a timeout on one ask only among them, is read as item 4 says.
+2. **A malformed reply to a handover tag is a break in the walk; the open still refuses.** Item 1
+   above makes `audit_hmac` raise for a reply `transit_mac_version` does not accept. For a
+   non-empty string it now raises the subclass `AuditMacMalformedError`. The walk
+   (`verify_audit_rows`, through `_handover_tag_ok`) logs it and reads it as a tag that does not
+   match, a break at that range row, as before engine PR 2903. The store open
+   (`settle_audit_ranges`) still calls `_audit_tag_ok` with no catch, so the open refuses, as on
+   engine PR 2903; that path is unruled and on the owner's queue. The open runs before every walk,
+   `audit-verify`'s read-only open included, so where the open's check reaches such a row and
+   refuses, no walk runs to read it. An empty or non-string reply is still a plain `CipherError`:
+   the walk could not run, and the open refuses.
+
+Evidence, in `tests/test_transit_bound_attestation.py`:
+`test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verifies`,
+`test_a_timeout_that_clears_on_the_second_ask_is_not_a_break`,
+`test_a_413_on_one_rows_verify_is_still_a_break`,
+`test_a_timeout_on_only_one_ask_is_still_a_break`,
+`test_a_persistent_504_on_one_rows_verify_could_not_run_on_the_startup_walk`,
+`test_a_both_asks_timeout_on_the_genesis_verify_at_open_logs_a_break_and_opens`,
+`test_the_store_vault_client_records_the_reply_status_on_hvacs_error`,
+`test_a_504_hvac_could_not_parse_still_reads_as_a_timeout`,
+`test_a_504_through_the_store_clients_request_path_reads_as_a_timeout`,
+`test_a_malformed_transit_reply_to_a_handover_tag_is_a_break_in_the_walk`,
+`test_a_malformed_handover_reply_at_open_still_refuses_the_open` and
+`test_an_empty_or_non_text_transit_reply_to_a_handover_tag_still_could_not_run`.
+

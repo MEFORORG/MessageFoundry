@@ -1355,11 +1355,13 @@ _CLI_OPENERS = {
     # vault BACKLOG #3849 B5: the reopen after the codes are shown, so the administrator_granted
     # alert's open instance lands in the store, on the write's verdict and posture. It passes no
     # create; this guard reads only the verdict, so nothing here pins that
-    "_provision_admin.reopen",
+    "_provision_admin.page_granted.reopen",
     # the supervisor's audit of a re-minted API pair, on the verdict serve's lifespan passes
     "_renew_api_tls_before_spawning._audit",
     "_audit_verify.run",
     "_audit_anchor.run",
+    # BACKLOG #1719: cipher-audit's read-only open of a PostgreSQL or SQL Server store
+    "_cipher_audit.run_server",
     "_backup.run",
     # BACKLOG #2337: record or withdraw the vault_transit bound attestation, with its audit row
     "_store_transit_bound.run",

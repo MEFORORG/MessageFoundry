@@ -96,7 +96,6 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
 )
 from messagefoundry.connection_events import check_connection_event_kind
-from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
@@ -155,9 +154,10 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.document_strip import (
+    StripCursor,
     StripResult,
-    cutoff_for,
-    log_unreadable_skips,
+    StripUpdate,
+    run_strip_pass,
 )
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
@@ -194,10 +194,13 @@ from messagefoundry.store.queue_tag import (
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
-    SESSION_KIND,
     USER_KIND,
-    RowSealer,
+    AnyRowSealer,
+    ResealOutcome,
     RowSealError,
+    SealPager,
+    classify_unrotated,
+    row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -217,6 +220,7 @@ from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
     _LAST_RECEIVED_SQL,
+    _RESOLVED_STATUSES,
     _SESSION_CAP_ORDER_SQL,
     AD_MAPS,
     AD_ROLE_MAP,
@@ -261,7 +265,6 @@ from messagefoundry.store.store import (
     DestinationMetrics,
     DiskFreeStatus,
     EnrolmentCodeOutcome,
-    EpochBump,
     EpochRaise,
     FailOutcome,
     FederatedUnbind,
@@ -279,6 +282,7 @@ from messagefoundry.store.store import (
     OutboxStatus,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -290,6 +294,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
     RestoreRecord,
     RevokeResult,
+    RevokeSealOutcome,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -303,28 +308,31 @@ from messagefoundry.store.store import (
     UserRecord,
     UserRow,
     WebAuthnCredential,
+    WorkerDeathOutcome,
     _alert_summary,
     _dead_target_pairs,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
     _opt_float,
     _session_cap_groups,
     _transit_attestation_row,
-    ad_map_write,
+    ad_map_write_async,
     admin_guard_counts,
     append_rename_audits,
-    approval_fails_seal,
-    approval_tombstone,
-    approval_update,
+    approval_fails_seal_async,
+    approval_tombstone_async,
+    approval_update_async,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
     birth_notify_email,
     build_audit_mac_keys,
+    cancels_at_entry,
     check_caller_event_kind,
     check_executing_owner_filter,
     check_open_store_pin,
     check_password_generated,
+    cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
     delivery_key,
@@ -337,12 +345,12 @@ from messagefoundry.store.store import (
     federated_bind,
     federated_unbind,
     first_admin_grant,
-    first_sealed_approval,
+    first_sealed_approval_async,
     full_authentication_clear,
     global_epoch_or_refuse,
     global_epoch_raise,
     global_epoch_unmoved,
-    held_approval_tombstone,
+    held_approval_tombstone_async,
     if_applied,
     inheritance_plan,
     inheriting_children,
@@ -359,6 +367,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    raise_account_epoch,
     read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
@@ -375,20 +384,21 @@ from messagefoundry.store.store import (
     require_ingress_audit,
     require_notify_email,
     require_operator_audit,
-    role_seal_ok,
+    require_role_seal_for_write,
+    require_user_seal_for_write,
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
     scope_if_source,
     scope_withdrawal,
-    seal_approval,
-    seal_role,
-    seal_session,
-    seal_user,
+    seal_approval_async,
+    seal_role_async,
+    seal_session_async,
+    seal_user_async,
     session_insert_params,
-    session_owes_unproven_factor,
+    session_owes_unproven_factor_async,
     session_reseal_params,
-    session_seal_ok,
+    session_writer_seal_check,
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
@@ -401,13 +411,16 @@ from messagefoundry.store.store import (
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    unheld_seal_refusal,
+    unrotated_seal_queries,
     user_disabled_change,
     user_insert_params,
     user_reseal_params,
-    user_seal_ok,
     verify_audit_rows,
+    way_past_passkeys,
     webauthn_insert_params,
     without_role,
+    write_kept_session,
 )
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
@@ -429,6 +442,16 @@ _PG_EPOCH_NOW = "EXTRACT(EPOCH FROM statement_timestamp())::double precision"
 # which is the memory budget the 500-row passes actually spend; 500 here would be ~650 MiB held in a
 # single transaction while the store is still opening.
 _ATTACHMENT_CHUNK_BATCH = 16
+
+
+def _check_walk_identifiers(*names: str) -> None:
+    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
+    constants (BACKLOG #1719), so this only stops a caller that passed something else."""
+    for name in names:
+        if not (name.isascii() and name.isidentifier()):
+            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
+
+
 # BACKLOG #3383: write a surface's `keyed_surface` marker unless it exists. RETURNING yields a row
 # only when this statement wrote the marker, which is how the seal learns it was the writer.
 _INSERT_KEYED_MARKER = (
@@ -626,7 +649,8 @@ _SCHEMA: list[str] = [
         updated_at       DOUBLE PRECISION NOT NULL,
         seq              BIGSERIAL,
         owner            TEXT,
-        lease_expires_at DOUBLE PRECISION
+        lease_expires_at DOUBLE PRECISION,
+        worker_deaths    INTEGER NOT NULL DEFAULT 0
     )""",
     # Track B Step 2: additive multi-node row-lease columns. NULL while a row is pending/terminal; set
     # only while inflight (owner = the claiming store instance, lease_expires_at = claim time + TTL).
@@ -1344,7 +1368,9 @@ _SCHEMA.append(
 # only thing that sends a store marked by an earlier build through both once.
 # 9 (BACKLOG #1720): the same function builds ux_users_federated_subject, moved out of _SCHEMA. The
 # _SCHEMA edit moves the hash too; the bump is what the contract above ties the body to.
-_MIGRATION_REV = 9
+# 10 (vault BACKLOG #4607 step 6): the same function ADDs queue.worker_deaths. The queue CREATE
+# TABLE moved too; the bump is what ties the migration body to the hash.
+_MIGRATION_REV = 10
 
 # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
 # is pinned by a test; this backend's plan has not been measured. Built in _migrate_lease_columns with
@@ -2062,6 +2088,8 @@ class PostgresStore:
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
     backend = StoreBackend.POSTGRES
+    # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
+    _reseal_outcome: ResealOutcome = ResealOutcome()
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
     #: columns (error/last_error/detail), and summary/metadata (MRN + patient name) added in EF-3.
@@ -2102,7 +2130,8 @@ class PostgresStore:
         self._settings = settings
         self._cipher: Cipher = cipher or IdentityCipher()
         # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
-        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
+        self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
+        self._seal_pager = SealPager()
         # A1 live cost counters (QueueStore protocol / `/stats` uniformity). Exposed at 0 on this backend:
         # counting is fully wired on SQLite + SQL Server, whose explicit ``conn.commit()`` / body-insert
         # sites funnel through single helpers; Postgres commits implicitly via ``async with
@@ -2190,6 +2219,7 @@ class PostgresStore:
     ) -> PostgresStore:
         """Open the store. ``create`` and ``read_only`` are :func:`~messagefoundry.store.base.open_store`'s
         (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
+        cancels_before = cancels_at_entry()  # BACKLOG #5720: only this open's cancels
         pool = await cls._create_pool(settings, posture=posture, max_size=settings.pool_size)
         store = cls(
             pool,
@@ -2231,15 +2261,32 @@ class PostgresStore:
                 await (
                     store._load_reference_cache()
                 )  # populate the reference-snapshot read cache (ADR 0006)
-        except Exception:
-            # Don't leak the pool if first-open initialization fails (M-6). A cleanup that fails is
-            # logged by class, so it never replaces the open's own error (vault BACKLOG #3054).
-            try:
-                await pool.close()
-            except Exception as cleanup:
-                log.warning(
-                    "closing the pool after a failed open also failed (%s)", type(cleanup).__name__
-                )
+        except BaseException as exc:
+            # Don't leak the pool if first-open initialization fails (M-6), a cancel included
+            # (BACKLOG #5720). The cleanup settles nothing, as before: a failed open forfeits the
+            # AES-GCM invocation block it reserved, and each forfeited block counts toward the
+            # key's fail-closed invocation ceiling. A cleanup that fails is logged by class, so it never replaces the open's own error (vault
+            # BACKLOG #3054).
+            async def _release() -> None:
+                try:
+                    await pool.close()
+                except Exception as cleanup:  # noqa: BLE001 — never mask the open's error
+                    log.warning(
+                        "closing the pool after a failed open also failed (%s)",
+                        type(cleanup).__name__,
+                    )
+
+            def _force_release() -> None:
+                # Synchronous: asyncpg's terminate() drops every connection without waiting. Read
+                # here, not at the except, so a pool without it fails inside the logged release.
+                pool.terminate()
+
+            await cleanup_failed_open(
+                exc,
+                _release,
+                _force_release,
+                cancels_before=cancels_before,
+            )
             raise
         return store
 
@@ -2698,7 +2745,7 @@ class PostgresStore:
             for r in await conn.fetch(
                 "SELECT column_name FROM information_schema.columns"
                 " WHERE table_schema = current_schema() AND table_name='queue' AND column_name = ANY($1::text[])",
-                ["owner", "lease_expires_at", "body_ref"],
+                ["owner", "lease_expires_at", "body_ref", "worker_deaths"],
             )
         }
         if "owner" not in present:
@@ -2709,6 +2756,12 @@ class PostgresStore:
         # identical). shared_body is created by the _SCHEMA loop's CREATE TABLE IF NOT EXISTS.
         if "body_ref" not in present:
             await conn.execute("ALTER TABLE queue ADD COLUMN body_ref TEXT")
+        # Vault BACKLOG #4607 step 6: the per-row worker-death count. A constant DEFAULT, so on
+        # PostgreSQL 11+ the ADD rewrites no row; 0 on an existing row is right.
+        if "worker_deaths" not in present:
+            await conn.execute(
+                "ALTER TABLE queue ADD COLUMN worker_deaths INTEGER NOT NULL DEFAULT 0"
+            )
         # The deref index, created AFTER body_ref is guaranteed present (like ix_queue_lease above).
         await conn.execute(_BODY_REF_INDEX_DDL)
         # The reclaim sweep scans inflight rows by lease expiry (reclaim_expired_leases). Partial:
@@ -3714,6 +3767,75 @@ class PostgresStore:
         )
         return row is not None
 
+    # --- the read-only cipher-cell walk (BACKLOG #1719) ----------------------
+    # The source `cipher_cells.read_server_cipher_cells` reads, for `messagefoundry cipher-audit`.
+    # Each call is one SELECT on its own bounded borrow, so no read transaction spans chunks. Every
+    # identifier is a declared constant from `cipher_cells`; only values are parameters.
+
+    async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]:
+        """The columns of each of ``tables`` this store's schema holds; an absent table is left out."""
+        rows = await self._fetchall(
+            "SELECT table_name, column_name FROM information_schema.columns"
+            " WHERE table_schema = current_schema() AND table_name = ANY($1::text[])",
+            list(tables),
+        )
+        found: dict[str, set[str]] = {}
+        for r in rows:
+            found.setdefault(str(r["table_name"]), set()).add(str(r["column_name"]))
+        return {t: frozenset(c) for t, c in found.items()}
+
+    async def cipher_walk_keyed_surface(self) -> tuple[str, str] | None:
+        """The first ``keyed_surface`` row, by name, or ``None``. The caller checks the table exists."""
+        row = await self._fetchone(
+            "SELECT surface_table, surface_column FROM keyed_surface ORDER BY 1, 2 LIMIT 1"
+        )
+        return None if row is None else (str(row[0]), str(row[1]))
+
+    async def cipher_walk_surface_sealed(self, table: str, column: str, *, keyed: bool) -> bool:
+        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
+        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked."""
+        _check_walk_identifiers(table, column)
+        if keyed and await self._surface_keyed(table, column):
+            return True
+        return await self._surface_holds_ciphertext(table, column, f"{_ENC_MARKER_PREFIX}%")
+
+    async def cipher_walk_chunk(
+        self,
+        table: str,
+        column: str,
+        select: Sequence[str],
+        order: Sequence[str],
+        after: Sequence[Any] | None,
+        limit: int,
+        *,
+        sealed_only: bool,
+    ) -> list[tuple[Any, ...]]:
+        """Up to ``limit`` rows of ``table`` whose ``column`` is not NULL, after the ``order`` key
+        ``after`` (``None`` for the first chunk), in ``order``. Each row is the ``select`` values,
+        then ``column``'s. ``sealed_only`` keeps a value only when it starts with the marker in any
+        ASCII case, as ``cipher_cells._sealed_test`` reads one."""
+        _check_walk_identifiers(table, column, *select, *order)
+        params: list[Any] = []
+
+        def bind(value: Any) -> str:
+            params.append(value)
+            return f"${len(params)}"
+
+        where = [f'"{column}" IS NOT NULL']
+        if sealed_only:
+            prefix = _ENC_MARKER_PREFIX.lower()
+            where.append(f'lower(left("{column}", {bind(len(prefix))})) = {bind(prefix)}')
+        if after is not None:
+            keys = ", ".join(f'"{c}"' for c in order)
+            where.append(f"({keys}) > ({', '.join(bind(v) for v in after)})")
+        picked = ", ".join(f'"{c}"' for c in (*select, column))
+        ordered = ", ".join(f'"{c}"' for c in order)
+        sql = (
+            f'SELECT {picked} FROM "{table}" WHERE {" AND ".join(where)}'
+            f" ORDER BY {ordered} LIMIT {bind(int(limit))}"
+        )
+        return [tuple(r) for r in await self._fetchall(sql, *params)]
+
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
 
     async def _reencrypt_tagged_to_active(
@@ -3778,6 +3900,7 @@ class PostgresStore:
         retired-key values; skips values already under the active key (idempotent) and NULL/blank
         ones. A value no configured key can decrypt raises before any UPDATE (PHI is never dropped).
         Returns the number of values rewritten. Ported, not stubbed — Postgres supports rotation."""
+        self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
@@ -3806,9 +3929,19 @@ class PostgresStore:
         # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
+        # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
+        # under a key this run does not hold leaves the store as this method found it.
+        preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if preflight.unheld:
+            self._reseal_outcome = preflight
+            raise unheld_seal_refusal(preflight, before_writes=True)
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
+        # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
+            raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             if is_row_tagged(table, column):
@@ -5646,6 +5779,56 @@ class PostgresStore:
             await self._after_fenced_write(exc)
             return
 
+    async def record_worker_death(
+        self, outbox_id: str, cap: int, error: str, now: float | None = None
+    ) -> WorkerDeathOutcome:
+        """See the base contract (vault BACKLOG #4607 step 6). The increment is neither terminal nor
+        a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT or PENDING row
+        (a lease sweep may have re-pended the row before the death) and takes its lock, so the
+        dead-letter that follows at the cap cannot find the row resolved and needs no status term
+        (Amendment C); a miss there is the resolve fence alone, handled as C3 says."""
+        error = safe_text(error)  # PHI chokepoint (#120)
+        now = time.time() if now is None else now
+        guard, guard_args = self._resolve_guard(6)  # ADR 0157 C1 — TERMINAL
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                # Not updated_at: the in-flight watch measures a held row's age from its claim.
+                hit = await conn.fetchrow(
+                    "UPDATE queue SET worker_deaths = worker_deaths + 1"
+                    " WHERE id=$1 AND status IN ($2, $3)"
+                    " RETURNING worker_deaths, message_id, destination_name",
+                    outbox_id,
+                    OutboxStatus.INFLIGHT.value,
+                    OutboxStatus.PENDING.value,
+                )
+                if hit is None:
+                    return WorkerDeathOutcome()
+                deaths = int(hit["worker_deaths"])
+                if deaths < cap:
+                    return WorkerDeathOutcome(deaths=deaths)
+                await self._exec_terminal(
+                    conn,
+                    "record_worker_death",
+                    (outbox_id,),
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard,
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                    *guard_args,
+                    checked=bool(guard),
+                )
+                await self._event(
+                    conn, hit["message_id"], "dead", hit["destination_name"], error, now
+                )
+                await self._maybe_finalize_message(conn, hit["message_id"], now)
+                return WorkerDeathOutcome(deaths=deaths, dead=True)
+        except _FencedWrite as exc:
+            await self._after_fenced_write(exc)
+            return WorkerDeathOutcome()
+
     async def mark_done(
         self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
     ) -> bool:
@@ -6978,12 +7161,19 @@ class PostgresStore:
         now = time.time() if now is None else now
         try:
             async with self._timed_acquire() as conn, conn.transaction():
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                # FOR UPDATE: the DEAD branch's decline below reads the row this transaction then
+                # writes, so no writer moves it in between (ADR 0157 Amendment C).
+                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", outbox_id)
                 if row is None:
                     return FailOutcome()
                 attempts = row["attempts"]
                 # max_attempts None = retry forever; a finite cap dead-letters once exhausted.
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
+                    if row["status"] in _RESOLVED_STATUSES:
+                        # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE,
+                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of
+                        # the UPDATE, so a miss there is still the epoch fence alone.
+                        return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
                     # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
@@ -7857,8 +8047,8 @@ class PostgresStore:
                     OutboxStatus.DONE.value,
                 )
             result = await conn.execute(
-                "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
-                f" updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
+                "UPDATE queue SET status=$1, attempts=0, worker_deaths=0, next_attempt_at=$2,"
+                f" last_error=NULL, updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
                 f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                 OutboxStatus.PENDING.value,
                 now,
@@ -8316,8 +8506,8 @@ class PostgresStore:
                 await self._append_operator_audit(conn, written, audit, 0)
                 return 0
             result = await conn.execute(
-                "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
-                " updated_at=$2 WHERE stage=$3 AND status=$4"
+                "UPDATE queue SET status=$1, attempts=0, worker_deaths=0, next_attempt_at=$2,"
+                " last_error=NULL, updated_at=$2 WHERE stage=$3 AND status=$4"
                 " AND ($5::text IS NULL OR channel_id=$5)"
                 f" AND ($6::text IS NULL OR destination_name=$6) AND ({_REPLAYABLE_BODY})"
                 f" AND {_NOT_PT_MARKER}",
@@ -9166,7 +9356,7 @@ class PostgresStore:
                 await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
                 # The open-request rule is the Store protocol's; the SQLite and SQL Server
                 # twins state it in their own SQL, and the shared repeat contract checks all three.
-                joined = first_sealed_approval(
+                joined = await first_sealed_approval_async(
                     self._row_sealer,
                     await conn.fetch(
                         _PG_APPROVAL_SELECT + " WHERE operation = $1 AND params = $2"
@@ -9198,11 +9388,11 @@ class PostgresStore:
         transaction. Returns whether a row was written."""
         sealer = self._row_sealer
         if current is None:
-            await conn.execute(_PG_APPROVAL_INSERT, *seal_approval(sealer, new).write_params())
+            sealed = await seal_approval_async(sealer, new)
+            await conn.execute(_PG_APPROVAL_INSERT, *sealed.write_params())
             return True
-        result = await conn.execute(
-            _PG_APPROVAL_UPDATE, *approval_update(sealer, current, new).update_params(current)
-        )
+        updated = await approval_update_async(sealer, current, new)
+        result = await conn.execute(_PG_APPROVAL_UPDATE, *updated.update_params(current))
         return _rowcount(result) > 0
 
     async def get_pending_approval(self, approval_id: str) -> Row | None:
@@ -9295,7 +9485,7 @@ class PostgresStore:
                 found is not None
                 and str(found["status"]) == "pending"
                 and found["seal"] == seal_read
-                and approval_fails_seal(self._row_sealer, found)
+                and await approval_fails_seal_async(self._row_sealer, found)
                 and await self._tombstone_approval(
                     conn,
                     approval_id,
@@ -9318,7 +9508,7 @@ class PostgresStore:
             _PG_APPROVAL_TOMBSTONE,
             approver,
             float(decided_at),
-            approval_tombstone(
+            await approval_tombstone_async(
                 self._row_sealer, approval_id, approver=approver, decided_at=decided_at
             ),
             approval_id,
@@ -9395,14 +9585,16 @@ class PostgresStore:
         """One row of :meth:`reseal_approval_records`, read under its lock: re-sealed as a request,
         or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
         :class:`RowSealError` when neither holds, before any statement runs, so the transaction
-        rolls back clean; store.py's twin states the rest of the contract."""
+        rolls back clean; store.py's twin states the rest of the contract, the Transit census
+        pin included (ADR 0217 slice 1b-ii)."""
         try:
             current = ApprovalRow.from_mapping(found)
             return await self._write_approval(conn, current, current=current)
-        except RowSealError:
-            tombstone = held_approval_tombstone(self._row_sealer, found)
-            if tombstone is None:
-                raise
+        except RowSealError as exc:
+            refused = exc
+        tombstone = await held_approval_tombstone_async(self._row_sealer, found)
+        if tombstone is None:
+            raise refused
         return await self._reseal_tombstone(
             conn, str(found["id"]), *tombstone, seal_read=found["seal"]
         )
@@ -9414,7 +9606,7 @@ class PostgresStore:
         ``MessageStore._reseal_tombstone`` states the contract."""
         result = await conn.execute(
             _PG_APPROVAL_TOMBSTONE_RESEAL,
-            approval_tombstone(
+            await approval_tombstone_async(
                 self._row_sealer, approval_id, approver=approver, decided_at=decided_at
             ),
             approval_id,
@@ -9701,10 +9893,12 @@ class PostgresStore:
         from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation.
 
         Constant-time, full-walk (ASVS 11.2.4) — see the SQLite twin
-        (:meth:`~messagefoundry.store.store.MessageStore.verify_audit_chain`): every row MAC and the
-        anchor head are compared with :func:`hmac.compare_digest` over
-        :func:`~messagefoundry.store.store.audit_mac_bytes`, and the walk always completes before the
-        first divergent row id is reported."""
+        (:meth:`~messagefoundry.store.store.MessageStore.verify_audit_chain`) and
+        :func:`~messagefoundry.store.store.verify_audit_rows`, which say which row compares are
+        :func:`hmac.compare_digest` and which are Transit's own ``verify``. A break does not end
+        the walk, and the first divergent row id is reported after it. Only when the walk found no
+        break is the anchor head compared, with :func:`hmac.compare_digest` over
+        :func:`~messagefoundry.store.store.audit_mac_bytes`."""
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
@@ -9754,7 +9948,7 @@ class PostgresStore:
         # BACKLOG #2592: the whole row, sealed, in one INSERT.
         await self._execute_with_audits(
             _PG_USER_INSERT,
-            user_insert_params(seal_user(self._row_sealer, record)),
+            user_insert_params(await seal_user_async(self._row_sealer, record)),
             audits,
             now=now,
         )
@@ -9797,15 +9991,14 @@ class PostgresStore:
         current = await self._read_user_record(conn, user_id)
         if current is None:
             return None
-        if not user_seal_ok(self._row_sealer, current):
-            raise RowSealError(USER_KIND)
+        await require_user_seal_for_write(self._row_sealer, current)
         changed = change(current)
         if changed is None:
             return None
         if changed.roles != current.roles:
             roles = await conn.fetch("SELECT id FROM roles")
             changed = existing_roles_only(current, changed, [str(r["id"]) for r in roles])
-        updated = seal_user(self._row_sealer, changed)
+        updated = await seal_user_async(self._row_sealer, changed)
         status = await conn.execute(_PG_USER_RESEAL, *user_reseal_params(updated, current))
         if _rowcount(status) != 1:
             return None
@@ -9838,8 +10031,7 @@ class PostgresStore:
         the contract."""
         current = await self._read_user_record(conn, user_id)
         if current is not None:
-            if not user_seal_ok(self._row_sealer, current):
-                raise RowSealError(USER_KIND)
+            await require_user_seal_for_write(self._row_sealer, current)
             if (
                 self._row_sealer is not None
                 and not removes_all
@@ -9853,17 +10045,43 @@ class PostgresStore:
             await self._write_user(conn, user_id, lambda r: r.changed(cred_digest=digest))
         return count
 
-    async def _bump_session_epoch(self, conn: Any, user_id: str) -> EpochRaise | None:
+    async def _bump_session_epoch(
+        self, conn: Any, user_id: str, outcome: RevokeSealOutcome
+    ) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside ``conn``'s
         transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
-        ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
-        the revoke that called this, and reports no raise."""
-        bump = EpochBump()
-        try:
-            return bump.raised(await self._write_user(conn, user_id, bump))
-        except RowSealError:
-            log.warning("an account's record failed its integrity seal; its sessions end anyway")
-            return None
+        ``MessageStore._bump_session_epoch`` says why a seal refusal does not stop the revoke that
+        called this, and reports no raise, and the residual that leaves for an account read as
+        Holds later."""
+        return await raise_account_epoch(
+            lambda bump: self._write_user(conn, user_id, bump),
+            outcome,
+            user_id,
+            lambda: self._lock_account_row(conn, user_id),
+        )
+
+    async def _lock_account_row(self, conn: Any, user_id: str) -> None:
+        """Lock the account row as :meth:`_write_user`'s read does, calling no Transit: a revoke a
+        Transit Outage tripped still holds every account row before its session sweep, the lock
+        order :meth:`revoke_all_sessions` relies on (decision d20261109T200352805-599b24, item
+        2)."""
+        await conn.fetchval("SELECT 1 FROM users WHERE id=$1 FOR UPDATE", user_id)
+
+    def reseal_outcome(self) -> ResealOutcome:
+        """store.py's ``MessageStore.reseal_outcome`` states the contract (vault BACKLOG #5635)."""
+        return self._reseal_outcome
+
+    async def _unrotated_seals(self) -> list[tuple[str, object]]:
+        """store.py's ``MessageStore._unrotated_seals`` states the contract (vault BACKLOG #5635)."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return []
+        active = f"{SEAL_PREFIX}{sealer.key_id}:%"
+        seals: list[tuple[str, object]] = []
+        for table, sql in unrotated_seal_queries("$1"):
+            rows = await self._fetchall(sql, active)
+            seals.extend((table, r["seal"]) for r in rows)
+        return seals
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -9872,7 +10090,7 @@ class PostgresStore:
         if sealer is None:
             return 0, 0
         cipher = self._cipher
-        if not isinstance(cipher, AesGcmCipher):  # no in-process keys, so no sealer either
+        if not isinstance(cipher, AesGcmCipher):  # no in-process keys: a Transit sealer, if any
             return 0, 0
         change = rotation_reseal(
             sealer,
@@ -10052,16 +10270,22 @@ class PostgresStore:
         )
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             # The passkeys the condition reads are read in the write's own transaction, after the
-            # account row is locked, so a concurrent removal waits for this write.
+            # account row is locked, so a concurrent removal waits for this write; and only where
+            # the locked row's TOTP does not already count (way_past_passkeys).
+            passkeys: list[WebAuthnCredential] = []
             if conditional:
-                await self._read_user_record(conn, user_id)
+                passkeys = await way_past_passkeys(
+                    await self._read_user_record(conn, user_id),
+                    lambda: self._account_passkeys(conn, user_id),
+                    totp_counts=totp_counts,
+                )
             change = password_change(
                 password_hash=password_hash,
                 password_generated=password_generated,
                 must_change_password=must_change_password,
                 require_way_past=conditional,
                 now=now,
-                passkeys=await self._account_passkeys(conn, user_id) if conditional else (),
+                passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -10212,8 +10436,14 @@ class PostgresStore:
             passkeys: list[WebAuthnCredential] = []
             if conditional:
                 # The account row first, locked, so a concurrent passkey removal waits for this.
-                await self._read_user_record(conn, user_id)
-                passkeys = await self._account_passkeys(conn, user_id)
+                # The TOTP is what goes, so the set is read wherever that TOTP counts, and one
+                # that cannot be read is empty (way_past_passkeys).
+                passkeys = await way_past_passkeys(
+                    await self._read_user_record(conn, user_id),
+                    lambda: self._account_passkeys(conn, user_id),
+                    totp_counts=totp_counts,
+                    drop_totp=True,
+                )
             change = totp_removal(
                 now,
                 require_way_past=conditional,
@@ -10318,7 +10548,7 @@ class PostgresStore:
                     "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", for_session
                 )
                 # No account: the insert below meets the foreign key (BACKLOG #1807).
-                if record is not None and session_owes_unproven_factor(
+                if record is not None and await session_owes_unproven_factor_async(
                     self._row_sealer,
                     None if session is None else SessionRecord.from_mapping(dict(session)),
                     record,
@@ -10380,7 +10610,11 @@ class PostgresStore:
                 current = await self._read_user_record(conn, user_id)
                 if current is None or not removal_keeps_way_past(
                     current,
-                    await self._account_passkeys(conn, user_id),
+                    await way_past_passkeys(
+                        current,
+                        lambda: self._account_passkeys(conn, user_id),
+                        totp_counts=totp_counts,
+                    ),
                     sealed=self._row_sealer is not None,
                     drop_passkey=credential_id_hash,
                     totp_counts=totp_counts,
@@ -10501,10 +10735,15 @@ class PostgresStore:
         role_ids: Sequence[str] = (),
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
         ``AuthStore``. The advisory lock comes first, so at the default READ COMMITTED the read after
-        it sees whatever an earlier holder committed before releasing it."""
+        it sees whatever an earlier holder committed before releasing it. ``audits`` are appended
+        only when the change is applied, last, so the audit advisory lock is taken after the
+        guard's lock and the account's row. The writers here that take the audit lock early, at
+        least the connection flag, the approval repeat and the transit attestation withdraw, take
+        neither after it (BACKLOG #2221)."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             if change.takes_role(admin_role_id, role_ids):
@@ -10537,6 +10776,8 @@ class PostgresStore:
                 )
             else:
                 assert_never(change)
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
         return True
 
     async def grant_first_admin_unless_admin_exists(
@@ -10616,12 +10857,27 @@ class PostgresStore:
         await self._write_user_txn(user_id, lambda r: full_authentication_clear(r, now))
 
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None:
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """See the SQLite twin (BACKLOG #5633): the clear and ``audit`` share one transaction. This
+        leg is CI-only, so a divergence from the SQLite and SQL Server bodies surfaces first in CI."""
         now = time.time() if now is None else now
-        await self._write_user_txn(
-            user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
-        )
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            if (
+                await self._write_user(
+                    conn, user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
+                )
+                is None
+            ):
+                return False  # nothing written, so nothing audited
+            appended = await self._append_audits(conn, (audit,), now=now)
+        tee_audits((audit,), appended, ts=now)
+        return True
 
     async def record_login_failure(
         self,
@@ -10719,7 +10975,8 @@ class PostgresStore:
     async def _write_role(self, conn: Any, row: RoleRow) -> None:
         """The one writer of a ``roles`` row (BACKLOG #2592); store.py's
         ``MessageStore._write_role`` states the contract. Call it inside ``conn``'s transaction."""
-        await conn.execute(_PG_ROLE_UPSERT, *seal_role(self._row_sealer, row).write_params())
+        sealed = await seal_role_async(self._row_sealer, row)
+        await conn.execute(_PG_ROLE_UPSERT, *sealed.write_params())
 
     async def list_roles(self) -> Sequence[Row]:
         return await self._fetchall("SELECT * FROM roles ORDER BY id")
@@ -10769,12 +11026,17 @@ class PostgresStore:
         *,
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> None:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             await self._write_user(
                 conn, user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
+            # BACKLOG #2221. In the role write's transaction; the append takes the audit advisory
+            # lock while the write holds the account's row lock, as `_execute_with_audits` does.
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
 
     async def set_user_roles_if_held(
         self,
@@ -10784,15 +11046,23 @@ class PostgresStore:
         expected_role_ids: Iterable[str],
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. The compare
-        runs on the row ``_write_user`` reads ``FOR UPDATE``, so a concurrent writer waits."""
+        runs on the row ``_write_user`` reads ``FOR UPDATE``, so a concurrent writer waits.
+        ``audits`` are appended only when it writes, last in its transaction, so the audit
+        advisory lock follows the account's row lock, as in :meth:`set_user_roles` (BACKLOG #3018
+        step 4)."""
         now = time.time() if now is None else now
         change = roles_if_held(
             role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
         )
         async with self._timed_acquire() as conn, conn.transaction():
-            return await self._write_user(conn, user_id, change) is not None
+            if await self._write_user(conn, user_id, change) is None:
+                return False
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def set_user_channel_scope(
         self,
@@ -10963,7 +11233,7 @@ class PostgresStore:
         )
         rows = await conn.fetch(sql.pairs)
         current = AdMap.of(name, [(str(r[0]), str(r[1])) for r in rows], str(seal or ""))
-        new = ad_map_write(self._row_sealer, current, change)
+        new = await ad_map_write_async(self._row_sealer, current, change)
         if new is None:
             return False
         if new.pairs != current.pairs:
@@ -11004,7 +11274,11 @@ class PostgresStore:
                 if locked is None:
                     continue
                 role = RoleRow.from_mapping(dict(locked))
-                if not role_seal_ok(sealer, role):
+                # The write path's own refusal (ADR 0217 (c) step 1), as store.py's twin: a Forged
+                # row is counted refused, as on main.
+                try:
+                    await require_role_seal_for_write(sealer, role)
+                except RowSealError:
                     refused += 1
                     continue
                 await self._write_role(conn, role)
@@ -11072,10 +11346,13 @@ class PostgresStore:
                     " FOR UPDATE",
                     user_id,
                 )
-            if require_federated_subject is not None:
-                bound = None if row is None else (row["oidc_issuer"], row["oidc_subject"])
-                if bound != require_federated_subject:
-                    return False
+            # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+            # INSERT's foreign-key error.
+            if row is None or (
+                require_federated_subject is not None
+                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            ):
+                return False
             record = new_session_record(
                 token_hash=token_hash,
                 user_id=user_id,
@@ -11085,14 +11362,14 @@ class PostgresStore:
                 seed_reauth=seed_reauth,
                 auth_mechanism=auth_mechanism,
                 idp_auth_time=idp_auth_time,
-                user_epoch=0 if row is None else int(row["session_epoch"]),
+                user_epoch=int(row["session_epoch"]),
                 # BACKLOG #5091: its own statement, after the row lock, so a sign-in that waited
                 # behind a revoke reads that revoke's global epoch beside its account epoch. A
                 # subquery in the locked read would keep its pre-wait snapshot, and the session
                 # would be minted dead. revoke_all_sessions says why this read never waits.
                 global_epoch=await self._global_session_epoch(conn),
             )
-            record = seal_session(self._row_sealer, record)
+            record = await seal_session_async(self._row_sealer, record)
             await conn.execute(_PG_SESSION_INSERT, *session_insert_params(record))
         return True
 
@@ -11113,9 +11390,8 @@ class PostgresStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        if not session_seal_ok(self._row_sealer, current):
-            raise RowSealError(SESSION_KIND)
-        updated = seal_session(self._row_sealer, change(current))
+        await session_writer_seal_check(self._row_sealer, current)
+        updated = await seal_session_async(self._row_sealer, change(current))
         status = await conn.execute(_PG_SESSION_RESEAL, *session_reseal_params(updated, current))
         return updated if _rowcount(status) > 0 else None
 
@@ -11129,10 +11405,16 @@ class PostgresStore:
         value = await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         return None if value is None else int(value)
 
-    def row_sealer(self) -> RowSealer | None:
+    def row_sealer(self) -> AnyRowSealer | None:
         """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
         :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
         return self._row_sealer
+
+    def seal_pager(self) -> SealPager:
+        """This store's seal page (decision d20261109T200352805-599b24 on ADR 0217, item 5). The
+        engine, the serve lifespan and ``admin-revoke-sessions`` arm it on their alert sink; each
+        disarms only its own registration."""
+        return self._seal_pager
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=$1", token_hash)
@@ -11179,10 +11461,17 @@ class PostgresStore:
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await self._write_session(conn, token_hash, stamp)
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        stamp = mfa_stamp(time.time() if now is None else now)
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            await self._write_session(conn, token_hash, stamp)
+            written = await self._write_session(conn, token_hash, stamp)
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None
@@ -11242,7 +11531,12 @@ class PostgresStore:
             )
 
     async def revoke_user_sessions(
-        self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        except_token_hash: str | None = None,
+        now: float | None = None,
+        audit: OperatorAudit[RevokeResult],
     ) -> RevokeResult:
         """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count
         and whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
@@ -11254,10 +11548,20 @@ class PostgresStore:
         too, read here without a lock clause as every reader of it is, and without refusing a
         missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined
         (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
-        :meth:`_after_commit_txn`'s, for the reason it gives."""
+        :meth:`_after_commit_txn`'s, for the reason it gives. ``audit``'s row is appended last,
+        in this transaction, so the audit advisory lock follows the account and session rows
+        (BACKLOG #3018 step 4)."""
+        require_operator_audit(audit, "store.revoke_user_sessions")  # BACKLOG #5069
         now = time.time() if now is None else now
-        async with self._after_commit_txn() as conn:
-            raised = await self._bump_session_epoch(conn, user_id)
+        outcome = RevokeSealOutcome(self._seal_pager)
+        # AuditedWrite inside the seal report: the operator row's tee runs as the commit
+        # lands, before the report awaits, so a report that raises cannot cost the tee.
+        async with (
+            outcome.committing(self.record_audit),
+            AuditedWrite(now) as written,
+            self._after_commit_txn() as conn,
+        ):
+            raised = await self._bump_session_epoch(conn, user_id, outcome)
             status = await conn.execute(
                 _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
                 now,
@@ -11265,23 +11569,37 @@ class PostgresStore:
                 except_token_hash,
             )
             if except_token_hash is None:
-                return RevokeResult(_rowcount(status))
-            unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
-            return await self._keep_or_end_session(
-                conn,
-                _rowcount(status),
-                except_token_hash,
-                KeptSessionRestamp(user_id, raised, unmoved),
-                now,
-            )
+                result = RevokeResult(_rowcount(status))
+            else:
+                unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
+                result = await self._keep_or_end_session(
+                    conn,
+                    _rowcount(status),
+                    except_token_hash,
+                    KeptSessionRestamp(user_id, raised, unmoved),
+                    now,
+                    outcome,
+                )
+            await self._append_operator_audit(conn, written, audit, result)
+        return result
 
     async def _keep_or_end_session(
-        self, conn: Any, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+        self,
+        conn: Any,
+        revoked: int,
+        token_hash: str,
+        restamp: KeptSessionRestamp,
+        now: float,
+        outcome: RevokeSealOutcome,
     ) -> RevokeResult:
         """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside
         ``conn``'s transaction (follow-up to BACKLOG #4975); store.py's
         ``MessageStore._keep_or_end_session`` states the contract."""
-        if restamp.kept(await self._write_session(conn, token_hash, restamp)):
+        if not outcome.tripped and restamp.kept(
+            await write_kept_session(
+                self._write_session(conn, token_hash, restamp), outcome, token_hash
+            )
+        ):
             return RevokeResult(revoked, kept=True)
         status = await conn.execute(
             _PG_END_DECLINED_KEPT_SESSION_SQL, now, restamp.user_id, token_hash
@@ -11317,6 +11635,16 @@ class PostgresStore:
         epoch reads it without a lock clause, and under MVCC such a read never waits on a writer,
         so holding it while the loop below waits on account rows cannot close a cycle."""
         now = time.time() if now is None else now
+        outcome = RevokeSealOutcome(self._seal_pager)
+        async with outcome.committing(self.record_audit):
+            result = await self._revoke_all_sessions_on(except_token_hash, now, outcome)
+        return result
+
+    async def _revoke_all_sessions_on(
+        self, except_token_hash: str | None, now: float, outcome: RevokeSealOutcome
+    ) -> RevokeResult:
+        """The body of :meth:`revoke_all_sessions`, in its own transaction, which has committed
+        when this returns."""
         async with self._timed_acquire() as conn, conn.transaction():
             global_raised = global_epoch_raise(
                 global_epoch_or_refuse(
@@ -11327,7 +11655,7 @@ class PostgresStore:
                 )
             )
             raised = {
-                str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]))
+                str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]), outcome)
                 for row in await conn.fetch("SELECT id FROM users ORDER BY id")
             }
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
@@ -11346,6 +11674,7 @@ class PostgresStore:
                 except_token_hash,
                 KeptSessionRestamp(owner, raised.get(owner), global_raised),
                 now,
+                outcome,
             )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
@@ -11524,94 +11853,60 @@ class PostgresStore:
         OBX-5 ED embed with a self-describing tombstone, keeps the message parseable, and sets
         ``documents_pruned``. Eligibility mirrors :meth:`purge_message_bodies` (per-connection-or-global
         cutoff AND not in-flight). Returns a :class:`StripResult` (counts + bytes; no PHI)."""
-        now = time.time() if now is None else now
-        content_types = content_types or {}
+        stamp = time.time() if now is None else now
         inflight = [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value]
-        # Bound the candidate scan with the LOOSEST finite cutoff (a keep-forever -inf never widens it);
-        # the precise per-connection cutoff is re-checked per row in Python (cutoff_for).
-        finite = [
-            c for c in [older_than, *(connection_cutoffs or {}).values()] if c != float("-inf")
-        ]
-        if not finite:
-            return StripResult()  # everything keep-forever ⇒ nothing to scan
-        scan_cutoff = max(finite)
-        async with self._timed_acquire() as conn:
-            rows = await conn.fetch(
+
+        async def fetch(scan_cutoff: float, after: StripCursor, limit: int) -> list[Any]:
+            # BACKLOG #5651: one keyset batch on (received_at, id), so the scan stays on
+            # ix_messages_received, with the cutoff and the in-flight guard on each; _fetchall
+            # gives the connection back before the crypto runs. The leading >= is the index seek;
+            # the OR resolves ties on received_at by id. -Infinity starts the first batch.
+            at, last_id = after if after is not None else (float("-inf"), "")
+            return await self._fetchall(
                 "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m"
-                " WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < $1"
+                " WHERE m.received_at < $1"
+                " AND m.received_at >= $3 AND (m.received_at > $3 OR m.id > $4)"
+                " AND m.raw <> '' AND m.documents_pruned IS NULL"
                 " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id"
-                " AND q.status = ANY($2::text[]))",
+                " AND q.status = ANY($2::text[])) ORDER BY m.received_at, m.id LIMIT $5",
                 scan_cutoff,
                 inflight,
+                at,
+                last_id,
+                limit,
             )
-            msgs = 0
-            docs = 0
-            reclaimed = 0
-            updates: list[tuple[str, float, str]] = []
-            failures: list[CellTagError] = []
-            unreadable: list[object] = []
-            for row in rows:
-                cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
-                if row["received_at"] >= cutoff:
-                    continue
-                try:
-                    raw = open_message_cell(
-                        self._cipher,
-                        "raw",
-                        row["raw"],
-                        message_id=row["id"],
-                        channel_id=row["channel_id"],
+
+        async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
+            # The compare-and-swap guard, and its limit, are document_strip's: its module docstring
+            # states both. A failure rolls back the whole batch.
+            landed: list[StripUpdate] = []
+            async with self._timed_acquire() as conn, conn.transaction():
+                for u in updates:
+                    tag = await conn.execute(
+                        "UPDATE messages SET raw=$1, documents_pruned=$2"
+                        " WHERE id=$3 AND documents_pruned IS NULL AND raw=$4"
+                        " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = messages.id"
+                        " AND q.status = ANY($5::text[]))",
+                        u.new_cell,
+                        stamp,
+                        u.message_id,
+                        u.stored,
+                        inflight,
                     )
-                except CipherError as exc:
-                    # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
-                    # must not abort the whole retention pass. The row is left exactly as found; the
-                    # message names only the cell and the message id, never the body (BACKLOG #1169).
-                    if isinstance(exc, CellTagError):
-                        # BACKLOG #2593: the read already logged and alerted it, once per hour; it is
-                        # audited below. No second WARNING on every pass.
-                        failures.append(exc)
-                        continue
-                    log.warning(
-                        "document strip skipped message %s: its body could not be read: %s",
-                        row["id"],
-                        exc,
-                    )
-                    continue
-                assert raw is not None  # raw is NOT NULL
-                new_raw, n_docs, n_bytes = _strip_documents(
-                    raw,
-                    pruned_at=now,
-                    min_bytes=min_bytes,
-                    content_type=content_types.get(row["channel_id"]),
-                    on_unreadable=functools.partial(unreadable.append, row["id"]),
-                )
-                if n_docs == 0:
-                    continue
-                updates.append(
-                    (
-                        self._cipher.encrypt(
-                            new_raw,
-                            aad=message_cell_aad(
-                                "raw", message_id=row["id"], channel_id=row["channel_id"]
-                            ),
-                        ),
-                        now,
-                        row["id"],
-                    )
-                )
-                msgs += 1
-                docs += n_docs
-                reclaimed += n_bytes
-            # Before the write, so a failed write does not lose the record of the skips.
-            log_unreadable_skips(unreadable)
-            if updates:
-                async with conn.transaction():
-                    await conn.executemany(
-                        "UPDATE messages SET raw=$1, documents_pruned=$2 WHERE id=$3", updates
-                    )
-        await report_cell_tag_failures(self, failures)
-        return StripResult(
-            messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
+                    if _rowcount(tag) == 1:
+                        landed.append(u)
+            return landed
+
+        return await run_strip_pass(
+            self._cipher,
+            fetch=fetch,
+            write=write,
+            report=functools.partial(report_cell_tag_failures, self),
+            now=stamp,
+            older_than=older_than,
+            connection_cutoffs=connection_cutoffs,
+            min_bytes=min_bytes,
+            content_types=content_types or {},
         )
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:

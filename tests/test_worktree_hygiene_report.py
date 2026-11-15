@@ -34,6 +34,8 @@ from typing import Any
 
 import pytest
 
+from tests.test_worktree_remove_path import _ENV
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "worktree" / "hygiene-report.ps1"
 REGISTER = ROOT / "scripts" / "worktree" / "register-hygiene-task.ps1"
@@ -60,12 +62,19 @@ READ_ONLY_GIT_VERBS = frozenset(
         "merge-base",
         "worktree list",
         "remote get-url",
+        # The shared removal gates the report reads a merged tree with (BACKLOG #5647).
+        "ls-files",
+        "ls-tree",
+        "for-each-ref",
+        "reflog show",
+        "config --get",
     }
 )
 DELETE_CMDLETS = frozenset(
     {"remove-item", "rm", "del", "rmdir", "rd", "ri", "erase", "clear-content", "move-item", "mi"}
 )
-_TWO_WORD = frozenset({"worktree", "remote", "stash", "branch"})
+#: Verbs whose sub-verb decides whether they write: `reflog expire` and `config <key> <value>` do.
+_TWO_WORD = frozenset({"worktree", "remote", "stash", "branch", "reflog", "config"})
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -152,7 +161,21 @@ DOT_SOURCED = (
     ROOT / "scripts" / "coord" / "occupancy.ps1",
     ROOT / "scripts" / "coord" / "session-registry.ps1",
     ROOT / "scripts" / "worktree" / "worktree-audit.ps1",
+    ROOT / "scripts" / "coord" / "coord-root.ps1",
+    ROOT / "scripts" / "worktree" / "worktree-gates.ps1",
 )
+
+
+def test_the_dot_sourced_list_is_what_the_report_dot_sources() -> None:
+    """A helper the report loads but this list leaves out would escape the scan above."""
+    loaded = set()
+    for ln in SCRIPT.read_text(encoding="utf-8").splitlines():
+        if ln.startswith('. "$PSScriptRoot\\'):
+            rel = ln.split('"')[1].removeprefix("$PSScriptRoot\\")
+            loaded.add((SCRIPT.parent / rel).resolve())
+    assert len(loaded) >= 3, f"the instrument found only {loaded}"
+    # session-registry.ps1 is listed because occupancy.ps1 loads it, not the report.
+    assert loaded <= {p.resolve() for p in DOT_SOURCED}, loaded
 
 
 def test_the_report_runs_no_destructive_git_verb_and_no_delete_cmdlet() -> None:
@@ -188,6 +211,8 @@ def test_the_scanner_flags_a_script_that_does_run_one(tmp_path: Path) -> None:
                 "git -C $root push origin main",
                 "git clean -fdx",
                 "git -C $root fetch --prune origin",
+                "git -C $root reflog expire --expire=now --all",
+                "git -C $root config core.fsmonitor x",
                 "Remove-Item -Recurse C:/x",
                 # A printed string must NOT count: the report prints exactly this for the owner.
                 "Write-Output 'git worktree remove C:/y'",
@@ -196,7 +221,7 @@ def test_the_scanner_flags_a_script_that_does_run_one(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     found = _violations(bad)
-    assert len(found) == 7, found
+    assert len(found) == 9, found
     assert not any("C:/y" in f for f in found), "a printed string was read as an invocation"
 
 
@@ -250,6 +275,9 @@ def _build(tmp: Path) -> Fx:
     _git(primary, "push", "-q", "origin", "main")
 
     fx = Fx(tmp, origin, primary, tmp / "cfg", tmp / "out")
+    # The coordination folder every engine clone carries. Its claims/ and alloc/ registries may be
+    # absent, but the folder holding them must be there for "absent" to read as "no records".
+    (primary / ".git" / "mefor-coord").mkdir()
     # The liveness fence needs one readable record to be AVAILABLE. A dead pid in a directory that is
     # no checkout: examined, placed nowhere, vetoes nothing.
     (fx.cfg / "sessions").mkdir(parents=True)
@@ -263,23 +291,7 @@ def _build(tmp: Path) -> Fx:
     def worktree(
         slug: str, *, merged_ago: timedelta | None, base: str = "main", fork: bool = False
     ) -> str:
-        path = primary.parent / f"repo-{slug}"
-        _git(primary, "worktree", "add", "-q", "-b", slug, str(path))
-        head = _commit(path, f"{slug}.txt", slug)
-        _git(path, "push", "-q", "origin", slug)
-        fx.paths[slug] = path
-        if merged_ago is not None:
-            fx.merged.append(
-                {
-                    "headRefName": slug,
-                    "headRefOid": head,
-                    "number": 100 + len(fx.merged),
-                    "mergedAt": _iso(merged_ago),
-                    "baseRefName": base,
-                    "isCrossRepository": fork,
-                }
-            )
-        return head
+        return _add_tree(fx, slug, merged_ago=merged_ago, base=base, fork=fork)
 
     old = timedelta(days=3)
     # Merged, clean, pushed; its remote branch was deleted on merge, so only the PR head proves it.
@@ -324,11 +336,17 @@ def _fake_gh(fx: Fx) -> tuple[Path, Path]:
 
 
 def _run(
-    fx: Fx, *extra: str, repo: Path | None = None, idle: str = "0"
+    fx: Fx,
+    *extra: str,
+    repo: Path | None = None,
+    idle: str = "0",
+    more_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run the report. Every fixture worktree was touched seconds ago, so the activity window is
     OFF by default here; the test that pins the window turns it back on."""
-    env = {k: v for k, v in os.environ.items() if k != "MEFOR_HYGIENE_GH"}
+    # The shared _ENV: no inherited GIT_* variable, CLAUDE_CONFIG_DIR or MEFOR_COORD_ROOT, so the claim
+    # and allocation reads resolve to the fixture's own coordination root, never the shared real one.
+    env = {k: v for k, v in _ENV.items() if k != "MEFOR_HYGIENE_GH"} | (more_env or {})
     return subprocess.run(
         [
             "pwsh",
@@ -390,6 +408,9 @@ def test_it_writes_both_files_and_proposes_only_the_safe_removals(fx: Fx) -> Non
     assert rows["repo-m-clean"]["remoteBranchExists"] is False
     assert rows["repo-m-venv"]["verdict"] == "REMOVE"
     assert "--force" not in rows["repo-m-venv"]["command"], "a gitignored .venv needs no --force"
+    assert rows["repo-m-clean"]["command"].startswith("if ([Environment]::MachineName -ne "), (
+        "no host circuit breaker"
+    )
     assert rows["repo-m-dirty"]["verdict"] == "HUMAN"
     assert any("uncommitted" in r for r in rows["repo-m-dirty"]["reasons"])
     assert rows["repo-m-unpushed"]["verdict"] == "HUMAN"
@@ -436,6 +457,136 @@ def test_it_writes_both_files_and_proposes_only_the_safe_removals(fx: Fx) -> Non
             timeout=120,
         )
         assert not Path(w["path"]).exists()
+
+
+def _add_tree(
+    fx: Fx, slug: str, *, merged_ago: timedelta | None, base: str = "main", fork: bool = False
+) -> str:
+    """A pushed worktree with one commit, and its merged PR when ``merged_ago`` is given."""
+    path = fx.primary.parent / f"repo-{slug}"
+    _git(fx.primary, "worktree", "add", "-q", "-b", slug, str(path))
+    head = _commit(path, f"{slug}.txt", slug)
+    _git(path, "push", "-q", "origin", slug)
+    fx.paths[slug] = path
+    if merged_ago is not None:
+        fx.merged.append(
+            {
+                "headRefName": slug,
+                "headRefOid": head,
+                "number": 100 + len(fx.merged),
+                "mergedAt": _iso(merged_ago),
+                "baseRefName": base,
+                "isCrossRepository": fork,
+            }
+        )
+    return head
+
+
+def _add_merged(fx: Fx, slug: str) -> Path:
+    """A worktree merged three days ago at its exact pushed tip: everything else would propose it."""
+    _add_tree(fx, slug, merged_ago=timedelta(days=3))
+    return fx.paths[slug]
+
+
+def _record(fx: Fx, kind: str, name: str, body: dict[str, Any]) -> None:
+    d = fx.primary / ".git" / "mefor-coord" / kind
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.json").write_text(json.dumps(body), encoding="utf-8")
+
+
+def test_what_the_removal_would_take_or_someone_holds_keeps_a_merged_tree_back(fx: Fx) -> None:
+    """BACKLOG #5647. Red before the fix: each of these trees is merged at its tip, clean, idle and
+    unoccupied, so the report proposed a raw `git worktree remove` for every one of them. Each holds
+    something that removal would lose or strand, and the clean twin in the same run is the control."""
+    alloc = _add_merged(fx, "m-alloc")
+    _record(
+        fx,
+        "alloc/backlog",
+        "9101",
+        {"number": "9101", "kind": "backlog", "title": "t", "branch": "m-alloc",
+         "worktree": alloc.as_posix()},
+    )  # fmt: skip
+    # The retired-allocator tombstone names no tree, and holds none back.
+    _record(
+        fx,
+        "alloc/backlog",
+        "1000000",
+        {"number": "1000000", "kind": "backlog", "title": "tombstone", "branch": "",
+         "worktree": "", "tombstone": True},
+    )  # fmt: skip
+    claimed = _add_merged(fx, "m-claimed")
+    _record(fx, "claims", "9201", {"key": "9201", "worktree": claimed.as_posix(), "note": "t"})
+    flagged = _add_merged(fx, "m-flagged")
+    _git(flagged, "update-index", "--skip-worktree", "seed.txt")
+    (flagged / "seed.txt").write_text("an edit git status cannot see", encoding="utf-8")
+    # A commit made on a detached HEAD, then left: only the HEAD reflog holds it.
+    reflog = _add_merged(fx, "m-reflog")
+    _git(reflog, "checkout", "-q", "--detach")
+    _commit(reflog, "loose.txt", "held by the HEAD reflog alone")
+    _git(reflog, "checkout", "-q", "m-reflog")
+    # A commit only a per-worktree ref holds, which the removal deletes with the tree.
+    wtref = _add_merged(fx, "m-wtref")
+    loose = _git(wtref, "commit-tree", "-m", "kept by refs/worktree", "HEAD^{tree}").strip()
+    _git(wtref, "update-ref", "refs/worktree/keep", loose)
+
+    fake, _ = _fake_gh(fx)
+    proc = _run(fx, "-Gh", str(fake), "-GhRepo", "acme/repo")
+    assert proc.returncode == 0, proc.stderr
+    rows = _rows(_report(fx))
+    expected = {
+        "repo-m-alloc": "not provably on origin/main",
+        "repo-m-claimed": "coordination claim names it",
+        "repo-m-flagged": "flagged skip-worktree or assume-unchanged",
+        "repo-m-reflog": "held only by its HEAD reflog or its own refs",
+        "repo-m-wtref": "held only by its HEAD reflog or its own refs",
+    }
+    for name, needle in expected.items():
+        assert rows[name]["verdict"] == "HUMAN", (name, rows[name])
+        assert any(needle in r for r in rows[name]["reasons"]), (name, rows[name]["reasons"])
+        assert rows[name]["command"] == ""
+    # The control in the same run: the clean twin is still proposed, the tombstone beside it.
+    assert rows["repo-m-clean"]["verdict"] == "REMOVE", rows["repo-m-clean"]
+    md = (fx.out / "latest.md").read_text(encoding="utf-8")
+    block = md.split("### d.", 1)[1].split("```powershell", 1)[1].split("```", 1)[0]
+    assert "repo-m-clean" in block
+    for name in expected:
+        assert name not in block, name
+
+
+def test_an_unreadable_claim_holds_every_merged_tree_back(fx: Fx) -> None:
+    """CANNOT-TELL HOLDS: a claim file that will not parse might name any tree."""
+    _record(fx, "claims", "x", {"key": "x", "worktree": "C:/elsewhere"})
+    (fx.primary / ".git" / "mefor-coord" / "claims" / "bad.json").write_text("{", encoding="utf-8")
+    fake, _ = _fake_gh(fx)
+    proc = _run(fx, "-Gh", str(fake), "-GhRepo", "acme/repo")
+    assert proc.returncode == 0, proc.stderr
+    row = _rows(_report(fx))["repo-m-clean"]
+    assert row["verdict"] == "HUMAN", row
+    assert any("claim file or directory could not be read" in r for r in row["reasons"]), row
+
+    # Control: the same claim registry, without the broken file, clears it.
+    (fx.primary / ".git" / "mefor-coord" / "claims" / "bad.json").unlink()
+    proc = _run(fx, "-Gh", str(fake), "-GhRepo", "acme/repo")
+    assert proc.returncode == 0, proc.stderr
+    assert _rows(_report(fx))["repo-m-clean"]["verdict"] == "REMOVE"
+
+
+def test_a_git_redirect_in_the_environment_holds_every_merged_tree_back(fx: Fx) -> None:
+    """GIT_INDEX_FILE makes ls-files read another index, so a flagged edit would read as none."""
+    fake, _ = _fake_gh(fx)
+    other = fx.root / "other.index"
+    other.write_bytes(b"")
+    proc = _run(
+        fx, "-Gh", str(fake), "-GhRepo", "acme/repo", more_env={"GIT_INDEX_FILE": str(other)}
+    )
+    assert proc.returncode == 0, proc.stderr
+    row = _rows(_report(fx))["repo-m-clean"]
+    assert row["verdict"] == "HUMAN", row
+    assert any("GIT_INDEX_FILE is set" in r for r in row["reasons"]), row["reasons"]
+
+    proc = _run(fx, "-Gh", str(fake), "-GhRepo", "acme/repo")
+    assert proc.returncode == 0, proc.stderr
+    assert _rows(_report(fx))["repo-m-clean"]["verdict"] == "REMOVE"
 
 
 def test_recent_git_activity_holds_a_merged_worktree_back(fx: Fx) -> None:
@@ -508,8 +659,11 @@ def test_the_report_does_not_touch_a_worktrees_index(fx: Fx) -> None:
     os.utime(wt / "m-clean.txt", (later, later))
     before = index.stat().st_mtime_ns
 
-    proc = _run(fx, "-SkipGh", "-SkipFetch")
+    # With merge status read, so m-clean is MERGED and every per-tree ownership read runs on it.
+    fake, _ = _fake_gh(fx)
+    proc = _run(fx, "-SkipFetch", "-Gh", str(fake), "-GhRepo", "acme/repo")
     assert proc.returncode == 0, proc.stderr
+    assert _rows(_report(fx))["repo-m-clean"]["merge"] == "MERGED"
     assert index.stat().st_mtime_ns == before, "the report rewrote a worktree's index"
 
     time.sleep(1.1)

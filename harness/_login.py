@@ -40,12 +40,14 @@ class LoginDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Sign in — MessageFoundry")
         self._client = client
-        # Seams read by _authenticate() after the dialog is accepted.
+        # Seams read by MonitorPanel._ensure_auth() after the dialog is accepted.
         self.must_change_password = False
         # BACKLOG #2009 (ASVS 6.4.5): when must_change_password is set, the instant the engine stops
         # accepting the temporary password (LoginResponse.credential_expires_at), or None.
         self.credential_expires_at: float | None = None
-        self.mfa_required = False  # engine wants a second factor before sensitive ops (WP-14)
+        # The engine refuses every authorized route on this session until a second factor is
+        # verified (WP-14); the monitor's _ensure_auth asks for it.
+        self.mfa_required = False
         self.entered_password = ""  # nosec B105 (empty seam init, not a credential)
 
         self._username = QLineEdit()
@@ -114,13 +116,13 @@ class LoginDialog(QDialog):
                 "Directory (or ask an administrator) before your access is restricted.",
             )
         else:
-            # Hand the must-change flag and the just-entered plaintext back to _authenticate.
+            # Hand the must-change flag and the just-entered plaintext back to the caller.
             self.must_change_password = result.must_change_password
             self.credential_expires_at = result.credential_expires_at
             self.entered_password = password
-        # The engine accepted the credential but wants a second factor; _authenticate prompts for the
-        # TOTP code before opening the window. This used to be documented as always False for a
-        # directory login; that delegation is retired (BACKLOG #1144), and a directory session now
-        # reports the debt like any other.
+        # The engine accepted the credential but wants a second factor; the monitor's _ensure_auth
+        # prompts for it before connecting (BACKLOG #5568). This used to be documented as always
+        # False for a directory login; that delegation is retired (BACKLOG #1144), and a directory
+        # session now reports the debt like any other.
         self.mfa_required = result.mfa_required
         self.accept()

@@ -897,7 +897,7 @@ async def test_a_role_map_that_fails_its_seal_is_not_called_a_demotion(
         )
         token = await _oidc_session(service, monkeypatch, rsa_key)
         flow_id, _url = await _begin(service, token)
-        monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+        monkeypatch.setattr(service_module, "ad_map_seal_ok_async", _map_fails)
 
         out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
 
@@ -1241,6 +1241,79 @@ async def test_a_code_completes_a_pending_oidc_factor_but_opens_no_window(
         uid = await _user_id(service, new)
         assert "10.0.0.9" in await store.list_known_login_addresses(uid, since=0.0)
         assert await _audit_rows(store, "auth.mfa_verified")
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("uv", [True, False])
+async def test_a_passkey_completes_a_pending_oidc_factor_but_opens_no_window(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, uv: bool
+) -> None:
+    """RED when: ``finish_webauthn_assertion`` stamps, clears or re-anchors an OIDC session.
+
+    Vault BACKLOG #2964 item 14 made the passkey re-anchor as a code does, and kept BACKLOG #2142's
+    exclusion: on an OIDC session the window and the anchor move only at the IdP. The window is
+    seeded first, so the non-UV case shows it is left as it was rather than cleared."""
+    pytest.importorskip("webauthn")
+    from webauthn.helpers import base64url_to_bytes
+
+    from tests._soft_webauthn import SoftAuthenticator
+
+    rp = "ops.example"
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(
+            store,
+            rsa_key,
+            ldap=_ProbingLdap(),
+            oidc_require_mfa_claim=False,
+            mfa_verify_min_elapsed_seconds=0,
+            admin_new_ip_step_up=True,
+        )
+        first = await _oidc_session(service, monkeypatch, rsa_key, client="10.0.0.1")
+        identity = await service.identity_for_token(first, activity=False)
+        assert identity is not None
+        auth = SoftAuthenticator(rp_id=rp, origin=ORIGIN)
+        staged = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=first, rp_id=rp, rp_name="MessageFoundry"
+            )
+        )
+        registered = await service.finish_webauthn_registration(
+            identity,
+            auth.create_response(base64url_to_bytes(staged["challenge"])),
+            label="k",
+            token=first,
+            rp_id=rp,
+            origin=ORIGIN,
+            enrolment_code=await enrolment_code_for(service, identity.user_id),
+        )
+        assert registered.ok, registered
+        pending = await _oidc_session(service, monkeypatch, rsa_key, client="10.0.0.1")
+        assert not await service.mfa_satisfied(pending)
+        seeded = time.time() - 60
+        await store.mark_session_reauthed(hash_token(pending), now=seeded)
+        options = await service.begin_webauthn_assertion(pending, rp_id=rp)
+        assert options is not None
+
+        verified = await service.finish_webauthn_assertion(
+            pending,
+            # With UV, only the oidc branch can keep the window as it was.
+            auth.get_response(
+                base64url_to_bytes(json.loads(options)["challenge"]), user_verified=uv
+            ),
+            client="10.0.0.9",
+            rp_id=rp,
+            origin=ORIGIN,
+        )
+
+        assert verified.ok and verified.token is not None, verified
+        assert await service.mfa_satisfied(verified.token)
+        session = await store.get_session(hash_token(verified.token))
+        assert session is not None and session.auth_mechanism == SessionMechanism.OIDC.value
+        assert session.reauth_at == seeded, "a passkey moved an OIDC session's step-up window"
+        assert session.client == "10.0.0.1", "a passkey re-anchored an OIDC session"
+        assert await service.flag_new_client_ip(verified.token, "10.0.0.9", path=NEXT)
     finally:
         await store.close()
 
@@ -1695,3 +1768,8 @@ async def test_the_step_up_return_audit_budget_goes_with_the_login_limiter_switc
         )
     finally:
         await store.close()
+
+
+async def _map_fails(*_: object) -> bool:
+    """The service's map seal check, switched to fail (ADR 0217 slice 1b: it is awaitable now)."""
+    return False

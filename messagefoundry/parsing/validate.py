@@ -19,6 +19,32 @@ a doc-sized switch. ``tests/test_validate_scope.py`` pins both halves, so a chan
 either is noticed rather than assumed. Field-content checks belong in a Handler, via
 :mod:`~messagefoundry.parsing.consistency`.
 
+hl7apy's grouping parse silently drops a line it cannot place in the structure, and validates only
+the tree it built, while the tolerant parser keeps and forwards that line. So :func:`validate`
+compares the tree with the tolerant parser's segments and refuses a message carrying a segment
+hl7apy dropped: an unknown one, a known one the structure has no place for, or a line that is not
+a segment at all (BACKLOG #5920), and a message type hl7apy has no structure for, since then
+nothing was validated. A **Z-segment** ("Z" plus exactly two letters or digits, then a field
+separator) is a site extension HL7 leaves undefined: it is left out of the text hl7apy parses, so
+it never breaks hl7apy's grouping, and listed in :attr:`ValidationResult.unvalidated_segments`.
+A refusal names at most a three-character segment ID the message's HL7 version defines, and the
+segment's 1-based position counting as the tolerant parser does (empty lines skipped), never the
+line's text: ``segment ORC at line N ...``, ``unknown segment at line N`` or ``unrecognised line
+N``. Where the structure has HL7's "any HL7 segment" slot, which hl7apy's tables spell
+``ANYHL7SEGMENT`` and its grouping never fills (MFN_M01 and QVR_Q17 among others), a dropped
+segment whose ID the message's version defines, followed by a field separator, is not refused; it
+is listed in :attr:`ValidationResult.unvalidated_segments`, but only when the comparison runs,
+which is when no earlier check refused the message (a Z-segment is listed whenever hl7apy parsed
+the message, and nothing is listed for a size, segment-cap or parse refusal). A dropped ID
+the version does not define, and a dropped bare defined ID with no field separator, are still
+refused. The exemption is per structure, not per slot: it does not count against the slot's
+cardinality or position. It holds only where MSH-9.1 names the structure's own message code, so a
+structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none; one
+borrowed under the same code (``MFN^M02^MFN_M01``) still gets it. Where the slot sits inside a
+nested group (at least PRR_PC5 and PPV_PCA), such a segment can still break hl7apy's grouping of
+what follows. Segment order is not checked as such: hl7apy keeps each segment where the message
+has it, so an out-of-order message may pass.
+
 It is slower and far stricter than :mod:`~messagefoundry.parsing.peek`, so it runs only when
 a channel sets ``validation.strict = true`` and is kept off the routing hot path.
 
@@ -36,6 +62,8 @@ rather than patching hl7apy: see :func:`_choice_fix_needed`.
 from __future__ import annotations
 
 import logging
+import re
+from collections import Counter
 from dataclasses import dataclass
 from functools import cache
 from typing import Any
@@ -45,6 +73,7 @@ from messagefoundry.parsing.peek import (
     DEFAULT_MAX_SEGMENTS,
     HL7MessageTooLarge,
     HL7PeekError,
+    drop_blank_segments,
     enforce_size_limits,
     normalize,
 )
@@ -246,18 +275,161 @@ def _first_choice_error(element: Any, ref: _Reference) -> str | None:
     return None
 
 
+# A segment ID as HL7 v2 spells one; a Z-segment is such an ID starting with "Z".
+_SEGMENT_ID = re.compile(r"[A-Z][A-Z0-9]{2}")
+
+
+def _segment_names(element: Any) -> Counter[str]:
+    """How many segments of each name ``element``'s parsed tree holds, at any group depth."""
+    from hl7apy.core import Segment
+
+    counts: Counter[str] = Counter()
+    for child in element.children:
+        if isinstance(child, Segment):
+            counts[child.name] += 1
+        else:
+            counts.update(_segment_names(child))
+    return counts
+
+
+@dataclass(frozen=True)
+class _Lines:
+    """``norm`` split as the tolerant parser splits it, with the Z-segments set apart.
+
+    ``segments`` holds each other line's ID, as the tolerant parser files it, and its 1-based
+    position; ``z_segments`` the same for each Z-segment; ``bare`` the positions in ``segments``
+    of the lines with no field separator; ``strict_text`` is the body hl7apy parses, the
+    Z-segment lines left out so that one inside a group does not break hl7apy's grouping of the
+    segments around it. The lines are whole and unmodified: this text is only validated, never
+    forwarded."""
+
+    segments: list[tuple[str, int]]
+    z_segments: list[tuple[str, int]]
+    bare: frozenset[int]
+    strict_text: str
+
+
+def _split_lines(norm: str) -> _Lines:
+    # As _builtin_hl7.parse splits a body: empty lines dropped, the whole body stripped. Its ID is
+    # the text before the first field separator, so ``PIDX|`` is PIDX, not hl7apy's PID.
+    lines = drop_blank_segments(norm).strip().split("\r")
+    field_sep = lines[0][3:4] or "|"
+    segments: list[tuple[str, int]] = []
+    z_segments: list[tuple[str, int]] = []
+    bare: set[int] = set()
+    kept_lines: list[str] = []
+    for number, line in enumerate(lines, start=1):
+        name = line.split(field_sep, 1)[0]
+        # A Z-segment carries a field separator after its ID: a bare ``ZOE`` is likely a wrapped
+        # name, so it is compared like any other line rather than tolerated.
+        if number > 1 and line != name and name[:1] == "Z" and _SEGMENT_ID.fullmatch(name):
+            z_segments.append((name, number))
+        else:
+            segments.append((name, number))
+            kept_lines.append(line)
+            if line == name:
+                bare.add(number)
+    return _Lines(segments, z_segments, frozenset(bare), "\r".join(kept_lines))
+
+
+def _holds_any_segment(ref: _Reference) -> bool:
+    return any(
+        name == "ANYHL7SEGMENT" or (marker == "GRP" and _holds_any_segment(sub))
+        for name, sub, _cardinality, marker in ref[1]
+    )
+
+
+# Cached over hl7apy's shipped tables, as _references is. It reads the table itself rather than
+# through _references, so a failure of the issue 151 rewrite cannot reach this check.
+@cache
+def _has_any_segment_slot(name: str, classname: str, hl7_version: str) -> bool:
+    """True if the structure has the "any HL7 segment" slot at any group depth (module docstring)."""
+    from hl7apy import load_reference
+
+    return _holds_any_segment(load_reference(name, classname, hl7_version))
+
+
+def _exempts_defined_segments(message: Any) -> bool:
+    """True if ``message``'s structure has the "any HL7 segment" slot and is its own.
+
+    hl7apy takes the structure from MSH-9.3 when one is given, so ``ADT^A01^MFN_M01`` would
+    borrow MFN_M01's slot for an ADT body. The exemption holds only where MSH-9.1 names the
+    structure's own message code, which fails closed on a structure borrowed under another code.
+    One borrowed under the same code (``MFN^M02^MFN_M01``) still gets it: MSH-9.2 is not
+    compared, since one structure can serve several trigger events (PGL_PC6 serves PC6 to PC8,
+    for one)."""
+    code = message.msh.msh_9.msh_9_1.to_er7()
+    return code == message.name.split("_", 1)[0] and _has_any_segment_slot(
+        message.name, message.classname, message.version
+    )
+
+
+# Structures whose tree the dropped-segment check could not read, so each is logged once.
+_compare_failures: set[tuple[str, str | None]] = set()
+
+
+def _dropped_lines(lines: _Lines, message: Any) -> tuple[list[str], list[tuple[str, int]]]:
+    """Refusals for the segments in ``lines`` that ``message``'s hl7apy tree lacks, and the
+    ``(segment ID, position)`` of each one the "any HL7 segment" exemption let through.
+
+    Worded as the module docstring sets out. An ID is printed only when the message's own HL7
+    version defines it: any other, such as ``KIM``, is likely a wrapped field, so it reads
+    ``unknown segment``, the rule ``docs/PHI.md`` sets for the anonymization report. Which
+    occurrence of a repeated ID was dropped is not knowable from the tree, so the later ones are
+    named; the count per ID is exact. In a structure with an "any HL7 segment" slot, a defined ID
+    followed by a field separator is not refused, as the module docstring says.
+    """
+    import hl7apy
+
+    kept = _segment_names(message)
+    if not kept:
+        # A message type hl7apy has no structure for (a site's ZZZ^Z01, say) builds an empty tree
+        # that hl7apy's validator passes, so nothing at all was validated.
+        return (
+            ["no segment could be validated: hl7apy has no structure for this message type"],
+            [],
+        )
+    defined = hl7apy.load_library(message.version).SEGMENTS
+    exempts: bool | None = None  # read once, on the first dropped defined segment
+    refusals: list[str] = []
+    exempted: list[tuple[str, int]] = []
+    for name, number in lines.segments:
+        if kept[name] > 0:
+            kept[name] -= 1
+        elif _SEGMENT_ID.fullmatch(name) is None:
+            refusals.append(f"unrecognised line {number}")
+        elif name in defined:
+            if exempts is None:
+                exempts = _exempts_defined_segments(message)
+            if exempts and number not in lines.bare:
+                exempted.append((name, number))
+            else:
+                refusals.append(
+                    f"segment {name} at line {number} has no place in this message's structure"
+                )
+        else:
+            refusals.append(f"unknown segment at line {number}")
+    return refusals, exempted
+
+
 @dataclass(frozen=True)
 class ValidationResult:
     """Outcome of strict validation. Truthy iff the message is conformant.
 
     ``oversize`` is True when the message failed :func:`validate`'s ``max_bytes`` cap, measured on
     the text that function itself normalizes, so a caller can answer a size refusal as one without
-    re-deriving that measurement (BACKLOG #2105)."""
+    re-deriving that measurement (BACKLOG #2105).
+
+    ``unvalidated_segments`` lists the segments strict validation left unchecked, the Z-segments
+    and, when the dropped-segment comparison ran, those the "any HL7 segment" exemption let
+    through, each as its ``(segment ID, 1-based position)`` in position order; the module
+    docstring has the rule. No engine surface shows it yet."""
 
     ok: bool
     version: str | None
     errors: list[str]
     oversize: bool = False
+    unvalidated_segments: tuple[tuple[str, int], ...] = ()
 
     def __bool__(self) -> bool:
         return self.ok
@@ -315,8 +487,9 @@ def validate(
             False, expected_version, [str(exc)], oversize=isinstance(exc, HL7MessageTooLarge)
         )
 
+    lines = _split_lines(norm)
     try:
-        message = _tolerant_parse(norm)
+        message = _tolerant_parse(lines.strict_text)
     except HL7apyException as exc:
         return ValidationResult(False, expected_version, [f"parse error: {exc}"])
     except Exception as exc:  # defensive: never let validation crash the pipeline
@@ -363,7 +536,38 @@ def validate(
             except Exception as exc:  # defensive, as above
                 errors.append(str(exc))
 
-    return ValidationResult(ok=not errors, version=version, errors=errors)
+    # hl7apy validated only the tree it built, so a line it dropped while grouping went
+    # unchecked, and the tolerant parser forwards it all the same.
+    # Only when nothing else refused, keeping the one-error contract.
+    exempted: list[tuple[str, int]] = []
+    if not errors:
+        try:
+            refusals, exempted = _dropped_lines(lines, message)
+        except Exception as exc:  # defensive, and closed: an unread tree is not a validated one
+            # Once per structure, as the shim's path above: a persistent fault repeats per message.
+            # The class name only, never exc_info: the exception text can quote message content.
+            key = (getattr(message, "name", ""), version)
+            if key not in _compare_failures:
+                _compare_failures.add(key)
+                logger.warning(
+                    "dropped-segment check could not compare the tree for %s v%s (%s)",
+                    key[0],
+                    version,
+                    type(exc).__name__,
+                )
+            refusals = [
+                f"could not compare the parsed tree with the message ({type(exc).__name__})"
+            ]
+        if refusals:
+            more = len(refusals) - 1
+            errors.append(refusals[0] + (f" (and {more} more)" if more else ""))
+
+    return ValidationResult(
+        ok=not errors,
+        version=version,
+        errors=errors,
+        unvalidated_segments=tuple(sorted(lines.z_segments + exempted, key=lambda s: s[1])),
+    )
 
 
 # How much of a body the warm-up reads to find its MSH segment: far past any real MSH.

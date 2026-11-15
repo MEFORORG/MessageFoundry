@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited. **Amended (2026-11-09).** The owner ruled that a frame found waiting before a request no longer fails that call: the worker is still dropped, and the message is retried once on a fresh worker (vault BACKLOG #3135 step 4). A length header over the frame cap is now read by the engine as a frame rather than a dead peer; AC-10's amendment says what that changes. AC-10 and the residual on a compromised worker denying its own feed carry the amendment beside them, and every kill now records a cause, as ADR 0187 *Amendment B* says. **Corrected (2026-11-10).** At least two statements were false of the code: the grandchild residual, which said nothing a grandchild writes can be taken as an answer, and the Decision bullet *"A frame answers a request, or the worker dies"*. Each correction sits beside its text, and the residual says what a grandchild can do. AC-10's 2026-11-09 amendment gains dated additions, at least those its *Added 2026-11-10* note names. **Owner acceptances (2026-11-10).** Two cases are accepted by the owner (records d20261110T144543956-d8f55a and d20261110T165507353-b70f7b), each only in its record's scope as the owner's scope rulings cited with it widen it; AC-10's 2026-11-09 amendment, *Owner acceptances*, cites the records and those rulings. **Corrected (2026-11-11).** At least the *Isolation denial routing* Decision bullet was false under `[delivery] internal_error = "stop"`: it said a `SandboxError` is one *"which the router/transform worker routes to `ERROR`/dead-letter **post-ACK**"*, under every policy, where `stop` halts the inbound's routing or transform instead. The correction sits beside it. At least the Context's reliability constraint, the `db_lookup`/`fhir_lookup` bullet, AC-11, AC-14 and the Handler-exception residual now name the policy too.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -29,8 +29,10 @@ The forcing constraints on any fix:
   reuse a long-lived worker.
 - **Reliability / purity (CLAUDE.md §2).** At-least-once re-runs a router/transform and *"relies on
   a re-run re-deriving identical output"*; isolation must not change the result or the disposition,
-  and any isolation fault must go to `ERROR`/dead-letter **post-ACK** — *"never accept-and-drop,
-  never crash the connection"* (count-and-log invariant).
+  and any isolation fault must fail the message's call **post-ACK**, for the
+  `[delivery] internal_error` policy to handle (`ERROR`/dead-letter under the default `continue`;
+  under `stop` the inbound's routing or transform halts) — *"never accept-and-drop, never crash the
+  connection"* (count-and-log invariant).
 - **Layering (CLAUDE.md §4).** Isolation is a `pipeline/` concern — *no `api/`/`console/` imports*.
 - **No new dependency without cause (CLAUDE.md §5).** Prefer stdlib.
 
@@ -41,8 +43,10 @@ Router/Handler in a **persistent per-inbound worker subprocess**; `mode=off` (th
 in-process, byte-identically and with zero overhead.
 
 - **Approach (B) SUBPROCESS, stdlib-only.** `pipeline/sandbox.py` (`SandboxPolicy`, `SandboxSession`,
-  `run_sandboxed`, `SandboxError`) + `pipeline/_sandbox_worker.py` (the child, launched
-  `python -m messagefoundry.pipeline._sandbox_worker`). No new dependency. **RestrictedPython is
+  `run_sandboxed`, `SandboxError`) + `pipeline/_sandbox_worker.py` (the child, launched with the
+  command line that `messagefoundry.childenv.python_child_argv` builds for
+  `messagefoundry.pipeline.sandbox.WORKER_MODULE`, not a bare `python -m`; that function's
+  docstring says what it adds). No new dependency. **RestrictedPython is
   rejected** — it is not hard isolation (it restricts an AST but shares the address space) and would
   add a dependency.
 - **Persistent per-inbound worker, never a per-message fork.** The child is spawned lazily on first
@@ -81,14 +85,22 @@ in-process, byte-identically and with zero overhead.
   validation ran long after `pickle.loads` had already executed whatever the child sent.
 - **`db_lookup`/`fhir_lookup` in the sandbox = FORBIDDEN, fail-closed (this PR).** They bridge back
   onto the engine event loop via `run_coroutine_threadsafe`, which a subprocess boundary breaks. A
-  sandboxed Handler that calls one gets a clear `SandboxError` → `ERROR`/dead-letter. A Handler that
-  needs live enrichment runs with `mode=off` (per-policy). Forward-over-IPC is a documented
-  next-phase residual.
+  sandboxed Handler that calls one gets a clear refusal, a `DbLookupError` or `FhirLookupError`; one
+  the Handler lets escape fails the call as a `SandboxError`, which the `[delivery] internal_error`
+  policy handles as the next bullet says. A Handler that needs live enrichment runs with `mode=off`
+  (per-policy). Forward-over-IPC is a documented next-phase residual.
 - **Isolation denial routing.** A forbidden import/op, a resource-cap overrun, a worker crash, or an
-  unmarshallable payload/run-context raises `SandboxError`, which the router/transform worker routes
-  to `ERROR`/dead-letter **post-ACK** via the existing `_apply_router_internal_error` /
-  `_apply_transform_internal_error` paths — no NAK, never accept-and-drop, never a crashed
-  connection.
+  unmarshallable payload/run-context raises `SandboxError`, which the router/transform worker hands,
+  **post-ACK**, to the engine-wide `[delivery] internal_error` policy via the existing
+  `_apply_router_internal_error` / `_apply_transform_internal_error` paths. Under the default,
+  `continue`, the message goes to `ERROR`/dead-letter and the inbound's processing carries on. Under
+  `stop` the inbound's routing or transform halts instead, with at least an `ERROR` log line and a
+  `connection_stopped` alert, and the head row is re-pended, or dead-lettered once its attempts
+  reach the retry cap; [CONFIGURATION.md, `[delivery]`](../CONFIGURATION.md#delivery), row
+  `internal_error`, says the rest. Either way: no NAK, never accept-and-drop, never a crashed
+  connection. *Corrected 2026-11-11:* this bullet said a `SandboxError` is one *"which the
+  router/transform worker routes to `ERROR`/dead-letter **post-ACK**"*, under every policy. That
+  claim holds under the default `continue` and is false under `internal_error = "stop"`.
 - **Load-time top-level exec is NOT sandboxed** in this PR. `_exec_module` runs admin config under
   the unchanged `_assert_safe_config_source` DACL gate (ADR 0036); sandboxing import-time exec is a
   chicken-and-egg (the worker itself must load the graph) and out of scope. `_assert_safe_config_source`
@@ -104,11 +116,12 @@ section 0).
 **Why.** `RLIMIT_CPU` counts the CPU a process spends over its whole life. The worker is persistent
 and serves many calls, so the limit was a lifetime budget rather than a per-call one. Once many
 short, innocent calls added up past it, the kernel killed the worker in whichever call came next,
-and that message dead-lettered. Engine PR 2084 measured it: a reused worker died on its tenth
-0.15 s call. That PR stopped the bootstrap's own CPU counting against the budget, and named a CPU
-kill as one, but the lifetime shape stayed. The wall cap already bounds every call on every
-platform, a CPU-bound runaway included, so for the case the backstop was there for it added only a
-way to fail. Vault BACKLOG #3133 listed a per-dispatch CPU cap as the alternative to dropping it.
+and, under the default `[delivery] internal_error`, that message dead-lettered. Engine PR 2084
+measured it: a reused worker died on its tenth 0.15 s call. That PR stopped the bootstrap's own CPU
+counting against the budget, and named a CPU kill as one, but the lifetime shape stayed. The wall
+cap already bounds every call on every platform, a CPU-bound runaway included, so for the case the
+backstop was there for it added only a way to fail. Vault BACKLOG #3133 listed a per-dispatch CPU
+cap as the alternative to dropping it.
 
 **What this gives up.** The limit counted the whole process, and a child inherits it, so it also
 bounded CPU the wall cap never sees. That CPU now has no bound; it is recorded under "Out of scope /
@@ -209,11 +222,12 @@ target, no `pickle` import left to mis-suppress:
 - **Wire.** Outer `>I length || body` (64 MiB cap, unchanged). The body is *segmented*:
   `>I header_len || header_json || ( >I blob_len || blob_bytes )*`, so a large message payload never
   round-trips through JSON string escaping. Bounds: header ≤ 64 MiB, ≤ 65536 segments, value nesting
-  ≤ 256 — each an independent fail-closed rejection. The header bound is deliberately the frame bound
-  and nothing tighter: a request header carries the whole `reference_view`, so a 16 MiB header cap was
-  in practice a ~700k-entry ceiling on reference tables that dead-lettered **every** message on a
-  bigger graph while `mode=off` served it, and the outer framing already refuses an over-cap frame
-  before a byte is parsed. A fail-closed cap must be sized against real traffic or it is an outage.
+  ≤ 256 — each an independent fail-closed rejection. The header bound is deliberately the frame
+  bound and nothing tighter: a request header carries the whole `reference_view`, so a 16 MiB header
+  cap was in practice a ~700k-entry ceiling on reference tables that, under the default
+  `[delivery] internal_error`, dead-lettered **every** message on a bigger graph while `mode=off`
+  served it, and the outer framing already refuses an over-cap frame before a byte is parsed. A
+  fail-closed cap must be sized against real traffic or it is an outage.
 - **Closed grammar.** Containers are tagged (`{"l":…}` list, `{"p":…}` tuple, `{"d":[[k,v],…]}` dict,
   `{"b":…}` bytes, `{"f":…}` non-finite float, `{"D"/"E"/"T":…}` datetime/date/time), so a bare array
   is illegal at value level and nothing needs escaping. Decoding is `json.loads` + `bytes.decode` +
@@ -224,22 +238,30 @@ target, no `pickle` import left to mis-suppress:
   succeeds only if every segment was consumed), so the one silent failure mode of an indirection
   table — cross-wiring one `Send`'s PHI body onto another `Send`'s destination — is unreachable by
   construction, not merely untested.
-- **A frame answers a request, or the worker dies.** Every dispatch mints a fresh
+- **A frame answers a request, or the worker is dropped.** Every dispatch mints a fresh
   `secrets.token_hex(16)` id and a response must echo the whole `(id, phase, name)` triple; *and* the
-  parent treats a frame queued **before** a dispatch — or left over **after** its answer — as fatal.
+  parent drops the worker on a frame it finds queued **before** a dispatch or left over **after** its
+  answer, at the two checks AC-10's 2026-11-09 amendment names. One the check after an answer finds
+  fails that call closed; one found before a request costs the message one retry on a fresh worker.
+  That amendment says when each check misses a frame, and points to when a retried message's call
+  fails.
   Both halves are needed, and a first attempt at this shipped only the weaker one: a derivable id
   (a per-spawn nonce plus a counter, both visible to the child) let the code running dispatch *N*
   compute *N+1*'s id and pre-stage its answer, so a benign sibling Handler's delivery was silently
   replaced by attacker-chosen content on a message it never saw — for `phase="accepts"`, a
   routing-verdict flip with no `ERROR` and no disposition anomaly. A random per-dispatch id is not
-  derivable, and the worker only learns it from the request frame, which the parent writes only after
-  proving nothing is already queued. A **dead peer** is deliberately not the same event: EOF is a
-  parent-private sentinel with no wire form, so a worker cannot manufacture one and it proves nothing
+  derivable, and the worker only learns it from the request frame. The parent checks that nothing is
+  queued before it encodes and writes that frame, so the check proves nothing about a frame arriving
+  after it; AC-10's amendment says what such a frame meets, and the grandchild residual says how one
+  can carry the right id. A **dead peer** is deliberately not the same event as a stray frame: EOF is a
+  parent-private sentinel with no wire form, so it proves nothing
   about trust. It reaps the worker without failing a call that already holds a correlation-proven
   answer — treating it as a forgery would fail closed on a signal that carries no information.
   **What this is not.** It does not confine one Handler from another *inside* a worker: code running a
   dispatch is handed that dispatch's id, and it could equally rebind a sibling in the child's own
-  registry. `mode=off` draws no such line either — see the residuals.
+  registry. `mode=off` draws no such line either — see the residuals. *Corrected 2026-11-10:* this
+  bullet was headed *"or the worker dies"*, called a frame before a dispatch fatal, and said the
+  request is written *"only after proving nothing is already queued"*.
 - **Result parity.** The child materialises a router result with `_handler_names`' own logic (so a
   documented-supported **generator Router**, which is unpicklable, now works under `mode=subprocess`)
   and — since the 2026-08-04 amendment — a transform result with `_partition`'s own logic, the shared
@@ -272,14 +294,14 @@ target, no `pickle` import left to mis-suppress:
 - **`Send` carries encoded text, never a live `Message`.** The sole parent-side consumer already
   reduces it to a `str`, so the parent's `Send(...)` rebuild is a provable no-op for ADR 0104's
   copy-on-Send choke point instead of taking a second snapshot.
-- **`code_sets` are hoisted off the per-dispatch frame** (they were ~430 KB / ~4.6 ms per message on a
-  realistic crosswalk) and travel **once per spawn in the `boot` frame** instead. The engine's tables
-  are the source of truth on both sides, so the child cannot diverge from `mode=off`. A first attempt
-  let the child re-read `codesets/` itself and pinned a SHA-256 digest to *detect* the divergence —
-  which converted a fail-open hazard into a worse fail-closed one: after any routine respawn (a
-  wall-cap kill, a crash) following an unreloaded `codesets/` edit, every message on that inbound
-  dead-lettered permanently, burning a full config load per attempt. Sending the tables removes the
-  hazard rather than detecting it.
+- **`code_sets` are hoisted off the per-dispatch frame** (they were ~430 KB / ~4.6 ms per message on
+  a realistic crosswalk) and travel **once per spawn in the `boot` frame** instead. The engine's
+  tables are the source of truth on both sides, so the child cannot diverge from `mode=off`. A first
+  attempt let the child re-read `codesets/` itself and pinned a SHA-256 digest to *detect* the
+  divergence — which converted a fail-open hazard into a worse fail-closed one: after any routine
+  respawn (a wall-cap kill, a crash) following an unreloaded `codesets/` edit, every message on that
+  inbound dead-lettered permanently under the default `[delivery] internal_error`, burning a full
+  config load per attempt. Sending the tables removes the hazard rather than detecting it.
 - **A lookup table travels in one of two forms, and they decode identically.** A crosswalk is
   overwhelmingly `str -> short str`; those tables ride as a single plain JSON object so the C
   encoder/decoder does the walk, and anything else falls back to the tagged per-entry form. The
@@ -350,28 +372,122 @@ target, no `pickle` import left to mis-suppress:
   staged *between* dispatches — THE SYSTEM SHALL NOT consume it as a later dispatch's answer; it SHALL
   drop that worker and fail the call closed, and the later dispatch SHALL resolve identically to
   `mode=off`. Request ids SHALL be unpredictable and never reused. A **dead peer** (EOF) is NOT a
-  frame — it has no wire form, so a worker cannot manufacture one — and SHALL drop the worker without
+  frame — it has no wire form — and SHALL drop the worker without
   failing a call that already has a correlation-proven answer.
+  > **Amended 2026-11-09 (vault BACKLOG #3135 step 4, owner ruling 2026-11-09).** A frame found
+  > waiting **before** a request still drops that worker and is still never consumed as an answer,
+  > but that frame no longer fails the call: its message never reached the worker, so it is retried
+  > once on a fresh worker. It still fails closed in at least the cases
+  > [ADR 0187](0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
+  > *Amendment B* lists, the fresh worker having a stray frame waiting too among them.
+  >
+  > - **The two checks run at fixed points.** `_live_worker` checks, through `_drop_unsolicited`,
+  >   before every request, on every worker it hands out, a fresh one included, and before the
+  >   request is encoded. `_reject_unsolicited` checks once, right after the call's answer is read.
+  >   A frame left **after** an answer still fails the call closed when it is queued by the time
+  >   that second check runs.
+  > - **A call refused at encode reads nothing after its check.** A request the engine cannot
+  >   encode, or one over the frame cap, fails only its message and keeps its worker. A frame that
+  >   arrives after that call's check before its request is not read by that call.
+  > - **A frame that arrives later meets at least these outcomes.** On a worker still kept, the
+  >   next call's check before its request finds it, and that message is retried. One that arrives
+  >   after that check, and ahead of that call's answer, is read in its place. It is rejected as an
+  >   invalid frame, and the call fails as an internal error, which the `[delivery] internal_error`
+  >   policy then handles, unless it is a well-formed answer to that very request, which is taken as
+  >   the answer, or, at `mode=isolated`, a well-formed lookup for that request carrying the next
+  >   sequence number, which is brokered like the worker's own. So in that window the later dispatch
+  >   does not resolve as `mode=off` does, a case the SHALL above does not except. **The condition
+  >   for every forged-answer case in this bullet,** a forged lookup aside: no other frame is queued when
+  >   `_reject_unsolicited(..., "after")` runs, right after the forged answer is read, which a writer
+  >   that reads the whole request frame from fd 0 can meet, since the worker then reads no request
+  >   and writes no answer. What the
+  >   forged answer then does is in `dispatch` in `messagefoundry/pipeline/sandbox.py`, and an answer's
+  >   fail kinds are the fail kinds `_answer` in `_sandbox_codec.py` accepts. Two cases in this
+  >   amendment are accepted by the owner (records d20261110T144543956-d8f55a and
+  >   d20261110T165507353-b70f7b), each only in the scope its record gives as the owner's scope
+  >   rulings cited with it widen it; *Owner acceptances* below cites the records and those rulings. Only a writer that knows the request's id can forge a frame that
+  >   carries that id: at least a grandchild or same-UID process that read the request (the
+  >   grandchild residual below), and code running in the worker (the residual on one Handler not
+  >   confined from another). One that arrives after that call's answer meets that call's own check
+  >   after its answer, or carries on to the next call. A frame still queued when its worker is
+  >   respawned is discarded unexamined, since a respawn starts a fresh queue and new pipes.
+  > - **A length header over the frame cap.** How the engine handles one is new since vault BACKLOG
+  >   #3135, not a carried-over rule; the worker's own reader still treats one as a dead peer.
+  >   Before vault BACKLOG #3135 the engine read such a header as a dead peer: at least, in the
+  >   answer slot the call failed as a crash, after an answer the worker was reaped and the answer
+  >   stood, before a request the message went to a respawn, and at boot it read as the worker
+  >   exiting during boot. The engine now reads it as a frame: at least, it counts as a stray frame
+  >   at both checks, failing the call closed after an answer and retrying the message before a
+  >   request, as an invalid frame in the answer slot, and as a rejected boot reply at boot.
+  >
+  > Every kill records a cause; ADR 0187 *Amendment B* says which kills write a WARNING.
+  >
+  > *Added 2026-11-10, after the owner's ruling and not part of it:* at least the list form, the encode-refusal
+  > bullet, the `mode=isolated` lookup case, the forged answer that carries the id, the boot leg
+  > of the over-cap bullet, and the pointer to the owner acceptances.
+  >
+  > **Owner acceptances 2026-11-10.** Two cases are accepted by the owner (the two acceptance records
+  > below, each with a scope ruling beside it), each
+  > until a fix narrows or closes it. The fixes are to be added as steps on vault
+  > BACKLOG #3135 (ledger ruling R2).
+  >
+  > - **Record d20261110T144543956-d8f55a:** a stray frame that arrives after a call's check before
+  >   its request and ahead of its answer, in the record's words, *"dead-letters that message"*. Record
+  >   d20261110T193056983-46d125: asked whether acceptance d20261110T144543956-d8f55a covers every
+  >   `[delivery] internal_error` policy, the owner answered *"Yes, any policy"*, so the case is
+  >   accepted under every such policy, where the call fails and that policy handles it,
+  >   `internal_error=stop` included.
+  > - **Record d20261110T165507353-b70f7b:** a grandchild that inherits the worker's request pipe
+  >   (fd 0) can read a later request's id and forge an answer that the engine accepts as that
+  >   message's result. This falls under this ADR's no-confinement residual, until a fix closes
+  >   the fd-0 path. *Not the record's words:* the condition under which the engine accepts such an
+  >   answer is the one in bold, *The condition for every forged-answer case in this bullet*, in
+  >   this amendment's bullet *A frame that arrives later meets at least these outcomes*. Record
+  >   d20261110T193058718-c708c5: asked whether acceptance d20261110T165507353-b70f7b covers forged
+  >   fail answers too, the owner answered *"Yes, all answer kinds"*, so it covers a forged answer
+  >   of every kind, `ok`, `denied`, `error` and `memory`, including the false `MEMORY_CAP` kill
+  >   cause a forged `memory` answer records.
+  >
+  > *The Manager's 2026-11-10 reading of the code and the two records, not the owner's words:* at
+  > least these are not accepted by either owner record, and each is to be added as a step on vault
+  > BACKLOG #3135 (ledger ruling R2).
+  >
+  > - On Linux, a forged answer from a same-UID process that opened the worker's `/proc/<pid>/fd/0`
+  >   or `/proc/<pid>/fd/1`, since the engine reads answers from the worker's stdout.
+  > - On Windows, a forged answer from a same-user process that duplicated the worker's pipe handles.
+  > - A forged lookup at `mode=isolated`, read after a call's check before its request and ahead of
+  >   its answer.
+  > - The desync of the next message after a partial read of fd 0 and a forged answer that keeps
+  >   the worker.
+  >
+  > A forged answer from code running in the worker is not in this list: it falls under the residual
+  > *One Handler is not confined from another inside a worker*.
+  >
+  > Closing the fd-0 path alone does not close the `/proc` route; see the grandchild residual.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,
   `tests/test_sandbox.py::test_request_ids_are_unpredictable_and_never_reused`,
   `tests/test_sandbox_codec.py::test_hostile_frames_fail_closed[name_mismatch]`
 - **AC-11** — WHERE `[sandbox].mode=subprocess`, THE SYSTEM SHALL route a **generator** Router
-  identically to `mode=off` (it previously dead-lettered every message), and SHALL preserve
-  `_partition` parity for **every** return shape — where, since the 2026-08-04 amendment, a
-  tuple/set/generator of `Send`s **delivers** in both modes (BACKLOG #341) and a `Send` subclass still
-  delivers. Parity is over the **multiset** of items in each of the three partitions, plus their
-  **order for an ordered container**; a `set` return has no defined iteration order in either mode, so
-  its fan-out order is explicitly **not** covered by this SHALL (see the Result-parity bullet).
-  **Amended 2026-09-14 (BACKLOG #1687).** This criterion read *"and a non-iterable unrecognized value
-  (a bare `int`, a `__reduce__` gadget) still drops"*. It no longer drops in either mode: both sides
-  now test admissibility against the one shared rule (`wiring.handler_item_fault`) and **raise** — the
-  parent a `ValueError` from `_partition`, the child a codec rejection its parent re-raises as
-  `SandboxError` — so the transform stage records `ERROR`/dead-letter instead of a `FILTERED` that
-  reads as a deliberate decline. The SHALL itself is unchanged: parity is still over every shape, and
-  the shapes that moved moved in BOTH modes together, which is the property this criterion exists to
-  hold.
+  identically to `mode=off` (under the default `[delivery] internal_error` it previously
+  dead-lettered every message), and SHALL preserve `_partition` parity for **every** return shape —
+  where, since the 2026-08-04 amendment, a tuple/set/generator of `Send`s **delivers** in both modes
+  (BACKLOG #341) and a `Send` subclass still delivers. Parity is over the **multiset** of items in
+  each of the three partitions, plus their **order for an ordered container**; a `set` return has no
+  defined iteration order in either mode, so its fan-out order is explicitly **not** covered by this
+  SHALL (see the Result-parity bullet).
+  **Amended 2026-09-14 (BACKLOG #1687).** This criterion read *"and a non-iterable unrecognized
+  value (a bare `int`, a `__reduce__` gadget) still drops"*. It no longer drops in either mode: both
+  sides now test admissibility against the one shared rule (`wiring.handler_item_fault`) and
+  **raise** — the parent a `ValueError` from `_partition`, the child a codec rejection its parent
+  re-raises as `SandboxError` — so the transform worker hands the `[delivery] internal_error` policy
+  a fault through `_apply_transform_internal_error`, or the router worker through
+  `_apply_router_internal_error` where the ADR 0057 inline fast path ran the transform inside it
+  (`ERROR`/dead-letter under the default `continue`; under `stop` the stage that ran it halts),
+  instead of a `FILTERED` that reads as a deliberate decline. The SHALL itself is
+  unchanged: parity is still over every shape, and the shapes that moved moved in BOTH modes
+  together, which is the property this criterion exists to hold.
   WHERE the Handler is a **generator**, its body SHALL execute inside the child's run context, so a
   run-scoped accessor within it resolves as it does under `mode=off` rather than raising.
   → `tests/test_sandbox.py::test_generator_router_routes_under_mode_subprocess`,
@@ -394,8 +510,9 @@ target, no `pickle` import left to mis-suppress:
   `messagefoundry.store` import, making the feature combination non-functional).
   → `tests/test_sandbox.py::test_response_view_reaches_a_sandboxed_handler`
 - **AC-14** — WHERE a value crosses the boundary that `mode=off` accepts — a large `reference_view`,
-  a deeply nested `SetState` value — THE SYSTEM SHALL marshal it rather than dead-letter it, so no
-  codec bound is a mode-dependent behaviour change.
+  a deeply nested `SetState` value — THE SYSTEM SHALL marshal it rather than fail the message's call
+  (a dead-letter under the default `[delivery] internal_error`), so no codec bound is a
+  mode-dependent behaviour change.
   → `tests/test_sandbox_codec.py::test_the_header_cap_is_the_frame_cap_and_nothing_tighter`,
   `tests/test_sandbox_codec.py::test_a_large_reference_view_round_trips`,
   `tests/test_sandbox_codec.py::test_a_deeply_nested_value_is_not_a_mode_dependent_dead_letter`
@@ -556,13 +673,33 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   narrows the obvious paths but is bypassable (a module imported before it goes up keeps a live
   reference) and carries no compensating-control weight. Least-privilege for the service account
   remains the host control that bounds this. ADR 0147 tracks the fuller closure.
-- **A grandchild the Handler spawns inherits fd 1** and outlives `proc.kill()`. It can write frames
-  into the parent's reader at any later moment. What makes that harmless is the *codec* (nothing it
-  writes can construct an arbitrary object) plus the request-answer binding (nothing it writes can be
-  taken as an answer, and its mere presence kills the worker) — not the process teardown. On POSIX,
-  `/proc/<pid>/fd/1` is additionally openable by any same-UID process subject to
-  `ptrace_scope`/`hidepid`. What it **can** still do is force a kill-and-respawn, i.e. dead-letter
-  messages on that inbound: a compromised worker can deny its own feed.
+- **A grandchild the Handler spawns inherits fd 1, and fd 0 too,** and can outlive the worker's
+  kill, since the tree reap is best effort (BACKLOG #342). Every spawn makes new pipes and a fresh
+  queue, so a survivor inherits only its own generation's pipes. It is still a same-UID process, so on
+  Linux it can open a later worker's `/proc/<pid>/fd/0` and `/proc/<pid>/fd/1` and reach that worker
+  the way any same-UID process can, as the 2026-11-10 correction below says. While its own worker
+  lives, it can write frames into the parent's reader at any moment. The *codec* still
+  bounds what any frame can construct (nothing arbitrary); the request-answer binding (a frame is
+  taken as an answer only if it echoes that dispatch's id) bounds only a writer that does not know
+  the id. Neither rests on the process teardown. **It can forge an answer.** fd 0 is the request
+  pipe, so a grandchild alive while the worker is can read a later request frame. That read gives
+  it the request's id, and it can also take some or all of the frame's bytes from the worker. It
+  can then write a well-formed answer that the engine can accept as that message's result; AC-10's
+  2026-11-09 amendment says when. It can also deny the feed. A frame it writes drops the worker at
+  least when one of the two checks in that amendment finds it, or when it is read as an answer and
+  rejected. Reading alone can starve or desynchronise the worker, and since the grandchild holds fd 1
+  the engine sees no EOF, so that dispatch ends at the wall cap. Its presence alone is never
+  detected, and a worker exiting mid-dispatch does not close that dispatch's answer slot to it while
+  it still holds fd 1. *Corrected 2026-11-10:* this bullet said *"nothing it writes can be taken as
+  an answer, and its mere presence kills the worker"*, and called the result harmless. On Linux,
+  `/proc/<pid>/fd/0` and `/proc/<pid>/fd/1` are additionally openable by a same-UID process,
+  so such a process can forge an answer the same way, with no grandchild. Yama's `ptrace_scope`
+  governs attaching rather than this open, and `hidepid` hides only other users' processes, so
+  neither is a bound on it. Whether a same-account process on Windows can do the same, by
+  duplicating the worker's pipe handles, is unmeasured. Either way a compromised worker can deny its
+  own feed: a kill-and-respawn fails calls on that inbound, which the `[delivery] internal_error`
+  policy then handles. (Since 2026-11-09 a frame staged before a request costs that message a retry on a
+  fresh worker, and in the cases AC-10's amendment points to, a failed call too.)
 - **One Handler is not confined from another inside a worker.** All of an inbound's Routers/Handlers
   share one child and one `Registry`, so admin code can rebind a sibling in-process. This seam does
   not change that — `mode=off` shares an address space too — and any claim that the pipe protects
@@ -595,11 +732,16 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   from every router/predicate dispatch, roughly doubling the wire cost of the routing stage to
   reproduce a documented authoring hazard. Pinned by AC-15 so it cannot drift silently. If a graph
   needs a Router-derived fact at the predicate, pass it through the message, not through mutation.
-- **A Handler's own exception reaches the operator wrapped.** In-process a Handler raise propagates as
-  itself; under `mode=subprocess` it is reported across the pipe and re-raised as `SandboxError`
-  carrying `"<Type>: <message>"`. The **disposition is identical** (both land in the router/transform
-  worker's `except Exception` → `ERROR`/dead-letter); only the `last_error` text differs, and no
-  traceback crosses.
+- **A Handler's own exception reaches the operator wrapped.** In-process a Handler raise propagates
+  as itself; under `mode=subprocess` it is reported across the pipe and re-raised as `SandboxError`
+  carrying `"<Type>: <message>"`. The **disposition is identical** (both land in the
+  router/transform worker's `except Exception` → the `[delivery] internal_error` policy:
+  `ERROR`/dead-letter under the default `continue`; under `stop` the inbound's routing or transform
+  halts). What differs is at least the exception type the operator sees: the policy's log line and,
+  under `stop`, the `connection_stopped` alert's detail name `SandboxError` where `mode=off` names
+  the Handler's own type, or `UserCodeCalledSysExit` for a Handler that calls `sys.exit()`, which
+  `_off_loop_sandboxed` converts before the policy sees it. The `last_error` text carries that type
+  only inside the `SandboxError` message. No traceback crosses.
 - **Run-scoped sinks do not cross back.** The `#162` unmapped-capture buffer drains inside the child
   against a sink the child never installs. No production sink exists today, so nothing is lost — but
   any future run-scoped sink (capture, metrics, audit) will silently no-op under `mode=subprocess`

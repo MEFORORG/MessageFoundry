@@ -953,12 +953,17 @@ count is above `0` (vault BACKLOG #2613).
   `auth.ad_reconcile_skipped` audit row; only the page waits. The table row above gives the load's
   bound.
 - **What you lose, the unreachable-account page:** the page about one account the directory keeps
-  failing for (vault BACKLOG #3100) counts that account's own probes, not outage passes, so its
-  least delay runs from that account's first failing probe, not from the first outage pass. An
-  `ad_reconcile_outage_passes` above `3`, a longer
-  `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate larger
-  than the budget delays it. The `ad_reconcile_outage_passes` row of
-  [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
+  failing for (vault BACKLOG #3100) counts that account's own probes, not outage passes: it pages
+  once `ad_reconcile_outage_passes` of its last `2 * ad_reconcile_outage_passes - 1` probes fail,
+  in a row or alternating with answers (vault BACKLOG #3709). Its time runs from that account's
+  first failing probe, not from the first outage pass. A value of `ad_reconcile_outage_passes`
+  other than `3` changes which failure patterns raise this page, and when. It does not simply
+  delay it: a pattern that pages at one value may never page at another. A longer
+  `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate
+  larger than the budget, spaces this account's probes further apart, which changes which failures
+  that vary over time raise this page, and when. A failure bounded in time can end before it pages
+  at all. The
+  `ad_reconcile_outage_passes` row of [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
   budget can stretch the outage page, as the bullet above says. Nor is a shorter
@@ -1002,8 +1007,12 @@ count is above `0` (vault BACKLOG #2613).
 > ([ADR 0077](adr/0077-action-bound-step-up.md)).
 - **What you lose:** a fixed set of routes asks for a fresh proof bound to that one action, used
   once. The `require_action_step_up` row of [CONFIGURATION.md](CONFIGURATION.md), under `[auth]`, lists them.
-  With the switch off, those routes accept the session-wide step-up window instead. A sign-in can
-  open that window, so a session taken over inside it can bind an authenticator, inject a message
+  With the switch off, those routes accept the session-wide step-up window instead. At least a
+  sign-in, a TOTP or recovery code on any session but an `oidc` one, and a passkey assertion that
+  completes a pending factor with the user-verification flag, on any session but an `oidc` one,
+  can open that window; that flag is
+  the authenticator's own report ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
+  2026-11-14 amendment). So a session taken over inside it can bind an authenticator, inject a message
   or export bodies in bulk with no fresh proof.
 - **When acceptable:** a site that has chosen the earlier session-window behaviour, for example
   while a client that cannot send the bound proof is updated.
@@ -2577,7 +2586,7 @@ count is above `0` (vault BACKLOG #2613).
   a virtual environment. An engine shard reports `interpreter_not_isolated` for itself: the
   supervisor starts it with `-P`, not `-I`.
 
-### `service_environment_secret`, `store_key_in_service_environment` and `service_environment_unobservable`: secrets in the Windows service's environment
+### `store_key_in_service_environment`, `service_environment_unobservable` and `secret_in_service_environment`: secrets in the Windows service's environment
 
 > **OBSERVATIONS, not switches.** No setting declares them. They follow from where the engine's
 > Windows service gets its environment. Vault BACKLOG #2595 and #2601.
@@ -2585,45 +2594,82 @@ count is above `0` (vault BACKLOG #2613).
   NSSM's `AppEnvironmentExtra` and `AppEnvironment` under `Parameters`, and the service's own
   `Environment` value. Who can read that key, and how that was measured, is stated once in
   [`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d).
-- **What is refused:** a store key in those lists, `MEFOR_STORE_ENCRYPTION_KEY` or
-  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`. `serve` and `supervise` refuse to start on it under
-  **every** `[security].enforcement` setting, before they open the store, and the refusal names
-  the registry value that holds it. That is the owner's 2026-10-01 ruling: a key in the
-  environment, and a secret in a Windows service's NSSM environment, are refused always. They also
+- **What is refused:** an engine secret in those lists. `serve` and `supervise` refuse to start on
+  one under **every** `[security].enforcement` setting, before they open the store, and the
+  refusal names the registry value that holds it. That is the owner's 2026-10-01 ruling: a key in
+  the environment, and a secret in a Windows service's NSSM environment, are refused always. The
+  names are the one list in `messagefoundry/engine_secrets.py`: a store key,
+  `MEFOR_STORE_ENCRYPTION_KEY` or `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`, whose way in is the DPAPI
+  key file ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)), and each
+  other secret-class setting, whose way in is the secrets directory that `MEFOR_SECRETS_DIRECTORY`
+  names, one restricted file per setting
+  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). Every
+  `MEFOR_VALUE_*` variable in those lists is refused too, an empty one and a host name as well as
+  a password, since the engine cannot tell which `env()` value is a secret (owner ruling
+  2026-11-14, vault BACKLOG #8212). The refusal never spells one, since the name was read from
+  the registry and may hold a value typed in the wrong place. It counts them: the names are
+  de-duplicated without regard to case, and each is counted once, under the first registry value
+  that sets it, so a name a later value also sets is not counted there. It sends each to the
+  secrets directory, or a value that is not a secret and is the same for every instance to the
+  active environment's value file. A `MEFOR_VALUE_*` variable a `[secrets].provider = "env"`
+  reference names is refused too, and the secrets directory does not supply it, since that
+  provider reads the environment only; the refusal says to drop the reference and put the
+  credential in the secrets directory under the setting it stands for, or else to use
+  `[secrets].provider = "vault"`, which applies engine-wide. It says to delete an empty entry, or
+  the bare name `MEFOR_VALUE_`, rather than move it. They also
   refuse a store key in their own environment when they found their service but could not read
-  its lists, since the key most likely came from there. The DPAPI key file is the way in
-  ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)).
-- **`service_environment_secret`: another engine secret is in that list.** The entry names each
-  one it finds: the store password, the AD bind password, the OIDC client secret, the OIDC
-  signing key and its passphrase, the SMTP password, the API TLS key passphrase, both Vault
-  tokens and the AI key. The same ruling would refuse them. The protected way in is the secrets
-  directory that `MEFOR_SECRETS_DIRECTORY` names, one restricted file per setting
-  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)): move each
-  one there and remove it from the list. A secret left in the list is still named and not refused;
-  the refusal is later work under vault BACKLOG #2595.
+  its lists, since the key most likely came from there; another secret in their own environment is
+  not refused then.
+- **`secret_in_service_environment`: what `serve` and `supervise` refuse, read where no refusal
+  ran.** An application that builds the API without them, with `create_app` or
+  `create_managed_app`, refuses on the same finding: the factory raises as it is built. The entry
+  is named, with the refusal's finding and remedy, only where the refusal would fire
+  (`messagefoundry/serviceenv.py`): the engine found its service, the way the bullet *How the
+  engine finds its own service* below says, and either an engine secret or a `MEFOR_VALUE_*`
+  variable is in that service's lists, or the lists could not be read and a store key is in the
+  engine's own environment. A
+  console-script launcher such as `uvicorn.exe` or `hypercorn.exe` between NSSM and the
+  interpreter is neither a Python interpreter nor `messagefoundry.exe`, so the engine does not
+  find its service there and this entry is not named. The reading is taken once per process, and
+  at least `serve`, `supervise` and both factories refuse on it before they serve the API, so the
+  entry reaches a caller that reads the loosenings itself, through `security_loosenings` with a
+  service reading. A factory refuses the app, not the engine: an engine the caller built, and
+  perhaps started, before `create_app(engine)` has already opened its store, and an engine
+  embedded with no API is not refused and has no posture to name it in. Clear it the way the
+  refusal says.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
-  machine-wide environment is readable by every local user too. A key in the service's own
-  lists refuses first, so the entry normally means the machine-wide environment.
+  machine-wide environment is readable by every local user too. Under `serve` and `supervise` a
+  key in the service's own lists refuses first, so there the entry normally means the
+  machine-wide environment.
 - **`service_environment_unobservable`: the engine could not finish the reading.** The entry
   carries the reason: an ancestor process that could not be queried, an `nssm.exe` with no
-  service, an `nssm.exe` above a process that is not Python, or a registry key it could not read.
-  It starts unless the last case applies with a store key in its environment. Check the lists
-  yourself.
-- **How the engine finds its own service:** it walks up through the Python interpreter processes
-  above it. When the first other process is `nssm.exe`, it asks the Service Control Manager which
-  service runs there. When that process is anything else, such as a shell, the engine is not a
-  service, unless an `nssm.exe` sits further up. Then it cannot tell a wrapper NSSM starts from a
-  shell inside another NSSM service, and names `service_environment_unobservable`.
-- **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
-  for the engine's own process. `supervise` logs one WARNING for each entry at start.
+  service, an `nssm.exe` above a process that is neither Python nor `messagefoundry.exe`, or a
+  registry key it could not read. It starts unless the last case applies with a store key in its
+  environment. Check the lists yourself.
+- **How the engine finds its own service:** it walks up through the Python interpreter and
+  `messagefoundry.exe` processes above it. When the first other process is `nssm.exe`, it asks
+  the Service Control Manager which service runs there. When that process is anything else, such
+  as a shell, the engine is not a service, unless an `nssm.exe` sits further up. Then it cannot
+  tell a wrapper NSSM starts from a shell inside another NSSM service, and names
+  `service_environment_unobservable`.
+- **Where they are reported:** `secret_in_service_environment` is reported where its bullet above
+  says. The others are reported in the serve-time loosening warning and `GET /security/posture`,
+  each for the engine's own process, and `supervise` logs one WARNING for each of them at start.
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
-  line says so. The reading is taken once, at start.
-- **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
-  list or the service's own `Environment` value, and from the machine-wide environment. Keep the
+  line says so. The reading is taken once per process: as `serve` or `supervise` starts, or at
+  the first reading an app built without them takes.
+- **How to clear them:** remove each variable the entry names or counts from the registry value
+  it names, NSSM's list or the service's own `Environment` value, and from the machine-wide
+  environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
-  and a secret a connection reads through `env()`, whose name only your config knows.
+  a variable named by a `[secrets].provider = "env"` reference, whose name only your config
+  knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable or a secret
+  other than a store key that reaches the engine from the machine-wide environment, which is
+  neither refused nor named. A `MEFOR_VALUE_*` variable in the service's own lists is covered,
+  as *What is refused* says, whatever reads it: an `env()` value or a `[secrets].provider = "env"`
+  reference.
 
 ---
 
@@ -2685,7 +2731,7 @@ chapter was not part of the verification above.
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `interpreter_not_isolated` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
-| `service_environment_secret` / `store_key_in_service_environment` / `service_environment_unobservable` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
+| `store_key_in_service_environment` / `service_environment_unobservable` / `secret_in_service_environment` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

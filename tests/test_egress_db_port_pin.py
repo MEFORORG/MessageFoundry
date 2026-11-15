@@ -144,11 +144,15 @@ def test_generic_server_carrying_a_port_is_refused(
 @pytest.mark.parametrize("server", [f"[{HOST}],6432", f"{HOST},", f"{HOST},replica.test.invalid"])
 def test_generic_server_holding_a_comma_anywhere_is_refused(check: Check, server: str) -> None:
     # libpq reads every one of these as a host list. The first two have no suffix the split reads
-    # as a port, so a check keyed on the split's port text let them through.
+    # as a port, so a check keyed on the split's port text let them through. Brackets in an entry
+    # hold an IPv6 literal alone (BACKLOG #5915), so no entry lists `[db],6432`: it is unlisted.
+    refusal = (
+        r"is not in the \[egress\]\.allowed_db allowlist$"
+        if server.startswith("[")
+        else "holds a comma, read as a port suffix or a host list"
+    )
     for entry in (server, f"{server}:5432"):
-        with pytest.raises(
-            WiringError, match="holds a comma, read as a port suffix or a host list"
-        ):
+        with pytest.raises(WiringError, match=refusal):
             check(
                 _generic(server=server, odbc_params={"PORT": "5432"}),
                 EgressSettings(allowed_db=[entry]),
@@ -175,9 +179,9 @@ def test_the_no_port_refusal_leads_with_its_remedy(check: Check) -> None:
 
 @pytest.mark.parametrize("server", [f"{HOST}:6432", "[::1]:6432"])
 def test_generic_server_with_a_colon_port_matches_no_entry(check: Check, server: str) -> None:
-    # An entry splits at its first colon, so no entry names a `host:port` server whole: refused as
-    # unlisted, as the shipped code refused it.
-    for entry in (server, HOST, "[::1]"):
+    # An entry's host holds no port (BACKLOG #5915: `[::1]:6432` is the host ::1 pinned to 6432), so
+    # no entry names a `host:port` server whole: refused as unlisted, as the shipped code refused it.
+    for entry in (server, HOST, "[::1]", "::1"):
         with pytest.raises(WiringError, match=r"is not in the \[egress\]\.allowed_db allowlist$"):
             check(
                 _generic(server=server, odbc_params={"PORT": "6432"}),

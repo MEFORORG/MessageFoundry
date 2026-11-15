@@ -50,7 +50,9 @@ async def _admin_row(service: AuthService, username: str, *, provider: AuthProvi
         audits=(),
     )
     await service.initialize()  # seeds the role the assignment refers to
-    await service.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")
+    await service.store.set_user_roles(
+        user_id, [Role.ADMINISTRATOR.value], assigned_by="test", audits=()
+    )
     return user_id
 
 

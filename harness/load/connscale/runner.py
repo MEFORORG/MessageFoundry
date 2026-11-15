@@ -380,6 +380,8 @@ async def run_connscale(
                                 break
                             records.append(record)
                             step += 1
+    if not records:
+        notes.append("NO STEP WAS RECORDED: the sweep measured nothing, so the run fails")
     slos = _evaluate_slos(profile, records)
     comparison: ClaimModeComparison | None = build_comparison(
         records, profile.claim_modes, missing_detail=missing_detail
@@ -405,7 +407,9 @@ async def run_connscale(
     # misses it can pair against a present arm: in a fusion A/B, a cell whose B0 and B1 both failed to
     # start leaves no row and no baseline gap, so nothing else would fail it.
     result_ok = (
-        steps_missed == 0
+        # A sweep that recorded nothing measured nothing, whatever its SLOs read (BACKLOG #5432).
+        bool(records)
+        and steps_missed == 0
         and all(c.ok for c in slos)
         and (comparison is None or comparison.ok)
         and (fuse_comparison is None or fuse_comparison.ok)
@@ -530,6 +534,7 @@ async def _run_one_step(
             sandbox_mode=sandbox_mode,
             mode=mode,
             count=count,
+            trial=trial,
             aggregate_rate=aggregate_rate,
             sink_host=sink_host,
             base_env=base_env,
@@ -556,6 +561,7 @@ async def _run_started_step(
     sandbox_mode: str,
     mode: str,
     count: int,
+    trial: int,
     aggregate_rate: float,
     sink_host: str,
     base_env: Mapping[str, str],
@@ -852,6 +858,7 @@ async def _run_started_step(
             reload_account=reload_account,
             per_lane_wake=_effective_per_lane_wake(node_env),
             sandbox=sandbox,
+            trial=trial,
         )
     finally:
         for task in sampler_tasks:
@@ -1756,6 +1763,9 @@ def _build_record(
     fd_probe_root_pid: int | None = None,
     per_lane_wake: bool | None = None,
     sandbox: SandboxReading | None = None,
+    # Required, like the other axes: a default would file a forgotten trial as trial 0 and chain the
+    # repeats into one lane again (BACKLOG #5570).
+    trial: int,
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
@@ -1821,6 +1831,9 @@ def _build_record(
     return ConnScaleRecord(
         sweep_mode=mode,
         count=count,
+        # The repeat of this cell, so the monotonicity pairing keeps each trial in its own lane
+        # (BACKLOG #5570).
+        trial=trial,
         offered_aggregate_rate=aggregate_rate,
         sent=c.sent,
         acked=c.acked,
@@ -2067,6 +2080,7 @@ def _reconcile(
     # COUNTS: one duplicated outbound row, or one row carried over from before the baseline, cancels
     # one lost message. Only a per-message audit separates them.
     write_short = read - written
+    # The whole pipeline, not the outbound stage alone: see EngineSample.backlog (BACKLOG #5433).
     drained = backlog == 0
     # The three reload guards. Each is a SIGNATURE, not a fraction of the offered volume, and none
     # applies to a step that offered nothing at all (`sent == 0`, e.g. a zero-rate lane).
@@ -2535,8 +2549,14 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
     out: list[SloCheck] = []
     slo = profile.slo
     if slo.zero_loss:
-        all_ok = all(r.no_loss.ok for r in records)
-        out.append(SloCheck("zero_loss", True, all_ok, all_ok))
+        # `all()` over nothing is True, so a sweep that kept no record would read zero-loss PASS;
+        # this function is shared with the batch-box aggregate, so the guard is here (BACKLOG #5432).
+        # An empty list says so, rather than reading as a message loss.
+        if not records:
+            out.append(SloCheck("zero_loss", True, "no step was recorded", False))
+        else:
+            all_ok = all(r.no_loss.ok for r in records)
+            out.append(SloCheck("zero_loss", True, all_ok, all_ok))
     if profile.intake_audit:
         # BACKLOG #1292, and DELIBERATELY NOT folded into zero_loss: this is a per-MESSAGE check and
         # zero_loss is a per-COUNT one, so they can disagree, and each disagreement is informative.
@@ -2567,10 +2587,11 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
             SloCheck("intake_audit", "no accept-ACKed message absent", observed, not suspect)
         )
     if slo.max_drain_seconds is not None:
-        worst = max(
-            (r.drain_seconds for r in records if r.drain_seconds is not None),
-            default=None,
-        )
+        # A timed-out drain (None) POISONS the worst case, as in the batchbox and compare copies:
+        # dropping it let any sibling that drained in time mask the step that never did (BACKLOG
+        # #5434).
+        drains = [r.drain_seconds for r in records]
+        worst = None if not drains or None in drains else max(d for d in drains if d is not None)
         ok = worst is not None and worst <= slo.max_drain_seconds
         out.append(
             SloCheck(
@@ -2859,8 +2880,8 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
     The run-level bound that some group actually had a pair to compare lives in
     ``tests/test_connscale_smoke.py`` (WALL #4 NEVER COMPARED), because only a real run knows whether
     the metric was measurable. Any new caller needs its own such bound or it inherits the hole."""
-    # The pairing itself — including the group-by-(sweep_mode, claim_mode) rule BACKLOG #1101 records
-    # as load-bearing — lives in `monotonic_pairs`. The emitter that records EVERY reading reads the
+    # The pairing itself — including the lane key, `monotonic_lane`, which BACKLOG #1101 and #5570
+    # record as load-bearing — lives in `monotonic_pairs`. The emitter that records EVERY reading reads the
     # same function, so a passing run and a failing run cannot describe the sequence differently.
     pairs = monotonic_pairs(records, key, tolerance=tolerance)
     breaches = [p for p in pairs if not p.ok]
@@ -2868,7 +2889,10 @@ def _monotonic_slo(  # type: ignore[no-untyped-def]
         "monotonic"
         if not breaches
         else "; ".join(
-            f"{p.label}@N={p.count}: {p.value:.3g} < prior {p.prior:.3g} * {p.tolerance_floor:.2f}"
+            # A non-finite reading is a broken instrument, not a drop: say so (BACKLOG #5570).
+            f"{p.label}@N={p.count}: reading {p.value} is not finite"
+            if not p.finite
+            else f"{p.label}@N={p.count}: {p.value:.3g} < prior {p.prior:.3g} * {p.tolerance_floor:.2f}"
             for p in breaches
         )
     )

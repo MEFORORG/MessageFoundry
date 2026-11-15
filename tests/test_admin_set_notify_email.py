@@ -93,7 +93,9 @@ def _seed(
                     password_generated=False,
                     audits=(),
                 )
-                await store.set_user_roles("u-viewer", [Role.VIEWER.value], assigned_by="test")
+                await store.set_user_roles(
+                    "u-viewer", [Role.VIEWER.value], assigned_by="test", audits=()
+                )
         finally:
             await store.close()
 

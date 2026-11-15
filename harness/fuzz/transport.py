@@ -2,17 +2,22 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """How a fuzz case reaches the engine, and what came back.
 
-Two shapes, both built on the ``harness/drivers`` family:
+One shape: ``mllp`` gets :class:`WireMLLPDriver`, the MLLP driver's wire-level twin. It sends the
+case's bytes verbatim -- framing included, so the ``frame`` layer can break the framing -- then
+half-closes its sending side, so an engine left holding an incomplete frame sees end-of-stream and
+can close cleanly instead of waiting out a timeout. It reads EVERY reply frame until the engine
+closes, so a two-frame case is answered and counted twice, and it tells a clean close from a
+timeout, a reset, a reply cut off mid-frame and bytes outside any frame, which the stock driver
+folds together. Its probe connects to the inbound before the first case.
 
-* ``mllp`` gets :class:`WireMLLPDriver`, the MLLP driver's wire-level twin. It sends the case's bytes
-  verbatim -- framing included, so the ``frame`` layer can break the framing -- then half-closes
-  its sending side, so an engine left holding an incomplete frame sees end-of-stream and can close
-  cleanly instead of waiting out a timeout. It reads EVERY reply frame until the engine closes, so a
-  two-frame case is answered and counted twice, and it tells a clean close from a timeout, a reset,
-  a reply cut off mid-frame and bytes outside any frame, which the stock driver folds together.
-* Any other kind is the stock driver for that kind (``harness.drivers.build``), sending the payload
-  unframed. Those transports carry the byte and field layers only, and an absent reply reads as a
-  clean close because the stock :class:`~harness.drivers.Injection` cannot say more.
+**Why only mllp.** Every other driver kind is refused as a setup error (BACKLOG #5638, #5639); this
+paragraph is the one statement of why, which the invariants module and the harness README point
+at. The invariants read every reply as an HL7 v2 ACK and match the store to the acknowledgements,
+and a stock driver has neither an inbound probe nor a per-frame reply count. So an HTTP, DIMSE or
+X12 reply would fail as not parsing as HL7, and a send that got no reply -- a file drop always,
+any other kind whenever the engine stays silent -- would pass with nothing checked, even against
+an endpoint no inbound polls. A kind joins only with its own probe and a reply invariant for its
+own shape. ``--fuzz-driver`` takes ``mllp`` alone at the argument parser, too.
 """
 
 from __future__ import annotations
@@ -22,11 +27,10 @@ import socket
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from harness import drivers
 from harness.drivers import Injection
 from harness.drivers.mllp import MLLPDriver
 from harness.endpoints import Endpoints
-from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError
+from messagefoundry.mllpcodec import MLLPDecoder, MLLPFrameError, frame_neutralised
 
 REPLY = "reply"
 CLOSED = "closed"
@@ -42,9 +46,6 @@ _MAX_REPLY_BYTES = 1024 * 1024
 #: answer. Without it, an engine that kept writing would never hit the per-read timeout.
 _MAX_EXCHANGE_BYTES = 16 * _MAX_REPLY_BYTES
 
-#: Start block, end block and trailing CR: what MLLP adds around each payload.
-_FRAME_OVERHEAD = 3
-
 
 @dataclass(frozen=True)
 class Exchange:
@@ -59,17 +60,17 @@ class Exchange:
 class Transport(abc.ABC):
     """Sends one case's bytes and reports the exchange."""
 
+    #: Names the replay files a campaign writes, so a replay is sent through the same kind.
     kind: str
-    #: True when ``send`` takes framed wire bytes (and so can carry the ``frame`` layer).
-    wire: bool
 
     @abc.abstractmethod
     def send(self, data: bytes) -> Exchange: ...
 
+    @abc.abstractmethod
     def probe(self) -> str:
         """Empty when the inbound is there to fuzz; otherwise why not. Checked once, before the
-        first case, so a wrong port is a setup error rather than an invariant failure."""
-        return ""
+        first case, so a wrong port is a setup error rather than an invariant failure. Abstract, so
+        a new transport cannot inherit a probe that reports every endpoint as there."""
 
 
 class WireMLLPDriver(MLLPDriver):
@@ -104,11 +105,12 @@ class WireMLLPDriver(MLLPDriver):
 def _read_replies(sock: socket.socket) -> Exchange:
     decoder = MLLPDecoder(max_frame_bytes=_MAX_REPLY_BYTES)
     replies: list[bytes] = []
-    received = 0
+    #: Every byte read, kept so the framing is checked exactly; bounded by the exchange ceiling.
+    received = bytearray()
     try:
         while chunk := sock.recv(65536):
-            received += len(chunk)
-            if received > _MAX_EXCHANGE_BYTES:
+            received += chunk
+            if len(received) > _MAX_EXCHANGE_BYTES:
                 detail = f"the engine sent over {_MAX_EXCHANGE_BYTES} reply bytes for one case"
                 return Exchange(MALFORMED, tuple(replies), detail)
             replies.extend(decoder.feed(chunk))
@@ -120,18 +122,22 @@ def _read_replies(sock: socket.socket) -> Exchange:
         return Exchange(RESET, tuple(replies), str(exc))
     if decoder.in_frame:
         return Exchange(MALFORMED, tuple(replies), "the engine closed inside a reply frame")
-    framed = sum(len(r) + _FRAME_OVERHEAD for r in replies)
-    if received != framed:
-        # The decoder discards bytes outside a frame, so count them: an engine that writes
-        # anything but whole SB..FS CR frames is answering in something other than MLLP.
-        detail = f"{received - framed} reply byte(s) outside an MLLP frame"
+    if received != b"".join(frame_neutralised(r) for r in replies):
+        # The decoder discards bytes outside a frame and closes one on the end block alone, so a
+        # byte count would pass a wrong trailer, or one frame short its CR beside one with two.
+        # Compared byte for byte with what a conforming engine writes: each reply framed as its
+        # listeners frame one (ADR 0205 rule 1), a frame byte in the payload neutralised. So a reply
+        # carrying a start byte as data fails too, where the bare frame() would have matched it.
+        detail = (
+            f"the {len(received)} reply byte(s) are not exactly {len(replies)} SB..FS CR "
+            "frame(s): bytes outside an MLLP frame, a wrong trailer, or a frame byte in a reply"
+        )
         return Exchange(MALFORMED, tuple(replies), detail)
     return Exchange(REPLY if replies else CLOSED, tuple(replies))
 
 
 class _WireTransport(Transport):
     kind = "mllp"
-    wire = True
 
     def __init__(self, driver: WireMLLPDriver) -> None:
         self.driver = driver
@@ -148,40 +154,20 @@ class _WireTransport(Transport):
         return ""
 
 
-class _DriverTransport(Transport):
-    wire = False
-
-    def __init__(self, kind: str, driver: drivers.Driver) -> None:
-        self.kind = kind
-        self.driver = driver
-
-    def send(self, data: bytes) -> Exchange:
-        (injection,) = self.driver.inject([data])
-        if injection.error:
-            return Exchange(REFUSED, detail=injection.error)
-        if injection.reply is None:
-            return Exchange(CLOSED)
-        return Exchange(REPLY, (injection.reply,))
-
-
-#: The endpoint a driver kind fuzzes when none is named. Only MLLP has an obvious one.
-DEFAULT_ENDPOINT = {"mllp": "mllp_in"}
+#: The endpoint the mllp driver fuzzes when none is named.
+DEFAULT_ENDPOINT = "mllp_in"
 
 
 def build_transport(
     kind: str, endpoints: Endpoints, key: str | None, *, timeout: float
 ) -> Transport:
-    """The transport for driver ``kind`` aimed at endpoint ``key`` (the kind's default when None).
-    Raises KeyError for a kind no harness driver serves, an endpoint no family declares, or a kind
-    with no default endpoint and none named; ValueError for a bad port value. ``timeout`` bounds
-    one MLLP reply; a stock driver keeps its own."""
-    if key is None:
-        try:
-            key = DEFAULT_ENDPOINT[kind]
-        except KeyError:
-            raise KeyError(
-                f"name the endpoint the {kind!r} driver sends to (--fuzz-endpoint)"
-            ) from None
-    if kind == "mllp":
-        return _WireTransport(WireMLLPDriver(endpoints.host, endpoints.port(key), timeout=timeout))
-    return _DriverTransport(kind, drivers.build(kind, endpoints, key))
+    """The transport for driver ``kind`` aimed at endpoint ``key`` (``mllp_in`` when None).
+    Raises ValueError for any kind but ``mllp`` (the module docstring says why) and for a bad port
+    value; KeyError for an endpoint no family declares. ``timeout`` bounds one MLLP reply."""
+    if kind != _WireTransport.kind:
+        raise ValueError(
+            f"--fuzz-driver accepts only {_WireTransport.kind}, not {kind!r} "
+            "(the harness/fuzz/transport.py module docstring says why)"
+        )
+    port = endpoints.port(DEFAULT_ENDPOINT if key is None else key)
+    return _WireTransport(WireMLLPDriver(endpoints.host, port, timeout=timeout))

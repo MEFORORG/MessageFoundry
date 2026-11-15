@@ -883,12 +883,38 @@ from typing import Any
 #: render such a row by reading ``username`` and ``roles`` off it, and raise; the digest refuses it
 #: at mount instead. Re-derived with ``--write``, from ``f44b72b2102da33e`` to ``4b5769ef2c675677``.
 #:
+#: BACKLOG #5931: ``POST /ui/account/mfa/verify`` gains a dependency ahead of its confirm gate.
+#: It sends an empty code to the re-auth before the gate can spend a held grant. The route's
+#: recorded gate chain grew. Re-derived with ``--write``, from ``4b5769ef2c675677`` to
+#: ``6737556a16ce6d15``.
+#:
+#: BACKLOG #5930: the console's edit-resend form parser ``_resubmit_form`` now restores the
+#: original's line endings through ``restore_eol`` and reads the body through ``_form_pairs``. Both
+#: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. It
+#: does not hash the ``EDIT_EOL_TERMINATORS`` mapping, which is module data, or the route's refusal
+#: of an unknown ``eol``, which sits in the endpoint body. No engine surface changed.
+#: Re-derived with ``--write``, on the branch from ``4b5769ef2c675677`` to ``8386df80553a4313``,
+#: and over the merge with #5931 from ``6737556a16ce6d15`` to ``c537067c6952d93c``.
+#:
+#: BACKLOG #5559: ``AdminHandlers`` gained ``checked_user``, ``auth_routes._checked_user``, and the
+#: console's user pages read the account through it rather than the store. What each page answers
+#: for a record that fails its seal is docs/SECURITY.md's to say, in *What an admin user read
+#: reports*. Two changes the digest does not see, as it records field names only:
+#: ``user_summary_scoped`` takes ``role_ids`` None for a checked record, and
+#: ``refuse_own_channel_scope`` lost its ``target`` parameter, which the console no longer passes.
+#: So an older console on this engine would raise TypeError on every channel scope save, which
+#: passed ``target``, and a newer console on an older engine would raise AttributeError on the user
+#: pages, which call ``checked_user``. The digest refuses both pairs at mount. Re-derived with
+#: ``--write``, from ``c537067c6952d93c`` to ``796ce45eeff0cf1e``. Then ``api.security`` gained
+#: ``account_read_errors``, the failures those post-action pages fall back on, which the console
+#: imports, so the surface grew again: from ``796ce45eeff0cf1e`` to ``080ed019349126b8``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "4b5769ef2c675677"
+ENGINE_UI_SEAM: str = "080ed019349126b8"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1011,6 +1037,9 @@ class AdminHandlers:
 
     list_roles: Callable[..., Awaitable[Any]]
     list_users: Callable[..., Awaitable[Any]]
+    # BACKLOG #5559: ``auth_routes._checked_user``, the seal-checked account read the console's
+    # user pages make; its docstring says what it answers.
+    checked_user: Callable[..., Awaitable[Any]]
     list_custom_roles: Callable[..., Awaitable[Any]]
     create_user: Callable[..., Awaitable[Any]]
     update_user: Callable[..., Awaitable[Any]]

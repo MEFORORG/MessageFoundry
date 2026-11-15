@@ -1546,7 +1546,7 @@ async def test_audit_export_stops_when_the_permission_is_withdrawn(
     re-check can carry the loss of ``audit:export``."""
 
     async def demote(service: AuthService, uid: str) -> None:
-        await service.store.set_user_roles(uid, [Role.VIEWER.value])
+        await service.store.set_user_roles(uid, [Role.VIEWER.value], audits=())
 
     data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.AUDITOR, demote)
     assert len(data) == 2
@@ -1560,7 +1560,7 @@ async def test_audit_export_stops_when_the_lock_rows_are_no_longer_readable(
     the lock rows the export started with, so it stops as a scope change."""
 
     async def narrow(service: AuthService, uid: str) -> None:
-        await service.store.set_user_roles(uid, [Role.AUDITOR.value])
+        await service.store.set_user_roles(uid, [Role.AUDITOR.value], audits=())
 
     data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.ADMINISTRATOR, narrow)
     assert len(data) == 2
@@ -1574,7 +1574,7 @@ async def test_audit_export_continues_when_the_lock_rows_become_readable(
     are read with the narrower start, so the export runs to the end."""
 
     async def widen(service: AuthService, uid: str) -> None:
-        await service.store.set_user_roles(uid, [Role.ADMINISTRATOR.value])
+        await service.store.set_user_roles(uid, [Role.ADMINISTRATOR.value], audits=())
 
     data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.AUDITOR, widen)
     assert len(data) == 7 and stops == []

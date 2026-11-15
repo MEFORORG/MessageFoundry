@@ -26,7 +26,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore, RevokeResult, session_seal_ok
+from messagefoundry.store.store import MessageStore, RevokeResult, no_audit_row, session_seal_ok
 
 #: Runs one statement with ``?`` placeholders against the store's database, outside the store.
 RawSql = Callable[[str, tuple[Any, ...]], Awaitable[None]]
@@ -143,7 +143,7 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
     behind = await _mint(store, alice)
     snapshot = await store.get_session(hash_token(behind))
     assert snapshot is not None
-    assert (await store.revoke_user_sessions(alice)).count >= 1
+    assert (await store.revoke_user_sessions(alice, audit=no_audit_row)).count >= 1
     await raw(
         "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
         (snapshot.seal, hash_token(behind)),
