@@ -37,6 +37,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import CellType, CodeType, FunctionType, MethodType, ModuleType
+from typing import cast
 
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.wiring import _CONFIG_MODULE_PREFIX, Registry
@@ -111,24 +112,31 @@ _ATTR_LOADS = frozenset({"LOAD_ATTR", "LOAD_METHOD"})
 
 
 def _function_of(obj: object) -> FunctionType | None:
-    """The plain function behind ``obj``: a bound method's ``__func__``, then any ``functools.wraps``
-    chain followed through ``__dict__``, or ``None`` for anything else (a callable instance, a
-    builtin, a ``partial``). No attribute lookup runs on a non-function, so a captured object's own
-    ``__getattr__`` never runs."""
-    if isinstance(obj, MethodType):
-        obj = obj.__func__
-    if not isinstance(obj, FunctionType):
-        return None
+    """The plain function behind ``obj``: a bound method's ``__func__``, and any ``__wrapped__`` chain
+    (``functools.wraps``, ``update_wrapper`` on a class-based decorator, ``functools.cache``)
+    followed to its end, or ``None`` for anything else (a callable instance, a builtin, a
+    ``partial``). The chain is read statically, so a captured object's own ``__getattr__`` or
+    ``__getattribute__`` never runs."""
+    # type() and inspect.getattr_static only: isinstance() falls back to obj.__class__, and getattr()
+    # runs the object's own __getattr__ / __getattribute__, either of which is author code.
     seen: set[int] = set()
     while id(obj) not in seen:
         seen.add(id(obj))
-        wrapped = obj.__dict__.get("__wrapped__")
-        if isinstance(wrapped, MethodType):
-            wrapped = wrapped.__func__
-        if not isinstance(wrapped, FunctionType):
-            break
-        obj = wrapped
-    return obj
+        if issubclass(type(obj), MethodType):
+            obj = cast("MethodType", obj).__func__
+        if issubclass(type(obj), FunctionType):
+            func = cast("FunctionType", obj)
+            if "__wrapped__" not in func.__dict__:
+                return func
+            obj = func.__dict__["__wrapped__"]
+            continue
+        # A wrapper that is not a function (a class-based decorator using functools.update_wrapper,
+        # a functools.cache wrapper): follow its __wrapped__, as inspect.unwrap did before.
+        try:
+            obj = inspect.getattr_static(obj, "__wrapped__")
+        except AttributeError:
+            return None
+    return None
 
 
 def _is_config_module(name: object, root_module: str) -> bool:

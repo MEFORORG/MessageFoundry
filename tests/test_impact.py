@@ -1232,6 +1232,45 @@ def test_a_callable_with_a_raising_getattr_does_not_break_the_index(tmp_path: Pa
     assert plan.unresolved == ()
 
 
+@pytest.mark.parametrize("decorator", ["@_Trace", "@functools.cache"])
+def test_a_handler_behind_a_non_function_wrapper_keeps_its_table(
+    tmp_path: Path, decorator: str
+) -> None:
+    """A class-based decorator that calls functools.update_wrapper, or functools.cache, wraps the
+    handler in an object that is not a function. Its __wrapped__ is followed, as inspect.unwrap did,
+    so the table it reads is not reported dead, and the rename still rewrites the read."""
+    body = (
+        "import functools\n"
+        + _PREAMBLE
+        + (
+            "class _Trace:\n"
+            "    def __init__(self, fn):\n"
+            "        functools.update_wrapper(self, fn)\n"
+            "        self._fn = fn\n"
+            "\n"
+            "    def __call__(self, msg):\n"
+            "        return self._fn(msg)\n"
+            "\n"
+            "\n"
+            '@handler("h_q")\n'
+            f"{decorator}\n"
+            "def h_q(msg):\n"
+            '    a = code_set("diets").get("A")\n'
+            '    return Send("OB_Q", msg)\n'
+        )
+    )
+    config_dir = _codeset_dir(tmp_path, {"mod.py": body}, "diets")
+    registry = load_config(config_dir)
+    index = build_reference_index(registry)
+    assert delete_impact(index, "code_set", "diets") == [
+        Reference("handler", "h_q", "code_set", "diets")
+    ]
+    assert ("code_set", "diets") not in index.unreferenced(registry)
+    plan = plan_rename(registry, config_dir, "code_set", "diets", "renamed")
+    assert plan.unresolved == ()
+    assert len(plan.edits) == 1
+
+
 def test_a_form_feed_line_does_not_shift_the_rename(tmp_path: Path) -> None:
     body = _PREAMBLE + (
         "\x0c\n"
