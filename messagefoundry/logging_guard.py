@@ -228,8 +228,10 @@ class LogWriteGuard:
         ``unwritable`` its window lapses only after a full window passes with no roll at all, not a
         window after its first roll. So a sink still needing a roll every few seconds keeps its
         streak past the bound: the roll is counted and its rolled-aside path recorded, the stage-2
-        cause stays on ``/status``, and nothing pages. A roll after a quiet window, or one that
-        heals a sink stage 2 declared dead, is a fresh heal and moves it to ``rolled`` as above.
+        cause stays on ``/status``, and nothing pages. A roll after a quiet window is a fresh heal
+        and moves it to ``rolled`` as above. So is a roll that heals a sink stage 2 declared dead,
+        unless that sink had already passed the bound within a window of its last roll: then it is
+        still flapping and stays latched, failing closed until a quiet window or :meth:`revalidate`.
 
         **PRECONDITION: ``reason`` and ``rolled_aside`` arrive ALREADY SCRUBBED** (BACKLOG #1591).
         Build them with :func:`_safe_reason` and :func:`_escape_only`, as
@@ -254,15 +256,17 @@ class LogWriteGuard:
             flapping = streak > _MAX_ROLLS_PER_WINDOW
             # The precondition holds through this join: ``reason`` arrived scrubbed and everything
             # appended is a literal plus two formatted numbers, so nothing new needs escaping.
-            flap_reason = (
+            verdict = (
                 f"{reason}; the sink needed rolling {streak} times in "
                 f"{_ROLL_FLAP_WINDOW_SECONDS:.0f}s, which is a failing log rather than a transient"
+                if flapping and not already_down
+                else reason
             )
             if flapping and previous is not None and already_down:
                 # Latched: keep the stage-2 cause the operator was paged with on ``/status``.
                 last_event, last_event_at = previous.last_event, previous.last_event_at
             else:
-                last_event, last_event_at = (flap_reason if flapping else reason), _utc_now()
+                last_event, last_event_at = verdict, _utc_now()
             self._sinks[sink] = LogSinkStatus(
                 sink=sink,
                 state="unwritable" if flapping else "rolled",
@@ -271,13 +275,14 @@ class LogWriteGuard:
                 last_event_at=last_event_at,
                 rolled_aside=rolled_aside,
             )
-            all_down = all(s.state == "unwritable" for s in self._sinks.values())
+            announce = flapping and not already_down
+            all_down = announce and all(s.state == "unwritable" for s in self._sinks.values())
         if not flapping:
             self._fire(
                 LogSinkEvent(sink=sink, stage="rolled", reason=reason, rolled_aside=rolled_aside)
             )
-        elif not already_down:
-            self._announce_unwritable(sink, reason=flap_reason, all_down=all_down)
+        elif announce:
+            self._announce_unwritable(sink, reason=verdict, all_down=all_down)
 
     def record_unwritable(self, sink: str, *, reason: str) -> None:
         """Stage 2: the replacement could not be written either. Escalates ONCE per break.
