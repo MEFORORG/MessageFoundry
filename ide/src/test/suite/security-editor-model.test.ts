@@ -6,6 +6,7 @@ import * as os from "os";
 import * as path from "path";
 
 import {
+  ShownFile,
   saveUpdatesProblem,
   securityConfigTarget,
   securitySetArgs,
@@ -65,7 +66,11 @@ suite("security editor host checks", () => {
 
   test("a value from user settings may name a file outside the workspace, but never a blank one", () => {
     const file = path.join(outside, "messagefoundry.toml");
-    assert.deepStrictEqual(securityConfigTarget(ws, file, false, real), { ok: true, path: file });
+    // Links resolved, as for a path inside, since containment is decided on the resolved path.
+    assert.deepStrictEqual(securityConfigTarget(ws, file, false, real), {
+      ok: true,
+      path: path.join(fs.realpathSync.native(outside), "messagefoundry.toml"),
+    });
     for (const setting of ["", "  ", undefined, 5]) {
       assert.strictEqual(securityConfigTarget(ws, setting, false, real).ok, false, `${JSON.stringify(setting)} was accepted`);
     }
@@ -110,6 +115,59 @@ suite("security editor host checks", () => {
     assert.ok(viaInner.ok, "a link inside the workspace");
     // The CLI is handed the resolved path, so it opens the folder that was checked.
     assert.strictEqual(viaInner.path, path.join(fs.realpathSync.native(path.join(ws, "inner")), "messagefoundry.toml"));
+  });
+
+  test("a user-set path that reaches the workspace by an alias gets the workspace's link rules", function () {
+    // An alias (a link, a mapped drive, an 8.3 name) into the workspace is lexically outside it, so
+    // containment is decided on the resolved path, against the workspace's own resolved path.
+    const alias = path.join(outside, "alias");
+    const away = fs.mkdtempSync(path.join(os.tmpdir(), "mf-secedit-away-"));
+    try {
+      try {
+        fs.symlinkSync(ws, alias, "junction");
+        fs.symlinkSync(away, path.join(ws, "linked"), "junction");
+      } catch {
+        this.skip();
+      }
+      // THE CONTROL: a file the alias reaches inside the workspace is accepted, as the resolved path.
+      assert.deepStrictEqual(securityConfigTarget(ws, path.join(alias, "messagefoundry.toml"), false, real), {
+        ok: true,
+        path: path.join(fs.realpathSync.native(ws), "messagefoundry.toml"),
+      });
+      // Through the alias and then out by a link the repository holds: refused, as it is lexically.
+      assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", false, real).ok, false, "lexically inside");
+      assert.strictEqual(
+        securityConfigTarget(ws, path.join(alias, "linked", "messagefoundry.toml"), false, real).ok,
+        false,
+        "through the alias",
+      );
+      // The alias naming the workspace folder itself is refused, as the folder is.
+      assert.strictEqual(securityConfigTarget(ws, alias, false, real).ok, false, "the folder by its alias");
+    } finally {
+      fs.rmSync(away, { recursive: true, force: true });
+    }
+  });
+
+  test("the file a panel shows is its own, and a disposed panel neither sets it nor saves through it", () => {
+    const a = new ShownFile();
+    const b = new ShownFile();
+    a.set("a.toml");
+    // THE CONTROL: a live panel saves only to the file it shows.
+    assert.ok(a.matches("a.toml"));
+    assert.ok(!a.matches("b.toml"));
+    // A second panel's state is apart from the first's.
+    assert.ok(!b.matches("a.toml"), "one panel's file leaked into another's");
+    b.set("b.toml");
+    assert.ok(a.matches("a.toml") && b.matches("b.toml"));
+    // A late refresh after dispose sets nothing, and the panel cannot save.
+    a.dispose();
+    assert.ok(!a.matches("a.toml"), "a disposed panel still saves");
+    a.set("a.toml");
+    assert.ok(!a.matches("a.toml"), "a late refresh set a disposed panel's file");
+    assert.ok(a.disposed);
+    assert.ok(b.matches("b.toml"), "disposing one panel cleared another's");
+    b.clear();
+    assert.ok(!b.matches("b.toml"));
   });
 
   test("each argv value is bound to its flag with =, so a leading dash is never read as a flag", () => {

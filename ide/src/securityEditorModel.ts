@@ -64,6 +64,32 @@ function resolveLinks(target: string, fsx: LinkFs): string | undefined {
   }
 }
 
+/** Whether `target`, followed component by component, reaches the folder whose resolved path is
+ *  `realRoot`: some existing prefix of it resolves to that folder or into it. That is how an alias
+ *  outside the folder, such as a link, a mapped drive or an 8.3 short name, leads into it. Undefined
+ *  when a prefix cannot be read, so the caller refuses. */
+function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | undefined {
+  let at = target;
+  for (;;) {
+    try {
+      const real = fsx.realpath(at);
+      if (path.relative(realRoot, real) === "" || inside(realRoot, real)) {
+        return true;
+      }
+    } catch (e) {
+      const code = errCode(e);
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        return undefined;
+      }
+    }
+    const parent = path.dirname(at);
+    if (parent === at) {
+      return false;
+    }
+    at = parent;
+  }
+}
+
 /**
  * The absolute service-settings path for `setting` (`messagefoundry.serviceConfig`), resolved against
  * the workspace folder `workspace` (BACKLOG #5411). A blank or non-string setting is refused.
@@ -76,7 +102,9 @@ function resolveLinks(target: string, fsx: LinkFs): string | undefined {
  *
  * Whatever its scope, a path inside the workspace folder, the default `messagefoundry.toml`
  * included, must not leave it through a symbolic link the repository holds, a dangling one included.
- * The path returned has those links resolved, so the CLI opens the folders that were checked.
+ * Inside is decided on resolved paths as well as lexically: a user-set path that reaches the folder
+ * by an alias, such as a link, a mapped drive or an 8.3 short name, gets the same link rules. The
+ * path returned has its links resolved, so the CLI opens the folders that were checked.
  */
 export function securityConfigTarget(
   workspace: string,
@@ -97,15 +125,56 @@ export function securityConfigTarget(
       "A value in workspace settings must name a file inside the workspace folder, and a path inside it must not leave " +
       "it through a link; to use a file elsewhere, set it in user settings",
   } as const;
-  if (!inside(root, target)) {
-    return fromWorkspace ? outside : { ok: true, path: target };
+  const lexicallyInside = inside(root, target);
+  if (!lexicallyInside && fromWorkspace) {
+    return outside;
   }
   const realRoot = resolveLinks(root, fsx);
   const realTarget = resolveLinks(target, fsx);
-  if (realRoot === undefined || realTarget === undefined || !inside(realRoot, realTarget)) {
+  if (realRoot === undefined || realTarget === undefined) {
+    return outside;
+  }
+  const entersRoot = lexicallyInside || reachesRoot(target, realRoot, fsx);
+  if (entersRoot === undefined || (entersRoot && !inside(realRoot, realTarget))) {
     return outside;
   }
   return { ok: true, path: realTarget };
+}
+
+/** The file one editor panel now shows (BACKLOG #5411). Save writes only to this file, so a setting
+ *  that moved after the form rendered cannot send one file's values into another. Each panel holds
+ *  its own, and once the panel is disposed a late refresh cannot set it and nothing saves through it. */
+export class ShownFile {
+  private file: string | undefined;
+  private gone = false;
+
+  /** Whether the panel has been disposed. */
+  get disposed(): boolean {
+    return this.gone;
+  }
+
+  /** The form shows no file, as while it reads one. */
+  clear(): void {
+    this.file = undefined;
+  }
+
+  /** The form now shows `file`, unless the panel is gone. */
+  set(file: string): void {
+    if (!this.gone) {
+      this.file = file;
+    }
+  }
+
+  /** The panel is gone: it shows no file again. */
+  dispose(): void {
+    this.gone = true;
+    this.file = undefined;
+  }
+
+  /** Whether a save may write to `file`: the live panel shows exactly that file. */
+  matches(file: string): boolean {
+    return !this.gone && this.file !== undefined && this.file === file;
+  }
 }
 
 /** The `security show` argv. Each value is bound to its flag with `=`, so a value that starts with

@@ -15,7 +15,7 @@ import * as vscode from "vscode";
 import { runJson, serviceConfig, workspaceDir } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { FIELDS, securityEditorScript } from "./securityEditorWebview";
-import { saveUpdatesProblem, securityConfigTarget, securitySetArgs, securityShowArgs } from "./securityEditorModel";
+import { ShownFile, saveUpdatesProblem, securityConfigTarget, securitySetArgs, securityShowArgs } from "./securityEditorModel";
 
 interface ShowResult {
   values: Record<string, unknown>;
@@ -24,10 +24,9 @@ interface ShowResult {
   loosenings: { switch: string; risk: string }[];
 }
 
-let panel: vscode.WebviewPanel | undefined;
-// The file the form now shows, or undefined while it shows none. Save writes only to this file, so a
-// setting that moved after the form rendered cannot send one file's values into another.
-let shownFile: string | undefined;
+// The open panel and the file its form shows. The file is held per panel, so a late refresh from a
+// disposed panel can neither set it nor save through it.
+let panel: { readonly view: vscode.WebviewPanel; readonly shown: ShownFile } | undefined;
 
 /** Open the [security] editor: loads the current switches + secure defaults and saves edits via the CLI. */
 export async function openSecurityEditor(context: vscode.ExtensionContext): Promise<void> {
@@ -37,22 +36,24 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
     return;
   }
   if (panel) {
-    panel.reveal(vscode.ViewColumn.Active);
-    void refresh(panel);
+    panel.view.reveal(vscode.ViewColumn.Active);
+    void refresh(panel.view, panel.shown);
     return;
   }
-  panel = vscode.window.createWebviewPanel(
+  const current = vscode.window.createWebviewPanel(
     "messagefoundry.securityEditor",
     "Security Settings",
     vscode.ViewColumn.Active,
     { enableScripts: true },
   );
-  const current = panel;
+  const shown = new ShownFile();
+  const opened = { view: current, shown };
+  panel = opened;
   current.onDidDispose(
     () => {
-      if (panel === current) {
+      shown.dispose();
+      if (panel === opened) {
         panel = undefined;
-        shownFile = undefined;
       }
     },
     null,
@@ -67,14 +68,14 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
           postToWebview(current.webview, { command: "error", message: `Not saved: ${problem}.` });
           return;
         }
-        await save(m.updates as Record<string, unknown>, current);
+        await save(m.updates as Record<string, unknown>, current, shown);
       } else if (m?.command === "cancel") {
         current.dispose();
       }
     },
   );
   current.webview.html = formHtml(current.webview);
-  await refresh(current);
+  await refresh(current, shown);
 }
 
 /** The service-settings file to read and write, which must be inside the workspace folder
@@ -95,12 +96,12 @@ function configPath(ws: string, current: vscode.WebviewPanel): string | undefine
 }
 
 /** Re-read `security show` and push the current state (values + defaults + loosenings) to the webview. */
-async function refresh(current: vscode.WebviewPanel, resolved?: string): Promise<void> {
+async function refresh(current: vscode.WebviewPanel, shown: ShownFile, resolved?: string): Promise<void> {
   const ws = workspaceDir();
-  if (!ws) {
+  if (!ws || shown.disposed) {
     return;
   }
-  shownFile = undefined;
+  shown.clear();
   // After a save, the file just written, so the state shown is that file's even if the setting moved.
   const file = resolved ?? configPath(ws, current);
   if (file === undefined) {
@@ -108,7 +109,10 @@ async function refresh(current: vscode.WebviewPanel, resolved?: string): Promise
   }
   try {
     const state = await runJson<ShowResult>(securityShowArgs(file), ws);
-    shownFile = file;
+    if (shown.disposed) {
+      return;
+    }
+    shown.set(file);
     postToWebview(current.webview, { command: "state", state });
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
@@ -120,16 +124,17 @@ async function refresh(current: vscode.WebviewPanel, resolved?: string): Promise
 async function save(
   updates: Record<string, unknown>,
   current: vscode.WebviewPanel,
+  shown: ShownFile,
 ): Promise<void> {
   const ws = workspaceDir();
-  if (!ws) {
+  if (!ws || shown.disposed) {
     return;
   }
   const file = configPath(ws, current);
   if (file === undefined) {
     return;
   }
-  if (file !== shownFile) {
+  if (!shown.matches(file)) {
     postToWebview(current.webview, {
       command: "error",
       message:
@@ -144,7 +149,7 @@ async function save(
     postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
-  await refresh(current, file);
+  await refresh(current, shown, file);
   void vscode.window.showInformationMessage(
     "MessageFoundry: saved [security] settings. Restart the engine to apply (read at startup).",
   );
