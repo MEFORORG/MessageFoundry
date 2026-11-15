@@ -840,6 +840,72 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
             "    review(1)\n    {\n      log(2)\n    }\n  }\n}\n",
             1,
         ),
+        # Read by the one forward lexer: each of these was a regression of a back-scanning reader.
+        (
+            "a method named class, its body scanned where it is invoked",
+            "function review(r) { return agent(r) }\nawait review(0)\n"
+            "await parallel([() => ({ class() {\n  review(1)\n  {\n    log(2)\n  }\n} }).class()])\n",
+            2,
+        ),
+        (
+            "of used as a variable before a bare block",
+            "function review(r) { return agent(r) }\nawait review(0)\nlet of = 1\nof\n{\n"
+            "  review(1)\n  {\n    log(2)\n  }\n}\n",
+            2,
+        ),
+        (
+            "a class field whose value is get",
+            "function review(r) { return agent(r) }\nawait review(0)\nclass A {\n  x = get\n"
+            "  review(r) { return 1 }\n}\n",
+            1,
+        ),
+        (
+            "a class field whose value is async",
+            "function review(r) { return agent(r) }\nawait review(0)\nclass A {\n  x = async\n"
+            "  review(r) { return 1 }\n}\n",
+            1,
+        ),
+        (
+            "a heritage ending in a class expression",
+            "function review(r) { return agent(r) }\nawait review(0)\n"
+            "class A extends class {} {\n  review(r) { return 1 }\n}\n",
+            1,
+        ),
+        (
+            "a heritage ending in a template",
+            "function review(r) { return agent(r) }\nawait review(0)\n"
+            "class A extends tag`x` {\n  review(r) { return 1 }\n}\n",
+            1,
+        ),
+        (
+            "a helper under new in the heritage of a class held in a class field",
+            "function review(r) { return agent(r) }\nawait review(0)\nclass Outer {\n"
+            "  Inner = class extends new review(Object) {}\n}\n",
+            2,
+        ),
+        (
+            "a regex after in, then a prefix increment on the next line",
+            "const g = (s) => s in /a/\n++n + agent(1)\ng(s)\ng(s)\n",
+            1,
+        ),
+        (
+            "a regex after if and return",
+            "function review(r) { if (r) return /[(]/.test(r); return agent(r) }\n"
+            "await review(1)\nawait review(2)\n",
+            2,
+        ),
+        (
+            "a block comment holding a line break ends the line",
+            "const g = () => k /*\n*/ !agent(1)\ng()\ng()\n",
+            1,
+        ),
+        (
+            "a comment between function and the name of a local function expression",
+            "const R = [1, 2, 3, 4, 5, 6]\nawait parallel(R.map(r => () => {\n"
+            "  const review = function /* one row */ review(x) { return agent(x) }\n"
+            "  return review(r)\n}))\n",
+            6,
+        ),
     ],
 )
 def test_shapes_the_helper_rules_must_not_misread(

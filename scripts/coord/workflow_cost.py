@@ -104,8 +104,6 @@ _LENGTH_RE = re.compile(r"^\s*\{\s*length\s*:\s*(\d+)\s*\}\s*$")
 _DECL_RE = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\[")
 # An assignment operator, compound forms included, that is not `==`, `===` or an arrow `=>`.
 _ASSIGN = r"(?:\*\*|\?\?|\|\||&&|>>>|>>|<<|[-+*/%&|^])?=(?![=>])"
-# Ending in a declaration keyword: the name that follows is being DECLARED, not assigned.
-_DECLARED_BEFORE_RE = re.compile(r"(?<![\w$.])(?:const|let|var|function\s*\*?)\s*$")
 _FUNCTION_DECL_RE = re.compile(r"(?<![\w$.])function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(")
 _BINDING_RE = re.compile(r"(?<![\w$.])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=(?![=>])")
 _FUNCTION_EXPR_RE = re.compile(r"(?:async\s+)?function\b\s*\*?\s*(?:[A-Za-z_$][\w$]*)?\s*\(")
@@ -155,9 +153,6 @@ _READS = frozenset(
         "toString",
     ]
 )
-_KEYWORDS = frozenset(
-    ["if", "for", "while", "switch", "catch", "with", "return", "typeof", "await", "yield", "new"]
-)
 # Function values. Where nothing visible invokes them, their agents are left to the residue.
 _TAIL_PATTERN = (
     r"|(?P<arrow>=>)"
@@ -180,27 +175,11 @@ _POSTFIX = ("++", "--")
 # A line opening with a binary operator continues the line before: no `;` is inserted ahead of one.
 # A bare `!` and a `++`/`--` open a new statement instead.
 _LEADS_ON_RE = re.compile("[" + re.escape(_CONTINUES + "/^") + r"]|!==?|(?:in|instanceof)(?![\w$])")
-# A code character after which an operand is expected: what follows it continues the expression.
-_EXPECTS_OPERAND = "(,=:?[&|!+-*/%<>~^"
-# A line ending in one of these awaits an operand, so the expression goes on to the next line.
-_OPERATOR_TAIL = _EXPECTS_OPERAND + "."
-# Keywords an operand follows, so a `++`/`--` after one is a prefix operator and not a postfix.
-_OPERAND_WORDS = frozenset(
-    ["in", "instanceof", "typeof", "void", "delete", "new", "await", "yield"]
-    + ["return", "throw", "case", "else", "do"]
-)
-# Of those, the ones a line break may follow: `return`, `throw` and `yield` take a `;` there.
-_RESTRICTED_WORDS = frozenset(["return", "throw", "yield"])
-_LINE_OPERAND_WORDS = _OPERAND_WORDS - _RESTRICTED_WORDS
-# Keywords after which a `{` opens an object literal; any other word before one ends a statement.
-_EXPRESSION_WORDS = (_OPERAND_WORDS - {"else", "do"}) | {"default", "of"}
-# Words that end a walk back through a class head: none of them can sit inside one.
-_HEAD_STOP = _KEYWORDS | _OPERAND_WORDS | {"function", "try", "finally", "default"}
-_MODIFIERS = frozenset(["get", "set", "static", "async"])
 _META_NAME_RE = re.compile(r"name\s*:\s*['\"]([^'\"]+)['\"]")
 
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
 _CLOSERS = ")]}"
+_OPENERS = {v: k for k, v in _PAIRS.items()}
 
 
 # --------------------------------------------------------------------------------------------
@@ -291,6 +270,11 @@ class _Ctx:
     token_re: re.Pattern[str] = field(default_factory=lambda: _token_re([]))
     interps: list[tuple[int, int]] = field(default_factory=list)
     held_newlines: set[int] = field(default_factory=set)
+    # What the lexer read: each code token's category by its last offset, the method heads, and
+    # the names being declared.
+    ends: dict[int, str] = field(default_factory=dict)
+    method_heads: set[int] = field(default_factory=set)
+    declared: dict[int, str] = field(default_factory=dict)
     # The raw text with only COMMENTS blanked: literals intact, so "is there code here" and "what
     # is the last character of this line" can be read without a comment deciding the answer.
     code: str = ""
@@ -312,65 +296,63 @@ class _Ctx:
 # --------------------------------------------------------------------------------------------
 
 
-def _is_regex_position(prev: str, src: str = "", prev_at: int = -1) -> bool:
-    """Decide whether a `/` opens a regex literal or divides.
+# ---- what a token leaves the expression wanting ----------------------------------------------
+# THE ONE ANSWER to "does an operand follow this token?". The forward lexer gives every token one of
+# these, and every reader asks it rather than scanning back: whether a `/` opens a regex, whether a
+# `++` is postfix, whether a line break ends an expression, and whether a `{` opens a block, an
+# object or a class body.
+_VALUE = "value"  # an operand is complete: a name, a literal, a value's closing bracket
+_OPERAND = "operand"  # an operator or keyword still waiting for its operand
+_RESTRICTED = "restricted"  # `return`, `throw`, `yield`: an operand on its line, a `;` at a break
+_AFTER_POSTFIX = "postfix"  # a postfix `++`/`--`: a value that cannot be called, indexed or dotted
+_END = "end"  # a statement's end or a block's start: `;`, `{`, a block's `}`, an `if (...)`'s `)`
+_VALUES = (_VALUE, _AFTER_POSTFIX)  # a `/` after either divides, and a `{` after either is a block
 
-    The standard heuristic: a `/` following a VALUE (identifier, literal, closing bracket) is
-    division; anywhere else it opens a regex. A postfix ``++``/``--`` ending at ``prev_at`` in
-    ``src`` is a value too: ``i++ / 2`` divides, and read as a regex it swallowed the rest of its
-    line, a template's closing backtick included. Imperfect at the margins -- `return /x/` is right,
-    a keyword like `typeof` ending in a letter reads as a value -- so `_mask` additionally refuses
-    any "regex" that does not close on its own line, which keeps a misread from desynchronising
-    the rest of the scan.
+# Reserved words. Each is a keyword only where the lexer reads one: after a member dot it names a
+# property, and as a class or object member's name it is a key, so `class() {}` defines a method.
+_RESERVED = frozenset(
+    ["break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete"]
+    + ["do", "else", "enum", "export", "extends", "finally", "for", "function", "if", "import"]
+    + ["in", "instanceof", "let", "new", "return", "switch", "throw", "try", "typeof", "var"]
+    + ["void", "while", "with", "yield", "await"]
+)
+# A line break after one of these takes a `;`, so it awaits an operand only on its own line.
+_RESTRICTED_WORDS = frozenset(["return", "throw", "yield", "break", "continue", "debugger"])
+# Keywords after which a `{` opens an object literal; any other keyword before one opens a block.
+_EXPRESSION_WORDS = frozenset(
+    ["in", "instanceof", "typeof", "void", "delete", "new", "await", "yield", "return", "throw"]
+    + ["case", "default", "of"]
+)
+# Keywords whose `( ... )` is a statement's head, so what follows its `)` is a statement.
+_STATEMENT_HEADS = frozenset(["if", "for", "while", "with", "switch", "catch"])
+# Words that modify the member name after them; anywhere else each is an ordinary identifier.
+_MODIFIERS = {"class": frozenset(["get", "set", "static", "async"])}
+_MODIFIERS["object"] = _MODIFIERS["class"] - {"static"}
+# Tokens that can name a class or object member.
+_KEY_KINDS = frozenset(["word", "private", "string", "number"])
+_WORD_RE = re.compile(r"(?:[^\W\d]|\$)[\w$]*")
+_NUMBER_RE = re.compile(
+    r"(?:0[xXoObB][\da-fA-F_]+|(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d+)?)n?"
+)
+_PUNCT_RE = re.compile(
+    r">>>=|\.\.\.|===|!==|\*\*=|<<=|>>=|>>>|&&=|\|\|=|\?\?=|=>|==|!=|<=|>=|&&|\|\||\?\?"
+    r"|\?\.(?!\d)|\+\+|--|\*\*|<<|>>|[-+*/%&|^]=|.",
+    re.S,
+)
+
+
+def _continues(cat: str, text: str, nxt: int) -> bool:
+    """Whether an expression whose line ends in a token of category ``cat`` goes on at ``nxt``.
+
+    THE ONE CONTINUATION TEST. A line ending in an operator awaits its operand, whatever the next
+    line opens with. Otherwise the next line continues it only by opening with a binary operator: a
+    ``++``/``--`` there is a prefix operator after an inserted ``;``, and a postfix result cannot be
+    called, indexed or dotted, so ASI splits before ``(``, ``[`` and ``.`` after one.
     """
-    if prev in ("+", "-") and _ends_postfix(src, prev_at):
-        return False
-    return prev == "" or not (prev.isalnum() or prev in "_$)]}")
-
-
-def _ends_postfix(text: str, at: int) -> bool:
-    """Whether the code character at ``at`` ends a postfix ``++``/``--``.
-
-    Only a run of exactly two after a value: ``a+++/x/`` lexes as ``a++ + /x/`` and ``1 + ++`` is a
-    prefix operator, and both still expect an operand. A keyword is not a value: ``typeof ++`` and
-    ``k in ++`` end in a prefix operator too.
-    """
-    c = text[at] if 0 <= at < len(text) else ""
-    if c not in ("+", "-"):
-        return False
-    k = at
-    while k >= 0 and text[k] == c:
-        k -= 1
-    if at - k != 2:
-        return False
-    while k >= 0 and text[k] in " \t":
-        k -= 1
-    if k < 0 or not (text[k].isalnum() or text[k] in "_$)]"):
-        return False
-    return _keyword_ending_at(text, k) not in _OPERAND_WORDS
-
-
-def _is_property(text: str, start: int) -> bool:
-    """Whether the word starting at ``start`` names a property: after a member dot, or private."""
-    if text[start - 1 : start] == "#":
-        return True
-    k = _prev_code(text, start)
-    return k >= 0 and text[k] == "." and text[k - 1 : k] != "."  # `...typeof x` spreads
-
-
-def _keyword_ending_at(text: str, k: int) -> str:
-    """The word ending at ``k`` as a candidate keyword: empty where none ends there, and empty
-    where it names a property, as in ``o.typeof++`` or ``extends mix(B).with(M)``."""
-    word, start = _word_ending_at(text, k)
-    return "" if _is_property(text, start) else word
-
-
-def _word_ending_at(text: str, k: int) -> tuple[str, int]:
-    """The identifier ending at ``k`` and its start, or ``("", k + 1)`` if none ends there."""
-    w = k
-    while w >= 0 and (text[w].isalnum() or text[w] in "_$"):
-        w -= 1
-    return text[w + 1 : k + 1], w + 1
+    leads = not text.startswith(_POSTFIX, nxt) and _LEADS_ON_RE.match(text, nxt) is not None
+    if cat == _AFTER_POSTFIX:
+        return leads and text[nxt] not in "([."
+    return cat == _OPERAND or leads
 
 
 @dataclass
@@ -379,7 +361,383 @@ class _MaskNotes:
 
     interps: list[tuple[int, int]] = field(default_factory=list)  # each top-level `${...}` inside
     comments: list[tuple[int, int]] = field(default_factory=list)
-    held_newlines: set[int] = field(default_factory=set)  # newlines inside a blanked span
+    # Newlines inside a blanked literal. Not a comment's: a block comment holding a line break is
+    # one, for ASI as for any other reader.
+    held_newlines: set[int] = field(default_factory=set)
+    # The category of every code token, keyed by the offset of its last character.
+    ends: dict[int, str] = field(default_factory=dict)
+    # The offset of every name that heads a method definition: a function value, not a call.
+    method_heads: set[int] = field(default_factory=set)
+    # Every name being declared, by offset: "binding" after `const`/`let`/`var`, "function" for a
+    # declaration, "expression" for a named function expression, which names only its own body.
+    declared: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class _Frame:
+    """One open bracket, and for a ``{`` what it opened."""
+
+    char: str  # "(", "[" or "{"; "" for the outermost frame
+    kind: str = ""  # "{": "class", "object" or "block"; "(": "head", "for", "params" or ""
+    closes_value: bool = True  # whether the closing bracket ends a value
+    member: str = ""  # a class or object body's member state; "" in any other frame
+    name: int = -1  # where the member being read names itself, when an identifier does
+    modifier: str = ""
+    owner: _Frame | None = None  # a method body's class or object, or a static block's class
+    conditionals: int = 0  # `?` still awaiting their `:` in this frame
+
+
+@dataclass
+class _Scan:
+    """One forward read's state: the open brackets and what the last token left wanting."""
+
+    stack: list[_Frame]
+    cat: str = _END  # the previous token's category; the start reads as a statement's end
+    text: str = ";"
+    kw: str = ""  # the previous token's text when it acted as a keyword
+    cat2: str = _END  # the category and keyword before that
+    kw2: str = ""
+    newline: bool = False  # a line break since the previous token, a block comment's included
+    colon: str = ""  # what the last `:` was: "key", "cond" or "label"
+    classes: list[tuple[int, bool]] = field(default_factory=list)  # (depth, expression) per head
+    fn: int = 0  # 1 after `function`, 2 after its name: the next `(` opens parameters
+    fn_value: bool = False
+    params: _Frame | None = None  # a parameter list that just closed: a `{` next is its body
+
+
+class _Lexer:
+    """THE ONE FORWARD READ: blank literals and comments, and classify every token as it passes.
+
+    It replaces four readers that each answered "does an operand follow here?" by scanning back,
+    each in its own way, so that every repair to one opened a new misread in another. Reading
+    forward, a keyword is known to be a keyword (not a property, not a member's name), a brace's
+    kind is known when it opens, and a method head is known from the member state of the class or
+    object body around it -- so no reader has to reconstruct any of it from the text behind it.
+    """
+
+    def __init__(self, src: str, notes: _MaskNotes) -> None:
+        self.src = src
+        self.notes = notes
+        self.out = list(src)
+        self.record = True  # off inside a template: its interpolations are masked whole
+
+    def blank(self, start: int, stop: int, comment: bool = False) -> None:
+        if not self.record:
+            return
+        stop = min(stop, len(self.src))
+        if comment:
+            self.notes.comments.append((start, stop))
+        for k in range(start, stop):
+            if self.out[k] != "\n":
+                self.out[k] = " "
+            elif not comment:
+                self.notes.held_newlines.add(k)
+
+    def template(self, start: int) -> int:
+        """Index just past the template literal whose opening backtick is at ``start``.
+
+        Each ``${...}`` is lexed as code, so a quote or brace in a string, comment, nested
+        template or regex inside one is text and moves neither the scan nor the depth.
+        """
+        src, n = self.src, len(self.src)
+        record, self.record = self.record, False
+        try:
+            j = start + 1
+            while j < n:
+                c = src[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == "`":
+                    return j + 1
+                if c == "$" and src.startswith("{", j + 1):
+                    close = self.code(j + 2, nested=True)
+                    if record and close < n:
+                        self.notes.interps.append((j + 2, close))
+                    j = close + 1
+                    continue
+                j += 1
+            return n
+        finally:
+            self.record = record
+
+    def code(self, i: int, nested: bool = False) -> int:
+        """Lex code from ``i``; ``nested`` stops at the ``}`` closing an interpolation."""
+        src, n = self.src, len(self.src)
+        st = _Scan([_Frame("", "block")])
+        while i < n:
+            c = src[i]
+            if c.isspace():
+                st.newline = st.newline or c == "\n"
+                i += 1
+                continue
+            if src.startswith("//", i):
+                end = src.find("\n", i)
+                end = n if end == -1 else end
+                self.blank(i, end, comment=True)
+                i = end
+                continue
+            if src.startswith("/*", i):
+                end = src.find("*/", i + 2)
+                end = n if end == -1 else end + 2
+                st.newline = st.newline or "\n" in src[i:end]
+                self.blank(i, end, comment=True)
+                i = end
+                continue
+            if c in "'\"":
+                j = i + 1
+                while j < n and src[j] != c and src[j] != "\n":
+                    j += 2 if src[j] == "\\" else 1
+                end, kind = min(j + 1, n), "string"
+            elif c == "`":
+                end, kind = self.template(i), "template"
+            # A regex that does not close on its line is division, which keeps the scan in sync.
+            elif c == "/" and st.cat not in _VALUES and (closed := _regex_close(src, i)) != -1:
+                end, kind = closed + 1, "regex"
+            elif m := _WORD_RE.match(src, i):
+                end, kind = m.end(), "word"
+            elif c == "#" and (m := _WORD_RE.match(src, i + 1)):
+                end, kind = m.end(), "private"
+            elif (c.isdigit() or (c == "." and src[i + 1 : i + 2].isdigit())) and (
+                m := _NUMBER_RE.match(src, i)
+            ):
+                end, kind = m.end(), "number"
+            else:
+                m = _PUNCT_RE.match(src, i)
+                end, kind = (m.end() if m else i + 1), "punct"
+                if nested and c == "}" and not any(f.char == "{" for f in st.stack[1:]):
+                    return i
+            if kind in ("string", "template", "regex"):
+                self.blank(i, end)
+            self.token(st, i, end, kind)
+            i = end
+        return n
+
+    def token(self, st: _Scan, start: int, end: int, kind: str) -> None:
+        """Classify one token and move the bracket and member state past it."""
+        text = self.src[start:end]
+        top = st.stack[-1]
+        brk = st.newline and not _continues(st.cat, self.src, start)
+        if brk:
+            top.conditionals = 0  # an inserted `;` ends the statement and its conditionals
+        role = self.member(st, top, kind, text, start, brk) if top.member else ""
+        kw = ""
+        if kind != "punct":
+            cat = _VALUE
+            if kind == "word" and not role and st.text not in (".", "?."):
+                kw = self.keyword(st, top, text)
+                if kw in _RESTRICTED_WORDS:
+                    cat = _RESTRICTED
+                elif kw:
+                    cat = _OPERAND
+                elif self.record and st.fn == 1:
+                    self.notes.declared[start] = "expression" if st.fn_value else "function"
+                elif self.record and st.kw in ("const", "let", "var"):
+                    self.notes.declared[start] = "binding"
+            if kw == "class":
+                st.classes.append((len(st.stack), self.expression(st)))
+            elif kw == "function":
+                st.fn, st.fn_value = 1, self.expression(st)
+        elif text in _PAIRS:
+            cat = _END if text == "{" else _OPERAND
+            st.stack.append(self.open(st, top, text, role))
+        elif text in _CLOSERS:
+            cat = self.close(st, text)
+        elif text in _POSTFIX:
+            # A postfix only straight after a value: across a line break it is a prefix operator.
+            cat = _AFTER_POSTFIX if st.cat == _VALUE and not st.newline else _OPERAND
+        elif text == ";":
+            cat, top.conditionals = _END, 0
+            st.classes = [h for h in st.classes if h[0] < len(st.stack)]
+        else:
+            cat = _OPERAND
+            if text == "?":
+                top.conditionals += 1
+            elif text == ":":
+                if role == "colon":
+                    st.colon = "key"
+                elif top.conditionals:
+                    st.colon, top.conditionals = "cond", top.conditionals - 1
+                else:
+                    st.colon = "label"  # a label, or a `case` or `default`
+        if self.record:
+            self.notes.ends[end - 1] = cat
+        if st.fn and not (kw == "function" or text == "*" or (st.fn == 1 and kind == "word")):
+            st.fn = 0
+        elif st.fn == 1 and kind == "word" and not kw:
+            st.fn = 2
+        if text != ")":
+            st.params = None
+        st.cat2, st.kw2 = st.cat, st.kw
+        st.cat, st.text, st.kw, st.newline = cat, text, kw, False
+
+    @staticmethod
+    def keyword(st: _Scan, top: _Frame, word: str) -> str:
+        """``word`` if it acts as a keyword here, else "" for an identifier or a value word."""
+        if word == "of":  # a keyword only between a for-of head's binding and its iterable
+            return word if top.kind == "for" and st.cat == _VALUE else ""
+        return word if word in _RESERVED else ""
+
+    @staticmethod
+    def expression(st: _Scan) -> bool:
+        """Whether a ``class`` or ``function`` keyword here starts an expression."""
+        cat, kw = (st.cat2, st.kw2) if st.text == "async" else (st.cat, st.kw)
+        return cat in (_OPERAND, _RESTRICTED) and kw not in ("export", "else", "do")
+
+    def open(self, st: _Scan, top: _Frame, text: str, role: str) -> _Frame:
+        """The frame a bracket opens; ``role`` is what ``member`` said the bracket starts."""
+        if text == "[":
+            return _Frame("[")
+        if text == "(":
+            if role == "method":  # a method's parameters: its body ends a value in an object
+                return _Frame("(", "params", top.kind == "object", owner=top)
+            if st.fn:
+                return _Frame("(", "params", st.fn_value)
+            if st.kw == "for" or (st.kw == "await" and st.kw2 == "for"):
+                return _Frame("(", "for")
+            return _Frame("(", "head" if st.kw in _STATEMENT_HEADS else "")
+        if st.params is not None:  # a function or method body
+            return _Frame("{", "block", st.params.closes_value, owner=st.params.owner)
+        if role == "static":
+            return _Frame("{", "block", False, owner=top)
+        if st.text == "=>":
+            return _Frame("{", "block")
+        heads = st.classes
+        if heads and heads[-1][0] == len(st.stack) and (st.kw == "class" or st.cat == _VALUE):
+            return _Frame("{", "class", heads.pop()[1], member="start")
+        kind = self.brace_kind(st)
+        return _Frame("{", kind, kind == "object", member="start" if kind == "object" else "")
+
+    @staticmethod
+    def brace_kind(st: _Scan) -> str:
+        """Whether a ``{`` that opens neither a body nor a class opens an object or a block.
+
+        After a statement's end, a ``)`` or a value it opens a block -- a ``;`` is inserted ahead
+        of it after a value -- and after an operator it opens an object. After a ``:`` it takes
+        the colon's kind: an object key's or a conditional's value, or a label's or ``case``'s
+        statement. ``return`` and ``yield`` take a ``;`` at a line break, so a ``{`` on the next
+        line opens a block.
+        """
+        if st.cat == _END:
+            return "block"
+        if st.text == ":":
+            return "object" if st.colon in ("key", "cond") else "block"
+        if st.kw:
+            broken = st.cat == _RESTRICTED and st.newline
+            return "object" if st.kw in _EXPRESSION_WORDS and not broken else "block"
+        return "block" if st.cat in _VALUES else "object"
+
+    def close(self, st: _Scan, text: str) -> str:
+        opener = _OPENERS[text]
+        at = next((k for k in range(len(st.stack) - 1, 0, -1) if st.stack[k].char == opener), 0)
+        if not at:
+            return _VALUE  # unbalanced: `_match_bracket` reports it where a pricer needs it
+        fr = st.stack[at]
+        del st.stack[at:]
+        st.classes = [h for h in st.classes if h[0] <= len(st.stack)]
+        st.params = fr if fr.kind == "params" else None
+        if fr.kind in ("head", "for"):
+            return _END
+        if text in ")]":
+            return _VALUE
+        if fr.owner is not None:  # a method body or static block ends; the next member starts
+            fr.owner.member = "start" if fr.owner.kind == "class" else "after"
+        return _VALUE if fr.closes_value else _END
+
+    def member(self, st: _Scan, fr: _Frame, kind: str, text: str, start: int, brk: bool) -> str:
+        """Move a class or object body's member state past a token directly inside it.
+
+        Returns "key" for a token that names a member -- a reserved word there is a name --
+        "colon" for an object key's ``:``, "method" for a method's ``(`` and "static" for a static
+        block's ``{``. A name followed by ``(`` heads a method, which is
+        recorded; ``get``/``set``/``static``/``async`` modify the name after them, and are the
+        name themselves when ``(``, ``=``, ``:`` or the member's end follows.
+        """
+        cls = fr.kind == "class"
+        name = start + 1 if kind == "private" else start if kind == "word" else -1
+        while True:
+            state = fr.member
+            if state == "init":  # a field's initializer or a property's value
+                if not ((cls and (text == ";" or brk)) or (not cls and text == ",")):
+                    return ""
+                fr.member = "start"
+                if text in ";,":
+                    return ""
+                continue  # a line break ended the field: this token starts the next member
+            if state == "after":  # an object method's body has closed
+                if text == ",":
+                    fr.member = "start"
+                return ""
+            if state == "method":  # the parameter list closed; the body opens next
+                if text == "{":
+                    return ""
+                fr.member = "init"
+                continue
+            if state == "start":
+                if text in (";", "}"):
+                    return ""
+                if text == "*":
+                    fr.member = "star"
+                    return ""
+                if text == "[":
+                    fr.member, fr.name = "named", -1
+                    return ""
+                if kind not in _KEY_KINDS:
+                    fr.member = "init"  # a spread or other expression
+                    return ""
+                mods = _MODIFIERS[fr.kind]
+                fr.member = "mod" if kind == "word" and text in mods else "named"
+                fr.name, fr.modifier = name, text
+                return "key"
+            if state == "star":  # a generator's `*`: its name comes next
+                if kind in _KEY_KINDS:
+                    fr.member, fr.name = "named", name
+                    return "key"
+                fr.member, fr.name = ("named", -1) if text == "[" else ("init", fr.name)
+                return ""
+            if state == "mod":
+                if fr.modifier == "async" and st.newline:
+                    fr.member = "start"  # `async` then a line break is a field named async
+                    continue
+                if kind == "word" and text in _MODIFIERS[fr.kind]:
+                    fr.name, fr.modifier = name, text
+                    return "key"
+                if kind in _KEY_KINDS:
+                    fr.member, fr.name = "named", name
+                    return "key"
+                if text == "[":
+                    fr.member, fr.name = "named", -1
+                    return ""
+                if text == "*":
+                    fr.member = "star"
+                    return ""
+                if cls and fr.modifier == "static" and text == "{":
+                    fr.member = "method"
+                    return "static"
+                fr.member = "named"  # the modifier word names the member itself
+                continue
+            # "named": the member's name has been read
+            if text == "(":
+                if fr.name >= 0 and self.record:
+                    self.notes.method_heads.add(fr.name)
+                fr.member = "method"
+                return "method"
+            if text == ":" and not cls:
+                fr.member = "init"
+                return "colon"
+            if text == "=":
+                fr.member = "init"
+                return ""
+            if text == ("," if not cls else ";"):
+                fr.member = "start"
+                return ""
+            if text == "}":
+                return ""
+            if cls and brk:  # a field with no initializer, ended by a line break
+                fr.member = "start"
+                continue
+            fr.member = "init"
+            return ""
 
 
 def _regex_close(src: str, start: int) -> int:
@@ -401,153 +759,17 @@ def _regex_close(src: str, start: int) -> int:
     return -1
 
 
-def _template_end(src: str, start: int, interps: list[tuple[int, int]] | None = None) -> int:
-    """Index just past the template literal whose opening backtick is at ``start``.
-
-    Each top-level ``${...}`` span is appended to ``interps`` when given. A brace counts toward an
-    interpolation's depth only in code: one inside a string or a nested template is text, or a
-    ``${x ? '{' : ''}`` would never close and the rest of the file would mask with it.
-    """
-    n = len(src)
-    j = start + 1
-    while j < n:
-        c = src[j]
-        if c == "\\":
-            j += 2
-            continue
-        if c == "`":
-            return j + 1
-        if c == "$" and j + 1 < n and src[j + 1] == "{":
-            close = _interp_end(src, j + 2)
-            if interps is not None and close < n:
-                interps.append((j + 2, close))
-            j = close + 1
-            continue
-        j += 1
-    return n
-
-
-def _interp_end(src: str, start: int) -> int:
-    """Index of the ``}`` closing an interpolation whose body starts at ``start``, or ``len(src)``.
-
-    The body is code, so it is lexed as ``_mask`` lexes code: a quote or brace inside a comment,
-    a string, a nested template or a regex literal is text and moves neither the scan nor the depth.
-    """
-    n = len(src)
-    depth = 0
-    prev, prev_at = "", -1
-    j = start
-    while j < n:
-        c = src[j]
-        if c == "/" and j + 1 < n and src[j + 1] == "/":
-            end = src.find("\n", j)
-            j = n if end == -1 else end
-            continue
-        if c == "/" and j + 1 < n and src[j + 1] == "*":
-            end = src.find("*/", j + 2)
-            j = n if end == -1 else end + 2
-            continue
-        if c in "'\"":
-            j += 1
-            while j < n and src[j] != c and src[j] != "\n":
-                j += 2 if src[j] == "\\" else 1
-            j, prev = j + 1, "x"
-            continue
-        if c == "`":
-            j, prev = _template_end(src, j), "x"
-            continue
-        if c == "/" and _is_regex_position(prev, src, prev_at):
-            closed = _regex_close(src, j)
-            if closed != -1:
-                j, prev = closed + 1, "x"
-                continue
-        if not c.isspace():
-            prev, prev_at = c, j
-        if c == "{":  # an object or block inside the interpolation
-            depth += 1
-        elif c == "}":
-            if not depth:
-                return j
-            depth -= 1
-        j += 1
-    return n
-
-
 def _mask(src: str, notes: _MaskNotes | None = None) -> str:
     """Blank out comments, strings, template literals and regexes, PRESERVING length and newlines.
 
     Positions and line numbers in the masked text therefore address the original file exactly, so
     findings can be reported against real line numbers without a second mapping. ``notes``, when
-    given, collects interpolation and comment spans and the newlines a blanked span holds.
+    given, collects interpolation and comment spans, the newlines a blanked literal holds, and what
+    the lexer read of every token: its category and the method heads.
     """
-    out = list(src)
-    n = len(src)
-    i = 0
-    prev, prev_at = "", -1
-    notes = notes if notes is not None else _MaskNotes()
-
-    def blank(start: int, stop: int, comment: bool = False) -> None:
-        if comment:
-            notes.comments.append((start, min(stop, n)))
-        for k in range(start, min(stop, n)):
-            if out[k] != "\n":
-                out[k] = " "
-            else:
-                notes.held_newlines.add(k)
-
-    while i < n:
-        c = src[i]
-
-        if c == "/" and i + 1 < n and src[i + 1] == "/":
-            end = src.find("\n", i)
-            end = n if end == -1 else end
-            blank(i, end, comment=True)
-            i = end
-            continue
-
-        if c == "/" and i + 1 < n and src[i + 1] == "*":
-            end = src.find("*/", i + 2)
-            end = n if end == -1 else end + 2
-            blank(i, end, comment=True)
-            i = end
-            continue
-
-        if c in "'\"":
-            j = i + 1
-            while j < n:
-                if src[j] == "\\":
-                    j += 2
-                    continue
-                if src[j] == c or src[j] == "\n":
-                    break
-                j += 1
-            end = min(j + 1, n)
-            blank(i, end)
-            i, prev = end, "x"
-            continue
-
-        if c == "`":
-            # A template literal masks whole, `${...}` interpolations included, so no pricer sees
-            # a call inside one; re-entering code mode mid-string desynchronises far more often
-            # than it helps. The residue reads the recorded interpolation spans instead.
-            end = _template_end(src, i, notes.interps)
-            blank(i, end)
-            i, prev = end, "x"
-            continue
-
-        if c == "/" and _is_regex_position(prev, src, prev_at):
-            closed = _regex_close(src, i)
-            if closed != -1:
-                blank(i, closed + 1)
-                i, prev = closed + 1, "x"
-                continue
-            # Did not close on its line: treat as division and keep the scan in sync.
-
-        if not c.isspace():
-            prev, prev_at = c, i
-        i += 1
-
-    return "".join(out)
+    lexer = _Lexer(src, notes if notes is not None else _MaskNotes())
+    lexer.code(0)
+    return "".join(lexer.out)
 
 
 # --------------------------------------------------------------------------------------------
@@ -604,7 +826,7 @@ def _has_spread(ctx: _Ctx, parts: list[tuple[int, int]]) -> bool:
 
 def _is_declared_at(ctx: _Ctx, i: int) -> bool:
     """Whether the name at ``i`` is being DECLARED there rather than referenced."""
-    return _DECLARED_BEFORE_RE.search(ctx.masked, max(0, i - 16), i) is not None
+    return i in ctx.declared
 
 
 def _word_re(name: str) -> re.Pattern[str]:
@@ -618,15 +840,8 @@ def _declaration_count(ctx: _Ctx, name: str) -> int:
     A named function EXPRESSION (``const review = function review(r) {...}``) names its own body
     rather than declaring a second binding, so ``function NAME`` counts only in statement position.
     """
-    count = 0
-    for m in _word_re(name).finditer(ctx.masked):
-        lo = max(0, m.start() - 16)
-        kw = _DECLARED_BEFORE_RE.search(ctx.masked, lo, m.start())
-        if kw and not (
-            kw.group().startswith("function") and not _is_statement_start(ctx, kw.start())
-        ):
-            count += 1
-    return count
+    found = (ctx.declared.get(m.start()) for m in _word_re(name).finditer(ctx.masked))
+    return sum(1 for kind in found if kind in ("binding", "function"))
 
 
 def _first_assignment(ctx: _Ctx, name: str) -> int | None:
@@ -741,7 +956,8 @@ def _skip_space(text: str, i: int) -> int:
 
 def _expr_end(ctx: _Ctx, i: int) -> int:
     """End of an expression-bodied arrow starting at ``i``: a top-level ``;``/``,``/closer, or a
-    line break that neither the line before nor the line after continues."""
+    line break that neither the line before nor the line after continues, a line break held in a
+    block comment included."""
     masked, raw = ctx.masked, ctx.code
     depth = 0
     for j in range(i, len(masked)):
@@ -757,30 +973,9 @@ def _expr_end(ctx: _Ctx, i: int) -> int:
         elif depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
             nxt = _NONSPACE_RE.search(raw, j)
             last = i + len(raw[i:j].rstrip()) - 1
-            if nxt is None or not _line_continues(ctx, last, nxt.start()):
+            if nxt is None or not _continues(ctx.ends.get(last, _VALUE), raw, nxt.start()):
                 return j
     return len(masked)
-
-
-def _line_continues(ctx: _Ctx, last: int, nxt: int) -> bool:
-    """Whether an expression whose line ends at ``last`` goes on at ``nxt``, the next line's code.
-
-    THE ONE CONTINUATION TEST. A line ending in an operator awaits its operand, whatever the next
-    line opens with. Otherwise the next line continues it only by opening with a binary operator: a
-    ``++``/``--`` there is a prefix operator after an inserted ``;``, and a postfix result cannot be
-    called, indexed or dotted, so ASI splits before ``(``, ``[`` and ``.`` after one.
-    """
-    raw = ctx.code
-    leads = not raw.startswith(_POSTFIX, nxt) and _LEADS_ON_RE.match(raw, nxt) is not None
-    if _ends_postfix(raw, last):
-        return leads and raw[nxt] not in "([."
-    # The mask blanks a regex literal, so a `/` it kept is division, not a regex's closing slash.
-    if raw[last] in _OPERATOR_TAIL and ctx.masked[last] == raw[last]:
-        return True
-    # `typeof`/`in` await an operand too.
-    if _keyword_ending_at(raw, last) in _LINE_OPERAND_WORDS:
-        return True
-    return leads
 
 
 def _function_body(ctx: _Ctx, open_paren: int) -> tuple[int, int] | None:
@@ -834,30 +1029,6 @@ def _bound_function_body(ctx: _Ctx, i: int) -> tuple[int, int] | None:
     return _arrow_body(ctx, arrow + 2)
 
 
-def _is_statement_start(ctx: _Ctx, i: int) -> bool:
-    """Whether ``function`` at ``i`` begins a declaration rather than an expression in place.
-
-    ``R.map(function review(r) {...})`` names a function it never calls by name; registering it
-    as a helper would skip its body and price the fan at zero.
-    """
-    raw = ctx.code
-    k = i - 1
-    while True:
-        newline = False
-        while k >= 0 and raw[k].isspace():
-            newline = newline or raw[k] == "\n"
-            k -= 1
-        if k < 0:
-            return True
-        w = k
-        while w >= 0 and (raw[w].isalnum() or raw[w] in "_$"):
-            w -= 1
-        if raw[w + 1 : k + 1] in ("async", "export", "default"):
-            k = w
-            continue
-        return raw[k] in ";{}" or (newline and raw[k] not in _EXPECTS_OPERAND)
-
-
 def _collect_helpers(ctx: _Ctx) -> None:
     """Find every named function, so its body is priced where it is CALLED (BACKLOG #5602).
 
@@ -869,9 +1040,10 @@ def _collect_helpers(ctx: _Ctx) -> None:
     found: dict[str, list[_Helper]] = {}
     bodies: list[tuple[int, int]] = []
     for m in _FUNCTION_DECL_RE.finditer(ctx.masked):
-        # `export default function main` is the entry point the runtime calls, not a helper.
-        entry = _EXPORT_DEFAULT_RE.search(ctx.code, max(0, m.start() - 32), m.start())
-        statement = _is_statement_start(ctx, m.start()) and entry is None
+        # `R.map(function review(r) {...})` names a function it never calls by name; registering
+        # it as a helper would skip its body and price the fan at zero. The lexer reads
+        # `export default function main`, the entry point the runtime calls, as an expression too.
+        statement = ctx.declared.get(m.start(1)) == "function"
         span = _function_body(ctx, m.end() - 1) if statement else None
         if span:
             found.setdefault(m.group(1), []).append(_Helper(m.start(1), *span))
@@ -1061,11 +1233,9 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
             pos = m.end()  # `function review(` names a function, registered or not; not a call
             continue
         # `{ review(r) {...} }` or `get review() {` defines a method of the same name: a function
-        # value, not a call.
-        method_head = bool(helper) and _is_method_head(ctx, m.start(), m.end() - 1)
-        if method_head:
-            ctx.def_names.add(m.start())
-        elif helper or hook:
+        # value, not a call. The lexer read which names head a method.
+        method_head = bool(helper) and m.start() in ctx.method_heads
+        if (helper or hook) and not method_head:
             open_idx = m.end() - 1
             close = _match_bracket(ctx.masked, open_idx)
             if close == -1 or close > end:
@@ -1092,162 +1262,6 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
         total = total + _price_loop(ctx, m)
         pos = _loop_head(ctx, m.end())[3]
     return total
-
-
-def _is_method_head(ctx: _Ctx, name_start: int, open_idx: int) -> bool:
-    """Whether ``name(...)`` at ``open_idx`` defines a method rather than calling a helper.
-
-    Decided from what PRECEDES the name: a member position, directly inside a class body or first
-    or after a comma in an object literal, a ``get``/``set``/``static``/``async``/``*`` prefix
-    allowed, with a block after the parameters on any line. Anywhere else a block after the call is
-    a statement of its own, and ``class A extends mixin(B) {`` calls ``mixin`` however much comment
-    or indentation sits between ``extends`` and the name.
-    """
-    close = _match_bracket(ctx.masked, open_idx)
-    if close == -1 or _block_body(ctx, close + 1) is None:
-        return False
-    brace = _enclosing_open(ctx.masked, name_start)
-    if brace == -1 or ctx.masked[brace] != "{":
-        return False
-    kind = _brace_kind(ctx, brace)
-    if kind == "block":
-        return False
-    code = ctx.code
-    k = _prev_code(code, name_start)
-    while k >= 0:
-        if code[k] == "*":
-            k = _prev_code(code, k)
-        elif _keyword_ending_at(code, k) in _MODIFIERS:
-            k = _prev_code(code, _word_ending_at(code, k)[1])
-        else:
-            break
-    if kind == "object":
-        return k >= 0 and code[k] in "{,"
-    # Not in a field's initializer, and not a class expression's heritage held in one.
-    return not _awaits_operand(ctx, k) and _keyword_ending_at(code, k) != "extends"
-
-
-def _awaits_operand(ctx: _Ctx, k: int) -> bool:
-    """Whether the code character at ``k`` is an operator still waiting for its operand.
-
-    Not a regex literal's closing ``/``, which the mask blanked, and not a postfix ``++``/``--``:
-    both end a value.
-    """
-    c = ctx.code[k]
-    return c in _EXPECTS_OPERAND and ctx.masked[k] == c and not _ends_postfix(ctx.code, k)
-
-
-def _prev_code(code: str, i: int) -> int:
-    """Index of the last code character before ``i`` in the comment-blanked text, or -1."""
-    k = i - 1
-    while k >= 0 and code[k].isspace():
-        k -= 1
-    return k
-
-
-def _enclosing_open(masked: str, i: int) -> int:
-    """Index of the innermost bracket still open at ``i``, or -1 at the top level."""
-    depth = 0
-    for k in range(i - 1, -1, -1):
-        c = masked[k]
-        if c in _CLOSERS:
-            depth += 1
-        elif c in _PAIRS:
-            if not depth:
-                return k
-            depth -= 1
-    return -1
-
-
-def _after_conditional(ctx: _Ctx, colon: int) -> bool:
-    """Whether the ``:`` at ``colon`` closes a conditional's ``?`` branch in the same statement.
-
-    Walks back over balanced brackets to the enclosing bracket, a ``;``, or a line break where
-    ``_line_continues`` says a ``;`` is inserted, so an earlier statement's conditional does not
-    claim a later ``case`` or label. Each ``:`` passed on the way pairs with the next ``?``, so
-    ``case a ? 1 : 2:`` closes the ``case``. ``?.`` and ``??`` are not a conditional's ``?``.
-    """
-    masked, code = ctx.masked, ctx.code
-    depth = pending = 0
-    for k in range(colon - 1, -1, -1):
-        c = masked[k]
-        if c in _CLOSERS:
-            depth += 1
-        elif c in _PAIRS:
-            if not depth:
-                return False
-            depth -= 1
-        elif depth == 0 and c == ";":
-            return False
-        elif depth == 0 and c == "\n" and k not in ctx.held_newlines:
-            last, nxt = _prev_code(code, k), _NONSPACE_RE.search(code, k)
-            if last >= 0 and nxt is not None and not _line_continues(ctx, last, nxt.start()):
-                return False
-        elif depth == 0 and c == ":":
-            pending += 1
-        elif depth == 0 and c == "?":
-            after, before = masked[k + 1 : k + 2], masked[k - 1 : k] if k else ""
-            chain = after == "." and not masked[k + 2 : k + 3].isdigit()  # `c ?.5 : d`
-            if after != "?" and not chain and before != "?":
-                if not pending:
-                    return True
-                pending -= 1
-    return False
-
-
-def _brace_kind(ctx: _Ctx, brace: int) -> str:
-    """Whether the ``{`` at ``brace`` opens a ``"class"`` body, an ``"object"`` or a ``"block"``.
-
-    Read from what precedes it. A class head is walked back across lines and over the brackets of
-    its heritage until ``class`` or a word no head can hold. Otherwise a ``{`` after a statement's
-    end, a ``)``, an arrow or ``else``/``do``/``try``/``finally`` opens a block, a ``:`` takes the
-    kind of the braces around it (an object's property, or a label or ``case``), and one after an
-    operator or an expression keyword opens an object.
-    """
-    code, masked = ctx.code, ctx.masked
-    before = k = _prev_code(code, brace)
-    while k >= 0:
-        if code[k] in ")]":
-            k = _match_bracket_back(masked, k, 0)
-            if k == -1:
-                break
-            k = _prev_code(code, k)
-            continue
-        if code[k] == ".":  # `extends ns.Base`, or `ns?.Base`
-            k = _prev_code(code, k - 1 if code[k - 1 : k] == "?" else k)
-            continue
-        word, start = _word_ending_at(code, k)
-        if not word:
-            break
-        keyword = _keyword_ending_at(code, k)
-        if keyword == "class":
-            return "class"
-        if keyword in _HEAD_STOP:
-            break
-        k = _prev_code(code, start)
-    k = before
-    if k < 0:
-        return "block"
-    c = code[k]
-    if c in ";{})" or code.startswith("=>", k - 1):
-        return "block"
-    if c == ":":
-        outer = _enclosing_open(masked, k)
-        if (outer != -1 and masked[outer] != "{") or _after_conditional(ctx, k):
-            return "object"  # a conditional's branch
-        if outer == -1:
-            return "block"  # a label
-        # A property's value inside an object; a label or a `case` inside a block.
-        return "object" if _brace_kind(ctx, outer) == "object" else "block"
-    if _word_ending_at(code, k)[0]:
-        # A property is a value. `return` and `yield` take a `;` at a line break, so a `{` on the
-        # next line opens a block.
-        keyword = _keyword_ending_at(code, k)
-        restricted = keyword in _RESTRICTED_WORDS and "\n" in code[k:brace]
-        return "object" if keyword in _EXPRESSION_WORDS and not restricted else "block"
-    # After an operator or a spread's dots an operand is due; after any other value, a `;` is
-    # inserted ahead of the `{` and it opens a block.
-    return "object" if c == "." or _awaits_operand(ctx, k) else "block"
 
 
 def _invoked_in_place(ctx: _Ctx, body_end: int) -> bool:
@@ -1281,8 +1295,8 @@ def _function_value_end(ctx: _Ctx, m: re.Match[str]) -> int:
         if span is None or _invoked_in_place(ctx, span[1]):
             return m.end()
         return span[1]
-    if m.group("method") in _KEYWORDS or _is_declared_at(ctx, m.start()):
-        return m.end()  # `function main(` was already judged at its `function` keyword
+    if m.start() not in ctx.method_heads:
+        return m.end()  # a call; `function main(` was already judged at its `function` keyword
     close = _match_bracket(ctx.masked, m.end() - 1)
     span = _block_body(ctx, close + 1) if close != -1 else None  # `review(r) { ... }`
     return span[1] if span else m.end()
@@ -1504,6 +1518,7 @@ def _residue(ctx: _Ctx) -> tuple[Unknown, ...]:
         if (
             m.start() in ctx.attributed
             or m.start() in ctx.def_names
+            or m.start() in ctx.method_heads  # names a method, wherever the scan reached
             or _is_declared_at(ctx, m.start())
         ):
             continue
@@ -1554,6 +1569,9 @@ def price_script(source: str) -> Cost:
         masked=masked,
         interps=notes.interps,
         held_newlines=notes.held_newlines,
+        ends=notes.ends,
+        method_heads=notes.method_heads,
+        declared=notes.declared,
         code="".join(chars),
     )
     ctx.widths, ctx.unstable = _collect_array_widths(ctx)
