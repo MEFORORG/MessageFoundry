@@ -2706,7 +2706,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 #: The staging directory prefixes. The sweep looks for these and nothing else.
 _BACKUP_STAGING_PREFIX = "mefor-backup-"
 _VERIFY_STAGING_PREFIX = "mefor-verify-"
-_SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX)
+#: A restore's, beside its destination (BACKLOG #5617): locked, torn down and swept like the other two.
+_RESTORE_STAGING_PREFIX = "mefor-restore-"
+_SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX, _RESTORE_STAGING_PREFIX)
 #: The probe :func:`_probe_owner` makes to learn the owner a new entry gets: an empty file. Never a
 #: staging directory; a leaked one is empty, and the sweep removes it only while it is empty. The
 #: sweep also removes an empty probe-named directory by ``rmdir`` alone.
@@ -4624,30 +4626,25 @@ def _restore_blocking(
     # rather than `except` for the rollback: nothing is caught on its account, so no failure mode is
     # missed -- a cancelled or interrupted restore rolls back too.
     #
-    # `completed` flips on the LAST LINE INSIDE the staging block, not after the block closes, and
-    # the difference is the regression this ordering exists to prevent. What runs between the two is
-    # the staging directory's own teardown, and `TemporaryDirectory` raises when that fails. A flag
-    # set after the block read the failed teardown as a failed restore and rolled back a store that
-    # was placed, verified and published -- the one outcome worse than the leftover it was reporting.
-    # So the teardown failure is its own arm below: reported, never rolled back.
+    # `completed` flips on the LAST LINE INSIDE the staging block, before the staging directory is
+    # torn down. A flag set after the teardown would read a failed teardown as a failed restore and
+    # roll back a store that was placed, verified and published -- the one outcome worse than the
+    # leftover it was reporting. So a teardown that leaves the directory is reported, never rolled
+    # back.
     published = False
     completed = False
     config_written: list[Path] = []
-    staging: Path | None = None
     try:
-        # Inside the `try`, so a parent that cannot be made meets the `staging is None` refusal
-        # below, and the `finally` removes what the mkdir made before it failed.
-        staging_parent.mkdir(parents=True, exist_ok=True)
         # Stage on the DESTINATION volume, not the system temp dir: the extracted store is then placed
         # by a hard link rather than a second multi-GB copy, and the decrypted PHI never lands on a
         # shared temp volume that may be less protected than the store's own.
         #
         # "Less protected than the store's own" is a claim about the VOLUME, and it does not carry to
-        # the files. `TemporaryDirectory` restricts the directory on POSIX, and on Windows under Python
-        # 3.13+ writes its own protected DACL (SYSTEM, Administrators, OWNER RIGHTS -- measured on
-        # 3.14.6) rather than inheriting the parent's. The files staged inside it are the whole
-        # decrypted archive and, on the store route, the whole extracted store. Both can be full-body
-        # PHI at rest (docs/PHI.md section 3), the archive on the config-only route too when a
+        # the files. `_open_staging` refuses a directory that did not come out owner-only: `mkdtemp`
+        # restricts it on POSIX, and on Windows under Python 3.13+ writes its own protected DACL
+        # (SYSTEM, Administrators, OWNER RIGHTS -- measured on 3.14.6) rather than inheriting the
+        # parent's. The files staged inside it are the whole decrypted archive and, on the store
+        # route, the whole extracted store. Both can be full-body PHI at rest (docs/PHI.md section 3), the archive on the config-only route too when a
         # store-carrying archive is decrypted whole before it is refused, and an archive can also
         # carry a config bundle that holds secrets. So each is handed to the store's own `_secure_file` the
         # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
@@ -4657,8 +4654,27 @@ def _restore_blocking(
         # a file carries the temp directory's entries explicitly (it removes inherited entries only;
         # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
         # published DACL. A follow-up recorded in ADR 0163.
-        with tempfile.TemporaryDirectory(prefix="mefor-restore-", dir=staging_parent) as tmp:
-            staging = Path(tmp)
+        #
+        # Staged under the backup's and verify's lock-and-sweep, not in a `TemporaryDirectory`
+        # (BACKLOG #5617). That `__exit__` raised when one unlink was refused (on Windows, a scanner
+        # holding the extracted store open) and left the whole decrypted archive behind, with no
+        # later run that would ever remove it. `release` never raises; a directory it cannot remove
+        # has its files emptied where they can be, keeps its lock file and marker, and the next
+        # restore, backup or verify that sweeps this directory removes it. `_open_staging` makes
+        # `staging_parent`, inside the `try`, so the `finally` removes what that made before it
+        # failed.
+        try:
+            work = _open_staging(staging_parent, _RESTORE_STAGING_PREFIX, secure=True)
+        except StagingNotPrivateError as exc:
+            raise BackupError("destination", safe_exc(exc)) from exc
+        except OSError as exc:
+            # The staging directory itself could not be made (an unwritable parent, say), so
+            # nothing was decrypted or written: a refusal line, not a traceback.
+            raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
+        staging = work.path
+        try:
+            # Before the decrypt, so a dead run's plaintext is gone before this one needs the space.
+            _sweep_abandoned_staging(staging_parent, owner=work.owner(), own=staging)
             tar_path = staging / "archive.tar"
             with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as tar_fh:
                 src = _HashingReader(raw_src)
@@ -4806,7 +4822,7 @@ def _restore_blocking(
                 # forged archive from exhausting the staging dir (ASVS 5.2.3). `secure` locks the
                 # extracted store to its owner before the first byte lands (see the block comment
                 # above the staging directory).
-                snap = _extract_member(tar_path, _STORE_MEMBER, Path(tmp), secure=True)
+                snap = _extract_member(tar_path, _STORE_MEMBER, staging, secure=True)
             except tarfile.TarError as exc:
                 raise BackupError("restore", safe_exc(exc)) from exc
             if snap is None:
@@ -4884,50 +4900,43 @@ def _restore_blocking(
                 )
             # The restore is whole from here. Nothing after this line may roll it back.
             completed = True
-    except OSError as exc:
-        if staging is None:
-            # The staging directory itself could not be made (an unwritable parent, say), so
-            # nothing was decrypted or written: a refusal line, not a traceback.
-            raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
-        if not completed:
-            # A refusal already leaving the block, found anywhere in the chain: an OSError raised
-            # on its way out (the staging teardown, whose rmtree retry chains its own first
-            # failure, or a close-time flush) would otherwise replace it with a traceback.
-            refusal = _refusal_in_flight(exc)
-            if refusal is None:
+        except BaseException as exc:
+            leftover = work.release()
+            refusal: BaseException = exc
+            if isinstance(exc, OSError):
                 # No refusal behind it: the OSError is the failure itself, such as a full volume
                 # mid-decrypt. A refusal line rather than a traceback, on both routes; the
                 # `finally` still rolls back what was published.
-                raise BackupError("restore", f"the restore failed: {safe_exc(exc)}") from exc
-            if not staging.exists():
-                raise refusal from exc
-            # The teardown failed, and the directory holds decrypted archive content.
-            raise BackupError(
-                refusal.kind,
-                f"{str(refusal).rstrip('.')}. Separately, the restore's own staging directory "
-                f"{staging}, beside the destination, could not be removed ({safe_exc(exc)}) and "
-                "still holds decrypted archive content: delete it by hand once nothing holds it "
-                "open",
-            ) from refusal
-        # Only the staging directory's teardown runs after `completed`, so an OSError here IS that
-        # teardown failing (on Windows, a scanner or the indexer still holding the extracted store
-        # open). The store and bundle are intact; what is left is the plaintext staging directory,
-        # which its own remover just failed to delete. A BackupError, so the CLI prints a refusal
-        # line rather than a traceback, and a kind of its own, so the line does not read as the
-        # restore having failed. The `finally` below sees `completed` and leaves the restore alone.
-        intact: list[str] = []
-        if dest_store_path is not None:
-            intact.append(f"the restored store at {dest_store_path}")
-        if config_dest is not None:
-            intact.append(f"the config bundle at {config_dest}")
-        held = "archive and store" if dest_store_path is not None else "archive"
-        raise BackupError(
-            "cleanup",
-            f"the restore completed, but its staging directory {staging} could not be removed: "
-            f"{safe_exc(exc)}. Intact: {', and '.join(intact)}. The staging "
-            f"directory still holds the decrypted {held}: delete it by hand once nothing "
-            "holds it open. Do not re-run the restore; the destination is now in use.",
-        ) from exc
+                refusal = BackupError("restore", f"the restore failed: {safe_exc(exc)}")
+            if leftover is not None:
+                if isinstance(refusal, BackupError):
+                    refusal = BackupError(
+                        refusal.kind, f"{str(refusal).rstrip('.')}. Separately, {leftover}"
+                    )
+                else:
+                    exc.add_note(leftover)
+            if refusal is exc:
+                raise
+            raise refusal from exc
+        finally:
+            # On the exception path `release` already ran above and this returns None, so only a
+            # restore that completed reaches the refusal below. The store and bundle are intact;
+            # what is left is the staging directory, which its own remover could not delete. A
+            # BackupError, so the CLI prints a refusal line rather than a traceback, and a kind of
+            # its own, so the line does not read as the restore having failed. The outer `finally`
+            # sees `completed` and leaves the restore alone.
+            leftover = work.release()
+            if leftover is not None:
+                intact: list[str] = []
+                if dest_store_path is not None:
+                    intact.append(f"the restored store at {dest_store_path}")
+                if config_dest is not None:
+                    intact.append(f"the config bundle at {config_dest}")
+                raise BackupError(
+                    "cleanup",
+                    f"the restore completed, but {leftover}. Intact: {', and '.join(intact)}. "
+                    "Do not re-run the restore; the destination is now in use.",
+                )
     finally:
         if published and not completed:
             _discard_partial_restore(dest_store_path, config_written)
@@ -4958,18 +4967,6 @@ def _staging_refusal(parent: Path, anchor: Path, exc: OSError) -> str:
         f"The restore stages the decrypted archive there, beside {anchor}, so that directory must "
         "exist or be creatable, and be writable. Nothing was decrypted"
     )
-
-
-def _refusal_in_flight(exc: BaseException) -> BackupError | None:
-    """The first :class:`BackupError` in ``exc``'s ``__context__`` chain, or ``None``."""
-    seen: set[int] = set()
-    link = exc.__context__
-    while link is not None and id(link) not in seen:
-        if isinstance(link, BackupError):
-            return link
-        seen.add(id(link))
-        link = link.__context__
-    return None
 
 
 def _missing_dirs(*paths: Path | None) -> list[Path]:

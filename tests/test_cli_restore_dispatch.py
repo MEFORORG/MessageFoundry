@@ -15,14 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import errno
 import inspect
 import io
 import json
 import os
 import shutil
 import tarfile
-import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -725,7 +723,7 @@ def test_restore_rollback_in_the_one_directory_form_never_reaches_the_staging_di
     # before the staging directory existed -- deletes the live staging directory out from under the
     # restore. The rollback must therefore run only after the staging directory is gone, and must
     # delete only what the restore recorded writing. Both are observed AT THE CALL, through a spy,
-    # because the end state alone cannot tell the two designs apart: `TemporaryDirectory` tolerates
+    # because the end state alone cannot tell the two designs apart: the teardown tolerates
     # its directory having been removed from under it, so the wrong design leaves the same tree.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     d = tmp_path / "dr"
@@ -745,7 +743,7 @@ def test_restore_rollback_in_the_one_directory_form_never_reaches_the_staging_di
     assert "member-count cap" in _refusal(capsys)
 
     # Exactly one rollback, and when it ran the staging directory no longer existed: the cleanup runs
-    # AFTER `TemporaryDirectory` has unlinked it, so it could not have been the thing that removed it.
+    # AFTER the staging teardown has removed it, so it could not have been the thing that removed it.
     assert len(calls) == 1, calls
     names_at_call, ledger = calls[0]
     assert not any(n.startswith("mefor-restore-") for n in names_at_call), names_at_call
@@ -803,32 +801,19 @@ def test_discard_partial_restore_removes_only_the_recorded_paths(tmp_path) -> No
     assert sorted(p.name for p in d.iterdir()) == ["mefor-restore-bystander", "shared"]
 
 
-_REAL_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory
+def _restore_staging_that_cannot_be_removed(mp: pytest.MonkeyPatch) -> None:
+    """Make every removal of a RESTORE staging directory fail, as a scanner holding a file open in it
+    does on Windows, with the retry schedule cut to nothing. The backup that builds the fixture
+    archive stages under ``mefor-backup-`` and is not touched."""
+    real_remove = dr_backup._remove_tree
 
+    def refuse(path: Path) -> bool:
+        if path.name.startswith("mefor-restore-"):
+            return False
+        return real_remove(path)
 
-class _StagingWhoseTeardownFails:
-    """The restore's staging directory, with the teardown that fails on Windows whenever a scanner or
-    the indexer still holds the just-extracted store open: the directory is created and handed out as
-    usual, and on exit its removal raises ``PermissionError`` and leaves it behind, exactly as a real
-    ``TemporaryDirectory`` does when ``rmtree`` cannot delete an open file. Holding a handle would
-    reproduce that on Windows alone; raising from the exit reproduces it everywhere."""
-
-    def __init__(self, *, prefix: str, dir: Path) -> None:
-        self.name = tempfile.mkdtemp(prefix=prefix, dir=dir)
-
-    def __enter__(self) -> str:
-        return self.name
-
-    def __exit__(self, *exc: object) -> None:
-        raise PermissionError(errno.EACCES, "another process holds a file in it open", self.name)
-
-
-def _staging_that_cannot_be_removed(*args, **kwargs):
-    """Intercept the RESTORE's staging directory only, by its prefix; every other caller (the backup
-    that builds the fixture archive stages under ``mefor-backup-``) gets the real class."""
-    if kwargs.get("prefix") == "mefor-restore-":
-        return _StagingWhoseTeardownFails(**kwargs)
-    return _REAL_TEMPORARY_DIRECTORY(*args, **kwargs)
+    mp.setattr(dr_backup, "_remove_tree", refuse)
+    mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
 
 
 def test_restore_keeps_a_whole_restore_when_its_staging_teardown_fails(
@@ -852,7 +837,7 @@ def test_restore_keeps_a_whole_restore_when_its_staging_teardown_fails(
         real_discard(dest_store_path, written)
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(tempfile, "TemporaryDirectory", _staging_that_cannot_be_removed)
+        _restore_staging_that_cannot_be_removed(mp)
         mp.setattr(dr_backup, "_discard_partial_restore", spy)
         rc = main(_restore_argv(archive, toml, dest, config_dest))
     # Reported, as a refusal line and not a traceback, under a kind that does not say the restore
@@ -1334,14 +1319,14 @@ def test_restore_config_only_route_stages_beside_a_dot_config_to(
     here.mkdir()
     monkeypatch.chdir(here)
     staged_in: list[Path] = []
-    real = tempfile.TemporaryDirectory
+    real = dr_backup._open_staging
 
-    def spy(*args, **kwargs):
-        if kwargs.get("prefix") == "mefor-restore-":
-            staged_in.append(Path(kwargs["dir"]).resolve())
-        return real(*args, **kwargs)
+    def spy(root: Path, prefix: str, *, secure: bool):
+        if prefix == "mefor-restore-":
+            staged_in.append(Path(root).resolve())
+        return real(root, prefix, secure=secure)
 
-    monkeypatch.setattr(tempfile, "TemporaryDirectory", spy)
+    monkeypatch.setattr(dr_backup, "_open_staging", spy)
     assert main([*_config_only_argv(str(tar), toml, Path(".")), "--allow-old-archive"]) == 0
     assert staged_in == [tmp_path.resolve()], staged_in
     assert sorted(p.name for p in here.iterdir()) == ["feed.py"]
@@ -1541,41 +1526,11 @@ def test_restore_config_members_refuses_a_member_that_ends_early(tmp_path) -> No
     assert dr_backup._restore_config_members(tar, tmp_path / "cfg-whole") == 1
 
 
-def test_a_refusal_survives_a_staging_teardown_that_fails(tmp_path, capsys, monkeypatch) -> None:
-    # On Windows a scanner holding the staged archive makes the teardown raise. That OSError used to
-    # replace the refusal leaving the block, so the operator got a traceback. The refusal stands,
-    # and names the leftover.
-    tar = _undated_config_only_tar(tmp_path)
-    toml = _service_toml(tmp_path, key_b64=None)
-    real = tempfile.TemporaryDirectory
-    left: list[str] = []
-
-    class HeldOpen(real):  # type: ignore[valid-type,misc]
-        def cleanup(self) -> None:
-            left.append(self.name)
-            self._finalizer.detach()  # removed by hand below, not at GC
-            # The rmtree retry's shape: its own first failure is the context of the one that
-            # escapes, so the refusal sits two links down the chain, not one.
-            try:
-                raise PermissionError(13, "first attempt refused", self.name)
-            except PermissionError:
-                raise PermissionError(13, "held open by a scanner", self.name) from None
-
-    monkeypatch.setattr(tempfile, "TemporaryDirectory", HeldOpen)
-    assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
-    err = _refusal(capsys)
-    assert "restore failed (age_undated)" in err and "Nothing was written" in err, err
-    assert "could not be removed" in err and "mefor-restore-" in err, err
-    assert ".." not in err.replace(str(tmp_path), ""), err
-    assert "Traceback" not in err, err
-    assert len(left) == 1 and Path(left[0]).is_dir()
-    shutil.rmtree(left[0])
-
-
 @pytest.mark.skipif(os.name != "nt", reason="only Windows refuses to delete an open file")
 def test_a_refusal_survives_a_real_held_open_staging_file(tmp_path, capsys, monkeypatch) -> None:
-    # The real shape, not a stand-in: a handle on the staged archive makes TemporaryDirectory's
-    # rmtree fail with its own retry chained in front of the refusal.
+    # The real shape, not a stand-in: a handle on the staged archive makes the teardown's rmtree
+    # fail. The refusal stands, and the archive the handle holds is emptied in place (BACKLOG #5617):
+    # Python's own `open` shares write access, so the truncate succeeds where the unlink cannot.
     tar = _undated_config_only_tar(tmp_path)
     toml = _service_toml(tmp_path, key_b64=None)
     handles: list = []
@@ -1592,10 +1547,109 @@ def test_a_refusal_survives_a_real_held_open_staging_file(tmp_path, capsys, monk
         for fh in handles:
             fh.close()
     err = _refusal(capsys)
-    assert "restore failed (age_undated)" in err and "could not be removed" in err, err
-    assert "Traceback" not in err, err
-    for leftover in tmp_path.glob("mefor-restore-*"):
-        shutil.rmtree(leftover)
+    assert "restore failed (age_undated)" in err and "Traceback" not in err, err
+    (leftover,) = tmp_path.glob("mefor-restore-*")
+    assert (leftover / "archive.tar").stat().st_size == 0
+    shutil.rmtree(leftover)
+
+
+def test_a_restore_staging_leftover_holds_no_plaintext_and_is_swept(
+    tmp_path, key_b64, capsys
+) -> None:
+    # BACKLOG #5617. The restore staged the decrypted archive and the extracted store in a
+    # `TemporaryDirectory`, outside the lock-and-sweep the backup and verify stage under. When its
+    # teardown failed, the whole decrypted archive stayed on the destination volume at full size,
+    # and no later run would ever remove it. It now stages like a verify: a failed teardown empties
+    # what it can, keeps the directory marked, and the next run's sweep removes it.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    with pytest.MonkeyPatch.context() as mp:
+        _restore_staging_that_cannot_be_removed(mp)
+        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
+    err = _refusal(capsys)
+    assert "restore failed (cleanup)" in err and "Traceback" not in err, err
+    leftovers = [p for p in dest.parent.iterdir() if p.name.startswith("mefor-restore-")]
+    assert len(leftovers) == 1, sorted(p.name for p in dest.parent.iterdir())
+    assert leftovers[0].name in err, err
+    # The decrypted archive is emptied in place. The extracted store shares the placed store's
+    # bytes through a hard link where links work, so it is left whole rather than truncating the
+    # restore itself.
+    assert (leftovers[0] / "archive.tar").stat().st_size == 0
+    # The restore is whole: the store opens and carries its row.
+    assert asyncio.run(_read_back(dest, key_b64)) == (1, _RAW_BODY)
+    # Marked for the sweep, and swept by the next restore that stages beside it.
+    assert (leftovers[0] / ".lock").exists() and (leftovers[0] / ".lock-held").exists()
+    second = tmp_path / "restored" / "again.db"
+    assert main(["restore", archive, "--to", str(second), "--service-config", toml]) == 0
+    capsys.readouterr()
+    _no_staging_left(dest.parent)
+    # The sweep removed a name, never the placed store's bytes.
+    assert asyncio.run(_read_back(dest, key_b64)) == (1, _RAW_BODY)
+
+
+def test_a_refused_restore_whose_staging_survives_keeps_its_refusal(tmp_path, capsys) -> None:
+    # The refusal in flight is the one reported, and the leftover holds no plaintext: every file in
+    # it was emptied, so there is nothing for the refusal to add.
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    with pytest.MonkeyPatch.context() as mp:
+        _restore_staging_that_cannot_be_removed(mp)
+        assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
+    err = _refusal(capsys)
+    assert "restore failed (age_undated)" in err and "Nothing was written" in err, err
+    assert "Separately" not in err and "Traceback" not in err, err
+    (leftover,) = tmp_path.glob("mefor-restore-*")
+    assert (leftover / "archive.tar").stat().st_size == 0
+    assert not (tmp_path / "cfg").exists()
+    # The next run sweeps it.
+    assert main([*_config_only_argv(str(tar), toml, tmp_path / "cfg"), "--allow-old-archive"]) == 0
+    _no_staging_left(tmp_path)
+
+
+def test_a_refusal_names_a_staging_leftover_that_still_holds_plaintext(tmp_path, capsys) -> None:
+    # Where a staged file could be neither removed nor emptied, the refusal stands and names the
+    # directory after it, rather than being replaced by the teardown's error.
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    with pytest.MonkeyPatch.context() as mp:
+        _restore_staging_that_cannot_be_removed(mp)
+        mp.setattr(dr_backup, "_empty_files_in_place", lambda staging: ["archive.tar"])
+        assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
+    err = _refusal(capsys)
+    assert err.startswith("error: restore failed (age_undated): Nothing was written"), err
+    assert "Separately, the plaintext staging directory" in err and "archive.tar" in err, err
+    (leftover,) = tmp_path.glob("mefor-restore-*")
+    assert leftover.name in err and "Traceback" not in err, err
+    shutil.rmtree(leftover)
+
+
+def test_restore_refuses_a_staging_directory_that_is_not_owner_only(tmp_path, capsys) -> None:
+    # The restore's staging directory gets the backup's and verify's owner-only check
+    # (BACKLOG #5617): on a volume that ignores the requested mode or ACL nothing is staged.
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    argv = [*_config_only_argv(str(tar), toml, tmp_path / "cfg"), "--allow-old-archive"]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_staging_is_private", lambda path: False)
+        assert main(argv) == 1
+    err = _refusal(capsys)
+    assert "restore failed (destination)" in err and "not owner-only" in err, err
+    _no_staging_left(tmp_path)
+    assert not (tmp_path / "cfg").exists()
+    # The control: the same command stages and restores.
+    assert main(argv) == 0
+
+
+def test_a_restore_staging_leftover_is_pruned_from_a_config_walk(tmp_path) -> None:
+    # A marked restore leftover inside a config directory is staging, not config, as a backup's
+    # or verify's is; a same-prefix directory with no lock file stays config.
+    marked = tmp_path / "mefor-restore-abc"
+    marked.mkdir()
+    (marked / ".lock").write_bytes(b"")
+    unmarked = tmp_path / "mefor-restore-maps"
+    unmarked.mkdir()
+    assert dr_backup._is_staging_dir(marked)
+    assert not dr_backup._is_staging_dir(unmarked)
 
 
 def test_an_os_error_mid_restore_is_a_refusal(tmp_path, key_b64, capsys) -> None:
@@ -1806,7 +1860,7 @@ def test_restore_downgrade_refusal_does_not_prescribe_a_setting_it_ignores(
 
 
 def test_restore_secures_every_staged_file_before_its_first_byte(tmp_path, key_b64, capsys) -> None:
-    # The staging directory sits on the DESTINATION volume, where `TemporaryDirectory` inherits the
+    # The staging directory sits on the DESTINATION volume, where a directory could inherit the
     # parent's ACL on Windows, and the files staged in it are the whole decrypted archive and the
     # whole store. Locking each to its owner AFTER its write completes leaves a multi-GB write of PHI
     # under the inherited ACL for as long as the write takes; the contract is that the lock lands on
