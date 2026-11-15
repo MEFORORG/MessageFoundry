@@ -72,10 +72,11 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  *    workspace folder. One that leaves it by `..`, is absolute elsewhere, or is the folder itself is
  *    refused. On Windows, a path whose folder or file name below the workspace folder ends in a dot
  *    or a space is refused before any file-system call. Node reads such a name as written, while
- *    the CLI's open can drop the ending and open another entry: measured on Python 3.14.7, it drops
- *    every trailing dot and space from the file name and one trailing dot from a folder name, but
- *    keeps a folder name's trailing space. The check refuses every such name, the ones the open
- *    keeps as written included. Then every existing path below
+ *    the CLI's open goes through Windows path normalization, which can drop the ending and open
+ *    another entry. Measured through Python 3.14.7's open, it dropped at least every trailing dot
+ *    and space from the file name and one trailing dot from a folder name, and kept a folder name's
+ *    trailing space. The check refuses every such name, the ones kept as written included. Then
+ *    every existing path below
  *    the workspace folder, down to the target, must lstat as
  *    not a link, a dangling one included; the walk stops at the first that does not exist. The
  *    deepest existing one must then realpath to the folder's own realpath joined with the same

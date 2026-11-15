@@ -198,8 +198,8 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
   that passes through a link it can detect; set an outside file in user settings. The workspace
   folder itself is taken as given and is not checked: it is the first folder the workspace opens,
-  which a repository's `.code-workspace` file can set to any folder, the repository's own or not.
-  It does not catch a user-set
+  which a repository's `.code-workspace` file can set to any folder, the repository's own or not,
+  so a value that file sets can name a file outside the repository. It does not catch a user-set
   alias into the folder, at least a subst drive or a junction. The rules and that open limit are in
   the `securityConfigTarget` docblock in `src/securityEditorModel.ts`. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in

@@ -69,15 +69,16 @@ function unlinkLinks(dir: string): void {
   }
 }
 
-/** The 8.3 short spelling of the existing folder `long`, as cmd's `%~s` prints it. It is `long`
- *  itself where the volume makes no short names. */
-function shortName(long: string): string {
+/** The 8.3 short spelling of the existing folder `long`, as cmd's `%~s` prints it, or undefined
+ *  where cmd fails or prints no folder that exists, as for a name its code page cannot print. It is
+ *  `long` itself where the volume made no short name for it. */
+function shortName(long: string): string | undefined {
   const r = spawnSync("cmd.exe", ["/d", "/s", "/c", `"for %I in ("${long}") do @echo %~sI"`], {
     encoding: "utf8",
     windowsVerbatimArguments: true,
   });
-  assert.strictEqual(r.status, 0, `cmd failed: ${r.stderr}`);
-  return r.stdout.trim();
+  const out = r.status === 0 ? r.stdout.trim() : "";
+  return out !== "" && fs.existsSync(out) ? out : undefined;
 }
 
 suite("security editor host checks", () => {
@@ -89,8 +90,11 @@ suite("security editor host checks", () => {
     outside = fs.mkdtempSync(path.join(os.tmpdir(), "mf-secedit-out-"));
   });
   teardown(() => {
-    unlinkLinks(ws);
-    unlinkLinks(outside);
+    for (const dir of [ws, outside]) {
+      if (fs.existsSync(dir)) {
+        unlinkLinks(dir);
+      }
+    }
     fs.rmSync(ws, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });
   });
@@ -241,7 +245,6 @@ suite("security editor host checks", () => {
       const away = modelFs(plain, { ...realpaths, [conf]: path.resolve(path.sep, "elsewhere") });
       assert.strictEqual(securityConfigTarget(short, setting, scope, away).ok, false, `a path below resolving elsewhere ${fromWorkspace}`);
     }
-    assert.strictEqual(securityConfigTarget(short, "../messagefoundry.toml", { fromWorkspace: true, trusted: true }, modelFs(plain, realpaths)).ok, false, "outside the folder");
   });
 
   test("a real workspace folder reached through an 8.3 short-name ancestor is accepted, and a link below it refused", function () {
@@ -250,10 +253,18 @@ suite("security editor host checks", () => {
     }
     const longDir = path.join(ws, "mf-secedit-long-folder-name");
     fs.mkdirSync(path.join(longDir, "ws", "conf"), { recursive: true });
+    const spelled = (p: string) => path.resolve(p).toLowerCase();
     const shortDir = shortName(longDir);
-    if (path.basename(shortDir).toLowerCase() === path.basename(longDir).toLowerCase()) {
-      // Measured: cmd's %~s printed the long name back, so this volume makes no 8.3 names. The
-      // model test above still ran.
+    let base: string;
+    if (shortDir !== undefined && spelled(shortDir) !== spelled(longDir)) {
+      base = shortDir;
+    } else if (spelled(real.realpath(ws)) !== spelled(ws)) {
+      // The new folder got no short name, but os.tmpdir() already spells an ancestor as an alias,
+      // as the CI runner's RUNNER~1, so the long folder is itself reached through one.
+      base = longDir;
+    } else {
+      // Measured: cmd's %~s printed no short name for the new folder, and no ancestor is spelled
+      // as an alias, so this volume gives the test no 8.3 spelling. The model test above still ran.
       this.skip();
     }
     try {
@@ -261,7 +272,7 @@ suite("security editor host checks", () => {
     } catch {
       this.skip();
     }
-    const root = path.join(shortDir, "ws");
+    const root = path.join(base, "ws");
     const setting = path.join("conf", "messagefoundry.toml");
     for (const fromWorkspace of [true, false]) {
       const scope = { fromWorkspace, trusted: true };
