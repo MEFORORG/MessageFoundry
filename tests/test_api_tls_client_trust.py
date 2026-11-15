@@ -39,7 +39,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, ExtensionOID, NameOID
 
 from messagefoundry import pki as pki_module
 from messagefoundry.__main__ import _client_cert_shim
@@ -65,6 +65,7 @@ from tests.test_trust_anchor_byte_binding import _handshake
 
 _NOW = datetime.datetime.now(datetime.UTC)
 _DAY = datetime.timedelta(days=1)
+_DER = serialization.Encoding.DER
 
 # The reload suite's autouse fixture, bound here by name so pytest applies it in this module too:
 # no held copies, refusals or reload pass state carried in from another test.
@@ -635,6 +636,61 @@ def test_a_ca_whose_akid_fit_cannot_be_read_has_no_crl_of_its_own(
     assert pki_module.cas_without_own_crl(ders, own) == [
         (new.subject.rfc4514_string(), new.serial_number)
     ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [x509.DuplicateExtension("twice", ExtensionOID.SUBJECT_KEY_IDENTIFIER), ValueError("bad")],
+    ids=["duplicate", "unreadable"],
+)
+def test_a_ca_whose_subject_key_identifier_cannot_be_read_has_no_crl_of_its_own(
+    rollover: _Rollover, error: Exception
+) -> None:
+    """Red before the fix: :func:`pki._akid_fit` read a CA whose Subject Key Identifier raised as
+    ruled out by a CRL that names a key, so that CRL was no candidate for it, and a CA with
+    another CRL it signed passed. OpenSSL skips the key identifier check where it reads no
+    identifier, so it may judge the CA's clients by that CRL. It fails closed now. The control is
+    the same CRL and a CA whose identifier reads."""
+
+    class _Extensions:
+        def get_extension_for_class(self, _kind: object) -> object:
+            raise error
+
+    class _Unread:
+        extensions = _Extensions()
+
+    keyed = x509.load_pem_x509_crl(_crl("Client Root", rollover.new_key, None))
+    akid = pki_module._crl_extensions(keyed).akid
+    assert akid is not None and akid.key_identifier is not None
+    new = rollover.new_root.read_bytes()
+    read = pki_module._listed_ca(x509.load_pem_x509_certificate(new).public_bytes(_DER))
+    assert pki_module._signed_by(keyed, akid, read) is True  # the control
+    unread = pki_module._ListedCa(read.name, _Unread(), read.serial)  # type: ignore[arg-type]
+    assert pki_module._signed_by(keyed, akid, unread) is False
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_reload_reports_a_ca_without_its_own_crl_as_a_file_to_fix_before_any_signature(
+    rollover: _Rollover,
+) -> None:
+    """Red before the fix: the reload checked the own-CRL rule after the signature check, whose
+    finding ends that context's checks, so a replacement that drops the old key's CRL and adds an
+    intermediate's CRL no listed CA issued was reported with a restart, and the restart is then
+    refused. It is a file to fix, as a start says."""
+    old_own = _crl("Client Root", rollover.old_key, None, age=2 * _DAY)
+    new_own = _crl("Client Root", rollover.new_key, None, age=2 * _DAY)
+    crl = rollover.crl("held.pem", old_own, new_own)
+    ctx = build_api_ssl_context(rollover.settings([rollover.old_root, rollover.new_root], crl))
+    crl.write_bytes(
+        _crl("Client Root", rollover.new_key, None, age=_DAY / 2)
+        + _crl("Some Intermediate", ec.generate_private_key(ec.SECP256R1()), None)
+    )
+    gc.collect()
+    (outcome,) = [o for o in crl_reload.reload_replaced_crls() if Path(o.path) == crl.resolve()]
+    assert outcome.refusal is not None and outcome.refusal.remedy == crl_reload.FIX
+    assert "have no CRL of their own" in outcome.refusal.reason
+    assert outcome.reloaded == 0
+    _handshake(rollover.client(), ctx)
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")

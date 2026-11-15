@@ -1080,7 +1080,13 @@ def _akid_fit(akid: _CrlAkid | None, listed: _ListedCa) -> bool | None:
     When it fits, the answer is whether the CRL **names the CA's key**: the AKID carries a key
     identifier, the CA carries a Subject Key Identifier, and the two are equal. A CRL with no
     AKID or no key identifier fits, and so does a CA with no Subject Key Identifier, but none of
-    those names the key."""
+    those names the key.
+
+    **A CA whose extensions do not read raises** ``ValueError``, or another of
+    :data:`_UNREADABLE_CA`, rather than reading as ruled out: OpenSSL skips the key identifier
+    check where it reads no identifier, so the CRL may still be one it judges that CA's peers by.
+    :func:`_signature_state` reads such a CA as fitting nothing, as it read ``None`` before, and
+    :func:`_signed_by` reads it as having no CRL of its own (vault BACKLOG #5627)."""
     if akid is None:
         return False
     ca = listed.cert
@@ -1090,8 +1096,8 @@ def _akid_fit(akid: _CrlAkid | None, listed: _ListedCa) -> bool | None:
             ski = ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
         except x509.ExtensionNotFound:
             ski = None
-        except (x509.DuplicateExtension, ValueError):
-            return None
+        except x509.DuplicateExtension as exc:
+            raise ValueError(f"the CA's extensions do not read: {exc}") from exc
         if ski is not None:
             if ski != akid.key_identifier:
                 return None
@@ -1259,9 +1265,11 @@ def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[
 def own_crl_refusal(missing: Iterable[tuple[str, int]]) -> str:
     """What a start and the running-hop reload say of the CAs :func:`cas_without_own_crl` found,
     after the setting or the file, so the two cannot drift apart (vault BACKLOG #5627). Each CA is
-    named with its serial number, since two CAs can share a name."""
+    named with its serial number, since two CAs can share a name, in one order whatever order the
+    caller read them in."""
     named = ", ".join(
-        f"{quoted_issuer(subject)} (serial number {serial:#x})" for subject, serial in missing
+        f"{quoted_issuer(subject)} (serial number {serial:#x})"
+        for subject, serial in sorted(missing)
     )
     return (
         f"the loaded client CA(s) {named} have no CRL of their own in it. Each needs a CRL that "
@@ -1274,7 +1282,9 @@ def own_crl_refusal(missing: Iterable[tuple[str, int]]) -> str:
         "CA's issuer and serial number separates two CAs unless they share both. A CA with no "
         "subject key identifier fits every CRL whose authority key identifier names a key alone, "
         "so beside another CA of its name it stays refused until that CA's CRLs also name their "
-        "signer's issuer and serial number, or it is reissued with a subject key identifier"
+        "signer's issuer and serial number, or it is reissued with a subject key identifier. A "
+        "CA whose certificate the engine cannot read well enough to match a CRL's authority key "
+        "identifier against is refused whatever CRLs the file holds: reissue it"
     )
 
 
