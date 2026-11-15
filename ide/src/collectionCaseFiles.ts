@@ -28,8 +28,8 @@ export function caseFileName(i: number): string {
  * directory is 0700 and each file is created exclusively at 0600, which on POSIX keeps every other
  * local account from reading a body while the run lasts. Windows ignores those modes, so there the
  * temp directory's own ACL governs: owner-only for the default per-user TEMP, not for a shared
- * directory TEMP is pointed at. On any failure the directory is removed
- * before the error is rethrown, so no partial set of bodies stays behind.
+ * directory TEMP is pointed at. On any failure the directory is removed, best effort, before the
+ * error is rethrown; a removal that fails leaves it for a later sweep.
  */
 export function materializeCases(inputs: readonly string[], base: string = os.tmpdir()): string {
   const dir = fs.mkdtempSync(path.join(base, CASE_DIR_PREFIX)); // mkdtemp makes it 0700 on POSIX
@@ -73,7 +73,7 @@ export function sweepStaleCaseDirs(
   } catch {
     return 0;
   }
-  const uid = process.getuid?.();
+  const uid = process.geteuid?.(); // a new directory gets the effective uid
   let removed = 0;
   for (const name of names) {
     if (!name.startsWith(CASE_DIR_PREFIX)) {

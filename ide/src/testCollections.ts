@@ -239,15 +239,18 @@ export function judgeCollectionRun(
     const rerun = reruns[i];
     const cmp = compareCase(c.expected, rerun ? rerun.deliveries : [], ignore);
     const clean = rerun !== undefined && rerunMatchesDisposition(c, rerun);
+    const disposition = typeof rerun?.disposition === "string" ? rerun.disposition : "NO RESULT";
     summaries.push({
       name: c.name,
       pass: clean && cmp.pass,
-      disposition: rerun?.disposition ?? "NO RESULT",
+      disposition,
     });
-    details.push({
-      error: rerun ? rerun.error : "no dry-run row produced for this case",
-      deliveries: cmp.deliveries,
-    });
+    let error = rerun ? rerun.error : "no dry-run row produced for this case";
+    if (rerun && !clean && error === null) {
+      // Say why a case with no delivery difference failed. Dispositions are fixed words, not PHI.
+      error = `disposition changed: saved as ${c.disposition ?? "(not recorded)"}, rerun ended ${disposition}`;
+    }
+    details.push({ error, deliveries: cmp.deliveries });
   });
   return { passed: summaries.filter((s) => s.pass).length, summaries, details };
 }

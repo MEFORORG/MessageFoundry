@@ -111,15 +111,15 @@ suite("collectionCaseFiles.sweepStaleCaseDirs — what a crashed run left (BACKL
       this.skip();
     }
     const dir = materializeCases([BODY], base);
-    const getuid = process.getuid;
+    const geteuid = process.geteuid;
     const later = Date.now() + 10 * STALE_CASE_DIR_MS;
     try {
       // Pretend to be a different user: the directory's owner then no longer matches.
-      (process as { getuid?: () => number }).getuid = () => (getuid ? getuid() : 0) + 1;
+      (process as { geteuid?: () => number }).geteuid = () => (geteuid ? geteuid() : 0) + 1;
       assert.strictEqual(sweepStaleCaseDirs(base, later), 0);
       assert.ok(fs.existsSync(dir));
     } finally {
-      (process as { getuid?: () => number }).getuid = getuid;
+      (process as { geteuid?: () => number }).geteuid = geteuid;
     }
     assert.strictEqual(sweepStaleCaseDirs(base, later), 1); // control: as its owner, it goes
   });

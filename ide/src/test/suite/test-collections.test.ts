@@ -235,8 +235,16 @@ suite("testCollections.judgeCollectionRun — the recorded disposition", () => {
     assert.strictEqual(judgeCollectionRun([saved("FILTERED")], [rerun("filtered")]).summaries[0].pass, true);
   });
 
-  test("another disposition that also delivers nothing fails", () => {
-    assert.strictEqual(judgeCollectionRun([saved("filtered")], [rerun("unrouted")]).summaries[0].pass, false);
+  test("another disposition that also delivers nothing fails, and its detail says why", () => {
+    const run = judgeCollectionRun([saved("filtered")], [rerun("unrouted")]);
+    assert.strictEqual(run.summaries[0].pass, false);
+    assert.strictEqual(run.details[0].error, "disposition changed: saved as filtered, rerun ended unrouted");
+  });
+
+  test("a non-string rerun disposition fails the case and reaches the summary as NO RESULT", () => {
+    const odd = { disposition: 7, error: null, deliveries: [] } as unknown as CaseRerun;
+    const run = judgeCollectionRun([saved("filtered")], [odd]);
+    assert.deepStrictEqual(run.summaries[0], { name: "filtered", pass: false, disposition: "NO RESULT" });
   });
 
   test("an errored rerun of a case saved clean fails", () => {
