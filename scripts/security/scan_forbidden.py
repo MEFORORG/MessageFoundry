@@ -646,30 +646,18 @@ _PR_BARE_HOLD = re.compile(
     rf"(?i){_PR_NB}{_PR_HOLD_VERB}(?:{_PR_SEP}(?:it|them|both|each))?{_PR_SEP}(?:at{_PR_SEP})?"
     rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT_STATE}"
 )
-#: Step 10's false-positive shapes, each read against a WHOLE unit (paragraph or table row): CI prose
-#: saying a row "is not failing" for a dotted number written bare ("The row is not failing for 2.5.1
-#: batches.", "Since 2.5.1 the row is not failing."), and a three-cell component row whose last cell
-#: says it "never fails" ("| 2.5.1 | parser | never fails |"). Anything else in the unit -- another
-#: sentence, a label or bind character, markup, a lead such as "ASVS", another cell -- fails the
-#: match, so main's hit stays.
-_PR_STEP10_ID = r"(?:1[0-7]|[1-9])\.[1-9]\.[1-9]\d?"
-_PR_STEP10_NOT = r"is(?:\s+not|n['’]t|\s+no\s+longer)"
+#: Step 10's false-positive shapes, each read against a WHOLE unit (paragraph or table row), and no
+#: wider than the bodies engine PR 2893's review named: CI prose about HL7 v2.5.1 ("The row is not
+#: failing for 2.5.1 batches.", "The row isn't passing for 2.5.1 batches.", "Since 2.5.1 the row is not
+#: failing.") and a component row about it ("| 2.5.1 | parser | never fails |", with "is never
+#: failing." or "has never been failing" in the last cell). Any other number, word, sentence, cell,
+#: label, markup or lead in the unit fails the match, so main's hit stays.
 _PR_STEP10_PROSE = re.compile(
-    rf"(?i)the\s+row\s+{_PR_STEP10_NOT}\s+(?:failing|passing)\s+for\s+{_PR_STEP10_ID}"
-    r"(?:\s+(?P<word>[a-z]+))?\.?"
-    rf"|since\s+{_PR_STEP10_ID},?\s+the\s+row\s+{_PR_STEP10_NOT}\s+(?:failing|passing)\.?"
+    r"(?i)the row (?:is not|isn't) (?:failing|passing) for 2\.5\.1 batches\."
+    r"|since 2\.5\.1 the row (?:is not|isn't) failing\."
 )
 _PR_STEP10_ROW = re.compile(
-    rf"(?i)\|\s*{_PR_STEP10_ID}\s*\|\s*(?P<word>[a-z]+)\s*\|\s*"
-    r"(?:never\s+(?:fails|passes)|is\s+never\s+(?:failing|passing)"
-    r"|has\s+never\s+been\s+(?:failing|passing))\.?\s*\|"
-)
-#: What the one free word of a step 10 shape must not be: a verdict word, a record verb, or a record
-#: noun ("| <id> | partial | never fails |", "| <id> | unchanged | never fails |").
-_PR_STEP10_RECORD_WORD = re.compile(
-    rf"(?i)(?:{_PR_VERDICT_WORDS}|{_PR_CI_VERDICT_WORDS}|unchanged|{_PR_PLAIN_STATE_VERB}"
-    rf"|{_PR_STATE_VERB}|{_PR_HOLD_VERB}|cells?|rows?|requirements?|anchors?|limbs?|grounds?"
-    r"|clauses?|asvs|scorecards?|scored?|verdicts?|grades?|graded|records?|recorded|re-?reads?)"
+    r"(?i)\| 2\.5\.1 \| parser \| (?:never fails|is never failing\.|has never been failing) \|"
 )
 _PR_GAP = re.compile(
     rf"(?i){_PR_EB}(?:gaps?|residuals?|shortfalls?|unimplemented|unmet"
@@ -1220,12 +1208,8 @@ def _pr_scan_unit(
 
 def _pr_step10_false_positive(unit: str, is_row: bool) -> bool:
     """Whether a whole unit is one of step 10's false-positive shapes (_PR_STEP10_PROSE,
-    _PR_STEP10_ROW) and its free word, where it has one, is no record word."""
-    shape = (_PR_STEP10_ROW if is_row else _PR_STEP10_PROSE).fullmatch(unit.strip())
-    if shape is None:
-        return False
-    word = shape.group("word")
-    return word is None or _PR_STEP10_RECORD_WORD.fullmatch(word) is None
+    _PR_STEP10_ROW)."""
+    return (_PR_STEP10_ROW if is_row else _PR_STEP10_PROSE).fullmatch(unit.strip()) is not None
 
 
 def _pr_sentence_found(

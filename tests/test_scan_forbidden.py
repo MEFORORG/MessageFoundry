@@ -1298,7 +1298,8 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
 #: head, at main's lines. The first ten are the Lander's hold on engine PR 2980 (blocking points 1 to
 #: 3); the next nineteen are the bodies review rounds 4f580a28dd and b628ef8690 listed, which an
 #: earlier draft of step 10 dropped by name and the hold's point 4 kept flagged (the first two of
-#: them say "tests pass" or "will fail" after the clause); the rest are review round-cc2be34b's.
+#: them say "tests pass" or "will fail" after the clause); the rest are review rounds cc2be34b's and
+#: df2d868b's.
 _PR_STEP10_MUST_FIRE: list[str] = [
     f"The row is not failing: {_REQ} here.",
     f"| never fails: {_REQ} |",
@@ -1354,6 +1355,28 @@ _PR_STEP10_MUST_FIRE: list[str] = [
     f"The row is not failing for {_REQ}: batches.",
     f"Since {_REQ} the row is not failing: {_PARTIAL}.",
     f"Since **{_REQ}** the row is not failing.",
+    # Review round-df2d868b: a requirement-shaped number other than 2.5.1, a gap or record word in
+    # the component cell or after the number, and the shapes' near variants.
+    "| 14.2.1 | logging | never passes |",
+    "| 8.3.1 | session | is never passing |",
+    "The row is not passing for 14.2.1 yet.",
+    "The row is no longer failing for 8.3.1.",
+    "Since 6.1.1, the row is not failing.",
+    "| 8.3.1 | gap | never fails |",
+    "The row is not failing for 2.5.1 gaps.",
+    "| 6.1.1 | residual | is never passing |",
+    "| 6.1.1 | rescore | never fails |",
+    "| 6.1.1 | regraded | never fails |",
+    "| 6.1.1 | vault | never passes |",
+    "The row is not passing for 6.1.1 regrade.",
+    "| 2.5.1 | satisfied | never fails |",
+    "| 2.5.1 | meets | never fails |",
+    "The row is no longer passing for 2.5.1 batches.",
+    "Since 2.5.1, the row isn’t passing.",
+    "| 2.5.1 | parser | never passes |",
+    "| 2.5.1 | parser | is never passing |",
+    "The row is not failing for 2.5.1.",
+    "The row is not failing for 2.5.1 batches either.",
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
@@ -1449,8 +1472,8 @@ _SPLITLINES_ONLY = (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)
 _SUPERSET_EXCEPTIONS = {
     # Step 9: a blank line ends an ASVS-headed table, so pipe rows after it are unmarked.
     "stay-quiet-2-step9": "9",
-    # Step 10: "never" before a CI verb in a cell, and a negated state verb then a CI verb after
-    # "row", beside an unmarked identifier, with no other verdict and no label between the two.
+    # Step 10: only these six bodies, the whole unit an exact shape (_PR_STEP10_PROSE,
+    # _PR_STEP10_ROW) about HL7 v2.5.1.
     "stay-quiet-4-step10": "10",
     "stay-quiet-5-step10": "10",
     "stay-quiet-6-step10": "10",
@@ -1629,9 +1652,9 @@ def test_the_head_reports_every_hit_main_reports_in_the_tracked_markdown(
     assert not lost, lost[:20]
 
 
-#: Review round-7bf3e998ba: a word ending in "row", or "row" behind markup that joins it to a word,
-#: is not step 10's clause, wherever a window's edge falls. Each shape is slid across every offset
-#: of the 80-character window; main flags each, through "failing: <id>" or "<id> stays partial".
+#: Review round-7bf3e998ba's bodies, from an earlier windowed draft of step 10, kept as regression
+#: pins: each is slid across every offset of the 80-character window, and head must report every hit
+#: main reports. Main flags each, through "failing: <id>" or "<id> stays partial".
 _STEP10_WORD_EDGE_SHAPES = [
     "Then narrow is not{pad}failing: 1.2.3 here.",
     "See `retry_row` is not{pad}failing: 1.2.3 here.",
@@ -1745,7 +1768,7 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         # two whole readings, and a long run of spaces, which the sentence split rescanned per space.
         "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass" + chr(0x200B) + chr(0x2028),
         _REQ + " " * 60000 + ": the row" + chr(0x200B) + chr(0x2028),
-        # Step 10's "goes on to a verdict" search after "never" and a CI verb, over a markup run.
+        # A cell that goes on past "never failing", over a markup run.
         f"| {_REQ} | x | is never failing; stays" + "*" * 80000 + " |",
         f"| {_REQ} | x | is never failing; stays" + " " * 80000 + " |",
     ],
@@ -1770,9 +1793,9 @@ def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
     ids=["underscore", "star", "backtick", "cell-underscore"],
 )
 def test_step_ten_reads_a_long_markup_run_as_fast_as_main(sf, body: str) -> None:
-    """Step 10 must not search _PR_PROSE_VERDICT over the whole sentence, where it backtracks
-    quadratically on a markup run: an earlier draft took 12 to 23 seconds on these bodies. The bound
-    is 1 second, loose for a slow runner."""
+    """No reading may search _PR_PROSE_VERDICT over a whole sentence, where it backtracks
+    quadratically on a markup run: an earlier draft of step 10 took 12 to 23 seconds on these
+    bodies. The bound is 1 second, loose for a slow runner."""
     began = time.perf_counter()
     sf.scan_pr_body(body)
     assert time.perf_counter() - began < 1
