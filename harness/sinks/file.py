@@ -28,6 +28,7 @@ folder's relative path (``meta["folder"]``) and no ``path`` or ``relpath``.
 
 from __future__ import annotations
 
+import ntpath
 import os
 import stat
 from pathlib import Path
@@ -69,15 +70,19 @@ def _is_link(st: os.stat_result) -> bool:
 
 
 def _unsafe_listed_name(name: str) -> bool:
-    """Whether a name read back from a listing must not be joined onto its folder: empty, ``.`` or
-    ``..``, holding a path separator or a NUL, or, on Windows, ending in a dot or a space, which
-    Windows strips so the joined path names another entry (``...`` reads as the folder itself)."""
+    """Whether a name read back from a listing must not be joined onto its folder.
+
+    On every platform: an empty name, ``.``, ``..``, or one holding a path separator or a NUL. On
+    Windows also: one holding a colon, which pathlib reads as a drive (``C:`` joins to the folder's
+    own drive, ``D:x`` to another drive) or which names an alternate data stream, and one
+    :func:`ntpath.isreserved` reports, which covers at least a trailing dot or space (Windows strips
+    it, so ``...`` reads as the folder itself) and a device name such as ``nul`` or ``NUL.txt``."""
     if name in ("", ".", ".."):
         return True
     separators = {"/", "\\"} if _WINDOWS else {os.sep, os.altsep or os.sep}
     if "\0" in name or any(sep in name for sep in separators):
         return True
-    return _WINDOWS and name[-1] in ". "
+    return _WINDOWS and (":" in name or ntpath.isreserved(name))
 
 
 class FileSink(Sink):

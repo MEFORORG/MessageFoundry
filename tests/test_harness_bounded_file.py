@@ -330,6 +330,8 @@ def test_a_symlink_swapped_in_after_the_lstat_is_not_regular(
 
 
 _BAD_NAMES = ("", ".", "..", "a/b", "a\0b", "a\\b", "x.", "x ")
+#: Refused by Windows rules only: a drive or stream colon, and reserved device names.
+_WINDOWS_BAD_NAMES = ("C:", "D:x", "a:b", "nul", "NUL.txt")
 
 
 @pytest.mark.parametrize("windows", [False, True], ids=["posix-rules", "windows-rules"])
@@ -338,7 +340,8 @@ def test_the_file_sink_refuses_an_unsafe_listed_name_before_joining_it(
 ) -> None:
     """Each listed name passes ``_unsafe_listed_name`` before it is joined onto its folder. A name a
     real listing should never yield (empty, ``.``, ``..``, a separator, a NUL) or, by Windows rules,
-    one ending in a dot or a space, which Windows strips so it aliases another entry, is recorded
+    one holding a colon or that Windows reserves (a trailing dot or space, a device name), which
+    would join to another drive, another entry or a device, is recorded
     unread and refused, once, and never joined, entered or read. The names are mocked into the
     listing, since no filesystem here can create them."""
     from harness.sinks import file as file_sink
@@ -358,7 +361,8 @@ def test_the_file_sink_refuses_an_unsafe_listed_name_before_joining_it(
             with real(self.folder) as listing:
                 names = [entry.name for entry in listing]
             if Path(self.folder) == tmp_path:
-                names += _BAD_NAMES
+                # Never by POSIX rules on a Windows host, where `C:` would loop the walk.
+                names += _BAD_NAMES + (_WINDOWS_BAD_NAMES if windows else ())
             return [_Entry(n) for n in names]
 
         def __exit__(self, *exc: object) -> None:
@@ -374,7 +378,7 @@ def test_the_file_sink_refuses_an_unsafe_listed_name_before_joining_it(
     if windows or os.name == "nt":
         expected.add("a\\b")
     if windows:
-        expected |= {"x.", "x "}
+        expected |= {"x.", "x ", *_WINDOWS_BAD_NAMES}
     unsafe = file_sink.UNSAFE_NAME
     refused = {r.meta["name"]: r for r in records if r.meta.get("refused") == unsafe}
     assert set(refused) == expected
