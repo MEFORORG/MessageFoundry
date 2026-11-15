@@ -6,8 +6,9 @@ Files present when the sink starts are ignored while they stay unchanged, so a l
 directory cannot satisfy a scenario with an earlier run's output; a file written again in place,
 whether present at start or already recorded, is recorded again. "Unchanged" is the ``lstat``
 identity, file type, size and modification time, and a file that changes while it is read is
-recorded once it settles, not twice. The scan walks the plain directories under the directory,
-never through a link or a junction, and records each file's path relative to it
+recorded once it settles, not twice. The scan enters only what ``lstat`` reads as a plain
+directory, never a link or a junction (a folder swapped for a link during the scan is an open race,
+see :meth:`FileSink._entries`), and records each file's path relative to it
 (``meta["relpath"]``) and whether its resolved path, symlinks followed, stays inside it
 (``meta["inside"]``). A link that cannot be resolved strictly (a loop, a dangling link, a race) is
 recorded as not inside, never as inside. A file written OUTSIDE the directory is by construction not
@@ -15,10 +16,10 @@ seen here; a scenario that tests for an escape must look where it would land, an
 records unread carries no control id, so a scenario must check ``meta["symlink"]`` itself.
 
 Reading is bounded the way the GUI's folder watcher is, through the same reader
-(:func:`harness.bounded_file.read_capped`): regular files only, symlinks not followed, each capped
-at the engine's per-message cap, checked again on the open handle, and an over-cap file (or one that
-grows past the cap while read) recorded with an empty payload and a ``refused`` reason rather than
-read. Only a plain directory is skipped: a symlink (``meta["symlink"]``), FIFO or device is recorded
+(:func:`harness.bounded_file.read_capped`): regular files only, a symlink as the last path
+component not followed, each capped at the engine's per-message cap, checked again on the open
+handle, and an over-cap file (or one that grows past the cap while read) recorded with an empty
+payload and a ``refused`` reason rather than read. Only a plain directory is skipped: a symlink (``meta["symlink"]``), FIFO or device is recorded
 unread with the :data:`~harness.bounded_file.NOT_REGULAR` reason, so a link out of the directory
 reads as an escape, not as nothing.
 """
@@ -79,10 +80,11 @@ class FileSink(Sink):
 
         The walk enters only entries that ``lstat`` reads as plain directories. A link, a junction
         included, is a candidate whatever its name and is not entered. A folder swapped for a link
-        between that ``lstat`` and its listing is not detected: it is listed through the link, and
-        what it reaches is read. That is an open race. A path gone before its
-        ``lstat``, or a folder gone before it is listed, is left out: nothing is there to record or
-        to ignore."""
+        after that ``lstat`` is not refused: at least from its listing until each file under it is
+        read in :meth:`records`, paths under it go through the link, so a file outside the
+        directory can be read and recorded. That is an open race. A path gone before its ``lstat``,
+        or a folder gone before it is listed, is left out: nothing is there to record or to
+        ignore."""
         found: list[tuple[Path, os.stat_result]] = []
         pending = [self.directory]
         while pending:
@@ -113,8 +115,9 @@ class FileSink(Sink):
     def _inside(self, path: Path, link: bool, root: Path) -> bool:
         """Whether ``path`` resolves inside ``root``; False where that cannot be shown. A link is
         resolved strictly, so a loop or a dangling link is not inside. A file is judged by its folder,
-        which the walk reached through plain directories only, so a file that vanishes after its read
-        is not mistaken for an escape."""
+        which the walk reached through what ``lstat`` read as plain directories, so a file that
+        vanishes after its read is not mistaken for an escape. A folder swapped for a link and back
+        during the scan defeats this check: the open race in :meth:`_entries`."""
         try:
             if link:
                 return path.resolve(strict=True).is_relative_to(root)
@@ -133,7 +136,8 @@ class FileSink(Sink):
                 data, refused = b"", NOT_REGULAR  # never read through a link
             else:
                 try:
-                    # O_NOFOLLOW on the open, where the OS has it, catches a link swapped in now.
+                    # O_NOFOLLOW on the open, where the OS has it, catches a link swapped in now
+                    # as the file itself, not as a folder above it.
                     data, refused = read_capped(path, self.max_file_bytes, follow_symlinks=False)
                 except OSError:
                     continue  # vanished or locked mid-write: the next scan retries it
