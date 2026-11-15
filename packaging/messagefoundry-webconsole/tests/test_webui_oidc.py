@@ -193,7 +193,7 @@ async def test_a_bad_authorization_code_cannot_hide_the_oidc_link(
     assert service.oidc_available is link_stays
 
 
-async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: Engine) -> None:
+async def test_oidc_start_hands_off_to_the_idp_and_sets_the_flow_cookie(engine: Engine) -> None:
     service = _oidc_service(engine)
     await service.initialize()
     async with _oidc_client(engine, service) as c:
@@ -241,6 +241,27 @@ async def test_oidc_start_post_answers_with_a_navigating_page_not_a_303(
     assert "mf_oidc_flow=flow-hop" in r.headers.get("set-cookie", "")
     # No session yet, so no watchdog: its first probe would race the hop to the login page.
     assert "data-mf-session-watchdog" not in r.text
+
+
+@pytest.mark.parametrize("cookie", [None, "not-a-live-session"], ids=["no-cookie", "dead-cookie"])
+async def test_the_interstitial_carries_no_watchdog_without_a_live_session(
+    engine: Engine, cookie: str | None
+) -> None:
+    """RED when: the "leaving this site" page that ``GET /ui/oidc/start`` shows by default carries
+    the session watchdog for a browser with no live session. The watchdog's first probe of
+    ``/ui/session-status`` then gets a 303 and sends the browser to ``/ui/login?e=expired`` before
+    Continue can be clicked, so federated sign-in never reaches the start POST (measured in headless
+    Edge 157). A cookie that no longer authenticates counts as no session: the probe 303s on it too.
+    The control, the same page WITH a live session, is in test_ui_oidc_step_up.py."""
+    service = _oidc_service(engine)
+    await service.initialize()
+    async with _oidc_client(engine, service) as c:
+        if cookie is not None:
+            c.cookies.set("mf_session", cookie)
+        r = await c.get("/ui/oidc/start", follow_redirects=False)
+    assert r.status_code == 200 and "leaving" in r.text.lower(), r.text
+    assert "data-mf-session-watchdog" not in r.text
+    assert 'action="/ui/logout"' not in r.text
 
 
 async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) -> None:
@@ -501,11 +522,14 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     async with _oidc_client(engine, service) as c:
         # ASVS 3.7.3: a real operator now traverses the interstitial, so the round trip does too --
         # GET renders "you are leaving this site" and stages nothing, the Continue POST mints the
-        # flow and 303s. Kept as two hops rather than shortcut to the POST: this test's value is that
-        # it walks the path a browser actually walks.
+        # flow and answers with a 200 page that navigates to the IdP. Kept as two hops rather than
+        # shortcut to the POST: this test's value is that it walks the path a browser actually walks.
+        # app.js does not run here, so the watchdog that would bounce a browser with no session off
+        # the interstitial is checked by its absence (test_the_interstitial_carries_no_watchdog...).
         leaving = await c.get("/ui/oidc/start", follow_redirects=False)
         assert leaving.status_code == 200
         assert "leaving" in leaving.text.lower()
+        assert "data-mf-session-watchdog" not in leaving.text
         start = await c.post("/ui/oidc/start", follow_redirects=False)
         params = dict(parse_qsl(urlsplit(idp_url(start)).query))
         flow_id = c.cookies.get("mf_oidc_flow")

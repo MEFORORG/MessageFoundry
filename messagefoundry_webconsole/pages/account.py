@@ -3,16 +3,14 @@
 """Auth/session/account page builders for the /ui ops dashboard (ADR 0065): sign-in, step-up
 re-auth, and the L4b self-service account pages (change password, TOTP MFA lifecycle).
 
-The account pages carry the normal chrome. A page that drops the full nav for focus/confinement and
-is reached WITH a live session renders ``nav=minimal_nav()``: the wordmark plus the same one-click
-POST Sign-out form (ASVS 7.4.4). At least step-up re-auth, reauth-continue, the forced
-must-change-password page, passkey enrolment, the federated landing hop and the IdP hop on the
-step-up leg do. A page served without a session is bare, ``nav=Markup("")``, because
-``minimal_nav`` brings the session watchdog: at least sign-in, the Windows-SSO challenge and the IdP
-hop on the federated sign-in leg are. Two pages break the rule. The sign-in IdP hop is bare even
-for a browser that holds a session it is about to replace, and the OIDC "leaving this site"
-interstitial renders ``minimal_nav`` although it is served without a session. Every dynamic value is placed through the escaping element
-builders in :mod:`.._html`. Secrets are handled once: a password is only ever an
+The account pages carry the normal chrome. A page that drops the full nav for focus/confinement
+renders ``nav=minimal_nav()``: the wordmark plus, when the request carries a live session, the same
+one-click POST Sign-out form (ASVS 7.4.4) and the session watchdog. A page that may be served
+either way, at least the OIDC "leaving this site" page and the IdP hop, passes
+``minimal_nav(session=...)`` with what its route found, because the watchdog on a page with no
+session sends the browser to the login page. The sign-in entry pages, at least sign-in and the
+Windows-SSO challenge, are bare, ``nav=Markup("")``. Every dynamic value is placed through the
+escaping element builders in :mod:`.._html`. Secrets are handled once: a password is only ever an
 ``<input type=password>`` (never echoed back), and the TOTP secret / recovery codes render exactly
 once on their dedicated pages.
 """
@@ -216,7 +214,7 @@ def _meta_refresh(target: str) -> Markup:
     return el("meta", **{"http-equiv": "refresh", "content": f"0;url={target}"})
 
 
-def idp_handoff(authorization_url: str, *, signed_in: bool) -> Markup:
+def idp_handoff(authorization_url: str, *, session: bool) -> Markup:
     """The hop from a federated START leg to the IdP. ``POST /ui/oidc/start`` and
     ``POST /ui/reauth/oidc`` answer with it, and so does ``GET /ui/oidc/start`` when it skips its
     interstitial and runs the sign-in POST leg itself.
@@ -230,10 +228,11 @@ def idp_handoff(authorization_url: str, *, signed_in: bool) -> Markup:
     and the CSP needs no IdP origin. The GET that runs the POST leg gets the same page: a 303
     would work there, but one leg with one answer is simpler to hold.
 
-    ``signed_in`` picks the chrome. On the step-up leg the browser holds a live session, so the
-    page carries :func:`.._html.minimal_nav` and its sign-out control (ASVS 7.4.4). On the sign-in
-    leg it is bare: ``minimal_nav`` brings the session watchdog, whose first probe sends a browser
-    with no session to the login page, racing this page's own navigation to the IdP.
+    ``session`` is whether the request carries a live session, and goes to
+    :func:`.._html.minimal_nav`. With one, as on the step-up leg, the page keeps its sign-out control
+    (ASVS 7.4.4) and the watchdog. Without one, as on a first sign-in, it carries neither: the
+    watchdog's first probe would send the browser to the login page, racing this page's own
+    navigation to the IdP.
 
     ``authorization_url`` comes from the engine's flow state, built from configuration, never from
     the request.
@@ -242,7 +241,7 @@ def idp_handoff(authorization_url: str, *, signed_in: bool) -> Markup:
     return page(
         "Signing in",
         body,
-        nav=minimal_nav() if signed_in else Markup(""),
+        nav=minimal_nav(session=session),
         head_extra=_meta_refresh(authorization_url),
     )
 
@@ -254,6 +253,7 @@ def leaving_site(
     idn_disguised: bool = False,
     cancel_href: str = "/ui/login",
     purpose: str = "",
+    session: bool,
 ) -> Markup:
     """The ASVS 3.7.3 interstitial: you are leaving, here is where to, and you may cancel.
 
@@ -306,10 +306,12 @@ def leaving_site(
         class_="card",
     )
     # ASVS 7.4.4: `nav=Markup("")` would suppress the shared chrome AND its sign-out control,
-    # stranding a signed-in operator on a page with no way out. `minimal_nav()` is what the
-    # sibling interstitial (`oidc_landing`) uses for exactly this reason. The first version of
-    # this page used the bare Markup("") and was wrong.
-    return page("Leaving this site", body, nav=minimal_nav())
+    # stranding a signed-in operator on a page with no way out. The first version of this page used
+    # the bare Markup("") and was wrong. But this page is also served to a browser with no session,
+    # the federated sign-in's first step, and there the session watchdog that minimal_nav carries
+    # would send the browser to the login page before Continue could be clicked. So the route says
+    # which: `session` is whether its request carries a live session.
+    return page("Leaving this site", body, nav=minimal_nav(session=session))
 
 
 def sso_challenge() -> Markup:

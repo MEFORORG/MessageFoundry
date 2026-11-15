@@ -245,6 +245,20 @@ def session_token(conn: Request | WebSocket) -> str | None:
     return conn.cookies.get(session_cookie_name(conn))
 
 
+async def has_live_session(request: Request, auth: AuthService | None) -> bool:
+    """Whether this request carries a session that still authenticates, for a page that may be
+    served either way to decide whether it carries the session watchdog (``minimal_nav(session=)``).
+
+    Asked as the watchdog's own probe would find it: ``identity_for_token`` with ``activity=False``,
+    so asking does not slide the idle clock. A cookie that no longer authenticates is no session:
+    the probe would 303 on it and the watchdog would send the browser to the login page.
+    """
+    token = session_token(request)
+    if not token or auth is None:
+        return False
+    return await auth.identity_for_token(token, activity=False) is not None
+
+
 # Strict, self-only CSP for the /ui surface — no 'unsafe-eval'/'unsafe-inline' (ADR 0065 §5). The only
 # script is the first-party /ui/static/app.js (no inline script, no on* handlers), so 'self' suffices.
 # Everything (script/style/font/img) is served from /ui/static, same origin.

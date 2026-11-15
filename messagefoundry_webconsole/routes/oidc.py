@@ -71,6 +71,7 @@ from .._auth import (
     assert_same_origin,
     claim_continuation,
     clear_oidc_flow_cookie,
+    has_live_session,
     hold_claim_for_flow,
     is_unlock_action,
     login_redirect_response,
@@ -256,13 +257,14 @@ _LOCATION_SAFE = ":/%#?=@[]!$&'()*+,;"
 
 
 def _idp_hop(
-    request: Request, auth: AuthService, flow_id: str, authorization_url: str, *, signed_in: bool
+    request: Request, auth: AuthService, flow_id: str, authorization_url: str, *, session: bool
 ) -> Response:
     """A start leg's answer once its flow is staged: the flow cookie, on a 200 page that navigates
     to the IdP. Never a 303: the start legs are form POSTs, and the /ui CSP's
-    ``form-action 'self'`` blocks a redirect to the IdP's origin (see :func:`pages.idp_handoff`)."""
+    ``form-action 'self'`` blocks a redirect to the IdP's origin (see :func:`pages.idp_handoff`).
+    ``session`` is whether the request carries a live session, which picks the page's chrome."""
     target = quote(authorization_url, safe=_LOCATION_SAFE)
-    resp = HTMLResponse(pages.idp_handoff(target, signed_in=signed_in), status_code=200)
+    resp = HTMLResponse(pages.idp_handoff(target, session=session), status_code=200)
     set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
     return resp
 
@@ -335,6 +337,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 idn_disguised=is_idn_disguised(idp_url),
                 cancel_href="/ui/login",
                 purpose="Continuing will take you to your organization's sign-in provider.",
+                # Without a live session the page carries no watchdog, which would otherwise send
+                # the browser to the login page before Continue could be clicked.
+                session=await has_live_session(request, auth),
             ),
             status_code=200,
         )
@@ -406,7 +411,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except FlowError:
             await auth.audit_oidc_reject("start_failed", client=client)
             return RedirectResponse("/ui/login?e=oidc_failed", status_code=303)
-        return _idp_hop(request, auth, flow_id, authorization_url, signed_in=False)
+        # A browser may start a sign-in while it holds a session it is about to replace.
+        return _idp_hop(
+            request,
+            auth,
+            flow_id,
+            authorization_url,
+            session=await has_live_session(request, auth),
+        )
 
     @app.post("/ui/reauth/oidc")
     @public_route("the federated re-authentication a step-up gate sends the browser to")
@@ -505,7 +517,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # mints one grant.
         if action.unlock:
             hold_claim_for_flow(flow_id, claim)
-        return _idp_hop(request, auth, flow_id, authorization_url, signed_in=True)
+        return _idp_hop(request, auth, flow_id, authorization_url, session=True)
 
     @app.get("/ui/oidc/callback")
     @public_route("the federated sign-in return; a session does not exist yet")

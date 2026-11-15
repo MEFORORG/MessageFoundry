@@ -485,10 +485,10 @@ def _default_nav(active: str) -> Markup:
     right = el("div", _nav_status_icons(), _logout_form(), class_="navright")
     # ``data-mf-session-watchdog`` (14.3.1) rides the <nav> element deliberately, so the hook is
     # present wherever a live session's rendered PHI needs discarding when that session ends, with no
-    # per-render authentication plumbing to keep in sync. minimal_nav carries it too. A page served
-    # without a session must therefore pass nav=Markup(""): at least the two unauthenticated entry
-    # pages and the IdP hop on the sign-in leg do. The OIDC "leaving this site" page does NOT, and it
-    # is served without a session, so the watchdog's first probe sends that browser to the login page.
+    # per-render authentication plumbing to keep in sync. minimal_nav carries it too, but only when
+    # its caller says a live session exists: on a page served without one, the watchdog's first probe
+    # would send the browser to the login page. A page served without a session never renders this
+    # full nav.
     return el(
         "nav",
         el("div", brand, *groups, class_="navlinks"),
@@ -497,9 +497,16 @@ def _default_nav(active: str) -> Markup:
     )
 
 
-def minimal_nav() -> Markup:
+def minimal_nav(*, session: bool = True) -> Markup:
     """The **confinement chrome**: the brand wordmark plus the one-click POST Sign-out form, and
     nothing else (ASVS 7.4.4).
+
+    ``session`` says whether the request this page answers carries a live session. Only then does
+    the chrome carry the Sign-out form and the session watchdog. A page that may be served without
+    one, at least the OIDC "leaving this site" page and the IdP hop, passes what its route found:
+    with no session the watchdog's first probe gets a 303 from ``GET /ui/session-status`` and sends
+    the browser to the login page, so such a page would never be usable, and it has no session to
+    sign out of. The default is ``True`` for the pages only a live session can reach.
 
     Authenticated pages that deliberately drop the full nav — step-up re-auth, the forced
     must-change-password page, passkey enrolment, the federated landing hop — used to render
@@ -517,6 +524,8 @@ def minimal_nav() -> Markup:
     itself — see :func:`_default_nav`.
     """
     brand = el("a", wordmark(tm=True), href="/ui", class_="brand")
+    if not session:
+        return el("nav", el("div", brand, class_="navlinks"))
     right = el("div", _logout_form(), class_="navright")
     return el("nav", el("div", brand, class_="navlinks"), right, data_mf_session_watchdog=True)
 

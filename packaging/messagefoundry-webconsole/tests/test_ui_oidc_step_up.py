@@ -295,6 +295,25 @@ async def test_the_step_up_start_answers_with_a_navigating_page_not_a_303(
     assert 'action="/ui/logout"' in r.text  # a live session, so its sign-out stays (ASVS 7.4.4)
 
 
+async def test_a_signed_in_browser_keeps_sign_out_on_the_sign_in_pages(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the no-session interstitial test in test_webui_oidc.py, and RED when: a
+    browser that holds a live session starts a federated sign-in (it hands that session over,
+    ASVS 7.2.4) and the IdP hop drops its Sign-out. Both the "leaving this site" page and the hop
+    are reached with a session here, so both carry Sign-out and the watchdog (ASVS 7.4.4, 14.3.1)."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        await _federated_sign_in(service, c, monkeypatch)
+        leaving = await c.get("/ui/oidc/start", follow_redirects=False)
+        hop = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
+    assert leaving.status_code == 200 and "leaving" in leaving.text.lower(), leaving.text
+    assert idp_url(hop)
+    for page in (leaving, hop):
+        assert 'action="/ui/logout"' in page.text
+        assert "data-mf-session-watchdog" in page.text
+
+
 async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

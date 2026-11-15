@@ -123,7 +123,7 @@ async def test_oidc_callback_get_with_neither_header_signs_in(
     assert "mf_session=" in r.headers.get("set-cookie", "")
 
 
-async def test_oidc_start_get_with_neither_header_redirects_to_the_idp(engine: Engine) -> None:
+async def test_oidc_start_get_with_neither_header_hands_off_to_the_idp(engine: Engine) -> None:
     """``GET /ui/oidc/start`` with no interstitial needed: the flow is minted and the browser is
     sent to the identity provider. This is the case the first cut answered with a JSON 403."""
     service = await _service(engine, held=Role.OPERATOR, bind=True)
@@ -185,7 +185,7 @@ async def test_oidc_start_get_still_refuses_what_it_refused(
 
 
 @pytest.mark.parametrize("site", ["", "x", "same-origin, none"], ids=["empty", "unknown", "folded"])
-async def test_oidc_start_get_with_an_unknown_site_and_no_foreign_origin_redirects(
+async def test_oidc_start_get_with_an_unknown_site_and_no_foreign_origin_hands_off(
     engine: Engine, site: str
 ) -> None:
     """The control for the B291-R1 rows above: the same unrecognised ``Sec-Fetch-Site`` with a
