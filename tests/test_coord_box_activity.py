@@ -37,7 +37,13 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / "scripts" / "coord"
-LIB = ("box-activity.ps1", "session-registry.ps1", "occupancy.ps1", "mail-key.ps1")
+LIB = (
+    "box-activity.ps1",
+    "session-registry.ps1",
+    "occupancy.ps1",
+    "mail-key.ps1",
+    "coord-root.ps1",
+)
 TIMEOUT = 120
 
 pytestmark = pytest.mark.skipif(
@@ -61,7 +67,30 @@ def sandbox(tmp_path: Path) -> Path:
     wt = tmp_path / "wt"
     wt.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main", str(wt)], check=True, capture_output=True)
+    # A legacy seat record (no `host`), which every reader takes as this machine's. The box's local
+    # probes are only this PC's to read when the seat is this PC's.
+    write_seat_record(tmp_path, host=None)
     return tmp_path
+
+
+def write_seat_record(sandbox: Path, host: str | None, box: str = "demo-box-0000") -> None:
+    d = sandbox / "seats" / box
+    d.mkdir(parents=True, exist_ok=True)
+    rec: dict[str, object] = {"worktree": str(sandbox / "wt"), "seat": "builder"}
+    if host is not None:
+        rec["host"] = host
+    (d / "s1.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+def this_host() -> str:
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "[Environment]::MachineName"],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    )
+    return proc.stdout.strip()
 
 
 def activity(sandbox: Path, **over: object) -> dict:
@@ -174,6 +203,130 @@ class TestTheSignalCountIsHonest:
         assert a["WorktreeExists"] is True
         assert a["Signals"] == 3
         assert a["Veto"] is False
+
+
+class TestLocalProbesOnlyCountForThisPcsSeat:
+    """`.writer-alive` lives on the SHARED root; the transcript, the session registry and the worktree
+    list are this PC's own disk. Pairing them for a seat on another PC counts an absence this PC could
+    never have seen as evidence. BACKLOG #5596."""
+
+    def test_a_seat_on_another_pc_is_not_evaluable_from_here(self, sandbox: Path) -> None:
+        """Old code: heartbeat + this PC's worktree list = 2 signals, Evaluable, no veto -- safe to
+        disturb a seat it cannot observe."""
+        write_seat_record(sandbox, host="ANOTHER-PC-0001")
+        write_heartbeat(sandbox, age_hours=48)
+        a = activity(sandbox)
+        assert a["HostHere"] is False, a
+        assert a["Signals"] == 1, a
+        assert a["Evaluable"] is False, a
+
+    def test_a_seat_naming_this_pc_still_counts_its_local_probes(self, sandbox: Path) -> None:
+        """The other half of the pair: a refusal that fired for every host would pass the test above."""
+        write_seat_record(sandbox, host=this_host())
+        write_heartbeat(sandbox, age_hours=48)
+        a = activity(sandbox)
+        assert a["HostHere"] is True, a
+        assert a["Signals"] == 2, a
+        assert a["Evaluable"] is True, a
+
+    def test_a_box_with_no_seat_record_names_no_host_and_is_not_evaluable(
+        self, sandbox: Path
+    ) -> None:
+        """No record, no host: this PC cannot tell whether the box is its own."""
+        shutil.rmtree(sandbox / "seats" / "demo-box-0000")
+        write_heartbeat(sandbox, age_hours=48)
+        a = activity(sandbox)
+        assert a["HostHere"] is False, a
+        assert a["Evaluable"] is False, a
+
+    def test_a_fresh_local_transcript_still_vetoes_a_box_with_no_host(self, sandbox: Path) -> None:
+        """Not-here stops the local probes COUNTING, never vetoing: a seat that launched before its
+        record was written is still seen by its transcript."""
+        shutil.rmtree(sandbox / "seats" / "demo-box-0000")
+        write_transcript(sandbox, age_hours=0.02)
+        a = activity(sandbox)
+        assert a["HostHere"] is False, a
+        assert a["Veto"] is True, a
+        assert a["Evaluable"] is False, a
+
+    def test_a_newest_record_that_is_not_an_object_names_no_host(self, sandbox: Path) -> None:
+        """A JSON array is not a seat record. ConvertFrom-Json unrolls a one-element array, so
+        without -NoEnumerate its element, which names no host, read as a legacy (this-PC) record."""
+        (sandbox / "seats" / "demo-box-0000" / "s1.json").write_text(
+            '[{"seat": "builder"}]', encoding="utf-8"
+        )
+        write_heartbeat(sandbox, age_hours=48)
+        a = activity(sandbox)
+        assert a["HostHere"] is False, a
+        assert a["WorktreeExists"] is None, a
+
+    def test_an_empty_explicit_record_host_names_nobody(self, sandbox: Path) -> None:
+        """A caller forwarding a missing record's host binds ''; that is not a legacy record."""
+        write_heartbeat(sandbox, age_hours=48)
+        a = activity(sandbox, RecordHost="")
+        assert a["HostHere"] is False, a
+        assert a["Evaluable"] is False, a
+
+    def test_an_explicit_record_host_wins_over_the_seat_record(self, sandbox: Path) -> None:
+        write_heartbeat(sandbox, age_hours=48)
+        a = activity(sandbox, RecordHost="ANOTHER-PC-0001")
+        assert a["HostHere"] is False, a
+        assert a["Evaluable"] is False, a
+
+
+class TestAnAbsentRegistryIsNotAnEvaluatedFence:
+    """BACKLOG #5596: Get-SessionLiveness answers UNKNOWN both for "the registry has no such record"
+    and for "there is no registry to look in" or "the record cannot be parsed yet". Only the first is
+    the fence looking."""
+
+    def test_no_registry_at_all_is_not_counted(self, sandbox: Path) -> None:
+        """Config root with no sessions/ directory. Old code: fence=UNKNOWN counted, Signals 2."""
+        (sandbox / "root").mkdir(exist_ok=True)
+        write_heartbeat(sandbox, age_hours=48)
+        write_transcript(sandbox, age_hours=48)
+        a = activity(sandbox, SessionId="abcd1234")
+        assert a["FenceState"] == "NO-REGISTRY", a
+        assert a["Signals"] == 3, a  # heartbeat + transcript + worktree, no fence
+
+    def test_a_registry_without_the_record_is_counted(self, sandbox: Path) -> None:
+        """The negative control: a readable registry that holds no such id IS the fence looking."""
+        sessions = sandbox / "root" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "1.json").write_text(
+            json.dumps({"pid": 1, "sessionId": "ffff0000", "startedAt": 0}), encoding="utf-8"
+        )
+        write_heartbeat(sandbox, age_hours=48)
+        write_transcript(sandbox, age_hours=48)
+        a = activity(sandbox, SessionId="abcd1234")
+        assert a["FenceState"] == "UNKNOWN", a
+        assert a["Signals"] == 4, a
+        assert a["Veto"] is False, a
+
+    def test_a_fresh_unreadable_record_vetoes(self, sandbox: Path) -> None:
+        """A record caught mid-write fails to parse and was dropped, so a session launching right now
+        read as no record at all. Old code: UNKNOWN, counted, no veto."""
+        sessions = sandbox / "root" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "2.json").write_text('{"pid": 2, "sessionId": "abcd', encoding="utf-8")
+        write_heartbeat(sandbox, age_hours=48)
+        write_transcript(sandbox, age_hours=48)
+        a = activity(sandbox, SessionId="abcd1234")
+        assert a["FenceState"] == "UNPARSED-REGISTRY", a
+        assert a["Veto"] is True, a
+        assert any("UNPARSED-REGISTRY" in w for w in a["Why"]), a["Why"]
+
+    def test_an_old_unreadable_record_does_not_veto_but_is_not_counted(self, sandbox: Path) -> None:
+        """A record that has been unparseable for days is not a session launching now."""
+        sessions = sandbox / "root" / "sessions"
+        sessions.mkdir(parents=True)
+        bad = sessions / "2.json"
+        bad.write_text('{"pid": 2, "sessionId": "abcd', encoding="utf-8")
+        _back_date(bad, 48)
+        write_heartbeat(sandbox, age_hours=48)
+        write_transcript(sandbox, age_hours=48)
+        a = activity(sandbox, SessionId="abcd1234")
+        assert a["Veto"] is False, a
+        assert a["Signals"] == 3, a
 
 
 class TestTheTranscriptSlug:

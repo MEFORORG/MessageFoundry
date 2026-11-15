@@ -16,7 +16,9 @@ never a proven collapse.
 
 from __future__ import annotations
 
+import dataclasses
 import math
+import pathlib
 import types
 
 import pytest
@@ -745,7 +747,7 @@ def test_collapsed_soak_reports_soak_not_sustained_not_pass() -> None:
     assert js["soak_not_sustained"] is True
     assert js["exit_code"] == 0
     assert (
-        js["schema_version"] == 8
+        js["schema_version"] == 9
     )  # v8 (#229): +the per-stage strand split for the sound H>D A4b permit
     assert "SOAK NOT SUSTAINED" in rep.render()
 
@@ -1821,8 +1823,8 @@ def test_cross_observer_inconclusive_propagates_to_ladder_result_and_json() -> N
     assert js["result"] == "SETUP_DEGRADED"
     assert js["store_truth_unconfirmed"] is True
     assert (
-        js["schema_version"] == 8
-    )  # v8 (#229): +per-stage strand split for the sound H>D A4b permit
+        js["schema_version"] == 9
+    )  # v9 (#5577): per-stage permit at H == D, residual rows, gated shortfall
     assert js["climb"][1]["verdict"] == "inconclusive"  # the enum value carries into the JSON
 
 
@@ -2505,46 +2507,103 @@ def test_a4b_outbound_strand_blocks_one_each_at_H_gt_D() -> None:
     assert slack == 40
 
 
-def test_a4b_per_stage_permit_is_byte_identical_at_H_equals_D_even_with_split_present() -> None:
-    """At H==D the gate MUST take the stage-blind branch even when the per-stage split IS supplied — the sound
-    per-stage weights (ingress*D) would otherwise diverge from the pre-#229 `A*D - stranded - dead` and
-    regress a published run. `free == 0` at H==D, so the sound branch is deliberately GATED to H>D."""
-    a, d = 1000, 8
-    slack = _OBSERVER_DISAGREE_TOL * a * d
-    # A spread at H==D; for each, the verdict must match the OLD `S > (A*D - stranded - dead) + slack`, and
-    # must be IDENTICAL whether or not the per-stage split is supplied (the gate ignores it at H==D).
+def test_a4b_per_stage_permit_applies_at_H_equals_D_when_the_split_is_present() -> None:
+    """BACKLOG #5577: at H == D the per-stage permit applies whenever the split is supplied. v8 fell back
+    to the stage-blind `A*D - stranded - dead` there, which charges an ingress strand ONE delivery where it
+    blocks D, so a sink beyond the store's real capacity read as an honest COLLAPSED. Without the split the
+    stage-blind fallback is unchanged."""
+    a, d = 1000, 8  # expected A*D = 8000, slack 80
+    # (ingress, routed, outbound, dead, sink, verdict with the split, verdict without it). The split
+    # holds dead rows too, as `_summarize_queue_rows` builds it, so `stranded` is the split's sum minus dead.
     cases = [
-        (0, 0, 0, 0, a * d - 500),  # honest collapse, agrees
-        (300, 0, 0, 300, a * d - 300 + int(slack) + 1),  # one past the edge ⇒ contradiction
-        (200, 100, 300, 0, a * d - 700),  # split across ingress+routed, sink short by the loss
+        (0, 0, 0, 0, 7500, False, False),  # honest collapse: both permits are 8000
+        (0, 300, 0, 300, 7781, True, True),  # 300 dead routed rows: both permits 7700, 7781 > 7780
+        # The defect: 200 ingress strands block 1600, so the real capacity is 8000 - 2000 = 6000. The
+        # stage-blind permit (8000 - 600) forgave a sink of 7300 that capacity cannot explain.
+        (200, 100, 300, 0, 7300, True, False),
+        (200, 100, 300, 0, 6050, False, False),  # within the slack of the real capacity
     ]
-    for ingress_s, routed_s, outbound_s, dead, sink in cases:
-        stranded = ingress_s + routed_s + outbound_s
-        old_permit = a * d - max(0, stranded) - max(0, dead)
-        old_verdict = sink > old_permit + slack
+    for ingress_s, routed_s, outbound_s, dead, sink, want_split, want_blind in cases:
+        stranded = ingress_s + routed_s + outbound_s - dead
+        common = {
+            "engine_ok": False,
+            "acked": a,
+            "sink_received": sink,
+            "delivering": d,
+            "handlers": d,
+            "engine_stranded": stranded,
+            "engine_dead_total": dead,
+        }
         with_split = observers_inconclusive(
-            engine_ok=False,
-            acked=a,
-            sink_received=sink,
-            delivering=d,
-            handlers=d,  # H == D ⇒ free == 0 ⇒ stage-blind branch, split IGNORED
-            engine_stranded=stranded,
-            engine_dead_total=dead,
             ingress_stranded=ingress_s,
             routed_stranded=routed_s,
             outbound_stranded=outbound_s,
+            **common,  # type: ignore[arg-type]
         )
-        without_split = observers_inconclusive(
-            engine_ok=False,
-            acked=a,
-            sink_received=sink,
-            delivering=d,
-            handlers=d,
-            engine_stranded=stranded,
-            engine_dead_total=dead,
-        )
-        assert with_split is old_verdict, (ingress_s, routed_s, outbound_s, dead, sink)
-        assert without_split is old_verdict, (ingress_s, routed_s, outbound_s, dead, sink)
+        without_split = observers_inconclusive(**common)  # type: ignore[arg-type]
+        assert with_split is want_split, (ingress_s, routed_s, outbound_s, dead, sink)
+        assert without_split is want_blind, (ingress_s, routed_s, outbound_s, dead, sink)
+
+
+def test_a4b_rows_outside_the_stage_split_are_charged_not_dropped() -> None:
+    """BACKLOG #5577: `_summarize_queue_rows` splits only ingress/routed/outbound, so a `response`-stage
+    row is in `stranded` but in no per-stage count. v8 charged it nothing on the per-stage branch; each
+    such residual row is now charged D, so the permit can only fall."""
+    a, d = 1000, 4
+    rows = _shardcert._summarize_queue_rows(
+        [("response", "pending", 500), ("outbound", "pending", 10)]
+    )
+    assert rows.nonterminal == 510
+    assert rows.ingress_stranded + rows.routed_stranded + rows.outbound_stranded == 10
+    # 3000: under the old permits (H == D stage-blind 4000 - 510; H > D per-stage 4000 - 10) by more than
+    # the slack, over the new one (4000 - (500 * 4 + 10)), so each shape tells the fix from the defect.
+    sink = 3000
+    kwargs: dict[str, int | bool] = {
+        "engine_ok": False,
+        "acked": a,
+        "sink_received": sink,
+        "delivering": d,
+        "engine_stranded": rows.nonterminal,
+        "engine_dead_total": rows.dead_total,
+        "ingress_stranded": rows.ingress_stranded,
+        "routed_stranded": rows.routed_stranded,
+        "outbound_stranded": rows.outbound_stranded,
+    }
+    for handlers in (d, d + 4):  # H == D and H > D
+        assert observers_inconclusive(handlers=handlers, **kwargs) is True, handlers  # type: ignore[arg-type]
+
+
+def test_a4b_material_sink_shortfall_behind_a_clean_drain_gate_is_inconclusive() -> None:
+    """BACKLOG #5577: with the drain gate present the sinks tally only after the engine reported every row
+    done, so a clean store-truth asserts all A*D copies delivered. A sink materially short of that is a
+    contradiction (INCONCLUSIVE, stops the climb), never the benign FROZEN_TAIL a LOST gate produces."""
+    acked = 1440
+    short = dataclasses.replace(
+        _drive(ingress=24.0, acked=acked, sink_received=acked * 8 // 2),  # half the copies missing
+        tallied_behind_gate=True,
+    )
+    gated = build_rung_outcome(_rung(idx=1, rate=24.0), short, _gate(engine_ok=True), _report())
+    assert gated.verdict is RungVerdict.INCONCLUSIVE
+    assert gated.drain_gated is True
+    assert gated.to_json_dict()["engine"]["drain_gated"] is True  # type: ignore[index]
+    assert stops_climb(gated.verdict)
+    assert any("cross-observer INCONCLUSIVE" in n for n in gated.notes)
+    # The gate reached disk, but only AFTER the drive's wait timed out and its sinks tallied: an early tally.
+    late = dataclasses.replace(short, tallied_behind_gate=False)
+    late_out = build_rung_outcome(_rung(idx=1, rate=24.0), late, _gate(engine_ok=True), _report())
+    assert late_out.verdict is RungVerdict.FROZEN_TAIL
+    assert late_out.drain_gated is False
+    # Without the gate (store-truth from the late report only) the sinks may have tallied early: a tail.
+    ungated = build_rung_outcome(_rung(idx=1, rate=24.0), short, None, _report())
+    assert ungated.verdict is RungVerdict.FROZEN_TAIL
+    # A within-tolerance tail behind the gate is still FROZEN_TAIL.
+    tail = dataclasses.replace(
+        _drive(ingress=24.0, acked=acked, sink_received=acked * 8 - 5), tallied_behind_gate=True
+    )
+    assert (
+        build_rung_outcome(_rung(idx=1, rate=24.0), tail, _gate(engine_ok=True), _report()).verdict
+        is RungVerdict.FROZEN_TAIL
+    )
 
 
 def test_rung_json_carries_the_shape_and_schema_v5() -> None:
@@ -2566,8 +2625,8 @@ def test_rung_json_carries_the_shape_and_schema_v5() -> None:
     assert rung_js["outbound_expected"] == out.acked * 4  # A * D, never A * dests
 
     assert (
-        js["schema_version"] == 8
-    )  # v8 (#229): +per-stage strand split for the sound H>D A4b permit
+        js["schema_version"] == 9
+    )  # v9 (#5577): per-stage permit at H == D, residual rows, gated shortfall
     topo = js["topology"]
     assert isinstance(topo, dict)
     assert topo["dests"] == 4 and topo["handlers"] == 20 and topo["delivering"] == 4
@@ -2631,8 +2690,10 @@ def test_drive_report_json_carries_the_shape_and_schema_v3() -> None:
     )
     js = drive.to_json_dict()
     # v2: `dests` != fan-out; v3: +routing; v4: +fidelity gate + G (inbound bands); v5: +store_pool and the
-    # DEFERRAL CAUSE SPLIT + sent_ratio ⇒ a stale reader notices rather than silently mis-reading.
-    assert js["schema_version"] == 5
+    # DEFERRAL CAUSE SPLIT + sent_ratio ⇒ a stale reader notices rather than silently mis-reading; v6
+    # (#5577): +tallied_behind_gate.
+    assert js["schema_version"] == 6
+    assert js["tallied_behind_gate"] is False
     topo = js["topology"]
     assert isinstance(topo, dict)
     assert (topo["dests"], topo["handlers"], topo["delivering"]) == (8, 20, 4)
@@ -3657,3 +3718,98 @@ def test_a_pool_bound_ceiling_does_not_mask_a_run_where_nothing_was_measured() -
         rep.result_label == "SETUP_DEGRADED"
     )  # ...but nothing was certified, and THAT is the headline
     assert rep.exit_code == 2
+
+
+# --- BACKLOG #5577, Manager ruling: the gate never softens a fail -----------------------------------------
+
+
+def _gated(*, sink_received: int, drained: bool = True) -> ShardCertDriveReport:
+    return dataclasses.replace(
+        _drive(ingress=24.0, acked=1440, sink_received=sink_received, drained=drained),
+        tallied_behind_gate=True,
+    )
+
+
+def test_gated_sink_shortfall_with_no_store_loss_is_inconclusive() -> None:
+    """The store-truth says every copy was delivered (engine_ok) and the gated sinks came up half short:
+    a genuine observer contradiction, so INCONCLUSIVE, which stops the climb and reads SETUP_DEGRADED."""
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        _gated(sink_received=1440 * 8 // 2),
+        _gate(engine_ok=True),
+        _report(),
+    )
+    assert out.verdict is RungVerdict.INCONCLUSIVE
+    assert out.gated_shortfall is True
+    rep = _rep([out])
+    assert rep.store_truth_unconfirmed is True
+    assert rep.exit_code == 2
+
+
+def test_gated_store_loss_is_not_softened() -> None:
+    """Store-truth loss behind the gate (rows stranded, engine_ok False, the sink short by them) is still
+    the COLLAPSED it was before #5577, never the softer INCONCLUSIVE, and never a gated shortfall."""
+    stranded = 400
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        _gated(sink_received=1440 * 8 - stranded, drained=False),
+        _gate(engine_ok=False, drained=False, stranded=stranded),
+        _report(),
+    )
+    assert out.verdict is RungVerdict.COLLAPSED
+    assert out.gated_shortfall is False
+
+
+@pytest.mark.parametrize(
+    ("sink", "gate_kwargs"),
+    [
+        (1440 * 8 // 2, {"engine_ok": True}),  # gated shortfall, store-truth clean
+        (1440 * 8 - 400, {"engine_ok": False, "drained": False, "stranded": 400}),  # store loss
+    ],
+)
+def test_soak_that_did_not_hold_behind_the_gate_reads_not_sustained(
+    sink: int, gate_kwargs: dict[str, object]
+) -> None:
+    """A soak whose store-truth WAS confirmed and did not hold reads SOAK_NOT_SUSTAINED. Before #5577 the
+    gated-shortfall soak was a FROZEN_TAIL and read that; trigger (c) must not soften it to UNCONFIRMED."""
+    soak = build_rung_outcome(
+        dataclasses.replace(_rung(idx=0, rate=20.0), is_soak=True, index=-1),
+        _gated(sink_received=sink),
+        _gate(**gate_kwargs),  # type: ignore[arg-type]
+        _report(),
+    )
+    rep = _rep([_outcome(20.0, RungVerdict.SUSTAINED)], soak=soak)
+    assert rep.soak_not_sustained is True
+    assert rep.soak_store_truth_unconfirmed is False
+    assert rep.result_label == "SOAK_NOT_SUSTAINED"
+
+
+def test_drive_fails_fast_when_the_engine_setup_failed(tmp_path: pathlib.Path) -> None:
+    """BACKLOG #5576 (note 3): an engine half whose store reset failed posts ENGINE_SETUP_FAILED, and the
+    drive's SHARDS_READY wait stops on it at once instead of waiting out its timeout."""
+    import asyncio
+    import time
+
+    c = coord.FileDropCoord(tmp_path, run_id="r")
+    c.post(_shardcert.ENGINE_SETUP_FAILED, {"reason": "store reset left rows in ['nodes']"})
+    t0 = time.monotonic()
+    with pytest.raises(_shardcert.EngineSetupFailed, match="nodes"):
+        asyncio.run(_shardcert._await_shards_ready(c, timeout=60.0))
+    assert time.monotonic() - t0 < 5.0
+    assert isinstance(_shardcert.EngineSetupFailed("x"), coord.CoordTimeout)
+
+
+def test_blind_collector_soak_behind_the_gate_stays_unconfirmed() -> None:
+    """A gated soak whose sinks saw NOTHING (trigger (b), a blind collector) proves nothing: it stays
+    SOAK_UNCONFIRMED and is not a gated shortfall, which would make it a proven SOAK_NOT_SUSTAINED."""
+    soak = build_rung_outcome(
+        dataclasses.replace(_rung(idx=0, rate=20.0), is_soak=True, index=-1),
+        _gated(sink_received=0),
+        _gate(engine_ok=True),
+        _report(),
+    )
+    assert soak.verdict is RungVerdict.INCONCLUSIVE
+    assert soak.gated_shortfall is False
+    rep = _rep([_outcome(20.0, RungVerdict.SUSTAINED)], soak=soak)
+    assert rep.soak_store_truth_unconfirmed is True
+    assert rep.soak_not_sustained is False

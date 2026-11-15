@@ -118,7 +118,15 @@ def sb(tmp_path: Path) -> Sandbox:
     s = make_sandbox(tmp_path)
     s.set_state(variables={"MEFOR_AFK_KILL": "off"})
     write_fake_usage(tmp_path / "usage.ps1", usage())
+    # The gate joins seat aliases through the roster and reviews without it, as a checkout has it.
+    _roster(s)
     return s
+
+
+def _roster(sb: Sandbox) -> None:
+    roster = sb.repo / "docs" / "roles"
+    roster.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
 
 
 def _usage_path(sb: Sandbox) -> Path:
@@ -392,9 +400,6 @@ def test_a_hit_stands_when_usage_reads_unknown_overall(sb: Sandbox) -> None:
 @pytest.mark.parametrize("seat", ["lander", "land"])
 def test_the_lander_is_exempt_from_the_halt(sb: Sandbox, seat: str) -> None:
     """The roster's aliases count too; the sandbox gets the real roster, as a checkout has it."""
-    roster = sb.repo / "docs" / "roles"
-    roster.mkdir(parents=True)
-    shutil.copy2(ROOT / "docs" / "roles" / "seats.json", roster / "seats.json")
     seed_vault(sb, calibrated(seat))
     write_fake_usage(_usage_path(sb), usage(99.0, state="CRITICAL"))
     code, doc = gate(sb, seat=seat)
@@ -927,6 +932,51 @@ def test_two_reversals_of_a_seats_decisions_close_that_seat_only(sb: Sandbox) ->
     assert code == REVIEW and "two reversals of manager's decisions" in why(doc)
     assert gate(sb, seat="builder")[0] == NO_REVIEW
     assert gate(sb, seat="lander")[0] == NO_REVIEW, "the outcome's own seat was charged"
+
+
+@pytest.mark.parametrize("spelling", ["manager1", " Manager ", "MGR"])
+def test_a_reversal_charged_to_an_alias_closes_the_seat_it_spells(
+    sb: Sandbox, spelling: str
+) -> None:
+    """BACKLOG #5597: the seat match was a raw string compare, so a decision logged under an alias or
+    a padded spelling escaped the seat's own reversal budget. The roster's aliases, trim and case
+    decide what one seat is."""
+    mine = [rec(at=ago(days=20), seat=spelling, item=f"x{i}") for i in range(2)]
+    seed_vault(sb, calibrated("manager") + calibrated("builder") + mine)
+    seed_vault(sb, [reversal(mine[0], ago(hours=3)), reversal(mine[1], ago(hours=2))])
+    code, doc = gate(sb)
+    assert code == REVIEW and "two reversals of manager's decisions" in why(doc), why(doc)
+    assert gate(sb, seat="builder")[0] == NO_REVIEW, "an alias closed a seat it does not spell"
+
+
+def test_an_alias_does_not_escape_the_seats_calibration_breach(sb: Sandbox) -> None:
+    """BACKLOG #5597: a calibrated history under `manager1` and a breach under `manager` are one
+    seat's history. Asked as the alias, the raw compare read only the clean half and answered
+    NO-REVIEW."""
+    bad = [rec(at=ago(days=19, minutes=i), seat="manager", item="calib") for i in range(4)]
+    rated = [
+        rec("rating", at=ago(days=19, minutes=-1 - i), seat="owner", ref=d["id"], rating="disagree")
+        for i, d in enumerate(bad)
+    ]
+    seed_vault(sb, calibrated("manager1") + bad + rated)
+    code, doc = gate(sb, seat="manager1")
+    assert code == REVIEW and "not calibrated" in why(doc), why(doc)
+
+
+def test_an_unreadable_roster_reviews_rather_than_reading_history_in_part(sb: Sandbox) -> None:
+    """Without docs/roles/seats.json no alias can be joined to its seat, so the seat's budget and
+    calibration may be read in part. BACKLOG #5597."""
+    (sb.repo / "docs" / "roles" / "seats.json").unlink()
+    seed_vault(sb, calibrated("manager"))
+    code, doc = gate(sb)
+    assert code == REVIEW and "seat roster" in why(doc), why(doc)
+
+
+def test_a_whitespace_seat_is_no_seat(sb: Sandbox) -> None:
+    """It canonicalizes to '', which would pool with every blank-seat record."""
+    seed_vault(sb, calibrated("manager"))
+    code, doc = gate(sb, seat="  ")
+    assert code == REVIEW and "no seat was given" in why(doc), why(doc)
 
 
 def test_a_reversal_logged_twice_counts_once(sb: Sandbox) -> None:

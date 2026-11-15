@@ -54,7 +54,7 @@ _BASE = _sample(read=0, written=0)
 
 
 def _poller(final: EngineSample) -> EnginePoller:
-    return cast(EnginePoller, SimpleNamespace(baseline=_BASE, final=final))
+    return cast(EnginePoller, SimpleNamespace(baseline=_BASE, final=final, samples=[_BASE, final]))
 
 
 # --- #5435: the sample ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ def test_load_reconcile_fails_a_run_whose_router_stalled_every_message() -> None
     )
     assert not result.ok
     assert result.backlog == 90
-    assert "backlog 90 not drained" in result.detail
+    assert "in_pipeline 90 not done" in result.detail
 
 
 def test_load_reconcile_still_passes_a_drained_run() -> None:

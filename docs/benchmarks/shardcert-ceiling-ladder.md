@@ -183,7 +183,8 @@ zeroes under load, #841) and is **never** an input to any gate. Per-rung classif
 |---|---|---|
 | `SUSTAINED` | engine drained clean **and** drive lossless — the pinned-ceiling candidate | continues |
 | `COLLAPSED` | engine did **not** drain clean (stranded/dead/backlog remained) — the real ceiling | **stops** |
-| `FROZEN_TAIL` | engine drained clean but the sink tally came up short with no ordering/dup break — a latency tail, **not** the ceiling (re-run with a longer drain) | continues |
+| `FROZEN_TAIL` | engine drained clean but the sink tally came up short with no ordering/dup break, and either the sinks tallied without the drain gate or the shortfall is within the 1% tolerance — a latency tail, **not** the ceiling (re-run with a longer drain) | continues |
+| `INCONCLUSIVE` | store-truth never arrived, or the two observers contradict each other. One case: the sinks tallied behind the drain gate and came up more than 1% short of `acked × delivering` against a clean engine (BACKLOG #5577). Not a ceiling, and the rate below it stays a floor | **stops** |
 | `CORRECTNESS_FAIL` | a per-lane FIFO inversion or duplicate — fails the ladder verdict | **stops** |
 
 ## Target framing (read this before quoting a number)

@@ -24,8 +24,13 @@ from scripts.release.tag_provenance import Report, reports_from, verdict
 _REQUIRED = ("CI gate", "cla")
 
 
-def _check(id_: int, name: str, conclusion: str, state: str = "completed") -> Report:
-    return Report(id=id_, context=name, kind="check", state=state, conclusion=conclusion)
+def _check(
+    id_: int, name: str, conclusion: str, state: str = "completed", suite: int = 1
+) -> Report:
+    # One suite by default, so a higher id is a re-run that supersedes; #5591's tests vary it.
+    return Report(
+        id=id_, context=name, kind="check", state=state, conclusion=conclusion, suite=suite
+    )
 
 
 def _status(id_: int, name: str, state: str) -> Report:
@@ -262,10 +267,11 @@ def test_read_server_asks_gh_for_each_endpoint_and_reads_its_pages(
             ],
             [],
         ],
-        "commits/abc/check-runs?per_page=100": [
+        "commits/abc/check-runs?filter=all&per_page=100": [
             {"check_runs": [{"id": 1, "name": "a", "status": "completed", "conclusion": "success"}]}
         ],
         "commits/abc/statuses?per_page=100": [[{"id": 2, "context": "b", "state": "success"}]],
+        "actions/runs?head_sha=abc&per_page=100": [{"workflow_runs": []}],
     }
     calls: list[list[str]] = []
 
@@ -280,5 +286,127 @@ def test_read_server_asks_gh_for_each_endpoint_and_reads_its_pages(
     assert [r.context for r in reports] == ["a", "b"]
     paginated = [c[-1] for c in calls if "--paginate" in c]
     assert all("--slurp" in c for c in calls if "--paginate" in c)
-    assert len(paginated) == 3, calls
+    assert len(paginated) == 4, calls
     assert calls[0][1:] == ["--jq", "{status}"], calls[0]
+
+
+def _run(id_: int, suite: int | None, status: str, conclusion: str | None = None) -> dict[str, Any]:
+    run: dict[str, Any] = {"id": id_, "name": "CI gate", "status": status, "conclusion": conclusion}
+    if suite is not None:
+        run["check_suite"] = {"id": suite}
+    return run
+
+
+def _runs(*runs: dict[str, Any], owners: dict[int, tuple[str, str]] | None = None) -> list[Report]:
+    """Reports from check runs, with ``owners`` mapping a suite id to its (workflow id, event)."""
+    workflow_runs = [
+        {"check_suite_id": suite, "workflow_id": workflow, "event": event}
+        for suite, (workflow, event) in (owners or {}).items()
+    ]
+    return reports_from([{"check_runs": list(runs)}], [], [{"workflow_runs": workflow_runs}])
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        # A red in one suite, then a green in another: the green does not supersede the red.
+        (_run(10, 100, "completed", "failure"), _run(11, 200, "completed", "success")),
+        # A run still going in one suite, then a green in another.
+        (_run(10, 100, "in_progress"), _run(11, 200, "completed", "success")),
+        # No suite named: each run stands alone, so the red is never superseded.
+        (_run(10, None, "completed", "failure"), _run(11, None, "completed", "success")),
+    ],
+    ids=["red-then-green-other-suite", "running-then-green-other-suite", "no-suite-id"],
+)
+def test_a_green_in_another_suite_does_not_hide_a_red_or_running_run(
+    runs: tuple[dict[str, Any], ...],
+) -> None:
+    """BACKLOG #5591: with no workflow run naming them, only the SAME suite supersedes."""
+    problems = verdict("behind", ["CI gate"], _runs(*runs))
+    assert len(problems) == 1 and "did not pass" in problems[0], problems
+
+
+@pytest.mark.parametrize(
+    "owners",
+    [
+        {100: ("1", "merge_group"), 200: ("1", "push")},
+        {100: ("1", "push"), 200: ("2", "push")},
+    ],
+    ids=["same-workflow-other-event", "same-event-other-workflow"],
+)
+def test_a_green_from_another_workflow_or_event_does_not_hide_a_red(
+    owners: dict[int, tuple[str, str]],
+) -> None:
+    """BACKLOG #5591: the merge-queue run and main's push run are independent reports."""
+    reports = _runs(
+        _run(10, 100, "completed", "failure"), _run(11, 200, "completed", "success"), owners=owners
+    )
+    problems = verdict("behind", ["CI gate"], reports)
+    assert len(problems) == 1 and "run 10, suite 100" in problems[0], problems
+
+
+def test_unfinished_sees_a_run_still_going_in_another_suite() -> None:
+    reports = _runs(_run(10, 100, "in_progress"), _run(11, 200, "completed", "success"))
+    assert tp.unfinished(["CI gate"], reports) == ["CI gate"]
+
+
+def test_a_rerun_in_the_same_suite_supersedes_the_failed_attempt() -> None:
+    """POSITIVE CONTROL for #5591: the documented remedy, re-running the failed job, still works."""
+    reports = _runs(
+        _run(10, 100, "completed", "failure"),
+        _run(11, 200, "completed", "success"),
+        _run(12, 100, "completed", "success"),
+    )
+    assert verdict("behind", ["CI gate"], reports) == []
+    assert tp.unfinished(["CI gate"], reports) == []
+
+
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch", "issue_comment"])
+def test_a_later_run_of_the_same_workflow_on_the_same_event_supersedes(event: str) -> None:
+    """The next nightly, a second dispatch, or a later comment run repeats the same test, so a red
+    one does not block the commit for good. A cancelled run counts as red until then."""
+    owners = {100: ("1", "merge_group"), 300: ("2", event), 400: ("2", event)}
+    first = [_run(10, 100, "completed", "success"), _run(11, 300, "completed", "cancelled")]
+    problems = verdict("behind", ["CI gate"], _runs(*first, owners=owners))
+    assert len(problems) == 1 and f"event {event}" in problems[0], problems
+    healed = _runs(*first, _run(12, 400, "completed", "success"), owners=owners)
+    assert verdict("behind", ["CI gate"], healed) == []
+
+
+def test_the_lineage_rule_never_passes_what_the_pre_5591_rule_refused() -> None:
+    """The newest run of a context, whatever its lineage, is a latest report under both rules."""
+    owners = {100: ("1", "push"), 300: ("2", "issue_comment"), 500: ("3", "other")}
+    for suite in (100, 300, 500, 900):
+        reports = _runs(
+            _run(10, 100, "completed", "success"),
+            _run(11, 300, "completed", "success"),
+            _run(12, suite, "completed", "failure"),
+            owners=owners,
+        )
+        assert verdict("behind", ["CI gate"], reports), suite
+
+
+def test_a_failure_names_its_run_suite_and_event() -> None:
+    """The remedy is re-running THAT workflow run, so the refusal must say which one it is."""
+    problems = verdict(
+        "behind",
+        ["CI gate"],
+        _runs(_run(10, 100, "completed", "failure"), owners={100: ("1", "push")}),
+    )
+    assert "run 10, suite 100, event push" in problems[0], problems
+
+
+def test_main_refuses_at_once_on_a_red_suite_waiting_cannot_fix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run still going in one suite cannot supersede a red in another, so nothing is waited for."""
+    contexts = tmp_path / "required-contexts.txt"
+    contexts.write_text("CI gate\n", encoding="utf-8")
+    reports = _runs(_run(10, 100, "completed", "failure"), _run(11, 200, "in_progress"))
+    monkeypatch.setattr(tp, "read_server", lambda *_a: ("behind", [], reports))
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    args = ["--repo", "o/r", "--sha", "abc", "--contexts-file", str(contexts)]
+    assert tp.main(args) == 1
+    assert sleeps == []
+    assert "completed/failure" in capsys.readouterr().out

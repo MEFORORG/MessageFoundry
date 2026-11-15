@@ -15,16 +15,18 @@ import csv
 import io
 import json
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 from harness._spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from harness.load.enginepoll import EnginePoller
 from harness.load.metrics import Counters, Histogram, LatencySummary
 from harness.load.profile import LoadProfile, Phase, Slo
 
-SCHEMA_VERSION = 5  # 1→2: committed_txns + txn_per_message_measured; 2→3: body_copies +
+SCHEMA_VERSION = 6  # 1→2: committed_txns + txn_per_message_measured; 2→3: body_copies +
 # copies_per_message (the #207 sizing proxy — a COPY COUNT, never a byte figure; ADR 0141);
 # 3 to 4: totals.refused_sends (sends the harness refused to frame, ADR 0205 rule 1);
-# 4 to 5: the poller's own cost and txn_per_message_poller_removed (vault BACKLOG #2794)
+# 4 to 5: the poller's own cost and txn_per_message_poller_removed (vault BACKLOG #2794);
+# 5 to 6: no_loss.inconclusive (BACKLOG #5574)
 
 # Exit codes (shared with the CLI).
 EXIT_OK = 0
@@ -81,6 +83,9 @@ class NoLoss:
     #: `no-loss: OK` the normal shape of a contended CI log. Defaulted, so every existing positional
     #: construction is unchanged.
     heavily_stranded: bool = False
+    #: ``ok`` is False and nothing proved a loss: the run cannot clear itself (BACKLOG #5574).
+    #: ``_reconcile`` holds the reasons. Rendered INCONCLUSIVE, not LOSS; it still fails zero_loss.
+    inconclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +260,7 @@ class RunReport:
             },
             "no_loss": {
                 "ok": self.no_loss.ok,
+                "inconclusive": self.no_loss.inconclusive,
                 "sent": self.no_loss.sent,
                 "engine_read": self.no_loss.engine_read,
                 "engine_written": self.no_loss.engine_written,
@@ -380,8 +386,9 @@ class RunReport:
             f"copies/msg ({e.db_backend or '?'}; NOT bytes): {copies} (body_copies={e.body_copies})"
         )
         nl = self.no_loss
+        verdict = "OK" if nl.ok else "INCONCLUSIVE" if nl.inconclusive else "LOSS"
         lines.append(
-            f"no-loss: {'OK' if nl.ok else 'LOSS'} — sent={nl.sent} engine_read={nl.engine_read} "
+            f"no-loss: {verdict} — sent={nl.sent} engine_read={nl.engine_read} "
             f"engine_written={nl.engine_written} sink_received={nl.sink_received} "
             f"backlog={nl.backlog} at_least_once={nl.at_least_once_redeliveries}"
         )
@@ -648,10 +655,39 @@ def _reconcile(
             -1,
             0,
             "engine metrics unavailable — cannot verify no-loss",
+            inconclusive=True,
         )
     read = final.read - base.read
     written = final.written - base.written
     backlog = final.backlog
+    # A restarted engine's counters begin again from zero, and a stats reset or a purge of counted
+    # rows also lowers them, so final - baseline is no longer a run total: it can go negative (read
+    # as a huge intake "loss") or, once the counters regrow past the baseline, look plausible while
+    # undercounting. No intake or delivery verdict rests on it (BACKLOG #5574). The whole sample run
+    # is read, not only its two ends, so a reset hidden by regrowth is still seen. At least this
+    # misses a restart of one shard of a cluster whose summed counters and max uptime kept rising.
+    # The dead-ACK-path signature reads no engine counter, so it still proves a loss here; it is
+    # computed here, once, for both paths (its reasoning is at its use below).
+    ack_path_dead = sent > 0 and counters.acked + counters.nak == 0
+    reset = _counter_reset(poller)
+    if reset is not None:
+        detail = (
+            f"{reset} — the read/written deltas cannot be reconciled against this run's sends, "
+            f"and the drain and delivery arms were not judged"
+        )
+        if ack_path_dead:
+            detail = f"{sent} sent and the sender saw no reply at all — a dead ACK path; {detail}"
+        return NoLoss(
+            False,
+            sent,
+            max(0, read),
+            max(0, written),
+            sink_received,
+            backlog,
+            0,
+            detail,
+            inconclusive=not ack_path_dead,
+        )
     at_least_once = max(0, sink_received - written)
     # Only a SHORTFALL is loss; an excess is benign. Intake: read < sent means the engine never
     # received some messages we sent. Delivery: sink_received < written means a delivery the engine
@@ -731,8 +767,10 @@ def _reconcile(
     # (harness/load/enginepoll.py) stops polling on `read >= sent - timeouts` AND
     # `sink_received >= written` AND an empty pipeline — which is `read_ok` AND `deliver_ok` AND
     # `drained`, the same three arms rearranged. So ON A RUN WHOSE SAMPLER SETTLED, all three hold
-    # by construction and `ok` is decided by `ack_path_dead` alone; the three only carry information
-    # on a run that exhausted `drain_timeout_s` without settling.
+    # by construction and, among the LOSS arms, `ok` is decided by `ack_path_dead` alone; the three
+    # only carry information on a run that exhausted `drain_timeout_s` without settling. The
+    # INCONCLUSIVE reasons (BACKLOG #5574), among them at least the counter reset above and the
+    # `unproven` list below, are independent of the sampler and can fail a settled run too.
     #
     # The coupling is not new — the sampler has always stopped on the reconcile's own condition, and
     # `read_short` has always been that condition. WHAT IS NEW is that the retired floor was the one
@@ -785,12 +823,29 @@ def _reconcile(
     # a handful of sends. A floor is deliberately NOT added: it would be one more tuned number in a
     # function whose defect was tuned numbers, and every profile this copy serves offers two orders
     # of magnitude more than that. Revisit if a genuinely tiny load profile ever ships.
-    ack_path_dead = sent > 0 and counters.acked + counters.nak == 0
     deliver_short = written - sink_received
     read_ok = read_short <= tolerance
     deliver_ok = deliver_short <= tolerance
-    drained = backlog == 0
-    ok = read_ok and deliver_ok and drained and not ack_path_dead
+    # Read the explicit fields rather than `backlog`, whose meaning (outbound only, or the whole
+    # pipeline) is not this function's to assume: drained needs BOTH no outbound row pending or
+    # inflight AND no not-done row in any stage, ingress and routed included (BACKLOG #5574).
+    outbound_backlog = final.pending + final.inflight
+    drained = outbound_backlog == 0 and final.in_pipeline == 0
+    lost = not read_ok or not deliver_ok or ack_path_dead
+    # Reasons the run cannot CLEAR itself even though no arm proved a loss (BACKLOG #5574). Each
+    # used to read as zero loss: the arms above are all inequalities that an empty, unsettled or
+    # undelivering run satisfies trivially.
+    unproven: list[str] = []
+    if sent == 0:
+        unproven.append("nothing was sent — the run measured nothing")
+    elif sink_received == 0 and written <= 0:
+        unproven.append(
+            f"nothing was delivered (sink_received 0, engine_written {written}) — "
+            f"no delivery to reconcile"
+        )
+    if drain_seconds is None:
+        unproven.append("the drain timed out — the final counts are an unsettled snapshot")
+    ok = not lost and drained and not unproven
     parts: list[str] = []
     if not read_ok:
         parts.append(
@@ -807,7 +862,11 @@ def _reconcile(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
     if not drained:
-        parts.append(f"backlog {backlog} not drained")
+        parts.append(
+            f"backlog {outbound_backlog} outbound, in_pipeline {final.in_pipeline} not done in "
+            f"any stage (ingress, routed or outbound) — not drained"
+        )
+    parts.extend(unproven)
     if heavily_stranded:
         # A NOTE, not a verdict: this no longer decides `ok`. It says the run is poorly confirmed —
         # most of what it offered was never replied to — which makes it a weak MEASUREMENT even
@@ -834,8 +893,44 @@ def _reconcile(
         )
     detail = "; ".join(parts) if parts else _NO_LOSS_ALL_CLEAR
     return NoLoss(
-        ok, sent, read, written, sink_received, backlog, at_least_once, detail, heavily_stranded
+        ok,
+        sent,
+        read,
+        written,
+        sink_received,
+        backlog,
+        at_least_once,
+        detail,
+        heavily_stranded,
+        inconclusive=not ok and not lost,
     )
+
+
+def _counter_reset(poller: EnginePoller) -> str | None:
+    """Name the first step between consecutive samples (the baseline is the first, the final the
+    last) where ``read`` or ``written`` went backwards, or where the engine's uptime is shorter than
+    the harness's own monotonic time since the previous sample -- it started after that sample.
+
+    Uptime is compared to the elapsed gap rather than to the previous uptime because the engine
+    derives uptime from the wall clock, so a clock step back is not a restart. At least a restart
+    of one shard whose summed counters and max uptime kept rising is missed here."""
+    for prev, cur in pairwise(poller.samples):
+        # A counter step back is a restart, a stats reset or a purge of counted rows; this cannot
+        # tell which, so it says so.
+        if cur.read < prev.read or cur.written < prev.written:
+            return (
+                f"engine counters went backwards (read {prev.read} -> {cur.read}, written "
+                f"{prev.written} -> {cur.written}): an engine restart, a stats reset or a purge"
+            )
+        # The engine clamps a negative wall-clock uptime to 0.0, so 0.0 is a large clock step back
+        # on a running engine rather than evidence of a restart, and is not read as one.
+        gap = cur.elapsed_s - prev.elapsed_s
+        if 0.0 < cur.uptime_s < gap:
+            return (
+                f"the engine restarted mid-run (uptime {cur.uptime_s:.1f}s is shorter than the "
+                f"{gap:.1f}s since the previous sample)"
+            )
+    return None
 
 
 def _engine_summary(
@@ -995,7 +1090,11 @@ def compare_to_baseline(
         if b_p99 > 0 and c_p99 > b_p99 * (1.0 + tolerance):
             out.append(f"{name}: e2e p99 regressed {c_p99:.1f} > {b_p99:.1f} ms")
     if _loss_ok(baseline) and not _loss_ok(current):
-        out.append("no-loss regressed: baseline had no loss, current run lost messages")
+        nl = current.get("no_loss")
+        if isinstance(nl, dict) and nl.get("inconclusive"):
+            out.append("no-loss regressed: baseline had no loss, current run is inconclusive")
+        else:
+            out.append("no-loss regressed: baseline had no loss, current run lost messages")
     return out
 
 
