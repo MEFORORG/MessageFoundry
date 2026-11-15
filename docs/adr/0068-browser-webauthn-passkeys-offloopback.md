@@ -772,10 +772,20 @@ factor, so the decision is made on the row the write replaces. When it applies:
 - without UV, `reauth_at` is cleared, whether or not the address moved, so a window opened earlier
   (for example by a password step-up on the pending session) never follows the anchor to a new
   address. A pending session that stepped up with the password from the same address loses that
-  window; this is accepted as the fail-closed answer. The clear covers `reauth_at` only: an
-  action-bound grant (ADR 0077) the pending session minted earlier, for example by
-  `POST /me/reauth` with a purpose, survives the assertion and the rotation, so after the anchor
-  moves it is spendable from the new address. That is left open here, not decided.
+  window; this is accepted as the fail-closed answer.
+
+**Parity with a code, measured.** A passkey that completes a pending factor never leaves the
+session weaker than a TOTP code (`verify_mfa`, unchanged here) completing the same pending factor.
+`tests/test_webauthn.py::test_a_non_uv_passkey_is_never_weaker_than_a_code_completing_the_same_factor`
+runs both from one state: a pending session at address A that minted an ADR 0077 grant by a
+password step-up there, whose factor is then completed from address B. Both paths move the anchor
+to B, so the new-address signal that every new-address refusal asks (`flag_new_client_ip`: the
+step-up gates, `require_phi_read`, `require_paced`, the reveal path and the console's
+`_refuse_from_new_address`) no longer fires from B, and both leave the earlier grant spendable from
+B. The code opens the window; the non-UV passkey shuts it. So the non-UV passkey matches the code
+on the anchor, the new-address refusal and the grant, and is stricter on the window. That an
+earlier grant and the new-address refusal both follow a factor completed from a new address is a
+property of both factor paths, not of the passkey, and is not decided here.
 
 No anchor is passed on an `oidc` session, whose window and anchor move only at the IdP (BACKLOG
 #2142). An assertion that reaches a session that has already met its factor, for example one
@@ -801,8 +811,9 @@ factor the engine checked. A TOTP code already had the same reach. Where
 `[auth].require_action_step_up` is off, every action-bound route falls back to the window, so there
 a user-verified passkey alone also passes factor binding and removal.
 
-AC-2 above is superseded: a verified assertion stamps `mfa_verified_at`, and, when it completes a
-pending factor, the client re-anchor and `reauth_at` only with UV, never on an `oidc` session. Its
+AC-2 above is superseded: a verified assertion stamps `mfa_verified_at`. When it completes a
+pending factor on any session but an `oidc` one, it also re-anchors the session to its client,
+with or without UV, and stamps `reauth_at` only with UV, clearing it without. Its
 verifying test is now `tests/test_webauthn.py::test_assertion_stamps_the_factor_and_re_anchors`,
 renamed from `test_assertion_stamps_mfa_only_never_reauth`.
 

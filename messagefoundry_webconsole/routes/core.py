@@ -2180,9 +2180,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # (the sanctioned /ui carve — the cookie stays confined to /ui deps; bearer_token()
     # is untouched) that verifies an assertion, marks the session's factor and, when that
     # completes a pending factor, re-anchors it as a TOTP code does, stamping the window only
-    # with the UV flag (vault BACKLOG #2964 item 14; not an oidc session). An assertion that
-    # arrives for a session that already met its factor (two tabs share the challenge, which
-    # moves with the session's re-key) marks it and re-keys, and moves no anchor and no window.
+    # with the UV flag (vault BACKLOG #2964 item 14; not an oidc session). The pages stage an
+    # assertion only for a session that has not met its factor, so an ordinary /ui/reauth step-up
+    # of a satisfied session gets no passkey and steps up with the password. An assertion can
+    # still arrive for a session that met its factor after the ceremony was staged (two tabs
+    # share the challenge, which moves with the session's re-key); it marks the factor and
+    # re-keys, and moves no anchor and no window.
     # An action-bound grant still comes only from a credential step-up, at least the password
     # leg of POST /ui/reauth, POST /me/reauth and the IdP leg (ADR 0077), never from this route.
     # NOT registered as a continuation (body-carrying JSON — part of the

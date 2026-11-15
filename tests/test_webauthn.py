@@ -1574,6 +1574,98 @@ async def test_a_factor_met_during_the_assertion_is_not_re_anchored(
         await store.close()
 
 
+async def test_a_non_uv_passkey_is_never_weaker_than_a_code_completing_the_same_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2964 item 14, the parity rule: a passkey assertion that completes a pending
+    factor must never leave the session weaker than a TOTP code (``verify_mfa``, unchanged by this
+    item) completing the same pending factor. Both paths run side by side from the same state: a
+    pending session at address A that minted an ADR 0077 grant by a password step-up there, whose
+    factor is then completed from address B. Measured on each: where the anchor ends, whether the
+    window is open, whether the new-address signal (the one every new-address refusal asks) still
+    fires from B, and whether the grant is spendable from B. A non-UV passkey must match the code
+    on every one, or be stricter. RED when: the non-UV passkey leaves any of them more permissive
+    than the code does."""
+    from messagefoundry.auth import totp
+    from messagefoundry.auth.service import STEP_UP_ACTION_MESSAGE_EXPORT as export
+    from tests._totp_clock import pin_totp_clock
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        enroll = await service.begin_mfa_enrollment(identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(enroll.secret, now=t0), token=token
+        )
+        assert confirmed.ok and confirmed.token is not None
+        auth, _ = await _enroll(service, identity, confirmed.token)
+
+        async def pending_with_grant() -> str:
+            out = await service.login(ADMIN_USERNAME, password, client="10.11.0.1")
+            assert out.ok and out.mfa_required and out.identity is not None
+            assert out.token is not None
+            stepped = await service.reauth(
+                out.identity, password, token=out.token, client="10.11.0.1", purpose=export
+            )
+            assert stepped.ok and stepped.token is not None
+            assert not await service.mfa_satisfied(stepped.token)
+            return stepped.token
+
+        async def measure(current: str) -> dict[str, object]:
+            client, window = await _session_after(service, current)
+            return {
+                "anchor": client,
+                "window_open": window,
+                "new_address_signal_from_b": await service.flag_new_client_ip(
+                    current, "10.11.0.2", path="/ui/x"
+                ),
+                "grant_spendable_from_b": await service.has_action_step_up(current, export),
+            }
+
+        pending = await pending_with_grant()
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        code = await service.verify_mfa(
+            pending, totp.totp(enroll.secret, now=t1), client="10.11.0.2"
+        )
+        assert code.ok and code.token is not None
+        by_code = await measure(code.token)
+
+        pending = await pending_with_grant()
+        options = await service.begin_webauthn_assertion(pending, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        tap = await service.finish_webauthn_assertion(
+            pending,
+            auth.get_response(challenge, user_verified=False),
+            client="10.11.0.2",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert tap.ok and tap.token is not None
+        by_tap = await measure(tap.token)
+
+        # The measurement, stated: the code moves the anchor to B, opens the window, lifts the
+        # new-address signal from B and leaves the grant spendable there.
+        assert by_code == {
+            "anchor": "10.11.0.2",
+            "window_open": True,
+            "new_address_signal_from_b": False,
+            "grant_spendable_from_b": True,
+        }
+        # The non-UV passkey matches it on everything but the window, which it shuts: stricter.
+        assert by_tap == {**by_code, "window_open": False}
+        for key in ("window_open", "grant_spendable_from_b"):
+            assert not (by_tap[key] and not by_code[key]), key  # never more permissive
+        signal = "new_address_signal_from_b"  # here the permissive answer is False
+        assert not (by_code[signal] and not by_tap[signal]), signal
+    finally:
+        await store.close()
+
+
 async def test_a_passkey_registration_does_not_re_anchor() -> None:
     """Control for vault BACKLOG #2964 item 14: enrolment keeps the anchor where it was. ADR 0197
     Amendment A lets a holder of the password alone enrol, so a registration proves nothing about

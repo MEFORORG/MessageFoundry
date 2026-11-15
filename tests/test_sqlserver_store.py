@@ -1464,7 +1464,8 @@ async def test_writes_keyed_to_an_account_queue_behind_its_delete(store, write: 
         del store._write_session
     if write == "mark_session_mfa_verified":
         # The session went with the account, so the stamp found no row and wrote nothing.
-        assert outcome is None and written == [None], (outcome, written)
+        # It answers False, the "no anchor applied" answer (vault BACKLOG #2964 item 14).
+        assert outcome is False and written == [None], (outcome, written)
     else:
         assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
     assert await store.list_known_login_addresses(account, since=0.0) == []

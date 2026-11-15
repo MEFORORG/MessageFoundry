@@ -569,9 +569,11 @@
     });
   });
 
-  // Step-up assertion: run the get() ceremony against the staged options and POST the assertion
-  // to the reauth passkey leg. On success the factor is met, and the window stamped only with the
-  // UV flag — the operator still enters the password below, which completes the step-up.
+  // Passkey assertion: run the get() ceremony against the staged options and POST the assertion
+  // to the passkey leg. The server stages one only for a session that has not met its factor, so
+  // on success that factor is met (and the window stamped only with the UV flag). On the reauth
+  // page the operator still enters the password below, which completes the step-up; a session
+  // that already met its factor is offered no passkey there and steps up with the password.
   feature("[data-mf-webauthn-get]", function (button) {
     var status = statusNode(button);
     if (!window.PublicKeyCredential) {

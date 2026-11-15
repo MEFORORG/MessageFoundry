@@ -168,8 +168,10 @@ async def test_audit_cookie_not_accepted_on_json_routes(engine: Engine) -> None:
 #
 # Browser-level ceremony tests use the in-repo soft authenticator and are gated FUNCTION-LOCALLY on
 # the [webauthn] extra (a module-level importorskip here would skip the whole webui suite on an
-# extra-less install). The passkey assertion meets the factor, and stamps the window only with the
-# UV flag, which the soft authenticator here does not set; an action-bound route's grant comes
+# extra-less install). A passkey is staged only for a session that has not met its factor; its
+# assertion meets that factor, and stamps the window only with the UV flag, which the soft
+# authenticator here does not set. A session that already met its factor is offered no passkey on
+# /ui/reauth and steps up with the password. An action-bound route's grant comes
 # from a credential step-up, here the password leg of POST /ui/reauth (ADR 0077). Options ride
 # HTML-escaped data-* attributes (CSP: no inline script); only the verify legs are JSON POSTs — the
 # sanctioned first cookie-authed JSON under /ui.

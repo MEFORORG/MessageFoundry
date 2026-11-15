@@ -15353,9 +15353,12 @@ class AuthService:
         completes a factor the session had not yet met (:meth:`finish_webauthn_assertion`), on any
         session but an ``oidc`` one, re-anchors it too, so the signal clears, but it stamps
         the window only when the authenticator reported user verification and otherwise shuts it,
-        so after an assertion without that flag a window-gated step-up still forces a step-up. An
-        action-bound grant the session minted before it is not cleared, so an action gate can pass
-        on that grant from the new address (left open by ADR 0068's 2026-11-14 amendment). An assertion
+        so after an assertion without that flag a window-gated step-up still forces a step-up. As
+        after a code that completes the same pending factor, an action-bound grant the session
+        minted before it is not cleared, so an action gate can pass on that grant from the new
+        address, and this signal no longer fires there for the PHI reads and paced writes either:
+        the passkey matches the code on both and is stricter on the window (measured by
+        tests/test_webauthn.py, ADR 0068's 2026-11-14 amendment). An assertion
         on a session that had already met its factor neither re-anchors nor stamps. An
         ``oidc`` session, which :meth:`reauth` refuses, can re-anchor through the IdP step-up
         (:meth:`complete_oidc_step_up`). It is
