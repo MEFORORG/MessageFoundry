@@ -2903,13 +2903,15 @@ def _write_spare_marker(item: Path, reason: str) -> bool:
     return True
 
 
-def _withhold_from_sweep(staging: Path) -> None:
+def _withhold_from_sweep(staging: Path) -> bool:
     """Remove the marker a sweep needs to prove ``staging`` abandoned, so no sweep ever tears it
     down: for a spare whose marker could not be written, which no later teardown could read. The
     lock file stays, so a config walk still prunes the directory (:func:`_is_staging_dir`). A
     restore calls this while it still holds the lock, so no sweep acts in between, except for the
     relabel to ``rolled-back`` a late rollback makes after its teardown: a sweep that took the
-    directory in that window re-marks it. Never raises."""
+    directory in that window re-marks it. Never raises. ``True`` when the marker is gone;
+    ``False``, logged at ERROR, when it could not be removed, so a sweep can still take the
+    directory, and nothing may say that none will."""
     try:
         os.unlink(staging / _HELD_MARKER_NAME)
     except FileNotFoundError:
@@ -2917,10 +2919,12 @@ def _withhold_from_sweep(staging: Path) -> None:
     except OSError as exc:
         log.error(
             "DR staging directory %s holds a file a restore spared but could not record, and could "
-            "not be kept from the next sweep: %s",
+            "not be kept from sweeps, which can still take it: %s",
             staging,
             safe_exc(exc),
         )
+        return False
+    return True
 
 
 def _record_spare(item: Path, reason: str) -> bool:
@@ -3169,7 +3173,12 @@ def _teardown_staging(path: Path, *, spared: Mapping[str, str] | None = None) ->
         for n, reason in (spared or {}).items()
         if reason and _still_there(path / n) and _records_another_reason(path / n, reason)
     )
-    for n in unrecorded:
+    # A spare whose marker could not be written holds for this run alone. Its restore already
+    # withheld the directory from every sweep while it held the lock (`_record_spare`); this
+    # repeats the withholding should that have failed, and declines to re-mark it below. Done
+    # before the discard, so the notes promise no sweep only where the withholding landed.
+    withheld = bool(unrecorded) and _withhold_from_sweep(path)
+    for n in unrecorded if withheld else ():
         if held and n in held:
             held[n] = held[n].replace(_NEXT_SWEEP, _NO_SWEEP)
     leftover: str | None
@@ -3185,15 +3194,14 @@ def _teardown_staging(path: Path, *, spared: Mapping[str, str] | None = None) ->
     if not os.path.lexists(path):
         return leftover
     if unrecorded:
-        # A spare whose marker could not be written holds for this run alone. Its restore already
-        # withheld the directory from every sweep while it held the lock (`_record_spare`); this
-        # only declines to re-mark it, and repeats the withholding should that have failed.
-        _withhold_from_sweep(path)
         log.error(
-            "DR staging directory %s keeps %s, which a restore spared but could not record, so "
-            "no sweep removes the directory: delete it by hand",
+            "DR staging directory %s keeps %s, which a restore spared but could not record, %s",
             path,
             ", ".join(unrecorded),
+            "so no sweep removes the directory: delete it by hand"
+            if withheld
+            else "and could not be withheld from sweeps, which report it under the reason its "
+            "marker holds",
         )
     else:
         # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
@@ -5784,19 +5792,29 @@ def _finish_rollback(
         return False, left
     # A marker that kept its older reason would have every later sweep report the copy as a name
     # for a store that is gone, so its directory is withheld instead.
-    relabelled = _record_spare(spared_item, _SPARE_ROLLED_BACK)
+    relabelled = _write_spare_marker(spared_item, _SPARE_ROLLED_BACK)
+    withheld = not relabelled and _withhold_from_sweep(spared_item.parent)
+    if relabelled:
+        outcome = "its marker says so"
+    elif withheld:
+        outcome = (
+            "its marker could not be relabelled and still reads its earlier reason, so no "
+            "sweep removes its directory"
+        )
+    else:
+        outcome = (
+            "its marker could not be relabelled and still reads its earlier reason, and its "
+            "directory could not be withheld from sweeps, which report it under that reason"
+        )
     log.error(
         "the failed restore's rollback removed the placed store at %s only after its staging "
         "teardown, so the staged copy %s is the only decrypted copy of it, kept unemptied; %s: "
         "delete it by hand",
         dest_store_path,
         spared_item,
-        "its marker says so"
-        if relabelled
-        else "its marker could not be relabelled and still reads its earlier reason, so no "
-        "sweep removes its directory",
+        outcome,
     )
-    return not relabelled, left
+    return withheld, left
 
 
 def _discard_partial_restore(dest_store_path: Path | None, written: list[Path]) -> None:

@@ -2355,6 +2355,57 @@ def test_a_late_relabel_that_fails_withholds_the_directory_and_says_so(
     shutil.rmtree(leftover)
 
 
+def _hold_held_marker(mp: pytest.MonkeyPatch) -> None:
+    """Refuse ``os.unlink`` on every staging directory's ``.lock-held``, so no withholding lands."""
+    real_unlink = os.unlink
+
+    def unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+        if os.path.basename(os.fspath(path)) == ".lock-held":
+            raise PermissionError(13, "held open by a scanner", os.fspath(path))
+        real_unlink(path, *args, **kwargs)
+
+    mp.setattr(os, "unlink", unlink)
+
+
+@pytest.mark.parametrize("relabel", ["rollback-failed", "rolled-back"])
+def test_a_withholding_that_fails_is_never_reported_as_landed(
+    tmp_path, key_b64, capsys, relabel
+) -> None:
+    # A relabel does not land, so the restore withholds the directory from every sweep by removing
+    # its `.lock-held`, and that removal is refused too. The directory is then NOT withheld: a
+    # sweep can still take it. The refusal used to say no sweep removes it whatever the removal
+    # did; it now keeps the next-sweep wording, and the failure is logged at ERROR.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    store_refusals: list[Path] = []
+
+    def held(path: Path) -> bool:
+        if (path.name, path.parent.name) == ("msg.db", "restored") and (
+            relabel == "rollback-failed" or not store_refusals
+        ):
+            store_refusals.append(path)
+            return True
+        return _is_staged_store(path)
+
+    errors = _ErrorRecords()
+    with pytest.MonkeyPatch.context() as mp, errors.on(dr_backup.log):
+        _hold(mp, held)
+        _hold_held_marker(mp)
+        _refuse_marker_reason(mp, relabel)
+        mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
+    err = _refusal(capsys)
+    (refusal,) = [line for line in err.splitlines() if line.startswith("error:")]
+    assert "member-count cap" in refusal, refusal
+    assert "which no sweep removes" not in refusal, refusal
+    assert "the next sweep removes this directory" in refusal, refusal
+    (leftover,) = dest.parent.glob("mefor-restore-*")
+    assert (leftover / ".lock-held").exists()
+    assert any("could not be kept from sweeps" in m for m in errors.messages), errors.messages
+    shutil.rmtree(leftover)
+
+
 def test_an_unreadable_spare_marker_is_logged(tmp_path, caplog) -> None:
     marker = tmp_path / "x.db.mefor-spared"
     marker.write_bytes(b"\xff\xfe")
