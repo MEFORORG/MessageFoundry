@@ -12,7 +12,8 @@ on that surface's output, and only replaces. The per-row tests here read only th
 each fails on the code before the stage on its assertion. The regression guard compares each surface
 with the stage on against the same surface with it off, which is the code before it, over every probe
 the superseded branch ``b234-scrub-5546-5550`` collected and a seeded corpus: no secret may print that
-the code before the stage hid.
+the code before the stage hid. A surface that reads the chain's output again is held to printing
+nothing the chain did not print before the stage; the guard's docstring says why it is held to less.
 
 Every value is synthetic. A key block's type is joined from parts, so no literal key block sits in this
 file for the repository's secret scanner to read."""
@@ -23,6 +24,7 @@ import logging
 import random
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import pytest
 
@@ -66,8 +68,6 @@ _REREAD_SURFACES_OF_CHAIN: tuple[tuple[str, Callable[[str], str]], ...] = (
     ("chain twice", _through_the_chain),
     ("bundle of chain", redact_log_line),
 )
-#: Each re-read surface, with the surface whose output it reads.
-_READS = {"chain twice": "write-time chain", "bundle of chain": "write-time chain"}
 
 
 def _without_the_added_stage(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -246,23 +246,58 @@ def test_5550_a_cut_short_body_ends_at_the_first_line_that_is_not_base64() -> No
     assert out == f"-----BEGIN RSA {_PK}-----{CREDENTIAL_PLACEHOLDER}\nretry in 5 s\nAAAA", out
 
 
+# --- Shapes the first review round found printing ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "connect failed MEFOR_DB_PASSWORD=b'zq-R1_A zq-R1_B' retrying",
+        "connect failed MEFOR_API_TOKEN=b'zq-R1_A zq-R1_B' retrying",
+        "x password=b'zq-R1_A zq-R1_B': y",
+        "x token=b'zq-R1_A zq-R1_B':retry",
+        "set MEFOR_VALUE_PW=b'zq-R1_A zq-R1_B'|next",
+        "connect failed MEFOR_VALUE_PW=b'zq-R1_A zq-R1_B'.",
+        'Authorization: Digest  username = "zq-R1_A" , nonce = "zq-R1_B", response="zq-R1_C"',
+        f"-----BEGIN RSA {_PK}-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,AB\n\n"
+        "zq-R1_A\nzq-R1_B",
+        f'{{"key": "-----BEGIN RSA {_PK}-----\\nMIIE\\nzq-R1_A\\/zq-R1_B\\n"}}',
+    ),
+)
+def test_a_round_one_shape_is_hidden(line: str) -> None:
+    _assert_hidden(line, ("zq-R1_A", "zq-R1_B"))
+
+
+def test_an_end_marker_the_stage_did_not_take_opens_no_body() -> None:
+    """On the chain the PHI pass spells every marker ``-----[redacted]-----``, an END marker
+    included, so that spelling is read only before base64-shaped lines."""
+    line = (
+        "-----END CERTIFICATE-----\nRetrying handshake with token=zq-v -----BEGIN CERTIFICATE-----"
+    )
+    for surface, apply in _SURFACES:
+        assert "Retrying handshake with token=" in apply(line), surface
+
+
 # --- The stage reads what an earlier pass left, and over-reads in stated places only ---------------
 
 
 @pytest.mark.parametrize(
     "line",
     (
-        '{"session": {"u": "x"}} tail',
         "setting 'password' (env 'MEFOR_VALUE_PW'='zq-v'): bad",
+        'token=zq-v mode="strict" level="high"',
+        'MEFOR_DB_PASSWORD=zq-v user="bob"',
+        '{"message": "connect failed password=zq-v", "exception": "x"}',
+        "MEFOR_X=zq-v then 'quoted words' end",
         "token=zq-v rest of line 'quoted words' end",
         "MEFOR_X='zq-v', other='words'",
         "pg://u:zq-p@host/db and mail ops@example.invalid",
     ),
 )
 def test_the_stage_leaves_ordinary_text_after_a_placeholder(line: str) -> None:
-    """A quoted key after a placeholder, punctuation after a closed ``MEFOR_`` value, a quoted run
-    after a space, and an "@" past the DSN's "/" are no remnant: the stage changes nothing the passes
-    before it wrote."""
+    """Punctuation after a closed ``MEFOR_`` value, a logfmt key after a credential, the quotes
+    between two JSON fields, a quoted run after a space, and an "@" past the DSN's "/" are no
+    remnant: the stage changes nothing the passes before it wrote."""
     with pytest.MonkeyPatch.context() as patch:
         _without_the_added_stage(patch)
         before = scrub_credentials(line)
@@ -475,41 +510,64 @@ def _surface_outputs(corpus: list[str]) -> dict[str, list[str]]:
     return out
 
 
-def _printed_now_and_hidden_before(
-    monkeypatch: pytest.MonkeyPatch, corpus: list[str]
-) -> tuple[list[str], int]:
-    """``(each secret a surface prints that the same surface hid with the stage off, the count the
-    reverse way)``. On a re-read surface, a secret the surface it reads printed with the stage off is
-    not counted: the first handler's log held it either way. The write-time chain is not idempotent,
-    so its second pass over the PHI pass's markers can hide a value the first printed, and over a
-    shorter line it can hide less; ``tests/test_secretscrub_camelcase_label.py`` reads the
-    same surfaces the same way."""
+@dataclass
+class _Reading:
+    """What the stage changed over a corpus, surface by surface."""
+
+    #: On the four surfaces: each secret printed now that the same surface hid with the stage off.
+    newly: list[str]
+    #: The count the other way, on the four surfaces.
+    hidden_now: int
+    #: On the two re-read surfaces: each secret printed now that the write-time chain did NOT print
+    #: with the stage off, so a log line the code before the stage never wrote.
+    beyond_first_surface: list[str]
+    #: On the two re-read surfaces: each secret printed now that the same re-read hid with the stage
+    #: off. Reported, not refused; the stage comment in secretscrub.py says why it can happen.
+    reread_newly: list[str]
+
+
+def _reading(monkeypatch: pytest.MonkeyPatch, corpus: list[str]) -> _Reading:
     after = _surface_outputs(corpus)
     with monkeypatch.context() as patch:
         _without_the_added_stage(patch)
         before = _surface_outputs(corpus)
     secrets = [_secrets(line) for line in corpus]
-    newly: list[str] = []
-    hidden_now = 0
+    direct = {name for name, _apply in _SURFACES}
+    reading = _Reading([], 0, [], [])
     for name in after:
         for i, line in enumerate(corpus):
             for secret in secrets[i]:
                 was, now = secret in before[name][i], secret in after[name][i]
-                upstream = name in _READS and secret in before[_READS[name]][i]
-                if now and not was and not upstream:
-                    newly.append(f"{name}: {secret!r} in {line!r} -> {after[name][i]!r}")
-                hidden_now += was and not now
-    return newly, hidden_now
+                where = f"{name}: {secret!r} in {line!r} -> {after[name][i]!r}"
+                if name in direct:
+                    if now and not was:
+                        reading.newly.append(where)
+                    reading.hidden_now += was and not now
+                    continue
+                if now and secret not in before["write-time chain"][i]:
+                    reading.beyond_first_surface.append(where)
+                if now and not was:
+                    reading.reread_newly.append(where)
+    return reading
 
 
 def test_the_stage_prints_nothing_the_code_before_it_hid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """THE REGRESSION GUARD. On every surface, and on the two that read a surface's output again, no
-    secret of any probe or seeded line may print that the same surface hid with the stage off. The
-    reverse count must be above zero, or the stage hid nothing and nothing was compared."""
+    """THE REGRESSION GUARD. On every surface the stage runs on, no secret of any probe or seeded line
+    may print that the same surface hid with the stage off. The reverse count must be above zero, or
+    the stage hid nothing and nothing was compared.
+
+    The two surfaces that read the chain's output again are held to less, and that is stated rather
+    than hidden behind an exemption: no secret may print there that the write-time chain did not
+    print with the stage off, so neither prints text the code before the stage never logged. They can
+    hide less than they did, since a span the stage took can hold a label they would have read; the
+    stage comment in ``secretscrub.py`` says so, and how many there are is measured, not refused."""
     corpus = [*_OLD_BRANCH_PROBES, *_seeded_corpus(3000, 5546)]
-    newly, hidden_now = _printed_now_and_hidden_before(monkeypatch, corpus)
-    assert not newly, f"{len(newly)} secrets printed that were hidden, first: {newly[:3]}"
-    assert hidden_now > 0, "the stage hid nothing, so the comparison proved nothing"
+    reading = _reading(monkeypatch, corpus)
+    assert not reading.newly, (
+        f"{len(reading.newly)} secrets printed that were hidden, first: {reading.newly[:3]}"
+    )
+    assert reading.hidden_now > 0, "the stage hid nothing, so the comparison proved nothing"
+    assert not reading.beyond_first_surface, reading.beyond_first_surface[:3]
 
 
 def test_the_guard_can_fail(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -522,8 +580,9 @@ def test_the_guard_can_fail(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(secretscrub, "scrub_added_shapes", leaky)
     monkeypatch.setattr(redact_mod, "scrub_added_shapes", leaky)
-    newly, _hidden = _printed_now_and_hidden_before(monkeypatch, list(_OLD_BRANCH_PROBES))
-    assert newly, "a stage that prints a hidden password went unnoticed"
+    reading = _reading(monkeypatch, list(_OLD_BRANCH_PROBES))
+    assert reading.newly, "a stage that prints a hidden password went unnoticed"
+    assert reading.beyond_first_surface, "the re-read arm let the restored password through"
 
 
 # --- Linear growth ------------------------------------------------------------------------------------

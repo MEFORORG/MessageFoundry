@@ -166,6 +166,7 @@ __all__ = [
     "CREDENTIAL_PLACEHOLDER",
     "credential_query_params",
     "has_credential_like_segment",
+    "scrub_added_shapes",
     "scrub_credentials",
 ]
 
@@ -1826,10 +1827,18 @@ def _scrub_credentials_base(text: str, *, placeholder: str = CREDENTIAL_PLACEHOL
 # span that grew took a later label, or a quote an earlier value closed on, or a "|" the PHI pass
 # reads a field run by, so the pass that should have read it never saw it. This stage runs AFTER every
 # pass a surface already runs, on that surface's output, and it only replaces a span with a
-# placeholder. So whatever the surface hid stays hidden: nothing reads this stage's output but the
-# caller. The surfaces are :func:`scrub_credentials`, and through it
-# ``logging_setup.CredentialScrubFilter``, the last credential filter on every handler; and
-# ``support/redact.redact_log_line``, which runs it over its own final output.
+# placeholder. So whatever a surface hid stays hidden ON THAT SURFACE. The surfaces are
+# :func:`scrub_credentials`, and through it ``logging_setup.CredentialScrubFilter``, the last
+# credential filter on every handler; and ``support/redact.redact_log_line``, which runs it over its
+# own final output.
+#
+# A SURFACE THAT READS ANOTHER'S OUTPUT AGAIN CAN HIDE LESS. A record a second handler filters, and
+# a log line the support bundle or the log tail reads back, are read again by passes that look for
+# labels, and a span this stage took can hold one. What such a reading prints, the first surface
+# printed under the code before this stage: the first surface's output holds only text its output held
+# before, and a reading of it holds only text it held. Each pattern here stops at a later placeholder
+# where it can, so it takes a label whose value a pass already hid only where it says so.
+# ``tests/test_secretscrub_added_stage.py`` holds that subset on the surfaces that read again.
 #
 # WHAT IT COSTS. Each shape is read from what is left once a pass has written its placeholder, so the
 # pattern sees less than the original text held. Where that is not enough to tell a credential from
@@ -1866,20 +1875,26 @@ _STAGE_PHI_MARKER = r"\[redacted\]"
 # ``BLOCK``), and five dashes; or five dashes around the PHI pass's marker, since on the write-time
 # chain :func:`messagefoundry.redaction.redact` runs first and its name-run rule rewrites every such
 # marker to ``-----[redacted]-----``. That second form names no key type, so a certificate or public
-# key block the PHI pass marked has its body hidden too.
+# key block the PHI pass marked has its body hidden too. It also spells every END marker, so an end
+# marker this stage did not take reads as a begin marker; text after it up to a later marker is then a
+# body if it holds no label a pass wrote (below), and prose there is hidden.
 #
-# THE BODY, IN ONE OF TWO FORMS. First, with an end marker after it, in either spelling: any text up
-# to the next five dashes, so PGP armor headers and the ``\n`` escapes a repr or a JSON string writes
-# are taken. It must open, past white space and escaped line breaks, on four base64 characters. The
-# end marker is part of the match and is written back, so the next match cannot read it as a begin
-# marker in the PHI pass's spelling, which is the same. Second, a block cut short, with no end marker:
-# read only when a line break, real or escaped, follows the marker, as a key block's marker stands on
-# its own line. Its body is taken one whole line at a time, each a run of base64 or base64url
-# characters ending at a line break, a quote (the last line of a truncated repr) or the end of the
-# text, and it ends at the first line that is not that shape: a line holding a space, a quote before
-# its end, or any other character outside that set stays. A line of one word is that shape, and is
-# taken. A marker followed by words on its own line, as a diagnostic naming it writes, has neither
-# form. The support bundle and the log tail read a log one line at a time, so there a block another
+# THE BODY, IN ONE OF TWO FORMS. First, with an end marker after it in either spelling: any text up
+# to the next five dashes that holds no ``=`` followed by a placeholder, the mark of a label a pass
+# already read, so a body never takes a later label. PGP armor headers and the ``\n`` escapes
+# a repr or a JSON string writes are taken. It must open, past white space and escaped line breaks, on
+# four base64 characters. Second, read only when a line break, real or escaped, follows the marker, as
+# a key block's marker stands on its own line: armor header lines (``Name: value``, as PGP's
+# ``Version:`` or an encrypted PEM's ``Proc-Type:`` and ``DEK-Info:``), then the body one whole line
+# at a time, each a run of base64 or base64url characters, a JSON-escaped "/" included, ending at a
+# line break, a quote (the last line of a truncated repr) or the end of the text, then the end marker
+# if one follows. It ends at the first line that is not that shape: a line holding a space, a quote
+# before its end, or any other character outside that set stays, so the last line of a block cut
+# short prints where text follows it on that line. A line of one word is that shape, and is taken.
+# Either form takes its end marker and writes it back, so the next match cannot read it as a begin
+# marker in the PHI pass's spelling. A marker followed by words on its own line, as a diagnostic
+# naming it writes, has neither form. The support bundle and the log tail read a log one line at a
+# time, so there a block another
 # tool wrote over several real lines is not read here; its body lines are left to that module's
 # long-base64 sweep. A record this engine wrote had its line breaks escaped, and this stage read it
 # whole at write time.
@@ -1887,15 +1902,21 @@ _STAGE_PHI_MARKER = r"\[redacted\]"
 # LINEAR. A match starts only at five dashes, the key type is bounded, and each body form is possessive
 # over branches that open on different characters. The first form ends at or before the next five
 # dashes, so two blocks' bodies never share a character; a block with no end marker is read twice,
-# once by each form.
+# once by each form. A header line ends at a line break or a backslash.
+_KEY_END_MARKER = r"(-----(?:END [A-Z0-9 ]{0,40}|" + _STAGE_PHI_MARKER + r"[A-Z0-9 ]{0,40})-----)"
 _PRIVATE_KEY_BODY = re.compile(
     r"(-----(?:BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?|"
     + _STAGE_PHI_MARKER
     + r"[A-Z0-9 ]{0,40})-----)"
-    r"(?:(?=(?:\s|\\++[rn])*+[A-Za-z0-9+/]{4})(?:[^-]++|-(?!----))++"
-    r"(-----(?:END [A-Z0-9 ]{0,40}|" + _STAGE_PHI_MARKER + r"[A-Z0-9 ]{0,40})-----)"
-    r"|(?=[ \t]*+(?:\r?\n|\\++[rn]))"
-    r"(?:(?:\s|\\++[rn])*+[A-Za-z0-9+/=_\-]++(?=[ \t]*+(?:\r?\n|\\++[rn]|\\*+['\"]|\Z)))++)"
+    r"(?:(?=(?:\s|\\++[rn])*+[A-Za-z0-9+/]{4})(?:[^-=]++|=(?!"
+    + _STAGE_PLACEHOLDER
+    + r")|-(?!----))++"
+    + _KEY_END_MARKER
+    + r"|(?=[ \t]*+(?:\r?\n|\\++[rn]))"
+    r"(?:(?:\s|\\++[rn])*+[A-Z][A-Za-z-]*+:[^\S\r\n][^\r\n\\]*+(?=\r?\n|\\++[rn]))*+"
+    r"(?:(?:\s|\\++[rn])*+(?:[A-Za-z0-9+/=_\-]++|\\/)++"
+    r"(?=[ \t]*+(?:\r?\n|\\++[rn]|\\*+['\"]|\Z)))++"
+    r"(?:(?:\s|\\++[rn])*+" + _KEY_END_MARKER + r")?+)"
 )
 
 # A DSN PASSWORD BEHIND AN EMPTY USERNAME (BACKLOG #5549). ``_DSN_PASSWORD`` needs one user character
@@ -1934,7 +1955,8 @@ _DSN_AT_IN_PASSWORD = re.compile(
 # first parameter's quoted value, as ``Authorization=<redacted>"u", realm="r", ...``, or, where the
 # first parameter was unquoted, the second parameter, as ``Authorization=<redacted> username="u",
 # ...``. This reads that remnant, one value then a comma and a parameter name and "=", and takes the
-# rest of the line. The scheme word is gone by then, so the label is what says it was a header:
+# rest of the line. RFC 7235 allows white space around a parameter's "=", so a remnant such as
+# ``Authorization=<redacted> = "u" , nonce = "n"`` is read too. The scheme word is gone by then, so the label is what says it was a header:
 # ``authorization`` at the end of the label, which also reads ``Proxy-Authorization``. What it costs:
 # text after the header on the same line, as a header map's later entries, is hidden too.
 #
@@ -1943,7 +1965,7 @@ _DSN_AT_IN_PASSWORD = re.compile(
 # possessive run to the line's end.
 _DIGEST_PARAMS_AFTER_PLACEHOLDER = re.compile(
     r"((?i:authorization)=" + _STAGE_PLACEHOLDER + r")[^\S\r\n]*+"
-    r"(?:[A-Za-z0-9_-]++\*?[^\S\r\n]*+=[^\S\r\n]*+)?+"
+    r"(?:[A-Za-z0-9_-]++\*?[^\S\r\n]*+)?+(?:=[^\S\r\n]*+)?+"
     r"(?:\"(?:[^\"\\\r\n]|\\.)*+\"|[^\s,\"]*+)"
     r"(?=[^\S\r\n]*+,[^\S\r\n]*+[A-Za-z0-9_-]++\*?[^\S\r\n]*+=)[^\r\n]*+"
 )
@@ -1953,14 +1975,15 @@ _DIGEST_PARAMS_AFTER_PLACEHOLDER = re.compile(
 # refuses a closer right after "=", where base64 padding puts one; so the plain class took the quote
 # and the scheme word, stopped at the space, and left ``Authorization=<redacted> dXNlcjpwYXNz=="``.
 # A padded Basic value is a base64 user and password. This reads that remnant: a placeholder, white
-# space, an RFC 7235 token68 run ending in "=", and a quote, a backslash-escaped one included. The
-# token and that closing quote are taken, so the quote cannot be read below as opening a value glued
-# to the placeholder.
+# space, an RFC 7235 token68 run ending in "=", and a quote, a backslash-escaped one included, that
+# closes a value: white space, ",", ";", ")", "]", "}" or the end follows it. So ``<redacted>
+# mode="strict"``, a logfmt key after a credential, is no remnant. The token and that closing quote
+# are taken, so the quote cannot be read below as opening a value glued to the placeholder.
 #
 # LINEAR. A match starts only at a placeholder, and the run ends at the first character outside the
 # token68 class.
 _PADDED_TOKEN_AFTER_PLACEHOLDER = re.compile(
-    r"(" + _STAGE_PLACEHOLDER + r")[^\S\r\n]++[A-Za-z0-9+/._~-]++=++\\*+['\"]"
+    r"(" + _STAGE_PLACEHOLDER + r")[^\S\r\n]++[A-Za-z0-9+/._~-]++=++\\*+['\"](?=[\s,;)\]}]|\Z)"
 )
 
 # A QUOTED VALUE GLUED TO A PLACEHOLDER (BACKLOG #5547). A Python bytes literal after a label,
@@ -1968,17 +1991,23 @@ _PADDED_TOKEN_AFTER_PLACEHOLDER = re.compile(
 # above needs its quote right after the separator, so the plain class took the "b" and stopped at the
 # quote, leaving ``password=<redacted>'v w'``. A placeholder followed directly by a quote is that
 # remnant, and the quoted run is taken with both quotes, a backslash-escaped quote inside it included.
-# A run with no closing quote on its line is left, as it printed before: a literal cut short. So is a
-# run whose closer is followed by ":" or "=", which is a quoted KEY, as in ``{"session": {"u": 1}}``,
-# where the pass took only the "{". What it costs: any other value a pass ended at a quote has the
-# quoted run after it hidden too.
+# The closing quote must close a value: white space, punctuation that ends one, an HL7 separator or
+# the end follows it. So in a JSON log record, ``"message": "password=<redacted>", "exception": ...``,
+# the ``", "`` between two fields is no remnant. A run that reaches a later placeholder, or the line's
+# end, before such a closer is left, as it printed before: a literal cut short, or a value that would
+# take a later label whose value a pass already hid. What it costs: a quoted run a pass left right
+# after a placeholder is hidden, as ``{"session": {"u": 1}}``'s ``"u"``, where the pass took only the
+# "{".
 #
 # LINEAR. A match starts only at a placeholder followed by a quote, and its run ends at the next
-# unescaped quote of the same kind or the line's end. A run that finds no closer has no later quote
-# of its kind on its line, so no other start of that kind follows it there to walk the same text.
+# unescaped quote of the same kind, the next placeholder, or the line's end. A run that ends without
+# a closer stops at the first of those, so the text it walked is walked again only by a start after
+# it.
 _QUOTED_AFTER_PLACEHOLDER = re.compile(
-    r"(" + _STAGE_PLACEHOLDER + r")(?:'(?:[^'\\\r\n]|\\.)*+'|\"(?:[^\"\\\r\n]|\\.)*+\")"
-    r"(?![^\S\r\n]*+[:=])"
+    r"(" + _STAGE_PLACEHOLDER + r")"
+    r"(?:'(?:(?!" + _STAGE_PLACEHOLDER + r")[^'\\\r\n]|\\.)*+'"
+    r"|\"(?:(?!" + _STAGE_PLACEHOLDER + r")[^\"\\\r\n]|\\.)*+\")"
+    r"(?=[\s,;:=.)\]}>|&^~]|\Z)"
 )
 
 # A BYTES LITERAL UNDER A ``MEFOR_`` NAME (BACKLOG #5547). ``_MEFOR_SECRET``'s plain value takes an
@@ -1986,17 +2015,33 @@ _QUOTED_AFTER_PLACEHOLDER = re.compile(
 # ``MEFOR_X=<redacted>v w'``. That pattern's value takes every character but white space and a quote,
 # so a placeholder followed directly by a value character there is that remnant, or the text after a
 # quoted value the pattern took with its closer, as in ``MEFOR_X='v'abc 'w'``; both are hidden. The
-# run is taken to the first quote followed by white space, punctuation that ends a value, or the end
-# of the text, and that quote with it. A quote followed by anything else is inside the value and
-# taken. A run that reaches the line's end or the next placeholder first is left, as it printed
-# before, so it never runs into a later label's value. Punctuation right after the placeholder, such
-# as the ")" or "," after a closed quoted value or the "}" a braced value closes on, is no remnant.
+# run is taken to the first quote that closes a value, one followed by white space, punctuation that
+# ends a value, an HL7 separator or the end of the text, and that quote with it. A quote followed by
+# anything else is inside the value and taken. A run that reaches the line's end or the next
+# placeholder first is left, as it printed before, so it never runs into a later label's value.
+# Punctuation right after the placeholder, such as the ")" or "," after a closed quoted value or the
+# "}" a braced value closes on, is no remnant.
+#
+# UNDER A NAME HOLDING A CREDENTIAL WORD, as ``MEFOR_DB_PASSWORD=b'v w'``, a later pass takes the
+# literal's first word as well, and leaves ``MEFOR_DB_PASSWORD=<redacted> w'``: white space, then a
+# run holding no quote, up to a quote that closes a value. That is taken too. A run after white space
+# that meets any other quote first is left, so ``MEFOR_X=v then 'w'`` keeps ``then 'w'``.
 #
 # LINEAR. A match starts only at a ``MEFOR_`` name and placeholder, and its run ends at the next
 # placeholder at the latest, which every later match starts with.
+_MEFOR_VALUE_CLOSER = r"['\"](?=[\s,;:.)\]}|&>^~]|\Z)"
 _MEFOR_GLUED_AFTER_PLACEHOLDER = re.compile(
-    r"((?-i:\bMEFOR_[A-Z0-9_]++)=" + _STAGE_PLACEHOLDER + r")(?=[^\s'\"(){}\[\],;:.])"
-    r"(?:(?!" + _STAGE_PLACEHOLDER + r")[^'\"\r\n]|['\"](?![\s,;:)\]}]|\Z))*+['\"]"
+    r"(\bMEFOR_[A-Z0-9_]++=" + _STAGE_PLACEHOLDER + r")"
+    r"(?:(?=[^\s'\"(){}\[\],;:.])"
+    r"(?:(?!"
+    + _STAGE_PLACEHOLDER
+    + r")[^'\"\r\n]|['\"](?![\s,;:.)\]}|&>^~]|\Z))*+"
+    + _MEFOR_VALUE_CLOSER
+    + r"|[^\S\r\n]++(?:(?!"
+    + _STAGE_PLACEHOLDER
+    + r")[^'\"\r\n])*+"
+    + _MEFOR_VALUE_CLOSER
+    + r")"
 )
 
 
@@ -2006,7 +2051,9 @@ def scrub_added_shapes(text: str, placeholder: str = CREDENTIAL_PLACEHOLDER) -> 
     The comment block above the patterns says why it is a stage of its own. Returns the SAME object
     when nothing matched."""
     if "-----" in text:
-        text = _PRIVATE_KEY_BODY.sub(lambda m: m.group(1) + placeholder + (m.group(2) or ""), text)
+        text = _PRIVATE_KEY_BODY.sub(
+            lambda m: m.group(1) + placeholder + (m.group(2) or m.group(3) or ""), text
+        )
     if "://" in text:
         text = _DSN_EMPTY_USER_PASSWORD.sub(lambda _m: "://:" + placeholder, text)
         text = _DSN_AT_IN_PASSWORD.sub(r"\1", text)

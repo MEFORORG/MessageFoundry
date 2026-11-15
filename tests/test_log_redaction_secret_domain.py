@@ -4129,5 +4129,6 @@ def test_a_token_quoted_key_takes_no_braced_value() -> None:
     loses only its "{", exactly as the bare ``session={...}`` shape does."""
     for key_shape in ('{"session": ', "session="):
         line = key_shape + '{"u": "x"} tail'
-        out = scrub_credentials(line)
+        # The passes alone: the added stage hides the quoted key the pass left after the placeholder.
+        out = scrub_mod._scrub_credentials_base(line)
         assert out.endswith(f'session={CREDENTIAL_PLACEHOLDER}"u": "x"}} tail'), out
