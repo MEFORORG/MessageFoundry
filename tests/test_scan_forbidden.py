@@ -1294,14 +1294,24 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("10", "verdict", f"ASVS {_REQ}: the row is not failing but stays {_PARTIAL}."),
     ("10", "verdict", f"| ASVS {_REQ} | the parser | is never failing; the cell is failing |"),
 ]
-#: Step 10's overlay at work: bodies main flags only through an exempt clause, so with the clause
-#: blanked main's own patterns bind nothing, and head drops the hit. Each is named in
-#: _SUPERSET_EXCEPTIONS below. The first group is step 10's false-positive class, quiet by design
-#: (review round-b628ef8690 finding 7). The rest are the bodies review rounds 4f580a28dd and
-#: b628ef8690 (findings 1 to 5) listed as losses: each states a verdict only beside the exempt
-#: clause ("the row is not failing but stays partial"), in words main binds to no identifier, so
-#: the overlay drops them too.
-_PR_STEP10_OVERLAY_EXEMPT: list[str] = [
+#: Bodies main flags through step 10's exempt clause or beside it, which step 10 must not drop: a
+#: verdict word outside the clause anywhere in the sentence or row, a label or bind character between
+#: the clause and the identifier, or a clause cell that also holds the identifier. Each must fire on
+#: main and on head, at main's lines. The first ten are the Lander's hold on engine PR 2980 (blocking
+#: points 1 to 3); the rest are the bodies review rounds 4f580a28dd and b628ef8690 listed, which an
+#: earlier draft of step 10 dropped by name and the hold's point 4 kept flagged. The first two of
+#: those carry "pass" and "fail" beside the clause, so they fire too.
+_PR_STEP10_MUST_FIRE: list[str] = [
+    f"The row is not failing: {_REQ} here.",
+    f"| never fails: {_REQ} |",
+    f"| {_REQ} | x | never failing: {_REQ} |",
+    f"For {_REQ} the row is not failing, it is {_PARTIAL}.",
+    f"For {_REQ} the row is not failing, it is {_NA}.",
+    f"For {_REQ} the row is not failing; ASVS score is {_PARTIAL}.",
+    f"{_REQ} (the row is not failing) stays {_PARTIAL}.",
+    f"{_REQ}, where the row is not failing, stays {_PARTIAL}.",
+    f"{_REQ} -> the row is not failing.",
+    f"{_REQ} | the row is not failing.",
     "The row is not failing for 2.5.1 batches; all twelve tests pass.",
     "The row is not failing for 2.5.1 batches and the gate will fail.",
     f"For {_REQ} the row is not failing but stays {_PARTIAL}.",
@@ -1377,10 +1387,15 @@ def test_a_pr_body_shape_engine_pr_2893_review_found_is_flagged(
     assert kind in _pr_kinds(sf, body), (step, body)
 
 
-@pytest.mark.parametrize("body", _PR_STEP10_OVERLAY_EXEMPT)
-def test_step_ten_drops_a_hit_only_its_exempt_clause_made(sf, body: str) -> None:
-    """Step 10's overlay: blank the exempt clause, and nothing main reads binds the identifier."""
-    assert sf.scan_pr_body(body) == [], body
+@pytest.mark.parametrize("body", _PR_STEP10_MUST_FIRE)
+def test_step_ten_keeps_every_hit_main_reports_beside_a_verdict_or_a_label(
+    sf, sf_frozen_main, body: str
+) -> None:
+    """Step 10 drops only its false-positive shape, so each body fires on main and on head, and head
+    reports every hit main reports, at main's line."""
+    main_hits = set(sf_frozen_main.scan_pr_body(body))
+    assert main_hits, body
+    assert main_hits <= set(sf.scan_pr_body(body)), body
 
 
 @pytest.mark.parametrize(
@@ -1413,16 +1428,13 @@ _SUPERSET_EXCEPTIONS = {
     # Step 9: a blank line ends an ASVS-headed table, so pipe rows after it are unmarked.
     "stay-quiet-2-step9": "9",
     # Step 10: "never" before a CI verb in a cell, and a negated state verb then a CI verb after
-    # "row", beside an unmarked identifier.
+    # "row", beside an unmarked identifier, with no other verdict and no label between the two.
     "stay-quiet-4-step10": "10",
     "stay-quiet-5-step10": "10",
     "stay-quiet-6-step10": "10",
     "stay-quiet-7-step10": "10",
     "stay-quiet-8-step10": "10",
     "stay-quiet-15-step10": "10",
-    "reviewer-step10-row": "10",
-    # Step 10's overlay: main binds each only through the exempt clause.
-    **{f"step10-exempt-{i}": "10" for i in range(len(_PR_STEP10_OVERLAY_EXEMPT))},
 }
 
 
@@ -1444,8 +1456,8 @@ def sf_frozen_main():
 
 def _superset_bodies() -> dict[str, str]:
     """The clean body, the bodies of every PR-body must-fire and must-stay-quiet list above (verdict,
-    gap, map, version, residue, cell markup, step 4, steps 5 to 12, and step 10's overlay-exempt
-    list) and of the header-table test,
+    gap, map, version, residue, cell markup, step 4, steps 5 to 12, and step 10's must-fire list)
+    and of the header-table test,
     the review rounds' bodies, and tables whose lines each separator joins, one and two in a row, with
     and without a line ending after them. Bodies other tests build inline are not in it."""
     bodies: dict[str, str] = {"clean": _PR_CLEAN_BODY}
@@ -1469,7 +1481,7 @@ def _superset_bodies() -> dict[str, str]:
         }
     )
     bodies.update({f"header-table-{name}": body for name, body in _PR_HEADER_TABLE_BODIES.items()})
-    bodies.update({f"step10-exempt-{i}": body for i, body in enumerate(_PR_STEP10_OVERLAY_EXEMPT)})
+    bodies.update({f"step10-fire-{i}": body for i, body in enumerate(_PR_STEP10_MUST_FIRE)})
     bodies.update(
         {f"must-fire-{i}-step{s}": body for i, (s, _, body) in enumerate(_PR_FINDINGS_MUST_FIRE)}
     )

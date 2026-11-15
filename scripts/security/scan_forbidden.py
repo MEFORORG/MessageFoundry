@@ -476,6 +476,11 @@ _PR_VERDICT_TAIL = r"(?![A-Za-z0-9/-])(?!\s+(?:closed|open|safe|fast|through|ove
 _PR_CI_VERDICT_WORDS = "passes|fails|passing|failing"
 _PR_CI_VERDICTS = frozenset(_PR_CI_VERDICT_WORDS.split("|"))
 _PR_VERDICT = rf"(?:{_PR_VERDICT_WORDS}|{_PR_CI_VERDICT_WORDS}){_PR_VERDICT_TAIL}"
+#: Any verdict word, without _PR_VERDICT_TAIL's failure-mode exclusions ("fails closed" counts here).
+#: Step 10 drops a hit only where its exempt clauses hold every one in the sentence or row.
+_PR_STATUS_WORD = re.compile(
+    rf"(?i){_PR_EB}(?:{_PR_VERDICT_WORDS}|{_PR_CI_VERDICT_WORDS})(?![A-Za-z0-9/-])"
+)
 #: The verdict words that name a STATE, without "passing"/"failing"/"passes"/"fails": a test "kept
 #: failing" or "keeps passing", and that is CI prose, not a requirement held at a verdict.
 _PR_VERDICT_STATE = rf"(?:{_PR_VERDICT_WORDS}){_PR_VERDICT_TAIL}"
@@ -1242,9 +1247,18 @@ def _blank(text: str, spans: list[tuple[int, int]]) -> str | None:
     return "".join(chars)
 
 
-def _pr_step10_prose_window(sentence: str, left: int, right: int) -> str | None:
+def _pr_step10_prose_window(
+    sentence: str, left: int, right: int, ident: re.Match[str], status: list[tuple[int, int]]
+) -> str | None:
     """One candidate's prose window, sentence[left:right], with step 10's exempt clauses in it
-    replaced by spaces, or None where it holds none.
+    replaced by spaces, or None where it holds none or where step 10 must not drop the candidate.
+
+    Step 10 drops only its false-positive shape: an identifier beside an exempt clause and no other
+    verdict. So the window is None where a verdict word stands outside the clauses anywhere in the
+    sentence (``status``, the spans of the sentence's _PR_STATUS_WORD matches, in order: "for <id>
+    the row is not failing, it is partial"), and where anything but letters and spaces stands
+    between the identifier and a clause ("<id> -> the row is not failing", "the row is not failing:
+    <id>"). Either way the hit main reports stays.
 
     A clause is "row", a negated state verb and a CI verb ("the row is not failing"). Each candidate
     is checked on its own window, blanked only with the clauses found in it: a clause one window
@@ -1265,21 +1279,43 @@ def _pr_step10_prose_window(sentence: str, left: int, right: int) -> str | None:
             and hit.group("row_verdict").lower() in _PR_CI_VERDICTS
             and not _pr_joined_to_a_word(sentence, row.start())
         ):
-            spans.append((hit.start() - left, hit.end() - left))
-    return _blank(sentence[left:right], spans)
+            spans.append((hit.start(), hit.end()))
+    if not spans:
+        return None
+    # A verdict word before or after the window lies outside every clause; one inside it must lie
+    # wholly inside a clause.
+    first, last = bisect.bisect_left(status, (left,)), bisect.bisect_left(status, (right,))
+    if first > 0 or last < len(status):
+        return None
+    for start, end in status[first:last]:
+        if not any(a <= start and end <= b for a, b in spans):
+            return None
+    for a, b in spans:
+        gap = sentence[ident.end() : a] if a >= ident.end() else sentence[b : ident.start()]
+        if not all(c.isalpha() or c.isspace() for c in gap):
+            return None
+    return _blank(sentence[left:right], [(a - left, b - left) for a, b in spans])
 
 
 def _pr_step10_blank_row(sentence: str) -> str | None:
     """A table row with step 10's exempt cell clauses replaced by spaces, so every offset stays, or
-    None where it holds none.
+    None where it holds none or where step 10 must not drop the row's hits.
+
+    Step 10 drops only its false-positive shape: a cell that is nothing but an exempt clause, in a
+    row with no other verdict. So the row is None where a verdict word (_PR_STATUS_WORD) stands
+    outside the clauses anywhere in it ("| <id> | is never failing; remains at failing |"), and where
+    a cell holding a clause holds a letter or digit outside it ("| never fails: <id> |"). Either way
+    the hit main reports stays.
 
     A clause is a cell's verdict reading, whole or leading, with "never" before a CI verb ("never
     fails", "is never failing; "), unless the cell opens with "unchanged" or a record verb. A cell is
     read trimmed and with its markup deleted, as _pr_table_verdict reads it; each reading's clause is
     mapped back to the characters of the row it came from."""
     spans: list[tuple[int, int]] = []
+    covered = [False] * len(sentence)
     edges = [-1, *(i for i, ch in enumerate(sentence) if ch == "|"), len(sentence)]
     for left, right in itertools.pairwise(edges):
+        cell_spans = len(spans)
         cell = sentence[left + 1 : right]
         offset = left + 1
         lead = len(cell) - len(cell.lstrip(_PR_CELL_EDGE))
@@ -1298,6 +1334,16 @@ def _pr_step10_blank_row(sentence: str) -> str | None:
                     and _PR_NEVER.search(text, hit.start(), hit.start("verdict")) is not None
                 ):
                     spans.append((where[hit.start()], where[hit.end() - 1] + 1))
+        if len(spans) == cell_spans:
+            continue
+        for a, b in spans[cell_spans:]:
+            covered[a:b] = [True] * (b - a)
+        if any(sentence[i].isalnum() and not covered[i] for i in range(left + 1, right)):
+            return None
+    if spans and any(
+        not all(covered[m.start() : m.end()]) for m in _PR_STATUS_WORD.finditer(sentence)
+    ):
+        return None
     return _blank(sentence, spans)
 
 
@@ -1308,8 +1354,9 @@ def _pr_sentence_found(
 
     Step 10 is an overlay on this full reading, never a change inside it. A verdict that an
     identifier the text does not mark binds, or that an unmarked row binds, is checked again on the
-    sentence with step 10's exempt clauses blanked out (_pr_step10_blank), and dropped only if that
-    check no longer binds it. Only the binding predicates run again, on the same identifiers with
+    sentence with step 10's exempt clauses blanked out (_pr_step10_prose_window,
+    _pr_step10_blank_row), and dropped only if that check no longer binds it and the sentence or row
+    is step 10's false-positive shape, with no verdict outside the clauses. Only the binding predicates run again, on the same identifiers with
     the version and mark the full reading gave them, so blanking cannot change what an identifier is
     or which tight pair is found; a tight pair's verdict is never dropped."""
     # Every identifier that binds a kind is recorded, not only the first: a repair that makes an
@@ -1387,11 +1434,12 @@ def _pr_sentence_found(
         ):
             found["verdict"].append(0)
         return found
+    status = [w.span() for w in _PR_STATUS_WORD.finditer(sentence)]
     for m, version in exemptable:
         # The candidate's own prose window holds every character its re-check reads (the binding
         # reads 60 before the identifier and 80 after it), so it is blanked and read alone.
         left = max(0, m.start() - _PR_WINDOW)
-        own = _pr_step10_prose_window(sentence, left, m.end() + _PR_WINDOW)
+        own = _pr_step10_prose_window(sentence, left, m.end() + _PR_WINDOW, m, status)
         if (
             own is None
             or _pr_verdict_bound_at(own, m.start() - left, m.end() - left, version, False)
