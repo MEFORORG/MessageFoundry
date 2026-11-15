@@ -976,6 +976,12 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
             1,
         ),
         (
+            "a method under a parenthesized decorator",
+            "function review(r) { return agent(r) }\nawait review(0)\nclass A {\n"
+            "  @(dec) review(r) { return 1 }\n}\n",
+            1,
+        ),
+        (
             "an async function declared under a default label",
             "switch (k) { default: async function review(r) { return agent(r) } }\n"
             "await review(1)\nawait review(2)\n",
@@ -1084,6 +1090,10 @@ def test_a_brace_inside_a_string_in_an_interpolation_does_not_mask_the_rest(
         (
             "a decorated method nothing calls",
             "class A {\n  @dec go(r) { return agent(r) }\n}\n",
+        ),
+        (
+            "a method under a parenthesized decorator nothing calls",
+            "class A {\n  @(dec) go(r) { return agent(r) }\n}\n",
         ),
         (
             "an array handed to a function",

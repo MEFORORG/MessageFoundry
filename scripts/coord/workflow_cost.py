@@ -689,8 +689,9 @@ class _Lexer:
                     return ""
                 fr.member = "init"
                 continue
-            if state == "deco":  # `@` or a dot: a decorator's next name
-                fr.member = "decorated" if kind in ("word", "private") else "init"
+            if state == "deco":  # `@` or a dot: a decorator's next name, or `@(expr)`
+                named = kind in ("word", "private") or text == "("
+                fr.member = "decorated" if named else "init"
                 return ""
             if state == "decorated":  # a decorator's name or call has been read
                 if text in (".", "("):
