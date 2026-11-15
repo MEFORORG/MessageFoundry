@@ -32,23 +32,12 @@ export function preflightArgs(): string[] {
 export const SERVE_DEFAULT_SERVICE_CONFIG = "messagefoundry.toml";
 
 /**
- * The `--service-config` Start hands serve, the admin probe and provision-admin, from
- * `messagefoundry.serviceConfig` and whether it is set (BACKLOG #5566); undefined leaves the flag off.
- * A blank or whitespace-only setting counts as unset: clearing the Settings box stores "", which VS
- * Code still reports as set, and refusing it would leave no way back to the default short of Reset
- * Setting. Unset, serve reads {@link SERVE_DEFAULT_SERVICE_CONFIG}, and the fork guard judges that
- * file. A set non-string, which only a hand edit produces, is passed as "" and so refused, as
- * connectionServiceConfig in connectionWizardModel.ts passes it.
+ * The `--service-config` Start hands serve, the admin probe and provision-admin (BACKLOG #5566). It
+ * IS connectionServiceConfig, which states the rule, so Start and connection edits cannot resolve one
+ * setting to two files. With the flag off, serve reads {@link SERVE_DEFAULT_SERVICE_CONFIG}, and the
+ * fork guard judges that file.
  */
-export function startServiceConfigValue(setting: unknown, isSet: boolean): string | undefined {
-  if (!isSet) {
-    return undefined;
-  }
-  if (typeof setting !== "string") {
-    return "";
-  }
-  return setting.trim() === "" ? undefined : setting;
-}
+export { connectionServiceConfig as startServiceConfigValue } from "./connectionWizardModel";
 
 /** The `--service-config` element serve, the probe and provision-admin share, or none when undefined.
  *  Bound with `=`, so a path that starts with a dash stays a value and never becomes a flag. */
