@@ -3666,7 +3666,10 @@ if ($tool -in @("Bash", "PowerShell")) {
     $disarms = foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         $first = $true
-        foreach ($m in [regex]::Matches($seg.Scan, "(?<via>\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)",
+        # `--config-env` (BACKLOG #5588) is git's top-level `-c` with the value read from an environment
+        # variable, in both spellings git accepts: `--config-env=<key>=<var>` and `--config-env <key>=<var>`.
+        # It is an override like `-c`, so nothing after it is a read; the $viaConfig test below keeps it so.
+        foreach ($m in [regex]::Matches($seg.Scan, "(?<via>--config-env(?:=|\s+)|\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)(?<rest>[^|;&]*)",
                                          [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
             # A LATER match counts only where a git word owns it, with no true separator between them
             # (review round b62475f26d): `git config core.hooksPath ; grep -c alias.x f` is a read and a
@@ -3700,7 +3703,15 @@ if ($tool -in @("Bash", "PowerShell")) {
         $badKey = $dis.Groups['key'].Value
         $rest = $dis.Groups['rest'].Value
         $via = $dis.Groups['via'].Value
-        $viaConfig = $via -match '\bconfig\b'
+        # ANCHORED AT THE START (BACKLOG #5588). The `config` alternative's via always begins with the
+        # word; `--config-env ` also holds it, unanchored, and would have been granted the read exemptions.
+        $viaConfig = $via -match '^config\b'
+        # A WRITE MODE BETWEEN `config` AND THE KEY (BACKLOG #5588). `git config --unset <key>` names no
+        # value and still removes the key, so neither read exemption below may excuse it. The flags and
+        # the subcommand words are git's own write modes; a mode missing here only leaves a shape the
+        # exemptions excuse, which is where this rule stood before. $viaRead is "a read exemption may apply".
+        $viaWrite = $via -match '\s--(?:unset(?:-all)?|remove-section|rename-section|replace-all|add)(?=[\s=])|^config\s+(?:set|unset|remove-section|rename-section)\s'
+        $viaRead = $viaConfig -and -not $viaWrite
         # THE EXPLICIT READ FLAGS ARE TESTED BELOW, AGAINST THE DISARMING INVOCATION'S OWN WINDOW, and
         # they used to be tested here against the WHOLE SEGMENT. See the block after $ownCmdWin.
         # ...AND THE IMPLICIT ONE (BACKLOG #1306). `git config <key>` with NO VALUE AFTER IT assigns
@@ -3717,7 +3728,7 @@ if ($tool -in @("Bash", "PowerShell")) {
         #
         # `$rest` stops at the next `|;&` because those start a new command, so a trailing separator
         # cannot be mistaken for a value.
-        if ($viaConfig -and $rest -notmatch '\S') { continue }
+        if ($viaRead -and $rest -notmatch '\S') { continue }
 
         $at = [regex]::Match($seg.Raw, $gitInvocation)
         $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
@@ -3802,8 +3813,26 @@ if ($tool -in @("Bash", "PowerShell")) {
         # `$rest` is appended for the trailing spelling. `git config --get <key>` is therefore excluded
         # exactly as before -- the flag is inside its own window -- and so is `git --no-pager config
         # --get <key>`, while the neighbouring read no longer reaches across the separator.
+        #
+        # THE FLAG IS READ OFF $via ALONE NOW, AND ONLY FOR THE `config` FORM (BACKLOG #5589). Three
+        # defects had one cause, the window this test read:
+        #   * `-c` and `--config-env` override the key for WHATEVER subcommand follows, so a read flag
+        #     anywhere after them excused `git -c core.hooksPath=/x commit -m x --list`. Only `config`
+        #     reads, so only the `config` form is exempt.
+        #   * git config stops parsing options at the key, so a `--list` AFTER it is the value. Measured:
+        #     `git config core.hooksPath --list` stores `--list`. $rest therefore never holds a read flag.
+        #   * $ownCmdWin ends where $via starts, at the `config` word, so the flag in `git config --get
+        #     <key> <pattern>` was in neither half and that read was refused. $via is where it sits.
+        # Measured on real git, every flag here placed before the key stores nothing however many
+        # arguments follow (tests/test_worktree_gate.py). A write mode in $via outranks a read flag.
+        #
+        # $via MUST BE ONE INVOCATION'S TEXT for its flag to be that invocation's. Its `[^|;&]` run does
+        # not stop at a substitution, so in `git config --list x $(git config <key> v)` the flag is the
+        # outer read's and the key the inner write's. A parenthesis, a backtick, a brace or a second git
+        # word in $via withholds the exemption; that costs a deny on an odd read, never an allow.
         # ===============================================================================================
-        if ("$ownCmdWin $rest" -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+        if ($viaRead -and $via -notmatch '[()`{}]|\bgit\b' -and
+            $via -match '\s--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
 
         # ===============================================================================================
         # AND WHAT DID AN EARLIER STATEMENT OR LINE PUT IN THE ENVIRONMENT? (BACKLOG #1379 class two)

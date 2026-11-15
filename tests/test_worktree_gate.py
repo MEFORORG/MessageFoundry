@@ -17,6 +17,7 @@ from __future__ import annotations
 import ctypes
 import functools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -2438,3 +2439,108 @@ def test_a_document_on_the_shared_root_is_still_allowed(
         run_gate(edit(shared_root / "handoffs" / "RESUME-HERE.md", cwd=worktree), repos_file)
         is None
     )
+
+
+# --- rule 3c: spellings the disarm pattern and its read exemptions misjudged (BACKLOG #5588, #5589) --
+#
+# Every row is judged in the same real governed repository as DISARM_WRITE, which each test asks
+# first as its positive control, so a fixture that stopped discriminating goes red rather than green.
+
+
+def _git_out(repo: Path, *args: str, env: dict[str, str] | None = None, check: bool = True) -> str:
+    """Run real git in ``repo`` and return its stdout: the ground truth the verdicts below rest on.
+    ``check=False`` only where a git error is itself an acceptable outcome."""
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **(env or {})},
+        check=check,
+    )
+    return proc.stdout.strip()
+
+
+def test_real_git_honours_the_spellings_these_rows_close(git_primary: Path) -> None:
+    """Measured, not assumed: each spelling below really sets or removes a disarm key."""
+    env = {"MEFOR_GATE_PROBE": "/nope"}
+    for flag in (
+        ["--config-env=core.hooksPath=MEFOR_GATE_PROBE"],
+        ["--config-env", "core.hooksPath=MEFOR_GATE_PROBE"],
+    ):
+        got = _git_out(git_primary, *flag, "config", "--get", "core.hooksPath", env=env)
+        assert got == "/nope", flag
+    _git_out(git_primary, "config", "core.hooksPath", "/x")
+    _git_out(git_primary, "config", "--unset", "core.hooksPath")
+    assert _git_out(git_primary, "config", "--get", "core.hooksPath", check=False) == ""
+    # Option parsing stops at the key, so a `--list` after it is the VALUE, and real git stores it.
+    _git_out(git_primary, "config", "core.hooksPath", "--list")
+    assert _git_out(git_primary, "config", "--get", "core.hooksPath") == "--list"
+    _git_out(git_primary, "config", "--unset", "core.hooksPath")
+
+
+@pytest.mark.parametrize("flag", ["--get", "--get-all", "--get-regexp", "--list", "--show-origin"])
+def test_real_git_stores_nothing_for_a_read_flag_before_the_key(
+    git_primary: Path, flag: str
+) -> None:
+    """The ground truth under the multi-argument read exemption: a read flag between `config` and
+    the key makes the trailing arguments a pattern, or an error, and never a stored value."""
+    _git_out(git_primary, "config", flag, "core.hooksPath", "/nope", check=False)
+    _git_out(git_primary, "config", "--local", flag, "alias.zz", "status", check=False)
+    # `--get` of an unset key exits 1, which is the answer asked for here.
+    assert _git_out(git_primary, "config", "--get", "core.hooksPath", check=False) == ""
+    assert _git_out(git_primary, "config", "--get", "alias.zz", check=False) == ""
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # #5588: a top-level --config-env override, in both spellings git accepts.
+        "git --config-env=core.hooksPath=MEFOR_X commit -m x",
+        "git --config-env core.hooksPath=MEFOR_X commit -m x",
+        "git --config-env=alias.st=MEFOR_X st",
+        "git --config-env=core.hooksPath=MEFOR_X config --list",
+        # #5588: removing a disarm key is a write even with nothing after the key.
+        "git config --unset core.hooksPath",
+        "git config --unset-all core.hooksPath",
+        "git config --unset core.hooksPath && echo done",
+        "git config unset core.hooksPath",
+        "git config --local --unset include.path",
+        # #5589: a read flag later on the line does not make a -c override a read.
+        "git -c core.hooksPath=/dev/null commit -m x --list",
+        "git -c core.hooksPath=/dev/null branch --list",
+        "git -c alias.st=status config --get-all x",
+        # #5589: a --list that is the VALUE is not a read flag.
+        "git config core.hooksPath -- --list",
+        'git config core.hooksPath "--list"',
+        "git config core.hooksPath '--list'",
+        "git config core.hooksPath --get",
+        # A read flag in a DIFFERENT invocation reached through a substitution excuses nothing.
+        "git config --list x $(git config core.hooksPath /dev/null)",
+        "git config --list x `git config core.hooksPath /dev/null`",
+        "git config --get x <(git config core.hooksPath /dev/null)",
+        "git config --list x && git config core.hooksPath /dev/null",
+    ],
+)
+def test_rule_3c_denies_the_spellings_it_used_to_miss(
+    git_primary: Path, git_repos_file: Path, cmd: str
+) -> None:
+    reason = assert_denied(run_gate(bash(cmd, cwd=git_primary), git_repos_file))
+    assert "SHARED git configuration" in reason
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # #5589: multi-argument reads, whose read flag sits between `config` and the key.
+        "git config --get core.hooksPath somepattern",
+        "git config --get-all alias.st status",
+        "git config --get-regexp alias.co .",
+        "git config --local --get core.hooksPath x",
+    ],
+)
+def test_rule_3c_allows_multi_argument_reads(
+    git_primary: Path, git_repos_file: Path, cmd: str
+) -> None:
+    assert_denied(run_gate(bash(DISARM_WRITE, cwd=git_primary), git_repos_file))  # control
+    assert run_gate(bash(cmd, cwd=git_primary), git_repos_file) is None
