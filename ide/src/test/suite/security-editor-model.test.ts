@@ -37,12 +37,12 @@ suite("security editor host checks", () => {
   test("a path inside the workspace resolves to its absolute file, existing or not", () => {
     // THE CONTROL for every refusal below.
     for (const setting of ["messagefoundry.toml", "conf/sub/messagefoundry.toml", "./a/../b.toml", "..conf/messagefoundry.toml", "..messagefoundry.toml"]) {
-      const t = securityConfigTarget(ws, setting, true, real, true);
+      const t = securityConfigTarget(ws, setting, { fromWorkspace: true, trusted: true }, real);
       // Links resolved, so the expected path is under the workspace's real path.
       assert.deepStrictEqual(t, { ok: true, path: path.resolve(fs.realpathSync.native(ws), setting) }, setting);
     }
     fs.writeFileSync(path.join(ws, "messagefoundry.toml"), "");
-    assert.ok(securityConfigTarget(ws, path.join(ws, "messagefoundry.toml"), true, real, true).ok, "an absolute path inside");
+    assert.ok(securityConfigTarget(ws, path.join(ws, "messagefoundry.toml"), { fromWorkspace: true, trusted: true }, real).ok, "an absolute path inside");
   });
 
   test("a path outside the workspace is refused", () => {
@@ -56,31 +56,31 @@ suite("security editor host checks", () => {
       "",
       "   ",
     ]) {
-      const t = securityConfigTarget(ws, setting, true, real, true);
+      const t = securityConfigTarget(ws, setting, { fromWorkspace: true, trusted: true }, real);
       assert.strictEqual(t.ok, false, `${JSON.stringify(setting)} was accepted`);
     }
     for (const setting of [undefined, null, 5, ["messagefoundry.toml"]]) {
-      assert.strictEqual(securityConfigTarget(ws, setting, true, real, true).ok, false, `${JSON.stringify(setting)} was accepted`);
+      assert.strictEqual(securityConfigTarget(ws, setting, { fromWorkspace: true, trusted: true }, real).ok, false, `${JSON.stringify(setting)} was accepted`);
     }
   });
 
   test("a value from user settings may name a file outside the workspace, but never a blank one", () => {
     const file = path.join(outside, "messagefoundry.toml");
     // A path that never reaches the workspace keeps its spelling, so every editor locks one folder.
-    assert.deepStrictEqual(securityConfigTarget(ws, file, false, real, true), { ok: true, path: file });
+    assert.deepStrictEqual(securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, real), { ok: true, path: file });
     for (const setting of ["", "  ", undefined, 5]) {
-      assert.strictEqual(securityConfigTarget(ws, setting, false, real, true).ok, false, `${JSON.stringify(setting)} was accepted`);
+      assert.strictEqual(securityConfigTarget(ws, setting, { fromWorkspace: false, trusted: true }, real).ok, false, `${JSON.stringify(setting)} was accepted`);
     }
   });
 
   test("a containment refusal does not quote the setting's value back", () => {
-    const t = securityConfigTarget(ws, "../secret-name.toml", true, real, true);
+    const t = securityConfigTarget(ws, "../secret-name.toml", { fromWorkspace: true, trusted: true }, real);
     assert.ok(!t.ok && !t.problem.includes("secret-name"), JSON.stringify(t));
   });
 
   test("an untrusted workspace is refused before any file-system call", () => {
-    // Finding 22: in Restricted Mode the editor must make no file-system contact, since a
-    // repository-held link to a UNC path can contact SMB on Windows when it is read.
+    // The Lander's hold on PR 2968, finding 22: in Restricted Mode the check makes no file-system
+    // call, since reading a repository-held link to a UNC path can contact SMB on Windows.
     const calls: string[] = [];
     const spy = {
       realpath: (p: string): string => {
@@ -97,7 +97,7 @@ suite("security editor host checks", () => {
       },
     };
     // THE CONTROL: the same setting in a trusted workspace is accepted, and the spy sees the reads.
-    assert.ok(securityConfigTarget(ws, "messagefoundry.toml", true, spy, true).ok);
+    assert.ok(securityConfigTarget(ws, "messagefoundry.toml", { fromWorkspace: true, trusted: true }, spy).ok);
     assert.ok(calls.length > 0, "the spy recorded no call, so it proves nothing");
     for (const [setting, fromWorkspace] of [
       ["messagefoundry.toml", true],
@@ -106,7 +106,7 @@ suite("security editor host checks", () => {
       ["", true],
     ] as const) {
       calls.length = 0;
-      const t = securityConfigTarget(ws, setting, fromWorkspace, spy, false);
+      const t = securityConfigTarget(ws, setting, { fromWorkspace: fromWorkspace, trusted: false }, spy);
       assert.ok(!t.ok && t.problem.includes("not trusted"), JSON.stringify(t));
       assert.deepStrictEqual(calls, [], `${JSON.stringify(setting)} touched the file system`);
     }
@@ -120,7 +120,7 @@ suite("security editor host checks", () => {
       lstat: () => ({ isSymbolicLink: () => false }),
       readlink: (): string => "",
     };
-    assert.strictEqual(securityConfigTarget(ws, "messagefoundry.toml", true, denied, true).ok, false);
+    assert.strictEqual(securityConfigTarget(ws, "messagefoundry.toml", { fromWorkspace: true, trusted: true }, denied).ok, false);
   });
 
   test("a path that leaves the workspace through a symbolic link is refused", function () {
@@ -131,19 +131,19 @@ suite("security editor host checks", () => {
       // Creating a link can need a privilege the runner lacks; the lexical cases still ran.
       this.skip();
     }
-    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", true, real, true).ok, false, "a new file through the link");
+    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", { fromWorkspace: true, trusted: true }, real).ok, false, "a new file through the link");
     // Whatever the scope: a user-set or default path inside the workspace is checked for links too.
-    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", false, real, true).ok, false, "a user-set path through the link");
+    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", { fromWorkspace: false, trusted: true }, real).ok, false, "a user-set path through the link");
     fs.writeFileSync(path.join(outside, "messagefoundry.toml"), "");
-    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", true, real, true).ok, false, "an existing file through the link");
+    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", { fromWorkspace: true, trusted: true }, real).ok, false, "an existing file through the link");
     // A dangling link, whose target does not exist yet, is refused too: it could be made later.
     const dangling = path.join(ws, "dangling");
     fs.symlinkSync(path.join(outside, "not-yet"), dangling, "junction");
-    assert.strictEqual(securityConfigTarget(ws, "dangling/messagefoundry.toml", true, real, true).ok, false, "a dangling link");
+    assert.strictEqual(securityConfigTarget(ws, "dangling/messagefoundry.toml", { fromWorkspace: true, trusted: true }, real).ok, false, "a dangling link");
     // THE CONTROL: a link that stays inside the workspace is accepted.
     fs.mkdirSync(path.join(ws, "inner"));
     fs.symlinkSync(path.join(ws, "inner"), path.join(ws, "inlink"), "junction");
-    const viaInner = securityConfigTarget(ws, "inlink/messagefoundry.toml", true, real, true);
+    const viaInner = securityConfigTarget(ws, "inlink/messagefoundry.toml", { fromWorkspace: true, trusted: true }, real);
     assert.ok(viaInner.ok, "a link inside the workspace");
     // The CLI is handed the resolved path, so it opens the folder that was checked.
     assert.strictEqual(viaInner.path, path.join(fs.realpathSync.native(path.join(ws, "inner")), "messagefoundry.toml"));
@@ -162,13 +162,13 @@ suite("security editor host checks", () => {
         this.skip();
       }
       // THE CONTROL: a file the alias reaches inside the workspace is accepted, as the resolved path.
-      assert.deepStrictEqual(securityConfigTarget(ws, path.join(alias, "messagefoundry.toml"), false, real, true), {
+      assert.deepStrictEqual(securityConfigTarget(ws, path.join(alias, "messagefoundry.toml"), { fromWorkspace: false, trusted: true }, real), {
         ok: true,
         path: path.join(fs.realpathSync.native(ws), "messagefoundry.toml"),
       });
       // Through the alias and then out by a link the repository holds: refused, as it is lexically.
       assert.strictEqual(
-        securityConfigTarget(ws, path.join(alias, "linked", "messagefoundry.toml"), false, real, true).ok,
+        securityConfigTarget(ws, path.join(alias, "linked", "messagefoundry.toml"), { fromWorkspace: false, trusted: true }, real).ok,
         false,
         "through the alias",
       );
@@ -176,11 +176,11 @@ suite("security editor host checks", () => {
       // workspace, so only following each hop sees that it passes through.
       const chained = path.join(outside, "chained");
       fs.symlinkSync(path.join(ws, "linked"), chained, "junction");
-      const t = securityConfigTarget(ws, path.join(chained, "messagefoundry.toml"), false, real, true);
+      const t = securityConfigTarget(ws, path.join(chained, "messagefoundry.toml"), { fromWorkspace: false, trusted: true }, real);
       assert.strictEqual(t.ok, false, "an alias to a repository link");
       assert.ok(!t.ok && t.problem.includes("set in user settings"), "the refusal names the user scope");
       // The alias naming the workspace folder itself is refused, as the folder is.
-      assert.strictEqual(securityConfigTarget(ws, alias, false, real, true).ok, false, "the folder by its alias");
+      assert.strictEqual(securityConfigTarget(ws, alias, { fromWorkspace: false, trusted: true }, real).ok, false, "the folder by its alias");
     } finally {
       fs.rmSync(away, { recursive: true, force: true });
     }
@@ -199,12 +199,12 @@ suite("security editor host checks", () => {
       readlink: real.readlink,
     });
     // THE CONTROL: the same path, with every read succeeding, is accepted.
-    assert.ok(securityConfigTarget(ws, file, false, failing(() => false), true).ok);
+    assert.ok(securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, failing(() => false)).ok);
     // The workspace folder cannot be resolved.
-    assert.strictEqual(securityConfigTarget(ws, file, false, failing((p) => p === path.resolve(ws)), true).ok, false, "the root");
+    assert.strictEqual(securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, failing((p) => p === path.resolve(ws))).ok, false, "the root");
     // An ancestor of the target cannot be read while walking it for an alias.
     const parent = path.dirname(outside);
-    assert.strictEqual(securityConfigTarget(ws, file, false, failing((p) => p === parent), true).ok, false, "an ancestor");
+    assert.strictEqual(securityConfigTarget(ws, file, { fromWorkspace: false, trusted: true }, failing((p) => p === parent)).ok, false, "an ancestor");
   });
 
   test("the file a panel shows is its own, and a disposed panel neither sets it nor saves through it", () => {

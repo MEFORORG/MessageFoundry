@@ -119,7 +119,7 @@ function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | u
  * The absolute service-settings path for `setting` (`messagefoundry.serviceConfig`), resolved against
  * the workspace folder `workspace` (BACKLOG #5411). A blank or non-string setting is refused.
  *
- * `fromWorkspace` says the value in force comes from the workspace's own settings, which a
+ * `scope.fromWorkspace` says the value in force comes from the workspace's own settings, which a
  * repository's `.vscode/settings.json` can set. Such a value must name a file inside the workspace
  * folder: one that leaves it by `..` or by being absolute elsewhere is refused, as is the folder
  * itself. A value from user settings is the operator's own and may name a file outside the folder,
@@ -127,30 +127,29 @@ function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | u
  *
  * Whatever its scope, a path inside the workspace folder, the default `messagefoundry.toml`
  * included, must not leave it through a symbolic link the repository holds, a dangling one included.
- * A user-set path that reaches the folder by an alias gets the same rules: at least a link, and a
- * mapped drive or an 8.3 short name where realpath resolves it to the folder. An alias realpath does
- * not resolve, such as a UNC loopback alias, a bind mount or a firmlink, is not caught. A path whose
+ * A user-set path that reaches the folder by an alias gets the same rules where realpath resolves the
+ * alias to the folder: at least a link, a mapped drive or an 8.3 short name. An alias realpath does
+ * not resolve to it, such as a UNC loopback or admin-share spelling (a link to one included), a bind
+ * mount or a firmlink, is not caught. A path whose
  * links, or the folder's, cannot be read is refused at either scope. A path that reaches the folder
  * is returned with its links resolved, so the CLI opens the folders that were checked; one that
  * never reaches it is returned as written.
  *
- * `trusted` says the workspace is trusted. An untrusted one is refused before anything else, so the
- * check touches no file: a repository-held link to a UNC path would otherwise be read, and on
- * Windows that can contact SMB, in Restricted Mode.
+ * `scope.trusted` says the workspace is trusted. An untrusted one is refused before anything else, so
+ * this check makes no file-system call there: it would otherwise read the repository's links, and on
+ * Windows reading a link to a UNC path can contact SMB. That bounds this check only; it says nothing
+ * of what VS Code itself reads in Restricted Mode.
  */
 export function securityConfigTarget(
   workspace: string,
   setting: unknown,
-  fromWorkspace: boolean,
+  scope: { readonly fromWorkspace: boolean; readonly trusted: boolean },
   fsx: LinkFs,
-  trusted: boolean,
 ): ConfigTarget {
-  if (!trusted) {
-    return {
-      ok: false,
-      problem: "this workspace is not trusted. Trust it to read or write its security settings",
-    };
+  if (!scope.trusted) {
+    return { ok: false, problem: "This workspace is not trusted. Trust it to read or write its security settings" };
   }
+  const { fromWorkspace } = scope;
   if (typeof setting !== "string" || setting.trim() === "") {
     return { ok: false, problem: "messagefoundry.serviceConfig is blank or is not text" };
   }
