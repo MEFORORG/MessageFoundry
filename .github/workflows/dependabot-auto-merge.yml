@@ -103,8 +103,9 @@ jobs:
       # what was approved, but auto-merge armed on the earlier head would stay armed and merge the new
       # head once CI went green, whatever this run then decides. So every `synchronize` run, and every
       # `reopened` one (a push to a closed PR emits no synchronize), DISARMS first, and only the merge
-      # step below re-arms, pinned to the head THIS run evaluated and only
-      # when every commit on the PR is Dependabot's own (the `authors` step). FAILS CLOSED: when the
+      # step below re-arms, pinned to the head THIS run evaluated, and only on a Dependabot push of a
+      # single Dependabot commit (the `authors` step). A reopened PR therefore always holds until
+      # Dependabot pushes again. FAILS CLOSED: when the
       # state cannot be read it disarms anyway, and a failed disarm, or a state that does not read
       # back as disarmed, fails the step, so every later step is skipped and nothing re-arms.
       # What this does not cover: it reads the auto-merge REQUEST only. Once a PR is already in the
@@ -488,32 +489,41 @@ jobs:
       # BACKLOG #5593. fetch-metadata derives every output above from the PR's FIRST commit, its body
       # and its branch name, never from the head, so a commit appended by anyone else would inherit
       # the first commit's verdict. Re-arming is therefore allowed only when ALL of these hold: the
-      # event's SENDER (the pusher, not a commit author) is dependabot[bot]; the PR has exactly ONE
-      # commit; and that commit's author is dependabot[bot]. The sender is the half no pusher can
-      # write: a human's or the Lander's push, and a web-flow commit a human makes through the API,
-      # all carry that human as sender. The committer is not checked, because GitHub's web-flow
-      # commits Dependabot's own work. An A3 lock-resync push adds a second commit, so it holds; it
-      # lands only on uv PRs, whose allow row is empty, so that costs nothing today. FAILS CLOSED: an
-      # API error, any other sender, any commit count but one, or any other author emits false.
-      # Gated on the allow-set so a held PR makes no API call.
+      # event is not `reopened`; its SENDER is dependabot[bot]; the PR has exactly ONE commit; that
+      # commit IS the head this run pins; its author is dependabot[bot]; and GitHub verified its
+      # signature. On `opened` and `synchronize` the sender is the account that pushed, so a human's
+      # or the Lander's push, and a web-flow commit a human makes through the API, carry that human.
+      # On `reopened` the sender is whoever reopened, which can be Dependabot acting on someone else's
+      # push to the closed PR, so a reopen never re-arms. The committer is not checked, because
+      # GitHub's web-flow commits Dependabot's own work. An A3 lock-resync push adds a second commit,
+      # so it holds; it lands only on uv PRs, whose allow row is empty, so that costs nothing today.
+      # FAILS CLOSED: an API error or any check above failing emits false. Gated on the allow-set, and
+      # skipped on a stale run, so a held PR makes no API call here.
       - name: Require a Dependabot push of a single Dependabot commit
         id: authors
-        if: steps.allowset.outputs.eligible == 'true'
+        if: steps.allowset.outputs.eligible == 'true' && steps.disarm.outputs.stale != 'true'
         env:
+          EVENT_ACTION: ${{ github.event.action }}
           SENDER: ${{ github.event.sender.login }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
+          if [ "$EVENT_ACTION" = "reopened" ]; then
+            echo "::notice::a reopen never re-arms; the PR holds until Dependabot pushes again."
+            echo "sole_author=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$SENDER" != "dependabot[bot]" ]; then
             echo "::notice::this event was sent by '${SENDER:-<none>}', not dependabot[bot] — routing to manual review."
             echo "sole_author=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # One `login=<author>` line per commit, so an empty login is a visible field, never a
-          # collapsed one (a whitespace IFS would shift the fields of a row with an empty value).
-          rows="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" --jq '.[] | "login=" + (.author.login // "")' 2>/dev/null)" || rows="ERR"
+          # One `<sha> <verified> login=<author>` line per commit, compared WHOLE against the one line
+          # that passes, so no field is parsed and an empty login cannot shift another field.
+          rows="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" --jq '.[] | .sha + " " + (.commit.verification.verified | tostring) + " login=" + (.author.login // "")' 2>/dev/null)" || rows="ERR"
           if [ "$rows" = "ERR" ]; then
             echo "::warning::could not list this PR's commits — failing closed (manual review)."
             echo "sole_author=false" >> "$GITHUB_OUTPUT"
@@ -526,8 +536,8 @@ jobs:
             echo "sole_author=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ "${commits[0]}" != "login=dependabot[bot]" ]; then
-            echo "::notice::the PR's commit is authored by '${commits[0]#login=}', not dependabot[bot] — routing to manual review."
+          if [ "${commits[0]}" != "${HEAD_SHA} true login=dependabot[bot]" ]; then
+            echo "::notice::the PR's one commit reads '${commits[0]}', not '${HEAD_SHA} true login=dependabot[bot]' — routing to manual review."
             echo "sole_author=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

@@ -383,8 +383,16 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
     assert "steps.ghsa.outputs.security_track != 'true'" in cond
     assert "steps.age.outputs.age_ok == 'true'" in cond, "merge not gated on the release-age guard"
     assert "steps.authors.outputs.sole_author == 'true'" in cond, (
-        "merge not gated on every commit being Dependabot's own (BACKLOG #5593)"
+        "merge not gated on a Dependabot push of one Dependabot commit (BACKLOG #5593)"
     )
+    assert "steps.disarm.outputs.stale != 'true'" in cond, "merge not gated on a stale run"
+    # The sender gate is only as good as its binding: the behavioural rows supply SENDER directly.
+    env = _step("authors").get("env") or {}
+    assert str(env.get("SENDER", "")).replace(" ", "") == "${{github.event.sender.login}}", env
+    assert (
+        str(env.get("HEAD_SHA", "")).replace(" ", "") == "${{github.event.pull_request.head.sha}}"
+    )
+    assert str(env.get("EVENT_ACTION", "")).replace(" ", "") == "${{github.event.action}}"
     # the in-scope update-type gate is still present (any patch / dev-only minor)
     assert "version-update:semver-patch" in cond
 
@@ -984,7 +992,7 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
         'case "$1 $2" in\n'
         '  "pr view")\n'
         '    if [ "${VIEW_FAIL:-0}" = 1 ]; then echo \'{"message":"Bad credentials"}\'; exit 1; fi\n'
-        '    case "$*" in *headRefOid*) echo "$GH_HEAD"; exit 0 ;; esac\n'
+        '    case "$*" in *headRefOid*) [ "${HEAD_FAIL:-0}" = 1 ] && exit 1; echo "$GH_HEAD"; exit 0 ;; esac\n'
         '    cat "$GH_STATE" ;;\n'
         '  "pr merge")\n'
         '    if [ "${DISARM_FAIL:-0}" = 1 ]; then echo "gh: refused" >&2; exit 1; fi\n'
@@ -1009,6 +1017,15 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
         ("a stale run leaves the arm alone", "true", {"GH_HEAD": "b" * 40}, 0, False, "true"),
         # An unreadable head is not stale: disarm, then fail so nothing re-arms.
         ("an unreadable head disarms and fails", "true", {"GH_HEAD": ""}, 1, True, "false"),
+        # Head unreadable, nothing armed: still red, so the later steps cannot re-arm.
+        (
+            "an unreadable head on an unarmed PR fails",
+            "false",
+            {"HEAD_FAIL": "1"},
+            1,
+            False,
+            "false",
+        ),
     ],
 )
 def test_disarm_step_behaviour(
@@ -1061,38 +1078,71 @@ def _gh_rows_stub(tmp_path: Path, rows: str | None) -> Path:
 
 
 _BOT = "dependabot[bot]"
+_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+_PASS = f"{_HEAD} true login=dependabot[bot]\n"
 
 
 @pytest.mark.parametrize(
-    ("label", "sender", "rows", "expected"),
+    ("label", "action", "sender", "rows", "expected"),
     [
-        # The discriminating PASS: a Dependabot push of one Dependabot commit re-arms.
-        ("Dependabot pushed one Dependabot commit", _BOT, "login=dependabot[bot]\n", "true"),
+        # The discriminating PASS: a Dependabot push of one verified Dependabot commit at the head.
+        ("Dependabot pushed one Dependabot commit", "synchronize", _BOT, _PASS, "true"),
         # A human or the Lander pushed: the sender is that person, whatever the commits say.
-        ("a human sender", "someone", "login=dependabot[bot]\n", "false"),
-        ("two commits", _BOT, "login=dependabot[bot]\nlogin=dependabot[bot]\n", "false"),
-        ("a Dependabot sender, human-authored commit", _BOT, "login=someone\n", "false"),
-        # An empty login is its own visible field, so it fails the author test, not a shifted one.
-        ("an author with no GitHub login", _BOT, "login=\n", "false"),
-        ("no commits", _BOT, "", "false"),
-        ("the API errors", _BOT, None, "false"),
+        ("a human sender", "synchronize", "someone", _PASS, "false"),
+        ("two commits", "synchronize", _BOT, _PASS + _PASS, "false"),
+        (
+            "a Dependabot sender, human-authored commit",
+            "synchronize",
+            _BOT,
+            f"{_HEAD} true login=someone\n",
+            "false",
+        ),
+        # An empty login is its own visible field, so it fails the whole-line test, not a shift.
+        ("an author with no GitHub login", "synchronize", _BOT, f"{_HEAD} true login=\n", "false"),
+        (
+            "an unverified commit",
+            "synchronize",
+            _BOT,
+            f"{_HEAD} false login=dependabot[bot]\n",
+            "false",
+        ),
+        (
+            "the commit is not the pinned head",
+            "synchronize",
+            _BOT,
+            f"{'b' * 40} true login=dependabot[bot]\n",
+            "false",
+        ),
+        # On reopen the sender is the reopener, which can be Dependabot after someone else's push.
+        ("a reopen", "reopened", _BOT, _PASS, "false"),
+        ("no commits", "synchronize", _BOT, "", "false"),
+        ("the API errors", "synchronize", _BOT, None, "false"),
     ],
 )
 def test_authors_step_rearms_only_a_dependabot_push_of_one_dependabot_commit(
-    label: str, sender: str, rows: str | None, expected: str, tmp_path: Path
+    label: str, action: str, sender: str, rows: str | None, expected: str, tmp_path: Path
 ) -> None:
     """fetch-metadata reads only the first commit, so re-arming needs the sender, the commit count
     and the single commit's author to all be Dependabot's."""
     run = _run_step_body(
         "authors",
-        {"SENDER": sender, "REPO": "example/example", "PR_NUMBER": "1", "GH_TOKEN": "stub"},
+        {
+            "EVENT_ACTION": action,
+            "SENDER": sender,
+            "HEAD_SHA": _HEAD,
+            "REPO": "example/example",
+            "PR_NUMBER": "1",
+            "GH_TOKEN": "stub",
+        },
         tmp_path,
         path_prepend=_gh_rows_stub(tmp_path, rows),
     )
     assert run.rc == 0, f"{label}: rc={run.rc}{_diagnostic(run)}"
     assert run.outputs.get("sole_author") == expected, f"{label}{_diagnostic(run)}"
     if label == "an author with no GitHub login":
-        assert "authored by ''" in run.stdout, f"failed for the wrong reason{_diagnostic(run)}"
+        assert "true login=', not" in run.stdout, f"failed for the wrong reason{_diagnostic(run)}"
 
 
 def _gh_arm_stub(tmp_path: Path, arm_ok: bool, head: str | None) -> Path:
