@@ -7725,12 +7725,13 @@ class RegistryRunner:
         one whose count the store failed to write) is retried on this backoff with no cap, as the
         fault arm retries a persistent ``Exception``.
 
-        The write is a deferred one for a task that is gone, so it is sent only while the dead
-        task's lease still holds (:meth:`RependFence.may_write`): on a node demoted since, or one
-        leading under a newer lease, the rows are the successor's promotion recovery's, as
-        :meth:`_release_tail_on_stop` says, and they are left alone."""
+        The write is a deferred one for a task that is gone, so it is not sent once another lease
+        than the dead task's is held (:meth:`RependFence.moved`): another node led since, and the
+        rows are its promotion recovery's, as :meth:`_release_tail_on_stop` says. A node that has
+        only stopped leading under the same lease goes into the hold, which waits on the not-leader
+        state as the fault arm's does, and resumes if this node leads again under that lease."""
         if dead is not None and dead.ids:
-            if dead.fence is not None and not dead.fence.may_write():
+            if dead.fence is not None and dead.fence.moved():
                 log.warning(
                     "%s worker %r: the dead worker's %d held row(s) were claimed under a lease "
                     "this node no longer holds; leaving them to the successor's recovery",
