@@ -1940,6 +1940,9 @@ def test_a_relabel_that_cannot_be_recorded_keeps_its_directory_from_every_sweep(
         mp.setattr(dr_backup, "_truncate_unfollowed", _truncate_ignoring_links)
         owner = dr_backup._owner_of(leftover)
         assert dr_backup._sweep_abandoned_staging(dest.parent, owner=owner, own=dest) == 0
+        # The sweep skips it before its teardown runs, so the marker is shown to spare the file
+        # by a teardown run on it directly.
+        dr_backup._teardown_staging(leftover)
     assert staged.stat().st_size == size
     shutil.rmtree(leftover)
 
@@ -2018,7 +2021,7 @@ def test_a_placement_that_fails_leaves_no_spare_on_the_staged_copy(
 
     real_place = dr_backup._place_restored_store
 
-    def refuse(src: Path, dest: Path, **kwargs: Any) -> int:
+    def refuse(src: Path, dest: Path, **kwargs: Any) -> tuple[int, bool]:
         # The marker lands as the real placement writes it, then the link fails.
         def link(*args: Any) -> None:
             raise OSError(28, "No space left on device")
@@ -2039,7 +2042,9 @@ def test_a_placement_that_fails_leaves_no_spare_on_the_staged_copy(
 
 def test_a_lost_create_race_leaves_the_winner_alone_and_no_spare(tmp_path, key_b64, capsys) -> None:
     # Another restore wins the exclusive create at --to between the checks and the link. The
-    # marker this restore wrote spares nothing then, and the winner's store is untouched.
+    # marker this restore wrote spares nothing then, and the winner's store is untouched. The
+    # staged store is held, so the rollback's own retry cannot remove it: only the unspare at the
+    # failed placement lets the teardown take it.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored" / "msg.db"
 
@@ -2049,6 +2054,8 @@ def test_a_lost_create_race_leaves_the_winner_alone_and_no_spare(tmp_path, key_b
         raise FileExistsError(17, "File exists", os.fspath(dst))
 
     with pytest.MonkeyPatch.context() as mp:
+        _hold(mp, _is_staged_store)
+        mp.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
         mp.setattr(os, "link", link)
         assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
     assert "restore failed (destination)" in _refusal(capsys)
@@ -2112,17 +2119,10 @@ def test_a_release_that_does_not_land_leaves_the_spare_and_says_so(
     def refuse(*args: Any, **kwargs: Any) -> Any:
         raise PermissionError(13, "held open by a scanner")
 
-    real_open = os.open
-
-    def open_(path: Any, flags: int, *args: Any) -> int:
-        if flags & os.O_WRONLY:
-            raise PermissionError(13, "held open by a scanner")
-        return real_open(path, flags, *args)
-
     with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR, dr_backup.log.name):
         _hold_markers(mp)
         if refused == "open":
-            mp.setattr(os, "open", open_)
+            mp.setattr(dr_backup, "_open_unfollowed", refuse)
         else:
             mp.setattr(os, "ftruncate", refuse)
         assert dr_backup._release_spare_marker(item) is False
@@ -2130,6 +2130,51 @@ def test_a_release_that_does_not_land_leaves_the_spare_and_says_so(
     assert marker == (b"restored-store" if refused == "open" else b"released-store"), marker
     assert any("spared no longer" in r.getMessage() for r in caplog.records)
     assert "extracted_store.db" in (dr_backup._spared_items(staging, None) or {})
+
+
+def test_a_marker_gone_after_its_refused_unlink_counts_as_released(tmp_path) -> None:
+    item = tmp_path / "extracted_store.db"
+    item.write_bytes(b"synthetic")
+    assert dr_backup._write_spare_marker(item, "restored-store")
+
+    def gone(*args: Any) -> int:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    with pytest.MonkeyPatch.context() as mp:
+        _hold_markers(mp)
+        mp.setattr(dr_backup, "_open_unfollowed", gone)
+        assert dr_backup._release_spare_marker(item) is True
+
+
+def test_a_marker_unreadable_at_the_teardown_is_not_taken_as_unrecorded(tmp_path) -> None:
+    # A marker there that cannot be read at that moment is unknown, not missing: the teardown must
+    # not withhold its directory for good on a transient sharing violation.
+    item = tmp_path / "extracted_store.db"
+    item.write_bytes(b"synthetic")
+    assert dr_backup._records_another_reason(item, "restored-store") is True  # no marker yet
+    assert dr_backup._write_spare_marker(item, "restored-store")
+    assert dr_backup._records_another_reason(item, "restored-store") is False
+    assert dr_backup._records_another_reason(item, "rollback-failed") is True
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_read_spare_reason", lambda marker: "")
+        assert dr_backup._records_another_reason(item, "rollback-failed") is False
+
+
+def test_a_placement_interrupted_after_its_link_removes_what_it_placed(tmp_path) -> None:
+    from messagefoundry.store import store as store_mod
+
+    src = tmp_path / "extracted_store.db"
+    src.write_bytes(b"synthetic store")
+    dest = tmp_path / "msg.db"
+
+    def interrupted(path: Path, *, dir_grants: object) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(store_mod, "_secure_store_file", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            dr_backup._place_restored_store(src, dest)
+    assert not dest.exists() and src.read_bytes() == b"synthetic store"
 
 
 def test_a_late_relabel_that_fails_withholds_the_directory_and_says_so(
