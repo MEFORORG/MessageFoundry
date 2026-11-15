@@ -1,24 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Read a file's Windows access list, and check what the rewrite ``store._secure_file`` leaves.
+"""Read a file's Windows access list, build a folder with an exact one, and check an owner-only file.
 
-That rewrite is ``icacls /inheritance:r /grant:r *<token SID>:F``. It removes INHERITED entries and
-replaces the token account's own; an EXPLICIT entry the file already carried stays. On the hosted
-windows-2022 and windows-2025 runners the rewritten file still names SYSTEM, Administrators and
-OWNER RIGHTS, as explicit entries beside the token account (CI run 43698326298; earlier, CI run
-36039014999, recorded beside the restore staging in ``pipeline/dr_backup.py``). Every one of those
-readings was taken AFTER the rewrite. Whether the entries were explicit before it, or were
-inherited and came out explicit, is not measured, and this check cannot tell the two apart for
-those three: a rewrite that copied exactly those inherited entries would pass. It still fails on
-any other entry, an inherited one, a deny, or a missing grant (the control in
-``tests/test_atomic_edit.py``). Windows only; callers skip elsewhere."""
+A test that checks what a restriction leaves must not take its folder from the test's temp
+directory. Python 3.13+ writes SYSTEM, Administrators and OWNER RIGHTS onto a directory made with
+mode 0700, as pytest's ``tmp_path`` and ``tempfile.mkdtemp`` both are, and on the hosted runners
+those entries have survived ``icacls /inheritance:r`` onto a file as explicit entries (CI runs
+36039014999 and 43698326298). :func:`folder_granting` gives the test a folder whose list it chose,
+so any extra entry on the file comes from the code under test. Windows only; callers skip
+elsewhere."""
 
 from __future__ import annotations
 
 from pathlib import Path
-
-#: SYSTEM, Administrators and OWNER RIGHTS: what the hosted runners leave beside the token account.
-REWRITE_RESIDUE_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544", "S-1-3-4"})
 
 
 def protected_entries(path: Path) -> tuple[str, str | None, list[tuple[str, str, str, str]]]:
@@ -39,11 +33,22 @@ def protected_entries(path: Path) -> tuple[str, str | None, list[tuple[str, str,
     return sddl, owner, entries
 
 
-def assert_rewritten_to_grantee(path: Path, grantee: str) -> None:
-    """``path`` carries what the rewrite leaves: a protected list, no inherited entry, no deny,
-    ``grantee`` (the token account the rewrite grants) at full control, and nobody else but
-    ``REWRITE_RESIDUE_SIDS``. A broad group, an inherited entry or a missing grant fails here."""
+def folder_granting(path: Path, *sids: str) -> Path:
+    """Make the folder ``path`` with a protected access list granting exactly ``sids`` full control,
+    inherited by what is created in it, and return it. Asserts the list took."""
+    from messagefoundry.store.store import _set_security_from_sddl
+
+    path.mkdir()
+    sddl = "D:P" + "".join(f"(A;OICI;FA;;;{sid})" for sid in sids)
+    result = _set_security_from_sddl(path, sddl, protected=True)
+    assert result.failure is None and result.dacl_status == 0, result
+    _, _, entries = protected_entries(path)
+    assert [sid for *_, sid in entries] == list(sids), entries
+    return path
+
+
+def assert_owner_only(path: Path, grantee: str) -> None:
+    """``path`` carries a protected access list with exactly one entry: ``grantee`` allowed full
+    control, explicitly."""
     sddl, _, entries = protected_entries(path)
-    assert all(kind == "A" and "ID" not in flags for kind, flags, _, _ in entries), sddl
-    assert ("A", "", "FA", grantee) in entries, sddl
-    assert {sid for *_, sid in entries} - {grantee} <= REWRITE_RESIDUE_SIDS, sddl
+    assert entries == [("A", "", "FA", grantee)], sddl

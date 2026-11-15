@@ -11,9 +11,10 @@ restriction (vault BACKLOG #2782). One copy here replaces the four.
 :func:`replace_validated` writes the new bytes to a CANDIDATE that carries the live file's own name,
 inside a private directory created beside it (unique, and on POSIX owner-only from creation: mode
 0700 for the directory and 0600 for the file; same filesystem, so the final ``os.replace`` is atomic).
-On Windows those modes are ignored and the candidate carries the directory's inherited access list
-until the replaced file is restricted (``store._secure_file``, or as the next paragraph says), the same window the old ``mkstemp`` writer
-had; the directory's own access list is the control there (``docs/SERVICE.md``). The caller's ``validate`` runs against that candidate. Only a candidate
+On Windows those modes are ignored, so the candidate is given an exact protected access list before
+its first byte is written (``_restrict_candidate`` says why), and the replaced file is restricted
+again (``store._secure_file``, or as the next paragraph says). The caller's ``validate`` runs
+against that candidate. Only a candidate
 that validates replaces the live file, so a refused edit never touches the live file at all: its bytes
 and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
 
@@ -391,6 +392,8 @@ def replace_validated(
         with refused_as(path, refused_error, "write its edit candidate"):
             fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
             with os.fdopen(fd, "wb") as handle:
+                if sys.platform == "win32":
+                    _restrict_candidate(candidate, live.windows_owner)
                 handle.write(data)
                 # On disk before the rename, so a crash just after it cannot leave an empty file.
                 handle.flush()
@@ -563,6 +566,44 @@ def _foreign_windows_owner(path: Path) -> str | None:
     return owner
 
 
+def _full_control_for(*sids: str | None) -> str:
+    """A protected SDDL access list granting each of ``sids`` but ``None`` full control, once each,
+    in order."""
+    from messagefoundry.restricted_file import _FULL_ACCESS, _protected_sddl
+
+    return _protected_sddl(dict.fromkeys(filter(None, sids), _FULL_ACCESS))
+
+
+def _restrict_candidate(candidate: Path, owner: str | None) -> None:
+    """Give the new, still empty ``candidate`` a protected access list granting the editing account
+    full control, and ``owner`` too when the live file is another account's (:class:`_LiveSecurity`).
+    Windows only; a failure is logged and the edit goes on, restricted after the rename as before.
+
+    The private directory ``mkdtemp`` makes carries its own protected list on Python 3.13+, granting
+    SYSTEM, Administrators and OWNER RIGHTS, and the candidate inherits it. The rename keeps those
+    entries on the replaced file, where the rewrite ``store._secure_file`` makes, which removes only
+    inherited entries, leaves them: an own-account edit left the file granting all four rather than
+    its owner alone. Writing the whole list here, before the first byte, makes the replaced file
+    owner-only whatever the directory carried."""
+    from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
+
+    editor = _current_user_sid()
+    if editor is None:
+        _log.warning(
+            "could not read this process's account from its token; the edit candidate for %s keeps "
+            "its directory's access list",
+            candidate.parent,
+        )
+        return
+    result = _set_security_from_sddl(candidate, _full_control_for(owner, editor), protected=True)
+    if result.failure is not None or result.dacl_status != 0:
+        _log.warning(
+            "could not restrict the edit candidate %s to this account: %s",
+            candidate,
+            result.failure or f"Win32 status {result.dacl_status}",
+        )
+
+
 def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
     """Restrict ``path`` to the account that owned the live file and the editing account, and give
     the ownership back; ``False``, logged, when the access list could not be written. Windows only.
@@ -576,8 +617,7 @@ def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
     from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
 
     editor = _current_user_sid()
-    grants = dict.fromkeys(sid for sid in (owner, editor) if sid)
-    sddl = f"O:{owner}D:P" + "".join(f"(A;;FA;;;{sid})" for sid in grants)
+    sddl = f"O:{owner}" + _full_control_for(owner, editor)
     result = _set_security_from_sddl(path, sddl, protected=True)
     if result.failure is not None:
         _log.warning("could not restrict %s to its owner after the edit: %s", path, result.failure)

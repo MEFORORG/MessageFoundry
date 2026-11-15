@@ -32,7 +32,7 @@ from messagefoundry.config import (
 )
 from messagefoundry.config.code_sets import load_code_set
 from messagefoundry.config.wiring import WiringError, load_config
-from tests._win_acl import assert_rewritten_to_grantee, protected_entries
+from tests._win_acl import assert_owner_only, folder_granting, protected_entries
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
 
@@ -455,11 +455,18 @@ def test_a_file_another_account_owns_stays_that_accounts_on_windows(
 def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The control: the edit's own-account path is the owner-only rewrite it always was. The token
-    # seam reports the file's real owner, so the test means the same on every runner.
+    # The edit's own-account path leaves the file its owner's alone. The folder grants only this
+    # account and SYSTEM, so an entry for Administrators or OWNER RIGHTS can come only from the edit's
+    # own staging: Python 3.13+ writes both, and SYSTEM, on the mkdtemp directory, and the rename
+    # used to carry them onto the file. The token seam reports the file's real owner, so the test
+    # means the same on every runner.
     import messagefoundry.store.store as store_mod
+    from messagefoundry.auth.anchor_path import SYSTEM_SID
 
-    path = tmp_path / "connections.toml"
+    token = store_mod._current_user_sid()
+    assert token is not None
+    folder = folder_granting(tmp_path / "config", token, SYSTEM_SID)
+    path = folder / "connections.toml"
     path.write_text(CONNECTIONS_TOML, encoding="utf-8")
     owner = _real_owner(path)
     monkeypatch.setattr(store_mod, "_current_user_sid", lambda: owner)
@@ -474,29 +481,8 @@ def test_a_file_this_account_owns_is_still_made_owner_only_on_windows(
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
     assert handed_back == [], "an edit by the file's own account took the foreign-owner path"
-    assert_rewritten_to_grantee(path, owner)
-
-
-@windows_only
-def test_the_rewrite_check_fails_on_an_inherited_entry_or_a_broad_group(tmp_path: Path) -> None:
-    """The control for :func:`assert_rewritten_to_grantee`: it must be able to fail."""
-    import subprocess
-
-    import messagefoundry.store.store as store_mod
-
-    grantee = store_mod._current_user_sid()
-    assert grantee is not None
-    untouched = tmp_path / "untouched"
-    untouched.write_bytes(b"x")
-    broad = tmp_path / "broad"
-    broad.write_bytes(b"x")
-    store_mod._secure_file(broad)
-    subprocess.run(  # nosec B603 B607 - a fixed system tool, no shell, test-only
-        ["icacls", str(broad), "/grant", "*S-1-5-32-545:R"], check=True, capture_output=True
-    )
-    for path in (untouched, broad):
-        with pytest.raises(AssertionError):
-            assert_rewritten_to_grantee(path, grantee)
+    assert_owner_only(path, owner)
+    assert path.read_bytes() == b"x = 1\n"
 
 
 @windows_only

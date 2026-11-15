@@ -167,18 +167,18 @@ def test_current_user_sid_is_the_process_token_account(monkeypatch: pytest.Monke
 
 @_windows_only
 def test_secure_file_leaves_the_real_token_account_owner_only(tmp_path) -> None:
-    # The real icacls, with a SID principal: the token's account is granted full control, no
-    # inherited entry is left, and nothing else is but the entries tests/_win_acl.py records a
-    # hosted runner leaves.
+    # The real icacls, with a SID principal: the file ends with one explicit entry, the token's,
+    # and no inherited ones. The folder grants this account alone, not the SYSTEM, Administrators
+    # and OWNER RIGHTS entries pytest's tmp_path carries (tests/_win_acl.py says why).
     import messagefoundry.store.store as store_mod
-    from tests._win_acl import assert_rewritten_to_grantee
+    from tests._win_acl import assert_owner_only, folder_granting
 
-    path = tmp_path / "real.db"
-    path.write_bytes(b"x")
-    store_mod._secure_file(path)
     sid = store_mod._current_user_sid()
     assert sid is not None
-    assert_rewritten_to_grantee(path, sid)
+    path = folder_granting(tmp_path / "store", sid) / "real.db"
+    path.write_bytes(b"x")
+    store_mod._secure_file(path)
+    assert_owner_only(path, sid)
 
 
 @_windows_only
