@@ -229,12 +229,9 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   ([the rule](../docs/SECURITY.md#multi-factor-authentication-totp-wp-14)). An exposed instance with
   `require_mfa=false` is **refused at startup** under the shipped `enforce`, unless
   `[security].allow_single_factor_admin_when_exposed` is set.
-- **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** See
-  [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) for hops it
-  reaches, as an at-least list. It has no effect at `[security].enforcement = enforce`, the default,
-  and none on the alert webhook. It is a dev / trusted-lab switch. At `warn` most of what it
-  permits is a per-hop weakening you also set, such as `verify_tls = false`, but at least one needs
-  nothing else: an SFTP key-only login then accepts an unknown host key.
+- **Never bake `MEFOR_ALLOW_INSECURE_TLS`.** It is a dev / trusted-lab switch;
+  [the escape hatch](../docs/DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what it
+  means.
 - **Cert-expiry monitor skips `env()`-referenced cert paths.** Use literal paths for any cert you want the
   built-in expiry alert to watch (the `[api]` cert is always literal and covered).
 - **In-engine TLS revocation is delegated** (ADR 0002). For enforced revocation use Topology B with an

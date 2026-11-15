@@ -91,11 +91,9 @@ is verified against [`config/settings.py`](../messagefoundry/config/settings.py)
 connection is TLS-verified out of the box. Give the managed Postgres a **CA-trusted** server cert (the
 provider's default RDS/Cloud SQL/Azure CA chains to a public root, or pin a private CA by file via
 `[store].ssl_root_cert` — a Postgres CA-bundle, see [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5). **Do not
-set `MEFOR_ALLOW_INSECURE_TLS`** in a real deployment. It is a dev / trusted-lab escape with no effect at
-`[security].enforcement = enforce`, the default; on an instance at `warn` it can let this store hop run
-with `[store].trust_server_certificate = true` or `[store].encrypt = false`.
-[The escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says which commands honour it
-there and which other hops it reaches.
+set `MEFOR_ALLOW_INSECURE_TLS`** in a real deployment. It never reaches this store hop, which refuses
+`[store].trust_server_certificate = true` or `[store].encrypt = false` at every posture;
+[the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch) says what it means.
 
 ### 2.2 Lease timings vs. failover speed
 

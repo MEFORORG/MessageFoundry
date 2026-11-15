@@ -367,12 +367,11 @@ The console stays a **host-side process**; only its target URL changes.
   PHI-at-rest store.
 - **External SQL Server / Postgres store.** The store connection is TLS by default
   (`[store].encrypt = true`, `[store].trust_server_certificate = false`). **`MEFOR_ALLOW_INSECURE_TLS`
-  must NOT be set in a real deployment** — it is the single switch that downgrades store TLS (and
-  MLLP-outbound verify, REST/SOAP verify, SFTP host-key) to best-effort. On most hops it no longer
-  releases a credential; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
-  says which, and the store login is not among them. Note CI sets
-  it deliberately for the self-signed SQL Server container; that is a **CI-only** posture and must
-  never leak into a production image/compose. Give the production DB a CA-trusted cert instead.
+  must NOT be set in a real deployment**; it no longer reaches the store hop, which refuses a weakened
+  setting at every posture, and [the escape hatch](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch)
+  says what it means. CORRECTED 2026-11-14 (vault BACKLOG #3533 item 2): this called it the single
+  switch that downgrades store TLS, and said CI set it for the self-signed SQL Server container. CI
+  now pins a generated certificate. Give the production DB a CA-trusted cert.
 - **Logs.** Keep the service at INFO (never raise to DEBUG in a PHI container — full-body logging risk
   per the PHI rules). **Off-box log + audit forwarding is built** (`[logging].forward_*` → syslog/SIEM);
   enable it so a container's logs + audit rows reach the org pipeline, both with only best-effort

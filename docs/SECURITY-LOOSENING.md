@@ -79,6 +79,7 @@ pointed at one of those levers.
 | `[auth]` AD binds | `ad_server` is a plain `ldap://` address, or a bare host (vault BACKLOG #3533) | use an `ldaps://` address; pin a private CA with `ad_tls_ca_cert_file` |
 | `[alerts]` SMTP relay login (`email_username`) | `email_use_tls = false` or `email_tls_verify = false`, refused at load (vault BACKLOG #3533) | turn both on; pin the relay's CA with `email_tls_ca_file`; or remove the login |
 | AI broker (`[ai].endpoint`) | the endpoint is plain `http` | use an `https` endpoint |
+| The store login (`[store]`, SQL Server and PostgreSQL) | `trust_server_certificate = true` or `encrypt = false` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2) | trust the server's certificate, or pin it with `[store].ssl_root_cert` |
 
 A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
 pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
@@ -116,9 +117,10 @@ engine has not verified, when the lever named beside each is set:
   [credential-shaped](#accepted-limit-a-neutral-header-crosses-plain-http-off-this-machine) under
   an allowlisted header name, such as an opaque token in `X-Request-ID`, on a `verify_tls = false`
   hop. The allowlist reads names, and the value test knows only the shapes that definition lists;
-- the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
-  `encrypt = false`.
+  `encrypt = false`, when the connection declares `tls_hop_attested` with its reason. Without that
+  declaration the hop is refused at every posture, whatever `MEFOR_ALLOW_INSECURE_TLS` says (owner
+  ruling 2026-11-14, vault BACKLOG #3533 item 2).
 
 **The forward-proxy login is judged by different owner rulings.** A `proxy_user` login rides the
 leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
@@ -701,13 +703,12 @@ is refused, so an opt-out does nothing and is not reported.
 - **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
   [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
   (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) are **honoured** again, only where the
-  code knows this posture. A plain `ldap://` AD bind is not: it is refused at every posture, and
-  the opt-in that this dial used to release, `[auth].ad_allow_insecure_ldap`, was removed (vault
-  BACKLOG #3533). A check that reads no posture refuses the escape whatever the dial says
-  (vault BACKLOG #2354): at least the CLI commands that open the store without one. That includes
-  `support-bundle` and `verify`, and at `warn` the commands BACKLOG #2532 covers and
-  `admin-revoke-sessions`, which pass the instance posture only at `enforce` (see *Which callers
-  know the posture* below).
+  code knows this posture and only in the cells each escape reaches. What `MEFOR_ALLOW_INSECURE_TLS`
+  opens, and what it never opens, the store hop among them, is stated once in
+  [DEPLOYMENT.md](DEPLOYMENT.md#the-mefor_allow_insecure_tls-escape-hatch). A plain `ldap://` AD
+  bind is not: it is refused at every posture, and the opt-in that this dial used to release,
+  `[auth].ad_allow_insecure_ldap`, was removed (vault BACKLOG #3533). A check that reads no posture
+  refuses the escape whatever the dial says (vault BACKLOG #2354).
   `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` is honoured again too, but only when this dial is set in the
   environment and not only in the settings file (its own entry below says why). This reproduces the
   historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext

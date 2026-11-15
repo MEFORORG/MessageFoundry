@@ -31,7 +31,8 @@ Configure `[store]` in the service settings (full reference: [`CONFIGURATION.md`
 - `[store].backend` — `postgres` or `sqlserver` (vs the default `sqlite`).
 - The connection target (host/port/database/auth) — supply secrets via `MEFOR_*` env, never the file.
 - `[store].encrypt` (default **true**) + `[store].trust_server_certificate` (default **false**) —
-  encrypt the DB connection; only weaken with `MEFOR_ALLOW_INSECURE_TLS` on a trusted lab segment.
+  encrypt the DB connection. A weakened setting is refused at every posture, and
+  `MEFOR_ALLOW_INSECURE_TLS` does not lift it (owner ruling 2026-11-14, vault BACKLOG #3533 item 2).
 - `[store].ssl_root_cert` — pin the DB server certificate by **file** so it verifies **without**
   installing anything box-globally into the OS trust store, on the secure posture only (`encrypt = true`,
   `trust_server_certificate = false`). **Postgres:** a **CA-bundle** PEM (chain + hostname still checked) —
