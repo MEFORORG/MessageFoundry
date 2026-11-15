@@ -89,7 +89,7 @@ jobs:
           set -uo pipefail
           echo "## ingress rate probe — $OS_LABEL" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| offered | sent | acked | stranded | % | engine_read | reconcile ok |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| offered | sent | acked | stranded | % | engine_read | no-loss |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
           # The probe's output is DATA. Only its stdout is parsed, and only by
           # scripts/ci/ingress_probe_summary.py, which accepts the two RESULT shapes the probe prints,

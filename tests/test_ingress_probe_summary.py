@@ -37,7 +37,7 @@ _PROBE_WORKFLOW = _WORKFLOWS / "ingress-rate-probe.yml"
 
 _GOOD = (
     "RESULT rate=60 sent=90 acked=44 stranded=46 pct=51.1 read=52 written=104 sink=104 "
-    "backlog=0 ok=True wall=7.31"
+    "backlog=0 ok=True no_loss=OK wall=7.31"
 )
 
 
@@ -62,7 +62,16 @@ def _split(result: Any) -> tuple[list[str], list[str]]:
 def test_a_measurement_line_renders_its_row() -> None:
     rows, errors = _split(summary.summarise(_GOOD + "\n", rate=60.0, repeat=1))
     assert errors == []
-    assert rows == ["| 60/s | 90 | 44 | 46 | 51.1% | 52 | True |"]
+    assert rows == ["| 60/s | 90 | 44 | 46 | 51.1% | 52 | OK |"]
+
+
+@pytest.mark.parametrize("verdict", ["LOSS", "INCONCLUSIVE"])
+def test_a_failed_reconcile_row_names_which_failure(verdict: str) -> None:
+    # BACKLOG #5574: `ok=False` alone cannot tell a proven loss from a run that cleared nothing.
+    line = _GOOD.replace("ok=True no_loss=OK", f"ok=False no_loss={verdict}")
+    rows, errors = _split(summary.summarise(line + "\n", rate=60.0, repeat=1))
+    assert errors == []
+    assert rows == [f"| 60/s | 90 | 44 | 46 | 51.1% | 52 | {verdict} |"]
 
 
 def test_a_setup_failure_row_ends_the_run_without_failing_it() -> None:
@@ -84,6 +93,11 @@ def test_a_setup_failure_row_ends_the_run_without_failing_it() -> None:
         _GOOD.replace(" wall=7.31", ""),
         _GOOD + " sent=91",
         _GOOD.replace("ok=True", "ok=yes"),
+        _GOOD.replace("no_loss=OK", "no_loss=MAYBE"),
+        _GOOD.replace(" no_loss=OK", ""),
+        # The two readings of one verdict disagree.
+        _GOOD.replace("no_loss=OK", "no_loss=INCONCLUSIVE"),
+        _GOOD.replace("ok=True", "ok=False"),
         _GOOD.replace("backlog=0", "backlog"),
         "RESULT rate=60 ERROR=Provision Failed",
         "RESULT rate=60 ERROR=x;id",
@@ -132,7 +146,7 @@ def test_main_copies_stdin_appends_the_summary_and_reports(
     out = tmp_path / "summary.md"
     monkeypatch.setattr(sys, "stdin", io.StringIO("probe chatter\n" + _GOOD + "\n"))
     assert summary.main(["--rate", "60", "--repeat", "1", "--summary", str(out)]) == 0
-    assert out.read_text(encoding="utf-8") == "| 60/s | 90 | 44 | 46 | 51.1% | 52 | True |\n"
+    assert out.read_text(encoding="utf-8") == "| 60/s | 90 | 44 | 46 | 51.1% | 52 | OK |\n"
     assert "probe chatter" in capsys.readouterr().out
 
     monkeypatch.setattr(sys, "stdin", io.StringIO("RESULT rate=60 sent=$(id)\n"))
