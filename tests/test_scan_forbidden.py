@@ -1090,6 +1090,8 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("11", "verdict", f"| ASVS-ID | Note | Result |\n|---|---|---|\n{_ROW}"),
     ("11", "verdict", f"| ASVS # | Note | Result |\n|---|---|---|\n{_ROW}"),
     ("11", "verdict", f"| Control (ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
+    # "No." before "ASVS" is the abbreviation for "number", not a disclaimer.
+    ("11", "verdict", f"| Ref No. (ASVS) | Note | Result |\n|---|---|---|\n{_ROW}"),
     # Step 11: underscore emphasis at the word-boundary sites that bind.
     ("11", "verdict", f"_{_PARTIAL}_: {_REQ}"),
     ("11", "verdict", f"For {_REQ} the _cell_ stays {_PARTIAL}."),
@@ -1333,6 +1335,18 @@ def _superset_bodies() -> dict[str, str]:
             ),
             "reviewer-step10-row": f"{_REQ} is listed; the row is not passing yet.",
             "reviewer-invisible-row": f"{marked_head}{chr(0x200B)}| {_REQ} | x | y | {_PASS} |",
+            # Review round-a924aac4a5: a tag right after a split's trailing space, and an earlier
+            # identifier a repair made bind in a hard-wrapped sentence.
+            "reviewer-tag-space-tag": (
+                f"<ul><li>Intro</li> <li>{_REQ} is not yet implemented</li></ul>"
+            ),
+            "reviewer-tag-space-tag-verdict": f"a -> b</p> <p>{_REQ} is {_PARTIAL}.",
+            "reviewer-wrapped-gap": (
+                f"This updates ASVS v5 {_REQ} and\n{_REQ_B}, which are not yet implemented."
+            ),
+            "reviewer-wrapped-verdict": (
+                f"{_REQ}, _which_ stays {_PARTIAL}, and\n{_REQ_B} stays {_PARTIAL}."
+            ),
             "reviewer-escaped-pipe": (
                 f"| Note | Version | ASVS | Result |\n|---|---|---|---|\n"
                 f"| x \\| y | {_REQ} | z | {_PASS.title()} (12 messages) |"
@@ -1370,8 +1384,9 @@ def test_every_superset_exception_names_a_body_main_flags(sf_frozen_main) -> Non
 def test_the_head_reports_every_hit_main_reports_in_a_constructed_body(
     sf, sf_frozen_main, name: str
 ) -> None:
-    """BACKLOG #3364: the repairs add hits and never lose one main reports, at main's line number,
-    except the deliberate step 9 and step 10 drops named in _SUPERSET_EXCEPTIONS."""
+    """BACKLOG #3364: on each constructed body, head reports every hit main reports, at main's line
+    number, except the deliberate step 9 and step 10 drops named in _SUPERSET_EXCEPTIONS. A finite
+    set: it pins these bodies, and a loss on a body outside it is not caught here."""
     if name in _SUPERSET_EXCEPTIONS:
         pytest.skip(f"step {_SUPERSET_EXCEPTIONS[name]} drops this body's hits on purpose")
     body = _SUPERSET_BODIES[name]
@@ -1382,7 +1397,8 @@ def test_the_head_reports_every_hit_main_reports_in_a_constructed_body(
 def test_the_head_reports_every_hit_main_reports_in_the_tracked_markdown(
     sf, sf_frozen_main
 ) -> None:
-    """The same superset over every tracked Markdown file, read as a pull request body."""
+    """The same superset over every tracked Markdown file, read as a pull request body: its bytes
+    decoded with no newline translation, so a "\\r\\n" or "\\r" line ending reaches the scanner."""
     listed = subprocess.run(
         ["git", "ls-files", "-z", "--", "*.md"],  # noqa: S607
         cwd=_REPO_ROOT,
@@ -1394,10 +1410,12 @@ def test_the_head_reports_every_hit_main_reports_in_the_tracked_markdown(
     assert len(paths) > 100
     main_hits = 0
     lost: list[tuple[str, str]] = []
+    unread: list[str] = []
     for path in paths:
         try:
-            body = path.read_text(encoding="utf-8")
+            body = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
+            unread.append(str(path.relative_to(_REPO_ROOT)))
             continue
         before = set(sf_frozen_main.scan_pr_body(body))
         main_hits += len(before)
@@ -1406,6 +1424,8 @@ def test_the_head_reports_every_hit_main_reports_in_the_tracked_markdown(
         ]
     # A second control: main flags the docs' ASVS tables, so a corpus main reads clean measured nothing.
     assert main_hits > 0
+    # Every tracked Markdown file is read: a file skipped here would be a body the guard never read.
+    assert not unread, unread
     assert not lost, lost[:20]
 
 

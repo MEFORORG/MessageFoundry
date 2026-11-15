@@ -729,7 +729,10 @@ _PR_ID_LIST_GAP = re.compile(r"(?:[\s,;/&+*`_\"']|(?i:and|or)(?![A-Za-z0-9]))+")
 #: negation anywhere before "ASVS" disclaims it ("Version (not ASVS)", "Non-ASVS ref", "(**not** an
 #: ASVS id)", "Not in ASVS") and names no column, as main's whole-cell match named none.
 _PR_TABLE_ASVS_HEAD = re.compile(rf"(?i){_PR_NB}asvs{_PR_NA}")
-_PR_TABLE_ASVS_DISCLAIMER = re.compile(rf"(?i){_PR_NB}(?:not|non|no|never|without){_PR_NA}")
+#: "No." is the abbreviation for "number" ("Ref No. (ASVS)"), not a negation.
+_PR_TABLE_ASVS_DISCLAIMER = re.compile(
+    rf"(?i){_PR_NB}(?:not|non|no(?!\s*\.)|never|without){_PR_NA}"
+)
 #: The characters of a markdown table's second line, which makes the line above it a header row. A set
 #: and not a pattern: a class holding "-" twice backtracks quadratically on a long run of dashes.
 _PR_TABLE_DELIMITER_CHARS = frozenset("|:- \t")
@@ -742,9 +745,13 @@ _PR_DELIMITER_CELL = re.compile(r":?-+:?")
 _PR_WINDOW = 80
 #: A sentence ends at a full stop before a capital, or at an HTML tag: bot bodies carry release notes as
 #: HTML, and a tag is a block edge there however the text runs on.
-#: The tag's leading space is tried only where a run of spaces starts: tried at every space of a long
-#: run, it rescans the rest of the run each time, which is quadratic. It matches what it matched before.
-_PR_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|(?<!\s)\s*</?[A-Za-z][^>]*>\s*")
+#: A tag's leading spaces are tried only from where their run starts, or not at all, with the match at
+#: the "<": tried from every space of a long run, "\s*<" rescans the rest of the run each time, which
+#: is quadratic. A split's trailing "\s*" takes a whole run, so a tag right after one (tag, space,
+#: tag) still starts a match at its "<", as main's pattern split it.
+_PR_SENTENCE_SPLIT = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|(?:(?<!\s)\s+)?</?[A-Za-z][^>]*>\s*"
+)
 _PR_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
 _PR_HEADING = re.compile(r"#{1,6}\s")
 _PR_QUOTE = re.compile(r"(?:>\s?)+")
@@ -1174,14 +1181,16 @@ def _pr_scan_unit(
     """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind)."""
     marks, unit_text, is_row = unit
     for start, sentence in _pr_sentences(unit_text, is_row):
-        found: dict[str, int] = {}
+        # Every identifier that binds a kind is recorded, not only the first: a repair that makes an
+        # earlier identifier bind must not move a hit off the line main reported it at.
+        found: dict[str, list[int]] = {kind: [] for kind in PR_BODY_REASONS}
         # The tree scan's tight pair, before the version filter can set its identifier aside: what
         # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
         # requirement shape, since the tree scan's own shape admits every dotted triple.
         for p in _RECORD_PAIR:
             pair = p.search(sentence)
             if pair is not None and _PR_REQ_ID.search(sentence, pair.start(), pair.end()):
-                found["verdict"] = pair.start()
+                found["verdict"].append(pair.start())
                 break
         ids = _pr_requirement_ids(sentence)
         # A table pairs an identifier cell with any other cell, so a row is one whole window, and
@@ -1210,30 +1219,28 @@ def _pr_scan_unit(
             )
             previous = (m.end(), marked)
             row_marked = row_marked or marked
-            if "verdict" not in found and (
-                _pr_verdict_bound(sentence, m, version, marked)
-                or (not version and not is_row and _pr_prose_verdict(window, marked))
+            if _pr_verdict_bound(sentence, m, version, marked) or (
+                not version and not is_row and _pr_prose_verdict(window, marked)
             ):
-                found["verdict"] = m.start()
-            if version or ("gap" in found and "map" in found):
+                found["verdict"].append(m.start())
+            if version:
                 continue
             if evidence is None or not is_row:
                 evidence = _pr_evidence(window)
             gap, marked_gap, code, symbol = evidence
-            if "gap" not in found and (gap or (marked_gap and marked)):
-                found["gap"] = m.start()
-            if "map" not in found and (code or (symbol and marked)):
-                found["map"] = m.start()
+            if gap or (marked_gap and marked):
+                found["gap"].append(m.start())
+            if code or (symbol and marked):
+                found["map"].append(m.start())
         requirement_ids = {m.group(0) for m, version in ids if not version}
         if (
             is_row
-            and "verdict" not in found
+            and not found["verdict"]
             and _pr_table_verdict(sentence, requirement_ids, row_marked)
         ):
-            found["verdict"] = 0
+            found["verdict"].append(0)
         for kind_index, kind in enumerate(PR_BODY_REASONS):
-            if kind in found:
-                hits.add((_pr_line_at(marks, start + found[kind]), kind_index))
+            hits.update((_pr_line_at(marks, start + at), kind_index) for at in found[kind])
 
 
 # Skip routable-IP detection (only) where dotted numbers are package versions, not hosts.
