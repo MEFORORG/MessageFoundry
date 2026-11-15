@@ -499,6 +499,66 @@ def test_a_helper_calling_a_helper_multiplies_through(mod: ModuleType) -> None:
         ),
         ("an export default expression arrow", "export default () => agent(1)\n", 1),
         ("a module.exports arrow", "module.exports = async (args) => { await agent(1) }\n", 1),
+        (
+            "a local named function expression inside a fan callback",
+            "const R = [1, 2, 3, 4, 5, 6]\nawait parallel(R.map(r => () => {\n"
+            "  const review = function review(x) { return agent(x) }\n  return review(r)\n}))\n",
+            6,
+        ),
+        (
+            "a named function expression in place sharing a helper's name",
+            "function review(r) { return agent(r) }\nconst R = [1, 2, 3, 4, 5, 6]\n"
+            "await Promise.all(R.map(function review(r) { return agent(r) }))\n"
+            "await review(1)\n",
+            7,
+        ),
+        (
+            "an object method sharing a helper's name",
+            "function review(r) { return agent(r) }\nconst api = { review(r) { return 1 } }\n"
+            "await review(1)\n",
+            1,
+        ),
+        (
+            "a class getter sharing a helper's name",
+            "function review(r) { return agent(r) }\nclass A { get review() { return 1 } }\n"
+            "await review(1)\n",
+            1,
+        ),
+        (
+            "a postfix increment divided inside an interpolation",
+            "const s = `${ i++ / 2 }`; const t = a / b\nconst R = [1, 2, 3]\n"
+            "await parallel(R.map(r => () => agent(r)))\n",
+            3,
+        ),
+        (
+            "a postfix decrement divided inside an interpolation",
+            "log(`${ n-- / total }`, x.split(/,/))\nconst R = [1, 2, 3]\n"
+            "await parallel(R.map(r => () => agent(r)))\n",
+            3,
+        ),
+        (
+            "a regex after a postfix increment and a plus",
+            "const y = a++ + /`/.source\nconst R = [1, 2, 3]\n"
+            "await parallel(R.map(r => () => agent(r)))\n",
+            3,
+        ),
+        (
+            "an expression-bodied helper ending in a postfix increment",
+            "let n = 0\nconst nextId = () => n++\nconst first = await agent('first')\n"
+            "nextId()\nnextId()\n",
+            1,
+        ),
+        (
+            "an expression-bodied helper ending in a postfix decrement",
+            "const dec = r => r.n--\nconst first = await agent('first')\n"
+            "const R = [1, 2, 3, 4, 5, 6]\nR.forEach(r => dec(r))\n",
+            1,
+        ),
+        (
+            "an unclosed regex class at the end of an interpolation",
+            "await agent(1)\nconst s = `${ /[abc",
+            1,
+        ),
     ],
 )
 def test_shapes_the_helper_rules_must_not_misread(

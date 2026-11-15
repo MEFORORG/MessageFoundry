@@ -175,6 +175,8 @@ def _token_re(helpers: list[str]) -> re.Pattern[str]:
 
 # A line ending, or the next line starting, with one of these continues an expression-bodied arrow.
 _CONTINUES = "?:.+-*%|&=<>,(["
+_POSTFIX = ("++", "--")
+_SAME_LINE_BRACE_RE = re.compile(r"[ \t]*\{")
 _META_NAME_RE = re.compile(r"name\s*:\s*['\"]([^'\"]+)['\"]")
 
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
@@ -302,6 +304,18 @@ def _is_regex_position(prev: str) -> bool:
     return prev == "" or not (prev.isalnum() or prev in "_$)]}")
 
 
+def _ends_postfix(src: str, i: int, floor: int = 0) -> bool:
+    """Whether the code before ``i`` ends in a postfix ``++``/``--``, whitespace skipped.
+
+    One character of ``prev`` cannot tell ``i++ / 2``, which divides, from ``a + /x/``; read as a
+    regex, the division swallowed the rest of its line, a template's closing backtick included.
+    """
+    k = i - 1
+    while k >= floor and src[k].isspace():
+        k -= 1
+    return k - 1 >= floor and src[k - 1 : k + 1] in _POSTFIX
+
+
 @dataclass
 class _MaskNotes:
     """What ``_mask`` saw while blanking, for the readers that need more than the masked text."""
@@ -322,6 +336,8 @@ def _regex_close(src: str, start: int) -> int:
         if src[j] == "[":
             while j < n and src[j] != "]" and src[j] != "\n":
                 j += 2 if src[j] == "\\" else 1
+            if j >= n:  # an unclosed class at end of input
+                return -1
         if src[j] == "/":
             return j
         j += 1
@@ -383,7 +399,7 @@ def _interp_end(src: str, start: int) -> int:
         if c == "`":
             j, prev = _template_end(src, j), "x"
             continue
-        if c == "/" and _is_regex_position(prev):
+        if c == "/" and _is_regex_position(prev) and not _ends_postfix(src, j, start):
             closed = _regex_close(src, j)
             if closed != -1:
                 j, prev = closed + 1, "x"
@@ -462,7 +478,7 @@ def _mask(src: str, notes: _MaskNotes | None = None) -> str:
             i, prev = end, "x"
             continue
 
-        if c == "/" and _is_regex_position(prev):
+        if c == "/" and _is_regex_position(prev) and not _ends_postfix(src, i):
             closed = _regex_close(src, i)
             if closed != -1:
                 blank(i, closed + 1)
@@ -682,9 +698,14 @@ def _expr_end(ctx: _Ctx, i: int) -> int:
         elif depth == 0 and c in ";,":
             return j
         elif depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
+            # A postfix `++`/`--` ends its line's expression, and one that starts the next line
+            # is a prefix operator after an inserted semicolon: neither continues.
+            tail = raw[i:j].rstrip()
             nxt = _NONSPACE_RE.search(raw, j)
-            if raw[i:j].rstrip()[-1] not in _CONTINUES and (
-                nxt is None or nxt.group() not in _CONTINUES
+            if (tail[-1] not in _CONTINUES or tail.endswith(_POSTFIX)) and (
+                nxt is None
+                or nxt.group() not in _CONTINUES
+                or raw.startswith(_POSTFIX, nxt.start())
             ):
                 return j
     return len(masked)
@@ -964,10 +985,15 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
             continue
 
         helper, hook = m.group("helper"), m.group("hook")
-        if helper and m.start() in ctx.def_names:  # `function review(` names it, not a call
-            pos = m.end()
+        if helper and (m.start() in ctx.def_names or _is_declared_at(ctx, m.start())):
+            pos = m.end()  # `function review(` names a function, registered or not; not a call
             continue
-        if helper or hook:
+        # `{ review(r) {...} }` or `get review() {` defines a method of the same name: a function
+        # value, not a call.
+        method_head = bool(helper) and _is_method_head(ctx, m.end() - 1)
+        if method_head:
+            ctx.def_names.add(m.start())
+        elif helper or hook:
             open_idx = m.end() - 1
             close = _match_bracket(ctx.masked, open_idx)
             if close == -1 or close > end:
@@ -986,13 +1012,23 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
             pos = _resume_after_call(ctx, m.end() - 1, end)
             continue
 
-        if m.group("arrow") or m.group("fn") or m.group("method"):
+        # A method head falls through to here on purpose: it is a function value like these.
+        if method_head or m.group("arrow") or m.group("fn") or m.group("method"):
             pos = m.end() if invoked else max(m.end(), _function_value_end(ctx, m))
             continue
 
         total = total + _price_loop(ctx, m)
         pos = _loop_head(ctx, m.end())[3]
     return total
+
+
+def _is_method_head(ctx: _Ctx, open_idx: int) -> bool:
+    """Whether ``name(...)`` at ``open_idx`` is a method head: a ``{`` follows on the same line.
+
+    Same line only: a call followed by a bare block on the next line must still price the call.
+    """
+    close = _match_bracket(ctx.masked, open_idx)
+    return close != -1 and _SAME_LINE_BRACE_RE.match(ctx.code, close + 1) is not None
 
 
 def _invoked_in_place(ctx: _Ctx, body_end: int) -> bool:
