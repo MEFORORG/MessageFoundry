@@ -1067,6 +1067,88 @@ def test_disqualifiers(readonly_fx: Fixture, sleeper: int, slug: str, needle: st
     assert needle in d["Reason"]
 
 
+def _hide_work(fx: Fixture, kind: str) -> None:
+    """Put work in ``repo-clean`` that ``git status --porcelain`` does not show."""
+    wt = fx.sibling("clean")
+    if kind in ("skip-worktree", "assume-unchanged"):
+        _git(wt, "update-index", f"--{kind}", "seed.txt")
+        (wt / "seed.txt").write_text("an edit status cannot see", encoding="utf-8")
+    elif kind == "ignored":
+        # info/exclude is in the common git dir, so it ignores the file in every tree of the family.
+        exclude = fx.primary / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a", encoding="utf-8") as f:
+            f.write("*.db\n")
+        (wt / "dev.db").write_text("a dev store, not regenerable", encoding="utf-8")
+    elif kind == "nested":
+        # Below an IGNORED (and otherwise tolerated) directory, so status lists only `.venv/`.
+        clone = wt / ".venv" / "lib" / "clone"
+        clone.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(clone)], check=True, capture_output=True)
+        (clone / "work.txt").write_text("uncommitted work in a nested checkout", encoding="utf-8")
+    else:
+        raise AssertionError(kind)
+
+
+@pytest.mark.parametrize(
+    ("kind", "needle"),
+    [
+        ("skip-worktree", "1 file(s) flagged skip-worktree or assume-unchanged"),
+        ("assume-unchanged", "1 file(s) flagged skip-worktree or assume-unchanged"),
+        ("ignored", "ignored entr(ies) that are not a regenerable cache"),
+        ("nested", "a nested git checkout at .venv/lib/clone/.git"),
+    ],
+)
+def test_work_git_status_cannot_see_is_never_pruned(
+    fx: Fixture, sleeper: int, kind: str, needle: str
+) -> None:
+    """BACKLOG #5603. Status alone read these trees clean, and --force deletes what it cannot see.
+
+    Positive control in the same run: ``gone`` is still removed, so the skip is not a run refusing
+    everything. ``test_clean_merged_unoccupied_is_pruned`` is the same tree with nothing hidden.
+    """
+    live_record(fx, sleeper, fx.primary)
+    _hide_work(fx, kind)
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP", d
+    assert any(needle in r for r in d["Reasons"]), d["Reasons"]
+    assert d["Clean"] is False
+    assert fx.sibling("clean").exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def test_an_inherited_git_redirect_refuses_the_tree(fx: Fixture, sleeper: int) -> None:
+    """BACKLOG #5603. GIT_INDEX_FILE makes status compare the tree against another index.
+
+    The variable names the tree's OWN index here, so every other reading in the run is unchanged and
+    the refusal is the variable's alone; its pair is ``test_clean_merged_unoccupied_is_pruned``.
+    """
+    live_record(fx, sleeper, fx.primary)
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = str(_gitdir(fx.sibling("clean")) / "index")
+    proc = subprocess.run(
+        _argv(
+            fx,
+            ("-Apply", "-IdleHours", "0"),
+            config_root="",
+            skip_gh=True,
+            skip_fetch=True,
+            as_json=True,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+        env=env,
+    )
+    res = json.loads(proc.stdout)
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP", d
+    assert any("GIT_INDEX_FILE is set" in r for r in d["Reasons"]), d["Reasons"]
+    assert fx.sibling("clean").exists()
+
+
 def test_gone_upstream_of_another_branch_is_not_a_merge_signal(
     readonly_fx: Fixture, sleeper: int
 ) -> None:

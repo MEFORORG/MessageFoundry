@@ -310,13 +310,48 @@ foreach ($e in $entries) {
     }
 }
 
-# POINTED-AT: a seat record's handoff pointer names it.
+# POINTED-AT: a seat record's handoff pointer names it. An entry is a top-level name in handoffs/, and a
+# per-box directory is one entry while the seat points at the document INSIDE it, so the pointer is keyed
+# by its leaf (a bare file name, the shape seat.ps1 keeps for a pointer that did not resolve) AND by the
+# first segment of its path below handoffs/. Keyed by the leaf alone, a pointer at
+# handoffs/<box>/HANDOFF.md named an entry `HANDOFF.md` and never held the box (BACKLOG #5598). A
+# relative pointer with a folder part is keyed by its first segment too: a hold that errs costs a -Force.
+# A rooted pointer spelled through another root (another PC's name for the share, a pre-migration local
+# path) does not resolve under this handoffs/, so it is also keyed by the segment after its last folder
+# named `handoffs`. The hashtable is case-insensitive, as Windows paths are.
+$handoffsFull = [System.IO.Path]::GetFullPath($handoffs).TrimEnd('\', '/')
+function Get-PointerKeys([string]$PointerPath) {
+    $keys = @(Split-Path $PointerPath -Leaf)
+    $rel = $PointerPath
+    if ([System.IO.Path]::IsPathRooted($PointerPath)) {
+        try { $rel = [System.IO.Path]::GetRelativePath($handoffsFull, [System.IO.Path]::GetFullPath($PointerPath)) }
+        catch { $rel = '' }
+        if ([System.IO.Path]::IsPathRooted($rel)) { $rel = '' }
+    }
+    $first = @($rel -split '[\\/]' | Where-Object { $_ -and $_ -ne '.' }) | Select-Object -First 1
+    if ($first -and $first -ne '..') { $keys += $first }
+    $parts = @($PointerPath -split '[\\/]')
+    for ($i = $parts.Count - 2; $i -ge 0; $i--) {
+        if ($parts[$i] -ieq 'handoffs') { if ($parts[$i + 1]) { $keys += $parts[$i + 1] }; break }
+    }
+    return $keys
+}
 $pointed = @{}
+# The newest seat record of each box that is this machine's to judge (Test-CoordRecordIsHere), by the
+# record file's write time, for the live-box hold below: another PC's session id and worktree path name
+# nothing in this PC's registry or transcript store.
+$boxRecords = @{}
 if (Test-Path -LiteralPath $seatsDir) {
     foreach ($f in @(Get-ChildItem -LiteralPath $seatsDir -Recurse -Filter *.json -File -EA SilentlyContinue)) {
         try { $rec = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
         catch { continue }
-        if ($rec.handoff -and $rec.handoff.path) { $pointed[(Split-Path ([string]$rec.handoff.path) -Leaf)] = $true }
+        if ($rec.handoff -and $rec.handoff.path) {
+            foreach ($k in @(Get-PointerKeys ([string]$rec.handoff.path))) { $pointed[$k] = $true }
+        }
+        if (-not (Test-CoordRecordIsHere $rec)) { continue }
+        $box = Split-Path $f.DirectoryName -Leaf
+        $prev = $boxRecords[$box]
+        if (-not $prev -or $f.LastWriteTimeUtc -gt $prev.Written) { $boxRecords[$box] = @{ Rec = $rec; Written = $f.LastWriteTimeUtc } }
     }
 }
 foreach ($e in $entries) { if ($pointed.ContainsKey($e.Name)) { $e.Flags += 'POINTED-AT' } }
@@ -348,17 +383,29 @@ foreach ($e in $entries) {
 
 # STALE-IN-A-LIVE-BOX: a box directory's own HANDOFF.md older than the box's newest activity by more
 # than FreshHours. This is the harm a liveness fence structurally CANNOT see -- the box is live, so
-# every fence says do not touch, while the document inside it went stale a day ago. Zero today,
-# because no box directories exist until the naming contract lands.
+# every fence says do not touch, while the document inside it went stale a day ago. -Where creates
+# a box directory, so the hold has entries to read.
+#
+# The box's newest seat record supplies its worktree and session (BACKLOG #5598). Read with an empty
+# worktree, Get-BoxActivity could see only the heartbeat, so a box whose hooks are off -- no heartbeat,
+# a transcript written an hour ago -- read as having no activity at all, and its stale document retired
+# without a hold. The newest activity is the youngest of the heartbeat and the transcript, and a live
+# session the fence names is activity now.
 foreach ($e in $entries) {
     if (-not $e.IsDir) { continue }
     $e.Box = $e.Name
     $doc = Join-Path $e.Path 'HANDOFF.md'
     if (-not (Test-Path -LiteralPath $doc -PathType Leaf)) { continue }
-    $act = Get-BoxActivity -BoxKey $e.Name -WorktreePath '' -SeatsDir $seatsDir -ConfigRoot $ConfigRoot -RepoHint $RepoHint -FreshHours $FreshHours -Now $now
+    $boxRec = if ($boxRecords[$e.Name]) { $boxRecords[$e.Name].Rec } else { $null }
+    $boxWt = if ($boxRec -and $boxRec.worktree) { [string]$boxRec.worktree } else { '' }
+    $boxSid = if ($boxRec -and $boxRec.sessionId) { [string]$boxRec.sessionId } else { '' }
+    $act = Get-BoxActivity -BoxKey $e.Name -WorktreePath $boxWt -SessionId $boxSid -SeatsDir $seatsDir -ConfigRoot $ConfigRoot -RepoHint $RepoHint -FreshHours $FreshHours -Now $now
     $docAgeH = [math]::Round(($now - (Get-Item -LiteralPath $doc).LastWriteTimeUtc).TotalHours, 2)
-    if ($null -ne $act.WriterAliveAgeH -and ($docAgeH - $act.WriterAliveAgeH) -gt $FreshHours) {
-        $e.Flags += 'STALE-IN-A-LIVE-BOX'
+    $ages = @(@($act.WriterAliveAgeH, $act.TranscriptAgeH) | Where-Object { $null -ne $_ })
+    if ($act.FenceVeto) { $ages += 0 }
+    if ($ages.Count -gt 0) {
+        $newestH = ($ages | Measure-Object -Minimum).Minimum
+        if (($docAgeH - $newestH) -gt $FreshHours) { $e.Flags += 'STALE-IN-A-LIVE-BOX' }
     }
 }
 

@@ -192,9 +192,11 @@ function Get-TreeRootRefusal([string]$Path, [switch]$Late) {
 # of the leak-gate token list the tree's copy is compared with. Returns '' or the refusal.
 function Get-ContentRefusal {
     param([string]$Path, [double]$IdleHours, [string]$Primary)
-    $flagged = Get-FlaggedFileCount $Path
-    if ($flagged -ne 0) { return $(if ($flagged -lt 0) { 'its flagged files could not be read' } else { "$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see" }) }
-    $clean = Test-WorktreeClean -Path $Path -AllUntracked
+    # The reads Test-WorktreeClean makes for prune-merged.ps1 (BACKLOG #5603), through the same
+    # functions, split so the costly ignored-entry status and walk come after the cheap idle readings.
+    $hidden = @(Get-HiddenWorkReasons -Path $Path -Checks 'flagged')
+    if ($hidden.Count -gt 0) { return $hidden[0] }
+    $clean = Test-WorktreeClean -Path $Path -AllUntracked -StatusOnly
     if (-not $clean.Clean) { return "not clean: $($clean.Reasons -join '; ')" }
 
     $cut = (Get-Date).AddHours(-1 * $IdleHours)
@@ -209,11 +211,8 @@ function Get-ContentRefusal {
     $ops = Get-InProgressOperation $Path
     if ($null -eq $ops) { return 'its git dir could not be read for an operation in progress' }
     if ($ops.Count -gt 0) { return "an operation is in progress in its git dir ($($ops -join ', ')), whose state the removal deletes" }
-    $ignored = Get-UnsafeIgnoredEntries $Path $Primary
-    if ($null -eq $ignored) { return 'its ignored files could not be listed' }
-    if ($ignored.Count -gt 0) { return "$($ignored.Count) ignored entr(ies) that are not a regenerable cache, which the removal would delete (first: $($ignored[0]))" }
-    try { $hazard = Get-NestedHazard $Path } catch { return $_.Exception.Message }
-    if ($hazard) { return "it holds $hazard, which git status does not read into" }
+    $hidden = @(Get-HiddenWorkReasons -Path $Path -Primary $Primary -Checks 'ignored', 'nested')
+    if ($hidden.Count -gt 0) { return $hidden[0] }
     return ''
 }
 

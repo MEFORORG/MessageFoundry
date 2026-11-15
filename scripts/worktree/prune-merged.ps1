@@ -21,7 +21,10 @@
 
       (a) merged     -- no commits beyond origin/main, OR a merged PR whose head is this exact tip, OR
                         its OWN upstream branch is gone (squash-merged + remote-deleted),
-      (b) clean      -- no uncommitted tracked changes AND no untracked files (see below),
+      (b) clean      -- no uncommitted tracked changes AND no untracked files (see below), and none of
+                        the work git status cannot see: skip-worktree or assume-unchanged edits, an
+                        ignored entry that is not a regenerable cache, a nested checkout or link, or an
+                        inherited git redirect variable (worktree-gates.ps1 Test-WorktreeClean),
       (c) unlocked   -- `git worktree lock` is git's own "in use" flag and this script honours it,
       (d) unoccupied -- no live Claude session is sitting in it OR in a worktree nested inside it, its
                         git metadata has not been touched within -IdleHours, and it does not contain
@@ -660,7 +663,7 @@ function Get-Decision {
         $reasons += "liveness fence unavailable -- $($occ.Detail)"
     }
 
-    $c = Test-WorktreeClean -Path $Wt.Path
+    $c = Test-WorktreeClean -Path $Wt.Path -Primary $RepoRoot
     $clean = [bool]$c.Clean
     $reasons += @($c.Reasons)
 
@@ -784,11 +787,12 @@ foreach ($w in $occ.Worktrees) {
     if (@(Get-WorktreeOccupants -Occupancy $occ -Path $w.Path -IncludeNested).Count -gt 0) { $reportHeld++; continue }
     # A tree containing another registered worktree is structural, not finished.
     if (@(Get-NestedWorktrees -Occupancy $occ -Path $w.Path).Count -gt 0) { $reportHeld++; continue }
-    $clean = Test-WorktreeClean -Path $w.Path
-    if (-not $clean.Clean) { $reportHeld++; continue }
-    # Signal 2: the same idle proxy the decision pass uses. Unknown activity withholds the row.
+    # Signal 2: the same idle proxy the decision pass uses. Unknown activity withholds the row. Read
+    # before the cleanliness reads, whose whole-tree walk is the slow one; either only withholds.
     $act = Get-WorktreeActivity -Path $w.Path
     if ($null -eq $act -or $act -gt $idleCut) { $reportHeld++; continue }
+    $clean = Test-WorktreeClean -Path $w.Path -Primary $RepoRoot
+    if (-not $clean.Clean) { $reportHeld++; continue }
     $idleH = [math]::Round(((Get-Date) - $act).TotalHours, 1)
 
     # WHAT REMOVAL ACTUALLY RISKS -- and the first two cuts of this both got it wrong.
@@ -1036,10 +1040,14 @@ if ($ReapVenvs) {
             }
             else { Add-Verdict 'C5' 'unoccupied' 'PASS' 'no veto-worthy session is placed in it or in a nested tree' }
 
-            # C6
-            $c = Test-WorktreeClean -Path $w.Path
-            if (-not $c.Clean) { Add-Verdict 'C6' 'clean' 'FAIL' ($c.Reasons -join '; ') }
-            else { Add-Verdict 'C6' 'clean' 'PASS' 'no uncommitted tracked change and no untracked file' }
+            # C6. Status, and the whole-tree walk, which reaches inside the .venv for a nested checkout, a
+            # link or a data file that clearing it would delete. The flagged-file and ignored-entry reads
+            # find work outside the .venv, which clearing it leaves, so they are left to a removal of
+            # the whole tree. The walk refuses on a hit anywhere in the tree, the stricter direction.
+            $c = Test-WorktreeClean -Path $w.Path -StatusOnly
+            $c6 = @($c.Reasons) + @(Get-HiddenWorkReasons -Path $w.Path -Checks 'nested')
+            if ($c6.Count -gt 0) { Add-Verdict 'C6' 'clean' 'FAIL' ($c6 -join '; ') }
+            else { Add-Verdict 'C6' 'clean' 'PASS' 'no uncommitted tracked change, no untracked file, and no nested checkout, link or cached data file' }
 
             # C7
             $act = Get-WorktreeActivity -Path $w.Path
@@ -1542,6 +1550,17 @@ if ($Apply -and $prunable.Count -gt 0) {
             Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
             continue
         }
+        # Same routine the decision pass used, so the reason survives: this used to flatten a vanished
+        # directory, an exit-128 status, an untracked file and a real edit into "no longer clean".
+        # BEFORE signal 2: its whole-tree walk is the slow read, so the fresh activity reading is the
+        # last one before the removal (BACKLOG #5603).
+        $c2 = Test-WorktreeClean -Path $d.Path -Primary $RepoRoot
+        if (-not $c2.Clean) {
+            $d.Outcome = 'skipped'
+            $d.OutcomeDetail = "re-check: $($c2.Reasons -join '; ')"
+            Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
+            continue
+        }
         # Signal 2, re-read. It was the ONE signal missing from this block, and it is the only one with
         # measured coverage of the class of worktree this tool prunes (signal 1 vetoed 0 of 4 real
         # siblings). The window is a gh round trip per candidate -- measured at 0.56s -- plus every
@@ -1561,15 +1580,6 @@ if ($Apply -and $prunable.Count -gt 0) {
                 Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
                 continue
             }
-        }
-        # Same routine the decision pass used, so the reason survives: this used to flatten a vanished
-        # directory, an exit-128 status, an untracked file and a real edit into "no longer clean".
-        $c2 = Test-WorktreeClean -Path $d.Path
-        if (-not $c2.Clean) {
-            $d.Outcome = 'skipped'
-            $d.OutcomeDetail = "re-check: $($c2.Reasons -join '; ')"
-            Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
-            continue
         }
 
         # --force suppresses git's refusal on untracked/modified files -- the exact refusal that would
@@ -1790,7 +1800,7 @@ if ($Json) {
                     idleHours     = $_.IdleH
                     safety        = $_.Landed
                     claudeManaged = (Test-ClaudeManagedPath $_.Path)
-                    whyFinished   = "no registered session launched in it or in a tree nested in it (the fence reads launch directories only); contains no other worktree; clean, with no tracked change and no untracked file; git metadata idle $($_.IdleH) h, beyond the $IdleHours h window; holds no coordination claim; $($_.Landed)"
+                    whyFinished   = "no registered session launched in it or in a tree nested in it (the fence reads launch directories only); contains no other worktree; clean, with no tracked change, no untracked file, no flagged file, no unsafe ignored entry and no nested checkout or link; git metadata idle $($_.IdleH) h, beyond the $IdleHours h window; holds no coordination claim; $($_.Landed)"
                 }
             })
         # $null when -ReapVenvs was not asked for; an object with `ran: false` when it WAS asked for

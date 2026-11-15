@@ -15,7 +15,7 @@
     Defines in the caller's scope: $IDLE_FLOOR_HOURS, $ACTIVITY_MTIME_FILES, $REGENERABLE_IGNORED_PATTERN,
     Test-PresentOrThrow, Get-EntriesOrThrow (both moved here from remove.ps1, which dot-sources this file
     for them), Get-ReflogLastEntry, Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header
-    says what it can and cannot see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath,
+    says what it can and cannot see), Test-WorktreeClean, Get-HiddenWorkReasons, Get-SetGitRedirects, Get-TipHolders, Test-ClaudeManagedPath,
     Get-FlaggedFileCount, Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord,
     Get-ClaimedWorktreeIndex, Test-RegistryPresentOrThrow, Get-AllocationRefusal, Get-TreeClaimsDirs
     and Get-OwnershipHolds (moved here from finished-worktree-removal.ps1, so hygiene-report.ps1 reads
@@ -37,8 +37,13 @@ $GIT_REDIRECT_NAMES = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX
 
 # Refused rather than cleared, as in remove.ps1: a dot-sourced caller shares the operator's process, so
 # clearing them would change the operator's shell.
+# The redirect names set in this process. Wrap the call in @(): one name unrolls to a string.
+function Get-SetGitRedirects {
+    $GIT_REDIRECT_NAMES | Where-Object { [Environment]::GetEnvironmentVariable($_) }
+}
+
 function Assert-NoGitRedirect([string]$Who) {
-    $set = @($GIT_REDIRECT_NAMES | Where-Object { [Environment]::GetEnvironmentVariable($_) })
+    $set = @(Get-SetGitRedirects)
     if ($set.Count -gt 0) {
         throw "$Who refuses: $($set -join ', ') is set, so git's readings of the tree named could come from another repository, working tree or index. Unset it and re-run. Nothing was removed."
     }
@@ -210,8 +215,23 @@ function Get-WorktreeActivity {
 # could not open: git warns on stderr, skips it and still exits 0, so its contents are unknown.
 # -AllUntracked adds `--untracked-files=all`, so an untracked file inside an untracked directory is
 # counted as a file rather than folded into one directory line. The verdict is the same either way.
+#
+# GIT STATUS ALONE IS NOT "CLEAN" (BACKLOG #5603). It cannot see, and a forced removal deletes: an edit
+# to a file flagged skip-worktree or assume-unchanged, an ignored file that is not a regenerable cache
+# (a .env, a dev *.db), and a nested checkout, link or data file below an ignored directory, which status
+# never reads into. And a GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE inherited from the
+# caller makes every reading below come from another repository, tree or index. So all four are read
+# here, by default (Get-HiddenWorkReasons holds the three content reads). -Primary is the primary checkout, which Get-UnsafeIgnoredEntries compares
+# the leak-gate token list with; without it that copy is unsafe. -StatusOnly reads status alone, for a
+# caller that runs the content reads itself (prune-merged.ps1's venv receipt, conjunct C6, and
+# finished-worktree-removal.ps1, which splits them around its idle readings): the redirect refusal still
+# applies there.
 function Test-WorktreeClean {
-    param([string]$Path, [switch]$AllUntracked)
+    param([string]$Path, [switch]$AllUntracked, [string]$Primary, [switch]$StatusOnly)
+    $redirects = @(Get-SetGitRedirects)
+    if ($redirects.Count -gt 0) {
+        return @{ Clean = $false; Reasons = @("$($redirects -join ', ') is set in this process, so git's readings of the tree could come from another repository, working tree or index -- unset it and re-run") }
+    }
     if (-not (Test-Path -LiteralPath $Path)) {
         return @{ Clean = $false; Reasons = @('directory is missing (already half-removed? investigate before pruning)') }
     }
@@ -221,7 +241,8 @@ function Test-WorktreeClean {
     # git one character per argument, which git reads as pathspecs; a dirty tree read clean.
     # The "could not open" warning below is matched as TEXT, so git is run untranslated: a localised
     # build would print it in another language, the match would miss, and an unreadable folder would
-    # read clean. LC_ALL=C also makes gettext ignore LANGUAGE; LANGUAGE is cleared anyway.
+    # read clean. LC_ALL=C also makes gettext ignore LANGUAGE; LANGUAGE is cleared anyway. The untracked
+    # mode is always named, so a status.showUntrackedFiles=no in some config cannot hide untracked files.
     $savedLocale = @{}
     foreach ($k in 'LC_ALL', 'LANG', 'LANGUAGE') { $savedLocale[$k] = [Environment]::GetEnvironmentVariable($k) }
     try {
@@ -229,7 +250,7 @@ function Test-WorktreeClean {
         [Environment]::SetEnvironmentVariable('LANG', 'C')
         [Environment]::SetEnvironmentVariable('LANGUAGE', $null)
         if ($AllUntracked) { $raw = @(& git -C $Path --no-optional-locks status --porcelain --untracked-files=all 2>&1) }
-        else { $raw = @(& git -C $Path --no-optional-locks status --porcelain 2>&1) }
+        else { $raw = @(& git -C $Path --no-optional-locks status --porcelain --untracked-files=normal 2>&1) }
         $statusExit = $LASTEXITCODE
     }
     finally {
@@ -252,7 +273,40 @@ function Test-WorktreeClean {
     if ($untracked.Count -gt 0) {
         $r += "$($untracked.Count) untracked file(s) present -- --force would delete them unrecoverably"
     }
+    if (-not $StatusOnly) { $r += @(Get-HiddenWorkReasons -Path $Path -Primary $Primary) }
     return @{ Clean = ($r.Count -eq 0); Reasons = $r }
+}
+
+# The work git status cannot see, as reasons: 'flagged' (skip-worktree or assume-unchanged edits),
+# 'ignored' (an ignored entry that is not a regenerable cache) and 'nested' (Get-NestedHazard's walk),
+# in the order -Checks names them. Test-WorktreeClean reads all three; finished-worktree-removal.ps1
+# splits them around its idle readings, so it names the ones it wants. Wrap the call in @().
+function Get-HiddenWorkReasons {
+    param([string]$Path, [string]$Primary, [string[]]$Checks = @('flagged', 'ignored', 'nested'))
+    $r = @()
+    foreach ($check in $Checks) {
+        switch ($check) {
+            'flagged' {
+                $flagged = Get-FlaggedFileCount $Path
+                if ($flagged -lt 0) { $r += 'its flagged files could not be read' }
+                elseif ($flagged -gt 0) { $r += "$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see" }
+            }
+            'ignored' {
+                $ignored = Get-UnsafeIgnoredEntries $Path $Primary
+                if ($null -eq $ignored) { $r += 'its ignored files could not be listed' }
+                elseif ($ignored.Count -gt 0) { $r += "$($ignored.Count) ignored entr(ies) that are not a regenerable cache, which the removal would delete (first: $($ignored[0]))" }
+            }
+            'nested' {
+                try {
+                    $hazard = Get-NestedHazard $Path
+                    if ($hazard) { $r += "it holds $hazard, which git status does not read into" }
+                }
+                catch { $r += $_.Exception.Message }
+            }
+            default { throw "Get-HiddenWorkReasons: unknown check '$check'." }
+        }
+    }
+    return $r
 }
 
 # The refs of -Repo that contain the worktree's HEAD, for a DETACHED tree: once it is removed, its
