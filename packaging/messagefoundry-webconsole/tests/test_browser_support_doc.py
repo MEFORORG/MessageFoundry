@@ -172,6 +172,26 @@ def test_every_request_header_the_server_reads_has_a_row() -> None:
         )
 
 
+_VERSION_FEATURES_HEADING = "### Each feature"
+
+
+def test_every_request_header_the_server_reads_has_a_version_row() -> None:
+    """The version table's floor must count each header the server reads (BACKLOG #3316 item 11).
+
+    ``test_ui_csp_canary.py`` holds that table to the response headers, detects and cookie
+    attributes; this is the request-header half, from the same derivation as the test above."""
+    derived = _request_headers_read()
+    # positive control, as above
+    assert {"Sec-Fetch-Site", "Sec-Fetch-User", "Origin"} <= derived, derived
+    leads = [row[0] for row in _rows(_section(_VERSION_FEATURES_HEADING))]
+    assert len(leads) >= 20, leads
+    for name in sorted(derived):
+        assert any(lead.startswith(f"`{name}`") for lead in leads), (
+            f"the server reads {name} off a request but docs/BROWSER-SUPPORT.md's version table "
+            f"has no row for it, so no browser's floor counts it"
+        )
+
+
 # --- request headers: absence verdicts derived by running the code ---------------------------------
 
 #: A same-site navigation that satisfies every middleware condition. Dropping one header at a time
