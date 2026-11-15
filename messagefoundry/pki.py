@@ -1215,17 +1215,26 @@ def crl_pem_blocks(pem: bytes) -> list[bytes]:
     return list(_crl_blocks(pem))
 
 
-def cas_without_issuer_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[str, str]]:
-    """Each CA in ``ca_ders`` that is not self-issued and whose issuer signed no CRL in
-    ``crl_pem``, as ``(ca subject, issuer)`` in RFC 4514 form (vault BACKLOG #5627). Under a
-    whole-chain CRL check OpenSSL needs that CRL for every peer under the CA. Raises
-    ``ValueError`` when a certificate or CRL block does not parse."""
-    issuers = {x509.load_pem_x509_crl(block).issuer for block in _crl_blocks(crl_pem)}
-    missing: list[tuple[str, str]] = []
+def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[str]:
+    """The subject, in RFC 4514 form, of each CA in ``ca_ders`` that signed no CRL in ``crl_pem``
+    (vault BACKLOG #5627). Under a whole-chain CRL check OpenSSL needs a loaded CA's own CRL for
+    every certificate it issued, a leaf or an intermediate a client sends, so without it every
+    client under that CA is refused. Names are matched the way OpenSSL matches them
+    (:func:`_issuer_name_key`). Raises ``ValueError`` naming which file did not parse."""
+    try:
+        signers = {
+            _issuer_name_key(x509.load_pem_x509_crl(block).issuer) for block in _crl_blocks(crl_pem)
+        }
+    except _UNREADABLE_CA as exc:
+        raise ValueError(f"a CRL block does not parse: {exc}") from exc
+    missing: list[str] = []
     for der in ca_ders:
-        ca = x509.load_der_x509_certificate(der)
-        if ca.issuer != ca.subject and ca.issuer not in issuers:
-            missing.append((ca.subject.rfc4514_string(), ca.issuer.rfc4514_string()))
+        try:
+            ca = x509.load_der_x509_certificate(der)
+            if _issuer_name_key(ca.subject) not in signers:
+                missing.append(ca.subject.rfc4514_string())
+        except _UNREADABLE_CA as exc:
+            raise ValueError(f"a loaded client CA does not parse: {exc}") from exc
     return missing
 
 

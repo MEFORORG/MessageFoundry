@@ -2701,11 +2701,11 @@ def test_extract_verified_peercert_variants() -> None:
 def test_enriched_app_state_snapshots_only_with_cert() -> None:
     base = {"shared": 1}
     # No cert → the SAME dict is returned (byte-identical; nothing stashed, no mutation).
-    same = enriched_app_state(base, _FakeTransport(_FakeSSL({})))  # type: ignore[arg-type]
+    same = enriched_app_state(base, _FakeTransport(_FakeSSL({})), trusted_proxies=())  # type: ignore[arg-type]
     assert same is base
     # A verified cert → a fresh per-connection copy carrying the cert; the shared dict is untouched.
     cert = _peercert("svc.internal")
-    enriched = enriched_app_state(base, _FakeTransport(_FakeSSL(cert)))  # type: ignore[arg-type]
+    enriched = enriched_app_state(base, _FakeTransport(_FakeSSL(cert)), trusted_proxies=())  # type: ignore[arg-type]
     assert enriched is not base
     assert enriched[MF_CLIENT_PEERCERT_STATE_KEY] == {
         **cert,

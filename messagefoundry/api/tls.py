@@ -25,9 +25,9 @@ from typing import TYPE_CHECKING, Literal
 from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
 from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth.trust_anchors import (
+    anchor_refusal,
     api_client_anchor_spec,
     api_client_crl_spec,
-    enforced_anchor,
     verified_anchor_cadata,
 )
 from messagefoundry.config.settings import ApiSettings
@@ -144,38 +144,46 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         if crl is not None:
             # Vault BACKLOG #5627: the CRL decides which client certificates are refused, so it
             # takes the client CA's owner-only ACL and path preflight. A broadly writable CRL could
-            # be swapped for an older one, signed and unexpired, from before a revocation. A file
-            # that cannot be read is left to harden_crl_check, which names it the same way.
+            # be swapped for an older one, signed and unexpired, from before a revocation. A
+            # missing file is left to harden_crl_check, which says so in its own words; a file
+            # that is there and cannot be read is refused here, naming the setting.
             if Path(crl.path).is_file():
-                enforced_anchor(crl, enforcing=enforcing)
+                refusal = anchor_refusal(crl, enforcing=enforcing)
+                if refusal is not None:
+                    raise refusal
             # And the whole chain is checked, so a revoked intermediate refuses its clients too.
             harden_crl_check(ctx, crl.path, setting=crl.setting, chain=True)
-            _refuse_a_loaded_ca_without_its_issuers_crl(ctx, crl.path, setting=crl.setting)
+            _refuse_a_loaded_ca_without_its_own_crl(ctx, crl.path, setting=crl.setting)
     return ctx
 
 
-def _refuse_a_loaded_ca_without_its_issuers_crl(
+def _refuse_a_loaded_ca_without_its_own_crl(
     ctx: ssl.SSLContext, crl_file: str, *, setting: str
 ) -> None:
-    """Refuse the build when a loaded client CA's issuer has no CRL in ``crl_file`` (vault BACKLOG
-    #5627). With the whole chain checked, OpenSSL needs that CRL for every client under the CA,
-    and refuses each one with ``unable to get certificate CRL`` when it is missing: a context that
-    builds and then refuses every client, which this says at start instead. A self-issued CA is
-    the end of its chain and needs none. An intermediate only the client sends cannot be checked
-    here. Raises ``ValueError`` naming ``setting``."""
-    from messagefoundry.pki import cas_without_issuer_crl
+    """Refuse the build when a loaded client CA signed no CRL in ``crl_file`` (vault BACKLOG
+    #5627). With the whole chain checked, OpenSSL needs that CRL for every certificate the CA
+    issued, a leaf or an intermediate a client sends, and refuses each client with ``unable to
+    get certificate CRL`` when it is missing: a context that builds and then refuses every client
+    under that CA, which this says at start instead. An intermediate only the client sends is not
+    loaded, so its own CRL cannot be checked here. Raises ``ValueError`` naming ``setting``."""
+    from messagefoundry.pki import cas_without_own_crl
 
     try:
-        missing = cas_without_issuer_crl(
-            ctx.get_ca_certs(binary_form=True), Path(crl_file).read_bytes()
-        )
-    except (OSError, ValueError) as exc:
+        pem = Path(crl_file).read_bytes()
+    except OSError as exc:
         raise ValueError(f"{setting} could not be read again after loading: {exc}") from exc
-    for subject, issuer in missing:
+    try:
+        missing = cas_without_own_crl(ctx.get_ca_certs(binary_form=True), pem)
+    except ValueError as exc:
         raise ValueError(
-            f"{setting} holds no CRL from {issuer!r}, the issuer of the loaded client CA "
-            f"{subject!r}. The whole client chain is checked against this file, so every client "
-            "under that CA would be refused. Add that issuer's CRL to the file"
+            f"{setting} could not be checked against [api].tls_client_ca_file: {exc}"
+        ) from exc
+    if missing:
+        named = ", ".join(repr(subject) for subject in missing)
+        raise ValueError(
+            f"{setting} holds no CRL signed by the loaded client CA(s) {named}. The whole client "
+            "chain is checked against this file, so every client under such a CA would be "
+            "refused. Add each one's CRL to the file"
         )
 
 

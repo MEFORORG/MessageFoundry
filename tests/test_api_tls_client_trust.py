@@ -315,21 +315,43 @@ def test_a_writable_crl_warns_and_loads_under_warn(
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")
-def test_a_loaded_intermediate_whose_issuer_has_no_crl_refuses_the_build(
-    two_tier: _TwoTier, tmp_path: Path
+@pytest.mark.parametrize("with_intermediate", [True, False], ids=["root-and-inter", "root-alone"])
+def test_a_loaded_ca_with_no_crl_of_its_own_refuses_the_build(
+    two_tier: _TwoTier, tmp_path: Path, with_intermediate: bool
 ) -> None:
-    """Root and intermediate loaded, only the intermediate's CRL in the file: under the chain
-    check every client would be refused at the handshake, so the build refuses instead."""
-    ca_file = tmp_path / "root-and-inter.pem"
-    ca_file.write_bytes(two_tier.root_file.read_bytes() + two_tier.inter_file.read_bytes())
+    """Only the intermediate's CRL in the file, the root loaded with or without the intermediate:
+    under the chain check every client would be refused at the handshake (the root-alone case was
+    measured by review round 2), so the build refuses instead."""
+    ca_file = tmp_path / "client-ca.pem"
+    ca_file.write_bytes(
+        two_tier.root_file.read_bytes()
+        + (two_tier.inter_file.read_bytes() if with_intermediate else b"")
+    )
     crl_file = tmp_path / "inter-crl-only.pem"
     crl_file.write_bytes(two_tier.inter_crl_file.read_bytes())
     settings = _settings(two_tier, crl_file).model_copy(update={"tls_client_ca_file": str(ca_file)})
-    with pytest.raises(ValueError, match="holds no CRL from 'CN=Client Root'"):
+    with pytest.raises(
+        ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Client Root'"
+    ):
         build_api_ssl_context(settings)
-    # The control: with the root's CRL added, the same CA file builds.
+    # The control: with the root's CRL added, the same CA file builds and admits the client.
     crl_file.write_bytes(two_tier.revokes_nothing.read_bytes())
-    build_api_ssl_context(settings)
+    _handshake(_client(two_tier), build_api_ssl_context(settings))
+
+
+def test_a_crl_that_is_there_but_unreadable_refuses_naming_its_setting(
+    two_tier: _TwoTier, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _denied(path: str) -> bytes:
+        if Path(path) == two_tier.revokes_nothing:
+            raise PermissionError(13, "Permission denied")
+        return Path(path).read_bytes()
+
+    monkeypatch.setattr(ta, "_read_regular_file", _denied)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(ok=True))
+    with pytest.raises(TrustAnchorError, match=r"\[api\]\.tls_client_crl_file: could not read"):
+        build_api_ssl_context(_settings(two_tier, two_tier.revokes_nothing))
 
 
 @pytest.mark.usefixtures("clean_anchor_checks")
@@ -378,7 +400,7 @@ def test_control_the_same_certificate_from_another_peer_is_stashed() -> None:
     assert state[MF_CLIENT_PEERCERT_STATE_KEY]["subject"] == _CERT["subject"]
     # And with no proxy declared, a peer is never a proxy, whatever its address.
     direct: Any = _Transport(("10.0.0.5", 1), _CERT)
-    assert MF_CLIENT_PEERCERT_STATE_KEY in enriched_app_state({}, direct)
+    assert MF_CLIENT_PEERCERT_STATE_KEY in enriched_app_state({}, direct, trusted_proxies=())
 
 
 @pytest.mark.parametrize("peer", [None, (), ("not-an-address", 1), 7])

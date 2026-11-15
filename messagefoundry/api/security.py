@@ -1658,8 +1658,13 @@ def peer_cert_from_request(request: Request) -> Mapping[str, Any] | None:
     # callers, so its certificate names none of them.
     app = request.scope.get("app")
     proxies = getattr(getattr(app, "state", None), "trusted_proxies", ())
-    if proxies and peer_is_trusted_proxy(transport, parse_trusted_proxies(proxies)):
-        return None
+    if proxies:
+        try:
+            parsed = parse_trusted_proxies(proxies)
+        except ValueError:
+            return None  # a list that cannot be read: deny rather than fail the request
+        if peer_is_trusted_proxy(transport, parsed):
+            return None
     # The same read the shim makes, verified issuer included (BACKLOG #2237).
     return peercert_from_ssl_object(ssl_object)
 

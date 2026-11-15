@@ -176,7 +176,7 @@ def enriched_app_state(
     app_state: Mapping[str, Any],
     transport: asyncio.BaseTransport,
     *,
-    trusted_proxies: Collection[TrustedProxy] = (),
+    trusted_proxies: Collection[TrustedProxy],
 ) -> Mapping[str, Any]:
     """``app_state`` unchanged, or a **per-connection copy** carrying the verified peer cert.
 
