@@ -135,7 +135,7 @@ function closeWindows(): void {
   }
 }
 
-function load(opts: { clone?: boolean; groups: unknown; initial?: unknown }): Page {
+function load(opts: { clone?: boolean; groups: unknown; initial?: unknown; transports?: string[] }): Page {
   const errors: unknown[] = [];
   const posted: Payload[] = [];
   const virtualConsole = new VirtualConsole();
@@ -164,9 +164,10 @@ function load(opts: { clone?: boolean; groups: unknown; initial?: unknown }): Pa
   });
   const el = window.document.createElement("script");
   el.textContent = connectionEditorScript(TOKEN, {
-    initial: opts.initial ?? RECORD,
+    // null is create mode; absent is RECORD.
+    initial: opts.initial === undefined ? RECORD : opts.initial,
     routers: ["route_adt"],
-    transports: ["mllp", "file"],
+    transports: opts.transports ?? ["mllp", "file"],
     fieldGroups: opts.groups,
     siblings: undefined,
     clone: opts.clone,
@@ -339,6 +340,27 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     assert.ok(!("tls_key_password" in saved(p, false)), "the removed credential came back on save");
   });
 
+  for (const how of ["removed", "cleared"]) {
+    test(`edit: a secret env reference's inline default ${how} before a transport round trip is not written back`, () => {
+      const p = load({ groups });
+      const doc = p.window.document;
+      if (how === "removed") {
+        doc.querySelector('#settings [data-remove-key="db_password"]').click();
+      } else {
+        doc.querySelector('#settings [data-key="db_password"]').value = "";
+      }
+      const transport = doc.getElementById("transport");
+      for (const to of ["file", "mllp"]) {
+        transport.value = to;
+        transport.dispatchEvent(new p.window.Event("change"));
+        const asked = p.posted.filter((m) => m.command === "fields");
+        p.deliver({ command: "fields", groups: buildForm(SCHEMA, to, "outbound", asked[asked.length - 1].settings) });
+      }
+      doc.querySelector('#settings [data-key="db_password"]').value = "DB_PW2";
+      assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW2" }, "the removed inline default came back");
+    });
+  }
+
   test("edit: a transport round trip never sends a held credential, and the save keeps every one", () => {
     const p = load({ groups });
     const transport = p.window.document.getElementById("transport");
@@ -440,6 +462,34 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     const asked = p.posted.filter((m) => m.command === "fields");
     assert.strictEqual(asked.length, 1);
     assert.strictEqual(asked[0][CHANNEL_FIELD], TOKEN, "the request does not name its render");
+  });
+});
+
+suite("connection editor — create mode draws the fields for the transport the picker shows (BACKLOG #5565)", () => {
+  teardown(closeWindows);
+
+  test("the picker and the fields agree from the first draw, and a save never mixes them", () => {
+    // The hosts build the create form for mllp, but the picker shows the engine's first transport.
+    const p = load({ initial: null, groups: buildForm(SCHEMA, "mllp", "inbound", {}), transports: ["file", "mllp"] });
+    const doc = p.window.document;
+    const picker = doc.getElementById("transport").value;
+    assert.strictEqual(picker, "file");
+    const keys = (): string[] => [...doc.querySelectorAll("#settings [data-key]")].map((c: DomNode) => c.dataset.key);
+    assert.ok(!keys().includes("host"), `mllp's fields are drawn under the ${picker} picker: ${keys().join(", ")}`);
+    doc.getElementById("name").value = "IB_SYNTH_FILE";
+    doc.getElementById("router").value = "route_adt";
+    doc.getElementById("save").click();
+    const save = p.posted.filter((m) => m.command === "save");
+    assert.strictEqual(save.length, 1);
+    assert.strictEqual(save[0].conn.transport, "file");
+    assert.ok(!("host" in (save[0].conn.settings ?? {})), "a save posted the file transport with mllp's settings");
+    // The page asked for the picker's transport and direction, and draws the reply.
+    const asked = p.posted.filter((m) => m.command === "fields");
+    assert.strictEqual(asked.length, 1, "the page did not ask for the picker's fields");
+    assert.strictEqual(asked[0].transport, "file");
+    assert.strictEqual(asked[0].direction, doc.getElementById("direction").value);
+    p.deliver({ command: "fields", groups: buildForm(SCHEMA, "file", asked[0].direction, asked[0].settings) });
+    assert.deepStrictEqual(keys(), ["path"]);
   });
 });
 

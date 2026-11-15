@@ -342,6 +342,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       $('name').placeholder = 'new name (was ' + INITIAL.name + ')';
       prefillFieldsFromInitial();
       setTimeout(() => $('name').focus(), 0);
+    } else if (FIELD_GROUPS) {
+      // Create: the hosts build the first form for one transport and direction, which need not be
+      // the ones the pickers show. Ask for the pickers' own, so the fields and the pickers agree;
+      // until the reply the settings area is empty, so a save never mixes the two.
+      requestFields();
     } else {
       prefillHints();
     }
@@ -417,8 +422,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           }
           const ref = { env: envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
-          if (HELD_DEFAULTS.has(key)) ref.default = HELD_MARK;
-          else if (f.envDefault !== undefined) ref.default = f.envDefault;
+          // A held inline default goes back only where this descriptor still carries a default: the
+          // record's own, or the mark a rebuild was sent. A key the request left out, because the
+          // user removed or cleared it, carries none, so the default is not written back.
+          if (f.envDefault !== undefined) ref.default = HELD_DEFAULTS.has(key) ? HELD_MARK : f.envDefault;
           settings[key] = ref;
           continue;
         }
