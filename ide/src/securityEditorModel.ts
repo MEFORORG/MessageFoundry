@@ -70,9 +70,13 @@ function resolveLinks(target: string, fsx: LinkFs): string | undefined {
  *
  * `fromWorkspace` says the value in force comes from the workspace's own settings, which a
  * repository's `.vscode/settings.json` can set. Such a value must name a file inside the workspace
- * folder: one that leaves it by `..`, by being absolute elsewhere, or through a symbolic link, a
- * dangling one included, is refused, as is the folder itself. A value from user settings is the
- * operator's own and may name a file anywhere, such as the service's TOML in another folder.
+ * folder: one that leaves it by `..` or by being absolute elsewhere is refused, as is the folder
+ * itself. A value from user settings is the operator's own and may name a file anywhere, such as the
+ * service's TOML in another folder.
+ *
+ * Whatever its scope, a path inside the workspace folder, the default `messagefoundry.toml`
+ * included, must not leave it through a symbolic link the repository holds, a dangling one included.
+ * The path returned has those links resolved, so the CLI opens the folders that were checked.
  */
 export function securityConfigTarget(
   workspace: string,
@@ -85,25 +89,23 @@ export function securityConfigTarget(
   }
   const root = path.resolve(workspace);
   const target = path.resolve(root, setting);
-  if (!fromWorkspace) {
-    return { ok: true, path: target };
-  }
   // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
   const outside = {
     ok: false,
     problem:
-      "the workspace settings set messagefoundry.serviceConfig to a path that is not a file inside the workspace folder, " +
-      "or whose links cannot be checked",
+      "messagefoundry.serviceConfig names a path that leaves the workspace folder, or whose links cannot be checked. " +
+      "A value in workspace settings must name a file inside the workspace folder, and a path inside it must not leave " +
+      "it through a link; to use a file elsewhere, set it in user settings",
   } as const;
   if (!inside(root, target)) {
-    return outside;
+    return fromWorkspace ? outside : { ok: true, path: target };
   }
   const realRoot = resolveLinks(root, fsx);
   const realTarget = resolveLinks(target, fsx);
   if (realRoot === undefined || realTarget === undefined || !inside(realRoot, realTarget)) {
     return outside;
   }
-  return { ok: true, path: target };
+  return { ok: true, path: realTarget };
 }
 
 /** The `security show` argv. Each value is bound to its flag with `=`, so a value that starts with

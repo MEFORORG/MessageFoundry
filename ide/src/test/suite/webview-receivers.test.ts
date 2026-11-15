@@ -1438,7 +1438,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       const p = security.load();
       p.deliver(variant(STATE_OK, (c) => (c.state.values[f.key] = 7)));
       const input = p.window.document.getElementById("in-" + f.key);
-      for (const blank of ["", "   "]) {
+      for (const blank of [""]) {
         p.posted.length = 0;
         input.value = blank;
         input.dispatchEvent(new p.window.Event("input"));

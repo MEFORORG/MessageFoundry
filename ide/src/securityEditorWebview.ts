@@ -143,7 +143,10 @@ export function securityEditorScript(token: string, fields: unknown): string {
           input = document.createElement('select');
           for (const [v, t] of [['','Derived from environment'],['true','Yes'],['false','No']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; input.appendChild(o); }
         } else if (f.type === 'int') {
-          input = document.createElement('input'); input.type = 'number'; if (typeof f.min === 'number') { input.min = String(f.min); }
+          input = document.createElement('input'); input.type = 'number';
+          // The spinner's floor. Only a field's own min is enforced on Save (intProblem); 0 here keeps
+          // the arrows from walking a session limit below 0, where every session would end at once.
+          input.min = String(typeof f.min === 'number' ? f.min : 0);
         } else {
           input = document.createElement('input'); input.type = 'text';
         }

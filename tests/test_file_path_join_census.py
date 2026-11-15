@@ -1049,13 +1049,6 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/chat.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/cli.ts": Site(2, OPERATOR, "Fixed venv interpreter paths under the workspace."),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
-    "ide/src/securityEditorModel.ts": Site(
-        3,
-        GUARDED,
-        "The security editor's settings path: a workspace-set value must resolve inside the "
-        "workspace folder, links included (BACKLOG #5411).",
-        "ide/src/securityEditorModel.ts::!inside(realRoot, realTarget)",
-    ),
     "ide/src/editorToolbar.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/engineTrustModel.ts": Site(
         1, OPERATOR, "The trust anchor setting, resolved under the workspace."
@@ -1086,6 +1079,13 @@ IDE_SITES: dict[str, Site] = {
         'ide/src/newRoute.ts::.replace(/[^A-Za-z0-9_-]/g, "_")}.py`',
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/securityEditorModel.ts": Site(
+        3,
+        OPERATOR,
+        "The security editor's settings path, from the operator's setting. A workspace-set value "
+        "must resolve inside the workspace folder, and any path inside it must not leave through a "
+        "link; a user-set path outside the workspace is the operator's own (BACKLOG #5411).",
+    ),
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
     "ide/src/statusBar.ts": Site(4, OPERATOR, _IDE_WORKSPACE),
     "ide/src/stepsView.ts": Site(3, OPERATOR, _IDE_WORKSPACE + " Two are fixed media names."),

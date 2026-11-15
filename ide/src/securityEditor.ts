@@ -25,6 +25,9 @@ interface ShowResult {
 }
 
 let panel: vscode.WebviewPanel | undefined;
+// The file the form now shows, or undefined while it shows none. Save writes only to this file, so a
+// setting that moved after the form rendered cannot send one file's values into another.
+let shownFile: string | undefined;
 
 /** Open the [security] editor: loads the current switches + secure defaults and saves edits via the CLI. */
 export async function openSecurityEditor(context: vscode.ExtensionContext): Promise<void> {
@@ -49,6 +52,7 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
     () => {
       if (panel === current) {
         panel = undefined;
+        shownFile = undefined;
       }
     },
     null,
@@ -96,6 +100,7 @@ async function refresh(current: vscode.WebviewPanel, resolved?: string): Promise
   if (!ws) {
     return;
   }
+  shownFile = undefined;
   // After a save, the file just written, so the state shown is that file's even if the setting moved.
   const file = resolved ?? configPath(ws, current);
   if (file === undefined) {
@@ -103,6 +108,7 @@ async function refresh(current: vscode.WebviewPanel, resolved?: string): Promise
   }
   try {
     const state = await runJson<ShowResult>(securityShowArgs(file), ws);
+    shownFile = file;
     postToWebview(current.webview, { command: "state", state });
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
@@ -121,6 +127,15 @@ async function save(
   }
   const file = configPath(ws, current);
   if (file === undefined) {
+    return;
+  }
+  if (file !== shownFile) {
+    postToWebview(current.webview, {
+      command: "error",
+      message:
+        "Not saved: the settings file this form shows is not the one messagefoundry.serviceConfig names now. " +
+        "Run Edit Security Settings to read the file again.",
+    });
     return;
   }
   try {

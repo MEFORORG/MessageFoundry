@@ -37,7 +37,8 @@ suite("security editor host checks", () => {
     // THE CONTROL for every refusal below.
     for (const setting of ["messagefoundry.toml", "conf/sub/messagefoundry.toml", "./a/../b.toml", "..conf/messagefoundry.toml", "..messagefoundry.toml"]) {
       const t = securityConfigTarget(ws, setting, true, real);
-      assert.deepStrictEqual(t, { ok: true, path: path.resolve(ws, setting) }, setting);
+      // Links resolved, so the expected path is under the workspace's real path.
+      assert.deepStrictEqual(t, { ok: true, path: path.resolve(fs.realpathSync.native(ws), setting) }, setting);
     }
     fs.writeFileSync(path.join(ws, "messagefoundry.toml"), "");
     assert.ok(securityConfigTarget(ws, path.join(ws, "messagefoundry.toml"), true, real).ok, "an absolute path inside");
@@ -94,6 +95,8 @@ suite("security editor host checks", () => {
       this.skip();
     }
     assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", true, real).ok, false, "a new file through the link");
+    // Whatever the scope: a user-set or default path inside the workspace is checked for links too.
+    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", false, real).ok, false, "a user-set path through the link");
     fs.writeFileSync(path.join(outside, "messagefoundry.toml"), "");
     assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", true, real).ok, false, "an existing file through the link");
     // A dangling link, whose target does not exist yet, is refused too: it could be made later.
@@ -103,7 +106,10 @@ suite("security editor host checks", () => {
     // THE CONTROL: a link that stays inside the workspace is accepted.
     fs.mkdirSync(path.join(ws, "inner"));
     fs.symlinkSync(path.join(ws, "inner"), path.join(ws, "inlink"), "junction");
-    assert.ok(securityConfigTarget(ws, "inlink/messagefoundry.toml", true, real).ok, "a link inside the workspace");
+    const viaInner = securityConfigTarget(ws, "inlink/messagefoundry.toml", true, real);
+    assert.ok(viaInner.ok, "a link inside the workspace");
+    // The CLI is handed the resolved path, so it opens the folder that was checked.
+    assert.strictEqual(viaInner.path, path.join(fs.realpathSync.native(path.join(ws, "inner")), "messagefoundry.toml"));
   });
 
   test("each argv value is bound to its flag with =, so a leading dash is never read as a flag", () => {
