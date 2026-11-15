@@ -175,7 +175,7 @@ function load(opts: {
     routers: ["route_adt"],
     transports: opts.transports ?? ["mllp", "file"],
     fieldGroups: opts.groups,
-    fieldGroupsFor: opts.fieldGroupsFor,
+    fieldGroupsFor: opts.fieldGroupsFor ?? null,
     siblings: undefined,
     clone: opts.clone,
   });
@@ -357,12 +357,22 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     type("");
     type("DB_PW2");
     assert.deepStrictEqual(saved(p, false).db_password, { env: "DB_PW2" }, "the cleared inline default came back");
-    // Control: retyping the key without emptying the box keeps the default.
+    // However the key is replaced, the old credential does not become the new key's default.
     const q = load({ groups });
     const qbox = q.window.document.querySelector('#settings [data-key="db_password"]');
     qbox.value = "DB_PW3";
     qbox.dispatchEvent(new q.window.Event("input"));
-    assert.deepStrictEqual(saved(q, false).db_password, { env: "DB_PW3", default: INLINE_DEFAULT });
+    assert.deepStrictEqual(saved(q, false).db_password, { env: "DB_PW3" }, "a replaced key kept the old default");
+  });
+
+  test("edit: a secret env reference's key emptied and then restored keeps its inline default", () => {
+    const p = load({ groups });
+    const box = p.window.document.querySelector('#settings [data-key="db_password"]');
+    for (const text of ["", "DB_PW"]) {
+      box.value = text;
+      box.dispatchEvent(new p.window.Event("input"));
+    }
+    assert.deepStrictEqual(saved(p, false).db_password, RECORD.settings.db_password, "a kept credential was dropped");
   });
 
   for (const how of ["removed", "cleared"]) {
@@ -548,6 +558,11 @@ suite("connection editor: create mode shows the transport whose fields are drawn
         transports: ["file", "mllp"],
       }],
       ["no fields: an engine that cannot describe itself", { initial: null, groups: null }],
+      ["fields built for a transport that declares none", {
+        initial: null,
+        groups: [],
+        fieldGroupsFor: { transport: "mllp", direction: "inbound" },
+      }],
     ];
     for (const [label, opts] of cases) {
       const p = load(opts);
@@ -591,6 +606,27 @@ suite("webviewMessaging.postToSameRender (BACKLOG #5565)", () => {
 
 suite("connection editor — the legacy rows, when the engine cannot describe itself (BACKLOG #5565)", () => {
   teardown(closeWindows);
+
+  test("create: a transport or direction change keeps the rows typed so far", () => {
+    const p = load({ initial: null, groups: null });
+    const doc = p.window.document;
+    const row = doc.querySelector("#settings .setting");
+    const [k, v] = row.querySelectorAll("input[type=text]");
+    k.value = "port";
+    v.value = "6661";
+    for (const id of ["transport", "direction"]) {
+      const sel = doc.getElementById(id);
+      sel.value = sel.options[sel.options.length - 1].value;
+      sel.dispatchEvent(new p.window.Event("change"));
+    }
+    const rows = doc.querySelectorAll("#settings .setting");
+    assert.strictEqual(rows.length, 1);
+    assert.deepStrictEqual(
+      [...rows[0].querySelectorAll("input[type=text]")].map((i: DomNode) => i.value),
+      ["port", "6661"],
+      "a picker change wiped the typed row",
+    );
+  });
 
   test("a table is shown as JSON and saved back as the same table", () => {
     const p = load({ groups: null });

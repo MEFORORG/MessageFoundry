@@ -21,8 +21,8 @@ export interface ConnectionEditorScriptInputs {
   routers: readonly string[];
   transports: readonly string[];
   fieldGroups: unknown;
-  /** The transport and direction `fieldGroups` was built for; absent or null when there is none. */
-  fieldGroupsFor?: { transport: string; direction: string } | null;
+  /** The transport and direction `fieldGroups` was built for; null when there are none. */
+  fieldGroupsFor: { transport: string; direction: string } | null;
   siblings: unknown;
   clone: boolean | undefined;
 }
@@ -41,7 +41,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // transport/direction change: the grouping rules live in one tested module, not duplicated here.
     let FIELD_GROUPS = ${embedJson(p.fieldGroups)};
     // The transport and direction the host built FIELD_GROUPS for, so create mode can show them.
-    const FIELD_GROUPS_FOR = ${embedJson(p.fieldGroupsFor ?? null)};
+    const FIELD_GROUPS_FOR = ${embedJson(p.fieldGroupsFor)};
     const SIBLINGS = ${embedJson(p.siblings)};
     const CLONE = ${embedJson(p.clone)};              // #175: create mode pre-filled from INITIAL, new name required
     const EDIT = INITIAL !== null && !CLONE;    // clone is NOT edit: name editable, no delete
@@ -143,10 +143,6 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     const HELD_DEFAULTS = new Map();
     // Keys whose inline credential the user chose to remove; the save then writes no value for them.
     const REMOVED_SECRETS = new Set();
-    // Keys of a secret env reference whose key box the user emptied: its held inline default is
-    // dropped, as a transport round trip with the box empty drops it, so a key typed afterwards
-    // never brings the old credential back as its default.
-    const CLEARED_DEFAULTS = new Set();
     function heldSecret(f) {
       if (REMOVED_SECRETS.has(f.key)) return undefined;
       if (f.preserveValue !== undefined && f.preserveValue !== HELD_MARK) return f.preserveValue;
@@ -214,9 +210,6 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       if (f.cast) { control.dataset.cast = f.cast; }
       HELD.set(control, f);
       SHOWN.set(control, control.value);
-      if (useEnv && HELD_DEFAULTS.has(f.key)) {
-        control.addEventListener('input', () => { if (control.value.trim() === '') CLEARED_DEFAULTS.add(f.key); });
-      }
       control.disabled = REMOVED_KEYS.has(f.key);
       const hint = document.createElement('div'); hint.className = 'sub'; hint.textContent = f.help || '';
       wrap.append(lab, control);
@@ -286,10 +279,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       }
     }
 
-    /** Legacy path: the engine could not describe itself, so fall back to free-text key/value rows. */
-    // Only for an engine that could not describe itself (FIELD_GROUPS null): the free-text row.
+    /** Legacy path: no schema fields to draw, so the free-text key/value rows. Rows already drawn,
+     *  and what was typed into them, stay; a blank row is drawn only where there is none. */
     function prefillHints() {
       if (EDIT) return;
+      if ($('settings').querySelector('.setting')) return;
       $('settings').innerHTML = '';
       settingRow('', '', false, '');
     }
@@ -353,20 +347,19 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       $('name').placeholder = 'new name (was ' + INITIAL.name + ')';
       prefillFieldsFromInitial();
       setTimeout(() => $('name').focus(), 0);
-    } else if (FIELD_GROUPS && FIELD_GROUPS_FOR && TRANSPORTS.includes(FIELD_GROUPS_FOR.transport) &&
+    } else if (FIELD_GROUPS && FIELD_GROUPS.some((g) => Array.isArray(g.fields) && g.fields.length > 0) &&
+        FIELD_GROUPS_FOR && TRANSPORTS.includes(FIELD_GROUPS_FOR.transport) &&
         [...$('direction').options].some((o) => o.value === FIELD_GROUPS_FOR.direction)) {
       // Create: the pickers show the transport and direction the host built the fields for, so the
       // two agree from the first draw and the host's default (MLLP) stays the default.
       $('transport').value = FIELD_GROUPS_FOR.transport;
       $('direction').value = FIELD_GROUPS_FOR.direction;
       renderGroups(FIELD_GROUPS);
-    } else if (FIELD_GROUPS) {
-      // Create, with fields built for a transport or direction the pickers cannot show: the free-text
-      // row instead, a working form that names no transport's fields. A transport or direction change
-      // still asks for that transport's fields, carrying what was typed.
-      $('settings').innerHTML = '';
-      settingRow('', '', false, '');
     } else {
+      // Create with no schema, or with fields that draw nothing or that were built for a transport
+      // or direction the pickers cannot show: the free-text row, a working form that names no
+      // transport's fields. With a schema, a transport or direction change still asks for that
+      // transport's fields, carrying what was typed.
       prefillHints();
     }
     refreshVisibility();
@@ -441,13 +434,13 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           }
           const ref = { env: envKey };
           if (el.dataset.cast) ref.cast = el.dataset.cast;
-          // A held inline default goes back only where this descriptor still carries a default: the
-          // record's own, or the mark a rebuild was sent. A key the request left out, because the
-          // user removed or cleared it, carries none, and a key box the user emptied drops it too
-          // (CLEARED_DEFAULTS), so the default is not written back.
+          // A held inline default goes back only with the env key it was recorded under, and only
+          // where this descriptor still carries one (the record's own, or the mark a rebuild was
+          // sent). A key the request left out, because the user removed or cleared it, carries none;
+          // a key replaced, however it was typed, does not take the old credential as its default.
           if (f.envDefault !== undefined) {
             if (!HELD_DEFAULTS.has(key)) ref.default = f.envDefault;
-            else if (!CLEARED_DEFAULTS.has(key)) ref.default = HELD_MARK;
+            else if (envKey === f.envKey) ref.default = HELD_MARK;
           }
           settings[key] = ref;
           continue;
