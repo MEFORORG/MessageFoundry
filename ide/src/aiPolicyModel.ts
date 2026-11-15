@@ -300,14 +300,15 @@ function policyOnly(p: CachedAiPolicy): AiPolicy {
  */
 const MALFORMED_DENY: AiPolicy = { ...UNVERIFIED_POLICY, assistPermitted: false };
 
-/** A carried entry as the carrier may use it: a deny-shaped object as it is, anything else as
- *  {@link MALFORMED_DENY}. Never throws, and never reads a non-deny as one. */
+/** A carried entry as the carrier may use it: a deny-shaped object the gate disables, as it is;
+ *  anything else as {@link MALFORMED_DENY}. A deny in a mode the gate does not know is not used as
+ *  it is, since the gate enables a mode it does not know. Never throws, and never permits. */
 function carriedEntry(value: unknown): AiPolicy {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return MALFORMED_DENY;
   }
   const p = value as AiPolicy;
-  return typeof p.mode === "string" && isPolicyDeny(p) ? p : MALFORMED_DENY;
+  return typeof p.mode === "string" && isPolicyDeny(p) && !assistantState(p).enabled ? p : MALFORMED_DENY;
 }
 
 // Every read-modify-write of the carrier runs on this one chain, so two resolves that overlap cannot
@@ -331,7 +332,7 @@ function withCarrier<T>(
     // authoritative permit clears: origin/main's rule for that key.
     const legacy = store.get<CachedAiPolicy>(LEGACY_AI_POLICY_KEY);
     if (legacy !== undefined && legacy !== null && typeof legacy === "object" && isPolicyDeny(legacy)) {
-      carried = { ...carried, [UNKNOWN_DENY_ISSUER]: policyOnly(legacy) };
+      carried = { ...carried, [UNKNOWN_DENY_ISSUER]: carriedEntry(policyOnly(legacy)) };
       migrated = true;
     }
     const { next, result } = step(carried);

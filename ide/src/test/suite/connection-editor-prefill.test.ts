@@ -304,6 +304,12 @@ suite("connection editor — edit and clone use the schema-driven fields (BACKLO
     const port = p.window.document.querySelector('#settings [data-key="port"]');
     port.value = "66x2";
     assert.strictEqual(saved(p, false).port, "66x2", "the typed text must be posted for the engine to refuse");
+    // Text a number box would have refused is not converted either: the engine sees what was typed.
+    for (const typed of ["0x1F90", "0b1", "0o17", "+6662", "Infinity"]) {
+      const h = load({ groups });
+      h.window.document.querySelector('#settings [data-key="port"]').value = typed;
+      assert.strictEqual(saved(h, false).port, typed, `${typed} must be posted as typed`);
+    }
     // A number still reads back as a number.
     const q = load({ groups });
     q.window.document.querySelector('#settings [data-key="port"]').value = " 6663 ";

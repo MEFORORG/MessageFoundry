@@ -429,8 +429,37 @@ suite("the deny carrier — a deny survives a retarget (BACKLOG #5564)", () => {
     assert.strictEqual(assistantState(tokenless).enabled, false, "a failed delete turned a deny into a permit");
   });
 
+  test("D4f: a malformed deny under the old key is migrated as a fail-closed deny, whether or not its delete fails", async () => {
+    for (const legacy of [{ mode: 7, assistPermitted: false }, { mode: "bogus", assistPermitted: false }]) {
+      for (const deleteFails of [false, true]) {
+        const label = `${JSON.stringify(legacy)} deleteFails=${deleteFails}`;
+        const store = memStore({ [LEGACY_AI_POLICY_KEY]: legacy });
+        if (deleteFails) {
+          failWrites(store, LEGACY_AI_POLICY_KEY);
+        }
+        for (let i = 0; i < 2; i++) {
+          const p = await unreachable(store, LOCAL, cliByo, false);
+          assert.strictEqual(assistantState(p).enabled, false, `resolve ${i + 1}: ${label}`);
+        }
+      }
+    }
+  });
+
   test("D6: a malformed carried entry fails closed, offline and online, and never throws", async () => {
-    for (const bad of [null, "off", 42, true, [], ["off"], {}, { mode: 7 }, { assistPermitted: false }, { mode: "byo", assistPermitted: true }]) {
+    for (const bad of [
+      null,
+      "off",
+      42,
+      true,
+      [],
+      ["off"],
+      {},
+      { mode: 7 },
+      { assistPermitted: false },
+      { mode: "byo", assistPermitted: true },
+      // A deny by isPolicyDeny that the gate would still enable: a mode it does not know.
+      { mode: "bogus", assistPermitted: false },
+    ]) {
       const label = JSON.stringify(bad);
       const store = memStore({ [AI_POLICY_DENY_KEY]: { [aiPolicyCacheKey(CENTRAL)]: bad } });
       const offline = await unreachable(store, LOCAL, cliByo, false);

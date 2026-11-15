@@ -165,8 +165,8 @@ export function buildConnObj(state: WizardState): WizardConnObj {
  * denies an unlisted outbound host by default. With no flag it reads `./messagefoundry.toml` in the
  * workspace, and only if that file exists.
  *
- * A set setting is always passed, whether or not its file exists, even where it spells the default
- * name. The CLI then refuses a missing file and names it, rather than checking the edit against a
+ * A set setting that is not blank is always passed, whether or not its file exists, even where it
+ * spells the default name. The CLI then refuses a missing file and names it, rather than checking the edit against a
  * file the setting did not name. A non-string setting, which only a hand edit produces, is passed
  * as an empty string, and `connection` refuses it as blank.
  *
@@ -177,7 +177,9 @@ export function buildConnObj(state: WizardState): WizardConnObj {
  * so a new workspace can still edit its connections.
  *
  * Start and Restart read the setting through this same function (`startServiceConfigValue` in
- * engineControlModel.ts is it), so one setting never names two files.
+ * engineControlModel.ts is it), so the two never resolve one setting to two files. The alert and
+ * security editors and the certificate inventory do not use it yet: they pass the setting as it
+ * is, so a blank one is refused there.
  */
 export function connectionServiceConfig(setting: unknown, isSet: boolean): string | undefined {
   if (!isSet) {

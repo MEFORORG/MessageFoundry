@@ -199,10 +199,11 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   user or workspace settings (a folder value is ignored), every connection edit passes it as
   `--service-config`, whether or not the file exists, so a missing file fails the edit with
   `service config not found` rather than letting it be checked against another file. A blank
-  setting is passed too, and `connection` refuses it as blank. Setting it to the default name, in
+  setting counts as unset for connection edits, as it does for Start and Restart, so the flag is
+  left off. Setting it to the default name, in
   user settings too, counts as set, so a workspace without that file cannot save a connection edit
   until the file exists or the setting is cleared. The flag is left off at least when
-  the setting is unset; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
+  the setting is unset or blank; the engine CLI then reads the workspace's `messagefoundry.toml` if there is
   one, the file this setting's default names, and no file if not.
 - `messagefoundry.engineUrl` (default `https://127.0.0.1:8765`) — engine API URL used by
   *Stage → Promote* when no named environments are configured. **Machine-scoped** (a workspace file

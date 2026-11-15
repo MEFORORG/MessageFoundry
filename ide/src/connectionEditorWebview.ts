@@ -365,13 +365,16 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
     // select takes the matching choice with its JSON type; a number or a bool is converted when the
     // text is one; anything else, and text that does not convert, is posted verbatim, so the
     // engine's validator refuses what the user typed rather than this page guessing.
+    const DECIMAL_TEXT = /^-?(\\d+(\\.\\d+)?|\\.\\d+)([eE][-+]?\\d+)?$/;
     function typedValue(f, raw) {
       if (f.control === 'table' || (f.value !== null && typeof f.value === 'object')) return parseTable(raw);
       if (f.control === 'select') {
         const hit = (f.choices || []).find((c) => String(c) === raw);
         return hit !== undefined ? hit : raw;
       }
-      if (f.type === 'int' || f.type === 'float') { const n = Number(raw); return Number.isFinite(n) ? n : raw; }
+      // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
+      // and a leading '+', which would post a number the user never typed.
+      if (f.type === 'int' || f.type === 'float') return DECIMAL_TEXT.test(raw) ? Number(raw) : raw;
       if (f.type === 'bool') return raw === 'true' ? true : raw === 'false' ? false : raw;
       return raw;
     }
