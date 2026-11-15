@@ -1882,12 +1882,32 @@ def test_a_rollback_that_removes_the_store_only_after_the_teardown_reports_the_l
     shutil.rmtree(leftover)
 
 
-def test_a_spare_that_cannot_be_recorded_keeps_its_directory_from_every_sweep(
+def test_a_spare_marker_that_cannot_be_written_refuses_the_placement(
     tmp_path, key_b64, capsys
 ) -> None:
-    # Where the marker cannot be written, the spare holds for that run alone, so the directory
-    # loses the mark a sweep needs before the run lets go of its lock, and no later sweep touches
-    # the staged name, even on a volume that reports one link.
+    # The marker is written just before the placement's link. Where it cannot be, the restore
+    # refuses while nothing is placed, rather than place a second name for the restored store
+    # that a crash could leave unmarked, or withhold a directory that a crash would then leave
+    # holding the whole decrypted archive where no sweep could ever prove it abandoned.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "_write_spare_marker", lambda item, reason: False)
+        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
+    err = _refusal(capsys)
+    assert "restore failed (destination)" in err and "nothing was placed" in err, err
+    # The restore removes the directory it made for --to only once it is empty, so its absence
+    # shows no store was placed and the staging directory went too.
+    assert not dest.parent.exists()
+
+
+def test_a_relabel_that_cannot_be_recorded_keeps_its_directory_from_every_sweep(
+    tmp_path, key_b64, capsys
+) -> None:
+    # Where a spare's relabel to `rollback-failed` cannot be written, the marker still reads
+    # `restored-store`, so the directory loses the mark a sweep needs before the run lets go of
+    # its lock, and no later sweep touches the staged name, even on a volume that reports one
+    # link. The teardown used to ask only whether a marker existed, and re-marked the directory.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored" / "msg.db"
     real_release = dr_backup._Staging.release
@@ -1900,16 +1920,20 @@ def test_a_spare_that_cannot_be_recorded_keeps_its_directory_from_every_sweep(
 
     with pytest.MonkeyPatch.context() as mp:
         _restore_staging_that_cannot_be_removed(mp)
-        _hold(mp, _is_staged_store)
-        mp.setattr(dr_backup, "_write_spare_marker", lambda item, reason: False)
+        _hold(
+            mp, lambda p: _is_staged_store(p) or (p.name, p.parent.name) == ("msg.db", "restored")
+        )
+        _refuse_marker_reason(mp, "rollback-failed")
         mp.setattr(dr_backup._Staging, "release", release)
-        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
+        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
+        assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
     capsys.readouterr()
     assert marked_at_release and not any(marked_at_release), marked_at_release
     (leftover,) = dest.parent.glob("mefor-restore-*")
     staged = leftover / "extracted_store.db"
     size = staged.stat().st_size
-    assert not (leftover / ".lock-held").exists()
+    assert (leftover / "extracted_store.db.mefor-spared").read_bytes() == b"restored-store"
+    assert not (leftover / ".lock-held").exists(), "the teardown undid the withholding"
     # The lock file stays, so a config walk still prunes the directory as staging.
     assert dr_backup._is_staging_dir(leftover)
     with pytest.MonkeyPatch.context() as mp:
@@ -1917,7 +1941,6 @@ def test_a_spare_that_cannot_be_recorded_keeps_its_directory_from_every_sweep(
         owner = dr_backup._owner_of(leftover)
         assert dr_backup._sweep_abandoned_staging(dest.parent, owner=owner, own=dest) == 0
     assert staged.stat().st_size == size
-    assert asyncio.run(_read_back(dest, key_b64)) == (1, _RAW_BODY)
     shutil.rmtree(leftover)
 
 
@@ -1993,8 +2016,17 @@ def test_a_placement_that_fails_leaves_no_spare_on_the_staged_copy(
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored" / "msg.db"
 
-    def refuse(src: Path, dest: Path) -> int:
-        raise OSError(28, "No space left on device")
+    real_place = dr_backup._place_restored_store
+
+    def refuse(src: Path, dest: Path, **kwargs: Any) -> int:
+        # The marker lands as the real placement writes it, then the link fails.
+        def link(*args: Any) -> None:
+            raise OSError(28, "No space left on device")
+
+        with pytest.MonkeyPatch.context() as inner:
+            inner.setattr(os, "link", link)
+            inner.setattr(shutil, "copyfileobj", link)
+            return real_place(src, dest, **kwargs)
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(dr_backup, "_place_restored_store", refuse)
@@ -2003,6 +2035,55 @@ def test_a_placement_that_fails_leaves_no_spare_on_the_staged_copy(
     # The restore removes the directory it made for --to only once it is empty, so its absence
     # shows the staging directory went too.
     assert not dest.parent.exists()
+
+
+def test_a_lost_create_race_leaves_the_winner_alone_and_no_spare(tmp_path, key_b64, capsys) -> None:
+    # Another restore wins the exclusive create at --to between the checks and the link. The
+    # marker this restore wrote spares nothing then, and the winner's store is untouched.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+
+    def link(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        with open(dst, "xb") as fh:
+            fh.write(b"the other restore's store")
+        raise FileExistsError(17, "File exists", os.fspath(dst))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "link", link)
+        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 1
+    assert "restore failed (destination)" in _refusal(capsys)
+    assert dest.read_bytes() == b"the other restore's store"
+    _no_staging_left(dest.parent)
+
+
+def test_a_copy_placement_unspares_the_staged_store_before_the_copy(
+    tmp_path, key_b64, capsys
+) -> None:
+    # Where links are unavailable the store is placed by a copy, which never makes the staged
+    # store a second name for it. The marker goes before the copy starts, so a crash mid-copy
+    # leaves no marker keeping a full decrypted store from every later sweep.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dest = tmp_path / "restored" / "msg.db"
+    real_copy = shutil.copyfileobj
+    marked_at_copy: list[bool] = []
+
+    def no_link(*args: Any, **kwargs: Any) -> None:
+        raise OSError(1, "Operation not permitted")
+
+    def copy(src: Any, dst: Any, *args: Any) -> None:
+        name = getattr(src, "name", "")
+        if isinstance(name, str) and name.endswith("extracted_store.db"):
+            marked_at_copy.append(Path(name + dr_backup._SPARE_SUFFIX).exists())
+        real_copy(src, dst, *args)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "link", no_link)
+        mp.setattr(shutil, "copyfileobj", copy)
+        assert main(["restore", archive, "--to", str(dest), "--service-config", toml]) == 0
+    capsys.readouterr()
+    assert marked_at_copy == [False], marked_at_copy
+    _no_staging_left(dest.parent)
+    assert asyncio.run(_read_back(dest, key_b64)) == (1, _RAW_BODY)
 
 
 def _refuse_marker_reason(mp: pytest.MonkeyPatch, refused: str) -> None:
@@ -2015,30 +2096,40 @@ def _refuse_marker_reason(mp: pytest.MonkeyPatch, refused: str) -> None:
     )
 
 
-def test_a_relabel_that_fails_over_an_older_marker_keeps_the_directory_withheld(
-    tmp_path, key_b64, capsys
+@pytest.mark.parametrize("refused", ["open", "ftruncate"])
+def test_a_release_that_does_not_land_leaves_the_spare_and_says_so(
+    tmp_path, caplog, refused
 ) -> None:
-    # The rollback could not remove the placed store, and the marker could not be relabelled
-    # `rollback-failed`, so it still reads `restored-store`. The restore withholds the directory
-    # from every sweep; the teardown used to ask only whether a marker existed, and re-marked it.
-    archive, toml = _make_archive(tmp_path, key_b64, capsys)
-    dest = tmp_path / "restored" / "msg.db"
-    with pytest.MonkeyPatch.context() as mp:
-        _restore_staging_that_cannot_be_removed(mp)
-        _hold(
-            mp, lambda p: _is_staged_store(p) or (p.name, p.parent.name) == ("msg.db", "restored")
-        )
-        _refuse_marker_reason(mp, "rollback-failed")
-        mp.setattr(dr_backup, "_MAX_CONFIG_MEMBERS", 1)
-        assert main(_restore_argv(archive, toml, dest, tmp_path / "bundle")) == 1
-    assert "member-count cap" in _refusal(capsys)
-    (leftover,) = dest.parent.glob("mefor-restore-*")
-    assert (leftover / "extracted_store.db.mefor-spared").read_bytes() == b"restored-store"
-    assert not (leftover / ".lock-held").exists(), "the teardown undid the withholding"
-    owner = dr_backup._owner_of(leftover)
-    assert dr_backup._sweep_abandoned_staging(dest.parent, owner=owner, own=tmp_path / "x") == 0
-    assert (leftover / "extracted_store.db").stat().st_size > 0
-    shutil.rmtree(leftover)
+    # Neither the unlink nor the in-place rewrite lands, or the rewrite cannot be cut to length
+    # (it then reads `released-store`, a reason nobody wrote). Either way the marker still
+    # spares the file, never reads empty, and the release reports failure at ERROR.
+    staging = tmp_path / "mefor-restore-x"
+    staging.mkdir()
+    item = staging / "extracted_store.db"
+    item.write_bytes(b"synthetic")
+    assert dr_backup._write_spare_marker(item, "restored-store")
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise PermissionError(13, "held open by a scanner")
+
+    real_open = os.open
+
+    def open_(path: Any, flags: int, *args: Any) -> int:
+        if flags & os.O_WRONLY:
+            raise PermissionError(13, "held open by a scanner")
+        return real_open(path, flags, *args)
+
+    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR, dr_backup.log.name):
+        _hold_markers(mp)
+        if refused == "open":
+            mp.setattr(os, "open", open_)
+        else:
+            mp.setattr(os, "ftruncate", refuse)
+        assert dr_backup._release_spare_marker(item) is False
+    marker = dr_backup._spare_marker(item).read_bytes()
+    assert marker == (b"restored-store" if refused == "open" else b"released-store"), marker
+    assert any("spared no longer" in r.getMessage() for r in caplog.records)
+    assert "extracted_store.db" in (dr_backup._spared_items(staging, None) or {})
 
 
 def test_a_late_relabel_that_fails_withholds_the_directory_and_says_so(

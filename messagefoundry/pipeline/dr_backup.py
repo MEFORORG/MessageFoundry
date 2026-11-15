@@ -2047,6 +2047,8 @@ def _empty_files_in_place(staging: Path, *, spared: Mapping[str, str] | None = N
             unproven.append(reason)
 
     spares = spared or {}
+    # Only a restore writes a spare marker, so only a restore's directory is read for one.
+    reads_markers = staging.name.startswith(_RESTORE_STAGING_PREFIX)
 
     def _is_spared(at_root: bool, name: str) -> bool:
         if not at_root:
@@ -2058,7 +2060,9 @@ def _empty_files_in_place(staging: Path, *, spared: Mapping[str, str] | None = N
         if target is None:
             return False
         # A marker reading `released` holds that word alone; emptied, it would read as a spare.
-        return target in spares or _read_spare_reason(staging / name) == _SPARE_RELEASED
+        return target in spares or (
+            reads_markers and _read_spare_reason(staging / name) == _SPARE_RELEASED
+        )
 
     walked = False
     if sys.platform == "win32":
@@ -2878,15 +2882,16 @@ def _record_spare(item: Path, reason: str) -> bool:
     return False
 
 
-def _clear_spare_marker(item: Path) -> bool:
+def _clear_spare_marker(item: Path, *, level: int = logging.ERROR) -> bool:
     """Remove ``item``'s spare marker, once nothing needs it spared. Never raises; ``False``,
-    logged, when the marker is still there and so still spares ``item``."""
+    logged at ``level``, when the marker is still there and so still spares ``item`` (a caller
+    for which that has no consequence, or that recovers it, passes a lower level)."""
     try:
         os.unlink(_spare_marker(item))
     except FileNotFoundError:
         pass
     except OSError as exc:
-        log.error("could not remove the spare marker of %s: %s", item, safe_exc(exc))
+        log.log(level, "could not remove the spare marker of %s: %s", item, safe_exc(exc))
         return False
     return True
 
@@ -2900,38 +2905,60 @@ def _release_spare_marker(item: Path) -> bool:
     before it is cut to length, so a failure leaves the old reason or an unknown one, both still a
     spare, and never an empty marker. Never raises; ``False``, logged, when the marker may still
     spare ``item``."""
-    if _clear_spare_marker(item):
+    if _clear_spare_marker(item, level=logging.WARNING):
         return True
     marker = _spare_marker(item)
     flags = os.O_WRONLY | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK
     try:
-        fd = os.open(marker, flags)
-        try:
-            os.write(fd, _SPARE_RELEASED.encode("ascii"))
-            os.ftruncate(fd, len(_SPARE_RELEASED))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        refused = _not_a_plain_marker(marker)
+        if refused is None:
+            fd = os.open(marker, flags)
+            try:
+                os.write(fd, _SPARE_RELEASED.encode("ascii"))
+                os.ftruncate(fd, len(_SPARE_RELEASED))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
     except OSError as exc:
-        reason = safe_exc(exc)
-    else:
+        refused = safe_exc(exc)
+    if refused is None:
         if _read_spare_reason(marker) == _SPARE_RELEASED:
             return True
-        reason = "it did not read back"
+        refused = "it did not read back"
     log.error(
         "could not record that %s is spared no longer, so its marker may still spare it from "
         "every later sweep: delete its directory by hand: %s",
         item,
-        reason,
+        refused,
     )
     return False
 
 
+def _not_a_plain_marker(marker: Path) -> str | None:
+    """Why ``marker`` must not be opened by name as a spare marker, or ``None``: it must be a
+    regular file, unfollowed, and on Windows neither a reparse point (``_O_NOFOLLOW`` is 0 there)
+    nor a name Windows opens as another object, such as a device (:func:`_win_opens_another`).
+    Raises ``OSError`` when it cannot be ``lstat``'ed."""
+    st = os.lstat(marker)
+    if not stat.S_ISREG(st.st_mode):
+        return "not a regular file"
+    if sys.platform == "win32" and (
+        getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        or _win_opens_another(marker)
+    ):
+        return "a name Windows opens as another object"
+    return None
+
+
 def _read_spare_reason(marker: Path) -> str:
     """The reason a spare marker holds, or ``""`` when it cannot be read as one, logged unless the
-    marker is simply not there."""
+    marker is simply not there. A name :func:`_not_a_plain_marker` refuses is not opened."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK
     try:
+        refused = _not_a_plain_marker(marker)
+        if refused is not None:
+            log.warning("did not read the spare marker %s: %s", marker, refused)
+            return ""
         fd = os.open(marker, flags)
         try:
             return os.read(fd, 64).decode("ascii")
@@ -4948,7 +4975,8 @@ def _restore_blocking(
     completed = False
     store_removed = False
     # What the staging teardown must neither unlink nor truncate: the staged store, while it is
-    # still a name for the placed one (set below, only when its unlink after placement is refused).
+    # or may become a name for the placed one (set just before the placement, and unset or given
+    # an empty reason, which unspares it, on every path that finds it no such name).
     # A spare marker beside it records that for every later teardown and sweep too (BACKLOG #5617).
     spared_item: Path | None = None
     spared_reason = _SPARE_RESTORED
@@ -5204,14 +5232,20 @@ def _restore_blocking(
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
             # `published` flips only once the store at `dest_store_path` is one THIS call made.
-            # The staged store is marked spared BEFORE the placement can make it a second name for
-            # the restored store, so no crash point leaves that name unmarked for a later sweep's
-            # fail-safe (BACKLOG #5617). Every path below that finds it no such name unspares it.
+            # The staged store is marked spared just BEFORE the placement's link can make it a
+            # second name for the restored store, so no crash point leaves that name unmarked for a
+            # later sweep's fail-safe, and unspared before a copy placement, which makes it no
+            # such name (BACKLOG #5617). A marker that cannot be written refuses the placement,
+            # while nothing is placed yet. Every path below that finds it no such name unspares it.
             spared_item = snap
-            _record_spare(snap, spared_reason)
             try:
                 try:
-                    store_bytes = _place_restored_store(snap, dest_store_path)
+                    store_bytes = _place_restored_store(
+                        snap,
+                        dest_store_path,
+                        before_link=lambda: _spare_before_link(snap),
+                        before_copy=lambda: _release_spare_marker(snap),
+                    )
                 except BaseException:
                     if not (
                         _still_there(dest_store_path) and _names_same_file(snap, dest_store_path)
@@ -5245,7 +5279,7 @@ def _restore_blocking(
                     spared_item, spared_reason = _unspare(snap)
             else:
                 # The name is gone, so its marker spares nothing even where it will not clear.
-                _clear_spare_marker(snap)
+                _clear_spare_marker(snap, level=logging.WARNING)
                 spared_item = None
 
             # The config bundle is written AFTER the store, and every way it can fail used to leave
@@ -5287,6 +5321,11 @@ def _restore_blocking(
                 spared_item, spared_reason = _unspare(spared_item)
             elif _drop_staged_name(spared_item):
                 spared_item = None
+            elif not published:
+                # The placement raised with the staged name possibly a name for the file at --to,
+                # which this restore did not publish and so does not roll back: it stays spared as
+                # it is, under the reason already written.
+                pass
             else:
                 # The rollback could not remove the placed store, so the staged name stays a name
                 # for it, and once the operator deletes that store it is the only decrypted copy.
@@ -5387,7 +5426,7 @@ def _restore_blocking(
                         "it, kept unemptied; %s: delete it by hand",
                         dest_store_path,
                         spared_item,
-                        "every sweep reports it"
+                        "its marker says so"
                         if relabelled
                         else "its marker could not be relabelled and still reads its earlier "
                         "reason, so no sweep removes its directory",
@@ -5582,12 +5621,30 @@ def _unspare(item: Path) -> tuple[Path | None, str]:
     return (None if _release_spare_marker(item) else item), ""
 
 
+def _spare_before_link(item: Path) -> None:
+    """Mark a restore's staged store spared before the placement's link, or refuse the placement
+    while nothing is placed: a link with no marker beside it could, through a crash, leave a
+    later sweep's fail-safe a second name for the restored store (BACKLOG #5617)."""
+    if not _write_spare_marker(item, _SPARE_RESTORED):
+        raise BackupError(
+            "destination",
+            f"could not record, in {item.parent}, that the staged store must not be removed once "
+            "the restored store is placed, so nothing was placed",
+        )
+
+
 def _names_same_file(item: Path, other: Path) -> bool:
-    """Whether ``item`` and ``other`` name one file. ``True`` when that is not known: for a spare,
-    the safe answer."""
+    """Whether ``item`` and ``other`` name one file. ``True``, logged, when that is not known: for
+    a spare, the safe answer."""
     try:
         return os.path.samefile(item, other)
-    except OSError:
+    except OSError as exc:
+        log.warning(
+            "could not tell whether %s is a name for %s, so it is kept as one: %s",
+            item,
+            other,
+            safe_exc(exc),
+        )
         return True
 
 
@@ -5900,7 +5957,13 @@ def _is_within(root: Path, path: Path) -> bool:
     return _norm_for_compare(path).is_relative_to(_norm_for_compare(root))
 
 
-def _place_restored_store(src: Path, dest: Path) -> int:
+def _place_restored_store(
+    src: Path,
+    dest: Path,
+    *,
+    before_link: Callable[[], object] | None = None,
+    before_copy: Callable[[], object] | None = None,
+) -> int:
     """Put the verified ``store.db`` at ``dest`` without ever overwriting, and return its size.
 
     A hard link first: ``src`` was staged on the destination's own volume, so this costs nothing where
@@ -5908,18 +5971,26 @@ def _place_restored_store(src: Path, dest: Path) -> int:
     check-then-write race that a concurrent creator could otherwise slip through. Where links are
     unavailable (FAT, some SMB shares) the fallback is an EXCLUSIVE-create copy, which has the same
     never-overwrite property. Either way the restored file is a full copy of the PHI-bearing store, so
-    it is locked down the way ``Store.snapshot_to`` locks its own output down."""
+    it is locked down the way ``Store.snapshot_to`` locks its own output down.
+
+    ``before_link`` runs just before the link, and may raise to refuse the placement;
+    ``before_copy`` just before the copy fallback. The restore marks and unmarks ``src`` spared
+    with them (BACKLOG #5617)."""
     # Reuse the store's own PHI-at-rest primitive rather than a second chmod/icacls path. It is the
     # store-trio rule, not bare _secure_file: restored into a hardened data directory, an owner-only
     # file would lock the service account out of the store it is about to open (ADR 0183 Wave 0b).
     from messagefoundry.store.store import _secure_store_file, _store_dir_grants
 
     size = src.stat().st_size
+    if before_link is not None:
+        before_link()
     try:
         os.link(src, dest)
     except FileExistsError:
         raise
     except OSError:
+        if before_copy is not None:
+            before_copy()
         # The exclusive create sits OUTSIDE the cleanup guard on purpose: a lost create race raises
         # FileExistsError here, and the file then at ``dest`` belongs to the winner — deleting it would
         # turn a refusal into the unrecoverable overwrite the refusal exists to prevent.

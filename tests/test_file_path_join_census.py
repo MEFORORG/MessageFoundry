@@ -806,8 +806,8 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place._is_spared": Site(
         1,
         INTERNAL,
-        "A spare marker's name, listed by the fail-safe's own walk at the top of a staging "
-        "directory, opened unfollowed and read only.",
+        "A spare marker's name, listed by the fail-safe's own walk at the top of a restore's "
+        "staging directory, lstat'ed as a plain file (_not_a_plain_marker) and read only.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_spare_marker": Site(
         1, INTERNAL, "A fixed suffix on the name of a file in a staging directory this module made."
@@ -816,7 +816,7 @@ SITES: dict[str, Site] = {
         2,
         INTERNAL,
         "Names listed from, or spared by this module's restore in, a staging directory this "
-        "module created; a marker is opened unfollowed and read only.",
+        "module created; a marker is lstat'ed as a plain file (_not_a_plain_marker) and read only.",
     ),
     "messagefoundry/pipeline/dr_backup.py::_withhold_from_sweep": Site(1, INTERNAL, _STAGING),
     "messagefoundry/pipeline/dr_backup.py::_tree_size": Site(
