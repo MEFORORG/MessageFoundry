@@ -4943,10 +4943,11 @@ def unheld_seal_refusal(outcome: ResealOutcome, *, before_writes: bool) -> Ciphe
 
     ``before_writes`` says which check fired. The pre-flight read runs before any re-seal or cell
     pass writes. The passes never write over a seal under a key the run does not hold, so with
-    nothing else writing it sees every such seal. The check after the passes reads once, and
-    neither read is atomic against a writer running alongside, such as an engine left running. A
-    seal such a writer commits during the run may be missed, or counted refused, rather than
-    stopping the run. The text names only tables and non-secret seal key ids."""
+    nothing else writing it sees every such seal. The check after the passes reads the tables it
+    checks once. The reads and the passes are separate transactions, so neither read is atomic
+    against a writer running alongside, such as an engine left running. A seal such a writer
+    commits during the run may be missed, or counted refused, rather than stopping the run. The
+    text names only tables and non-secret seal key ids."""
     done = (
         "Nothing was written by this pass: the check ran before any re-seal or re-encryption."
         if before_writes
