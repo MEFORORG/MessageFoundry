@@ -50,6 +50,7 @@ from typing import Any
 import pytest
 
 from tests._dead_pid import never_live_pid
+from tests.test_worktree_remove_path import _is_link
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "worktree" / "prune-merged.ps1"
 
@@ -141,8 +142,20 @@ def _age_reflog(gitdir: Path, when: float) -> None:
     os.utime(log, (when, when))
 
 
-def _backdate(primary: Path, worktree: Path, hours: float) -> None:
-    """Age a worktree's PRIVATE git metadata so the activity veto releases it."""
+#: The caches whose files worktree-gates.ps1 Get-WorkingTreeActivity reads,
+#: its $WORKING_TREE_ACTIVITY_CACHES.
+_ACTIVITY_CACHES = (".pytest_cache", ".ruff_cache", ".mypy_cache")
+
+
+def _backdate(primary: Path, worktree: Path, hours: float, *, working_tree: bool = True) -> None:
+    """Age a worktree's PRIVATE git metadata, and by default its working tree, so the activity veto
+    releases it.
+
+    Signal 2 reads both (BACKLOG #5603): the working tree as Get-WorkingTreeActivity does, its top
+    folder, each entry directly under it, and the files in the three caches. ``working_tree=False``
+    ages the git metadata alone, for a test of the working-tree reading. A link is not followed, so
+    nothing outside the tree is touched.
+    """
     gitdir = _gitdir(worktree)
     when = time.time() - hours * 3600
     for rel in (*_GITDIR_FILES, "logs/HEAD"):
@@ -150,6 +163,15 @@ def _backdate(primary: Path, worktree: Path, hours: float) -> None:
         if f.exists():
             os.utime(f, (when, when))
     _age_reflog(gitdir, when)
+    if not working_tree:
+        return
+    entries = [worktree, *(e for e in worktree.iterdir() if not _is_link(e))]
+    for cache in _ACTIVITY_CACHES:
+        top = worktree / cache
+        if top.is_dir() and not _is_link(top):
+            entries += [f for f in top.rglob("*") if f.is_file() and not _is_link(f)]
+    for entry in entries:
+        os.utime(entry, (when, when))
 
 
 class Fixture:
@@ -1019,7 +1041,7 @@ def test_disabled_activity_veto_is_declared(fx: Fixture, sleeper: int) -> None:
     live_record(fx, sleeper, fx.primary)
     res = run(fx, "-IdleHours", "0")
     assert res["fence"]["activityVeto"] is False
-    assert any("activity veto DISABLED" in r for r in res["fence"]["reducedAssurance"])
+    assert any("recent-activity veto lifted" in r for r in res["fence"]["reducedAssurance"])
 
     text = run_text(fx, "-IdleHours", "0").stdout
     assert "REDUCED ASSURANCE" in text
@@ -1065,6 +1087,500 @@ def test_disqualifiers(readonly_fx: Fixture, sleeper: int, slug: str, needle: st
     d = by_leaf(res, slug)
     assert d["Decision"] == "SKIP"
     assert needle in d["Reason"]
+
+
+def _exclude(fx: Fixture, *patterns: str) -> None:
+    """Ignore ``patterns`` through info/exclude, which is in the common git dir, so it ignores them
+    in every tree of the family."""
+    exclude = fx.primary / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as f:
+        f.writelines(f"{p}\n" for p in patterns)
+
+
+def _hide_work(fx: Fixture, kind: str) -> None:
+    """Put work in ``repo-clean`` that ``git status --porcelain`` does not show."""
+    wt = fx.sibling("clean")
+    if kind in ("skip-worktree", "assume-unchanged"):
+        _git(wt, "update-index", f"--{kind}", "seed.txt")
+        (wt / "seed.txt").write_text("an edit status cannot see", encoding="utf-8")
+    elif kind == "ignored":
+        _exclude(fx, "*.db")
+        (wt / "dev.db").write_text("a dev store, not regenerable", encoding="utf-8")
+    elif kind == "nested":
+        # Below an IGNORED (and otherwise tolerated) directory, so status lists only `.venv/`.
+        clone = wt / ".venv" / "lib" / "clone"
+        clone.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(clone)], check=True, capture_output=True)
+        (clone / "work.txt").write_text("uncommitted work in a nested checkout", encoding="utf-8")
+    else:
+        raise AssertionError(kind)
+
+
+@pytest.mark.parametrize(
+    ("kind", "needle"),
+    [
+        ("skip-worktree", "1 file(s) flagged skip-worktree or assume-unchanged"),
+        ("assume-unchanged", "1 file(s) flagged skip-worktree or assume-unchanged"),
+        ("ignored", "ignored entr(ies) that are not a regenerable cache"),
+        ("nested", "a nested git checkout at .venv/lib/clone/.git"),
+    ],
+)
+def test_work_git_status_cannot_see_is_never_pruned(
+    fx: Fixture, sleeper: int, kind: str, needle: str
+) -> None:
+    """BACKLOG #5603. Status alone read these trees clean, and --force deletes what it cannot see.
+
+    Positive control in the same run: ``gone`` is still removed, so the skip is not a run refusing
+    everything. ``test_clean_merged_unoccupied_is_pruned`` is the same tree with nothing hidden.
+    """
+    live_record(fx, sleeper, fx.primary)
+    _hide_work(fx, kind)
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP", d
+    assert any(needle in r for r in d["Reasons"]), d["Reasons"]
+    assert d["Clean"] is False
+    assert fx.sibling("clean").exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def _populate_mypy_cache(fx: Fixture) -> Path:
+    """A ``.mypy_cache`` as mypy's SQLite cache leaves it, ignored through info/exclude.
+
+    The names are what a real tree holds, ``cache.db`` and the sharded ``cache.N.db``, in mypy's
+    ``<python-version>/`` folder, with no ``-wal``/``-shm`` sidecar, as mypy leaves the cache once it
+    has closed it. The info/exclude rule stands
+    in for this repository's own top-level ``.mypy_cache/`` rule in ``.gitignore``, which the
+    ignored-entry read needs to list the directory as one regenerable entry.
+    """
+    wt = fx.sibling("clean")
+    _exclude(fx, ".mypy_cache/")
+    ver = wt / ".mypy_cache" / "3.14"
+    ver.mkdir(parents=True)
+    for name in ("cache.db", "cache.0.db", "cache.15.db"):
+        (ver / name).write_bytes(b"SQLite format 3\x00")
+    (wt / ".mypy_cache" / ".gitignore").write_text("*\n", encoding="utf-8")
+    return wt
+
+
+def test_a_populated_mypy_cache_does_not_hold_a_clean_tree(fx: Fixture, sleeper: int) -> None:
+    """mypy's own SQLite cache is the regenerable cache ``.mypy_cache`` is tolerated as, not data."""
+    live_record(fx, sleeper, fx.primary)
+    _populate_mypy_cache(fx)
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "PRUNE", d
+    assert d["Outcome"] == "removed", d
+    assert not fx.sibling("clean").exists()
+
+
+@pytest.mark.parametrize(
+    ("planted", "needle"),
+    [
+        # Inside the cache, beside mypy's files, but not one of mypy's names.
+        (
+            ".mypy_cache/3.14/dev.db",
+            "a data file inside a cache directory at .mypy_cache/3.14/dev.db",
+        ),
+        # mypy's name and version folder, but in another cache directory.
+        (
+            ".pytest_cache/3.14/cache.0.db",
+            "a data file inside a cache directory at .pytest_cache/3.14/cache.0.db",
+        ),
+        # mypy's name, but at the cache's top rather than in a version folder.
+        (".mypy_cache/cache.db", "a data file inside a cache directory at .mypy_cache/cache.db"),
+        # mypy's name, but in a folder not named like a Python version.
+        (
+            ".mypy_cache/tmp/cache.db",
+            "a data file inside a cache directory at .mypy_cache/tmp/cache.db",
+        ),
+        # The sidecars of mypy's cache: there while a connection holds the cache open.
+        (
+            ".mypy_cache/3.14/cache.0.db-wal",
+            "a data file inside a cache directory at .mypy_cache/3.14/cache.0.db-wal",
+        ),
+        (
+            ".mypy_cache/3.14/cache.0.db-shm",
+            "a data file inside a cache directory at .mypy_cache/3.14/cache.0.db-shm",
+        ),
+        (
+            ".mypy_cache/3.14/cache.db-journal",
+            "a data file inside a cache directory at .mypy_cache/3.14/cache.db-journal",
+        ),
+        # mypy's name in another case: the match is case-sensitive.
+        (
+            ".mypy_cache/3.14/CACHE.7.DB",
+            "a data file inside a cache directory at .mypy_cache/3.14/CACHE.7.DB",
+        ),
+    ],
+)
+def test_other_data_beside_a_mypy_cache_still_holds_the_tree(
+    fx: Fixture, sleeper: int, planted: str, needle: str
+) -> None:
+    """POSITIVE CONTROL for the exemption: it covers mypy's names in mypy's folder and nothing else.
+
+    ``gone`` is still removed in the same run, so the skip is this tree's own.
+    """
+    live_record(fx, sleeper, fx.primary)
+    wt = _populate_mypy_cache(fx)
+    _exclude(fx, ".pytest_cache/")
+    target = wt / planted
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("a dev store, not regenerable", encoding="utf-8")
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP", d
+    assert any(needle in r for r in d["Reasons"]), d["Reasons"]
+    assert wt.exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def test_a_db_outside_the_caches_still_holds_a_tree_with_a_mypy_cache(
+    fx: Fixture, sleeper: int
+) -> None:
+    """POSITIVE CONTROL: a real ``.db`` outside every cache, ignored, still refuses the tree."""
+    live_record(fx, sleeper, fx.primary)
+    wt = _populate_mypy_cache(fx)
+    _hide_work(fx, "ignored")
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP", d
+    # The entry named is dev.db, not one of mypy's files listed one by one.
+    assert any(
+        "1 ignored entr(ies) that are not a regenerable cache" in r and "dev.db)" in r
+        for r in d["Reasons"]
+    ), d["Reasons"]
+    assert wt.exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def test_a_freshly_written_mypy_cache_holds_a_tree_whose_git_metadata_is_idle(
+    fx: Fixture, sleeper: int
+) -> None:
+    """BACKLOG #5603. A session that ran mypy and no git command moves only mypy's cache files.
+
+    Once the walk stopped reading those files as data, the git metadata was the only idle reading
+    left, and it cannot see that run. The working-tree reading can. ``cache.0.db`` is touched in
+    place, as a second mypy run leaves it, so neither the top folder nor any entry under it moves:
+    only the read inside ``.mypy_cache`` sees it.
+    """
+    live_record(fx, sleeper, fx.primary)
+    wt = _populate_mypy_cache(fx)
+    _backdate(fx.primary, wt, hours=100)
+    os.utime(wt / ".mypy_cache" / "3.14" / "cache.0.db", None)
+    d = by_leaf(run(fx, "-Apply"), "clean")
+    assert d["Decision"] == "SKIP", d
+    assert d["Reason"].startswith("recently active (the working tree was written"), d["Reasons"]
+    assert wt.exists()
+
+    # Control: the same tree, with the cache as old as the rest, prunes in the default window.
+    _backdate(fx.primary, wt, hours=100)
+    d = by_leaf(run(fx, "-Apply"), "clean")
+    assert d["Decision"] == "PRUNE", d
+    assert d["Outcome"] == "removed", d
+    assert not wt.exists()
+
+
+def test_the_cache_list_backdate_ages_mirrors_the_gates() -> None:
+    """``_backdate`` ages the caches the working-tree reading dates. A cache added to the gates and
+    not here would leave every tree planting it read as recently active, for a reason no test names."""
+    gates_src = (SCRIPT.parent / "worktree-gates.ps1").read_text(encoding="utf-8")
+    ours = re.search(r"\$WORKING_TREE_ACTIVITY_CACHES = @\(([^)]*)\)", gates_src)
+    assert ours, "the instrument found no list to compare"
+    assert tuple(re.findall(r"'([^']+)'", ours.group(1))) == _ACTIVITY_CACHES
+
+
+def test_the_working_tree_reading_refuses_an_unset_cache_list(tmp_path: Path) -> None:
+    """BACKLOG #5603. A lost cache list would read no cache, so a tree a test run just wrote to would
+    read idle: Get-WorkingTreeActivity returns unknown instead. The first call, with the list as the
+    gates set it, is the control."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "f.txt").write_text("x\n", encoding="utf-8")
+    command = (
+        f". '{SCRIPT.parent / 'worktree-gates.ps1'}'; "
+        "$a = Get-WorkingTreeActivity -Path $env:T_TREE; "
+        "$WORKING_TREE_ACTIVITY_CACHES = $null; "
+        "$b = Get-WorkingTreeActivity -Path $env:T_TREE; "
+        "'{0}|{1}' -f ($null -ne $a), ($null -eq $b)"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "T_TREE": str(tree)},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "True|True", (proc.stdout, proc.stderr)
+
+
+#: What a stood-in Get-Item throws: a file a git command deleted after Test-Path saw it, and a drive
+#: that went away between the two.
+_GET_ITEM_FAILURES = {
+    "vanished-file": "[System.Management.Automation.ItemNotFoundException]::new('stub: deleted')",
+    "dropped-drive": "[System.Management.Automation.DriveNotFoundException]::new('stub: no drive')",
+}
+
+#: Loads hygiene-report.ps1's Get-PrivateGitActivity alone, lifted from the script by its AST: the
+#: script runs a whole report when it is dot-sourced.
+_LIFT_PRIVATE_GIT_ACTIVITY = (
+    "$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:T_SCRIPT, [ref]$null, "
+    "[ref]$null); $fn = $ast.Find({ param($n) $n -is "
+    "[System.Management.Automation.Language.FunctionDefinitionAst] -and "
+    "$n.Name -eq 'Get-PrivateGitActivity' }, $true); . ([scriptblock]::Create($fn.Extent.Text)); "
+)
+
+
+def _read_with_get_item_failing(
+    tmp_path: Path,
+    script: Path,
+    load: str,
+    call: str,
+    throw: str,
+    *,
+    control: str = "($null -ne $a)",
+    second: str = "($null -eq $b)",
+    only: str = "",
+) -> str:
+    """Run ``call`` on a linked worktree under $ErrorActionPreference = 'Stop', once as the control
+    and once with Get-Item throwing ``throw``, for every file or, with ``only``, for the file whose
+    name ends so. Prints ``<control>|<second>``, or ``<control>|threw: ...`` when the throw escaped.
+    The tree holds an ORIG_HEAD, so a read that fails there has read ``index`` and ``HEAD`` first."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(
+        repo,
+        "-c",
+        "user.email=t@example.invalid",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "seed",
+    )
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", "-b", "linked", str(linked))
+    (_gitdir(linked) / "ORIG_HEAD").write_text(_head(linked) + "\n", encoding="utf-8")
+    stub = (
+        "function global:Get-Item { [CmdletBinding()] param([string]$LiteralPath, [switch]$Force) "
+        f"if ($LiteralPath -like '*{only}') {{ throw {throw} }}; "
+        "Microsoft.PowerShell.Management\\Get-Item @PSBoundParameters }; "
+    )
+    command = (
+        f"$ErrorActionPreference = 'Stop'; {load}"
+        f"$a = {call}; {stub}"
+        f"try {{ $b = {call}; $r = {second} }} "
+        'catch { $r = "threw: $($_.Exception.Message)" }; '
+        f"'{{0}}|{{1}}' -f {control}, $r"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "T_TREE": str(linked), "T_SCRIPT": str(script)},
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+@pytest.mark.parametrize("failure", sorted(_GET_ITEM_FAILURES))
+def test_a_failed_git_file_read_is_an_unknown_reading_not_a_crash(
+    tmp_path: Path, failure: str
+) -> None:
+    """BACKLOG #5603. A git command can delete ORIG_HEAD or MERGE_MSG between Get-WorktreeActivity's
+    Test-Path and its Get-Item. Under the callers' $ErrorActionPreference = 'Stop' that used to end
+    prune-merged mid -Apply loop with no receipt; it is an unknown reading now, which vetoes.
+
+    The first call, before Get-Item is stood in for, is the control: the same tree reads a date."""
+    out = _read_with_get_item_failing(
+        tmp_path,
+        SCRIPT.parent / "worktree-gates.ps1",
+        ". $env:T_SCRIPT; ",
+        "Get-WorktreeActivity -Path $env:T_TREE",
+        _GET_ITEM_FAILURES[failure],
+    )
+    assert out == "True|True", out
+
+
+@pytest.mark.parametrize("failure", sorted(_GET_ITEM_FAILURES))
+def test_hygiene_reports_private_git_read_survives_a_failed_git_file_read(
+    tmp_path: Path, failure: str
+) -> None:
+    """BACKLOG #5603. hygiene-report.ps1's twin reader runs under the report's 'Stop' preference, so a
+    file deleted between its Test-Path and its Get-Item ended the whole report. It names the file
+    now, which the report holds the tree on, and keeps the ``index`` reading taken before it. The
+    first call, a clean read, is the control."""
+    out = _read_with_get_item_failing(
+        tmp_path,
+        SCRIPT.parent / "hygiene-report.ps1",
+        _LIFT_PRIVATE_GIT_ACTIVITY,
+        "Get-PrivateGitActivity $env:T_TREE",
+        _GET_ITEM_FAILURES[failure],
+        control="('{0}/{1}' -f ($null -ne $a.When), $a.Unreadable)",
+        second="('{0}/{1}' -f ($null -ne $b.When), $b.Unreadable)",
+        only="ORIG_HEAD",
+    )
+    assert out == "True/|True/ORIG_HEAD", out
+
+
+def test_hygiene_reports_private_git_read_holds_on_a_dot_git_that_became_a_directory(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5603. Test-Path saw a .git file, and by the read it is a directory: Get-Content
+    refuses that with an InvalidOperationException, which the named catch let end the report. Any
+    failure of the .git read now names '.git', which the report holds the tree on. Test-Path is stood
+    in for, to answer as it did before the swap; the first call, without it, is the control: a .git
+    directory is no linked worktree, so nothing is read and nothing failed."""
+    tree = tmp_path / "tree"
+    (tree / ".git").mkdir(parents=True)
+    command = (
+        f"$ErrorActionPreference = 'Stop'; {_LIFT_PRIVATE_GIT_ACTIVITY}"
+        "$a = Get-PrivateGitActivity $env:T_TREE; "
+        "function global:Test-Path { [CmdletBinding()] param([string]$LiteralPath, "
+        "[string]$PathType) $true }; "
+        "try { $b = Get-PrivateGitActivity $env:T_TREE; "
+        "$r = '{0}/{1}/{2}' -f ($null -eq $b.When), $b.Unreadable, $b.Error } "
+        'catch { $r = "threw: $($_.Exception.GetType().Name)" }; '
+        "'{0}/{1}|{2}' -f ($null -eq $a.When), $a.Unreadable, $r"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            "T_TREE": str(tree),
+            "T_SCRIPT": str(SCRIPT.parent / "hygiene-report.ps1"),
+        },
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "True/|True/.git/InvalidOperationException", (
+        proc.stdout,
+        proc.stderr,
+    )
+
+
+def test_hygiene_reports_private_git_read_holds_on_a_reflog_that_became_a_directory(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5603. The same race on logs/HEAD: Test-Path saw a file, and by the read it is a
+    directory, whose InvalidOperationException the named catch let end the report. Any failure of
+    that read now names logs/HEAD and the exception's type, and keeps the admin-file reading taken
+    before it. Test-Path is stood in for on logs/HEAD alone, to answer as it did before the swap."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(
+        repo,
+        "-c",
+        "user.email=t@example.invalid",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "seed",
+    )
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", "-b", "linked", str(linked))
+    log = _gitdir(linked) / "logs" / "HEAD"
+    log.unlink()
+    log.mkdir()
+    command = (
+        f"$ErrorActionPreference = 'Stop'; {_LIFT_PRIVATE_GIT_ACTIVITY}"
+        "function global:Test-Path { [CmdletBinding()] param([string]$LiteralPath, "
+        "[string]$PathType) if ($LiteralPath -match 'logs[\\\\/]HEAD$') { return $true }; "
+        "Microsoft.PowerShell.Management\\Test-Path @PSBoundParameters }; "
+        "try { $b = Get-PrivateGitActivity $env:T_TREE; "
+        "'{0}/{1}/{2}' -f ($null -ne $b.When), $b.Unreadable, $b.Error } "
+        'catch { "threw: $($_.Exception.GetType().Name)" }'
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            "T_TREE": str(linked),
+            "T_SCRIPT": str(SCRIPT.parent / "hygiene-report.ps1"),
+        },
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "True/logs/HEAD/InvalidOperationException", (
+        proc.stdout,
+        proc.stderr,
+    )
+
+
+def test_a_cache_too_big_to_date_holds_the_tree(fx: Fixture, sleeper: int) -> None:
+    """BACKLOG #5603. Past its cap the working-tree reading does not sample a cache: the file a run
+    just rewrote could be one it never reached, so the tree's activity is unknown and it is held."""
+    live_record(fx, sleeper, fx.primary)
+    wt = fx.sibling("clean")
+    _exclude(fx, ".ruff_cache/")
+    cache = wt / ".ruff_cache"
+    cache.mkdir()
+    for i in range(2001):
+        (cache / f"{i}").write_bytes(b"")
+    _backdate(fx.primary, wt, hours=100)
+    d = by_leaf(run(fx, "-Apply"), "clean")
+    assert d["Decision"] == "SKIP", d
+    assert any(
+        "activity unknown (working tree unreadable, or a cache too big to date)" in r
+        for r in d["Reasons"]
+    ), d
+    assert wt.exists()
+
+    # Control: at the cap, the same tree prunes.
+    (cache / "0").unlink()
+    _backdate(fx.primary, wt, hours=100)
+    d = by_leaf(run(fx, "-Apply"), "clean")
+    assert d["Decision"] == "PRUNE", d
+    assert d["Outcome"] == "removed", d
+
+
+def test_an_inherited_git_redirect_refuses_the_tree(fx: Fixture, sleeper: int) -> None:
+    """BACKLOG #5603. GIT_INDEX_FILE makes status compare the tree against another index.
+
+    The variable names the tree's OWN index here, so every other reading in the run is unchanged and
+    the refusal is the variable's alone; its pair is ``test_clean_merged_unoccupied_is_pruned``.
+    """
+    live_record(fx, sleeper, fx.primary)
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = str(_gitdir(fx.sibling("clean")) / "index")
+    proc = subprocess.run(
+        _argv(
+            fx,
+            ("-Apply", "-IdleHours", "0"),
+            config_root="",
+            skip_gh=True,
+            skip_fetch=True,
+            as_json=True,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+        env=env,
+    )
+    res = json.loads(proc.stdout)
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP", d
+    assert any("GIT_INDEX_FILE is set" in r for r in d["Reasons"]), d["Reasons"]
+    assert fx.sibling("clean").exists()
 
 
 def test_gone_upstream_of_another_branch_is_not_a_merge_signal(
@@ -1433,6 +1949,89 @@ def test_activity_is_rechecked_before_the_removal(
     assert d["OutcomeDetail"].startswith("re-check: git metadata was touched")
     assert fx.sibling("clean").exists()
     assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def test_a_mypy_run_during_the_apply_window_is_caught_by_the_recheck(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """BACKLOG #5603. The re-check reads the working tree too: a mypy run between the decision and
+    the delete touches no git metadata, only mypy's cache."""
+    wt = _populate_mypy_cache(fx)
+    _stage_recheck(fx, sleeper)
+    cache = wt / ".mypy_cache" / "3.14" / "cache.0.db"
+    shim = gh_shim(tmp_path, side_effect=f"os.utime(r'{cache}', None)\n")
+
+    res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "PRUNE"
+    assert d["Outcome"] == "skipped"
+    assert d["OutcomeDetail"].startswith("re-check: the working tree was written"), d
+    assert wt.exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def _grow_past_the_cap(tmp_path: Path, tree: Path, payload: str = "[]") -> Path:
+    """A gh shim whose first call grows ``tree``'s .ruff_cache past the working-tree reading's cap,
+    which makes that reading unknown: a tree gone unreadable between its decision and its delete."""
+    cache = tree / ".ruff_cache"
+    return gh_shim(
+        tmp_path,
+        payload=payload,
+        side_effect=(
+            f"p = pathlib.Path(r'{cache}')\np.mkdir()\n"
+            "for i in range(2001):\n    (p / str(i)).write_bytes(b'')\n"
+        ),
+    )
+
+
+def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_idle_hours_zero(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """BACKLOG #5603. -IdleHours 0 lifts a RECENT activity reading, never an unreadable one, in the
+    -Apply re-check as in the decision pass.
+
+    Every other sibling is locked, so none reaches its merge test, and the first gh call, which runs
+    the side effect, is ``gone``'s, after ``clean``'s decision, as in the default-mode re-check tests.
+    """
+    _exclude(fx, ".ruff_cache/")
+    _stage_recheck(fx, sleeper)
+    for other in fx.primary.parent.glob("repo-*"):
+        if other.name not in ("repo-clean", "repo-gone"):
+            subprocess.run(
+                ["git", "-C", str(fx.primary), "worktree", "lock", str(other)],
+                capture_output=True,
+                check=False,
+            )
+    shim = _grow_past_the_cap(tmp_path, fx.sibling("clean"))
+
+    res = run(fx, "-Apply", "-IdleHours", "0", skip_gh=False, path_prepend=shim)
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "PRUNE", d["Reasons"]
+    assert d["Outcome"] == "skipped", d
+    assert d["OutcomeDetail"].startswith("re-check: activity became unreadable"), d
+    assert fx.sibling("clean").exists()
+
+
+def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_name(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """BACKLOG #5603. -Name lifts a RECENT activity reading, never an unreadable one, in the -Apply
+    re-check as in the decision pass. ``ahead`` is merged by a PR at its exact tip, so its own merge
+    test makes the one gh call, after its decision and before its delete."""
+    _exclude(fx, ".ruff_cache/")
+    live_record(fx, sleeper, fx.primary)
+    use_github_remote(fx)
+    _backdate(fx.primary, fx.sibling("ahead"), hours=100)
+    tip = _git(fx.primary, "rev-parse", "ahead").strip()
+    payload = json.dumps([{"number": 7, "headRefOid": tip}])
+    shim = _grow_past_the_cap(tmp_path, fx.sibling("ahead"), payload)
+
+    res = run(fx, "-Apply", "-Name", "ahead", skip_gh=False, path_prepend=shim)
+    d = by_leaf(res, "ahead")
+    assert d["Decision"] == "PRUNE", d["Reasons"]
+    assert d["Outcome"] == "skipped", d
+    assert d["OutcomeDetail"].startswith("re-check: activity became unreadable"), d
+    assert fx.sibling("ahead").exists()
 
 
 def test_a_nested_worktree_appearing_mid_run_is_vetoed(
@@ -2411,6 +3010,24 @@ def test_an_empty_reflog_contributes_nothing_rather_than_its_mtime(
 # by hand. These cover the reporting path and, more importantly, that it stays a REPORTING path.
 
 
+def test_a_report_only_tree_with_a_freshly_written_working_tree_is_withheld(
+    fx: Fixture, sleeper: int
+) -> None:
+    """BACKLOG #5603. The report pass reads the working tree too, so a tree whose git metadata is idle
+    but whose folder was just written is withheld rather than suggested."""
+    live_record(fx, sleeper, fx.primary)
+    nested = fx.primary / ".claude" / "worktrees" / "nested"
+    _backdate(fx.primary, nested, hours=100)
+    res = run(fx)
+    # Positive control: idle in both readings, it is reported in the default window.
+    assert "nested" in {r["leaf"] for r in res["reportOnly"]}, res["reportOnly"]
+
+    os.utime(nested, None)
+    res = run(fx)
+    assert "nested" not in {r["leaf"] for r in res["reportOnly"]}
+    assert res["counts"]["reportOnlyHeld"] >= 1
+
+
 def test_a_nested_claude_worktree_is_reported_but_never_a_candidate(
     readonly_fx: Fixture, sleeper: int
 ) -> None:
@@ -2717,6 +3334,9 @@ def test_c6_an_untracked_file_holds_the_venv(fx: Fixture, sleeper: int) -> None:
     plant_control(fx)
     victim = _plant_venv_tree(fx, "messy-ff6600")
     (victim / "brand_new_module.py").write_text("# never committed anywhere\n", encoding="utf-8")
+    # Old untracked work: C7 reads the working tree too (BACKLOG #5603), so a fresh write would also
+    # fail C7 and the row would no longer isolate C6.
+    _backdate(fx.primary, victim, hours=500.0)
 
     res = run(fx, "-ReapVenvs")
     row = venv_row(res, "messy-ff6600")
@@ -2727,16 +3347,35 @@ def test_c6_an_untracked_file_holds_the_venv(fx: Fixture, sleeper: int) -> None:
     assert_control_is_reapable(res)
 
 
+def test_c7_a_freshly_written_working_tree_holds_the_venv(fx: Fixture, sleeper: int) -> None:
+    """BACKLOG #5603. C7 reads the working tree too: the git metadata here is 500 h idle."""
+    live_record(fx, sleeper, fx.primary)
+    plant_control(fx)
+    victim = _plant_venv_tree(fx, "wrote-0b0b0b")
+    os.utime(victim, None)  # the tree's own folder, as a file created and deleted there leaves it
+
+    res = run(fx, "-ReapVenvs")
+    row = venv_row(res, "wrote-0b0b0b")
+    assert row["verdict"] == "SKIP"
+    assert row["stoppedBy"] == "C7 idle"
+    assert row["stoppedDetail"].startswith("the working tree was written"), row
+    assert only_failing(row) == ["C7"]
+    assert_control_is_reapable(res)
+
+
 def test_c7_recent_git_metadata_holds_the_venv(fx: Fixture, sleeper: int) -> None:
     live_record(fx, sleeper, fx.primary)
     plant_control(fx)
-    # Not backdated: `worktree add` stamped its metadata seconds ago.
-    _plant_venv_tree(fx, "fresh-006611", idle_hours=0.0)
+    # The working tree 500 h idle and only the git metadata fresh, so the git reading alone holds it:
+    # its pair, test_c7_a_freshly_written_working_tree_holds_the_venv, isolates the other reading.
+    victim = _plant_venv_tree(fx, "fresh-006611")
+    os.utime(_gitdir(victim) / "HEAD", None)
 
     res = run(fx, "-ReapVenvs")
     row = venv_row(res, "fresh-006611")
     assert row["verdict"] == "SKIP"
     assert row["stoppedBy"] == "C7 idle"
+    assert row["stoppedDetail"].startswith("git metadata was touched"), row
     assert "inside the 72 h window" in row["stoppedDetail"]
     assert only_failing(row) == ["C7"]
     assert_control_is_reapable(res)

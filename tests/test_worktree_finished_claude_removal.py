@@ -215,7 +215,7 @@ def fx(tmp_path: Path) -> Fx:
     for name in (*FINISHED, *UNSAFE):
         if name == "touched":
             # Git metadata idle, but the working tree written just now.
-            _backdate(f.primary, f.tree(name), 200)
+            _backdate(f.primary, f.tree(name), 200, working_tree=False)
         elif name != "active":
             _age(f.primary, f.tree(name), 200)
 
@@ -675,6 +675,36 @@ def test_a_data_file_inside_a_tolerated_cache_refuses(fx: Fx, name: str) -> None
         in rows["clean"]["Reason"]
     )
     assert fx.tree("clean").is_dir()
+
+
+def test_a_mypy_run_in_an_idle_tree_refuses_as_recent_activity(fx: Fx) -> None:
+    """BACKLOG #5603. The working-tree reading looks inside ``.mypy_cache``.
+
+    A session that ran mypy and no git command moves only mypy's cache files, which the walk no
+    longer reads as data. ``cache.0.db`` is touched in place, as a second run leaves it, so neither
+    the top folder nor any entry under it moves: only the read inside ``.mypy_cache`` sees it.
+    """
+    tree = fx.tree("clean")
+    with (fx.primary / ".git" / "info" / "exclude").open("a", encoding="utf-8") as f:
+        f.write(".mypy_cache/\n")
+    ver = tree / ".mypy_cache" / "3.14"
+    ver.mkdir(parents=True)
+    for name in ("cache.db", "cache.0.db"):
+        (ver / name).write_bytes(b"SQLite format 3\x00")
+    (tree / ".mypy_cache" / ".gitignore").write_text("*\n", encoding="utf-8")
+    _age(fx.primary, tree, 200)
+    os.utime(ver / "cache.0.db", None)
+
+    rows = remove(fx, [tree], apply=True)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "recently active: the working tree was written" in rows["clean"]["Reason"]
+    assert tree.is_dir()
+
+    # Control: the same tree, with the cache as old as the rest, is removed.
+    _age(fx.primary, tree, 200)
+    rows = remove(fx, [tree], apply=True)
+    assert rows["clean"]["Outcome"] == "REMOVED", rows["clean"]
+    assert not tree.exists()
 
 
 def test_a_registry_whose_holding_folder_is_gone_reads_as_unreadable(fx: Fx) -> None:

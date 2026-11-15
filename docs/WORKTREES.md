@@ -335,9 +335,10 @@ running batch.
 So `-Path` also refuses on a held **claim** and on **recent activity**, the last four entries in
 the list above. `-Name` refuses on the same four. A claim names the worktree that took it,
 whoever launched the session. Git activity is read from the tree's own git directory. Working-tree
-activity is read from the tree's top folder, each entry directly under it, and `.pytest_cache` and
-`.ruff_cache`. Uncommitted work is dated path by path, at any depth. None is proof that a tree is
-free:
+activity is read from the tree's top folder, each entry directly under it, and every cache
+`$WORKING_TREE_ACTIVITY_CACHES` in [`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1)
+names, `.mypy_cache` among them. Uncommitted work is dated path by path, at any depth. None is
+proof that a tree is free:
 
 - Work that was never claimed, in a tree nobody has committed to or written in for six hours,
   passes all four.
@@ -513,7 +514,13 @@ Occupancy is checked by two independent signals, and **either one vetoes**:
    matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
    pid + process start time. A session in a **nested** worktree vetoes its ancestor too.
 2. **Recent activity** (`-IdleHours`, default **72**) — the newest mtime of the worktree's *private*
-   git metadata (`index`, `HEAD`, `logs/HEAD`, …), not the working files. This is the signal that does
+   git metadata (`index`, `HEAD`, `logs/HEAD`, …), and of the working tree's top level and the files
+   in its test, lint and type-check caches (`Get-WorkingTreeActivity` in
+   [`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1), the read the `.claude/worktrees`
+   removal makes too), so a session that ran pytest or mypy at the tree's root and no git command
+   still vetoes. Not every run writes its cache (ruff leaves `.ruff_cache` alone when no file
+   changed), and a file edited in place below the top level moves neither reading. This is the
+   signal that does
    **not** depend on a recorded cwd.
 
 **The default was 36 until 2026-09-17, and the old number's own measurement is why it moved.** The
@@ -560,17 +567,21 @@ that session and this script. The run therefore prints how many candidates signa
 rather than letting "the fence ran" imply "the fence covered it".
 
 What neither signal sees, printed on every run: a cwd recorded as a UNC or 8.3 short path; a session
-that never registered; and a session that only edits files and runs no git command (invisible to
-signal 2 as well, since it touches none of the metadata files).
+that never registered; and a session that only edits files below the top level and runs no git
+command and no test or type check that rewrites a root-level cache (invisible to signal 2 as well,
+since it moves none of the git metadata, top-level entries or cache files it reads).
 
 Everything that **narrows** either signal is named in red on the run and in the JSON receipt, because
 an operator who believes they are fenced when they are not is worse off than one who knows they
 aren't: `-IdleHours 0`; any `-IdleHours` **below the 12h floor** (an occupied worktree has been
-measured at 10.4h idle, so `-IdleHours 0.5` typed for "half an hour" disarms signal 2 completely); an
-explicit `-ConfigRoot`; a **failed fetch** (merge decisions then rest on stale refs); a **gh PR probe
-that errored**; and every **`-Name`-confirmed worktree**. `-Name` is worth spelling out — it is
-`-IdleHours 0` scoped to one tree, and since signal 1 has been measured vetoing 0 of 4 real siblings,
-`-Apply -Name <slug>` can leave a candidate with no working occupancy signal at all. A negative
+measured at 10.4h idle, so `-IdleHours 0.5` typed for "half an hour" releases trees signal 2 would
+have held); an explicit `-ConfigRoot`; a **failed fetch** (merge decisions then rest on stale refs); a
+**gh PR probe that errored**; and every **`-Name`-confirmed worktree**. Under `-IdleHours 0` and
+`-Name`, a **recent** signal 2 reading no longer vetoes; an **unknown** one (the git metadata or the
+working tree could not be read) still does, in the decision pass and the `-Apply` re-check alike.
+`-Name` is worth spelling out — it is `-IdleHours 0` scoped to one tree, and since signal 1 has been
+measured vetoing 0 of 4 real siblings, `-Apply -Name <slug>` can leave a candidate that a session is
+actively working in with no occupancy signal that would stop it. A negative
 `-IdleHours` is refused outright, because it would put the cut-off in the future and disarm signal 2
 while appearing to set it.
 

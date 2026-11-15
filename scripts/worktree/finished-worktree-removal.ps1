@@ -60,8 +60,9 @@
       * no file in it is flagged skip-worktree or assume-unchanged, whose edits git status cannot see;
       * `git status --porcelain --untracked-files=all`, run with LC_ALL=C so its warning text is
         untranslated, exits 0, prints nothing, and warns of no folder it could not open;
-      * its private git metadata, and its working tree (the top level, plus the files in .pytest_cache
-        and .ruff_cache), are both idle beyond -IdleHours;
+      * its private git metadata, and its working tree (the top level, plus the files in .pytest_cache,
+        .ruff_cache and .mypy_cache, as Get-WorkingTreeActivity in worktree-gates.ps1 reads them; a
+        cache past its cap cannot be dated and refuses), are both idle beyond -IdleHours;
       * no rebase, am, cherry-pick, merge, revert or bisect is in progress in its own git dir;
       * every IGNORED entry git lists is a regenerable cache directory, by the list remove.ps1 -Path
         tolerates ($REGENERABLE_IGNORED_PATTERN in worktree-gates.ps1, which names them), and a plain
@@ -76,7 +77,8 @@
         and no refusal prints the file's contents;
       * a walk of the whole working tree, ignored directories included, finds no nested git checkout (an
         entry named .git), no link of any kind, and inside a cache directory no file named like data
-        ($CACHE_DATA_NAME_PATTERN); a folder it cannot list refuses;
+        ($CACHE_DATA_NAME_PATTERN, less mypy's own cache files, $MYPY_CACHE_DB_PATTERN); a folder it
+        cannot list refuses;
       * no commit is held only by its own HEAD reflog or per-worktree refs, which the removal deletes (a
         commit the branch's own reflog holds survives, so it does not count; a detached tip is covered);
       * it owns no allocation (alloc.ps1) whose item is not provably on origin/main, matched by the path
@@ -192,9 +194,11 @@ function Get-TreeRootRefusal([string]$Path, [switch]$Late) {
 # of the leak-gate token list the tree's copy is compared with. Returns '' or the refusal.
 function Get-ContentRefusal {
     param([string]$Path, [double]$IdleHours, [string]$Primary)
-    $flagged = Get-FlaggedFileCount $Path
-    if ($flagged -ne 0) { return $(if ($flagged -lt 0) { 'its flagged files could not be read' } else { "$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see" }) }
-    $clean = Test-WorktreeClean -Path $Path -AllUntracked
+    # The reads Test-WorktreeClean makes for prune-merged.ps1 (BACKLOG #5603), through the same
+    # functions, split so the costly ignored-entry status and walk come after the cheap idle readings.
+    $hidden = @(Get-HiddenWorkReasons -Path $Path -Checks 'flagged')
+    if ($hidden.Count -gt 0) { return $hidden[0] }
+    $clean = Test-WorktreeClean -Path $Path -AllUntracked -StatusOnly
     if (-not $clean.Clean) { return "not clean: $($clean.Reasons -join '; ')" }
 
     $cut = (Get-Date).AddHours(-1 * $IdleHours)
@@ -209,11 +213,8 @@ function Get-ContentRefusal {
     $ops = Get-InProgressOperation $Path
     if ($null -eq $ops) { return 'its git dir could not be read for an operation in progress' }
     if ($ops.Count -gt 0) { return "an operation is in progress in its git dir ($($ops -join ', ')), whose state the removal deletes" }
-    $ignored = Get-UnsafeIgnoredEntries $Path $Primary
-    if ($null -eq $ignored) { return 'its ignored files could not be listed' }
-    if ($ignored.Count -gt 0) { return "$($ignored.Count) ignored entr(ies) that are not a regenerable cache, which the removal would delete (first: $($ignored[0]))" }
-    try { $hazard = Get-NestedHazard $Path } catch { return $_.Exception.Message }
-    if ($hazard) { return "it holds $hazard, which git status does not read into" }
+    $hidden = @(Get-HiddenWorkReasons -Path $Path -Primary $Primary -Checks 'ignored', 'nested')
+    if ($hidden.Count -gt 0) { return $hidden[0] }
     return ''
 }
 
