@@ -1121,12 +1121,13 @@ fleet, so never take them*.
   *"Merge, file rows (Recommended)"* on engine PRs 2675 and 2676, and *"Merge both, file rows"* on
   engine PRs 2691 and 2671. `CLAUDE.md` section 5 cites the signed text, under R5.
 
-  **CORRECTED 2026-11-15, added after the move.** The paragraph above paraphrases R2's signed
-  *"in its mechanics only"* as *"filing mechanics only"*. Decision d20261111T061703900-432f31,
-  decided by the Lander under the owner's delegation of 2026-11-11, reads R2's signed text as
-  governing the order of filing and merging. So the Lander's proposal quoted under 2026-10-12,
-  which the owner approved, stays as the record of that day, but no longer states when a row is
-  filed. `CLAUDE.md` section 5 states the order once, in its merge bullet, with the findings that
+  **CORRECTED 2026-11-15, added after the move.** The paragraph above gives R2's whole effect as *"a
+  merged PR now files at most one row"*, and that is incomplete. Decision
+  d20261111T061703900-432f31, decided by the Lander under the owner's delegation of 2026-11-11,
+  reads R2's signed text as governing the order of filing and merging too. R2's own words are *"in
+  its mechanics only"*, not *"filing mechanics only"*. So the Lander's proposal quoted under
+  2026-10-12, which the owner approved, stays as the record of that day, but no longer states when
+  a row is filed. `CLAUDE.md` section 5 states the order once, in its merge bullet, with the findings that
   still hold the merge and the authority for the change, so read it there.
 
 - **A PR's merge state is a join over clocks, and the join is the part you must not miss.**

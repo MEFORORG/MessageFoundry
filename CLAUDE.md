@@ -752,20 +752,22 @@ Manager's watch reached the cloud session 29 seconds after its question.
   above. It says *"The merge still never waits on an open finding, and no finding goes
   unrecorded."* Decision d20261111T061703900-432f31 reads R2's signed text as governing the order of
   filing and merging. **Filing a finding as a row never holds the merge.** Before the merge, the
-  Lander names each open finding on the PR in one line, with its filed row or "queued for filing".
-  In a public repository the line names the subject and pastes no row text. The Lander files the
-  queued ones in the next ledger pass, under the sweep in korus `roles/LANDER.md`, *An item left in
-  a PR comment is yours to carry*. A finding that goes to the owner still holds the merge until the
-  owner rules: R2's item 4 keeps one such route by name, and the permission above still requires
-  that none changes behaviour or weakens a control. That reading is this text's; the decision's
-  record does not state it. The Lander decided the order under the owner's delegation of 2026-11-11; the
-  decision's record gives the question as *"does CLAUDE.md s5 file-before-merge or R2 merge-first
-  govern?"* and the owner's answer as *"/driver"*. The authority for this text is the owner
-  confirmation in the Repair Manager's chat, 2026-11-15: *"Confirmed: fix all 11 findings on korus
-  PR 270 and whatever engine PR 2891 leaves open, including the edits to engine CLAUDE.md section 5
-  and korus roles/LANDER.md, so both repos state one merge order. R5 does not block this pair."*
-  **CORRECTED 2026-11-15:** this paragraph read *"changes how the findings are filed, and nothing
-  else in this bullet"* and *"The merge permission, and what goes to the owner, are unchanged."*
+  Lander names each open finding on the PR, one line each, with its filed row or "queued for
+  filing". In a public repository the line names the subject and pastes no row text. The Lander
+  files the queued ones in the next ledger pass, under the sweep in korus `roles/LANDER.md`, *An
+  item left in a PR comment is yours to carry*. A finding that goes to the owner still holds the
+  merge until the owner rules: the permission above still requires that none changes behaviour or
+  weakens a control, and R2's item 4 keeps a false security-record statement going to the owner.
+  That reading is this text's; neither R2 nor the decision's record states it. The Lander decided
+  the order under the owner's delegation of 2026-11-11; the decision's record gives the question as
+  *"does CLAUDE.md s5 file-before-merge or R2 merge-first govern?"* and the owner's answer as
+  *"/driver"*. The authority for this text is the owner confirmation in the Repair Manager's chat,
+  2026-11-15: *"Confirmed: fix all 11 findings on korus PR 270 and whatever engine PR 2891 leaves
+  open, including the edits to engine CLAUDE.md section 5 and korus roles/LANDER.md, so both repos
+  state one merge order. R5 does not block this pair."* **CORRECTED 2026-11-15:** this paragraph
+  read *"changes how the findings are filed, and nothing else in this bullet"* and *"The merge
+  permission, and what goes to the owner, are unchanged."* What goes to the owner is still
+  unchanged; the filing condition and the order changed.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
