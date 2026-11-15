@@ -904,6 +904,7 @@ def observers_inconclusive(
     ingress_stranded: int = -1,
     routed_stranded: int = -1,
     outbound_stranded: int = -1,
+    drain_gated: bool = False,
     tol: float = _OBSERVER_DISAGREE_TOL,
 ) -> bool:
     """Whether the two INDEPENDENT observers of a rung — the ENGINE store-truth tally and the DRIVE sink
@@ -941,9 +942,10 @@ def observers_inconclusive(
         if sink_received ≥ expected and unclear > 0:  return True
         # (a) below the lossless line the sink UNDER-counts; only THEN credit the H>D budget:
         free    = acked × max(0, handlers − delivering)   # non-delivering-handler routed rows
-        if H > D and the per-stage strand split is present (BACKLOG #229):
-            blocked = ingress_stranded × D + max(0, routed_stranded − free) + outbound_stranded
-        else:  # H==D, or per-stage counts absent (sentinel) → stage-blind, pre-#229 identical
+        if the per-stage strand split is present (BACKLOG #229; at H == D too since #5577):
+            residual = max(0, unclear − (ingress + routed + outbound))   # rows at no named stage
+            blocked  = (ingress_stranded + residual) × D + max(0, routed_stranded − free) + outbound_stranded
+        else:  # per-stage counts absent (sentinel) → stage-blind, pre-#229 identical
             blocked = max(0, unclear − free)
         permit  = expected − blocked
 
@@ -976,15 +978,16 @@ def observers_inconclusive(
     ``free`` budget is credited AGAINST the ROUTED strands ONLY — the non-delivering handlers' routed rows —
     which is the load-bearing bit: a genuine H>D collapse strands ~A×H routed rows, ~A×(H−D) of them
     non-delivering, so crediting ``free`` there keeps the collapse an honest COLLAPSED instead of re-fabricating
-    the INCONCLUSIVE this guard exists to prevent. The sound branch is GATED to ``H > D`` **and** all three
-    per-stage counts present (``≥ 0``); at H==D (``free==0``) or an absent split (an older payload / aborted
-    rung → the ``< 0`` sentinel) it falls back to the stage-blind ``max(0, unclear − free)``, byte-identical to
-    the pre-#229 formula.
+    the INCONCLUSIVE this guard exists to prevent. Under #229 the sound branch was GATED to ``H > D``; since
+    #5577 it needs only all three per-stage counts present (``≥ 0``). An absent split (an older payload /
+    aborted rung → the ``< 0`` sentinel) falls back to the stage-blind ``max(0, unclear − free)``,
+    byte-identical to the pre-#229 formula.
 
-    **``H == D`` identity (matches the pre-fix formula wherever the two observers can disagree, so no published
-    run regresses).** At ``H == D`` (and for any caller that does not pass ``handlers`` — it defaults to ``0``
-    with ``max(0, 0 − D) == 0``), ``free == 0``, so the UNDER-counting branch is ``permit == expected −
-    max(0, stranded) − max(0, dead)`` — EXACTLY the old expression. (Reaching that branch already guarantees
+    **``H == D`` identity — WITHOUT the per-stage split only (narrowed by BACKLOG #5577).** At ``H == D``
+    (and for any caller that does not pass ``handlers`` — it defaults to ``0`` with ``max(0, 0 − D) == 0``),
+    ``free == 0``, so the stage-blind UNDER-counting branch is ``permit == expected − max(0, stranded) −
+    max(0, dead)`` — EXACTLY the old expression. With the split present the permit is now the per-stage one
+    at H == D too, which is never larger (an ingress or residual row is charged D, not 1). (Reaching that branch already guarantees
     ``stranded ≥ 0`` and ``dead ≥ 0``: the ``< 0`` sentinel path below returns first when ``not engine_ok``,
     and when ``engine_ok`` the store-truth pass bar forces both to ``0``, so ``max(0, s) + max(0, d)`` equals
     ``max(0, s + d)`` and the terms fold identically.) The lossless-sink clause (a′) is the ONE point where the
@@ -995,7 +998,7 @@ def observers_inconclusive(
     lossless rung (a run that stranded rows was not lossless), so this stricter edge changes no real verdict —
     it only removes a corner where the noise slack wrongly forgave a real contradiction.
 
-    Two triggers, each a hard inter-observer contradiction rather than a mere shortfall:
+    Three triggers, each a hard inter-observer contradiction rather than a mere shortfall:
 
     (a) **The sink counted MORE deliveries than the engine's own store-truth permits.** Split in two by the
         lossless line. When the sink is FULLY lossless (``S ≥ A×D``) and the engine reports ANY unclear row,
@@ -1013,6 +1016,22 @@ def observers_inconclusive(
         is a blind/absent collector, not a measured zero — it cannot certify SUSTAINED nor a benign
         FROZEN_TAIL. (A genuine total collapse also reads ``S == 0``, but then the engine CONFIRMS it —
         ``engine_ok`` is False — and the run is honestly COLLAPSED, not caught here.)
+
+    (c) **BACKLOG #5577 — a MATERIAL sink under-count behind a clean DRAIN GATE.** ``drain_gated`` says the
+        ENGINE_DRAINED gate arrived, so the sinks tallied only AFTER the engine reported every row done. A
+        clean store-truth then says every copy was delivered, and a sink more than ``tol × A×D`` short of
+        ``A×D`` contradicts it. That is not the benign frozen tail FROZEN_TAIL names (a tail is what a LOST
+        gate produces, when the sinks may tally early), so it fires. Without the gate the shortfall stays a
+        FROZEN_TAIL, as before.
+
+    **BACKLOG #5577 — the per-stage permit is used WHENEVER the split is present, at ``H == D`` too, and it
+    charges rows at a stage outside the three it names.** The stage-blind fallback charged an INGRESS strand
+    one delivery at ``H == D`` where it blocks ``D``. And ``_summarize_queue_rows`` drops a row at any other
+    stage (``response``, ADR 0013) from the split while ``stranded`` still counts it, so the split summed to
+    less than ``unclear`` and those rows were charged nothing at ``H > D``. Each such residual row is now
+    charged ``D``, the most a row can block: an unexplained row may only lower the permit, never raise it.
+    The price is that a real collapse with residual rows can read INCONCLUSIVE (the fail-safe verdict, never
+    a PASS); the shardcert graph declares no ``reingress_to``, so it produces no ``response`` rows.
     """
     if acked < 0 or sink_received < 0:
         return False  # observer counts not supplied ⇒ guard inert (see docstring)
@@ -1022,6 +1041,11 @@ def observers_inconclusive(
     slack = tol * expected
     # (b) blind required collector: the engine says all-clean-delivered, the sink saw nothing.
     if sink_received == 0 and engine_ok:
+        return True
+    # (c) BACKLOG #5577: the drain gate held the sink tally until the engine reported every row done, so a
+    # clean store-truth asserts all A×D copies delivered. A sink materially short of that contradicts it;
+    # only a LOST gate (sinks may tally early) makes such a shortfall a benign FROZEN_TAIL.
+    if drain_gated and engine_ok and sink_received < expected - slack:
         return True
     # (a) the sink over-counts vs the engine store-truth's permitted deliveries. When the engine claims a
     # collapse we need the strand/dead tally to compute the permit; an unknown tally (a sentinel <0) can't
@@ -1046,12 +1070,10 @@ def observers_inconclusive(
     # strand count scales with H while deliveries scale with D, and the sink honestly under-counts) read as
     # the honest COLLAPSED the observers AGREE on, rather than a fabricated INCONCLUSIVE.
     free = acked * max(0, handlers - delivering)
-    if (
-        handlers > delivering
-        and ingress_stranded >= 0
-        and routed_stranded >= 0
-        and outbound_stranded >= 0
-    ):
+    # BACKLOG #5577: the per-stage branch applies whenever the split is present, H == D included. At
+    # H == D `free` is 0, and the stage-blind fallback below would charge an ingress strand ONE delivery
+    # where it blocks D, raising the permit and hiding an over-count.
+    if ingress_stranded >= 0 and routed_stranded >= 0 and outbound_stranded >= 0:
         # BACKLOG #229 — SOUND per-stage `blocked`. `stranded` is opaque across all stages, so the
         # stage-blind `max(0, unclear - free)` credits an INGRESS strand (which blocks all D copies — the
         # message never routed) or an OUTBOUND strand (blocks 1) to the non-delivering-handler `free` budget
@@ -1066,11 +1088,19 @@ def observers_inconclusive(
         #     genuine H>D collapse strands ~A×H routed rows, of which ~A×(H−D) are non-delivering; `free`
         #     absorbs exactly those so the collapse reads as the honest COLLAPSED the observers agree on,
         #     rather than re-fabricating the INCONCLUSIVE this guard exists to prevent.
-        blocked = ingress_stranded * delivering + max(0, routed_stranded - free) + outbound_stranded
+        #   * RESIDUAL (BACKLOG #5577) → rows `unclear` counts that the three-stage split does not (a
+        #     `response`-stage row, or any stage the split drops). Their weight is unknown, so each is
+        #     charged D, the most a row can block: an unexplained row may only LOWER the permit.
+        residual = max(0, unclear - (ingress_stranded + routed_stranded + outbound_stranded))
+        blocked = (
+            (ingress_stranded + residual) * delivering
+            + max(0, routed_stranded - free)
+            + outbound_stranded
+        )
     else:
-        # H==D (free==0 ⇒ `blocked == unclear`, so permit == expected − unclear) OR the per-stage split is
-        # absent (an older payload / aborted rung → the `< 0` sentinel): the stage-blind tally, byte-identical
-        # to the pre-#229 formula `expected - max(0, stranded) - max(0, dead)` (see docstring).
+        # The per-stage split is absent (an older payload / aborted rung → the `< 0` sentinel): the
+        # stage-blind tally, byte-identical to the pre-#229 formula `expected - max(0, stranded) -
+        # max(0, dead)` at H == D (see docstring).
         blocked = max(0, unclear - free)
     permit = expected - blocked
     return sink_received > permit + slack
@@ -1092,6 +1122,7 @@ def classify_rung(
     ingress_stranded: int = -1,
     routed_stranded: int = -1,
     outbound_stranded: int = -1,
+    drain_gated: bool = False,
     observer_tol: float = _OBSERVER_DISAGREE_TOL,
 ) -> RungVerdict:
     """Classify one rung from the two RELIABLE authorities only. ``engine_reported`` is whether the ENGINE
@@ -1112,7 +1143,8 @@ def classify_rung(
     required collector) are also INCONCLUSIVE — trusting one to break the tie is the exact silent fabrication
     this ladder refuses; (4) a CONFIRMED non-drained engine that the sink does NOT contradict is a true
     COLLAPSE; (5) the engine having drained clean, a lossless run is SUSTAINED and a short sink tally is a
-    (benign) frozen tail, never collapse.
+    (benign) frozen tail, never collapse — unless ``drain_gated`` (the sinks tallied behind the ENGINE_DRAINED
+    barrier) and the shortfall is past tolerance, which step (3) has already made INCONCLUSIVE (#5577).
 
     **NO FILLING TERM — and that is a KNOWN GAP, stated so nobody assumes otherwise (2026-07-13).** A rung
     can be lossless-and-drained yet still have been FILLING (its in-flight backlog growing through the hold,
@@ -1140,6 +1172,7 @@ def classify_rung(
         ingress_stranded=ingress_stranded,
         routed_stranded=routed_stranded,
         outbound_stranded=outbound_stranded,
+        drain_gated=drain_gated,
         tol=observer_tol,
     ):
         return RungVerdict.INCONCLUSIVE
@@ -1222,6 +1255,9 @@ class RungOutcome:
     engine_ingress_stranded: int = -1
     engine_routed_stranded: int = -1
     engine_outbound_stranded: int = -1
+    #: BACKLOG #5577: the drive tallied its sinks behind the ENGINE_DRAINED barrier, which arms the A4b
+    #: material-shortfall trigger. Recorded so the verdict can be re-derived from the rung record alone.
+    drain_gated: bool = False
     #: WHICH SHAPE served this rung (from the drive report, which learned it from SHARDS_READY). Load-bearing
     #: for reading `handlers`/`delivering`: under `partitioned` they are the DERIVED accounting pair (1, 1),
     #: which a legal BROADCAST run can also produce with a totally different lane topology.
@@ -1518,6 +1554,7 @@ class RungOutcome:
                 "routed_stranded": self.engine_routed_stranded,
                 "outbound_stranded": self.engine_outbound_stranded,
                 "in_pipeline_final": self.engine_in_pipeline_final,
+                "drain_gated": self.drain_gated,  # v9 (#5577): sinks tallied behind the drain gate
             },
             "in_pipeline_slope": self.in_pipeline_slope,
             "phase_timing": self.phase.to_json_dict(),
@@ -1628,6 +1665,7 @@ def build_rung_outcome(
             "processes; this run's pool is NOT the one it claims"
         )
 
+    drain_gated = gate is not None and drive.tallied_behind_gate
     verdict = classify_rung(
         engine_reported=engine_reported,
         engine_ok=engine_ok,
@@ -1652,6 +1690,9 @@ def build_rung_outcome(
         ingress_stranded=engine_ingress_stranded,
         routed_stranded=engine_routed_stranded,
         outbound_stranded=engine_outbound_stranded,
+        # BACKLOG #5577: only a drive that RECEIVED the gate before tallying counted after the drain; a gate
+        # that reached disk after the drive's wait timed out does not make an early tally late.
+        drain_gated=drain_gated,
     )
     # A4b: distinguish this INCONCLUSIVE from the store-truth-unconfirmed one (which already noted itself
     # above) so an operator sees WHY a confirmed rung would not certify — the two observers disagreed.
@@ -1660,7 +1701,7 @@ def build_rung_outcome(
             "cross-observer INCONCLUSIVE: the ENGINE store-truth and the DRIVE sink count are "
             f"inconsistent (acked={drive.acked} delivering={drive.delivering} "
             f"sink_received={drive.sink_received} engine_ok={engine_ok} stranded={engine_stranded} "
-            f"dead={engine_dead_total}) — neither observer is trusted to break the tie (excluded from "
+            f"dead={engine_dead_total} drain_gated={drain_gated}) — neither observer is trusted to break the tie (excluded from "
             "the ceiling bracket)"
         )
     # ARTIFACT 4: the FIDELITY gate. It is deliberately NOT folded into `verdict` — a drive shortfall is not
@@ -1737,6 +1778,7 @@ def build_rung_outcome(
         engine_ingress_stranded=engine_ingress_stranded,
         engine_routed_stranded=engine_routed_stranded,
         engine_outbound_stranded=engine_outbound_stranded,
+        drain_gated=drain_gated,
         engine_in_pipeline_final=engine_in_pipeline_final,
         in_pipeline_slope=slope,
         phase=phase,
@@ -2886,7 +2928,15 @@ class ConsolidatedLadderReport:
             # ingress strand D copies, an outbound strand 1, a routed strand [0,1] (crediting the
             # non-delivering-handler `free` budget against ROUTED strands only). At H == D or when the split is
             # absent (an older engine payload → a `< 0` sentinel) the permit is byte-identical to v7.
-            "schema_version": 8,
+            #
+            # v9 (BACKLOG #5577) — one new key, per-rung `engine.drain_gated`; three SCORING changes, each
+            # only ever moves a rung toward
+            # INCONCLUSIVE: (1) the per-stage permit applies at H == D too (v8 charged an ingress strand ONE
+            # delivery there, not D); (2) rows `stranded` counts outside the three-stage split (a `response`
+            # row) are charged D each, where v8 charged them 1 at H == D and nothing at H > D; (3) when the
+            # drive tallied behind the drain gate, a sink more than the tolerance short of A*D against a clean
+            # store-truth is INCONCLUSIVE, not FROZEN_TAIL.
+            "schema_version": 9,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
             "exit_code": self.exit_code,
