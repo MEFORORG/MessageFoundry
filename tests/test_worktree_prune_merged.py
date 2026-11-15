@@ -1067,6 +1067,15 @@ def test_disqualifiers(readonly_fx: Fixture, sleeper: int, slug: str, needle: st
     assert needle in d["Reason"]
 
 
+def _exclude(fx: Fixture, *patterns: str) -> None:
+    """Ignore ``patterns`` through info/exclude, which is in the common git dir, so it ignores them
+    in every tree of the family."""
+    exclude = fx.primary / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as f:
+        f.writelines(f"{p}\n" for p in patterns)
+
+
 def _hide_work(fx: Fixture, kind: str) -> None:
     """Put work in ``repo-clean`` that ``git status --porcelain`` does not show."""
     wt = fx.sibling("clean")
@@ -1074,11 +1083,7 @@ def _hide_work(fx: Fixture, kind: str) -> None:
         _git(wt, "update-index", f"--{kind}", "seed.txt")
         (wt / "seed.txt").write_text("an edit status cannot see", encoding="utf-8")
     elif kind == "ignored":
-        # info/exclude is in the common git dir, so it ignores the file in every tree of the family.
-        exclude = fx.primary / ".git" / "info" / "exclude"
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        with exclude.open("a", encoding="utf-8") as f:
-            f.write("*.db\n")
+        _exclude(fx, "*.db")
         (wt / "dev.db").write_text("a dev store, not regenerable", encoding="utf-8")
     elif kind == "nested":
         # Below an IGNORED (and otherwise tolerated) directory, so status lists only `.venv/`.
@@ -1115,6 +1120,91 @@ def test_work_git_status_cannot_see_is_never_pruned(
     assert any(needle in r for r in d["Reasons"]), d["Reasons"]
     assert d["Clean"] is False
     assert fx.sibling("clean").exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def _populate_mypy_cache(fx: Fixture) -> Path:
+    """A ``.mypy_cache`` as mypy's SQLite cache leaves it, ignored through info/exclude.
+
+    The names are what a real tree holds, ``cache.db`` and the sharded ``cache.N.db`` with their
+    ``-wal``/``-shm`` sidecars, in mypy's ``<python-version>/`` folder.
+    """
+    wt = fx.sibling("clean")
+    _exclude(fx, ".mypy_cache/")
+    ver = wt / ".mypy_cache" / "3.14"
+    ver.mkdir(parents=True)
+    for name in ("cache.db", "cache.0.db", "cache.15.db", "cache.0.db-wal", "cache.0.db-shm"):
+        (ver / name).write_bytes(b"SQLite format 3\x00")
+    (wt / ".mypy_cache" / ".gitignore").write_text("*\n", encoding="utf-8")
+    return wt
+
+
+def test_a_populated_mypy_cache_does_not_hold_a_clean_tree(fx: Fixture, sleeper: int) -> None:
+    """mypy's own SQLite cache is the regenerable cache ``.mypy_cache`` is tolerated as.
+
+    Read as data, ``.mypy_cache/<ver>/cache.N.db`` vetoed about 67 of 96 real clean trees.
+    """
+    live_record(fx, sleeper, fx.primary)
+    _populate_mypy_cache(fx)
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "PRUNE", d
+    assert d["Outcome"] == "removed", d
+    assert not fx.sibling("clean").exists()
+
+
+@pytest.mark.parametrize(
+    ("planted", "needle"),
+    [
+        # Inside the cache, beside mypy's files, but not one of mypy's names.
+        (
+            ".mypy_cache/3.14/dev.db",
+            "a data file inside a cache directory at .mypy_cache/3.14/dev.db",
+        ),
+        # mypy's name, but in another cache directory.
+        (
+            ".pytest_cache/cache.0.db",
+            "a data file inside a cache directory at .pytest_cache/cache.0.db",
+        ),
+        # mypy's name, but at the cache's top rather than in a version folder.
+        (".mypy_cache/cache.db", "a data file inside a cache directory at .mypy_cache/cache.db"),
+    ],
+)
+def test_other_data_beside_a_mypy_cache_still_holds_the_tree(
+    fx: Fixture, sleeper: int, planted: str, needle: str
+) -> None:
+    """POSITIVE CONTROL for the exemption: it covers mypy's names in mypy's folder and nothing else.
+
+    ``gone`` is still removed in the same run, so the skip is this tree's own.
+    """
+    live_record(fx, sleeper, fx.primary)
+    wt = _populate_mypy_cache(fx)
+    _exclude(fx, ".pytest_cache/")
+    target = wt / planted
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("a dev store, not regenerable", encoding="utf-8")
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP", d
+    assert any(needle in r for r in d["Reasons"]), d["Reasons"]
+    assert wt.exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"
+
+
+def test_a_db_outside_the_caches_still_holds_a_tree_with_a_mypy_cache(
+    fx: Fixture, sleeper: int
+) -> None:
+    """POSITIVE CONTROL: a real ``.db`` outside every cache, ignored, still refuses the tree."""
+    live_record(fx, sleeper, fx.primary)
+    wt = _populate_mypy_cache(fx)
+    _hide_work(fx, "ignored")
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP", d
+    assert any("ignored entr(ies) that are not a regenerable cache" in r for r in d["Reasons"]), d[
+        "Reasons"
+    ]
+    assert wt.exists()
     assert by_leaf(res, "gone")["Outcome"] == "removed"
 
 

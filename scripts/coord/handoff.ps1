@@ -348,6 +348,10 @@ if (Test-Path -LiteralPath $seatsDir) {
         if ($rec.handoff -and $rec.handoff.path) {
             foreach ($k in @(Get-PointerKeys ([string]$rec.handoff.path))) { $pointed[$k] = $true }
         }
+        # Only a record that names a worktree or a session can stand for its box. A file that parses to
+        # null, a scalar, an array or an empty object names no host, so it reads as this machine's, and
+        # as the newest it emptied the worktree and session the hold reads with (BACKLOG #5598).
+        if ($rec -isnot [System.Management.Automation.PSCustomObject] -or -not ($rec.worktree -or $rec.sessionId)) { continue }
         if (-not (Test-CoordRecordIsHere $rec)) { continue }
         $box = Split-Path $f.DirectoryName -Leaf
         $prev = $boxRecords[$box]

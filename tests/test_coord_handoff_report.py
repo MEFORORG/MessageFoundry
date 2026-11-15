@@ -344,6 +344,24 @@ class TestPerBoxDirectoriesAreHeld:
         assert proc.returncode == 1, proc.stdout + proc.stderr
         assert "STALE-IN-A-LIVE-BOX" in proc.stdout
 
+    @pytest.mark.parametrize("body", ["null", "", "{}"])
+    def test_a_newer_seat_file_with_no_record_in_it_does_not_shadow_the_box_record(
+        self, sandbox: Path, body: str
+    ) -> None:
+        """A seat file that parses to null, or to anything that names no worktree or session, is
+        not the box's newest record. Taken as one, it emptied the worktree the activity read uses,
+        so the fresh transcript went unread and the stale document retired (BACKLOG #5598)."""
+        put_box(sandbox, "box-aaaa", age_hours=72)
+        root = self._live_box(sandbox, transcript_age_hours=1)
+        newer = sandbox / "coord" / "seats" / "box-aaaa" / "zz-newer.json"
+        newer.write_text(body, encoding="utf-8")
+        when = time.time() + 60
+        os.utime(newer, (when, when))
+        proc = run(sandbox, "-Retire", "box-aaaa", config_root=root)
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "STALE-IN-A-LIVE-BOX" in proc.stdout
+        assert (sandbox / "coord" / "handoffs" / "box-aaaa" / "HANDOFF.md").is_file()
+
     def test_and_it_moves_once_the_transcript_is_as_old_as_the_document(
         self, sandbox: Path
     ) -> None:

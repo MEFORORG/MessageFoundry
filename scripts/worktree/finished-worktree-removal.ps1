@@ -76,7 +76,8 @@
         and no refusal prints the file's contents;
       * a walk of the whole working tree, ignored directories included, finds no nested git checkout (an
         entry named .git), no link of any kind, and inside a cache directory no file named like data
-        ($CACHE_DATA_NAME_PATTERN); a folder it cannot list refuses;
+        ($CACHE_DATA_NAME_PATTERN, less mypy's own cache files, $MYPY_CACHE_DB_PATTERN); a folder it
+        cannot list refuses;
       * no commit is held only by its own HEAD reflog or per-worktree refs, which the removal deletes (a
         commit the branch's own reflog holds survives, so it does not count; a detached tip is covered);
       * it owns no allocation (alloc.ps1) whose item is not provably on origin/main, matched by the path
