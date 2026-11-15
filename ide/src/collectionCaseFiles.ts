@@ -69,12 +69,15 @@ function unlinkWithRetries(file: string, retries: number): void {
   }
 }
 
-/** Whether the OS resolves `p` to `expected`, every link on the way followed; path.relative compares
- *  Windows paths case-insensitively. The `.native` form is the one that resolves the junction
- *  deleteCaseDir's step 1 describes; plain realpathSync, which walks by lstat, returns it unresolved
- *  (measured on Node v24.20.0). Throws if `p` cannot be resolved. */
+/** Whether the OS resolves `p` to exactly `expected`, every link on the way followed. The compare is
+ *  exact, never case-insensitive: path.relative's lowercasing folds U+212A KELVIN SIGN onto `k`, so
+ *  it matches a junction to a different directory whose name differs only so (measured on Node
+ *  v24.20.0). Callers build `expected` from the OS's own resolution and listing, which agree on case.
+ *  The `.native` form is the one that resolves the junction deleteCaseDir's step 1 describes; plain
+ *  realpathSync, which walks by lstat, returns it unresolved (measured on Node v24.20.0). Throws if
+ *  `p` cannot be resolved. */
 export function isAt(p: string, expected: string): boolean {
-  return path.relative(expected, fs.realpathSync.native(p)) === "";
+  return fs.realpathSync.native(p) === expected;
 }
 
 /**
@@ -85,11 +88,13 @@ export function isAt(p: string, expected: string): boolean {
  * What it does, in order:
  * 1. Check `dir`'s identity. Its expected path is its name under its parent's real path, as the OS
  *    resolves it (realpathSync.native). `dir` must lstat as a plain directory, and the OS must
- *    resolve it to that expected path, compared case-insensitively on Windows. Anything else throws,
- *    and nothing is removed: at least a symlink, a junction to a drive-letter path (which lstats as
- *    a link), and a junction to a `\\?\Volume{GUID}\` path (which lstats as a plain directory but
- *    resolves elsewhere; measured on Node v24.20.0). So does a `dir` already gone, or one the OS
- *    cannot resolve.
+ *    resolve it to exactly that expected path (isAt). Anything else throws, and nothing is removed:
+ *    at least a symlink, a junction to a drive-letter path (which lstats as a link), and a junction
+ *    to a `\\?\Volume{GUID}\` path, which lstats as its target does, so as a plain directory, with
+ *    the target's modification time, when the target is one, but resolves elsewhere (measured on
+ *    Node v24.20.0). So does a `dir` already gone, or one the OS cannot resolve: at least on a volume
+ *    where realpathSync.native fails, as it does with EISDIR on some RAM disks and virtual drives
+ *    (workspaceContainment.ts records this), step 1 refuses every run directory.
  * 2. List `dir`; a listing that fails throws at once, and nothing is removed. An entry whose name
  *    matches CASE_FILE (`case_`, at least four digits, `.hl7`), that lstats as a regular file, and
  *    that the OS resolves to its own name under `dir`'s expected path, is unlinked. A matching regular
@@ -99,7 +104,9 @@ export function isAt(p: string, expected: string): boolean {
  *    followed.
  * 3. An unlink that fails with EBUSY or EPERM is tried `retries` more times, 100 ms apart, each wait
  *    blocking the calling thread; removeCaseDir passes 3 and sweepStaleCaseDirs 0. An lstat or an
- *    identity check is not retried. An entry already gone is skipped. An entry whose lstat or
+ *    identity check is not retried. An entry that lstats as not found is skipped: at least one
+ *    already gone, and a `\\?\Volume{GUID}\` junction to a file, which lstats as not found (measured
+ *    on Node v24.20.0) and then keeps `dir`, since the rmdir fails on it. An entry whose lstat or
  *    identity check fails, or whose unlink still fails, does not stop the others: once every listed
  *    entry has been tried, the first such error is thrown and `dir` is not removed.
  * 4. Otherwise `dir` is removed with rmdir, which is not retried. Apart from the open limits
@@ -122,8 +129,9 @@ export function isAt(p: string, expected: string): boolean {
  *   read through the swapped parent: regular files there named as case files can be unlinked, and
  *   the directory there removed once it is empty. After step 1, each entry's check still expects a
  *   path under the original parent and refuses an entry in the target, so an unlink acts there only
- *   when the swap falls between that entry's check and its unlink, the retry waits included; the
- *   rmdir acts there too, and removes the directory there if it is empty.
+ *   when the swap falls between that entry's check and its unlink, the retry waits included. A
+ *   refused entry throws before step 4, so the rmdir acts there only when no entry was refused, and
+ *   removes the directory there if it is empty.
  * - If `dir` is replaced by another plain directory at any time before the rmdir, before step 1,
  *   after it and after the last unlink included, the steps after the replacement act on that
  *   directory instead. An empty plain directory placed there after the last unlink is removed by the
@@ -132,13 +140,15 @@ export function isAt(p: string, expected: string): boolean {
  *   the listing lists the target's entries; a swap before an entry's check acts on the listed names
  *   in the target, where an entry's check then expects a path under `dir` and refuses one there; a
  *   swap after a check and before its unlink, the retry waits included, unlinks that name in the
- *   target. The rmdir of step 4 then acts on the link itself: on Windows it removes a junction even
- *   when its target still holds entries (measured on Node v24.20.0, outside the extension host), and
- *   sweepStaleCaseDirs counts that as a directory removed.
+ *   target. A refused entry throws before step 4. Only when no entry was refused does the rmdir of
+ *   step 4 act on the link itself: on Windows it removes a junction even when its target still
+ *   holds entries (measured on Node v24.20.0, outside the extension host), and sweepStaleCaseDirs
+ *   counts that as a directory removed.
  * - If an entry is swapped between its identity check and its unlink, whatever is then at that name
  *   is unlinked if it can be: a symlink or a drive-letter junction is unlinked itself, not its
- *   target. A directory there, a junction to a `\\?\Volume{GUID}\` path included, fails to unlink
- *   with EPERM (measured on Node v24.20.0), which step 3 retries.
+ *   target. A directory there fails to unlink: on Windows with EPERM, a `\\?\Volume{GUID}\`
+ *   junction included (measured on Node v24.20.0), which step 3 retries; elsewhere the error can
+ *   differ, at least EISDIR on Linux, which step 3 does not retry.
  */
 function deleteCaseDir(dir: string, retries: number): void {
   const expected = path.join(fs.realpathSync.native(path.dirname(dir)), path.basename(dir));
@@ -196,11 +206,13 @@ export function removeCaseDir(dir: string): void {
  * this process's effective uid, since the OS temp directory can be shared there, as `/tmp` is. On
  * Windows no owner is checked: the default TEMP is per-user, but a TEMP pointed at a shared
  * directory is not. A symlink and a drive-letter junction do not lstat as a directory. A junction to
- * a `\\?\Volume{GUID}\` path does, so it passes these gates; deleteCaseDir's step 1 identity check
- * then refuses it, and it is not counted. Each entry tried is deleted by deleteCaseDir with no
- * in-pass retry, and any error is dropped, with no log line or notice. A directory that is not
- * removed is tried again by each later sweep that finds it past these gates. So a case file a sweep could not unlink goes once a later sweep can
- * unlink it, while a directory still holding an entry deleteCaseDir leaves stays on every sweep.
+ * a `\\?\Volume{GUID}\` path lstats as its target does (deleteCaseDir's step 1), so the type and age
+ * gates read its target: one whose target is a directory last modified over the hour ago passes
+ * them, deleteCaseDir's step 1 identity check then refuses it, and it is not counted. Each entry
+ * tried is deleted by deleteCaseDir with no in-pass retry, and any error is dropped, with no log line
+ * or notice. A directory that is not removed is tried again by each later sweep that finds it past
+ * these gates. So a case file a sweep could not unlink goes once a later sweep can unlink it, while
+ * a directory still holding an entry deleteCaseDir leaves stays on every sweep.
  *
  * The age gate reads the directory's modification time, which at least the run's own case-file
  * writes set and each unlink in it updates, so a partial deletion restarts the hour. It cannot tell
@@ -212,8 +224,9 @@ export function removeCaseDir(dir: string): void {
  * that ended before the run's `finally` ran, such as a crash, or a window close or reload while the
  * dry-run is pending (deactivate removes nothing); a directory whose dry-run never returns, since
  * the dry-run has no timeout and the run's `finally` does not run while it is pending; and a case
- * file deleteCaseDir could not unlink. A
- * directory holding an entry deleteCaseDir leaves stays on every sweep, as above.
+ * file deleteCaseDir could not unlink. A directory holding an entry deleteCaseDir leaves stays on
+ * every sweep, as above, and so does every run directory on a volume where deleteCaseDir's step 1
+ * cannot resolve paths.
  *
  * Open limit, at least this one, besides deleteCaseDir's: the gates are read from one lstat, and
  * deleteCaseDir re-checks only that the entry is a plain directory at its expected path, so a

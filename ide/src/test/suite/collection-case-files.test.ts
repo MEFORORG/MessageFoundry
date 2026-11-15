@@ -186,6 +186,22 @@ suite("collectionCaseFiles: a run directory is deleted without recursing (BACKLO
       remove(dir);
       assert.deepStrictEqual(fs.readdirSync(dir), [caseFileName(9999)]);
     });
+
+    // Step 2's identity check: a regular case file the OS resolves elsewhere. No link on disk lstats
+    // as a regular file and resolves elsewhere, so the OS's answer is stubbed for that one file.
+    test(`${how}: a case file the OS resolves elsewhere is not unlinked, and keeps the directory`, () => {
+      const dir = materializeCases([BODY, BODY], base);
+      const odd = path.join(dir, caseFileName(1));
+      const native = fs.realpathSync.native;
+      const realpath = fs.realpathSync as unknown as { native: (p: fs.PathLike) => string };
+      realpath.native = (p) => (String(p) === odd ? path.join(base, "elsewhere") : native(p));
+      try {
+        remove(dir);
+      } finally {
+        realpath.native = native;
+      }
+      assert.deepStrictEqual(fs.readdirSync(dir), [caseFileName(1)]);
+    });
   }
 });
 
@@ -203,8 +219,10 @@ function volumeJunction(link: string, target: string): void {
   assert.strictEqual(r.status, 0, `mklink /J failed: ${r.stdout}${r.stderr}`);
 }
 
-// The junction deleteCaseDir's step 1 describes: it lstats as a plain directory, so only the
-// real-path check can refuse it. Every target lives outside `base`.
+// The junction deleteCaseDir's step 1 describes: with a directory target it lstats as a plain
+// directory, so as a run directory only the real-path check refuses it. As a case-named entry the
+// regular-file check already leaves it; the stubbed test above reaches the entry's real-path check.
+// Every target lives outside `base`.
 suite("collectionCaseFiles: a volume-GUID junction is refused (Windows, BACKLOG #5415)", () => {
   let base = "";
   let outside = "";
@@ -245,6 +263,18 @@ suite("collectionCaseFiles: a volume-GUID junction is refused (Windows, BACKLOG 
     outsideIntact();
     assert.ok(fs.existsSync(planted), "the planted junction was removed");
     assert.ok(!fs.existsSync(stale), "the real stale run directory was not removed");
+  });
+
+  test("removeCaseDir refuses one whose name differs from its target's only by a case fold", () => {
+    // U+212A KELVIN SIGN lowercases to "k", so a case-insensitive compare matched this junction to
+    // the sibling it points at; NTFS keeps the two names apart.
+    const sibling = materializeCases([BODY], base);
+    const junction = sibling.replace(/[^\\]*$/, (leaf) => `${leaf}K`);
+    fs.renameSync(sibling, `${sibling}k`);
+    volumeJunction(junction, volumeGuidPath(`${sibling}k`) ?? assert.fail("no volume GUID"));
+    removeCaseDir(junction);
+    assert.deepStrictEqual(fs.readdirSync(`${sibling}k`), [caseFileName(0)], "the sibling's case file was deleted");
+    assert.ok(fs.existsSync(junction), "the junction was removed");
   });
 
   test("removeCaseDir refuses a run directory that is one", () => {

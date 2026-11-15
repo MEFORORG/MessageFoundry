@@ -14,20 +14,30 @@ import { isAt } from "../collectionCaseFiles";
  *  Node v24.20.0), and the extension host's recursive rmSync follows it into its target (measured
  *  on its Node v24.21.0). So a directory that the OS does not resolve to its own path (isAt) is
  *  treated as a link: it is removed with rmdir, which removes the junction and leaves its target,
- *  since unlink fails on it with EPERM. `real` is `dir`'s real path. */
-export function unlinkLinks(dir: string, real: string = fs.realpathSync.native(dir)): void {
+ *  since unlink fails on it with EPERM. `real` is `dir`'s real path. Where the OS cannot resolve
+ *  `dir`, at least where realpathSync.native fails with EISDIR on some RAM disks and virtual
+ *  drives, the walk falls back to lstat alone, which a volume-GUID junction gets past. */
+export function unlinkLinks(dir: string, real: string | undefined = realPath(dir)): void {
   for (const name of fs.readdirSync(dir)) {
     const p = path.join(dir, name);
     const st = fs.lstatSync(p);
     if (st.isSymbolicLink()) {
       fs.unlinkSync(p);
     } else if (st.isDirectory()) {
-      const expected = path.join(real, name);
-      if (isAt(p, expected)) {
+      const expected = real === undefined ? undefined : path.join(real, name);
+      if (expected === undefined || isAt(p, expected)) {
         unlinkLinks(p, expected);
       } else {
         fs.rmdirSync(p);
       }
     }
+  }
+}
+
+function realPath(dir: string): string | undefined {
+  try {
+    return fs.realpathSync.native(dir);
+  } catch {
+    return undefined; // see the docblock: the walk falls back to lstat alone
   }
 }
