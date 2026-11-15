@@ -303,7 +303,7 @@ from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 # mount_ui), so the engine imports + boots + serves the JSON API with the console ABSENT. serve_ui-on
 # behavior is preserved via three seams the console installs: app.state.ui_csp,
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
-from messagefoundry.auth import Identity, Permission, Role
+from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
@@ -11514,6 +11514,7 @@ _PROVISION_ADMIN_HINT = (
 async def _assert_security_notice_is_deliverable(
     store: Store,
     *,
+    auth: AuthService,
     auth_settings: AuthSettings,
     alerts_settings: AlertsSettings | None,
     security_settings: SecuritySettings | None,
@@ -11573,25 +11574,27 @@ async def _assert_security_notice_is_deliverable(
     Deliberately narrow: it asks only whether SOME enabled administrator carries an address, not
     whether mail to it would arrive. Proving actual delivery needs an SMTP round trip at startup,
     which is a different and much larger change.
+
+    **It asks the auth service's checked predicates, never the store's readers
+    (BACKLOG #5629).** The store's ``list_users`` and ``get_user_role_ids`` return rows unchecked,
+    so on a keyed store a ``notify_email``, a ``disabled`` flag or a ``user_roles`` row written
+    outside the store would have passed this gate on an Administrator no seal covers. Every field
+    the gate weighs -- the address, the flag and the role rows -- comes from a record that passed
+    its seal; one that fails is reported by the service and does not count. A Vault transit Outage
+    raises out of the start, which is the fail-closed answer: the gate cannot be settled without it.
     """
     alerts = alerts_settings or AlertsSettings()
     # The two preconditions of the deliverability question. Either one false skips the refusal: the
     # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
     gated = auth_settings.notify_security_events and alerts.security_notifications_required
-    # Addressed accounts first, so the common start stops at the first addressed Administrator and
-    # never reads the roles of the rest of the table. Once an Administrator WITHOUT an address is
-    # reached, every account after it lacks one too, so the question is settled there.
-    enabled = sorted(
-        (u for u in await store.list_users() if not u.disabled), key=lambda u: not u.notify_email
-    )
-    administrator_exists = False
-    for user in enabled:
-        if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
-            continue
-        if user.notify_email or not gated:
-            return
-        administrator_exists = True
-        break
+    # The service's own predicates, which read only checked records, so the gate and the service
+    # agree on who counts as an enabled Administrator. The second scan runs only on the refusal
+    # and warning paths.
+    if gated and await auth.has_notifiable_admin():
+        return
+    administrator_exists = await auth.has_enabled_administrator()
+    if administrator_exists and not gated:
+        return
     if not administrator_exists:
         # A SQLite store file named absolutely, since the operator's shell may sit in another
         # directory than the service; a server backend's descriptor is server/database, names no
@@ -13176,6 +13179,7 @@ def create_managed_app(
                 app.state.auth = auth
                 await _assert_security_notice_is_deliverable(
                     store,
+                    auth=auth,
                     auth_settings=auth_settings,
                     alerts_settings=alerts_settings,
                     security_settings=security_settings,
