@@ -1143,19 +1143,28 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     # ASVS header still marks the column, as main read it.
     ("5", "verdict", f"| ASVS | Note | Result |\n|---|---|\n{_ROW}"),
     ("5", "verdict", f"| ASVS | Note | Result |\n| - - | - - | - - |\n{_ROW}"),
+    # Review round-edb619bb's losses against main. The GFM readings only add to main's: an invisible
+    # character that is the only separator, a no-break-space line inside a table, and an ASVS table
+    # stacked under another with no blank line.
+    ("11", "map", f"{_REQ}{chr(0x200B)}is enforced in pkg/example_guard.py."),
+    ("11", "verdict", f"{_REQ}: {_PARTIAL}{chr(0x200B)}pending review."),
+    ("9", "verdict", f"{_HEAD}{chr(0xA0)}\n{_ROW}"),
+    ("5", "verdict", f"| Version | Note | Result |\n|---|---|---|\n| a | b | c |\n{_HEAD}{_ROW}"),
+    # A record verb after "the row" names a verdict even where the first one is a CI verb.
+    ("10", "verdict", f"{_REQ} is listed here; the row went from failing to {_PARTIAL}."),
+    ("10", "verdict", f"{_REQ} is listed here; the row re-scored as failing."),
+    # A cell opening with "unchanged" or a record verb states a verdict, "never" or not.
+    ("10", "verdict", f"| {_REQ} | x | unchanged, never failing. |"),
+    ("10", "verdict", f"| {_REQ} | x | stays never failing |"),
+    # A version-lead word in underscore emphasis is no lead, as main reads it, so the id stays one.
+    ("11", "gap", f"This applies _to_ {_REQ}, which is not yet implemented."),
+    ("11", "gap", f"_Section_ {_REQ} is not yet implemented."),
 ]
 _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 5: the same placeholder rows under a header that does not name the column ASVS.
     ("5", f"| Version | Note | Result |\n|---|---|---|\n| a | b | c |\n| - | - | - |\n{_ROW}"),
     # Step 6: the same rules after a table whose header does not name the column ASVS.
     ("6", f"| Version | Note | Result |\n|---|---|---|\n{_ROW}\n---"),
-    # Step 8: the escaped pipe moves no column onto the identifier when the header names another.
-    # Split at the escaped pipe, the header puts ASVS over the identifier's column; read whole, not.
-    (
-        "8",
-        f"| a \\| b | Note | ASVS | Ref |\n|---|---|---|---|\n"
-        f"| {_PASS.title()} (12 messages) | the limb | x | {_REQ} |",
-    ),
     # Step 9: a blank line ends the ASVS-headed table, so a headerless pipe block after it is unmarked.
     ("9", f"{_HEAD}| a | b | c |\n\n{_ROW}"),
     ("9", f"{_HEAD}| a | b | c |\n\n| Version | Note | Result |\n|---|---|---|\n{_ROW}"),
@@ -1175,9 +1184,8 @@ _PR_FINDINGS_MUST_STAY_QUIET: list[tuple[str, str]] = [
     # Step 11: a snake_case join is not emphasis, so these words stay inside their names.
     ("11", "The `retry_gap` setting is read for 2.5.1 batches."),
     ("11", "The example_row_is_failing flag is set for 2.5.1 batches."),
-    # Step 11: underscore emphasis on a version lead keeps the version a version.
-    ("11", "_lxml_ 2.9.1 parsing lives in pkg/example_peek.py."),
-    ("11", "_HL7_ V2.5.1 parsing lives in pkg/example_peek.py."),
+    # Step 10's word order with the version first: a plain space before "the row" marks nothing.
+    ("10", "Since 2.5.1 the row is not failing."),
     # Step 11: zero-width characters around a cell beside an unmarked HL7 version.
     ("11", f"| 2.5.1 | ADT^A01 |\u200b{_PASS.title()} (12 messages)\u200b|"),
 ]
@@ -1204,13 +1212,6 @@ def test_the_review_finding_repairs_leave_versions_and_other_tables_alone(
     sf, step: str, body: str
 ) -> None:
     assert sf.scan_pr_body(body) == [], (step, body)
-
-
-def test_a_version_lead_still_binds_without_emphasis(sf) -> None:
-    """The must-fire controls for step 11's two version-lead sites: with no lead word at all, the same
-    sentences are requirement maps, so the quiet cases above are the lead's doing, not the path's."""
-    assert "map" in _pr_kinds(sf, "The 2.9.1 parsing lives in pkg/example_peek.py.")
-    assert "map" in _pr_kinds(sf, "See V2.5.1 parsing in pkg/example_peek.py.")
 
 
 _CELL_CONNECTIVES = [
