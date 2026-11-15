@@ -634,6 +634,14 @@ QUOTED_SUBSTITUTION_DENY = [
     pytest.param("cat <<EOF\ndon't\nEOF\nfind /proc", id="apostrophe-in-a-top-level-heredoc"),
     # Arithmetic is not a heredoc opener.
     pytest.param('echo "$((1 << n))"\nfind /proc', id="shift-inside-quoted-arithmetic"),
+    # Arithmetic still runs a substitution, and a comment's apostrophe opens no span. In each the
+    # walk sits inside the double-quoted span, where the plain toggle blanks it too.
+    pytest.param(
+        'echo "logs: $(( $(find / -name x | wc -l) + 0 ))"', id="substitution-in-quoted-arithmetic"
+    ),
+    pytest.param(
+        'echo "$(echo a # don\'t\n) $(find /proc)"', id="comment-apostrophe-before-a-substitution"
+    ),
 ]
 
 
@@ -652,6 +660,7 @@ QUOTED_PROSE_ALLOW = [
     pytest.param("echo '$(find /proc)'", id="substitution-inside-single-quotes"),
     pytest.param("echo \"$(echo 'find /proc')\"", id="single-quoted-word-inside-a-substitution"),
     pytest.param(r"echo $'it\'s find /proc'", id="ansi-c-quoted-prose"),
+    pytest.param('echo "$(echo a # it\'s a find /proc mention\n)"', id="walk-named-in-a-comment"),
 ]
 
 
@@ -736,8 +745,8 @@ EXPECTED_ROW_COUNTS = {
     "OPTION_GRAMMAR_DENY": 12,
     "PRUNE_INERT_DENY": 9,
     "FOLDING_ALLOW": 20,
-    "QUOTED_SUBSTITUTION_DENY": 13,
-    "QUOTED_PROSE_ALLOW": 6,
+    "QUOTED_SUBSTITUTION_DENY": 15,
+    "QUOTED_PROSE_ALLOW": 7,
     "POWERSHELL_QUOTE_DENY": 2,
     "TOGGLE_FLOOR_DENY": 5,
 }

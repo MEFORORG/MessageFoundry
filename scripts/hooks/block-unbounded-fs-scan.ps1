@@ -98,7 +98,8 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # output of this function, so a quote in a body (`don't`) would otherwise open a span here that
 # blanks the terminator and the walk after it -- most often inside "$(cat <<'EOF' ... EOF)", the
 # commit-message form. Arithmetic, `$((...))`, is blanked for the same reason: `1 << n` would read
-# as a heredoc opener.
+# as a heredoc opener. A substitution inside it still runs, so that is left visible, and so is the
+# `#` of a comment, whose body is blanked.
 function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
     if ($Plain) {
@@ -145,6 +146,11 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
         $kind = $kinds[$top]
         $next = if ($n + 1 -lt $Text.Length) { $Text[$n + 1] } else { $null }
         if ($kind -ceq 'arith') {
+            # Arithmetic still runs a substitution, so that is left visible as in double quotes.
+            if ($ch -ceq '$' -and $next -ceq '(' -and -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(')) {
+                $kinds.Add('sub'); $depths.Add(0); [void]$sb.Append('$('); $n += 2; continue
+            }
+            if ($ch -ceq '`') { $kinds.Add('bt'); $depths.Add(0); [void]$sb.Append($ch); $n++; continue }
             if ($ch -ceq '(') { $depths[$top]++; [void]$sb.Append(' ') }
             elseif ($ch -ceq ')' -and $depths[$top] -gt 0) { $depths[$top]--; [void]$sb.Append(' ') }
             elseif ($ch -ceq ')' -and $next -ceq ')') {
@@ -201,6 +207,19 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
             }
             [void]$sb.Append('<<'); $prevDollar = $false
             $n += 2; continue
+        }
+        # A `#` starting a word starts a comment, which bash never runs and in which a quote opens
+        # nothing. It is blanked up to the newline (or, in a backtick substitution, the closing
+        # backtick), keeping the `#`.
+        if ($ch -ceq '#' -and ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1]) -or ';&|()'.IndexOf($Text[$n - 1]) -ge 0)) {
+            $end = $Text.IndexOf("`n", $n)
+            if ($end -lt 0) { $end = $Text.Length }
+            if ($kind -ceq 'bt') {
+                $tick = $Text.IndexOf('`', $n)
+                if ($tick -ge 0 -and $tick -lt $end) { $end = $tick }
+            }
+            [void]$sb.Append('#' + ' ' * ($end - $n - 1)); $prevDollar = $false
+            $n = $end; continue
         }
         # An unquoted backslash escapes the next character, whatever it is.
         if ($ch -ceq '\') {
@@ -331,11 +350,14 @@ try {
     # Read safely: under strict mode a missing tool_name would throw, and the catch would allow.
     $tool = if ($j.PSObject.Properties['tool_name']) { [string]$j.tool_name } else { '' }
     # THE PLAIN TOGGLE IS A FLOOR UNDER THE BASH READING, NOT REPLACED BY IT (BACKLOG #5607). The
-    # bash reading was added to deny walks the toggle blanked, but a misreading of its own blanks a
-    # walk the toggle sees: measured, an arithmetic `$((...))` holding a substitution, `$((cmd) )`,
+    # bash reading was added to deny walks the toggle blanked, but a misreading of its own blanked
+    # walks the toggle sees: measured, an arithmetic `$((...))` holding a substitution, `$((cmd) )`,
     # `cat<<` with no space, two heredocs on one line, and a `#` comment holding an apostrophe inside
     # "$(...)". So a bash command is scanned under BOTH views and denied if either denies: the bash
-    # reading can only add denies to the toggle's, never remove one.
+    # reading can only add denies to the toggle's, never remove one. The floor does NOT make the bash
+    # reading right. Where the toggle blanks the same walk -- inside one double-quoted span, say --
+    # a misreading still allows it; at least `$((cmd) )`, `cat<<`, and two heredocs on a line remain.
+    # The price is the toggle's own false denies, such as `'It'\''s; find /proc'`, which main had.
     # Most commands mask the same under both, and then one scan is enough.
     $scans = @(Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain))
     if ($tool -cne 'PowerShell') {
@@ -376,9 +398,13 @@ try {
                "MSYS root: measured 2026-09-20, 'ls //' listed the network root, so the walk " +
                "enumerates network and WSL shares with no bound. " + $UNSTOPPABLE
 
+    # A segment both views mask alike is checked once.
+    $checked = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($b in $bounds) {
         if ($b[2] -le 0) { continue }
-        $s = $b[0].Substring($b[1], $b[2]).Trim()
+        $seg = $b[0].Substring($b[1], $b[2])
+        if (-not $checked.Add("$($b[1]):$seg")) { continue }
+        $s = $seg.Trim()
         $rawSeg = $cmd.Substring($b[1], $b[2]).Trim()
         if (-not $s) { continue }
 
