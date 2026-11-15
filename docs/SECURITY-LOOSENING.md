@@ -2602,10 +2602,10 @@ count is above `0` (vault BACKLOG #2613).
   ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). Every
   `MEFOR_VALUE_*` variable in those lists is refused too, an empty one and a host name as well as
   a password, since the engine cannot tell which `env()` value is a secret (owner ruling
-  2026-11-14, vault BACKLOG #8212); the refusal sends a secret to the secrets directory and any
-  other value to the active environment's value file. A `MEFOR_VALUE_*` name that, upper-cased as
-  the engine reads it, is not the prefix followed by letters, digits and underscores is counted in
-  the refusal rather than spelled. They also
+  2026-11-14, vault BACKLOG #8212). The refusal counts them per registry value and never spells
+  one, since the name was read from the registry and may hold a value typed in the wrong place. It
+  sends each to the secrets directory, or a value that is not a secret and is the same for every
+  instance to the active environment's value file. They also
   refuse a store key in their own environment when they found their service but could not read
   its lists, since the key most likely came from there; another secret in their own environment is
   not refused then.
@@ -2614,8 +2614,9 @@ count is above `0` (vault BACKLOG #2613).
   `create_managed_app`, refuses on the same finding: the factory raises as it is built. The entry
   is named, with the refusal's finding and remedy, only where the refusal would fire
   (`messagefoundry/serviceenv.py`): the engine found its service, the way the bullet *How the
-  engine finds its own service* below says, and either an engine secret is in that service's lists
-  or the lists could not be read and a store key is in the engine's own environment. A
+  engine finds its own service* below says, and either an engine secret or a `MEFOR_VALUE_*`
+  variable is in that service's lists, or the lists could not be read and a store key is in the
+  engine's own environment. A
   console-script launcher such as `uvicorn.exe` or `hypercorn.exe` between NSSM and the
   interpreter is neither a Python interpreter nor `messagefoundry.exe`, so the engine does not
   find its service there and this entry is not named. The reading is taken once per process, and

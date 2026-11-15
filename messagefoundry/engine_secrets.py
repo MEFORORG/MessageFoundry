@@ -57,7 +57,6 @@ __all__ = [
     "SECRETS_DIRECTORY_VARIABLE",
     "SECRET_SETTING_NAMES",
     "VALUE_PREFIX",
-    "is_value_name",
     "SecretsDirectory",
     "SecretsDirectoryError",
     "open_secrets_directory",
@@ -141,7 +140,7 @@ _VALUE_NAME = re.compile(r"MEFOR_VALUE_[A-Za-z0-9_]+")
 _FILE_NAME = re.compile(r"[A-Za-z0-9_]+")
 
 
-def is_value_name(key: str) -> bool:
+def _is_value_name(key: str) -> bool:
     """Whether ``key`` names an ``env()`` value."""
     return _VALUE_NAME.fullmatch(key) is not None
 
@@ -228,7 +227,7 @@ class SecretsDirectory:
 
         ``name`` must be one of :data:`DIRECTORY_SETTING_NAMES` or start with :data:`VALUE_PREFIX`.
         Raises :class:`SecretsDirectoryError` for a file that cannot be used."""
-        if name not in DIRECTORY_SETTING_NAMES and not is_value_name(name):
+        if name not in DIRECTORY_SETTING_NAMES and not _is_value_name(name):
             raise ValueError(f"{name} is not a setting the secrets directory supplies")
         on_disk = self.names.get(_name_key(name))
         if on_disk is None:
@@ -241,7 +240,7 @@ class SecretsDirectory:
         return {
             on_disk: self._read_file(on_disk)
             for key, on_disk in sorted(self.names.items())
-            if is_value_name(key)
+            if _is_value_name(key)
         }
 
     def _read_file(self, on_disk: str) -> str:
@@ -336,7 +335,7 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
                 "directory: keep it in a DPAPI-protected key file ([store].encryption_key_file, "
                 "made with `messagefoundry protect-key`) and remove that file"
             )
-        if key in _ALLOWED_KEYS or is_value_name(key):
+        if key in _ALLOWED_KEYS or _is_value_name(key):
             # env() keys are matched lower-cased, so two files that differ only in case would
             # supply one value with no way to tell which.
             twin = folded.setdefault(key.lower(), entry)

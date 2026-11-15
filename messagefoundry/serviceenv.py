@@ -19,8 +19,10 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   refusal points there (vault BACKLOG #2595, slice B).
 * **So does every ``MEFOR_VALUE_*`` variable there, whatever ``[security].enforcement`` says.**
   The owner ruled on 2026-11-14 that the same ruling covers an ``env()`` value (vault BACKLOG
-  #8212 item 7). The engine cannot tell which of them is a secret, so it refuses each. The way
-  in is the secrets directory for a secret and the environment's value file for anything else.
+  #8212 item 7). The engine cannot tell which of them is a secret, so it refuses each, and counts
+  them without printing a name it read from the registry. The way in is the secrets directory,
+  or the environment's value file for a value that is not a secret and is the same for every
+  instance.
 * **Both refusals are ``serve``'s and ``supervise``'s, and the API app factories'.**
   ``create_app`` and ``create_managed_app`` raise on the same finding as they are built (vault
   BACKLOG #8212 item 1). The loosening ``secret_in_service_environment`` names it for a caller
@@ -156,15 +158,27 @@ class ServiceEnvPosture:
 
     @property
     def listed_value_names(self) -> tuple[str, ...]:
-        """The ``MEFOR_VALUE_*`` names the service's environment lists set, upper-cased as the
-        engine's own environment holds them on Windows. Unlike the two properties above, these
-        come from the registry, not from a fixed list."""
-        return tuple(name for name in self.listed if name.startswith(_VALUE_PREFIX))
+        """The ``MEFOR_VALUE_*`` names the service's environment lists set. Unlike the two
+        properties above, these come from the registry, so a refusal counts them and never prints
+        one: an operator may have typed a value where the name goes. The bare prefix names no
+        ``env()`` key, so it is not one."""
+        return tuple(
+            name for name in self.listed if name.startswith(_VALUE_PREFIX) and name != _VALUE_PREFIX
+        )
 
     def named_with_source(self, names: Sequence[str]) -> str:
         """``names``, each with the registry value that sets it."""
         where = dict(self.sources)
         return ", ".join(f"{name} (in {where[name]})" if name in where else name for name in names)
+
+    def counted_with_source(self, names: Sequence[str]) -> str:
+        """How many of ``names`` each registry value sets, with no name printed."""
+        where = dict(self.sources)
+        counts: dict[str, int] = {}
+        for name in names:
+            source = where.get(name, "an unknown value")
+            counts[source] = counts.get(source, 0) + 1
+        return ", ".join(f"{n} MEFOR_VALUE_* variable(s) (in {src})" for src, n in counts.items())
 
 
 class ServiceProbe(Protocol):
@@ -423,18 +437,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     keys = posture.listed_keys
     others = posture.listed_directory_names
     values = posture.listed_value_names
-    # The secrets directory's own name rule, judged on the name as the engine's environment holds
-    # it. A registry string that breaks it is not known to be a name, so it is counted.
-    plain = tuple(name for name in values if _setting_names.is_value_name(name))
-    hidden = len(values) - len(plain)
     if keys or others or values:
-        shown = (*keys, *others, *plain)
-        named = [posture.named_with_source(shown)] if shown else []
-        if hidden:
-            named.append(
-                f"{hidden} more MEFOR_VALUE_* name(s) (not spelled here: not the prefix followed "
-                "by letters, digits and underscores)"
-            )
+        named = [posture.named_with_source((*keys, *others))] if keys or others else []
+        if values:
+            named.append(posture.counted_with_source(values))
         found = f"{', '.join(named)} is set in {_where(posture)}"
     elif posture.status is ServiceEnvStatus.UNOBSERVABLE and posture.service_name is not None:
         if not posture.keys_in_environment:
@@ -461,7 +467,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     if others or values:
         put = [", ".join(others)] if others else []
         if values:
-            put.append("each MEFOR_VALUE_* value that is a secret")
+            put.append("each MEFOR_VALUE_* variable")
         step = (
             f"Put {' and '.join(put)} in the secrets directory MEFOR_SECRETS_DIRECTORY names, as "
             "one restricted file per setting named as its variable"
@@ -469,16 +475,11 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         cite = 'See docs/CONFIGURATION.md, "The secrets directory"'
         if values:
             step += (
-                ", and any other MEFOR_VALUE_* value in the active environment's value file, "
-                "environments/<env>.toml by default, keyed by the name after MEFOR_VALUE_ in "
-                "lower case"
+                ". A MEFOR_VALUE_* value that is not a secret and is the same for every instance "
+                "of the environment may go in its value file instead, environments/<env>.toml by "
+                "default, keyed by the name after MEFOR_VALUE_ in lower case"
             )
             cite += ' and "[environments]"'
-        if hidden:
-            step += (
-                ". A name not spelled above is not one the secrets directory accepts either, so "
-                "rename that env() key to letters, digits and underscores first"
-            )
         steps.append(f"{step}. {cite}")
         if _DIRECTORY_VARIABLE not in posture.listed:
             # Two routes, because install-service.ps1 refuses an existing directory the service

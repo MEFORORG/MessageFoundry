@@ -693,8 +693,9 @@ NSSM environment.
   of the engine's own secret settings other than the store key and its retired keys here from the
   service's NSSM list, where `serve` and `supervise` refuse it if the engine could read that
   list, and not if it could not (the previous bullet links where that is stated).
-  A `MEFOR_VALUE_*` value there is refused the same way, secret or not: move a secret one here and
-  any other to the active environment's value file (the previous bullet's link says when and why).
+  A `MEFOR_VALUE_*` value there is refused the same way, secret or not: move it here, or to the
+  active environment's value file if it is not a secret and is the same for every instance (the
+  previous bullet's link says when and why).
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:

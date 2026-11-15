@@ -155,7 +155,9 @@ def test_every_name_printed_is_a_constant_and_never_a_registry_string() -> None:
     known = (*KEY_CLASS_NAMES, *DIRECTORY_CLASS_NAMES)
     posture = _service(
         [f"{name.lower()}=-----BEGIN x" for name in known]
-        + ["MEFOR_STORE_PASSWORDX=x", "mefor_unknown_thing=x"],
+        + ["MEFOR_STORE_PASSWORDX=x", "mefor_unknown_thing=x"]
+        # Vault BACKLOG #8212 item 7: refused, and counted, never spelled.
+        + ["MEFOR_VALUE_PASTED_SECRET_TEXT=x"],
         MEFOR_STORE_ENCRYPTION_KEY=_KEY_VALUE,
     )
     for name in (*posture.listed_keys, *posture.listed_directory_names):
@@ -164,10 +166,11 @@ def test_every_name_printed_is_a_constant_and_never_a_registry_string() -> None:
         service_env_refusal(posture)
     )
     # Plus the secrets directory's own variable, a constant the loosening points to (vault BACKLOG
-    # #2595, ADR 0214).
+    # #2595, ADR 0214), and the bare prefix the value count prints.
     assert set(re.findall(r"MEFOR_[A-Z_]+", printed, flags=re.IGNORECASE)) == {
         *known,
         "MEFOR_SECRETS_DIRECTORY",
+        "MEFOR_VALUE_",
     }
 
 
@@ -666,46 +669,55 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
     """Vault BACKLOG #8212 item 7, the owner's ruling of 2026-11-14: every ``MEFOR_VALUE_*``
     variable in the service's lists refuses, a host name as well as a password, since the engine
     cannot tell which is a secret. An empty or blank one refuses too: the engine still overlays it
-    on the value file. The remedy names both ways in: the secrets directory for a secret, the
-    environment's value file for anything else."""
+    on the value file. The name came from the registry, so it is counted and never printed. The
+    remedy names both ways in: the secrets directory, and the environment's value file for a value
+    that is not a secret."""
     name = entry.split("=", 1)[0].upper()
     posture = _service([entry, "MEFOR_AI_ENVIRONMENT=prod"])
     assert posture.listed_value_names == (name,)
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert f"{name} (in Parameters\\AppEnvironmentExtra) is set in" in refusal
+    assert refusal.startswith(
+        "1 MEFOR_VALUE_* variable(s) (in Parameters\\AppEnvironmentExtra) is set in"
+    )
+    assert name not in refusal and name.lower() not in refusal
     assert "'MessageFoundry'" in refusal
     assert (
-        "Put each MEFOR_VALUE_* value that is a secret in the secrets directory "
-        "MEFOR_SECRETS_DIRECTORY names"
+        "Put each MEFOR_VALUE_* variable in the secrets directory MEFOR_SECRETS_DIRECTORY names"
     ) in refusal
-    assert "environments/<env>.toml" in refusal
+    assert "environments/<env>.toml" in refusal and '"[environments]"' in refusal
     assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
     assert _ENFORCEMENT_NOTE in refusal
     assert "protect-key" not in refusal
     value = entry.split("=", 1)[1]
     assert not value.strip() or value not in refusal, "the value must never reach the refusal"
-    assert '"[environments]"' in refusal
     [(loosening, twin)] = service_env_loosenings(posture)
     assert loosening == "secret_in_service_environment"
     _assert_twin_of(refusal, twin)
 
 
-def test_an_env_value_name_that_is_not_plain_is_counted_and_never_spelled() -> None:
-    """The value names come from the registry, not from a fixed list, so one that breaks the
-    letters-digits-underscores rule is refused without being printed."""
-    posture = _service(["MEFOR_VALUE_ODD NAME=synthetic-value", "MEFOR_VALUE_PLAIN=x"])
+def test_env_values_are_counted_per_registry_value() -> None:
+    """Two values in one list and one in another are counted per value, and the bare prefix,
+    which names no ``env()`` key, is not one of them."""
+
+    class _AlsoInEnvironment(_Probe):
+        def environment_entries(self, service_name: str) -> list[tuple[str, str]]:
+            return [*super().environment_entries(service_name), ("Environment", "MEFOR_VALUE_C=w")]
+
+    probe = _AlsoInEnvironment(
+        ancestors=_UNDER_NSSM,
+        services={100: "MessageFoundry"},
+        entries=["MEFOR_VALUE_A=x", "MEFOR_VALUE_B=y", "MEFOR_VALUE_=z"],
+    )
+    posture = read_service_env_posture(probe=probe, environ={})
+    assert posture.listed_value_names == ("MEFOR_VALUE_A", "MEFOR_VALUE_B", "MEFOR_VALUE_C")
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert "ODD NAME" not in refusal and "synthetic-value" not in refusal
-    assert (
-        "MEFOR_VALUE_PLAIN (in Parameters\\AppEnvironmentExtra), 1 more MEFOR_VALUE_* name(s) "
-        "(not spelled here: not the prefix followed by letters, digits and underscores) is set in"
-    ) in refusal
-    assert "rename that env() key to letters, digits and underscores first" in refusal
-    for odd in ("MEFOR_VALUE_ODD NAME=synthetic-value", "MEFOR_VALUE_=synthetic-value"):
-        only_odd = service_env_refusal(_service([odd]))
-        assert only_odd is not None and only_odd.startswith("1 more MEFOR_VALUE_* name(s)")
+    assert refusal.startswith(
+        "2 MEFOR_VALUE_* variable(s) (in Parameters\\AppEnvironmentExtra), "
+        "1 MEFOR_VALUE_* variable(s) (in Environment) is set in"
+    )
+    assert service_env_refusal(_service(["MEFOR_VALUE_=z"])) is None
 
 
 def test_a_directory_secret_and_an_env_value_share_one_remedy_sentence() -> None:
@@ -718,9 +730,13 @@ def test_a_directory_secret_and_an_env_value_share_one_remedy_sentence() -> None
     )
     refusal = service_env_refusal(posture)
     assert refusal is not None
+    assert refusal.startswith(
+        "MEFOR_STORE_PASSWORD (in Parameters\\AppEnvironmentExtra), "
+        "1 MEFOR_VALUE_* variable(s) (in Parameters\\AppEnvironmentExtra) is set in"
+    )
     assert (
-        "Put MEFOR_STORE_PASSWORD and each MEFOR_VALUE_* value that is a secret in the secrets "
-        "directory MEFOR_SECRETS_DIRECTORY names"
+        "Put MEFOR_STORE_PASSWORD and each MEFOR_VALUE_* variable in the secrets directory "
+        "MEFOR_SECRETS_DIRECTORY names"
     ) in refusal
     assert refusal.count('"The secrets directory"') == 1
     assert "set no MEFOR_SECRETS_DIRECTORY" not in refusal
