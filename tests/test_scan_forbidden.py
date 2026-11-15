@@ -1231,3 +1231,155 @@ def test_the_pr_body_workflow_reads_the_body_safely_and_is_not_required() -> Non
     _, script = step_script(workflow, key, "Scan the pull request body")
     assert '--pr-body-event "$GITHUB_EVENT_PATH"' in script
     assert context_of(key, job) not in required_contexts()
+
+
+# --- batch 479: four fail-open gaps (BACKLOG #5582, #5583, #5584, #5585) ------------------------------
+
+
+def test_scan_text_names_no_estate_token_in_its_reason(sf) -> None:
+    """BACKLOG #5584. The anonymizer leak-check raises and logs these reasons, and the estate token IS
+    the private string, so the reason says which kind fired and never which token."""
+    reasons = sf.scan_text("ZPD|1|xwidgetcox|acmecorp", include_estate=True)
+    assert reasons.count("estate token") == 1, reasons
+    for token in _SYNTH_ESTATE:
+        assert not any(token in r.lower() for r in reasons), reasons
+
+
+def test_scan_text_sees_a_name_inside_an_underscore_identifier(sf, tmp_path: Path) -> None:
+    """BACKLOG #5584. ``scan_file`` already read a name inside ``OB_<NAME>_ORU``; the body scan did not."""
+    text = "route OB_ACME_ORU onward"
+    p = tmp_path / "feed.txt"
+    p.write_text(text + "\n", encoding="utf-8")
+    assert sf.scan_file(p), "control: the file scan must see it, or this asserts nothing"
+    assert "customer name (ACME)" in sf.scan_text(text)
+    # A phrase pattern takes no identifier pass, in either scan: snake_case is not a phrase.
+    sf.FORBIDDEN.append((re.compile(r"\bwidget co\b", re.I), "partner phrase"))
+    assert "partner phrase" not in sf.scan_text("a widget_co value")
+
+
+@pytest.mark.parametrize("flag", ["--print-detector-counts", "--assert-floor-fresh", "--self-test"])
+def test_a_staged_file_named_like_a_terminal_flag_does_not_end_the_scan(
+    sf_main, tmp_path: Path, flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5585. pre-commit passes the staged names after its args, so a file named like a
+    terminal flag used to turn the commit gate into a report that exited 0 having scanned nothing."""
+    _clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main([str(dirty / "leak.md"), flag]) == 2
+    assert "unknown option" in capsys.readouterr().err
+
+
+def test_a_terminal_flag_alone_still_runs_its_mode(sf_main) -> None:
+    """The control: the whole command line is still a terminal mode."""
+    assert sf_main.main(["--print-detector-counts"]) == 0
+
+
+@pytest.mark.parametrize("segment", ["build", "dist", "venv", "node_modules", ".venv"])
+def test_a_tracked_or_staged_file_under_a_build_directory_is_scanned(
+    sf_main, tmp_path: Path, segment: str
+) -> None:
+    """BACKLOG #5585. A file the tracked or staged scan names is content git holds, wherever it sits."""
+    leak = tmp_path / "pkg" / segment / "leak.md"
+    leak.parent.mkdir(parents=True)
+    leak.write_text("contact ACME about this\n", encoding="utf-8")
+    assert sf_main.main([str(leak)]) == 1
+
+
+def test_the_path_walk_still_skips_an_untracked_environment(sf_main, tmp_path: Path) -> None:
+    """The --path walk meets untracked environments and build output, so it keeps its skip."""
+    root = tmp_path / "tree"
+    (root / "node_modules").mkdir(parents=True)
+    (root / "node_modules" / "leak.md").write_text("contact ACME\n", encoding="utf-8")
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(root)]) == 0
+
+
+def test_only_a_vendored_action_bundle_keeps_the_dist_skip(
+    sf_main, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The narrowed skip: a JavaScript action's compiled bundle, and no other ``dist`` directory."""
+    monkeypatch.chdir(tmp_path)
+    for rel in (".github/actions/example/dist/index.js", "pkg/dist/index.js"):
+        (tmp_path / rel).parent.mkdir(parents=True)
+        (tmp_path / rel).write_text("contact ACME\n", encoding="utf-8")
+    assert sf_main.main([".github/actions/example/dist/index.js"]) == 0
+    assert sf_main.main(["pkg/dist/index.js"]) == 1
+    # Anchored: the same directories under another root are not the vendored bundle.
+    (tmp_path / "x/.github/actions/example/dist").mkdir(parents=True)
+    (tmp_path / "x/.github/actions/example/dist/index.js").write_text("ACME\n", encoding="utf-8")
+    assert sf_main.main(["x/.github/actions/example/dist/index.js"]) == 1
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-16-be", "utf-32"])
+def test_utf16_and_utf32_text_is_scanned(sf, tmp_path: Path, encoding: str) -> None:
+    """BACKLOG #5583. A NUL near the start meant binary outright, so wide text went unscanned."""
+    p = tmp_path / "wide.txt"
+    p.write_bytes(("first line\nThis note mentions ACME here.\n" * 3).encode(encoding))
+    hits = sf.scan_file(p)
+    assert any("customer name (ACME)" in h for h in hits), hits
+
+
+def test_an_unreadable_file_is_a_hit_not_a_clean_file(
+    sf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5583. An unread file used to read as empty and pass."""
+    p = tmp_path / "locked.md"
+    p.write_text("contact ACME\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self == p:
+            raise PermissionError(13, "denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    hits = sf.scan_file(p, "locked.md")
+    assert hits and "unreadable" in hits[0] and "not scanned" in hits[0], hits
+    assert str(tmp_path) not in hits[0], "the hit must not echo the absolute path"
+
+
+def test_a_binary_file_does_not_count_as_scanned(
+    sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5583. A run whose files were all binary examined nothing, and must say so."""
+    root = tmp_path / "bin"
+    root.mkdir()
+    (root / "blob.bin").write_bytes(b"\x00\x01\x02 ACME 203.0.113.9")
+    assert sf_main.main(["--path", str(root)]) == 2
+    (root / "ok.md").write_text("fine\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(root)]) == 0
+    err = capsys.readouterr().err
+    assert "examined 1 file(s)" in err and "1 more were binary" in err, err
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"ASVS {_REQ} is enforced in [the guard](pkg/example_guard.py).",
+        f"ASVS <b>{_REQ}</b> is enforced by <code>pkg/example_guard.py</code>.",
+        f'ASVS {_REQ} is enforced in <a href="pkg/example_guard.py">the guard</a>.',
+        f"<p>ASVS <em>{_REQ}</em> lives in <code>pkg/example_guard.py</code></p>",
+    ],
+)
+def test_a_code_path_in_a_link_target_or_across_inline_tags_is_a_map(sf, line: str) -> None:
+    """BACKLOG #5582. Link targets were stripped and every HTML tag ended a sentence, so these passed."""
+    assert "map" in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # A block tag still ends a sentence: the pinned release-notes control, restated.
+        "<p>Changes in 7.1.2: fix</p><p>the residual leak in pkg/example_linux.py</p>",
+        # A link to a document is not a map, and a bare identifier is still unruled.
+        f"See [the notes](docs/EXAMPLE.md) for {_REQ_B}.",
+        "Bumps <code>lxml</code> from 6.1.1 to 6.1.2 in <code>requirements.lock</code>.",
+    ],
+)
+def test_the_second_reading_leaves_block_tags_documents_and_versions_alone(sf, line: str) -> None:
+    assert sf.scan_pr_body(line) == [], line
+
+
+def test_a_mid_line_angle_bracket_is_not_read_as_a_quote(sf) -> None:
+    """The quote marker was unanchored, so it deleted a line's first ``>`` wherever it sat."""
+    assert sf._pr_units("a -> b")[0][1] == "a -> b"
+    assert sf._pr_units("> quoted")[0][1] == "quoted"
