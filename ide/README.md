@@ -198,10 +198,10 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   editor refuses a value set in workspace settings that names a file outside the workspace folder,
   and any path inside it that leaves through a link; set an outside file in user settings. A user-set
   path that reaches the workspace folder by an alias gets the same link rules where realpath resolves
-  the alias to the folder: at least a link, a subst drive or an 8.3 short name. An alias realpath
-  does not resolve to it is not caught: at least a network-mapped drive (`net use`), since realpath
-  returns its UNC form, a UNC loopback or admin-share spelling (a link to one included), a bind mount
-  or a firmlink. A path whose links cannot be read is refused at either scope,
+  the alias to the folder: at least a link, a subst drive onto a local path or an 8.3 short name. An
+  alias that realpath resolves to a different spelling than the folder's own is not caught: at least
+  a `net use` drive or a subst drive onto a UNC target when the folder is local, a UNC loopback or
+  admin-share spelling (a link to one included), a bind mount or a firmlink. A path whose links cannot be read is refused at either scope,
   and in an untrusted workspace the editor refuses before it reads any file. Connection edits
   are checked against this file, at least its `[egress]` allowlist. Once you set this setting, in
   user or workspace settings (a folder value is ignored), every connection edit passes it as

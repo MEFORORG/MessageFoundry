@@ -71,9 +71,9 @@ const MAX_HOPS = 40;
 /** Whether resolving `target` passes through the folder whose resolved path is `realRoot`. Each
  *  existing prefix is resolved, and each link on the way is also followed one hop at a time, since a
  *  link chain resolves straight to its end: an alias pointing at a link the workspace holds must
- *  count too. That is how an alias outside the folder that realpath resolves to it, such as a link, a
- *  subst drive or an 8.3 short name, leads into it. Undefined when a prefix or link cannot be read, or
- *  there are too many hops, so the caller refuses. */
+ *  count too. That is how an alias outside the folder that realpath resolves to it leads into it; the
+ *  aliases this covers are listed under {@link securityConfigTarget}. Undefined when a prefix or
+ *  link cannot be read, or there are too many hops, so the caller refuses. */
 function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | undefined {
   const pending = [target];
   const seen = new Set<string>();
@@ -99,7 +99,9 @@ function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | u
       }
       try {
         if (fsx.lstat(at).isSymbolicLink()) {
-          const hop = path.resolve(path.dirname(at), fsx.readlink(at));
+          // A relative target is resolved from the link's real folder, as the OS does: the folder as
+          // spelled may be an alias that is not itself a link, such as a subst drive.
+          const hop = path.resolve(fsx.realpath(path.dirname(at)), fsx.readlink(at));
           pending.push(path.join(hop, path.relative(at, whole)));
         }
       } catch (e) {
@@ -128,18 +130,18 @@ function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | u
  * Whatever its scope, a path inside the workspace folder, the default `messagefoundry.toml`
  * included, must not leave it through a symbolic link the repository holds, a dangling one included.
  * A user-set path that reaches the folder by an alias gets the same rules where realpath resolves the
- * alias to the folder: at least a link, a subst drive or an 8.3 short name. An alias realpath does not
- * resolve to it is not caught: at least a network-mapped drive (`net use`), since realpath.native
- * returns its UNC form, a UNC loopback or admin-share spelling (a link to one included), a bind mount
- * or a firmlink. A path whose links, or the folder's, cannot be read is refused at either scope. A path that reaches the folder
- * is returned with its links resolved, so the CLI opens the folders that were checked; one that
- * never reaches it is returned as written.
+ * alias to the folder: at least a link, a subst drive onto a local path or an 8.3 short name. An alias
+ * that realpath resolves to a different spelling than the folder's own is not caught: at least a
+ * `net use` drive or a subst drive onto a UNC target when the folder is local, a UNC loopback or
+ * admin-share spelling (a link to one included), a bind mount or a firmlink. A path whose links, or
+ * the folder's, cannot be read is refused at either scope. A path that reaches the folder is returned
+ * with its links resolved, so the CLI opens the folders that were checked; one that never reaches it
+ * is returned as written.
  *
  * `scope.trusted` says the workspace is trusted. An untrusted one is refused before anything else, so
- * this check makes no file-system call there. Otherwise realpath and lstat would follow the
- * repository's links, and on Windows following a link to a UNC path can contact SMB; readlink only
- * reads the link itself. That bounds this check only; it says nothing
- * of what VS Code itself reads in Restricted Mode.
+ * this check makes no file-system call there. Otherwise realpath, lstat and readlink would traverse
+ * the repository's links, and on Windows traversing a link to a UNC path can contact SMB. That bounds
+ * this check only; it says nothing of what VS Code itself reads in Restricted Mode.
  */
 export function securityConfigTarget(
   workspace: string,

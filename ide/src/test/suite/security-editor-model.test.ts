@@ -80,7 +80,7 @@ suite("security editor host checks", () => {
 
   test("an untrusted workspace is refused before any file-system call", () => {
     // The Lander's hold on PR 2968, finding 22: in Restricted Mode the check makes no file-system
-    // call, since reading a repository-held link to a UNC path can contact SMB on Windows.
+    // call, so it traverses none of the repository's links.
     const calls: string[] = [];
     const spy = {
       realpath: (p: string): string => {
@@ -150,8 +150,9 @@ suite("security editor host checks", () => {
   });
 
   test("a user-set path that reaches the workspace by an alias gets the workspace's link rules", function () {
-    // An alias (a link, a mapped drive, an 8.3 name) into the workspace is lexically outside it, so
-    // containment is decided on the resolved path, against the workspace's own resolved path.
+    // An alias realpath resolves into the workspace (at least a link, a subst drive onto a local path,
+    // an 8.3 name) is lexically outside it, so containment is decided on the resolved path, against
+    // the workspace's own resolved path.
     const alias = path.join(outside, "alias");
     const away = fs.mkdtempSync(path.join(os.tmpdir(), "mf-secedit-away-"));
     try {
@@ -184,6 +185,75 @@ suite("security editor host checks", () => {
     } finally {
       fs.rmSync(away, { recursive: true, force: true });
     }
+  });
+
+  test("a relative link below a non-link alias is resolved from the link's real folder", () => {
+    // A subst-style alias: base/S is the folder base/deep/dirA under another name, and is not itself a
+    // link. base/deep/dirA/l is a relative link, ../../ws/linked, onto a link the repository holds,
+    // which leads out to base/away. No file is touched: this LinkFs is a model.
+    const base = path.resolve(path.sep, "mf-secedit-model");
+    const at = (...p: string[]) => path.join(base, ...p);
+    const alias = new Map([[at("S"), at("deep", "dirA")]]);
+    const links = new Map([
+      [at("deep", "dirA", "l"), path.join("..", "..", "ws", "linked")],
+      [at("ws", "linked"), at("away")],
+    ]);
+    const dirs = new Set([base, at("ws"), at("deep"), at("deep", "dirA"), at("away"), at("S")]);
+    const enoent = () => Object.assign(new Error("missing"), { code: "ENOENT" });
+    const realpath = (p: string): string => {
+      const rel = path.relative(base, p);
+      if (rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
+        if (base.startsWith(p)) {
+          return p; // an ancestor of the model's base
+        }
+        throw enoent();
+      }
+      let cur = base;
+      for (const part of rel === "" ? [] : rel.split(path.sep)) {
+        cur = path.join(cur, part);
+        cur = alias.get(cur) ?? cur;
+        for (let hops = 0; links.has(cur); hops++) {
+          assert.ok(hops < 10, "the model loops");
+          cur = path.resolve(path.dirname(cur), links.get(cur) as string);
+        }
+        if (!dirs.has(cur)) {
+          throw enoent();
+        }
+      }
+      return cur;
+    };
+    const last = (p: string) => path.join(realpath(path.dirname(p)), path.basename(p));
+    const model = {
+      realpath,
+      lstat: (p: string) => {
+        if (path.dirname(p) === p) {
+          return { isSymbolicLink: () => false };
+        }
+        const l = last(p);
+        if (links.has(l)) {
+          return { isSymbolicLink: () => true };
+        }
+        if (dirs.has(l)) {
+          return { isSymbolicLink: () => false };
+        }
+        throw enoent();
+      },
+      readlink: (p: string): string => {
+        const target = links.get(last(p));
+        if (target === undefined) {
+          throw Object.assign(new Error("not a link"), { code: "EINVAL" });
+        }
+        return target;
+      },
+    };
+    const scope = { fromWorkspace: false, trusted: true };
+    // THE CONTROL: a user-set path outside the workspace that never reaches it is accepted as written.
+    const away = at("away", "messagefoundry.toml");
+    assert.deepStrictEqual(securityConfigTarget(at("ws"), away, scope, model), { ok: true, path: away });
+    // Through the alias, the relative link and the repository's link: it passes through the
+    // workspace and leaves it, so it is refused.
+    const t = securityConfigTarget(at("ws"), at("S", "l", "messagefoundry.toml"), scope, model);
+    assert.strictEqual(t.ok, false, JSON.stringify(t));
   });
 
   test("a user-set path whose links or whose workspace cannot be read is refused", () => {

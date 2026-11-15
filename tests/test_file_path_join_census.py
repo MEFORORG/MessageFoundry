@@ -1091,13 +1091,10 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/securityEditorModel.ts": Site(
         5,
         OPERATOR,
-        "The security editor builds its settings path from the workspace folder, the operator's "
-        "setting, and link targets and resolved prefixes read from the workspace, which a "
-        "repository can hold; no part is checked before its join. The two reachesRoot hop paths "
-        "go to lstat, readlink and realpath before any containment check. On Windows the SMB "
-        "contact a link to a UNC path can cause comes from realpath(at) and resolveLinks following "
-        "it, not from a join. The containment refusal runs after every join and decides only which "
-        "path the CLI is given. The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
+        "Every join runs only after securityConfigTarget has refused an untrusted workspace, so each "
+        "part is the workspace folder, the messagefoundry.serviceConfig setting, or what the disk "
+        "holds, links included, read only once the operator has trusted the workspace. Containment "
+        "is refused after the joins. The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
     ),
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
     "ide/src/statusBar.ts": Site(4, OPERATOR, _IDE_WORKSPACE),
