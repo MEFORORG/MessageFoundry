@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from messagefoundry import redaction, secretscrub
+from messagefoundry import logging_guard, redaction, secretscrub
 from messagefoundry.logging_setup import CredentialScrubFilter, _install_phi_filters
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support import redact as redact_mod
@@ -203,7 +203,8 @@ def test_5549_the_at_sign_tail_stops_at_a_separator(line: str, kept: str) -> Non
         f"key load failed b'-----BEGIN {_PK}-----\\nMIIEvQIBADAN\\nzq-pem_pem-99\\n"
         f"-----END {_PK}-----\\n' retrying now",
         f"key load failed:\n-----BEGIN OPENSSH {_PK}-----\nb3BlbnNz\nzq-pem_pem-99",
-        f"key load failed -----BEGIN {_PK}----- MIIEab zq-pem_pem-99 -----END {_PK}----- now",
+        f"key load failed -----BEGIN {_PK}----- MIIEvQIBADANBgkqhk zq-pem_pem-99-abcdef "
+        f"-----END {_PK}----- now",
         f"key load failed:\n-----BEGIN PGP {_PK} BLOCK-----\nVersion: GnuPG v1 (GNU/Linux)\n"
         f"Comment: ops@example.invalid\n\nlQOYBF\nzq-pem_pem-99\n-----END PGP {_PK} BLOCK-----",
         f"key load failed cfg=-----BEGIN RSA {_PK}-----\\\\nMIIEpA\\\\nzq-pem_pem-99\\\\n"
@@ -262,10 +263,47 @@ def test_5550_a_cut_short_body_ends_at_the_first_line_that_is_not_base64() -> No
         f"-----BEGIN RSA {_PK}-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,AB\n\n"
         "zq-R1_A\nzq-R1_B",
         f'{{"key": "-----BEGIN RSA {_PK}-----\\nMIIE\\nzq-R1_A\\/zq-R1_B\\n"}}',
+        "ValueError(\"password=b'zq-R1_A zq-R1_B'\")",
+        "KeyError('token=b\"zq-R1_A zq-R1_B\"')",
+        "env MEFOR_X=b'zq-R1_A zq-R1_B'!",
+        "x password=b'zq-R1_A zq-R1_B'/next",
     ),
 )
 def test_a_round_one_shape_is_hidden(line: str) -> None:
     _assert_hidden(line, ("zq-R1_A", "zq-R1_B"))
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "-----Engine Start-----\nconnections loaded ok\n-----Engine Ready-----",
+        "-----Config Summary-----\nconn IB_ACME_ADT port 6661\n-----End Summary-----",
+    ),
+)
+def test_prose_between_two_banners_is_no_key_body(line: str) -> None:
+    """The PHI pass spells a dash-wrapped banner as it spells a key marker."""
+    for surface, apply in _SURFACES:
+        out = apply(line)
+        assert "loaded ok" in out or "port 6661" in out, f"{surface}: {out!r}"
+
+
+def test_a_long_bytes_literal_does_not_shorten_a_clipped_store_error() -> None:
+    """The store error text is clipped after redaction, so a stage that shortened the line before the
+    clip would print text the clip cut off. ``redact_log_line_head`` clips first."""
+    text = "login failed password=b'" + "zq-w " * 58 + "' rejected; echoed 'zq-tail-value'"
+    assert "zq-tail-value" not in redact_mod.redact_log_line_head(text, 300)
+    with pytest.MonkeyPatch.context() as patch:
+        _without_the_added_stage(patch)
+        before = redact_log_line(text)[:300]
+    assert "zq-tail-value" not in before
+
+
+def test_a_long_bytes_literal_does_not_shorten_a_clipped_guard_diagnostic() -> None:
+    """The log-write guard clips its diagnostic after the credential pass, so it too runs the
+    stage after the clip."""
+    text = "sink failed password=b'" + "zq-w " * 195 + "' then echoed 'zq-tail-value'"
+    # The clip cuts the literal's closing quote, so its words print as they did before the stage.
+    assert "zq-tail-value" not in logging_guard._safe_diagnostic(text)
 
 
 def test_an_end_marker_the_stage_did_not_take_opens_no_body() -> None:
@@ -599,6 +637,8 @@ _GROWTH_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     ("_PRIVATE_KEY_BODY", lambda n: "-----[redacted]-----\n" + "Ab-" * (n // 3)),
     ("_PRIVATE_KEY_BODY", lambda n: f"-----BEGIN {_PK}-----\n" + "AbCd\n" * (n // 5) + "a b"),
     ("_PRIVATE_KEY_BODY", lambda n: f"-----BEGIN {_PK}-----\nAAAA" + "-" * n),
+    ("_PRIVATE_KEY_BODY", lambda n: "-----[redacted]-----" + " AAAAAAAAAAAAAAAAAAAA" * (n // 21)),
+    ("_PRIVATE_KEY_BODY", lambda n: "-----[redacted]-----\n" + "AAAA<redacted>\n" * (n // 15)),
     ("_DSN_EMPTY_USER_PASSWORD", lambda n: "pg://:" + "a:" * (n // 2)),
     ("_DSN_EMPTY_USER_PASSWORD", lambda n: "pg://:ab " * (n // 9)),
     ("_DSN_AT_IN_PASSWORD", lambda n: "pg://u:<redacted>@" + "a@" * (n // 2) + "x"),
@@ -608,6 +648,9 @@ _GROWTH_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     ("_DIGEST_PARAMS_AFTER_PLACEHOLDER", lambda n: 'authorization=<redacted>"' + "x y " * (n // 4)),
     ("_DIGEST_PARAMS_AFTER_PLACEHOLDER", lambda n: "authorization=<redacted> " * (n // 25)),
     ("_DIGEST_PARAMS_AFTER_PLACEHOLDER", lambda n: 'authorization=<redacted>"' * (n // 25)),
+    ("_DIGEST_PARAMS_AFTER_PLACEHOLDER", lambda n: "authorization=<redacted>" * (n // 24)),
+    ("_DIGEST_PARAMS_AFTER_PLACEHOLDER", lambda n: "authorization=<redacted>';" * (n // 26)),
+    ("_DIGEST_PARAMS_AFTER_PLACEHOLDER", lambda n: "authorization=<redacted>'}" * (n // 26)),
     (
         "_DIGEST_PARAMS_AFTER_PLACEHOLDER",
         lambda n: "authorization=<redacted> " + "ab=cd" * (n // 5),

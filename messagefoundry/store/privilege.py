@@ -62,7 +62,7 @@ from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
 )
-from messagefoundry.support.redact import redact_log_line
+from messagefoundry.support.redact import redact_log_line_head
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from messagefoundry.store.base import Store
@@ -617,7 +617,7 @@ def probe_failure(backend: StoreBackend, exc: BaseException) -> StorePrivilegeRe
     return StorePrivilegeReport(
         backend=backend,
         status=StorePrivilegeStatus.UNOBSERVABLE,
-        detail=f"{type(exc).__name__}: {redact_log_line(str(exc))[:300]}",
+        detail=f"{type(exc).__name__}: {redact_log_line_head(str(exc), 300)}",
     )
 
 

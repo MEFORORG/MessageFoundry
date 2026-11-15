@@ -426,7 +426,7 @@ from messagefoundry.store.store import (
     write_kept_session,
 )
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
-from messagefoundry.support.redact import redact_log_line
+from messagefoundry.support.redact import redact_log_line_head
 
 log = logging.getLogger(__name__)
 
@@ -5723,7 +5723,7 @@ class SqlServerStore:
             log.warning(
                 "check-privileges: could not close the probe connection: %s: %s",
                 type(exc).__name__,
-                redact_log_line(str(exc))[:300],
+                redact_log_line_head(str(exc), 300),
             )
         return report
 

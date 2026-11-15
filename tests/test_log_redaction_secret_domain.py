@@ -551,8 +551,10 @@ def _applied_gate_names(module: ModuleType, applier: str) -> set[str]:
 
 
 def test_the_family_table_covers_every_applied_pattern() -> None:
-    """Every pattern redact_log_line applies is claimed by a family or named as a non-secret."""
-    applied = _applied_pattern_names(redact_mod, "redact_log_line")
+    """Every pattern redact_log_line applies is claimed by a family or named as a non-secret. Its
+    passes live in ``_redact_log_line_layers``; the added stage it runs last is held by
+    ``tests/test_secretscrub_added_stage.py``."""
+    applied = _applied_pattern_names(redact_mod, "_redact_log_line_layers")
     # Positive control: the derivation must actually find patterns. A silently-empty domain would make
     # every assertion below vacuously true, which is the failure this whole file exists to prevent.
     assert len(applied) >= 5, f"AST derivation found only {sorted(applied)} -- instrument is broken"
@@ -824,7 +826,7 @@ def test_ordinary_engine_diagnostics_are_not_eaten_by_the_credential_patterns(li
 #: cannot see the other regress. The pattern set is derived from the applying function by AST, so
 #: neither module can grow a pattern these guards do not check.
 CREDENTIAL_SURFACES: tuple[tuple[ModuleType, str], ...] = (
-    (redact_mod, "redact_log_line"),
+    (redact_mod, "_redact_log_line_layers"),
     (scrub_mod, "_run"),
 )
 
@@ -1689,7 +1691,9 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
 
     # THE GATE-REJECT PATH IS A SUBJECT IN ITS OWN RIGHT, and it is the one that runs on nearly every
     # record: a line naming no credential word at all. It reaches `_ANY_HINT`'s substring sweeps (23
-    # since BACKLOG #5545) and then returns, so nothing below it is exercised -- which is exactly why
+    # since BACKLOG #5545) and then returns, so no label pass below it is exercised; the added stage
+    # (BACKLOG #5546 to #5550) still runs its own substring gates, and on a line holding "://" its two
+    # DSN patterns, which this row times too -- which is exactly why
     # it needs its own timed row rather than being inferred from the marked one. Without it a
     # regression that made that sweep pathological would have no timed coverage anywhere in this file.
     subjects: tuple[tuple[str, Callable[[str], object], bool], ...] = (
@@ -2195,7 +2199,10 @@ def test_the_gate_admits_every_keyword_spelled_with_a_fold_character() -> None:
     for line in lines:
         if _FOLD_VALUE in scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, None):
             failures.append(f"ungated pattern misses {ascii(line)}")
-        if scrub_credentials(line) != scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, None):
+        # The passes the gate admits, without the added stage, which no word gate admits.
+        if scrub_mod._scrub_credentials_base(line) != scrub_mod._run(
+            line, CREDENTIAL_PLACEHOLDER, None
+        ):
             failures.append(f"the gate changed the result on {ascii(line)}")
         alone, chained, reached = _through_write_time_filters(line)
         if _FOLD_VALUE in alone:

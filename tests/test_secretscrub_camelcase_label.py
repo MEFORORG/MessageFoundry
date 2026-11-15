@@ -180,7 +180,7 @@ def test_a_plain_value_does_not_swallow_a_later_quoted_camelcase_label() -> None
         assert not printed, f"{name}: {len(printed)} lines printed, first {printed[:3]}"
 
 
-def test_the_support_bundle_still_prints_a_swallowed_camelcase_label(
+def test_the_bundle_label_passes_alone_still_print_a_swallowed_camelcase_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A RESIDUAL OF THE LABEL PASSES, pinned so its closing is noticed. ``support/redact.py`` runs
