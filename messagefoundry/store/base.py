@@ -2806,10 +2806,18 @@ class AuthStore(Protocol):
 
     # The offline administrator unlock's write (ADR 0171 as amended by ADR 0197): clears both locks and
     # both failure counts, and keeps both cycle counts unless ``reset_cycles``. A named method, in
-    # place of the ``record_login_failure`` reuse ADR 0171 shipped with.
+    # place of the ``record_login_failure`` reuse ADR 0171 shipped with. ``audit`` is appended in the
+    # SAME transaction (BACKLOG #5633), so an unlock is never committed unrecorded: a refused append
+    # rolls the clear back. Returns whether a row was written. False writes and audits nothing: no
+    # such account, or a row that changed under the write's compare-and-set.
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None: ...
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool: ...
 
     # The RAW sign-in lockout-state write: it sets exactly the two values it is handed and nothing
     # else. No engine code calls it since ADR 0197 moved ``admin-unlock`` to ``clear_lockout``; tests
@@ -4523,6 +4531,14 @@ def store_call_errors() -> tuple[type[Exception], ...]:
     first. Cached, because naming a server driver imports it: build it at startup, so the first
     refusal does not run that import on the event loop (vault BACKLOG #3145, #3113)."""
     return (RuntimeError, OSError, ValueError, *store_driver_errors())
+
+
+def sealed_read_errors() -> tuple[type[Exception], ...]:
+    """What a refused read of a sealed record can raise (BACKLOG #5559): :func:`store_call_errors`
+    and ``CipherError``, from a record that cannot be decrypted. The same caveat holds: a caller
+    that must not read a bug as a refusal re-raises
+    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first."""
+    return (*store_call_errors(), CipherError)
 
 
 @cache

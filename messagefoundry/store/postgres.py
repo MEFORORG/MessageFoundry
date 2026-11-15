@@ -10823,12 +10823,27 @@ class PostgresStore:
         await self._write_user_txn(user_id, lambda r: full_authentication_clear(r, now))
 
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None:
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """See the SQLite twin (BACKLOG #5633): the clear and ``audit`` share one transaction. This
+        leg is CI-only, so a divergence from the SQLite and SQL Server bodies surfaces first in CI."""
         now = time.time() if now is None else now
-        await self._write_user_txn(
-            user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
-        )
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            if (
+                await self._write_user(
+                    conn, user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
+                )
+                is None
+            ):
+                return False  # nothing written, so nothing audited
+            appended = await self._append_audits(conn, (audit,), now=now)
+        tee_audits((audit,), appended, ts=now)
+        return True
 
     async def record_login_failure(
         self,

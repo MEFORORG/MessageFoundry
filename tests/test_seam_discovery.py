@@ -165,10 +165,12 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
     joined when the session-cookie read took the same rule (BACKLOG #2454).
     ``ConfigWriteNotRecorded`` joined when the console's flag route took the audit refusal by type
     (BACKLOG #3811). ``record_ws_gate`` joined with the WebSocket accept gate (vault
-    BACKLOG #2955)."""
+    BACKLOG #2955). ``account_read_errors`` joined with the console's post-action name read
+    (BACKLOG #5559)."""
     assert surface.security_symbols == (
         "ConfigWriteNotRecorded",
         "RepeatedCredentialError",
+        "account_read_errors",
         "alert_directory_administrator_granted",
         "authorization_header",
         "client_ip",

@@ -1009,8 +1009,9 @@ SITES: dict[str, Site] = {
     "messagefoundry/uploads.py::UploadStore._paths_unfollowed": Site(
         2,
         INTERNAL,
-        "A 32-hex id the store generated, refused by regex if malformed. `_paths` adds a parent "
-        "check; the reseal instead opens only a regular file, by lstat.",
+        "A 32-hex id the store generated, refused by regex if malformed. `_paths` adds a check that "
+        "each path resolves to itself, which refuses a symlink but not a hard link; the reseal "
+        "instead opens only a regular file, by lstat.",
     ),
     "messagefoundry/uploads.py::UploadStore._reseal_to_active_sync": Site(
         1, INTERNAL, "The fixed pair lock file name (`LOCK_FILE_NAME`) under the uploads root."

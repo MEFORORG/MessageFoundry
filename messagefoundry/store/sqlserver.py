@@ -15838,12 +15838,39 @@ class SqlServerStore:
         await self._write_user_txn(user_id, lambda r: full_authentication_clear(r, now))
 
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None:
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """See the SQLite twin (BACKLOG #5633): the clear and ``audit`` share one transaction. This
+        leg is CI-only, so a divergence from the SQLite and Postgres bodies surfaces first in CI.
+        Same lock order as ``replace_totp_enrolment``: the in-process gate, then the connection."""
         now = time.time() if now is None else now
-        await self._write_user_txn(
-            user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
-        )
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        if (
+                            await self._write_user(
+                                cur,
+                                user_id,
+                                lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now),
+                            )
+                            is None
+                        ):
+                            await conn.rollback()
+                            return False  # nothing written, so nothing audited
+                        appended = await self._append_audits(cur, (audit,), now=now)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard, as replace_totp_enrolment does.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits((audit,), appended, ts=now)
+        return True
 
     async def record_login_failure(
         self,
