@@ -3415,7 +3415,8 @@ class AuthStore(Protocol):
         default ``None`` applies no anchor, which is the behaviour every other caller has.
 
         Returns ``True`` only when the write landed and applied the anchor, so a caller restarts
-        its new-address bookkeeping only for a session whose anchor moved; ``False`` for a write
+        its new-address bookkeeping only for a session an anchor was applied to (with
+        ``anchor.client`` ``None`` that is True with the address unchanged); ``False`` for a write
         that applied none, a session gone or revoked, or a write that lost its seal compare."""
         ...
 

@@ -1010,6 +1010,19 @@ def _anchor_is_none_on_oidc(leg: ast.AST) -> bool:
     )
 
 
+#: Calls that read a session's factor state, at least the ones the console MFA routes can reach,
+#: directly or through the must-change confinement helpers (vault BACKLOG #2964 item 14).
+_FACTOR_STATE_READERS = (
+    "mfa_satisfied",
+    "mfa_status",
+    "rotation_comes_first",
+    "confined_before_its_factor",
+    "must_change_target",
+    "password_change_owes_factor",
+    "_owes_known_factor",
+)
+
+
 def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     """ASVS 6.1.3 was held at partial a third time (BACKLOG #1133) on passages older than both fixes.
 
@@ -1094,6 +1107,23 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
             f"the {label} MFA route now checks whether the session already met its factor before "
             "the code; the doc says a TOTP refreshes the step-up window at any time."
         )
+        # The route also reads factor state BEFORE the code through a helper: rotation_comes_first
+        # sends a must-change session that must rotate first to the password page unread. The doc
+        # names that one pre-code ask; any other factor-state reader ahead of verify_mfa is a new
+        # ask the doc does not state.
+        pre_code = sorted(
+            name
+            for name in _FACTOR_STATE_READERS
+            if any(c.lineno < min(verify_lines) for c in call_sites(handler, name))
+        )
+        assert pre_code == ([] if label == "JSON" else ["rotation_comes_first"]), (
+            f"the {label} MFA route's factor-state reads before verify_mfa are {pre_code}; the doc "
+            "names only rotation_comes_first's must-change redirect."
+        )
+    assert (
+        "before the code, through `rotation_comes_first`, whether a must-change session must "
+        "change its password first" in " ".join(_doc_text().split())
+    ), "the doc no longer states POST /ui/mfa's must-change redirect ahead of the code."
 
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
     assert ceremony == [

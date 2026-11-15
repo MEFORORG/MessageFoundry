@@ -3499,8 +3499,11 @@ once its window lapses. **On any session but an `oidc` one, a TOTP or recovery c
 too, at any time the second-step lock is not live**
 (a directory account also needs the directory to confirm it, next paragraph):
 `verify_mfa`, behind both `POST /auth/mfa-verify` and `POST /ui/mfa`, does not ask whether the
-session already met its factor (`POST /ui/mfa` asks only after a code was refused, to send a
-satisfied session to `/ui` rather than re-render the gate), so
+session already met its factor. `POST /ui/mfa` asks around it at least twice: before the code,
+through `rotation_comes_first`, whether a must-change session must change its password first, in
+which case the code is not read and the browser goes to `/ui/account/password`; and after a refused
+code, to send a satisfied session to `/ui` rather than re-render the gate. So, outside that
+must-change case,
 an account holding a TOTP can renew its window with a code alone, with no password or directory
 re-bind. That renews the window only; it mints no action-bound grant. An `oidc` session cannot: its
 window opens only by the IdP round trip. For that one mechanism `verify_mfa` does ask: a code on an
@@ -4076,7 +4079,8 @@ and answered after another tab met the factor, neither re-anchors nor stamps. Th
 inside the factor write, from the session row that write reads in its own transaction
 (`mark_session_mfa_verified` with an anchor; its docstring says what each store backend does
 between that read and the write). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
-`/ui`, as the page's GET does, and stages no assertion. An
+`/ui`, as the page's GET does, and stages no assertion; a must-change session that must change its
+password first is sent to `/ui/account/password` before its code is read. An
 action-bound grant still comes only from the credential leg: the password leg of `POST /ui/reauth`,
 or for an `oidc` session the IdP leg, which shows no password field. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **re-proof-only
 step-up**, with no MFA gate: the password or directory re-bind, or the IdP leg for an `oidc`

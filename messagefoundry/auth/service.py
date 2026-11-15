@@ -8152,8 +8152,8 @@ class AuthService:
                 # engine's own login stamp satisfy `has_recent_step_up` for the whole
                 # `step_up_max_age_seconds` window with no directory interaction. So the first
                 # window-gated action demands a real step-up: a directory re-bind, or an engine TOTP
-                # or recovery code or a user-verified passkey at the MFA gate for a `kerberos`
-                # session, since those stamp the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
+                # or recovery code at the MFA gate, or a user-verified passkey that completes a
+                # pending factor, for a `kerberos` session, since those stamp the window, and only the IdP for an `oidc` one (`/ui/reauth/oidc`, BACKLOG
                 # #296, #2142).
                 #
                 # A CONSTANT, NOT A PARAMETER. This used to be `seed_reauth: bool = True`, and the
