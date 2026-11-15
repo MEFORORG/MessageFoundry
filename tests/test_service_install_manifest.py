@@ -1660,26 +1660,33 @@ def test_a_junction_in_the_config_dir_is_not_followed_and_is_named(tmp_path: Pat
 
 
 def test_the_walk_changes_a_link_itself_never_its_target() -> None:
-    """A file link whose own DACL denies read shows an empty LinkType, so ``$isLink`` does not skip
-    it and the walk reaches its per-item calls. Without ``/L`` icacls follows the link and re-owns
-    and resets its target, which may lie outside the config dir. Both per-item calls must carry
-    ``/L``; on a file that is not a link, ``/L`` changes nothing (measured)."""
+    """Without ``/L`` icacls follows a link and re-owns and resets its target, which may lie
+    outside the config dir. A link the checks before the per-item calls miss would reach them, so
+    every icacls call in the per-item loop must carry ``/L``, wherever in its arguments; on a file
+    that is not a link, ``/L`` changes nothing (measured)."""
     m = re.search(r"(?ms)^function Reset-ConfigTreeAcl \{.*?^\}", _script_text())
     assert m is not None, "Reset-ConfigTreeAcl is missing from install-service.ps1"
-    calls = re.findall(r"^\s*& icacls \$item (.*)$", m.group(0), re.MULTILINE)
-    assert len(calls) == 2, f"expected the walk's two per-item icacls calls, found: {calls}"
-    for verb in ("/setowner", "/reset"):
-        hits = [c for c in calls if verb in c.split()]
-        assert len(hits) == 1, f"no single per-item {verb} call in the walk: {calls}"
-        assert hits[0].split()[0] == "/L", (
-            f"the walk's per-item {verb} lacks /L, so it acts on a link's target: {hits[0]}"
+    loop = re.search(r"(?ms)foreach \(\$child in \$children\) \{.*?^        \}", m.group(0))
+    assert loop is not None, "the per-item loop of Reset-ConfigTreeAcl was not found"
+    # An invocation starts a statement; a message that only mentions icacls does not.
+    call = re.compile(r"""(?i)^\s*(?:&\s*)?["']?icacls(?:\.exe)?["']?\s""")
+    calls = [ln for ln in loop.group(0).splitlines() if call.search(ln)]
+    verbs = {v for c in calls for v in ("/setowner", "/reset") if v in c.split()}
+    assert verbs == {"/setowner", "/reset"}, (
+        f"CONTROL FAILED: the per-item /setowner and /reset calls were not found: {calls}"
+    )
+    for c in calls:
+        assert "/L" in c.split(), (
+            f"a per-item icacls call lacks /L, so it acts on a link's target: {c}"
         )
 
 
 @_windows_only
 def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Path) -> None:
-    """The behaviour behind the static pin above. Creating a symbolic link needs the privilege an
-    unelevated account has only in Developer Mode, so the test skips without it. Unelevated, no
+    """A file link whose own DACL hides its link type passes ``$isLink``, so the walk fails closed on
+    any file reparse point whose type reads empty: it skips the item and names it. A named problem
+    withholds the installer's "Config : locked" line. Creating a symbolic link needs the privilege
+    an unelevated account has only in Developer Mode, so the test skips without it. Unelevated, no
     owner can be set with /L or without, so only an elevated run (CI) witnesses the owner arm."""
     probe = tmp_path / "symlink-probe"
     try:
@@ -1691,9 +1698,7 @@ def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Pa
     & icacls $paths.target /grant '*S-1-5-32-547:R' | Out-Null
     $hidden = Join-Path $cfg 'hidden.py'
     New-Item -ItemType SymbolicLink -Path $hidden -Target $paths.target | Out-Null
-    # Denying SYNCHRONIZE empties LinkType and still lets Get-Acl read the link (measured on
-    # pwsh 7.6). A denied read would hide the type too, but unelevated the walk's own Get-Acl of the
-    # item would then fail, since this account cannot take ownership to regain READ_CONTROL.
+    # Denying SYNCHRONIZE empties LinkType (measured on pwsh 7.6).
     & icacls $hidden /L /deny "${me}:(S)" | Out-Null
     if ("$((Get-Item -LiteralPath $hidden -Force).LinkType)") {
       throw "CONTROL FAILED: the deny entry did not hide the link's type"
@@ -1708,6 +1713,18 @@ def test_a_file_link_whose_type_is_hidden_does_not_reach_its_target(tmp_path: Pa
     assert got["after"]["targetOwner"] == got["before"]["targetOwner"], (
         "the owner step followed a link whose type it could not read and re-owned a file OUTSIDE "
         "the config dir"
+    )
+    assert any("hidden.py" in p and "link type could not be read" in p for p in got["problems"]), (
+        "a link whose type could not be read was not named, so the installer would print the "
+        f"locked line over it: {got['problems']}"
+    )
+    decided = re.search(
+        r"(?s)if \(\$ConfigLockProblems\) \{.*?Write-Warning.*?\} else \{.*?Config : locked",
+        _script_text(),
+    )
+    assert decided is not None, (
+        "the installer no longer withholds the 'Config : locked' line when the lockdown returns a "
+        "problem"
     )
 
 

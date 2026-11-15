@@ -1243,22 +1243,25 @@ function Reset-ConfigTreeAcl {
       nothing when the tree is locked. A problem is at least: $Path still inheriting, lacking
       $Account's read or carrying a deny entry, an owner other than Administrators or SYSTEM, an
       entry for anyone but SYSTEM, Administrators and $Account, a DACL that could not be reset or
-      read, or a link the listing shows as one. An entry a child only inherits is named once, where it comes from.
+      read, a link the listing shows as one, or a file reparse point whose link type cannot be
+      read. An entry a child only inherits is named once, where it comes from.
 
       THE WALK IS DONE HERE, NOT WITH `icacls /T`. Measured: `icacls <dir>\* /reset /T /C` reset a
       file in a junction's target outside <dir>, with /L or without. So each item is set on its own,
       and an item the listing shows as a junction, symbolic link or folder reparse point (a mounted
       volume) is neither changed nor entered, and is named instead: what it points at was not locked, and the guard may still load
       a module through it. A queued folder is read again before it is listed, in case it has become
-      one since. A file reparse point of another kind, such as a cloud-file placeholder, is a file
-      and is locked as one. So is a file link whose own DACL hides its link type from the listing:
-      the link check does not name it, and the per-item calls pass /L, so they change the link's own
-      owner and DACL and leave its target as it was, not locked.
+      one since. A FILE REPARSE POINT WHOSE LINK TYPE READS EMPTY OR CANNOT BE READ is skipped and
+      named too, failing closed: the item's own DACL can hide a symbolic link's type (a deny of
+      SYNCHRONIZE or read on it, measured). That includes a cloud-file placeholder, whose link type
+      reads empty. Every other item
+      is changed with /L, so the change lands on the item itself and is not followed through a link.
 
       A FILE THE LISTING SHOWS AS HARD-LINKED keeps its own entries and is named. Its other names,
       perhaps outside $Path, share its DACL, and the entries it inherits still follow $Path, as any
-      change to the folder that holds it would make them. A hard-linked file whose link type cannot
-      be read is locked as a file, which changes it under every name it has.
+      change to the folder that holds it would make them. The hard-link check reads LinkType too, so
+      it can miss at least a hard-linked file whose link type does not read; one it does not detect
+      is locked as a file, which changes it under every name it has.
 
       A WRITE GRANT FOR $Account BELOW $Path IS DROPPED TO READ by the reset, and named in a warning:
       a folder a connection writes to does not belong in a config dir the guard executes from.
@@ -1277,6 +1280,19 @@ function Reset-ConfigTreeAcl {
         param($Entry)
         ($Entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
             ($Entry.PSIsContainer -or "$($Entry.LinkType)" -in @("Junction", "SymbolicLink"))
+    }
+    # Fail closed on a file reparse point whose link type reads empty or throws. LinkType opens the
+    # item, and the item's own DACL can refuse that (a deny of SYNCHRONIZE or read on a symbolic
+    # link empties it, measured), which would let a link through $isLink. The ReparsePoint bit comes
+    # from the directory listing and needs no open.
+    $isUnreadReparse = {
+        param($Entry)
+        if ($Entry.PSIsContainer -or -not ($Entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            return $false
+        }
+        $type = $null
+        try { $type = "$($Entry.LinkType)" } catch { return $true }
+        -not $type
     }
     $readBack = {
         param([string]$Item)
@@ -1339,15 +1355,20 @@ function Reset-ConfigTreeAcl {
                 $problems += "'$item' is a junction, a link or a mounted folder, so what it points at was not locked"
                 continue
             }
+            if (& $isUnreadReparse $child) {
+                $problems += ("'$item' is a reparse point whose link type could not be read, so it was " +
+                    "not changed, and what it may point at was not locked")
+                continue
+            }
             if ("$($child.LinkType)" -eq "HardLink") {
                 $problems += ("'$item' has a hard link, so its own entries, which every name of it " +
                     "shares, were not reset")
                 continue
             }
             # Owner first: a child whose DACL leaves Administrators out can be reset only by its owner.
-            # /L here and on /reset below: a link whose own DACL hides its type from $isLink reaches
-            # this point, and without /L icacls follows it and changes its target, perhaps outside
-            # $Path. On a file that is not a link, /L changes nothing (measured).
+            # /L here and on /reset below, so a link that reaches this point despite the checks above
+            # is changed itself, never followed to a target perhaps outside $Path. On a file that is
+            # not a link, /L changes nothing (measured).
             & icacls $item /L /setowner "*S-1-5-32-544" | Out-Null
             if ($accountSid) {
                 $held = @((Get-Acl -LiteralPath $item -ErrorAction SilentlyContinue).Access | Where-Object {
