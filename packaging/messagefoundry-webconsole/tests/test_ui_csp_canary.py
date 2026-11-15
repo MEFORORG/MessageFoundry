@@ -815,9 +815,15 @@ _COUNTS_COLUMN = "Counts toward the floor"
 _NO_VERSION = ("none", "not verified")
 _VERSION_CELL_RE = re.compile(r"\d+(?:\.\d+)*")
 #: The rows that do not count toward a browser's floor. A literal on purpose: leaving a row out of
-#: the floor is the one edit that lowers a floor without touching a number, so a new exclusion has to
-#: be made here as well as on the page, which states each reason in the row.
+#: the floor lowers a floor without touching a number, so a new exclusion has to be made here as
+#: well as on the page, which states each reason in the row.
 _OUT_OF_FLOOR = frozenset({"'strict-dynamic'", "report-uri", "report-to", "Reporting-Endpoints"})
+#: Where the version section lists the policy directives that have no row of their own.
+_OTHER_DIRECTIVES_LEAD = (
+    "The console's and the attachment download's policies have other directives"
+)
+#: A trailing ``(note N)`` or ``(not verified)`` on an item of a floor-table cell.
+_ITEM_SUFFIX_RE = re.compile(r"\s*\((?:note \d+|not verified)\)$")
 
 
 def _cells(line: str) -> list[str]:
@@ -848,6 +854,20 @@ def _row_features(first_cell: str) -> set[str]:
     }
 
 
+def _items(cell: str) -> dict[str, str]:
+    """A floor-table cell's items, each a feature table row's first cell, mapped to the item as
+    written. Exact names rather than substrings, so ``Clear-Site-Data`` and ``Clear-Site-Data``
+    with ``"cache"`` stay two features."""
+    items = [item.strip() for item in cell.rstrip(".").split(". ") if item.strip()]
+    return {_ITEM_SUFFIX_RE.sub("", item): item for item in items}
+
+
+def _policy_directives() -> set[str]:
+    """Every directive name in the console's nonce policy and the attachment download's policy."""
+    policies = (security.build_ui_csp("n"), engine_app._ATTACHMENT_CSP)
+    return {part.split()[0] for policy in policies for part in policy.split(";") if part.strip()}
+
+
 def _version(cell: str) -> tuple[int, ...] | None:
     if cell in _NO_VERSION:
         return None
@@ -862,10 +882,13 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
     stated absence in each browser's column and a named source.
 
     The sets are the same ones the degrade-table check derives: the emitted browser-security headers,
-    the ``window.<Feature>`` detects and the session-cookie attributes. So a header the console
-    starts sending, or a detect it starts reading, reds here until its version row exists, and a row
-    cannot be deleted to lift a floor. The request headers the server reads are held to the same
-    table by ``test_browser_support_doc.py``, which derives them.
+    the ``window.<Feature>`` detects and the session-cookie attributes. Each directive of the two
+    policies needs a row or a place in the section's list of other directives, and the in-page
+    referrer tag needs a row while the page shell emits it. So a header, detect or directive the
+    console starts using reds here until the table names it, and a row for any of those cannot be
+    deleted to lift a floor. Rows outside those sets, such as the passkey options, are held by
+    nothing here. The request headers the server reads are held to the same table by
+    ``test_browser_support_doc.py``, which derives them.
 
     Names are matched by backticked token rather than by substring, as the degrade-table check does,
     because this table splits ``Content-Security-Policy`` into one row per directive."""
@@ -886,6 +909,15 @@ def test_the_version_table_has_a_row_for_every_feature_the_console_uses() -> Non
         f"docs/BROWSER-SUPPORT.md's version table has no row for {missing}, which the console uses, "
         f"so the floor it states was not derived from every feature"
     )
+    directives = _policy_directives()
+    assert {"script-src", "frame-ancestors", "sandbox"} <= directives, directives
+    section = " ".join(_support_doc_text().split(_VERSION_TABLE_HEADING, 1)[1].split())
+    assert _OTHER_DIRECTIVES_LEAD in section, _OTHER_DIRECTIVES_LEAD
+    listed = section.split(_OTHER_DIRECTIVES_LEAD, 1)[1].split(". ", 1)[0]
+    unnamed = sorted(d for d in directives if d not in named and f"`{d}`" not in listed)
+    assert not unnamed, f"no version row and no place in the list of other directives: {unnamed}"
+    if 'name="referrer"' in (_PACKAGE_DIR / "_html.py").read_text(encoding="utf-8"):
+        assert any('`<meta name="referrer">`' in row[0] for row in rows), "the referrer tag row"
     nonce_rows = [row for row in rows if "'nonce-...'" in _row_features(row[0])]
     assert len(nonce_rows) == 1, (
         "the CSP nonce-source row, the one feature the console needs to run"
@@ -932,11 +964,13 @@ def test_each_browsers_floor_is_the_latest_version_in_its_column() -> None:
             f"{floor_row[0]}'s floor reads {floor_row[supported]}, but the latest version among the "
             f"rows that count is {'.'.join(map(str, latest))}"
         )
+        setters, missing = _items(floor_row[set_by]), _items(floor_row[gaps])
+        assert set(setters) | set(missing) <= {row[0] for row in counted}, (setters, missing)
         for version, row in known:
-            assert (row[0] in floor_row[set_by]) == (version == latest), (floor_row[0], row[0])
-            assert (row[0] in floor_row[gaps]) == (version is None), (floor_row[0], row[0])
+            assert (row[0] in setters) == (version == latest), (floor_row[0], row[0])
+            assert (row[0] in missing) == (version is None), (floor_row[0], row[0])
             if row[column] == "not verified":
-                assert f"{row[0]} (not verified)" in floor_row[gaps], (floor_row[0], row[0])
+                assert missing[row[0]].endswith("(not verified)"), (floor_row[0], row[0])
 
 
 def _runbook_contract_table() -> str:
