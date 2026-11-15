@@ -96,8 +96,66 @@ async def assert_a_done_marker_still_finalizes_the_parent(store: Any) -> None:
     assert await store.count_dead(allowed_channels=None) == 0
 
 
+OB = "OB_PT_SCOPE"
+BUCKETS = (0.5, 5.0, 60.0)
+
+
+async def _outbound_aggregates(store: Any) -> tuple[Any, list[Any]]:
+    """The connections dashboard's outbound metrics and the latency histogram, at a fixed clock."""
+    metrics = await store.connection_metrics(since=0.0, now=1000.0, rate_window=10_000.0)
+    return metrics.destinations, list(await store.delivery_latency_histogram(buckets=BUCKETS))
+
+
+async def assert_a_marker_counts_in_no_outbound_aggregate(store: Any) -> None:
+    """A marker is not a delivery, so neither a done nor a dead one adds a (channel, destination)
+    entry to the connection metrics or the latency histogram (BACKLOG #5614). Scoping the marker to
+    the parent's channel would otherwise list a phantom "parent > pass-through" edge there."""
+    # The control: one real delivery from the parent's channel, which both aggregates count.
+    real, routed = await _seed_routed(store, metadata=None, now=300.0)
+    assert await store.transform_handoff(
+        routed_id=routed,
+        message_id=real,
+        channel_id=PARENT,
+        deliveries=[(OB, RAW)],
+        now=310.0,
+    )
+    [item] = await store.claim_ready(destination_name=OB, now=311.0)
+    await store.mark_done(item.id, now=312.0)
+    destinations, histogram = await _outbound_aggregates(store)
+    assert list(destinations) == [(PARENT, OB)] and destinations[(PARENT, OB)].written == 1
+    assert [(h.channel_id, h.destination_name, h.count) for h in histogram] == [(PARENT, OB, 1)]
+    # A done marker, then a dead one, on the same channel.
+    done, routed = await _seed_routed(store, metadata=None, now=400.0)
+    assert await store.transform_handoff(
+        routed_id=routed,
+        message_id=done,
+        channel_id=PARENT,
+        deliveries=[],
+        pt_deliveries=[(PT, RAW)],
+        now=410.0,
+    )
+    cap = 2
+    dead, routed = await _seed_routed(
+        store,
+        metadata=json.dumps({"correlation_depth": cap, "correlation_root_id": "root-agg"}),
+        now=500.0,
+    )
+    assert await store.transform_handoff(
+        routed_id=routed,
+        message_id=dead,
+        channel_id=PARENT,
+        deliveries=[],
+        pt_deliveries=[(PT, RAW)],
+        correlation_depth_cap=cap,
+        now=510.0,
+    )
+    assert await store.count_dead(channel_id=PARENT, allowed_channels=None) == 1
+    assert await _outbound_aggregates(store) == (destinations, histogram)
+
+
 #: Every case, for ``pytest.mark.parametrize``. Each takes ``(store,)``.
 CASES = [
     pytest.param(assert_a_dead_marker_is_scoped_to_the_parent_channel, id="dead-marker-scope"),
     pytest.param(assert_a_done_marker_still_finalizes_the_parent, id="done-marker"),
+    pytest.param(assert_a_marker_counts_in_no_outbound_aggregate, id="outbound-aggregates"),
 ]

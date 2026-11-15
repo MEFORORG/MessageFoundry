@@ -12142,6 +12142,7 @@ class PostgresStore:
         for cid, (read, errored) in counts.items():
             inbound[cid] = InboundMetrics(read=int(read), errored=int(errored or 0), last_at=None)
 
+        # A pass-through marker is not a delivery, so it is no edge either (BACKLOG #5614).
         dest_rows = await self._fetchall(
             "SELECT channel_id, destination_name,"
             " SUM(CASE WHEN status IN ($1,$2) THEN 1 ELSE 0 END) AS queue_depth,"
@@ -12150,7 +12151,7 @@ class PostgresStore:
             " MIN(CASE WHEN status=$7 THEN created_at END) AS oldest_pending_at,"
             " SUM(CASE WHEN status=$8 AND updated_at>=$9 THEN 1 ELSE 0 END) AS recent_done,"
             " MAX(CASE WHEN status=$10 THEN updated_at END) AS last_done_at"
-            " FROM queue WHERE stage=$11 GROUP BY channel_id, destination_name",
+            f" FROM queue WHERE stage=$11 AND {_NOT_PT_MARKER} GROUP BY channel_id, destination_name",
             OutboxStatus.PENDING.value,
             OutboxStatus.INFLIGHT.value,
             OutboxStatus.DONE.value,
@@ -12197,7 +12198,8 @@ class PostgresStore:
             "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
             " AS sum_seconds,"
             " COUNT(*) AS cnt"
-            f" FROM queue WHERE stage=${n + 1} AND status=${n + 2}"
+            # A pass-through marker is not a delivery (BACKLOG #5614).
+            f" FROM queue WHERE stage=${n + 1} AND status=${n + 2} AND {_NOT_PT_MARKER}"
             " GROUP BY channel_id, destination_name"
             " ORDER BY channel_id, destination_name"
         )

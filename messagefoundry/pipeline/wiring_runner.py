@@ -1408,6 +1408,23 @@ def _peek_read_fault(ic: InboundConnection, exc: Exception) -> str:
     return f"parse error: peek read failed ({type(exc).__name__})"
 
 
+def _guard_loopback_body(ic: InboundConnection, body: str) -> str | None:
+    """:func:`reingress_body_error` inside the read-fault guard :func:`_peek_for_loopback` runs the
+    peek in (BACKLOG #5616). A guard that raises anything but its own refusal would otherwise escape
+    the re-ingress step, so the worker's fault arm re-pends the token at the lane's head on every
+    pass. Here it is a recorded refusal instead, so the reply is an ERROR child and the lane drains.
+    Only the exception TYPE is logged or recorded, as :func:`_peek_read_fault` does."""
+    try:
+        return reingress_body_error(ic, body)
+    except PEEK_READ_FAULTS as exc:
+        log.warning(
+            "loopback %r: a content guard on a re-ingressed reply raised %s; recording ERROR",
+            ic.name,
+            type(exc).__name__,
+        )
+        return f"ingress guard error: content check failed ({type(exc).__name__})"
+
+
 def _peek_for_loopback(
     ic: InboundConnection, body: str
 ) -> tuple[str | None, str | None, str | None, str | None]:
@@ -11848,7 +11865,7 @@ class RegistryRunner:
         # BACKLOG #5616: then at least the listener's content guards, which a loopback never ran
         # (reingress_body_error and _peek_for_loopback list them). A refusal takes the peek_failed
         # path below, so the reply is still recorded as an ERROR child, never dropped or routed.
-        refusal = reingress_size_error(ic, body) or reingress_body_error(ic, body)
+        refusal = reingress_size_error(ic, body) or _guard_loopback_body(ic, body)
         if refusal is None:
             control_id, message_type, summary, refusal = _peek_for_loopback(ic, body)
         else:

@@ -345,10 +345,24 @@ def reingress_body_error(ic: InboundConnection, body: str) -> str | None:
             return None
         decode_ingress(body, ic)
         if ic.content_type is not ContentType.HL7V2 and not blank:
-            check_declared_type(ic, text_sniff_head(body))
+            check_declared_type(ic, _reply_text_sniff_head(body))
     except IngressGuardError as exc:
         return exc.reason
     return None
+
+
+def _reply_text_sniff_head(body: str) -> bytes:
+    """:func:`text_sniff_head` of a text loopback reply, or the ``decode``-phase refusal when its
+    head will not encode. A lone surrogate is one no charset decode yields, and its UTF-8 encode
+    raises a ``UnicodeEncodeError`` that is no :class:`IngressGuardError`, so it would escape the
+    re-ingress guard and re-pend the token at the lane's head (BACKLOG #5616). The refusal is raised
+    after the handler ends, because the caught error's ``.object`` is the body (see
+    :class:`IngressGuardError`)."""
+    try:
+        return text_sniff_head(body)
+    except UnicodeError as exc:
+        reason = f"encode error (utf-8): {safe_exc(exc)}"
+    raise IngressGuardError(reason, phase="decode")
 
 
 class IngressTooLarge(IngressGuardError):

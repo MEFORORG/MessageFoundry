@@ -15,6 +15,7 @@ import base64
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,7 +30,7 @@ from messagefoundry.pipeline.refused_body import (
     RefusedBodyPolicy,
     head_only_resubmit_refusal,
 )
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.crypto import generate_key, make_cipher, verify_refused_body_digest
 from tests._reingress_refused_body_contract import CASES
 
@@ -290,3 +291,75 @@ async def test_a_reply_holding_the_document_marker_is_refused(store: MessageStor
     control_id, message_type, _, refusal = _peek_for_loopback(_loopback(ContentType.HL7V2), body)
     assert refusal == DOC_REF_MARKER_REFUSED_REASON
     assert control_id is not None and message_type is not None
+
+
+def test_a_reply_head_that_will_not_encode_is_a_guard_refusal() -> None:
+    """BACKLOG #5616: a lone surrogate in a text loopback reply's sniffed head is the guard's own
+    ``decode``-phase refusal, not a ``UnicodeEncodeError`` raised past it. The reason carries no
+    character of the body."""
+    from messagefoundry.pipeline.ingress_guards import reingress_body_error
+
+    for ct in (ContentType.JSON, ContentType.FHIR, ContentType.XML, ContentType.X12):
+        refused = reingress_body_error(_loopback(ct), '{"a": "\udc80"}')
+        assert refused is not None and refused.startswith("encode error (utf-8):"), ct
+        assert "\udc80" not in refused
+    # The control: the same reply with an encodable character is admitted on a JSON loopback.
+    assert reingress_body_error(_loopback(ContentType.JSON), '{"a": "é"}') is None
+
+
+async def test_a_reply_head_that_will_not_encode_reaches_the_handoff_as_a_refusal(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5616: the re-ingress step hands a lone-surrogate reply to ``ingress_handoff`` as a
+    refusal rather than raising out of the step. No store can capture such a reply (a capture's
+    encode refuses it), so the body read is substituted, and the handoff is recorded rather than
+    run, since the refused child's raw would hold the surrogate too."""
+    from tests._reingress_refused_body_contract import LOOP, _allowance, _runner
+
+    body = '{"a": "\udc80"}'
+    calls: list[dict[str, Any]] = []
+
+    async def _read(_row_id: str) -> str:
+        return body
+
+    async def _handoff(**kwargs: Any) -> bool:
+        calls.append(kwargs)
+        return False
+
+    monkeypatch.setattr(store, "response_body_for_work_row", _read)
+    monkeypatch.setattr(store, "ingress_handoff", _handoff)
+    runner = _runner(store, _allowance(10_000), ContentType.JSON)
+    work = SimpleNamespace(id="resp-1", message_id="origin-1")
+    await runner._process_response_item(LOOP, work)  # type: ignore[arg-type]
+    [call] = calls
+    assert call["peek_failed"] is True
+    assert call["peek_error"].startswith("encode error (utf-8):")
+
+
+async def test_a_faulting_content_guard_is_recorded_and_the_lane_drains(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5616: a content guard that raises anything but its own refusal is recorded as an
+    ERROR child, with only the fault's type, so the next reply on the loopback lane still
+    re-ingresses. Before the fix the fault escaped the re-ingress step, and the worker re-pended the
+    token at the lane's head on every pass."""
+    from messagefoundry.pipeline import wiring_runner
+    from messagefoundry.pipeline.ingress_guards import reingress_body_error as real
+    from tests._reingress_refused_body_contract import REPLY, _allowance, _reingress, _runner
+
+    faulting = REPLY.replace("RSP1", "FLT1")
+
+    def _guard(ic: Any, body: str) -> str | None:
+        if body == faulting:
+            raise ValueError("synthetic guard fault")
+        return real(ic, body)
+
+    monkeypatch.setattr(wiring_runner, "reingress_body_error", _guard)
+    runner = _runner(store, _allowance(10_000))
+    bad = await _reingress(store, runner, faulting, now=1100.0)
+    assert bad["status"] == MessageStatus.ERROR.value
+    assert bad["error"] == "ingress guard error: content check failed (ValueError)"
+    assert bad["raw"] == faulting
+    # The lane keeps draining: the next reply is admitted and routed as before.
+    good = await _reingress(store, runner, REPLY, now=1110.0)
+    assert good["status"] == MessageStatus.RECEIVED.value and good["raw"] == REPLY
