@@ -88,8 +88,9 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
     """Split a DICOM ``PatientName`` (a ``^``-delimited PN — ``Family^Given^Middle^Prefix^Suffix``,
     with ``=``-separated alphabetic/ideographic/phonetic groups) into HL7 ``XPN`` components.
 
-    Uses the first group with a component that is not blank, so an ideographic-only name is not
-    lost, and ``()`` for an absent or all-blank name. A name taken from the ideographic or phonetic
+    Uses the first group with a non-blank component among its first five, so an ideographic-only
+    name is not lost, and ``()`` for an absent or all-blank name. A blank (spaces-only) component
+    is written empty. A name taken from the ideographic or phonetic
     group carries ``I`` or ``P`` in ``XPN-8`` (name representation code), so a receiver does not
     read it as the alphabetic name. ``XPN`` puts the suffix before the prefix
     (``Family^Given^Middle^Suffix^Prefix``), so the DICOM prefix and suffix swap places. A PN has
@@ -98,15 +99,19 @@ def person_name_components(patient_name: str | None) -> tuple[str, ...]:
     (BACKLOG #5804)."""
     if not patient_name:
         return ()
-    groups = patient_name.split("=")[:3]  # alphabetic, ideographic, phonetic
-    group_index = next((i for i, g in enumerate(groups) if g.replace("^", "").strip()), None)
+    # Alphabetic, ideographic, phonetic; each cut to its five components, a blank one made empty.
+    candidates = [
+        [part if part.strip() else "" for part in (group.split("^") + [""] * 5)[:5]]
+        for group in patient_name.split("=")[:3]
+    ]
+    group_index = next((i for i, parts in enumerate(candidates) if any(parts)), None)
     if group_index is None:
         return ()
-    parts = (groups[group_index].split("^") + [""] * 5)[:5]
+    parts = candidates[group_index]
     parts[3], parts[4] = parts[4], parts[3]
     if group_index:
         parts += ["", "", "IP"[group_index - 1]]  # XPN-6 and XPN-7 empty, then XPN-8
-    while not parts[-1].strip():
+    while not parts[-1]:  # any() above keeps at least one non-empty component
         parts.pop()
     return tuple(parts)
 

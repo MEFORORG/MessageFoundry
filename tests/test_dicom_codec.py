@@ -236,6 +236,10 @@ def test_person_name_components_splits_pn() -> None:
         pytest.param("=Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="ideographic-only"),
         pytest.param("^ =Yamada^Taro", ("Yamada", "Taro", *[""] * 5, "I"), id="blank-alphabetic"),
         pytest.param("^^=^=Yamada", ("Yamada", *[""] * 6, "P"), id="phonetic-only"),
+        # Text only past the fifth component is no name: fall through, or come back empty.
+        pytest.param("^^^^^X=Yamada", ("Yamada", *[""] * 6, "I"), id="text-past-fifth"),
+        pytest.param("^^^^^X", (), id="only-past-fifth"),
+        pytest.param("Doe^ ^Q", ("Doe", "", "Q"), id="blank-middle"),
         pytest.param("^^^^", (), id="all-empty"),
         pytest.param("== ", (), id="blank-groups"),
     ],
