@@ -452,11 +452,13 @@ def test_a_file_another_account_owns_stays_that_accounts_on_windows(
 
 
 @windows_only
-def test_a_failed_hand_back_keeps_the_foreign_owners_grant_on_windows(
+def test_a_failed_owner_and_editor_list_write_keeps_the_foreign_owners_grant_on_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # When the owner-and-editor write after the rename fails, the fallback list must still name the
-    # account that owns the file, or that account could no longer read it (vault BACKLOG #5619).
+    # When the owner-and-editor list write after the rename fails, the fallback list must still
+    # name the account that owns the file, or that account could no longer read it (vault BACKLOG
+    # #5619). The candidate's own list write fails too, so the file reaches the fallback with its
+    # staging directory's inherited list, and only the fallback's own write can pass this test.
     import messagefoundry.restricted_file as restricted_mod
     import messagefoundry.store.store as store_mod
 
@@ -466,13 +468,21 @@ def test_a_failed_hand_back_keeps_the_foreign_owners_grant_on_windows(
     monkeypatch.setattr(store_mod, "_current_user_sid", lambda: _EDITOR_SID)
     monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
     monkeypatch.setattr(atomic_edit, "_restrict_to_owner_and_editor", lambda _path, _owner: False)
+    real_write = store_mod._set_security_from_sddl
+
+    def _candidate_refused(target: Path, sddl: str, *, protected: bool) -> Any:
+        if target != path:
+            return store_mod._SddlWrite(failure="refused for the test")
+        return real_write(target, sddl, protected=protected)
+
+    monkeypatch.setattr(store_mod, "_set_security_from_sddl", _candidate_refused)
     secured: list[Path] = []
     monkeypatch.setattr(atomic_edit, "_secure_file", secured.append)
 
     atomic_edit.replace_validated(path, b"x = 1\n", _noop)
 
     assert secured == []
-    assert [sid for *_, sid in protected_entries(path)[2]] == [owner, _EDITOR_SID]
+    assert protected_entries(path)[2] == [("A", "", "FA", owner), ("A", "", "FA", _EDITOR_SID)]
     assert path.read_bytes() == b"x = 1\n"
 
 

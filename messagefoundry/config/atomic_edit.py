@@ -426,7 +426,8 @@ def replace_validated(
     _fsync_dir(path.parent)
     if live.windows_owner is not None and _restrict_to_owner_and_editor(path, live.windows_owner):
         return
-    # A failed hand-back still keeps the live owner's grant, as the candidate's list did.
+    # When the owner-and-editor list write fails, the fallback still grants the live owner, as the
+    # candidate's list did. A refused ownership hand-back whose list was written never gets here.
     if sys.platform == "win32" and _restrict_to_editor(path, owner=live.windows_owner):
         return
     _secure_file(path)
