@@ -54,7 +54,9 @@ def test_a_reload_of_the_guard_reaches_the_scan(reloaded_guard: ModuleType) -> N
     report = tee_leak.leak_report(f"{_HEAD}\rZPD|1|ZQSYNTHPARTNER^zqsynthestate")
     assert tee_leak.denylist_is_live(report)
     assert "synthetic partner" in report.hits
-    assert "estate token (zqsynthestate)" in report.hits
+    assert "estate token" in report.hits
+    # The reason names no token: the token is the private estate string (BACKLOG #5584).
+    assert not any("zqsynthestate" in h for h in report.hits)
 
 
 def test_no_guard_reports_no_token_check_and_refuses_only_on_the_opt_in(

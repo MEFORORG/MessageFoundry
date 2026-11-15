@@ -278,15 +278,17 @@ def test_prose_naming_a_weak_source_is_not_a_hit() -> None:
     gate = _gate()
     prose = (
         "// WHY Math.random() cannot be used here: it is xorshift128+.\n"
+        "/**\n"
         " * A doc comment mentioning Math.random() is not a call.\n"
+        " */\n"
         "/* Math.random() in a block comment is not a call either. */\n"
     )
     assert gate.randomness_tokens_in(prose) == set()
 
 
 def test_a_trailing_comment_cannot_hide_a_call() -> None:
-    # The conservative direction of _is_comment_only, asserted rather than assumed: only a WHOLLY
-    # commented line is skipped, so putting a // earlier on a code line does not launder the draw.
+    # The conservative direction of _js_code's per-line view, asserted rather than assumed: a code
+    # line is scanned whole, so putting a // later on a code line does not launder the draw.
     gate = _gate()
     assert gate.randomness_tokens_in("const n = Math.random(); // harmless, honest\n") == {
         "Math.random"
@@ -706,7 +708,7 @@ def test_each_non_python_operation_pattern_fires(line: str, token: str) -> None:
 
 def test_a_comment_naming_an_operation_is_not_an_operation() -> None:
     gate = _gate()
-    text = "// we do not call createHash( here\n * rejectUnauthorized: false is refused\n"
+    text = "// we do not call createHash( here\n/*\n * rejectUnauthorized: false is refused\n */\n"
     assert gate.non_python_operation_tokens_in(text) == set()
 
 
@@ -1337,3 +1339,298 @@ def test_the_positive_control_covers_sibling_and_augmented_matchers(
     empty = () if rule_table == "SIBLING_IMPORT_ROOTS" else frozenset()
     monkeypatch.setattr(gate.crypto_operations, rule_table, empty)
     assert gate.operations_self_test(), rule_table
+
+
+# --- BACKLOG #5578: a line that merely STARTS with /* or * is not thereby a comment -----------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("/* seed */ const n = Math.random();\n", id="after-an-inline-block"),
+        pytest.param("/* a */ /* b */ const n = Math.random();\n", id="after-two-inline-blocks"),
+        pytest.param("const n = 1000\n  * Math.random();\n", id="star-continuation-line"),
+        pytest.param("/*\n * prose\n */ const n = Math.random();\n", id="after-a-block-close"),
+        pytest.param("const a = 1; /* opens\nconst n = Math.random();\n", id="mid-line-opener"),
+        pytest.param("const u = 'http://x/*';\nconst n = Math.random();\n", id="opener-in-string"),
+    ],
+)
+def test_a_weak_draw_on_a_line_starting_with_a_comment_token_is_found(text: str) -> None:
+    assert _gate().randomness_tokens_in(text) == {"Math.random"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("/* legacy */ createHash('md5')\n", id="after-an-inline-block"),
+        pytest.param("const d = x\n  * createHash('md5')\n", id="star-continuation-line"),
+    ],
+)
+def test_an_operation_on_a_line_starting_with_a_comment_token_is_found(text: str) -> None:
+    assert "hash:createHash[md5]" in _gate().non_python_operation_tokens_in(text)
+
+
+def test_a_multi_line_block_comment_still_hides_its_prose() -> None:
+    # The other half: inside a real block, a call named on a *-led prose line is not a call.
+    # cspNonce.ts depends on this; test_the_real_cspnonce_draw_is_not_a_false_positive holds it on
+    # the real file. A prose line with no leading * still counts, as it did before #5578.
+    text = "/**\n * Math.random() is xorshift128+.\n * createHash('md5') too.\n */\n"
+    gate = _gate()
+    assert gate.randomness_tokens_in(text) == set()
+    assert gate.non_python_operation_tokens_in(text) == set()
+
+
+# --- BACKLOG #5579: a name imported twice keeps both bindings ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "token"),
+    [
+        pytest.param(
+            "import hashlib\n\n\ndef a(b):\n    return hashlib.md5(b)\n\n\n"
+            "def other():\n    from mylib import thing as hashlib\n    return hashlib\n",
+            "hash:hashlib.md5",
+            id="local-import-reuses-a-crypto-module-name",
+        ),
+        pytest.param(
+            "from mylib import thing as secrets\n\n\ndef a():\n    import secrets\n"
+            "    return secrets.token_bytes(16)\n",
+            "csprng:secrets.token_bytes",
+            id="module-import-shadows-a-local-crypto-import",
+        ),
+        pytest.param(
+            "try:\n    import hashlib as h\nexcept ImportError:\n    import mylib as h\n\n\n"
+            "def a(b):\n    return h.sha1(b)\n",
+            "hash:hashlib.sha1",
+            id="fallback-import-of-the-same-name",
+        ),
+    ],
+)
+def test_a_reused_import_name_does_not_hide_a_crypto_call(source: str, token: str) -> None:
+    ops = _gate().crypto_operations
+    found = ops.aggregate(ops.discover_operations_in({"messagefoundry/x.py": source}))
+    assert token in found.get("messagefoundry/x.py", frozenset()), found
+
+
+def test_a_reused_provider_name_does_not_hide_the_provider_call() -> None:
+    # The provider half of #5579: a function-local import that reuses a first-party provider's name
+    # used to replace the module-level binding, so the call through the provider vanished.
+    ops = _gate().crypto_operations
+    sources = {
+        "messagefoundry/seam.py": "import ssl\n\n\ndef build():\n    return ssl.create_default_context()\n",
+        "messagefoundry/plain.py": "def build():\n    return 1\n",
+        "messagefoundry/user.py": (
+            "from messagefoundry.seam import build\n\n\ndef go():\n    return build()\n\n\n"
+            "def other():\n    from messagefoundry.plain import build\n    return build\n"
+        ),
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found.get("messagefoundry/user.py") == frozenset({"tls_context:via messagefoundry.seam"})
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(
+            "// note\x85/* x\nconst n = Math.random();\n/** doc */\n", id="nel-in-a-line-comment"
+        ),
+        pytest.param(
+            "const s = 'a\x0c/* b';\nconst n = Math.random();\n/** doc */\n",
+            id="form-feed-in-a-string",
+        ),
+        pytest.param("// c\rconst n = Math.random();\n", id="lone-cr-ends-a-line-comment"),
+        # Discriminating: the per-line view skips the /*-led second line, and an unfolded lexer
+        # blanks the whole comment, so only the folding finds the call.
+        pytest.param(
+            "// c\u2028/* x */ const n = Math.random();\n", id="u2028-then-comment-led-code"
+        ),
+        pytest.param("// c\r/* x */ const n = Math.random();\n", id="cr-then-comment-led-code"),
+        pytest.param("// c\u2028const n = Math.random();\n", id="u2028-ends-a-line-comment"),
+        pytest.param("// c\u2029const n = Math.random();\n", id="u2029-ends-a-line-comment"),
+    ],
+)
+def test_a_non_newline_line_break_cannot_open_a_phantom_block(text: str) -> None:
+    # A form feed or NEL is not a JS line terminator, so the /* after one is inside the comment or
+    # string and opens nothing; the later */ would close a phantom block if it did. A lone CR, U+2028
+    # or U+2029 IS one, so it ends the // comment before the call.
+    assert _gate().randomness_tokens_in(text) == {"Math.random"}
+
+
+def test_a_bom_led_file_keeps_its_doc_comment_prose_out_of_the_randomness_arm(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ide"
+    root.mkdir()
+    (root / "a.ts").write_text(
+        "\ufeff/**\n * Math.random() is weak\n */\nconst k = 1;\n", encoding="utf-8"
+    )
+    # Positive control: the same BOM-led walk does reach a real draw after the comment.
+    (root / "b.ts").write_text(
+        "\ufeff/**\n * header\n */\nconst k = Math.random();\n", encoding="utf-8"
+    )
+    gate = _gate()
+    assert gate.discover_non_python(root, repo=tmp_path) == {"ide/b.ts": frozenset({"Math.random"})}
+    # The BOM is dropped for the lexer only. A BOM-led /*-led first line whose code the lexer
+    # misreads (a TypeScript ``!`` before a division) is still scanned by the per-line view, as
+    # origin/main scans it; dropping the BOM there too hid this draw.
+    text = (
+        '\ufeff/* hdr */ const r = m.get(k)! / total; const s = "a/b"; '
+        'const u = "http://y"; const n = Math.random();\n'
+    )
+    assert gate.randomness_tokens_in(text) == {"Math.random"}
+
+
+def test_a_tls_value_under_a_second_binding_reaches_its_token() -> None:
+    # The weakening binding is the MODULE-level one, so last-write-wins (the function-local import
+    # is walked later) dropped it: this fails on origin/main's import_aliases.
+    ops = _gate().crypto_operations
+    source = (
+        "from ssl import CERT_NONE as mode\n\n\ndef f(ctx):\n"
+        "    from ssl import CERT_REQUIRED as mode\n    ctx.verify_mode = mode\n"
+    )
+    found = ops.aggregate(ops.discover_operations_in({"messagefoundry/x.py": source}))
+    assert "tls_context:.verify_mode = CERT_NONE" in found["messagefoundry/x.py"], found
+
+
+def test_a_name_reexported_to_a_library_and_a_first_party_def_keeps_the_method_rule() -> None:
+    # a.verify is bound twice: to the library's verify at module level and to a first-party def by a
+    # function-local import. Last-write-wins kept only the def, so the call read as first-party and
+    # the method rule was skipped. The rule is skipped only when EVERY binding ends first-party.
+    ops = _gate().crypto_operations
+    sources = {
+        "messagefoundry/c.py": "def verify(x):\n    return x\n",
+        "messagefoundry/a.py": (
+            "from nacl.signing import verify\n\n\ndef other():\n"
+            "    from messagefoundry.c import verify\n    return verify\n"
+        ),
+        "messagefoundry/b.py": "from messagefoundry import a\n\n\ndef go(s):\n    a.verify(s)\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert "sign_verify:.verify()" in found.get("messagefoundry/b.py", frozenset()), found
+
+
+def test_a_crypto_binding_does_not_mask_another_bindings_method_rule() -> None:
+    # The signer is the MODULE-level binding and secrets the function-local one, so last-write-wins
+    # read the call as secrets.sign only: this fails on origin/main.
+    ops = _gate().crypto_operations
+    source = (
+        "from mylib import signer as s\n\n\ndef f(data):\n    import secrets as s\n"
+        "    return s.sign(data)\n"
+    )
+    found = ops.aggregate(ops.discover_operations_in({"messagefoundry/x.py": source}))
+    assert "sign_verify:.sign()" in found["messagefoundry/x.py"], found
+
+
+def test_an_unterminated_block_opener_in_a_string_does_not_hide_the_rest_of_the_file() -> None:
+    text = (
+        "const help = `\n/* matches every file\n`;\n"
+        "const n = Math.random();\nconst d = createHash('md5');\n"
+    )
+    gate = _gate()
+    assert gate.randomness_tokens_in(text) == {"Math.random"}
+    assert "hash:createHash[md5]" in gate.non_python_operation_tokens_in(text)
+
+
+@pytest.mark.parametrize(
+    "closer",
+    [
+        pytest.param('const g = "src/**/*.ts";\n', id="later-glob-string"),
+        pytest.param("/** doc */\nfunction f() {}\n", id="later-jsdoc"),
+    ],
+)
+def test_a_template_line_starting_a_comment_opener_does_not_hide_later_code(closer: str) -> None:
+    # BACKLOG #5578 re-cut. A template-literal line that starts with /* is string text. The
+    # line-rule stripper read it as a block comment and hid every line up to the next */ anywhere
+    # in the file, here a glob string or a JSDoc; origin/main's per-line rule and the lexer both see
+    # the calls.
+    text = (
+        "const tpl = `\n/* rules\n`;\nconst n = Math.random();\n"
+        "const d = createHash('md5');\n" + closer
+    )
+    gate = _gate()
+    assert gate.randomness_tokens_in(text) == {"Math.random"}
+    assert "hash:createHash[md5]" in gate.non_python_operation_tokens_in(text)
+
+
+def test_a_lexer_misread_cannot_hide_a_line_the_per_line_view_scanned() -> None:
+    # A TypeScript non-null ``!`` before a division reads as a regex opener to the lexer, which
+    # then loses string parity and blanks real code. The per-line view still scans the line.
+    text = 'const r = m.get(k)! / total; const s = "a/b"; const u = "http://y"; const n = Math.random();\n'
+    assert _gate().randomness_tokens_in(text) == {"Math.random"}
+
+
+def test_the_lexer_reads_a_regex_after_await_and_default() -> None:
+    from scripts.security.js_lexer import blank_js_comments
+
+    for text in (
+        "export default /\\/\\//; const n = 1;\n",
+        "const z = await /\\/\\//; const n = 1;\n",
+    ):
+        assert "const n = 1;" in blank_js_comments(text), text
+
+
+def test_a_provider_def_its_module_also_imports_is_still_followed() -> None:
+    # #5579 on the provider side: a.build is a crypto def, and a function-local import in a.py binds
+    # the same name. The call from x.py reaches the def at runtime, so it must stay a provider call.
+    ops = _gate().crypto_operations
+    nl = chr(10)
+    sources = {
+        "messagefoundry/a.py": nl.join(
+            [
+                "import ssl",
+                "",
+                "",
+                "def build():",
+                "    return ssl.create_default_context()",
+                "",
+                "",
+                "def legacy():",
+                "    from old import build",
+                "    return build",
+                "",
+            ]
+        ),
+        "messagefoundry/x.py": nl.join(
+            ["from messagefoundry.a import build", "", "", "def go():", "    return build()", ""]
+        ),
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert "tls_context:via messagefoundry.a" in found.get("messagefoundry/x.py", frozenset()), (
+        found
+    )
+
+
+@pytest.mark.parametrize("loop", ["cycle", "self-link"])
+def test_a_binding_that_never_ends_first_party_keeps_the_method_rule(loop: str) -> None:
+    # b.verify is bound to a first-party def AND, by a function-local import, to a chain that never
+    # ends: a cycle between d and e, or a self-link. Only every branch ending first-party may skip
+    # the method rule; origin/main reports the .verify() here, and so must this.
+    ops = _gate().crypto_operations
+    nl = chr(10)
+    if loop == "cycle":
+        far = {
+            "messagefoundry/d.py": "from messagefoundry.e import verify" + nl,
+            "messagefoundry/e.py": "from messagefoundry.d import verify" + nl,
+        }
+    else:
+        far = {"messagefoundry/d.py": "from messagefoundry.d import verify" + nl}
+    sources = {
+        **far,
+        "messagefoundry/c.py": nl.join(["def verify(x):", "    return x", ""]),
+        "messagefoundry/b.py": nl.join(
+            [
+                "from messagefoundry.c import verify",
+                "",
+                "",
+                "def other():",
+                "    from messagefoundry.d import verify",
+                "    return verify",
+                "",
+            ]
+        ),
+        "messagefoundry/x.py": nl.join(
+            ["from messagefoundry import b", "", "", "def go(s):", "    b.verify(s)", ""]
+        ),
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert "sign_verify:.verify()" in found.get("messagefoundry/x.py", frozenset()), found

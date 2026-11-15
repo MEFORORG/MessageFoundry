@@ -178,7 +178,7 @@ def _guard(leak: ModuleType) -> object:
     ("value", "reason"),
     [
         ("ZQSYNTH\\T\\PARTNER", "synthetic partner"),
-        ("zqsynth\\X65\\state", f"estate token ({_ESTATE})"),
+        ("zqsynth\\X65\\state", "estate token"),
         # Decoded whole, as a Message component read decodes it, the hex escape reads as the &.
         ("ZQSYNTH\\X26&\\PARTNER", "synthetic partner"),
     ],
