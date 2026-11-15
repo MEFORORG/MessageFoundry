@@ -130,7 +130,7 @@
     a FAILED fetch (merge decisions then rest on stale refs), a gh PR probe that errored, and every
     -Name-confirmed worktree. -Name is the one worth spelling out: it is -IdleHours 0 scoped to one
     tree, and since signal 1 has been measured vetoing 0 of 4 real siblings, `-Apply -Name <slug>` can
-    leave a candidate with only signal 2's unknown-reading veto. It stays available because there are
+    leave a candidate with at least signal 1 and signal 2's unknown-reading veto. It stays available because there are
     legitimate uses, but it is never silent -- an operator who believes they are fenced when they are
     not is worse off than one who knows they aren't.
 
@@ -404,7 +404,7 @@ $RepoLeaf = Split-Path $RepoRoot -Leaf
 $activityVeto = ($IdleHours -gt 0)
 $reducedAssurance = @()
 if (-not $activityVeto) {
-    $reducedAssurance += 'activity veto DISABLED (-IdleHours 0): a RECENT signal 2 reading no longer vetoes, so a session writing in by absolute path is invisible to this run; an unknown reading still vetoes'
+    $reducedAssurance += 'recent-activity veto lifted (-IdleHours 0): a RECENT signal 2 reading no longer vetoes, so a session writing in by absolute path is invisible to this run; an unknown reading still vetoes'
 }
 elseif ($IdleHours -lt $IDLE_FLOOR_HOURS) {
     # Only the literal 0 used to be declared. Everything between 0 and the floor disarmed signal 2 just

@@ -1041,7 +1041,7 @@ def test_disabled_activity_veto_is_declared(fx: Fixture, sleeper: int) -> None:
     live_record(fx, sleeper, fx.primary)
     res = run(fx, "-IdleHours", "0")
     assert res["fence"]["activityVeto"] is False
-    assert any("activity veto DISABLED" in r for r in res["fence"]["reducedAssurance"])
+    assert any("recent-activity veto lifted" in r for r in res["fence"]["reducedAssurance"])
 
     text = run_text(fx, "-IdleHours", "0").stdout
     assert "REDUCED ASSURANCE" in text
@@ -1335,11 +1335,20 @@ _LIFT_PRIVATE_GIT_ACTIVITY = (
 
 
 def _read_with_get_item_failing(
-    tmp_path: Path, script: Path, load: str, call: str, throw: str
+    tmp_path: Path,
+    script: Path,
+    load: str,
+    call: str,
+    throw: str,
+    *,
+    control: str = "($null -ne $a)",
+    second: str = "($null -eq $b)",
+    only: str = "",
 ) -> str:
     """Run ``call`` on a linked worktree under $ErrorActionPreference = 'Stop', once as the control
-    and once with Get-Item throwing ``throw``. Prints ``<control read a value>|<second read>``, where
-    the second is True for an unknown reading and ``threw: ...`` when the throw escaped."""
+    and once with Get-Item throwing ``throw``, for every file or, with ``only``, for the file whose
+    name ends so. Prints ``<control>|<second>``, or ``<control>|threw: ...`` when the throw escaped.
+    The tree holds an ORIG_HEAD, so a read that fails there has read ``index`` and ``HEAD`` first."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
@@ -1357,13 +1366,18 @@ def _read_with_get_item_failing(
     )
     linked = tmp_path / "linked"
     _git(repo, "worktree", "add", "-q", "-b", "linked", str(linked))
+    (_gitdir(linked) / "ORIG_HEAD").write_text(_head(linked) + "\n", encoding="utf-8")
+    stub = (
+        "function global:Get-Item { [CmdletBinding()] param([string]$LiteralPath, [switch]$Force) "
+        f"if ($LiteralPath -like '*{only}') {{ throw {throw} }}; "
+        "Microsoft.PowerShell.Management\\Get-Item @PSBoundParameters }; "
+    )
     command = (
         f"$ErrorActionPreference = 'Stop'; {load}"
-        f"$a = {call}; "
-        f"function global:Get-Item {{ throw {throw} }}; "
-        f"try {{ $b = {call}; $r = ($null -eq $b) }} "
+        f"$a = {call}; {stub}"
+        f"try {{ $b = {call}; $r = {second} }} "
         'catch { $r = "threw: $($_.Exception.Message)" }; '
-        "'{0}|{1}' -f ($null -ne $a), $r"
+        f"'{{0}}|{{1}}' -f {control}, $r"
     )
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
@@ -1401,16 +1415,20 @@ def test_hygiene_reports_private_git_read_survives_a_failed_git_file_read(
     tmp_path: Path, failure: str
 ) -> None:
     """BACKLOG #5603. hygiene-report.ps1's twin reader runs under the report's 'Stop' preference, so a
-    file deleted between its Test-Path and its Get-Item ended the whole report. It returns nothing
-    now, as the shared reader does. The first call is the control."""
+    file deleted between its Test-Path and its Get-Item ended the whole report. It names the file
+    now, which the report holds the tree on, and keeps the ``index`` reading taken before it. The
+    first call, a clean read, is the control."""
     out = _read_with_get_item_failing(
         tmp_path,
         SCRIPT.parent / "hygiene-report.ps1",
         _LIFT_PRIVATE_GIT_ACTIVITY,
         "Get-PrivateGitActivity $env:T_TREE",
         _GET_ITEM_FAILURES[failure],
+        control="('{0}/{1}' -f ($null -ne $a.When), $a.Unreadable)",
+        second="('{0}/{1}' -f ($null -ne $b.When), $b.Unreadable)",
+        only="ORIG_HEAD",
     )
-    assert out == "True|True", out
+    assert out == "True/|True/ORIG_HEAD", out
 
 
 def test_a_cache_too_big_to_date_holds_the_tree(fx: Fixture, sleeper: int) -> None:

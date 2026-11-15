@@ -604,6 +604,23 @@ def test_recent_git_activity_holds_a_merged_worktree_back(fx: Fx) -> None:
     assert _rows(_report(fx))["repo-m-clean"]["verdict"] == "REMOVE"
 
 
+def test_a_failed_git_activity_read_holds_the_tree_naming_the_file(fx: Fx) -> None:
+    """BACKLOG #5603. A reflog whose last epoch no date can hold is a read that failed. It used to end
+    the whole report; it holds the tree now, as a reason naming the file, and never reads as idle."""
+    wt = fx.paths["m-clean"]
+    log = Path(_git(wt, "rev-parse", "--git-path", "logs/HEAD").strip())
+    if not log.is_absolute():
+        log = wt / log
+    with log.open("a", encoding="utf-8") as f:
+        f.write(f"{'0' * 40} {'1' * 40} t <t@example.invalid> 999999999999 +0000\tcommit: x\n")
+    fake, _ = _fake_gh(fx)
+    proc = _run(fx, "-Gh", str(fake), "-GhRepo", "acme/repo", idle="72")
+    assert proc.returncode == 0, proc.stderr
+    row = _rows(_report(fx))["repo-m-clean"]
+    assert row["verdict"] == "HUMAN", row
+    assert any("git activity could not be read (logs/HEAD" in r for r in row["reasons"]), row
+
+
 def test_without_gh_merge_status_is_unknown_and_nothing_is_proposed(fx: Fx) -> None:
     proc = _run(fx, "-Gh", "no-such-gh-command-zz9", "-GhRepo", "acme/repo")
     assert proc.returncode == 0, proc.stderr

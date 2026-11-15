@@ -189,8 +189,9 @@ function Get-WorktreeActivity {
     # A git command can delete ORIG_HEAD, MERGE_MSG or the reflog between Test-Path and Get-Item. A
     # failed read of these files is an UNKNOWN reading, which vetoes: under a caller's
     # $ErrorActionPreference = 'Stop' a throw ended prune-merged.ps1 mid -Apply loop with no receipt
-    # (BACKLOG #5603). Caught: SessionStateException (at least a vanished file and a dropped drive),
-    # IOException and UnauthorizedAccessException. Anything else still throws, so a defect is not hidden.
+    # (BACKLOG #5603). Caught: ItemNotFoundException (a vanished file), DriveNotFoundException (a
+    # dropped drive), IOException and UnauthorizedAccessException. Anything else still throws, so a
+    # defect is not hidden.
     try {
         foreach ($rel in $ACTIVITY_MTIME_FILES) {
             $f = Join-Path $gitdir $rel
@@ -203,7 +204,7 @@ function Get-WorktreeActivity {
         $item = $null
         if (Test-Path -LiteralPath $log) { $item = Get-Item -LiteralPath $log -Force -ErrorAction Stop }
     }
-    catch [System.Management.Automation.SessionStateException], [System.IO.IOException], [System.UnauthorizedAccessException] {
+    catch [System.Management.Automation.ItemNotFoundException], [System.Management.Automation.DriveNotFoundException], [System.IO.IOException], [System.UnauthorizedAccessException] {
         return $null
     }
     if ($null -ne $item) {
