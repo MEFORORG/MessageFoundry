@@ -15016,9 +15016,9 @@ class AuthService:
 
         A LOCAL login that owes no second factor is the first verification. No directory login is:
         Kerberos and OIDC sessions are born with no window (BACKLOG #1144 step 5). A Kerberos session
-        opens one by at least a step-up, a code at the MFA gate, or a user-verified passkey that
-        completes its pending factor, at the MFA gate or on ``/ui/reauth`` (a passkey never renews a
-        window once the factor is met), an OIDC
+        opens one by at least a step-up, a TOTP or recovery code, or a user-verified passkey that
+        completes its pending factor (a passkey never renews a window once the factor is met), an
+        OIDC
         session only by the IdP step-up
         (BACKLOG #2142)."""
         if not token:

@@ -1036,13 +1036,10 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     1. ``GET /ui/oidc/start`` is not simply "rate-limited" or simply "free". It renders the ASVS 3.7.3
        interstitial and charges nothing, unless ``_interstitial_needed()`` is false, when it runs the
        POST leg itself: limiter, flow and all.
-    2. A browser SSO or OIDC session's first sensitive action does not always force a step-up.
-       ``verify_mfa`` stamps ``reauth_at`` and does not ask whether the session already met its
-       factor, so a TOTP or recovery code opens a fresh window at any time. ``POST /ui/mfa`` asks
-       around it: before the code (``rotation_comes_first``, a must-change session's redirect) and
-       after a refused one (``mfa_satisfied``, a satisfied session's redirect to ``/ui``). Since vault
-       BACKLOG #2964 item 14 a passkey assertion with the UV flag that completes a pending factor
-       stamps one too.
+    2. A browser SSO session's first sensitive action does not always force a step-up.
+       Except on an oidc session, a TOTP or recovery code that ``verify_mfa`` accepts stamps
+       ``reauth_at``, and since vault BACKLOG #2964 item 14 so does a passkey assertion with the UV
+       flag that completes a pending factor.
     3. Console routes charge the per-actor ceremony budget, ``POST /ui/mfa`` among them. There were
        four when this pass ran; BACKLOG #296 added ``POST /ui/reauth/oidc`` for five, and the doc's
        count is now derived from the route list below rather than written into this test.
@@ -1102,9 +1099,8 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
         if isinstance(n, ast.AsyncFunctionDef) and n.name == "mfa_verify"
     )
     for label, handler in (("POST /ui/mfa", routes["POST /ui/mfa"]), ("JSON", json_verify)):
-        # Vault BACKLOG #2964 item 14: POST /ui/mfa may ask, but only AFTER verify_mfa has run, to
-        # send a satisfied session's refused code to /ui instead of re-rendering the gate. A code
-        # is still never refused for a met factor.
+        # Vault BACKLOG #2964 item 14: POST /ui/mfa may call mfa_satisfied after verify_mfa has run,
+        # to send a satisfied session's refused code to /ui instead of re-rendering the gate.
         verify_lines = [c.lineno for c in call_sites(handler, "verify_mfa")]
         asked_lines = [c.lineno for c in call_sites(handler, "mfa_satisfied")]
         assert verify_lines and (
@@ -2034,7 +2030,7 @@ def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -
     assert _anchored_factor_writes(_service_func("finish_webauthn_assertion"))
     assert _calls_method(AuthService.verify_mfa, "mark_session_mfa_verified")
     assert _calls_method(AuthService.verify_mfa, "mark_session_reauthed")
-    # The passkey is not relied on for user verification: asked for at PREFERRED, never required.
+    # User verification is asked for at PREFERRED and never required to verify an assertion.
     assert "`verify_assertion`" in block
     uv_required = keyword_values(webauthn_module.verify_assertion, "require_user_verification")
     assert all(isinstance(v, ast.Constant) and v.value is False for v in uv_required), (
