@@ -291,6 +291,11 @@ def reingress_size_error(ic: InboundConnection, body: str) -> str | None:
     return ingress_size_error(len(body))
 
 
+#: Base64 characters of a carriage decoded for the declared-type sniff: a multiple of 4, so the
+#: prefix of an unbroken carriage decodes alone, and 384 bytes, past DICOM's 132-byte magic.
+_CARRIAGE_SNIFF_CHARS = 512
+
+
 def reingress_body_error(ic: InboundConnection, body: str) -> str | None:
     """The refusal text for a loopback re-ingress ``body`` the listener's content guards would refuse
     (BACKLOG #5616), or ``None`` when they admit it. Run after :func:`reingress_size_error` passes.
@@ -298,18 +303,20 @@ def reingress_body_error(ic: InboundConnection, body: str) -> str | None:
     A loopback has no listener, so a captured reply never met them: the NUL, MLLP frame-byte and
     second-``MSH`` rules of :func:`check_decoded` for a text loopback, and the declared-type sniff of
     :func:`check_declared_type` for a non-HL7 one, whose HL7 type check stays ``Peek.parse``. A binary
-    loopback is sniffed on the bytes a canonical ``mfb64:v1:`` carriage holds; a body that is not
-    carriage, or whose carriage does not decode, is left to the codec, as the size rule leaves it.
+    loopback is sniffed on the leading bytes a canonical ``mfb64:v1:`` carriage holds, decoded from
+    a prefix only, since the sniff reads no further; a body that is not carriage, or whose head does
+    not decode, is left to the codec, as the size rule leaves it.
 
     The reason is the guard's own, which carries no byte of the body."""
     try:
         if ic.content_type.is_binary:
-            if is_marked(body):
-                try:
-                    data = decode_carriage(body)
-                except BinaryCarriageError:
-                    return None
-                check_declared_type(ic, data)
+            if not is_marked(body):
+                return None
+            try:
+                head = decode_carriage(body[: len(CARRIAGE_MARKER) + _CARRIAGE_SNIFF_CHARS])
+            except BinaryCarriageError:
+                return None
+            check_declared_type(ic, head)
             return None
         check_decoded(body, ic)
         if ic.content_type is not ContentType.HL7V2:

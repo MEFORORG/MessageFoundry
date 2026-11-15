@@ -221,10 +221,11 @@ def test_reingress_body_error_reads_the_listener_guards() -> None:
     # A whole MLLP frame around the reply is tolerated, as the listener tolerates it (ADR 0205).
     assert reingress_body_error(hl7, "\x0b" + reply + "\x1c\r") is None
     dicom = _loopback(ContentType.DICOM)
-    not_dicom = RawMessage.from_bytes(b"%PDF-1.7 synthetic" * 20, ContentType.DICOM.value).raw
+    not_dicom = RawMessage.from_bytes(b"%PDF-1.7 synthetic" * 60, ContentType.DICOM.value).raw
     refused = reingress_body_error(dicom, not_dicom)
     assert refused is not None and "'dicom'" in refused
-    part10 = b"\x00" * 128 + b"DICM" + b"\x02\x00" * 8
+    # Longer than the decoded sniff prefix, so only its head is decoded.
+    part10 = b"\x00" * 128 + b"DICM" + b"\x02\x00" * 600
     assert (
         reingress_body_error(dicom, RawMessage.from_bytes(part10, ContentType.DICOM.value).raw)
         is None

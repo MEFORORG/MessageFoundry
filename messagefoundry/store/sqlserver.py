@@ -1229,10 +1229,11 @@ def _insert_marker_params(
     status: str,
     now: float,
 ) -> tuple[Any, ...]:
-    # The PT parent-marker row: an ALREADY-TERMINAL outbound-shaped row (lane = the PT inbound name),
-    # never claimed. ``channel_id`` is the parent's inbound, as on every outbound row the handoff
-    # writes, so a dead marker is scoped to the parent's channel in the dead-letter view (#5614). Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the marker stamp in
-    # ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when the child was
+    # The PT parent-marker row: an ALREADY-TERMINAL outbound-shaped row (its lane, destination_name,
+    # is the PT inbound name), never claimed. ``channel_id`` is the parent's inbound, as on every
+    # outbound row the handoff writes, so a dead marker is scoped to the parent's channel in the
+    # dead-letter view (#5614). Bound to :data:`_SQL_INSERT_QUEUE_PT_MARKER`, which carries the
+    # marker stamp in ``handler_name`` (BACKLOG #1580) and its own terminal ``status`` (DONE when the child was
     # produced, DEAD on a depth-cap breach) rather than PENDING.
     return (
         row_id,
