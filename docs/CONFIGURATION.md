@@ -536,8 +536,10 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   them as an argument, as they refused any value but `True` or `False` before. A `None` written
   straight into a lookup's or reference source's settings, past its factory, reads as off, so it
   attests and accepts nothing. A non-bool literal there is refused with advice to write `True` or
-  `False`, since these flags take no `env()` reference. A raw `tls_hop_attested` in a
-  connection's transport settings is refused as not a transport setting, whatever its value. The
+  `False`, since these flags take no `env()` reference. A raw `tls_hop_attested` written into a
+  connection's transport settings before the declaration is refused there as not a transport
+  setting, whatever its value. Written after the declaration, the load refuses only a value that
+  is not a `bool`, and the connection's build refuses the key whatever its value. The
   flags `inbound()` and `outbound()` take themselves, such as
   `simulate`, `deployed`, `auto_start`, `strict` and `capture_ack`, must be a real `True` or
   `False` as well. Any other value there, such as a string or a number, stops the load when the

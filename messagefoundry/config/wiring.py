@@ -1666,7 +1666,7 @@ def _bool_literal_problem(key: str, value: Any) -> str | None:
         require_flag(value, f"setting {key!r}")
     except ValueError as exc:  # names the key and the type, never the value
         composer = _COMPOSER_OF_BOOL_SETTING.get(key)
-        named = f" (the enabled= flag of {composer})" if composer is not None else ""
+        named = f" (the key {composer}(enabled=) writes)" if composer is not None else ""
         return f"{exc}{named}{_bool_remedy(key, value)}"
     return None
 
@@ -1682,16 +1682,17 @@ def _quoted_false_hint(value: object) -> str:
 def _bool_remedy(key: str, value: object) -> str:
     """The remedy every refusal of a non-bool literal ends with, after :func:`_quoted_false_hint`.
     A hop-policy flag refuses ``env()`` (:func:`refuse_unresolved_hop_flags`), so it gets that
-    flag's own remedy, :func:`_flag_hint`, rather than advice to write a reference."""
+    flag's own remedy, :func:`_flag_hint`, rather than advice to write a reference. It gets no
+    quoted-false hint either: its readers refuse a string (``flag_from_settings``) or read a false
+    spelling as false, so no reader takes a quoted false on it as true."""
     if key in HOP_POLICY_FLAGS:
-        return f"{_quoted_false_hint(value)}{_flag_hint(value)}"
+        return _flag_hint(value)
     return f"{_quoted_false_hint(value)}; write True, False or an env() reference"
 
 
 def _bool_literal_problems_in(settings: Mapping[str, Any]) -> Iterator[str]:
     """:func:`_bool_literal_problem` for every setting in ``settings``, in order. The one loop
-    behind :func:`_refuse_bool_literals`, :func:`_refuse_factory_bool_literals` and
-    :meth:`Registry.bool_literal_problems`."""
+    behind :func:`_refuse_bool_literals` and :meth:`Registry.bool_literal_problems`."""
     for key, value in settings.items():
         if (bad := _bool_literal_problem(key, value)) is not None:
             yield bad
@@ -1703,18 +1704,14 @@ def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
     false would otherwise be refused as if it were set, or overwritten (``reingress_to`` sets
     ``capture_response``) before the load's :meth:`Registry.bool_literal_problems` could see it.
     Raising stops the config module, so a later declaration in it is not reached, as with every
-    other refusal a declaration raises."""
+    other refusal a declaration raises.
+
+    A factory calls it too, on one of its own arguments, where a check inside the factory reads
+    that argument by truthiness before ``inbound()`` or ``outbound()`` can refuse it, and names
+    itself as ``where``, since it runs before the declaration has a name. Problems are joined with
+    `` | ``, because each already holds a ``;`` before its remedy."""
     if problems := list(_bool_literal_problems_in(settings)):
-        raise WiringError(f"{where}: " + "; ".join(problems))
-
-
-def _refuse_factory_bool_literals(factory: str, **values: object) -> None:
-    """:func:`_refuse_bool_literals` for a factory's own arguments, for a check inside the factory
-    that reads one of them before ``inbound()`` or ``outbound()`` can refuse it. Without it, such
-    a check judges the flag by truthiness and refuses with an error about the flag's effect
-    (``DICOMweb(verify_tls=0, tls_ca_file=...)`` read as verification off). Named by the factory,
-    which runs before the declaration has a name."""
-    _refuse_bool_literals(values, factory)
+        raise WiringError(f"{where}: " + " | ".join(problems))
 
 
 def _refuse_non_bool_flags(
@@ -2848,8 +2845,10 @@ def MLLP(
     each message its first read completes is recorded as ``ERROR``, then answered ``AR`` where the
     inbound replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
     and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
-    # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
-    _refuse_factory_bool_literals("MLLP", tls=tls)
+    if tls_client_subjects is not None:
+        # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
+        # Only here: elsewhere inbound()/outbound() refuse it, naming the connection.
+        _refuse_bool_literals({"tls": tls}, "MLLP")
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
     return ConnectionSpec(
         ConnectorType.MLLP,
@@ -3652,7 +3651,8 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
             raise WiringError("Http intake_api_key_header must be a non-empty header name")
         return
 
-    # mtls_subject
+    # mtls_subject. The check below reads tls by truthiness, so 0 would be refused as "needs tls=True".
+    _refuse_bool_literals({"tls": settings["tls"]}, "Http")
     if not settings["tls"] or not settings["tls_ca_file"]:
         raise WiringError(
             "Http intake_auth='mtls_subject' needs tls=True and tls_ca_file — without a CA the "
@@ -4613,8 +4613,10 @@ def DICOMweb(
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("DICOMweb", headers)
-    # The CA check below reads verify_tls by truthiness, so 0 would be refused as verification off.
-    _refuse_factory_bool_literals("DICOMweb", verify_tls=verify_tls)
+    if tls_ca_file is not None:
+        # The CA check below reads verify_tls by truthiness, so 0 would be refused as verification
+        # off. Only here: elsewhere outbound() refuses it, naming the connection.
+        _refuse_bool_literals({"verify_tls": verify_tls}, "DICOMweb")
     _check_tls_ca_file(
         "DICOMweb",
         tls_ca_file,
@@ -6616,9 +6618,11 @@ class Registry:
 
         Refused, never read: a factory's own body and the pre-resolve readers have read the literal
         by now, so turning it into a bool here would split one setting into two readings, and a
-        refused graph never runs. Here and not in the factories, because a ``with_*`` composer
+        refused graph never runs. Here and not only in the factories, because a ``with_*`` composer
         writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
-        registered. ``None`` passes where the setting has one default on every factory: there an
+        registered. ``inbound()``/``outbound()`` refuse a connection's literals at declaration, and
+        ``MLLP``, ``DICOMweb`` and ``Http`` refuse the one flag a check of their own reads first
+        (:func:`_refuse_bool_literals`), so this pass is the one that sees the rest. ``None`` passes where the setting has one default on every factory: there an
         explicit ``None`` is that default to ``bool_setting`` (vault BACKLOG #3230). It is refused on
         a composer's flag, whose reader takes ``None`` as off while the composer's own default is on,
         and on a setting with no single default. ``env()`` references are read strictly once
