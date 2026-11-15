@@ -81,14 +81,12 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
 /** The service-settings file to read and write, which must be inside the workspace folder
  *  (BACKLOG #5411), or undefined after the refusal is posted to the webview. */
 function configPath(ws: string, current: vscode.WebviewPanel): string | undefined {
+  // Trust is passed in and checked first, so an untrusted workspace makes no file-system contact.
   const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
   // Unread scope counts as the workspace's, so the check is never skipped by a missing answer.
   const fromWorkspace = seen === undefined || seen.workspaceValue !== undefined || seen.workspaceFolderValue !== undefined;
-  const target = securityConfigTarget(ws, serviceConfig(), fromWorkspace, {
-    realpath: fs.realpathSync.native,
-    lstat: fs.lstatSync,
-    readlink: fs.readlinkSync,
-  });
+  const fsx = { realpath: fs.realpathSync.native, lstat: fs.lstatSync, readlink: fs.readlinkSync };
+  const target = securityConfigTarget(ws, serviceConfig(), fromWorkspace, fsx, vscode.workspace.isTrusted);
   if (!target.ok) {
     postToWebview(current.webview, { command: "error", message: `${target.problem}. Nothing was read or written.` });
     return undefined;

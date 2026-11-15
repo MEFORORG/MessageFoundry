@@ -128,17 +128,29 @@ function reachesRoot(target: string, realRoot: string, fsx: LinkFs): boolean | u
  * Whatever its scope, a path inside the workspace folder, the default `messagefoundry.toml`
  * included, must not leave it through a symbolic link the repository holds, a dangling one included.
  * A user-set path that reaches the folder by an alias gets the same rules: at least a link, and a
- * mapped drive or an 8.3 short name where realpath resolves it to the folder. A path whose links, or
- * the folder's, cannot be read is refused at either scope. A path that reaches the folder is returned
- * with its links resolved, so the CLI opens the folders that were checked; one that never reaches it
- * is returned as written.
+ * mapped drive or an 8.3 short name where realpath resolves it to the folder. An alias realpath does
+ * not resolve, such as a UNC loopback alias, a bind mount or a firmlink, is not caught. A path whose
+ * links, or the folder's, cannot be read is refused at either scope. A path that reaches the folder
+ * is returned with its links resolved, so the CLI opens the folders that were checked; one that
+ * never reaches it is returned as written.
+ *
+ * `trusted` says the workspace is trusted. An untrusted one is refused before anything else, so the
+ * check touches no file: a repository-held link to a UNC path would otherwise be read, and on
+ * Windows that can contact SMB, in Restricted Mode.
  */
 export function securityConfigTarget(
   workspace: string,
   setting: unknown,
   fromWorkspace: boolean,
   fsx: LinkFs,
+  trusted: boolean,
 ): ConfigTarget {
+  if (!trusted) {
+    return {
+      ok: false,
+      problem: "this workspace is not trusted. Trust it to read or write its security settings",
+    };
+  }
   if (typeof setting !== "string" || setting.trim() === "") {
     return { ok: false, problem: "messagefoundry.serviceConfig is blank or is not text" };
   }
