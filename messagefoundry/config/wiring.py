@@ -1114,9 +1114,9 @@ def DatabaseRef(
     column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
     shape). Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is
     refused at ``messagefoundry check`` and at every sync unless ``tls_hop_attested`` below is
-    set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at ``[security].enforcement = warn``. The
-    dial-out is gated by the **fail-closed** ``[egress].allowed_db`` allowlist, exactly like a
-    DATABASE poll source — point the engine only at allowed hosts.
+    set; ``MEFOR_ALLOW_INSECURE_TLS`` does not permit it, even at
+    ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed**
+    ``[egress].allowed_db`` allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts.
 
     ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
     the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
@@ -1304,9 +1304,10 @@ def DatabaseLookup(
     statement does not buffer its whole result in the transform worker first. ``0`` removes it.
 
     Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is refused unless
-    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
-    ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
-    allowlist, like a DATABASE source — point the engine only at allowed hosts. Example::
+    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` does not permit it, even at
+    ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed**
+    ``[egress].allowed_db`` allowlist, like a DATABASE source — point the engine only at allowed
+    hosts. Example::
 
         DatabaseLookup("clarity", server=env("clarity_host"), database="Clarity",
                        username=env("clarity_user"), password=env("clarity_pw"))
@@ -4697,7 +4698,7 @@ def Database(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS does not permit it, even at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -4794,7 +4795,7 @@ def DatabasePoll(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS does not permit it, even at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -4826,8 +4827,8 @@ def DatabasePoll(
     its cursor. The *Database source* section of docs/CONNECTIONS.md says what one needs and names
     some of the cases where it loses a row even then (BACKLOG #4958). Put secrets (``password``) in
     ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
-    ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
-    ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
+    ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` does not permit it,
+    even at ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
 
     ``poll_max_rows`` mirrors transports.base.DEFAULT_MAX_ITEMS_PER_POLL and **ships on**: one poll
     fetches at most this many rows and leaves the rest of the result set in the table for the next poll.

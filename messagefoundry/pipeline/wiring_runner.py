@@ -3073,11 +3073,11 @@ class RegistryRunner:
         for name, spec in self.registry.lookups.items():
             refuse_unresolved_hop_flags(spec.settings, f"database lookup {name!r}")
             resolved[name] = resolve_env_settings(spec.settings, self._env_values)
-        # #200 (ADR 0092): stamp the derived posture around the live executor build so the DSN's
-        # weakened-TLS refusal (_build_dsn → _weakened_tls_permitted) keys on THIS instance's posture,
-        # applying the production-PHI clamp. engine.start()/reload build the executor here WITHOUT going
-        # through build_check_registry's active_hop_posture scope, so an unstamped build would fall back
-        # to the UNCLAMPED escape at query time and let a prod-PHI weakened-TLS live read cross.
+        # #200 (ADR 0092): stamp the derived posture around the live executor build, so the cells it
+        # builds that read one (the attestation audit line, the generic dialect's cleartext guard)
+        # read THIS instance's. engine.start()/reload build the executor here WITHOUT going through
+        # build_check_registry's active_hop_posture scope. The weakened-TLS refusal in _build_dsn
+        # reads no posture: it refuses at every posture (vault BACKLOG #3533 item 2).
         with active_hop_posture(self._hop_posture):
             return DatabaseLookupExecutor(resolved, egress=self._egress)
 

@@ -260,45 +260,38 @@ def _weakened_store() -> StoreSettings:
     )
 
 
-def test_store_tls_refuses_prod_phi_even_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+@pytest.mark.parametrize("escape", [True, False], ids=["escape", "no-escape"])
+def test_store_tls_refuses_weakened_at_every_posture(
+    monkeypatch: pytest.MonkeyPatch, escape: bool
+) -> None:
+    # Owner ruling 2026-11-14 (vault BACKLOG #3533 item 2): the store login never crosses a weakened
+    # hop, so the escape on a warn (STAGING_PHI) posture, which used to build the string, refuses too.
+    if escape:
+        monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    else:
+        monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
     s = _weakened_store()
-    # Finding 3: the engine<->store hop must refuse a weakened-TLS production-PHI hop even with the
-    # global escape set (decision 2 — the escape can never relax a production hop).
-    with pytest.raises(ValueError, match="MITM-able"):
-        connection_string(s, posture=PROD_PHI)
-    # Non-production + escape still permitted (the escape downgrades a non-prod hop).
-    assert "TrustServerCertificate=yes" in connection_string(s, posture=STAGING_PHI)
-    # No posture fails closed (vault BACKLOG #2354); it used to fall back to the unclamped escape.
-    with active_hop_posture(None), pytest.raises(ValueError, match="MITM-able"):
-        connection_string(s, posture=None)
-
-
-def test_store_tls_refuses_weakened_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
-    s = _weakened_store()
-    # No escape at all: refused for every posture (unchanged strict-cell behaviour).
     for posture in (PROD_PHI, STAGING_PHI, SYNTHETIC, None):
-        with pytest.raises(ValueError, match="MITM-able"):
-            connection_string(s, posture=posture)
+        with active_hop_posture(posture), pytest.raises(ValueError, match="MITM-able"):
+            connection_string(s)
 
 
-def test_postgres_build_ssl_clamps_prod_phi(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The Postgres engine<->store twin is keyed identically to the SQL Server one.
+def test_postgres_build_ssl_refuses_weakened_at_every_posture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Postgres engine<->store twin is keyed identically to the SQL Server one. The warn posture
+    # with the escape used to return a CERT_NONE context here (vault BACKLOG #3533 item 2).
     from messagefoundry.store.postgres import _build_ssl
 
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    pg = StoreSettings(
-        backend=StoreBackend.POSTGRES,
-        server="db.example",
-        database="mefor",
-        username="mefor",
-        trust_server_certificate=True,
-    )
-    with pytest.raises(ValueError, match="MITM-able"):
-        _build_ssl(pg, posture=PROD_PHI)
-    # Non-prod + escape: an escape-permitted CERT_NONE context is returned (crosses, not refused).
-    import ssl as _ssl
-
-    ctx = _build_ssl(pg, posture=STAGING_PHI)
-    assert isinstance(ctx, _ssl.SSLContext) and ctx.verify_mode is _ssl.CERT_NONE
+    for weak in ({"trust_server_certificate": True}, {"encrypt": False}):
+        pg = StoreSettings(
+            backend=StoreBackend.POSTGRES,
+            server="db.example",
+            database="mefor",
+            username="mefor",
+            **weak,  # type: ignore[arg-type]
+        )
+        for posture in (PROD_PHI, STAGING_PHI, None):
+            with pytest.raises(ValueError, match="MITM-able"):
+                _build_ssl(pg, posture=posture)

@@ -95,11 +95,9 @@ from messagefoundry.config.models import (
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     EgressSettings,
-    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import (
     HOP_ATTESTATION_LEVER,
-    HopPosture,
     InsecureHopRefused,
     current_hop_posture,
     hop_name_prefix,
@@ -195,24 +193,16 @@ _NO_NEXTSET_STATES = frozenset({"IM001", "HYC00", "HY007"})
 _CLIENT_FETCH_STATES = frozenset({"07006"})
 
 
-def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
-    """Whether a weakened (verify-off) customer-DB TLS posture may be used, routed through the ONE
-    shared hop authority (#200, ADR 0092).
+def _weakened_tls_permitted(*, attested: bool) -> bool:
+    """Whether a weakened (verify-off) customer-DB TLS posture may be used (#200, ADR 0092).
 
-    A per-connection ``tls_hop_attested`` ALLOWs it (the operator affirms the hop is secure by other
-    means — a proxy-terminated / trusted-segment DB link). Otherwise this stays a **STRICT verify-off
-    cell** (decision 5): refused unless the global ``MEFOR_ALLOW_INSECURE_TLS`` escape applies, and
-    that escape works only at ``[security].enforcement = warn`` (decision 2), so it can never relax
-    an enforcing hop.
-
-    The escape question is the shared :func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`,
-    so this cell and every other weakened-TLS cell answer it in one place. ``posture`` is the
-    construction-time posture; the send-time tripwire passes the one its connector captured, because
-    a delivery worker runs outside the scope that stamped it. ``None`` fails closed (vault BACKLOG
-    #2354). CORRECTED: an unstamped call used to fall back to the unclamped escape, on the premise
-    that the enforced gate had already vetted the real posture; callers the gate never reaches made
-    that false."""
-    return attested or weakened_tls_escape_permitted(posture)
+    Only a per-connection ``tls_hop_attested`` ALLOWs it (the operator affirms the hop is secure by
+    other means: a proxy-terminated or trusted-segment DB link). Otherwise this is a **STRICT
+    verify-off cell** (decision 5), refused at every posture. The connection's login would cross the
+    hop, so ``MEFOR_ALLOW_INSECURE_TLS`` does not permit it, even on an instance at
+    ``[security].enforcement = warn`` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2). It used
+    to take a posture, and the escape on such an instance let the login cross."""
+    return attested
 
 
 def _audit_attested_weakened_tls(cell: str, *, connection: str | None = None) -> None:
@@ -233,19 +223,17 @@ def _assert_send_hop(
     *,
     weakened: bool,
     attested: bool,
-    posture: HopPosture | None,
     connection: str | None = None,
 ) -> None:
     """Zero-I/O byte-crossing re-assertion (#200 decision 4): before a payload crosses a weakened-TLS
-    DB hop, re-confirm the posture-keyed authority still permits it. Raises :class:`InsecureHopRefused`
-    (a ``ValueError``) otherwise — a fail-closed tripwire behind the construction-time gate. No-op for
-    a non-weakened (verifying-TLS) hop. ``posture`` is the one the connector captured when it was
-    built."""
-    if weakened and not _weakened_tls_permitted(attested=attested, posture=posture):
+    DB hop, re-confirm :func:`_weakened_tls_permitted` still permits it. Raises
+    :class:`InsecureHopRefused` (a ``ValueError``) otherwise — a fail-closed tripwire behind the
+    construction-time gate. No-op for a non-weakened (verifying-TLS) hop."""
+    if weakened and not _weakened_tls_permitted(attested=attested):
         raise InsecureHopRefused(
             f"{hop_name_prefix(connection)}DATABASE destination: refusing to put a payload on a "
             "weakened-TLS database hop "
-            "(posture-keyed refusal, #200)"
+            "(#200)"
         )
 
 
@@ -263,10 +251,9 @@ def _build_dsn(
     BACKLOG #4873).
 
     Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
-    ``ServerCertificate`` pin. A weakened TLS posture is **refused** via the shared posture-keyed
-    authority (:func:`_weakened_tls_permitted`, #200) — a STRICT verify-off cell that stays refused
-    for staging AND prod PHI, with the global escape clamped so it can never relax a production hop;
-    ``attested`` (the per-connection ``tls_hop_attested``) is the surgical, audited per-hop opt-in.
+    ``ServerCertificate`` pin. A weakened TLS posture is **refused** (:func:`_weakened_tls_permitted`,
+    #200) at every posture, even with ``MEFOR_ALLOW_INSECURE_TLS`` set at
+    ``[security].enforcement = warn`` (vault BACKLOG #3533 item 2); ``attested`` (the per-connection ``tls_hop_attested``) is the surgical, audited per-hop opt-in.
 
     ``read_only`` (the db_lookup pool and, since BACKLOG #2617, the ``DatabaseRef`` sync set it;
     destination/source omit it, keeping their DSN byte-identical) appends ``ApplicationIntent=ReadOnly``
@@ -286,18 +273,15 @@ def _build_dsn(
         raise ValueError(f"{where}DATABASE {refusal}")
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
-    if (trust or not encrypt) and not _weakened_tls_permitted(
-        attested=attested, posture=current_hop_posture()
-    ):
+    if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
         raise ValueError(
             f"{where}DATABASE connection TLS is weakened "
             "(trust_server_certificate=true or encrypt=false), "
-            "which is MITM-able. Use a trusted server certificate with encrypt=true; set "
-            f"{HOP_ATTESTATION_LEVER} on the connection if the hop is "
-            "secure by other means (a proxy-terminated or isolated segment; reported as a loosening); "
-            f"or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at [security].enforcement = warn to "
-            "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "
-            "the default, or with no posture)."
+            "which is MITM-able, and the connection's login would cross it. Use a trusted server "
+            f"certificate with encrypt=true, or set {HOP_ATTESTATION_LEVER} on the connection if the "
+            "hop is secure by other means (a proxy-terminated or isolated segment; reported as a "
+            f"loosening). {INSECURE_TLS_ESCAPE_ENV}=1 does not permit it, even on an instance at "
+            "[security].enforcement = warn."
         )
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
@@ -2054,7 +2038,7 @@ def _warn_generic_tls_unenforced(
     params: Mapping[str, Any], *, family: str, connection: str | None = None
 ) -> None:
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
-    path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
+    path **cannot introspect the driver's TLS posture**, so the weakened-TLS refusal
     (#200 / ADR 0092) does not apply and :func:`_build_connection` reports the hop as non-weakened. That
     is a deliberate operator-owned-TLS model.
 
@@ -2117,7 +2101,7 @@ def _warn_generic_tls_unenforced(
 # construction.
 #
 # SCOPE IS DELIBERATE: the generic dialect only, and only when the classifier returns a reason. The SQL
-# Server preset keeps its own posture-keyed weakened-TLS refusal (:func:`_build_dsn`) — moving that arm
+# Server preset keeps its own weakened-TLS refusal (:func:`_build_dsn`) — moving that arm
 # onto this gradient would ADD the loopback and ``cleartext_accepted`` relaxations to a path that
 # refuses today, which is a loosening.
 
@@ -2136,7 +2120,7 @@ def generic_cleartext_hop_guard(
     nothing on this arm to gate (BACKLOG #1178).
 
     ``None`` covers two different situations. A non-``generic`` dialect is not this arm at all — the SQL
-    Server preset keeps its own posture-keyed weakened-TLS refusal in :func:`_build_dsn`. A generic
+    Server preset keeps its own weakened-TLS refusal in :func:`_build_dsn`. A generic
     connection returns ``None`` when :func:`generic_odbc_tls_unenforced` does, because it found no reason to think the hop crosses in plaintext; the
     engine still cannot VERIFY an arbitrary driver's keyword, and that residual is unchanged and
     written down above :data:`_ODBC_NO_TLS_VALUES`.
@@ -3826,8 +3810,6 @@ class DatabaseDestination(DestinationConnector):
         # send-time byte-crossing re-assertion below.
         self._hop_attested = config.tls_hop_attested
         self._connection_name = config.name
-        # The posture this connector was built under, for the send-time tripwire (vault BACKLOG #2354).
-        self._hop_posture = current_hop_posture()
         self._dsn, self._weakened_tls = _build_connection(
             s, attested=self._hop_attested, connection=config.name
         )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
@@ -3900,15 +3882,14 @@ class DatabaseDestination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
-        # #200 decision 4: zero-I/O byte-crossing re-assertion of the posture-keyed hop decision, so a
-        # payload never crosses a weakened-TLS DB hop the shared authority would refuse. Defense-in-depth
-        # BEHIND the construction-time _build_dsn gate (which already refused a prod-PHI weakened hop),
+        # #200 decision 4: zero-I/O byte-crossing re-assertion of the hop decision, so a
+        # payload never crosses a weakened-TLS DB hop _weakened_tls_permitted would refuse. Defense-in-depth
+        # BEHIND the construction-time _build_dsn gate (which already refused an unattested weakened hop),
         # catching a reload / build that reached send() around it. Fixed DSN target → this only ever
         # fires as a tripwire.
         _assert_send_hop(
             weakened=self._weakened_tls,
             attested=self._hop_attested,
-            posture=self._hop_posture,
             connection=self._connection_name,
         )
         # BACKLOG #1178: the generic dialect's twin of the line above. That tripwire is keyed on
@@ -4224,7 +4205,7 @@ class DatabaseSource(SourceConnector):
         if refusal is not None:
             raise ValueError(refusal)
         # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
-        # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
+        # verify-off refusal as the destination (a read still crosses the wire).
         self._dsn, _ = _build_connection(
             s,
             attested=config.tls_hop_attested,

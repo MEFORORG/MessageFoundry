@@ -7625,7 +7625,7 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
             "database": "master",
             "username": login,
             "password": password,
-            "trust_server_certificate": True,
+            # Verifying: CI trusts the server's generated certificate (vault BACKLOG #3533 item 2).
         }
     )
     store = connection_string(

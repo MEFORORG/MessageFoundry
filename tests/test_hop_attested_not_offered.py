@@ -149,8 +149,10 @@ def test_database_weakened_tls_refusal() -> None:
     message = str(exc.value)
     _assert_offers_the_supported_lever(message)
     assert "trusted server certificate" in message
-    # The escape variable does nothing while enforcing, so the text must say where it does apply.
-    assert "[security].enforcement = warn" in message
+    # The escape variable does not reach this hop at any posture (vault BACKLOG #3533 item 2), so the
+    # text must not offer it, and must say so for an operator who already set it.
+    assert "or set MEFOR_ALLOW_INSECURE_TLS" not in message
+    assert "MEFOR_ALLOW_INSECURE_TLS=1 does not permit it" in message
 
 
 def test_email_cleartext_refusal() -> None:
