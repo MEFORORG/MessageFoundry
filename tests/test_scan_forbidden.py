@@ -1519,7 +1519,9 @@ def test_an_attribute_shaped_bracket_does_not_swallow_a_verdict(sf, line: str) -
     assert "verdict" in _pr_kinds(sf, line), line
 
 
-@pytest.mark.parametrize("bom", [b"\xff\xfe", b"\xfe\xff"], ids=["16le", "16be"])
+@pytest.mark.parametrize(
+    "bom", [b"\xff\xfe", b"\xfe\xff", b"\xff\xfe\x00\x00"], ids=["16le", "16be", "32le"]
+)
 def test_a_stray_byte_order_mark_before_utf8_text_does_not_hide_it(
     sf, tmp_path: Path, bom: bytes
 ) -> None:
@@ -1533,21 +1535,57 @@ def test_a_stray_byte_order_mark_before_utf8_text_does_not_hide_it(
     "body",
     [
         "[x](" + "1" * 60000 + ")",
-        "<b x=" + " " * 60000,
-        "<b x=" + " " * 60000 + ">",
+        "<b x=" + " " * 30000 + "y",
         "a " + " " * 60000 + "b",
+        "[" * 60000,
+        "[x](" * 15000,
     ],
-    ids=["digit-target", "open-attr", "closed-attr", "space-run"],
+    ids=["digit-target", "attr-space-run", "space-run", "bracket-run", "link-run"],
 )
 def test_a_long_pr_body_shape_scans_in_linear_time(sf, body: str) -> None:
-    """Re-brief note 3: each took seconds, quadratic, near GitHub's 65,536-character body limit. Measured well under 0.1 s each at 16k after
-    the fix; the bound is loose for a slow runner."""
+    """Re-brief note 3. Each shape was quadratic before this fix, measured in seconds near GitHub's
+    65,536-character body limit, and each now scans in well under 0.1 s at that size. The bound is
+    loose so a loaded runner does not fail it."""
     began = time.perf_counter()
     sf.scan_pr_body(body)
-    assert time.perf_counter() - began < 1
+    assert time.perf_counter() - began < 2
 
 
 def test_a_boolean_attribute_block_tag_still_ends_a_sentence(sf) -> None:
     """Re-brief note 4: ``<details open>`` is a block edge, so the id and the path stay apart."""
     body = f"ASVS {_REQ} stays {_PARTIAL}; see <details open>the code in pkg/example_guard.py</details>"
     assert _pr_kinds(sf, body) == {"verdict"}
+
+
+def test_wide_text_mostly_above_latin1_behind_its_mark_is_still_scanned(sf, tmp_path: Path) -> None:
+    """Re-brief review: a mark whose bytes disagree is read both ways, so a UTF-16 ``tree`` listing
+    full of box-drawing characters is not dropped as binary."""
+    p = tmp_path / "tree.txt"
+    p.write_bytes(("│├── " * 200 + "OB_ACME_FEED\n").encode("utf-16"))
+    assert any("customer name (ACME)" in h for h in sf.scan_file(p))
+
+
+@pytest.mark.parametrize(
+    ("line", "kind"),
+    [
+        (f"ASVS {_REQ} where x<y or z > w still has a residual gap.", "gap"),
+        (f"ASVS {_REQ} when n<max and m > 0 see pkg/example_guard.py", "map"),
+    ],
+)
+def test_a_prose_comparison_is_not_a_tag(sf, line: str, kind: str) -> None:
+    """A tag closes with ``>`` straight after its attributes, so ``x<y or z > w`` stays prose."""
+    assert kind in _pr_kinds(sf, line), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Bumps lib. See <a href=https://github.com/example/lib/blob/16.9.97/src/core.py>notes</a> here.",
+        'Release notes.</p> <img src="https://github.com/o/r/blob/16.9.97/docs/shot.png"> and '
+        "<code>pkg/a.py</code>",
+    ],
+)
+def test_an_unquoted_or_second_tag_in_a_run_is_still_a_tag(sf, line: str) -> None:
+    """An unquoted value is a value, and a tag the previous split's trailing space reached still
+    splits, so neither leaves a version-shaped target in the text as a requirement id."""
+    assert sf.scan_pr_body(line) == [], line

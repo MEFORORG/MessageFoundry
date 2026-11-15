@@ -669,17 +669,23 @@ _PR_WINDOW = 80
 #: A sentence ends at a full stop before a capital, or at an HTML tag: bot bodies carry release notes as
 #: HTML, and a tag is a block edge there however the text runs on.
 #: An HTML tag is a tag name and at most 20 attributes, each a name with an optional quoted (500 at
-#: most) or bare (100 at most) value. Every quantifier is bounded or anchored on a different class, so
-#: the tag cannot run past a newline, a `;` or a full stop the way `[^<>]*` did: `n<limit max=3 ...
-#: stays partial -> later` is no tag, so its verdict stays. A boolean attribute (`<details open>`) is one.
+#: most) or unquoted (200 at most, as HTML allows one) value, closed by `>` straight after them or by
+#: `/>`. Every quantifier is bounded or anchored on a different class, so the tag cannot run past a
+#: newline, a `;` or a full stop the way `[^<>]*` did: `n<limit max=3 ... stays partial -> later` is no
+#: tag, so its verdict stays, and nor is prose like `x<y or z > w`. A boolean attribute
+#: (`<details open>`) is one.
 _PR_TAG_NAME = r"[A-Za-z]\w*(?:-\w+)*"
 _PR_TAG_ATTRS = (
     rf"(?:\s+{_PR_TAG_NAME}"
-    r"""(?:\s*=\s*(?:"[^"<>\n]{0,500}"|'[^'<>\n]{0,500}'|[\w-]{1,100}))?)"""
+    r"""(?:\s*=\s*(?:"[^"<>\n]{0,500}"|'[^'<>\n]{0,500}'|[^\s"'<>=`]{1,200}))?)"""
     r"{0,20}"
 )
+_PR_TAG_END = r"(?:\s*/>|>)"
+#: The whitespace lead starts only at the head of a run, so a long run is read once; it is optional so
+#: a tag the previous split's trailing whitespace already reached still splits.
 _PR_SENTENCE_SPLIT = re.compile(
-    rf"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])|(?<!\s)\s*</?{_PR_TAG_NAME}{_PR_TAG_ATTRS}\s*/?>\s*"
+    rf"(?<=[.!?])\s+(?=[A-Z*`\[(\"'#>-])"
+    rf"|(?:(?<!\s)\s+)?</?{_PR_TAG_NAME}{_PR_TAG_ATTRS}{_PR_TAG_END}\s*"
 )
 _PR_LIST_ITEM = re.compile(r"(?:[-*+]|\d+[.)])\s")
 _PR_HEADING = re.compile(r"#{1,6}\s")
@@ -688,7 +694,9 @@ _PR_QUOTE = re.compile(r"^(?:>\s?)+")
 #: A markdown link reads as its text: `[<id>](url) stays partial` is the identifier beside its verdict.
 #: The body is read a second time with each target kept after its text, so a link whose TARGET is the
 #: code path maps the identifier to code too (BACKLOG #5582).
-_PR_MD_LINK = re.compile(r"\[([^\]\n]*)\]\(([^)\s]*)\)")
+#: No `[` in the text and no bracket in the target, so each scan stops at the next one and a run of
+#: `[` or of `[x](` stays linear.
+_PR_MD_LINK = re.compile(r"\[([^\[\]\n]*)\]\(([^()\[\]\s]*)\)")
 #: An inline HTML tag, which sits inside a sentence rather than ending one: `<b>`, `<code>`, `<a href>`.
 #: It is taken out of the line before the sentence split, so only a block tag still ends a sentence.
 #: A `<code>` tag reads as a backtick, as markdown writes one; the second reading keeps a tag's
@@ -696,7 +704,7 @@ _PR_MD_LINK = re.compile(r"\[([^\]\n]*)\]\(([^)\s]*)\)")
 #: bounded grammar, so the tag stops where a real one would and stays linear on a long run.
 _PR_INLINE_TAG = re.compile(
     r"</?(?i:(code|kbd|samp|tt)|a|abbr|b|cite|del|dfn|em|i|ins|mark|q|s|small|span|strong|sub|sup|u|var)"
-    rf"({_PR_TAG_ATTRS})\s*/?>"
+    rf"({_PR_TAG_ATTRS}){_PR_TAG_END}"
 )
 #: A dotted number inside a link target, which a target reading must not take as a requirement id: a
 #: GitHub ``blob/8.1.8/CHANGES.rst`` link is a version and a path, never a map.
@@ -928,7 +936,8 @@ def scan_pr_body(body: str) -> list[str]:
     """
     as_text = _pr_units(body)
     hits = _pr_unit_hits(as_text)
-    with_targets = _pr_units(body, targets=True)
+    # No link and no tag means no target, so the second reading would only repeat the first.
+    with_targets = _pr_units(body, targets=True) if "](" in body or "<" in body else as_text
     if with_targets != as_text:
         # Only a map: the second reading exists so a target's code path counts, and a target's words
         # are a URL's, not the body's own verdict or gap.
@@ -1734,10 +1743,15 @@ def _read_text(path: Path) -> str | None:
     data = path.read_bytes()
     head = data[:_HEAD_BYTES]
     for bom, codec in _BOMS:
-        # A mark alone is not trusted: a NUL-free UTF-8 body behind a stray `FF FE` would decode as
-        # UTF-16 garbage and hide every token in it. Only a mark the following bytes agree with counts.
-        if data.startswith(bom) and _wide_shape(head[len(bom) :], codec, bom):
-            return data.decode(codec, errors="replace")
+        if not data.startswith(bom):
+            continue
+        wide_text = data.decode(codec, errors="replace")
+        if _wide_shape(head[len(bom) :], codec, bom):
+            return wide_text
+        # The bytes disagree with the mark: a UTF-8 body behind a stray mark, or wide text mostly above
+        # U+00FF (box drawing, CJK). Neither reading can be ruled out, so both are scanned: picking one
+        # hid every token of the other (fail closed).
+        return wide_text + "\n" + data.decode("utf-8", errors="replace")
     if b"\x00" not in head:
         return data.decode("utf-8", errors="replace")
     wide = _bomless_utf16(head)
