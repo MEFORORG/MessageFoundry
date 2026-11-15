@@ -1073,9 +1073,10 @@ IDE_SITES: dict[str, Site] = {
         "for a breakpoint match.",
     ),
     "ide/src/newRoute.ts": Site(
-        2,
+        1,
         GUARDED,
-        "The wizard's inbound name is reduced to `[A-Za-z0-9_-]` before it names the new file.",
+        "The wizard's inbound name is reduced to `[A-Za-z0-9_-]` before it names the new file, "
+        "joined onto a config directory workspaceContainment.ts has held inside the workspace.",
         'ide/src/newRoute.ts::.replace(/[^A-Za-z0-9_-]/g, "_")}.py`',
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
@@ -1091,6 +1092,13 @@ IDE_SITES: dict[str, Site] = {
         "A temp directory the extension made and generated case-file names, or the fixtures setting.",
     ),
     "ide/src/validate.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/workspaceContainment.ts": Site(
+        3,
+        GUARDED,
+        "The containment check itself: it resolves a workspace setting to a real path and refuses "
+        "one whose path relative to the workspace's real path climbs out or is absolute.",
+        "ide/src/workspaceContainment.ts::path.relative(root, target)",
+    ),
 }
 
 SCRIPT_SITES: dict[str, Site] = {
