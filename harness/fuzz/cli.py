@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""``python -m harness --fuzz``: exit 0 when every invariant held, 1 when one broke, 2 on setup."""
+"""``python -m harness --fuzz``: exit 0 when every invariant held, 1 when one broke or the run
+checked nothing (``CampaignResult.vacuous``), 2 on setup."""
 
 from __future__ import annotations
 
@@ -80,7 +81,8 @@ def main(
         # once the campaign runs is recorded in the result, never raised, so it still exits 1.
         return fail_setup(str(exc))
     if not result.ok:
-        if not replay_files:
+        # A vacuous run broke no invariant, so it kept no file and has nothing to replay.
+        if result.failures and not replay_files:
             where = f"--fuzz-driver {driver}" + (f" --fuzz-endpoint {endpoint}" if endpoint else "")
             print(f"replay with: python -m harness --fuzz-replay FILE {where} (seed {seed})")
         return EXIT_INVARIANT

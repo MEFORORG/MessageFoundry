@@ -371,14 +371,14 @@ def test_build_ack_echoes_a_letter_field_separator_its_own_text_never_holds(code
 # --- invariants without an engine ----------------------------------------------------------------
 
 
-def _plain_ack(payload: bytes) -> bytes:
+def _plain_ack(payload: bytes, code: str = "AA") -> bytes:
     """An AA for ``payload`` under the standard delimiters, echoing its control id when that id is
     plain text. Not build_ack: these fakes stand in for an engine, and their replies must not move
     when build_ack's echo rules do."""
     cid = control_id_of(payload) or ""
     if not queryable(cid) or any(ch in cid for ch in "|^~\\&"):
         cid = ""
-    return f"MSH|^~\\&|E|E|H|H|||ACK||P|2.5.1\rMSA|AA|{cid}\r".encode()
+    return f"MSH|^~\\&|E|E|H|H|||ACK||P|2.5.1\rMSA|{code}|{cid}\r".encode()
 
 
 class _EchoTransport(Transport):
@@ -410,6 +410,15 @@ class _FakeClient:
         self.health_fails_after: int | None = None
         self.health_status = 500
         self.frozen_total: int | None = None
+
+    def __enter__(self) -> _FakeClient:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        pass
+
+    def set_token(self, token: str) -> None:
+        pass
 
     def health(self) -> Health:
         self.health_calls += 1
@@ -508,6 +517,101 @@ def test_silence_on_a_well_framed_message_breaks_the_reply_invariant(tmp_path: P
     assert "complete frame(s) sent but 0 acknowledgement(s) came back" in failure.reason
 
 
+class _NakTransport(_EchoTransport):
+    """Answers every complete frame AR: an engine that refuses everything it is sent."""
+
+    def send(self, data: bytes) -> Exchange:
+        self.sent.append(data)
+        replies = tuple(_plain_ack(payload, "AR") for payload in frames(data))
+        return Exchange(REPLY if replies else CLOSED, replies)
+
+
+def test_a_campaign_that_checked_no_stored_row_is_not_a_pass(tmp_path: Path) -> None:
+    """BACKLOG #5419: every invariant held, but no positive ACK was matched to a stored row, so
+    the per-message store invariant never ran. That was a PASS with a warning, and exit 0."""
+    naks = _NakTransport()
+    config = FuzzConfig(out_dir=tmp_path / "out", settle=0.0, seed=3, iterations=30)
+    lines: list[str] = []
+    result = run(cast(EngineClient, _FakeClient(naks)), naks, config, emit=lines.append)
+    assert not result.failures and result.stored_checked == 0 and result.replies["AR"] > 0
+    assert result.vacuous and not result.ok
+    assert any(line.startswith("FAIL seed=3 ") for line in lines)
+    assert not any(line.startswith("PASS") for line in lines)
+    # Control: the same campaign against an engine that accepts is a pass that checked rows.
+    transport, client, config = _offline(tmp_path, seed=3, iterations=30)
+    result = run(cast(EngineClient, client), transport, config, emit=lambda _: None)
+    assert result.ok and not result.vacuous
+
+
+def test_the_cli_exits_one_on_a_vacuous_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    transport = _NakTransport()
+    monkeypatch.setattr(fuzz_cli, "build_transport", lambda *a, **k: transport)
+    monkeypatch.setattr(fuzz_cli, "EngineClient", lambda *a, **k: _FakeClient(transport))
+    args = ["--fuzz", "--fuzz-seed", "3", "--fuzz-iterations", "10", "--fuzz-out", str(tmp_path)]
+    assert main(args) == 1
+    out = capsys.readouterr().out
+    assert "never ran" in out and "replay with:" not in out
+
+
+def test_a_replay_needs_an_acknowledgement_not_a_stored_row(tmp_path: Path) -> None:
+    """A replay is one kept case, often a NAKed one, so it is judged by its reply; silence that
+    checked nothing is still not a pass."""
+    kept = tmp_path / "fuzz-seed3-iter0.mllp.bin"
+    kept.write_bytes(_first(3, "none").data)
+    transport = _NakTransport()
+    client = _FakeClient(transport)
+    config = FuzzConfig(out_dir=tmp_path / "out", settle=0.0, seed=3)
+    result = replay(cast(EngineClient, client), transport, [kept], config, emit=lambda _: None)
+    assert result.ok and result.stored_checked == 0
+    silent = _SilentTransport()
+    kept.write_bytes(b"\x0bMSH|^~\\&|A")  # no complete frame: nothing is owed and nothing checked
+    result = replay(
+        cast(EngineClient, _FakeClient(silent)), silent, [kept], config, emit=lambda _: None
+    )
+    assert not result.failures and result.vacuous and not result.ok
+
+
+class _BlankEchoTransport(_EchoTransport):
+    """The echo transport, except the AA for one case echoes no control id in MSA-2."""
+
+    def __init__(self, target: bytes) -> None:
+        super().__init__()
+        self.target = target
+
+    def send(self, data: bytes) -> Exchange:
+        exchange = super().send(data)
+        if data != self.target:
+            return exchange
+        # An AA built for a frame with no MSH: MSA-2 empty, one per frame sent.
+        return Exchange(REPLY, tuple(_plain_ack(b"") for _ in exchange.replies))
+
+
+def test_a_positive_ack_that_echoes_no_control_id_fails(tmp_path: Path) -> None:
+    """BACKLOG #5420: an AA with an empty MSA-2 skipped the per-message store check, and the
+    batch's row count could not tell its row was missing when other rows grew the store."""
+    victim = _first(3, "none")
+    assert victim.iteration < 30 and victim.control_id
+    transport = _BlankEchoTransport(victim.data)
+    client = _FakeClient(transport)
+    config = FuzzConfig(out_dir=tmp_path / "out", settle=0.0, seed=3, iterations=30)
+    result = run(cast(EngineClient, client), transport, config, emit=lambda _: None)
+    assert not result.ok
+    failure = result.failures[0]
+    assert failure.case == victim
+    assert "echoed no control id" in failure.reason
+
+
+def test_a_positive_ack_may_echo_none_where_build_ack_blanks_it() -> None:
+    """The engine's own ACK blanks a control id the default delimiters would restructure (BACKLOG
+    #2875), so an empty MSA-2 is owed exactly where build_ack writes one, and nowhere else."""
+    blanked = _DATA_CONTROL_IDS["pipe-under-letter-field-sep"].encode()
+    assert invariants.echo_owed(blanked) is None
+    assert invariants.echo_owed(b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|C1|P|2.5.1\r") == "C1"
+    assert invariants.echo_owed(b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01||P|2.5.1\r") is None
+
+
 def test_a_4xx_mid_campaign_is_a_setup_error_not_a_verdict(tmp_path: Path) -> None:
     transport, client, config = _offline(tmp_path, seed=3, iterations=30)
     client.health_fails_after, client.health_status = 1, 401
@@ -557,6 +661,32 @@ def test_a_cut_off_or_unframed_reply_is_not_a_clean_close(sent: bytes, detail: s
         theirs.close()
         ours.settimeout(5.0)
         assert _read_replies(ours).outcome == REPLY
+
+
+_ACK_BODY = b"MSH|^~\\&|E|F\rMSA|AA|1\r"
+
+
+@pytest.mark.parametrize(
+    "sent",
+    [
+        b"\x0b" + _ACK_BODY + b"\x1c\n",  # LF where the trailing CR belongs
+        b"\x0b" + _ACK_BODY + b"\x1c\x1c",  # a second end block as the trailer
+        # One frame short its CR, the next carrying two: the byte counts balance.
+        b"\x0b" + _ACK_BODY + b"\x1c" + frame(_ACK_BODY) + b"\r",
+    ],
+    ids=["lf-trailer", "fs-trailer", "compensating"],
+)
+def test_a_reply_with_a_wrong_trailer_is_not_a_clean_reply(sent: bytes) -> None:
+    """BACKLOG #5421: the reply bytes were checked by count, so a wrong trailer byte, or one frame
+    short a CR and the next long one, read as clean MLLP. They are compared byte for byte now."""
+    ours, theirs = socket.socketpair()
+    with ours, theirs:
+        theirs.sendall(sent)
+        theirs.close()
+        ours.settimeout(5.0)
+        exchange = _read_replies(ours)
+    assert exchange.outcome == MALFORMED, exchange
+    assert "not exactly" in exchange.detail
 
 
 def test_replies_past_the_exchange_ceiling_stop_the_read(monkeypatch: pytest.MonkeyPatch) -> None:

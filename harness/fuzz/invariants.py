@@ -9,7 +9,10 @@ acknowledgements, at two strengths, because the engine gives two different guara
 * A **positive** acknowledgement (AA or CA) is sent only after ``enqueue_ingress`` commits a row
   carrying the message's control id (ACK-on-receipt). So for each one, the control id the ACK
   echoes in MSA-2 must name a stored row -- a NEW one, when the campaign could predict that id and
-  count its rows before sending -- with a disposition. This is the per-message check.
+  count its rows before sending -- with a disposition. This is the per-message check. A positive
+  acknowledgement with an empty MSA-2 breaks it unless the engine's own ACK builder would have
+  written that MSA-2 empty for the frame (:func:`echo_owed`), since an id it dropped would leave
+  only the batch count to notice a missing row.
 * A **negative** acknowledgement (AE AR CE CR) is sent after the decode, NUL, parse or strict path
   has recorded an ERROR row, but the decode and parse paths record it with no control id, because
   none could be read. So a NAK cannot be matched to its row. It is counted instead: across each
@@ -42,6 +45,7 @@ from functools import partial
 
 from harness.fuzz.transport import CLOSED, REPLY, Exchange
 from messagefoundry.apiclient import ApiError, EngineClient
+from messagefoundry.mllpcodec import build_ack
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS
 
@@ -149,6 +153,21 @@ def _read_ack(reply: bytes) -> tuple[Ack | None, str]:
     if msa1 is None or msa1 not in ACK_CODES:
         return None, f"reply MSA-1 is not an acknowledgement code ({shown(msa1)})"
     return Ack(msa1, msa2 or None), ""
+
+
+def echo_owed(payload: bytes) -> str | None:
+    """The MSA-2 a positive ACK for the frame ``payload`` must echo, or None when it owes none.
+
+    Read from :func:`~messagefoundry.mllpcodec.build_ack`, the engine's own ACK builder, through
+    the same parser :func:`_read_ack` reads a reply with: the builder blanks a control id the
+    default delimiters would restructure (BACKLOG #2875), and the parser strips the reply's trailing
+    whitespace, so both a blank and a shortened echo are what the engine legitimately writes. Any
+    other empty MSA-2 on a positive ACK is a control id the engine dropped (BACKLOG #5420)."""
+    try:
+        ack = build_ack(payload.decode("utf-8", errors="replace"), timestamp="20260101")
+        return Peek.parse(ack).field("MSA-2") or None
+    except PEEK_READ_FAULTS:
+        return None
 
 
 def queryable(control_id: str) -> bool:

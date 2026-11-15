@@ -21,9 +21,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from harness.fuzz.invariants import (
+    ACK_CODES,
     ApiFault,
     check_health,
     check_stored,
+    echo_owed,
     judge,
     queryable,
     rows_for,
@@ -89,10 +91,29 @@ class CampaignResult:
     #: per-message store invariant never ran, which proves nothing.
     stored_checked: int = 0
     failures: list[Failure] = field(default_factory=list)
+    #: What a result must have checked to pass: a stored row for a campaign, an acknowledgement for
+    #: a replay, which is one kept case and often a NAKed one.
+    require_stored: bool = True
+
+    @property
+    def vacuous(self) -> str:
+        """Why nothing the pass rests on was checked (BACKLOG #5419), or empty when something
+        was: no stored row was matched to a positive ACK, or, for a replay, no acknowledgement came
+        back at all."""
+        if self.require_stored:
+            if self.stored_checked == 0:
+                return (
+                    "no positive acknowledgement was matched to a stored row, so the "
+                    "per-message store invariant never ran"
+                )
+        elif not any(self.replies[code] for code in ACK_CODES):
+            return "no acknowledgement came back, so no reply was judged"
+        return ""
 
     @property
     def ok(self) -> bool:
-        return not self.failures
+        """A pass: no invariant broke, and the run was not :attr:`vacuous`."""
+        return not self.failures and not self.vacuous
 
 
 def run(
@@ -152,6 +173,7 @@ def replay(
             )
         )
     session = _Session(client, transport, config, emit, keep_replays=False)
+    session.result.require_stored = False
     session.batch(cases, None)
     return session.finish()
 
@@ -229,7 +251,8 @@ class _Session:
         """Send one case; return its acknowledgement count and its broken invariants."""
         self.result.cases += 1
         self.result.layers[case.layer] += 1
-        verdict = judge(self.transport.send(case.data), expected=len(frames(case.data)))
+        sent_frames = frames(case.data)
+        verdict = judge(self.transport.send(case.data), expected=len(sent_frames))
         for ack in verdict.acks:
             self.result.replies[ack.code] += 1
         if verdict.problem:
@@ -238,12 +261,21 @@ class _Session:
         if not verdict.acks:
             self.result.replies["closed"] += 1
         problems: list[str] = []
-        for ack in verdict.acks:
+        # judge held the count to one acknowledgement per frame, answered in the order sent.
+        for ack, payload in zip(verdict.acks, sent_frames, strict=True):
             if not ack.positive:
+                continue
+            if ack.control_id is None:
+                owed = echo_owed(payload)
+                if owed is not None:
+                    problems.append(
+                        f"positive acknowledgement echoed no control id in MSA-2, but the "
+                        f"engine's ACK for that frame echoes {shown(owed)}"
+                    )
                 continue
             stored = self._stored_as(ack.control_id, case.control_id, before)
             if stored is None:
-                continue  # an empty or unqueryable control id: the batch's store count covers it
+                continue  # an unqueryable control id: the batch's store count covers it
             problem = check_stored(self.client, *stored, self.config.settle)
             if problem:
                 problems.append(problem)
@@ -253,7 +285,7 @@ class _Session:
 
     @staticmethod
     def _stored_as(
-        echoed: str | None, predicted: str | None, before: dict[str, int]
+        echoed: str, predicted: str | None, before: dict[str, int]
     ) -> tuple[str, int] | None:
         """The control id a positive ACK is stored under, with its pre-send row count, or none
         when the API cannot ask for it.
@@ -264,8 +296,6 @@ class _Session:
         last field, so an id ending in a space, tab or VT comes back without it; the prediction,
         read from the frame the engine decoded, still carries it. Leading whitespace is not lost
         that way, so a difference there is the engine's and is not papered over."""
-        if echoed is None:
-            return None
         stored = echoed
         if predicted is not None and predicted != echoed and predicted.rstrip() == echoed:
             stored = predicted
@@ -326,9 +356,8 @@ class _Session:
             f"{verdict} seed={r.seed} cases={r.cases} replies[{replies}] layers[{layers}] "
             f"stored_checked={r.stored_checked} elapsed={elapsed:.1f}s"
         )
-        if r.ok and r.stored_checked == 0:
+        if r.vacuous and not r.failures:
             self.emit(
-                "WARNING: no positive acknowledgement was matched to a stored row, so the "
-                "per-message store invariant never ran; this pass proves little"
+                f"FAIL seed={r.seed} reason={r.vacuous}; a run that checked nothing is not a pass"
             )
         return r
