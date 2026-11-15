@@ -310,8 +310,9 @@ _ALLOWED: tuple[_Allowed, ...] = (
         count=2,
     ),
     _Allowed(
-        f"{_APP}.upload_file::<no handler>" + _HTTP,
-        _SAFE + "the 415 is raised outside any handler, so this from None does nothing",
+        f"{_APP}.upload_file::UploadNotTextError" + _HTTP,
+        _SAFE + "it carries the upload's display name and the sniff's fixed reason, never content; "
+        "the 415 detail is that reason, and the same uploader gets the name back on a 400",
     ),
     _Allowed(
         f"{_APP}.upload_file::MultipartTooLargeError" + _HTTP,

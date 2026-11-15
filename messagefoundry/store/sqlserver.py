@@ -187,8 +187,10 @@ from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     USER_KIND,
     AnyRowSealer,
+    ResealOutcome,
     RowSealError,
     SealPager,
+    classify_unrotated,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -283,6 +285,7 @@ from messagefoundry.store.store import (
     OutboxStatus,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -415,6 +418,8 @@ from messagefoundry.store.store import (
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    unheld_seal_refusal,
+    unrotated_seal_queries,
     user_disabled_change,
     user_insert_params,
     user_reseal_params,
@@ -3500,6 +3505,8 @@ class SqlServerStore:
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
     backend = StoreBackend.SQLSERVER
+    # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
+    _reseal_outcome: ResealOutcome = ResealOutcome()
     # H1 fence state (ADR 0157). Class defaults so a store built via object.__new__ (several offline
     # suites) reads as unfenced, and its SQL stays character-identical, instead of raising.
     _leader_epoch: int | None = None
@@ -9768,6 +9775,7 @@ class SqlServerStore:
         Each batch's re-encrypt list is built UP FRONT so an undecryptable value raises BEFORE any
         UPDATE (all-or-nothing; PHI never dropped). Skips rows already under the active key and
         blank/purged values."""
+        self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
@@ -9796,9 +9804,19 @@ class SqlServerStore:
         # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
+        # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
+        # under a key this run does not hold leaves the store as this method found it.
+        preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if preflight.unheld:
+            self._reseal_outcome = preflight
+            raise unheld_seal_refusal(preflight, before_writes=True)
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
+        # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
+            raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
         # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error (H4):
         # exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop
@@ -15032,6 +15050,22 @@ class SqlServerStore:
         2)."""
         await _hold_account_row(cur, user_id, "UPDLOCK, ROWLOCK")
 
+    def reseal_outcome(self) -> ResealOutcome:
+        """store.py's ``MessageStore.reseal_outcome`` states the contract (vault BACKLOG #5635)."""
+        return self._reseal_outcome
+
+    async def _unrotated_seals(self) -> list[tuple[str, object]]:
+        """store.py's ``MessageStore._unrotated_seals`` states the contract (vault BACKLOG #5635)."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return []
+        active = f"{SEAL_PREFIX}{sealer.key_id}:%"
+        seals: list[tuple[str, object]] = []
+        for table, sql in unrotated_seal_queries("?", collate=" COLLATE Latin1_General_100_BIN2"):
+            rows = await self._fetchall(sql, (active,))
+            seals.extend((table, r["seal"]) for r in rows)
+        return seals
+
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
         store.py's ``MessageStore.reseal_user_records`` states the contract."""
@@ -15824,12 +15858,39 @@ class SqlServerStore:
         await self._write_user_txn(user_id, lambda r: full_authentication_clear(r, now))
 
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None:
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """See the SQLite twin (BACKLOG #5633): the clear and ``audit`` share one transaction. This
+        leg is CI-only, so a divergence from the SQLite and Postgres bodies surfaces first in CI.
+        Same lock order as ``replace_totp_enrolment``: the in-process gate, then the connection."""
         now = time.time() if now is None else now
-        await self._write_user_txn(
-            user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
-        )
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        if (
+                            await self._write_user(
+                                cur,
+                                user_id,
+                                lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now),
+                            )
+                            is None
+                        ):
+                            await conn.rollback()
+                            return False  # nothing written, so nothing audited
+                        appended = await self._append_audits(cur, (audit,), now=now)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard, as replace_totp_enrolment does.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits((audit,), appended, ts=now)
+        return True
 
     async def record_login_failure(
         self,
@@ -16633,8 +16694,16 @@ class SqlServerStore:
         stamp = reauth_stamp(time.time() if now is None else now, client, idp_auth_time)
         await self._write_session_txn(token_hash, stamp)
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        await self._write_session_txn(token_hash, mfa_stamp(time.time() if now is None else now))
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
+        written = await self._write_session_txn(token_hash, stamp)
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None

@@ -14,8 +14,9 @@
                                                 mutations of generated HL7 through the MLLP driver,
                                                 checking health, ACK-implies-stored, reply shape and no
                                                 5xx after each batch. Exits 0 (held) / 1 (an invariant
-                                                broke; the seed and a replay file are printed) / 2
-                                                (setup). ``--fuzz-replay FILE`` resends a kept case.
+                                                broke, or the run checked nothing; see
+                                                harness/fuzz/cli.py) / 2 (setup). ``--fuzz-replay
+                                                FILE`` resends a kept case.
 ``python -m harness --list-profiles`` → list the built-in load profiles.
 ``python -m harness --load NAME``     → run a load profile headless against a running engine and exit
                                                 0 (SLOs met) / 1 (SLO violation, incl. zero_loss when
@@ -287,8 +288,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--fuzz-out",
-        help="fuzz: directory a failing case's exact bytes are written to (default: a "
-        "messagefoundry-harness-fuzz directory under the system temp directory)",
+        help="fuzz: directory a failing case's exact bytes are written to (default: a fresh "
+        "messagefoundry-harness-fuzz-* directory under the system temp directory)",
     )
     parser.add_argument(
         "--fuzz-replay",

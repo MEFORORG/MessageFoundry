@@ -1,0 +1,58 @@
+# The anon.toml overlay for samples/messages/hapi-hl7v2/oml_o21.hl7 (BACKLOG #5558).
+#
+# That file was vendored from HAPI HL7v2 byte-verbatim, with the names in it: patients, the staff
+# who ordered and collected, the doctor who interpreted, and the insurer. It was then scrubbed by
+# DEFAULT_RULES plus THIS file, over each of its 13 messages. This file is the record of that pass.
+# It holds the fields this corpus scrubs that are NOT defaults, says why each is not one, and lists
+# under [hl7] keep every other field the leak-check walks, each decided as safe to leave. So no
+# field it walks is undecided, and tests/test_anon_hapi_samples.py holds the corpus to that. The
+# leak-check does not walk the MSH header, so no MSH field is scrubbed or listed here.
+#
+# The salt was not recorded, so nothing here reproduces the committed surrogates.
+#
+# Use it with:  anonymize_checked(raw, salt=..., rules=load_rules(Path("tests/fixtures/anon/oml_o21.anon.toml")))
+
+[hl7.fields]
+# Entered-by and the specimen collector: staff names here. No default maps them yet: a default is
+# a decision for every feed, and this file is about one corpus.
+"ORC-10" = "provider"
+"OBR-10" = "provider"
+
+# The insurer's plan name. ADR 0030 section 3 keeps IN1-2/3/4 by default, because they are plan and
+# company codes that correlation and routing tests rely on. Here IN1-4 names a real insurer's
+# plan, and this corpus has no such test, so it is redacted. That is a fact about one corpus, not a
+# reason to change the ratified default.
+"IN1-4" = "freetext"
+
+# The requested, results-reported and specimen collection and receipt times. The defaults map the
+# order, observation and transaction times, not these.
+"OBR-6" = "date"
+"OBR-22" = "date"
+"SPM-17" = "date"
+"SPM-18" = "date"
+
+[hl7]
+# Every other field this corpus carries, reviewed and left intact. A keep makes a field decided;
+# the leak-check still scans it for PHI shapes. A keep rewrites nothing.
+keep = [
+    # Codes, flags, units and ranges: the table-coded values a router or validator reads.
+    "MSA-1", "ORC-1", "ORC-5", "TQ1-9",
+    "OBR-5", "OBR-11", "OBR-24", "OBR-25",
+    "OBX-2", "OBX-6", "OBX-7", "OBX-8", "OBX-10", "OBX-11",
+    "SPM-4", "SPM-11", "SPM-20", "SPM-21", "SPM-26",
+    "IN1-2", "IN1-3",
+    # The coded clinical content, which ADR 0030 keeps: the ordered service and the observation code.
+    "OBR-4", "OBX-3",
+    # The order, group and specimen numbers. Upstream invented them as placeholder runs (12345678,
+    # 555, 666, 123456781 onward), and they are what ties each ORC to its OBR and SPM, which is what
+    # the example shows. MSA-2 is the acknowledged control id. PV1-18 (12345) and OBR-17, the
+    # order callback phone (821), hold placeholder values of the same kind; they are kept because
+    # these values are placeholders, not because the fields are codes.
+    "ORC-2", "ORC-3", "ORC-4", "OBR-2", "OBR-3", "SPM-2", "MSA-2", "PV1-18", "OBR-17",
+    # The ordering facility: a department, not a person. In most messages it repeats the sending
+    # facility in MSH-4, which ADR 0030 keeps for routing.
+    "ORC-21",
+    # OBR-27's quantity and timing holds a start time, and no kind rewrites one component of it.
+    # ADR 0030 names such unmapped dates among the reasons a run is not Safe Harbor.
+    "OBR-27",
+]

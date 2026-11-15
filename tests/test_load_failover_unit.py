@@ -492,3 +492,137 @@ def test_a_status_answer_past_the_cap_is_no_answer_and_one_at_it_is_read(
     assert _status_read(b"x" * 65) == (None, None)
     # At the cap but not JSON: the status stands, the body does not.
     assert _status_read(b"x" * 64) == (200, None)
+
+
+# --- the recovery monitor's baseline (BACKLOG #5571) -------------------------
+
+# One scripted poll of the survivor: its role, and the ``done`` values its stats reads return in
+# order within that poll (the last repeats; None is a failed read). A poll before promotion reads
+# stats once before the role; the promotion poll reads it twice, once on each side of the role.
+_Poll = tuple[str | None, list[int | None]]
+
+
+class _World:
+    """The scripted cluster. The monitor's sleep ends a poll, so it moves the script to the next
+    poll; the last poll repeats."""
+
+    def __init__(self, polls: list[_Poll]) -> None:
+        self._polls = polls
+        self._poll = 0
+        self._read = 0
+
+    def next_poll(self) -> None:
+        self._poll = min(self._poll + 1, len(self._polls) - 1)
+        self._read = 0
+
+    def role(self) -> str | None:
+        return self._polls[self._poll][0]
+
+    def stats(self) -> NodeStats | None:
+        reads = self._polls[self._poll][1]
+        done = reads[min(self._read, len(reads) - 1)]
+        self._read += 1
+        if done is None:
+            return None
+        return NodeStats(done=done, dead=0, pending=0, inflight=0, in_pipeline=0)
+
+
+class _ScriptedNode:
+    """Stands in for an :class:`EngineNode` in ``_monitor_failover``: the survivor answers from the
+    world's script; the killed node is down, so it answers nothing."""
+
+    def __init__(self, node_id: str, world: _World | None = None) -> None:
+        self.node_id = node_id
+        self._world = world
+
+    async def role(self, client: object) -> str | None:
+        return self._world.role() if self._world else None
+
+    async def stats(self, client: object) -> NodeStats | None:
+        return self._world.stats() if self._world else None
+
+
+def _monitor(
+    polls: list[_Poll], monkeypatch: pytest.MonkeyPatch, deadline_s: float
+) -> tuple[_KillOutcome, list[str]]:
+    world = _World(polls)
+    real_sleep = asyncio.sleep
+
+    async def end_poll(_seconds: float) -> None:
+        world.next_poll()
+        await real_sleep(0)
+
+    # Only the failover module sees this sleep: its own asyncio name, not the process-wide module,
+    # is swapped, so no other event loop in the process can end a scripted poll.
+    monkeypatch.setattr(failover, "asyncio", SimpleNamespace(sleep=end_poll))
+    notes: list[str] = []
+    outcome = asyncio.run(
+        failover._monitor_failover(
+            _ScriptedNode("fo-a"),  # type: ignore[arg-type]
+            _ScriptedNode("fo-b", world),  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            0,
+            deadline_s,
+            notes,
+        )
+    )
+    return outcome, notes
+
+
+# A run that should see recovery breaks out at once, so its deadline only bounds a regression; one
+# that should not runs to the deadline, which is long enough for the script's few polls to play.
+_RECOVERS_WITHIN = 10.0
+_TIMES_OUT_AFTER = 0.3
+
+
+def test_monitor_counts_a_recovery_that_drained_before_promotion_was_seen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the baseline is first read on the poll that sees the promotion. The survivor
+    promoted and delivered the rest in that gap, so the promotion read already holds the progress
+    and nothing later exceeds it: a recovery that completed would read as a timeout."""
+    outcome, notes = _monitor(
+        [("standby", [100]), ("standby", [100]), ("primary", [150])],
+        monkeypatch,
+        _RECOVERS_WITHIN,
+    )
+    assert outcome.promotion_seconds is not None
+    assert outcome.recovery_seconds is not None
+    assert any("forward progress resumed" in n for n in notes)
+
+
+def test_monitor_never_reads_a_missing_stats_read_as_a_zero_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a stats read that fails on the promotion poll sets the baseline to zero, so the
+    next read, which shows no new delivery, reads as instant recovery and passes the SLO."""
+    outcome, notes = _monitor(
+        [("standby", [None]), ("primary", [None, 100]), ("primary", [100])],
+        monkeypatch,
+        _TIMES_OUT_AFTER,
+    )
+    assert outcome.promotion_seconds is not None
+    assert outcome.recovery_seconds is None
+    assert any("NOT observed" in n for n in notes)
+    assert any("no stats read was usable as a baseline" in n for n in notes)
+
+
+@pytest.mark.parametrize(
+    ("polls", "recovered"),
+    [
+        # A failed standby read keeps the last good baseline (100): replacing it with zero would
+        # pass the first case, and dropping it would fail the second.
+        ([("standby", [100]), ("standby", [None]), ("primary", [100])], False),
+        ([("standby", [100]), ("standby", [None]), ("primary", [101])], True),
+        # A poll whose role read failed proves nothing about promotion, so its stats read (which
+        # already holds the survivor's delivery) must not become the baseline.
+        ([("standby", [100]), (None, [150]), ("primary", [150])], True),
+    ],
+    ids=["failed-read-no-progress", "failed-read-then-progress", "unknown-role"],
+)
+def test_monitor_moves_the_baseline_only_on_a_good_standby_read(
+    monkeypatch: pytest.MonkeyPatch, polls: list[_Poll], recovered: bool
+) -> None:
+    outcome, _ = _monitor(polls, monkeypatch, _RECOVERS_WITHIN if recovered else _TIMES_OUT_AFTER)
+    assert outcome.promotion_seconds is not None
+    assert (outcome.recovery_seconds is not None) is recovered

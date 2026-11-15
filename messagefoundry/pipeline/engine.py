@@ -3216,52 +3216,19 @@ class Engine:
 
         The value file this engine reads (:meth:`_value_file`) is read into the snapshot too,
         wherever ``[environments].base_dir`` puts it, after the same trust check a value read
-        makes, of the file and the folders :meth:`_value_file_folders` names. So a released
+        makes, of the file, its folder and the links an open of it follows
+        (:func:`~messagefoundry.config.wiring.assert_trusted_start_paths`). That check runs
+        before the config directory is read, so a value file in its ``environments/`` folder is
+        vetted before its bytes are read too (vault BACKLOG #6654 item 5). So a released
         reload checks those bytes against its approval's binding (:func:`_require_approved`), and
         the provider parses them rather than the file as it is later. A file that is
-        not there is held as none; one that cannot be read raises ``WiringError`` naming it, so a
+        not there is held as none, unless the trust check refuses it first, as it does where the
+        open finds no file but the walk of its links reaches one; one that cannot be read raises
+        ``WiringError`` naming it, so a
         reload, gated or not, never falls back to reading it from disk for that fault. A config
         directory that cannot be read whole still returns ``None``, as above, and then an ungated
         reload reads the values from disk."""
         return await asyncio.to_thread(self._reload_snapshot_blocking, path, self._value_file())
-
-    @staticmethod
-    def _value_file_folders(value_file: Path) -> list[Path]:
-        """The folders a reload vets before it reads ``value_file``: its own, the folder of every
-        link along a chain of file links from it, and the folder the chain ends in. Each one's
-        writer could re-point the link it holds, or replace the file, between the vet and the read
-        (vault BACKLOG #2596). Walked rather than refused, so a ConfigMap-style chain still reads.
-        A folder above one of these is not vetted, as for the value file itself
-        (:func:`~messagefoundry.config.wiring.assert_trusted_start_paths`). A loop of links stops
-        the walk, and the read then fails and refuses the reload."""
-        folders = [value_file.parent]
-        hop = value_file
-        # Past every platform's own bound on a chain (40 on Linux, 63 on Windows).
-        for _ in range(64):
-            if not os.path.islink(hop):
-                break
-            text = os.readlink(hop)
-            if os.name == "nt":
-                import errno
-
-                from messagefoundry.auth.anchor_path import _strip_win_prefix
-
-                # Windows answers an absolute target in its \\?\ form; the plain form names the
-                # same folder and compares with the others. A device path has no folder to vet.
-                plain = _strip_win_prefix(text)
-                if plain is None:
-                    raise OSError(errno.EINVAL, "a value file link leads to a device path", text)
-                text = plain
-            target = Path(text)
-            # A relative target names a path from the real folder holding the link. Joined as
-            # text to a folder reached through a directory link, Win32 collapses its ``..``
-            # before following that link and names a decoy folder, so each hop's folder is
-            # resolved first.
-            hop = target if target.is_absolute() else Path(os.path.realpath(hop.parent)) / target
-            hop = Path(os.path.realpath(hop.parent)) / hop.name
-            folders.append(hop.parent)
-        folders.append(Path(os.path.realpath(value_file)).parent)
-        return list(dict.fromkeys(folders))
 
     @staticmethod
     def _reload_snapshot_blocking(
@@ -3269,6 +3236,16 @@ class Engine:
     ) -> ConfigSnapshot | None:
         from messagefoundry.config.snapshot import ConfigDirMissing, with_value_file
 
+        if value_file is not None:
+            # Vetted before anything is read, as the config directory is, with the links an open of
+            # it follows (assert_trusted_start_paths): the bytes read here are the ones a reload
+            # applies, in the config directory's environments/ folder too (vault BACKLOG #2596,
+            # #6654 item 5).
+            assert_trusted_start_paths(
+                [value_file],
+                lead="refusing to read environment values from",
+                folders=[value_file.parent],
+            )
         try:
             snapshot = read_trusted_snapshot(path, strict=True)
         except ConfigDirMissing:
@@ -3290,16 +3267,7 @@ class Engine:
             return snapshot
         refusal: str | None = None
         try:
-            # Vetted before it is read, as the config directory is: the bytes read here are the
-            # ones a reload applies (vault BACKLOG #2596, step 4).
-            assert_trusted_start_paths(
-                [value_file],
-                lead="refusing to read environment values from",
-                folders=Engine._value_file_folders(value_file),
-            )
             return with_value_file(snapshot, value_file, strict=True)
-        except WiringError:
-            raise  # the trust check's refusal, which is a ValueError too
         except (OSError, ValueError) as exc:
             # A fault, never absence, which with_value_file holds as no file. Refused rather than
             # read again from disk, where the same fault can read as no file and env() defaults

@@ -445,6 +445,23 @@ SITES: dict[str, Site] = {
         "harness/sinks/_sftp_server.py::_confined",
         called=True,
     ),
+    "harness/sinks/file.py::FileSink._entries": Site(
+        1,
+        GUARDED,
+        "A name from listing the sink's directory, which the engine under test writes, or a "
+        "folder under it, checked by `_unsafe_listed_name` before the join; see its docstring. "
+        "Folders are entered only if `_is_link` reads their `lstat` as not a link. At least the "
+        "folder-swap race stays open, as the `_entries` docstring states (BACKLOG #5426).",
+        "harness/sinks/file.py::_unsafe_listed_name",
+        called=True,
+    ),
+    "harness/sinks/file.py::FileSink._inside": Site(
+        1,
+        REVIEWED,
+        "A listed file's name onto its folder's strict resolution, built only to compare against "
+        "the root; nothing is opened through it. Under the `_entries` race a file read through a "
+        "link can still read as inside: see the `_inside` docstring.",
+    ),
     # --- messagefoundry/ ---
     "messagefoundry/__main__.py::_cert_import": Site(3, OPERATOR, _CERT_OUT),
     "messagefoundry/__main__.py::_cert_self_signed": Site(3, OPERATOR, _CERT_OUT),
@@ -609,6 +626,15 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/config/wiring.py::_HelperImporter._load": Site(
         1, OPERATOR, "A helper module name from an import in the operator's own config code."
+    ),
+    "messagefoundry/config/wiring.py::_link_chain": Site(
+        3,
+        REVIEWED,
+        "A name of the operator's settings or value file path joined to the real folder reached so "
+        "far, a link's own target joined to the real folder holding the link, and the rest of the "
+        "path joined to that target, to name what the start check vets. The walk lstats each "
+        "joined name and reads its link target; no file's contents are read or written through "
+        "any of the three (vault BACKLOG #2596, #6654).",
     ),
     "messagefoundry/config/wiring.py::config_source_trust_paths": Site(
         3,
@@ -817,15 +843,6 @@ SITES: dict[str, Site] = {
         "it for a link or a junction and, when pruned, named in the caller's WARNING (BACKLOG "
         "#5221).",
     ),
-    "messagefoundry/pipeline/engine.py::Engine._value_file_folders": Site(
-        2,
-        REVIEWED,
-        "A file link's own target, joined to the real folder holding the link, and that hop's "
-        "name re-joined to its own resolved folder, to name the folder the vet checks before "
-        "the value file is read. The walk lstats each joined hop and reads its link target "
-        "before that vet runs; no file's contents are read or written through either join "
-        "(vault BACKLOG #2596).",
-    ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
     ),
@@ -1009,8 +1026,9 @@ SITES: dict[str, Site] = {
     "messagefoundry/uploads.py::UploadStore._paths_unfollowed": Site(
         2,
         INTERNAL,
-        "A 32-hex id the store generated, refused by regex if malformed. `_paths` adds a parent "
-        "check; the reseal instead opens only a regular file, by lstat.",
+        "A 32-hex id the store generated, refused by regex if malformed. `_paths` adds a check that "
+        "each path resolves to itself, which refuses a symlink but not a hard link; the reseal "
+        "instead opens only a regular file, by lstat.",
     ),
     "messagefoundry/uploads.py::UploadStore._reseal_to_active_sync": Site(
         1, INTERNAL, "The fixed pair lock file name (`LOCK_FILE_NAME`) under the uploads root."
@@ -1097,9 +1115,10 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        42,
+        44,
         OPERATOR,
-        "Fixed names under paths the operator passes or the script derives (repo root, install "
+        "Fixed names, and a folder named from a fresh GUID under the Windows temp folder, under "
+        "paths the operator passes or the script derives (repo root, install "
         "root and its site-packages, dist-info, wheelhouse and buildtemp folders, the engine "
         "wheel's folder, "
         "the base interpreter's folder and the one above it, "
@@ -1120,7 +1139,10 @@ SCRIPT_SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed name under the install directory."
     ),
     "scripts/service/uninstall-service.ps1": Site(
-        5, OPERATOR, "Fixed names under temp and registry keys named after the service's images."
+        7,
+        OPERATOR,
+        "Fixed names, and a folder named from a fresh GUID, under the Windows temp folder or a "
+        "parent the tests pass, and registry keys named after the service's images.",
     ),
 }
 

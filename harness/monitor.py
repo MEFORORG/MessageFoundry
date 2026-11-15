@@ -277,9 +277,10 @@ class MonitorPanel(QWidget):
             self._set_status(str(exc), error=True)
             return
         if not self._ensure_auth(client):
-            # A must-change sign-in leaves the client holding a session it will never use. End it
-            # before dropping the client, or it stays live until it expires (BACKLOG #2091). The
-            # engine lets a must-change session reach /auth/logout.
+            # A must-change sign-in, or one whose second factor was never verified, leaves the client
+            # holding a session it will never use. End it before dropping the client, or it stays
+            # live until it expires (BACKLOG #2091, #5568). The engine lets a must-change or an
+            # MFA-pending session reach /auth/logout.
             if client.token is not None:
                 with contextlib.suppress(ApiError):
                     client.logout()
@@ -319,7 +320,8 @@ class MonitorPanel(QWidget):
 
     def _ensure_auth(self, client: EngineClient) -> bool:
         """Return True if usable: a no-auth engine answers ``/auth/me`` directly; an authed one
-        401/403s, so prompt sign-in via the :class:`LoginDialog`."""
+        401/403s, so prompt sign-in via the :class:`LoginDialog`, then for the second factor the
+        sign-in still owes, if any."""
         try:
             client.me()
             return True
@@ -340,7 +342,54 @@ class MonitorPanel(QWidget):
                 error=True,
             )
             return False
+        if dialog.mfa_required and not self._verify_second_factor(client):
+            return False
         return client.token is not None
+
+    def _verify_second_factor(self, client: EngineClient) -> bool:
+        """Verify the second factor an accepted sign-in still owes (BACKLOG #5568).
+
+        A user who leaves the dialog's code blank, or whose engine requires MFA, gets an
+        MFA-pending session, on which the engine refuses every poll and action. When the account
+        has an authenticator enrolled, ask once for a TOTP or recovery code and verify it. Return
+        False when it has none (a passkey cannot answer here, and enrolment is the web console's),
+        on a cancel or a blank answer, and on any refusal, naming the engine's reason; the caller
+        then ends the pending session. ``verify_mfa`` rotates the session, and the polling client is
+        built from the rotated token after this returns. A verify whose reply is lost is the one
+        case that can strand a session: the engine may have rotated it, and the caller's logout
+        then ends only the old token, so the status says the outcome is unknown."""
+        try:
+            totp_enrolled = client.mfa_status().enabled
+        except ApiError as exc:
+            self._set_status(str(exc), error=True)
+            return False
+        if not totp_enrolled:
+            self._set_status(
+                "Account needs a second factor, and this panel takes only an authenticator app "
+                "code: enrol an authenticator in the web console first.",
+                error=True,
+            )
+            return False
+        code, ok = QInputDialog.getText(
+            self,
+            "Second factor required",
+            "Enter the code from your authenticator app, or a recovery code:",
+            QLineEdit.EchoMode.Password,
+        )
+        code = code.strip()
+        if not ok or not code:
+            self._set_status("sign-in cancelled: no second factor was entered")
+            return False
+        try:
+            client.verify_mfa(code)
+        except ApiError as exc:
+            if exc.status is None:
+                # No answer: the engine may have verified and rotated the session anyway.
+                self._set_status(f"second factor outcome unknown: {exc}", error=True)
+            else:
+                self._set_status(f"second factor refused: {exc}", error=True)
+            return False
+        return True
 
     def _step_up(self) -> bool:
         """Answer a step-up refusal (403 + ``X-Step-Up-Required``): ask for the password, masked,

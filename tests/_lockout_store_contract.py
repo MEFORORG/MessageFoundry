@@ -58,6 +58,16 @@ import pytest
 
 from messagefoundry.auth.service import _opened_totp_state
 from messagefoundry.auth.tokens import credential_id_hash
+from messagefoundry.store.store import AuditAppend
+
+#: The audit row the contract's unlocks append, in the clear's own transaction (BACKLOG #5633).
+_UNLOCK_AUDIT = AuditAppend("auth.admin_unlocked", actor="cli:contract")
+
+
+async def _unlock_rows(store: Any) -> int:
+    """How many unlock rows the contract's actor has in the audit log."""
+    return len(await store.list_audit(limit=500, actor="cli:contract"))
+
 
 #: Discoverable passkeys stored under today's credential-id hash scheme (BACKLOG #3423): only such a
 #: row is a way past the sign-in lock, since only it can sign in.
@@ -331,7 +341,7 @@ async def _assert_passkey_escalates_the_sign_in_lock(store: Any) -> None:
             )
             seen.append(locked - (start + THRESHOLD - 1))
             start = locked + 1.0
-        await store.clear_lockout(user_id, reset_cycles=True, now=start)
+        await store.clear_lockout(user_id, audit=_UNLOCK_AUDIT, reset_cycles=True, now=start)
         return seen
 
     await store.create_user(
@@ -589,13 +599,33 @@ async def _assert_counters_stay_apart_and_clear(store: Any) -> None:
     assert user is not None and user.password_hash == "h2"
     assert _lockout_columns(user) == before
 
+    # --- BACKLOG #5633: a refused audit append rolls the clear back, on every backend -------------
+    locked = _lockout_columns(user)
+
+    async def refuse_append(*_a: object, **_k: object) -> object:
+        raise RuntimeError("audit append refused (test)")
+
+    store._append_audits = refuse_append  # the store is typed Any here: one patch, three backends
+    try:
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await store.clear_lockout("lock-u2", audit=_UNLOCK_AUDIT, now=step_until - 1.0)
+    finally:
+        del store._append_audits
+    user = await store.get_user("lock-u2")
+    assert user is not None and _lockout_columns(user) == locked, "an unaudited unlock committed"
+    # ... and an unknown account writes nothing and appends no row.
+    unlocks = await _unlock_rows(store)
+    assert not await store.clear_lockout("lock-nobody", audit=_UNLOCK_AUDIT, now=step_until)
+    assert await _unlock_rows(store) == unlocks
+
     # --- AC-9: clear_lockout clears both locks and both counts, and KEEPS both cycle counts --------
-    await store.clear_lockout("lock-u2", now=step_until - 1.0)
+    assert await store.clear_lockout("lock-u2", audit=_UNLOCK_AUDIT, now=step_until - 1.0)
     user = await store.get_user("lock-u2")
     assert user is not None and _lockout_columns(user) == (0, None, 2, 0, None, 2)
     assert user.password_hash == "h2", "an unlock must never touch the credential"
+    assert await _unlock_rows(store) == unlocks + 1, "the unlock committed without its audit row"
     # ... and zeroes them too when the operator says the campaign is over.
-    await store.clear_lockout("lock-u2", reset_cycles=True, now=step_until)
+    await store.clear_lockout("lock-u2", audit=_UNLOCK_AUDIT, reset_cycles=True, now=step_until)
     user = await store.get_user("lock-u2")
     assert user is not None and _lockout_columns(user) == (0, None, 0, 0, None, 0)
 

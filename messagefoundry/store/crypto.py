@@ -185,6 +185,19 @@ _ALG_AES_256_GCM = "a256gcm"
 _NONCE_BYTES = 12  # 96-bit random nonce, the standard size for AES-GCM
 _GCM_TAG_BYTES = 16  # the AES-GCM authentication tag every sealed value ends with
 _KEY_ID_LEN = 16  # hex chars of the SHA-256 key fingerprint embedded as key_id
+#: The most characters of one marker field an error message echoes (BACKLOG #5553). A version, an
+#: algorithm id or a key id is cut from the stored text, so a damaged or planted value decides its
+#: length, and the message reaches logs, refusals and HTTP answers. Every real one is far shorter.
+_ECHO_LIMIT = 32
+
+
+def _echo(field: str) -> str:
+    """``repr`` of a marker field cut from a stored value, at most :data:`_ECHO_LIMIT` characters of
+    it, with the full length named when it was cut (BACKLOG #5553)."""
+    if len(field) <= _ECHO_LIMIT:
+        return repr(field)
+    return f"{field[:_ECHO_LIMIT]!r}... ({len(field)} characters)"
+
 
 # HKDF info label for the audit-chain HMAC key (#190). Versioned so a future re-derivation is an
 # additive label, never a silent change to an existing deployment's derived key.
@@ -2085,7 +2098,7 @@ class AesGcmCipher(_UnmarkedPolicy):
     def _alg_checked(self, alg: str, version: str) -> None:
         if alg != _ALG_AES_256_GCM:
             raise CipherError(
-                f"unknown/unsupported at-rest cipher algorithm {alg!r} in mfenc:{version} marker; "
+                f"unknown/unsupported at-rest cipher algorithm {_echo(alg)} in mfenc:{version} marker; "
                 "this build registers only AES-256-GCM"
             )
 
@@ -2116,7 +2129,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         # Transit cipher reads) must NOT be passed through as plaintext or mis-decrypted — fail closed.
         version = stored[len(MARKER_PREFIX) :].partition(":")[0]
         raise CipherError(
-            f"unknown at-rest marker version {version!r}; this build decodes mfenc:v1, mfenc:v2 and "
+            f"unknown at-rest marker version {_echo(version)}; this build decodes mfenc:v1, mfenc:v2 and "
             "mfenc:v4 only"
         )
 
@@ -2152,11 +2165,11 @@ class AesGcmCipher(_UnmarkedPolicy):
         try:
             raw = base64.b64decode(blob)
         except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
-            raise CipherError(f"malformed ciphertext (bad base64, key_id={key_id!r})") from exc
+            raise CipherError(f"malformed ciphertext (bad base64, key_id={_echo(key_id)})") from exc
         if len(raw) < _NONCE_BYTES + _GCM_TAG_BYTES:
             # Too short to hold a nonce and a tag. AESGCM.decrypt would raise a bare ValueError for a
             # short nonce, which no caller contains as a CipherError (BACKLOG #2593).
-            raise CipherError(f"malformed ciphertext (too short, key_id={key_id!r})")
+            raise CipherError(f"malformed ciphertext (too short, key_id={_echo(key_id)})")
         nonce, ct = raw[:_NONCE_BYTES], raw[_NONCE_BYTES:]
         # Try the named key first (the fast path for current-format rows), then every other key — this
         # transparently decrypts legacy key_id='0' rows and rows written under a retired key mid-rotation.
@@ -2215,10 +2228,10 @@ class AesGcmCipher(_UnmarkedPolicy):
                 if locked:
                     _unlock_memory(pt)
             raise CipherError(
-                f"decrypted value is not valid UTF-8 (key_id={key_id!r}); the row is corrupt"
+                f"decrypted value is not valid UTF-8 (key_id={_echo(key_id)}); the row is corrupt"
             )
         raise UnauthenticatedCipherError(
-            f"no configured key decrypts this value (key_id={key_id!r}); if rotating, supply the "
+            f"no configured key decrypts this value (key_id={_echo(key_id)}); if rotating, supply the "
             "prior key via MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
         )
 

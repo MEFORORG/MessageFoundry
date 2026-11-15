@@ -195,8 +195,10 @@ from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
     USER_KIND,
     AnyRowSealer,
+    ResealOutcome,
     RowSealError,
     SealPager,
+    classify_unrotated,
     row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
@@ -279,6 +281,7 @@ from messagefoundry.store.store import (
     OutboxStatus,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -407,6 +410,8 @@ from messagefoundry.store.store import (
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    unheld_seal_refusal,
+    unrotated_seal_queries,
     user_disabled_change,
     user_insert_params,
     user_reseal_params,
@@ -2063,6 +2068,8 @@ class PostgresStore:
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
     backend = StoreBackend.POSTGRES
+    # Vault BACKLOG #5635: reencrypt_to_active's side result; frozen, so the shared default is safe.
+    _reseal_outcome: ResealOutcome = ResealOutcome()
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
     #: columns (error/last_error/detail), and summary/metadata (MRN + patient name) added in EF-3.
@@ -3870,6 +3877,7 @@ class PostgresStore:
         retired-key values; skips values already under the active key (idempotent) and NULL/blank
         ones. A value no configured key can decrypt raises before any UPDATE (PHI is never dropped).
         Returns the number of values rewritten. Ported, not stubbed — Postgres supports rotation."""
+        self._reseal_outcome = ResealOutcome()  # this run's alone (vault BACKLOG #5635)
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             # BACKLOG #1165 (ASVS 11.2.2). Two very different cases used to share this return,
@@ -3898,9 +3906,19 @@ class PostgresStore:
         # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
+        # Vault BACKLOG #5635: a pre-flight read before any pass writes, so a refusal for a seal
+        # under a key this run does not hold leaves the store as this method found it.
+        preflight = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if preflight.unheld:
+            self._reseal_outcome = preflight
+            raise unheld_seal_refusal(preflight, before_writes=True)
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
         report_approval_reseal(*await self.reseal_approval_records())
+        # Vault BACKLOG #5635: what the passes left under another key; store.py's twin says why.
+        self._reseal_outcome = classify_unrotated(self._row_sealer, await self._unrotated_seals())
+        if self._reseal_outcome.unheld:  # only a writer running alongside can make one now
+            raise unheld_seal_refusal(self._reseal_outcome, before_writes=False)
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             if is_row_tagged(table, column):
@@ -10026,6 +10044,22 @@ class PostgresStore:
         2)."""
         await conn.fetchval("SELECT 1 FROM users WHERE id=$1 FOR UPDATE", user_id)
 
+    def reseal_outcome(self) -> ResealOutcome:
+        """store.py's ``MessageStore.reseal_outcome`` states the contract (vault BACKLOG #5635)."""
+        return self._reseal_outcome
+
+    async def _unrotated_seals(self) -> list[tuple[str, object]]:
+        """store.py's ``MessageStore._unrotated_seals`` states the contract (vault BACKLOG #5635)."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return []
+        active = f"{SEAL_PREFIX}{sealer.key_id}:%"
+        seals: list[tuple[str, object]] = []
+        for table, sql in unrotated_seal_queries("$1"):
+            rows = await self._fetchall(sql, active)
+            seals.extend((table, r["seal"]) for r in rows)
+        return seals
+
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
         store.py's ``MessageStore.reseal_user_records`` states the contract."""
@@ -10800,12 +10834,27 @@ class PostgresStore:
         await self._write_user_txn(user_id, lambda r: full_authentication_clear(r, now))
 
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None:
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """See the SQLite twin (BACKLOG #5633): the clear and ``audit`` share one transaction. This
+        leg is CI-only, so a divergence from the SQLite and SQL Server bodies surfaces first in CI."""
         now = time.time() if now is None else now
-        await self._write_user_txn(
-            user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
-        )
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            if (
+                await self._write_user(
+                    conn, user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
+                )
+                is None
+            ):
+                return False  # nothing written, so nothing audited
+            appended = await self._append_audits(conn, (audit,), now=now)
+        tee_audits((audit,), appended, ts=now)
+        return True
 
     async def record_login_failure(
         self,
@@ -11389,10 +11438,17 @@ class PostgresStore:
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await self._write_session(conn, token_hash, stamp)
 
-    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
-        stamp = mfa_stamp(time.time() if now is None else now)
+    async def mark_session_mfa_verified(
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            await self._write_session(conn, token_hash, stamp)
+            written = await self._write_session(conn, token_hash, stamp)
+        return written is not None and stamp.anchored
 
     async def rotate_session(
         self, token_hash: str, *, new_token_hash: str, now: float | None = None

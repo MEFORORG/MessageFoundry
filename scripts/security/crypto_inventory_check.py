@@ -2856,8 +2856,13 @@ POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
         "sign_verify",
     ),
     "Rfc2898DeriveBytes": (re.compile(r"\bRfc2898DeriveBytes\b", re.I), "kdf"),
+    # A certificate parsed, singly or as a collection (import-db-ca.ps1 reads a bundle into one).
     "X509": (
-        re.compile(r"\bX509Certificate2\]::new\b|New-Object\s+\S*X509Certificate2\b", re.I),
+        re.compile(
+            r"\bX509Certificate2(?:Collection)?\]::new\b"
+            r"|New-Object\s+\S*X509Certificate2(?:Collection)?\b",
+            re.I,
+        ),
         "key_cert",
     ),
     "X509Store": (
@@ -2897,10 +2902,14 @@ POWERSHELL_OPERATION_PATTERNS: dict[str, tuple[re.Pattern[str], str]] = {
 #: The maintained PowerShell operation inventory. Bidirectional, like the others.
 POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # --- The operator deployment path (docs/SERVICE.md). These two are the reason this arm exists. ---
-    # Parses the operator's CA certificate (so a malformed file fails before anything is touched and
-    # the operator sees what they are about to trust), then INSTALLS it into the machine root store.
-    # A trust-anchor decision for the whole host, not only for the engine.
-    "scripts/service/import-db-ca.ps1": frozenset({"key_cert:X509", "key_cert:Import-Certificate"}),
+    # Parses the operator's CA certificate file into a collection (so a malformed file fails before
+    # anything is touched and the operator sees every certificate they are about to trust), checks
+    # whether each one's signature verifies under its own key (to tell a self-signed root from an
+    # issuing CA), then INSTALLS each one through X509Store into a machine store (docs/DEPLOY-SERVER-DB.md
+    # section 5.2 says which). A trust-anchor decision for the whole host, not only the engine.
+    "scripts/service/import-db-ca.ps1": frozenset(
+        {"key_cert:X509", "key_cert:X509Store", "sign_verify:SignData"}
+    ),
     # Downloads the NSSM service wrapper and checks it against a pinned SHA-256 before extracting it:
     # supply-chain verification of a binary that then runs as a service. The download hop ADDS TLS
     # 1.2 to the enabled protocol set with `-bor`; that is not a floor, so anything the machine

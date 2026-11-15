@@ -28,7 +28,12 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.row_seal import SEAL_PREFIX, RowSealError
-from messagefoundry.store.store import SessionRecord, no_audit_row, session_seal_ok
+from messagefoundry.store.store import (
+    PendingFactorAnchor,
+    SessionRecord,
+    no_audit_row,
+    session_seal_ok,
+)
 
 #: Runs one statement with ``?`` placeholders against the store's database, outside the store.
 RawSql = Callable[[str, tuple[Any, ...]], Awaitable[None]]
@@ -198,6 +203,53 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     assert await store.rotate_session(hash_token(kept), new_token_hash=hash_token(rotated))
     assert await service.identity_for_token(rotated) is not None
     assert await service.identity_for_token(kept) is None  # the old hash names no row now
+
+    # --- the factor write applies its anchor only to a row that has not met its factor ---------
+    # Vault BACKLOG #2964 item 14: decided inside the write, on the row it reads and replaces.
+    pending = await _mint(store)
+    seeded = await store.get_session(hash_token(pending))
+    assert seeded is not None and seeded.mfa_verified_at is None and seeded.reauth_at is not None
+    shut = PendingFactorAnchor("192.0.2.5", open_window=False)
+    assert await store.mark_session_mfa_verified(hash_token(pending), anchor=shut) is True
+    moved = await store.get_session(hash_token(pending))
+    assert moved is not None and moved.mfa_verified_at is not None
+    # Without open_window the window is cleared, whatever it held.
+    assert (moved.client, moved.reauth_at) == ("192.0.2.5", None)
+    assert session_seal_ok(sealer, moved)
+    # Again, on the row that has now met its factor: only the factor stamp moves.
+    later = moved.mfa_verified_at + 5
+    other_anchor = PendingFactorAnchor("192.0.2.6", open_window=True)
+    assert (
+        await store.mark_session_mfa_verified(hash_token(pending), now=later, anchor=other_anchor)
+        is False
+    )
+    met = await store.get_session(hash_token(pending))
+    assert met is not None and (met.client, met.reauth_at, met.mfa_verified_at) == (
+        "192.0.2.5",
+        None,
+        later,
+    )
+    assert session_seal_ok(sealer, met)
+    # open_window on a fresh pending row stamps the window; a None client keeps the address.
+    opening = await _mint(store)
+    at = time.time() + 1
+    opener = PendingFactorAnchor(None, open_window=True)
+    assert await store.mark_session_mfa_verified(hash_token(opening), now=at, anchor=opener)
+    opened = await store.get_session(hash_token(opening))
+    assert opened is not None and (opened.client, opened.reauth_at) == ("192.0.2.10", at)
+    # Control: no anchor applies nothing and answers False, as every other caller expects.
+    plain = await _mint(store)
+    unanchored = await store.get_session(hash_token(plain))
+    assert unanchored is not None
+    assert await store.mark_session_mfa_verified(hash_token(plain)) is False
+    stamped_only = await store.get_session(hash_token(plain))
+    assert stamped_only is not None and stamped_only.mfa_verified_at is not None
+    assert (stamped_only.client, stamped_only.reauth_at) == (
+        unanchored.client,
+        unanchored.reauth_at,
+    )
+    # A hash that names no row writes nothing and answers False.
+    assert not await store.mark_session_mfa_verified(hash_token(mint_token()), anchor=shut)
 
     # --- ending every session raises the epoch: an older copy of a row is refused --------------
     mine = await _mint(store)

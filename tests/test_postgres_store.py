@@ -118,6 +118,8 @@ _TABLES = (
     "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
     "processed_files",  # BACKLOG #3424: the ledger contract writes rows a later probe would see
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
+    "pending_approvals",  # vault BACKLOG #5635: an open request sealed under an earlier test's
+    #                     key would stop every key rotation in a later test
     "user_roles",
     "ad_group_role_map",
     "authority_set_seal",  # BACKLOG #2592: the map's seal, under the key of the test that wrote it
@@ -5240,6 +5242,10 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
             audits=(),
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
+        # Vault BACKLOG #5635: an open request another test left, sealed under its own key,
+        # would stop this run. The fixture does not clear this table, so this test does.
+        async with seed._pool.acquire() as conn:
+            await conn.execute("DELETE FROM pending_approvals")
     finally:
         await seed.close()
 
@@ -5811,6 +5817,29 @@ async def test_role_seal_contract(store) -> None:
             )
         assert {str(r["column_name"]) for r in rows} == {f.name for f in fields(RoleRow)}
         await assert_role_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_reseal_outcome_contract(store) -> None:
+    """Vault BACKLOG #5635: ``reencrypt_to_active`` records what its re-seal passes left under a
+    key it does not hold, for ``rotate-key`` to read, on a keyed handle. ``raw`` runs each
+    statement outside the store's helpers. The fixture truncates the tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._reseal_outcome_contract import assert_reseal_outcome_contract
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        await assert_reseal_outcome_contract(keyed, raw)
     finally:
         await keyed.close()
 

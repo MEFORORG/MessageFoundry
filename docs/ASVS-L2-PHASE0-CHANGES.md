@@ -154,7 +154,9 @@ for, not how it is protected before it gets there.
 > (BACKLOG #1164) reads the same roots for every operation class. It finds the TLS floor and suite pin
 > `ide/src/engineClient.ts` applies to every https request, and the console's WebAuthn ceremony in
 > `static/app.js`. A fourth arm reads the PowerShell under `scripts/`. That includes
-> `scripts/service/import-db-ca.ps1`, which installs a trust anchor into the machine root store. It
+> `scripts/service/import-db-ca.ps1`, which installs CA certificates into the machine certificate
+> stores ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.2 says which store each goes into
+> and what each is a trust anchor for). It
 > also includes `scripts/service/install-service.ps1`, which checks the service wrapper against a
 > pinned SHA-256. That script ADDS TLS 1.2 to the enabled protocols with `-bor`, which is not a floor,
 > so the pinned hash is the control that holds. Both arms run as `--non-python-operations` in their

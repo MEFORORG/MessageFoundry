@@ -177,7 +177,7 @@ _CREDENTIAL_EGRESS_URL_KEYS: tuple[tuple[str, str], ...] = (
     # ADR 0024 — the connector POSTs a signed ``client_assertion`` here.
     ("smart_token_url", "SMART token endpoint"),
     # ADR 0126 — the client-credentials grant POSTs ``client_id`` + ``client_secret`` here, either as
-    # form fields or as a Basic header (``transports/http_auth.py`` ``_fetch_token``). Ungated until
+    # form fields or as a Basic header (``transports/http_auth.py`` ``_grant``). Ungated until
     # 2026-07-31: the scheme was constrained to http(s) and nothing else, so a crafted
     # ``oauth2_token_url`` exfiltrated the client credentials to any host while ``[egress]
     # .allowed_http`` gated only the data URL. Found re-scoring ASVS 14.2.3.

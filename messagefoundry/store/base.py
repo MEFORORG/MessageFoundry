@@ -77,7 +77,7 @@ from messagefoundry.store.privilege import (
     probe_failure,
     sqlite_not_applicable,
 )
-from messagefoundry.store.row_seal import AnyRowSealer
+from messagefoundry.store.row_seal import AnyRowSealer, ResealOutcome
 from messagefoundry.store.store import (
     ANY_CLAIM_OWNER,
     OPEN_STORE_PIN,
@@ -116,6 +116,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OwnedLanes,
     PasskeyCounts,
+    PendingFactorAnchor,
     PinCheck,
     ReingressOriginMissing,
     ReingressOutcome,
@@ -1688,6 +1689,13 @@ class QueueStore(StoreLifecycle, Protocol):
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
 
+    def reseal_outcome(self) -> ResealOutcome:
+        """What the last :meth:`reencrypt_to_active` left sealed under a key other than the active
+        one: the user, role, approval and directory-map seals its re-seal passes did not move
+        (vault BACKLOG #5635). A side result, so ``reencrypt_to_active`` keeps its count; empty
+        before one has run, and always empty on a store with no in-process seal key."""
+        ...
+
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
     async def add_cipher_invocations(self, key_id: str, count: int) -> int:
         """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total.
@@ -2806,10 +2814,18 @@ class AuthStore(Protocol):
 
     # The offline administrator unlock's write (ADR 0171 as amended by ADR 0197): clears both locks and
     # both failure counts, and keeps both cycle counts unless ``reset_cycles``. A named method, in
-    # place of the ``record_login_failure`` reuse ADR 0171 shipped with.
+    # place of the ``record_login_failure`` reuse ADR 0171 shipped with. ``audit`` is appended in the
+    # SAME transaction (BACKLOG #5633), so an unlock is never committed unrecorded: a refused append
+    # rolls the clear back. Returns whether a row was written. False writes and audits nothing: no
+    # such account, or a row that changed under the write's compare-and-set.
     async def clear_lockout(
-        self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
-    ) -> None: ...
+        self,
+        user_id: str,
+        *,
+        audit: AuditAppend,
+        reset_cycles: bool = False,
+        now: float | None = None,
+    ) -> bool: ...
 
     # The RAW sign-in lockout-state write: it sets exactly the two values it is handed and nothing
     # else. No engine code calls it since ADR 0197 moved ``admin-unlock`` to ``clear_lockout``; tests
@@ -3360,8 +3376,10 @@ class AuthStore(Protocol):
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
         is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This and
         :meth:`supersede_session`, which returns the row it revoked, are the single-session UPDATEs
-        that report what they changed: every other one is deliberately blind (a write against a dead
-        hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
+        that report what they changed, with one narrower exception:
+        :meth:`mark_session_mfa_verified` answers only whether it landed AND applied a pending-factor
+        anchor, so its False does not tell a dead hash from a stamp that applied none. Every other
+        one is deliberately blind (a write against a dead hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
         so it must be able to fail closed if the session died underneath it.
 
         **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG
@@ -3394,8 +3412,31 @@ class AuthStore(Protocol):
         ...
 
     async def mark_session_mfa_verified(
-        self, token_hash: str, *, now: float | None = None
-    ) -> None: ...
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        anchor: PendingFactorAnchor | None = None,
+    ) -> bool:
+        """Stamp the session's second factor as met (``mfa_verified_at``), always.
+
+        ``anchor`` (vault BACKLOG #2964 item 14) is applied only when the row this write reads has
+        not met its factor. The decision is made inside the write's own transaction, on the row the
+        write reads. PostgreSQL and SQL Server hold a row lock from that read to the write, and
+        SQLite's writer lock orders this process's writers, so a factor another request met first
+        leaves this a plain factor stamp. On SQLite a commit by another process between the read
+        and the write makes the write raise rather than replace anything, which the passkey leg
+        answers by ending the session (fail closed). When
+        applied, the anchor moves the session's address to ``anchor.client`` (``None`` keeps it)
+        and opens the step-up window (``reauth_at``) when ``anchor.open_window`` is true. When
+        ``open_window`` is false it CLEARS ``reauth_at``, whether or not the address moved. The
+        default ``None`` applies no anchor, which is the behaviour every other caller has.
+
+        Returns ``True`` only when the write landed and applied the anchor, so a caller restarts
+        its new-address bookkeeping only for a session an anchor was applied to (with
+        ``anchor.client`` ``None`` that is True with the address unchanged); ``False`` for a write
+        that applied none, a session gone or revoked, or a write that lost its seal compare."""
+        ...
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
@@ -4523,6 +4564,14 @@ def store_call_errors() -> tuple[type[Exception], ...]:
     first. Cached, because naming a server driver imports it: build it at startup, so the first
     refusal does not run that import on the event loop (vault BACKLOG #3145, #3113)."""
     return (RuntimeError, OSError, ValueError, *store_driver_errors())
+
+
+def sealed_read_errors() -> tuple[type[Exception], ...]:
+    """What a refused read of a sealed record can raise (BACKLOG #5559): :func:`store_call_errors`
+    and ``CipherError``, from a record that cannot be decrypted. The same caveat holds: a caller
+    that must not read a bug as a refusal re-raises
+    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first."""
+    return (*store_call_errors(), CipherError)
 
 
 @cache
