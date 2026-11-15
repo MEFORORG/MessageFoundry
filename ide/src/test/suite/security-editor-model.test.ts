@@ -18,7 +18,7 @@ import { FIELDS } from "../../securityEditorWebview";
 // the workspace, each argv value is bound to its flag with `=`, and a save message is checked for
 // shape before anything is written.
 
-const real = (p: string): string => fs.realpathSync.native(p);
+const real = { realpath: fs.realpathSync.native, lstat: fs.lstatSync };
 
 suite("security editor host checks", () => {
   let ws: string;
@@ -35,12 +35,12 @@ suite("security editor host checks", () => {
 
   test("a path inside the workspace resolves to its absolute file, existing or not", () => {
     // THE CONTROL for every refusal below.
-    for (const setting of ["messagefoundry.toml", "conf/sub/messagefoundry.toml", "./a/../b.toml"]) {
-      const t = securityConfigTarget(ws, setting, real);
+    for (const setting of ["messagefoundry.toml", "conf/sub/messagefoundry.toml", "./a/../b.toml", "..conf/messagefoundry.toml", "..messagefoundry.toml"]) {
+      const t = securityConfigTarget(ws, setting, true, real);
       assert.deepStrictEqual(t, { ok: true, path: path.resolve(ws, setting) }, setting);
     }
     fs.writeFileSync(path.join(ws, "messagefoundry.toml"), "");
-    assert.ok(securityConfigTarget(ws, path.join(ws, "messagefoundry.toml"), real).ok, "an absolute path inside");
+    assert.ok(securityConfigTarget(ws, path.join(ws, "messagefoundry.toml"), true, real).ok, "an absolute path inside");
   });
 
   test("a path outside the workspace is refused", () => {
@@ -54,12 +54,35 @@ suite("security editor host checks", () => {
       "",
       "   ",
     ]) {
-      const t = securityConfigTarget(ws, setting, real);
+      const t = securityConfigTarget(ws, setting, true, real);
       assert.strictEqual(t.ok, false, `${JSON.stringify(setting)} was accepted`);
     }
     for (const setting of [undefined, null, 5, ["messagefoundry.toml"]]) {
-      assert.strictEqual(securityConfigTarget(ws, setting, real).ok, false, `${JSON.stringify(setting)} was accepted`);
+      assert.strictEqual(securityConfigTarget(ws, setting, true, real).ok, false, `${JSON.stringify(setting)} was accepted`);
     }
+  });
+
+  test("a value from user settings may name a file outside the workspace, but never a blank one", () => {
+    const file = path.join(outside, "messagefoundry.toml");
+    assert.deepStrictEqual(securityConfigTarget(ws, file, false, real), { ok: true, path: file });
+    for (const setting of ["", "  ", undefined, 5]) {
+      assert.strictEqual(securityConfigTarget(ws, setting, false, real).ok, false, `${JSON.stringify(setting)} was accepted`);
+    }
+  });
+
+  test("a containment refusal does not quote the setting's value back", () => {
+    const t = securityConfigTarget(ws, "../secret-name.toml", true, real);
+    assert.ok(!t.ok && !t.problem.includes("secret-name"), JSON.stringify(t));
+  });
+
+  test("a read error other than not-found refuses rather than passing", () => {
+    const denied = {
+      realpath: (): string => {
+        throw Object.assign(new Error("denied"), { code: "EACCES" });
+      },
+      lstat: (): unknown => undefined,
+    };
+    assert.strictEqual(securityConfigTarget(ws, "messagefoundry.toml", true, denied).ok, false);
   });
 
   test("a path that leaves the workspace through a symbolic link is refused", function () {
@@ -70,13 +93,17 @@ suite("security editor host checks", () => {
       // Creating a link can need a privilege the runner lacks; the lexical cases still ran.
       this.skip();
     }
-    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", real).ok, false, "a new file through the link");
+    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", true, real).ok, false, "a new file through the link");
     fs.writeFileSync(path.join(outside, "messagefoundry.toml"), "");
-    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", real).ok, false, "an existing file through the link");
+    assert.strictEqual(securityConfigTarget(ws, "linked/messagefoundry.toml", true, real).ok, false, "an existing file through the link");
+    // A dangling link, whose target does not exist yet, is refused too: it could be made later.
+    const dangling = path.join(ws, "dangling");
+    fs.symlinkSync(path.join(outside, "not-yet"), dangling, "junction");
+    assert.strictEqual(securityConfigTarget(ws, "dangling/messagefoundry.toml", true, real).ok, false, "a dangling link");
     // THE CONTROL: a link that stays inside the workspace is accepted.
     fs.mkdirSync(path.join(ws, "inner"));
     fs.symlinkSync(path.join(ws, "inner"), path.join(ws, "inlink"), "junction");
-    assert.ok(securityConfigTarget(ws, "inlink/messagefoundry.toml", real).ok, "a link inside the workspace");
+    assert.ok(securityConfigTarget(ws, "inlink/messagefoundry.toml", true, real).ok, "a link inside the workspace");
   });
 
   test("each argv value is bound to its flag with =, so a leading dash is never read as a flag", () => {

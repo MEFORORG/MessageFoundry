@@ -1049,6 +1049,13 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/chat.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/cli.ts": Site(2, OPERATOR, "Fixed venv interpreter paths under the workspace."),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/securityEditorModel.ts": Site(
+        3,
+        GUARDED,
+        "The security editor's settings path: a workspace-set value must resolve inside the "
+        "workspace folder, links included (BACKLOG #5411).",
+        "ide/src/securityEditorModel.ts::!inside(realRoot, realTarget)",
+    ),
     "ide/src/editorToolbar.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/engineTrustModel.ts": Site(
         1, OPERATOR, "The trust anchor setting, resolved under the workspace."

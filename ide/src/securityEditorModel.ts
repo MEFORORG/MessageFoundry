@@ -12,59 +12,95 @@ import type { Field, FieldType } from "./securityEditorWebview";
 export type ConfigTarget = { readonly ok: true; readonly path: string } | { readonly ok: false; readonly problem: string };
 
 /** Whether `target` lies strictly inside `root`. path.relative so a sibling sharing a name prefix
- *  does not match, and on Windows the comparison ignores case as the file system does. */
+ *  does not match, and on Windows the comparison ignores case as the file system does. A first
+ *  component that only starts with two dots, such as `..conf`, is inside. */
 function inside(root: string, target: string): boolean {
   const rel = path.relative(root, target);
-  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  return rel !== "" && rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
 }
 
-/** `target` with every symbolic link in the part of it that exists resolved. The rest, a file or
- *  folders not made yet, cannot be a link, so it is joined back as written. */
-function resolveLinks(target: string, realpath: (p: string) => string): string {
+/** The file-system reads the containment check makes, as fs.realpathSync.native and fs.lstatSync
+ *  make them: each throws an error carrying `code` for a path it cannot read. */
+export interface LinkFs {
+  realpath(p: string): string;
+  lstat(p: string): unknown;
+}
+
+function errCode(e: unknown): unknown {
+  return typeof e === "object" && e !== null ? (e as { code?: unknown }).code : undefined;
+}
+
+/** `target` with every symbolic link in it resolved, or undefined when that cannot be told. The part
+ *  that does not exist yet is joined back as written, so each missing component is checked to be
+ *  truly absent: a dangling link exists to lstat and is refused, since it could later lead anywhere.
+ *  Any error but "does not exist" is refused too. */
+function resolveLinks(target: string, fsx: LinkFs): string | undefined {
   const tail: string[] = [];
   let at = target;
   for (;;) {
     try {
-      return path.join(realpath(at), ...tail);
-    } catch {
-      const parent = path.dirname(at);
-      if (parent === at) {
-        // Not even the root resolves. Read as written, which the lexical check already passed.
-        return path.join(at, ...tail);
+      return path.join(fsx.realpath(at), ...tail);
+    } catch (e) {
+      const code = errCode(e);
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        return undefined;
       }
-      tail.unshift(path.basename(at));
-      at = parent;
     }
+    try {
+      fsx.lstat(at);
+      return undefined; // it exists, yet does not resolve: a dangling or looping link
+    } catch (e) {
+      const code = errCode(e);
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        return undefined;
+      }
+    }
+    const parent = path.dirname(at);
+    if (parent === at) {
+      return undefined;
+    }
+    tail.unshift(path.basename(at));
+    at = parent;
   }
 }
 
 /**
- * The absolute service-settings path for `setting` (`messagefoundry.serviceConfig`), which must name
- * a file inside the workspace folder `workspace` (BACKLOG #5411). The setting is workspace-scoped, so
- * a repository's own `.vscode/settings.json` can set it; this keeps such a setting from pointing the
- * security editor at a file elsewhere on the machine. A path that leaves the workspace, by `..`, by
- * being absolute elsewhere, or through a symbolic link, is refused, as is a blank or non-string
- * setting and one that names the workspace folder itself. `realpath` throws for a path that does not
- * exist, as fs.realpathSync does.
+ * The absolute service-settings path for `setting` (`messagefoundry.serviceConfig`), resolved against
+ * the workspace folder `workspace` (BACKLOG #5411). A blank or non-string setting is refused.
+ *
+ * `fromWorkspace` says the value in force comes from the workspace's own settings, which a
+ * repository's `.vscode/settings.json` can set. Such a value must name a file inside the workspace
+ * folder: one that leaves it by `..`, by being absolute elsewhere, or through a symbolic link, a
+ * dangling one included, is refused, as is the folder itself. A value from user settings is the
+ * operator's own and may name a file anywhere, such as the service's TOML in another folder.
  */
 export function securityConfigTarget(
   workspace: string,
   setting: unknown,
-  realpath: (p: string) => string,
+  fromWorkspace: boolean,
+  fsx: LinkFs,
 ): ConfigTarget {
   if (typeof setting !== "string" || setting.trim() === "") {
     return { ok: false, problem: "messagefoundry.serviceConfig is blank or is not text" };
   }
   const root = path.resolve(workspace);
   const target = path.resolve(root, setting);
+  if (!fromWorkspace) {
+    return { ok: true, path: target };
+  }
+  // The value is not quoted back (docs/REVIEW-STANDARDS.md R12); the operator can read the setting.
   const outside = {
     ok: false,
-    problem: `messagefoundry.serviceConfig names ${JSON.stringify(setting)}, which is not a file inside the workspace folder`,
+    problem:
+      "the workspace settings set messagefoundry.serviceConfig to a path that is not a file inside the workspace folder, " +
+      "or whose links cannot be checked",
   } as const;
   if (!inside(root, target)) {
     return outside;
   }
-  if (!inside(resolveLinks(root, realpath), resolveLinks(target, realpath))) {
+  const realRoot = resolveLinks(root, fsx);
+  const realTarget = resolveLinks(target, fsx);
+  if (realRoot === undefined || realTarget === undefined || !inside(realRoot, realTarget)) {
     return outside;
   }
   return { ok: true, path: target };
@@ -86,14 +122,14 @@ const VALUE_OK = {
   bool: (v: unknown) => typeof v === "boolean",
   tristate: (v: unknown) => typeof v === "boolean",
   string: (v: unknown) => typeof v === "string",
-  int: (v: unknown, f: Field) => Number.isSafeInteger(v) && (v as number) >= (f.min ?? 0),
+  int: (v: unknown, f: Field) => Number.isSafeInteger(v) && (f.min === undefined || (v as number) >= f.min),
 } satisfies Record<FieldType, (v: unknown, f: Field) => boolean>;
 
 /**
  * What is wrong with the `updates` of a save message, or null. The webview builds it in
  * collectUpdates(), but anything that reaches the host is checked again before it is written. It
  * must be a plain object whose every key is a switch `fields` lists, each value null (reset to the
- * default) or of that switch's type: an int a whole number at or above the switch's minimum.
+ * default) or of that switch's type: an int a whole number, at or above the switch's minimum if it has one.
  */
 export function saveUpdatesProblem(updates: unknown, fields: readonly Field[]): string | null {
   if (typeof updates !== "object" || updates === null || Array.isArray(updates)) {
@@ -112,7 +148,7 @@ export function saveUpdatesProblem(updates: unknown, fields: readonly Field[]): 
     if (value === null) {
       continue;
     }
-    if (!Object.hasOwn(VALUE_OK, f.type) || !VALUE_OK[f.type](value, f)) {
+    if (!VALUE_OK[f.type](value, f)) {
       return `${f.label} has a value this editor does not save`;
     }
   }

@@ -23,8 +23,9 @@ export interface Field {
   // `defaults` rather than restated here: the two session limits (vault BACKLOG #2600). 0 or less ends
   // every session at once, which is stricter, so only a value above the default is marked.
   looserAboveDefault?: boolean;
-  // The least value an int switch takes. Save refuses a value below it (BACKLOG #5412), and the
-  // host checks it again (securityEditorModel.ts). Unset on an int means 0.
+  // The least value an int switch takes, where the engine refuses less. Save refuses a value below
+  // it (BACKLOG #5412), and the host checks it again (securityEditorModel.ts). Unset means no
+  // minimum: a session limit of 0 or less is stricter, and the engine takes it.
   min?: number;
   risk?: string;
 }
@@ -63,10 +64,10 @@ export const FIELDS: Field[] = [
     desc: "Audited ack (ADR 0140): lifts the start refusal that an exposed instance with Require MFA off meets under strict enforcement.",
     insecure: true, risk: "an EXPOSED instance under enforcement = enforce may start with [security].require_mfa off, on an audited warning instead of the refusal. Every account with no second factor enrolled is then single-factor over the network, unless an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on" },
   // Each risk ends with the engine's own clause; tests/test_security_config.py reds when it drifts.
-  { key: "sign_out_after_idle_minutes", min: 0, label: "Sign out after idle (min)", type: "int", group: "Sign-in & identity",
+  { key: "sign_out_after_idle_minutes", label: "Sign out after idle (min)", type: "int", group: "Sign-in & identity",
     desc: "Session idle timeout, in minutes. Above the default is a loosening.",
     looserAboveDefault: true, risk: "the idle sign-out is longer than the default, so a session left open or taken over stays usable for longer before it is signed out" },
-  { key: "max_session_hours", min: 0, label: "Max session (hours)", type: "int", group: "Sign-in & identity",
+  { key: "max_session_hours", label: "Max session (hours)", type: "int", group: "Sign-in & identity",
     desc: "Absolute session lifetime, in hours. Above the default is a loosening.",
     looserAboveDefault: true, risk: "the absolute session lifetime is longer than the default, so a session left open or taken over stays usable for longer before it is signed out" },
   // ── Data handling ───────────────────────────────────────────────
@@ -142,7 +143,7 @@ export function securityEditorScript(token: string, fields: unknown): string {
           input = document.createElement('select');
           for (const [v, t] of [['','Derived from environment'],['true','Yes'],['false','No']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; input.appendChild(o); }
         } else if (f.type === 'int') {
-          input = document.createElement('input'); input.type = 'number'; input.min = String(intMin(f));
+          input = document.createElement('input'); input.type = 'number'; if (typeof f.min === 'number') { input.min = String(f.min); }
         } else {
           input = document.createElement('input'); input.type = 'text';
         }
@@ -161,8 +162,6 @@ export function securityEditorScript(token: string, fields: unknown): string {
       // select choose one again. A new input is already empty.
       for (const s of root.querySelectorAll('select')) { s.selectedIndex = -1; }
     }
-
-    function intMin(f) { return typeof f.min === 'number' ? f.min : 0; }
 
     // A cleared number field is null: Save sends it as a reset to the secure default, never as 0,
     // which for the retention switch is keep-indefinitely (BACKLOG #5412). Any other text is read
@@ -186,7 +185,7 @@ export function securityEditorScript(token: string, fields: unknown): string {
         const v = currentValue(f);
         if (v === null) { continue; }
         if (!mfInt(v)) { return f.label + ' must be a whole number'; }
-        if (v < intMin(f)) { return f.label + ' must be ' + intMin(f) + ' or more'; }
+        if (typeof f.min === 'number' && v < f.min) { return f.label + ' must be ' + f.min + ' or more'; }
       }
       return null;
     }
@@ -264,7 +263,6 @@ export function securityEditorScript(token: string, fields: unknown): string {
       if (!rendered) { return; }
       const problem = intProblem();
       if (problem !== null) { show('Not saved: ' + problem + '. Clear the field to reset it to the default.'); return; }
-      errorEl.style.display = 'none';
       vscode.postMessage({ command: 'save', updates: collectUpdates() });
     });
     $('close').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));

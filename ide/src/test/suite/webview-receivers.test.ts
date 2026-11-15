@@ -1455,10 +1455,12 @@ suite("webview receivers discard a malformed payload and render a well-formed on
   });
 
   test("Security Settings: Save refuses a number below the minimum or not a whole number, and posts nothing", () => {
-    for (const f of FIELDS.filter((x) => x.type === "int")) {
+    const ints = FIELDS.filter((x) => x.type === "int");
+    assert.deepStrictEqual(ints.filter((x) => x.min !== undefined).map((x) => x.key), ["delete_message_bodies_after_days"]);
+    for (const f of ints) {
       // "unparseable" is what a browser holds for text it cannot read as a number, such as "1e": an
       // empty value with validity.badInput set. jsdom never sets badInput, so the case stubs it.
-      for (const bad of ["-1", "1.5", "unparseable"]) {
+      for (const bad of [...(f.min === undefined ? [] : [String(f.min - 1)]), "1.5", "unparseable"]) {
         const p = security.load();
         p.deliver(STATE_OK);
         const input = p.window.document.getElementById("in-" + f.key);
@@ -1481,6 +1483,13 @@ suite("webview receivers discard a malformed payload and render a well-formed on
         assert.strictEqual(p.posted[0].updates[f.key], 5);
       }
     }
+    // A session limit has no minimum: 0 or less is stricter, and the engine takes it, so a stored
+    // negative value does not block a Save of some other switch.
+    const neg = security.load();
+    neg.deliver(variant(STATE_OK, (c) => (c.state.values.max_session_hours = -1)));
+    neg.window.document.getElementById("save").click();
+    assert.strictEqual(neg.posted.length, 1, "a stored negative session limit blocked Save");
+    assert.strictEqual(neg.posted[0].updates.max_session_hours, -1);
     // THE CONTROL: an explicit 0 the operator types is still sent as 0, and marked loosened.
     const p = security.load();
     p.deliver(STATE_OK);

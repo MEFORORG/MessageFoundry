@@ -76,7 +76,13 @@ export async function openSecurityEditor(context: vscode.ExtensionContext): Prom
 /** The service-settings file to read and write, which must be inside the workspace folder
  *  (BACKLOG #5411), or undefined after the refusal is posted to the webview. */
 function configPath(ws: string, current: vscode.WebviewPanel): string | undefined {
-  const target = securityConfigTarget(ws, serviceConfig(), fs.realpathSync.native);
+  const seen = vscode.workspace.getConfiguration("messagefoundry").inspect("serviceConfig");
+  // Unread scope counts as the workspace's, so the check is never skipped by a missing answer.
+  const fromWorkspace = seen === undefined || seen.workspaceValue !== undefined || seen.workspaceFolderValue !== undefined;
+  const target = securityConfigTarget(ws, serviceConfig(), fromWorkspace, {
+    realpath: fs.realpathSync.native,
+    lstat: fs.lstatSync,
+  });
   if (!target.ok) {
     postToWebview(current.webview, { command: "error", message: `${target.problem}. Nothing was read or written.` });
     return undefined;
@@ -85,12 +91,13 @@ function configPath(ws: string, current: vscode.WebviewPanel): string | undefine
 }
 
 /** Re-read `security show` and push the current state (values + defaults + loosenings) to the webview. */
-async function refresh(current: vscode.WebviewPanel): Promise<void> {
+async function refresh(current: vscode.WebviewPanel, resolved?: string): Promise<void> {
   const ws = workspaceDir();
   if (!ws) {
     return;
   }
-  const file = configPath(ws, current);
+  // After a save, the file just written, so the state shown is that file's even if the setting moved.
+  const file = resolved ?? configPath(ws, current);
   if (file === undefined) {
     return;
   }
@@ -122,7 +129,7 @@ async function save(
     postToWebview(current.webview, { command: "error", message: String(e) });
     return;
   }
-  await refresh(current);
+  await refresh(current, file);
   void vscode.window.showInformationMessage(
     "MessageFoundry: saved [security] settings. Restart the engine to apply (read at startup).",
   );
