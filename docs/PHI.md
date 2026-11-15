@@ -735,12 +735,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    was not given stops it (vault BACKLOG #5635).** When a user, role, open approval or directory-map
    seal names a key the run does not hold, a pre-flight read finds it before any re-seal or cell
    pass writes, and the store pass aborts having written nothing, naming the tables and the seal
-   key ids; the command exits 1 with nothing rolled or stamped. The read is not atomic against a
-   writer running alongside. The check after the re-seal passes reads each sealed table once. It
-   catches only a seal such a writer made under a key the run does not hold before that read of
-   the seal's table, and that refusal says so. A seal it makes under a retired key the run holds,
-   as an engine still on the prior key would, is counted with the refused records below and does
-   not stop the run, so stop the engine before rotating and before dropping the prior key.
+   key ids; the command exits 1 with nothing rolled or stamped. The check after the re-seal
+   passes reads once, and that read is not atomic against a writer running alongside. A seal such
+   a writer commits during the run may be missed, or counted with the refused records, rather than
+   stopping the run. So stop the engine before rotating, and before dropping the prior key.
    Supply that key and re-run, or remove a record no key you hold opens. A seal that fails under a
    key the run holds, or is malformed, does not stop it; the run notes it. When a start finds that the key in
    use differs from its stamp, or has none, and the record names that key or cannot be read, `serve`
