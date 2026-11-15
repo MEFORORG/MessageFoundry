@@ -1004,10 +1004,10 @@ def _open_recorder(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         steps.append("probe")
         raise StoreNotFoundError.server_schema(StoreBackend.SQLSERVER, "MessageFoundry")
 
-    async def _options(settings: object, *, posture: object) -> None:
+    async def _options(settings: object) -> None:
         steps.append("alter-database")
 
-    async def _pool(settings: object, *, posture: object, maxsize: int) -> object:
+    async def _pool(settings: object, *, maxsize: int) -> object:
         steps.append("pool")
         raise _Refused
 

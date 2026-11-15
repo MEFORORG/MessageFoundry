@@ -99,7 +99,6 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import (
     HOP_ATTESTATION_LEVER,
     InsecureHopRefused,
-    current_hop_posture,
     hop_name_prefix,
 )
 from messagefoundry.config.wiring import _is_text_codec
@@ -206,17 +205,19 @@ def _weakened_tls_permitted(*, attested: bool) -> bool:
 
 
 def _audit_attested_weakened_tls(cell: str, *, connection: str | None = None) -> None:
-    """Loud-log a per-connection attestation that suppresses a would-be **production-PHI** weakened-TLS
-    refusal (#200 decision 3 — attestation is AUDITED when it crosses a prod-PHI hop). No-op on a
-    non-prod / non-PHI / unstamped posture (nothing was suppressed there)."""
-    posture = current_hop_posture()
-    if posture is not None and posture.enforcing:
-        logger.warning(
-            "%s%s: weakened TLS permitted by per-connection tls_hop_attested on a production-PHI "
-            "instance (operator attests the hop is secure by other means)",
-            hop_name_prefix(connection),
-            cell,
-        )
+    """Loud-log a per-connection attestation that suppresses a weakened-TLS refusal (#200 decision 3 —
+    attestation is AUDITED when it crosses a hop that would otherwise be refused).
+
+    It logs at every posture, because the refusal it suppresses holds at every posture: without the
+    attestation :func:`_weakened_tls_permitted` refuses the hop even at ``[security].enforcement =
+    warn`` (owner ruling 2026-11-14, vault BACKLOG #3533 item 2). It used to log only while
+    enforcing, when ``MEFOR_ALLOW_INSECURE_TLS`` could permit the hop at ``warn`` instead."""
+    logger.warning(
+        "%s%s: weakened TLS permitted by per-connection tls_hop_attested (operator attests the hop is "
+        "secure by other means)",
+        hop_name_prefix(connection),
+        cell,
+    )
 
 
 def _assert_send_hop(

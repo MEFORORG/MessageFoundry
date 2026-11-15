@@ -154,6 +154,29 @@ def test_build_dsn_prod_phi_weak_tls_allowed_by_attestation(
     assert "Encrypt=no" in dsn
 
 
+@pytest.mark.parametrize("posture", [PROD_PHI, STAGING_PHI, None], ids=["enforce", "warn", "none"])
+def test_build_dsn_audits_an_attested_weak_hop_at_every_posture(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    posture: HopPosture | None,
+) -> None:
+    # The attestation suppresses a refusal that holds at every posture (vault BACKLOG #3533 item 2),
+    # so the audit line fires at every posture. Before this change it fired only while enforcing.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    caplog.set_level("WARNING", logger="messagefoundry.transports.database")
+    with active_hop_posture(posture):
+        _build_dsn(dict(_WEAK_DB), attested=True)
+    assert "weakened TLS permitted by per-connection tls_hop_attested" in caplog.text
+
+
+def test_build_dsn_does_not_audit_a_verified_hop(caplog: pytest.LogCaptureFixture) -> None:
+    # Control: a verifying hop, attested or not, suppressed nothing, so nothing is audited.
+    caplog.set_level("WARNING", logger="messagefoundry.transports.database")
+    with active_hop_posture(STAGING_PHI):
+        _build_dsn({"server": "s", "database": "d"}, attested=True)
+    assert "tls_hop_attested" not in caplog.text
+
+
 def test_build_dsn_staging_phi_trust_cert_refused_without_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
