@@ -350,7 +350,7 @@ def test_a_loaded_ca_with_no_crl_of_its_own_refuses_the_build(
     crl_file.write_bytes(two_tier.inter_crl_file.read_bytes())
     settings = _settings(two_tier, crl_file).model_copy(update={"tls_client_ca_file": str(ca_file)})
     with pytest.raises(
-        ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Client Root'"
+        ValueError, match="client CA.s. 'CN=Client Root'.* have no CRL of their own"
     ):
         build_api_ssl_context(settings)
     # The control: with the root's CRL added, the same CA file builds and admits the client.
@@ -447,7 +447,7 @@ def test_a_crl_the_cas_key_signed_under_another_name_refuses_the_build(
     crl = rollover.crl("renamed.pem", _crl("Renamed Root", rollover.new_key, None))
     settings = rollover.settings([rollover.new_root], crl)
     with pytest.raises(
-        ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Client Root'"
+        ValueError, match="client CA.s. 'CN=Client Root'.* have no CRL of their own"
     ):
         build_api_ssl_context(settings)
     by_hand = _crl_checked_server(
@@ -467,18 +467,58 @@ def test_a_same_name_rollover_whose_crls_name_no_key_refuses_the_build(
 ) -> None:
     """Each key signed a CRL, but neither CRL names its key, so OpenSSL tells them apart by date
     alone: with the old key's CRL the newer one, the new key's client fails with ``CRL signature
-    failure``. The start refuses both CAs instead. The control is the earlier rollover test, whose
-    CRLs name their keys and admit the client."""
+    failure``. The start refuses both CAs instead. The control, at the end, is the same two CRLs
+    and dates with each naming its key, which build and admit that client."""
+
+    def crls(name: str, *, akid: bool) -> Path:
+        return rollover.crl(
+            name,
+            _crl("Client Root", rollover.old_key, None, akid=akid, age=_DAY / 4),
+            _crl("Client Root", rollover.new_key, None, akid=akid),
+        )
+
+    crl = crls("no-akid.pem", akid=False)
+    settings = rollover.settings([rollover.old_root, rollover.new_root], crl)
+    with pytest.raises(
+        ValueError, match="client CA.s. 'CN=Client Root'.* have no CRL of their own"
+    ) as err:
+        build_api_ssl_context(settings)
+    for root in (rollover.old_root, rollover.new_root):
+        serial = x509.load_pem_x509_certificate(root.read_bytes()).serial_number
+        assert f"(serial number {serial:#x})" in str(err.value)
+    by_hand = _crl_checked_server(
+        rollover.server_cert,
+        rollover.server_key,
+        Path(str(settings.tls_client_ca_file)),
+        crl,
+        chain=True,
+    )
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(rollover.client(), by_hand)
+    keyed = settings.model_copy(update={"tls_client_crl_file": str(crls("akid.pem", akid=True))})
+    _handshake(rollover.client(), build_api_ssl_context(keyed))
+
+
+@pytest.mark.usefixtures("clean_anchor_checks")
+def test_a_newer_crl_naming_no_key_beside_each_cas_own_refuses_the_build(
+    rollover: _Rollover,
+) -> None:
+    """Each key has its own CRL naming it, and a newer CRL from the old key names no key, so
+    OpenSSL may pick it for the new key's clients and fail them with ``CRL signature failure``.
+    Every CRL a CA fits must be its own, so the start refuses the new key's CA."""
     crl = rollover.crl(
-        "no-akid.pem",
+        "poisoned.pem",
+        _crl("Client Root", rollover.old_key, None),
+        _crl("Client Root", rollover.new_key, None),
         _crl("Client Root", rollover.old_key, None, akid=False, age=_DAY / 4),
-        _crl("Client Root", rollover.new_key, None, akid=False),
     )
     settings = rollover.settings([rollover.old_root, rollover.new_root], crl)
     with pytest.raises(
-        ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Client Root'"
-    ):
+        ValueError, match="client CA.s. 'CN=Client Root'.* have no CRL of their own"
+    ) as err:
         build_api_ssl_context(settings)
+    new_serial = x509.load_pem_x509_certificate(rollover.new_root.read_bytes()).serial_number
+    assert f"(serial number {new_serial:#x})" in str(err.value)
     by_hand = _crl_checked_server(
         rollover.server_cert,
         rollover.server_key,
@@ -501,7 +541,7 @@ def test_a_same_name_rollover_with_only_the_old_keys_crl_refuses_the_build(
     old_only = rollover.crl("old-only.pem", old_crl)
     settings = rollover.settings([rollover.old_root, rollover.new_root], old_only)
     with pytest.raises(
-        ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Client Root'"
+        ValueError, match="client CA.s. 'CN=Client Root'.* have no CRL of their own"
     ) as err:
         build_api_ssl_context(settings)
     # It names the new key's CA alone, by serial number, since the two share a name.
@@ -539,7 +579,7 @@ def test_control_a_loaded_ca_with_no_crl_at_all_still_refuses_the_build(
     other = rollover.d / "other-ca.pem"
     other.write_bytes(_pem(_cert("Other CA", other_key, "Other CA", other_key, ca=True)))
     crl = rollover.crl("new-only.pem", _crl("Client Root", rollover.new_key, None))
-    with pytest.raises(ValueError, match="no CRL signed by the loaded client CA.s. 'CN=Other CA'"):
+    with pytest.raises(ValueError, match="client CA.s. 'CN=Other CA'.* have no CRL of their own"):
         build_api_ssl_context(rollover.settings([rollover.new_root, other], crl))
 
 

@@ -1216,18 +1216,22 @@ def crl_pem_blocks(pem: bytes) -> list[bytes]:
 
 
 def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[str, int]]:
-    """Each CA in ``ca_ders`` with no CRL of its own in ``crl_pem``, as its subject in RFC 4514
+    """Each CA in ``ca_ders`` that ``crl_pem`` gives no CRL of its own, as its subject in RFC 4514
     form and its certificate's serial number (vault BACKLOG #5627). Under a whole-chain CRL check
     OpenSSL needs a loaded CA's own CRL for every certificate it issued, a leaf or an intermediate
     a client sends, so without it every client under that CA is refused.
 
-    **A CRL is the CA's own when it carries the CA's name and the CA's key signed it**
-    (:func:`_signed_by`). OpenSSL finds a CRL by name, so a CRL the key signed under another name
-    is no CRL for that CA. The name is compared as OpenSSL compares it (:func:`_openssl_name_key`,
-    white space folded too), so a CRL whose issuer differs only in white space counts, though
-    :func:`_signature_state` reads it ``unlisted``. The key decides among CAs that share a name,
-    as in a rollover that keeps the name under a new key: the old key's CRL is not the new CA's.
-    Raises ``ValueError`` naming which file did not parse."""
+    **A CA's candidates are the CRLs OpenSSL may judge its clients by**: those that carry its
+    name and that its authority key identifier does not rule out (:func:`_akid_fit`). OpenSSL
+    finds a CRL by name, so a CRL the CA's key signed under another name is no candidate. The
+    name is compared by :func:`_openssl_name_key`, the engine's model of OpenSSL's comparison,
+    white space folded, so a CRL whose issuer differs only in white space is a candidate, though
+    :func:`_signature_state` reads it ``unlisted``. **A CA has a CRL of its own when it has at
+    least one candidate and signed every one** (:func:`_signed_by`). Every one, since OpenSSL
+    picks among them by its own score and by date: in a rollover that keeps the name under a new
+    key, a CRL that names no key is a candidate for both CAs and one of them did not sign it.
+    That is stricter than OpenSSL where the CA's own CRL would win the pick. Raises
+    ``ValueError`` naming which file did not parse."""
     try:
         crls = [
             (crl, _openssl_name_key(crl.issuer), _crl_extensions(crl).akid)
@@ -1235,48 +1239,42 @@ def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[
         ]
     except _UNREADABLE_CA as exc:
         raise ValueError(f"a CRL block does not parse: {exc}") from exc
-    cas: list[tuple[_ListedCa, CrlIssuerKey]] = []
+    missing: list[tuple[str, int]] = []
     for der in ca_ders:
         try:
             ca = _listed_ca(der)
-            cas.append((ca, _openssl_name_key(ca.cert.subject)))
+            name = _openssl_name_key(ca.cert.subject)
         except _UNREADABLE_CA as exc:
             raise ValueError(f"a loaded client CA does not parse: {exc}") from exc
-    missing: list[tuple[str, int]] = []
-    for ca, name in cas:
-        namesakes = [other for other, other_name in cas if other_name == name and other is not ca]
-        if not any(
-            crl_name == name and _signed_by(crl, akid, ca, namesakes)
+        verdicts = [
+            verdict
             for crl, crl_name, akid in crls
-        ):
+            if crl_name == name and (verdict := _signed_by(crl, akid, ca)) is not None
+        ]
+        if not verdicts or not all(verdicts):
             missing.append((ca.cert.subject.rfc4514_string(), ca.serial))
     return missing
 
 
 def _signed_by(
-    crl: x509.CertificateRevocationList,
-    akid: _CrlAkid | None,
-    ca: _ListedCa,
-    namesakes: list[_ListedCa],
-) -> bool:
-    """Whether ``ca``, which carries ``crl``'s issuer name, signed it, judged as
-    :func:`_signature_state` judges a CA of that name: the CA fits the CRL's Authority Key
-    Identifier ``akid`` (:func:`_akid_fit`), and its key is not proven not to verify the CRL. A
-    signature the engine cannot check counts, as a start loads such a CRL with a warning
-    (``uncheckable``). A CA whose extensions do not read is not shown not to fit, so the
-    signature decides.
+    crl: x509.CertificateRevocationList, akid: _CrlAkid | None, ca: _ListedCa
+) -> bool | None:
+    """Whether ``ca``, which carries ``crl``'s issuer name, signed it: ``None`` when the CRL's
+    Authority Key Identifier ``akid`` rules the CA out (:func:`_akid_fit`), so the CRL is no
+    candidate for it. A CA whose AKID fit raises one of :data:`_UNREADABLE_CA` is not ruled out.
 
-    **A CRL that does not name the CA's key must also verify with each namesake**, a loaded CA
-    of the same name, ``namesakes``. With no key named, OpenSSL tells such CRLs apart by name and
-    date alone, so it can check the CA's clients against a namesake's CRL, and fail them with
-    ``CRL signature failure``."""
+    Otherwise True when the CA's key verifies the CRL, or when the engine cannot check the
+    signature and the CRL names the CA's key by key identifier, which a start loads with a warning
+    (``uncheckable``). A signature that cannot be checked proves nothing where no key is named,
+    since a key of another kind than the signature cannot check it either, so that is False."""
     try:
         names_key = _akid_fit(akid, ca)
     except _UNREADABLE_CA:
         names_key = False
-    if names_key is None or _verifies(crl, ca.cert) is False:
-        return False
-    return names_key or all(_verifies(crl, other.cert) is not False for other in namesakes)
+    if names_key is None:
+        return None
+    verified = _verifies(crl, ca.cert)
+    return verified is True or (verified is None and names_key)
 
 
 def _crl_blocks(pem: bytes) -> Iterator[bytes]:
