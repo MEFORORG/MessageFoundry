@@ -779,34 +779,42 @@ def _pr_lines(body: str) -> tuple[list[str], list[int]]:
     """The body's one line model: its lines as str.splitlines reads them, so a hit reports the line
     number main reported, and the numbers of its blank lines as GFM counts them.
 
-    A blank line is a whole GFM line (between "\\n", "\\r\\n" or "\\r") holding only spaces and tabs,
-    quote markers aside. A separator only str.splitlines reads (a form feed, U+2028) ends a line here
-    but never makes a blank one: the line it ends, or the empty line it opens, lies inside a GFM line
-    with content, so it ends no table (step 9)."""
+    A blank line is a whole GFM line (between "\\n", "\\r\\n" or "\\r") holding only spaces and tabs.
+    Its quote markers are stripped first only where the GFM line above it is quoted too, so a lone
+    ">" line between the rows of a quoted table ends it (step 9), and one between the rows of an
+    unquoted table does not, as main read it (_pr_is_blank). A separator only str.splitlines reads (a form feed,
+    U+2028) ends a line here but never makes a blank one: the line it ends, or the empty line it
+    opens, lies inside a GFM line with content, so it ends no table (step 9)."""
     lines: list[str] = []
     blanks: list[int] = []
     start = 0
     # Whether the current line starts a GFM line: the body's start, or a GFM line ending before it.
     whole = True
+    # Whether the GFM line above the current one opens with a quote marker.
+    quoted = False
     for end in _PR_LINE_END.finditer(body):
         lines.append(body[start : end.start()])
         gfm_end = end.group() in _PR_GFM_LINE_ENDS
-        if whole and gfm_end and _pr_is_blank(lines[-1]):
-            blanks.append(len(lines))
+        if whole:
+            if gfm_end and _pr_is_blank(lines[-1], quoted):
+                blanks.append(len(lines))
+            quoted = _PR_QUOTE_BLANK.match(lines[-1]) is not None
         whole = gfm_end
         start = end.end()
     # A final line ending opens no line, as str.splitlines reads it.
     if start < len(body):
         lines.append(body[start:])
-        if whole and _pr_is_blank(lines[-1]):
+        if whole and _pr_is_blank(lines[-1], quoted):
             blanks.append(len(lines))
     return lines, blanks
 
 
-def _pr_is_blank(line: str) -> bool:
-    """A GFM blank line: only spaces and tabs once quote markers are stripped, so a ">" then a
-    no-break space is a quoted line with content."""
-    return not _PR_QUOTE_BLANK.sub("", line).strip(" \t")
+def _pr_is_blank(line: str, quoted: bool) -> bool:
+    """A GFM blank line: only spaces and tabs, once its quote markers are stripped where the line
+    above is quoted. A ">" then a no-break space is a quoted line with content. A quote-marker-only
+    line under an unquoted line is not blank here: main read no blank line at all, so a lone ">" in
+    an unquoted ASVS table must not reset its column."""
+    return not (_PR_QUOTE_BLANK.sub("", line) if quoted else line).strip(" \t")
 
 
 def _pr_units(lines: list[str], delete_invisible: bool) -> _PrUnits:
@@ -851,7 +859,10 @@ def _pr_units(lines: list[str], delete_invisible: bool) -> _PrUnits:
 
 
 def _pr_line_at(marks: list[tuple[int, int]], offset: int) -> int:
-    return max(lineno for start, lineno in marks if start <= offset)
+    """The line of the last mark at or before the offset. Marks rise in offset and line together, so
+    a bisection finds it: a scan over every mark, once per binding identifier, is quadratic in a
+    hard-wrapped paragraph."""
+    return marks[bisect.bisect_right(marks, offset, key=lambda mark: mark[0]) - 1][1]
 
 
 def _pr_requirement_ids(text: str) -> list[tuple[re.Match[str], bool]]:

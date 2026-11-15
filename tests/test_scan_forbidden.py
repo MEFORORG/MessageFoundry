@@ -1035,20 +1035,29 @@ def test_the_step_four_rules_leave_versions_and_other_tables_alone(
     assert sf.scan_pr_body(body) == [], (item, body)
 
 
+_HEADER_TABLE_ROW = f"| {_REQ} | the limb | {_PASS.title()} (12 messages) |"
+_HEADER_TABLE_ONE = f"| ASVS | Note | Result |\n| --- | --- | --- |\n{_HEADER_TABLE_ROW}"
+#: The bodies of the header-table test below, by name, so the frozen-main guard reads them too.
+_PR_HEADER_TABLE_BODIES = {
+    "one": _HEADER_TABLE_ONE,
+    "two": _HEADER_TABLE_ONE
+    + "\n\n| Version | Note | Result |\n| --- | --- | --- |\n"
+    + _HEADER_TABLE_ROW,
+    "placeholder": f"| ASVS | Note | Result |\n|---|---|---|\n| - | - | - |\n{_HEADER_TABLE_ROW}",
+    "wrong-column": (
+        f"| ASVS | Note |\n| --- | --- |\n| the limb | {_REQ} | x | {_PASS.title()} (12 messages) |"
+    ),
+}
+
+
 def test_a_header_row_marks_only_its_own_table_and_column(sf) -> None:
     """The ASVS header of one table must not mark the identifiers of the next one, or of prose below."""
-    row = f"| {_REQ} | the limb | {_PASS.title()} (12 messages) |"
-    one = f"| ASVS | Note | Result |\n| --- | --- | --- |\n{row}"
-    assert sf.scan_pr_body(one), "the control must fire, or the next two assert nothing"
-    two = one + "\n\n| Version | Note | Result |\n| --- | --- | --- |\n" + row
-    assert sf.scan_pr_body(two) == [f"pr-body:3: {sf.PR_BODY_REASONS['verdict']}"]
+    bodies = _PR_HEADER_TABLE_BODIES
+    assert sf.scan_pr_body(bodies["one"]), "the control must fire, or the next two assert nothing"
+    assert sf.scan_pr_body(bodies["two"]) == [f"pr-body:3: {sf.PR_BODY_REASONS['verdict']}"]
     # A placeholder row of dashes is data, not a delimiter, and must not wipe the marked column.
-    placeholder = f"| ASVS | Note | Result |\n|---|---|---|\n| - | - | - |\n{row}"
-    assert sf.scan_pr_body(placeholder) == [f"pr-body:4: {sf.PR_BODY_REASONS['verdict']}"]
-    wrong_column = (
-        f"| ASVS | Note |\n| --- | --- |\n| the limb | {_REQ} | x | {_PASS.title()} (12 messages) |"
-    )
-    assert sf.scan_pr_body(wrong_column) == []
+    assert sf.scan_pr_body(bodies["placeholder"]) == [f"pr-body:4: {sf.PR_BODY_REASONS['verdict']}"]
+    assert sf.scan_pr_body(bodies["wrong-column"]) == []
 
 
 #: BACKLOG #3364 steps 5 to 12, engine PR 2893's open review findings. Every body fires with the kind
@@ -1119,9 +1128,9 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("11", "gap", f"AS{chr(0x034F)}VS {_REQ} lacks a row-completeness pin."),
     ("11", "verdict", f"| ASVS {_REQ} | the limb | stays par{chr(0xFE0F)}tial |"),
     ("11", "verdict", f"| ASVS {_REQ} | the limb | stays par{chr(0xE0100)}tial |"),
-    # Steps 5 and 9: a pipe line above the header renders as a paragraph, and the table starts at the
-    # header; a header whose first cell is empty keeps its columns where they render.
+    # Step 5: a pipe line above the header renders as a paragraph, and the table starts at the header.
     ("5", "verdict", f"| Summary |\n{_HEAD}{_ROW}"),
+    # Step 8: a header whose first cell is empty keeps its columns where they render.
     ("8", "verdict", f"|| ASVS | Note | Result |\n|---|---|---|---|\n| x {_ROW}"),
     # Step 10's boundary: an unmarked verdict-state cell after "never", and "row" before a verdict
     # state, still bind; only the CI verbs are exempt.
@@ -1142,8 +1151,12 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("11", "map", f"{_REQ} is enforced in\n{chr(0x200B)}\npkg/example_guard.py."),
     ("11", "map", f"{_REQ} is enforced\n{chr(0x200B)}- in pkg/example_guard.py."),
     ("11", "map", f"{_REQ} is enforced\n{chr(0x200B)}# in pkg/example_guard.py."),
-    # Punctuation binding the identifier to "the row" marks it, so a CI verb after it binds.
+    # "the row" then a CI verb that is not negated binds an unmarked identifier too, so this body would
+    # bind with no mark and does not test _PR_MARK_AFTER; the negated body after it does.
     ("10", "verdict", f"{_REQ}: the row is failing."),
+    # Punctuation binding the identifier to "the row" marks it (_PR_MARK_AFTER), so a negated state
+    # verb then a CI verb, which step 10 exempts beside an unmarked identifier, binds here.
+    ("10", "verdict", f"{_REQ}: the row is not failing."),
     # Review pass 3's new loss: with no GFM-valid pair in the run, a mistyped delimiter under an
     # ASVS header still marks the column, as main read it.
     ("5", "verdict", f"| ASVS | Note | Result |\n|---|---|\n{_ROW}"),
@@ -1303,8 +1316,10 @@ def sf_frozen_main():
 
 
 def _superset_bodies() -> dict[str, str]:
-    """Every must-fire and must-stay-quiet body above, the review rounds' bodies, and tables whose
-    lines each separator joins, one and two in a row, with and without a line ending after them."""
+    """The clean body, the bodies of every PR-body must-fire and must-stay-quiet list above (verdict,
+    gap, map, version, residue, cell markup, step 4, and steps 5 to 12) and of the header-table test,
+    the review rounds' bodies, and tables whose lines each separator joins, one and two in a row, with
+    and without a line ending after them. Bodies other tests build inline are not in it."""
     bodies: dict[str, str] = {"clean": _PR_CLEAN_BODY}
     plain = [
         *_PR_VERDICT_MUST_FIRE,
@@ -1316,6 +1331,16 @@ def _superset_bodies() -> dict[str, str]:
         *_PR_CELL_MARKUP_MUST_FIRE,
     ]
     bodies.update({f"plain-{i}": body for i, body in enumerate(plain)})
+    bodies.update(
+        {f"step4-fire-{i}-{item}": body for i, (item, _, body) in enumerate(_PR_STEP4_MUST_FIRE)}
+    )
+    bodies.update(
+        {
+            f"step4-quiet-{i}-{item}": body
+            for i, (item, body) in enumerate(_PR_STEP4_MUST_STAY_QUIET)
+        }
+    )
+    bodies.update({f"header-table-{name}": body for name, body in _PR_HEADER_TABLE_BODIES.items()})
     bodies.update(
         {f"must-fire-{i}-step{s}": body for i, (s, _, body) in enumerate(_PR_FINDINGS_MUST_FIRE)}
     )
@@ -1347,7 +1372,12 @@ def _superset_bodies() -> dict[str, str]:
             "reviewer-wrapped-verdict": (
                 f"{_REQ}, _which_ stays {_PARTIAL}, and\n{_REQ_B} stays {_PARTIAL}."
             ),
+            # A quote-marker-only line inside an unquoted ASVS table is not a blank line: main read
+            # none, so it keeps the column marked, between rows, between the header and its
+            # delimiter, and padded with spaces.
             "reviewer-quote-marker-line": f"{_HEAD}| a | b | c |\n>\n{_ROW}",
+            "reviewer-quote-marker-header": f"| ASVS | Note | Result |\n>\n|---|---|---|\n{_ROW}",
+            "reviewer-quote-marker-padded": f"{_HEAD}| a | b | c |\n  >  \n{_ROW}",
             "reviewer-escaped-pipe": (
                 f"| Note | Version | ASVS | Result |\n|---|---|---|---|\n"
                 f"| x \\| y | {_REQ} | z | {_PASS.title()} (12 messages) |"
@@ -1516,6 +1546,21 @@ def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
     began = time.perf_counter()
     sf.scan_pr_body(row)
     assert time.perf_counter() - began < 10
+
+
+def test_a_hard_wrapped_paragraph_reports_every_identifier_line_in_linear_time(sf) -> None:
+    """A hard-wrapped paragraph is one unit with a line mark per line, and every binding identifier is
+    reported at its own line, so finding that line must not scan every mark once per identifier.
+    24000 lines, one binding identifier each: about 1.4 seconds here, against about 25 seconds when
+    each lookup scanned every mark. The bound is 10 seconds, loose for a slow runner."""
+    lines = 24000
+    body = "\n".join([f"{_REQ} stays {_PARTIAL}"] * lines)
+    began = time.perf_counter()
+    hits = sf.scan_pr_body(body)
+    elapsed = time.perf_counter() - began
+    # A positive control: each line's identifier is reported at its own line, so the lookup ran.
+    assert len(hits) == lines
+    assert elapsed < 10
 
 
 def _pr_kinds(sf, body: str) -> set[str]:
