@@ -599,9 +599,6 @@ function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
 function Get-DecisionBlindState($Decisions, [hashtable]$Ratings) {
     # One history's owner-rating state, verdicts oldest first. A breach is any trailing 60 holding
     # more than 3 disagreements; after the latest one, 60 newer ratings must pass before it heals.
-    # A history shorter than 60 is its own trailing 60, so 4 disagreements in 10 ratings are a
-    # breach too: that changes nothing for a history of 60 or more, whose first full window holds
-    # every shorter one, but it lets a short history of another name of the seat close this one.
     $verdicts = @($Decisions | Where-Object { $Ratings.ContainsKey([string]$_.id) } |
             Sort-Object { [string]$Ratings[[string]$_.id].id } | ForEach-Object { [string]$Ratings[[string]$_.id].rating -eq 'disagree' })
     $n = $verdicts.Count
@@ -611,7 +608,7 @@ function Get-DecisionBlindState($Decisions, [hashtable]$Ratings) {
     for ($i = 0; $i -lt $n; $i++) {
         if ($verdicts[$i]) { $dis++ }
         if ($i -ge 60 -and $verdicts[$i - 60]) { $dis-- }
-        if ($dis -gt 3) { $lastBreach = $i }
+        if ($i -ge 59 -and $dis -gt 3) { $lastBreach = $i }
     }
     $since = $n - 1 - $lastBreach
     return [pscustomobject]@{
@@ -634,10 +631,13 @@ function Get-DecisionCalibration {
       - The SAMPLES are the name's own: the decisions logged under -Seat's spelling, trimmed and
         lower-cased, and never under another name of its seat. Borrowing them would let a name with
         no record of its own inherit its seat's calibration.
-      - A live BREACH in any history of the seat -- its roster name's, any alias's, or all its names'
-        read together -- applies to every name of it, so an alias escapes nothing.
+      - A live owner-rating BREACH in any history of the seat -- its roster name's, any alias's, or
+        all its names' read together -- applies to every name of it, so an alias escapes nothing.
+        A history is in breach as its own row would read it, and heals only on 60 ratings of its own.
       - REVERSALS are charged across the names: another name's reversed decisions in -RecentDays
-        count in this rate, while its unreversed ones never dilute it.
+        count in this name's rate, while its unreversed ones never dilute it. The rate itself is
+        this name's, so a rate breach under another name reaches this one only through the
+        reversals it charges here.
       The gate and the digest both call this, so they apply the ruling alike.
     #>
     param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays,
@@ -656,13 +656,19 @@ function Get-DecisionCalibration {
     $blind = if ($st.N -lt 60) { "review path, $($st.N)/60 samples" }
     elseif ($st.Breached) { "BREACH: review path, $($st.Since)/60 fresh samples" }
     else { $blindOk = $true; 'calibrated' }
-    # The seat's other histories: each other name alone, then every name together, which also
-    # catches disagreements split across names so that no one name holds more than 3.
+    # The seat's other histories: each other name alone, then, when no single history is in breach
+    # and two or more names hold ratings, every name together, which catches disagreements split
+    # across names so that no one name holds more than 3.
     $breachedIn = [System.Collections.Generic.List[string]]::new()
+    $ratedNames = [int]($st.N -gt 0)
     foreach ($g in $otherNames) {
-        if ((Get-DecisionBlindState $g.Group $Ratings).Breached) { $breachedIn.Add($g.Name) }
+        $o = Get-DecisionBlindState $g.Group $Ratings
+        if ($o.N) { $ratedNames++ }
+        if ($o.Breached) { $breachedIn.Add($g.Name) }
     }
-    if ($others.Count -and (Get-DecisionBlindState $family $Ratings).Breached) { $breachedIn.Add("all of $canon's names together") }
+    if (-not $st.Breached -and -not $breachedIn.Count -and $ratedNames -ge 2 -and (Get-DecisionBlindState $family $Ratings).Breached) {
+        $breachedIn.Add("all of $canon's names together")
+    }
     if ($breachedIn.Count) {
         $seatBreach = "BREACH in seat $canon's history ($($breachedIn -join ', ')): review path"
         $blind = if ($blindOk) { $seatBreach } else { "$blind; $seatBreach" }

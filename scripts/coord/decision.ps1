@@ -381,9 +381,8 @@ function Invoke-DecisionGate {
         $closed = $false
 
         # Calibration reads the window alone, so it is the digest's whatever else was read for joins.
-        # Every seat's Class B pool, and -Seat as asked: Get-DecisionCalibration joins the seat's names
-        # by roster name, never by raw string (BACKLOG #5597), keeps the samples that name's own, and
-        # applies a breach or a reversal under any name of the seat (owner ruling 2026-11-15, option c).
+        # Every seat's Class B pool and -Seat as asked; Get-DecisionCalibration applies the alias
+        # ruling (owner ruling 2026-11-15, option c) and says how.
         $cal = Get-DecisionCalibration -Ratings $ratings -Outcomes $outcomes -RecentDays @(Get-DecisionDayRange $today 14) -Seat $Seat -Decisions @($all | Where-Object {
                 $_.kind -eq 'decision' -and $_.class -eq 'B' -and $window -contains (Get-DecisionIdDay ([string]$_.id))
             })

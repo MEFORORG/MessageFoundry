@@ -16,6 +16,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1070,7 +1071,7 @@ def test_a_reversal_of_a_decision_the_log_does_not_hold_reviews(sb: Sandbox) -> 
 def test_an_alias_keeps_its_own_samples_and_takes_its_seats_breach(sb: Sandbox) -> None:
     """Option c in one place: `mgr`'s own calibrated 60 do not save it from the manager's breach,
     and `manager2`, with no samples of its own, does not borrow the calibrated manager's."""
-    seed_vault(sb, calibrated("mgr"))
+    seed_vault(sb, calibrated("mgr") + calibrated("builder"))
     assert gate(sb, seat="mgr")[0] == NO_REVIEW, "the control: mgr's own 60 calibrate it"
     seed_vault(sb, calibrated("manager"))
     assert gate(sb)[0] == NO_REVIEW, "the control: the manager itself is calibrated"
@@ -1080,32 +1081,32 @@ def test_an_alias_keeps_its_own_samples_and_takes_its_seats_breach(sb: Sandbox) 
     seed_vault(sb, _rated("manager", 19, disagree=(10, 20, 30, 40)))
     code, doc = gate(sb, seat="mgr")
     assert code == REVIEW, why(doc)
-    assert "BREACH in seat manager's history (manager" in why(doc), why(doc)
+    assert "BREACH in seat manager's history (manager)" in why(doc), why(doc)
+    assert gate(sb, seat="builder")[0] == NO_REVIEW, "a breach closed a seat it does not belong to"
 
 
-def test_disagreements_split_across_a_seats_names_are_one_breach(sb: Sandbox) -> None:
+@pytest.mark.parametrize(
+    ("theirs", "expected"), [((0, 1), REVIEW), ((0,), NO_REVIEW)], ids=["four", "three"]
+)
+def test_disagreements_split_across_a_seats_names_are_one_breach(
+    sb: Sandbox, theirs: tuple[int, ...], expected: int
+) -> None:
     """Two under `manager`, at the end of its 60, and two under `manager1`, at the start of its 60:
-    neither name alone holds more than 3, but one trailing 60 of the seat holds all four."""
+    neither name alone holds more than 3, but one trailing 60 of the seat holds all four. Three
+    split the same way are no breach, the control."""
     seed_vault(
-        sb, _rated("manager", 19, disagree=(58, 59)) + _rated("manager1", 18, disagree=(0, 1))
+        sb, _rated("manager", 19, disagree=(58, 59)) + _rated("manager1", 18, disagree=theirs)
     )
     code, doc = gate(sb, seat="manager1")
-    assert code == REVIEW, why(doc)
-    assert "BREACH in seat manager's history (all of manager's names together)" in why(doc), why(
-        doc
-    )
+    assert code == expected, why(doc)
+    if expected == REVIEW:
+        assert "BREACH in seat manager's history (all of manager's names together)" in why(doc)
 
 
-@pytest.mark.parametrize("seat_count", [60, 10], ids=["full-history", "short-history"])
-def test_an_aliass_clean_samples_do_not_heal_its_seats_breach(sb: Sandbox, seat_count: int) -> None:
+def test_an_aliass_clean_samples_do_not_heal_its_seats_breach(sb: Sandbox) -> None:
     """120 newer clean ratings under `manager1` heal the breach in the names read together; the
-    manager's own history still holds it, so the alias stays closed. A history shorter than 60 is
-    its own trailing 60, so 4 disagreements in 10 ratings are a breach too."""
-    seed_vault(
-        sb,
-        _rated("manager", 19, disagree=(0, 1, 2, 3), count=seat_count)
-        + _rated("manager1", 18, count=120),
-    )
+    manager's own history still holds it, so the alias stays closed."""
+    seed_vault(sb, _rated("manager", 19, disagree=(0, 1, 2, 3)) + _rated("manager1", 18, count=120))
     code, doc = gate(sb, seat="manager1")
     assert code == REVIEW, why(doc)
     assert "BREACH in seat manager's history (manager)" in why(doc), why(doc)
@@ -1781,9 +1782,24 @@ def test_the_digest_closes_an_alias_on_its_seats_breach_as_the_gate_does(sb: San
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     out = proc.stdout
     assert "| mgr | B | 60 | 0 | BREACH in seat manager's history (manager" in out, out
-    assert "| MGR " not in out, out
+    assert not re.search(r"\|\s*MGR\s*\|", out), out
     gate_row = next(line for line in out.splitlines() if line.startswith("| mgr | 0 of 2"))
     assert gate_row.endswith("| no |"), out
+
+
+def test_the_digest_without_the_roster_reads_no_seat_calibrated(sb: Sandbox) -> None:
+    """The gate answers REVIEW for every seat when docs/roles/seats.json cannot be read, so the
+    digest says so and reads no seat calibrated. The roster present is the control."""
+    seed_vault(sb, calibrated("manager"))
+    with_roster = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "0")))
+    assert with_roster.returncode == 0, (with_roster.stdout, with_roster.stderr)
+    assert "| manager | 0 of 2 in the trailing 24 hours; open | yes |" in with_roster.stdout
+    (sb.repo / "docs" / "roles" / "seats.json").unlink()
+    assert gate(sb)[0] == REVIEW
+    proc = sb.run(DIGEST, *no_host_usage(sb, ("-Sample", "0")))
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert "The seat roster docs/roles/seats.json could not be read" in proc.stdout, proc.stdout
+    assert "| manager | 0 of 2 in the trailing 24 hours; open | no |" in proc.stdout, proc.stdout
 
 
 def test_the_digest_shows_the_gate_state_and_lists_the_attic_without_pruning(

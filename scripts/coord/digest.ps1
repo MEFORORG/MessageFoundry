@@ -275,15 +275,20 @@ $md.Add('')
 
 $md.Add('## Calibration, per seat and class')
 $md.Add('')
-$md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day. Each name keeps its own samples, but a breach under any name of its roster seat closes every name of it, and a row's acted and reversed counts also hold the reversed decisions logged under another name of its seat, as the gate reads them (owner ruling 2026-11-15, option c), so one reversal can show in several rows.")
+$md.Add("Trailing 60 rated decisions within the last $Window days; reversals over the 14 days ending $Day. Each name keeps its own samples, but an owner-rating breach under any name of its roster seat closes every name of it, and a row's acted and reversed counts also hold the reversed decisions logged under another name of its seat, as the gate reads them (owner ruling 2026-11-15, option c), so one reversal can show in several rows.")
 $md.Add('')
+$rosterRead = $null -ne (Get-DecisionSeatAliases)
+if (-not $rosterRead) {
+    # The gate answers REVIEW for every seat in this state, so the digest must not read calibrated.
+    $md.Add('**The seat roster docs/roles/seats.json could not be read**, so each name below stands alone, no alias is joined to its seat, and `decision.ps1 -Gate` answers REVIEW for every seat.')
+    $md.Add('')
+}
 $md.Add('| Seat | Class | Rated | Disagree | Blind status | Acted decisions, 14 days | Reversed | Reversal rate |')
 $md.Add('|---|---|---|---|---|---|---|---|')
 $recent = @(Get-DecisionDayRange $Day 14)
 # Kept by "name|class", so the gate-state table below reads each name's Class B row from here. A row
-# is one name, trimmed and lower-cased as the gate pools its samples, and Get-DecisionCalibration
-# applies the seat's breaches and reversals to it, as decision.ps1 -Gate does (owner ruling
-# 2026-11-15, option c), so this table agrees with what the gate answers.
+# is one name, as Get-DecisionCalibration pools samples; it applies the alias ruling for the gate and
+# for this table alike.
 $calibration = @{}
 $byClass = @{}
 foreach ($g in @($decisions | Group-Object { [string]$_.class })) { $byClass[$g.Name] = $g.Group }
@@ -326,7 +331,7 @@ $md.Add('| Seat | Seat reversal budget | Class B calibrated |')
 $md.Add('|---|---|---|')
 foreach ($s in @($decisions | ForEach-Object { ConvertTo-DecisionSeatLabel ([string]$_.seat) } | Where-Object { $_ } | Sort-Object -Unique)) {
     $cal = $calibration["$s|B"]
-    $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if ($cal -and $cal.Calibrated) { 'yes' } else { 'no' }) |")
+    $md.Add("| $s | $(Format-Budget (Get-DecisionBudget -Reversals $reversals -Now $asOf -Seat $s)) | $(if ($rosterRead -and $cal -and $cal.Calibrated) { 'yes' } else { 'no' }) |")
 }
 $md.Add('')
 $md.Add('Chain limit: each item where a further Class B decision would build on more than two unsampled ones, by the 24-hour floor. A decision''s own buildsOn links can only raise its depth.')
