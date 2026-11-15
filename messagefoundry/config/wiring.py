@@ -41,8 +41,10 @@ import io
 import ipaddress
 import logging
 import math
+import ntpath
 import os
 import re
+import stat
 import sys
 import threading
 import tokenize
@@ -10695,21 +10697,155 @@ def _enforce_posix_paths(
 # answer to "who can write this path" for config and for start, on each platform.
 
 
-def _file_and_folder(files: Iterable[Path]) -> list[Path]:
-    """Each file in ``files`` that exists, then the folder it sits in, each path once.
+def _stat_mode(path: Path) -> int | None:
+    """The mode of what an open of ``path`` reaches, following links.
 
-    The folder counts because whoever can write it can replace the file. A file that does not exist
-    is left out with its folder, because nothing reads it. The value file is read again on every
-    reload, and each of those reads checks it again (``serve``'s ``env_values``), so one created
-    after the start is checked when it is first read."""
-    return list(
-        dict.fromkeys(
-            path
-            for file in files
-            if file.is_file()
-            for path in (file.absolute(), file.absolute().parent)
-        )
-    )
+    ``None`` where no object can be opened by that path (:func:`is_missing_directory`), so nothing
+    there is read. Any other stat error raises: ``Path.is_dir`` and ``Path.is_file`` answer
+    ``False`` for it too, and the start check then vetted nothing there (vault BACKLOG #6654 items
+    2 and 17)."""
+    try:
+        return path.stat().st_mode
+    except OSError as exc:
+        if is_missing_directory(exc):
+            return None
+        raise
+
+
+def _link_chain(path: Path) -> tuple[list[Path], Path | None]:
+    """What a walk modelling an open of ``path`` passes through that its writer could re-point,
+    and where the walk ends.
+
+    The first list holds the real folder holding each link the walk follows, a folder link
+    anywhere in the path included, and on Windows the link itself: whoever can write that folder,
+    or on Windows the link, can re-point it between a vet and a read. A POSIX link's own mode
+    means nothing, so it is not listed. The list ends with the real object the walk reaches, which
+    the second item names too (vault BACKLOG #2596, #6654 item 5). Where the walk meets a name
+    that is not there, the list ends instead with the last real folder the walk reached on the way
+    to it, or, for a file met where a folder belongs, the folder holding that file, if a link led
+    there, and the second item is ``None``. A path may appear more than once. Only folders holding
+    a link are named: the folders above a path's own folder are not vetted, as for a path with no
+    link.
+
+    A model of how the open resolves, walked one name at a time from the root, so a relative link
+    target names a path from the real folder holding the link: on POSIX ``..`` is the real parent
+    of the folder reached, and on Windows the text is normalized before each pass. The model is
+    not the open: :func:`_file_and_folder` checks where it ends against the kernel's own answer.
+
+    Raises ``OSError`` where a name cannot be stat'ed for any reason but absence, a link cannot be
+    read, more than :data:`_LINK_HOPS` links are followed, or, on Windows, a name in the path or
+    in a link target holds a colon or ends in a space or a dot, a link leads to a device path, a
+    drive with no separator after it or a path rooted with no drive, the name is a reparse point
+    other than a symbolic link or a junction, or a relative link target holding ``..`` is met
+    after a junction. Each of those could leave a folder the open passes through unread, or have
+    the walk vet another object than the open reaches: Win32 strips a trailing dot or space where
+    a link's target, opened as written, keeps it, a joined name holding a colon restarts the path
+    at a drive (``anchor_path.windows_chain`` refuses both), and the open can resolve the ``..``
+    of a relative link reached through a junction against the path through the junction
+    (measured). That last refusal holds for the rest of the walk, so it also refuses some layouts
+    the open would land on safely, such as one with an absolute link between the junction and the
+    relative link: it fails closed."""
+    from messagefoundry.auth.anchor_path import _IO_REPARSE_TAG_MOUNT_POINT, _NAME_SURROGATE_BIT
+
+    windows = os.name == "nt"
+    found: list[Path] = []
+    hops = 0
+    # Measured on Windows: the open can resolve the ``..`` of a relative link reached through a
+    # junction against the path through the junction, not the real folder this walk reaches, so
+    # it can take a route this walk never vets. Once a junction is crossed, such a target is
+    # refused for the rest of the walk, which fails closed on some layouts the open lands on
+    # safely, such as an absolute link between the two.
+    junction_crossed = False
+    pending = os.fspath(path.absolute())
+    while True:
+        if windows:
+            # Win32 collapses ``.`` and ``..`` in the text before it follows any link.
+            pending = os.path.normpath(pending)
+        drive, rest = os.path.splitdrive(pending)
+        cur = drive + os.sep
+        cur_is_folder = True
+        parts = [part for part in rest.split(os.sep) if part]
+        if windows:
+            # Checked over the whole pass before anything is joined, as windows_chain does: a
+            # remaining name ``a:b`` joined after a link target restarts the path at ``a:\``.
+            if any(":" in part for part in parts):
+                raise OSError(errno.EINVAL, "a name in the path holds a colon")
+            if any(part.endswith((" ", ".")) and part not in (".", "..") for part in parts):
+                raise OSError(errno.EINVAL, "a name in the path ends in a space or a dot")
+        for index, name in enumerate(parts):
+            if name == ".":
+                continue
+            if name == "..":
+                # POSIX only: the kernel takes the parent of the folder already reached, which
+                # holds no link.
+                cur = os.path.dirname(cur)
+                cur_is_folder = True
+                continue
+            child = os.path.join(cur, name)
+            try:
+                st = os.lstat(child)
+            except OSError as exc:
+                if is_missing_directory(exc):
+                    if found:
+                        # A link leads here: whoever can write this folder can create the
+                        # missing name before the read. A file met where a folder belongs
+                        # (ENOTDIR) can be replaced by a folder through its own folder.
+                        found.append(Path(cur if cur_is_folder else os.path.dirname(cur)))
+                    return found, None
+                raise
+            tag = getattr(st, "st_reparse_tag", 0)
+            if not (stat.S_ISLNK(st.st_mode) or tag == _IO_REPARSE_TAG_MOUNT_POINT):
+                if tag & _NAME_SURROGATE_BIT:
+                    raise OSError(
+                        errno.EINVAL, f"a reparse point (tag 0x{tag:08x}) this check cannot follow"
+                    )
+                cur, cur_is_folder = child, stat.S_ISDIR(st.st_mode)
+                continue
+            hops += 1
+            if hops > _LINK_HOPS:
+                raise OSError(errno.ELOOP, f"more than {_LINK_HOPS} links were followed")
+            found.append(Path(cur))
+            if windows:
+                # GetNamedSecurityInfoW reads a link's own access list, not its target's.
+                found.append(Path(child))
+            target = os.readlink(child)
+            if windows:
+                target = _windows_link_target(target)
+            if not os.path.isabs(target):
+                if junction_crossed and ".." in re.split(r"[\\/]", target):
+                    raise OSError(
+                        errno.EINVAL, "a relative link climbing with '..' follows a junction"
+                    )
+                target = os.path.join(cur, target)
+            if tag == _IO_REPARSE_TAG_MOUNT_POINT:
+                junction_crossed = True
+            pending = os.path.join(target, *parts[index + 1 :])
+            break
+        else:
+            found.append(Path(cur))
+            return found, found[-1]
+
+
+#: Past every platform's own bound on a chain of links (40 on Linux, 63 on Windows), so a chain
+#: the open follows is never refused for its length alone.
+_LINK_HOPS: Final = 64
+
+
+def _windows_link_target(text: str) -> str:
+    """A Windows link's target, as :func:`_link_chain` joins it: its ``\\\\?\\`` prefix dropped.
+    Raises ``OSError`` for a target the walk could not follow to the folder the open reaches: a
+    device path, a drive with no separator after it (``D:x``), read from that drive's own working
+    directory, or a path rooted with no drive (``\\x``), which may name the object namespace."""
+    from messagefoundry.auth.anchor_path import _drive_relative, _strip_win_prefix
+
+    plain = _strip_win_prefix(text)
+    if plain is None:
+        raise OSError(errno.EINVAL, "a link leads to a device path")
+    if _drive_relative(plain):
+        raise OSError(errno.EINVAL, "a link leads to a drive with no separator after it")
+    if not ntpath.splitdrive(plain)[0] and plain[:1] in ("\\", "/"):
+        raise OSError(errno.EINVAL, "a link leads to a path rooted with no drive")
+    return plain
 
 
 def assert_trusted_start_paths(
@@ -10717,28 +10853,102 @@ def assert_trusted_start_paths(
 ) -> None:
     """Refuse a start that reads a settings file or value file another account could write.
 
-    ``files`` are the settings file and the value file this start reads. Each one that exists is
-    checked with the folder it sits in, by the config-source policy: on Windows the owner and DACL,
-    on POSIX the mode and the owning uid. A refusal raises :class:`WiringError` through
-    :func:`_refuse_unsafe_config_source`, so the clamped ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``
-    escape downgrades it exactly as it does a config refusal (vault BACKLOG #2599). Each message
-    starts with ``lead``, so a re-read of the value file on reload says what it refused.
+    ``files`` are the settings file and the value file this start reads. Each one that is a
+    regular file is checked with the folder it sits in, by the config-source policy: on Windows the
+    owner and DACL, on POSIX the mode and the owning uid. A refusal raises :class:`WiringError`
+    through :func:`_refuse_unsafe_config_source`, so the clamped
+    ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` escape downgrades it exactly as it does a config refusal
+    (vault BACKLOG #2599). Each message starts with ``lead``, so a re-read of the value file on
+    reload says what it refused.
 
     Neither file is code, but each one steers code: the settings file sets the posture, the DR hook
     command, the reload roots and the egress lists, and the value file feeds every ``env()`` lookup
     in the graph. A writer of either would own the service at its next start (vault BACKLOG #2626
     step 3).
 
-    Each of ``folders`` that exists is checked too, whether or not a file in it does: a reload that
-    applies value bytes read earlier needs the folder vetted even when the file has gone since
+    Each of ``folders`` that is a folder is checked too, whether or not a file in it is: a reload
+    that applies value bytes read earlier needs the folder vetted even when the file has gone since
     (vault BACKLOG #2596).
 
-    **Not checked**, at least: the folders above each file's own folder, and a file named in the
-    settings that the start reads later, such as a key, certificate or CRL file. Those have their
-    own checks where they are read, or none."""
-    paths = _file_and_folder(files)
-    paths += [f.absolute() for f in folders if f.is_dir() and f.absolute() not in paths]
+    Where a file or folder is reached through links, what :func:`_link_chain` names is checked
+    too, by the same policy; docs/SECURITY.md says what that refuses and misses (vault BACKLOG
+    #6654 item 5).
+
+    A path that cannot be stat'ed, for any reason but nothing being there, or whose link chain
+    cannot be walked, is refused with ``WiringError`` naming it, and the escape does not downgrade
+    that: nothing about it was vetted (vault BACKLOG #6654 item 2). So is a path whose open and
+    walk disagree, where one reaches an object and the other none, or ``os.path.samefile`` says
+    they reach two: the walk vetted another route than the open takes. That includes a path no
+    open can read but the walk can, such as one whose final link names a file with a trailing
+    separator, which is refused rather than read as absent. A file or folder that both
+    find not there is not itself checked, because nothing reads it; what its link chain names,
+    if a link leads to it, still is.
+
+    **Not checked**, at least: the folders above each file's own folder and above each folder
+    holding a link, a ``subst`` drive's own folder, and a file named in the settings that the start
+    reads later, such as a key, certificate or CRL file. Those have their own checks where they are
+    read, or none."""
+    paths = _file_and_folder(files, folders, lead=lead)
     _check_trusted_paths(paths, lead=lead, refuse=_refuse_unsafe_config_source)
+
+
+def _file_and_folder(
+    files: Iterable[Path], folders: Iterable[Path] = (), *, lead: str = "refusing to start from"
+) -> list[Path]:
+    """What :func:`assert_trusted_start_paths` checks, each path once: each of ``files`` that is a
+    regular file, then the folder it sits in, then what :func:`_link_chain` names for it with the
+    real file's real folder; then each of ``folders`` that is a folder, with what
+    :func:`_link_chain` names for it. A file or folder that is not there adds what its link chain
+    names, if a link leads to it, and nothing otherwise; so does a path holding a NUL, which no
+    open accepts, logged as skipped. Raises ``WiringError``, its message starting with ``lead``,
+    for a path that cannot be stat'ed or walked, and for one whose open and walk disagree: one
+    reaches an object and the other reaches none, or they reach two objects."""
+    paths: list[Path] = []
+    for path, folder in [*((f, False) for f in files), *((f, True) for f in folders)]:
+        if "\0" in os.fspath(path):
+            _logger.warning(
+                "the start check skipped %s: no file can have that name",
+                scrub_log_argument(repr(os.fspath(path))),
+            )
+            continue
+        try:
+            mode = _stat_mode(path)
+            present = mode is not None and (stat.S_ISDIR if folder else stat.S_ISREG)(mode)
+            chain, end = _link_chain(path)
+            # The kernel's own answer, against the walk's, for any gap left in the walk's model:
+            # a final link naming a file with a trailing separator, for one, which the open
+            # refuses (ENOTDIR) and the walk's split drops, or a ``\\?\`` target the walk normalizes and the open takes
+            # literally. Where they disagree the walk vetted another route than the open takes.
+            if mode is not None and end is None:
+                raise OSError(
+                    errno.EINVAL, "the open reaches an object where the walk reaches none"
+                )
+            if mode is None and end is not None:
+                raise OSError(
+                    errno.EINVAL, "the walk reaches an object where the open reaches none"
+                )
+            if end is not None and not os.path.samefile(path, end):
+                raise OSError(errno.EINVAL, "the open reaches another object than the walk")
+        except (OSError, ValueError) as exc:
+            # ValueError: a link target holding a NUL, which lstat refuses.
+            refusal = safe_exc(exc)
+        else:
+            if not present and (end is not None or not chain):
+                # Nothing there, or something that is not a file or folder as asked, with no
+                # dangling link leading anywhere a writer could create one.
+                continue
+            if present:
+                given = path.absolute()
+                paths += [given, given.parent] if not folder else [given]
+            # A dangling link's chain too: it ends with the last real folder the walk reached on
+            # the way to the missing name.
+            paths += chain
+            if end is not None and not folder:
+                paths.append(end.parent)
+            continue
+        # Outside the handler, so the refusal carries no __context__.
+        raise WiringError(f"{lead} {path}: could not vet it: {refusal}")
+    return list(dict.fromkeys(paths))
 
 
 def install_trust_paths() -> list[Path]:

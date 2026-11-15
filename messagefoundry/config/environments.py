@@ -207,7 +207,12 @@ def load_environment_values(
     Reads ``<base_dir>/<dir_name>/<environment>.toml`` (a flat table of scalars and arrays with no
     table in them) if present, then overlays ``MEFOR_VALUE_<KEY>`` env vars (env wins), then a ``MEFOR_VALUE_<KEY>`` file in the secrets
     directory (the directory wins; :mod:`messagefoundry.engine_secrets`). A missing file is **not** an error here —
-    referenced-but-undefined keys fail loud when a connector is built, not at gather time. A file
+    referenced-but-undefined keys fail loud when a connector is built, not at gather time. ``serve``
+    runs :func:`~messagefoundry.config.wiring.assert_trusted_start_paths` before this read, and
+    that check refuses a file the open finds missing where the walk of its links reaches one, so
+    under ``serve`` such a file is refused there rather than read as missing here. Callers that run
+    no such check, such as the ``check`` command's build check and the connections-edit
+    validation, read it as missing. A file
     that cannot be stated or read raises its ``OSError``
     (:func:`~messagefoundry.config.snapshot.is_regular_file` says which is which).
     :func:`environment_values_from_bytes` says what it refuses.

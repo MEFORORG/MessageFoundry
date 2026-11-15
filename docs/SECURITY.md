@@ -2845,13 +2845,42 @@ from disk instead. On a store that holds an in-process key, the approval covers 
 environment value file wherever `[environments].base_dir` puts it. A store with none binds a value
 file outside the config directory to nothing, as a later paragraph says. In the config directory's
 `environments/` folder the digest
-folds it. Elsewhere, the default layout, the release reads it into the snapshot after vetting the
-file, its folder, and the folder of each link along a chain of file links from it, and checks it
-against a keyed binding the hold took at request time, which the next paragraph describes. That
-vet misses at least these: a directory link
-in the path to the value file, or to any link along that chain, is resolved rather than walked,
-so the folder that holds it is not vetted, and on Windows the link objects themselves are not
-vetted (`Engine._value_file_folders` in [`pipeline/engine.py`](../messagefoundry/pipeline/engine.py)).
+folds it. Elsewhere, the default layout, the release reads it into the snapshot and checks it
+against a keyed binding the hold took at request time, which the next paragraph describes. In
+either place a reload with `serve`'s value provider vets the value file before it reads the config
+directory: the file, its folder, and, along the links a walk that models the open follows, the
+real folder holding each link, a folder link anywhere in its path included, each such link
+itself on Windows, and the real file and folder the links lead to (`_link_chain` in
+[`config/wiring.py`](../messagefoundry/config/wiring.py), vault BACKLOG #6654 item 5). Where a
+link leads to a file that is not there, the last folder the walk reaches on the way to it is
+vetted. A start vets
+the file and the links it follows the same way when the engine is built, before its first load
+reads the directory; where the value file is not there and no link leads to it, that check does
+not vet its folder. On Windows the open can resolve the `..` of a relative link reached through
+a junction against the path through the junction, not the real folder the walk reached
+(measured), so a relative link target holding `..` met after the walk crossed a junction is
+refused, whether or not a file is there. The refusal holds for the rest of the walk, so it also
+refuses some layouts the open would land on safely, such as one with an absolute link between
+the junction and the relative link: it fails closed. The check also stats the value file through the open's own resolution and
+refuses it where that and the walk disagree: one reaches something and the other reaches
+nothing, or `os.path.samefile` says they reach two different ones. That refuses at least a
+value file whose final link names a file with a trailing separator, which the open cannot read
+but the walk reads as that file; it is refused rather than read as a missing file. Where some
+other gap in the walk's model leads it and the open by different routes to the same object, or
+to nothing, the check passes, and what only the open's route passes through can go unvetted,
+the folder where a writer could plant the file before a read included. `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades
+neither refusal. A
+folder holding a link is judged by the rule the file's own folder is, so a link that sits directly
+in `C:\` or `C:\ProgramData`, as Windows ships them, is refused. The file or folder vetted, or a
+name along the links it follows, that cannot be stat'ed, for any reason but nothing being there,
+is refused rather than skipped; on POSIX the policy's own read of each path still skips one that
+stops answering after that stat. On Windows a name in the path or in a link's target that holds a
+colon, or ends in a dot or a space, is refused, as `anchor_path.windows_chain` refuses it: there
+the open can reach another object than the walk would vet. The walk stats each name from the
+root, so on Windows a value or settings file is refused where the engine's account may traverse a folder above it but not read
+its attributes, though the open would succeed. That vet misses at least the folders above each of
+those folders, the folders a `subst` drive letter stands for, and every other `environments/*.toml`
+file the snapshot reads but never applies.
 Where that value file alone cannot be read, the
 reload is refused, released or not, rather than reading it again from disk. Where the config
 directory cannot be read whole, a value file in its `environments/` folder included, a released
