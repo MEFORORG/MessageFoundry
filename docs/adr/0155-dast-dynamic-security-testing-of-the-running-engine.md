@@ -248,7 +248,7 @@ detectors judge each case:
 | `liveness` | After every case, a well-formed message on a new connection is accepted and persisted. |
 | `time` | Each case ends inside its budget. The listener closes a stalled or trickling peer inside the stall bound, and releases a closed one. |
 | `resources` | Heap (`tracemalloc`), OS handles (`psutil`) and asyncio tasks grow less than a fixed bound over repeated passes after a warm-up pass. |
-| `log_body` | No engine record at INFO or above carries a per-run sentinel planted in PID-5. This checks the call site; the receipt also says whether the shipped redaction filters would have removed a hit. |
+| `log_body` | No engine record at INFO or above carries a per-run sentinel. Since vault BACKLOG #5581 the MLLP, raw-TCP and X12 catalogue bodies, the mutation seeds and the liveness probes carry it (in PID-5 or an NTE on HL7, NM1-03 on X12). At least the header-only cases, a split frame cut before the sentinel and a mutation that removes it are not covered; the sweep module's docstring lists them. This checks the call site; the receipt also says whether the shipped redaction filters would have removed a hit. |
 
 **Every detector has a positive control that must fire.** Six canaries, each injected at the runtime
 seam and never by a source patch: `no-reply` (the supported `ack_mode=none`), `ack-and-drop`,

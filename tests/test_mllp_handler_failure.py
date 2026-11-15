@@ -595,13 +595,16 @@ async def test_an_owed_reply_that_cannot_be_built_closes_the_connection(
 
 async def test_a_codec_fault_in_the_listener_still_drops_as_framing_error() -> None:
     # The last-resort arm (ASVS 16.5.4) still covers the listener's own path: a reply the
-    # listener's encoding cannot carry is not a handler fault, and it still drops the connection.
+    # listener's encoding can neither carry nor replace characters in is not a handler fault, and
+    # it still drops the connection. BACKLOG #5799: a narrow charset that can replace now answers
+    # (the next test), so this uses idna: its strict encode refuses a label over 63 characters,
+    # and it supports no `replace` error handler at all.
     cap = _Capture()
-    source = _mllp(encoding="ascii")
+    source = _mllp(encoding="idna")
     source.on_connection_event = cap
 
     async def unencodable(raw: bytes) -> str:
-        return build_ack(raw, code="AA", text="café")
+        return build_ack(raw, code="AA", text="a" * 64)
 
     await source.start(unencodable)
     try:
@@ -615,6 +618,32 @@ async def test_a_codec_fault_in_the_listener_still_drops_as_framing_error() -> N
         await asyncio.wait_for(source.stop(), timeout=5.0)
     kinds = cap.kinds()
     assert "framing_error" in kinds and "handler_error" not in kinds, kinds
+
+
+async def test_a_reply_a_narrow_charset_cannot_hold_is_still_sent() -> None:
+    # BACKLOG #5799: the reply is written after the message is committed, so dropping the
+    # connection here made the sender resend a stored message. The character the charset cannot
+    # hold is replaced, and the sender gets its ACK on a connection that stays open. Mutation:
+    # re-raise UnicodeEncodeError in frame_reply. Red: the reply is b"" and framing_error is seen.
+    cap = _Capture()
+    source = _mllp(encoding="ascii")
+    source.on_connection_event = cap
+
+    async def narrow(raw: bytes) -> str:
+        return build_ack(raw, code="AA", text="café")
+
+    await source.start(narrow)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        writer.write(frame(_ADT))
+        await writer.drain()
+        reply = await _read_reply(reader)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert b"MSA|AA|MSG1|caf?" in reply, reply
+    assert "framing_error" not in cap.kinds(), cap.kinds()
 
 
 async def _raise_locked(*args: Any, **kwargs: Any) -> NoReturn:

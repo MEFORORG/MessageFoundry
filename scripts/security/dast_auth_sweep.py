@@ -25,7 +25,8 @@ FIVE PASSES, over the gated HTTP rows derived by ``scripts/security/route_gates.
   BFLA         every gated GET whose permission set the low-privilege role does NOT hold, with the
                viewer bearer. Refused = {401, 403, 429}; anything else is a finding, INCLUDING 404 —
                the path template matched, so a 404 means the caller got past authorization into
-               resource lookup.
+               resource lookup. A 403 carrying a step-up header is a finding too: the engine asks for
+               a step-up only after the permission check passed (see :func:`is_bfla_refused`).
   WRITE BFLA   the same rule over the non-GET candidate rows.
   WRITE REACH  every gated non-GET row, with the administrator bearer, re-proving as REACH does.
                Runs LAST, so no earlier measurement can depend on state a write probe left behind.
@@ -78,7 +79,7 @@ import argparse
 import asyncio
 import json
 import sys
-from collections.abc import Coroutine, Sequence
+from collections.abc import Coroutine, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Final
@@ -141,6 +142,16 @@ _PREFIX = "dast_auth_sweep"
 #: The header an action-bound step-up gate names its action in (ADR 0077). Read only to decide
 #: whether to re-prove; its value is never written to the receipt.
 STEP_UP_ACTION_HEADER = "X-Step-Up-Action"
+
+#: The header every step-up refusal carries (``_step_up_refusal`` in ``api/security.py``), with or
+#: without ``X-Step-Up-Action``. Read only as present or absent; never written to the receipt.
+STEP_UP_REQUIRED_HEADER = "X-Step-Up-Required"
+
+#: The ``expected`` text of a BFLA finding whose 403 was a step-up challenge.
+_STEP_UP_CHALLENGE_EXPECTED: Final = (
+    "401, 403 or 429 without a step-up header; a 403 asking for a step-up means the permission "
+    "check let this caller through to the step-up gate"
+)
 
 
 class PolicyError(RuntimeError):
@@ -213,6 +224,61 @@ def is_refused(status: int) -> bool:
     return status in REFUSED
 
 
+def is_step_up_challenge(status: int, headers: Mapping[str, str]) -> bool:
+    """Whether a response is a step-up gate's 403 rather than a permission refusal.
+
+    ``headers`` is an ``httpx.Headers`` on the live path, whose lookups ignore case.
+    """
+    return status == 403 and bool(
+        headers.get(STEP_UP_REQUIRED_HEADER) or headers.get(STEP_UP_ACTION_HEADER)
+    )
+
+
+def is_bfla_refused(status: int, step_up_challenged: bool) -> bool:
+    """The BFLA oracle: whether the LOW-PRIVILEGE caller was refused by authorization itself.
+
+    Vault BACKLOG #5580. Every step-up gate in ``api/security.py`` runs ``_admit`` first, and
+    ``_admit`` checks the route's permissions before it returns, so its permission refusal is a
+    plain 403 with no step-up header. A 403 that DOES carry ``X-Step-Up-Required`` or
+    ``X-Step-Up-Action`` (:func:`is_step_up_challenge`) was raised after the permission check
+    passed: RBAC admitted a caller the route's permission set excludes, and only the step-up wall
+    stood in front of the handler. Scoring that 403 as a refusal, as :func:`is_refused` alone does,
+    would let an RBAC bypass on any step-up route pass the sweep with no finding.
+
+    ``X-MFA-Required`` is not read. ``_admit`` raises it ABOVE the permission loop, so on its own it
+    cannot tell a refusal from a bypass, although some gates also raise it after the loop; the
+    scanned posture leaves MFA off, so no BFLA probe meets it. Nor is a post-permission 429 from
+    the admin-write pacing told apart: the posture disables that limiter. Both are latent blind
+    spots of a header-based oracle, recorded here rather than assumed away.
+    """
+    return is_refused(status) and not step_up_challenged
+
+
+async def _send(
+    client: httpx.AsyncClient, method: str, url: str, token: str | None
+) -> httpx.Response:
+    """One request with ``token`` as the bearer, or no credential when it is ``None``."""
+    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+    return await client.request(method, url, headers=headers)
+
+
+async def _bfla_probe(
+    client: httpx.AsyncClient, method: str, url: str, token: str
+) -> tuple[int, bool]:
+    """One low-privilege probe: ``(status, step-up challenged)``. Only the status code and whether
+    a step-up header was present leave this function, never a header value."""
+    response = await _send(client, method, url, token)
+    return response.status_code, is_step_up_challenge(response.status_code, response.headers)
+
+
+def _bfla_finding(
+    method: str, path: str, pass_name: str, status: int, challenged: bool
+) -> dict[str, Any]:
+    """A BFLA finding, naming a step-up challenge in ``expected`` so a 403 finding reads right."""
+    expected = _STEP_UP_CHALLENGE_EXPECTED if challenged else "401, 403 or 429"
+    return _finding(method, path, pass_name, status, expected)
+
+
 def is_reached(status: int) -> bool:
     """Whether a privileged probe got past authentication and authorization. The inverse of
     :func:`is_refused`, named separately because it is the sweep's anti-fake-green measurement."""
@@ -253,9 +319,7 @@ def _finding(
 
 async def _probe(client: httpx.AsyncClient, method: str, url: str, token: str | None) -> int:
     """One request; the STATUS CODE is the only thing that leaves this function."""
-    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
-    response = await client.request(method, url, headers=headers)
-    return response.status_code
+    return (await _send(client, method, url, token)).status_code
 
 
 #: ``POST /me/reauth`` answers to a re-proof that would refuse every later re-proof too: the session
@@ -293,7 +357,7 @@ async def _reach_probe(
     the method and path template go into ``reproved`` and ``reproof_refused``, never the action: it
     is a header value.
     """
-    response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
+    response = await _send(client, row.method, url, token)
     action = response.headers.get(STEP_UP_ACTION_HEADER)
     if response.status_code != 403 or not action:
         return response.status_code, token
@@ -305,7 +369,7 @@ async def _reach_probe(
         reproof_refused.append(f"{row.method} {row.path}")
         return response.status_code, token
     reproved.append(f"{row.method} {row.path}")
-    response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
+    response = await _send(client, row.method, url, token)
     return response.status_code, token
 
 
@@ -321,9 +385,12 @@ async def _write_pass(
     rebuilt: list[str],
     reproved: list[str] | None = None,
     reproof_refused: list[str] | None = None,
-) -> tuple[list[tuple[route_gates.RouteRow, int]], str]:
+) -> tuple[list[tuple[route_gates.RouteRow, int, bool]], str]:
     """Probe ``rows`` with ``username``'s session, keeping that session alive across side effects.
-    Returns the results and the session's token as the pass left it.
+    Returns the results and the session's token as the pass left it. Each result is ``(row,
+    status, step-up challenged)``; the flag is measured on the BFLA path only and is ``False`` on
+    the reach path, where :func:`_reach_probe` re-proves an action-bound step-up 403 and scores
+    any other refusal as unreached.
 
     With ``reproved`` given, each probe passes an action-bound step-up wall through
     :func:`_reach_probe`, which records the row there, or in ``reproof_refused`` when the engine
@@ -350,11 +417,12 @@ async def _write_pass(
     if (reproved is None) != (reproof_refused is None):
         # Either both lists or neither: one without the other would drop refused re-proofs.
         raise ValueError("reproved and reproof_refused are passed together")
-    results: list[tuple[route_gates.RouteRow, int]] = []
+    results: list[tuple[route_gates.RouteRow, int, bool]] = []
     for row in rows:
         url = route_gates.concrete_path(row.path, placeholder)
+        challenged = False
         if reproved is None or reproof_refused is None:
-            status = await _probe(client, row.method, url, token)
+            status, challenged = await _bfla_probe(client, row.method, url, token)
         else:
             status, token = await _reach_probe(
                 client,
@@ -365,7 +433,7 @@ async def _write_pass(
                 reproved=reproved,
                 reproof_refused=reproof_refused,
             )
-        results.append((row, status))
+        results.append((row, status, challenged))
 
         # The liveness probe is a plain GET on the preflight route, so it can never itself mutate
         # anything, and it reuses is_refused() rather than carrying a second copy of the rule.
@@ -473,15 +541,14 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
 
             for row in (r for r in bfla_candidates if r.method == "GET"):
                 url = route_gates.concrete_path(row.path, placeholder)
-                status = await _probe(client, "GET", url, target.viewer_token)
+                status, challenged = await _bfla_probe(client, "GET", url, target.viewer_token)
                 bfla_probes += 1
-                if not is_refused(status):
+                if not is_bfla_refused(status, challenged):
                     # 404 counts. With the path template matched, it means the caller got PAST
-                    # authorization and into resource lookup.
+                    # authorization and into resource lookup. So does a step-up 403: the permission
+                    # check let the caller through to the step-up gate.
                     bfla_violations += 1
-                    findings.append(
-                        _finding(row.method, row.path, "bfla", status, "401, 403 or 429")
-                    )
+                    findings.append(_bfla_finding(row.method, row.path, "bfla", status, challenged))
 
             # The two write passes run LAST, and BFLA before REACH. Nothing measured earlier can then
             # depend on state a write probe left behind, and the low-privilege pass — which should be
@@ -497,15 +564,15 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
                 max_rebuilds=max_rebuilds,
                 rebuilt=rebuilt,
             )
-            for row, status in write_bfla_results:
+            for row, status, challenged in write_bfla_results:
                 write_bfla_probes += 1
-                if not is_refused(status):
+                if not is_bfla_refused(status, challenged):
                     # A missing body cannot manufacture a false PASS here, which is what makes the
                     # write pass sound: dependencies are solved BEFORE body validation, so a gate that
                     # meant to refuse this caller would have answered 403 and never reached the 422.
                     write_bfla_violations += 1
                     findings.append(
-                        _finding(row.method, row.path, "bfla-write", status, "401, 403 or 429")
+                        _bfla_finding(row.method, row.path, "bfla-write", status, challenged)
                     )
 
             write_reach_results, admin_token = await _write_pass(
@@ -520,7 +587,7 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
                 reproved=reproved,
                 reproof_refused=reproof_refused,
             )
-            for row, status in write_reach_results:
+            for row, status, _challenged in write_reach_results:
                 write_outcomes[write_probe_outcome(status)] += 1
                 if is_reached(status):
                     write_reached += 1

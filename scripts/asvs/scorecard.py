@@ -2296,7 +2296,10 @@ def _landing_swallows(source: str) -> bool:
 # backstop was written for.
 
 
-def _toplevel(source: str) -> tuple[dict[str, ast.arguments], set[str]] | None:
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+
+
+def _toplevel(source: str) -> tuple[dict[str, _FunctionNode], set[str]] | None:
     """Top-level function signatures by name, plus every top-level name bound. ``None`` if `source`
     does not parse.
 
@@ -2308,11 +2311,11 @@ def _toplevel(source: str) -> tuple[dict[str, ast.arguments], set[str]] | None:
         tree = ast.parse(source)
     except SyntaxError:
         return None
-    sigs: dict[str, ast.arguments] = {}
+    sigs: dict[str, _FunctionNode] = {}
     bound: set[str] = set()
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            sigs[node.name] = node.args
+            sigs[node.name] = node
             bound.add(node.name)
         elif isinstance(node, ast.ClassDef):
             bound.add(node.name)
@@ -2323,22 +2326,31 @@ def _toplevel(source: str) -> tuple[dict[str, ast.arguments], set[str]] | None:
     return sigs, bound
 
 
-def _signature(args: ast.arguments) -> tuple[object, ...]:
+def _signature(fn: _FunctionNode) -> tuple[object, ...]:
     """The call-compatible shape of a signature: what a CALL SITE can observe.
 
     Parameter NAMES are included, not just counts -- a rename breaks every keyword call, which is the
     same wrecking-ball failure as a wrong count and is invisible to an arity-only comparison. Default
-    values are compared by COUNT and never by value: a mutation legitimately changes what a default
-    IS (that can be the whole reintroduction), while changing how many there are moves the arity.
+    values are compared by PRESENCE and never by value: a mutation legitimately changes what a default
+    IS (that can be the whole reintroduction), while changing which parameters carry one moves the
+    arity. Positional defaults always trail, so their count fixes which parameters carry one;
+    keyword-only defaults do not, so each keyword-only parameter's presence is recorded in order --
+    moving a default from one to another keeps the count and breaks a call that omitted the other.
+
+    ``async`` is part of the shape too: a plain caller of an ``async def`` gets a coroutine it never
+    runs, and an awaiting caller of a ``def`` gets a non-awaitable, so a swap breaks every call site
+    with every parameter intact (BACKLOG #5590).
     """
+    args = fn.args
     return (
+        isinstance(fn, ast.AsyncFunctionDef),
         tuple(p.arg for p in args.posonlyargs),
         tuple(p.arg for p in args.args),
         tuple(p.arg for p in args.kwonlyargs),
         args.vararg.arg if args.vararg else None,
         args.kwarg.arg if args.kwarg else None,
         len(args.defaults),
-        sum(1 for d in args.kw_defaults if d is not None),
+        tuple(d is not None for d in args.kw_defaults),
     )
 
 
@@ -2383,8 +2395,10 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
             findings.problems.append(
                 f"{cell_id}: absence claim PROVE-ERROR — the mutation redefines {name}() with a "
                 f"different signature than {a.mutation_path} declares "
-                f"({_signature(margs)} vs {_signature(real)}). Applied, that raises TypeError at "
-                "every call site, so the observable would go red for the arity and not for the "
+                f"((async, positional-only, positional, keyword-only, *args, **kwargs, positional "
+                f"defaults, keyword-only defaults) = {_signature(margs)} vs {_signature(real)}). "
+                "Applied, that breaks every call site -- a TypeError, or a coroutine where a value "
+                "was expected -- so the observable would go red for the call shape and not for the "
                 "reintroduction — a wrecking ball wearing the shape of a surgical proof. Copy the "
                 "live signature; the mutation lives in a different repository from the symbol it "
                 "shadows, so nothing else keeps the two in step"

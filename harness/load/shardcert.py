@@ -894,6 +894,34 @@ class ShardCertNode(EngineNode):
         )
 
 
+def _copies_ok(delivering: int, acked_copies_missing: int) -> bool:
+    """The per-message copy check both co-located and driver pass bars gate on (BACKLOG #5575, #5640):
+    every ACKed message arrived at each destination the served router picks for it. An unknown fan-out
+    (``delivering < 1``) or an unmeasured count (``-1``) fails."""
+    return delivering >= 1 and acked_copies_missing == 0
+
+
+def _copies_label(delivering: int, acked_copies_missing: int) -> str:
+    """The render word for :func:`_copies_ok`: UNCHECKED when either input is unknown, else OK or LOSS."""
+    if delivering < 1 or acked_copies_missing < 0:
+        return "UNCHECKED"
+    return "OK" if acked_copies_missing == 0 else "LOSS"
+
+
+def _copies_missing(tracker: FailoverTracker, *, routing: str, dests: int, delivering: int) -> int:
+    """Copies of ACKed messages that never arrived, against exactly the destinations the served router
+    picks for each seq (:func:`destinations_for_seq`), read from each copy's lane label. O(A x D) under
+    broadcast and O(A x dests) under the partitioned modes, so an async caller runs it off the loop."""
+    fanout = max(delivering, 0)
+    if routing == BROADCAST:
+        every = frozenset(destinations_for_seq(0, routing=BROADCAST, dests=dests, fanout=fanout))
+        return tracker.acked_copies_missing(lambda _seq: every, fifo_lane_destination)
+    return tracker.acked_copies_missing(
+        lambda seq: destinations_for_seq(seq, routing=routing, dests=dests, fanout=fanout),
+        fifo_lane_destination,
+    )
+
+
 @dataclass
 class ShardCertReport:
     """The certification outcome — sink/drain-derived, plus store diagnostics."""
@@ -951,9 +979,9 @@ class ShardCertReport:
     notes: list[str] = field(default_factory=list)
     # BACKLOG #209 topology: the shape this run SERVED. `dests` is the destination-CONNECTION count
     # (topology), `handlers` (H) is the router's selection width, `delivering` (D) is the fan-out. Default
-    # sentinels (-1) so a caller that doesn't supply them is byte-identical; the CLI always does. The
-    # verdict here is a per-message-id set difference (`acked_not_delivered`), so it is fan-out-agnostic —
-    # these are RECORDED so a reader can tell an H!=D run from a default-shape one (schema_version 2).
+    # sentinels (-1); the CLI always supplies them. Since BACKLOG #5575 `delivering` is a GATE INPUT, not
+    # only a record: the per-message copy check (`acked_copies_missing`) expects D copies of each ACKed
+    # message, and an unknown D (-1) FAILS the verdict (schema_version 2 recorded the shape; v5 gates on it).
     dests: int = -1
     handlers: int = -1
     delivering: int = -1
@@ -978,6 +1006,12 @@ class ShardCertReport:
     #: ``-1`` = NOT RECORDED ⇒ a ``sent`` shortfall is OFFER_SHORTFALL (cause-neutral), never DRIVE_SHORTFALL.
     deferred_backpressure: int = -1  # full send buffers ⇒ THE ENGINE would not take the bytes
     deferred_schedule: int = -1  # tick-lag / no target ⇒ THE RIG could not schedule the sends
+    #: Copies of ACKed messages that never arrived (BACKLOG #5575): per ACKed seq, the destinations the
+    #: served router picks for it that no copy's lane label names
+    #: (:meth:`FailoverTracker.acked_copies_missing`). Must be 0. ``-1`` = NOT MEASURED, which FAILS
+    #: :attr:`copies_ok`: ``acked_not_delivered`` counts DISTINCT messages, so one copy of each clears it
+    #: and a fan-out run that lost most of its copies would otherwise certify PASS.
+    acked_copies_missing: int = -1
 
     @property
     def inbound_bands(self) -> int:
@@ -986,14 +1020,26 @@ class ShardCertReport:
         return inbound_band_count(len(self.shards), self.lanes_per_shard)
 
     @property
+    def copies_ok(self) -> bool:
+        """Every ACKed message arrived at each destination the served router picks for it
+        (:func:`_copies_ok`, the same check the two-box driver gates on)."""
+        return _copies_ok(self.delivering, self.acked_copies_missing)
+
+    @property
+    def lossless(self) -> bool:
+        """The loss half of :attr:`ok`, which the ladder's step record also reads as ``no_loss``: every
+        copy arrived, no ACKed message is missing, and the pipeline drained."""
+        return self.copies_ok and self.acked_not_delivered == 0 and self.drained
+
+    @property
     def ok(self) -> bool:
-        """Pass bar: zero acknowledged loss, drained pipeline, per-lane FIFO (non-vacuous), no
-        dead-letters, no stranded non-terminal rows. Duplicates are allowed only across a kill."""
+        """Pass bar: :attr:`lossless` (every ACKed message delivered to each of its expected
+        destinations, drained pipeline), per-lane FIFO (non-vacuous), no dead-letters, no stranded
+        non-terminal rows. Duplicates are allowed only across a kill."""
         dup_ok = self.lane_repeats == 0 if self.killed_shard is None else True
         return (
             self.acked > 0
-            and self.acked_not_delivered == 0
-            and self.drained
+            and self.lossless
             and self.in_pipeline_final == 0
             and self.engine_dead == 0
             and self.lane_inversions == 0
@@ -1008,6 +1054,8 @@ class ShardCertReport:
             + (f"  killed={self.killed_shard}" if self.killed_shard else "  (baseline, no kill)"),
             f"  sent={self.sent} acked={self.acked} delivered_distinct={self.delivered_distinct} "
             f"sink_received={self.sink_received}",
+            f"  fanout(delivering)={self.delivering} acked_copies_missing={self.acked_copies_missing} -> "
+            + _copies_label(self.delivering, self.acked_copies_missing),
             f"  acked_not_delivered={self.acked_not_delivered} (0 = no acknowledged loss)",
             f"  lane_inversions={self.lane_inversions} lanes_observed={self.lanes_observed} "
             f"lane_repeats(dups)={self.lane_repeats}",
@@ -1031,7 +1079,7 @@ class ShardCertReport:
         return {
             # v2 (BACKLOG #209): adds the `topology` block. The `--handlers`/`--delivering` CLI knobs let
             # this report describe an H!=D run, so a reader can no longer assume H = D = dests; the shape
-            # is now RECORDED. (The PASS/FAIL verdict itself is a fan-out-agnostic set difference, unchanged.)
+            # is now RECORDED. (v2's PASS/FAIL was a fan-out-agnostic set difference; v5 below changes that.)
             #
             # v3 (PARTITIONED routing): `topology.routing` is new, and the MEANING of `handlers`/`delivering`
             # is now MODE-DEPENDENT — under `partitioned` they are the DERIVED accounting pair (1, 1) while
@@ -1046,7 +1094,11 @@ class ShardCertReport:
             #    is unauditable — and a pool bind is column-for-column identical to a pooled-claim wall.
             #  * `topology.lanes_per_shard` / `topology.inbound_bands` — G, the INGRESS/ROUTED pool width.
             #    At G < dests the INBOUND pool is the narrow one and any plateau is an ingress plateau.
-            "schema_version": 4,
+            #
+            # v5 (BACKLOG #5575) — the PASS bar CHANGED: `correctness.acked_copies_missing` is new and gated.
+            # A v4 PASS checked only that each ACKed message reached SOME sink, so a fan-out run that lost
+            # most of its copies could PASS; a v5 PASS also requires every expected copy to have arrived.
+            "schema_version": 5,
             "kind": "shardcert",
             "verdict": "PASS" if self.ok else "FAIL",
             "shards": list(self.shards),
@@ -1080,6 +1132,7 @@ class ShardCertReport:
             "store_pool": self.pool.to_json_dict(),
             "correctness": {
                 "acked_not_delivered": self.acked_not_delivered,
+                "acked_copies_missing": self.acked_copies_missing,
                 "lane_inversions": self.lane_inversions,
                 "lanes_observed": self.lanes_observed,
                 "lane_repeats": self.lane_repeats,
@@ -1176,38 +1229,158 @@ async def _await_port(host: str, port: int, *, timeout: float) -> bool:
 # --- store helpers (SQL Server) ----------------------------------------------
 
 
+#: The tables :func:`_reset_store` empties, children before ``messages`` (``queue`` and ``response``
+#: carry a foreign key to it, and SQL Server refuses a DELETE while a row still refers to it). The names
+#: are spliced into T-SQL, so this must stay a LITERAL constant: never build it from settings or input.
+_RESET_TABLES = (
+    "queue",
+    "response",
+    "delivered_keys",
+    "state",
+    "leader_lease",
+    "nodes",
+    "cluster_config",
+    "messages",
+)
+
+
+def _store_driver_error() -> type[Exception]:
+    """The SQL Server driver's error base class. Lazily imported: pyodbc is the optional ``sqlserver``
+    extra, and only :func:`_reset_store` needs it."""
+    import pyodbc
+
+    error: type[Exception] = pyodbc.Error
+    return error
+
+
+class StoreResetFailed(RuntimeError):
+    """:func:`_reset_store` could not empty a table, so the run would certify against stale rows."""
+
+
+#: The coord message the ENGINE half posts when its setup failed before SHARDS_READY (today: a
+#: :class:`StoreResetFailed`), so the drive half stops at once instead of waiting out its whole
+#: ``shards_ready_timeout`` for a SHARDS_READY that will never come.
+ENGINE_SETUP_FAILED = "engine_setup_failed"
+
+
+class EngineSetupFailed(CoordTimeout):
+    """The ENGINE half posted :data:`ENGINE_SETUP_FAILED`, so no SHARDS_READY will arrive. A
+    :class:`CoordTimeout` so every caller that already treats a missing SHARDS_READY as a rendezvous
+    failure (setup abort, exit 2) handles this the same way, only sooner."""
+
+
+async def _await_shards_ready(coord: FileDropCoord, *, timeout: float) -> dict[str, Any]:
+    """Wait for SHARDS_READY, failing fast on :data:`ENGINE_SETUP_FAILED` (BACKLOG #5576)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        ready = coord.read(SHARDS_READY)
+        if ready is not None:
+            return ready
+        failed = coord.read(ENGINE_SETUP_FAILED)
+        if failed is not None:
+            # The reason is the OTHER box's text read from a shared directory: escape it before it can
+            # reach a terminal through a CLI that prints this exception.
+            reason = escape_for_terminal(str(failed.get("reason")), single_line=True)
+            raise EngineSetupFailed(
+                f"the engine half failed its setup before SHARDS_READY: {reason}"
+            )
+        if loop.time() >= deadline:
+            raise CoordTimeout(
+                f"coord message {SHARDS_READY!r} not received within {timeout}s (dir={coord.directory})"
+            )
+        await asyncio.sleep(0.25)
+
+
+async def _reset_store_or_signal(coord: FileDropCoord, node_env: Mapping[str, str]) -> None:
+    """The ENGINE half's :func:`_reset_store`, telling a waiting drive half at once when it fails
+    (:data:`ENGINE_SETUP_FAILED`). The post is best-effort: a coord write error must not replace the
+    :class:`StoreResetFailed` the CLI turns into exit 2."""
+    try:
+        await _reset_store(node_env)
+    except StoreResetFailed:
+        # A fixed reason, not str(exc): the coord directory is shared across hosts and carries metadata
+        # only, and the driver's error text names the server, database and table. It stays on stderr.
+        with contextlib.suppress(OSError):
+            coord.post(
+                ENGINE_SETUP_FAILED, {"reason": "store reset failed (see the engine box's stderr)"}
+            )
+        raise
+
+
 async def _reset_store(env: Mapping[str, str]) -> None:
-    """DELETE the pipeline tables so a re-run starts clean (mirrors test_load_failover_sqlserver)."""
+    """DELETE the pipeline tables so a re-run starts clean (mirrors test_load_failover_sqlserver).
+
+    FAIL-CLOSED (BACKLOG #5576). A table that does not exist is legitimately empty and is skipped in
+    SQL (``OBJECT_ID``), but any other DELETE failure raises :class:`StoreResetFailed`, and so does a
+    table that still holds rows after the DELETE. Suppressing the error would leave rows from an earlier
+    run in place for this run's drain and store-truth reads to count."""
     import os
 
     from messagefoundry.config.settings import load_settings
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.store.sqlserver import SqlServerStore
 
+    driver_error = _store_driver_error()
     # The TLS-escape guard (insecure_tls_allowed) reads os.environ DIRECTLY, so the parent-process
     # store open needs the escape + creds in os.environ, not just the load_settings `environ=` arg.
     with _env_scope(dict(env)):
         settings = load_settings(environ=os.environ).store
         # The escape needs a known warn posture (vault BACKLOG #2354); this rig is a dev container.
-        store = await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
+        try:
+            store = await SqlServerStore.open(settings, posture=HopPosture(enforcing=False))
+        except driver_error as exc:
+            raise StoreResetFailed(
+                f"store reset could not open the store: {type(exc).__name__}: {exc}"
+            ) from exc
     try:
         async with store._pool.acquire() as conn:
             cur = await conn.cursor()
-            for table in (
-                "queue",
-                "response",
-                "delivered_keys",
-                "state",
-                "leader_lease",
-                "nodes",
-                "cluster_config",
-                "messages",
-            ):
-                with contextlib.suppress(Exception):
-                    await cur.execute(f"DELETE FROM {table}")
-            await conn.commit()
+            for table in _RESET_TABLES:
+                try:
+                    await cur.execute(
+                        f"IF OBJECT_ID(N'{table}', N'U') IS NOT NULL DELETE FROM {table}"
+                    )
+                except driver_error as exc:
+                    raise StoreResetFailed(
+                        f"store reset could not empty {table!r}: {type(exc).__name__}: {exc}"
+                    ) from exc
+            try:
+                await conn.commit()
+            except driver_error as exc:
+                raise StoreResetFailed(
+                    f"store reset could not commit: {type(exc).__name__}: {exc}"
+                ) from exc
+            # Read back after the commit: the DELETEs reporting success is not the tables being empty.
+            # It is a point-in-time read. A writer still running from an earlier run can refill a table
+            # after it, and nothing here stops that. One round trip names every table holding rows.
+            try:
+                left = await _reset_leftovers(cur)
+            except driver_error as exc:
+                raise StoreResetFailed(
+                    f"store reset could not read back: {type(exc).__name__}: {exc}"
+                ) from exc
+            if left:
+                raise StoreResetFailed(f"store reset left rows in {left} after the DELETE")
     finally:
         await store.close()
+
+
+async def _reset_leftovers(cur: Any) -> list[str]:
+    """The reset tables still holding rows, in one round trip."""
+    await cur.execute(
+        "SET NOCOUNT ON; DECLARE @left TABLE (t sysname); "
+        + " ".join(
+            # Nested, not `AND`: T-SQL compiles a whole IF condition and does not promise to
+            # short-circuit, so `EXISTS (SELECT 1 FROM t)` must sit in its own statement for a
+            # missing table to be skipped rather than raise error 208.
+            f"IF OBJECT_ID(N'{t}', N'U') IS NOT NULL IF EXISTS (SELECT 1 FROM {t}) "
+            f"INSERT INTO @left VALUES (N'{t}');"
+            for t in _RESET_TABLES
+        )
+        + " SELECT t FROM @left"
+    )
+    return [str(r[0]) for r in await cur.fetchall()]
 
 
 @dataclass(frozen=True)
@@ -1224,7 +1397,9 @@ class QueueBreakdown:
     strand blocks in ``[0, 1]`` (a delivering handler's row blocks one, a non-delivering handler's blocks
     zero) — rather than the stage-blind flat one the opaque ``stranded + dead`` total forced. The per-stage
     split sums to ``nonterminal + dead_total`` (every ``queue`` row sits at exactly one of the three
-    stages: ``ingress`` → ``routed`` → ``outbound``)."""
+    stages: ``ingress`` → ``routed`` → ``outbound``), EXCEPT for a row at any other stage, such as the
+    optional ``response`` stage (ADR 0013): it counts in ``nonterminal``/``dead_total`` and in no split
+    field, and the ladder's A4b permit charges that residual D copies a row (BACKLOG #5577)."""
 
     nonterminal: int
     dead_total: int
@@ -1235,7 +1410,8 @@ class QueueBreakdown:
 
 
 #: The three persisted pipeline stages (ADR 0001 Step B), lower-cased for a case-insensitive match against
-#: the stored ``stage`` discriminator. Every ``queue`` row sits at exactly one of these.
+#: the stored ``stage`` discriminator. A row at any other stage (the optional ``response`` stage, ADR
+#: 0013) is counted in the totals but in no split field; see :class:`QueueBreakdown`.
 _PIPELINE_STAGES = ("ingress", "routed", "outbound")
 
 
@@ -1410,9 +1586,9 @@ async def run_shardcert(
     poller during the hold, ``in_pipeline_peak`` stays ``-1``).
 
     ``handlers`` (H) / ``delivering`` (D) are the BACKLOG #209 shape split; both default to ``dests``
-    (⇒ the pre-#209 ``H = D = dests`` graph). ``dests`` remains TOPOLOGY only. This single-box path's
-    verdict is a per-message-id set difference (``acked_not_delivered``), so it is fan-out-agnostic by
-    construction and needs no D-keyed arithmetic — it only has to SERVE the requested shape.
+    (⇒ the pre-#209 ``H = D = dests`` graph). ``dests`` remains TOPOLOGY only. Since BACKLOG #5575 the
+    verdict is NOT fan-out-agnostic: ``acked_copies_missing`` expects each ACKed message at every
+    destination the served router picks for it, so ``routing``/``dests``/``delivering`` are gate inputs.
     """
     import os
 
@@ -1671,7 +1847,8 @@ async def run_shardcert(
         final = poller.final
 
         # Store-truth: stranded non-terminal rows + stage/status breakdown. (Single-box gates no-loss
-        # on the SINK-truth `acked_not_delivered==0`, so the all-stage dead total is surfaced in the
+        # on the SINK truth -- `acked_copies_missing==0` and `acked_not_delivered==0` -- so the all-stage
+        # dead total is surfaced in the
         # breakdown but not separately gated here — see ShardCertEngineReport for the two-box rationale.)
         _qb = await _queue_breakdown(node_env)
         stranded, breakdown = _qb.nonterminal, _qb.summary
@@ -1707,6 +1884,10 @@ async def run_shardcert(
     e2e = e2e_agg.summary()
     e2e_first = e2e_first_hist.summary() if e2e_first_hist is not None else None
     e2e_second = e2e_second_hist.summary() if e2e_second_hist is not None else None
+    # Every sender and sink is stopped, so the tracker is final; the O(A x D) walk runs off the loop.
+    copies_missing = await asyncio.to_thread(
+        _copies_missing, tracker, routing=routing, dests=dests, delivering=r_delivering
+    )
     return ShardCertReport(
         shards=tuple(ids_list),
         owned=owned,
@@ -1720,6 +1901,9 @@ async def run_shardcert(
         delivered_distinct=tracker.delivered_count,
         sink_received=ctr.sink_received,
         acked_not_delivered=tracker.acked_not_delivered(),
+        # BACKLOG #5575: per message and per expected destination, so a fan-out run that delivered one copy
+        # of each message (which clears `acked_not_delivered`) still fails on the copies it lost.
+        acked_copies_missing=copies_missing,
         lane_inversions=tracker.lane_inversions,
         lanes_observed=tracker.lanes_observed,
         lane_repeats=tracker.lane_repeats,
@@ -1769,7 +1953,9 @@ async def run_shardcert(
 #: The gate VERSION stamped into the ladder JSON. Bumped whenever the sustain bar changes, so a reader
 #: cannot silently compare a ceiling measured under one gate against one measured under another. v2 added
 #: the `filling` term (2026-07-13) — see the `_FILLING_RATIO` block for its SCOPE (co-located ladder only).
-CEILING_GATE_VERSION = 2
+#: v3 (BACKLOG #5575): `no_loss` also requires every expected copy of every ACKed message
+#: (`ShardCertReport.lossless`), so a fan-out rung that lost copies is a ceiling, not a sustained rung.
+CEILING_GATE_VERSION = 3
 
 
 def _is_ceiling(*, no_loss: bool, achieved_intake: int, offered: int, filling: bool) -> bool:
@@ -1966,7 +2152,8 @@ class ShardCertStepRecord:
             ack_p50_ms=report.ack_p50_ms,
             ack_p99_ms=report.ack_p99_ms,
             drain_seconds=report.drain_seconds,
-            no_loss=report.acked_not_delivered == 0 and report.drained,
+            # BACKLOG #5575: a fan-out rung that lost copies is not lossless, whatever its distinct count.
+            no_loss=report.lossless,
             lane_inversions=report.lane_inversions,
             lane_repeats=report.lane_repeats,
             stranded_nonterminal=report.stranded_nonterminal,
@@ -2115,16 +2302,31 @@ class ShardCertLadderReport:
     #: exit 2 — nothing was established about the engine at the stopping rung. ``None`` when the ceiling is
     #: admissible (or engine-bound, which KEEPS its rate) or the climb never stopped.
     ceiling_void_reason: str | None = None
+    #: BACKLOG #5576: the climb stopped because a rung's store reset failed (:class:`StoreResetFailed`).
+    #: The rungs measured before it are kept; the run is SETUP_DEGRADED (exit 2), never a clean PASS.
+    aborted_reason: str | None = None
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def _records_ok(self) -> bool:
+        return all(
+            r.no_loss and r.lane_inversions == 0 and r.stranded_nonterminal == 0
+            for r in self.records
+        )
 
     @property
     def ok(self) -> bool:
         """Every step held the correctness invariants WHILE climbing (no acknowledged loss, per-lane
         FIFO, no stranded rows). The ceiling itself is a MEASUREMENT, not a failure."""
-        return bool(self.records) and all(
-            r.no_loss and r.lane_inversions == 0 and r.stranded_nonterminal == 0
-            for r in self.records
-        )
+        return bool(self.records) and self._records_ok
+
+    @property
+    def _broken(self) -> bool:
+        """A correctness FAIL (exit 1): a measured rung broke an invariant, or nothing was measured and
+        no setup abort explains why. A climb a failed reset stopped before its first rung is SETUP."""
+        if self.records:
+            return not self._records_ok
+        return self.aborted_reason is None
 
     @property
     def ceiling_pool_bound(self) -> bool:
@@ -2155,20 +2357,28 @@ class ShardCertLadderReport:
 
         ARTIFACT 2 adds the POOL: a ceiling measured on a rung that tripped the pre-registered store-pool
         tripwire is a POOL BIND, not an engine ceiling, and must not publish a rate either."""
-        return self.ceiling_void_reason is not None or self.ceiling_pool_bound
+        return (
+            self.ceiling_void_reason is not None
+            or self.ceiling_pool_bound
+            or self.aborted_reason is not None
+        )
 
     @property
     def exit_code(self) -> int:
         """0 (correctness held) / 1 (a correctness break) / 2 (a SETUP degradation — nothing was measured
         about the engine at the rung that stopped the climb, or the STORE POOL was the constraint there)."""
-        if not self.ok:
+        if self._broken:
             return 1
         return 2 if self.setup_degraded else 0
 
     @property
     def result_label(self) -> str:
-        if not self.ok:
+        if self._broken:
             return "FAIL"
+        # An aborted climb outranks POOL_BOUND, as in the two-box report: the climb never finished, so no
+        # ceiling it names (pool-bound or not) is the run's answer.
+        if self.aborted_reason is not None:
+            return "SETUP_DEGRADED"
         # POOL_BOUND is called out by name, not folded into SETUP_DEGRADED: "the pool was the wall" is a
         # specific, actionable finding (raise --store-pool-size and re-run), and the whole point of ARTIFACT
         # 2 is that it must never again be indistinguishable from a claim wall in the headline.
@@ -2280,13 +2490,18 @@ class ShardCertLadderReport:
             #  * ADDED per record: `hold_seconds`, `sent`, `sent_ratio`, `accepted_rate`, the FIDELITY block
             #    (incl. the `deferred_backpressure`/`deferred_schedule` CAUSE SPLIT), `topology`,
             #    `store_pool`.
-            "schema_version": 2,
+            #
+            # v3 (BACKLOG #5575, #5576): per-record `no_loss` now also requires every expected copy of every
+            # ACKed message (a fan-out rung that lost copies was `no_loss: true` in v2), and the new
+            # `aborted_reason` names a climb a failed store reset stopped (exit 2, the rungs before it kept).
+            "schema_version": 3,
             "kind": "shardcert_ladder",
             "result": self.result_label,
             "exit_code": self.exit_code,
             "ceiling_rate": self.ceiling_rate,
             "ceiling_admissible": self.ceiling_admissible,
             "ceiling_void_reason": self.ceiling_void_reason,
+            "aborted_reason": self.aborted_reason,
             # ARTIFACT 2: the ceiling's own rung tripped the pre-registered pool tripwire ⇒ the wall is the
             # STORE POOL, not the engine. Gated (exit 2 / result POOL_BOUND), not merely noted.
             "ceiling_pool_bound": self.ceiling_pool_bound,
@@ -2363,6 +2578,11 @@ class ShardCertLadderReport:
             )
         elif self.ceiling_rate is not None:
             lines.append(f"  ceiling ~ {self.ceiling_rate:g} msg/s (aggregate)")
+        elif self.aborted_reason is not None:
+            lines.append(
+                "  ceiling: NONE — the climb ABORTED before it found one "
+                f"({self.aborted_reason}). Fix the store and re-run."
+            )
         elif self.ceiling_void_reason is not None:
             # NEVER print a rate here: the rung that stopped the climb was not evidence about the engine.
             lines.append(
@@ -2473,20 +2693,28 @@ async def run_shardcert_ladder(
     if not ordered:
         raise ValueError("run_shardcert_ladder needs at least one rate")
     for rate in ordered:
-        rec = await _run_ladder_step(
-            rate=rate,
-            dests=dests,
-            handlers=handlers,
-            delivering=delivering,
-            hold_seconds=hold_seconds,
-            drain_timeout=drain_timeout,
-            store_env=store_env,
-            cwd=cwd,
-            sink_host=sink_host,
-            sink_port=sink_port,
-            store_pool_size=store_pool_size,
-            strict_bands=strict_bands,
-        )
+        try:
+            rec = await _run_ladder_step(
+                rate=rate,
+                dests=dests,
+                handlers=handlers,
+                delivering=delivering,
+                hold_seconds=hold_seconds,
+                drain_timeout=drain_timeout,
+                store_env=store_env,
+                cwd=cwd,
+                sink_host=sink_host,
+                sink_port=sink_port,
+                store_pool_size=store_pool_size,
+                strict_bands=strict_bands,
+            )
+        except StoreResetFailed as exc:
+            # BACKLOG #5576: keep the rungs already measured. Raising would discard them with the report.
+            report.aborted_reason = escape_for_terminal(
+                f"store reset failed before the {rate:g} msg/s rung: {exc}", single_line=True
+            )
+            report.notes.append(f"CLIMB ABORTED: {report.aborted_reason}")
+            break
         report.records.append(rec)
         # ARTIFACT 4: a rung that was not DRIVEN at its own plan is not a ceiling — say so at the moment it
         # is recorded, so a `ceiling_rate` read out of this report is never quoted without the caveat.
@@ -2959,7 +3187,7 @@ class ShardCertDriverReport:
         copies of a send whose ACK this side never saw. ``acked_not_delivered`` alone cannot see this loss: it
         counts DISTINCT messages, so one copy of each clears it. A fan-out below 1 is unknown, so it
         fails. The aggregate ``sink_received`` against ``acked * delivering`` is only reported."""
-        return self.delivering >= 1 and self.acked_copies_missing == 0
+        return _copies_ok(self.delivering, self.acked_copies_missing)
 
     @property
     def ok(self) -> bool:
@@ -2988,7 +3216,7 @@ class ShardCertDriverReport:
             f"sink_received={self.sink_received}",
             f"  routing={self.routing} fanout(delivering)={self.delivering}  "
             f"acked_copies_missing={self.acked_copies_missing} -> "
-            + ("UNCHECKED" if self.delivering < 1 else "OK" if self.copies_ok else "LOSS"),
+            + _copies_label(self.delivering, self.acked_copies_missing),
             f"  aggregate (reported, not gated): S={self.sink_received} "
             f"A*delivering={self.acked * self.delivering} timeouts={self.timeouts}",
             f"  acked_not_delivered={self.acked_not_delivered} (0 = no acknowledged loss)",
@@ -3106,7 +3334,9 @@ async def run_shardcert_engine(
     # record, not left to whatever MEFOR_PIPELINE_CLAIM_MODE happened to be in the parent env.
     node_env["MEFOR_PIPELINE_CLAIM_MODE"] = claim_mode
 
-    await _reset_store(node_env)
+    # A stale failure from an earlier run of this run id must not be read as this one's.
+    coord.clear_messages(ENGINE_SETUP_FAILED)
+    await _reset_store_or_signal(coord, node_env)
 
     killed = _choose_killed(kill, kill_shard, ids_list, owned)
     nodes: dict[str, ShardCertNode] = {}
@@ -3484,7 +3714,7 @@ async def run_shardcert_driver(
 
     The drain poll is https with the remote rig session unless ``allow_insecure``; ``cacert`` is the
     engine box's certificate PEM (see :func:`_remote_engine_poller`)."""
-    ready = await coord.await_message(SHARDS_READY, timeout=shards_ready_timeout)
+    ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
     lanes = int(ready.get("lanes", 1))
@@ -3592,6 +3822,10 @@ async def run_shardcert_driver(
         await _teardown_step("sink stop", sink.stop())
 
     ctr = metrics.counters
+    # The sender and sink are stopped, so the tracker is final; the copy walk runs off the event loop.
+    copies_missing = await asyncio.to_thread(
+        _copies_missing, tracker, routing=routing, dests=dests, delivering=delivering
+    )
     return ShardCertDriverReport(
         shards=tuple(ids_list),
         killed_shard=killed,
@@ -3612,12 +3846,7 @@ async def run_shardcert_driver(
         routing=routing,
         # Each ACKed message must arrive at exactly the destinations the served router picks for it,
         # so a copy under some other destination cannot stand in for a lost one.
-        acked_copies_missing=tracker.acked_copies_missing(
-            lambda seq: destinations_for_seq(
-                seq, routing=routing, dests=dests, fanout=max(delivering, 0)
-            ),
-            fifo_lane_destination,
-        ),
+        acked_copies_missing=copies_missing,
         timeouts=ctr.timeouts,
         notes=notes,
     )
@@ -3949,7 +4178,7 @@ async def run_shardcert_driver_worker(
     It NEVER binds a sink (the external sink tier owns delivery) and NEVER spawns an engine — the whole
     point is CPU isolation and horizontal sender scale. **Fail loud** if the band slice is empty / the
     worker count exceeds the bands (see :func:`_band_slice`)."""
-    ready = await coord.await_message(SHARDS_READY, timeout=shards_ready_timeout)
+    ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
     lanes = int(ready.get("lanes", 1))
@@ -4166,6 +4395,10 @@ class ShardCertDriveReport:
     #: size rides SHARDS_READY (available before the fleet drives); the full saturation evidence + tripwire
     #: rides the ENGINE_DRAINED gate, which upgrades this in place when it arrives.
     pool: PoolStats = EMPTY_POOL_STATS
+    #: Whether the drive RECEIVED the ENGINE_DRAINED gate before it released the sinks to tally (BACKLOG
+    #: #5577). Only then is ``sink_received`` a post-drain count; a gate that lands on disk after the wait
+    #: timed out does not make an early tally late. False = no barrier (default OFF, or timed out).
+    tallied_behind_gate: bool = False
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -4338,6 +4571,8 @@ class ShardCertDriveReport:
             f"  advisory (poller x-check, NOT gated): engine_done={self.engine_done} "
             f"engine_dead={self.engine_dead} in_pipeline_final={self.in_pipeline_final} "
             f"drained={self.drained}",
+            # BACKLOG #5577: whether sink_received is a post-drain count (sinks held behind the gate).
+            f"  sinks tallied behind the ENGINE_DRAINED gate: {self.tallied_behind_gate}",
         ]
         for n in self.notes:
             lines.append(f"  note: {n}")
@@ -4378,7 +4613,10 @@ class ShardCertDriveReport:
             #    cannot say whose fault it was; these can. WARNING: `traffic.fidelity` is therefore NARROWED: a v4
             #    `drive_shortfall` is a v5 `backpressure_bind`, `drive_shortfall` or `offer_shortfall`.
             #  * `traffic.sent_ratio` — so the UNMEASURED 0.98 sent bar can be re-derived from banked runs.
-            "schema_version": 5,
+            #
+            # v6 (BACKLOG #5577) — ADDITIVE: `tallied_behind_gate`, True only when the drive RECEIVED the
+            # ENGINE_DRAINED gate before its sinks tallied. A v5 artifact carries no such key; read it absent.
+            "schema_version": 6,
             "kind": "shardcert_drive",
             "verdict": "PASS" if self.ok else "FAIL",
             "shards": list(self.shards),
@@ -4469,6 +4707,8 @@ class ShardCertDriveReport:
                 "drained": self.drained,
             },
             "ack_ms": {"p50": round(self.ack_p50_ms, 3), "p99": round(self.ack_p99_ms, 3)},
+            # BACKLOG #5577: True only when the drive RECEIVED the drain gate before its sinks tallied.
+            "tallied_behind_gate": self.tallied_behind_gate,
             "notes": self.notes,
         }
 
@@ -4516,7 +4756,7 @@ async def run_shardcert_drive(
     alone risks reading a teardown-frozen in-flight tail as loss; awaiting the engine's DIRECT store read
     closes that window. Bounded + best-effort — a missing signal degrades to the advisory-drain fallback
     with a note, never a hang."""
-    ready = await coord.await_message(SHARDS_READY, timeout=shards_ready_timeout)
+    ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     dests = int(ready["dests"])
     # BACKLOG #209: REQUIRED keys, never `.get(..., dests)`. These are GATE INPUTS — `delivering` is the
@@ -4693,9 +4933,11 @@ async def run_shardcert_drive(
         # the engine's DIRECT store read closes that window. B7: the wait is now DERIVED from drain_timeout
         # (it must cover the engine's own drain + its store read), not a fixed 300s that a raised drain
         # window silently outgrew. Best-effort — a missing signal is noted rather than hanging.
+        tallied_behind_gate = False
         if await_engine_drained:
             try:
                 drained_msg = await coord.await_message(ENGINE_DRAINED, timeout=engine_drained_wait)
+                tallied_behind_gate = True
                 notes.append(
                     f"engine drain gate: engine_ok={drained_msg.get('engine_ok')} "
                     f"stranded={drained_msg.get('stranded')} dead_total={drained_msg.get('dead_total')}"
@@ -4808,5 +5050,6 @@ async def run_shardcert_drive(
         in_pipeline_final=(final.in_pipeline if final else -1),
         drained=drain_s is not None,
         drain_seconds=drain_s,
+        tallied_behind_gate=tallied_behind_gate,
         notes=notes,
     )

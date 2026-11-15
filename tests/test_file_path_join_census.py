@@ -1097,7 +1097,15 @@ IDE_SITES: dict[str, Site] = {
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
-    "ide/src/statusBar.ts": Site(4, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/statusBar.ts": Site(
+        5,
+        REVIEWED,
+        "Existence checks only; nothing is opened through any of them. Three are fixed names under "
+        "the workspace. Two `path.resolve` the `messagefoundry.serviceConfig` setting, or serve's "
+        "default name, from the workspace and stat the result; the setting may name a path outside "
+        "it. Both run only in a trusted workspace: behind `canControl` in `controlContextFor`, and "
+        "after the trust refusals in Start and Restart.",
+    ),
     "ide/src/stepsView.ts": Site(3, OPERATOR, _IDE_WORKSPACE + " Two are fixed media names."),
     "ide/src/symbolIndex.ts": Site(
         1, OPERATOR, "Names from listing the operator's config directory."

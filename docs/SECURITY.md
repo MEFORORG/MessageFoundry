@@ -3841,9 +3841,12 @@ carries `empty_password`. A local account's empty re-auth password is still chec
 stored hash and counted like any wrong password.
 
 Without this, an account disabled in the directory would keep renewing its window with a code
-until the reconciliation pass revoked its sessions. The engine row's `disabled` flag is only as
-fresh as that pass, which runs every `[auth].ad_session_recheck_seconds` (300 s by default) and
-revokes after `[auth].ad_session_recheck_strikes` refusals in a row (2 by default). An id-less row
+until the reconciliation pass revoked its sessions. The engine row's `disabled` flag would not stop
+it sooner: the pass never writes that flag, which an administrator's edit of the account sets. The
+pass ends the account's live sessions instead, and writes its roles only from an answer that reads
+the account present, when its groups map to a different set.
+[Directory session reconciliation](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
+says how often it runs, when it revokes, and when a pass revokes nothing. An id-less row
 with no binding used to be looked up by name here, as the reconciler did until BACKLOG #2434. Since the
 rest of BACKLOG #2027 this check refuses it, as the Windows SSO sign-in and the password step-up do.
 
@@ -6820,11 +6823,11 @@ feeds the **second-step** counter, and a combined sign-in feeds one or the other
 
 So the sign-in lock refuses **no** second-factor leg: a session holder has already passed the step it
 guards. The IdP step-up feeds no counter either. The second-step checks in `verify_mfa` and
-`finish_webauthn_assertion` never filtered on `auth_provider`. Each leg has one provider branch,
+`finish_webauthn_assertion` never filtered on `auth_provider`. Their provider branches, at least
 the directory check of BACKLOG #2023 on the code leg and of BACKLOG #2239 on the passkey leg (see
-[step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). Each runs after
-the second-step lock check and adds a refusal for a directory account; neither exempts any account
-from the second-step lock. Since BACKLOG #1638 a
+[step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)), only add or
+reorder refusals for a directory account; none exempts any account from the second-step lock.
+Since BACKLOG #1638 a
 Kerberos or OIDC sign-in refuses a mirror row under either lock before it completes. WebAuthn
 assertion failures deliberately do not **feed** a counter (signatures are not guessable secrets, and a flaky authenticator
 must not lock an account) — **but an account under the second-step lock IS refused at the assertion leg

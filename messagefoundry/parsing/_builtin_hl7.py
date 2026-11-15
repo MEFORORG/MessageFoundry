@@ -14,6 +14,7 @@ records its answers, and ``tests/test_builtin_hl7_parity.py`` holds this module 
 Data model (a plain built-in structure)::
 
     ParsedMessage = {
+        "_lazy": {index: raw line},  # first, so a deepcopy reads it before segments (_ensure_split)
         "segments": [ {"id": str, "fields": list[str | dict]}, ... ],
         "raw": str | None,           # cached encode; None once dirtied
         "seps": (field, component, repetition, subcomponent, escape),
@@ -122,14 +123,15 @@ class Segment(TypedDict):
 
 
 class ParsedMessage(TypedDict):
-    """The whole parsed message — see the module docstring for the shape."""
+    """The whole parsed message — see the module docstring for the shape. Build it with ``_lazy``
+    as the first key, as :func:`parse` does: :func:`_ensure_split` relies on that order."""
 
-    segments: list[Segment]
-    raw: str | None
-    seps: tuple[str, str, str, str, str]
     # Per-segment raw text awaiting a lazy split (index in ``segments`` → raw line). MSH is never
     # here (parsed eagerly). A segment leaves this map the first time a field path touches it.
     _lazy: dict[int, str]
+    segments: list[Segment]
+    raw: str | None
+    seps: tuple[str, str, str, str, str]
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +243,9 @@ def parse(norm: str) -> ParsedMessage:
         segments.append({"id": line.split(field_sep, 1)[0] if line else "", "fields": []})
         lazy[index] = line
 
-    return {"segments": segments, "raw": strmsg + "\r", "seps": seps, "_lazy": lazy}
+    # ``_lazy`` goes in first on purpose: ``copy.deepcopy`` (``Message._ensure_owned``) copies a dict
+    # in insertion order, so it reads ``_lazy`` before ``segments``, the order _ensure_split needs.
+    return {"_lazy": lazy, "segments": segments, "raw": strmsg + "\r", "seps": seps}
 
 
 def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
@@ -250,8 +254,21 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     A non-MSH segment is split on the field separator the first time a field path touches it; the
     field entries start as bare ``str`` (component split is deferred again, per field, to first
     componentized access). MSH segments are never lazy.
+
+    The fields are stored **before** the raw line leaves ``_lazy``. A :meth:`Message.copy` clone
+    shares this tree until one side writes, so another thread can read the segment mid-split. That
+    can happen on a GIL build too, not only a free-threaded one: the GIL can switch threads between
+    storing the fields and the ``pop``, or inside a deepcopy's loop. A reader that looks at
+    ``_lazy`` before ``fields`` then sees either the raw line or the full field list, never an
+    empty segment (BACKLOG #5801). That holds for at least the readers in this module and the
+    copy-on-write ``copy.deepcopy``, because :func:`parse` puts ``_lazy`` first in the dict; a new
+    reader must keep the same order. It does not make a deepcopy safe against the ``pop`` itself:
+    one that is iterating ``_lazy`` at that moment can still raise ``RuntimeError`` for a dict that
+    changed size. The ``pop`` keeps its default because a racing split of the same segment may have
+    removed it.
     """
-    raw = msg["_lazy"].pop(seg_index, None)
+    lazy = msg["_lazy"]
+    raw = lazy.get(seg_index)
     if raw is None:
         return
     field_sep = msg["seps"][0]
@@ -259,6 +276,7 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
     # parts[0] is the segment id; fields are 1-based after it (matching python-hl7's Segment indexing
     # where index 0 is the id and field N is at list index N).
     msg["segments"][seg_index]["fields"] = list(parts)
+    lazy.pop(seg_index, None)
 
 
 def segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:

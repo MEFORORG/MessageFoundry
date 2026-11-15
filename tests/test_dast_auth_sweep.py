@@ -27,6 +27,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -40,10 +41,15 @@ from scripts.security import dast_target as dast_target_module
 from scripts.security import route_gates
 from scripts.security.dast_auth_sweep import (
     INDEPENDENCE_NOTICE,
+    STEP_UP_ACTION_HEADER,
+    STEP_UP_REQUIRED_HEADER,
+    _bfla_probe,
     _write_pass,
     annotation_level,
     evaluate,
+    is_bfla_refused,
     is_refused,
+    is_step_up_challenge,
     load_policy,
     main,
     receipt_lines,
@@ -352,6 +358,15 @@ def test_canary_bfla_is_detected(tmp_path: Path) -> None:
         "function-level authorization."
     )
     assert receipt["bfla_violations"] >= 5, receipt["bfla_violations"]
+    # Vault BACKLOG #5580, through run_sweep's own scoring loop: the over-granted identity meets
+    # the action-bound step-up wall on PATCH /users/{user_id}, and that 403 must be a finding.
+    assert any(
+        f["pass_name"] == "bfla-write"
+        and f["path"] == "/users/{user_id}"
+        and f["observed_status"] == 403
+        and "step-up" in f["expected"]
+        for f in receipt["findings"]
+    ), [f for f in receipt["findings"] if f["observed_status"] == 403]
     assert receipt["negative_non_401"] == 0, (
         "the bfla canary must inject ONLY an authorization defect; a negative finding here means it "
         "also broke authentication, and the two canaries would no longer be independent"
@@ -540,7 +555,7 @@ async def test_a_session_destroying_write_probe_does_not_poison_the_rows_after_i
             assert rebuilt == ["POST /auth/logout"], (
                 f"expected the logout probe to be recorded as destroying the session, got {rebuilt}"
             )
-            after = [(row.method, row.path, status) for row, status in results[1:]]
+            after = [(row.method, row.path, status) for row, status, _ch in results[1:]]
             assert all(status != 401 for _m, _p, status in after), (
                 f"rows probed after the session-destroying one answered 401: {after}. The re-mint did "
                 "not happen, so every one of them would be counted as refused."
@@ -1014,6 +1029,99 @@ def test_bfla_oracle_treats_404_as_a_violation() -> None:
     code, errors = evaluate(receipt, policy)
     assert code == 1, f"a 404 answered to the low-privilege identity exited {code}, not 1"
     assert any("404" in line and "bfla" in line for line in errors), errors
+
+
+async def test_the_engine_step_up_refusal_carries_the_header_the_bfla_oracle_reads() -> None:
+    """Vault BACKLOG #5580: the oracle reads the headers the engine really sends.
+
+    Drives the engine's own ``_step_up_refusal`` and reads the headers off the exception it
+    returns, so a renamed header reds this test whether or not the literal moved."""
+    from messagefoundry.api import security
+
+    class _Auth:
+        async def session_steps_up_at_idp(self, _token: str | None) -> bool:
+            return False
+
+    window = await security._step_up_refusal(_Auth(), "t")  # type: ignore[arg-type]
+    bound = await security._step_up_refusal(_Auth(), "t", "purge")  # type: ignore[arg-type]
+    assert window.status_code == bound.status_code == 403
+    assert is_step_up_challenge(403, httpx.Headers(window.headers or {}))
+    assert is_step_up_challenge(403, httpx.Headers(bound.headers or {}))
+    assert (bound.headers or {}).get(STEP_UP_ACTION_HEADER) == "purge"
+    assert STEP_UP_REQUIRED_HEADER in (window.headers or {})
+
+
+def test_a_step_up_403_to_the_low_privilege_caller_is_not_a_refusal() -> None:
+    """Vault BACKLOG #5580. The permission check runs before every step-up gate, so a 403 that asks
+    for a step-up means RBAC let the caller through. The BFLA oracle must score it as a finding."""
+    plain = httpx.Headers({})
+    window = httpx.Headers({"x-step-up-required": "1"})
+    bound = httpx.Headers({STEP_UP_REQUIRED_HEADER: "1", STEP_UP_ACTION_HEADER: "purge"})
+    mfa = httpx.Headers({"X-MFA-Required": "1"})
+
+    assert is_step_up_challenge(403, plain) is False
+    assert is_step_up_challenge(403, window) is True
+    assert is_step_up_challenge(403, bound) is True
+    # MFA sits ABOVE the permission loop, so its 403 says nothing about RBAC.
+    assert is_step_up_challenge(403, mfa) is False
+    # Only a 403 is a step-up challenge; a 401 with a stray header is still a refusal.
+    assert is_step_up_challenge(401, window) is False
+
+    assert is_bfla_refused(403, False) is True
+    assert is_bfla_refused(403, True) is False
+    assert is_bfla_refused(404, False) is False
+
+
+def _step_up_transport(row_path: str) -> httpx.MockTransport:
+    """A target whose ``row_path`` answers a step-up 403, as an RBAC bypass on a step-up route would,
+    and whose preflight route answers 200 so the write pass keeps its session."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == row_path:
+            return httpx.Response(
+                403,
+                headers={STEP_UP_REQUIRED_HEADER: "1", STEP_UP_ACTION_HEADER: "purge"},
+            )
+        return httpx.Response(200)
+
+    return httpx.MockTransport(handler)
+
+
+async def test_the_bfla_passes_flag_a_step_up_403_as_a_violation() -> None:
+    """Vault BACKLOG #5580, driven through the shipped probe functions of both BFLA passes.
+
+    Before the fix both passes kept the status code only, so this 403 was scored as refused and
+    an RBAC bypass on an action-bound step-up route passed with no finding."""
+    row = route_gates.RouteRow(
+        method="POST",
+        path="/messages/purge",
+        permissions=("messages:purge",),
+        gates=("require_step_up_action",),
+        kind=route_gates.KIND_GATED,
+        action="purge",
+    )
+    async with httpx.AsyncClient(
+        base_url="http://dast.test", transport=_step_up_transport(row.path)
+    ) as client:
+        status, challenged = await _bfla_probe(client, "GET", row.path, "viewer-token")
+        assert (status, challenged) == (403, True)
+        assert is_bfla_refused(status, challenged) is False
+
+        async def _no_relogin(_username: str) -> str:
+            raise AssertionError("the session never died, so nothing should re-mint it")
+
+        target = SimpleNamespace(relogin=_no_relogin)
+        results, _token = await _write_pass(
+            client,
+            [row],
+            target=target,  # type: ignore[arg-type]
+            username="viewer",
+            token="viewer-token",
+            placeholder=route_gates.PATH_PARAM_PLACEHOLDER,
+            max_rebuilds=0,
+            rebuilt=[],
+        )
+    assert results == [(row, 403, True)], results
 
 
 def test_an_unexplained_unreached_operation_is_a_finding() -> None:

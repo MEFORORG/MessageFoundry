@@ -36,6 +36,9 @@ $script:DecisionTitlePrefix = 'decision-log '
 
 # Read at load time: inside a function $PSScriptRoot would name the caller's script.
 $script:DecisionHere = $PSScriptRoot
+# Get-DecisionSeatAliases's cache: the map, $false once the roster failed, or $null before the first
+# read. Set here so a StrictMode caller can read it before the first load.
+$script:DecisionSeatAliases = $null
 
 # The spool's retry (Invoke-DecisionSpoolIo) is coord-root.ps1's.
 . (Join-Path $PSScriptRoot 'coord-root.ps1')
@@ -690,7 +693,8 @@ function Get-DecisionBudget {
     $Limit = 3
     if ($Seat) {
         $Limit = 2
-        $Reversals = @($Reversals | Where-Object { $_.Seat -eq $Seat -or $null -eq $_.Seat })
+        $canon = ConvertTo-DecisionSeat $Seat
+        $Reversals = @($Reversals | Where-Object { $null -eq $_.Seat -or (ConvertTo-DecisionSeat $_.Seat) -eq $canon })
     }
     $day = [TimeSpan]::FromHours(24)
     # A reversal that could still close the scope at $Now happened in the last 24 hours, and the 24
@@ -758,19 +762,42 @@ function Get-DecisionRecentUnsampledB {
         })
 }
 
-function Test-DecisionLanderSeat([string]$Seat) {
-    # The Lander, or a roster alias of it (docs/roles/seats.json). An unreadable roster is no
-    # exemption: this only ever relaxes the cost rung, so a fault must not grant it.
-    if (-not $Seat) { return $false }
-    $s = $Seat.Trim().ToLowerInvariant()
-    if ($s -eq 'lander') { return $true }
+function Get-DecisionSeatAliases {
+    # docs/roles/seats.json's alias map, lower-cased label -> lower-cased seat, read once. $null when
+    # the roster cannot be read: every label then stands for itself, trimmed and lower-cased, and the
+    # gate goes to review rather than read a seat's history in part.
+    if ($script:DecisionSeatAliases -is [hashtable]) { return $script:DecisionSeatAliases }
+    if ($script:DecisionSeatAliases -eq $false) { return $null }
+    $map = @{}
     try {
         $roster = Join-Path (Split-Path -Parent (Split-Path -Parent $script:DecisionHere)) 'docs/roles/seats.json'
-        $alias = ([System.IO.File]::ReadAllText($roster) | ConvertFrom-Json -ErrorAction Stop).aliases.PSObject.Properties[$s]
-        return [bool]($alias -and [string]$alias.Value -eq 'lander')
+        $doc = Read-CoordText $roster | ConvertFrom-Json -ErrorAction Stop
+        $aliases = Get-DecisionJsonValue $doc 'aliases'
+        if ($aliases -isnot [System.Management.Automation.PSCustomObject]) { throw "$roster holds no aliases map" }
+        foreach ($p in $aliases.PSObject.Properties) { $map[$p.Name.Trim().ToLowerInvariant()] = ([string]$p.Value).Trim().ToLowerInvariant() }
     } catch {
-        return $false
+        $script:DecisionSeatAliases = $false
+        return $null
     }
+    $script:DecisionSeatAliases = $map
+    return $map
+}
+
+function ConvertTo-DecisionSeat([string]$Seat) {
+    # One seat's one name: trimmed, lower-cased, and an alias collapsed onto the seat it spells
+    # (docs/roles/seats.json). Every seat comparison here goes through this, so a padded or aliased
+    # spelling cannot escape a seat's reversal budget or calibration history (BACKLOG #5597).
+    if (-not $Seat) { return '' }
+    $s = $Seat.Trim().ToLowerInvariant()
+    $map = Get-DecisionSeatAliases
+    if ($map -and $map.ContainsKey($s)) { return [string]$map[$s] }
+    return $s
+}
+
+function Test-DecisionLanderSeat([string]$Seat) {
+    # The Lander, or a roster alias of it. An unreadable roster is no exemption for an alias: this
+    # only ever relaxes the cost rung, so a fault must not grant it.
+    return ((ConvertTo-DecisionSeat $Seat) -eq 'lander')
 }
 
 function Get-DecisionJsonValue($Object, [string]$Name) {

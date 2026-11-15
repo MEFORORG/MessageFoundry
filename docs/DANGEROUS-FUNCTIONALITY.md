@@ -829,6 +829,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads your workspace's `.gitignore` and `.gitattributes`, to add the lines they lack | `sourceControl.ts` |
 | It reads files that ship inside the extension: its HL7 schema tables and its snippets | `hl7schema.ts`, `insertElement.ts` |
 | It reads a value you typed into the extension's connection form | `connectionForm.ts` |
+| Its page script reads, as JSON, the text in a connection editor field that is a table or held a table or array. That text is at least the recorded value from your config, what you typed over it, and a choice the schema offered. Text that does not parse is posted trimmed, for the engine's validator to judge. | `connectionEditorWebview.ts` |
 | It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 | It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
@@ -862,6 +863,9 @@ or compression library:
   type its extension names. Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.
+- `parsing/dicom/_deps.py` imports `zlib` only to name `zlib.error` in the tuple of parse errors
+  that the DICOM parsers turn into a `DicomError` (BACKLOG #5803). It calls nothing in `zlib`,
+  decompresses nothing and opens no archive, so it has nothing to bound.
 - `pipeline/dr_backup.py` reads a disaster-recovery backup, which is a tar archive, on
   `messagefoundry restore` and `restore-verify`. `_extract_member` never uses a member's stored name
   as a path: it streams the store member into one fixed file name. The reader accepts only an

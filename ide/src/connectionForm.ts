@@ -446,8 +446,10 @@ function count(text: string, character: string): number {
  * the engine's `parse_env_setting` exactly: an inline table is an env reference only when it carries
  * a non-empty string `env` AND no key outside {env, default, cast}. A REST `headers` map that happens
  * to contain an "env" header is therefore read as the literal table it is, not as a reference.
+ * The key list is exported so the connection editor page applies the same list (BACKLOG #5565).
  */
-const ENVREF_KEYS = new Set(["env", "default", "cast"]);
+export const ENVREF_KEY_NAMES: readonly string[] = ["env", "default", "cast"];
+const ENVREF_KEYS = new Set(ENVREF_KEY_NAMES);
 
 function envRefOf(
   value: unknown,

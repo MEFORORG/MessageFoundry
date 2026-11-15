@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable
 
 import pytest
@@ -513,3 +514,78 @@ def test_clear_then_rebuild_repeating_block() -> None:
     assert m.count_segments("OBX") == 2
     assert [m.field("OBX-3.1", occurrence=i) for i in (1, 2)] == ["GLU", "NA"]
     assert m.field("OBX-5") == "OK"
+
+
+class _ReadOnRemoveLazy(dict[int, str]):
+    """A ``_lazy`` map that runs a reader right after an entry leaves it, the instant a reader on
+    another thread sharing a :meth:`Message.copy` tree could land in, on a GIL build or a
+    free-threaded one (BACKLOG #5801)."""
+
+    def __init__(self, msg: _builtin_hl7.ParsedMessage, seen: list[str]) -> None:
+        super().__init__(msg["_lazy"])
+        self._msg = msg
+        self._seen = seen
+
+    def _read(self, key: int) -> None:
+        self._seen.append(_builtin_hl7._encode_segment(self._msg, key, self._msg["seps"]))
+
+    def pop(self, key: int, *default: object) -> object:  # type: ignore[override]
+        present = key in self
+        value = super().pop(key, *default)
+        if present:
+            self._read(key)
+        return value
+
+
+def test_lazy_split_stores_fields_before_dropping_the_raw_line() -> None:
+    # The lazy split must never leave a moment where the raw line is gone and the fields are not yet
+    # stored: a reader of a shared copy there would encode PID as its bare id, its fields dropped.
+    m = Message.parse(ADT)
+    clone = m.copy()  # shares the backing tree until a write
+    tree = clone._m
+    seen: list[str] = []
+    tree["_lazy"] = _ReadOnRemoveLazy(tree, seen)
+    pid = _builtin_hl7.segment_index(tree, "PID", 1)
+    assert pid is not None
+
+    assert m["PID-5.1"] == "DOE"  # the first touch splits PID in the shared tree
+
+    assert seen == ["PID|1||100^^^HOSP^MR||DOE^JANE^Q||19800101|F"]
+    assert pid not in tree["_lazy"]
+    tree["raw"] = None  # drop parse's cached text, so the encode is rebuilt from the split fields
+    assert clone.encode() == ADT
+
+
+class _SplitDuringCopySegments(list[_builtin_hl7.Segment]):
+    """A ``segments`` list whose deepcopy lets a lazy split of ``seg_index`` run right after it is
+    copied: a reader on another thread finishing its split in the middle of a copy-on-write copy."""
+
+    def __init__(self, msg: _builtin_hl7.ParsedMessage, seg_index: int) -> None:
+        super().__init__(msg["segments"])
+        self._msg = msg
+        self._seg_index = seg_index
+
+    def __deepcopy__(self, memo: dict[int, object]) -> list[_builtin_hl7.Segment]:
+        copied = copy.deepcopy(list(self), memo)
+        _builtin_hl7._ensure_split(self._msg, self._seg_index)
+        return copied
+
+
+def test_a_split_during_the_copy_on_write_deepcopy_keeps_the_segment() -> None:
+    # copy.deepcopy reads the tree's keys in insertion order. Were segments read before _lazy, a
+    # split landing between the two would leave the private copy with neither the raw line nor the
+    # fields, and it would encode PID as its bare id (BACKLOG #5801).
+    m = Message.parse(ADT)
+    clone = m.copy()
+    tree = m._m
+    pid = _builtin_hl7.segment_index(tree, "PID", 1)
+    assert pid is not None and pid in tree["_lazy"]
+    tree["segments"] = _SplitDuringCopySegments(tree, pid)
+
+    clone.set("PID-8", "M")  # the write takes the private deepcopy
+
+    assert pid not in tree["_lazy"]  # the split did run in the middle of the copy
+    assert clone["PID-5.1"] == "DOE"
+    assert clone.encode() == ADT.replace("19800101|F", "19800101|M")
+    tree["raw"] = None  # rebuild the original from its split fields, not parse's cached text
+    assert m.encode() == ADT

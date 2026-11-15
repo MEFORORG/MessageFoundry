@@ -567,9 +567,9 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     an old sentence true again reds this test instead of passing it. A provider check added at the
     ROUTE layer would slip past this AST read; the service methods are what it covers.
 
-    ``verify_mfa`` is off the no-provider list since BACKLOG #2023, and only for one branch: a
-    directory account is asked of the directory before its code is checked. That branch adds a
-    refusal and exempts nothing, and the Lockout asymmetry paragraph says so. The behaviour the rows
+    ``verify_mfa`` is off the no-provider list since BACKLOG #2023: a directory account is asked
+    of the directory before its code is checked. Its provider branches add or reorder refusals and
+    exempt nothing, and the Lockout asymmetry paragraph says so. The behaviour the rows
     rest on (a directory account's wrong code feeds the lockout, and its lock is checked before the
     lookup) is pinned in ``tests/test_mfa_directory_recheck.py``, not by this AST read.
 
@@ -580,9 +580,14 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     begin legs still read no provider, and the finish legs read none themselves.
     """
 
-    # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
-    # call, so verify_mfa reads no provider itself and the helper reads it exactly once (through
-    # _is_directory_account since BACKLOG #3780; _provider_reads counts either form).
+    # Since BACKLOG #3068 the directory check lives in the shared helper both second-factor legs
+    # call, and the helper reads the provider exactly once (through _is_directory_account since
+    # BACKLOG #3780; _provider_reads counts either form). Since BACKLOG #3780 item 2 verify_mfa
+    # reads it once itself, re-derived against the rows: for a directory account its in-queue
+    # read stands in for the holder re-read the helper no longer runs for it, so it adds a
+    # refusal (lookup keys moved since the role test) and asks the lock before TOTP and the lapse.
+    # Both only add or reorder refusals; nothing is exempted, and the lockout feed below is pinned
+    # as before.
     def _tree(func: object) -> ast.AST:
         return ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
 
@@ -592,17 +597,17 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     verify_tree = _tree(AuthService.verify_mfa)
     helper_tree = _tree(AuthService._directory_vouches_for_factor)
     assert (
-        _provider_reads(verify_tree) == 0
+        _provider_reads(verify_tree) == 1
         and _provider_reads(_tree(AuthService._factor_holder_current)) == 0
         and "_directory_vouches_for_factor" in _attrs(verify_tree)
         and _provider_reads(helper_tree) == 1
         and "_directory_step_up_refusal" in _attrs(helper_tree)
     ), (
-        "verify_mfa grew a provider branch beyond the BACKLOG #2023 directory check; re-derive the "
-        "pathway rows, which say a directory account's TOTP leg feeds and meets the lockout."
+        "verify_mfa's provider reads changed; re-derive the pathway rows, which say a directory "
+        "account's TOTP leg feeds and meets the lockout."
     )
     assert "BACKLOG #2023" in _section(), (
-        "the pathway section no longer names verify_mfa's one provider branch (BACKLOG #2023)."
+        "the pathway section no longer names verify_mfa's directory check (BACKLOG #2023)."
     )
     for func in (
         AuthService.begin_mfa_enrollment,

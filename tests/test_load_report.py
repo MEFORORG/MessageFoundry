@@ -182,7 +182,8 @@ def test_json_is_metrics_only_no_phi() -> None:
     )
     text = report.to_json()
     # 4 to 5: engine_side gained the poller's own cost (vault BACKLOG #2794).
-    assert '"schema_version": 5' in text
+    # 5 to 6: no_loss.inconclusive (BACKLOG #5574).
+    assert '"schema_version": 6' in text
     # No raw HL7 / control ids / PHI tokens ever reach the artifact.
     for forbidden in ("MSH|", "PID|", "\r", "MEFOR", "^~"):
         assert forbidden not in text
