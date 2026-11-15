@@ -20,6 +20,8 @@ import pytest
 from messagefoundry.config import codeset_edit
 from messagefoundry.config.code_sets import load_code_set
 from messagefoundry.config.impact import (
+    LiteralEdit,
+    RenamePlan,
     apply_rename,
     delete_impact,
     plan_rename,
@@ -291,6 +293,55 @@ def test_rename_router_rewrites_binding_and_definition_and_connections_toml(
     # The def statement's NAME token (def r_shared) is not a string literal — never rewritten.
     assert "def r_shared(msg):" in mod
     load_config(config_dir)
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u0085"])
+def test_rename_router_toml_binding_survives_a_unicode_line_separator_in_an_earlier_value(
+    tmp_path: Path, separator: str
+) -> None:
+    # str.splitlines breaks a line on U+2028 / U+0085, but apply_rename splits as tokenize does (\n,
+    # \r\n, \r only). A connections.toml edit numbered by str.splitlines lands one line too low, so the
+    # router binding below the value is skipped and dangles after the rename.
+    original = (
+        "[[outbound]]\n"
+        'name = "OB_FILE"\n'
+        'transport = "file"\n'
+        "  [outbound.settings]\n"
+        f'  directory = "out{separator}dir"\n'
+        "\n" + _ROUTER_TOML
+    )
+    config_dir = _write_config(tmp_path, {"mod.py": _ROUTER_MOD, "connections.toml": original})
+    registry = load_config(config_dir)
+
+    plan = plan_rename(registry, config_dir, "router", "r_shared", "r_flow")
+    applied = apply_rename(plan)
+
+    assert len(applied) == len(plan.edits) == 3
+    raw = (config_dir / "connections.toml").read_bytes().decode("utf-8")
+    # The binding is rewritten and nothing else in the file moved.
+    assert raw == original.replace('router = "r_shared"', 'router = "r_flow"')
+    assert load_config(config_dir).inbound["IB_DATA"].router == "r_flow"
+
+
+def test_apply_rename_multi_line_edit_keeps_an_earlier_edit_on_its_line_after_u2028(
+    tmp_path: Path,
+) -> None:
+    # A multi-line (backslash-continued) literal is re-split after it is rewritten. Re-split with
+    # str.splitlines, a U+2028 earlier on its first line breaks that line in two, so an earlier edit on
+    # the same line no longer finds its literal at its column and is silently skipped.
+    path = tmp_path / "m.py"
+    first = 's = "\u2028"; t = "AA"; u = "BB\\\n'
+    path.write_text(first + 'BB"\n', encoding="utf-8", newline="")
+    aa = first.index('"AA"')
+    bb = first.index('"BB')
+    edits = (
+        LiteralEdit(str(path), 1, aa, 1, aa + 4, '"AA"', '"CC"'),
+        LiteralEdit(str(path), 1, bb, 2, 3, '"BB\\\nBB"', '"DD"'),
+    )
+    applied = apply_rename(RenamePlan("outbound", "x", "y", edits=edits))
+
+    assert len(applied) == 2
+    assert path.read_bytes().decode("utf-8") == 's = "\u2028"; t = "CC"; u = "DD"\n'
 
 
 def test_fstring_bytes_and_adjacent_concat_are_never_rewritten(tmp_path: Path) -> None:

@@ -49,6 +49,7 @@ from messagefoundry.config.reachability import (
     build_reference_index,
     captured_values,
     reached_functions,
+    source_lines,
     table_kinds,
 )
 from messagefoundry.config.wiring import Registry, WiringError, config_py_files
@@ -294,9 +295,9 @@ def apply_rename(plan: RenamePlan) -> list[LiteralEdit]:
     for file, file_edits in by_file.items():
         raw = Path(file).read_bytes()
         text = raw.decode("utf-8")
-        # Split as tokenize counts lines (\n, \r\n, \r only), so an edit's line is the line it names;
-        # str.splitlines also breaks on a form feed or U+2028.
-        lines = io.StringIO(text, newline="").readlines()
+        # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline read,
+        # which breaks on exactly those, so an edit's line is the line it names here too.
+        lines = source_lines(text)
         # Bottom-to-top, right-to-left: a multi-line edit changes the line count below it, so applying
         # in descending (start_line, start_col) keeps every not-yet-applied edit's indices valid.
         for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
@@ -589,12 +590,12 @@ def _fn_span(fn: object) -> tuple[str | None, _Span | None]:
     if code is None:
         return None, None
     try:
-        source_lines, start = inspect.getsourcelines(target)
+        fn_lines, start = inspect.getsourcelines(target)
     except (OSError, TypeError, SyntaxError, tokenize.TokenError):
         # A file that changed since it loaded (an editor mid-save) cannot be located either.
         return None, None
     file = str(code.co_filename)
-    return file, _Span(start, start + len(source_lines) - 1)
+    return file, _Span(start, start + len(fn_lines) - 1)
 
 
 def _statement_span(file: str, start_line: int) -> _Span | None:
@@ -811,7 +812,10 @@ def _toml_value_edits(toml_path: str, key: str, old: str, new: str) -> list[Lite
         + r"(?P=q))"
     )
     edits: list[LiteralEdit] = []
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    # Number lines exactly as apply_rename splits them: a TOML string may hold U+2028 or U+0085, and a
+    # split on those would shift every later edit's line.
+    for lineno, line in enumerate(source_lines(text), start=1):
+        line = line.rstrip("\r\n")
         m = pattern.match(line)
         if m is None:
             continue
@@ -865,7 +869,8 @@ def _apply_one(lines: list[str], edit: LiteralEdit) -> bool:
     if region[inner_start:inner_end] != edit.old_literal:
         return False
     new_region = region[:inner_start] + edit.new_literal + region[inner_end:]
-    lines[lo : hi + 1] = new_region.splitlines(keepends=True)
+    # Re-split as apply_rename split the file, so an earlier edit on line ``lo`` still indexes its line.
+    lines[lo : hi + 1] = source_lines(new_region)
     return True
 
 

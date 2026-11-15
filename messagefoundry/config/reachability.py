@@ -51,6 +51,7 @@ __all__ = [
     "captured_values",
     "code_names",
     "reached_functions",
+    "source_lines",
     "table_kinds",
 ]
 
@@ -255,6 +256,15 @@ def table_kinds(registry: Registry) -> dict[str, list[str]]:
     return out
 
 
+def source_lines(text: str) -> list[str]:
+    """``text``'s lines, ends kept, split on \\n, \\r\\n and \\r only, as ``ast`` and a universal-newline
+    read count them. ``str.splitlines`` also breaks on a form feed, U+2028, U+0085 and others, so a line
+    number taken from it can name a different line than the one an edit or a token means. The
+    tokenizer, fed through ``io.StringIO(text).readline``, does not break on a lone \\r, so it agrees
+    with this split only on text already read with universal newlines (``Path.read_text``)."""
+    return io.StringIO(text, newline="").readlines()
+
+
 class SourceCache:
     """Parsed config sources by file name, for one index build or rename plan."""
 
@@ -268,9 +278,7 @@ class SourceCache:
             try:
                 # utf-8-sig: a BOM-encoded module (common from Windows editors) parses too.
                 text = Path(file).read_text(encoding="utf-8-sig")
-                # Lines split as the parser and the tokenizer count them (\n, \r\n, \r only), not as
-                # str.splitlines does, which also breaks on a form feed or U+2028.
-                lines = io.StringIO(text, newline="").readlines()
+                lines = source_lines(text)
                 self._parsed[file] = (ast.parse(text), lines)
             except (OSError, SyntaxError, ValueError, MemoryError, RecursionError) as exc:
                 # MemoryError and RecursionError are the parser's width and depth walls (BACKLOG #1858).
