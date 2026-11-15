@@ -138,8 +138,10 @@ def test_the_file_sink_records_an_over_cap_file_as_refused_and_unread(tmp_path: 
 def _symlink_or_skip(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target)
-    except OSError as exc:  # Windows without Developer Mode or the symlink privilege
-        pytest.skip(f"cannot create a symlink here: {exc}")
+    except OSError as exc:
+        if sys.platform != "win32":
+            raise  # POSIX makes a symlink unprivileged: a failure here is a broken test
+        pytest.skip(f"no symlink privilege here (Developer Mode off): {exc}")
 
 
 def test_the_file_sink_reports_a_symlink_unread_with_where_it_resolves(tmp_path: Path) -> None:
@@ -153,10 +155,14 @@ def test_the_file_sink_reports_a_symlink_unread_with_where_it_resolves(tmp_path:
         (out / "ok.hl7").write_bytes(_BODY)
         _symlink_or_skip(out / "link.hl7", outside)
         _symlink_or_skip(out / "in.hl7", out / "ok.hl7")
+        # A name the sink skips for a file (a dot-file, an engine temp) does not hide a link.
+        _symlink_or_skip(out / ".dot", outside)
+        _symlink_or_skip(out / "x.part", outside)
         records = sink.records()
         assert sink.records() == records  # recorded once, not on every scan
     by_name = {r.meta["name"]: r for r in records}
-    assert set(by_name) == {"ok.hl7", "link.hl7", "in.hl7"}
+    assert set(by_name) == {"ok.hl7", "link.hl7", "in.hl7", ".dot", "x.part"}
+    assert {by_name[n].meta["inside"] for n in (".dot", "x.part")} == {"false"}
     assert by_name["ok.hl7"].payload == _BODY and "symlink" not in by_name["ok.hl7"].meta
     for name, inside in (("link.hl7", "false"), ("in.hl7", "true")):
         record = by_name[name]
@@ -246,6 +252,28 @@ def test_the_file_sink_records_a_file_changed_while_read_once_it_settles(
     assert [r.payload for r in settled] == [_BODY]
 
 
+def test_the_file_sink_records_a_file_removed_right_after_its_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file read whole and then moved away is still a delivery, judged inside by its folder."""
+    import harness.sinks.file as file_sink
+
+    target = tmp_path / "x.hl7"
+    with FileSink(tmp_path) as sink:
+        target.write_bytes(_BODY)
+
+        def read_then_remove(
+            path: Path, cap: int, *, follow_symlinks: bool = True
+        ) -> tuple[bytes, str]:
+            result = read_capped(path, cap, follow_symlinks=follow_symlinks)
+            path.unlink()
+            return result
+
+        monkeypatch.setattr(file_sink, "read_capped", read_then_remove)
+        records = sink.records()
+    assert [(r.payload, r.meta["inside"]) for r in records] == [(_BODY, "true")]
+
+
 def test_the_file_sink_does_not_record_a_chmod_as_a_write(tmp_path: Path) -> None:
     target = tmp_path / "x.hl7"
     with FileSink(tmp_path) as sink:
@@ -281,7 +309,7 @@ def test_a_symlink_swapped_in_after_the_lstat_is_not_regular(
 ) -> None:
     """Where O_NOFOLLOW exists, a file swapped for a symlink between the lstat and the open fails the
     open with ELOOP (EMLINK on FreeBSD). Not following, that is NOT_REGULAR, as a symlink seen by the
-    lstat is, so every caller skips it alike; following, or for any other errno, it still raises."""
+    lstat is, so every caller treats it alike; following, or for any other errno, it still raises."""
     target = tmp_path / "f.hl7"
     target.write_bytes(b"MSH|")
 

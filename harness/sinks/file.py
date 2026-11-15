@@ -78,9 +78,11 @@ class FileSink(Sink):
         """``(path, lstat)`` for each candidate under the directory, sorted by path.
 
         The walk descends into plain directories only. A link, a junction included, is a candidate
-        itself and is never walked through, so nothing outside the directory is listed or read by
-        way of one. A path gone before its ``lstat``, or a folder gone before it is listed, is left
-        out: nothing is there to record or to ignore."""
+        whatever its name, and is never walked through, so nothing outside the directory is listed
+        by way of one. A folder swapped for a link after it is listed is not caught here; the
+        settle check in :meth:`records` drops what was read through it. A path gone before its
+        ``lstat``, or a folder gone before it is listed, is left out: nothing is there to record or
+        to ignore."""
         found: list[tuple[Path, os.stat_result]] = []
         pending = [self.directory]
         while pending:
@@ -96,13 +98,15 @@ class FileSink(Sink):
                     st = path.lstat()
                 except OSError:
                     continue
-                if stat.S_ISDIR(st.st_mode) and not _is_link(st):
+                link = _is_link(st)
+                if stat.S_ISDIR(st.st_mode) and not link:
                     pending.append(path)
-                elif (
-                    path.match(self.pattern)
+                elif link or (
+                    path.relative_to(self.directory).match(self.pattern)
                     and not name.startswith(".")
                     and path.suffix not in _ENGINE_TEMP_SUFFIXES
                 ):
+                    # A link is never an engine temp, so no name or pattern keeps one out.
                     found.append((path, st))
         return sorted(found, key=lambda item: item[0])
 
@@ -136,6 +140,8 @@ class FileSink(Sink):
             inside = self._inside(path, link, root)
             try:
                 settled = _signature(path.lstat()) == signature
+            except FileNotFoundError:
+                settled = True  # gone after a whole read: what was read is the delivery
             except OSError:
                 settled = False
             if not settled:

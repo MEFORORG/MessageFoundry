@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 from harness import sinks
+from harness.bounded_file import NOT_REGULAR
 from harness.scenarios._core import (
     Scenario,
     ScenarioContext,
@@ -91,9 +92,10 @@ def verify_written(
     problems: list[str] = []
     for record in records:
         where = record.meta.get("relpath", "?")
-        if record.meta.get("symlink") == "true":
-            # Unread, so it carries no control id; a link in the outbox is a problem whatever it names.
-            problems.append(f"a link appeared in the outbox ({where})")
+        if record.meta.get("symlink") == "true" or record.meta.get("refused") == NOT_REGULAR:
+            # Unread, so it carries no control id; a link, FIFO or device in the outbox is a
+            # problem whatever it names.
+            problems.append(f"a link or other non-file entry appeared in the outbox ({where})")
             continue
         cid = control_id_of(record.payload)
         if cid is None or cid not in sent:
