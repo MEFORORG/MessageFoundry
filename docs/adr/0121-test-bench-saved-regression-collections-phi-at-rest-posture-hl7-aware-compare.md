@@ -79,7 +79,7 @@ of volatile fields (MSH-7, MSH-10).**
   a click on a case shows its expected-vs-actual differences (see *Reveal on click*).
   *Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):* this supersedes "deletes the temp directory
   in a `finally`" and "*Consequences* says what removes it" above. The `finally` tries to delete the
-  directory and the sweep in *Consequences* can try again later, but neither always removes it, and
+  directory and the sweep in *Consequences* can try later, but neither always removes it, and
   case files can stay with it. The first half of that sentence, "A hard crash can still leave the
   directory behind", still holds, and a crash is not the only way a directory is left. What is
   removed and what stays is recorded in the `deleteCaseDir` and `sweepStaleCaseDirs` docblocks in
@@ -109,11 +109,13 @@ existing Load / before-after / Coverage-Profiling panes and the `--show-phi` pos
 
 **Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):** this supersedes "the temp materialization
 is always cleaned up" in the sentence above: it is not always cleaned up, and case files can stay on
-disk. What must not break in its place is that the delete never recurses, never follows a link
-that is an entry in the run directory, and unlinks only regular files named as case files in that
-directory, apart from the open limits recorded in the `deleteCaseDir` and `sweepStaleCaseDirs`
-docblocks in `ide/src/collectionCaseFiles.ts`. Those docblocks are where what it removes, what
-stays, and at least the races known to remain are recorded.
+disk. What must not break in its place: a run's `finally` tries to delete its directory; a sweep
+tries to delete old run directories when a Test Bench panel is created and before a collection run
+writes its own directory; and the delete never recurses, never follows a link that is an entry in
+the run directory, and unlinks only regular files named as case files in that directory. The only
+exception allowed is a race in which a path is swapped between a check and the act on it. The
+races known to remain, what the delete removes, and what stays are recorded in the `deleteCaseDir`
+and `sweepStaleCaseDirs` docblocks in `ide/src/collectionCaseFiles.ts`.
 
 ## Acceptance Criteria
 
@@ -169,14 +171,15 @@ a future per-collection override lands.
 
 *Amended 2026-11-15 (engine PR 2968, BACKLOG #5415):* this supersedes, in the paragraph above,
 "always cleaned in `finally`", the sentence beginning "A directory a crash left behind is deleted",
-and "Until then it stays on disk". The `finally` tries to delete a run directory and a later sweep
-can try again, but neither always removes it: case files, and the directory holding them, can stay with
-no bound, and a sweep can unlink the case files of a run still going more than an hour after they
-were written, in another window included. The sweep still runs only when a Test Bench panel is
-created or a collection runs, only past the one-hour age gate, and on POSIX only for a directory
-this user owns. The rest of the first sentence, "but a hard crash mid-run could leave a temp
-file", still holds. The detail is recorded in the `deleteCaseDir` and `sweepStaleCaseDirs`
-docblocks in `ide/src/collectionCaseFiles.ts`.
+and the sentence "Until then it stays on disk, with no bound if the Test Bench is not used again".
+The `finally` tries to delete a run directory and a later sweep can try to, but neither always
+removes it: case files, and the directory holding them, can stay with no bound, and a sweep can
+unlink the case files of a run still going more than an hour after its directory was last
+modified, in another window included. The sweep runs when a Test Bench panel is created or a
+collection runs; which directories it tries, and the races that can get past its checks, are in
+the docblocks named below. The rest of the sentence beginning "Rerun writes transient PHI", "but a
+hard crash mid-run could leave a temp file", still holds. The detail is recorded in the
+`deleteCaseDir` and `sweepStaleCaseDirs` docblocks in `ide/src/collectionCaseFiles.ts`.
 
 **Out of scope** — Per-collection custom ignore policies (future amendment); encrypting
 `workspaceState`; cross-workspace/shared collections; any engine/CLI change (e.g. a `dryrun` stdin

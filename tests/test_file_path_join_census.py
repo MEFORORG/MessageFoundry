@@ -1053,9 +1053,10 @@ IDE_SITES: dict[str, Site] = {
         GUARDED,
         "A temp directory the extension made and generated case-file names, plus names read back"
         " from listing the shared OS temp directory, which another account can plant; the sweep"
-        " deletes one only if it is a real directory this user owns (POSIX). Names listed from a"
-        " run directory are unlinked only when they match the case-file name and lstat as a"
-        " regular file, and the directory goes only by rmdir, never a recursive delete.",
+        " tries one only if it lstats as a real directory this user owns (POSIX). Names listed from"
+        " a run directory are unlinked only when they match the case-file name and lstat as a"
+        " regular file, and the directory goes only by rmdir, never a recursive delete. The races"
+        " that can get past these checks are in the deleteCaseDir and sweepStaleCaseDirs docblocks.",
         "ide/src/collectionCaseFiles.ts::st.uid !== uid",
     ),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
