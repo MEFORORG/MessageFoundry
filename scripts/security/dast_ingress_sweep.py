@@ -29,13 +29,15 @@ the ingress path must do, and each judgement is a DETECTOR with a positive contr
 * ``resources`` -- heap, OS handles and asyncio tasks, measured across repeated passes of the
   catalogue after a warm-up pass, stay under a fixed growth bound. Instruments: ``tracemalloc``
   traced bytes, ``psutil`` handle (Windows) or descriptor (POSIX) count, ``len(asyncio.all_tasks())``.
-* ``log_body`` -- no log record at INFO or above carries message content. Every catalogue case
-  that writes a body, every mutation seed and every liveness probe carries a per-run sentinel
-  (:func:`carries_sentinel`; HL7 in PID-5 or an NTE, X12 in the subscriber's NM1-03), and a record
-  whose rendered text contains it is a finding. ``tests/test_dast_ingress_sweep.py`` holds every
-  case to that, on all three planes. It checks the bytes a case WRITES: a case that splits a body
-  across frames, and a mutation that cuts the sentinel out, can still hand the engine a frame
-  without it, and a log of that frame would be missed.
+* ``log_body`` -- no log record at INFO or above carries message content. Bodies carry a per-run
+  sentinel (:func:`run_sentinel`; HL7 in PID-5 or an NTE, X12 in the subscriber's NM1-03), and a
+  record whose rendered text contains it is a finding. ``tests/test_dast_ingress_sweep.py`` holds
+  every catalogue case and mutation seed to :func:`carries_sentinel`; the liveness probes carry it
+  too. NOT covered, at least: the header-only and framing-only cases, the trickle of
+  ``slowloris-in-frame`` (the listener closes it long before the sentinel's bytes arrive), a frame
+  that a split case such as ``end-byte-mid-body`` cuts off before the sentinel, and a mutation that
+  cuts the sentinel out (measured: about 45 percent of mutations). A log of any of those bodies
+  would be missed.
   This is a CALL-SITE check: the receipt also says whether the shipped redaction filters would have
   removed the hit, but a hit is a finding either way, because section 9 binds the call site.
 
@@ -181,12 +183,19 @@ def _hl7_with_sentinel(seed: bytes, sentinel: str) -> bytes:
 
 def _through_sentinel(body: bytes, sentinel: str) -> bytes:
     """``body`` cut just past the sentinel, for a case that drops a connection mid-message."""
-    return body[: body.index(_b(sentinel)) + len(sentinel) + 1]
+    marker = _b(sentinel)
+    return body[: body.index(marker) + len(marker) + 1]
+
+
+def run_sentinel(seed: int) -> str:
+    """The run's sentinel, derived from its seed so a receipt's seed names it."""
+    return f"ZZDASTSENTINEL{seed:08X}"
 
 
 def case_bytes(case: Case) -> bytes:
-    """Every byte a case writes: payload, tail and trickle."""
-    return case.payload + case.tail + case.trickle
+    """The bytes a case writes that reach the engine whole: payload and tail. The trickle is left
+    out, because the listener closes a trickling peer after its first few bytes."""
+    return case.payload + case.tail
 
 
 def carries_sentinel(case: Case, sentinel: str) -> bool:
@@ -763,7 +772,7 @@ def _judge(result: CaseResult, got: bytes) -> None:
 
 
 async def probe_liveness(
-    target: IngressTarget, plane: str, index: int, budget: Budget, sentinel: str = "LIVENESS"
+    target: IngressTarget, plane: str, index: int, budget: Budget, sentinel: str
 ) -> str | None:
     """A well-formed message on a fresh connection must be accepted and persisted. ``None`` = alive.
 
@@ -875,7 +884,7 @@ async def _quiesce(target: IngressTarget, budget: Budget) -> int:
 
 
 async def measure_resources(
-    target: IngressTarget, cases: Sequence[Case], passes: int, budget: Budget
+    target: IngressTarget, cases: Sequence[Case], passes: int, budget: Budget, sentinel: str
 ) -> tuple[Resources, list[dict[str, str]]]:
     """Warm up with one pass, then measure growth across ``passes`` more. Every repeat is still
     judged, and a liveness probe closes each pass, so a defect that shows only on a repeat or a
@@ -890,7 +899,7 @@ async def measure_resources(
                 ).findings
             )
         for plane in PLANES:
-            if (failure := await probe_liveness(target, plane, 0, budget)) is not None:
+            if (failure := await probe_liveness(target, plane, 0, budget, sentinel)) is not None:
                 findings.append(finding("liveness", plane, label, failure))
 
     async def quiesce(label: str) -> None:
@@ -1003,7 +1012,7 @@ async def run_sweep(
     budget = Budget.from_policy(policy, canary=canary)
     cap = budget.cap
     seed = int(policy["seed"]) if seed is None else seed
-    sentinel = f"ZZDASTSENTINEL{seed:08X}"
+    sentinel = run_sentinel(seed)
     fixed = catalogue(sentinel, cap)
     cases = list(fixed)
     if canary is not None:
@@ -1066,7 +1075,7 @@ async def run_sweep(
                 ]
                 passes = int(policy["resource_bounds"]["passes"])
                 resources, resource_findings = await measure_resources(
-                    target, resource_cases, passes, budget
+                    target, resource_cases, passes, budget, sentinel
                 )
             posture_out = target.posture
     finally:

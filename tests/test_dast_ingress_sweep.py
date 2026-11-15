@@ -50,6 +50,7 @@ from scripts.security.dast_ingress_sweep import (
     mutation_seeds,
     reference_frames,
     run_case,
+    run_sentinel,
 )
 from scripts.security.dast_ingress_target import (
     CANARIES,
@@ -473,7 +474,7 @@ def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
     seed but one, carried none, while the module said every catalogue body did. A case may lack it
     only when it writes framing bytes alone (an empty frame, an idle connection) or a bare header
     (``HEADER_ONLY_CASES``)."""
-    sentinel = "ZZDASTSENTINEL0000013E"
+    sentinel = run_sentinel(int(_policy()["seed"]))
     cases = catalogue(sentinel, _CAP)
     assert {c.plane for c in cases} == {"mllp", "tcp", "x12"}, "a plane dropped out of the census"
     blind = [f"{c.plane}:{c.name}" for c in cases if not carries_sentinel(c, sentinel)]
@@ -485,7 +486,12 @@ def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
 
     # Positive control: the exemption covers framing-only cases and nothing that has a body.
     exempt = {f"{c.plane}:{c.name}" for c in cases if sentinel.encode() not in case_bytes(c)}
-    framing_only = {"mllp:empty-frame", "tcp:empty-frame", "mllp:idle-after-connect"}
+    framing_only = {
+        "mllp:empty-frame",
+        "tcp:empty-frame",
+        "mllp:idle-after-connect",
+        "mllp:slowloris-in-frame",
+    }
     assert exempt == framing_only | {"x12:idle-after-connect"} | HEADER_ONLY_CASES, exempt
     assert not carries_sentinel(Case("x", "tcp", b"\x02body\x03"), sentinel)
 
@@ -493,7 +499,7 @@ def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
 def test_the_sentinel_keeps_the_x12_seed_an_interchange() -> None:
     """The X12 sentinel sits in NM1-03, after the fixed-width ISA, so the well-formed X12 and raw-TCP
     cases still decode as one interchange each."""
-    cases = {(c.plane, c.name): c for c in catalogue("ZZDASTSENTINEL0000013E", _CAP)}
+    cases = {(c.plane, c.name): c for c in catalogue(run_sentinel(int(_policy()["seed"])), _CAP)}
     assert len(reference_frames("x12", cases[("x12", "well-formed")].payload, _CAP)[0]) == 1
     assert len(reference_frames("tcp", cases[("tcp", "well-formed")].payload, _CAP)[0]) == 1
 
