@@ -1005,26 +1005,40 @@ def _gh_disarm_stub(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("label", "armed", "extra", "rc", "disarm_called", "end_state"),
+    ("label", "armed", "extra", "rc", "disarm_called", "end_state", "stale"),
     [
-        ("armed on an earlier head is disarmed", "true", {}, 0, True, "false"),
-        ("not armed: nothing to do", "false", {}, 0, False, "false"),
+        ("armed on an earlier head is disarmed", "true", {}, 0, True, "false", False),
+        ("not armed: nothing to do", "false", {}, 0, False, "false", False),
         # Unknown is not "not armed": it disarms anyway, then cannot confirm, so the step is red.
-        ("state unreadable: disarms anyway", "true", {"VIEW_FAIL": "1"}, 1, True, "false"),
-        ("a refused disarm fails closed", "true", {"DISARM_FAIL": "1"}, 1, True, "true"),
-        ("a disarm that did not take fails closed", "true", {"DISARM_NOOP": "1"}, 1, True, "true"),
-        # A re-run of an older run: the newer run's arm is left alone.
-        ("a stale run leaves the arm alone", "true", {"GH_HEAD": "b" * 40}, 0, False, "true"),
-        # An unreadable head is not stale: disarm, then fail so nothing re-arms.
-        ("an unreadable head disarms and fails", "true", {"GH_HEAD": ""}, 1, True, "false"),
-        # Head unreadable, nothing armed: still red, so the later steps cannot re-arm.
+        ("state unreadable: disarms anyway", "true", {"VIEW_FAIL": "1"}, 1, True, "false", False),
+        ("a refused disarm fails closed", "true", {"DISARM_FAIL": "1"}, 1, True, "true", False),
+        ("a disarm that did not take", "true", {"DISARM_NOOP": "1"}, 1, True, "true", False),
+        # THE RACE: an arm placed on the older head, a human pushed a newer one, and this run's
+        # event head is the older one (a re-run, or the newer run was cancelled). It must disarm.
         (
-            "an unreadable head on an unarmed PR fails",
+            "stale run after an arm on the older head",
+            "true",
+            {"GH_HEAD": "b" * 40},
+            1,
+            True,
+            "false",
+            True,
+        ),
+        ("stale run, nothing armed", "false", {"GH_HEAD": "b" * 40}, 1, False, "false", True),
+        # A head read that is not exactly 40 lowercase hex characters: disarm and fail, never stale.
+        ("an empty head read", "true", {"GH_HEAD": ""}, 1, True, "false", False),
+        ("a short head read", "true", {"GH_HEAD": "abc"}, 1, True, "false", False),
+        ("an uppercase head read", "true", {"GH_HEAD": "A" * 40}, 1, True, "false", False),
+        ("a 41-character head read", "true", {"GH_HEAD": "b" * 41}, 1, True, "false", False),
+        ("a garbled head read", "true", {"GH_HEAD": "g" * 40}, 1, True, "false", False),
+        (
+            "a failed head read, nothing armed",
             "false",
             {"HEAD_FAIL": "1"},
             1,
             False,
             "false",
+            False,
         ),
     ],
 )
@@ -1035,6 +1049,7 @@ def test_disarm_step_behaviour(
     rc: int,
     disarm_called: bool,
     end_state: str,
+    stale: bool,
     tmp_path: Path,
 ) -> None:
     """The disarm body EXECUTED. A non-zero exit is the fail-closed outcome: Actions then skips every
@@ -1053,9 +1068,9 @@ def test_disarm_step_behaviour(
         **extra,
     }
     run = _run_step_body("disarm", env, tmp_path, path_prepend=_gh_disarm_stub(tmp_path))
-    assert (run.outputs.get("stale") == "true") is (
-        extra.get("GH_HEAD", "a" * 40) not in ("a" * 40, "")
-    ), f"{label}: stale={run.outputs.get('stale')!r}{_diagnostic(run)}"
+    assert (run.outputs.get("stale") == "true") is stale, (
+        f"{label}: stale={run.outputs.get('stale')!r}{_diagnostic(run)}"
+    )
     assert run.rc == rc, f"{label}: rc={run.rc}, expected {rc}{_diagnostic(run)}"
     called = any("--disable-auto" in ln for ln in log.read_text(encoding="utf-8").splitlines())
     assert called is disarm_called, f"{label}: disarm called={called}{_diagnostic(run)}"
@@ -1173,6 +1188,8 @@ _EVALUATED = "a" * 40
         ("refused because the head moved", False, "b" * 40, 0),
         ("refused on the evaluated head", False, _EVALUATED, 1),
         ("refused and the head is unreadable", False, None, 1),
+        # A short hex read is not proof the head moved, so it must not pass green.
+        ("refused and the head read is short", False, "abc", 1),
     ],
 )
 def test_merge_step_passes_only_a_head_moved_refusal(

@@ -113,10 +113,13 @@ jobs:
       # whether a push dequeues it is GitHub's behaviour and is not measured here. An auto-merge a
       # human armed by hand is dropped too, deliberately: the push changed what they approved.
       #
-      # A STALE RUN does nothing. "Re-run jobs" replays the old payload, so a re-run of an earlier
-      # synchronize run would otherwise disarm the arm a newer run placed and then fail to re-arm.
-      # When the event's head is not the PR's current head, this step emits stale=true without
-      # disarming, and the merge step does not run.
+      # A STALE RUN DISARMS AND FAILS. "Re-run jobs" replays the old payload, so a run whose event head
+      # is not the PR's current head cannot judge that head. It must not rely on a newer run to disarm
+      # either: GitHub keeps one pending run per concurrency group, so a re-run can cancel that newer
+      # run, and a lagging head read can make the newest run itself look stale. So a stale run emits
+      # stale=true, disarms, reads the state back and exits non-zero, so it shows red and nothing
+      # re-arms. The cost is a hold; a Dependabot push or a manual arm re-arms. A head read that is
+      # not exactly 40 lowercase hex characters is treated the same way.
       - name: Disarm auto-merge armed on an earlier head
         id: disarm
         if: github.event.action == 'synchronize' || github.event.action == 'reopened'
@@ -126,31 +129,27 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
-          head_unknown=false
+          # fail_closed: disarm as usual, then exit non-zero so no later step re-arms.
+          fail_closed=""
           now="$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid 2>/dev/null)" || now="ERR"
-          case "$now" in
-            ""|ERR|*[!0-9a-f]*)
-              # NOT treated as stale: a stale run would leave the arm alone, and an unknown head must
-              # not take that path. Disarm, then fail the step below so nothing re-arms.
-              echo "::warning::could not read this PR's head — disarming anyway; nothing re-arms."
-              head_unknown=true
-              ;;
-            *)
-              if [ "$now" != "$HEAD_SHA" ]; then
-                echo "::notice::this run's head $HEAD_SHA is not the PR's head $now; the run for the newer head decides."
-                echo "stale=true" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              ;;
-          esac
+          case "$now" in *[!0-9a-f]*) now_ok=false ;; *) now_ok=true ;; esac
+          [ "${#now}" -eq 40 ] || now_ok=false
+          if [ "$now_ok" != true ]; then
+            echo "::warning::could not read this PR's head (got '${now}') — disarming; nothing re-arms."
+            fail_closed="the PR head could not be read"
+          elif [ "$now" != "$HEAD_SHA" ]; then
+            echo "::warning::this run's head $HEAD_SHA is not the PR's head $now — disarming; nothing re-arms."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            fail_closed="this run is stale (its head is not the PR's head)"
+          fi
           # `||` outside the substitution, for the reason the ghsa step gives: `gh` writes an error
           # body to stdout, and the shape check below must see the sentinel, not that body.
           armed="$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null)" || armed="ERR"
           case "$armed" in
             false)
               echo "::notice::no auto-merge request is armed on this PR (a merge-queue entry is not read here)."
-              if [ "$head_unknown" = true ]; then
-                echo "::error::the PR head could not be read — failing closed, nothing re-arms."
+              if [ -n "$fail_closed" ]; then
+                echo "::error::${fail_closed} — failing closed, nothing re-arms."
                 exit 1
               fi
               exit 0
@@ -168,8 +167,8 @@ jobs:
             echo "::error::auto-merge still reads '${after}' after the disarm — failing closed, nothing re-arms."
             exit 1
           fi
-          if [ "$head_unknown" = true ]; then
-            echo "::error::disarmed, but the PR head could not be read — failing closed, nothing re-arms."
+          if [ -n "$fail_closed" ]; then
+            echo "::error::disarmed; ${fail_closed} — failing closed, nothing re-arms."
             exit 1
           fi
           echo "::warning::disarmed auto-merge armed on an earlier head; it re-arms only if the guardrails below admit this head."
@@ -491,8 +490,10 @@ jobs:
       # the first commit's verdict. Re-arming is therefore allowed only when ALL of these hold: the
       # event is not `reopened`; its SENDER is dependabot[bot]; the PR has exactly ONE commit; that
       # commit IS the head this run pins; its author is dependabot[bot]; and GitHub verified its
-      # signature. On `opened` and `synchronize` the sender is the account that pushed, so a human's
-      # or the Lander's push, and a web-flow commit a human makes through the API, carry that human.
+      # signature. On `synchronize` the sender is the account that pushed, so a human's or the
+      # Lander's push, and a web-flow commit a human makes through the API, carry that human. On
+      # `opened` it is the account that opened the PR; a commit someone else pushed to the branch
+      # first is caught by the single-commit and head comparison, not by the sender.
       # On `reopened` the sender is whoever reopened, which can be Dependabot acting on someone else's
       # push to the closed PR, so a reopen never re-arms. The committer is not checked, because
       # GitHub's web-flow commits Dependabot's own work. An A3 lock-resync push adds a second commit,
@@ -570,12 +571,12 @@ jobs:
             exit 0
           fi
           now="$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid 2>/dev/null)" || now="ERR"
-          case "$now" in
-            ""|ERR|*[!0-9a-f]*)
-              echo "::error::arming failed and the PR head could not be read."
-              exit 1
-              ;;
-          esac
+          case "$now" in *[!0-9a-f]*) now_ok=false ;; *) now_ok=true ;; esac
+          [ "${#now}" -eq 40 ] || now_ok=false
+          if [ "$now_ok" != true ]; then
+            echo "::error::arming failed and the PR head could not be read (got '${now}')."
+            exit 1
+          fi
           if [ "$now" != "$HEAD_SHA" ]; then
             echo "::notice::the head moved from $HEAD_SHA to $now while this run evaluated; the run for the new head decides."
             exit 0
