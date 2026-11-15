@@ -12602,13 +12602,10 @@ class AuthService:
         """Whether a page that may be served with or without a session shows this browser as
         signed in: Sign-out and the session watchdog. A DISPLAY decision, never an authorization.
 
-        A row that fails its integrity seal is ended and reported, by :meth:`_load_session`, as
-        every read of a session row is. Unlike :meth:`identity_for_token`, this method touches no
-        session, and a row it refuses after that read, on its clock, its owner's lapsed temporary
-        credential or its epoch, reads ``False``, is not audited, and is left as it is. So a
-        session a sign-in start presents is still there for the callback's supersession to end,
-        and a lapsed credential is recorded there (BACKLOG #3749). An account record that fails
-        its own seal is reported, as every read of it is.
+        It refuses, ends and reports a session as :meth:`identity_for_token` does, with one
+        exception: a session whose owner's temporary credential has lapsed reads ``False`` and is
+        left as it is, so the sign-in callback's supersession ends it and records the lapse
+        (BACKLOG #3749). Unlike that method, this one touches no session.
         """
         if not token:
             return False
@@ -12617,11 +12614,14 @@ class AuthService:
             return False
         now = time.time()
         if not session.is_live(now=now, idle_seconds=self.session_idle_seconds):
+            await self._store.revoke_session(session.token_hash, now=now)
             return False
         user = await self._load_user(session.user_id)
-        if user is None or user.disabled:
+        if user is not None and (refusal := self._gate_refusal(session, user, now)) is not None:
+            if refusal != "credential":
+                await self._session_seal_failed(session.token_hash)
             return False
-        return self._gate_refusal(session, user, now) is None
+        return user is not None and not user.disabled
 
     async def _load_session(self, token_hash: str) -> SessionRecord | None:
         """The session ``token_hash`` names, or ``None`` (BACKLOG #2592). The ONLY reader of

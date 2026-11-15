@@ -26,7 +26,8 @@ from messagefoundry_webconsole.routes import oidc as oidc_routes
 
 
 class _FakeAuth:
-    """The narrow slice of AuthService the start legs touch before they would reach the IdP."""
+    """The narrow slice of AuthService the start legs touch, for a request that carries no session
+    cookie, before they would reach the IdP."""
 
     oidc_enabled = True
     oidc_flow_ttl_seconds = 300

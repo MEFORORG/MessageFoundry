@@ -522,6 +522,83 @@ async def test_both_start_legs_end_and_report_a_session_row_that_fails_its_seal(
     assert await service.identity_for_token(intact, activity=False) is not None
 
 
+async def _local_sessions(service: AuthService, count: int) -> list[str]:
+    """``count`` sessions of one local account, ``ivan``."""
+    await create_local_user_chosen(
+        service,
+        username="ivan",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    tokens = []
+    for _ in range(count):
+        outcome = await service.login("ivan", PW, client="127.0.0.1")
+        assert outcome.ok and outcome.token
+        tokens.append(outcome.token)
+    return tokens
+
+
+async def _at_the_interstitial(engine: Engine, service: AuthService, token: str) -> httpx.Response:
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", token)
+        leaving = await c.get("/ui/oidc/start", follow_redirects=False)
+    assert leaving.status_code == 200 and "leaving" in leaving.text.lower(), leaving.text
+    assert "data-mf-session-watchdog" not in leaving.text
+    assert "clear-site-data" in leaving.headers
+    return leaving
+
+
+async def test_the_interstitial_ends_and_reports_a_session_a_revoke_staled(
+    engine: Engine,
+) -> None:
+    """RED when: the interstitial's display read leaves a session whose account epoch moved past
+    it unended or unreported. ``identity_for_token`` ends and reports such a row as one that fails
+    its seal (BACKLOG #2592), and so did the watchdog's probe the read replaced. The control is a
+    second session of the same account, sealed after the epoch moved, which the read leaves live."""
+    service = await _service(engine, _FakeLdap())
+    (presented,) = await _local_sessions(service, 1)
+    await engine.store._db.execute(
+        "UPDATE users SET session_epoch=session_epoch+1 WHERE username=?", ("ivan",)
+    )
+    await engine.store._db.commit()
+    outcome = await service.login("ivan", PW, client="127.0.0.1")
+    assert outcome.ok and outcome.token
+    control = outcome.token
+    await _at_the_interstitial(engine, service, presented)
+    assert await _ended(engine, presented)
+    assert await _seal_failures(engine, presented) == 1
+    assert not await _ended(engine, control)
+    assert await service.session_shows_signed_in(control)
+    assert await _seal_failures(engine, control) == 0
+
+
+@pytest.mark.parametrize("column", ["expires_at", "last_used_at"])
+async def test_the_interstitial_ends_a_session_past_its_expiry_or_idle_window(
+    engine: Engine, column: str
+) -> None:
+    """RED when: the interstitial's display read leaves a session past its absolute expiry or its
+    idle window unended. ``identity_for_token`` revokes it, and so did the watchdog's probe the
+    read replaced. It is no integrity failure, so nothing is reported. The control is a second
+    session of the same account, still inside both, which the read leaves live."""
+    service = await _service(engine, _FakeLdap())
+    presented, control = await _local_sessions(service, 2)
+    past = time.time() - service.session_idle_seconds - 60
+    statement = {
+        "expires_at": "UPDATE sessions SET expires_at=? WHERE token_hash=?",
+        "last_used_at": "UPDATE sessions SET last_used_at=? WHERE token_hash=?",
+    }[column]
+    await engine.store._db.execute(statement, (past, hash_token(presented)))
+    await engine.store._db.commit()
+    await _at_the_interstitial(engine, service, presented)
+    assert await _ended(engine, presented)
+    assert await _seal_failures(engine, presented) == 0
+    assert not await _ended(engine, control)
+    assert await service.session_shows_signed_in(control)
+
+
 async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

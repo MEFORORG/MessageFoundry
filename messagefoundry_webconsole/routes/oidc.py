@@ -41,9 +41,9 @@ Two deliberate departures a reviewer will want to check rather than "fix":
 * **The callback returns 200 + a meta refresh, never a 303.** See :func:`pages.oidc_landing`.
 
 Ordering rule inherited from ``sso.py``: **every audit-writing branch sits behind the rate limiter,
-except at least the session read on the interstitial GET, which ends and reports a session row that
-fails its integrity seal, and reports an account record that fails its own.** That read ends no
-other session. The sign-in POST's session read runs after its limiter.
+except at least the session read on the interstitial GET, which can end a refused session and
+report it** (see ``AuthService.session_shows_signed_in``). The sign-in POST's session read runs
+after its limiter.
 Both legs are unauthenticated, so an attacker looping them would otherwise be an unbounded
 audit_log-write amplifier. The availability and rate-limit rejects therefore write no audit row.
 The callback picks its limiter from the flow its cookie names (BACKLOG #3374): see
