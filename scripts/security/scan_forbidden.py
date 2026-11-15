@@ -1207,30 +1207,17 @@ def _pr_scan_unit(
     loose_columns: set[int],
     hits: set[tuple[int, int]],
 ) -> None:
-    """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind).
-
-    Step 10 is an overlay on the full reading, never a change inside it. A verdict an identifier the
-    text does not mark binds (or a row's, where no identifier in it is marked) is dropped only when
-    the sentence, read again with step 10's exempt clauses blanked out (_pr_step10_blank), no longer
-    binds it: then nothing but the exempt clause made it a verdict."""
+    """Scan one unit of one reading of scan_pr_body, adding each hit to ``hits`` as (line, kind)."""
     marks, unit_text, is_row = unit
     for start, sentence in _pr_sentences(unit_text, is_row):
-        found, exemptable = _pr_sentence_found(sentence, is_row, asvs_columns, loose_columns)
-        if exemptable.intersection(found["verdict"]):
-            blanked = _pr_step10_blank(sentence, is_row)
-            if blanked != sentence:
-                still = set(
-                    _pr_sentence_found(blanked, is_row, asvs_columns, loose_columns)[0]["verdict"]
-                )
-                found["verdict"] = [
-                    at for at in found["verdict"] if at not in exemptable or at in still
-                ]
+        found = _pr_sentence_found(sentence, is_row, asvs_columns, loose_columns)
         for kind_index, kind in enumerate(PR_BODY_REASONS):
             hits.update((_pr_line_at(marks, start + at), kind_index) for at in found[kind])
 
 
-def _pr_step10_blank(sentence: str, is_row: bool) -> str:
-    """The sentence with each of step 10's exempt clauses replaced by spaces, so every offset stays.
+def _pr_step10_blank(sentence: str, is_row: bool) -> str | None:
+    """The sentence with each of step 10's exempt clauses replaced by spaces, so every offset stays,
+    or None where it holds no exempt clause.
 
     In prose, a clause is "row", a negated state verb and a CI verb ("the row is not failing"). In a
     row, it is a cell's verdict reading, whole or leading, with "never" before a CI verb ("never
@@ -1268,7 +1255,7 @@ def _pr_step10_blank(sentence: str, is_row: bool) -> str:
                     ):
                         spans.append((where[hit.start()], where[hit.end() - 1] + 1))
     if not spans:
-        return sentence
+        return None
     chars = list(sentence)
     for left, right in spans:
         chars[left:right] = " " * (right - left)
@@ -1277,14 +1264,20 @@ def _pr_step10_blank(sentence: str, is_row: bool) -> str:
 
 def _pr_sentence_found(
     sentence: str, is_row: bool, asvs_columns: set[int], loose_columns: set[int]
-) -> tuple[dict[str, list[int]], set[int]]:
-    """Every binding in one sentence of a unit, by kind, as offsets into it, with no step 10
-    exemption; and the verdict offsets step 10 may exempt: an unmarked identifier's, and a row's own
-    (offset 0) where no identifier in it is marked."""
+) -> dict[str, list[int]]:
+    """Every binding in one sentence of a unit, by kind, as offsets into it.
+
+    Step 10 is an overlay on this full reading, never a change inside it. A verdict that an
+    identifier the text does not mark binds, or that an unmarked row binds, is checked again on the
+    sentence with step 10's exempt clauses blanked out (_pr_step10_blank), and dropped only if that
+    check no longer binds it. Only the binding predicates run again, on the same identifiers with
+    the version and mark the full reading gave them, so blanking cannot change what an identifier is
+    or which tight pair is found; a tight pair's verdict is never dropped."""
     # Every identifier that binds a kind is recorded, not only the first: a repair that makes an
     # earlier identifier bind must not move a hit off the line main reported it at.
     found: dict[str, list[int]] = {kind: [] for kind in PR_BODY_REASONS}
-    exemptable: set[int] = set()
+    # The unmarked identifiers that bound a verdict, which step 10 may exempt.
+    exemptable: list[tuple[re.Match[str], bool]] = []
     # The tree scan's tight pair, before the version filter can set its identifier aside: what
     # that scan flags in a file, this one flags in a body -- when the pair's identifier has the
     # requirement shape, since the tree scan's own shape admits every dotted triple.
@@ -1321,9 +1314,10 @@ def _pr_sentence_found(
         if _pr_verdict_bound(sentence, m, version, marked) or (
             not version and not is_row and _pr_prose_verdict(window, marked)
         ):
-            found["verdict"].append(m.start())
-            if not marked:
-                exemptable.add(m.start())
+            if marked:
+                found["verdict"].append(m.start())
+            else:
+                exemptable.append((m, version))
         if version:
             continue
         if evidence is None or not is_row:
@@ -1336,11 +1330,26 @@ def _pr_sentence_found(
     requirement_ids = {m.group(0) for m, version in ids if not version}
     # A row's own verdict is read whether or not an identifier bound one: step 10 may drop the
     # identifier's, and the row's line must keep any other verdict it holds.
-    if is_row and _pr_table_verdict(sentence, requirement_ids, row_marked):
+    row_verdict = is_row and _pr_table_verdict(sentence, requirement_ids, row_marked)
+    if row_verdict and row_marked:
         found["verdict"].append(0)
-        if not row_marked:
-            exemptable.add(0)
-    return found, exemptable
+    if not exemptable and not (row_verdict and not row_marked):
+        return found
+    blanked = _pr_step10_blank(sentence, is_row)
+    for m, version in exemptable:
+        if blanked is None or _pr_verdict_bound(blanked, m, version, False):
+            found["verdict"].append(m.start())
+        elif not version and not is_row:
+            window = blanked[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
+            if _pr_prose_verdict(window, False):
+                found["verdict"].append(m.start())
+    if (
+        row_verdict
+        and not row_marked
+        and (blanked is None or _pr_table_verdict(blanked, requirement_ids, False))
+    ):
+        found["verdict"].append(0)
+    return found
 
 
 # Skip routable-IP detection (only) where dotted numbers are package versions, not hosts.

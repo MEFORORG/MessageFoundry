@@ -1272,6 +1272,24 @@ _PR_FINDINGS_MUST_FIRE: list[tuple[str, str, str]] = [
     ("10", "verdict", f"| {_REQ_B} | x | is never failing; {_PARTIAL} |"),
     ("10", "verdict", f"| {_REQ} | the parser | is never failing; stays failing |"),
     ("10", "verdict", f"| {_REQ} | the parser | is never failing; re-scored as failing |"),
+    # Review round-4aa302cd29's losses, each flagged by main: blanking an exempt clause must not make
+    # an identifier read as a version (a version-lead word or "HL7" now beside it), nor move which
+    # tight pair is found, so a verdict that never needed the clause stays.
+    (
+        "10",
+        "verdict",
+        "| Tool | Check | Requirement | Verdict |\n|---|---|---|---|\n| uv | never fails | 1.2.3 | met |",
+    ),
+    (
+        "10",
+        "verdict",
+        "| Job | CI | Req | Result |\n|---|---|---|---|\n| smoke-test | never passing | 1.2.3 | not met |",
+    ),
+    ("10", "verdict", "| unchanged, partial | na | smoke-test | never fails; | 1.2.4 |"),
+    ("10", "verdict", "Per Python row is not failing 1.2.3 is met."),
+    ("10", "verdict", "HL7 row is not failing V1.2.3 is met."),
+    ("10", "verdict", "Build 3.14.0 | row is not failing pass, and\n1.2.3: fail closed."),
+    ("10", "verdict", "[1.2.4] row is not failing pass and\n1.2.3: fail closed."),
     # A marked identifier is never exempt.
     ("10", "verdict", f"ASVS {_REQ}: the row is not failing but stays {_PARTIAL}."),
     ("10", "verdict", f"| ASVS {_REQ} | the parser | is never failing; the cell is failing |"),
