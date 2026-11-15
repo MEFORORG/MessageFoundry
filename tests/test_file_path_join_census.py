@@ -1048,6 +1048,14 @@ _IDE_MEDIA = "The extension's install directory joined to fixed media or snippet
 IDE_SITES: dict[str, Site] = {
     "ide/src/chat.ts": Site(1, INTERNAL, _IDE_MEDIA),
     "ide/src/cli.ts": Site(2, OPERATOR, "Fixed venv interpreter paths under the workspace."),
+    "ide/src/collectionCaseFiles.ts": Site(
+        3,
+        GUARDED,
+        "A temp directory the extension made and generated case-file names, plus names read back"
+        " from listing the shared OS temp directory, which another account can plant; the sweep"
+        " deletes one only if it is a real directory this user owns (POSIX).",
+        "ide/src/collectionCaseFiles.ts::st.uid !== uid",
+    ),
     "ide/src/configRefresh.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/editorToolbar.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/engineTrustModel.ts": Site(
@@ -1098,11 +1106,7 @@ IDE_SITES: dict[str, Site] = {
     "ide/src/symbolIndex.ts": Site(
         1, OPERATOR, "Names from listing the operator's config directory."
     ),
-    "ide/src/testBench.ts": Site(
-        3,
-        INTERNAL,
-        "A temp directory the extension made and generated case-file names, or the fixtures setting.",
-    ),
+    "ide/src/testBench.ts": Site(1, OPERATOR, "The fixtures setting, under the workspace."),
     "ide/src/validate.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/workspaceContainment.ts": Site(
         4,
