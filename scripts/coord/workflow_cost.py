@@ -345,13 +345,15 @@ _PUNCT_RE = re.compile(
 def _continues(cat: str, text: str, nxt: int) -> bool:
     """Whether an expression whose line ends in a token of category ``cat`` goes on at ``nxt``.
 
-    THE ONE CONTINUATION TEST. A line ending a statement or opening a block goes on to nothing. A
-    line ending in an operator awaits its operand, whatever the next line opens with. Otherwise the next line continues it only by opening with a binary operator: a
-    ``++``/``--`` there is a prefix operator after an inserted ``;``, and a postfix result cannot be
-    called, indexed or dotted, so ASI splits before ``(``, ``[`` and ``.`` after one.
+    THE ONE CONTINUATION TEST. A line ending a statement or opening a block goes on only to a
+    conditional's ``:``, which no ``;`` is inserted ahead of. A line ending in an operator awaits
+    its operand, whatever the next line opens with. Otherwise the next line continues it only by
+    opening with a binary operator: a ``++``/``--`` there is a prefix operator after an inserted
+    ``;``, and a postfix result cannot be called, indexed or dotted, so ASI splits before ``(``,
+    ``[`` and ``.`` after one.
     """
-    if cat == _END:  # nothing continues a statement that has ended, or a block that opened
-        return False
+    if cat == _END:  # only a conditional's `:` goes on past an arrow body or a bare `yield`
+        return text.startswith(":", nxt)
     leads = not text.startswith(_POSTFIX, nxt) and _LEADS_ON_RE.match(text, nxt) is not None
     if cat == _AFTER_POSTFIX:
         return leads and text[nxt] not in "([."
@@ -398,7 +400,8 @@ class _Scan:
     cat: str = _END  # the previous token's category; the start reads as a statement's end
     text: str = ";"
     kw: str = ""  # the previous token's text when it acted as a keyword
-    cat2: str = _END  # the category and keyword before that
+    cat2: str = _END  # the category, text and keyword before that
+    text2: str = ";"
     kw2: str = ""
     newline: bool = False  # a line break since the previous token, a block comment's included
     colon: str = ""  # what the last `:` was: "key", "cond" or "label"
@@ -467,7 +470,8 @@ class _Lexer:
     def code(self, i: int, nested: bool = False) -> int:
         """Lex code from ``i``; ``nested`` stops at the ``}`` closing an interpolation."""
         src, n = self.src, len(self.src)
-        st = _Scan([_Frame("", "block")])
+        # An interpolation is an operand position, where a `{` opens an object.
+        st = _Scan([_Frame("", "block")], _OPERAND if nested else _END)
         while i < n:
             c = src[i]
             if c.isspace():
@@ -574,7 +578,7 @@ class _Lexer:
             st.fn = 2
         if text != ")":
             st.params = None
-        st.cat2, st.kw2 = st.cat, st.kw
+        st.cat2, st.text2, st.kw2 = st.cat, st.text, st.kw
         st.cat, st.text, st.kw, st.newline = cat, text, kw, False
 
     @staticmethod
@@ -587,9 +591,11 @@ class _Lexer:
     @staticmethod
     def expression(st: _Scan) -> bool:
         """Whether a ``class`` or ``function`` keyword here starts an expression."""
-        if st.text == ":" and st.colon == "label":  # a labelled or `case` declaration
+        # `async function` reads what precedes `async`, unless a line break ends `async` first.
+        prefixed = st.text == "async" and not st.newline
+        cat, text, kw = (st.cat2, st.text2, st.kw2) if prefixed else (st.cat, st.text, st.kw)
+        if text == ":" and st.colon == "label":  # a labelled or `case` declaration
             return False
-        cat, kw = (st.cat2, st.kw2) if st.text == "async" else (st.cat, st.kw)
         return cat in (_OPERAND, _RESTRICTED) and kw not in ("export", "else", "do")
 
     def open(self, st: _Scan, top: _Frame, text: str, role: str) -> _Frame:
@@ -605,7 +611,10 @@ class _Lexer:
                 return _Frame("(", "for")
             return _Frame("(", "head" if st.kw in _STATEMENT_HEADS else "")
         if st.params is not None:  # a function or method body
-            return _Frame("{", "block", st.params.closes_value, owner=st.params.owner)
+            owner = st.params.owner
+            if owner is not None and owner.name >= 0 and self.record:
+                self.notes.method_heads.add(owner.name)  # a method head only once its body opens
+            return _Frame("{", "block", st.params.closes_value, owner=owner)
         if role == "static":
             return _Frame("{", "block", False, owner=top)
         if st.text == "=>":  # nothing calls, indexes or operates on an arrow function
@@ -680,8 +689,20 @@ class _Lexer:
                     return ""
                 fr.member = "init"
                 continue
+            if state == "deco":  # `@` or a dot: a decorator's next name
+                fr.member = "decorated" if kind in ("word", "private") else "init"
+                return ""
+            if state == "decorated":  # a decorator's name or call has been read
+                if text in (".", "("):
+                    fr.member = "deco" if text == "." else "decorated"
+                    return ""
+                fr.member = "start"  # the decorated member itself starts here
+                continue
             if state == "start":
                 if text in (";", "}"):
+                    return ""
+                if text == "@" and cls:
+                    fr.member = "deco"
                     return ""
                 if text == "*":
                     fr.member = "star"
@@ -725,8 +746,6 @@ class _Lexer:
                 continue
             # "named": the member's name has been read
             if text == "(":
-                if fr.name >= 0 and self.record:
-                    self.notes.method_heads.add(fr.name)
                 fr.member = "method"
                 return "method"
             if text == ":" and not cls:
@@ -1304,7 +1323,7 @@ def _function_value_end(ctx: _Ctx, m: re.Match[str]) -> int:
         return span[1]
     if m.start() not in ctx.method_heads:
         return m.end()  # a call; `function main(` was already judged at its `function` keyword
-    close = _match_bracket(ctx.masked, m.end() - 1)
+    close = _match_bracket(ctx.masked, ctx.masked.find("(", m.end() - 1))
     span = _block_body(ctx, close + 1) if close != -1 else None  # `review(r) { ... }`
     return span[1] if span else m.end()
 
