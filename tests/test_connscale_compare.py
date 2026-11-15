@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 from harness.load.connscale.compare import (
@@ -237,3 +238,76 @@ def test_all_baselines_breached_yields_null_not_phantom_true() -> None:
     assert _summary(cmp)["throughput_non_regression"] is None
     assert cmp.resilience_wins == 2
     assert cmp.ok  # pooled held zero-loss at both counts
+
+
+def _timed_out(rec: ConnScaleRecord) -> ConnScaleRecord:
+    return dataclasses.replace(rec, drain_seconds=None)
+
+
+def test_a_lossy_earlier_trial_fails_the_cell_bug_5429() -> None:
+    # Two trials per arm; the pooled arm's FIRST trial lost messages and the last held. Keeping only the
+    # last trial per cell used to pass this A/B.
+    recs = [
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _record(
+            claim_mode="pooled", count=500, achieved_read=399.0, idle_poll=0.0, no_loss_ok=False
+        ),
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _record(claim_mode="pooled", count=500, achieved_read=399.0, idle_poll=0.0),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert not cmp.ok
+    (row,) = cmp.rows
+    assert row.candidate_lost
+    assert row.candidate is not None
+    assert row.candidate.trials == 2
+    assert "trial 0: lost 100" in row.candidate.no_loss_detail
+
+
+def test_a_timed_out_candidate_trial_fails_the_cell_bug_5429() -> None:
+    recs = [
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _timed_out(_record(claim_mode="pooled", count=500, achieved_read=399.0, idle_poll=0.0)),
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _record(claim_mode="pooled", count=500, achieved_read=399.0, idle_poll=0.0),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert not cmp.ok
+    assert cmp.rows[0].candidate is not None
+    assert "trial 0: drain timed out" in cmp.rows[0].candidate.no_loss_detail
+
+
+def test_an_orphan_candidate_cell_fails_the_ab_bug_5429() -> None:
+    # A pooled cell at N=1000 with no per_lane baseline has no row, so it used to be skipped silently.
+    recs = [
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _record(claim_mode="pooled", count=500, achieved_read=399.0, idle_poll=0.0),
+        _record(
+            claim_mode="pooled", count=1000, achieved_read=10.0, idle_poll=0.0, no_loss_ok=False
+        ),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert not cmp.ok
+    assert cmp.orphan_candidate_cells == [("fixed_aggregate", 1000)]
+    summary = cmp.to_json_dict()["summary"]
+    assert isinstance(summary, dict)
+    assert summary["orphan_candidate_cells"] == [{"sweep_mode": "fixed_aggregate", "count": 1000}]
+    assert any("NO per_lane baseline" in n for n in cmp.notes)
+
+
+def test_trials_aggregate_to_the_mean_rate_bug_5429() -> None:
+    recs = [
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _record(claim_mode="pooled", count=500, achieved_read=390.0, idle_poll=0.0),
+        _record(claim_mode="per_lane", count=500, achieved_read=400.0, idle_poll=100.0),
+        _record(claim_mode="pooled", count=500, achieved_read=410.0, idle_poll=0.0),
+    ]
+    cmp = build_comparison(recs, ("per_lane", "pooled"))
+    assert cmp is not None
+    assert cmp.ok
+    assert cmp.rows[0].candidate is not None
+    assert cmp.rows[0].candidate.achieved_read_per_s == 400.0
+    assert cmp.rows[0].candidate.sent == 2000

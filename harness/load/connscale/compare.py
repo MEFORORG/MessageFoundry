@@ -82,26 +82,53 @@ class _ArmMetrics:
     sink_received: int
     backlog: int
     no_loss_detail: str
+    trials: int = 1
 
     @classmethod
-    def from_record(cls, r: ConnScaleRecord) -> _ArmMetrics:
+    def from_records(cls, recs: list[ConnScaleRecord]) -> _ArmMetrics:
+        """One arm's read-off over EVERY trial of its cell (BACKLOG #5429). Keeping only the last trial
+        let an earlier lossy or timed-out trial vanish from a passing verdict, so the loss signal is
+        all-trials and a timed-out drain counts against it: ``await_drain`` never saw the whole-pipeline
+        gauge reach 0, so rows were stranded somewhere, which is the fusion comparator's reading too.
+        Rates are trial means; peaks and tail latencies are the worst trial."""
+        if not recs:
+            raise ValueError("an arm needs at least one record")
+        last = recs[-1]
+        failures: list[str] = []
+        for i, r in enumerate(recs):
+            label = f"trial {i}: " if len(recs) > 1 else ""
+            if not r.no_loss.ok:
+                failures.append(f"{label}{r.no_loss.detail}")
+            if r.drain_seconds is None:
+                failures.append(f"{label}drain timed out")
+        detail = "; ".join(failures) or last.no_loss.detail
+
+        def _mean_or_none(values: list[float | None]) -> float | None:
+            present = [v for v in values if v is not None]
+            return statistics.fmean(present) if present else None
+
+        def _max_or_none[T: (int, float)](values: list[T | None]) -> T | None:
+            present = [v for v in values if v is not None]
+            return max(present) if present else None
+
         return cls(
-            claim_mode=r.claim_mode,
-            achieved_read_per_s=r.achieved_read_per_s,
-            achieved_written_per_s=r.achieved_written_per_s,
-            idle_poll_per_s=r.idle_poll_per_s,
-            wake_fanout_per_s=r.wake_fanout_per_s,
-            ack_p99_ms=r.ack_p99_ms,
-            pool_wait_p99_ms=r.pool_wait_p99_ms,
-            cpu_seconds_total=r.cpu_seconds_total,
-            cpu_util_cores_mean=r.cpu_util_cores_mean,
-            fd_count_peak=r.fd_count_peak,
-            working_set_peak_bytes=r.working_set_peak_bytes,
-            no_loss_ok=r.no_loss.ok,
-            sent=r.no_loss.sent,
-            sink_received=r.no_loss.sink_received,
-            backlog=r.no_loss.backlog,
-            no_loss_detail=r.no_loss.detail,
+            claim_mode=last.claim_mode,
+            achieved_read_per_s=statistics.fmean(r.achieved_read_per_s for r in recs),
+            achieved_written_per_s=statistics.fmean(r.achieved_written_per_s for r in recs),
+            idle_poll_per_s=statistics.fmean(r.idle_poll_per_s for r in recs),
+            wake_fanout_per_s=statistics.fmean(r.wake_fanout_per_s for r in recs),
+            ack_p99_ms=max(r.ack_p99_ms for r in recs),
+            pool_wait_p99_ms=_max_or_none([r.pool_wait_p99_ms for r in recs]),
+            cpu_seconds_total=_mean_or_none([r.cpu_seconds_total for r in recs]),
+            cpu_util_cores_mean=_mean_or_none([r.cpu_util_cores_mean for r in recs]),
+            fd_count_peak=_max_or_none([r.fd_count_peak for r in recs]),
+            working_set_peak_bytes=_max_or_none([r.working_set_peak_bytes for r in recs]),
+            no_loss_ok=not failures,
+            sent=sum(r.no_loss.sent for r in recs),
+            sink_received=sum(r.no_loss.sink_received for r in recs),
+            backlog=max(r.no_loss.backlog for r in recs),
+            no_loss_detail=detail,
+            trials=len(recs),
         )
 
 
@@ -161,10 +188,15 @@ class ClaimModeComparison:
     # The window every rate in `rows` was computed over, read off the records (BACKLOG #2012). An A/B
     # from before #1420 or #2024 read a different window, so it does not compare with this one.
     rate_window: str | None = None
+    # ``(sweep_mode, count)`` cells the CANDIDATE produced that the baseline never did (BACKLOG #5429).
+    # They have no row to fail, so the verdict fails on them directly rather than skipping them.
+    orphan_candidate_cells: list[tuple[str, int]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return all(row.ok for row in self.rows) and bool(self.rows)
+        return (
+            all(row.ok for row in self.rows) and bool(self.rows) and not self.orphan_candidate_cells
+        )
 
     @property
     def missing_arms(self) -> int:
@@ -229,6 +261,9 @@ class ClaimModeComparison:
                 "resilience_wins": self.resilience_wins,
                 "worst_collapse": self.worst_collapse,
                 "missing_arms": self.missing_arms,
+                "orphan_candidate_cells": [
+                    {"sweep_mode": sm, "count": n} for sm, n in self.orphan_candidate_cells
+                ],
             },
             "rows": [_row_json(row) for row in self.rows],
             "notes": self.notes,
@@ -251,7 +286,8 @@ class ClaimModeComparison:
             f"overall: {overall}  (candidate_zero_loss_ok={self.candidate_zero_loss_ok}, "
             f"throughput_non_regression={_tnr_label(self.throughput_non_regression)}, "
             f"resilience_wins={self.resilience_wins}, worst_collapse={self.worst_collapse}, "
-            f"missing_arms={self.missing_arms})"
+            f"missing_arms={self.missing_arms}, "
+            f"orphan_candidate_cells={len(self.orphan_candidate_cells)})"
         )
         for row in self.rows:
             lines.append("")
@@ -325,9 +361,10 @@ def build_comparison(
     )
     missing_detail = missing_detail or {}
 
-    by_key: dict[tuple[str, str, int], ConnScaleRecord] = {}
+    # Every trial of a cell, not the last one (BACKLOG #5429): ``profile.trials`` repeats each cell.
+    by_key: dict[tuple[str, str, int], list[ConnScaleRecord]] = {}
     for r in records:
-        by_key[(r.claim_mode, r.sweep_mode, r.count)] = r
+        by_key.setdefault((r.claim_mode, r.sweep_mode, r.count), []).append(r)
 
     # Iterate the (sweep_mode, count) cells the BASELINE produced, in first-seen order, so the report
     # is stable and a missing pooled arm is detected against the baseline that always runs.
@@ -342,10 +379,9 @@ def build_comparison(
 
     rows: list[ComparisonRow] = []
     for sweep_mode, count in baseline_cells:
-        base_rec = by_key[(baseline_mode, sweep_mode, count)]
-        base = _ArmMetrics.from_record(base_rec)
-        cand_rec = by_key.get((candidate_mode, sweep_mode, count))
-        if cand_rec is None:
+        base = _ArmMetrics.from_records(by_key[(baseline_mode, sweep_mode, count)])
+        cand_recs = by_key.get((candidate_mode, sweep_mode, count))
+        if not cand_recs:
             rows.append(
                 ComparisonRow(
                     sweep_mode=sweep_mode,
@@ -362,7 +398,7 @@ def build_comparison(
                 )
             )
             continue
-        cand = _ArmMetrics.from_record(cand_rec)
+        cand = _ArmMetrics.from_records(cand_recs)
         # The throughput delta is only SOUND when both arms held zero-loss; a breached (drowning)
         # baseline has a poller-zeroed achieved rate we must not read as a pass/fail.
         candidate_lost = not cand.no_loss_ok
@@ -400,6 +436,16 @@ def build_comparison(
             "-- see each arm's recorded reason (on SQL Server one cause is READ_COMMITTED_SNAPSHOT "
             "OFF; set RCSI ON on the target DB)."
         )
+    orphans: list[tuple[str, int]] = []
+    for r in records:
+        key = (r.sweep_mode, r.count)
+        if r.claim_mode == candidate_mode and key not in seen and key not in orphans:
+            orphans.append(key)
+    if orphans:
+        notes.append(
+            f"{len(orphans)} pooled cell(s) with NO per_lane baseline to compare against: "
+            f"{', '.join(f'[{sm}] N={n}' for sm, n in orphans)} -- the A/B fails rather than skip them."
+        )
     return ClaimModeComparison(
         baseline_mode=baseline_mode,
         candidate_mode=candidate_mode,
@@ -409,6 +455,7 @@ def build_comparison(
         rows=rows,
         notes=notes,
         rate_window=records_rate_window(records),
+        orphan_candidate_cells=orphans,
     )
 
 
